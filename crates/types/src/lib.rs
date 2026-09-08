@@ -2,8 +2,8 @@
 //!
 //! These are the types that cross the consensus ⇄ application boundary
 //! defined in `docs/oai-spec.md`. They are deliberately *engine-agnostic*:
-//! an [`OxideBlockRecord`] is the same whether the block was finalized by
-//! `oxideBFT`, the `MockEngine`, or a future `CometBFT` bridge — followers,
+//! a [`BlockRecord`] is the same whether the block was finalized by
+//! `oxideBFT`, the `MockEngine`, or any other engine — followers,
 //! indexers, the journal, and RPC consume this shape, never an engine's
 //! internal header format (oai-spec.md §1).
 //!
@@ -313,10 +313,10 @@ impl<'a> Decode<'a> for StateAttestation {
 /// internal header (oai-spec.md §1). Chained by `prev` into a hash
 /// chain rooted at genesis.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OxideBlockRecord {
+pub struct BlockRecord {
     /// The height of this block.
     pub height: Height,
-    /// Hash of the previous `OxideBlockRecord`. All-zero at genesis.
+    /// Hash of the previous `BlockRecord`. All-zero at genesis.
     pub prev: Hash,
     /// Merkle root of the block's transactions (ordered).
     pub tx_root: Hash,
@@ -324,7 +324,7 @@ pub struct OxideBlockRecord {
     pub attestation: Option<StateAttestation>,
 }
 
-impl Encode for OxideBlockRecord {
+impl Encode for BlockRecord {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.height.encode(buf);
         self.prev.encode(buf);
@@ -339,7 +339,7 @@ impl Encode for OxideBlockRecord {
     }
 }
 
-impl<'a> Decode<'a> for OxideBlockRecord {
+impl<'a> Decode<'a> for BlockRecord {
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         let height = Height::decode(reader)?;
         let prev = Hash::decode(reader)?;
@@ -439,8 +439,8 @@ mod tests {
     }
 
     #[test]
-    fn oxide_block_record_wire_with_attestation() {
-        let rec = OxideBlockRecord {
+    fn block_record_wire_with_attestation() {
+        let rec = BlockRecord {
             height: Height::new(1),
             prev: Hash([0; 32]),
             tx_root: Hash([0xff; 32]),
@@ -457,8 +457,8 @@ mod tests {
     }
 
     #[test]
-    fn oxide_block_record_wire_no_attestation() {
-        let rec = OxideBlockRecord {
+    fn block_record_wire_no_attestation() {
+        let rec = BlockRecord {
             height: Height::new(0),
             prev: Hash([0; 32]),
             tx_root: Hash([0; 32]),

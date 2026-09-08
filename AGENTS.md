@@ -65,6 +65,14 @@ nightly adds fuzz and long simulations.
   of the pre-commit checklist (`.devin/skills/git-conventions`).
 
 - Edition 2024; workspace lint level strict (`clippy::all -D warnings`).
+- **Naming: keep code identifiers generic — no `Oxide` prefix on types,
+  traits, functions, or crates.** The project name ("Oxide") lives in
+  README/docs prose and the repo path; code stays engine- and
+  project-neutral so types read the same in any consumer. The one
+  exception is `oxideBFT`, the consensus engine's *proper name* (like
+  HotStuff, Jolteon) — it is not a prefix and is not generalized.
+  **No CometBFT references or usage anywhere** — Oxide's engine is
+  oxideBFT; the boundary is the OAI, not ABCI/CometBFT.
 - Every constant on a hot path carries a comment: unit, origin (plan.md /
   spec §), and the tradeoff of changing it.
 - Benchmarks document the acceptance gate they enforce (source: plan.md §13).

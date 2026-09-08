@@ -15,7 +15,7 @@
 //! # Why traits, not concrete types
 //!
 //! The chain's identity is engine-agnostic (oai-spec.md §1): followers,
-//! indexers, the journal, and RPC consume the [`types::OxideBlockRecord`]
+//! indexers, the journal, and RPC consume the [`types::BlockRecord`]
 //! ledger, never an engine's internal header. Swapping the engine changes
 //! consensus certificates, not the chain's data model. The traits make
 //! that swap a compile-time property — a node wires an engine via

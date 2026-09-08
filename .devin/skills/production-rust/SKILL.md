@@ -45,6 +45,14 @@ context from the author.
 - Types are nouns (`OrderBook`, `ViewCertificate`); functions are verbs
   (`recover_threshold`, `apply_batch`); predicates read as questions
   (`is_finalized`, `has_quorum`).
+- **No `Oxide` prefix on code identifiers.** Types, traits, functions,
+  and crates stay generic (`BlockRecord`, not `OxideBlockRecord`;
+  `ConsensusEngine`, not `OxideConsensusEngine`). The project name lives
+  in prose and repo paths, not in code — code reads the same in any
+  consumer. The single exception is `oxideBFT`, the consensus engine's
+  proper name (like HotStuff, Jolteon): it is a name, not a prefix, and
+  is not generalized. **No CometBFT references or usage** — the engine
+  is oxideBFT and the boundary is the OAI, not ABCI/CometBFT.
 - Booleans are never bare parameters (`fn place(self, post_only: bool)` is
   unreadable at call sites) — use an enum (`PostOnly::Yes/No`) or a builder.
 - `#[repr(C, align(64))]` and explicit layouts are used on any struct that

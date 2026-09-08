@@ -3,14 +3,13 @@
 Status: Phase 0 scope — the *contract* between consensus engines and the
 application, plus the reference `MockEngine` and the conformance-suite
 skeleton. The default engine (oxideBFT, `docs/oxidebft-spec.md`) and the
-adapter family (CometBFT bridge, sequencer, …) all program against this
-document. If code and spec disagree, one of them is wrong — fix it in
-the same PR.
+adapter family (sequencer, …) all program against this document. If code
+and spec disagree, one of them is wrong — fix it in the same PR.
 
 ## 1. What OAI is
 
-The ABCI-analog boundary (CometBFT ⇄ app in Cosmos), adapted to Oxide's
-two defining architectural facts (plan.md §1):
+The ABCI-analog boundary (the consensus ⇄ app seam in Cosmos-style
+chains), adapted to Oxide's two defining architectural facts (plan.md §1):
 
 1. **Engines order; they never execute.** A consensus engine's output
    is a finalized, reorg-free *ordering* of opaque transaction bytes.
@@ -18,7 +17,7 @@ two defining architectural facts (plan.md §1):
    execution-derived data flowing back is the opaque
    [`StateAttestation`] embedded in later proposals.
 2. **The chain's identity is engine-agnostic.** Followers, indexers, the
-   journal, and RPC consume the app's `OxideBlockRecord` ledger — never
+   journal, and RPC consume the app's `BlockRecord` ledger — never
    an engine's internal header format. Swapping the engine changes
    consensus certificates, not the chain's data model.
 
@@ -102,7 +101,7 @@ against every registered engine:
 | `FinalizedBlock` | height + ordered `TxBytes` — the engine's whole output |
 | `CommitAck` | height — reception assertion from the app |
 | `StateAttestation` | height + root — opaque to the engine |
-| `OxideBlockRecord` | the engine-agnostic canonical ledger entry: height, prev record hash, tx-root, optional attestation |
+| `BlockRecord` | the engine-agnostic canonical ledger entry: height, prev record hash, tx-root, optional attestation |
 
 All implement the `codec` traits (deterministic wire forms; the codec's
 round-trip properties apply to all of them).
@@ -111,7 +110,7 @@ round-trip properties apply to all of them).
 
 - **Async boundary shape:** native `async fn` in traits (AFIT) with a
   boxing layer for `dyn`, vs. a channel-based boundary (which also
-  suits out-of-process engines like the CometBFT bridge). Decided when
+  suits out-of-process engines). Decided when
   oxideBFT's real loop exists; v0 sync signatures were chosen so the
   decision is not pre-baked.
 - **Epoch/validator-set queries:** oxideBFT needs the staking module's

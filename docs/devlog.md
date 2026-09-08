@@ -365,7 +365,7 @@ Spec-first, then code, then a real bug the conformance suite caught.
 a. **`docs/oai-spec.md` v1.** The Oxide Application Interface — the
    ABCI-analog boundary, adapted to Oxide's two defining facts: engines
    order, they never execute; the chain's identity is engine-agnostic
-   (followers consume `OxideBlockRecord`, never an engine header). v0
+   (followers consume `BlockRecord`, never an engine header). v0
    traits are *synchronous* on purpose — the reference path
    (MockEngine + deterministic runtime + conformance) is inherently
    synchronous, and premature async is an API every adapter must honor
@@ -396,7 +396,7 @@ b. **`runtime` crate — safe, std-only deterministic executor.** The
 
 c. **`types` crate — OAI data model.** `TxBytes`, `BlockBudget`,
    `Proposal`, `Verdict`, `MempoolAck`, `FinalizedBlock`, `CommitAck`,
-   `StateAttestation`, `OxideBlockRecord` — all with `codec` impls so
+   `StateAttestation`, `BlockRecord` — all with `codec` impls so
    the consensus contract (byte-identical encodings across validators)
    holds for the whole boundary. Wire forms pinned by per-type unit
    tests. Adding string-carrying types (`Verdict::Reject`,
@@ -432,7 +432,7 @@ f. **Misc clippy/fmt:** `cast_possible_truncation` on varint→usize
    `missing_panics_doc` on the runtime's `Mutex::lock().unwrap()` (the
    mutexes can't be poisoned in single-threaded use — documented
    honestly in `# Panics` sections); `doc_markdown` backticks around
-   `MockEngine`/`CometBFT`/`oxideBFT`.
+   `MockEngine`/`oxideBFT`.
 
 ### Verification
 
@@ -462,3 +462,25 @@ floor), and a six-stage Phase 1 implementation order, each stage
 gated by the OAI conformance suite. This is a design document, not
 implementation; the implementation lands in Phase 1 against the OAI
 traits and must pass `ports::conformance` before it ships.
+
+## Session 4 addendum 2 — naming: generic identifiers, no CometBFT
+
+User direction: code identifiers stay generic — no `Oxide` prefix on
+types/traits/functions/crates. `OxideBlockRecord` → `BlockRecord`
+(the engine-agnostic canonical ledger entry). The project name
+"Oxide" lives in README/docs prose and the repo path, not in code;
+code reads the same in any consumer. The single exception is
+`oxideBFT`, the consensus engine's proper name (like HotStuff,
+Jolteon) — a name, not a prefix, not generalized.
+
+Also: no CometBFT references or usage anywhere. Oxide's engine is
+oxideBFT; the boundary is the OAI, not ABCI/CometBFT. All CometBFT
+mentions removed from docs/oai-spec.md, docs/oxidebft-spec.md, README,
+types, devlog, changelog.
+
+Codified in AGENTS.md (Conventions) and the production-rust skill
+(§2 Structure & Naming) so future work honors it without re-deriving
+the rule.
+
+Verification: fmt clean, clippy -D warnings clean, 56 tests pass
+(unchanged from before — pure rename + reference removal).

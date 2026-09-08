@@ -104,7 +104,7 @@ swap them — the Rust-native answer to Cosmos's ABCI composability:
 
 | Port | Default | Swap examples |
 |---|---|---|
-| `ConsensusEngine` | **oxideBFT** (2-chain HotStuff) | `MockEngine` (sims/tests), `SequencerEngine` (dev mode) — shipped; CometBFT bridge, hotstuff_rs wrapper — planned |
+| `ConsensusEngine` | **oxideBFT** (2-chain HotStuff) | `MockEngine` (sims/tests), `SequencerEngine` (dev mode) — shipped; hotstuff_rs wrapper — planned |
 | `AppInterface` (OAI) | oxide app: mempool + executor + state | the boundary every engine programs against (`docs/oai-spec.md`) |
 | `StorageBackend` | authenticated journal (MMR-over-log) | `Volatile` (in-memory), `Mdbx` / `RocksDb` / `Redb` (plain, followers) |
 | `ColdStore` | MDBX (pending Phase 0 bench-off) | RocksDB, redb |
@@ -143,7 +143,7 @@ oxide/
 │   ├── trading/         # ★ matching engine, risk engine (HFT-grade)
 │   ├── rpc/             # JSON-RPC + WebSocket (eth_* + oxide_*)
 │   ├── node/            # node assembly: config-driven wiring of all ports
-│   └── types/           # shared chain types (Tx, Header, QC, OxideBlockRecord…)
+│   └── types/           # shared chain types (Tx, Header, QC, BlockRecord…)
 ├── modules/                   # Cosmos-SDK-style module framework + modules
 │   ├── framework/  core/  bank/  staking/
 │   ├── evm/        # revm host + native precompiles (the "x/vm" analog)

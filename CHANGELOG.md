@@ -27,7 +27,7 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     sequence), and a pinned delivery order `[3,0,1,2]`.
   - `types` crate: the OAI data model — `TxBytes`, `BlockBudget`,
     `Proposal`, `Verdict`, `MempoolAck`, `FinalizedBlock`, `CommitAck`,
-    `StateAttestation`, `OxideBlockRecord` — all with deterministic
+    `StateAttestation`, `BlockRecord` — all with deterministic
     `codec` impls and per-type wire-form pinning tests.
   - `ports` crate: the plug-and-play seams — `ConsensusEngine` and
     `AppInterface` traits, a reference `MockEngine`/`MockApp`, and a

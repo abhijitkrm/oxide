@@ -32,8 +32,8 @@ executes them (oai-spec.md §1).
    application's `StateAttestation` verbatim in later proposals and
    never parses it (oai-spec.md §3 rule 5).
 4. **Pluggability.** oxideBFT is the *default* engine, not the *only*
-   one. It implements `ports::ConsensusEngine`; the `MockEngine` and a
-   future CometBFT bridge implement the same trait. The conformance
+   one. It implements `ports::ConsensusEngine`; the `MockEngine` and
+   other alternative engines implement the same trait. The conformance
    suite is the contract.
 5. **Determinism.** Given identical inputs (tx submissions + network
    message log), oxideBFT produces byte-identical finalized blocks
