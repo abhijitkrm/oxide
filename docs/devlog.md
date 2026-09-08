@@ -1206,3 +1206,21 @@ change) and proven deterministic across runs. The next Phase 1
 deliverables are new crates: `SequencerEngine` adapter (proves the
 consensus seam), `broadcast` (erasure + PlainGossip), `mempool`,
 `executor` v0, `modules` (core/bank/staking), and the local devnet.
+
+### CI fix: rustfmt gate
+
+Commit `746b758` passed all local gates but failed CI on the Format
+step. Root cause: I ran `cargo fmt --check` (without `--all`) in
+local verification, but CI runs `cargo fmt --all --check`. A line
+in the new `run_simulation` helper exceeded the width limit after
+a clippy-driven edit (the `u8::try_from` cast fix) was made *after*
+the last fmt pass. The `--all` flag formats every workspace
+package; without it, the check skipped the consensus crate's new
+code.
+
+Fix (`fe813e4`): ran `cargo fmt --all` to split the long line.
+Pushed to main; CI green after.
+
+Lesson: run `cargo fmt --all --check` as the *last* step before
+committing, after all other edits. The CI order is fmt → clippy →
+test; mirror that order and never edit after the fmt pass.
