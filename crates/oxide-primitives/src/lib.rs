@@ -125,7 +125,7 @@ impl fmt::Debug for Hash {
 /// (`H160`).
 ///
 /// Oxide unifies native accounts and EVM accounts into one address space
-/// (README.md → "Plug-and-play"): a native (ed25519) user and a MetaMask
+/// (README.md → "Plug-and-play"): a native (ed25519) user and a `MetaMask`
 /// user are both addressed by 20 bytes, which is what lets the EVM module
 /// read and write native-module state without a bridge.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -329,6 +329,10 @@ impl<T: IdSpace> Id<T> {
 
     /// Next value in the space; consensus uses this heavily
     /// (`view.next()` on timeout) and it must stay `const`-cheap.
+    ///
+    /// `#[must_use]`: computing `next()` and discarding it is always a
+    /// bug — the caller meant to advance something.
+    #[must_use]
     pub const fn next(self) -> Self {
         Id::new(self.0 + 1)
     }

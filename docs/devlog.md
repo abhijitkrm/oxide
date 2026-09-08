@@ -141,6 +141,17 @@ d. **Off-by-one hand-written test expectation.** `test_display_formats_
    only.
 e. **Dead code warning**: unused `Hash::HEX_LEN` const removed (truncation
    math derives from `bytes.len()` in the shared helper).
+f. **Lint-group priority ambiguity.** `rust_2018_idioms = "warn"` (a lint
+   *group*) alongside individual lints at the same implicit priority →
+   clippy warning about precedence. Fix: explicit
+   `{ level = "warn", priority = -1 }` for the group.
+g. **clippy pedantic hygiene**: `MetaMask` needed backticks in a doc
+   comment (`doc_markdown`), and `Id::next` needed `#[must_use]` —
+   discarding `next()`'s result is always a caller bug. Both fixed.
+h. **Typo'd lint name in workspace lints**: `need_pass_by_value` → the
+   lint is `needless_pass_by_value`; the typo surfaced as an
+   unknown-lint warning only in some targets. Fixed; clippy now
+   warning-free across the workspace.
 
 ### Next up (Phase 0 remainder)
 
