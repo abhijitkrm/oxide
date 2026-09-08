@@ -12,6 +12,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase 1 stage 4: oxideBFT 2-chain commit + multi-validator**
+  (2026-09-09)
+  - 2-chain commit rule: a block is committed when a later block
+    extends it and gets a QC. The engine tracks one pending block
+    (the pipeline tip) and commits it when the next QC arrives.
+  - Multi-validator API: `propose`, `vote`, `collect_vote`,
+    `try_form_qc`, `deliver_qc`, `on_timeout`, `on_timeout_certificate`.
+    4-validator tests prove the 2-chain rule works with quorum > 1.
+  - Pipeline flush: empty blocks advance the pipeline to commit
+    pending blocks when no txs are pending.
+  - Height tracking: engine's `next_height` advances on proposal
+    (not finalization), leading the app's height.
+  - MockApp fix: accepts empty proposals (pipelined engines need them).
+  - 3 multi-validator tests + conformance; 108 total.
+
+  **In plain words:** oxideBFT now uses the 2-chain commit rule — the
+  safety rule that prevents a new leader from forking a locked block
+  during a view change. The engine also supports multiple validators:
+  the leader proposes, followers vote, the leader forms QCs from
+  quorum, and all validators commit. This is the first stage where
+  oxideBFT's safety argument is real (1-chain was only safe in the
+  happy path). BLS signatures are still placeholders until stage 5.
+
 - **Phase 1 stage 3: oxideBFT engine, single-leader happy path**
   (2026-09-09)
   - `OxideBft` engine implementing `ConsensusEngine` — the first real

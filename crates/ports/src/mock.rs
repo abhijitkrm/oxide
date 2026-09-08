@@ -104,18 +104,14 @@ impl AppInterface for MockApp {
     }
 
     fn process_proposal(&self, proposal: &Proposal) -> Verdict {
-        // Static validity only: reject if the proposal exceeds the
-        // budget the engine would have used. Never executes — a
-        // proposal that would revert is still accepted (oai-spec.md
-        // §3, rule 4). The mock's budget is generous, so this is
-        // effectively always `Accept` for well-formed proposals.
-        if proposal.txs.is_empty() && proposal.height != Height::new(0) {
-            // An empty non-genesis proposal is suspicious in the mock
-            // (it means the leader had nothing to propose but tried
-            // anyway). Surface it so the conformance suite can detect
-            // misbehavior, but do not execute.
-            return Verdict::Reject { reason: "empty non-genesis proposal".to_string() };
-        }
+        // Static validity only. Never executes — a proposal that would
+        // revert is still accepted (oai-spec.md §3, rule 4).
+        //
+        // Empty proposals are accepted: pipelined engines (e.g. oxideBFT
+        // with 2-chain commit) propose empty blocks to advance the
+        // pipeline and commit pending blocks. Rejecting empty proposals
+        // would break the pipeline flush.
+        let _ = proposal;
         Verdict::Accept
     }
 

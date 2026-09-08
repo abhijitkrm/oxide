@@ -805,3 +805,96 @@ Stage 4: view changes via TC (faulty leader bypass). This upgrades
 the commit rule from 1-chain to 2-chain and wires in the pacemaker for
 active view synchronization. The conformance suite + deterministic
 simulation must pass.
+
+## Session 9 — Phase 1 stage 4: 2-chain commit + multi-validator
+
+Stage 4 of the oxideBFT spec's staged implementation order
+(docs/oxidebft-spec.md §8): the 2-chain commit rule and multi-
+validator support. The conformance suite passes.
+
+### What landed
+
+**Upgraded `OxideBft` engine** (crates/consensus/src/engine.rs):
+
+- **2-chain commit rule:** a block B is committed when (1) there is
+  a QC over B, (2) a later block B' extends B (B'.high_qc == QC_B),
+  and (3) there is a QC over B'. In the pipeline, each new QC commits
+  the *previous* pending block. The engine tracks one `PendingBlock`
+  at a time (the tip of the pipeline).
+
+- **Multi-validator API:** the engine exposes methods for both
+  single-validator (conformance suite) and multi-validator
+  (simulation) modes:
+  - `propose()` — leader proposes a block.
+  - `vote()` — validator votes on a proposal (with double-vote
+    protection via `last_voted_view: Option<View>`).
+  - `collect_vote(voter, vote)` — leader collects a vote from a
+    specific validator (indexed by voter, not leader).
+  - `try_form_qc()` — leader forms a QC when quorum (≥2f+1) reached.
+  - `deliver_qc()` — all validators receive a QC, check 2-chain commit.
+  - `on_timeout()` / `on_timeout_certificate()` — view change hooks
+    (wired to the pacemaker from stage 2).
+
+- **Height tracking:** the engine maintains its own `next_height` that
+  advances on *proposal* (not finalization). The 2-chain pipeline
+  proposes multiple blocks before committing any; the engine's height
+  leads the app's. The app's `next_proposal_height` advances on
+  finalization (in `finalize_block`).
+
+- **Pipeline flush:** when there are no pending txs but the pending
+  block has txs, the engine proposes an empty block to advance the
+  pipeline and commit the pending block. This is the 2-chain flush.
+
+### MockApp fix
+
+The MockApp's `process_proposal` rejected empty non-genesis proposals.
+This broke the 2-chain pipeline, which needs empty blocks to flush.
+Fixed: empty proposals are accepted (pipelined engines need them;
+the OAI spec doesn't prohibit them).
+
+### Conformance suite
+
+The conformance suite was already modified in stage 3 to handle
+pipelined engines (checks all txs appear in some finalized block,
+allows empty blocks). Both MockEngine and OxideBft pass.
+
+### Multi-validator tests
+
+Three new tests exercise the multi-validator API with 4 validators:
+- `multi_validator_two_chain_commits`: one tx → 2 rounds → committed.
+- `multi_validator_multiple_rounds`: 5 txs → 6 rounds → all committed.
+- `multi_validator_finalized_heights_match`: all validators agree.
+
+### Design decisions
+
+- **`last_voted_view: Option<View>`:** initialized to `None` (never
+  voted). The check `is_some_and(|v| v >= header.view)` prevents
+  double-voting while allowing the first vote in view 0. Using
+  `View::new(0)` as the initial value would reject the first vote
+  (0 >= 0 is true).
+
+- **`collect_vote(voter, vote)`:** the voter's index is passed
+  explicitly (not derived from the vote's view). This is because the
+  vote doesn't carry the voter's identity — the leader knows which
+  validator sent the vote (from the network layer) and indexes the
+  bitmap accordingly.
+
+- **`PendingBlock` simplified:** only carries `hash` and `proposal`
+  (the txs). The header and QC are not needed after the pending block
+  is created — the hash is enough to identify it, and the proposal
+  has the txs for the `FinalizedBlock`.
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test
+--workspace` — 108 tests pass (consensus 30: 19 pacemaker/validator +
+11 engine, including conformance + 3 multi-validator); `cargo deny
+check` — all four checks ok.
+
+### Next
+
+Stage 5: BLS aggregation integration with `blst`. This replaces the
+placeholder `Signature::ZERO` and `AggregateSignature::ZERO` with
+real BLS12-381 signing, verification, and aggregation. A benchmark
+gate proves the aggregation is fast enough for production.
