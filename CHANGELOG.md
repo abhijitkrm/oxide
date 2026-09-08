@@ -12,6 +12,39 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Oxide Application Interface (OAI) — spec, traits, reference engine,
+  conformance suite** (2026-09-09)
+  - `docs/oai-spec.md` v1: the ABCI-analog boundary, adapted to Oxide's
+    "engines order, never execute" and "chain identity is
+    engine-agnostic" invariants. v0 traits are synchronous by design;
+    the async-vs-channel decision is deferred to Phase 1 with the first
+    real consumer.
+  - `runtime` crate: a safe, std-only deterministic single-threaded
+    executor (FIFO ready queue, FIFO mailboxes, no timers/threads/unsafe)
+    — the reproducibility backbone of the deterministic-simulation test
+    layer. 4-node echo simulation (simplified Bracha reliable broadcast)
+    asserts liveness, determinism (two runs → identical delivery
+    sequence), and a pinned delivery order `[3,0,1,2]`.
+  - `types` crate: the OAI data model — `TxBytes`, `BlockBudget`,
+    `Proposal`, `Verdict`, `MempoolAck`, `FinalizedBlock`, `CommitAck`,
+    `StateAttestation`, `OxideBlockRecord` — all with deterministic
+    `codec` impls and per-type wire-form pinning tests.
+  - `ports` crate: the plug-and-play seams — `ConsensusEngine` and
+    `AppInterface` traits, a reference `MockEngine`/`MockApp`, and a
+    reusable `conformance::assert_conformance` suite asserting the four
+    engine-agnostic rules (liveness, gap-free heights, finality-is-final,
+    determinism). An end-to-end OAI test exercises the two rules the
+    generic suite can't (ordering-only, attestations opaque).
+
+  **In plain words:** the consensus ⇄ app boundary now has a written
+  contract, a working reference implementation, and an automated test
+  suite every future consensus engine must pass before it ships. The
+  reference engine is deliberately trivial (single-leader, no voting,
+  no network) so it can serve as the specification of the contract; the
+  real `oxideBFT` will drop in behind the same traits. The deterministic
+  runtime means multi-node simulations replay byte-identically every
+  run — a prerequisite for bisecting flaky consensus failures.
+
 - **Repository bootstrap** (2026-09-08)
   - Exhaustive open-source README: mission, performance targets vs. state
     of the art (Hyperliquid / Monad / Sei Giga / CME-class engines),

@@ -1,0 +1,19 @@
+# Oxide blockchain — `ports` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+
+[package]
+name = "ports"
+description = "Oxide plug-and-play seams: the ConsensusEngine and AppInterface traits (OAI), a reference MockEngine, and the adapter conformance suite."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+types = { workspace = true }
+
+[lints]
+workspace = true

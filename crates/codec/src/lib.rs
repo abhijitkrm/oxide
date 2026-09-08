@@ -80,6 +80,10 @@ pub enum DecodeError {
         /// Length the input actually had.
         got: usize,
     },
+    /// A byte string that must be valid UTF-8 (e.g. an OAI rejection
+    /// reason) contained invalid UTF-8. Surfaced at trust boundaries as a
+    /// peer-to-penalize framing error, not a truncation.
+    InvalidUtf8,
 }
 
 impl fmt::Display for DecodeError {
@@ -99,6 +103,9 @@ impl fmt::Display for DecodeError {
             }
             DecodeError::WrongSliceLength { expected, got } => {
                 write!(f, "slice length {got} != required {expected}")
+            }
+            DecodeError::InvalidUtf8 => {
+                write!(f, "byte string contained invalid UTF-8")
             }
         }
     }

@@ -1,0 +1,21 @@
+# Oxide blockchain — `runtime` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+
+[package]
+name = "runtime"
+description = "Oxide runtime: a safe, std-only deterministic single-threaded executor for simulations and tests — the reproducibility backbone of the five-layer test pyramid."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# std-only by design (production-rust skill §5): this crate exists so
+# that simulations never depend on OS scheduling. The tokio-backed
+# production runtime arrives in Phase 1 as a *sibling* implementation
+# behind the same `Spawner` shape, not a rewrite of this one.
+
+[lints]
+workspace = true

@@ -41,6 +41,9 @@ needless_pass_by_value = "allow"
 # Internal crates (exact versions keep the graph deterministic and reviews local).
 primitives = { path = "crates/primitives" }
 codec = { path = "crates/codec" }
+runtime = { path = "crates/runtime" }
+types = { path = "crates/types" }
+ports = { path = "crates/ports" }
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable

@@ -357,3 +357,93 @@ autofixes (semicolons, doc backticks, `ilog2`, `?` for let-else).
 - `runtime` (deterministic executor + 4-node echo sim) → `types` +
   `ports` (OAI traits + MockEngine + conformance skeleton) → protocol
   specs (`docs/oxidebft-spec.md`, `docs/oai-spec.md`) → fuzz targets.
+
+## Session 4 — OAI spec, runtime, types, ports (Phase 0 foundation)
+
+Spec-first, then code, then a real bug the conformance suite caught.
+
+a. **`docs/oai-spec.md` v1.** The Oxide Application Interface — the
+   ABCI-analog boundary, adapted to Oxide's two defining facts: engines
+   order, they never execute; the chain's identity is engine-agnostic
+   (followers consume `OxideBlockRecord`, never an engine header). v0
+   traits are *synchronous* on purpose — the reference path
+   (MockEngine + deterministic runtime + conformance) is inherently
+   synchronous, and premature async is an API every adapter must honor
+   forever. The async-vs-channel decision is explicitly deferred to
+   Phase 1 with the first real consumer (oxideBFT's loop).
+
+b. **`runtime` crate — safe, std-only deterministic executor.** The
+   reproducibility backbone of the five-layer test pyramid's top
+   (deterministic simulation). `tokio`/OS scheduling is deliberately
+   non-deterministic; this crate is the opposite: FIFO ready queue, FIFO
+   mailboxes, no timers, no I/O, no threads, no `unsafe` (workspace
+   denies it). Wakers built on stable `std::task::Wake` (`Arc<Task>` +
+   `Send+Sync` via `Mutex` — the mutexes are never contended, they
+   exist only to satisfy `Wake`'s bounds). A wake-dedup `AtomicBool`
+   per task is the determinism invariant: without it the same task
+   could appear in the ready queue multiple times and poll order would
+   depend on how many redundant wakes happened.
+
+   The 4-node echo sim (simplified Bracha reliable broadcast) is the
+   Phase 0 acceptance: liveness (all nodes deliver), determinism (two
+   runs → identical delivery sequence), and a pinned order
+   `[3,0,1,2]` as a regression guard. Writing the sim caught a real
+   protocol bug: the initiator (node 0) never receives `Init`, so it
+   never echoes, so every node's echo-count tops out at N−1 and nobody
+   delivers. Fix: node 0 emits its own `Echo` alongside the `Init`s.
+   The `echo_known_order` test exists to guard that invariant — remove
+   the self-echo and it fails with node 0 stuck at 3 echoes.
+
+c. **`types` crate — OAI data model.** `TxBytes`, `BlockBudget`,
+   `Proposal`, `Verdict`, `MempoolAck`, `FinalizedBlock`, `CommitAck`,
+   `StateAttestation`, `OxideBlockRecord` — all with `codec` impls so
+   the consensus contract (byte-identical encodings across validators)
+   holds for the whole boundary. Wire forms pinned by per-type unit
+   tests. Adding string-carrying types (`Verdict::Reject`,
+   `MempoolAck::Rejected`) justified a new `codec::DecodeError::InvalidUtf8`
+   variant — the codec now carries strings, so the error belongs there
+   rather than a misleading `InvalidBool` reuse at the call site.
+
+d. **`ports` crate — the plug-and-play seams.** `ConsensusEngine` +
+   `AppInterface` traits (matching the OAI spec), a reference
+   `MockEngine`/`MockApp`, and a reusable `conformance::assert_conformance`
+   suite asserting the four engine-agnostic rules: liveness, gap-free
+   height sequence from genesis, finality-is-final, and determinism
+   under identical inputs. Rules 4 (ordering-only) and 5 (attestations
+   opaque) are exercised in the e2e test, which needs engine+app
+   cooperation a generic factory can't provide.
+
+e. **Bug the conformance suite caught (the point of writing it).**
+   `MockApp::prepare_proposal` advanced `next_proposal_height` on every
+   call. But the engine calls `prepare_proposal` to *check for pending
+   work* and then drops the empty proposal — so the app's counter
+   advanced with no block finalized, desyncing it from the engine's
+   `next_height`. Result: finalized heights `{0, 2}` with a gap at 1,
+   and the gap-free-heights assertion failed. Fix: the counter moves
+   *only* in `finalize_block` (the one place a height is committed),
+   keeping app and engine in lockstep. This is exactly the class of
+   bug the conformance suite exists to catch — and it caught it before
+   any real engine was built against the trait.
+
+f. **Misc clippy/fmt:** `cast_possible_truncation` on varint→usize
+   counts (added a `read_count` helper mapping overflow to
+   `LengthPrefixTooLarge`, keeping the trust-boundary vocabulary
+   uniform); `needless_range_loop` on broadcast loops → iterators;
+   `missing_panics_doc` on the runtime's `Mutex::lock().unwrap()` (the
+   mutexes can't be poisoned in single-threaded use — documented
+   honestly in `# Panics` sections); `doc_markdown` backticks around
+   `MockEngine`/`CometBFT`/`oxideBFT`.
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test
+--workspace` — 56 tests pass (codec 5, primitives 10, runtime 3,
+storage 16 + 6 properties, types 11, ports 1 conformance + 4 e2e).
+
+### Next up (Phase 0 remainder)
+
+- `docs/oxidebft-spec.md` v1 draft.
+- Fuzz targets at trust boundaries (codec decode, journal replay,
+  MMR proof verify, consensus message decode).
+- Then Phase 0 gate close.

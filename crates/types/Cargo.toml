@@ -1,0 +1,19 @@
+# Oxide blockchain — `types` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+
+[package]
+name = "types"
+description = "Oxide Application Interface (OAI) data model: the engine-agnostic block, proposal, and attestation types that cross the consensus/application boundary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+
+[lints]
+workspace = true
