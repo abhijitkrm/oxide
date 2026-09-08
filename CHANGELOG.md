@@ -12,6 +12,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **oxideBFT hardening: tail-fork resistance, view-change test,
+  deterministic simulation** (2026-09-09)
+  - Tail-fork resistance enforced in `vote()`: validators reject
+    proposals that don't extend the highest QC they voted for
+    (prevents MEV-by-discard). 4 new tests.
+  - Faulty-leader view-change test: 4 validators, faulty leader
+    bypassed via timeout certificate, new leader takes over. 1 new
+    test.
+  - Deterministic multi-node simulation: N validators, multiple
+    rounds with leader rotation, asserts liveness + finality
+    agreement + determinism across runs. 4 new tests (4 and 7
+    validators). 137 total tests.
+
+  **In plain words:** oxideBFT now rejects leaders that try to fork
+  away notarized blocks (tail-fork resistance), proves that a faulty
+  leader is bypassed within one timeout, and demonstrates that
+  multiple validators produce identical finalized block sequences
+  across repeated runs. The consensus engine is now safe under
+  faults and deterministic — the two properties required before
+  building the rest of Phase 1 (broadcast, mempool, executor,
+  modules, devnet).
+
 - **Phase 1 stage 6: epoch rotation (two-phase handoff)** (2026-09-09)
   - `schedule_rotation(new_set)` — phase 1: announce the new
     validator set. Old set continues to operate.

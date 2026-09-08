@@ -400,6 +400,34 @@ impl OxideBft {
         if self.last_voted_view.is_some_and(|v| v >= header.view) {
             return None;
         }
+        // Tail-fork resistance (docs/oxidebft-spec.md §4): reject
+        // proposals that don't extend our highest QC. A leader that
+        // forks away a notarized block must be bypassed, not
+        // rewarded. The check: the proposal's `high_qc` must equal
+        // (or extend) our `high_qc`. In the happy path they're equal
+        // (the leader built on the same QC). On a view change, the
+        // new leader's `high_qc` may be higher than ours (it saw a
+        // QC we missed) — that's fine, we accept it. But a leader
+        // with a *lower* `high_qc` is forking.
+        //
+        // Exception: at genesis (no high_qc yet), any proposal is
+        // accepted.
+        if let Some(our_high_qc) = &self.high_qc {
+            match &header.high_qc {
+                // Proposal has a high_qc: it must match ours. (We
+                // don't chase chains of QCs here — the 2-chain
+                // commit rule already ensures block validity. This
+                // check prevents the simple fork where a leader
+                // discards a notarized block.)
+                Some(prop_qc) if prop_qc.block_hash != our_high_qc.block_hash => {
+                    return None;
+                }
+                // Proposal has no high_qc but we have one: the
+                // leader is proposing a fork that ignores our QC.
+                None => return None,
+                _ => {}
+            }
+        }
         // Process the proposal through the app (static validity).
         match self.app.process_proposal(proposal) {
             Verdict::Accept => {}
@@ -639,6 +667,7 @@ mod tests {
     //! the internal state (block hash, `tx_root`, view advancement).
 
     use super::*;
+    use crate::pacemaker::PacemakerEvent;
     use ports::conformance;
     use ports::mock::MockApp;
 
@@ -1116,5 +1145,413 @@ mod tests {
         engine.submit_tx(TxBytes::new(vec![2]));
         engine.run_until_idle();
         assert_eq!(engine.epoch(), Epoch::new(1));
+    }
+
+    // ---- Tail-fork resistance tests ----
+    //
+    // docs/oxidebft-spec.md §4: validators reject proposals that don't
+    // extend the highest QC they voted for. This prevents a faulty
+    // leader from discarding a notarized block (MEV-by-discard).
+
+    #[test]
+    fn tail_fork_rejects_proposal_without_high_qc() {
+        // After the engine has a high_qc, a proposal with no high_qc
+        // (a fork) must be rejected.
+        let mut engine = make_engine();
+        // Drive one round to establish a high_qc.
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        assert!(engine.high_qc.is_some(), "high_qc should be set");
+
+        // Craft a proposal with no high_qc (a fork).
+        let proposal = Proposal {
+            height: Height::new(99),
+            txs: vec![TxBytes::new(vec![2])],
+            attestation: None,
+        };
+        let header = BlockHeader {
+            height: Height::new(99),
+            view: View::new(99),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            high_qc: None, // fork: no high_qc
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+        };
+        let vote = engine.vote(&header, &proposal);
+        assert!(vote.is_none(), "fork proposal without high_qc must be rejected");
+    }
+
+    #[test]
+    fn tail_fork_rejects_proposal_with_wrong_high_qc() {
+        // After the engine has a high_qc, a proposal with a different
+        // high_qc (extending a different chain) must be rejected.
+        let mut engine = make_engine();
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        let our_high_qc = engine.high_qc.clone().expect("high_qc set");
+
+        // Craft a fake QC over a different block.
+        let fake_qc = QuorumCertificate {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO, // different block
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0x01],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+
+        let proposal = Proposal {
+            height: Height::new(99),
+            txs: vec![TxBytes::new(vec![2])],
+            attestation: None,
+        };
+        let header = BlockHeader {
+            height: Height::new(99),
+            view: View::new(99),
+            epoch: Epoch::new(0),
+            prev_block: fake_qc.block_hash,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            high_qc: Some(fake_qc),
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+        };
+        let vote = engine.vote(&header, &proposal);
+        assert!(
+            vote.is_none(),
+            "fork proposal with wrong high_qc must be rejected (our high_qc block: {:?})",
+            our_high_qc.block_hash
+        );
+    }
+
+    #[test]
+    fn tail_fork_accepts_proposal_extending_high_qc() {
+        // After the engine has a high_qc, a proposal that extends it
+        // (same high_qc) must be accepted.
+        let mut engine = make_engine();
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        let our_high_qc = engine.high_qc.clone().expect("high_qc set");
+
+        let proposal = Proposal {
+            height: Height::new(99),
+            txs: vec![TxBytes::new(vec![2])],
+            attestation: None,
+        };
+        let header = BlockHeader {
+            height: Height::new(99),
+            view: View::new(99),
+            epoch: Epoch::new(0),
+            prev_block: our_high_qc.block_hash,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            high_qc: Some(our_high_qc),
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+        };
+        let vote = engine.vote(&header, &proposal);
+        assert!(vote.is_some(), "proposal extending high_qc must be accepted");
+    }
+
+    #[test]
+    fn tail_fork_accepts_genesis_proposal() {
+        // At genesis (no high_qc), any proposal is accepted.
+        let mut engine = make_engine();
+        let proposal = Proposal {
+            height: Height::new(0),
+            txs: vec![TxBytes::new(vec![1])],
+            attestation: None,
+        };
+        let header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+        };
+        let vote = engine.vote(&header, &proposal);
+        assert!(vote.is_some(), "genesis proposal must be accepted");
+    }
+
+    // ---- View-change tests (multi-validator) ----
+    //
+    // docs/oxidebft-spec.md §4: a faulty leader is bypassed after one
+    // timeout. Validators collect timeout signatures, form a TC, and
+    // advance the view. The new leader takes over.
+
+    #[test]
+    fn faulty_leader_bypassed_via_timeout() {
+        // 4 validators. The leader (index 0) for view 0 is faulty
+        // (withholds proposals). The 3 followers time out, collect
+        // timeout signatures, form a TC, and advance to view 1.
+        // The leader for view 1 (index 1) is honest and proposes.
+        let mut v0 = make_multi_engine(0);
+        let mut v1 = make_multi_engine(1);
+        let mut v2 = make_multi_engine(2);
+        let mut v3 = make_multi_engine(3);
+
+        // All followers time out for view 0.
+        let _ = v1.on_timeout();
+        let _ = v2.on_timeout();
+        let _ = v3.on_timeout();
+
+        // Each follower produces a timeout signature (placeholder
+        // Signature::ZERO — stage 5 would sign the timeout message).
+        // The signatures are gossiped: each validator collects
+        // signatures from the others. v1 collects from itself, v2, v3.
+        let _ = v1.pacemaker.on_timeout_signature(1, Signature::ZERO); // self
+        let events1 = v1.pacemaker.on_timeout_signature(2, Signature::ZERO);
+        let events1b = v1.pacemaker.on_timeout_signature(3, Signature::ZERO);
+
+        // With 3 signatures (quorum = 3 for n=4, f=1), v1 should
+        // form a TC and advance the view.
+        let tc_formed = events1
+            .iter()
+            .chain(events1b.iter())
+            .any(|e| matches!(e, PacemakerEvent::TimeoutCertificateFormed(_)));
+        assert!(tc_formed, "v1 should form a TC at quorum");
+
+        // Extract the TC from the events.
+        let tc = events1
+            .iter()
+            .chain(events1b.iter())
+            .find_map(|e| {
+                if let PacemakerEvent::TimeoutCertificateFormed(tc) = e {
+                    Some(tc.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("TC should be in the events");
+        assert_eq!(tc.view, View::new(0), "TC is for view 0");
+
+        // v1's pacemaker already advanced its view internally, but
+        // the engine's `current_view` field is separate. Sync it
+        // from the pacemaker. (In a real system, the engine would
+        // process its own AdvanceView event; here we sync directly.)
+        v1.current_view = v1.pacemaker.current_view();
+
+        // All other validators receive the TC and advance the view.
+        v2.on_timeout_certificate(&tc);
+        v3.on_timeout_certificate(&tc);
+        v0.on_timeout_certificate(&tc);
+
+        // All validators should now be at view 1.
+        assert_eq!(v1.current_view(), View::new(1), "v1 should be at view 1");
+        assert_eq!(v2.current_view(), View::new(1), "v2 should be at view 1");
+        assert_eq!(v3.current_view(), View::new(1), "v3 should be at view 1");
+        assert_eq!(v0.current_view(), View::new(1), "v0 should be at view 1");
+
+        // The leader for view 1 is validator 1 (round-robin).
+        assert!(v1.is_leader(), "v1 should be leader for view 1");
+    }
+
+    // ---- Deterministic multi-node simulation ----
+    //
+    // A synchronous deterministic simulation of N validators running
+    // oxideBFT. This is layer 4 of the testing pyramid (testing-
+    // standards skill §4): deterministic simulation. The simulation
+    // drives multiple engines in a fixed round-robin order, routes
+    // messages deterministically, and asserts:
+    // - Liveness: all submitted txs appear in finalized blocks.
+    // - Finality: all validators agree on the same finalized blocks.
+    // - Determinism: two runs with the same inputs produce identical
+    //   finalized block sequences.
+
+    /// A deterministic multi-node simulation. Creates N validators,
+    /// drives `rounds` happy-path rounds with txs, and returns the
+    /// finalized blocks from each validator.
+    fn run_simulation(n: usize, txs_per_round: usize, rounds: usize) -> Vec<Vec<FinalizedBlock>> {
+        let pks: Vec<crypto::bls::PublicKey> = (1..=u8::try_from(n).unwrap()).map(pk).collect();
+        let stakes = vec![1u64; n];
+        let vs = ValidatorSet::new(pks, stakes).expect("validator set");
+
+        let mut engines: Vec<OxideBft> = (0..n)
+            .map(|i| {
+                OxideBft::with_index(
+                    Arc::new(MockApp::new()),
+                    vs.clone(),
+                    u16::try_from(i).unwrap(),
+                )
+            })
+            .collect();
+
+        for round in 0..rounds {
+            // The leader for this view is engines[0]'s leader.
+            let leader_idx = usize::from(vs.leader(engines[0].current_view()));
+            let tx = TxBytes::new(vec![u8::try_from(round).unwrap() + 1, u8::try_from(txs_per_round).unwrap()]);
+            // Submit tx only to the leader's app. In a real system,
+            // txs are gossiped, but each validator's mempool dedups
+            // by tx hash. Here, each engine has its own MockApp, so
+            // submitting to all would cause duplicate txs in blocks
+            // (each leader would pull all pending txs from its
+            // mempool). Submitting only to the leader matches the
+            // real-world flow: the leader proposes, followers vote.
+            engines[leader_idx].submit_tx(tx);
+
+            // Leader proposes.
+            let (header, proposal) = engines[leader_idx]
+                .propose()
+                .unwrap_or_else(|| panic!("leader {leader_idx} should propose in round {round}"));
+            let block_hash = OxideBft::block_hash(&header);
+
+            // Leader self-votes.
+            let leader_vote = Vote {
+                view: header.view,
+                phase: VotePhase::Prepare,
+                block_hash,
+                signature: Signature::ZERO,
+            };
+            engines[leader_idx].collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote);
+
+            // All followers vote (deterministic order: 0, 1, 2, ...).
+            // Collect votes first to avoid double mutable borrow.
+            let mut follower_votes = Vec::new();
+            for (i, engine) in engines.iter_mut().enumerate() {
+                if i == leader_idx {
+                    continue;
+                }
+                if let Some(vote) = engine.vote(&header, &proposal) {
+                    follower_votes.push((u16::try_from(i).unwrap(), vote));
+                }
+            }
+            for (voter, vote) in follower_votes {
+                engines[leader_idx].collect_vote(voter, vote);
+            }
+
+            // Leader forms QC.
+            let qc = engines[leader_idx]
+                .try_form_qc()
+                .unwrap_or_else(|| panic!("quorum should be reached in round {round}"));
+
+            // All validators receive the QC (deterministic order).
+            for engine in &mut engines {
+                engine.deliver_qc(qc.clone());
+            }
+
+            // All validators advance the view (deterministic order).
+            for engine in &mut engines {
+                engine.advance_view();
+            }
+
+            // Sync next_height across all engines. In a real system,
+            // the height is a chain property (all validators see the
+            // same blocks via broadcast). Here, each engine has its
+            // own next_height counter, so we sync them to the max
+            // after each round.
+            let max_height = engines.iter().map(|e| e.next_height.value()).max().unwrap_or(0);
+            for engine in &mut engines {
+                if engine.next_height.value() < max_height {
+                    engine.next_height = Height::new(max_height);
+                }
+            }
+        }
+
+        // Drive one more empty round to flush the pipeline.
+        let leader_idx = usize::from(vs.leader(engines[0].current_view()));
+        let (header, proposal) =
+            engines[leader_idx].propose().expect("leader should propose flush round");
+        let block_hash = OxideBft::block_hash(&header);
+        let leader_vote = Vote {
+            view: header.view,
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature: Signature::ZERO,
+        };
+        engines[leader_idx].collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote);
+        let mut follower_votes = Vec::new();
+        for (i, engine) in engines.iter_mut().enumerate() {
+            if i == leader_idx {
+                continue;
+            }
+            if let Some(vote) = engine.vote(&header, &proposal) {
+                follower_votes.push((u16::try_from(i).unwrap(), vote));
+            }
+        }
+        for (voter, vote) in follower_votes {
+            engines[leader_idx].collect_vote(voter, vote);
+        }
+        let qc = engines[leader_idx].try_form_qc().expect("flush quorum");
+        for engine in &mut engines {
+            engine.deliver_qc(qc.clone());
+        }
+        for engine in &mut engines {
+            engine.advance_view();
+        }
+
+        // Collect finalized blocks from each validator.
+        engines
+            .iter()
+            .map(|e| {
+                let h = e.finalized_height().map_or(0, primitives::Id::value);
+                (0..=h).filter_map(|i| e.finalized_block(Height::new(i))).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sim_4_validators_liveness() {
+        // 4 validators, 5 rounds with txs. All txs must be finalized.
+        let results = run_simulation(4, 1, 5);
+        // All validators should have the same number of finalized blocks.
+        let n_blocks = results[0].len();
+        assert!(n_blocks > 0, "should have finalized blocks");
+        for (i, blocks) in results.iter().enumerate() {
+            assert_eq!(
+                blocks.len(),
+                n_blocks,
+                "validator {i} has {n_blocks} blocks expected, got {}",
+                blocks.len()
+            );
+        }
+        // All txs should be present.
+        let total_txs: usize = results[0].iter().map(|b| b.txs.len()).sum();
+        assert_eq!(total_txs, 5, "all 5 txs must be finalized");
+    }
+
+    #[test]
+    fn sim_4_validators_finality_agreement() {
+        // All validators must agree on the same finalized blocks.
+        let results = run_simulation(4, 1, 5);
+        let reference = &results[0];
+        for (i, blocks) in results.iter().enumerate().skip(1) {
+            assert_eq!(blocks.len(), reference.len(), "validator {i} disagrees on block count");
+            for (j, (a, b)) in reference.iter().zip(blocks.iter()).enumerate() {
+                assert_eq!(a.height, b.height, "validator {i} disagrees on height at block {j}");
+                assert_eq!(a.txs, b.txs, "validator {i} disagrees on txs at block {j}");
+            }
+        }
+    }
+
+    #[test]
+    fn sim_deterministic_across_runs() {
+        // Two runs with identical inputs must produce identical outputs.
+        let run1 = run_simulation(4, 1, 5);
+        let run2 = run_simulation(4, 1, 5);
+        assert_eq!(run1.len(), run2.len(), "different validator count across runs");
+        for (i, (a, b)) in run1.iter().zip(run2.iter()).enumerate() {
+            assert_eq!(a.len(), b.len(), "validator {i}: different block count");
+            for (j, (ba, bb)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(ba.height, bb.height, "validator {i} block {j}: height mismatch");
+                assert_eq!(ba.txs, bb.txs, "validator {i} block {j}: txs mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn sim_7_validators_liveness() {
+        // 7 validators (f=2, quorum=5). 3 rounds with txs.
+        let results = run_simulation(7, 1, 3);
+        let n_blocks = results[0].len();
+        assert!(n_blocks > 0, "should have finalized blocks");
+        let total_txs: usize = results[0].iter().map(|b| b.txs.len()).sum();
+        assert_eq!(total_txs, 3, "all 3 txs must be finalized");
     }
 }

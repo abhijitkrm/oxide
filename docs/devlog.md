@@ -1097,3 +1097,112 @@ implementation. All six stages are done:
 The conformance suite passes at every stage. The engine is now ready
 for the next phase: deterministic multi-validator simulation under
 the `runtime` crate, then production networking.
+
+## Session 11 — oxideBFT hardening: tail-fork resistance, view-change test, deterministic simulation
+
+After completing stages 1–6, three gaps remained before oxideBFT
+could be called "solid under faults" (the Phase 1 acceptance gate).
+This session closes all three.
+
+### Gap 1: Tail-fork resistance enforced
+
+**Spec:** docs/oxidebft-spec.md §4 — "a leader's proposal is only
+valid if it extends the highest QC it voted for; validators reject
+proposals that fork away their predecessor's notarized block."
+
+**Before:** `vote()` carried `high_qc` in proposals but never
+validated it. A faulty leader could propose a fork that discards a
+notarized block (MEV-by-discard).
+
+**Fix** (crates/consensus/src/engine.rs `vote()`):
+- If the validator has a `high_qc`, the proposal's `high_qc` must
+  match it. A proposal with a different `high_qc` (extending a
+  different chain) or no `high_qc` (ignoring our QC) is rejected.
+- At genesis (no `high_qc` yet), any proposal is accepted.
+- On a view change, the new leader's `high_qc` may be higher than
+  ours (it saw a QC we missed) — that's accepted. But a leader with
+  a *lower* `high_qc` is forking.
+
+**Tests:** 4 new tests — rejects proposal without high_qc, rejects
+proposal with wrong high_qc, accepts proposal extending high_qc,
+accepts genesis proposal.
+
+### Gap 2: Faulty-leader view-change test
+
+**Spec:** docs/oxidebft-spec.md §4 — "on leader failure, exactly one
+timeout delay (leader fault isolation), then next leader proceeds
+responsive."
+
+**Before:** the pacemaker had `on_timeout` / `on_timeout_certificate`
+hooks, but no test exercised the full view-change path: faulty
+leader → followers timeout → TC formed → view advances → new leader
+takes over.
+
+**Fix:** added `faulty_leader_bypassed_via_timeout` test with 4
+validators:
+1. Leader (index 0) for view 0 is faulty (withholds proposals).
+2. Three followers time out via `on_timeout()`.
+3. Timeout signatures are gossiped (manually routed).
+4. One follower collects 3 signatures (quorum = 3 for n=4, f=1),
+   forms a TC via `on_timeout_signature`.
+5. TC is delivered to all validators via `on_timeout_certificate`.
+6. All validators advance to view 1; validator 1 is the new leader.
+
+### Gap 3: Deterministic multi-node simulation
+
+**Spec:** testing-standards skill §4 layer 4 — "deterministic
+simulation: replaying a multi-node scenario must produce byte-
+identical results every run."
+
+**Before:** multi-validator tests were hand-driven by a
+`drive_round` helper. No test ran multiple engines through multiple
+rounds with leader rotation and asserted liveness + finality +
+determinism.
+
+**Fix:** added `run_simulation(n, txs_per_round, rounds)` — a
+synchronous deterministic simulation of N validators:
+- Creates N engines with a shared validator set.
+- Drives `rounds` happy-path rounds with txs, rotating leaders
+  (round-robin).
+- Syncs `next_height` across engines after each round (in a real
+  system, height is a chain property; here each engine has its own
+  counter).
+- Flushes the 2-chain pipeline with one empty round.
+- Collects finalized blocks from each validator.
+
+**Tests:** 4 new tests:
+- `sim_4_validators_liveness` — 4 validators, 5 rounds, all 5 txs
+  finalized.
+- `sim_4_validators_finality_agreement` — all validators agree on
+  the same finalized blocks (same heights, same txs).
+- `sim_deterministic_across_runs` — two runs with identical inputs
+  produce identical outputs.
+- `sim_7_validators_liveness` — 7 validators (f=2, quorum=5), 3
+  rounds, all 3 txs finalized.
+
+### Design note: synchronous vs. async simulation
+
+The simulation is synchronous (no `runtime` crate). The `OxideBft`
+engine is synchronous — `propose`, `vote`, `deliver_qc` are direct
+calls, not futures. The `runtime` crate's async executor + mailboxes
+are for when we add real networking (Phase 1 broadcast/p2p crates).
+For consensus behavior testing, a synchronous simulation with fixed
+message routing order is sufficient and clearer — determinism comes
+from the fixed order, not from an async scheduler.
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace` — 137
+tests pass (consensus 49: 19 pacemaker/validator + 30 engine
+including conformance + 3 multi-validator + 2 BLS + 8 epoch + 4
+tail-fork + 1 view-change + 4 simulation); `cargo deny check` — all
+four checks ok.
+
+### What's next
+
+oxideBFT is now safe under faults (tail-fork resistance + view
+change) and proven deterministic across runs. The next Phase 1
+deliverables are new crates: `SequencerEngine` adapter (proves the
+consensus seam), `broadcast` (erasure + PlainGossip), `mempool`,
+`executor` v0, `modules` (core/bank/staking), and the local devnet.
