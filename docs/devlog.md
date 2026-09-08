@@ -898,3 +898,114 @@ Stage 5: BLS aggregation integration with `blst`. This replaces the
 placeholder `Signature::ZERO` and `AggregateSignature::ZERO` with
 real BLS12-381 signing, verification, and aggregation. A benchmark
 gate proves the aggregation is fast enough for production.
+
+## Session 10 — Phase 1 stage 5: BLS aggregation via blst
+
+Stage 5 of the oxideBFT spec's staged implementation order
+(docs/oxidebft-spec.md §8): real BLS12-381 signing, verification, and
+aggregation. The placeholder `Signature::ZERO` and
+`AggregateSignature::ZERO` are replaced with real `blst` operations
+where a secret key is set; conformance mode (no key) still uses the
+placeholders for fast deterministic tests.
+
+### What landed
+
+**New `bls_signer` module** (crates/crypto/src/bls_signer.rs):
+
+- `BlsSecretKey` — wraps `blst::min_pk::SecretKey`. Deterministic key
+  generation from 32+ bytes of IKM (for tests), sign with domain
+  separation, serialize/deserialize to 32 bytes.
+- `verify(sig, domain, msg, pk)` — single-signature verification.
+- `aggregate(sigs)` — aggregate N signatures over the same message
+  into one 96-byte aggregate signature.
+- `aggregate_verify(agg, domain, msg, pks)` — fast aggregate
+  verification (one pairing check regardless of N — the throughput
+  lever for oxideBFT QCs).
+- `BlsError` — error enum (InvalidKeyMaterial, InvalidSignature,
+  EmptyAggregation).
+
+**Domain separation:** each `Domain` maps to a fixed DST string
+(`"oxide/vote"`, `"oxide/qc"`, etc.). This prevents cross-protocol
+signature reuse (a vote signature can't be replayed as a timeout
+signature).
+
+**Engine integration** (crates/consensus/src/engine.rs):
+
+- `OxideBft::with_secret_key(sk)` — set the engine's BLS secret key.
+  When set, votes are signed with real BLS and QCs aggregate the real
+  signatures. When `None` (conformance mode), placeholder `ZERO` is
+  used — this keeps the conformance suite fast (no pairing math).
+- `sign_vote(view, block_hash)` — signs the block hash under the
+  `Vote` domain. The `view` parameter is reserved for future use
+  (signing the view into the message for stronger safety).
+- `try_form_qc` — aggregates the collected vote signatures via
+  `crypto::aggregate` when a secret key is set.
+- `step` (single-validator mode) — aggregates the self-vote signature.
+
+**Tests:**
+
+- 10 new BLS unit tests (sign/verify, wrong message, wrong domain,
+  wrong key, aggregate, missing signer, empty aggregation, key
+  round-trip, different keys → different PKs).
+- 2 new engine BLS integration tests:
+  - `bls_signed_vote_verifies` — single validator, QC has a real
+    aggregate signature that verifies against the validator's PK.
+  - `bls_multi_validator_qc_verifies` — 4 validators, QC aggregate
+    verifies against all 4 PKs.
+
+**Benchmark** (crates/crypto/benches/bls.rs):
+
+| Operation | Time |
+|-----------|------|
+| `bls/sign` | ~317 µs |
+| `bls/verify` | ~792 µs |
+| `bls/aggregate/128` | ~3.56 ms |
+| `bls/aggregate_verify/4` | ~798 µs |
+| `bls/aggregate_verify/32` | ~1.18 ms |
+| `bls/aggregate_verify/128` | ~2.45 ms |
+
+**Interpretation:** aggregate_verify scales sub-linearly — 4→128
+validators (32×) is only ~3× slower. This is the BLS advantage: one
+pairing check regardless of N, with the per-PK aggregation cost
+amortized. At 128 validators, a QC verifies in ~2.5 ms — well within
+the oxideBFT view timeout budget.
+
+For comparison, an Ed25519 QC at 128 validators would be 128 × ~50 µs
+= ~6.4 ms of verification alone, plus 128 × 64 = 8192 bytes of
+signature data on the wire. BLS aggregates to 96 bytes and one
+pairing check.
+
+### Design decisions
+
+- **Conformance mode vs. BLS mode:** the engine supports both. When
+  no secret key is set, `Signature::ZERO` is used — this keeps the
+  conformance suite fast (no pairing math) and deterministic (no
+  crypto randomness). When a key is set, real BLS is used. This
+  lets the conformance suite test protocol behavior without crypto
+  overhead, while the BLS integration tests prove the crypto works.
+
+- **DST from `Domain`:** the DST is the domain's name as a fixed
+  string. This is simpler than the numeric discriminant and equally
+  unforgeable (the name is part of the consensus contract).
+
+- **`fast_aggregate_verify`:** we use blst's `fast_aggregate_verify`
+  (one pairing check) rather than `aggregate_verify` (N pairings).
+  All votes in a QC are over the same message (the block hash), so
+  fast aggregation is correct.
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test
+--workspace` — 120 tests pass (crypto 24: 14 hash + 10 BLS;
+consensus 32: 19 pacemaker/validator + 13 engine including
+conformance + 3 multi-validator + 2 BLS integration); `cargo deny
+check` — all four checks ok; `cargo bench -p crypto --bench bls` —
+all benchmarks run.
+
+### Next
+
+Stage 6: epoch rotation (two-phase handoff). This adds epoch-aware
+validator sets, leader selection, and QC/TC validation, plus the
+two-phase handoff that safely transitions from one validator set to
+the next.

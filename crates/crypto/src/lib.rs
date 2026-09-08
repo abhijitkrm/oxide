@@ -1,6 +1,6 @@
 //! Cryptographic primitives for the Oxide blockchain.
 //!
-//! Two concerns, one crate:
+//! Three concerns, one crate:
 //!
 //! - [`hash`] — domain-separated BLAKE3 hashing. Centralizes the
 //!   domain-tag discipline that [`storage`](crate) applied inline so
@@ -9,12 +9,16 @@
 //!   vote hash. Domain separation is mandatory for consensus safety
 //!   (production-rust skill §6: every hash input carries a domain tag).
 //!
-//! - [`bls`] — BLS12-381 signature type stubs for oxideBFT (Phase 1).
-//!   Phase 0 defines the *types* and *traits* oxideBFT will program
-//!   against; the actual signing/verification (via `blst` or
-//!   `bls12_381`) lands in Phase 1 when the first consumer exists.
-//!   This avoids pulling a BLS dependency before there is code that
-//!   uses it, while ensuring the type shape is settled.
+//! - [`bls`] — BLS12-381 signature wire types for oxideBFT (Phase 1).
+//!   Defines the *types* (`PublicKey`, `Signature`, `AggregateSignature`)
+//!   and their codec impls; the actual signing/verification lives in
+//!   [`bls_signer`].
+//!
+//! - [`bls_signer`] — BLS12-381 signing, verification, and aggregation
+//!   via `blst` (Phase 1 stage 5). This is the production BLS layer:
+//!   sign votes, aggregate quorum certificates, verify them. The
+//!   wire types from [`bls`] carry the bytes; this module operates on
+//!   them.
 //!
 //! # Why BLAKE3
 //!
@@ -24,7 +28,9 @@
 //!   domain tags are consistent across the whole codebase.
 
 pub mod bls;
+pub mod bls_signer;
 pub mod hash;
 
 pub use bls::{AggregateSignature, PublicKey, Signature, ValidatorIndex};
+pub use bls_signer::{BlsError, BlsSecretKey, aggregate, aggregate_verify, verify};
 pub use hash::{Domain, Hasher};

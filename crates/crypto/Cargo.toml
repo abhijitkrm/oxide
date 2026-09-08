@@ -19,6 +19,7 @@ codec = { workspace = true }
 # domain-separated hashing API so storage and consensus share one
 # implementation rather than each inlining blake3 calls.
 blake3 = "1"
+blst = "0.3.17"
 
 [lints]
 workspace = true
@@ -28,4 +29,8 @@ criterion = "0.7.0"
 
 [[bench]]
 name = "hash"
+harness = false
+
+[[bench]]
+name = "bls"
 harness = false

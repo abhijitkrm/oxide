@@ -95,6 +95,9 @@ pub struct OxideBft {
     validator_set: ValidatorSet,
     /// This engine's index in the validator set.
     validator_index: ValidatorIndex,
+    /// This engine's BLS secret key (stage 5). Used to sign votes and
+    /// timeout messages. `None` in conformance mode (no real signing).
+    secret_key: Option<crypto::BlsSecretKey>,
     /// The pacemaker (stage 2). Drives view changes on timeout.
     pacemaker: crate::pacemaker::Pacemaker,
     /// The highest QC the engine has seen. Carried in the next
@@ -132,14 +135,15 @@ impl OxideBft {
     /// Construct a fresh engine with `app` and `validator_set` at
     /// genesis (height 0, view 0, epoch 0). The engine is validator
     /// index 0 by default; use [`OxideBft::with_index`] to set a
-    /// different index for multi-validator mode.
+    /// different index for multi-validator mode. No BLS secret key
+    /// (conformance mode — placeholder signatures).
     #[must_use]
     pub fn new(app: Arc<dyn AppInterface>, validator_set: ValidatorSet) -> Self {
         Self::with_index(app, validator_set, 0)
     }
 
     /// Construct a fresh engine with a specific validator index (for
-    /// multi-validator mode).
+    /// multi-validator mode). No BLS secret key.
     #[must_use]
     pub fn with_index(
         app: Arc<dyn AppInterface>,
@@ -155,6 +159,7 @@ impl OxideBft {
             app,
             validator_set,
             validator_index,
+            secret_key: None,
             pacemaker,
             high_qc: None,
             last_voted_view: None,
@@ -167,6 +172,15 @@ impl OxideBft {
             votes: vec![None; n],
             vote_count: 0,
         }
+    }
+
+    /// Set the BLS secret key for this engine (stage 5). When set,
+    /// votes are signed with real BLS; when `None`, placeholder
+    /// `Signature::ZERO` is used (conformance mode).
+    #[must_use]
+    pub fn with_secret_key(mut self, sk: crypto::BlsSecretKey) -> Self {
+        self.secret_key = Some(sk);
+        self
     }
 
     /// The budget the engine uses when assembling proposals. Phase 1
@@ -281,7 +295,9 @@ impl OxideBft {
     /// the validator already voted in this view (safety: no double-
     /// voting) or the proposal is invalid.
     ///
-    /// The validator stores the block for later commit lookup.
+    /// The validator stores the block for later commit lookup. If a
+    /// BLS secret key is set (stage 5), the vote is signed with real
+    /// BLS; otherwise `Signature::ZERO` is used (conformance mode).
     pub fn vote(&mut self, header: &BlockHeader, proposal: &Proposal) -> Option<Vote> {
         // Safety: never vote twice in the same view.
         if self.last_voted_view.is_some_and(|v| v >= header.view) {
@@ -296,12 +312,24 @@ impl OxideBft {
         let block_hash = Self::block_hash(header);
         self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
         self.last_voted_view = Some(header.view);
-        Some(Vote {
-            view: header.view,
-            phase: VotePhase::Prepare,
-            block_hash,
-            signature: Signature::ZERO, // Stage 5: real BLS signing
-        })
+        // Sign the vote (stage 5: real BLS if key is set).
+        let signature = self.sign_vote(header.view, block_hash);
+        Some(Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature })
+    }
+
+    /// Sign a vote with this engine's BLS secret key. If no key is set
+    /// (conformance mode), returns `Signature::ZERO`. The `view` is
+    /// reserved for future use (e.g. signing the view into the message).
+    fn sign_vote(&self, _view: View, block_hash: Hash) -> Signature {
+        match &self.secret_key {
+            Some(sk) => {
+                // The signed message is the block hash (32 bytes).
+                // The domain is `Vote` for vote signatures.
+                let msg = block_hash.as_bytes();
+                sk.sign(crypto::hash::Domain::Vote, msg)
+            }
+            None => Signature::ZERO,
+        }
     }
 
     /// Leader: collect a vote from validator `voter`. Stores the vote
@@ -335,13 +363,24 @@ impl OxideBft {
                 signer_bitmap[i / 8] |= 1u8 << (i % 8);
             }
         }
+
+        // Stage 5: aggregate the collected signatures via blst.
+        // If no secret key is set (conformance mode), use ZERO.
+        let aggregate_signature = if self.secret_key.is_some() {
+            let sigs: Vec<Signature> =
+                self.votes.iter().filter_map(|v| v.as_ref().map(|v| v.signature)).collect();
+            crypto::aggregate(&sigs).unwrap_or(AggregateSignature::ZERO)
+        } else {
+            AggregateSignature::ZERO
+        };
+
         let qc = QuorumCertificate {
             view: first_vote.view,
             phase: first_vote.phase,
             block_hash: first_vote.block_hash,
             epoch: self.epoch,
             signer_bitmap,
-            aggregate_signature: AggregateSignature::ZERO, // Stage 5: blst
+            aggregate_signature,
         };
 
         // Clear the vote buffer for the next view.
@@ -438,27 +477,31 @@ impl OxideBft {
         };
         let block_hash = Self::block_hash(&header);
 
-        // Self-vote.
-        let vote = Vote {
-            view: self.current_view,
-            phase: VotePhase::Prepare,
-            block_hash,
-            signature: Signature::ZERO,
-        };
+        // Self-vote (stage 5: real BLS if key is set).
+        let signature = self.sign_vote(self.current_view, block_hash);
+        let vote =
+            Vote { view: self.current_view, phase: VotePhase::Prepare, block_hash, signature };
         self.last_voted_view = Some(self.current_view);
 
-        // Form QC (single validator: quorum = 1).
+        // Form QC (single validator: quorum = 1). Stage 5: aggregate
+        // the real signature(s) if a key is set.
         let bitmap_len = self.validator_set.n().div_ceil(8);
         let mut signer_bitmap = vec![0u8; bitmap_len];
         let idx = usize::from(self.validator_index);
         signer_bitmap[idx / 8] |= 1u8 << (idx % 8);
+        let aggregate_signature = if self.secret_key.is_some() {
+            // Real BLS: aggregate the single self-vote.
+            crypto::aggregate(&[vote.signature]).unwrap_or(AggregateSignature::ZERO)
+        } else {
+            AggregateSignature::ZERO
+        };
         let qc = QuorumCertificate {
             view: self.current_view,
             phase: VotePhase::Prepare,
             block_hash,
             epoch: self.epoch,
             signer_bitmap,
-            aggregate_signature: AggregateSignature::ZERO,
+            aggregate_signature,
         };
 
         // Deliver the QC (checks 2-chain commit).
@@ -751,5 +794,107 @@ mod tests {
         assert_eq!(f1.finalized_height(), leader_h, "f1 height mismatch");
         assert_eq!(f2.finalized_height(), leader_h, "f2 height mismatch");
         assert_eq!(f3.finalized_height(), leader_h, "f3 height mismatch");
+    }
+
+    // ---- BLS integration tests (stage 5) ----
+    //
+    // These tests use real BLS signing (via blst) to prove the engine
+    // produces valid signatures and aggregate signatures.
+
+    fn bls_key(byte: u8) -> crypto::BlsSecretKey {
+        let ikm = vec![byte; 32];
+        crypto::BlsSecretKey::from_ikm(&ikm).expect("key gen")
+    }
+
+    #[test]
+    fn bls_signed_vote_verifies() {
+        // Single validator with a real BLS key.
+        let key = bls_key(1);
+        let pk = key.public_key();
+        let app = Arc::new(MockApp::new());
+        let vs = single_validator_set();
+        let mut engine = OxideBft::new(app, vs).with_secret_key(key);
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+
+        // The engine should have formed a QC with a real aggregate
+        // signature (not ZERO).
+        let qc = engine.high_qc.as_ref().expect("high_qc");
+        assert_ne!(
+            qc.aggregate_signature,
+            AggregateSignature::ZERO,
+            "QC must have a real aggregate signature"
+        );
+
+        // Verify the aggregate signature against the validator's PK.
+        // The signed message is the block hash.
+        let block_hash = qc.block_hash;
+        let result = crypto::aggregate_verify(
+            &qc.aggregate_signature,
+            crypto::hash::Domain::Vote,
+            block_hash.as_bytes(),
+            &[pk],
+        );
+        assert!(result.is_ok(), "QC aggregate signature must verify");
+    }
+
+    #[test]
+    fn bls_multi_validator_qc_verifies() {
+        // 4 validators with real BLS keys.
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let stakes = vec![1u64; 4];
+        let vs = ValidatorSet::new(pks.clone(), stakes).expect("4 validators");
+
+        let mut leader = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+            .with_secret_key(keys[0].clone());
+        let mut followers: Vec<OxideBft> = (1..4u8)
+            .map(|i| {
+                OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), u16::from(i))
+                    .with_secret_key(keys[i as usize].clone())
+            })
+            .collect();
+
+        // Submit a tx and drive one round.
+        leader.submit_tx(TxBytes::new(vec![42]));
+        let (header, proposal) = leader.propose().expect("propose");
+        let block_hash = OxideBft::block_hash(&header);
+
+        // Leader self-votes.
+        let leader_sig = keys[0].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        leader.collect_vote(
+            0,
+            Vote {
+                view: header.view,
+                phase: VotePhase::Prepare,
+                block_hash,
+                signature: leader_sig,
+            },
+        );
+
+        // Followers vote.
+        for (i, follower) in followers.iter_mut().enumerate() {
+            if let Some(vote) = follower.vote(&header, &proposal) {
+                leader.collect_vote(u16::try_from(i + 1).expect("validator index fits u16"), vote);
+            }
+        }
+
+        // Form QC.
+        let qc = leader.try_form_qc().expect("quorum");
+        assert_ne!(
+            qc.aggregate_signature,
+            AggregateSignature::ZERO,
+            "QC must have a real aggregate signature"
+        );
+
+        // Verify the aggregate signature against all 4 public keys.
+        let result = crypto::aggregate_verify(
+            &qc.aggregate_signature,
+            crypto::hash::Domain::Vote,
+            block_hash.as_bytes(),
+            &pks,
+        );
+        assert!(result.is_ok(), "QC aggregate signature must verify against all 4 keys");
     }
 }

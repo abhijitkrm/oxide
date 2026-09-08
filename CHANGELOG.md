@@ -12,6 +12,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase 1 stage 5: BLS12-381 aggregation via `blst`** (2026-09-09)
+  - New `bls_signer` module: `BlsSecretKey`, `verify`,
+    `aggregate`, `aggregate_verify` — real BLS12-381 signing,
+    verification, and aggregation via `blst`.
+  - Domain separation: each `Domain` maps to a fixed DST string
+    (`"oxide/vote"`, `"oxide/qc"`, etc.) to prevent cross-protocol
+    signature reuse.
+  - Engine integration: `OxideBft::with_secret_key(sk)` enables real
+    BLS signing. Votes are signed, QCs aggregate the real signatures.
+    Conformance mode (no key) still uses placeholder `ZERO` for fast
+    deterministic tests.
+  - 10 BLS unit tests + 2 engine BLS integration tests; 120 total.
+  - Benchmark: `aggregate_verify/128` = ~2.5 ms (sub-linear scaling).
+
+  **In plain words:** oxideBFT now uses real BLS12-381 cryptography.
+  Validators sign votes with their BLS secret keys; the leader
+  aggregates the signatures into one 96-byte aggregate; verifiers
+  check the aggregate with one pairing check regardless of validator
+  count. This is the throughput lever that lets oxideBFT scale to
+  hundreds of validators without quadratic signature verification.
+  At 128 validators, a QC verifies in ~2.5 ms — well within the view
+  timeout budget.
+
 - **Phase 1 stage 4: oxideBFT 2-chain commit + multi-validator**
   (2026-09-09)
   - 2-chain commit rule: a block is committed when a later block

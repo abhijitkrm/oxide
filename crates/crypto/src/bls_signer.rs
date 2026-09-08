@@ -1,0 +1,311 @@
+//! BLS12-381 signing, verification, and aggregation via `blst`
+//! (Phase 1 stage 5).
+//!
+//! This module provides the cryptographic operations that the oxideBFT
+//! engine uses to sign votes, form quorum certificates, and verify
+//! them. The wire types ([`PublicKey`], [`Signature`],
+//! [`AggregateSignature`]) are defined in [`crate::bls`]; this module
+//! adds the operations.
+//!
+//! # Why `blst`
+//!
+//! `blst` is the Supranational BLS12-381 library — the production
+//! standard used by Ethereum 2.0, Algorand, and others. It's the
+//! fastest BLS implementation in Rust (constant-time, assembly-optimized
+//! for `x86_64` and `aarch64`). The `min_pk` profile (48-byte PKs, 96-byte
+//! sigs) matches our wire types.
+//!
+//! # Domain separation
+//!
+//! All signing uses a DST (domain separation tag) derived from
+//! [`crate::hash::Domain`]. The DST is the domain's name as a UTF-8
+//! string, ensuring cross-domain signature non-malleability (a vote
+//! signature can't be replayed as a timeout signature).
+//!
+//! # Aggregation
+//!
+//! BLS aggregation compresses N validators' signatures over the *same*
+//! message into one 96-byte aggregate. Verification is one pairing
+//! check regardless of N — the throughput lever for oxideBFT QCs. For
+//! votes over *different* messages, use `aggregate_verify` (which
+//! does N pairings internally).
+
+use blst::BLST_ERROR;
+use blst::min_pk::{
+    AggregateSignature as BlstAggSig, PublicKey as BlstPk, SecretKey, Signature as BlstSig,
+};
+
+use crate::bls::{AggregateSignature, PublicKey, Signature};
+use crate::hash::Domain;
+
+/// The DST (domain separation tag) for a [`Domain`].
+///
+/// BLS signing requires a DST to prevent cross-protocol signature
+/// reuse. We use the domain's name as a fixed string — this is
+/// simpler than the domain's numeric discriminant and equally
+/// unforgeable (the name is part of the consensus contract).
+fn dst(domain: Domain) -> &'static [u8] {
+    match domain {
+        Domain::Block => b"oxide/block",
+        Domain::Transaction => b"oxide/transaction",
+        Domain::Vote => b"oxide/vote",
+        Domain::QuorumCertificate => b"oxide/qc",
+        Domain::Timeout => b"oxide/timeout",
+        Domain::MmrNode => b"oxide/mmr-node",
+        Domain::MmrLeaf => b"oxide/mmr-leaf",
+        Domain::StateRoot => b"oxide/state-root",
+    }
+}
+
+/// A BLS12-381 secret key (32 bytes). Used to sign messages.
+///
+/// This is a wrapper around `blst::min_pk::SecretKey` that produces
+/// signatures compatible with our wire [`Signature`] type.
+#[derive(Debug, Clone)]
+pub struct BlsSecretKey {
+    inner: SecretKey,
+}
+
+impl BlsSecretKey {
+    /// Deterministically generate a secret key from key material
+    /// (≥32 bytes). The same `ikm` always produces the same key —
+    /// useful for deterministic tests.
+    ///
+    /// # Errors
+    /// Returns `BlsError::InvalidKeyMaterial` if `ikm` is < 32 bytes.
+    pub fn from_ikm(ikm: &[u8]) -> Result<Self, BlsError> {
+        let inner = SecretKey::key_gen(ikm, b"oxide")?;
+        Ok(Self { inner })
+    }
+
+    /// Derive the public key for this secret key.
+    #[must_use]
+    pub fn public_key(&self) -> PublicKey {
+        let pk = self.inner.sk_to_pk();
+        let bytes = pk.compress();
+        PublicKey(bytes)
+    }
+
+    /// Sign a message under this key. The `domain` provides the DST.
+    /// The `msg` is the raw bytes to sign (typically a domain-
+    /// separated hash, but any bytes are accepted).
+    #[must_use]
+    pub fn sign(&self, domain: Domain, msg: &[u8]) -> Signature {
+        let sig = self.inner.sign(msg, dst(domain), b"");
+        let bytes = sig.compress();
+        Signature(bytes)
+    }
+
+    /// Serialize the secret key to 32 bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.inner.to_bytes()
+    }
+
+    /// Deserialize a secret key from 32 bytes.
+    ///
+    /// # Errors
+    /// Returns `BlsError::InvalidKeyMaterial` if the bytes are not a
+    /// valid secret key.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlsError> {
+        let inner = SecretKey::from_bytes(bytes)?;
+        Ok(Self { inner })
+    }
+}
+
+/// Verify a single signature against a public key.
+///
+/// # Errors
+/// Returns `BlsError::InvalidSignature` if the signature is invalid.
+pub fn verify(sig: &Signature, domain: Domain, msg: &[u8], pk: &PublicKey) -> Result<(), BlsError> {
+    let blst_sig = BlstSig::from_bytes(sig.as_bytes())?;
+    let blst_pk = BlstPk::from_bytes(pk.as_bytes())?;
+    let result = blst_sig.verify(false, msg, dst(domain), b"", &blst_pk, true);
+    if result == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::InvalidSignature) }
+}
+
+/// Aggregate multiple signatures (over the same message) into one
+/// aggregate signature.
+///
+/// # Errors
+/// Returns `BlsError::EmptyAggregation` if `sigs` is empty.
+pub fn aggregate(sigs: &[Signature]) -> Result<AggregateSignature, BlsError> {
+    if sigs.is_empty() {
+        return Err(BlsError::EmptyAggregation);
+    }
+    let mut agg = BlstAggSig::from_signature(&BlstSig::from_bytes(sigs[0].as_bytes())?);
+    for sig in &sigs[1..] {
+        let blst_sig = BlstSig::from_bytes(sig.as_bytes())?;
+        agg.add_signature(&blst_sig, false).map_err(|_| BlsError::InvalidSignature)?;
+    }
+    let bytes = agg.to_signature().compress();
+    Ok(AggregateSignature(bytes))
+}
+
+/// Verify an aggregate signature against a set of public keys, all
+/// over the same message. This is the fast path for QC verification
+/// (one pairing check regardless of validator count).
+///
+/// # Errors
+/// Returns `BlsError::InvalidSignature` if the aggregate signature is
+/// invalid, or `BlsError::EmptyAggregation` if `pks` is empty.
+pub fn aggregate_verify(
+    agg_sig: &AggregateSignature,
+    domain: Domain,
+    msg: &[u8],
+    pks: &[PublicKey],
+) -> Result<(), BlsError> {
+    if pks.is_empty() {
+        return Err(BlsError::EmptyAggregation);
+    }
+    let blst_agg = BlstSig::from_bytes(agg_sig.as_bytes())?;
+    let blst_pks: Vec<BlstPk> =
+        pks.iter().map(|pk| BlstPk::from_bytes(pk.as_bytes())).collect::<Result<_, _>>()?;
+    let pk_refs: Vec<&BlstPk> = blst_pks.iter().collect();
+    let result = blst_agg.fast_aggregate_verify(true, msg, dst(domain), &pk_refs);
+    if result == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::InvalidSignature) }
+}
+
+/// Errors from BLS operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlsError {
+    /// The key material or signature bytes are malformed.
+    InvalidKeyMaterial,
+    /// The signature is invalid (failed verification).
+    InvalidSignature,
+    /// Aggregation was called with an empty set.
+    EmptyAggregation,
+}
+
+impl From<BLST_ERROR> for BlsError {
+    fn from(err: BLST_ERROR) -> Self {
+        match err {
+            BLST_ERROR::BLST_SUCCESS => BlsError::InvalidSignature, // shouldn't happen
+            _ => BlsError::InvalidKeyMaterial,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Test real BLS sign/verify/aggregate operations.
+    //!
+    //! These tests use deterministic key generation (from fixed IKM)
+    //! so they're reproducible. They prove the `blst` integration
+    //! works end-to-end: `sign` → `verify` → `aggregate` → `aggregate_verify`.
+
+    use super::*;
+
+    fn sk(byte: u8) -> BlsSecretKey {
+        let ikm = vec![byte; 32];
+        BlsSecretKey::from_ikm(&ikm).expect("key gen")
+    }
+
+    #[test]
+    fn sign_and_verify() {
+        let key = sk(1);
+        let pk = key.public_key();
+        let msg = b"hello oxide";
+        let sig = key.sign(Domain::Vote, msg);
+        assert!(verify(&sig, Domain::Vote, msg, &pk).is_ok(), "valid signature must verify");
+    }
+
+    #[test]
+    fn wrong_message_fails() {
+        let key = sk(1);
+        let pk = key.public_key();
+        let sig = key.sign(Domain::Vote, b"hello");
+        assert!(
+            verify(&sig, Domain::Vote, b"goodbye", &pk).is_err(),
+            "signature over wrong message must fail"
+        );
+    }
+
+    #[test]
+    fn wrong_domain_fails() {
+        let key = sk(1);
+        let pk = key.public_key();
+        let sig = key.sign(Domain::Vote, b"hello");
+        assert!(
+            verify(&sig, Domain::Timeout, b"hello", &pk).is_err(),
+            "signature with wrong domain must fail"
+        );
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let key1 = sk(1);
+        let key2 = sk(2);
+        let pk2 = key2.public_key();
+        let sig = key1.sign(Domain::Vote, b"hello");
+        assert!(
+            verify(&sig, Domain::Vote, b"hello", &pk2).is_err(),
+            "signature with wrong key must fail"
+        );
+    }
+
+    #[test]
+    fn aggregate_and_verify() {
+        let key1 = sk(1);
+        let key2 = sk(2);
+        let key3 = sk(3);
+        let pk1 = key1.public_key();
+        let pk2 = key2.public_key();
+        let pk3 = key3.public_key();
+        let msg = b"qc payload";
+        let sig1 = key1.sign(Domain::QuorumCertificate, msg);
+        let sig2 = key2.sign(Domain::QuorumCertificate, msg);
+        let sig3 = key3.sign(Domain::QuorumCertificate, msg);
+        let agg = aggregate(&[sig1, sig2, sig3]).expect("aggregate");
+        assert!(
+            aggregate_verify(&agg, Domain::QuorumCertificate, msg, &[pk1, pk2, pk3]).is_ok(),
+            "aggregate signature must verify"
+        );
+    }
+
+    #[test]
+    fn aggregate_with_missing_signer_fails() {
+        let key1 = sk(1);
+        let key2 = sk(2);
+        let key3 = sk(3);
+        let pk1 = key1.public_key();
+        let pk2 = key2.public_key();
+        let pk3 = key3.public_key();
+        let msg = b"qc payload";
+        // Only 2 of 3 sign.
+        let sig1 = key1.sign(Domain::QuorumCertificate, msg);
+        let sig2 = key2.sign(Domain::QuorumCertificate, msg);
+        let agg = aggregate(&[sig1, sig2]).expect("aggregate");
+        // Verify against all 3 keys — must fail (key3 didn't sign).
+        assert!(
+            aggregate_verify(&agg, Domain::QuorumCertificate, msg, &[pk1, pk2, pk3]).is_err(),
+            "aggregate with missing signer must fail"
+        );
+    }
+
+    #[test]
+    fn empty_aggregation_fails() {
+        assert!(aggregate(&[]).is_err());
+    }
+
+    #[test]
+    fn empty_aggregate_verify_fails() {
+        let agg = AggregateSignature::ZERO;
+        assert!(aggregate_verify(&agg, Domain::Vote, b"msg", &[]).is_err());
+    }
+
+    #[test]
+    fn secret_key_round_trip() {
+        let key = sk(42);
+        let bytes = key.to_bytes();
+        let restored = BlsSecretKey::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(key.public_key(), restored.public_key(), "key must round-trip");
+    }
+
+    #[test]
+    fn different_keys_produce_different_pks() {
+        let key1 = sk(1);
+        let key2 = sk(2);
+        assert_ne!(key1.public_key(), key2.public_key(), "different keys → different PKs");
+    }
+}
