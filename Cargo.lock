@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "oxide-codec"
+version = "0.1.0"
+dependencies = [
+ "oxide-primitives",
+]
+
+[[package]]
 name = "oxide-primitives"
 version = "0.1.0"

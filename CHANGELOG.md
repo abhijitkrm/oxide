@@ -35,6 +35,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     `codegen-units = 1`, `panic = "unwind"` (actor boundaries catch
     panics; consensus never aborts silently).
 
+- **`oxide-codec` v0.1.0** (2026-09-08) — deterministic wire codec
+  - Hand-rolled binary format (no serde — determinism is a consensus
+    requirement): fixed-width little-endian integers, LEB128 varints
+    (bounded to 10 bytes), varint-length-prefixed byte strings with
+    zero-copy borrowed reads, strict `0x00/0x01` booleans.
+  - `Encode`/`Decode`/`Codec` traits; impls for `u8..u128`, `bool`,
+    `Vec<u8>`, and the `oxide-primitives` vocabulary (`Hash`,
+    `Address`, `Height`/`View`/`Epoch`, `TimestampMs`, `Price`, `Qty`).
+  - Zero-allocation decode cursor; decoding never panics — corrupted
+    input maps to precise, documented `DecodeError` variants that let
+    trust boundaries distinguish malicious framing from truncated tails.
+  - 5 unit tests pinning exact wire bytes, varint boundary lengths, and
+    error paths.
+
 - **`oxide-primitives` v0.1.0** (2026-09-08) — foundational types
   - `Hash`: 32-byte digest newtype, stable hex `Display`, truncated
     `Debug` that can never be mistaken for a full digest.

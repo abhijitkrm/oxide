@@ -153,12 +153,52 @@ h. **Typo'd lint name in workspace lints**: `need_pass_by_value` → the
    unknown-lint warning only in some targets. Fixed; clippy now
    warning-free across the workspace.
 
+### `oxide-codec` (second crate, same session)
+
+- Implemented the deterministic wire codec: `Reader` zero-copy cursor
+  (`read_slice`/`read_fixed`/`read_u8..u128`/`read_bool`/`read_varint`/
+  `read_bytes`), `write` free-function module (LE fixed ints, LEB128
+  varints, length-prefixed bytes, strict booleans), `Encode`/`Decode`/
+  `Codec` traits, impls for primitives + `Hash`/`Address`/`Id<T>`/
+  `TimestampMs`/`Price`/`Qty`/`Vec<u8>`.
+- Wire rules table is in the crate docs and pinned by tests
+  (`test_wire_format_matches_spec` asserts exact bytes).
+- 5 unit tests green (wire forms, varint boundaries, borrowed bytes,
+  corruption-never-panics with exact error variants, domain-type forms).
+
+### Bug hunt log (oxide-codec)
+
+i. **Associated consts cannot be const-generic arguments.** The planned
+   `read_fixed::<{T::LEN}>` for a blanket `impl<T: Fixed>` is rejected by
+   rustc — associated consts are not const-generic arguments. Moved to
+   slice-level reads with the `Fixed::LEN` contract checked via
+   `debug_assert`.
+j. **Blanket foreign-trait impl = future overlap (E0119).** rustc
+   rejects `impl<T: Fixed> Encode for T` next to `impl Encode for u8`
+   because upstream *could* later add `Fixed for u8`. Replaced with
+   explicit per-type impls (`Hash`, `Address`) using their inherent
+   `as_bytes`/`from_slice` (which also removed the trait import).
+k. **HRTB needed in round-trip helper.** A naive `T: Codec<'a>` helper
+   borrows a local buffer under a caller-chosen lifetime → E0597.
+   Fixed with `T: for<'b> Codec<'b>` (owned types implement `Codec`
+   for every lifetime).
+l. **`as usize` cast flagged** (`cast_possible_truncation`): replaced
+   with `usize::try_from` + an explicit invariant comment (claimed ≤
+   remaining ≤ `usize::MAX`), mapping the impossible failure to the
+   semantically-correct error variant.
+m. Minor: import paths (`Price`/`Qty` live in `oxide_primitives::fixed`),
+   `DoS` backticks, `0xAABB_CCDD_u32` separators, `vec!` → array,
+   temp-value-dropped-while-borrowed in a test (bind the Vec first).
+   clippy is warning-free after all of the above; an impl-block
+   `#[allow(clippy::missing_errors_doc)]` on `Reader` carries a
+   justification comment (per-method failure modes are the `DecodeError`
+   enum's own exhaustive docs).
+
 ### Next up (Phase 0 remainder)
 
-- `oxide-codec` (Reader/Writer, varints, Encode/Decode; property tests +
-  fuzz target) → `oxide-storage` (journal + MMR-over-log + Volatile
-  backend + criterion benches; acceptance gates: ≥1M appends/s
-  single-thread, MMR build+root over 1M leaves < 20ms) → `oxide-runtime`
-  deterministic executor + 4-node echo sim → `oxide-types`/`oxide-ports`
-  (OAI traits + MockEngine + conformance skeleton) → protocol specs in
-  `docs/` (oxidebft, OAI, storage).
+- `oxide-storage` (journal + MMR-over-log + Volatile backend + criterion
+  benches; acceptance gates: ≥1M appends/s single-thread, MMR build+root
+  over 1M leaves < 20ms) → `oxide-runtime` deterministic executor +
+  4-node echo sim → `oxide-types`/`oxide-ports` (OAI traits + MockEngine
+  + conformance skeleton) → protocol specs in `docs/` (oxidebft, OAI,
+  storage) → fuzz targets (need nightly toolchain via rustup).

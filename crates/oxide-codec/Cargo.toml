@@ -1,0 +1,16 @@
+[package]
+name = "oxide-codec"
+description = "Deterministic, allocation-light wire codec for the Oxide blockchain: fixed-width little-endian primitives, LEB128 varints, length-prefixed byte strings, and Encode/Decode traits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Types to make wire-capable (Hash, Address, Id, fixed-point). This is the
+# one dependency hot-path crates may share, and it is internal.
+oxide-primitives = { workspace = true }
+
+[lints]
+workspace = true
