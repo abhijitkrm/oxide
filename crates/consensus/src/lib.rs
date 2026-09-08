@@ -10,10 +10,11 @@
 //!
 //! - **Stage 1** (done): vote/QC/TC types in `types`.
 //! - **Stage 2** (done): the pacemaker as a state machine over views.
-//! - **Stage 3** (this commit): single-leader happy path — the engine
+//! - **Stage 3** (done): single-leader happy path — the engine
 //!   proposes, self-votes, forms QCs, and commits via the OAI boundary.
-//!   1-chain commit rule (safe in the happy path); 2-chain is stage 4.
-//! - Stages 4-6: view changes, BLS aggregation, epoch rotation.
+//! - **Stage 4** (done): 2-chain commit rule + multi-validator support.
+//! - **Stage 5** (done): BLS aggregation via `blst`.
+//! - **Stage 6** (this commit): epoch rotation (two-phase handoff).
 //!
 //! Each stage ships behind the conformance suite; no stage closes
 //! until the suite passes.
@@ -22,6 +23,6 @@ pub mod engine;
 pub mod pacemaker;
 pub mod validator;
 
-pub use engine::OxideBft;
+pub use engine::{EpochRotationError, OxideBft};
 pub use pacemaker::{Pacemaker, PacemakerEvent, PacemakerState};
 pub use validator::{ValidatorIndex, ValidatorSet};

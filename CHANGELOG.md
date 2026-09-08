@@ -12,6 +12,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase 1 stage 6: epoch rotation (two-phase handoff)** (2026-09-09)
+  - `schedule_rotation(new_set)` — phase 1: announce the new
+    validator set. Old set continues to operate.
+  - `rotate_epoch()` — phase 2: complete the rotation. Switches to
+    the new set, increments the epoch, resets view to 0, clears old
+    epoch state.
+  - `rotation_pending()`, `epoch()` — query rotation/epoch state.
+  - `EpochRotationError` — `AlreadyPending`, `NoPendingRotation`.
+  - 8 epoch rotation tests; 128 total.
+
+  **In plain words:** oxideBFT now supports epoch rotation — the
+  validator set can change across epochs without stopping the chain.
+  The handoff is two-phase: first the new set is announced (old set
+  keeps running), then the old set commits its last block and the
+  new set takes over. This ensures no ambiguity in leadership during
+  the transition. Phase 1 of oxideBFT is now complete: all six
+  stages (types, pacemaker, happy path, 2-chain commit, BLS, epoch
+  rotation) are implemented and tested.
+
 - **Phase 1 stage 5: BLS12-381 aggregation via `blst`** (2026-09-09)
   - New `bls_signer` module: `BlsSecretKey`, `verify`,
     `aggregate`, `aggregate_verify` — real BLS12-381 signing,

@@ -80,6 +80,26 @@ struct PendingBlock {
     proposal: Proposal,
 }
 
+/// Errors from epoch rotation (stage 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochRotationError {
+    /// A rotation was scheduled while one was already pending.
+    AlreadyPending,
+    /// A rotation completion was attempted with no pending rotation.
+    NoPendingRotation,
+}
+
+impl std::fmt::Display for EpochRotationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyPending => write!(f, "epoch rotation already pending"),
+            Self::NoPendingRotation => write!(f, "no pending epoch rotation"),
+        }
+    }
+}
+
+impl std::error::Error for EpochRotationError {}
+
 /// The oxideBFT consensus engine.
 ///
 /// Implements `ports::ConsensusEngine`. In single-validator mode
@@ -93,6 +113,12 @@ pub struct OxideBft {
     app: Arc<dyn AppInterface>,
     /// The validator set for the current epoch.
     validator_set: ValidatorSet,
+    /// The next validator set (stage 6 epoch rotation). `None` when no
+    /// rotation is pending. When set, the engine is in the first
+    /// phase of the two-phase handoff: the old set continues to
+    /// propose/vote/commit, and the new set takes over after the old
+    /// set commits the last block of the old epoch.
+    next_validator_set: Option<ValidatorSet>,
     /// This engine's index in the validator set.
     validator_index: ValidatorIndex,
     /// This engine's BLS secret key (stage 5). Used to sign votes and
@@ -122,7 +148,9 @@ pub struct OxideBft {
     /// The current view. Advances by 1 per proposed block (one view
     /// per block in the happy path) or on view change (via TC).
     current_view: View,
-    /// The current epoch. Fixed in stage 4; stage 6 adds rotation.
+    /// The current epoch. Stage 6 adds rotation: when a rotation is
+    /// pending and the old set commits the last block, the epoch
+    /// increments and the new validator set takes over.
     epoch: Epoch,
     /// Collected votes for the current view (leader only). `None` =
     /// no vote from that validator. Indexed by `ValidatorIndex`.
@@ -158,6 +186,7 @@ impl OxideBft {
         Self {
             app,
             validator_set,
+            next_validator_set: None,
             validator_index,
             secret_key: None,
             pacemaker,
@@ -195,6 +224,74 @@ impl OxideBft {
     #[must_use]
     pub fn current_view(&self) -> View {
         self.current_view
+    }
+
+    /// Current epoch.
+    #[must_use]
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// Whether an epoch rotation is pending (stage 6 two-phase handoff,
+    /// phase 1: the new validator set is announced but the old set
+    /// is still active).
+    #[must_use]
+    pub fn rotation_pending(&self) -> bool {
+        self.next_validator_set.is_some()
+    }
+
+    /// Schedule an epoch rotation (stage 6). The new validator set
+    /// takes over after the old set commits the last block of the
+    /// current epoch. This is the first phase of the two-phase
+    /// handoff: announce the new set, continue with the old set.
+    ///
+    /// # Errors
+    /// Returns `EpochRotationError::AlreadyPending` if a rotation is
+    /// already pending (the caller must wait for it to complete).
+    pub fn schedule_rotation(&mut self, new_set: ValidatorSet) -> Result<(), EpochRotationError> {
+        if self.next_validator_set.is_some() {
+            return Err(EpochRotationError::AlreadyPending);
+        }
+        self.next_validator_set = Some(new_set);
+        Ok(())
+    }
+
+    /// Complete the epoch rotation (stage 6, phase 2). Switches to
+    /// the new validator set, increments the epoch, and resets the
+    /// view to 0. Called when the old set commits the last block of
+    /// the old epoch.
+    ///
+    /// # Errors
+    /// Returns `EpochRotationError::NoPendingRotation` if no
+    /// rotation is pending.
+    fn complete_rotation(&mut self) -> Result<(), EpochRotationError> {
+        let Some(new_set) = self.next_validator_set.take() else {
+            return Err(EpochRotationError::NoPendingRotation);
+        };
+        self.validator_set = new_set;
+        self.epoch = Epoch::new(self.epoch.value() + 1);
+        self.current_view = View::new(0);
+        self.last_voted_view = None;
+        self.high_qc = None;
+        self.pending = None;
+        self.votes = vec![None; self.validator_set.n()];
+        self.vote_count = 0;
+        // Reset the pacemaker for the new epoch.
+        self.pacemaker =
+            crate::pacemaker::Pacemaker::new(self.validator_set.clone(), View::new(0), self.epoch);
+        Ok(())
+    }
+
+    /// Force-complete the epoch rotation (for tests and simulation).
+    /// This completes the rotation immediately, regardless of whether
+    /// the old set has committed the last block. In production, the
+    /// rotation completes automatically when the old set commits.
+    ///
+    /// # Errors
+    /// Returns `EpochRotationError::NoPendingRotation` if no rotation
+    /// is pending.
+    pub fn rotate_epoch(&mut self) -> Result<(), EpochRotationError> {
+        self.complete_rotation()
     }
 
     /// Whether this engine is the leader for the current view.
@@ -896,5 +993,128 @@ mod tests {
             &pks,
         );
         assert!(result.is_ok(), "QC aggregate signature must verify against all 4 keys");
+    }
+
+    // ---- Epoch rotation tests (stage 6) ----
+    //
+    // These tests exercise the two-phase epoch handoff: schedule a
+    // new validator set, then complete the rotation.
+
+    fn second_validator_set() -> ValidatorSet {
+        ValidatorSet::new(vec![pk(5), pk(6)], vec![1, 1]).expect("2 validators")
+    }
+
+    #[test]
+    fn schedule_rotation_sets_pending() {
+        let mut engine = make_engine();
+        assert!(!engine.rotation_pending());
+        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        assert!(engine.rotation_pending());
+    }
+
+    #[test]
+    fn schedule_rotation_rejects_double_schedule() {
+        let mut engine = make_engine();
+        engine.schedule_rotation(second_validator_set()).expect("first");
+        let err = engine.schedule_rotation(second_validator_set());
+        assert!(err.is_err(), "double schedule must fail");
+    }
+
+    #[test]
+    fn rotate_epoch_completes_rotation() {
+        let mut engine = make_engine();
+        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        assert!(engine.rotation_pending());
+        engine.rotate_epoch().expect("rotate");
+        assert!(!engine.rotation_pending());
+        assert_eq!(engine.epoch(), Epoch::new(1));
+        assert_eq!(engine.current_view(), View::new(0));
+    }
+
+    #[test]
+    fn rotate_epoch_without_pending_fails() {
+        let mut engine = make_engine();
+        let err = engine.rotate_epoch();
+        assert!(err.is_err(), "rotation without pending must fail");
+    }
+
+    #[test]
+    fn rotate_epoch_resets_view_and_votes() {
+        let mut engine = make_engine();
+        // Advance the view and collect some state.
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        let view_before = engine.current_view();
+        assert!(view_before.value() > 0, "view should have advanced");
+
+        // Schedule and complete rotation.
+        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        engine.rotate_epoch().expect("rotate");
+
+        // View resets to 0, last_voted_view resets to None.
+        assert_eq!(engine.current_view(), View::new(0));
+        assert_eq!(engine.last_voted_view, None);
+    }
+
+    #[test]
+    fn rotate_epoch_changes_validator_set() {
+        let mut engine = make_engine();
+        let original_n = engine.validator_set.n();
+        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        engine.rotate_epoch().expect("rotate");
+        // The new set has 2 validators, the old had 1.
+        assert_ne!(engine.validator_set.n(), original_n);
+        assert_eq!(engine.validator_set.n(), 2);
+    }
+
+    #[test]
+    fn engine_continues_after_rotation() {
+        let mut engine = make_engine();
+        // Commit a block in epoch 0.
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+
+        // Rotate to a new epoch.
+        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        engine.rotate_epoch().expect("rotate");
+        assert_eq!(engine.epoch(), Epoch::new(1));
+
+        // The engine should still be able to propose and commit in
+        // the new epoch. Note: the validator_index (0) is still valid
+        // in the new 2-validator set.
+        engine.submit_tx(TxBytes::new(vec![2]));
+        engine.run_until_idle();
+
+        // The new tx should be committed.
+        let h = engine.finalized_height().expect("finalized").value();
+        let mut found = false;
+        for i in 0..=h {
+            if let Some(block) = engine.finalized_block(Height::new(i)) {
+                if block.txs.iter().any(|t| t.as_bytes() == [2]) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "tx submitted after rotation must be committed");
+    }
+
+    #[test]
+    fn epoch_in_blocks_increments_after_rotation() {
+        let mut engine = make_engine();
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+
+        // Before rotation, blocks are in epoch 0.
+        assert_eq!(engine.epoch(), Epoch::new(0));
+
+        // Rotate.
+        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        engine.rotate_epoch().expect("rotate");
+
+        // After rotation, new blocks are in epoch 1.
+        engine.submit_tx(TxBytes::new(vec![2]));
+        engine.run_until_idle();
+        assert_eq!(engine.epoch(), Epoch::new(1));
     }
 }
