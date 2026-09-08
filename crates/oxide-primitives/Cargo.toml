@@ -1,0 +1,15 @@
+[package]
+name = "oxide-primitives"
+description = "Foundational types for the Oxide blockchain: hashes, addresses, chain identifiers, and deterministic fixed-point arithmetic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# POLICY (.devin/skills/production-rust §5): this crate is on every hot
+# path in the system — it must remain std-only, forever.
+[dependencies]
+
+[lints]
+workspace = true

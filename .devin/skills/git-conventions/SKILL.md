@@ -45,4 +45,7 @@ what they asked for — nothing more, and only for that commit.
 1. `cargo fmt --check` clean (or run `cargo fmt` and restage).
 2. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 3. `cargo test --workspace` green.
-4. Message follows the format above, with **no attribution trailers**.
+4. `docs/devlog.md` has an entry for this change (every step, however
+   small — decisions, bug hunts with root cause, fixes) and
+   `CHANGELOG.md` updated if anything user-visible shipped.
+5. Message follows the format above, with **no attribution trailers**.

@@ -1,0 +1,10 @@
+# Formatting is CI-enforced (`cargo fmt --check`); these settings keep
+# diffs mechanical and reviews focused on semantics.
+#
+# NOTE: stable-only options here — `imports_granularity`/`group_imports`
+# are nightly-only and emit warnings on every stable `cargo fmt` run.
+# When the project adopts a nightly fmt CI job, they can return.
+
+edition = "2024"
+max_width = 100
+use_small_heuristics = "Max"

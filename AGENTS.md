@@ -53,6 +53,11 @@ nightly adds fuzz and long simulations.
 
 ## Conventions
 
+- **Log as you go:** every change gets a `docs/devlog.md` entry (no
+  matter how small — decisions, dead ends, bug hunts with root cause),
+  and `CHANGELOG.md` is updated for anything user-visible. This is part
+  of the pre-commit checklist (`.devin/skills/git-conventions`).
+
 - Edition 2024; workspace lint level strict (`clippy::all -D warnings`).
 - Every constant on a hot path carries a comment: unit, origin (plan.md /
   spec §), and the tradeoff of changing it.

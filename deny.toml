@@ -1,0 +1,43 @@
+# cargo-deny policy. Run: `cargo deny check`.
+# The repository is GPL-3.0; every dependency must be GPL-3.0-compatible
+# (AGENTS.md → Conventions). MIT / BSD / Apache-2.0 / MPL-2.0 / ISC are
+# one-way compatible into a GPL-3.0 work. GPLv2-only, CDDL, and proprietary
+# licenses are NOT and are rejected below.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+  # GPL-family: fine to combine with GPL-3.0.
+  "GPL-3.0",
+  "GPL-3.0-only",
+  "LGPL-3.0",
+  "AGPL-3.0",
+]
+exceptions = []
+
+[bans]
+# Duplicated versions are allowed at first (ecosystem reality) but surfaced
+# so we can pin/trim as the tree matures.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

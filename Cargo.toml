@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+# NOTE: add "modules/*" and "bin/*" back to `members` the moment those
+# directories get their first crate — cargo errors on globs that match
+# nothing, so the list below tracks what actually exists.
+members = ["crates/*"]
+
+# NOTE: `fuzz/` is intentionally NOT a workspace member — cargo-fuzz targets
+# require a nightly toolchain and their own build graph. Build them with
+# `cargo +nightly fuzz run <target>` from the `fuzz/` directory.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0"
+repository = "https://github.com/abhijitkrm/oxide"
+
+[workspace.lints.rust]
+# A production financial system: unsafe is a reviewed, budgeted resource
+# (see .devin/skills/production-rust, §4). Arena/huge-page crates opt back in
+# with `#[allow(unsafe_code)]` + SAFETY comments.
+unsafe_code = "deny"
+missing_docs = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# `must_use` on getters that are cheap copies adds call-site noise without
+# catching real bugs in this codebase; theReviewer enforces intent via docs.
+must_use_candidate = "allow"
+# Our types are small and pervasive (Hash, Height, View); pass-by-value is
+# deliberate on hot paths.
+need_pass_by_value = "allow"
+
+[workspace.dependencies]
+# Internal crates (exact versions keep the graph deterministic and reviews local).
+oxide-primitives = { path = "crates/oxide-primitives" }
+oxide-codec = { path = "crates/oxide-codec" }
+
+[profile.release]
+# Whole-program optimization for the hot paths; slower builds are acceptable
+# because perf gates (README.md → Roadmap) are release-profile measurements.
+lto = "thin"
+codegen-units = 1
+panic = "unwind" # consensus must never abort silently; panics are caught at actor boundaries
+
+[profile.bench]
+debug = true # flamegraphs need symbols
