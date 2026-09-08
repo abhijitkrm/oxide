@@ -484,3 +484,36 @@ the rule.
 
 Verification: fmt clean, clippy -D warnings clean, 56 tests pass
 (unchanged from before — pure rename + reference removal).
+
+## Session 4 addendum 3 — fix cargo-deny CI failures
+
+Three issues surfaced by the cargo-deny-action in CI:
+
+g. **bincode unmaintained (RUSTSEC-2025-0141).** bincode is a dev-only
+   benchmark dependency in `codec` (the "prove it was worth building"
+   head-to-head comparison, benchmarks skill §4) — it never ships in a
+   binary. The advisory states "No safe upgrade is available" (the team
+   ceased development permanently). Added to `[advisories] ignore` in
+   deny.toml with a documented justification: dev-only, no safe
+   upgrade, reviewed. If a maintained alternative with equivalent
+   ergonomics emerges (postcard, rkyv) we will switch and drop the
+   ignore.
+
+h. **Wildcard dependencies (bans FAILED).** cargo-deny's
+   `wildcards = "deny"` flags workspace path deps without an explicit
+   version — a bare `{ path = "crates/primitives" }` is a wildcard.
+   Fixed by adding `version = "0.1.0"` to every workspace dependency in
+   `[workspace.dependencies]`. This also resolved the
+   `unresolved-workspace-dependency` bug for storage.
+
+i. **GPL-3.0 deprecated SPDX (licenses parse-error warnings).** The
+   SPDX identifier `GPL-3.0` is deprecated; the valid form is
+   `GPL-3.0-only` (the repo's LICENSE is plain GPL-3.0, not "or
+   later"). Updated `workspace.package.license` and the deny.toml
+   allow-list (also fixed `LGPL-3.0` → `LGPL-3.0-only` and
+   `AGPL-3.0` → `AGPL-3.0-only`).
+
+Verified locally with `cargo deny check`: advisories ok, bans ok,
+licenses ok, sources ok. The remaining `license-not-encountered`
+warnings are informational (allowed licenses no current dep uses yet)
+— not failures.

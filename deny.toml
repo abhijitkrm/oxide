@@ -1,5 +1,5 @@
 # cargo-deny policy. Run: `cargo deny check`.
-# The repository is GPL-3.0; every dependency must be GPL-3.0-compatible
+# The repository is GPL-3.0-only; every dependency must be GPL-3.0-compatible
 # (AGENTS.md → Conventions). MIT / BSD / Apache-2.0 / MPL-2.0 / ISC are
 # one-way compatible into a GPL-3.0 work. GPLv2-only, CDDL, and proprietary
 # licenses are NOT and are rejected below.
@@ -19,11 +19,12 @@ allow = [
   "MPL-2.0",
   "Unicode-3.0",
   "Zlib",
-  # GPL-family: fine to combine with GPL-3.0.
-  "GPL-3.0",
+  # GPL-family: fine to combine with GPL-3.0-only. Use the valid SPDX
+  # identifiers (the bare `GPL-3.0` / `LGPL-3.0` / `AGPL-3.0` forms are
+  # deprecated and trigger cargo-deny parse-error warnings).
   "GPL-3.0-only",
-  "LGPL-3.0",
-  "AGPL-3.0",
+  "LGPL-3.0-only",
+  "AGPL-3.0-only",
 ]
 exceptions = []
 
@@ -37,6 +38,14 @@ highlight = "all"
 [advisories]
 version = 2
 yanked = "deny"
+# RUSTSEC-2025-0141: bincode is permanently unmaintained (the team ceased
+# development after a doxxing/harassment incident). No safe upgrade exists.
+# We use bincode only as a dev-dependency in `codec`'s benchmark harness
+# (the "prove it was worth building" head-to-head comparison, benchmarks
+# skill §4) — it never ships in a binary. Ignoring here is a reviewed,
+# documented decision; if a maintained alternative with equivalent
+# ergonomics emerges (postcard, rkyv) we will switch and drop the ignore.
+ignore = ["RUSTSEC-2025-0141"]
 
 [sources]
 unknown-registry = "deny"

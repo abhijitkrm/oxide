@@ -13,7 +13,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
 repository = "https://github.com/abhijitkrm/oxide"
 
 [workspace.lints.rust]
@@ -38,12 +38,14 @@ must_use_candidate = "allow"
 needless_pass_by_value = "allow"
 
 [workspace.dependencies]
-# Internal crates (exact versions keep the graph deterministic and reviews local).
-primitives = { path = "crates/primitives" }
-codec = { path = "crates/codec" }
-runtime = { path = "crates/runtime" }
-types = { path = "crates/types" }
-ports = { path = "crates/ports" }
+# Internal crates: path + exact version. The version is required by
+# cargo-deny's `wildcards = "deny"` (a bare `{ path = ... }` is a
+# wildcard) and keeps the graph deterministic and reviews local.
+primitives = { path = "crates/primitives", version = "0.1.0" }
+codec = { path = "crates/codec", version = "0.1.0" }
+runtime = { path = "crates/runtime", version = "0.1.0" }
+types = { path = "crates/types", version = "0.1.0" }
+ports = { path = "crates/ports", version = "0.1.0" }
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable
