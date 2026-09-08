@@ -1,0 +1,453 @@
+//! Merkle Mountain Range over leaf hashes — the authentication
+//! primitive for the append-only journal (docs/storage-spec.md §3).
+//!
+//! ## What this module does
+//!
+//! [`Mmr`] accumulates pre-hashed 32-byte leaves, maintaining its node
+//! forest incrementally: [`Mmr::push`] is O(1) amortized (leaf append +
+//! mountain merges as heights collide), [`Mmr::root`] bags the current
+//! peaks into one 32-byte commitment, and [`Mmr::proof`] produces an
+//! O(log n) inclusion proof for any leaf that [`Mmr::verify`] checks
+//! against a root alone — no trusted tree required.
+//!
+//! ## Why an MMR (and not a trie)
+//!
+//! The journal only ever appends; an MMR's shape is exactly append-only
+//! (new leaves touch only the right edge — no re-hashing of cold
+//! history, no key-ordered structure to maintain). This is the QMDB
+//! insight (plan.md §8 L1): merklization with little memory and no
+//! disk access on the commit path.
+//!
+//! ## Layout (canonical, Grin-lineage)
+//!
+//! Nodes live in one vector in **append order**: pushing a leaf appends
+//! its hash, then, while the two rightmost mountains have equal height,
+//! appends `parent = H(left ‖ right)`. For `n` leaves the forest holds
+//! `2n − popcount(n)` nodes. Peaks are tracked incrementally in a small
+//! side vector, so `push` never re-derives the forest shape.
+//!
+//! ## Hashing (BLAKE3-256, domain-separated)
+//!
+//! | Input | Preimage |
+//! |---|---|
+//! | leaf | caller-supplied pre-hashed 32 bytes |
+//! | internal node | `0x01 ‖ left ‖ right` |
+//! | root | `0x02 ‖ bagged_peaks ‖ leaf_count (u64 LE)` |
+//!
+//! Peak bagging folds right-to-left (`acc = H(peak ‖ acc)` from the
+//! rightmost peak). Binding `leaf_count` into the root makes two
+//! different-sized forests unambiguously different commitments.
+//!
+//! ## Invariants (property-tested)
+//!
+//! 1. Every leaf in `[0, n)` proves against the root for that exact `n`.
+//! 2. Verification fails on: wrong leaf, tampered step, wrong index,
+//!    wrong leaf count, wrong peak.
+//! 3. Identical push sequences yield identical roots, forever.
+
+use primitives::Hash;
+
+/// Domain-separation prefix for internal nodes (spec §3 table).
+const DOMAIN_NODE: u8 = 0x01;
+/// Domain-separation prefix for the root finalization.
+const DOMAIN_ROOT: u8 = 0x02;
+
+/// Preimage width of an internal-node hash: prefix + two 32-byte digests.
+const NODE_PREIMAGE_LEN: usize = 65;
+/// Preimage width of the root finalization: prefix + digest + u64 count.
+const ROOT_PREIMAGE_LEN: usize = 41;
+
+/// A Merkle Mountain Range over pre-hashed leaves.
+///
+/// `peaks` is the incremental forest shape: `(node index, height)` for
+/// each mountain, left to right. It is redundant with `leaf_count` (and
+/// cross-checked against the pure [`peak_positions`] in tests) but kept
+/// so [`Mmr::push`] never pays a forest re-derivation.
+#[derive(Debug, Default, Clone)]
+pub struct Mmr {
+    /// Every node hash (leaves and internal) in append order.
+    nodes: Vec<Hash>,
+    /// Mountain peaks (index, height), left to right.
+    peaks: Vec<(usize, u32)>,
+    /// Number of leaves committed.
+    leaf_count: u64,
+}
+
+/// One step of an inclusion path: the sibling hash at this level and
+/// which side the *proven target* sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathStep {
+    /// Sibling hash at this level of the path.
+    pub sibling: Hash,
+    /// `true` = the target (or its subtree) is the LEFT child here.
+    pub target_is_left: bool,
+}
+
+/// A self-contained inclusion proof: reconstructs the target's peak,
+/// checks it against the supplied peaks, bags, and compares roots.
+#[derive(Clone, Debug)]
+pub struct MmrProof {
+    /// Index of the proven leaf (0-based).
+    pub leaf_index: u64,
+    /// Leaf count at proof time — binds the forest shape.
+    pub leaf_count: u64,
+    /// Sibling path, leaf → peak (bottom-up order).
+    pub path: Vec<PathStep>,
+    /// All peak hashes at proof time, left to right.
+    pub peaks: Vec<Hash>,
+}
+
+/// Hash an internal node: `H(0x01 ‖ left ‖ right)`.
+///
+/// The preimage is assembled in a fixed stack buffer and hashed in one
+/// single-shot call — byte-identical to a chained-update formulation
+/// but faster on short inputs (no hasher-state setup, no per-update
+/// block buffering; see devlog session 3, bug q). Public because the
+/// bench exposes this as the hash floor every push amortizes to (the
+/// gate decomposition in docs/storage-spec.md §3).
+pub fn hash_node(left: &Hash, right: &Hash) -> Hash {
+    let mut preimage = [0u8; NODE_PREIMAGE_LEN];
+    preimage[0] = DOMAIN_NODE;
+    preimage[1..33].copy_from_slice(left.as_bytes());
+    preimage[33..65].copy_from_slice(right.as_bytes());
+    Hash(blake3::hash(&preimage).into())
+}
+
+/// Bag peaks right-to-left and finalize the root:
+/// `H(0x02 ‖ bag ‖ leaf_count LE)`.
+fn bag_root(peaks: &[Hash], leaf_count: u64) -> Hash {
+    // An empty forest commits to the zero hash with leaf_count 0 —
+    // documented, deterministic, and only reachable pre-genesis.
+    if peaks.is_empty() {
+        return Hash::ZERO;
+    }
+    let mut acc = peaks[peaks.len() - 1];
+    // Fold from the second-rightmost peak leftward: acc = H(peak ‖ acc).
+    for peak in peaks[..peaks.len() - 1].iter().rev() {
+        acc = hash_node(peak, &acc);
+    }
+    let mut preimage = [0u8; ROOT_PREIMAGE_LEN];
+    preimage[0] = DOMAIN_ROOT;
+    preimage[1..33].copy_from_slice(acc.as_bytes());
+    preimage[33..41].copy_from_slice(&leaf_count.to_le_bytes());
+    Hash(blake3::hash(&preimage).into())
+}
+
+/// Pure function: peak `(root index, height)` pairs for a forest of
+/// `n` leaves (spec §3 layout). Heights are log2 of each mountain's
+/// leaf count; each mountain's nodes occupy `2^(h+1) − 1` consecutive
+/// slots and its **root** is the last of them — the root index is what
+/// proof descent and the incremental peak stack both need (a first-node
+/// index would make `left_child = root − 2^h` underflow; this exact
+/// mismatch was devlog session 3, bug p).
+#[allow(clippy::cast_possible_truncation)]
+// Justification: node indexes are memory-bounded — a forest larger
+// than `usize::MAX` nodes cannot exist in the address space that holds
+// it. Validator targets are 64-bit; the cast is a width formality.
+pub fn peak_positions(n: u64) -> Vec<(usize, u32)> {
+    let mut out = Vec::new();
+    let mut first: u64 = 0;
+    // Walk set bits of n from the most significant down: each set bit
+    // is one mountain, sized by its bit position.
+    let mut rest = n;
+    while rest > 0 {
+        let height = rest.ilog2();
+        let mountain_nodes = 2 * (1u64 << height) - 1;
+        let root = first + mountain_nodes - 1;
+        out.push((root as usize, height));
+        first += mountain_nodes;
+        rest ^= 1u64 << height;
+    }
+    out
+}
+
+impl Mmr {
+    /// Empty forest.
+    pub fn new() -> Self {
+        Mmr { nodes: Vec::new(), peaks: Vec::new(), leaf_count: 0 }
+    }
+
+    /// Number of leaves committed.
+    pub fn leaf_count(&self) -> u64 {
+        self.leaf_count
+    }
+
+    /// Total node count (leaves + internal) — the structural law
+    /// `2n − popcount(n)` from spec §3, exposed so tests and the
+    /// conformance suite can assert it against any forest state.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Append one pre-hashed leaf; O(1) amortized.
+    ///
+    /// The leaf is pushed, then mountains merge while the two rightmost
+    /// have equal height — each merge appends one internal-node hash.
+    /// Over `n` pushes this does exactly `n − popcount_draining` hashes
+    /// (amortized ≤ 1 per push): the hash count is information-theoretic
+    /// for a Merkle structure, so the *structure* overhead here is the
+    /// vector push plus a couple of peak-stack pops.
+    pub fn push(&mut self, leaf: Hash) {
+        self.nodes.push(leaf);
+        self.peaks.push((self.nodes.len() - 1, 0));
+        self.leaf_count += 1;
+        // Merge cascade: while the two rightmost mountains are equal
+        // height, their parent becomes the new rightmost mountain.
+        while self.peaks.len() >= 2 {
+            let (right_index, right_height) = self.peaks[self.peaks.len() - 1];
+            let (left_index, left_height) = self.peaks[self.peaks.len() - 2];
+            if right_height != left_height {
+                break;
+            }
+            let parent = hash_node(&self.nodes[left_index], &self.nodes[right_index]);
+            self.nodes.push(parent);
+            self.peaks.pop();
+            self.peaks.pop();
+            self.peaks.push((self.nodes.len() - 1, right_height + 1));
+        }
+    }
+
+    /// The root commitment: bagged peaks finalized with `leaf_count`.
+    ///
+    /// O(#peaks) hashes (~log n); maintained incrementally by [`push`],
+    /// so calling this after every append costs the bagging only.
+    pub fn root(&self) -> Hash {
+        let peak_hashes: Vec<Hash> = self.peaks.iter().map(|&(i, _)| self.nodes[i]).collect();
+        bag_root(&peak_hashes, self.leaf_count)
+    }
+
+    /// Build an inclusion proof for leaf `leaf_index` (0-based).
+    ///
+    /// Strategy: locate the mountain containing the leaf (mountains
+    /// cover leaf ranges left to right), then descend from that peak to
+    /// the leaf, recording each sibling; the recorded path is reversed
+    /// to bottom-up order. Descending from the peak avoids the
+    /// error-prone "is this index a left or right child" index algebra
+    /// entirely — child positions are always local to a subtree:
+    /// `left_child(parent) = parent − 2^parent_height`,
+    /// `right_child(parent) = parent − 1`.
+    ///
+    /// # Errors
+    /// `None` if `leaf_index >= leaf_count` (out of range).
+    #[must_use]
+    pub fn proof(&self, leaf_index: u64) -> Option<MmrProof> {
+        if leaf_index >= self.leaf_count {
+            return None;
+        }
+        let peaks = peak_positions(self.leaf_count);
+        // Find the mountain whose leaf range contains leaf_index, and
+        // the leaf's offset within that mountain. Mountain leaf ranges
+        // partition [0, leaf_count), so a valid index always matches —
+        // the `found` guard keeps that argument local and explicit.
+        let mut leaf_start = 0u64;
+        let mut found = None;
+        for &(index, height) in &peaks {
+            let mountain_leaves = 1u64 << height;
+            if leaf_index < leaf_start + mountain_leaves {
+                found = Some((index, height, leaf_index - leaf_start));
+                break;
+            }
+            leaf_start += mountain_leaves;
+        }
+        // `?` on the Option: an in-range leaf always finds its mountain
+        // (ranges partition [0, leaf_count)), but the operator keeps
+        // that argument structural instead of a hand-rolled else.
+        let (mut node, height, mut local) = found?;
+        // Descend peak → leaf, collecting siblings top-down.
+        let mut path_down = Vec::with_capacity(height as usize);
+        let mut h = height;
+        while h > 0 {
+            let left_child = node - (1usize << h);
+            let right_child = node - 1;
+            let left_leaves = 1u64 << (h - 1);
+            if local < left_leaves {
+                // Target is in the LEFT child; sibling is the right child.
+                path_down.push(PathStep { sibling: self.nodes[right_child], target_is_left: true });
+                node = left_child;
+            } else {
+                // Target is in the RIGHT child; sibling is the left child.
+                path_down.push(PathStep { sibling: self.nodes[left_child], target_is_left: false });
+                local -= left_leaves;
+                node = right_child;
+            }
+            h -= 1;
+        }
+        // The descent consumed exactly `height` steps (loop structure);
+        // reversing yields the bottom-up order `verify` folds.
+        let path: Vec<PathStep> = path_down.into_iter().rev().collect();
+        Some(MmrProof {
+            leaf_index,
+            leaf_count: self.leaf_count,
+            path,
+            peaks: peaks.iter().map(|&(i, _)| self.nodes[i]).collect(),
+        })
+    }
+
+    /// Verify `leaf` is committed by `root` according to `proof`.
+    ///
+    /// Reconstructs the target's peak from the path, checks it against
+    /// the proof's peaks at the position implied by `leaf_index` and
+    /// `leaf_count`, bags, and compares to `root`. Self-contained: no
+    /// tree access, so it is exactly what a light client runs.
+    #[must_use]
+    pub fn verify(leaf: &Hash, proof: &MmrProof, root: &Hash) -> bool {
+        if proof.leaf_index >= proof.leaf_count {
+            return false;
+        }
+        let peaks = peak_positions(proof.leaf_count);
+        if peaks.len() != proof.peaks.len() {
+            return false;
+        }
+        // Which mountain contains the leaf, and its leaf-range start.
+        let mut leaf_start = 0u64;
+        let mut mountain = None;
+        for (m, &(_, height)) in peaks.iter().enumerate() {
+            let mountain_leaves = 1u64 << height;
+            if proof.leaf_index < leaf_start + mountain_leaves {
+                mountain = Some(m);
+                break;
+            }
+            leaf_start += mountain_leaves;
+        }
+        let Some(m) = mountain else { return false };
+        // The path must be exactly the mountain's height (one sibling
+        // per level) — a wrong-length path is malformed, not false-y.
+        if proof.path.len() != peaks[m].1 as usize {
+            return false;
+        }
+        // Fold bottom-up: acc = leaf, then combine with each sibling.
+        let mut acc = *leaf;
+        for step in &proof.path {
+            acc = if step.target_is_left {
+                hash_node(&acc, &step.sibling)
+            } else {
+                hash_node(&step.sibling, &acc)
+            };
+        }
+        // `acc` is now the target mountain's peak hash.
+        if acc != proof.peaks[m] {
+            return false;
+        }
+        // Bag the (checked-at-m, supplied-elsewhere) peaks.
+        bag_root(&proof.peaks, proof.leaf_count) == *root
+    }
+}
+
+/// Hash a leaf preimage with BLAKE3-256 — the canonical way callers
+/// produce the pre-hashed leaves [`Mmr::push`] consumes.
+pub fn hash_leaf(preimage: &[u8]) -> Hash {
+    Hash(blake3::hash(preimage).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic test leaves: blake3 of the index.
+    fn leaf(i: u64) -> Hash {
+        hash_leaf(&i.to_le_bytes())
+    }
+
+    /// Structural law: `n` leaves ⇒ `2n − popcount(n)` nodes, and the
+    /// incrementally-maintained peaks equal the pure derivation.
+    #[test]
+    fn test_forest_shape_matches_law() {
+        let mut mmr = Mmr::new();
+        for n in 1u64..=1024 {
+            mmr.push(leaf(n));
+            let expected_nodes = 2 * n - u64::from(n.count_ones());
+            assert_eq!(mmr.nodes.len() as u64, expected_nodes, "node count law at n={n}");
+            let pure = peak_positions(n);
+            assert_eq!(mmr.peaks.len(), pure.len(), "peak count at n={n}");
+            for (a, b) in mmr.peaks.iter().zip(pure.iter()) {
+                assert_eq!(a, b, "peak positions agree at n={n}");
+            }
+        }
+    }
+
+    /// Exhaustive small-n: every leaf proves, and tampering anywhere in
+    /// the proof (leaf, one step, peaks, counts) fails verification.
+    #[test]
+    fn test_every_leaf_proves_and_tamper_fails() {
+        for n in 1u64..=64 {
+            let mut mmr = Mmr::new();
+            for i in 0..n {
+                mmr.push(leaf(i));
+            }
+            let root = mmr.root();
+            for i in 0..n {
+                let proof = mmr.proof(i).expect("in-range leaf has a proof");
+                assert!(Mmr::verify(&leaf(i), &proof, &root), "n={n} leaf={i} proves");
+
+                // Wrong leaf hash.
+                let bad_leaf = leaf(i + 1_000);
+                assert!(
+                    !Mmr::verify(&bad_leaf, &proof, &root),
+                    "wrong leaf rejected (n={n},i={i})"
+                );
+                // Tampered sibling (each step, if the path is non-empty).
+                for s in 0..proof.path.len() {
+                    let mut tampered = proof.clone();
+                    tampered.path[s].sibling = Hash([0xEE; 32]);
+                    assert!(
+                        !Mmr::verify(&leaf(i), &tampered, &root),
+                        "tampered step rejected (n={n},i={i},step={s})"
+                    );
+                }
+                // Wrong leaf count (forest-shape lie).
+                let mut wrong_count = proof.clone();
+                wrong_count.leaf_count += 1;
+                assert!(!Mmr::verify(&leaf(i), &wrong_count, &root), "wrong count rejected");
+                // Tampered peak.
+                if !proof.peaks.is_empty() {
+                    let mut bad_peak = proof.clone();
+                    bad_peak.peaks[0] = Hash([0xDD; 32]);
+                    assert!(!Mmr::verify(&leaf(i), &bad_peak, &root), "tampered peak rejected");
+                }
+            }
+            // Out-of-range index produces no proof.
+            assert!(mmr.proof(n).is_none(), "n={n}: out-of-range rejected");
+        }
+    }
+
+    /// Root determinism: identical sequence ⇒ identical root; a
+    /// different final leaf ⇒ different root.
+    #[test]
+    fn test_root_determinism_and_sensitivity() {
+        let build = |final_leaf: u64| {
+            let mut m = Mmr::new();
+            for i in 0..9u64 {
+                m.push(leaf(if i == 8 { final_leaf } else { i }));
+            }
+            m.root()
+        };
+        assert_eq!(build(9), build(9), "same sequence, same root");
+        assert_ne!(build(9), build(10), "different leaf, different root");
+    }
+
+    /// Empty forest: zero root, no proofs, zero leaves.
+    #[test]
+    fn test_empty_forest() {
+        let m = Mmr::new();
+        assert_eq!(m.root(), Hash::ZERO);
+        assert_eq!(m.leaf_count(), 0);
+        assert!(m.proof(0).is_none());
+    }
+
+    /// Larger forest spot-check (powers of two and neighbors — the
+    /// boundary shapes where mountain math is most error-prone).
+    #[test]
+    fn test_power_of_two_boundaries() {
+        for &n in &[1023u64, 1024, 1025, 4095, 4096, 4097] {
+            let mut m = Mmr::new();
+            for i in 0..n {
+                m.push(leaf(i));
+            }
+            let root = m.root();
+            for &i in &[0, n / 2, n - 1] {
+                let proof = m.proof(i).unwrap();
+                assert!(Mmr::verify(&leaf(i), &proof, &root), "n={n}, i={i}");
+            }
+        }
+    }
+}

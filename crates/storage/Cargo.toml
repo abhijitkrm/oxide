@@ -1,0 +1,38 @@
+# Oxide blockchain — `storage` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+
+[package]
+name = "storage"
+description = "Oxide storage engine: append-only CRC'd journal (group commit), Merkle Mountain Range over leaf hashes, and the StorageBackend seam with an in-memory reference implementation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Shared type vocabulary (Hash keys, per plan.md §8 sizing). Internal,
+# hot-path-approved dependency — the same one `codec` uses.
+primitives = { workspace = true }
+# BLAKE3 is the consensus hash (docs/storage-spec.md §3). Justification
+# (production-rust skill §5): collision resistance is non-negotiable for
+# an authenticated data structure, implementing our own would be
+# negligent, and blake3 is mature/pinned. The journal *core* (segments,
+# CRC-32, replay) stays std-only; only the merkle layer touches this.
+blake3 = "1"
+
+[dev-dependencies]
+criterion = "0.7.0"
+proptest = "1"
+
+[[bench]]
+name = "journal"
+harness = false
+
+[[bench]]
+name = "mmr"
+harness = false
+
+[lints]
+workspace = true

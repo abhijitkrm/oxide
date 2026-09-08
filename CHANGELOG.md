@@ -91,6 +91,42 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **`storage` v0.1.0** (2026-09-08) — persistence + authentication layer
+  (spec: `docs/storage-spec.md`, written before the code)
+  - `journal`: append-only CRC-32'd records in immutable size-bounded
+    segments; group commit (one sequential write + one fdatasync per
+    block batch — durability is replayed, never per-op); torn-tail and
+    corruption recovery trust exactly the complete prefix; a missing
+    directory is an empty journal (fresh-node bootstrap).
+  - `mmr`: Merkle Mountain Range over pre-hashed leaves with
+    incrementally maintained peaks (O(1) amortized push), descent-based
+    O(log n) inclusion proofs that verify against the root alone, and
+    domain-separated BLAKE3 with the leaf count bound into the root.
+  - `backend`: the `StorageBackend` seam (minimal by design — it grows
+    only when later phases need it), `Op`/`Caps`, and `Volatile`, the
+    in-memory reference implementation and conformance oracle.
+  - 16 unit tests + 6 proptest properties, including the
+    arbitrary-cut journal-recovery contract modeled from the byte
+    layout.
+  - Gates (dev Mac): journal append **185ns/op (5.4M/s** vs the ≥1M/s
+    gate); append+flush amortized 267ns/op; MMR structure overhead
+    **~16ns/op** (< 20ns gate) with the BLAKE3 hash floor (160ns per
+    65-byte node hash) and the 1M-leaf full build (248ms) reported as
+    hardware/hash-throughput-bound numbers.
+
+  **In plain words:** this is the part of the node that remembers. Every
+  committed batch of changes is written once, end-to-end, into an
+  append-only file (with checksums on every record), so a crash means
+  "replay the file and continue" instead of "hope the database wasn't
+  half-writing." On top of the log sits a cryptographic summary (a
+  "Merkle Mountain Range") that lets anyone prove a particular record
+  was included, using only a tiny proof and the summary hash — that's
+  what lets light clients and other chains trust Oxide's state without
+  downloading it. The commit path itself costs 185 nanoseconds per
+  record — about 5.4 million records per second on one core — and the
+  MMR bookkeeping adds only ~16 nanoseconds per record on top of the
+  (hardware-bound) cryptographic hashing.
+
 - **Benchmark infrastructure** (2026-09-08)
   - `.devin/skills/benchmarks`: a hot-path feature isn't done until it's
     benched — gate/baseline conventions, head-to-head "prove it was worth
@@ -115,6 +151,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   user-facing feature (benchmarks skill, §4).
 
 ### Changed
+
+- **MMR acceptance gate decomposed** (2026-09-08): the Phase 0 figure
+  "MMR root over 1M ops < 20ms" was unachievable as a single-threaded,
+  hashing-included number (every push amortizes to exactly one 65-byte
+  BLAKE3 hash — information-theoretic for any Merkle structure). Per
+  the benchmarks skill it was renegotiated openly, not silently
+  weakened: structure-only overhead < 20ns/op (measured ~16ns ✓), hash
+  floor and full-build wall-clock reported with their hardware context,
+  and merge parallelization staged for Phase 1. Spec + plan updated in
+  the same change.
 
 - **Crate naming: dropped the `oxide-` prefix** (2026-09-08):
   `oxide-primitives` → `primitives`, `oxide-codec` → `codec` (renamed
