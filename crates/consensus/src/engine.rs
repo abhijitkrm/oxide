@@ -1386,7 +1386,10 @@ mod tests {
         for round in 0..rounds {
             // The leader for this view is engines[0]'s leader.
             let leader_idx = usize::from(vs.leader(engines[0].current_view()));
-            let tx = TxBytes::new(vec![u8::try_from(round).unwrap() + 1, u8::try_from(txs_per_round).unwrap()]);
+            let tx = TxBytes::new(vec![
+                u8::try_from(round).unwrap() + 1,
+                u8::try_from(txs_per_round).unwrap(),
+            ]);
             // Submit tx only to the leader's app. In a real system,
             // txs are gossiped, but each validator's mempool dedups
             // by tx hash. Here, each engine has its own MockApp, so
