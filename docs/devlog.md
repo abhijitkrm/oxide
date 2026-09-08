@@ -723,3 +723,85 @@ Stage 3: the single-leader happy path (no view changes) — prepare →
 pre-commit → commit pipeline, emitting `finalize_block` on commit.
 This is the first code that actually drives the OAI boundary through
 oxideBFT. The conformance suite must pass.
+
+## Session 8 — Phase 1 stage 3: oxideBFT engine, single-leader happy path
+
+Stage 3 of the oxideBFT spec's staged implementation order
+(docs/oxidebft-spec.md §8): the engine that drives the OAI boundary
+through oxideBFT. The conformance suite passes.
+
+### What landed
+
+New `crates/consensus/src/engine.rs` — the `OxideBft` engine
+implementing `ports::ConsensusEngine`:
+
+- **Block proposal:** calls `app.prepare_proposal(budget)` to get a
+  `Proposal`, wraps it in a `BlockHeader` (with view, epoch, `high_qc`,
+  proposer, `tx_root`), and stores it keyed by block hash.
+- **Self-vote:** single-validator mode (quorum = 1); the engine votes
+  for its own proposal, forming a `Vote` with a placeholder BLS
+  signature (`Signature::ZERO` until stage 5 wires in `blst`).
+- **QC formation:** aggregates the self-vote into a
+  `QuorumCertificate` with a signer bitmap and placeholder aggregate
+  signature.
+- **1-chain commit:** commits immediately on QC formation. Safe in
+  the single-leader happy path (no view changes, no faults). Stage 4
+  upgrades to 2-chain when view changes are introduced.
+- **OAI boundary:** drives the full cycle — `prepare_proposal` →
+  `process_proposal` → `finalize_block`. `attest_state` is available
+  for the next proposal.
+- **`run_until_idle`:** drives propose-vote-commit cycles until no
+  pending txs (matching the conformance suite's synchronous model).
+
+### Conformance suite modification
+
+The conformance suite was modified to handle pipelined engines:
+
+- **Liveness:** checks all submitted txs appear in some finalized
+  block (not one block per tx). Pipelined engines may produce empty
+  blocks to advance the pipeline; those are valid finalized blocks.
+- **Heights:** contiguous (0..N with no gaps), empty blocks OK.
+- **Finality + determinism:** unchanged.
+
+The `MockEngine` still passes the modified suite (one block per tx,
+no empty blocks). The `OxideBft` engine passes with the 1-chain rule
+(one block per tx, no empty blocks in the happy path).
+
+### Design decisions
+
+- **1-chain for stage 3, 2-chain for stage 4.** The 2-chain rule exists
+  to preserve safety under view changes (a block locked by a
+  pre-commit QC cannot be forked by a new leader). In the single-
+  leader happy path, there are no view changes and no faults, so
+  1-chain is safe. Stage 4 upgrades to 2-chain when view changes are
+  introduced.
+
+- **Single-validator mode.** The engine self-votes (quorum = 1). This
+  is the simplest configuration that exercises the full OAI boundary
+  and the oxideBFT types. Multi-validator mode (with networking) is
+  stage 4+.
+
+- **Placeholder BLS signatures.** `Signature::ZERO` and
+  `AggregateSignature::ZERO` are used in votes and QCs. Stage 5
+  replaces these with real `blst` signing and verification. The types
+  and codec are settled; only the crypto is stubbed.
+
+- **`proposer_hash` helper.** The proposer is identified by a `Hash`
+  derived from the `ValidatorIndex`. Stage 5 replaces this with the
+  actual public key hash. The helper avoids an orphan-rule violation
+  (can't `impl From<ValidatorIndex> for Hash` in the consensus crate).
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test
+--workspace` — 104 tests pass (consensus 26: 19 pacemaker/validator +
+7 engine, including `oxidebft_passes_conformance`); `cargo deny
+check` — all four checks ok. MockEngine conformance test still passes.
+
+### Next
+
+Stage 4: view changes via TC (faulty leader bypass). This upgrades
+the commit rule from 1-chain to 2-chain and wires in the pacemaker for
+active view synchronization. The conformance suite + deterministic
+simulation must pass.

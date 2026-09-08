@@ -101,6 +101,13 @@ impl Signature {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// The all-zero signature — a placeholder for "no signature yet"
+    /// (e.g. before BLS signing is wired in, stage 5). Phase 1
+    /// verification rejects this as invalid; it exists so consensus
+    /// types can carry a syntactically valid signature field before
+    /// the signer is implemented.
+    pub const ZERO: Self = Self([0u8; Self::LEN]);
 }
 
 impl Encode for Signature {

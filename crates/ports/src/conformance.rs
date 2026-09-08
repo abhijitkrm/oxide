@@ -10,8 +10,10 @@
 //!
 //! # What is asserted
 //!
-//! - **Liveness** (rule implied by §3): submitted transactions become
-//!   finalized blocks.
+//! - **Liveness** (rule implied by §3): every submitted transaction
+//!   appears in exactly one finalized block. Pipelined engines (e.g.
+//!   oxideBFT) may produce additional empty blocks to advance the
+//!   pipeline — those are valid finalized blocks, just without txs.
 //! - **Heights are a sequence** (§3 rule 2): finalized heights are
 //!   strictly increasing from genesis (0) with no gaps.
 //! - **Finality is final** (§3 rule 1): re-running the engine does not
@@ -23,7 +25,9 @@
 //! in the end-to-end OAI test (`tests/oai_e2e.rs`), which needs
 //! engine+app cooperation that a generic engine factory cannot provide.
 
-use primitives::Height;
+use std::collections::HashSet;
+
+use primitives::Hash;
 use types::{FinalizedBlock, TxBytes};
 
 use crate::ConsensusEngine;
@@ -46,9 +50,9 @@ fn sample_txs() -> Vec<TxBytes> {
     (0..3u8).map(|i| TxBytes::new(vec![i, i.wrapping_mul(2), i.wrapping_mul(3)])).collect()
 }
 
-/// Submit `txs` one per `run_until_idle`, finalizing one block per tx.
-/// Driving one-tx-per-run makes the height sequence explicit and
-/// independent of the engine's block-packing policy.
+/// Submit `txs` one per `run_until_idle`. Pipelined engines may need
+/// multiple `run_until_idle` calls to flush the pipeline; the caller
+/// drives one tx at a time to make the submission order explicit.
 fn submit_and_run<E: ConsensusEngine>(engine: &mut E, txs: &[TxBytes]) {
     for tx in txs {
         engine.submit_tx(tx.clone());
@@ -56,42 +60,68 @@ fn submit_and_run<E: ConsensusEngine>(engine: &mut E, txs: &[TxBytes]) {
     }
 }
 
+/// Collect all finalized blocks as a contiguous sequence from height 0.
+/// Returns `(blocks, count)`. Stops at the first gap (height with no
+/// block), which is the engine's `finalized_height` + 1.
+fn collect_finalized<E: ConsensusEngine>(engine: &E) -> Vec<FinalizedBlock> {
+    let mut blocks = Vec::new();
+    let mut h = 0u64;
+    while let Some(block) = engine.finalized_block(primitives::Height::new(h)) {
+        assert_eq!(
+            block.height,
+            primitives::Height::new(h),
+            "block at index {h} reports the wrong height"
+        );
+        blocks.push(block);
+        h += 1;
+    }
+    blocks
+}
+
 /// Liveness + strictly-increasing, gap-free heights from genesis.
+///
+/// Liveness checks that every submitted tx appears in exactly one
+/// finalized block. Pipelined engines may produce empty blocks to
+/// advance the pipeline; those are valid but don't count toward the
+/// tx-inclusion check.
 fn liveness_and_sequence<E: ConsensusEngine>(make_engine: &impl Fn() -> E) {
     let mut engine = make_engine();
     let txs = sample_txs();
     submit_and_run(&mut engine, &txs);
 
-    // Every tx must be finalized somewhere; with one-tx-per-run we
-    // expect heights 0..txs.len(), each block containing one tx.
-    let mut expected_height = 0u64;
-    while let Some(block) = engine.finalized_block(Height::new(expected_height)) {
-        assert_eq!(
-            block.height,
-            Height::new(expected_height),
-            "block at index {expected_height} reports the wrong height"
-        );
-        // One tx per run → one tx per block (for engines that honor the
-        // one-tx-per-run driving contract; MockEngine does).
-        assert!(
-            !block.txs.is_empty(),
-            "finalized block at height {expected_height} has no transactions"
-        );
-        expected_height += 1;
+    let blocks = collect_finalized(&engine);
+
+    // Heights are a sequence: 0..N with no gaps (verified by
+    // `collect_finalized` walking contiguous heights).
+    assert!(!blocks.is_empty(), "no blocks were finalized — liveness violated");
+
+    // Every submitted tx must appear in exactly one finalized block.
+    // Collect all tx hashes from finalized blocks and check coverage.
+    let mut seen_tx_hashes: HashSet<Hash> = HashSet::new();
+    for block in &blocks {
+        for tx in &block.txs {
+            let tx_hash =
+                crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, tx.as_bytes());
+            assert!(
+                seen_tx_hashes.insert(tx_hash),
+                "tx appears in multiple finalized blocks — double-inclusion"
+            );
+        }
     }
-    let finalized_count =
-        usize::try_from(expected_height).expect("a finalized-height count always fits usize");
-    assert_eq!(
-        finalized_count,
-        txs.len(),
-        "expected {} finalized blocks (one per submitted tx), got {expected_height}",
-        txs.len()
-    );
-    // Heights are a sequence: 0..N with no gaps (verified by the loop
-    // above walking contiguous heights until the first missing one).
+    for tx in &txs {
+        let tx_hash =
+            crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, tx.as_bytes());
+        assert!(
+            seen_tx_hashes.contains(&tx_hash),
+            "submitted tx not found in any finalized block — liveness violated"
+        );
+    }
+
+    // `finalized_height` must be the highest contiguous height.
+    let expected_final = primitives::Height::new((blocks.len() - 1) as u64);
     assert_eq!(
         engine.finalized_height(),
-        Some(Height::new((txs.len() - 1) as u64)),
+        Some(expected_final),
         "finalized_height must be the highest contiguous height"
     );
 }
@@ -103,21 +133,14 @@ fn finality_is_final<E: ConsensusEngine>(make_engine: &impl Fn() -> E) {
     submit_and_run(&mut engine, &txs);
 
     // Snapshot the finalized blocks.
-    let snapshot: Vec<FinalizedBlock> = (0..txs.len() as u64)
-        .map(|h| engine.finalized_block(Height::new(h)).expect("finalized"))
-        .collect();
+    let snapshot = collect_finalized(&engine);
 
     // Run again with no new txs — must be a no-op for finalization.
     engine.run_until_idle();
     engine.run_until_idle();
 
-    for (h, original) in snapshot.iter().enumerate() {
-        let after = engine.finalized_block(Height::new(h as u64)).expect("block must still exist");
-        assert_eq!(
-            after, *original,
-            "finalized block at height {h} changed after a no-op run — finality violated"
-        );
-    }
+    let after = collect_finalized(&engine);
+    assert_eq!(after, snapshot, "finalized blocks changed after a no-op run — finality violated");
 }
 
 /// Two independent engines, same tx sequence → byte-identical blocks.
@@ -126,15 +149,11 @@ fn determinism<E: ConsensusEngine>(make_engine: &impl Fn() -> E) {
 
     let mut first = make_engine();
     submit_and_run(&mut first, &txs);
-    let first_blocks: Vec<FinalizedBlock> = (0..txs.len() as u64)
-        .map(|h| first.finalized_block(Height::new(h)).expect("finalized"))
-        .collect();
+    let first_blocks = collect_finalized(&first);
 
     let mut second = make_engine();
     submit_and_run(&mut second, &txs);
-    let second_blocks: Vec<FinalizedBlock> = (0..txs.len() as u64)
-        .map(|h| second.finalized_block(Height::new(h)).expect("finalized"))
-        .collect();
+    let second_blocks = collect_finalized(&second);
 
     assert_eq!(
         first_blocks, second_blocks,

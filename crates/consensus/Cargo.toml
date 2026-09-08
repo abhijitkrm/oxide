@@ -16,6 +16,7 @@ primitives = { workspace = true }
 codec = { workspace = true }
 crypto = { workspace = true }
 types = { workspace = true }
+ports = { workspace = true }
 
 [lints]
 workspace = true

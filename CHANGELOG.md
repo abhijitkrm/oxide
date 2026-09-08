@@ -12,6 +12,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase 1 stage 3: oxideBFT engine, single-leader happy path**
+  (2026-09-09)
+  - `OxideBft` engine implementing `ConsensusEngine` — the first real
+    consensus engine (not a mock). Drives the full OAI boundary:
+    `prepare_proposal` → `process_proposal` → `finalize_block`.
+  - Block proposal with `BlockHeader` (view, epoch, QC, proposer,
+    `tx_root`), self-vote, QC formation, 1-chain commit.
+  - Placeholder BLS signatures (`Signature::ZERO`,
+    `AggregateSignature::ZERO`); stage 5 wires in `blst`.
+  - Conformance suite modified to handle pipelined engines (checks
+    all txs are finalized, not one block per tx; allows empty blocks).
+  - 7 new engine tests (including `oxidebft_passes_conformance`);
+    104 total.
+
+  **In plain words:** oxideBFT now drives the application boundary —
+  it proposes blocks, votes on them, forms quorum certificates, and
+  commits. This is the first real consensus engine (not a mock), and
+  it passes the same conformance suite as the MockEngine. The commit
+  rule is 1-chain (commit on QC formation) which is safe in the
+  single-leader happy path; stage 4 upgrades to 2-chain when view
+  changes are added. BLS signatures are placeholders until stage 5.
+
 - **Phase 1 stage 2: oxideBFT pacemaker state machine** (2026-09-09)
   - New `consensus` crate with the pacemaker — a pure state machine
     over views (Active ↔ TimedOut) that drives view changes via
