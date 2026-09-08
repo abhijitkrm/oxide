@@ -16,7 +16,8 @@
 //! property tests.
 
 use codec::{Decode, DecodeError, Encode, Reader, write};
-use primitives::{Hash, Height};
+use crypto::bls::{AggregateSignature, Signature};
+use primitives::{Epoch, Hash, Height, View};
 
 /// Read a length/count varint as `usize`. A varint larger than
 /// `usize::MAX` (only possible on 32-bit targets) is surfaced as
@@ -350,6 +351,291 @@ impl<'a> Decode<'a> for BlockRecord {
     }
 }
 
+// ─── oxideBFT consensus types ──────────────────────────────────────
+//
+// These are the *engine-internal* message types that oxideBFT validators
+// exchange (docs/oxidebft-spec.md §2-4). They do NOT cross the OAI
+// boundary — the application never sees a Vote or QC; it only sees the
+// finalized ordering via `FinalizedBlock`. They live in `types` (not a
+// `consensus` crate) because their wire forms are part of the consensus
+// contract (byte-identical encodings across validators) and the codec
+// round-trip property must hold for them.
+//
+// Phase 1 stage 1 (oxideBFT spec §8): types + codec only. The pacemaker,
+// vote pipeline, and BLS sign/verify land in stages 2-5.
+
+/// The phase of a `HotStuff` vote within the 2-chain pipeline
+/// (docs/oxidebft-spec.md §2).
+///
+/// - `Prepare` — the leader proposed a block; validators sign a
+///   prepare vote once they have the parent's pre-commit QC.
+/// - `PreCommit` — a prepare QC formed for this height; validators
+///   sign a pre-commit vote (the "lock").
+/// - `Commit` — a pre-commit QC formed; validators sign a commit
+///   vote. A commit QC is finality.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VotePhase {
+    /// Prepare phase (first chain link).
+    Prepare = 0,
+    /// Pre-commit phase (the lock).
+    PreCommit = 1,
+    /// Commit phase (finality).
+    Commit = 2,
+}
+
+impl VotePhase {
+    /// Decode from a single byte; rejects unknown discriminants.
+    fn from_byte(b: u8) -> Result<Self, DecodeError> {
+        match b {
+            0 => Ok(Self::Prepare),
+            1 => Ok(Self::PreCommit),
+            2 => Ok(Self::Commit),
+            other => Err(DecodeError::InvalidBool { got: other }),
+        }
+    }
+}
+
+/// A single validator's vote in the 2-chain pipeline
+/// (docs/oxidebft-spec.md §3).
+///
+/// The vote signs `(view, phase, block_hash)` with the validator's BLS
+/// secret key. The signature is domain-separated (`crypto::Domain::Vote`)
+/// so a prepare vote can never be confused with a pre-commit or commit
+/// vote, even if the block hash happens to be identical.
+///
+/// Wire form (pinned by `vote_wire` test):
+/// ```text
+/// [view u64 LE][phase u8][block_hash 32B][signature 96B]
+/// ```
+/// Total: 137 bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vote {
+    /// The view this vote is cast in.
+    pub view: View,
+    /// The pipeline phase (prepare / pre-commit / commit).
+    pub phase: VotePhase,
+    /// The block being voted on.
+    pub block_hash: Hash,
+    /// The validator's BLS signature over `(view, phase, block_hash)`.
+    pub signature: Signature,
+}
+
+impl Encode for Vote {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.view.encode(buf);
+        buf.push(self.phase as u8);
+        self.block_hash.encode(buf);
+        self.signature.encode(buf);
+    }
+}
+
+impl<'a> Decode<'a> for Vote {
+    fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        let view = View::decode(reader)?;
+        let phase = VotePhase::from_byte(reader.read_u8()?)?;
+        let block_hash = Hash::decode(reader)?;
+        let signature = Signature::decode(reader)?;
+        Ok(Self { view, phase, block_hash, signature })
+    }
+}
+
+/// A quorum certificate: the aggregate of ≥2f+1 votes for a single
+/// `(view, phase, block_hash)` (docs/oxidebft-spec.md §3).
+///
+/// The QC carries the aggregate BLS signature (one group element,
+/// regardless of validator count) and a bitmap identifying which
+/// validators signed. Verification (Phase 1 stage 5) is a single
+/// aggregate check against the signers' aggregate public key — this
+/// is the throughput lever that keeps the consensus hot path off the
+/// floor.
+///
+/// Wire form (pinned by `quorum_certificate_wire` test):
+/// ```text
+/// [view u64 LE][phase u8][block_hash 32B][epoch u64 LE]
+/// [signer_bitmap_len varint][signer_bitmap bytes]
+/// [aggregate_signature 96B]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuorumCertificate {
+    /// The view the QC was formed in.
+    pub view: View,
+    /// The pipeline phase of the votes aggregated.
+    pub phase: VotePhase,
+    /// The block the QC certifies.
+    pub block_hash: Hash,
+    /// The epoch the QC belongs to (for validator-set lookup).
+    pub epoch: Epoch,
+    /// Bitmap of which validators signed (index into the epoch's
+    /// validator set). A `1` bit at position *i* means validator *i*
+    /// signed. The bitmap's length is the validator set size (rounded
+    /// up to the next byte).
+    pub signer_bitmap: Vec<u8>,
+    /// The aggregate BLS signature over all signers' votes.
+    pub aggregate_signature: AggregateSignature,
+}
+
+impl Encode for QuorumCertificate {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.view.encode(buf);
+        buf.push(self.phase as u8);
+        self.block_hash.encode(buf);
+        self.epoch.encode(buf);
+        write::bytes(buf, &self.signer_bitmap);
+        self.aggregate_signature.encode(buf);
+    }
+}
+
+impl<'a> Decode<'a> for QuorumCertificate {
+    fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        let view = View::decode(reader)?;
+        let phase = VotePhase::from_byte(reader.read_u8()?)?;
+        let block_hash = Hash::decode(reader)?;
+        let epoch = Epoch::decode(reader)?;
+        let signer_bitmap = reader.read_bytes()?.to_vec();
+        let aggregate_signature = AggregateSignature::decode(reader)?;
+        Ok(Self { view, phase, block_hash, epoch, signer_bitmap, aggregate_signature })
+    }
+}
+
+/// A timeout certificate: ≥2f+1 validators signed a timeout for view
+/// `v`, proving the view should advance (docs/oxidebft-spec.md §4).
+///
+/// The TC is the "force a view change without the leader" mechanism —
+/// tail-fork resistance. The next leader (view *v+1*) embeds the TC in
+/// its proposal, proving it is the legitimate successor.
+///
+/// Wire form (pinned by `timeout_certificate_wire` test):
+/// ```text
+/// [view u64 LE][epoch u64 LE]
+/// [signer_bitmap_len varint][signer_bitmap bytes]
+/// [aggregate_signature 96B]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeoutCertificate {
+    /// The view that timed out.
+    pub view: View,
+    /// The epoch the TC belongs to.
+    pub epoch: Epoch,
+    /// Bitmap of which validators signed the timeout.
+    pub signer_bitmap: Vec<u8>,
+    /// Aggregate BLS signature over the timeout messages.
+    pub aggregate_signature: AggregateSignature,
+}
+
+impl Encode for TimeoutCertificate {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.view.encode(buf);
+        self.epoch.encode(buf);
+        write::bytes(buf, &self.signer_bitmap);
+        self.aggregate_signature.encode(buf);
+    }
+}
+
+impl<'a> Decode<'a> for TimeoutCertificate {
+    fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        let view = View::decode(reader)?;
+        let epoch = Epoch::decode(reader)?;
+        let signer_bitmap = reader.read_bytes()?.to_vec();
+        let aggregate_signature = AggregateSignature::decode(reader)?;
+        Ok(Self { view, epoch, signer_bitmap, aggregate_signature })
+    }
+}
+
+/// A consensus block header — the engine-internal header format that
+/// oxideBFT validators agree on (docs/oxidebft-spec.md §2, plan.md §4).
+///
+/// This is distinct from [`BlockRecord`] (the engine-agnostic ledger
+/// entry): the `BlockHeader` carries consensus-specific fields (view,
+/// epoch, QC, proposer) that the OAI boundary strips away. Followers
+/// and indexers consume `BlockRecord`, never `BlockHeader`.
+///
+/// Wire form (pinned by `block_header_wire` test):
+/// ```text
+/// [height u64 LE][view u64 LE][epoch u64 LE]
+/// [prev_block 32B][tx_root 32B]
+/// [has_qc u8][qc ... if present]
+/// [has_tc u8][tc ... if present]
+/// [proposer 32B][timestamp u64 LE]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockHeader {
+    /// The block's height in the chain.
+    pub height: Height,
+    /// The view this block was proposed in.
+    pub view: View,
+    /// The epoch this block belongs to.
+    pub epoch: Epoch,
+    /// Hash of the previous block (`Hash::ZERO` at genesis).
+    pub prev_block: Hash,
+    /// Merkle root of the block's transactions.
+    pub tx_root: Hash,
+    /// The highest QC the leader knew when proposing (embedded in the
+    /// proposal to advance the pipeline). `None` for genesis.
+    pub high_qc: Option<QuorumCertificate>,
+    /// A timeout certificate justifying the view change that led to
+    /// this block (if the block starts a new view due to a timeout).
+    /// `None` in the happy path (no view change).
+    pub timeout_cert: Option<TimeoutCertificate>,
+    /// The proposer's public key hash (identifies the leader).
+    pub proposer: Hash,
+    /// Proposal timestamp in milliseconds since Unix epoch.
+    pub timestamp: u64,
+}
+
+impl Encode for BlockHeader {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.height.encode(buf);
+        self.view.encode(buf);
+        self.epoch.encode(buf);
+        self.prev_block.encode(buf);
+        self.tx_root.encode(buf);
+        match &self.high_qc {
+            Some(qc) => {
+                write::bool(buf, true);
+                qc.encode(buf);
+            }
+            None => write::bool(buf, false),
+        }
+        match &self.timeout_cert {
+            Some(tc) => {
+                write::bool(buf, true);
+                tc.encode(buf);
+            }
+            None => write::bool(buf, false),
+        }
+        self.proposer.encode(buf);
+        buf.extend_from_slice(&self.timestamp.to_le_bytes());
+    }
+}
+
+impl<'a> Decode<'a> for BlockHeader {
+    fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        let height = Height::decode(reader)?;
+        let view = View::decode(reader)?;
+        let epoch = Epoch::decode(reader)?;
+        let prev_block = Hash::decode(reader)?;
+        let tx_root = Hash::decode(reader)?;
+        let high_qc =
+            if reader.read_bool()? { Some(QuorumCertificate::decode(reader)?) } else { None };
+        let timeout_cert =
+            if reader.read_bool()? { Some(TimeoutCertificate::decode(reader)?) } else { None };
+        let proposer = Hash::decode(reader)?;
+        let timestamp = reader.read_u64()?;
+        Ok(Self {
+            height,
+            view,
+            epoch,
+            prev_block,
+            tx_root,
+            high_qc,
+            timeout_cert,
+            proposer,
+            timestamp,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Wire-form pinning + round-trip for every OAI type. The codec's
@@ -479,5 +765,173 @@ mod tests {
         let bad = [1u8, 2, 0xff, 0xfe];
         let mut r = Reader::new(&bad);
         assert!(Verdict::decode(&mut r).is_err());
+    }
+
+    // ─── oxideBFT consensus type wire forms ──────────────────────
+
+    #[test]
+    fn vote_wire() {
+        let vote = Vote {
+            view: View::new(7),
+            phase: VotePhase::PreCommit,
+            block_hash: Hash([0xAB; 32]),
+            signature: Signature([0xCD; 96]),
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&7u64.to_le_bytes()); // view
+        expected.push(1); // phase = PreCommit
+        expected.extend_from_slice(&[0xAB; 32]); // block_hash
+        expected.extend_from_slice(&[0xCD; 96]); // signature
+        roundtrip(&vote, &expected);
+    }
+
+    #[test]
+    fn vote_phase_discriminants() {
+        // Pin the phase byte to the variant discriminant — part of the
+        // wire consensus contract.
+        assert_eq!(VotePhase::Prepare as u8, 0);
+        assert_eq!(VotePhase::PreCommit as u8, 1);
+        assert_eq!(VotePhase::Commit as u8, 2);
+    }
+
+    #[test]
+    fn vote_rejects_unknown_phase() {
+        // A byte that is not 0/1/2 must be rejected, not silently
+        // mapped to a default.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&0u64.to_le_bytes()); // view
+        bad.push(99); // invalid phase
+        bad.extend_from_slice(&[0; 32]); // block_hash
+        bad.extend_from_slice(&[0; 96]); // signature
+        let mut r = Reader::new(&bad);
+        assert!(Vote::decode(&mut r).is_err());
+    }
+
+    #[test]
+    fn quorum_certificate_wire() {
+        let qc = QuorumCertificate {
+            view: View::new(5),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x11; 32]),
+            epoch: Epoch::new(1),
+            signer_bitmap: vec![0b0000_0011], // 2 signers
+            aggregate_signature: AggregateSignature([0x22; 96]),
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&5u64.to_le_bytes()); // view
+        expected.push(0); // phase = Prepare
+        expected.extend_from_slice(&[0x11; 32]); // block_hash
+        expected.extend_from_slice(&1u64.to_le_bytes()); // epoch
+        // signer_bitmap: varint length (1) + 1 byte
+        expected.push(1);
+        expected.push(0b0000_0011);
+        expected.extend_from_slice(&[0x22; 96]); // aggregate_signature
+        roundtrip(&qc, &expected);
+    }
+
+    #[test]
+    fn timeout_certificate_wire() {
+        let tc = TimeoutCertificate {
+            view: View::new(3),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b1111_1111, 0b0000_0001], // 9 signers
+            aggregate_signature: AggregateSignature([0x33; 96]),
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&3u64.to_le_bytes()); // view
+        expected.extend_from_slice(&0u64.to_le_bytes()); // epoch
+        // signer_bitmap: varint length (2) + 2 bytes
+        expected.push(2);
+        expected.push(0b1111_1111);
+        expected.push(0b0000_0001);
+        expected.extend_from_slice(&[0x33; 96]); // aggregate_signature
+        roundtrip(&tc, &expected);
+    }
+
+    #[test]
+    fn block_header_wire_genesis_no_qc_no_tc() {
+        // Genesis block: no parent QC, no timeout cert.
+        let header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: Hash([0xFF; 32]),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: Hash([0x42; 32]),
+            timestamp: 1000,
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0u64.to_le_bytes()); // height
+        expected.extend_from_slice(&0u64.to_le_bytes()); // view
+        expected.extend_from_slice(&0u64.to_le_bytes()); // epoch
+        expected.extend_from_slice(&[0; 32]); // prev_block
+        expected.extend_from_slice(&[0xFF; 32]); // tx_root
+        expected.push(0); // no high_qc
+        expected.push(0); // no timeout_cert
+        expected.extend_from_slice(&[0x42; 32]); // proposer
+        expected.extend_from_slice(&1000u64.to_le_bytes()); // timestamp
+        roundtrip(&header, &expected);
+    }
+
+    #[test]
+    fn block_header_wire_with_qc() {
+        // A non-genesis block carrying a high QC.
+        let qc = QuorumCertificate {
+            view: View::new(4),
+            phase: VotePhase::PreCommit,
+            block_hash: Hash([0x55; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: AggregateSignature([0x66; 96]),
+        };
+        let header = BlockHeader {
+            height: Height::new(1),
+            view: View::new(5),
+            epoch: Epoch::new(0),
+            prev_block: Hash([0xAA; 32]),
+            tx_root: Hash([0xBB; 32]),
+            high_qc: Some(qc),
+            timeout_cert: None,
+            proposer: Hash([0x42; 32]),
+            timestamp: 2000,
+        };
+        // Encode + round-trip (the QC makes the full wire form long;
+        // roundtrip checks both encode-match and decode-match).
+        let mut buf = Vec::new();
+        header.encode(&mut buf);
+        let mut r = Reader::new(&buf);
+        let decoded = BlockHeader::decode(&mut r).expect("decode");
+        assert_eq!(decoded, header);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn block_header_wire_with_tc() {
+        // A block starting a new view due to a timeout.
+        let tc = TimeoutCertificate {
+            view: View::new(4),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0xFF],
+            aggregate_signature: AggregateSignature([0x77; 96]),
+        };
+        let header = BlockHeader {
+            height: Height::new(1),
+            view: View::new(5),
+            epoch: Epoch::new(0),
+            prev_block: Hash([0xAA; 32]),
+            tx_root: Hash([0xBB; 32]),
+            high_qc: None,
+            timeout_cert: Some(tc),
+            proposer: Hash([0x42; 32]),
+            timestamp: 3000,
+        };
+        let mut buf = Vec::new();
+        header.encode(&mut buf);
+        let mut r = Reader::new(&buf);
+        let decoded = BlockHeader::decode(&mut r).expect("decode");
+        assert_eq!(decoded, header);
+        assert!(r.is_empty());
     }
 }

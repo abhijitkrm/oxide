@@ -581,3 +581,70 @@ storage journal + MMR, oxide-bench harness, CI, plan + oxideBFT spec
 + OAI spec. All acceptance gates (line 398) pass: journal append
 ≥1M ops/s, MMR structure overhead <20ns/op, 4-node echo sim, mock
 engine OAI e2e. Phase 0 is closed.
+
+## Session 6 — Phase 1 stage 1: oxideBFT vote/QC/TC types
+
+Stage 1 of the oxideBFT spec's staged implementation order
+(docs/oxidebft-spec.md §8): the consensus message types that oxideBFT
+validators exchange, with pinned wire forms.
+
+### What landed
+
+Added to `crates/types`:
+
+- `VotePhase` (`Prepare`/`PreCommit`/`Commit`): the 2-chain pipeline
+  phase. `repr(u8)` with discriminants pinned (0/1/2) — part of the
+  wire consensus contract. Unknown discriminants are rejected on
+  decode, not silently defaulted.
+- `Vote { view, phase, block_hash, signature }`: a single validator's
+  signed vote. 137-byte wire form. The signature is a BLS12-381
+  `crypto::bls::Signature` (96 bytes); the domain separation happens
+  in the signer (Phase 1 stage 5), not in the type.
+- `QuorumCertificate { view, phase, block_hash, epoch, signer_bitmap,
+  aggregate_signature }`: ≥2f+1 votes compressed to one aggregate
+  BLS signature + a bitmap. The bitmap's length is the validator set
+  size (rounded up to the next byte); a `1` bit at position *i* means
+  validator *i* signed.
+- `TimeoutCertificate { view, epoch, signer_bitmap,
+  aggregate_signature }`: ≥2f+1 timeout signatures proving a view
+  should advance. The next leader embeds this in its proposal.
+- `BlockHeader { height, view, epoch, prev_block, tx_root, high_qc,
+  timeout_cert, proposer, timestamp }`: the engine-internal header.
+  Distinct from `BlockRecord` (the OAI ledger entry): `BlockHeader`
+  carries consensus-specific fields (view, epoch, QC, TC, proposer)
+  that the OAI boundary strips away. Followers consume `BlockRecord`,
+  never `BlockHeader`.
+
+### Design decisions
+
+- **Types in `types`, not a `consensus` crate.** The wire forms are
+  part of the consensus contract (byte-identical encodings across
+  validators), and the codec round-trip property must hold. The
+  pacemaker and vote pipeline (stages 2-4) will live in a `consensus`
+  crate; the types stay here.
+- **`BlockHeader` vs `BlockRecord`.** The OAI spec is explicit:
+  engines produce their own headers, the app maintains the canonical
+  `BlockRecord` ledger. `BlockHeader` is what oxideBFT agrees on;
+  `BlockRecord` is what the journal stores. The conversion happens
+  at the OAI boundary (stage 3).
+- **BLS types are still stubs.** `Signature` and `AggregateSignature`
+  are the Phase 0 `crypto::bls` types — fixed-size byte arrays with
+  codec impls. Stage 5 wires in `blst` for sign/verify/aggregate; the
+  types don't change.
+- **`VotePhase` is `repr(u8)`.** The discriminant is the wire byte;
+  `as u8` in encode and `from_byte` in decode. No `Default` — a
+  missing phase is a decode error, not a silent `Prepare`.
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test
+--workspace` — 78 tests pass (types 19, up from 11: 8 new consensus
+type wire-form + reject tests); `cargo deny check` — all four checks
+ok.
+
+### Next
+
+Stage 2: the pacemaker as a state machine over views (no networking):
+timeout → TC formation → view advance. Unit + property tests. This
+will be the first code in a new `consensus` crate.

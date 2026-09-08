@@ -12,6 +12,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase 1 stage 1: oxideBFT consensus message types** (2026-09-09)
+  - `VotePhase` (`Prepare`/`PreCommit`/`Commit`): the 2-chain pipeline
+    phase, `repr(u8)` with pinned discriminants.
+  - `Vote`: a single validator's signed vote (view, phase, block hash,
+    BLS signature).
+  - `QuorumCertificate`: ≥2f+1 votes compressed to one aggregate BLS
+    signature + a signer bitmap.
+  - `TimeoutCertificate`: ≥2f+1 timeout signatures proving a view
+    should advance (the tail-fork-resistance mechanism).
+  - `BlockHeader`: the engine-internal consensus header (view, epoch,
+    QC, TC, proposer) — distinct from the OAI `BlockRecord`.
+  - All types implement `codec::Encode`/`Decode` with pinned wire
+    forms; 8 new tests in `types` (19 total, up from 11).
+
+  **In plain words:** the first piece of oxideBFT is in place — the
+  message types validators exchange (votes, quorum certificates,
+  timeout certificates, block headers) with their exact wire formats
+  pinned by tests. No consensus logic yet; that's stage 2 (the
+  pacemaker). These types settle the consensus contract so every
+  validator agrees on what a vote and a QC look like on the wire.
+
 - **Phase 0 completion: crypto crate, ports v1, oxide-bench, fuzz
   targets** (2026-09-09)
   - `crypto` crate: domain-separated BLAKE3 hashing (the `Domain` enum
