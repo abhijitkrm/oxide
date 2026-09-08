@@ -447,3 +447,18 @@ storage 16 + 6 properties, types 11, ports 1 conformance + 4 e2e).
 - Fuzz targets at trust boundaries (codec decode, journal replay,
   MMR proof verify, consensus message decode).
 - Then Phase 0 gate close.
+
+## Session 4 addendum — oxideBFT spec v1 draft
+
+`docs/oxidebft-spec.md` v1 (draft): pins the approved architecture for
+the default consensus engine — pipelined two-chain Jolteon-style
+HotStuff, BLS threshold signature aggregation, active pacemaker with
+timeout certificates (tail-fork resistance), stake-weighted
+round-robin leader rotation, decoupled execution. Records the
+two-chain-vs-one/three-chain rationale (Jolteon is the minimal
+pipelined form preserving HotStuff safety+liveness), the BLS-vs-Ed25519
+choice (aggregate verification keeps the consensus hot path off the
+floor), and a six-stage Phase 1 implementation order, each stage
+gated by the OAI conformance suite. This is a design document, not
+implementation; the implementation lands in Phase 1 against the OAI
+traits and must pass `ports::conformance` before it ships.
