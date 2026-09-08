@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target
+**/target
+Cargo.lock.bak
+
+# Byte-compiled / cache
+*.pyc
+__pycache__/
+
+# Local node data (devnets, journals, snapshots)
+/local
+/data
+*.log
+logs/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Perf tooling output
+*.flamegraph
+perf.data*
+dhat-heap.json
+
+# Criterion reports (regenerated on demand)
+/target/criterion
+
+plan.md
+
