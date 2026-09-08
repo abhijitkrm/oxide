@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-# NOTE: add "modules/*" and "bin/*" back to `members` the moment those
-# directories get their first crate — cargo errors on globs that match
-# nothing, so the list below tracks what actually exists.
-members = ["crates/*"]
+# NOTE: add "modules/*" back to `members` the moment that directory
+# gets its first crate — cargo errors on globs that match nothing,
+# so the list below tracks what actually exists.
+members = ["crates/*", "bin/*"]
 
 # NOTE: `fuzz/` is intentionally NOT a workspace member — cargo-fuzz targets
 # require a nightly toolchain and their own build graph. Build them with
@@ -43,6 +43,7 @@ needless_pass_by_value = "allow"
 # wildcard) and keeps the graph deterministic and reviews local.
 primitives = { path = "crates/primitives", version = "0.1.0" }
 codec = { path = "crates/codec", version = "0.1.0" }
+crypto = { path = "crates/crypto", version = "0.1.0" }
 runtime = { path = "crates/runtime", version = "0.1.0" }
 types = { path = "crates/types", version = "0.1.0" }
 ports = { path = "crates/ports", version = "0.1.0" }

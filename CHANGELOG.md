@@ -12,6 +12,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase 0 completion: crypto crate, ports v1, oxide-bench, fuzz
+  targets** (2026-09-09)
+  - `crypto` crate: domain-separated BLAKE3 hashing (the `Domain` enum
+    makes the domain tag a compile-time-checked API, not a magic byte)
+    + BLS12-381 signature type stubs for oxideBFT (types and codec
+    settled; sign/verify/aggregate land in Phase 1 via `blst`).
+  - `ports` v1 complete: `BroadcastEngine` (data-availability port)
+    and `Transport` (p2p port) traits with capability flags. All five
+    OAI/adapter traits are now defined.
+  - `oxide-bench` harness (`bin/oxide-bench`): unified benchmark
+    runner with per-crate pass/fail summary and CI exit code.
+  - `fuzz/` directory with four cargo-fuzz targets at trust boundaries:
+    codec decode, OAI types decode, journal replay, MMR proof verify.
+    Builds with nightly, separate workspace.
+
+  **In plain words:** the last four pieces of the foundation are in
+  place. The crypto crate gives every component one consistent hashing
+  API with domain separation built in (so a block hash can never be
+  confused with a vote hash), plus the BLS signature types oxideBFT
+  will use — the types are settled now so Phase 1 just fills in the
+  math. The two missing adapter seams (broadcast and transport) are
+  defined, so the full plug-and-play surface is ready. The benchmark
+  runner and fuzz targets close the testing pyramid's bottom layer.
+
 - **Oxide Application Interface (OAI) — spec, traits, reference engine,
   conformance suite** (2026-09-09)
   - `docs/oai-spec.md` v1: the ABCI-analog boundary, adapted to Oxide's

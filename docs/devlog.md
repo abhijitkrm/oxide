@@ -517,3 +517,67 @@ Verified locally with `cargo deny check`: advisories ok, bans ok,
 licenses ok, sources ok. The remaining `license-not-encountered`
 warnings are informational (allowed licenses no current dep uses yet)
 — not failures.
+
+## Session 5 — Phase 0 completion: crypto, ports v1, oxide-bench, fuzz
+
+The four remaining Phase 0 deliverables (plan.md §13, line 397):
+
+j. **`crypto` crate.** Domain-separated BLAKE3 hashing (centralizing
+   what storage applied inline) + BLS12-381 signature type stubs for
+   oxideBFT. The `Domain` enum makes the domain tag a compile-time-
+   checked part of the API — every hash call site names its domain
+   explicitly, and the tag byte is pinned to the variant discriminant
+   (part of the wire consensus contract). The `Hasher` API offers
+   single-shot (`hash_one`), pair (`hash_pair`), and streaming
+   (`new`/`update`/`finalize`) shapes. BLS types (`PublicKey`,
+   `Signature`, `AggregateSignature`, `ValidatorIndex`) are Phase 0
+   stubs — the types and codec are settled so oxideBFT Phase 1 fills
+   in sign/verify/aggregate via `blst`, not the types. A `Signable`
+   trait decouples the signing primitive from consensus types. 14
+   tests pin domain separation (different domains never collide, same
+   domain + same bytes always match, tag byte = discriminant) and
+   BLS wire forms.
+
+k. **`ports` v1 completion.** Added `BroadcastEngine` (DA port:
+   erasure-coded broadcast by default, `PlainGossip` for devnets) and
+   `Transport` (p2p port: commonware-p2p by default, in-process mock
+   for deterministic sim). Both carry capability flags
+   (`BroadcastCaps`, `TransportCaps`) checked at wiring time and by
+   conformance. v0 synchronous, matching the OAI v0 traits; Phase 1
+   revisits with oxideBFT's real I/O loop. The `Transport` send/recv
+   shape mirrors `runtime::Mailbox` so the deterministic runtime can
+   serve as a zero-code-change mock.
+
+l. **`oxide-bench` harness.** `bin/oxide-bench` — a CLI that runs
+   per-crate criterion benches in a unified harness with per-crate
+   pass/fail summary and non-zero exit on failure (CI gate). Phase 0
+   scope: invoke `cargo bench -p <crate>` for each registered target.
+   Phase 1+ adds HDR histograms, adapter report cards, and dashboard
+   output. Registered: primitives, codec, crypto, storage.
+
+m. **Fuzz targets.** `fuzz/` with four cargo-fuzz targets at trust
+   boundaries: `codec-decode` (every primitive codec decoder, no-panic
+   on arbitrary bytes), `types-decode` (every OAI type decoder),
+   `journal-replay` (arbitrary bytes as a segment file, replay must
+   not panic), `mmr-proof-verify` (forged proofs, verify must not
+   panic). `fuzz/` is its own workspace (empty `[workspace]` table)
+   so it builds with nightly and its own dependency graph, separate
+   from the root workspace. All four compile clean under nightly.
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test
+--workspace` — 70 tests pass (codec 5, crypto 14, ports 1 conformance
++ 4 e2e, primitives 10, runtime 3, storage 16 + 6 properties, types
+11); `cargo deny check` — advisories ok, bans ok, licenses ok, sources
+ok; `cargo +nightly check` in fuzz/ — all four targets compile.
+
+### Phase 0 status: complete
+
+All deliverables (plan.md line 397) are done: workspace scaffolding,
+primitives, codec, crypto, runtime, ports v1 (all five traits),
+storage journal + MMR, oxide-bench harness, CI, plan + oxideBFT spec
++ OAI spec. All acceptance gates (line 398) pass: journal append
+≥1M ops/s, MMR structure overhead <20ns/op, 4-node echo sim, mock
+engine OAI e2e. Phase 0 is closed.

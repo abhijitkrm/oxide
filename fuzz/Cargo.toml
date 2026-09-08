@@ -1,0 +1,44 @@
+[package]
+name = "oxide-fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+
+# cargo-fuzz requires nightly and its own build graph. Run with:
+#   cargo +nightly fuzz run <target> -- -max_total_time=600
+# from this directory. NOT a workspace member (see root Cargo.toml).
+# The empty [workspace] table keeps this crate out of the root workspace
+# so it builds with its own (nightly) toolchain and dependency graph.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+codec = { path = "../crates/codec" }
+primitives = { path = "../crates/primitives" }
+storage = { path = "../crates/storage" }
+types = { path = "../crates/types" }
+
+[[bin]]
+name = "codec-decode"
+path = "fuzz_targets/codec_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "journal-replay"
+path = "fuzz_targets/journal_replay.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mmr-proof-verify"
+path = "fuzz_targets/mmr_proof_verify.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "types-decode"
+path = "fuzz_targets/types_decode.rs"
+test = false
+doc = false

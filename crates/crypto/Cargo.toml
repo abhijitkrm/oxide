@@ -1,0 +1,31 @@
+# Oxide blockchain — `crypto` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+
+[package]
+name = "crypto"
+description = "Cryptographic primitives for Oxide: domain-separated BLAKE3 hashing and BLS12-381 signature type stubs for oxideBFT."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+# BLAKE3 is the chain's hash function (plan.md §3). Pinned, mature,
+# GPL-3.0-compatible (Apache-2.0). The crypto crate owns the
+# domain-separated hashing API so storage and consensus share one
+# implementation rather than each inlining blake3 calls.
+blake3 = "1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bench]]
+name = "hash"
+harness = false

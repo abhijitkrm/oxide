@@ -1,16 +1,24 @@
 //! Oxide plug-and-play seams: the Oxide Application Interface (OAI)
-//! traits plus a reference [`mock::MockEngine`] and the
-//! [`conformance`] suite every engine must pass.
+//! traits plus the broadcast and transport ports, a reference
+//! [`mock::MockEngine`], and the [`conformance`] suite every engine
+//! must pass.
 //!
 //! # What this crate is
 //!
 //! The boundary between consensus engines and the application, as
-//! specified in `docs/oai-spec.md`. Two traits carry the whole contract:
+//! specified in `docs/oai-spec.md`. The crate carries five trait seams:
 //!
 //! - [`AppInterface`] — implemented by the application (executor +
 //!   mempool + state).
 //! - [`ConsensusEngine`] — implemented by engines (oxideBFT is the
 //!   default; [`mock::MockEngine`] is the reference).
+//! - [`BroadcastEngine`] — the data-availability port (erasure-coded
+//!   broadcast by default; `PlainGossip` for devnets).
+//! - [`Transport`] — the peer-to-peer networking port (commonware-p2p
+//!   by default; in-process mock for deterministic simulation).
+//! - [`StorageBackend`] — re-exported from the `storage` crate (the
+//!   storage adapter seam; defined there because storage owns the
+//!   conformance suite for backends).
 //!
 //! # Why traits, not concrete types
 //!
@@ -30,8 +38,13 @@
 //! forever. Phase 1 revisits the boundary shape with `oxideBFT`'s real
 //! loop.
 
+pub mod broadcast;
 pub mod conformance;
 pub mod mock;
+pub mod transport;
+
+pub use broadcast::{BroadcastCaps, BroadcastEngine, BroadcastError};
+pub use transport::{InboundMessage, PeerId, Transport, TransportCaps, TransportError};
 
 use primitives::Height;
 use types::{

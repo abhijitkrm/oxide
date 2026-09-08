@@ -1,0 +1,22 @@
+# Oxide blockchain — `oxide-bench` binary
+# (workspace: github.com/abhijitkrm/oxide)
+
+[package]
+name = "oxide-bench"
+description = "Orchestrated benchmark runner for Oxide: invokes per-crate criterion benches in a unified harness and reports results."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxide-bench"
+path = "src/main.rs"
+
+[dependencies]
+# std-only CLI — no heavy deps. The bench harness shells out to
+# `cargo bench` per crate; it does not link the crates themselves.
+
+[lints]
+workspace = true
