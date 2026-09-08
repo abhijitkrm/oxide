@@ -12,6 +12,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **SequencerEngine adapter: single-leader dev-mode engine** (2026-09-09)
+  - New `sequencer` module in the `consensus` crate.
+  - `SequencerEngine` — a single-leader, no-voting dev-mode engine
+    that implements `ConsensusEngine`. Strict subset of oxideBFT's
+    happy path: one leader, immediate finality, no views/QCs/epochs.
+  - Passes the conformance suite (the same suite `MockEngine` and
+    `OxideBft` pass).
+  - Seam-swap test: `MockEngine` and `SequencerEngine` produce
+    identical finalized blocks for the same tx sequence — proves the
+    app is engine-agnostic. 7 new tests; 144 total.
+
+  **In plain words:** Oxide now has a second consensus engine — a
+  simple single-leader mode for dev/testnets. The same application
+  runs under both engines without changes, proving the plug-and-play
+  seam is real: you can swap `oxideBFT` for `sequencer` in config and
+  the app doesn't notice. This is the first Phase 1 deliverable
+  after oxideBFT hardening, and it validates the architecture's core
+  promise — every subsystem is a swappable adapter.
+
 - **oxideBFT hardening: tail-fork resistance, view-change test,
   deterministic simulation** (2026-09-09)
   - Tail-fork resistance enforced in `vote()`: validators reject

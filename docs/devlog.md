@@ -1224,3 +1224,79 @@ Pushed to main; CI green after.
 Lesson: run `cargo fmt --all --check` as the *last* step before
 committing, after all other edits. The CI order is fmt → clippy →
 test; mirror that order and never edit after the fmt pass.
+
+## Session 12 — SequencerEngine adapter: proving the consensus seam
+
+The first new Phase 1 deliverable after oxideBFT hardening: the
+`SequencerEngine` adapter. This is the second engine behind the
+`ConsensusEngine` seam (plan.md §2.1, §13 Phase 1).
+
+### What landed
+
+**New `sequencer` module** (crates/consensus/src/sequencer.rs):
+
+`SequencerEngine` is a single-leader, no-voting dev-mode engine.
+It's a strict subset of oxideBFT's happy path:
+- One configured leader (no validator set, no voting, no QCs).
+- Each `run_until_idle` with pending txs produces one block at the
+  next height, containing all pending txs up to budget.
+- No empty blocks (no pipeline to flush — single-block commit).
+- No views, no TCs, no epochs.
+- Finality is immediate: a block is finalized the moment it's
+  proposed.
+
+It takes `Arc<dyn AppInterface>` — the same app type as `OxideBft`.
+This is the key design decision: the app is shared across all
+engines, which is what makes the seam test meaningful.
+
+### Why not just use MockEngine?
+
+`MockEngine` (crates/ports/src/mock.rs) is the *reference* engine —
+it exists to specify the OAI contract. `SequencerEngine` is a *real*
+engine — it has a configured leader identity, a view counter (always
+0), and block headers with a proposer field. It's the minimal engine
+a devnet could actually run (modulo networking). `MockEngine` is test
+infrastructure; `SequencerEngine` is a dev-mode product.
+
+### The seam-swap test
+
+The Phase 1 acceptance gate (plan.md §13): "devnet also runs on
+SequencerEngine via config swap with zero app-code changes (proves
+the seam)."
+
+The `seam_swap_same_app_same_outputs` test proves this at the unit
+level: the same `MockApp` (the application) runs under `MockEngine`
+and `SequencerEngine`, producing identical finalized block sequences.
+If this passes, the app is engine-agnostic — the seam is real.
+
+### Tests
+
+7 new tests (consensus crate: 49 → 56):
+- `sequencer_passes_conformance` — the conformance suite (the same
+  suite `MockEngine` and `OxideBft` pass).
+- `sequencer_starts_at_genesis` — no blocks at genesis.
+- `one_tx_produces_one_committed_block` — basic liveness.
+- `multiple_txs_all_committed` — 5 txs, 5 blocks.
+- `no_work_when_idle` — no new blocks when idle.
+- `finality_is_final` — re-running doesn't alter finalized blocks.
+- `seam_swap_same_app_same_outputs` — MockEngine and SequencerEngine
+  produce identical finalized blocks for the same tx sequence.
+
+### Verification
+
+`cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace
+--all-targets` — 144 tests pass; `cargo deny check` — all four
+checks ok.
+
+### What's next
+
+The seam is proven at the unit level. The next Phase 1 deliverables:
+- `broadcast` crate (erasure-coded dissemination + PlainGossip) —
+  the data-availability port.
+- `mempool` crate (fee-priority tx pool, per-account nonce queues).
+- `executor` v0 (sequential block executor).
+- `modules` (core/bank/staking) — the Cosmos-SDK-style module
+  framework.
+- `oxide-validator` / `oxide-fullnode` / `oxide-deploy` local devnet
+  with config-driven engine selection.
