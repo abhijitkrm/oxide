@@ -1,0 +1,21 @@
+# Oxide blockchain — `oxide-deploy` binary
+# (workspace: github.com/abhijitkrm/oxide)
+
+[package]
+name = "oxide-deploy"
+description = "Devnet deployment tool — assembles and runs a local in-process devnet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxide-deploy"
+path = "src/main.rs"
+
+[dependencies]
+devnet = { workspace = true }
+
+[lints]
+workspace = true

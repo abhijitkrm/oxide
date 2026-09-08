@@ -1,0 +1,25 @@
+# Oxide blockchain — `executor` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention)
+
+[package]
+name = "executor"
+description = "Sequential block executor with module router — consumes finalized blocks, executes txs, produces state roots."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
+types = { workspace = true }
+ports = { workspace = true }
+mempool = { workspace = true }
+
+[dev-dependencies]
+consensus = { workspace = true }
+
+[lints]
+workspace = true

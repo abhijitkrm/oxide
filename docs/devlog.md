@@ -1300,3 +1300,125 @@ The seam is proven at the unit level. The next Phase 1 deliverables:
   framework.
 - `oxide-validator` / `oxide-fullnode` / `oxide-deploy` local devnet
   with config-driven engine selection.
+
+## Session 13 — Phase 1 stack: mempool, executor, modules, broadcast, devnet
+
+The full Phase 1 application stack landed in one session: mempool,
+executor v0, module framework + core/bank/staking, broadcast
+(PlainGossip + ErasureBroadcast), and the local devnet with
+config-driven engine selection. 41 new tests (144 → 185 total).
+
+### What landed
+
+**`mempool` crate** (`crates/mempool`):
+- Fee-priority transaction pool with per-account nonce queues.
+- Dedup by tx hash (OAI §2 idempotence).
+- Eviction: when full, lowest-fee txs are evicted to make room for
+  higher-fee ones.
+- v0 tx format: `[sender: 20B][nonce: 8B LE][fee: 8B LE][payload]`.
+- 10 tests: basic submit/select, dedup, fee priority, nonce ordering,
+  byte budget, eviction, malformed rejection, empty pool, pool full,
+  multi-sender.
+
+**`executor` crate** (`crates/executor`):
+- Sequential block executor with module router.
+- Implements `AppInterface` — wires behind any `ConsensusEngine`.
+- Module dispatch: tx payload's first byte is the module ID.
+- State root: hash of all module state roots.
+- 4 tests: block execution + state root, end-to-end with
+  SequencerEngine, unknown module skip, multi-block state advance.
+
+**Module framework** (`modules/framework`):
+- `Module` trait (re-exported from executor).
+- Canonical module dispatch IDs (CORE=0, BANK=1, STAKING=2).
+- `ModuleRouter` for registration and lookup.
+- `KVStore` (in-memory BTreeMap) and `subtree_root` helper.
+- 2 tests: router lookup, subtree root changes.
+
+**Core module** (`modules/core`):
+- Chain metadata: height, epoch.
+- `begin_block` records height; `end_block` advances it.
+- 2 tests: height tracking, state root changes.
+
+**Bank module** (`modules/bank`):
+- Token transfers and balances.
+- Transfer message: `[to: 20B][amount: 8B LE]`.
+- v0 limitation: sender not yet passed to `handle` (documented).
+- 5 tests: transfer, accumulate, malformed rejection, mint, state root.
+
+**Staking module** (`modules/staking`):
+- Delegation and validator set.
+- Delegate message: `[validator: 20B][amount: 8B LE]`.
+- `top_validators(n)` returns top-N by stake (descending).
+- 6 tests: delegate, accumulate, top validators, zero-stake exclusion,
+  malformed rejection, state root.
+
+**`broadcast` crate** (`crates/broadcast`):
+- `PlainGossip`: sends whole block to every peer. No erasure coding,
+  no proof of availability. For small devnets.
+- `ErasureBroadcast`: replication-based erasure coding (v0; real RS
+  in Phase 2). Stores f+1 chunks; reconstructs from any f+1.
+- Both implement `BroadcastEngine` from ports.
+- 8 tests: gossip broadcast, oversized rejection, caps, erasure
+  storage, oversized rejection, caps, BFT quorum, empty proposal.
+
+**`devnet` crate** (`crates/devnet`):
+- Config-driven node assembly: `ConsensusConfig::Sequencer` or
+  `ConsensusConfig::OxideBft`.
+- `DevnetNode::assemble` builds executor + core/bank/staking modules,
+  wires behind the selected engine.
+- `run_devnet_smoke_test`: end-to-end smoke test (submit tx, finalize
+  block, verify state root).
+- 4 tests: assembly, smoke test, config parsing, engine swap.
+
+**Binaries**:
+- `oxide-validator`: runs the full stack, submits a smoke-test tx,
+  reports the state root. `--engine sequencer|oxideBFT` flag.
+- `oxide-fullnode`: assembles the stack in follower mode (sync not
+  yet implemented — Phase 2).
+- `oxide-deploy`: runs the devnet smoke test.
+
+### Design decisions
+
+1. **Module dispatch byte in the mempool payload.** The mempool
+   owns the tx envelope (`[sender][nonce][fee][payload]`); the
+   executor routes on the first byte of `payload`
+   (`[module_id][module_payload]`). This keeps the mempool
+   format-agnostic and the executor module-aware.
+
+2. **`Arc<dyn AppInterface>` for the executor.** The executor is
+   shared between the engine (which drives it) and the devnet (which
+   inspects it). `Arc<dyn>` allows both to hold a reference without
+   ownership transfer.
+
+3. **`Mutex` for mempool and module state.** `AppInterface` methods
+   take `&self`, but the mempool's `select` needs `&mut self`. The
+   executor is single-threaded in the deterministic runtime, but the
+   trait requires `Sync` for `Arc<dyn>`. `Mutex` is the simplest
+   solution; the locks are uncontended.
+
+4. **oxideBFT falls back to SequencerEngine in the devnet.** Multi-
+   node oxideBFT requires a validator set and networking — Phase 2.
+   The devnet logs a warning and uses SequencerEngine so the config
+   seam is still testable.
+
+### Verification
+
+`cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace
+--all-targets` — 185 tests pass; `cargo deny check` — all four
+checks ok.
+
+### What's next
+
+The Phase 1 stack is functionally complete. The remaining Phase 1
+acceptance gates (plan.md §13):
+- 4–50 node local devnet (needs networking — Phase 2 transport).
+- 50–100ms blocks on oxideBFT (needs real I/O loop — Phase 2).
+- ≥ 200k simple native tx/s in sim (needs the simulator — Phase 2).
+- Fault injection recovery within 2 views (needs multi-node — Phase 2).
+- Bit-exact journal replay (needs the storage crate — Phase 2).
+
+The next session should focus on the transport crate (real
+networking) to enable multi-node devnet and the remaining acceptance
+gates.

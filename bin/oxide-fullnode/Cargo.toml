@@ -1,0 +1,21 @@
+# Oxide blockchain — `oxide-fullnode` binary
+# (workspace: github.com/abhijitkrm/oxide)
+
+[package]
+name = "oxide-fullnode"
+description = "Full node binary — runs the executor + modules without consensus (read-only follower)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxide-fullnode"
+path = "src/main.rs"
+
+[dependencies]
+devnet = { workspace = true }
+
+[lints]
+workspace = true

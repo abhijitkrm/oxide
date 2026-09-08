@@ -12,6 +12,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase 1 application stack: mempool, executor, modules, broadcast, devnet** (2026-09-09)
+  - `mempool` crate: fee-priority tx pool with per-account nonce
+    queues, dedup, and eviction.
+  - `executor` crate: sequential block executor with module router;
+    implements `AppInterface`.
+  - `framework` + `core` + `bank` + `staking` modules: the
+    Cosmos-SDK-style module framework with the first three chain
+    modules.
+  - `broadcast` crate: `PlainGossip` (devnet) and `ErasureBroadcast`
+    (production v0) data-availability engines.
+  - `devnet` crate: config-driven node assembly with engine selection
+    (`sequencer` / `oxideBFT`).
+  - `oxide-validator`, `oxide-fullnode`, `oxide-deploy` binaries.
+  - 41 new tests; 185 total.
+
+  **In plain words:** Oxide now has a full application stack behind the
+  consensus seam: a mempool that orders txs by fee, a sequential
+  executor that routes txs to modules, the first three modules
+  (core/bank/staking), two broadcast engines, and a local devnet you
+  can assemble and run with a single command. The same app runs under
+  any consensus engine via config — the seam is real end-to-end, not
+  just at the unit level. This completes the Phase 1 stack; the
+  remaining acceptance gates (multi-node networking, throughput sim,
+  fault injection) need the transport crate, which is the next
+  deliverable.
+
 - **SequencerEngine adapter: single-leader dev-mode engine** (2026-09-09)
   - New `sequencer` module in the `consensus` crate.
   - `SequencerEngine` — a single-leader, no-voting dev-mode engine

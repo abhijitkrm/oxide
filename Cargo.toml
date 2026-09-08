@@ -3,7 +3,7 @@ resolver = "3"
 # NOTE: add "modules/*" back to `members` the moment that directory
 # gets its first crate — cargo errors on globs that match nothing,
 # so the list below tracks what actually exists.
-members = ["crates/*", "bin/*"]
+members = ["crates/*", "modules/*", "bin/*"]
 
 # NOTE: `fuzz/` is intentionally NOT a workspace member — cargo-fuzz targets
 # require a nightly toolchain and their own build graph. Build them with
@@ -48,6 +48,14 @@ runtime = { path = "crates/runtime", version = "0.1.0" }
 types = { path = "crates/types", version = "0.1.0" }
 ports = { path = "crates/ports", version = "0.1.0" }
 consensus = { path = "crates/consensus", version = "0.1.0" }
+mempool = { path = "crates/mempool", version = "0.1.0" }
+executor = { path = "crates/executor", version = "0.1.0" }
+framework = { path = "modules/framework", version = "0.1.0" }
+core = { path = "modules/core", version = "0.1.0" }
+bank = { path = "modules/bank", version = "0.1.0" }
+staking = { path = "modules/staking", version = "0.1.0" }
+broadcast = { path = "crates/broadcast", version = "0.1.0" }
+devnet = { path = "crates/devnet", version = "0.1.0" }
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable

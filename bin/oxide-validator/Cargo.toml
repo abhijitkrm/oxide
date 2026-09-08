@@ -1,0 +1,26 @@
+# Oxide blockchain — `oxide-validator` binary
+# (workspace: github.com/abhijitkrm/oxide)
+
+[package]
+name = "oxide-validator"
+description = "Validator node binary — runs the full consensus + executor stack."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxide-validator"
+path = "src/main.rs"
+
+[dependencies]
+devnet = { workspace = true }
+primitives = { workspace = true }
+types = { workspace = true }
+ports = { workspace = true }
+framework = { workspace = true }
+bank = { workspace = true }
+
+[lints]
+workspace = true

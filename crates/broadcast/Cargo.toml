@@ -1,0 +1,21 @@
+# Oxide blockchain — `broadcast` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention)
+
+[package]
+name = "broadcast"
+description = "Data-availability broadcast engines — PlainGossip (devnet) and erasure-coded (production)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
+types = { workspace = true }
+ports = { workspace = true }
+
+[lints]
+workspace = true
