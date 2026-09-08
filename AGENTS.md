@@ -60,8 +60,10 @@ nightly adds fuzz and long simulations.
 - New dependencies: justify in the PR, must be published ≥7 days, exact-pin,
   `cargo deny check` green. Hot-path crates take **no** dependencies.
 - Commits: imperative subject + body explaining *why*.
-- License headers: not required; keep files dual MIT/Apache-2.0 compatible
-  (no GPL dependencies — `deny.toml` enforces).
+- License headers: not required; the repository is GPL-3.0 — dependencies
+  must be GPL-3.0-compatible (MIT, BSD, Apache-2.0, MPL-2.0, GPLv2-or-later
+  and AGPL-3.0 are fine; GPLv2-only, CDDL, and proprietary are not —
+  `deny.toml` enforces).
 
 ## Current status
 

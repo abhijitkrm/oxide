@@ -254,8 +254,7 @@ best-effort.
 
 ## License
 
-Dual-licensed under **MIT** and **Apache-2.0** (your choice), matching the
-Rust ecosystem convention. See `LICENSE-MIT` and `LICENSE-APACHE`.
+Licensed under the **GNU General Public License v3.0**. See [`LICENSE`](LICENSE).
 
 ## Acknowledgments
 
