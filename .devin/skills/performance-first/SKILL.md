@@ -36,7 +36,7 @@ are exempt — optimize for *clarity* there.
    module subtree). Cross-thread hand-off = bounded SPSC/MPSC rings
    (crossbeam). If you need a lock, you need a different architecture.
 4. **Fixed-point only.** Prices/quantities are `u64` scaled integers
-   (1e8 / 1e6 — see oxide-primitives). Floats in state are forbidden:
+   (1e8 / 1e6 — see primitives). Floats in state are forbidden:
    they break cross-validator determinism. Multiply via `u128`, divide
    with banker's-mode rounding, document rounding on every op.
 5. **Cache-line hygiene.** Hot structs are `#[repr(C, align(64))]`, fields
@@ -48,7 +48,7 @@ are exempt — optimize for *clarity* there.
    appends (one CRC'd record per block batch), network (vectored IO),
    market data (frame coalescing). A per-item syscall/flush is a bug.
 7. **No `dyn`, no serde, no tracing in the loop.** Static dispatch via
-   generics resolved at node wiring; codec is oxide-codec (memcpy-shaped);
+   generics resolved at node wiring; codec is codec (memcpy-shaped);
    logging uses pre-resolved static strings and counters, never formatting
    in the loop.
 

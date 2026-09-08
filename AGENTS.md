@@ -23,6 +23,10 @@ Codified as skills in `.devin/skills/`:
 4. **`git-conventions`** — imperative subjects, *why*-focused bodies,
    scope prefixes — and **never add AI co-author/attribution trailers to
    commits unless the user explicitly asks** (project policy).
+5. **`benchmarks`** — a hot-path feature isn't done until it's benched;
+   gates + baselines (including head-to-head vs the displaced
+   alternative), plain-English reporting of results; every user-facing
+   changelog entry carries an "In plain words" section.
 
 ## Commands
 
@@ -40,9 +44,11 @@ nightly adds fuzz and long simulations.
 
 ## Structure quick map
 
-- `crates/oxide-*` — infrastructure crates; ★ differentiating custom cores:
-  `oxide-consensus` (oxideBFT), `oxide-storage` (journal + MMR),
-  `oxide-trading` (matching engine), `oxide-executor`, `oxide-ports` (the
+- `crates/*` — infrastructure crates (bare names, no `oxide-` prefix:
+  the workspace already scopes them; see devlog session 2 for the
+  convention); ★ differentiating custom cores:
+  `consensus` (oxideBFT), `storage` (journal + MMR),
+  `trading` (matching engine), `executor`, `ports` (the
   plug-and-play seams + conformance suites).
 - `modules/` — Cosmos-SDK-style module framework (`framework/`) and chain
   modules (`core`, `bank`, `staking`, `evm`, `exchange`, `perps`, `oracle`,

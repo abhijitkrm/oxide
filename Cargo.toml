@@ -39,8 +39,8 @@ needless_pass_by_value = "allow"
 
 [workspace.dependencies]
 # Internal crates (exact versions keep the graph deterministic and reviews local).
-oxide-primitives = { path = "crates/oxide-primitives" }
-oxide-codec = { path = "crates/oxide-codec" }
+primitives = { path = "crates/primitives" }
+codec = { path = "crates/codec" }
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable

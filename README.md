@@ -127,23 +127,23 @@ sits on a per-order code path.
 oxide/
 ├── docs/                      # protocol specs (oxideBFT, OAI, storage)
 ├── crates/
-│   ├── oxide-primitives/      # Hash, Address, Height/View/Epoch, fixed-point
-│   ├── oxide-codec/           # deterministic wire codec (no serde on hot paths)
-│   ├── oxide-crypto/          # BLS12-381 threshold, ed25519, batch verify, hashers
-│   ├── oxide-runtime/         # runtime abstraction: tokio (prod) + deterministic (sim)
-│   ├── oxide-ports/           # ★ the seams: ConsensusEngine, AppInterface (OAI), …
+│   ├── primitives/      # Hash, Address, Height/View/Epoch, fixed-point
+│   ├── codec/           # deterministic wire codec (no serde on hot paths)
+│   ├── crypto/          # BLS12-381 threshold, ed25519, batch verify, hashers
+│   ├── runtime/         # runtime abstraction: tokio (prod) + deterministic (sim)
+│   ├── ports/           # ★ the seams: ConsensusEngine, AppInterface (OAI), …
 │   │                          #   + MockEngine + conformance suites
-│   ├── oxide-consensus/       # ★ oxideBFT engine + mock/sequencer engines + epochs
-│   ├── oxide-broadcast/       # erasure-coded dissemination + backfill
-│   ├── oxide-p2p/             # Transport impl over commonware-p2p
-│   ├── oxide-mempool/         # fee-priority pool, nonce queues, dedup
-│   ├── oxide-storage/         # ★ journal + MMR-over-log + StorageBackend adapters
-│   ├── oxide-state/           # in-memory authenticated state overlay
-│   ├── oxide-executor/        # block executor: module router + parallel EVM scheduler
-│   ├── oxide-trading/         # ★ matching engine, risk engine (HFT-grade)
-│   ├── oxide-rpc/             # JSON-RPC + WebSocket (eth_* + oxide_*)
-│   ├── oxide-node/            # node assembly: config-driven wiring of all ports
-│   └── oxide-types/           # shared chain types (Tx, Header, QC, OxideBlockRecord…)
+│   ├── consensus/       # ★ oxideBFT engine + mock/sequencer engines + epochs
+│   ├── broadcast/       # erasure-coded dissemination + backfill
+│   ├── p2p/             # Transport impl over commonware-p2p
+│   ├── mempool/         # fee-priority pool, nonce queues, dedup
+│   ├── storage/         # ★ journal + MMR-over-log + StorageBackend adapters
+│   ├── state/           # in-memory authenticated state overlay
+│   ├── executor/        # block executor: module router + parallel EVM scheduler
+│   ├── trading/         # ★ matching engine, risk engine (HFT-grade)
+│   ├── rpc/             # JSON-RPC + WebSocket (eth_* + oxide_*)
+│   ├── node/            # node assembly: config-driven wiring of all ports
+│   └── types/           # shared chain types (Tx, Header, QC, OxideBlockRecord…)
 ├── modules/                   # Cosmos-SDK-style module framework + modules
 │   ├── framework/  core/  bank/  staking/
 │   ├── evm/        # revm host + native precompiles (the "x/vm" analog)
@@ -174,6 +174,12 @@ This repository codifies its engineering process in `.devin/skills/`:
   syscall, no locks (single-writer + rings), fixed-point only, cache-line
   hygiene, batch everything, measured budgets on every hot function,
   profile-before-optimize.
+- **`benchmarks`** — a hot-path feature isn't done until it's benched:
+  criterion conventions, gates and baselines (including head-to-head
+  "prove it was worth building" comparisons), and mandatory
+  plain-English reporting of results.
+- **`git-conventions`** — commit format and history hygiene; project
+  policy: no AI attribution trailers unless explicitly requested.
 
 Read them before contributing. They are short, and they are the contract.
 

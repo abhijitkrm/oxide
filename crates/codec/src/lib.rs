@@ -36,10 +36,10 @@
 //! - `decode(encode(x)) == x` for every [`Codec`] type (property-tested).
 //! - Decoding **never panics** on any byte input; corrupted data returns
 //!   [`DecodeError`] (fuzz-tested).
-//! - No floats on the wire (see `oxide-primitives` for the rationale).
+//! - No floats on the wire (see `primitives` for the rationale).
 
-use oxide_primitives::fixed::{Price, Qty};
-use oxide_primitives::{Address, Hash, Id, IdSpace, TimestampMs};
+use primitives::fixed::{Price, Qty};
+use primitives::{Address, Hash, Id, IdSpace, TimestampMs};
 use std::fmt;
 
 /// Every way decoding structured data from bytes can fail.
@@ -73,7 +73,7 @@ pub enum DecodeError {
         got: u8,
     },
     /// A fixed-width type received the wrong number of bytes
-    /// (re-exported shape from `oxide-primitives`).
+    /// (re-exported shape from `primitives`).
     WrongSliceLength {
         /// Length the type requires.
         expected: usize,
@@ -530,7 +530,7 @@ impl<'a> Decode<'a> for Qty {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxide_primitives::{Address, Epoch, Hash, Height, View};
+    use primitives::{Address, Epoch, Hash, Height, View};
 
     /// Deterministic encoding: same value → identical bytes, twice.
     ///

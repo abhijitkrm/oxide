@@ -38,7 +38,7 @@ layers, each catching what the previous one cannot.
   not `test_book_1`.
 - Every error path has at least one test asserting the exact variant.
 - **Determinism rule:** no `std::time`, no randomness, no thread-sleep-based
-  assertions. If timing matters, inject a `Clock` (oxide-runtime).
+  assertions. If timing matters, inject a `Clock` (runtime).
 
 ## Layer 2 — Property tests (proptest)
 
@@ -55,10 +55,10 @@ layers, each catching what the previous one cannot.
 - Regression workflow: **bug → failing property test → fix → green.** A PR
   fixing a bug without a new property/unit test is incomplete.
 
-## Layer 3 — Conformance suites (oxide-ports / oxide-storage)
+## Layer 3 — Conformance suites (ports / storage)
 
 Any pluggable adapter (`ConsensusEngine`, `StorageBackend`) must pass its
-conformance suite before it can be registered in `oxide-node`:
+conformance suite before it can be registered in `node`:
 
 - `consensus-conformance`: no reorg after `finalize_block`; deterministic
   ordering under identical message logs; commit certificates verifiable;
@@ -67,12 +67,12 @@ conformance suite before it can be registered in `oxide-node`:
 - `storage-conformance`: batch atomicity; crash-replay determinism; iteration
   order stability; snapshot export/import round-trip MMR equality.
 
-Run: `cargo test -p oxide-ports --features conformance` (and the storage
+Run: `cargo test -p ports --features conformance` (and the storage
 equivalent). CI runs these against **every** registered adapter in a matrix.
 
 ## Layer 4 — Deterministic simulation (sim/)
 
-- Uses `oxide-runtime::deterministic` (single-threaded executor, seeded,
+- Uses `runtime::deterministic` (single-threaded executor, seeded,
   reproducible by `(seed, scenario)` pair — the commonware deterministic-
   runtime pattern).
 - Scenarios: kill-leader, partition(1/3), asynchrony bursts, byzantine

@@ -202,3 +202,71 @@ m. Minor: import paths (`Price`/`Qty` live in `oxide_primitives::fixed`),
   4-node echo sim → `oxide-types`/`oxide-ports` (OAI traits + MockEngine
   + conformance skeleton) → protocol specs in `docs/` (oxidebft, OAI,
   storage) → fuzz targets (need nightly toolchain via rustup).
+
+---
+
+## 2026-09-08 — Session 2: benchmarks, plain-English docs, crate naming
+
+### Benchmarks infrastructure (per owner request: "prove it was worth building")
+
+- Added `.devin/skills/benchmarks/SKILL.md`: a hot-path feature isn't done
+  until it's benched; gates cite their source; baselines strongest-first
+  (displaced alternative → hardware floor → previous measurement);
+  parity is an acceptable result when the win is determinism/no-alloc/
+  zero-deps — say so honestly; numbers reported p50/p99 with machine
+  context; plain-English explanation mandatory for user-facing changes.
+- Added criterion benches: `primitives/benches/fixed.rs` (4 gates),
+  `codec/benches/wire.rs` (7 gates incl. head-to-head vs `bincode` on an
+  identical `Vec<u64>` payload — the "worth building" comparison).
+- CHANGELOG entries now carry an "In plain words" section (retrofitted
+  for primitives + codec); README/AGENTS list the benchmarks skill.
+
+### Crate naming convention (owner decision)
+
+- Crates drop the `oxide-` prefix: `oxide-primitives` → `primitives`,
+  `oxide-codec` → `codec` (git mv, history preserved); future crates
+  follow (consensus/storage/trading/…). Rationale: the workspace already
+  scopes the names; matches the commonware bare-name convention; if ever
+  published to crates.io a prefix can be added then. The Oxide identity
+  lives in each file's header comment + Cargo.toml header instead.
+  Kept as-is: `oxideBFT` (engine name), `oxide_*` JSON-RPC namespace,
+  and `bin/oxide-*` commands.
+
+### Bench results (dev Mac — relative claims only; all gates PASS)
+
+| Bench | p50 | Gate |
+|---|---|---|
+| primitives: notional | 0.88 ns | < 10 ns ✓ |
+| primitives: mul_div_half_up | 3.0 ns | < 150 ns ✓ (constant divisor → strength-reduced; noted) |
+| primitives: qty_checked_ops | 2.2 ns | < 5 ns ✓ |
+| primitives: hash/from_slice | 0.56 ns | < 15 ns ✓ |
+| codec: encode u64 (warm buffer) | 0.89 ns | < 5 ns ✓ |
+| codec: encode varint u64::MAX | 5.3 ns | < 25 ns ✓ |
+| codec: decode varint u64::MAX | 4.1 ns | < 20 ns ✓ |
+| codec: hash roundtrip | 3.65 ns | < 20 ns ✓ |
+| codec: order-msg roundtrip (~80B) | 10.2 ns | < 80 ns ✓ |
+| encode Vec<u64>×16: ours vs bincode | 10.1 vs 94.1 ns | ours 9.3× faster ✓ |
+| decode Vec<u64>×16: ours vs bincode | 66.5 vs 93.6 ns | ours 1.4× faster ✓ (parity ≤ 2×) |
+
+Framing stated in the bench file: our encode writes into a caller-owned
+reused buffer (bincode's `encode_to_vec` allocates its result by API
+design); both decodes allocate the output `Vec`.
+
+### Bug hunt log (session 2)
+
+n. **Bench honesty (three artifacts, found by the gates themselves):**
+   (1) encode benches allocated the output buffer inside the timed loop —
+   measuring the allocator, not the codec (u64 encode read 19ns; true
+   cost 0.89ns); (2) the `Vec<u64>` decode wrapper grew its output Vec
+   without capacity → 16 reallocations → 3.5× slower than bincode
+   (166ns); fixed with `Vec::with_capacity(wire_len)` → 66ns, faster
+   than bincode; (3) `iter_batched` with fresh buffers per batch charges
+   first-touch cache misses to the codec (hash roundtrip read 38ns);
+   production callers reuse one warm buffer → restructured to
+   allocate-once-outside + `clear()`-inside. Lesson recorded: the bench
+   must measure the *production shape* of the API, and every failed gate
+   got a written explanation before the fix.
+o. **`FnMut` escape**: closures returning references to captured buffers
+   cannot implement `b.iter`'s `FnMut() -> T`; fix = observe the buffer
+   inside the closure (`black_box(&buf);`) instead of returning it —
+   same dead-store protection, no escaping borrow.

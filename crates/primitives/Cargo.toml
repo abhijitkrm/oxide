@@ -1,5 +1,9 @@
+# Oxide blockchain — `primitives` crate
+# (workspace: github.com/abhijitkrm/oxide; the crate name carries no
+# `oxide-` prefix: see docs/devlog.md, session 2, for the convention)
+
 [package]
-name = "oxide-primitives"
+name = "primitives"
 description = "Foundational types for the Oxide blockchain: hashes, addresses, chain identifiers, and deterministic fixed-point arithmetic."
 version.workspace = true
 edition.workspace = true
@@ -13,3 +17,10 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bench]]
+name = "fixed"
+harness = false

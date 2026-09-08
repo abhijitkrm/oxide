@@ -76,8 +76,8 @@ context from the author.
 
 ## 5. Dependencies
 
-- Hot-path crates (`oxide-primitives`, `oxide-codec`, `oxide-trading`,
-  `oxide-storage` journal core) must remain **dependency-free** (std only) —
+- Hot-path crates (`primitives`, `codec`, `trading`,
+  `storage` journal core) must remain **dependency-free** (std only) —
   this is a supply-chain and performance guarantee.
 - New dependencies anywhere require: (a) a justification comment in the
   crate's README or Cargo.toml, (b) `cargo deny check` passing, (c) published
