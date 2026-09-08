@@ -12,6 +12,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase 1 stage 2: oxideBFT pacemaker state machine** (2026-09-09)
+  - New `consensus` crate with the pacemaker — a pure state machine
+    over views (Active ↔ TimedOut) that drives view changes via
+    timeout → TC formation → view advance.
+  - `ValidatorSet` with stake-weighted round-robin leader election
+    (O(log n) binary search over cumulative stakes; deterministic, no
+    VRF). Fault tolerance `f = (n-1)/3`, quorum `2f+1`.
+  - Exponential backoff on consecutive timeouts (2s base, 30s cap);
+    progress resets to base.
+  - 19 new tests (10 pacemaker + 9 validator); 97 total.
+
+  **In plain words:** the second piece of oxideBFT is in place — the
+  pacemaker that keeps finality moving under a faulty leader. When a
+  validator's local timer expires, it broadcasts a timeout; when
+  ≥2f+1 validators timeout, a certificate forms and the view advances
+  to the next leader. No consensus loop yet (that's stage 3); this is
+  the pure state machine, tested in isolation.
+
 - **Phase 1 stage 1: oxideBFT consensus message types** (2026-09-09)
   - `VotePhase` (`Prepare`/`PreCommit`/`Commit`): the 2-chain pipeline
     phase, `repr(u8)` with pinned discriminants.

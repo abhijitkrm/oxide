@@ -648,3 +648,78 @@ ok.
 Stage 2: the pacemaker as a state machine over views (no networking):
 timeout → TC formation → view advance. Unit + property tests. This
 will be the first code in a new `consensus` crate.
+
+## Session 7 — Phase 1 stage 2: pacemaker state machine
+
+Stage 2 of the oxideBFT spec's staged implementation order
+(docs/oxidebft-spec.md §8): the pacemaker as a pure state machine
+over views — no networking, no real BLS signing (stage 5 adds that).
+
+### What landed
+
+New `consensus` crate with two modules:
+
+- `validator.rs` — `ValidatorSet` + leader election. Fault tolerance
+  (`f = (n-1)/3`), quorum (`2f+1`), and stake-weighted round-robin
+  leader election. The leader for view *v* is determined by
+  `view % total_stake` mapped through a cumulative-stake binary
+  search — O(log n), deterministic, no VRF. For equal stakes this
+  reduces to pure round-robin (`view mod n`); for unequal stakes a
+  high-stake validator leads proportionally more often. Tested: a
+  90%-stake validator leads ~90% of views over 1000 samples.
+
+- `pacemaker.rs` — the pacemaker state machine. Two states
+  (`Active`, `TimedOut`), four events:
+  - `on_local_timeout()`: timer expired → broadcast Timeout, transition
+    to `TimedOut`. Idempotent within a view (no re-broadcast).
+  - `on_timeout_signature(validator, sig)`: collect a timeout sig; on
+    quorum (≥2f+1), form a TC and advance the view. Duplicate sigs
+    are ignored (idempotent via bitmap).
+  - `on_timeout_certificate(tc)`: external TC for the current view →
+    advance immediately (a peer already collected the quorum). Stale
+    TCs (past view/epoch) are ignored.
+  - `on_progress()`: valid proposal arrived → reset timer and backoff,
+    transition back to `Active`.
+
+  Exponential backoff: consecutive timeouts double the timeout
+  duration (capped at 30s). Progress resets to the 2s base.
+
+### Design decisions
+
+- **Pacemaker is a pure state machine.** It does not send messages;
+  it emits `PacemakerEvent`s for the consensus loop (stage 3) to act
+  on. This keeps the pacemaker testable without networking and lets
+  the deterministic runtime drive it synchronously.
+
+- **Signatures collected but not verified (stage 2).** The pacemaker
+  counts signatures and checks quorum, but does not verify BLS
+  signatures — that's stage 5's job (`blst` integration). The caller
+  is responsible for verifying before calling `on_timeout_signature`.
+  The TC's aggregate signature is `AggregateSignature::ZERO` (a
+  placeholder); stage 5 replaces this with real BLS aggregation.
+
+- **`view % total_stake` for leader election.** The original stride-
+  based approach (`view * stride % total_stake`) gave uniform
+  distribution regardless of stake — wrong. `view % total_stake`
+  cycles through every point in `[0, total_stake)`, so each validator
+  gets selected proportionally to its stake. For equal stakes this
+  is pure round-robin; for 1:9 stake it gives 10%/90% as expected.
+
+- **Bitmap-based signer tracking.** The pacemaker uses the same
+  bitmap format as the QC's `signer_bitmap` — a `Vec<u8>` with one
+  bit per validator. This makes TC formation a direct copy of the
+  bitmap, no conversion needed.
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test
+--workspace` — 97 tests pass (consensus 19: 10 pacemaker + 9
+validator); `cargo deny check` — all four checks ok.
+
+### Next
+
+Stage 3: the single-leader happy path (no view changes) — prepare →
+pre-commit → commit pipeline, emitting `finalize_block` on commit.
+This is the first code that actually drives the OAI boundary through
+oxideBFT. The conformance suite must pass.

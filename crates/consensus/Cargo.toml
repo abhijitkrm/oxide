@@ -1,0 +1,21 @@
+# Oxide blockchain — `consensus` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+
+[package]
+name = "consensus"
+description = "oxideBFT consensus engine — pipelined 2-chain HotStuff with an active pacemaker, BLS quorum certificates, and tail-fork resistance."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
+types = { workspace = true }
+
+[lints]
+workspace = true

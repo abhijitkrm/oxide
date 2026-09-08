@@ -47,6 +47,7 @@ crypto = { path = "crates/crypto", version = "0.1.0" }
 runtime = { path = "crates/runtime", version = "0.1.0" }
 types = { path = "crates/types", version = "0.1.0" }
 ports = { path = "crates/ports", version = "0.1.0" }
+consensus = { path = "crates/consensus", version = "0.1.0" }
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable
