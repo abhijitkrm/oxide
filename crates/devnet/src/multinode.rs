@@ -131,18 +131,100 @@ impl MultiNodeDevnet {
         // Flush round: propose with no tx to commit the last pending block.
         self.run_round();
 
-        // Collect finalized blocks from each validator.
-        let finalized = self
-            .engines
-            .iter()
-            .map(|e| {
-                let h = e.finalized_height().map_or(0, primitives::Id::value);
-                (0..=h)
-                    .filter_map(|i| e.finalized_block(primitives::Height::new(i)))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        DevnetResult { finalized }
+        self.collect_result()
+    }
+
+    /// Run `rounds` consensus rounds with a faulty leader at
+    /// `faulty_round`. The faulty leader withholds its proposal;
+    /// the followers time out, form a TC, and advance the view.
+    /// The next leader (honest) proposes and the chain recovers.
+    ///
+    /// This tests the Phase 1 acceptance gate: "fault injection
+    /// (kill leader) recovers within 2 views" (plan.md §13).
+    ///
+    /// Returns the finalized blocks from each validator.
+    pub fn run_with_faulty_leader(&mut self, rounds: usize, faulty_round: usize) -> DevnetResult {
+        for round in 0..rounds {
+            let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
+            if round == faulty_round {
+                // The leader is faulty: it withholds its proposal.
+                // Followers detect the timeout, form a TC, and
+                // advance the view. The next leader (view+1) proposes.
+                self.handle_faulty_leader();
+                // Retry the round with the new leader.
+                let new_leader =
+                    usize::from(self.validator_set.leader(self.engines[0].current_view()));
+                let tx = make_round_tx(round);
+                self.engines[new_leader].submit_tx(tx);
+                self.run_round();
+            } else {
+                let tx = make_round_tx(round);
+                self.engines[leader_idx].submit_tx(tx);
+                self.run_round();
+            }
+        }
+        // Flush round.
+        self.run_round();
+
+        self.collect_result()
+    }
+
+    /// Handle a faulty leader: all non-leader validators time out,
+    /// collect timeout signatures, form a TC, and advance the view.
+    ///
+    /// The view advances by exactly 1 (one timeout, one TC). The
+    /// acceptance gate requires recovery within 2 views; this is
+    /// 1 view.
+    fn handle_faulty_leader(&mut self) {
+        let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
+
+        // All non-leader validators time out for the current view.
+        // Each produces a timeout signature (placeholder ZERO in v0).
+        for (i, engine) in self.engines.iter_mut().enumerate() {
+            if i == leader_idx {
+                continue;
+            }
+            let _ = engine.on_timeout();
+        }
+
+        // Collect timeout signatures: each non-leader validator
+        // collects signatures from all other non-leader validators.
+        // The first to reach quorum forms a TC.
+        let non_leader_indices: Vec<usize> = (0..self.n).filter(|&i| i != leader_idx).collect();
+        let mut formed_tc: Option<types::TimeoutCertificate> = None;
+        for &collector_i in &non_leader_indices {
+            for &signer_i in &non_leader_indices {
+                if signer_i == collector_i {
+                    continue;
+                }
+                if let Some(tc) = self.engines[collector_i].collect_timeout_signature(
+                    u16::try_from(signer_i).unwrap(),
+                    crypto::bls::Signature::ZERO,
+                ) {
+                    formed_tc = Some(tc);
+                }
+            }
+            // Self-signature (the validator that timed out also
+            // signs its own timeout).
+            if let Some(tc) = self.engines[collector_i].collect_timeout_signature(
+                u16::try_from(collector_i).unwrap(),
+                crypto::bls::Signature::ZERO,
+            ) {
+                formed_tc = Some(tc);
+            }
+        }
+
+        // If no TC was formed (not enough signatures), we need to
+        // collect more. For n=4, f=1, quorum=3: 3 non-leader
+        // validators each sign, so the first collector that gets
+        // all 3 (self + 2 others) forms the TC.
+        let tc = formed_tc.expect("a TC should form at quorum");
+
+        // All validators (including the faulty leader) receive the
+        // TC and advance the view.
+        for engine in &mut self.engines {
+            engine.on_timeout_certificate(&tc);
+        }
     }
 
     /// Run one consensus round: propose → vote → QC → advance.
@@ -199,6 +281,21 @@ impl MultiNodeDevnet {
         for engine in &mut self.engines {
             engine.sync_next_height(max_height);
         }
+    }
+
+    /// Collect finalized blocks from each validator into a `DevnetResult`.
+    fn collect_result(&self) -> DevnetResult {
+        let finalized = self
+            .engines
+            .iter()
+            .map(|e| {
+                let h = e.finalized_height().map_or(0, primitives::Id::value);
+                (0..=h)
+                    .filter_map(|i| e.finalized_block(primitives::Height::new(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        DevnetResult { finalized }
     }
 }
 
@@ -308,5 +405,83 @@ mod tests {
         let mut devnet = MultiNodeDevnet::new(1, 10_000);
         let result = devnet.run(3);
         assert!(!result.finalized[0].is_empty(), "single validator should finalize");
+    }
+
+    /// Fault injection: kill the leader at round 2. The followers
+    /// time out, form a TC, advance the view, and the next leader
+    /// proposes. The chain recovers within 1 view (the acceptance
+    /// gate is 2 views).
+    #[test]
+    fn fault_injection_kill_leader_recovers() {
+        let mut devnet = MultiNodeDevnet::new(4, 10_000);
+        let result = devnet.run_with_faulty_leader(5, 2);
+
+        // All validators should agree on finalized blocks.
+        let n_blocks = result.finalized[0].len();
+        assert!(n_blocks > 0, "should have finalized blocks despite faulty leader");
+        for (i, blocks) in result.finalized.iter().enumerate() {
+            assert_eq!(blocks.len(), n_blocks, "validator {i} disagrees on block count");
+        }
+
+        // All 5 txs should be finalized (the faulty round's tx is
+        // resubmitted to the new leader).
+        let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
+        assert_eq!(total_txs, 5, "all 5 txs must be finalized after recovery");
+    }
+
+    /// Fault injection: kill the leader at round 0 (the very first
+    /// round). The chain should still bootstrap and finalize.
+    #[test]
+    fn fault_injection_kill_first_leader() {
+        let mut devnet = MultiNodeDevnet::new(4, 10_000);
+        let result = devnet.run_with_faulty_leader(3, 0);
+        let n_blocks = result.finalized[0].len();
+        assert!(n_blocks > 0, "should finalize despite first leader being faulty");
+        // All validators agree.
+        for (i, blocks) in result.finalized.iter().enumerate() {
+            assert_eq!(blocks.len(), n_blocks, "validator {i} disagrees");
+        }
+    }
+
+    /// Fault injection: 7 validators (f=2), kill the leader. The
+    /// 6 remaining validators form a TC (quorum=5) and recover.
+    #[test]
+    fn fault_injection_7_validators_kill_leader() {
+        let mut devnet = MultiNodeDevnet::new(7, 10_000);
+        let result = devnet.run_with_faulty_leader(4, 1);
+        let n_blocks = result.finalized[0].len();
+        assert!(n_blocks > 0, "should finalize despite faulty leader in 7-validator set");
+        for (i, blocks) in result.finalized.iter().enumerate() {
+            assert_eq!(blocks.len(), n_blocks, "validator {i} disagrees");
+        }
+        let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
+        assert_eq!(total_txs, 4, "all 4 txs must be finalized");
+    }
+
+    /// Fault injection: kill the leader at the last round. The
+    /// chain should still finalize all blocks.
+    #[test]
+    fn fault_injection_kill_last_leader() {
+        let mut devnet = MultiNodeDevnet::new(4, 10_000);
+        let result = devnet.run_with_faulty_leader(3, 2);
+        let n_blocks = result.finalized[0].len();
+        assert!(n_blocks > 0, "should finalize despite last leader being faulty");
+    }
+
+    /// Fault injection: finality agreement after recovery. All
+    /// validators must agree on the same blocks after a faulty
+    /// leader is bypassed.
+    #[test]
+    fn fault_injection_finality_agreement() {
+        let mut devnet = MultiNodeDevnet::new(4, 10_000);
+        let result = devnet.run_with_faulty_leader(5, 2);
+        let reference = &result.finalized[0];
+        for (i, blocks) in result.finalized.iter().enumerate().skip(1) {
+            assert_eq!(blocks.len(), reference.len(), "validator {i} disagrees on count");
+            for (j, (a, b)) in reference.iter().zip(blocks.iter()).enumerate() {
+                assert_eq!(a.height, b.height, "validator {i} block {j}: height mismatch");
+                assert_eq!(a.txs, b.txs, "validator {i} block {j}: txs mismatch");
+            }
+        }
     }
 }

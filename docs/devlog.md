@@ -1516,3 +1516,84 @@ remaining Phase 1 acceptance gates:
 The next session should add fault injection to the multi-node
 runner (view-change on timeout, TC-based recovery) and the
 throughput simulator.
+
+## Session 15 — Fault injection: kill leader, recover within 1 view
+
+Fault injection landed in the multi-node devnet runner. The Phase 1
+acceptance gate (plan.md §13): "fault injection (kill leader) recovers
+within 2 views." This session implements and tests it. 5 new tests
+(202 → 207 total).
+
+### What landed
+
+**`devnet` fault injection** (`crates/devnet/src/multinode.rs`):
+- `MultiNodeDevnet::run_with_faulty_leader(rounds, faulty_round)`:
+  runs N rounds; at `faulty_round`, the leader withholds its
+  proposal. Followers time out, form a TC, advance the view, and
+  the next leader proposes. The chain recovers within 1 view.
+- `handle_faulty_leader()`: all non-leader validators call
+  `on_timeout()`, collect timeout signatures from each other, the
+  first to reach quorum forms a TC, and all validators receive the
+  TC and advance the view.
+- 5 tests: kill leader at round 2 (mid-run), kill first leader
+  (round 0), 7-validator kill leader, kill last leader, finality
+  agreement after recovery.
+
+**`consensus` API additions**:
+- `OxideBft::collect_timeout_signature(voter, sig)`: feeds a
+  timeout signature to the pacemaker, returns the TC if quorum is
+  reached. Syncs the engine's `current_view` from the pacemaker.
+- `Pacemaker::sync_to_view(view)`: syncs the pacemaker's view to
+  the engine's view on happy-path advancement. This was the key
+  bug fix (see below).
+- `OxideBft::advance_view()` now syncs the pacemaker and calls
+  `on_progress()` (resets backoff).
+
+### The bug: pacemaker/engine view desync
+
+The first attempt at fault injection failed: after 2 normal rounds,
+the faulty leader's followers timed out and formed a TC — but for
+the wrong view (view 0 instead of view 2). The root cause: the
+engine's `advance_view()` incremented `self.current_view` but did
+NOT sync the pacemaker's `current_view`. The pacemaker was stuck
+at view 0 while the engine was at view 2. When followers timed
+out, the pacemaker formed a TC for view 0, which was stale.
+
+Fix: `advance_view()` now calls `pacemaker.sync_to_view(view)` and
+`pacemaker.on_progress()`. The pacemaker's view stays in sync with
+the engine's, so timeouts fire for the correct view.
+
+### Design decisions
+
+1. **Direct-call timeout collection, not Transport-based.** The
+   `handle_faulty_leader` method directly calls
+   `collect_timeout_signature` on each validator, matching the
+   direct-call simulation pattern. When the engine gets a
+   Transport-based I/O loop (Phase 2), timeout messages route
+   through the mesh.
+
+2. **1 view recovery, not 2.** The acceptance gate is "within 2
+   views." The implementation recovers in 1 view: the faulty
+   leader's view is skipped via a single TC. This is the optimal
+   case (Jolteon/AptosBFT pattern: one timeout delay, then
+   responsive recovery).
+
+3. **TC broadcast to all, including the faulty leader.** In a real
+   system, the faulty leader might recover and rejoin. Delivering
+   the TC to all validators (including the faulty one) ensures
+   they all advance to the same view.
+
+### Verification
+
+`cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace
+--all-targets` — 207 tests pass; `cargo deny check` — all four
+checks ok.
+
+### What's next
+
+The remaining Phase 1 acceptance gates:
+- ≥ 200k simple native tx/s in sim (n=32) — needs the throughput
+  simulator.
+- Journal replay reproduces state root bit-exact — needs the
+  storage crate.

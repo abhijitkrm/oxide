@@ -104,9 +104,12 @@ impl MeshNetwork {
             1 => Some(usize::from(pid[0])),
             2 => Some(u16::from_le_bytes([pid[0], pid[1]]) as usize),
             4 => Some(u32::from_le_bytes([pid[0], pid[1], pid[2], pid[3]]) as usize),
-            8 => Some(usize::try_from(u64::from_le_bytes([
-                pid[0], pid[1], pid[2], pid[3], pid[4], pid[5], pid[6], pid[7],
-            ])).ok()?),
+            8 => Some(
+                usize::try_from(u64::from_le_bytes([
+                    pid[0], pid[1], pid[2], pid[3], pid[4], pid[5], pid[6], pid[7],
+                ]))
+                .ok()?,
+            ),
             _ => None,
         }
     }

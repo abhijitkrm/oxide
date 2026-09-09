@@ -12,6 +12,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Fault injection: kill leader, recover within 1 view** (2026-09-09)
+  - `devnet` multi-node runner gains `run_with_faulty_leader`:
+    at a specified round, the leader withholds its proposal;
+    followers time out, form a timeout certificate, advance the
+    view, and the next leader proposes. The chain recovers in 1
+    view (the acceptance gate is 2).
+  - `consensus` gains `OxideBft::collect_timeout_signature` for
+    multi-node view-change collection, and `Pacemaker::sync_to_view`
+    to keep the pacemaker's view in sync with the engine on
+    happy-path advancement.
+  - 5 new tests; 207 total.
+
+  **In plain words:** Oxide's multi-node devnet can now simulate a
+  faulty leader. When the leader stops proposing, the followers
+  detect the timeout, form a timeout certificate, skip the faulty
+  leader, and the next leader takes over — all within one view
+  change. This proves the chain stays live under leader failure, a
+  core BFT requirement.
+
 - **p2p crate (MeshTransport) + multi-node devnet runner** (2026-09-09)
   - `p2p` crate: in-process `MeshTransport` implementing the
     `Transport` port — fully-connected mesh of N FIFO queues, no

@@ -160,6 +160,22 @@ impl Pacemaker {
         self.current_view
     }
 
+    /// Advance to a specific view (happy-path sync). Used by the
+    /// engine when it advances the view on a QC (not a timeout) —
+    /// the pacemaker needs to stay in sync with the engine's view
+    /// so that a later timeout fires for the correct view.
+    ///
+    /// Resets per-view state (timeout signers, `own_timeout_sent`)
+    /// and transitions back to `Active`. Does NOT change the
+    /// backoff (progress resets it separately via `on_progress`).
+    pub fn sync_to_view(&mut self, view: View) {
+        if view.value() > self.current_view.value() {
+            self.current_view = view;
+            self.state = PacemakerState::Active;
+            self.reset_view_state();
+        }
+    }
+
     /// Current epoch.
     #[must_use]
     pub fn current_epoch(&self) -> Epoch {

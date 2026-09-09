@@ -589,9 +589,12 @@ impl OxideBft {
 
     /// Advance to the next view (happy path: one view per block).
     /// Public so the multi-node simulation can drive view advancement
-    /// in lockstep across all validators.
+    /// in lockstep across all validators. Syncs the pacemaker so that
+    /// a later timeout fires for the correct view.
     pub fn advance_view(&mut self) {
         self.current_view = View::new(self.current_view.value() + 1);
+        self.pacemaker.sync_to_view(self.current_view);
+        self.pacemaker.on_progress();
     }
 
     /// Validator: local timer expired. Returns a timeout signature
@@ -603,6 +606,37 @@ impl OxideBft {
     pub fn on_timeout(&mut self) -> Option<Signature> {
         let _ = self.pacemaker.on_local_timeout();
         Some(Signature::ZERO)
+    }
+
+    /// Validator: collect a timeout signature from `voter` for the
+    /// current view. If this brings the pacemaker to a quorum, a TC
+    /// is formed and the view advances internally. Returns the TC
+    /// if one was formed.
+    ///
+    /// This is the multi-node simulation's view-change path: when
+    /// the leader is faulty, followers collect timeout signatures
+    /// from each other; the first to reach quorum forms a TC and
+    /// broadcasts it.
+    pub fn collect_timeout_signature(
+        &mut self,
+        voter: ValidatorIndex,
+        signature: Signature,
+    ) -> Option<TimeoutCertificate> {
+        let events = self.pacemaker.on_timeout_signature(voter, signature);
+        let tc = events.iter().find_map(|e| {
+            if let crate::pacemaker::PacemakerEvent::TimeoutCertificateFormed(tc) = e {
+                Some(tc.clone())
+            } else {
+                None
+            }
+        });
+        // Sync the engine's current_view from the pacemaker if the
+        // view advanced (the pacemaker advances internally on TC
+        // formation).
+        if tc.is_some() {
+            self.current_view = self.pacemaker.current_view();
+        }
+        tc
     }
 
     /// Validator: process a timeout certificate. Advances the view
