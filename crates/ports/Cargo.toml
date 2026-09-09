@@ -15,6 +15,7 @@ repository.workspace = true
 primitives = { workspace = true }
 types = { workspace = true }
 crypto = { workspace = true }
+storage = { workspace = true }
 
 [lints]
 workspace = true

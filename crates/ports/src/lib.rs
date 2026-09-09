@@ -41,6 +41,7 @@
 pub mod broadcast;
 pub mod conformance;
 pub mod mock;
+pub mod storage_conformance;
 pub mod transport;
 
 pub use broadcast::{BroadcastCaps, BroadcastEngine, BroadcastError};

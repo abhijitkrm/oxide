@@ -57,6 +57,7 @@ staking = { path = "modules/staking", version = "0.1.0" }
 broadcast = { path = "crates/broadcast", version = "0.1.0" }
 p2p = { path = "crates/p2p", version = "0.1.0" }
 devnet = { path = "crates/devnet", version = "0.1.0" }
+storage = { path = "crates/storage", version = "0.1.0" }
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable
