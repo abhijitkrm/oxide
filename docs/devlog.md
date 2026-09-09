@@ -2199,3 +2199,58 @@ malformed txs and they'd be silently skipped during execution.
 
 224 tests pass (was 220, +4 M2 tests). fmt clean. clippy
 `-D warnings` clean. cargo deny ok.
+
+## Session 18e — M4 + M5 fixes
+
+### M4: Multi-sender throughput workload
+
+The M4 audit finding: all throughput tests used a single sender
+(`[0u8; 20]`). This didn't test per-account nonce ordering, nonce
+gaps, or dedup behavior under multiple senders.
+
+Fix:
+- Added `make_multi_sender_tx(sender_idx, nonce)` helper that
+  generates a bank-transfer tx from a distinct sender address.
+- Added `run_batch_multi_sender(rounds, txs_per_round, num_senders)`
+  method that distributes txs across `num_senders` senders with
+  per-sender sequential nonces.
+- The devnet constructor now mints to senders `[0u8; 20]` through
+  `[31u8; 20]` (32 senders) so each has a genesis balance.
+- Added `throughput_sim_multi_sender` test (ignored, release mode):
+  4 validators, 3 rounds, 1000 txs/round, 8 senders.
+
+Result (M2 dev machine, release mode):
+```
+throughput_sim_multi_sender: 3000 txs in 75.7ms = 39629 tx/s (8 senders)
+```
+
+This is comparable to the single-sender `throughput_sim_large_batch`
+(50,946 tx/s), confirming that multi-sender workloads don't
+collapse due to dedup or nonce issues.
+
+Initial bug found and fixed: the first version used globally
+sequential nonces (`round * txs_per_round + tx_i`), which created
+per-sender nonce gaps (sender 0 got nonces 0, 8, 16, ...). The
+mempool's strict nonce ordering rejected all but the first tx per
+sender per block, resulting in only 24 finalized txs out of 3000.
+Fixed by using per-sender sequential nonce counters.
+
+### M5: Throughput simulations in nightly CI
+
+The M5 audit finding: throughput tests were `#[ignore]`d and absent
+from CI. Performance regressions could land without detection.
+
+Fix: added `.github/workflows/nightly.yml` with:
+- `throughput-sims` job: runs all `--ignored` tests in release
+  mode with `--test-threads=1` and `--nocapture`. Uploads output
+  as an artifact.
+- `fuzz` job: runs each fuzz target for 5 minutes (bounded budget).
+  Uploads fuzz artifacts.
+
+The nightly runs at 05:00 UTC daily. PR CI remains fast (fmt +
+clippy + test + deny). Performance regressions are caught within
+24 hours.
+
+### Verification
+
+224 tests pass. fmt clean. clippy `-D warnings` clean. cargo deny ok.

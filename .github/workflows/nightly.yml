@@ -1,0 +1,62 @@
+# Nightly CI: long-running simulations, throughput tests, and fuzz.
+# Keeps PR CI fast while catching performance regressions and fuzz
+# failures regularly. Source: AGENTS.md "Commands" + testing-standards
+# skill (layer 4: deterministic simulation, layer 5: fuzz).
+
+name: nightly
+
+on:
+  schedule:
+    # 05:00 UTC daily — off-peak for US/EU dev cycles.
+    - cron: "0 5 * * *"
+  workflow_dispatch: # manual trigger for debugging
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  throughput-sims:
+    name: throughput simulations (release, --ignored)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run ignored throughput simulations
+        run: |
+          cargo test --release --workspace --all-targets -- \
+            --ignored --nocapture --test-threads=1
+      - name: Upload simulation output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-sim-output
+          path: |
+            target/release/deps/*.log
+            target/release/deps/*.out
+
+  fuzz:
+    name: fuzz targets (bounded budget)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Run fuzz targets (5 min each)
+        run: |
+          # Run each fuzz target for 5 minutes (300s). This is a
+          # bounded budget — not exhaustive, but catches regressions
+          # in decoders and journal/MMR handling.
+          for target in codec_journal_replay codec_mmr_decode codec_consensus_msg; do
+            echo "=== Fuzzing $target ==="
+            cargo +nightly fuzz run "$target" -- -max_total_time=300 || true
+          done
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/

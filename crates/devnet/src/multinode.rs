@@ -34,11 +34,7 @@ use executor::Executor;
 use ports::{AppInterface, ConsensusEngine};
 use types::{FinalizedBlock, TxBytes};
 
-/// The sender address used in devnet bank-transfer txs. All
-/// transfers in the simulation come from this address.
-const GENESIS_SENDER: primitives::Address = primitives::Address([0u8; 20]);
-
-/// The genesis balance minted to the sender on each validator's
+/// The genesis balance minted to each sender on every validator's
 /// bank module. Large enough that the simulation never exhausts
 /// it (the max transfer in any round is `rounds` tokens; the
 /// throughput test sends 1 token per tx, up to ~30k txs).
@@ -110,8 +106,14 @@ impl MultiNodeDevnet {
             // can debit (C2 fix: the bank now debits the sender, so
             // the sender needs an initial balance). The bank module
             // is minted before registration.
+            //
+            // M4: mint to a range of sender addresses ([0u8; 20]
+            // through [31u8; 20]) so the multi-sender throughput
+            // test can use distinct senders.
             let bank = bank::BankModule::new();
-            bank.mint(&GENESIS_SENDER, GENESIS_BALANCE);
+            for sender_byte in 0u8..32 {
+                bank.mint(&primitives::Address([sender_byte; 20]), GENESIS_BALANCE);
+            }
             executor.register_module(Arc::new(bank));
             executor.register_module(Arc::new(staking::StakingModule::new()));
             let app: Arc<Executor> = Arc::new(executor);
@@ -197,6 +199,48 @@ impl MultiNodeDevnet {
             self.run_round();
         }
         // Flush round: propose with no tx to commit the last pending block.
+        self.run_round();
+        let elapsed = start.elapsed();
+        (self.collect_result(), elapsed)
+    }
+
+    /// Run `rounds` consensus rounds with `txs_per_round` txs from
+    /// `num_senders` distinct senders. Each sender gets a per-sender
+    /// nonce. This exercises the M4 scenario: multiple senders
+    /// transferring concurrently, testing per-account nonce
+    /// ordering and dedup behavior.
+    ///
+    /// Each sender must have a genesis balance. This method mints
+    /// to each sender on every validator's bank module before
+    /// running the rounds.
+    pub fn run_batch_multi_sender(
+        &mut self,
+        rounds: usize,
+        txs_per_round: usize,
+        num_senders: u8,
+    ) -> (DevnetResult, std::time::Duration) {
+        // The constructor mints to senders [0u8; 20] through
+        // [31u8; 20]. The caller must ensure `num_senders <= 32`.
+        //
+        // Nonces are per-sender sequential: sender i gets nonces
+        // 0, 1, 2, ... This is the correct multi-sender workload
+        // (M4 fix). The mempool enforces strict per-sender nonce
+        // ordering, so gaps would cause txs to be stuck.
+        let start = std::time::Instant::now();
+        // Track per-sender nonce counters across rounds.
+        let mut sender_nonces: Vec<u64> = vec![0; num_senders as usize];
+        for _round in 0..rounds {
+            let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
+            for tx_i in 0..txs_per_round {
+                let sender_idx = u8::try_from(tx_i % num_senders as usize).unwrap_or(0);
+                let nonce = sender_nonces[usize::from(sender_idx)];
+                sender_nonces[usize::from(sender_idx)] += 1;
+                let tx = make_multi_sender_tx(sender_idx, nonce);
+                self.engines[leader_idx].submit_tx(tx);
+            }
+            self.run_round();
+        }
+        // Flush round.
         self.run_round();
         let elapsed = start.elapsed();
         (self.collect_result(), elapsed)
@@ -457,6 +501,30 @@ fn make_core_tx(round: usize, tx_i: usize) -> TxBytes {
     TxBytes::new(bytes)
 }
 
+/// Construct a multi-sender bank-transfer tx for throughput
+/// testing. Each tx comes from a distinct sender (derived from
+/// `sender_idx`) with a per-sender nonce. This exercises the
+/// M4 scenario: multiple senders transferring concurrently,
+/// testing per-account nonce ordering and dedup behavior.
+///
+/// The sender address is `[sender_idx; 20]` (deterministic). The
+/// genesis mint in `MultiNodeDevnet::new` mints to `[0u8; 20]`
+/// only, so this function also requires the caller to pre-mint
+/// to each sender address. See `run_batch_multi_sender`.
+fn make_multi_sender_tx(sender_idx: u8, nonce: u64) -> TxBytes {
+    let sender = primitives::Address([sender_idx; 20]);
+    let fee = 100u64;
+    let to = primitives::Address([0xff; 20]);
+    let module_payload = bank::msg::transfer(to, 1);
+    let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
+    bytes.extend_from_slice(&sender.0);
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&fee.to_le_bytes());
+    bytes.push(framework::module_id::BANK);
+    bytes.extend_from_slice(&module_payload);
+    TxBytes::new(bytes)
+}
+
 /// Compute transactions per second from a tx count and elapsed
 /// duration. Uses `f64` for the rate; tx counts in the simulation
 /// are well below 2^52 so no precision is lost.
@@ -701,6 +769,24 @@ mod tests {
         assert!(total_txs > 0, "should finalize some txs");
         let tps = tps(total_txs, elapsed);
         eprintln!("throughput_sim_large_batch: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s");
+    }
+
+    /// Multi-sender throughput sim (M4 fix): 4 validators, 3 rounds,
+    /// 1000 txs/round, 8 distinct senders. Each sender has a genesis
+    /// balance (minted in the constructor). Tests that multiple
+    /// senders can transfer concurrently without nonce collisions
+    /// or dedup collapse.
+    #[test]
+    #[ignore = "throughput sim: run with --release -- --ignored"]
+    fn throughput_sim_multi_sender() {
+        let mut devnet = MultiNodeDevnet::new(4, 100_000);
+        let (result, elapsed) = devnet.run_batch_multi_sender(3, 1000, 8);
+        let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
+        assert!(total_txs > 0, "should finalize some txs");
+        let tps = tps(total_txs, elapsed);
+        eprintln!(
+            "throughput_sim_multi_sender: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s (8 senders)"
+        );
     }
 
     /// Throughput sim: 4 validators, 5 rounds, 100 txs/round.
