@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use consensus::SequencerEngine;
+use consensus::{OxideBft, SequencerEngine};
 use executor::Executor;
 use ports::{AppInterface, ConsensusEngine};
 use primitives::Address;
@@ -89,11 +89,21 @@ impl DevnetNode {
     ///
     /// Registers the core, bank, and staking modules on the executor,
     /// then wires the executor behind the selected consensus engine.
+    ///
+    /// # Panics
+    ///
+    /// Panics if BLS key generation fails (impossible with valid IKM)
+    /// or if the validator set construction fails (impossible with
+    /// equal stakes ≥ 1).
     pub fn assemble(config: &NodeConfig) -> Self {
         // Build the executor with standard modules.
         let mut executor = Executor::new(config.max_mempool_entries);
         executor.register_module(Arc::new(core::CoreModule::new()));
-        executor.register_module(Arc::new(bank::BankModule::new()));
+        // Genesis-mint to the sender address so bank transfers can
+        // debit (C2 fix: the bank now debits the sender).
+        let bank = bank::BankModule::new();
+        bank.mint(&primitives::Address([0u8; 20]), 1_000_000_000_000);
+        executor.register_module(Arc::new(bank));
         executor.register_module(Arc::new(staking::StakingModule::new()));
         let app: Arc<Executor> = Arc::new(executor);
         let app_dyn: Arc<dyn AppInterface> = app.clone();
@@ -102,14 +112,21 @@ impl DevnetNode {
         let engine: Box<dyn ConsensusEngine> = match config.consensus {
             ConsensusConfig::Sequencer => Box::new(SequencerEngine::new(app_dyn.clone())),
             ConsensusConfig::OxideBft => {
-                // oxideBFT multi-node requires a validator set and
-                // networking — Phase 2. For v0, we fall back to
-                // SequencerEngine and log a warning.
-                eprintln!(
-                    "devnet: oxideBFT multi-node not yet supported in devnet; \
-                     falling back to SequencerEngine"
-                );
-                Box::new(SequencerEngine::new(app_dyn.clone()))
+                // oxideBFT in single-validator mode (quorum=1): the
+                // engine self-proposes, self-votes, and commits via
+                // the 2-chain rule. This is a real oxideBFT run, not
+                // a fallback — the consensus logic is identical to
+                // the multi-node case, just with n=1.
+                //
+                // M6 fix: previously this silently fell back to
+                // SequencerEngine, which meant the config name
+                // "oxideBFT" was a lie. Now it runs the real engine.
+                let key =
+                    crypto::BlsSecretKey::from_ikm(&[1u8; 32]).expect("BLS key gen from valid IKM");
+                let pk = key.public_key();
+                let vs =
+                    consensus::ValidatorSet::new(vec![pk], vec![1]).expect("single validator set");
+                Box::new(OxideBft::new(app_dyn.clone(), vs).with_secret_key(key))
             }
         };
 
