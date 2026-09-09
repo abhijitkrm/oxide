@@ -74,5 +74,9 @@ harness = false
 name = "mmr"
 harness = false
 
+[[bench]]
+name = "backend"
+harness = false
+
 [lints]
 workspace = true
