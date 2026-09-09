@@ -1454,6 +1454,7 @@ version = "0.1.0"
 dependencies = [
  "codec",
  "consensus",
+ "criterion",
  "crypto",
  "mempool",
  "ports",

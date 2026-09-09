@@ -20,6 +20,11 @@ mempool = { workspace = true }
 
 [dev-dependencies]
 consensus = { workspace = true }
+criterion = "0.7.0"
+
+[[bench]]
+name = "uniswap_transfer"
+harness = false
 
 [lints]
 workspace = true
