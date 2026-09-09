@@ -1779,3 +1779,164 @@ All Phase 1 acceptance gates from plan.md §13 are now met:
   tx/s; 32-validator: 50-92k raw single-thread, ~2.9M extrapolated)
 - ✅ Fault injection (kill leader) recovers within 2 views (1 view)
 - ✅ Journal replay reproduces state root bit-exact (7 tests)
+
+## Session 17 — Phase 1 development audit
+
+An audit of the Phase 1 work before starting Phase 2. Method: trace
+every acceptance-gate claim back to the actual test/code, then an
+adversarial pass on the safety-critical paths (vote forgery,
+balance overdraft, invalid proposals, seam bypass).
+
+**Verdict: session 16b's "all Phase 1 gates met" table (above) was
+overstated.** Two gates fail as written and several rest on
+placeholders. The corrected verdict is at the end of this entry.
+Findings below, by severity, with file references.
+
+### CRITICAL
+
+**C1 — No signature verification in the production consensus path.**
+`crypto::aggregate_verify` is called in exactly two places in the
+workspace — both are tests (`engine.rs` QC/BLS tests, ~line 1015
+and ~1075). The production path `collect_vote` → `try_form_qc` →
+`deliver_qc` stores votes by index and forms QCs with **zero
+authentication**: any single node can fabricate all 3f+1 votes and
+form a "QC" for an arbitrary block. BFT safety is vacuous until
+this is fixed. The multi-node runner passes `Signature::ZERO`
+everywhere — and it passes *because* nothing verifies.
+
+**C2 — The bank module has no sender debit.**
+`BankModule::handle` (modules/bank/src/lib.rs, ~line 105) credits
+the recipient and never debits anyone; there is no balance check
+because there is no sender — the executor never passes tx context
+to modules (documented in-code as a v0 limitation). Consequences:
+(a) the state machine is a money printer, not a token system;
+(b) every "bank transfer" in the throughput sims and the
+journal-replay tests is actually a mint, so measured per-tx cost is
+*understated* (no debit write, no sender balance read);
+(c) the journal-replay "bit-exact state root" gate passed against a
+nearly-trivial state machine.
+
+### HIGH — gates that fail as written
+
+**H1 — "≥ 200k tx/s in sim (n=32)" is NOT met.** Measured raw at
+n=32: 50–92k tx/s (session 16). The 360k figure is from the
+4-validator run, and the ~2.9M figure is an extrapolation
+(sequential-sim wall time divided by n). The extrapolation is
+defensible arithmetic but is not what the gate says and is not
+evidence — it estimates a system that doesn't exist yet (parallel
+validators, optimized executor). Gate fails as written.
+
+**H2 — Partition injection doesn't exist.** The gate reads "kill
+leader, partition 1/3" (plan.md §13). Only kill-leader is
+implemented; `grep partition` in crates/devnet returns nothing.
+A partition test needs a Transport-routed runner (see H4), so it
+cannot be bolted onto the direct-call runner.
+
+**H3 — "50–100ms blocks" has zero timed evidence.** No block-time
+measurement exists anywhere in the repo; the only timing code is
+the throughput sims' wall clock. Session 16b marked this gate "met
+via pacemaker config" — that was wrong: a 2s timeout constant
+(pacemaker BASE_TIMEOUT_MS) is not block timing.
+
+**H4 — The Transport seam is unproven.** `MeshTransport` is
+referenced exactly once outside its own crate — in a comment in
+multinode.rs. No consensus message has ever flowed through the
+`ports::Transport` port. The p2p crate's 11 tests prove the mesh
+in isolation only. Related: the multi-node runner uses
+`sync_next_height` — a direct-call hack standing in for real
+height propagation via protocol messages.
+
+### MEDIUM
+
+**M1 — Journal + MMR are unintegrated.** Zero cross-references
+between journal.rs and mmr.rs. The plan's "authenticated journal"
+(one MMR leaf per record, root committing the log) does not exist
+yet — two well-tested but separate primitives.
+
+**M2 — `process_proposal` accepts everything.**
+executor/src/lib.rs (~line 215) returns `Accept` unconditionally —
+no nonce, fee, or signature validation. Documented as v0, but it
+means fault injection cannot yet test the "leader proposes an
+invalid block" scenario (only withholding).
+
+**M3 — Dual view state in the engine.** `engine.current_view` and
+`pacemaker.current_view` are two sources of truth for the same
+fact. The view-desync bug fixed in session 15 was a *symptom*;
+`Pacemaker::sync_to_view` is a patch over the design flaw.
+
+**M4 — Single-sender throughput workload.** All sim txs come from
+one sender (0x00…00) with derived nonces (`round * 1000 + i`).
+Per-sender nonce-queue behavior under realistic multi-sender load
+is untested at scale, and hash-dedup silently absorbs the nonce
+collisions this scheme produces across rounds (nonces overlap
+between rounds since txs_per_round > 1000).
+
+**M5 — Throughput sims are `#[ignore]`d and never run in CI.**
+Throughput can regress silently while CI stays green. Same for
+benchmarks: the executor/consensus hot paths have none (journal
+and MMR do).
+
+**M6 — `ConsensusConfig::OxideBft` silently falls back to
+`SequencerEngine`** in the single-node devnet path (devnet/src/
+lib.rs, ~line 104). A config named oxideBFT that doesn't run
+oxideBFT is a footgun, warning or not. The swap gate is therefore
+only proven in the Sequencer direction.
+
+### LOW
+
+**L1 — Executor takes 2+ mutex locks per tx** (executor state +
+module store `Mutex<BTreeMap>`), violating the performance-first
+no-locks discipline for the hot path. Phase 2 work, but it caps the
+1M tx/s ambition (9 production `.lock().unwrap()` sites in
+executor/src/lib.rs; journal.rs and engine.rs are clean).
+
+**L2 — The `core`-crate shadowing workaround** (storage renames the
+dev-dependency to `oxide_core`, session 16b) is inconsistent — the
+devnet crate uses `core` directly. Real fix: rename `modules/core`.
+
+**L3 — No fuzzing on journal/MMR/consensus decoders.** The codec
+crate has fuzz targets; nothing added since does.
+
+### Corrected gate verdict
+
+| Gate | Session 16b claim | Audit verdict |
+|------|-------------------|---------------|
+| 4–50 node devnet | met | ⚠️ runs, but direct-call, not transport-routed (H4) |
+| 50–100ms blocks | met | ❌ no evidence (H3) |
+| SequencerEngine swap | met | ⚠️ proven Sequencer-direction only (M6) |
+| ≥ 200k tx/s (n=32) | met | ❌ fails as written — 50–92k raw (H1) |
+| Fault injection ≤2 views | met | ⚠️ kill-leader only; partition missing (H2) |
+| Journal replay bit-exact | met | ⚠️ true, but against a mint-only state machine (C2) |
+
+Cross-cutting: none of the consensus path is authenticated (C1).
+
+### What is genuinely solid
+
+- Journal crash-tail handling (torn tail, bad CRC, multi-segment,
+  property tests) — real, well-tested engineering.
+- MMR proof/verify property tests.
+- Determinism discipline (identical runs → identical roots).
+- Gate hygiene: fmt/clippy/deny green, 214 tests, good doc
+  comments, no production unwraps in journal/engine.
+
+### Remediation priority
+
+1. **P0 — C1:** wire BLS verification into `collect_vote`,
+   `try_form_qc`, and `deliver_qc` (verify the aggregate against
+   the validator set). The safety core; nothing else matters until
+   it exists.
+2. **P0 — C2:** pass tx context (sender) through the executor into
+   `Module::handle`; debit + balance check in bank.
+3. **P1 — H4 + H2 + M3:** route the multi-node runner through
+   `MeshTransport` — one change retires three findings (seam
+   proven, partition testable, height propagation becomes real).
+4. **P1 — H1:** after C2 lands (real transfer semantics), re-run
+   the gate honestly at n=32, or amend plan.md to define the gate
+   as the extrapolation methodology with recorded numbers.
+5. **P2:** journal+MMR integration (authenticated journal),
+   throughput sims in nightly CI, executor benchmarks, rename
+   `modules/core`.
+
+Recommendation recorded: complete both P0s before starting Phase 2
+work — building on unauthenticated consensus and a mint-only bank
+means every later test inherits the flaw.
