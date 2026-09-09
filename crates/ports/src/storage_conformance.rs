@@ -29,14 +29,13 @@
 //! - **Prefix exactness**: `range(prefix)` returns exactly the keys
 //!   starting with `prefix`, no more, no less.
 //!
-//! Snapshot export/import round-trip MMR equality is tested in the
-//! storage-conformance suite's snapshot extension, which lands with
-//! the snapshot API (Phase 2, after `StorageBackend` gains
-//! `export_snapshot` / `import_snapshot`).
+//! Snapshot export/import round-trip: export a snapshot from one
+//! backend, import it into a fresh backend, and verify the state
+//! is byte-identical (plan.md §8, §2.5).
 
 use primitives::Hash;
 
-use storage::{Op, StorageBackend};
+use storage::{Op, Snapshot, StorageBackend};
 
 /// Run the full storage conformance suite against a backend produced
 /// by `make_backend`.
@@ -50,6 +49,7 @@ pub fn assert_storage_conformance<B: StorageBackend>(make_backend: impl Fn() -> 
     crash_replay_determinism(&make_backend);
     prefix_exactness(&make_backend);
     delete_idempotence(&make_backend);
+    snapshot_round_trip(&make_backend);
 }
 
 // ---- Test keys ----
@@ -193,4 +193,40 @@ fn delete_idempotence<B: StorageBackend>(make_backend: &impl Fn() -> B) {
     store.apply_batch(&[Op::Delete { key: k }]);
     let state_after_two_deletes = store.range(&[]);
     assert_eq!(state_after_one_delete, state_after_two_deletes, "double delete must be idempotent");
+}
+
+/// Snapshot export/import round-trip: export a snapshot from one
+/// backend, import it into a fresh backend, and verify the state is
+/// byte-identical (plan.md §8, §2.5).
+///
+/// This is the gate for state sync: a new node imports a snapshot to
+/// skip replaying the entire journal from genesis. The round-trip
+/// must be lossless — export → import → export must produce the same
+/// snapshot.
+fn snapshot_round_trip<B: StorageBackend>(make_backend: &impl Fn() -> B) {
+    // Populate a backend with some state.
+    let mut store = make_backend();
+    store.apply_batch(&[
+        Op::Set { key: key1(1), value: b"alpha".to_vec() },
+        Op::Set { key: key1(2), value: b"beta".to_vec() },
+        Op::Set { key: key1(3), value: b"gamma".to_vec() },
+        Op::Delete { key: key1(2) }, // delete one to test non-trivial state
+    ]);
+
+    // Export the snapshot.
+    let snapshot: Snapshot = store.snapshot_export();
+    assert_eq!(snapshot.entries.len(), 2, "snapshot must have 2 keys (1 deleted)");
+
+    // Import into a fresh backend.
+    let mut store2 = make_backend();
+    store2.snapshot_import(snapshot.clone()).expect("import must succeed");
+
+    // Verify the imported state matches the original.
+    let original_state = store.range(&[]);
+    let imported_state = store2.range(&[]);
+    assert_eq!(original_state, imported_state, "imported state must match original");
+
+    // Re-export from the imported backend and verify round-trip equality.
+    let snapshot2: Snapshot = store2.snapshot_export();
+    assert_eq!(snapshot.entries, snapshot2.entries, "round-trip must be lossless");
 }

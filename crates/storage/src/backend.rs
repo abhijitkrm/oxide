@@ -101,7 +101,72 @@ pub trait StorageBackend {
     /// Apply one atomic batch (block commit). Order within the batch is
     /// the write order; the last op for a key wins.
     fn apply_batch(&mut self, ops: &[Op]);
+
+    /// Export the entire current state as a snapshot (plan.md §8).
+    ///
+    /// A snapshot is a consistent point-in-time copy of all key-value
+    /// pairs. It's used for fast state sync: a new node imports a
+    /// snapshot to skip replaying the entire journal from genesis.
+    ///
+    /// The snapshot must be deterministic: two backends with the same
+    /// state must produce byte-identical snapshots. This is verified
+    /// by the storage-conformance suite.
+    fn snapshot_export(&self) -> Snapshot;
+
+    /// Import a snapshot, replacing all current state (plan.md §8).
+    ///
+    /// After import, the backend's state must be byte-identical to
+    /// the state that produced the snapshot. This is verified by the
+    /// storage-conformance suite (export → import → export round-trip
+    /// equality).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SnapshotError` if the snapshot is malformed or the
+    /// import fails.
+    fn snapshot_import(&mut self, snapshot: Snapshot) -> Result<(), SnapshotError>;
 }
+
+/// A point-in-time snapshot of a `StorageBackend`'s entire state
+/// (plan.md §8).
+///
+/// A snapshot is a sorted list of (key, value) pairs — the complete
+/// state at a given block height. It's used for fast state sync: a
+/// new node imports a snapshot to skip replaying the entire journal
+/// from genesis.
+///
+/// # Determinism
+///
+/// Snapshots are deterministic: two backends with the same state
+/// produce byte-identical snapshots. The pairs are sorted by key
+/// (lexicographic over the 32-byte `Hash`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The block height this snapshot was taken at.
+    pub height: u64,
+    /// The (key, value) pairs, sorted by key.
+    pub entries: Vec<(Hash, Vec<u8>)>,
+}
+
+/// A snapshot import/export error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The snapshot is malformed (e.g., unsorted keys, duplicate keys).
+    Malformed,
+    /// The backend cannot perform the operation.
+    BackendError,
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => write!(f, "malformed snapshot"),
+            Self::BackendError => write!(f, "backend error"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
 
 /// In-memory reference backend: a `BTreeMap` keyed by the full 32-byte
 /// key. O(log n) ops, deterministic ordered iteration, no
@@ -205,6 +270,32 @@ impl StorageBackend for Volatile {
                 }
             }
         }
+    }
+
+    fn snapshot_export(&self) -> Snapshot {
+        // BTreeMap iterates in sorted key order, so the snapshot
+        // entries are already sorted (deterministic).
+        let entries: Vec<(Hash, Vec<u8>)> = self.map.iter().map(|(k, v)| (*k, v.clone())).collect();
+        Snapshot { height: 0, entries }
+    }
+
+    fn snapshot_import(&mut self, snapshot: Snapshot) -> Result<(), SnapshotError> {
+        // Validate: keys must be sorted and unique.
+        let mut prev: Option<&Hash> = None;
+        for (k, _) in &snapshot.entries {
+            if let Some(p) = prev {
+                if k <= p {
+                    return Err(SnapshotError::Malformed);
+                }
+            }
+            prev = Some(k);
+        }
+        // Replace all state.
+        self.map.clear();
+        for (k, v) in snapshot.entries {
+            self.map.insert(k, v);
+        }
+        Ok(())
     }
 }
 

@@ -31,9 +31,9 @@
 
 use std::path::Path;
 
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::backend::{Caps, Op, StorageBackend};
+use crate::backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend};
 use primitives::Hash;
 
 /// The redb table definition: byte-slice keys → byte-slice values.
@@ -169,6 +169,58 @@ impl StorageBackend for RedbBackend {
             }
         }
         txn.commit().expect("redb commit");
+    }
+
+    fn snapshot_export(&self) -> Snapshot {
+        let mut entries = Vec::new();
+        let Ok(txn) = self.db.begin_read() else {
+            return Snapshot { height: 0, entries };
+        };
+        let Ok(table) = txn.open_table(TABLE) else {
+            return Snapshot { height: 0, entries };
+        };
+        // redb iterates in sorted key order, so the snapshot is
+        // deterministic.
+        if let Ok(iter) = table.iter() {
+            for item in iter {
+                let Ok((k, v)) = item else { continue };
+                let key_bytes = k.value();
+                if key_bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(key_bytes);
+                    entries.push((Hash(arr), v.value().to_vec()));
+                }
+            }
+        }
+        Snapshot { height: 0, entries }
+    }
+
+    fn snapshot_import(&mut self, snapshot: Snapshot) -> Result<(), SnapshotError> {
+        // Validate: keys must be sorted and unique.
+        let mut prev: Option<&Hash> = None;
+        for (k, _) in &snapshot.entries {
+            if let Some(p) = prev {
+                if k <= p {
+                    return Err(SnapshotError::Malformed);
+                }
+            }
+            prev = Some(k);
+        }
+        // Replace all state: clear + insert in a single transaction.
+        let txn = self.db.begin_write().map_err(|_| SnapshotError::BackendError)?;
+        {
+            let mut table = txn.open_table(TABLE).map_err(|_| SnapshotError::BackendError)?;
+            // Clear all existing keys.
+            table.retain(|_, _| false).map_err(|_| SnapshotError::BackendError)?;
+            // Insert snapshot entries.
+            for (k, v) in &snapshot.entries {
+                table
+                    .insert(k.as_bytes(), v.as_slice())
+                    .map_err(|_| SnapshotError::BackendError)?;
+            }
+        }
+        txn.commit().map_err(|_| SnapshotError::BackendError)?;
+        Ok(())
     }
 }
 
