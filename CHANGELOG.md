@@ -12,6 +12,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Consensus message fuzz target (L3 fix)** (2026-09-10)
+  - Added a fuzz target for consensus message decoding (Vote,
+    QuorumCertificate, TimeoutCertificate, BlockHeader). These
+    types cross trust boundaries and must never panic on arbitrary
+    byte input. Nightly CI now runs all 5 fuzz targets.
+
+- **Multi-sender throughput workload + nightly CI (M4, M5 fixes)** (2026-09-10)
+  - Added a multi-sender throughput test with per-sender sequential
+    nonces. Nightly CI runs all ignored throughput simulations and
+    fuzz targets.
+
+- **Proposal validation (M2 fix)** (2026-09-10)
+  - `process_proposal` now validates each tx's static structure
+    (parseable context, registered module) before accepting. A
+    malformed proposal is rejected with `Verdict::Reject`.
+
+- **oxideBFT single-node mode (M6 fix)** (2026-09-10)
+  - `ConsensusConfig::OxideBft` no longer silently falls back to
+    `SequencerEngine`. The single-node devnet runs a real `OxideBft`
+    engine with a single-validator set (quorum=1, real BLS keys).
+
+- **Block-timing measurement (H3 fix)** (2026-09-10)
+  - Added `block_timing_4_validators` test measuring per-block
+    wall-clock time: 9.26ms/block (release mode, no network delay).
+
 - **Bank module: sender debit + balance check (C2 fix)** (2026-09-10)
   - The bank module now debits the sender and credits the recipient
     on transfers. A sender with insufficient balance is rejected.
