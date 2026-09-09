@@ -75,6 +75,9 @@ redb = "4.2.0"
 # RocksDB is Apache-2.0 (GPL-3.0-compatible), the industry-standard
 # LSM KV store. C++ binding via the official `rocksdb` crate.
 rocksdb = "0.24.0"
+# libmdbx is MPL-2.0 (GPL-3.0-compatible), the idiomatic Rust
+# wrapper for MDBX (LMDB-compatible, improved). C binding.
+libmdbx = "0.6.6"
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable

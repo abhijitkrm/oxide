@@ -47,6 +47,9 @@ pub mod redb_backend;
 #[cfg(feature = "rocksdb")]
 pub mod rocksdb_backend;
 
+#[cfg(feature = "mdbx")]
+pub mod mdbx_backend;
+
 pub use auth_journal::{AuthenticatedJournal, AuthenticatedReplay, replay_verified};
 pub use backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend, Volatile};
 pub use journal::{JournalConfig, JournalWriter, Location, Replay, ReplayRecord, replay};
@@ -57,3 +60,6 @@ pub use redb_backend::RedbBackend;
 
 #[cfg(feature = "rocksdb")]
 pub use rocksdb_backend::RocksDbBackend;
+
+#[cfg(feature = "mdbx")]
+pub use mdbx_backend::MdbxBackend;

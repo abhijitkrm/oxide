@@ -29,6 +29,10 @@ redb = { workspace = true, optional = true }
 # adapter). Optional, behind the "rocksdb" feature. Apache-2.0
 # (GPL-3.0-compatible). C++ binding — requires a C++ compiler.
 rocksdb = { workspace = true, optional = true }
+# libmdbx: idiomatic Rust wrapper for MDBX (LMDB-compatible,
+# improved). Optional, behind the "mdbx" feature. MPL-2.0
+# (GPL-3.0-compatible). C binding.
+libmdbx = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -36,6 +40,8 @@ default = []
 redb = ["dep:redb"]
 # Enable the RocksDB StorageBackend adapter.
 rocksdb = ["dep:rocksdb"]
+# Enable the MDBX StorageBackend adapter.
+mdbx = ["dep:libmdbx"]
 
 [dev-dependencies]
 criterion = "0.7.0"
