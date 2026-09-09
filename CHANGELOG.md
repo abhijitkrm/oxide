@@ -12,6 +12,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Speculative parallel EVM execution** (2026-01-25)
+  - **`EvmModule::handle_batch_parallel`**: new batch execution
+    path that parallelizes EVM execution across sender groups.
+    Transactions from different senders execute in parallel on
+    isolated `CacheDB` clones; same-sender txs execute sequentially
+    (nonce dependency). Conflict detection via actual `EvmState`
+    touched-account sets (not heuristic). Conflicting groups are
+    re-executed sequentially against the main DB. Coinbase tips
+    are handled additively to avoid false conflicts. Single-sender
+    batches fall back to `handle_batch` to avoid clone overhead.
+  - **9 correctness tests**: serial/speculative state-root
+    equality for conflict-free, conflict, multi-nonce,
+    single-sender, empty, invalid-tx, and determinism cases.
+  - **3 benchmarks**: `batch_parallel_multi_sender` (conflict-free
+    100-sender workload), `batch_parallel_conflict` (same-recipient
+    conflict workload), comparison against existing `batch_parallel`
+    serial baseline.
+  - **In plain words**: the EVM can now execute transactions from
+    different senders in parallel, with automatic fallback to
+    sequential execution when transactions conflict. The current
+    implementation is correct but not yet faster than serial
+    execution because cloning the in-memory state per sender group
+    is expensive. The next optimization (copy-on-write nested
+    caches) will reduce this cost from O(state) to O(touched).
+
 - **Phase B: Ethereum-compatible MPT state root** (2026-01-24)
   - **B1 — Trie integration**: added `modules/evm/src/trie.rs`
     wrapping `alloy-trie` (0.9.5). Provides `state_root()`,

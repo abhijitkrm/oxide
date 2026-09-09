@@ -3904,3 +3904,113 @@ phase itself:
 
 These are future work — the current 128,000 tx/s is a solid
 foundation for an L1 blockchain.
+
+## Session N: Speculative parallel EVM execution
+
+### Goal
+
+Parallelize the EVM execution phase itself, not just signature
+recovery. The previous session established that signature recovery
+is ~88% of per-tx cost and is already parallelized, leaving sequential
+EVM execution (~4 µs/tx) as the remaining bottleneck. The goal was
+to execute transactions from different senders in parallel on
+isolated state snapshots, then commit in canonical order with
+conflict detection.
+
+### Design
+
+The algorithm (`EvmModule::handle_batch_parallel`):
+
+1. **Parallel decode + recovery** (same as `handle_batch`).
+2. **Group by sender** — same-sender txs have nonce dependencies
+   and must execute sequentially. Different senders are
+   independent.
+3. **Clone the main CacheDB per group** — each group gets its own
+   isolated `CacheDB<EmptyDB>` snapshot. Txs within a group execute
+   sequentially via `transact` (non-commit) + manual `commit` to
+   the clone, accumulating the `EvmState` diff.
+4. **Parallel execution** — groups execute in parallel via rayon.
+5. **Conflict detection** — groups are committed in canonical
+   order (by first tx appearance). If a group's touched accounts
+   (excluding coinbase) overlap with a previously committed group,
+   the group is re-executed sequentially against the main DB.
+6. **Coinbase handling** — the coinbase is touched by every tx
+   (receives tips). Tips are strictly additive, so the coinbase
+   balance delta is computed per-group and applied once at the
+   end. This avoids treating the coinbase as a conflict source.
+7. **Single-sender fallback** — if there's only one group, fall
+   back to `handle_batch` to avoid clone overhead.
+
+### Key correctness insights
+
+1. **Coinbase double-counting bug**: The first implementation
+   committed the full `EvmState` (including coinbase) AND applied
+   the `coinbase_delta`. This double-counted tips. Fix: remove
+   coinbase from the state before committing, apply only the
+   delta.
+
+2. **Coinbase state root mismatch**: The manual coinbase account
+   creation used `code_hash = B256::ZERO` and
+   `account_state = None`, but revm's `commit_account` uses
+   `KECCAK_EMPTY` and `Touched`. This produced a different state
+   root. Fix: match revm's exact field values.
+
+3. **Conflict re-execution coinbase**: When a group is
+   re-executed sequentially via `transact_commit`, the coinbase
+   is already updated by revm. Adding the `coinbase_delta` for
+   conflicting groups would double-count. Fix: only accumulate
+   `coinbase_delta` for non-conflicting groups.
+
+### Safety: why sender grouping alone is not sufficient
+
+Two different senders can touch the same account (e.g., both
+transfer to the same recipient, or both call the same contract).
+The implementation uses the `EvmState` keys (the actual touched
+accounts from revm execution) for conflict detection — not a
+heuristic based on caller/recipient/coinbase. This is the correct
+approach: the access set comes from actual execution, not from a
+static analysis that could miss indirect calls, storage reads,
+or contract-created accounts.
+
+### Benchmark results (honest)
+
+Measured with criterion, 10 samples, 2s measurement time, on
+this machine:
+
+| Workload | 10k txs time | TPS |
+|---|---|---|
+| `batch_parallel` (1 sender, serial exec) | 91 ms | 110k |
+| `batch_parallel_multi_sender` (100 senders) | 128 ms | 78k |
+| `batch_parallel_conflict` (100 senders, same recipient) | 140 ms | 71k |
+
+**The parallel speculative path is currently SLOWER than the
+serial path.** The bottleneck is the `CacheDB::clone()` per group
+— with 100 senders, we clone the entire in-memory state 100 times.
+The clone cost dominates the parallelism gain.
+
+### Why this is still valuable
+
+1. **Correctness infrastructure**: The conflict detection,
+   re-execution fallback, and coinbase handling are all correct
+   and tested. These are the hard parts — the performance
+   optimization is mechanical.
+2. **Path to COW**: The next step is to replace `CacheDB::clone()`
+   with `CacheDB::nest()` (revm's nested database composition),
+   which creates a copy-on-write child that shares the parent's
+   state. This reduces the per-group cost from O(state) to
+   O(touched).
+3. **Test coverage**: 9 new tests prove serial/speculative
+   equivalence for conflict-free, conflict, multi-nonce,
+   single-sender, empty, invalid, and determinism cases.
+
+### Next steps
+
+1. **Replace `CacheDB::clone()` with `CacheDB::nest()`** — this
+   is the key optimization. A nested cache shares the parent's
+   accounts/contracts/storage and only records deltas. Per-group
+   cost drops from O(state) to O(touched).
+2. **Per-storage-slot conflict detection** — currently, any
+   shared touched account triggers re-execution. Finer-grained
+   detection (per-storage-slot) would reduce false conflicts.
+3. **Pipeline recovery and execution** — start executing early
+   groups while later groups are still being recovered.

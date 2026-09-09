@@ -77,11 +77,12 @@ pub mod tx;
 use revm::Context;
 use revm::context::TxEnv;
 use revm::database::CacheDB;
-use revm::database_interface::EmptyDB;
-use revm::handler::{ExecuteCommitEvm, MainBuilder, MainContext};
+use revm::database_interface::{DatabaseCommit, EmptyDB};
+use revm::handler::{ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 use revm::inspector::NoOpInspector;
 use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
+use revm::state::EvmState;
 
 /// The EVM module's dispatch ID in the module router.
 ///
@@ -564,6 +565,498 @@ impl EvmModule {
 
         results
     }
+
+    /// Execute a batch of signed EVM transactions with **parallel
+    /// speculative execution**.
+    ///
+    /// This is the highest-throughput execution path. It extends
+    /// [`handle_batch`](Self::handle_batch) by parallelizing not only
+    /// signature recovery but also EVM execution itself, using
+    /// per-sender-group state snapshots.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. **Parallel decode + recovery**: All senders are recovered in
+    ///    parallel (same as `handle_batch`).
+    /// 2. **Sender grouping**: Transactions are grouped by sender.
+    ///    Within a group, transactions execute sequentially (nonce
+    ///    dependency). Across groups, transactions are independent
+    ///    (different senders).
+    /// 3. **Parallel execution**: Each group executes on its own clone
+    ///    of the main `CacheDB`. Groups execute in parallel via `rayon`.
+    ///    Each transaction uses `transact` (non-commit) to obtain the
+    ///    `EvmState` diff, then commits it to the group's local clone so
+    ///    the next transaction in the group sees the updated state.
+    /// 4. **Conflict detection**: After parallel execution, groups are
+    ///    committed in canonical order (by minimum original tx index).
+    ///    If a group's touched accounts overlap with a previously
+    ///    committed group — **excluding the coinbase**, which is handled
+    ///    additively — the group is re-executed sequentially against the
+    ///    main DB. This preserves Ethereum semantics: any read-write
+    ///    conflict between groups falls back to the serial path.
+    /// 5. **Coinbase handling**: The coinbase (fee recipient) is touched
+    ///    by every transaction. Each group's tip contribution is
+    ///    computed as a balance delta and applied additively to the main
+    ///    DB's coinbase. This is correct because tips are strictly
+    ///    additive (the coinbase only receives balance, never spends).
+    ///
+    /// # When to use this vs `handle_batch`
+    ///
+    /// Use `handle_batch_parallel` when the batch contains
+    /// transactions from **multiple senders** (the common case in a
+    /// real blockchain). When all transactions share a single sender,
+    /// this method degrades to sequential execution (one group) plus
+    /// the overhead of cloning the DB — `handle_batch` is faster in
+    /// that case.
+    ///
+    /// # Limitations
+    ///
+    /// - Clones the entire `CacheDB` per group. For large state (many
+    ///   accounts), the clone cost may dominate. A future optimization
+    ///   will use copy-on-write or account-level snapshots.
+    /// - Conflict detection is conservative: any shared touched
+    ///   account (excluding coinbase) triggers sequential
+    ///   re-execution of the later group. Finer-grained conflict
+    ///   detection (per-storage-slot) is future work.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: the transaction context (unused for EVM — the sender
+    ///   is recovered from the signature).
+    /// - `msgs`: a slice of raw RLP-encoded signed transactions.
+    ///
+    /// # Returns
+    ///
+    /// A vector of results, one per input transaction. Each result is
+    /// either a vector of events (success) or an `ExecError` (failure).
+    ///
+    /// # Errors
+    ///
+    /// Individual transactions may fail independently. A failed
+    /// transaction does not abort the batch — subsequent transactions
+    /// are still executed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `DB`, `coinbase`, `block_height`,
+    /// `block_timestamp`, or touched mutex is poisoned (a previous
+    /// thread panicked while holding the lock).
+    #[allow(clippy::too_many_lines)]
+    pub fn handle_batch_parallel(
+        &self,
+        ctx: &TxContext,
+        msgs: &[Vec<u8>],
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
+        // Fast path: empty batch.
+        if msgs.is_empty() {
+            return Vec::new();
+        }
+
+        // Phase 1: decode + recover all senders in parallel.
+        // Same as handle_batch — rayon parallelizes the 88%-of-cost
+        // secp256k1 recovery across cores.
+        let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = msgs
+            .par_iter()
+            .map(|raw| {
+                let mut buf = raw.as_slice();
+                let signed: tx::SignedTx =
+                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                if signed.chain_id() != self.chain_id {
+                    return Err(ExecError::Malformed);
+                }
+                let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+                let caller = alloy_primitives_address(sender.0);
+                Ok((signed, caller))
+            })
+            .collect();
+
+        // Phase 2: group txs by sender, preserving original order
+        // within each group. Txs from the same sender must execute
+        // sequentially (nonce dependency). Txs from different senders
+        // can execute in parallel.
+        //
+        // We use an insertion-ordered map so that groups are naturally
+        // ordered by first appearance (canonical order).
+        let mut groups: std::collections::HashMap<
+            revm::primitives::Address,
+            Vec<(usize, tx::SignedTx)>,
+        > = std::collections::HashMap::new();
+        let mut group_order: Vec<revm::primitives::Address> = Vec::new();
+        let mut errors: Vec<Option<ExecError>> = vec![None; msgs.len()];
+
+        for (idx, item) in decoded.into_iter().enumerate() {
+            match item {
+                Ok((signed, caller)) => {
+                    use std::collections::hash_map::Entry;
+                    match groups.entry(caller) {
+                        Entry::Occupied(_) => {
+                            groups.get_mut(&caller).expect("group exists").push((idx, signed));
+                        }
+                        Entry::Vacant(v) => {
+                            group_order.push(caller);
+                            v.insert(Vec::from([(idx, signed)]));
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors[idx] = Some(e);
+                }
+            }
+        }
+
+        // Fast path: single group (all txs from one sender). Fall back
+        // to handle_batch to avoid the clone overhead — there's no
+        // parallelism to gain with one group.
+        if group_order.len() <= 1 {
+            return self.handle_batch(ctx, msgs);
+        }
+
+        // Phase 3: snapshot the main DB. Each group will clone this
+        // snapshot for its own isolated execution.
+        //
+        // Limitation: for large state, this clone is O(state) per
+        // group. A future COW/nested-cache optimization will reduce
+        // this to O(touched) per group.
+        let snapshot = {
+            let db = self.db.lock().expect("db mutex not poisoned");
+            db.clone()
+        };
+        let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
+        let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
+        let block_timestamp =
+            *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned");
+
+        // Phase 4: execute each group in parallel on its own clone.
+        // Each group's txs execute sequentially (transact + commit to
+        // clone), accumulating the group's EvmState diff.
+        let group_results: Vec<GroupExecResult> = group_order
+            .par_iter()
+            .map(|sender| {
+                let txs = groups.get(sender).expect("group exists");
+                let mut db = snapshot.clone();
+                let mut accumulated_state: EvmState = EvmState::default();
+                let mut tx_results: Vec<(
+                    usize,
+                    Result<revm::context::result::ExecutionResult, ExecError>,
+                )> = Vec::with_capacity(txs.len());
+
+                for (idx, signed) in txs {
+                    let caller = *sender;
+                    let tx_env = match Self::build_tx_env(signed, caller) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tx_results.push((*idx, Err(e)));
+                            continue;
+                        }
+                    };
+
+                    // Execute with `transact` (non-commit) to obtain
+                    // the EvmState diff. Then commit to the clone so
+                    // the next tx sees the updated state.
+                    let exec_result = {
+                        let mut evm = Context::mainnet()
+                            .with_db(&mut db)
+                            .modify_cfg_chained(|cfg| {
+                                cfg.set_spec_and_mainnet_gas_params(self.spec);
+                            })
+                            .modify_block_chained(|block| {
+                                block.number = revm::primitives::U256::from(block_number);
+                                block.beneficiary = coinbase;
+                                block.timestamp = revm::primitives::U256::from(block_timestamp);
+                                block.gas_limit = self.block_gas_limit;
+                                block.basefee = self.base_fee;
+                            })
+                            .build_mainnet_with_inspector(NoOpInspector);
+                        evm.transact(tx_env)
+                    };
+
+                    match exec_result {
+                        Ok(result_and_state) => {
+                            let revm::context_interface::result::ExecResultAndState {
+                                result,
+                                state,
+                            } = result_and_state;
+                            // Commit to the clone so the next tx sees
+                            // the updated state.
+                            db.commit(state.clone());
+                            // Accumulate state: later txs overwrite
+                            // earlier txs for the same account.
+                            for (addr, account) in state {
+                                accumulated_state.insert(addr, account);
+                            }
+                            tx_results.push((*idx, Ok(result)));
+                        }
+                        Err(e) => {
+                            tx_results.push((
+                                *idx,
+                                Err(ExecError::ModuleRejected(format!(
+                                    "evm transact failed: {e:?}"
+                                ))),
+                            ));
+                        }
+                    }
+                }
+
+                // Compute the coinbase balance delta for this group.
+                // The clone's coinbase balance = snapshot's coinbase
+                // balance + tips received by this group. The delta is
+                // strictly additive (the coinbase only receives tips).
+                let coinbase_after = db
+                    .cache
+                    .accounts
+                    .get(&coinbase)
+                    .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
+                let coinbase_before = snapshot
+                    .cache
+                    .accounts
+                    .get(&coinbase)
+                    .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
+                let coinbase_delta = coinbase_after - coinbase_before;
+
+                GroupExecResult { sender: *sender, tx_results, accumulated_state, coinbase_delta }
+            })
+            .collect();
+
+        // Phase 5: commit groups in canonical order with conflict
+        // detection. Groups are already ordered by first appearance
+        // (group_order), which matches canonical tx order.
+        //
+        // We maintain a set of accounts touched by previously
+        // committed groups. If a new group touches any of those
+        // accounts (excluding the coinbase, which is handled
+        // additively), we re-execute the group sequentially against
+        // the main DB to preserve Ethereum semantics.
+        let mut db = self.db.lock().expect("db mutex not poisoned");
+        let mut committed_touched: std::collections::HashSet<revm::primitives::Address> =
+            std::collections::HashSet::new();
+        let mut total_coinbase_delta = revm::primitives::U256::ZERO;
+        let mut all_touched: std::collections::HashSet<revm::primitives::Address> =
+            std::collections::HashSet::new();
+        // Results from sequential re-execution of conflicting groups.
+        // Keyed by original tx index. Takes precedence over the
+        // speculative results in `group_results`.
+        let mut reexec_results: std::collections::HashMap<
+            usize,
+            Result<revm::context::result::ExecutionResult, ExecError>,
+        > = std::collections::HashMap::new();
+
+        for gr in &group_results {
+            // Touched accounts for this group, excluding coinbase.
+            let group_touched: std::collections::HashSet<revm::primitives::Address> =
+                gr.accumulated_state.keys().filter(|addr| **addr != coinbase).copied().collect();
+
+            let has_conflict = group_touched.iter().any(|addr| committed_touched.contains(addr));
+
+            if has_conflict {
+                // Conflict: re-execute this group's txs sequentially
+                // against the main DB. The speculative execution
+                // assumed stale state for the conflicting account.
+                for (idx, signed) in groups.get(&gr.sender).expect("group exists") {
+                    let caller = gr.sender;
+                    let tx_env = match Self::build_tx_env(signed, caller) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            reexec_results.insert(*idx, Err(e));
+                            continue;
+                        }
+                    };
+                    let result = {
+                        let mut evm = Context::mainnet()
+                            .with_db(&mut *db)
+                            .modify_cfg_chained(|cfg| {
+                                cfg.set_spec_and_mainnet_gas_params(self.spec);
+                            })
+                            .modify_block_chained(|block| {
+                                block.number = revm::primitives::U256::from(block_number);
+                                block.beneficiary = coinbase;
+                                block.timestamp = revm::primitives::U256::from(block_timestamp);
+                                block.gas_limit = self.block_gas_limit;
+                                block.basefee = self.base_fee;
+                            })
+                            .build_mainnet_with_inspector(NoOpInspector);
+                        evm.transact_commit(tx_env)
+                    };
+                    match result {
+                        Ok(r) => {
+                            all_touched.insert(caller);
+                            if let tx::TxKind::Call(addr) = signed.to() {
+                                all_touched.insert(revm::primitives::Address::from(addr.0));
+                            }
+                            if let Some(created) = r.created_address() {
+                                all_touched.insert(created);
+                            }
+                            committed_touched.insert(caller);
+                            if let tx::TxKind::Call(addr) = signed.to() {
+                                committed_touched.insert(revm::primitives::Address::from(addr.0));
+                            }
+                            if let Some(created) = r.created_address() {
+                                committed_touched.insert(created);
+                            }
+                            reexec_results.insert(*idx, Ok(r));
+                        }
+                        Err(e) => {
+                            reexec_results.insert(
+                                *idx,
+                                Err(ExecError::ModuleRejected(format!(
+                                    "evm transact failed: {e:?}"
+                                ))),
+                            );
+                        }
+                    }
+                }
+            } else {
+                // No conflict: commit the group's accumulated state
+                // directly. Correct because no other group touched
+                // these accounts.
+                //
+                // Exclude the coinbase from the commit — it is
+                // handled additively via `coinbase_delta` at the
+                // end. Including it here would double-count the
+                // tips (once from the state commit, once from the
+                // delta).
+                let mut state_to_commit = gr.accumulated_state.clone();
+                state_to_commit.remove(&coinbase);
+                db.commit(state_to_commit);
+                committed_touched.extend(group_touched.iter().copied());
+                all_touched.extend(group_touched.iter().copied());
+
+                // Coinbase delta is only added for non-conflicting
+                // groups. For conflicting groups, the sequential
+                // re-execution via `transact_commit` already pays
+                // tips to the coinbase — adding the delta here would
+                // double-count.
+                total_coinbase_delta += gr.coinbase_delta;
+            }
+        }
+
+        // Apply the total coinbase balance delta.
+        if total_coinbase_delta != revm::primitives::U256::ZERO {
+            let coinbase_account =
+                db.cache.accounts.entry(coinbase).or_insert_with(|| revm::database::DbAccount {
+                    info: revm::database::state::AccountInfo {
+                        balance: revm::primitives::U256::ZERO,
+                        nonce: 0,
+                        // `KECCAK_EMPTY` matches what revm's
+                        // `insert_contract` sets for an empty-code
+                        // account. Using `B256::ZERO` here would
+                        // produce a different state root from the
+                        // serial path.
+                        code_hash: revm::primitives::KECCAK_EMPTY,
+                        account_id: None,
+                        code: Some(revm::bytecode::Bytecode::new_raw(
+                            revm::primitives::Bytes::new(),
+                        )),
+                    },
+                    // `Touched` matches what revm's `commit_account`
+                    // sets for a modified account.
+                    account_state: revm::database::AccountState::Touched,
+                    storage: revm::primitives::HashMap::default(),
+                });
+            coinbase_account.info.balance += total_coinbase_delta;
+            all_touched.insert(coinbase);
+        }
+
+        // Merge touched accounts into the module-level set.
+        {
+            let mut touched = self.touched.lock().expect("touched mutex not poisoned");
+            touched.extend(all_touched);
+        }
+
+        // Phase 6: assemble results in original order.
+        // Re-executed results (from conflict fallback) take
+        // precedence over speculative results.
+        //
+        // Build a flat index map from tx index -> speculative
+        // result, so we can look up results in O(1) instead of
+        // O(groups * txs).
+        let mut spec_index: std::collections::HashMap<
+            usize,
+            &Result<revm::context::result::ExecutionResult, ExecError>,
+        > = std::collections::HashMap::with_capacity(msgs.len());
+        for gr in &group_results {
+            for (idx, result) in &gr.tx_results {
+                spec_index.insert(*idx, result);
+            }
+        }
+
+        let mut results: Vec<Result<Vec<Event>, ExecError>> = Vec::with_capacity(msgs.len());
+        for (i, err) in errors.iter().enumerate() {
+            if let Some(e) = err {
+                results.push(Err(e.clone()));
+                continue;
+            }
+            // Check re-executed results first (conflict fallback).
+            if let Some(r) = reexec_results.remove(&i) {
+                results.push(Self::exec_result_to_events(r, self.base_fee));
+                continue;
+            }
+            // Fall back to speculative results.
+            match spec_index.get(&i) {
+                Some(result) => {
+                    results.push(Self::exec_result_to_events((*result).clone(), self.base_fee));
+                }
+                None => {
+                    results.push(Err(ExecError::ModuleRejected(
+                        "parallel execution: missing result".to_string(),
+                    )));
+                }
+            }
+        }
+
+        // Silence unused-ctx warning — ctx is part of the Module
+        // interface but EVM recovers the sender from the signature.
+        let _ = ctx;
+
+        results
+    }
+
+    /// Convert a revm `ExecutionResult` to a vector of Oxide events.
+    ///
+    /// Shared between `handle_batch` and `handle_batch_parallel` to
+    /// ensure identical event formatting.
+    fn exec_result_to_events(
+        result: Result<revm::context::result::ExecutionResult, ExecError>,
+        base_fee: u64,
+    ) -> Result<Vec<Event>, ExecError> {
+        match result {
+            Ok(r) => {
+                let receipt = receipts::Receipt::from_execution_result(&r);
+                let status_str = if receipt.status { "success" } else { "revert" };
+                let contract_info =
+                    receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
+                let log_count = receipt.logs.len();
+                Ok(vec![Event {
+                    module: "evm",
+                    kind: "evm_call".to_string(),
+                    data: format!(
+                        "gas_used={} status={} base_fee={} logs={}{}",
+                        receipt.gas_used, status_str, base_fee, log_count, contract_info
+                    )
+                    .into_bytes(),
+                }])
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The result of executing a single sender group in parallel.
+///
+/// Each group executes on its own clone of the main `CacheDB`. The
+/// `accumulated_state` is the union of all `EvmState` diffs from the
+/// group's transactions — the final state of every account touched by
+/// the group. The `coinbase_delta` is the group's tip contribution
+/// (additive, applied once at the end).
+struct GroupExecResult {
+    /// The sender address for this group.
+    sender: revm::primitives::Address,
+    /// Per-tx results, indexed by original position in the batch.
+    tx_results: Vec<(usize, Result<revm::context::result::ExecutionResult, ExecError>)>,
+    /// Accumulated state diff for the group (final state of all
+    /// touched accounts).
+    accumulated_state: EvmState,
+    /// The coinbase balance delta for this group (tips received).
+    coinbase_delta: revm::primitives::U256,
 }
 
 impl Module for EvmModule {
@@ -1440,5 +1933,299 @@ mod tests {
         assert!(results[0].is_ok(), "valid tx must succeed");
         assert!(results[1].is_err(), "invalid tx must fail");
         assert_eq!(m.nonce(&sender), 1, "only the valid tx incremented nonce");
+    }
+
+    // ── Parallel speculative execution tests ──────────────────────
+
+    /// Build a signed transfer tx (test helper for parallel tests).
+    fn signed_transfer_tx(
+        privkey: &[u8],
+        nonce: u64,
+        to: revm::primitives::Address,
+        value: u128,
+    ) -> Vec<u8> {
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                to: tx::TxKind::Call(to),
+                value: U256::from(value),
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        tx::SignedTx::sign_legacy(tx, privkey).expect("sign").encode_to_bytes()
+    }
+
+    /// Parallel execution with multiple senders, distinct
+    /// recipients — the conflict-free fast path. State and nonces
+    /// must match serial execution.
+    #[test]
+    fn handle_batch_parallel_multi_sender_distinct_recipients() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let m = make_module();
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        let recipient_a = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let recipient_b = revm::primitives::Address::from_slice(&[0x43; 20]);
+
+        // Sender A -> recipient A (nonce 0)
+        // Sender B -> recipient B (nonce 0)
+        let txs = vec![
+            signed_transfer_tx(&pk_a, 0, recipient_a, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 0, recipient_b, 1_000_000_000),
+        ];
+
+        let results = m.handle_batch_parallel(&dummy_ctx(), &txs);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok(), "tx 0 must succeed");
+        assert!(results[1].is_ok(), "tx 1 must succeed");
+        assert_eq!(m.nonce(&addr_a), 1, "sender A nonce must be 1");
+        assert_eq!(m.nonce(&addr_b), 1, "sender B nonce must be 1");
+        let oxide_recipient_a = primitives::Address(recipient_a.0.into());
+        let oxide_recipient_b = primitives::Address(recipient_b.0.into());
+        assert_eq!(m.balance(&oxide_recipient_a), 1_000_000_000, "recipient A balance");
+        assert_eq!(m.balance(&oxide_recipient_b), 1_000_000_000, "recipient B balance");
+    }
+
+    /// Parallel execution must produce the same state root as serial
+    /// execution for the same multi-sender workload.
+    #[test]
+    fn handle_batch_parallel_matches_serial_state_root() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let recipient_a = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let recipient_b = revm::primitives::Address::from_slice(&[0x43; 20]);
+
+        // Serial module.
+        let m_serial = make_module();
+        fund(&m_serial, &addr_a);
+        fund(&m_serial, &addr_b);
+        let txs = vec![
+            signed_transfer_tx(&pk_a, 0, recipient_a, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 0, recipient_b, 1_000_000_000),
+        ];
+        m_serial.begin_block(Height::new(1));
+        for raw in &txs {
+            m_serial.handle(&dummy_ctx(), raw).expect("serial tx must succeed");
+        }
+        m_serial.end_block(Height::new(1));
+        let serial_root = m_serial.state_root();
+
+        // Parallel module.
+        let m_par = make_module();
+        fund(&m_par, &addr_a);
+        fund(&m_par, &addr_b);
+        m_par.begin_block(Height::new(1));
+        let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+        m_par.end_block(Height::new(1));
+        let parallel_root = m_par.state_root();
+
+        assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+        assert_eq!(serial_root, parallel_root, "state roots must match");
+    }
+
+    /// Parallel execution with conflicting recipients (two senders
+    /// transfer to the same recipient). The conflict must be detected
+    /// and the second group re-executed sequentially. The final
+    /// recipient balance must be the sum of both transfers.
+    #[test]
+    fn handle_batch_parallel_conflict_same_recipient() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let m = make_module();
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        let shared_recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        // Both senders transfer to the SAME recipient -> conflict.
+        let txs = vec![
+            signed_transfer_tx(&pk_a, 0, shared_recipient, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 0, shared_recipient, 2_000_000_000),
+        ];
+
+        let results = m.handle_batch_parallel(&dummy_ctx(), &txs);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok(), "tx 0 must succeed");
+        assert!(results[1].is_ok(), "tx 1 must succeed");
+        let oxide_recipient = primitives::Address(shared_recipient.0.into());
+        assert_eq!(
+            m.balance(&oxide_recipient),
+            3_000_000_000,
+            "recipient must have sum of both transfers"
+        );
+    }
+
+    /// Parallel execution with conflicting recipients must produce the
+    /// same state root as serial execution.
+    #[test]
+    fn handle_batch_parallel_conflict_matches_serial_state_root() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let shared_recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let txs = vec![
+            signed_transfer_tx(&pk_a, 0, shared_recipient, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 0, shared_recipient, 2_000_000_000),
+        ];
+
+        // Serial.
+        let m_serial = make_module();
+        fund(&m_serial, &addr_a);
+        fund(&m_serial, &addr_b);
+        m_serial.begin_block(Height::new(1));
+        for raw in &txs {
+            m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+        }
+        m_serial.end_block(Height::new(1));
+        let serial_root = m_serial.state_root();
+
+        // Parallel.
+        let m_par = make_module();
+        fund(&m_par, &addr_a);
+        fund(&m_par, &addr_b);
+        m_par.begin_block(Height::new(1));
+        let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+        m_par.end_block(Height::new(1));
+        let parallel_root = m_par.state_root();
+
+        assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+        assert_eq!(serial_root, parallel_root, "conflict state roots must match");
+    }
+
+    /// Parallel execution with multiple nonces per sender. Each
+    /// sender's txs must execute in nonce order within the group.
+    #[test]
+    fn handle_batch_parallel_multi_nonce_per_sender() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let m = make_module();
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        let recipient_a = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let recipient_b = revm::primitives::Address::from_slice(&[0x43; 20]);
+
+        // Sender A: 3 txs (nonces 0, 1, 2)
+        // Sender B: 2 txs (nonces 0, 1)
+        let txs = vec![
+            signed_transfer_tx(&pk_a, 0, recipient_a, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 0, recipient_b, 1_000_000_000),
+            signed_transfer_tx(&pk_a, 1, recipient_a, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 1, recipient_b, 1_000_000_000),
+            signed_transfer_tx(&pk_a, 2, recipient_a, 1_000_000_000),
+        ];
+
+        let results = m.handle_batch_parallel(&dummy_ctx(), &txs);
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(std::result::Result::is_ok), "all txs must succeed");
+        assert_eq!(m.nonce(&addr_a), 3, "sender A nonce must be 3");
+        assert_eq!(m.nonce(&addr_b), 2, "sender B nonce must be 2");
+        let oxide_recipient_a = primitives::Address(recipient_a.0.into());
+        assert_eq!(m.balance(&oxide_recipient_a), 3_000_000_000, "recipient A balance");
+        let oxide_recipient_b = primitives::Address(recipient_b.0.into());
+        assert_eq!(m.balance(&oxide_recipient_b), 2_000_000_000, "recipient B balance");
+    }
+
+    /// Parallel execution with a single sender falls back to
+    /// `handle_batch` (no parallelism, but must be correct).
+    #[test]
+    fn handle_batch_parallel_single_sender_fallback() {
+        let (pk, addr) = test_keypair();
+        let m = make_module();
+        fund(&m, &addr);
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let txs: Vec<Vec<u8>> =
+            (0..5).map(|i| signed_transfer_tx(&pk, i, recipient, 1_000_000_000)).collect();
+
+        let results = m.handle_batch_parallel(&dummy_ctx(), &txs);
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(std::result::Result::is_ok), "all txs must succeed");
+        assert_eq!(m.nonce(&addr), 5, "nonce must be 5");
+        let oxide_recipient = primitives::Address(recipient.0.into());
+        assert_eq!(m.balance(&oxide_recipient), 5_000_000_000, "recipient balance");
+    }
+
+    /// Parallel execution with empty batch returns empty results.
+    #[test]
+    fn handle_batch_parallel_empty_batch() {
+        let m = make_module();
+        let results = m.handle_batch_parallel(&dummy_ctx(), &[]);
+        assert!(results.is_empty());
+    }
+
+    /// Parallel execution with invalid txs mixed in. Invalid txs
+    /// must not affect valid txs.
+    #[test]
+    fn handle_batch_parallel_skips_invalid_txs() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let m = make_module();
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let valid_a = signed_transfer_tx(&pk_a, 0, recipient, 1_000_000_000);
+        let valid_b = signed_transfer_tx(&pk_b, 0, recipient, 1_000_000_000);
+
+        // Invalid tx: wrong chain ID.
+        let invalid_tx = {
+            let tx = tx::TxLegacy {
+                fields: tx::TxFields {
+                    nonce: 0,
+                    gas_limit: DEFAULT_GAS_LIMIT,
+                    to: tx::TxKind::Call(recipient),
+                    value: U256::from(1_000_000_000),
+                    data: revm::primitives::Bytes::new(),
+                    chain_id: 999,
+                },
+                gas_price: U256::from(1_000_000_000),
+            };
+            tx::SignedTx::sign_legacy(tx, &pk_a).expect("sign").encode_to_bytes()
+        };
+
+        let txs = vec![valid_a, invalid_tx, valid_b];
+        let results = m.handle_batch_parallel(&dummy_ctx(), &txs);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok(), "valid tx 0 must succeed");
+        assert!(results[1].is_err(), "invalid tx must fail");
+        assert!(results[2].is_ok(), "valid tx 2 must succeed");
+    }
+
+    /// Parallel execution determinism: running the same batch twice
+    /// must produce the same state root.
+    #[test]
+    fn handle_batch_parallel_deterministic_state_root() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let recipient_a = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let recipient_b = revm::primitives::Address::from_slice(&[0x43; 20]);
+
+        let txs = vec![
+            signed_transfer_tx(&pk_a, 0, recipient_a, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 0, recipient_b, 1_000_000_000),
+        ];
+
+        // Run 1.
+        let m1 = make_module();
+        fund(&m1, &addr_a);
+        fund(&m1, &addr_b);
+        m1.begin_block(Height::new(1));
+        m1.handle_batch_parallel(&dummy_ctx(), &txs);
+        m1.end_block(Height::new(1));
+        let root1 = m1.state_root();
+
+        // Run 2.
+        let m2 = make_module();
+        fund(&m2, &addr_a);
+        fund(&m2, &addr_b);
+        m2.begin_block(Height::new(1));
+        m2.handle_batch_parallel(&dummy_ctx(), &txs);
+        m2.end_block(Height::new(1));
+        let root2 = m2.state_root();
+
+        assert_eq!(root1, root2, "state roots must be deterministic");
     }
 }

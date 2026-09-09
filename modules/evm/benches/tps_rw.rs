@@ -297,6 +297,9 @@ fn bench_full_block_cycle(c: &mut Criterion) {
 /// This is the optimized path: `handle_batch` recovers all senders
 /// in parallel using rayon, then executes sequentially. Compare
 /// against the serial `handle` path above.
+///
+/// Gate: > 100k tx/s for 10k txs (single-sender, parallel recovery
+/// only). Baseline: serial `handle` path (~28k tx/s).
 fn bench_batch_parallel(c: &mut Criterion) {
     let key = TestKey::new();
     let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
@@ -330,6 +333,127 @@ fn bench_batch_parallel(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: parallel speculative execution with multiple senders.
+///
+/// This is the `handle_batch_parallel` path: transactions from
+/// multiple senders execute in parallel on per-sender-group cloned
+/// state. This is the realistic blockchain workload — a real block
+/// contains txs from many different senders.
+///
+/// Gate: > 128k tx/s for 10k txs with 100 senders (must beat the
+/// single-sender `batch_parallel` baseline). Baseline:
+/// `batch_parallel` (~128k tx/s, single sender, parallel recovery
+/// only).
+///
+/// Workload: `n_senders` senders, each sending `n_txs / n_senders`
+/// transfers to distinct recipients. This is the conflict-free case
+/// (each sender has its own recipient). The conflict-heavy case is
+/// benchmarked separately in `bench_batch_parallel_conflict`.
+fn bench_batch_parallel_multi_sender(c: &mut Criterion) {
+    // Generate 100 senders. For 10k txs, each sender sends 100 txs.
+    const N_SENDERS: usize = 100;
+    let keys: Vec<TestKey> = (0..N_SENDERS).map(|_| TestKey::new()).collect();
+    let recipients: Vec<revm::primitives::Address> = (0..N_SENDERS)
+        .map(|i| {
+            revm::primitives::Address::from_slice(
+                &[0x42 + u8::try_from(i).expect("N_SENDERS fits in u8"); 20],
+            )
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("batch_parallel_multi_sender");
+
+    for &n_txs in &[100usize, 1000, 10000] {
+        group.bench_function(format!("{n_txs}_txs_{N_SENDERS}_senders"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    for key in &keys {
+                        fund(&module, &key.addr);
+                    }
+                    let txs_per_sender = (n_txs / N_SENDERS) as u64;
+                    let mut txs: Vec<Vec<u8>> = Vec::with_capacity(n_txs);
+                    for (i, key) in keys.iter().enumerate() {
+                        for j in 0..txs_per_sender {
+                            txs.push(signed_transfer(
+                                &key.privkey,
+                                j,
+                                recipients[i],
+                                1_000_000_000,
+                            ));
+                        }
+                    }
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch_parallel(&dummy_ctx(), &txs);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark: parallel speculative execution with conflicts.
+///
+/// All senders transfer to the SAME recipient, forcing conflict
+/// detection and sequential re-execution. This measures the
+/// overhead of the conflict detection and fallback path.
+///
+/// Gate: should not be slower than `batch_parallel` (single-sender
+/// sequential execution). Baseline: `batch_parallel` (~128k tx/s).
+fn bench_batch_parallel_conflict(c: &mut Criterion) {
+    const N_SENDERS: usize = 100;
+    let keys: Vec<TestKey> = (0..N_SENDERS).map(|_| TestKey::new()).collect();
+    let shared_recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+    let mut group = c.benchmark_group("batch_parallel_conflict");
+
+    for &n_txs in &[100usize, 1000, 10000] {
+        group.bench_function(format!("{n_txs}_txs_{N_SENDERS}_senders"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    for key in &keys {
+                        fund(&module, &key.addr);
+                    }
+                    let txs_per_sender = (n_txs / N_SENDERS) as u64;
+                    let mut txs: Vec<Vec<u8>> = Vec::with_capacity(n_txs);
+                    for key in &keys {
+                        for j in 0..txs_per_sender {
+                            txs.push(signed_transfer(
+                                &key.privkey,
+                                j,
+                                shared_recipient,
+                                1_000_000_000,
+                            ));
+                        }
+                    }
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch_parallel(&dummy_ctx(), &txs);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_tps_simple_transfer,
@@ -338,5 +462,7 @@ criterion_group!(
     bench_write_ops,
     bench_full_block_cycle,
     bench_batch_parallel,
+    bench_batch_parallel_multi_sender,
+    bench_batch_parallel_conflict,
 );
 criterion_main!(benches);
