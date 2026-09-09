@@ -43,5 +43,9 @@ harness = false
 name = "trie_root"
 harness = false
 
+[[bench]]
+name = "tps_rw"
+harness = false
+
 [lints]
 workspace = true
