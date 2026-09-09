@@ -12,6 +12,37 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase B: Ethereum-compatible MPT state root** (2026-01-24)
+  - **B1 — Trie integration**: added `modules/evm/src/trie.rs`
+    wrapping `alloy-trie` (0.9.5). Provides `state_root()`,
+    `storage_root()`, `build_trie_account()`, and the
+    `EMPTY_ROOT` / `KECCAK_EMPTY` constants. The state trie is
+    keyed by `keccak256(address)` with RLP-encoded
+    `TrieAccount { nonce, balance, storage_root, code_hash }`
+    values. 10 new trie unit tests.
+  - **B2 — Replace module state root**: `EvmModule::state_root()`
+    now computes the Ethereum-compatible MPT root over all
+    CacheDB accounts, including per-account storage tries. This
+    replaces the Phase 2 sorted-account BLAKE3 hash. The new root
+    matches Ethereum mainnet and reth for identical state. New
+    test: `empty_state_root_matches_ethereum_constant` verifies
+    the empty state produces `0x56e81f17...`.
+  - **Dependencies**: `alloy-trie = "0.9.5"` (ethereum feature),
+    `alloy-primitives = "1.0"` — both MIT/Apache-2.0, same alloy
+    ecosystem as revm.
+  - **Benchmark**: `modules/evm/benches/trie_root.rs` — full MPT
+    rebuild baseline: 1k accounts = 620 µs, 10k = 6.3 ms, 100k =
+    65 ms. Shows the O(N) scaling that motivates B3 (incremental
+    updates via ProofRetainer, deferred).
+  - **In plain words**: the EVM module's state root is now a
+    proper Ethereum Merkle-Patricia Trie root, computed with
+    keccak-256 — the same algorithm Ethereum mainnet and reth use.
+    For identical account state, Oxide now produces the same
+    state root as Ethereum. The empty state produces Ethereum's
+    well-known empty root constant `0x56e81f17...`. The full
+    rebuild is correct but O(N) in the number of accounts;
+    incremental updates (B3) will make it O(touched) in a follow-up.
+
 - **Phase A: EVM transaction authenticity, mempool admission, gas economics** (2026-01-24)
   - **A1 — secp256k1 + Keccak in the crypto crate**: added
     `recover_sender`, `sign`, `generate_keypair_for_test`, and

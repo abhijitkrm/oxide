@@ -3560,3 +3560,137 @@ Phase B: Ethereum-compatible Merkle Patricia Trie state roots via
 `alloy-trie`. The current state root is a sorted-account hash —
 deterministic but not Ethereum-compatible. Phase B replaces it
 with a proper MPT root so Oxide's state root matches reth's.
+
+---
+
+## 2026-01-24 — Session 28: Phase B — Ethereum-compatible MPT state root
+
+### Overview
+
+Phase B of the EVM production-readiness program delivers
+Ethereum-compatible Merkle-Patricia Trie (MPT) state roots. The EVM
+module's `state_root()` now computes a proper keccak-256 MPT root
+over all accounts, matching Ethereum mainnet and reth for identical
+state. This replaces the Phase 2 sorted-account BLAKE3 hash with
+the real Ethereum state root.
+
+### B1 — Trie integration (`modules/evm/src/trie.rs`)
+
+New module wrapping `alloy-trie` (0.9.5, MIT/Apache-2.0):
+- `state_root(accounts) -> B256`: computes the account trie root,
+  keyed by `keccak256(address)`, value = RLP-encoded
+  `TrieAccount { nonce, balance, storage_root, code_hash }`.
+- `storage_root(storage) -> B256`: computes the per-account
+  storage trie root, keyed by `keccak256(slot)`.
+- `build_trie_account(nonce, balance, storage_root, code_hash)`:
+  builds a `TrieAccount` from revm account fields.
+- `EMPTY_ROOT`: Ethereum's empty trie root constant
+  (`0x56e81f17...`).
+- `KECCAK_EMPTY`: `keccak256("")` constant.
+
+Dependencies added:
+- `alloy-trie = "0.9.5"` with the `ethereum` feature (enables
+  `TrieAccount` and `state_root_unhashed`).
+- `alloy-primitives = "1.0"` (core Ethereum types: B256, Address,
+  U256, keccak256). Already a transitive dep via revm; declared
+  explicitly for direct use in the trie and tx modules.
+
+10 unit tests:
+- `empty_root_matches_mainnet_constant`: the empty trie root
+  matches Ethereum's `0x56e81f17...`.
+- `empty_state_produces_empty_root`: zero accounts → empty root.
+- `single_empty_account_has_known_root`: one account → non-empty
+  root, deterministic.
+- `insertion_order_does_not_affect_root`: two accounts, swapped
+  insertion order → same root (critical consensus property).
+- `different_states_produce_different_roots`: different nonces →
+  different roots.
+- `empty_storage_produces_empty_root`: zero slots → empty root.
+- `single_storage_slot_has_non_empty_root`: one slot → non-empty.
+- `storage_insertion_order_does_not_affect_root`: swapped → same.
+- `keccak_empty_matches_empty_bytes`: `KECCAK_EMPTY == keccak256("")`.
+- `account_with_storage_has_different_root_than_without`: storage
+  root affects state root.
+
+### B2 — Replace module state root
+
+`EvmModule::state_root()` now:
+1. Iterates over all accounts in the `CacheDB`.
+2. For each account, computes its storage root from its storage
+   map (U256 → B256 conversion for slots, then `trie::storage_root`).
+3. Builds a `TrieAccount` with (nonce, balance, storage_root,
+   code_hash).
+4. Calls `trie::state_root()` with all (address, TrieAccount) pairs.
+5. Converts the alloy `B256` root to Oxide's `Hash` type.
+
+The old sorted-account BLAKE3 hash is removed. The new root is:
+- **Ethereum-compatible**: matches mainnet and reth for identical
+  state.
+- **Deterministic**: alloy-trie sorts internally by hashed key, so
+  HashMap iteration order doesn't matter.
+- **Order-independent**: verified by the
+  `insertion_order_does_not_affect_root` test.
+
+New EVM-level test:
+- `empty_state_root_matches_ethereum_constant`: a fresh EvmModule
+  with zero accounts produces `0x56e81f17...`.
+
+All existing tests pass without modification — they compare roots
+across runs (determinism), not against fixed constants, so the root
+value change is transparent.
+
+### B3 — Incremental root updates (deferred)
+
+The full rebuild is O(N) in the number of accounts. The benchmark
+shows:
+- 1k accounts: 620 µs
+- 10k accounts: 6.3 ms
+- 100k accounts: 65 ms
+- Extrapolated 1M accounts: ~650 ms
+
+The Phase B gate for the incremental path is < 10ms for 100 touched
+accounts at 1M total state. The full rebuild doesn't meet this gate
+at scale. B3 (incremental updates via `ProofRetainer`) is deferred
+to a follow-up optimization pass. The full rebuild is correct and
+sufficient for current test and devnet scales.
+
+### Benchmark: `trie_root`
+
+`modules/evm/benches/trie_root.rs`:
+- `state_root_full_rebuild/{1k, 10k, 100k}`: full MPT root
+  computation. Shows the O(N) scaling that motivates B3.
+  - 1k: 620 µs
+  - 10k: 6.3 ms
+  - 100k: 65 ms
+- `storage_root/{10, 100, 1000}`: per-account storage trie root.
+  - 10: 7 µs
+  - 100: 66 µs
+  - 1000: 660 µs
+
+The benchmark establishes the full-rebuild baseline. B3 must beat
+this asymptotically (O(touched) vs O(N)).
+
+### Test verification
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy -p evm --all-targets -- -D warnings`: clean.
+- `cargo test -p evm -p executor`: all pass.
+  - EVM lib: 70 tests (10 new trie + 1 new empty-root + 59 existing).
+  - EVM exploits: 18 tests.
+  - EVM multiblock: 5 tests.
+  - EVM replay: 2 tests.
+  - Executor: 27 tests.
+- `cargo test -p evm -- --ignored`: load (10k txs, 34.58s) and
+  standalone (50-block) tests pass. The load test is slower than
+  before (34.58s vs 7.47s) due to the full MPT rebuild per block —
+  B3 will restore the performance.
+
+### What's next
+
+B3: incremental root updates via `ProofRetainer`. Track touched
+accounts during execution; on `state_root()`, re-root only the
+touched accounts using retained proofs from the last root. Target:
+< 10ms for 100 touched accounts at 1M total state.
+
+Then Phase C: execution completeness (receipts, chain spec, modern
+tx types, precompiles).

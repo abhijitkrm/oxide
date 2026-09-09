@@ -64,6 +64,7 @@ use primitives::{Address, Hash, Height};
 pub mod fee;
 mod persist;
 pub mod precompiles;
+pub mod trie;
 pub mod tx;
 
 // revm imports. The `revm` crate re-exports all sub-crates.
@@ -510,35 +511,61 @@ impl Module for EvmModule {
     }
 
     fn state_root(&self) -> Hash {
-        // Phase 2 v0: hash the CacheDB's account state. We serialize
-        // each account's (address, balance, nonce, code_hash) into a
-        // flat buffer and hash it. Full implementation hashes the EVM
-        // state trie (Merkle Patricia Trie).
+        // Phase B: compute the Ethereum-compatible Merkle-Patricia
+        // Trie state root over all accounts in the CacheDB.
         //
-        // Determinism (exploit suite, audit session 24): the account
-        // map is a `HashMap`, whose iteration order is randomized per
-        // instance — hashing in map order made the root differ across
-        // processes (two validators executing the same block would
-        // sign *different* state roots, breaking execution
-        // attestations). Sort by address so the hash preimage is
-        // canonical regardless of map order.
+        // The state trie is keyed by keccak256(address) with the
+        // RLP-encoded `TrieAccount { nonce, balance, storage_root,
+        // code_hash }` as the value. Each account's `storage_root`
+        // is computed from its individual storage trie (keyed by
+        // keccak256(slot)).
+        //
+        // This replaces the Phase 2 sorted-account BLAKE3 hash with
+        // a proper keccak MPT root — matching Ethereum mainnet and
+        // reth for identical state. The root is deterministic
+        // regardless of HashMap iteration order (alloy-trie sorts
+        // internally by hashed key).
         //
         // # Panics
         //
         // Panics if the DB mutex is poisoned (a thread panicked while
         // holding the lock). This is unrecoverable and indicates a bug.
-        use crypto::hash::{Domain, Hasher};
         let db = self.db.lock().expect("db mutex not poisoned");
-        let mut accounts: Vec<_> = db.cache.accounts.iter().collect();
-        accounts.sort_by(|a, b| a.0.cmp(b.0));
-        let mut data = Vec::new();
-        for (addr, account) in accounts {
-            data.extend_from_slice(addr.as_slice());
-            data.extend_from_slice(&account.info.balance.to_be_bytes::<32>());
-            data.extend_from_slice(&account.info.nonce.to_be_bytes());
-            data.extend_from_slice(account.info.code_hash.as_slice());
-        }
-        Hasher::hash_one(Domain::StateRoot, &data)
+
+        // Build the account iterator: for each account, compute its
+        // storage root and build a TrieAccount.
+        let accounts = db.cache.accounts.iter().map(|(addr, account)| {
+            // Compute the storage root for this account.
+            // The storage trie is keyed by keccak256(slot) with
+            // RLP-encoded U256 values. Empty storage → EMPTY_ROOT.
+            let storage_root = if account.storage.is_empty() {
+                trie::EMPTY_ROOT
+            } else {
+                // Convert U256 storage keys to B256 (big-endian 32
+                // bytes) for the trie. alloy-trie hashes them
+                // internally with keccak256.
+                let storage_iter = account.storage.iter().map(|(slot, value)| {
+                    (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
+                });
+                trie::storage_root(storage_iter)
+            };
+
+            // Build the TrieAccount for the MPT.
+            let trie_account = trie::build_trie_account(
+                account.info.nonce,
+                account.info.balance,
+                storage_root,
+                account.info.code_hash,
+            );
+
+            (*addr, trie_account)
+        });
+
+        // Compute the state root via alloy-trie.
+        let root = trie::state_root(accounts);
+
+        // Convert the alloy B256 root to Oxide's Hash type.
+        Hash(root.0)
     }
 }
 
@@ -895,6 +922,23 @@ mod tests {
             m2.state_root(),
             "two fresh modules must have the same state root"
         );
+    }
+
+    /// An empty EVM state must produce Ethereum's `EMPTY_ROOT_HASH`.
+    /// This is the most important MPT invariant: if our empty root
+    /// differs from mainnet, no state root will ever match.
+    #[test]
+    fn empty_state_root_matches_ethereum_constant() {
+        let m = make_module();
+        let root = m.state_root();
+        // Ethereum's EMPTY_ROOT_HASH — the state root of a chain
+        // with zero accounts.
+        let expected = Hash([
+            0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0,
+            0xf8, 0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5,
+            0xe3, 0x63, 0xb4, 0x21,
+        ]);
+        assert_eq!(root, expected, "empty state root must match Ethereum's EMPTY_ROOT_HASH");
     }
 
     #[test]

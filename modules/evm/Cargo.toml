@@ -22,6 +22,14 @@ storage = { workspace = true }
 # alloy-rlp: Ethereum RLP encoding for signed tx types (Phase A).
 # Already a transitive dep via revm/alloy-primitives. MIT-licensed.
 alloy-rlp = { workspace = true }
+# alloy-trie: Merkle-Patricia Trie for Ethereum-compatible state roots
+# (Phase B). Same alloy ecosystem as revm. The `ethereum` feature
+# enables TrieAccount and state_root_unhashed. MIT/Apache-2.0.
+alloy-trie = { workspace = true }
+# alloy-primitives: core Ethereum types (B256, Address, U256, keccak256).
+# Already a transitive dep via revm; declared explicitly for direct use
+# in the trie and tx modules. MIT/Apache-2.0.
+alloy-primitives = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.7.0"
@@ -29,6 +37,10 @@ ports = { workspace = true }
 
 [[bench]]
 name = "fee"
+harness = false
+
+[[bench]]
+name = "trie_root"
 harness = false
 
 [lints]

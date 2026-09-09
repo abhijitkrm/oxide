@@ -88,6 +88,19 @@ alloy-rlp = "0.3.16"
 # the padding differs). MIT/Apache-2.0 licensed.
 sha3 = "0.11.0"
 
+# alloy-trie: Merkle-Patricia Trie state root calculator and proof
+# generator (Phase B). Same alloy ecosystem as revm (B256, alloy-rlp,
+# nybbles). Used by foundry/reth tooling. MIT/Apache-2.0 licensed.
+# The `ethereum` feature enables `TrieAccount` and `state_root_unhashed`.
+# This is the Ethereum-compatible MPT — replaces the sorted-account
+# BLAKE3 hash with a proper keccak MPT root matching reth/mainnet.
+alloy-trie = { version = "0.9.5", features = ["ethereum"] }
+
+# alloy-primitives: core Ethereum types (B256, Address, U256, keccak256).
+# Already a transitive dep via revm; declared explicitly for direct use
+# in the EVM module (trie, tx types). MIT/Apache-2.0 licensed.
+alloy-primitives = { version = "1.0", features = ["std"] }
+
 # External storage adapters (plan.md §2.3: StorageBackend adapters).
 # redb is Apache-2.0 (GPL-3.0-compatible), pure Rust, ACID, LMDB-like.
 redb = "4.2.0"
