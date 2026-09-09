@@ -2521,3 +2521,81 @@ TC authentication evidence.
 
 241 tests pass (was 236, +5 backfill). fmt clean. clippy
 `-D warnings` clean. cargo deny ok.
+
+## 2026-01-22 — Session 20: Phase 2 start (storage-conformance + EVM)
+
+### Context
+
+Phase 1 is complete (session 19). Phase 2 is EVM + storage
+hardening (plan.md §13). This session starts Phase 2 with the
+two foundational deliverables: the storage-conformance suite
+(the gate every StorageBackend adapter must pass) and the EVM
+module (the `x/vm` analog wrapping revm).
+
+### Storage-conformance suite
+
+The storage-conformance suite is the gate every StorageBackend
+adapter must pass before node wiring lets a validator run it
+(plan.md §2.5). This is the first Phase 2 deliverable — the
+gate the MDBX/RocksDB/redb adapters must pass.
+
+Properties asserted (plan.md §2.5):
+- Batch atomicity: apply_batch is atomic, last-op-wins.
+- Deterministic iteration order: range returns keys in
+  lexicographic order regardless of insertion order.
+- Crash-replay determinism: two fresh backends fed the same
+  batch sequence produce byte-identical state.
+- Prefix exactness: range(prefix) returns exactly the matching
+  keys, with edge cases (empty, all-0xFF, too-long).
+- Delete idempotence: deleting an absent key is a no-op.
+
+Volatile (the in-memory reference) passes the suite. Disk-backed
+adapters (MDBX, RocksDB, redb) must pass the same suite before
+they can be registered.
+
+Also: added `storage` to workspace.dependencies (was missing —
+the `StorageBackend` trait is defined in `storage` but `ports`
+couldn't reference it without the workspace dep).
+
+Commit: `a09a9bb`.
+
+### EVM module: skeleton + full revm execution
+
+The EVM module is the `x/vm` analog (plan.md §2, §8): it wraps
+the `revm` EVM engine and exposes it as a Cosmos-SDK-style
+`Module` in the Oxide module router.
+
+Two commits:
+
+1. Skeleton (commit `c35e2e3`):
+   - `EvmModule` implements the `Module` trait (handle,
+     begin_block, end_block, state_root).
+   - EIP-1559 gas metering fields (chain_id, base_fee).
+   - `module_id::EVM` (3) added to the framework.
+   - revm 42.0.1 added to workspace.dependencies (MIT,
+     GPL-3.0-compatible).
+   - ruint bumped to 1.20.0 (fixes RUSTSEC-2026-0220, the Uint
+     shift overflow-flag vulnerability).
+   - CC0-1.0 added to deny.toml licenses (public domain, used
+     by revm's alloy deps).
+   - RUSTSEC-2024-0436 (paste unmaintained) added to deny
+     ignore (build-time proc-macro, no safe upgrade).
+
+2. Full revm execution (commit `243a569`):
+   - `CacheDB<EmptyDB>` as the in-memory EVM state.
+   - `Context::mainnet()` with `SpecId::PRAGUE` hardfork.
+   - `transact_commit()` executes the tx and commits state in
+     one step (`ExecuteCommitEvm` trait).
+   - Message format: `[to: 20B][calldata: ...]`. All-zeros `to`
+     = contract deployment (`TxKind::Create`).
+   - `state_root()` hashes the CacheDB's account state
+     (address, balance, nonce, code_hash).
+   - `balance()` and `nonce()` read from the CacheDB.
+   - 14 unit tests (was 10), including real EVM execution:
+     deploy a contract (PUSH1/SSTORE bytecode), verify state
+     root changes, verify caller nonce increments.
+
+### Verification
+
+256 tests pass (was 241, +15: 1 storage conformance, 14 EVM).
+fmt, clippy `-D warnings`, cargo deny all clean.

@@ -12,6 +12,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Storage-conformance suite (Phase 2 start)** (2026-01-22)
+  - Added the `storage-conformance` suite — the gate every
+    `StorageBackend` adapter must pass before node wiring lets a
+    validator run it. Asserts batch atomicity, deterministic
+    iteration order, crash-replay determinism, prefix exactness,
+    and delete idempotence. `Volatile` (the in-memory reference)
+    passes; MDBX/RocksDB/redb must pass the same suite.
+  - In plain words: a test suite that verifies any storage
+    backend behaves correctly before it can be used in a
+    validator.
+
+- **EVM module with revm execution (Phase 2)** (2026-01-22)
+  - Added `modules/evm` — the `x/vm` analog wrapping the `revm`
+    EVM engine. Executes EVM transactions (call + deploy) with
+    EIP-1559 gas metering, `CacheDB`-backed state, and
+    `SpecId::PRAGUE` hardfork. 14 unit tests including real
+    contract deployment.
+  - In plain words: the chain can now run Ethereum smart
+    contracts. This is the first step toward MetaMask/Foundry
+    compatibility.
+
 - **Timeout certificate authentication (TC safety fix)** (2026-01-21)
   - Timeout certificates are now authenticated with real BLS
     signatures. `on_timeout()` signs the view with the validator's
