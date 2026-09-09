@@ -42,3 +42,9 @@ name = "types-decode"
 path = "fuzz_targets/types_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "consensus-msg"
+path = "fuzz_targets/consensus_msg.rs"
+test = false
+doc = false

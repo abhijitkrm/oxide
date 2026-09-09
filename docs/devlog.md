@@ -2254,3 +2254,29 @@ clippy + test + deny). Performance regressions are caught within
 ### Verification
 
 224 tests pass. fmt clean. clippy `-D warnings` clean. cargo deny ok.
+
+## Session 18f — L3 fix: consensus message fuzz target
+
+The L3 audit finding: fuzz targets existed for journal, MMR, codec,
+and types decoding, but not for consensus message decoding (Vote,
+QuorumCertificate, TimeoutCertificate, BlockHeader). These types
+cross trust boundaries — they arrive from the network and must
+never panic on arbitrary byte input.
+
+### What changed
+
+- Added `fuzz/fuzz_targets/consensus_msg.rs`: feeds arbitrary
+  bytes to `Vote`, `QuorumCertificate`, `TimeoutCertificate`, and
+  `BlockHeader` decoders. Asserts no panic — a `DecodeError` is
+  the correct response to malformed bytes.
+- Added the target to `fuzz/Cargo.toml` as `consensus-msg`.
+- Updated `.github/workflows/nightly.yml` to run all 5 fuzz
+  targets: `codec-decode`, `journal-replay`, `mmr-proof-verify`,
+  `types-decode`, `consensus-msg`.
+- Added fuzz artifacts (`fuzz/corpus/`, `fuzz/artifacts/`,
+  `fuzz/target/`) to `.gitignore`.
+
+### Verification
+
+Fuzz crate compiles with `cargo +nightly check`. 224 workspace
+tests pass. fmt clean. clippy `-D warnings` clean. cargo deny ok.

@@ -31,5 +31,10 @@ dhat-heap.json
 # Criterion reports (regenerated on demand)
 /target/criterion
 
+# Fuzz artifacts (corpus, crash inputs, coverage data)
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/target/
+
 plan.md
 
