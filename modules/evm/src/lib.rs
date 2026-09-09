@@ -64,6 +64,8 @@ use primitives::{Address, Hash, Height};
 pub mod fee;
 mod persist;
 pub mod precompiles;
+pub mod receipts;
+pub mod spec;
 pub mod trie;
 pub mod tx;
 
@@ -269,7 +271,8 @@ impl EvmModule {
     /// the core security boundary: authentication is enforced at
     /// execution, not admission.
     ///
-    /// Returns the gas used and the execution status (true = success).
+    /// Returns the revm `ExecutionResult` containing gas used, status,
+    /// logs, output, and (for CREATE) the created address.
     ///
     /// # Errors
     ///
@@ -277,7 +280,11 @@ impl EvmModule {
     /// as a valid signed transaction (RLP decode failure, invalid
     /// signature, wrong chain ID).
     /// Returns [`ExecError::ModuleRejected`] if the EVM execution fails.
-    fn execute(&self, _ctx: &TxContext, msg: &[u8]) -> Result<(u64, bool), ExecError> {
+    fn execute(
+        &self,
+        _ctx: &TxContext,
+        msg: &[u8],
+    ) -> Result<revm::context::result::ExecutionResult, ExecError> {
         // Decode the signed transaction from RLP.
         let mut buf = msg;
         let signed: tx::SignedTx =
@@ -326,10 +333,7 @@ impl EvmModule {
             .transact_commit(tx)
             .map_err(|e| ExecError::ModuleRejected(format!("evm transact failed: {e:?}")))?;
 
-        let gas_used = result.tx_gas_used();
-        let success = result.is_success();
-
-        Ok((gas_used, success))
+        Ok(result)
     }
 
     /// Build a revm `TxEnv` from a signed transaction and recovered
@@ -489,14 +493,28 @@ impl Module for EvmModule {
     }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-        let (gas_used, success) = self.execute(ctx, msg)?;
+        let result = self.execute(ctx, msg)?;
 
-        let status_str = if success { "success" } else { "revert" };
+        // Phase C: build a receipt from the execution result.
+        // The receipt captures status, gas used, logs, bloom, and
+        // (for CREATE) the created address. This is the data that
+        // `eth_getTransactionReceipt` returns and that goes into the
+        // block's receipts trie.
+        let receipt = receipts::Receipt::from_execution_result(&result);
+
+        let status_str = if receipt.status { "success" } else { "revert" };
+        let contract_info =
+            receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
+        let log_count = receipt.logs.len();
+
         Ok(vec![Event {
             module: "evm",
             kind: "evm_call".to_string(),
-            data: format!("gas_used={gas_used} status={status_str} base_fee={}", self.base_fee)
-                .into_bytes(),
+            data: format!(
+                "gas_used={} status={} base_fee={} logs={}{}",
+                receipt.gas_used, status_str, self.base_fee, log_count, contract_info
+            )
+            .into_bytes(),
         }])
     }
 
