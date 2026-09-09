@@ -26,9 +26,12 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --features storage/redb,storage/rocksdb,storage/mdbx
       - name: Test
-        run: cargo test --workspace --all-targets
+        # Feature-gated conformance tests (redb, RocksDB, MDBX) must
+        # run on every PR — a regression in an adapter would otherwise
+        # land unnoticed (audit session 24 gap 4).
+        run: cargo test --workspace --all-targets --features storage/redb,storage/rocksdb,storage/mdbx
 
   supply-chain:
     name: cargo-deny

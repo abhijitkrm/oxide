@@ -797,6 +797,7 @@ name = "broadcast"
 version = "0.1.0"
 dependencies = [
  "codec",
+ "criterion",
  "crypto",
  "ports",
  "primitives",
@@ -983,6 +984,7 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "codec",
+ "criterion",
  "crypto",
  "ports",
  "primitives",
@@ -1440,6 +1442,7 @@ name = "evm"
 version = "0.1.0"
 dependencies = [
  "codec",
+ "criterion",
  "crypto",
  "executor",
  "framework",
@@ -2036,6 +2039,7 @@ name = "mempool"
 version = "0.1.0"
 dependencies = [
  "codec",
+ "criterion",
  "crypto",
  "primitives",
  "types",
@@ -2207,6 +2211,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-sim"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "consensus",
+ "crypto",
+ "devnet",
+ "ports",
+ "primitives",
+ "runtime",
+ "types",
+]
+
+[[package]]
 name = "oxide-spammer"
 version = "0.1.0"
 dependencies = [
@@ -2246,6 +2264,7 @@ dependencies = [
 name = "p2p"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ports",
 ]
 

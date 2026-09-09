@@ -12,6 +12,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Audit gap fixes: sim crate, binary tests, benchmarks, CI** (2026-01-22)
+  - Resolved all 4 structural gaps from the session-24 audit: created
+    the `sim/` workspace crate, added 9 smoke tests across 5 binaries,
+    added criterion benchmarks for 5 previously-unbenched crates
+    (consensus, mempool, broadcast, p2p, evm-fee), and wired
+    feature-gated conformance tests + the new fuzz target into CI.
+  - In plain words: the audit found our test coverage had blind spots
+    — 5 binaries with zero tests, 5 hot-path crates with no benchmarks,
+    storage adapter tests that silently skipped in CI, and a `sim/`
+    directory the docs promised but didn't exist. All four are fixed.
+
 - **Security audit + EVM exploit suite (session 24)** (2026-01-22)
   - Self-audit across all quality layers plus 17 adversarial EVM
     exploit tests. **Three real bugs found and fixed**: (1) MMR proof

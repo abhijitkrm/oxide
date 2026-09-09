@@ -60,6 +60,18 @@ const BENCHES: &[BenchTarget] = &[
         package: "storage",
         description: "Journal append gate + MMR push/root/proof gates",
     },
+    BenchTarget {
+        package: "executor",
+        description: "Uniswap-transfer mix throughput (≥1 GG/s gate)",
+    },
+    BenchTarget { package: "consensus", description: "oxideBFT propose/vote/block-hash hot path" },
+    BenchTarget { package: "mempool", description: "Fee-priority pool submit/select/contains" },
+    BenchTarget {
+        package: "broadcast",
+        description: "Erasure-coded dissemination broadcast/reconstruct",
+    },
+    BenchTarget { package: "p2p", description: "Mesh transport peer-ID/transport/partition-heal" },
+    BenchTarget { package: "evm", description: "EIP-1559 base-fee adjustment per block" },
 ];
 
 fn print_list() {
@@ -135,5 +147,41 @@ fn main() -> ExitCode {
     } else {
         eprintln!("\nSome benches FAILED.");
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bench registry must be non-empty and contain the core
+    /// crates that have benches (audit session 24, gap 2: the
+    /// oxide-bench binary had zero tests).
+    #[test]
+    fn bench_registry_is_non_empty() {
+        assert!(!BENCHES.is_empty(), "bench registry must have entries");
+    }
+
+    /// The registry must include the five original bench crates.
+    /// A missing entry means `oxide-bench` would silently skip a
+    /// crate that has benchmarks — the harness exists to make
+    /// coverage explicit.
+    #[test]
+    fn bench_registry_contains_core_crates() {
+        let names: Vec<&str> = BENCHES.iter().map(|t| t.package).collect();
+        for required in ["primitives", "codec", "crypto", "storage", "executor"] {
+            assert!(names.contains(&required), "bench registry missing `{required}`");
+        }
+    }
+
+    /// No duplicate entries — a duplicate would run the same bench
+    /// twice and skew the summary.
+    #[test]
+    fn bench_registry_has_no_duplicates() {
+        let names: Vec<&str> = BENCHES.iter().map(|t| t.package).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names.len(), sorted.len(), "duplicate bench targets in registry");
     }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "oxide-sim"
+description = "Deterministic simulation harness for Oxide — swarm, byzantine strategies, network models."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+runtime = { workspace = true }
+devnet = { workspace = true }
+consensus = { workspace = true }
+ports = { workspace = true }
+types = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
+primitives = { workspace = true }
+
+[lints]
+workspace = true

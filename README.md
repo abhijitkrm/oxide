@@ -150,7 +150,7 @@ oxide/
 │   └── exchange/  perps/  oracle/  governance/
 ├── bin/                       # oxide-validator, oxide-fullnode, oxide-spammer,
 │                              # oxide-deploy, oxide-bench
-├── sim/                       # deterministic swarm simulations
+├── sim/                       # deterministic swarm simulations (echo sim now; Phase 4: byzantine strategies)
 ├── fuzz/                      # cargo-fuzz targets
 └── .devin/skills/             # coding/testing/performance standards (see below)
 ```

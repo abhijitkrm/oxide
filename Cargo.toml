@@ -3,7 +3,7 @@ resolver = "3"
 # NOTE: add "modules/*" back to `members` the moment that directory
 # gets its first crate — cargo errors on globs that match nothing,
 # so the list below tracks what actually exists.
-members = ["crates/*", "modules/*", "bin/*"]
+members = ["crates/*", "modules/*", "bin/*", "sim"]
 
 # NOTE: `fuzz/` is intentionally NOT a workspace member — cargo-fuzz targets
 # require a nightly toolchain and their own build graph. Build them with

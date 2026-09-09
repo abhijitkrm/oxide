@@ -24,8 +24,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run ignored throughput simulations
+        # Feature-gated conformance tests (redb, RocksDB, MDBX) are
+        # included so adapter regressions are caught nightly too
+        # (audit session 24 gap 4).
         run: |
-          cargo test --release --workspace --all-targets -- \
+          cargo test --release --workspace --all-targets \
+            --features storage/redb,storage/rocksdb,storage/mdbx -- \
             --ignored --nocapture --test-threads=1
       - name: Upload simulation output
         if: always()
@@ -50,7 +54,7 @@ jobs:
           # Run each fuzz target for 5 minutes (300s). This is a
           # bounded budget — not exhaustive, but catches regressions
           # in decoders and journal/MMR handling.
-          for target in codec-decode journal-replay mmr-proof-verify types-decode consensus-msg; do
+          for target in codec-decode journal-replay mmr-proof-verify types-decode consensus-msg evm-execute; do
             echo "=== Fuzzing $target ==="
             cargo +nightly fuzz run "$target" -- -max_total_time=300 || true
           done

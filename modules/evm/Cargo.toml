@@ -19,5 +19,12 @@ executor = { workspace = true }
 framework = { workspace = true }
 revm = { workspace = true }
 
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bench]]
+name = "fee"
+harness = false
+
 [lints]
 workspace = true

@@ -3194,3 +3194,78 @@ untested trust boundary (user transactions into the EVM).
 exploits). fmt, clippy `-D warnings`, cargo deny clean. Fuzz:
 mmr-proof-verify 4.9M runs, types-decode 8.9M runs, evm-execute
 329k runs — all clean after fixes.
+
+## Session 25 — Fix 4 remaining audit gaps
+
+The session-24 audit found 3 security bugs (all fixed) and recorded 4
+structural gaps. This session fixes all 4 gaps.
+
+### Gap 1: `sim/` directory created
+
+The `sim/` directory was referenced in `plan.md` (lines 185, 214,
+428), `README.md` (line 153), and `AGENTS.md` (line 58) but did not
+exist. Actual simulation code lived in `crates/runtime/tests/echo.rs`
+(4-node Bracha broadcast) and `crates/devnet/src/multinode.rs`
+(throughput/timing sims).
+
+Fix: created `sim/` as a workspace member (`oxide-sim` crate) with:
+- `src/lib.rs`: documents the Phase 4 roadmap (swarm, byzantine
+  strategies, network models, nightly harness) and provides a
+  `run_echo_sim()` entry point (stub — the real echo sim stays in
+  the runtime crate's integration test).
+- `tests/basic.rs`: verifies the crate compiles and its API is
+  callable.
+- Updated `Cargo.toml` (root) to add `"sim"` to workspace members.
+- Updated `README.md` and `AGENTS.md` to reflect `sim/` now exists.
+
+### Gap 2: Binary smoke tests (9 tests)
+
+All 5 binaries (oxide-validator, oxide-fullnode, oxide-spammer,
+oxide-deploy, oxide-bench) had 0 tests. Added:
+
+- `bin/oxide-validator/tests/smoke.rs` (3 tests): assemble under
+  sequencer, submit+finalize+state-root under sequencer, same under
+  oxideBFT.
+- `bin/oxide-fullnode/tests/smoke.rs` (1 test): assemble stack.
+- `bin/oxide-spammer/tests/smoke.rs` (1 test): batch 100 txs +
+  finalize.
+- `bin/oxide-deploy/tests/smoke.rs` (1 test): `run_devnet_smoke_test()`.
+- `bin/oxide-bench/src/main.rs` (3 tests inside `#[cfg(test)]`):
+  registry non-empty, contains core crates, no duplicates. Also
+  added `executor` + 5 new bench crates to the bench registry.
+
+### Gap 3: Benchmarks for 5 crates
+
+Added criterion benchmarks for the 5 crates that had none:
+
+- `crates/consensus/benches/engine.rs`: propose_single, vote_on_
+  proposal (iter_batched for fresh engine per iteration), block_hash
+  (BLAKE3 floor via crypto::hash).
+- `crates/mempool/benches/pool.rs`: submit_single, submit_batch_
+  1000, select_100_of_10000 (iter_batched), contains_check.
+- `crates/broadcast/benches/dissemination.rs`: broadcast_single
+  (iter_batched), can_reconstruct.
+- `crates/p2p/benches/transport.rs`: peer_id_parse, transport_
+  create, partition_heal.
+- `modules/evm/benches/fee.rs`: fee_update_single, fee_update_100_
+  congested, fee_update_100_alternating.
+
+Each bench file includes a gate table (source: benchmarks skill §3).
+All Cargo.tomls updated with `criterion = "0.7.0"` dev-dep + `[[bench]]`
+entries. The oxide-bench registry now lists all 11 bench crates.
+
+### Gap 4: CI feature flags + fuzz target
+
+- `.github/workflows/ci.yml`: clippy and test steps now include
+  `--features storage/redb,storage/rocksdb,storage/mdbx` — the
+  feature-gated conformance tests (redb, RocksDB, MDBX) now run on
+  every PR (previously silently skipped).
+- `.github/workflows/nightly.yml`: throughput-sims job includes the
+  same feature flags; fuzz job adds `evm-execute` to the target list
+  (was missing from session 24).
+
+### Verification
+
+405 tests pass (was 395, +10: 9 binary smoke + 1 sim). fmt, clippy
+`-D warnings`, cargo deny all clean. All 5 new bench crates compile
+and pass clippy. CI and nightly workflows updated.

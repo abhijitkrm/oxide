@@ -55,7 +55,7 @@ nightly adds fuzz and long simulations.
   `governance`).
 - `bin/` — node binaries and tooling (`oxide-validator`, `oxide-fullnode`,
   `oxide-spammer`, `oxide-deploy`, `oxide-bench`).
-- `sim/`, `fuzz/` — deterministic swarm simulations; cargo-fuzz targets.
+- `sim/`, `fuzz/` — deterministic swarm simulations (`oxide-sim` crate, echo sim now; Phase 4 adds byzantine strategies); cargo-fuzz targets.
 
 ## Conventions
 
@@ -86,6 +86,6 @@ nightly adds fuzz and long simulations.
 
 ## Current status
 
-Phase 0 (foundation). See `plan.md` §13 for the phase gate that is currently
-being worked toward. Do not start Phase N+1 work before Phase N's gates pass
-unless the plan says otherwise.
+Phase 2 complete (EVM + storage). See `plan.md` §13 for the phase
+gate that is currently being worked toward. Do not start Phase N+1
+work before Phase N's gates pass unless the plan says otherwise.
