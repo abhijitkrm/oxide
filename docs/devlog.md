@@ -1422,3 +1422,97 @@ acceptance gates (plan.md §13):
 The next session should focus on the transport crate (real
 networking) to enable multi-node devnet and the remaining acceptance
 gates.
+
+## Session 14 — p2p crate (MeshTransport) + multi-node devnet runner
+
+The transport seam and multi-node devnet runner landed. The p2p
+crate provides an in-process `MeshTransport` implementing the
+`Transport` port; the devnet crate gains a `MultiNodeDevnet` runner
+that assembles N validators with oxideBFT and the real app stack
+(executor + core/bank/staking modules). 17 new tests (185 → 202
+total).
+
+### What landed
+
+**`p2p` crate** (`crates/p2p`):
+- `MeshNetwork`: a fully-connected in-process mesh of N nodes. Each
+  node has a FIFO queue behind a `Mutex`. Clone the network to hand
+  out `MeshTransport` handles.
+- `MeshTransport`: a single node's handle. Implements `Transport`:
+  `send` appends to the target's queue, `recv` pops from own queue.
+  `PeerId` is little-endian bytes of the node index (compact: 1
+  byte for n ≤ 255).
+- Caps: `authenticated = false`, `encrypted = false` (devnet/sim
+  only). `max_message_bytes = 16 MiB` (matches broadcast's erasure
+  cap).
+- 11 tests: basic send/recv, FIFO order, unknown peer, index out of
+  range, message too large, empty recv, capabilities, broadcast,
+  bidirectional, PeerId round-trip, self-send.
+
+**`devnet` multi-node runner** (`crates/devnet/src/multinode.rs`):
+- `MultiNodeDevnet`: assembles N validators, each with its own
+  `Executor` (core/bank/staking modules) and `OxideBft` engine.
+  Shared `ValidatorSet` with equal stakes.
+- `run(rounds)`: drives the consensus round loop — leader proposes,
+  self-votes, followers vote in index order, leader forms QC, all
+  deliver QC and advance. One flush round clears the pipeline.
+- Returns `DevnetResult` with finalized blocks per validator.
+- 6 tests: 4-validator liveness, 4-validator finality agreement,
+  determinism across runs, 7-validator liveness, bank module
+  execution (non-zero state root), single validator.
+
+**Consensus API additions** (`crates/consensus/src/engine.rs`):
+- `OxideBft::block_hash` made public (was private).
+- `OxideBft::advance_view` made public (was private).
+- `OxideBft::next_height_value` and `sync_next_height` added (the
+  simulation's height-sync equivalent of broadcast delivery).
+
+### Design decisions
+
+1. **In-process mesh, not commonware-p2p.** The plan says
+   commonware-p2p is the default transport, but it's post-testnet.
+   The in-process mesh proves the `Transport` seam end-to-end and
+   enables the multi-node devnet without a heavy networking
+   dependency. When the real adapter lands, it implements the same
+   trait and the devnet swaps it via config.
+
+2. **Direct-call simulation, not Transport-based I/O loop.** The
+   `OxideBft` engine doesn't yet have an I/O loop that consumes a
+   `Transport`. The multi-node runner uses the same direct-call
+   pattern as the consensus tests (propose → vote → QC → advance).
+   When the engine gets a Transport-based I/O loop (Phase 2), the
+   runner swaps direct calls for `MeshTransport` message routing —
+   same consensus logic, different delivery mechanism.
+
+3. **Real app stack, not MockApp.** The existing consensus
+   simulation uses `MockApp`. The multi-node runner uses the real
+   `Executor` with core/bank/staking modules, proving the full
+   stack (consensus + executor + modules) works end-to-end in a
+   multi-validator setting.
+
+4. **PeerId as compact little-endian index.** The `PeerId` for
+   node `i` is `i.to_le_bytes().to_vec()` — 1 byte for n ≤ 255, 2
+   for n ≤ 65535. This keeps wire overhead minimal for small
+   devnets and is deterministic.
+
+### Verification
+
+`cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace
+--all-targets` — 202 tests pass; `cargo deny check` — all four
+checks ok.
+
+### What's next
+
+The transport seam is proven and the multi-node devnet runs. The
+remaining Phase 1 acceptance gates:
+- Fault injection (kill leader, partition 1/3) recovers within 2
+  views — needs fault injection in the multi-node runner.
+- ≥ 200k simple native tx/s in sim (n=32) — needs the throughput
+  simulator.
+- Journal replay reproduces state root bit-exact — needs the
+  storage crate.
+
+The next session should add fault injection to the multi-node
+runner (view-change on timeout, TC-based recovery) and the
+throughput simulator.

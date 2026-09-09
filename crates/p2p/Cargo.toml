@@ -1,0 +1,18 @@
+# Oxide blockchain — `p2p` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+
+[package]
+name = "p2p"
+description = "Oxide transport implementations: in-process MeshTransport for deterministic devnet/sim, commonware-p2p adapter post-testnet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ports = { workspace = true }
+
+[lints]
+workspace = true

@@ -300,6 +300,25 @@ impl OxideBft {
         self.validator_set.leader(self.current_view) == self.validator_index
     }
 
+    /// The next height at which this engine will propose a block.
+    /// Used by the multi-node simulation to sync heights across
+    /// engines (the in-process equivalent of broadcast delivery).
+    #[must_use]
+    pub fn next_height_value(&self) -> u64 {
+        self.next_height.value()
+    }
+
+    /// Sync this engine's `next_height` to `max_height`. In a real
+    /// system, all validators see the same blocks via broadcast, so
+    /// their `next_height` stays in lockstep. In the in-process
+    /// simulation, each engine has its own counter, so we sync them
+    /// to the max after each round.
+    pub fn sync_next_height(&mut self, max_height: u64) {
+        if self.next_height.value() < max_height {
+            self.next_height = Height::new(max_height);
+        }
+    }
+
     /// Compute the Merkle root of a transaction list.
     ///
     /// Stage 4: a simple domain-separated hash of the concatenated tx
@@ -319,7 +338,9 @@ impl OxideBft {
     /// separated so a block hash can never collide with a vote or tx
     /// hash. Deterministic: two validators produce the same hash for
     /// the same header (the consensus contract).
-    fn block_hash(header: &BlockHeader) -> Hash {
+    /// Compute the block hash for a header. Public so the multi-node
+    /// simulation can reference the same hash when constructing votes.
+    pub fn block_hash(header: &BlockHeader) -> Hash {
         let mut buf = Vec::new();
         header.encode(&mut buf);
         Hasher::hash_one(Domain::Block, &buf)
@@ -567,7 +588,9 @@ impl OxideBft {
     }
 
     /// Advance to the next view (happy path: one view per block).
-    fn advance_view(&mut self) {
+    /// Public so the multi-node simulation can drive view advancement
+    /// in lockstep across all validators.
+    pub fn advance_view(&mut self) {
         self.current_view = View::new(self.current_view.value() + 1);
     }
 

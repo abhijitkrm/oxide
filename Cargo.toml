@@ -55,6 +55,7 @@ core = { path = "modules/core", version = "0.1.0" }
 bank = { path = "modules/bank", version = "0.1.0" }
 staking = { path = "modules/staking", version = "0.1.0" }
 broadcast = { path = "crates/broadcast", version = "0.1.0" }
+p2p = { path = "crates/p2p", version = "0.1.0" }
 devnet = { path = "crates/devnet", version = "0.1.0" }
 
 [profile.release]

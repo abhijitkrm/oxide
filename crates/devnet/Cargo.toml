@@ -24,6 +24,9 @@ core = { workspace = true }
 bank = { workspace = true }
 staking = { workspace = true }
 broadcast = { workspace = true }
+p2p = { workspace = true }
+
+[dev-dependencies]
 
 [lints]
 workspace = true

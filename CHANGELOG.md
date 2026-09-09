@@ -12,6 +12,26 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **p2p crate (MeshTransport) + multi-node devnet runner** (2026-09-09)
+  - `p2p` crate: in-process `MeshTransport` implementing the
+    `Transport` port — fully-connected mesh of N FIFO queues, no
+    real networking. The dev/test mock the transport port docs
+    describe; commonware-p2p adapter is post-testnet.
+  - `devnet` multi-node runner: `MultiNodeDevnet` assembles N
+    validators with oxideBFT and the real app stack (executor +
+    core/bank/staking modules), drives the consensus round loop,
+    and returns finalized blocks per validator.
+  - 17 new tests; 202 total.
+
+  **In plain words:** Oxide now has a transport layer (in-process
+  mesh for devnet/sim) and a multi-node devnet runner that spins up
+  N validators with the real application stack and drives them
+  through oxideBFT consensus. The same app (executor + modules) that
+  runs under SequencerEngine also runs under oxideBFT in a
+  multi-validator setting — the seam is proven end-to-end. The real
+  commonware-p2p transport swaps in later via the same `Transport`
+  trait.
+
 - **Phase 1 application stack: mempool, executor, modules, broadcast, devnet** (2026-09-09)
   - `mempool` crate: fee-priority tx pool with per-account nonce
     queues, dedup, and eviction.

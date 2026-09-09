@@ -27,6 +27,8 @@ use executor::Executor;
 use ports::{AppInterface, ConsensusEngine};
 use primitives::Address;
 
+pub mod multinode;
+
 /// The consensus engine selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusConfig {

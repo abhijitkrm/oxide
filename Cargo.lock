@@ -339,6 +339,7 @@ dependencies = [
  "executor",
  "framework",
  "mempool",
+ "p2p",
  "ports",
  "primitives",
  "staking",
@@ -586,6 +587,13 @@ dependencies = [
  "ports",
  "primitives",
  "types",
+]
+
+[[package]]
+name = "p2p"
+version = "0.1.0"
+dependencies = [
+ "ports",
 ]
 
 [[package]]
