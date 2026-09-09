@@ -2998,9 +2998,11 @@ name = "rpc"
 version = "0.1.0"
 dependencies = [
  "evm",
+ "hex",
  "primitives",
  "serde",
  "serde_json",
+ "sha3",
  "types",
 ]
 

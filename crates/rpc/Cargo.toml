@@ -16,6 +16,12 @@ types = { workspace = true }
 evm = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# hex: hex encoding/decoding for RPC params (addresses, data, hashes).
+# MIT/Apache-2.0 licensed.
+hex = "0.4"
+# sha3: keccak-256 for `web3_sha3` and tx hash computation.
+# MIT/Apache-2.0 licensed. Already a transitive dep via revm.
+sha3 = { workspace = true }
 
 [lints]
 workspace = true

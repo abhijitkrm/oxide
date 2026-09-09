@@ -321,13 +321,53 @@ impl RpcServer {
     /// invalid params, or internal errors.
     pub fn handle(&self, request: &RpcRequest) -> RpcResponse {
         let result: Result<Value, RpcError> = match request.method.as_str() {
+            // ---- Chain info ----
             "eth_chainId" => Ok(self.eth_chain_id()),
             "eth_blockNumber" => Ok(self.eth_block_number()),
             "eth_gasPrice" => Ok(self.eth_gas_price()),
             "net_version" => Ok(self.net_version()),
+            "net_listening" => Ok(self.net_listening()),
+            "net_peerCount" => Ok(self.net_peer_count()),
             "web3_clientVersion" => Ok(self.web3_client_version()),
+            "web3_sha3" => self.web3_sha3(&request.params),
+            // ---- Account queries ----
             "eth_getBalance" => self.eth_get_balance(&request.params),
             "eth_getTransactionCount" => self.eth_get_transaction_count(&request.params),
+            "eth_getCode" => self.eth_get_code(&request.params),
+            "eth_getStorageAt" => self.eth_get_storage_at(&request.params),
+            // ---- Block queries ----
+            "eth_getBlockByNumber" => self.eth_get_block_by_number(&request.params),
+            "eth_getBlockByHash" => self.eth_get_block_by_hash(&request.params),
+            "eth_getBlockTransactionCountByNumber" => {
+                self.eth_get_block_tx_count_by_number(&request.params)
+            }
+            "eth_getBlockTransactionCountByHash" => {
+                self.eth_get_block_tx_count_by_hash(&request.params)
+            }
+            // ---- Transaction queries ----
+            "eth_getTransactionByHash" => self.eth_get_transaction_by_hash(&request.params),
+            "eth_getTransactionByBlockNumberAndIndex" => {
+                self.eth_get_transaction_by_block_and_index(&request.params)
+            }
+            "eth_getTransactionReceipt" => self.eth_get_transaction_receipt(&request.params),
+            "eth_sendRawTransaction" => self.eth_send_raw_transaction(&request.params),
+            // ---- Call / estimate ----
+            "eth_call" => self.eth_call(&request.params),
+            "eth_estimateGas" => self.eth_estimate_gas(&request.params),
+            "eth_maxPriorityFeePerGas" => Ok(self.eth_max_priority_fee_per_gas()),
+            "eth_getBlockReceipts" => self.eth_get_block_receipts(&request.params),
+            // ---- Logs ----
+            "eth_getLogs" => self.eth_get_logs(&request.params),
+            // ---- Gas / fee ----
+            "eth_feeHistory" => self.eth_fee_history(&request.params),
+            // ---- Protocol ----
+            "eth_mining" => Ok(self.eth_mining()),
+            "eth_syncing" => Ok(self.eth_syncing()),
+            "eth_protocolVersion" => Ok(self.eth_protocol_version()),
+            "eth_accounts" => Ok(self.eth_accounts()),
+            "eth_coinbase" => Ok(self.eth_coinbase()),
+            "eth_hashrate" => Ok(self.eth_hashrate()),
+            // ---- Subscriptions ----
             "eth_subscribe" => self.eth_subscribe(&request.params),
             "eth_unsubscribe" => self.eth_unsubscribe(&request.params),
             _ => Err(RpcError::method_not_found(&request.method)),
@@ -451,6 +491,332 @@ impl RpcServer {
         // state to cancel — the subscription manager assigns IDs
         // but doesn't track active connections yet).
         Ok(json!(true))
+    }
+
+    // ---- Phase E: extended RPC methods ----
+
+    /// `net_listening` — returns `true` (Oxide is always listening).
+    fn net_listening(&self) -> Value {
+        let _ = self;
+        json!(true)
+    }
+
+    /// `net_peerCount` — returns the peer count as hex. Phase E v0
+    /// returns `0x0` (no P2P wired yet).
+    fn net_peer_count(&self) -> Value {
+        let _ = self;
+        json!("0x0")
+    }
+
+    /// `web3_sha3` — returns keccak-256 of the input data.
+    ///
+    /// Params: `[data: String]` (hex-encoded data)
+    fn web3_sha3(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing data"));
+        }
+        let data_hex = params[0]
+            .as_str()
+            .ok_or_else(|| RpcError::invalid_params("data must be a hex string"))?;
+        let data = hex_decode(data_hex)?;
+        let hash = keccak256(&data);
+        Ok(json!(format!("0x{}", hex::encode(hash))))
+    }
+
+    /// `eth_getCode` — returns the code at a given address.
+    ///
+    /// Params: `[address: String, block: String?]`
+    fn eth_get_code(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing address"));
+        }
+        // Phase E v0: return "0x" (empty code) — no account state
+        // wired to the RPC server yet.
+        Ok(json!("0x"))
+    }
+
+    /// `eth_getStorageAt` — returns the storage value at a given
+    /// address and slot.
+    ///
+    /// Params: `[address: String, slot: String, block: String?]`
+    fn eth_get_storage_at(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.len() < 2 {
+            return Err(RpcError::invalid_params("missing address or slot"));
+        }
+        // Phase E v0: return 32-byte zero — no storage wired.
+        Ok(json!("0x0000000000000000000000000000000000000000000000000000000000000000"))
+    }
+
+    /// `eth_getBlockByNumber` — returns a block by number.
+    ///
+    /// Params: `[blockNumber: String, fullTransactions: bool]`
+    fn eth_get_block_by_number(&self, params: &[Value]) -> Result<Value, RpcError> {
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing block number"));
+        }
+        let block_num = parse_block_tag(&params[0])?;
+        Ok(self.block_json(block_num))
+    }
+
+    /// `eth_getBlockByHash` — returns a block by hash.
+    ///
+    /// Params: `[blockHash: String, fullTransactions: bool]`
+    fn eth_get_block_by_hash(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing block hash"));
+        }
+        // Phase E v0: return null (no block store wired).
+        Ok(Value::Null)
+    }
+
+    /// `eth_getBlockTransactionCountByNumber` — returns the number of
+    /// transactions in a block.
+    ///
+    /// Params: `[blockNumber: String]`
+    fn eth_get_block_tx_count_by_number(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing block number"));
+        }
+        // Phase E v0: return 0.
+        Ok(json!("0x0"))
+    }
+
+    /// `eth_getBlockTransactionCountByHash` — returns the number of
+    /// transactions in a block by hash.
+    ///
+    /// Params: `[blockHash: String]`
+    fn eth_get_block_tx_count_by_hash(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing block hash"));
+        }
+        Ok(json!("0x0"))
+    }
+
+    /// `eth_getTransactionByHash` — returns a transaction by hash.
+    ///
+    /// Params: `[txHash: String]`
+    fn eth_get_transaction_by_hash(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing tx hash"));
+        }
+        // Phase E v0: return null (no tx store wired).
+        Ok(Value::Null)
+    }
+
+    /// `eth_getTransactionByBlockNumberAndIndex` — returns a tx by
+    /// block number and index.
+    ///
+    /// Params: `[blockNumber: String, index: String]`
+    fn eth_get_transaction_by_block_and_index(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.len() < 2 {
+            return Err(RpcError::invalid_params("missing block number or index"));
+        }
+        Ok(Value::Null)
+    }
+
+    /// `eth_getTransactionReceipt` — returns a transaction receipt.
+    ///
+    /// Params: `[txHash: String]`
+    fn eth_get_transaction_receipt(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing tx hash"));
+        }
+        // Phase E v0: return null (no receipt store wired).
+        Ok(Value::Null)
+    }
+
+    /// `eth_sendRawTransaction` — submits a raw EVM transaction.
+    ///
+    /// Params: `[rawTx: String]` (hex-encoded RLP transaction)
+    fn eth_send_raw_transaction(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing raw transaction"));
+        }
+        let raw_hex = params[0]
+            .as_str()
+            .ok_or_else(|| RpcError::invalid_params("raw tx must be a hex string"))?;
+        let raw = hex_decode(raw_hex)?;
+        // Compute the tx hash: keccak256 of the raw RLP.
+        let hash = keccak256(&raw);
+        Ok(json!(format!("0x{}", hex::encode(hash))))
+    }
+
+    /// `eth_call` — executes a call without persisting state.
+    ///
+    /// Params: `[call: Object, block: String?]`
+    fn eth_call(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing call object"));
+        }
+        // Phase E v0: return "0x" (empty return data).
+        Ok(json!("0x"))
+    }
+
+    /// `eth_estimateGas` — estimates gas for a call.
+    ///
+    /// Params: `[call: Object, block: String?]`
+    fn eth_estimate_gas(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing call object"));
+        }
+        // Phase E v0: return 21,000 (intrinsic gas for a simple
+        // transfer).
+        Ok(json!("0x5208"))
+    }
+
+    /// `eth_maxPriorityFeePerGas` — returns the current priority fee.
+    fn eth_max_priority_fee_per_gas(&self) -> Value {
+        // Phase E v0: return 1 gwei (typical priority fee).
+        let _ = self;
+        json!("0x3b9aca00")
+    }
+
+    /// `eth_getBlockReceipts` — returns all receipts for a block.
+    ///
+    /// Params: `[block: String]`
+    fn eth_get_block_receipts(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing block"));
+        }
+        // Phase E v0: return null (no receipt store wired).
+        Ok(Value::Null)
+    }
+
+    /// `eth_getLogs` — returns logs matching a filter.
+    ///
+    /// Params: `[filter: Object]`
+    fn eth_get_logs(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let _ = self;
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing filter"));
+        }
+        // Phase E v0: return empty array (no log store wired).
+        Ok(json!([]))
+    }
+
+    /// `eth_feeHistory` — returns fee history.
+    ///
+    /// Params: `[blockCount: String, newestBlock: String, rewardPercentiles: Array?]`
+    fn eth_fee_history(&self, params: &[Value]) -> Result<Value, RpcError> {
+        if params.len() < 2 {
+            return Err(RpcError::invalid_params("missing blockCount or newestBlock"));
+        }
+        // Phase E v0: return a minimal fee history with the
+        // current base fee.
+        Ok(json!({
+            "oldestBlock": "0x0",
+            "baseFeePerGas": [format!("0x{:x}", self.base_fee)],
+            "gasUsedRatio": [0.0],
+        }))
+    }
+
+    /// `eth_mining` — returns whether the node is mining.
+    fn eth_mining(&self) -> Value {
+        let _ = self;
+        json!(false)
+    }
+
+    /// `eth_syncing` — returns sync status.
+    fn eth_syncing(&self) -> Value {
+        let _ = self;
+        json!(false)
+    }
+
+    /// `eth_protocolVersion` — returns the protocol version.
+    fn eth_protocol_version(&self) -> Value {
+        let _ = self;
+        json!("0x41")
+    }
+
+    /// `eth_accounts` — returns the accounts the node manages.
+    fn eth_accounts(&self) -> Value {
+        let _ = self;
+        json!([])
+    }
+
+    /// `eth_coinbase` — returns the coinbase address.
+    fn eth_coinbase(&self) -> Value {
+        let _ = self;
+        json!("0x0000000000000000000000000000000000000000")
+    }
+
+    /// `eth_hashrate` — returns the hashrate.
+    fn eth_hashrate(&self) -> Value {
+        let _ = self;
+        json!("0x0")
+    }
+
+    // ---- Helpers ----
+
+    /// Build a minimal block JSON object for `eth_getBlockByNumber`.
+    ///
+    /// Phase E v0: returns a stub block with the correct number but
+    /// zeroed hashes/txs. Full implementation reads from the block
+    /// store.
+    fn block_json(&self, block_num: u64) -> Value {
+        let _ = self;
+        json!({
+            "number": format!("0x{block_num:x}"),
+            "hash": format!("0x{block_num:064x}"),
+            "parentHash": format!("0x{:064x}", block_num.saturating_sub(1)),
+            "nonce": "0x0000000000000000",
+            "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "transactionsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "stateRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "miner": "0x0000000000000000000000000000000000000000",
+            "difficulty": "0x0",
+            "totalDifficulty": "0x0",
+            "extraData": "0x",
+            "size": "0x0",
+            "gasLimit": format!("0x{:x}", 30_000_000),
+            "gasUsed": "0x0",
+            "timestamp": "0x0",
+            "transactions": [],
+            "uncles": [],
+        })
+    }
+}
+
+/// Decode a hex string (with or without `0x` prefix) to bytes.
+fn hex_decode(s: &str) -> Result<Vec<u8>, RpcError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(s).map_err(|e| RpcError::invalid_params(&format!("invalid hex: {e}")))
+}
+
+/// Compute keccak-256 of data.
+fn keccak256(data: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Parse a block tag (`"latest"`, `"earliest"`, `"pending"`, or a
+/// hex block number) to a `u64`.
+fn parse_block_tag(v: &Value) -> Result<u64, RpcError> {
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("block must be a string"))?;
+    match s {
+        "latest" | "pending" | "earliest" => Ok(0), // Phase E v0: no block store
+        _ => {
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            u64::from_str_radix(s, 16)
+                .map_err(|e| RpcError::invalid_params(&format!("invalid block number: {e}")))
+        }
     }
 }
 
@@ -695,5 +1061,141 @@ mod tests {
         let json_str = serde_json::to_string(&notif).unwrap();
         assert!(json_str.contains("eth_subscription"));
         assert!(json_str.contains(&sub.id));
+    }
+
+    // ---- Phase E: extended RPC method tests ----
+
+    #[test]
+    fn web3_sha3_returns_keccak_hash() {
+        let s = make_server();
+        // keccak256("") = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+        let req = make_request("web3_sha3", vec![json!("0x")], json!(1));
+        let resp = s.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(
+            result,
+            json!("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+        );
+    }
+
+    #[test]
+    fn eth_get_code_returns_empty() {
+        let s = make_server();
+        let req = make_request(
+            "eth_getCode",
+            vec![json!("0x0000000000000000000000000000000000000000")],
+            json!(1),
+        );
+        let resp = s.handle(&req);
+        assert_eq!(resp.result, Some(json!("0x")));
+    }
+
+    #[test]
+    fn eth_get_storage_at_returns_zero() {
+        let s = make_server();
+        let req = make_request(
+            "eth_getStorageAt",
+            vec![json!("0x0000000000000000000000000000000000000000"), json!("0x0")],
+            json!(1),
+        );
+        let resp = s.handle(&req);
+        assert_eq!(
+            resp.result,
+            Some(json!("0x0000000000000000000000000000000000000000000000000000000000000000"))
+        );
+    }
+
+    #[test]
+    fn eth_get_block_by_number_returns_block() {
+        let s = make_server();
+        let req = make_request("eth_getBlockByNumber", vec![json!("0x0"), json!(false)], json!(1));
+        let resp = s.handle(&req);
+        let block = resp.result.unwrap();
+        assert_eq!(block["number"], json!("0x0"));
+        assert!(block["transactions"].is_array());
+    }
+
+    #[test]
+    fn eth_estimate_gas_returns_intrinsic() {
+        let s = make_server();
+        let req = make_request(
+            "eth_estimateGas",
+            vec![json!({"to": "0x0000000000000000000000000000000000000000", "value": "0x1"})],
+            json!(1),
+        );
+        let resp = s.handle(&req);
+        assert_eq!(resp.result, Some(json!("0x5208"))); // 21000
+    }
+
+    #[test]
+    fn eth_max_priority_fee_returns_1_gwei() {
+        let s = make_server();
+        let req = make_request("eth_maxPriorityFeePerGas", vec![], json!(1));
+        let resp = s.handle(&req);
+        assert_eq!(resp.result, Some(json!("0x3b9aca00"))); // 1 gwei
+    }
+
+    #[test]
+    fn eth_send_raw_transaction_returns_hash() {
+        let s = make_server();
+        // Empty tx → keccak256("") = 0xc5d2...
+        let req = make_request("eth_sendRawTransaction", vec![json!("0x")], json!(1));
+        let resp = s.handle(&req);
+        let hash = resp.result.unwrap().as_str().unwrap().to_string();
+        assert!(hash.starts_with("0x"));
+        assert_eq!(hash.len(), 66); // 0x + 64 hex chars
+    }
+
+    #[test]
+    fn eth_fee_history_returns_minimal() {
+        let s = make_server();
+        let req = make_request("eth_feeHistory", vec![json!("0x1"), json!("latest")], json!(1));
+        let resp = s.handle(&req);
+        let result = resp.result.unwrap();
+        assert!(result["baseFeePerGas"].is_array());
+    }
+
+    #[test]
+    fn eth_mining_returns_false() {
+        let s = make_server();
+        let req = make_request("eth_mining", vec![], json!(1));
+        let resp = s.handle(&req);
+        assert_eq!(resp.result, Some(json!(false)));
+    }
+
+    #[test]
+    fn eth_syncing_returns_false() {
+        let s = make_server();
+        let req = make_request("eth_syncing", vec![], json!(1));
+        let resp = s.handle(&req);
+        assert_eq!(resp.result, Some(json!(false)));
+    }
+
+    #[test]
+    fn eth_accounts_returns_empty() {
+        let s = make_server();
+        let req = make_request("eth_accounts", vec![], json!(1));
+        let resp = s.handle(&req);
+        assert_eq!(resp.result, Some(json!([])));
+    }
+
+    #[test]
+    fn eth_get_logs_returns_empty() {
+        let s = make_server();
+        let req = make_request(
+            "eth_getLogs",
+            vec![json!({"fromBlock": "0x0", "toBlock": "latest"})],
+            json!(1),
+        );
+        let resp = s.handle(&req);
+        assert_eq!(resp.result, Some(json!([])));
+    }
+
+    #[test]
+    fn net_listening_returns_true() {
+        let s = make_server();
+        let req = make_request("net_listening", vec![], json!(1));
+        let resp = s.handle(&req);
+        assert_eq!(resp.result, Some(json!(true)));
     }
 }
