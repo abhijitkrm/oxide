@@ -2280,3 +2280,31 @@ never panic on arbitrary byte input.
 
 Fuzz crate compiles with `cargo +nightly check`. 224 workspace
 tests pass. fmt clean. clippy `-D warnings` clean. cargo deny ok.
+
+## Session 18g — L1 fix: executor hot-path lock reduction
+
+The L1 audit finding: the executor's `execute_block` hot path
+locked `self.events` on every tx. With 1000 txs per block, that's
+1000 lock/unlock cycles per block — pure overhead on a hot path.
+
+### What changed
+
+**`executor/src/lib.rs`:**
+- `execute_block` now collects events in a local `Vec<Event>`
+  during the per-tx loop, then publishes them with a single
+  `self.events.lock().unwrap().extend(block_events)` at the end.
+- This reduces lock acquisitions from O(txs) to O(1) per block.
+- The per-tx execution path is now lock-free at the executor level.
+
+### What is NOT changed (Phase 2)
+
+The module-level mutexes (`BankModule::store`, `StakingModule::validators`)
+remain. Removing them requires changing `Module::handle` from
+`&self` to `&mut self`, which breaks the `Send + Sync` bound on the
+trait. This is a significant architectural change (single-writer
+state ownership) that belongs in Phase 2, when the executor moves
+to parallel execution and the trait can be redesigned.
+
+### Verification
+
+224 tests pass. fmt clean. clippy `-D warnings` clean. cargo deny ok.

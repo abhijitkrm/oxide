@@ -210,6 +210,13 @@ impl Executor {
         }
 
         // Execute each tx sequentially.
+        //
+        // L1 fix: collect events in a local Vec instead of locking
+        // `self.events` on every tx. The hot path (per-tx execution)
+        // is now lock-free; the lock is taken once per block to
+        // publish the collected events. This reduces lock acquisitions
+        // from O(txs) to O(1) per block.
+        let mut block_events: Vec<Event> = Vec::new();
         for tx in &block.txs {
             let bytes = tx.as_bytes();
             // Parse the tx context (sender, nonce, fee) from the
@@ -223,10 +230,12 @@ impl Executor {
             let payload = module_payload(bytes);
             if let Some(module) = self.modules.get(&module_id) {
                 if let Ok(events) = module.handle(&ctx, payload) {
-                    self.events.lock().unwrap().extend(events);
+                    block_events.extend(events);
                 }
             }
         }
+        // Publish all events from this block in one lock acquisition.
+        self.events.lock().unwrap().extend(block_events);
 
         // end_block for all modules.
         for module in self.modules.values() {
