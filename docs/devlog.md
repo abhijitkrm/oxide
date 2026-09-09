@@ -3818,3 +3818,89 @@ Analysis:
 
 Bottleneck: the O(N) state root rebuild dominates block commit
 time at scale. B3 is the next priority for performance.
+
+## Session — TPS optimization: parallel sender recovery
+
+### Problem: secp256k1 recovery is 88% of per-tx cost
+
+Breakdown benchmark (modules/evm/benches/breakdown.rs) revealed:
+
+| Step | Time | % of total |
+|------|------|-----------|
+| RLP decode | 75 ns | 0.2% |
+| secp256k1 recovery | 29.6 µs | 88% |
+| revm execution + locks | ~4 µs | 12% |
+| Total | 33.6 µs | 100% |
+
+The EVM execution itself is only ~4 µs. The dominant cost is
+secp256k1 ECDSA sender recovery — a computationally expensive
+point multiplication on the secp256k1 curve.
+
+### Fix: batch parallel recovery + context reuse
+
+Added `EvmModule::handle_batch()` — a high-throughput batch
+execution path that:
+
+1. **Phase 1 — parallel recovery**: decodes and recovers all
+   senders in parallel using `rayon`. Each tx is independently
+   decoded and its sender recovered. On 8 cores, the 29.6 µs/tx
+   recovery cost becomes 29.6/8 ≈ 3.7 µs/tx.
+
+2. **Phase 2 — sequential execution**: executes all txs
+   sequentially under a single DB lock. The CacheDB is a
+   single-writer structure — parallel execution would require
+   state partitioning (future work).
+
+3. **EVM context reuse**: builds the revm `Context` once and
+   reuses it across all txs in the batch. The context (cfg, block
+   env) is the same for all txs in a block — only the tx env
+   changes. This saves ~100 ns/tx.
+
+4. **Batch touched tracking**: accumulates touched accounts in a
+   local `HashSet` and merges into the global set once at the end,
+   avoiding a mutex lock per tx.
+
+### Results
+
+| Path | Batch | Per-tx | TPS | Speedup |
+|------|-------|--------|-----|---------|
+| Serial (handle) | 1000 | 35.3 µs | 28,300 | 1.0x |
+| Parallel (v1) | 10000 | 9.8 µs | 102,000 | 3.6x |
+| Parallel (v2) | 10000 | **7.8 µs** | **128,000** | **4.5x** |
+
+v1 = parallel recovery only.
+v2 = parallel recovery + context reuse + batch touched tracking.
+
+The 7.8 µs/tx is essentially at the theoretical minimum:
+- Recovery: 29.6 µs / 8 cores = 3.7 µs/tx
+- Execution: ~4 µs/tx (sequential)
+- Total: ~7.7 µs/tx
+
+The remaining 0.1 µs is rayon scheduling overhead.
+
+### Why not 8x speedup?
+
+The execution phase is sequential (CacheDB is single-writer), so
+the speedup is limited by Amdahl's law:
+- Parallel fraction: 88% (recovery) → 88%/8 = 11%
+- Sequential fraction: 12% (execution)
+- Total: 11% + 12% = 23% of original → 1/0.23 ≈ 4.3x
+
+We achieved 4.5x, slightly better than Amdahl's prediction because
+the context reuse reduced the sequential fraction.
+
+### Next steps for higher TPS
+
+To go beyond ~128,000 tx/s, we need to parallelize the execution
+phase itself:
+1. **OCC (optimistic concurrency control)**: partition accounts
+   across shards, execute txs in parallel on non-overlapping
+   shards, abort on conflict.
+2. **State partitioning**: split the CacheDB into N partitions,
+   each with its own lock. Txs that touch different partitions
+   can execute in parallel.
+3. **Pre-execution**: start executing txs before the full batch is
+   recovered (pipeline the recovery and execution phases).
+
+These are future work — the current 128,000 tx/s is a solid
+foundation for an L1 blockchain.

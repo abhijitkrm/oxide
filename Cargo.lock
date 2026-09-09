@@ -1530,6 +1530,7 @@ dependencies = [
  "framework",
  "ports",
  "primitives",
+ "rayon",
  "revm",
  "storage",
  "types",

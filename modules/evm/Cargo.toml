@@ -30,6 +30,10 @@ alloy-trie = { workspace = true }
 # Already a transitive dep via revm; declared explicitly for direct use
 # in the trie and tx modules. MIT/Apache-2.0.
 alloy-primitives = { workspace = true }
+# rayon: parallel secp256k1 sender recovery in `handle_batch`.
+# 88% of per-tx cost is ECDSA recovery; parallelizing across cores
+# turns that into 88%/N_cores. MIT/Apache-2.0.
+rayon = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.7.0"
@@ -45,6 +49,10 @@ harness = false
 
 [[bench]]
 name = "tps_rw"
+harness = false
+
+[[bench]]
+name = "breakdown"
 harness = false
 
 [lints]

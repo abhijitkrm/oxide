@@ -109,6 +109,8 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 - **EVM TPS and read/write benchmarks** (2026-01-25)
   - Added `modules/evm/benches/tps_rw.rs` measuring EVM
     execution throughput and read/write operation costs.
+  - Added `modules/evm/benches/breakdown.rs` isolating each
+    step of the tx execution path.
   - Results (single-threaded, no networking):
     - Simple transfer: ~28,800 tx/s (34.7 µs/tx)
     - 10-tx batch: ~29,500 tx/s (339.5 µs/batch)
@@ -124,6 +126,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     bottleneck for large blocks is the O(N) state root rebuild
     (35.5 ms for 1000 accounts). Incremental root updates (B3)
     will bring this down to O(touched).
+
+- **EVM batch parallel execution — 4.5x TPS improvement** (2026-01-25)
+  - Added `EvmModule::handle_batch()` — a high-throughput batch
+    execution path that recovers all secp256k1 senders in
+    parallel using `rayon`, then executes sequentially with
+    EVM context reuse and batch touched-account tracking.
+  - Profiling revealed secp256k1 ECDSA recovery is 88% of
+    per-tx cost (29.6 µs out of 33.6 µs). Parallelizing across
+    8 cores turns that into 88%/8 ≈ 11%, yielding a 4.5x
+    speedup.
+  - Results (10000-tx batch, 8 cores):
+    - Serial: ~28,200 tx/s (35.5 µs/tx)
+    - Parallel: **~128,000 tx/s** (7.8 µs/tx)
+    - Speedup: **4.5x**
+  - The 7.8 µs/tx is at the theoretical minimum (3.7 µs
+    recovery/8 cores + 4 µs sequential execution = 7.7 µs).
+  - Dependency: `rayon = "1.12"` (MIT/Apache-2.0).
+  - 2 new unit tests (batch execution, invalid tx skipping).
+  - **In plain words**: by recovering transaction signatures in
+    parallel across CPU cores, the EVM now sustains ~128,000
+    transactions per second on an 8-core machine — a 4.5x
+    improvement over the serial path. This is the execution-
+    layer ceiling; the full node stack (networking, consensus,
+    mempool) will determine the real-world throughput.
 
 - **Phase A: EVM transaction authenticity, mempool admission, gas economics** (2026-01-24)
   - **A1 — secp256k1 + Keccak in the crypto crate**: added

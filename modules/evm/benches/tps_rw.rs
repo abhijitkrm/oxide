@@ -292,6 +292,44 @@ fn bench_full_block_cycle(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: batch execution with parallel sender recovery.
+///
+/// This is the optimized path: `handle_batch` recovers all senders
+/// in parallel using rayon, then executes sequentially. Compare
+/// against the serial `handle` path above.
+fn bench_batch_parallel(c: &mut Criterion) {
+    let key = TestKey::new();
+    let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+    let mut group = c.benchmark_group("batch_parallel");
+
+    for &n_txs in &[10u64, 100, 1000, 10000] {
+        group.bench_function(format!("{n_txs}_txs"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    fund(&module, &key.addr);
+                    let txs: Vec<Vec<u8>> = (0u64..n_txs)
+                        .map(|i| signed_transfer(&key.privkey, i, recipient, 1_000_000_000))
+                        .collect();
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch(&dummy_ctx(), &txs);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_tps_simple_transfer,
@@ -299,5 +337,6 @@ criterion_group!(
     bench_read_ops,
     bench_write_ops,
     bench_full_block_cycle,
+    bench_batch_parallel,
 );
 criterion_main!(benches);

@@ -108,6 +108,12 @@ alloy-primitives = { version = "1.0", features = ["std"] }
 # Oxide's non-EVM modules (bank, staking, trading) — faster
 # verification than secp256k1 and no malleability.
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+# rayon: data-parallelism for batch secp256k1 sender recovery.
+# The EVM tx hot path spends 88% of its time on secp256k1 ECDSA
+# recovery. Recovering N senders in parallel across cores turns
+# that 88% into 88%/N_cores. MIT/Apache-2.0. Work-stealing
+# threadpool, mature, used by reth/Foundry.
+rayon = "1.12"
 
 # External storage adapters (plan.md §2.3: StorageBackend adapters).
 # redb is Apache-2.0 (GPL-3.0-compatible), pure Rust, ACID, LMDB-like.
