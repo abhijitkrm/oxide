@@ -28,6 +28,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use crypto::secp;
 use evm::EvmModule;
+use evm::PreverifiedTx;
 use evm::tx::{SignedTx, TxFields, TxKind, TxLegacy};
 use executor::Module;
 use primitives::{Address, Height};
@@ -532,6 +533,190 @@ fn bench_native_vs_revm(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: pre-verified sender recovery vs full recovery.
+///
+/// This is the "prove it was worth building" comparison for the
+/// pre-verified sender recovery optimization. The pre-verified path
+/// skips secp256k1 recovery entirely (the caller pre-recovered
+/// senders at mempool ingestion time). This benchmark compares:
+///
+/// - `handle_batch` (recovery): parallel decode + secp256k1 recovery
+///   + native execution.
+/// - `handle_batch_preverified` (pre-verified): parallel decode only
+///   (no recovery) + native execution.
+///
+/// Gate: pre-verified path must be ≥ 3x faster than recovery for 10k
+/// simple transfers. Expected: ~5-8x based on breakdown analysis
+/// (recovery is ~30 µs/tx parallelized to ~3.7 µs/tx on 8 cores;
+/// skipping it removes the dominant cost).
+///
+/// Workload: 10k simple transfers from a single sender to a single
+/// recipient. Both paths use the native fast path for execution;
+/// the only difference is whether sender recovery is performed.
+fn bench_preverified_vs_recovery(c: &mut Criterion) {
+    let key = TestKey::new();
+    let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+    let mut group = c.benchmark_group("preverified_vs_recovery");
+
+    for &n_txs in &[1000u64, 10000] {
+        // Full recovery (handle_batch — recovers senders internally).
+        group.bench_function(format!("{n_txs}_txs_recovery"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    fund(&module, &key.addr);
+                    let txs: Vec<Vec<u8>> = (0u64..n_txs)
+                        .map(|i| signed_transfer(&key.privkey, i, recipient, 1_000_000_000))
+                        .collect();
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch(&dummy_ctx(), &txs);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+
+        // Pre-verified (handle_batch_preverified — skips recovery).
+        group.bench_function(format!("{n_txs}_txs_preverified"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    fund(&module, &key.addr);
+                    let txs: Vec<Vec<u8>> = (0u64..n_txs)
+                        .map(|i| signed_transfer(&key.privkey, i, recipient, 1_000_000_000))
+                        .collect();
+                    // Pre-recover senders (simulates mempool ingestion).
+                    let preverified: Vec<PreverifiedTx> = module
+                        .preverify_batch(&txs)
+                        .into_iter()
+                        .map(|r| r.expect("preverify must succeed"))
+                        .collect();
+                    (module, preverified)
+                },
+                |(module, preverified)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch_preverified(&dummy_ctx(), &preverified);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark: pre-verified parallel execution vs full recovery parallel.
+///
+/// Same comparison as `bench_preverified_vs_recovery` but for the
+/// parallel speculative execution path (`handle_batch_parallel` vs
+/// `handle_batch_parallel_preverified`). Uses 100 senders to exercise
+/// the parallel grouping and conflict detection.
+///
+/// Gate: pre-verified parallel must be ≥ 2x faster than recovery
+/// parallel for 10k txs with 100 senders.
+fn bench_preverified_parallel_vs_recovery(c: &mut Criterion) {
+    const N_SENDERS: usize = 100;
+    let keys: Vec<TestKey> = (0..N_SENDERS).map(|_| TestKey::new()).collect();
+    let recipients: Vec<revm::primitives::Address> = (0..N_SENDERS)
+        .map(|i| {
+            revm::primitives::Address::from_slice(
+                &[0x42 + u8::try_from(i).expect("N_SENDERS fits in u8"); 20],
+            )
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("preverified_parallel_vs_recovery");
+
+    for &n_txs in &[1000usize, 10000] {
+        // Full recovery (handle_batch_parallel).
+        group.bench_function(format!("{n_txs}_txs_{N_SENDERS}_senders_recovery"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    for key in &keys {
+                        fund(&module, &key.addr);
+                    }
+                    let txs_per_sender = (n_txs / N_SENDERS) as u64;
+                    let mut txs: Vec<Vec<u8>> = Vec::with_capacity(n_txs);
+                    for (i, key) in keys.iter().enumerate() {
+                        for j in 0..txs_per_sender {
+                            txs.push(signed_transfer(
+                                &key.privkey,
+                                j,
+                                recipients[i],
+                                1_000_000_000,
+                            ));
+                        }
+                    }
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch_parallel(&dummy_ctx(), &txs);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+
+        // Pre-verified (handle_batch_parallel_preverified).
+        group.bench_function(format!("{n_txs}_txs_{N_SENDERS}_senders_preverified"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    for key in &keys {
+                        fund(&module, &key.addr);
+                    }
+                    let txs_per_sender = (n_txs / N_SENDERS) as u64;
+                    let mut txs: Vec<Vec<u8>> = Vec::with_capacity(n_txs);
+                    for (i, key) in keys.iter().enumerate() {
+                        for j in 0..txs_per_sender {
+                            txs.push(signed_transfer(
+                                &key.privkey,
+                                j,
+                                recipients[i],
+                                1_000_000_000,
+                            ));
+                        }
+                    }
+                    let preverified: Vec<PreverifiedTx> = module
+                        .preverify_batch(&txs)
+                        .into_iter()
+                        .map(|r| r.expect("preverify must succeed"))
+                        .collect();
+                    (module, preverified)
+                },
+                |(module, preverified)| {
+                    module.begin_block(Height::new(1));
+                    let results =
+                        module.handle_batch_parallel_preverified(&dummy_ctx(), &preverified);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_tps_simple_transfer,
@@ -543,5 +728,7 @@ criterion_group!(
     bench_batch_parallel_multi_sender,
     bench_batch_parallel_conflict,
     bench_native_vs_revm,
+    bench_preverified_vs_recovery,
+    bench_preverified_parallel_vs_recovery,
 );
 criterion_main!(benches);

@@ -120,6 +120,40 @@ const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
 /// simple transfers.
 const TX_GAS_TRANSFER: u64 = 21_000;
 
+/// A transaction with a pre-recovered sender.
+///
+/// The mempool recovers the sender once at ingestion time (via
+/// [`SignedTx::recover_sender`](tx::SignedTx::recover_sender)). The
+/// execution layer trusts this pre-recovered sender and skips
+/// secp256k1 recovery entirely, saving ~30 µs/tx — the dominant
+/// cost in batch execution.
+///
+/// # Security
+///
+/// The caller MUST ensure `sender` is correctly recovered from
+/// `raw`. A byzantine block proposer providing wrong senders will
+/// cause state divergence, detectable by state root comparison
+/// across validators. For the Phase 0 devnet (single validator),
+/// trusting the proposer is safe. For production, pair this with
+/// verification sampling (future work).
+///
+/// # Construction
+///
+/// Use [`EvmModule::preverify_batch`] to construct a batch of
+/// `PreverifiedTx` from raw RLP-encoded transactions. Then pass
+/// the result to [`EvmModule::handle_batch_preverified`] or
+/// [`EvmModule::handle_batch_parallel_preverified`].
+#[derive(Debug, Clone)]
+pub struct PreverifiedTx {
+    /// RLP-encoded signed transaction bytes (Legacy, EIP-2930, or
+    /// EIP-1559 per EIP-2718).
+    pub raw: Vec<u8>,
+    /// The sender recovered from the transaction's secp256k1
+    /// signature by the mempool. The execution layer trusts this
+    /// address without re-verifying.
+    pub sender: revm::primitives::Address,
+}
+
 /// The EVM module: wraps `revm` and exposes it as an Oxide `Module`.
 ///
 /// State is stored in a `CacheDB<EmptyDB>` (in-memory) during
@@ -641,6 +675,10 @@ impl EvmModule {
     /// ~33.6 µs to ~4 µs (execution) + 29.6/8 µs (recovery) ≈ 7.7 µs,
     /// yielding ~130,000 tx/s.
     ///
+    /// For even higher throughput, use [`handle_batch_preverified`](Self::handle_batch_preverified)
+    /// which skips sender recovery entirely (the caller pre-recovers
+    /// senders at mempool ingestion time).
+    ///
     /// # Arguments
     ///
     /// - `ctx`: the transaction context (unused for EVM — the sender
@@ -671,6 +709,12 @@ impl EvmModule {
         // Phase 1: decode + recover all senders in parallel.
         // Each tx is independently decoded and its sender recovered.
         // Failures are recorded and skipped during execution.
+        //
+        // secp256k1 recovery (~30 µs/tx) is the dominant cost. Rayon
+        // parallelizes it across cores, reducing effective per-tx
+        // cost to ~30µs/N_cores. For pre-recovered senders (mempool
+        // already verified), use `handle_batch_preverified` to skip
+        // this entirely.
         let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = msgs
             .par_iter()
             .map(|raw| {
@@ -686,6 +730,146 @@ impl EvmModule {
             })
             .collect();
 
+        self.execute_decoded(ctx, decoded)
+    }
+
+    /// Pre-recover senders from a batch of raw transactions.
+    ///
+    /// The mempool calls this at ingestion time to recover the sender
+    /// for each transaction **once**. The resulting [`PreverifiedTx`]
+    /// pairs are then passed to [`handle_batch_preverified`](Self::handle_batch_preverified)
+    /// or [`handle_batch_parallel_preverified`](Self::handle_batch_parallel_preverified),
+    /// which skip secp256k1 recovery entirely during block execution.
+    ///
+    /// This is the key to eliminating the ~30 µs/tx signature recovery
+    /// cost from the block execution critical path. Recovery happens
+    /// once at mempool admission (off the consensus critical path);
+    /// execution reuses the pre-recovered sender.
+    ///
+    /// # Arguments
+    ///
+    /// - `msgs`: raw RLP-encoded signed transactions.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `PreverifiedTx` (for valid txs) or `ExecError` (for
+    /// malformed txs, wrong chain ID, or invalid signatures). The
+    /// vector is in the same order as the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Malformed`] for each transaction that
+    /// cannot be decoded, has the wrong chain ID, or has an invalid
+    /// signature.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    pub fn preverify_batch(&self, msgs: &[Vec<u8>]) -> Vec<Result<PreverifiedTx, ExecError>> {
+        msgs.par_iter()
+            .map(|raw| {
+                let mut buf = raw.as_slice();
+                let signed: tx::SignedTx =
+                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                if signed.chain_id() != self.chain_id {
+                    return Err(ExecError::Malformed);
+                }
+                let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+                let caller = alloy_primitives_address(sender.0);
+                Ok(PreverifiedTx { raw: raw.clone(), sender: caller })
+            })
+            .collect()
+    }
+
+    /// Execute a batch of transactions with **pre-verified senders**.
+    ///
+    /// This is the highest-throughput serial execution path. The
+    /// caller (mempool/block builder) has already recovered the sender
+    /// for each tx via [`preverify_batch`](Self::preverify_batch).
+    /// This method skips secp256k1 recovery entirely — only RLP
+    /// decoding (~79 ns/tx) and chain ID validation remain in Phase 1.
+    ///
+    /// # Performance
+    ///
+    /// Eliminating recovery removes ~30 µs/tx (single-threaded) or
+    /// ~3.7 µs/tx (8-core parallelized) from the critical path. For
+    /// 10k simple transfers, this reduces batch time from ~80 ms
+    /// (recovery + native execution) to ~10 ms (decode + native
+    /// execution) — roughly a 5-8x speedup.
+    ///
+    /// # Security
+    ///
+    /// The caller MUST ensure `senders` are correctly recovered from
+    /// the corresponding `raw` bytes. A byzantine block proposer could
+    /// provide wrong senders, causing state divergence. This is
+    /// detectable by state root comparison across validators. For
+    /// production multi-validator deployment, pair this with
+    /// verification sampling (re-verify a random fraction of senders).
+    /// For the current Phase 0 devnet (single validator), trusting
+    /// the proposer is safe.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: the transaction context (unused for EVM — the sender
+    ///   is pre-recovered).
+    /// - `txs`: a slice of [`PreverifiedTx`] (raw bytes + pre-recovered
+    ///   sender).
+    ///
+    /// # Returns
+    ///
+    /// A vector of results, one per input transaction.
+    ///
+    /// # Errors
+    ///
+    /// Individual transactions may fail independently. A failed
+    /// transaction does not abort the batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `DB`, `coinbase`, `block_height`,
+    /// `block_timestamp`, or touched mutex is poisoned.
+    pub fn handle_batch_preverified(
+        &self,
+        ctx: &TxContext,
+        txs: &[PreverifiedTx],
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
+        // Phase 1: decode only (no recovery). RLP decode is ~79 ns/tx
+        // vs ~30 µs/tx for secp256k1 recovery — a 380x speedup on
+        // Phase 1 alone.
+        let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = txs
+            .par_iter()
+            .map(|pv| {
+                let mut buf = pv.raw.as_slice();
+                let signed: tx::SignedTx =
+                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                if signed.chain_id() != self.chain_id {
+                    return Err(ExecError::Malformed);
+                }
+                Ok((signed, pv.sender))
+            })
+            .collect();
+
+        self.execute_decoded(ctx, decoded)
+    }
+
+    /// Shared execution loop for decoded transactions.
+    ///
+    /// Both [`handle_batch`](Self::handle_batch) and
+    /// [`handle_batch_preverified`](Self::handle_batch_preverified)
+    /// produce a `decoded` vector of `(SignedTx, caller)` pairs (or
+    /// errors). This method executes them sequentially under a single
+    /// DB lock, trying the native fast path first and falling through
+    /// to revm for non-native txs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `DB`, `coinbase`, `block_height`,
+    /// `block_timestamp`, or touched mutex is poisoned.
+    fn execute_decoded(
+        &self,
+        ctx: &TxContext,
+        decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>>,
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
         // Phase 2: execute all txs sequentially under a single lock.
         // The CacheDB is a single-writer structure — parallel execution
         // would require partitioning the state, which is future work.
@@ -699,7 +883,7 @@ impl EvmModule {
         // batches, the EVM context is built per non-native tx inside a
         // scoped block; the ~100 ns rebuild cost is negligible vs the
         // ~3.7 µs EVM execution cost.
-        let mut results = Vec::with_capacity(msgs.len());
+        let mut results = Vec::with_capacity(decoded.len());
 
         // Acquire the DB lock once for the entire batch.
         let mut db = self.db.lock().expect("db mutex not poisoned");
@@ -890,6 +1074,9 @@ impl EvmModule {
         // Phase 1: decode + recover all senders in parallel.
         // Same as handle_batch — rayon parallelizes the 88%-of-cost
         // secp256k1 recovery across cores.
+        //
+        // For pre-recovered senders (mempool already verified), use
+        // `handle_batch_parallel_preverified` to skip this entirely.
         let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = msgs
             .par_iter()
             .map(|raw| {
@@ -905,6 +1092,96 @@ impl EvmModule {
             })
             .collect();
 
+        self.execute_parallel_decoded(ctx, decoded)
+    }
+
+    /// Execute a batch of transactions with **pre-verified senders**
+    /// and **parallel speculative execution**.
+    ///
+    /// This combines the two highest-throughput optimizations:
+    /// 1. **Pre-verified senders** — skips secp256k1 recovery entirely
+    ///    (the caller pre-recovered senders at mempool ingestion time).
+    /// 2. **Parallel speculative execution** — transactions from
+    ///    different senders execute in parallel on per-group state
+    ///    snapshots, with conflict detection and sequential fallback.
+    ///
+    /// This is the fastest execution path in the EVM module. Use it
+    /// when the mempool has already verified senders and the batch
+    /// contains transactions from multiple senders.
+    ///
+    /// # Security
+    ///
+    /// Same security model as
+    /// [`handle_batch_preverified`](Self::handle_batch_preverified):
+    /// the caller MUST ensure senders are correctly recovered. See
+    /// that method's documentation for the full security discussion.
+    ///
+    /// # Arguments
+    ///
+    /// - `ctx`: the transaction context (unused for EVM).
+    /// - `txs`: a slice of [`PreverifiedTx`] (raw bytes + pre-recovered
+    ///   sender).
+    ///
+    /// # Returns
+    ///
+    /// A vector of results, one per input transaction.
+    ///
+    /// # Errors
+    ///
+    /// Individual transactions may fail independently.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `DB`, `coinbase`, `block_height`,
+    /// `block_timestamp`, or touched mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
+    pub fn handle_batch_parallel_preverified(
+        &self,
+        ctx: &TxContext,
+        txs: &[PreverifiedTx],
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
+        // Fast path: empty batch.
+        if txs.is_empty() {
+            return Vec::new();
+        }
+
+        // Phase 1: decode only (no recovery). RLP decode is ~79 ns/tx
+        // vs ~30 µs/tx for secp256k1 recovery.
+        let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = txs
+            .par_iter()
+            .map(|pv| {
+                let mut buf = pv.raw.as_slice();
+                let signed: tx::SignedTx =
+                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                if signed.chain_id() != self.chain_id {
+                    return Err(ExecError::Malformed);
+                }
+                Ok((signed, pv.sender))
+            })
+            .collect();
+
+        self.execute_parallel_decoded(ctx, decoded)
+    }
+
+    /// Shared parallel execution loop for decoded transactions.
+    ///
+    /// Both [`handle_batch_parallel`](Self::handle_batch_parallel) and
+    /// [`handle_batch_parallel_preverified`](Self::handle_batch_parallel_preverified)
+    /// produce a `decoded` vector. This method implements the
+    /// parallel speculative execution algorithm: sender grouping,
+    /// parallel execution on per-group snapshots, conflict detection,
+    /// and sequential fallback for conflicting groups.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `DB`, `coinbase`, `block_height`,
+    /// `block_timestamp`, or touched mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
+    fn execute_parallel_decoded(
+        &self,
+        ctx: &TxContext,
+        decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>>,
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
         // Phase 2: group txs by sender, preserving original order
         // within each group. Txs from the same sender must execute
         // sequentially (nonce dependency). Txs from different senders
@@ -917,7 +1194,8 @@ impl EvmModule {
             Vec<(usize, tx::SignedTx)>,
         > = std::collections::HashMap::new();
         let mut group_order: Vec<revm::primitives::Address> = Vec::new();
-        let mut errors: Vec<Option<ExecError>> = vec![None; msgs.len()];
+        let mut errors: Vec<Option<ExecError>> = vec![None; decoded.len()];
+        let n_txs = decoded.len();
 
         for (idx, item) in decoded.into_iter().enumerate() {
             match item {
@@ -939,12 +1217,11 @@ impl EvmModule {
             }
         }
 
-        // Fast path: single group (all txs from one sender). Fall back
-        // to handle_batch to avoid the clone overhead — there's no
-        // parallelism to gain with one group.
-        if group_order.len() <= 1 {
-            return self.handle_batch(ctx, msgs);
-        }
+        // Note: single-group batches (all txs from one sender) are
+        // handled correctly by the parallel path — the group executes
+        // sequentially on its own clone. The clone cost (O(n_accounts))
+        // is acceptable; a future optimization can skip the clone for
+        // single-group batches by calling `execute_decoded` directly.
 
         // Phase 3: snapshot the main DB into an `Arc` for
         // copy-on-write sharing. Each group gets a
@@ -1287,14 +1564,14 @@ impl EvmModule {
         let mut spec_index: std::collections::HashMap<
             usize,
             &Result<revm::context::result::ExecutionResult, ExecError>,
-        > = std::collections::HashMap::with_capacity(msgs.len());
+        > = std::collections::HashMap::with_capacity(n_txs);
         for gr in &group_results {
             for (idx, result) in &gr.tx_results {
                 spec_index.insert(*idx, result);
             }
         }
 
-        let mut results: Vec<Result<Vec<Event>, ExecError>> = Vec::with_capacity(msgs.len());
+        let mut results: Vec<Result<Vec<Event>, ExecError>> = Vec::with_capacity(n_txs);
         for (i, err) in errors.iter().enumerate() {
             if let Some(e) = err {
                 results.push(Err(e.clone()));
@@ -2696,5 +2973,170 @@ mod tests {
         let root2 = m2.state_root();
 
         assert_eq!(root1, root2, "state roots must be deterministic");
+    }
+
+    // ── Pre-verified sender recovery tests ──────────────────────
+
+    /// `preverify_batch` recovers senders correctly: the
+    /// pre-recovered address matches what `SignedTx::recover_sender`
+    /// would produce.
+    #[test]
+    fn preverify_batch_recovers_correct_senders() {
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let m = make_module();
+
+        let txs = vec![
+            signed_transfer_tx(&pk, 0, recipient, 1_000_000_000),
+            signed_transfer_tx(&pk, 1, recipient, 1_000_000_000),
+        ];
+
+        let preverified = m.preverify_batch(&txs);
+        assert_eq!(preverified.len(), 2, "must return one result per tx");
+        for (i, pv) in preverified.iter().enumerate() {
+            let pv = pv.as_ref().expect("valid tx must preverify");
+            let expected = alloy_primitives_address(addr.0);
+            assert_eq!(pv.sender, expected, "pre-recovered sender must match keypair address");
+            assert_eq!(pv.raw, txs[i], "raw bytes must be preserved");
+        }
+    }
+
+    /// `preverify_batch` rejects malformed transactions.
+    #[test]
+    fn preverify_batch_rejects_malformed() {
+        let m = make_module();
+        let garbage = vec![vec![0xff, 0xff, 0xff]];
+        let preverified = m.preverify_batch(&garbage);
+        assert_eq!(preverified.len(), 1);
+        assert!(preverified[0].is_err(), "malformed tx must fail preverify");
+    }
+
+    /// `handle_batch_preverified` produces identical state roots to
+    /// `handle_batch` (which recovers senders internally). This is the
+    /// core correctness invariant: pre-verified recovery is an
+    /// optimization, not a semantic change.
+    #[test]
+    fn preverified_matches_recovery_state_root() {
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let txs: Vec<Vec<u8>> =
+            (0..10).map(|i| signed_transfer_tx(&pk, i, recipient, 1_000_000_000)).collect();
+
+        // Path 1: handle_batch (recovers senders internally).
+        let m1 = make_module();
+        fund(&m1, &addr);
+        m1.begin_block(Height::new(1));
+        m1.handle_batch(&dummy_ctx(), &txs);
+        m1.end_block(Height::new(1));
+        let root1 = m1.state_root();
+
+        // Path 2: preverify + handle_batch_preverified.
+        let m2 = make_module();
+        fund(&m2, &addr);
+        let preverified: Vec<PreverifiedTx> = m2
+            .preverify_batch(&txs)
+            .into_iter()
+            .map(|r| r.expect("preverify must succeed"))
+            .collect();
+        m2.begin_block(Height::new(1));
+        m2.handle_batch_preverified(&dummy_ctx(), &preverified);
+        m2.end_block(Height::new(1));
+        let root2 = m2.state_root();
+
+        assert_eq!(root1, root2, "pre-verified and recovery state roots must match");
+    }
+
+    /// `handle_batch_parallel_preverified` produces identical state
+    /// roots to `handle_batch_parallel` (which recovers senders
+    /// internally). This verifies the pre-verified path is correct
+    /// for the parallel speculative execution algorithm.
+    #[test]
+    fn preverified_parallel_matches_recovery_parallel_state_root() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let recipient_a = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let recipient_b = revm::primitives::Address::from_slice(&[0x43; 20]);
+
+        let txs = vec![
+            signed_transfer_tx(&pk_a, 0, recipient_a, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 0, recipient_b, 1_000_000_000),
+            signed_transfer_tx(&pk_a, 1, recipient_a, 1_000_000_000),
+            signed_transfer_tx(&pk_b, 1, recipient_b, 1_000_000_000),
+        ];
+
+        // Path 1: handle_batch_parallel (recovers senders internally).
+        let m1 = make_module();
+        fund(&m1, &addr_a);
+        fund(&m1, &addr_b);
+        m1.begin_block(Height::new(1));
+        m1.handle_batch_parallel(&dummy_ctx(), &txs);
+        m1.end_block(Height::new(1));
+        let root1 = m1.state_root();
+
+        // Path 2: preverify + handle_batch_parallel_preverified.
+        let m2 = make_module();
+        fund(&m2, &addr_a);
+        fund(&m2, &addr_b);
+        let preverified: Vec<PreverifiedTx> = m2
+            .preverify_batch(&txs)
+            .into_iter()
+            .map(|r| r.expect("preverify must succeed"))
+            .collect();
+        m2.begin_block(Height::new(1));
+        m2.handle_batch_parallel_preverified(&dummy_ctx(), &preverified);
+        m2.end_block(Height::new(1));
+        let root2 = m2.state_root();
+
+        assert_eq!(
+            root1, root2,
+            "pre-verified parallel and recovery parallel state roots must match"
+        );
+    }
+
+    /// `handle_batch_preverified` with an empty batch returns an empty
+    /// result vector (no panic).
+    #[test]
+    fn preverified_empty_batch() {
+        let m = make_module();
+        let results = m.handle_batch_preverified(&dummy_ctx(), &[]);
+        assert!(results.is_empty(), "empty batch must return empty results");
+    }
+
+    /// `handle_batch_parallel_preverified` with an empty batch returns
+    /// an empty result vector (no panic).
+    #[test]
+    fn preverified_parallel_empty_batch() {
+        let m = make_module();
+        let results = m.handle_batch_parallel_preverified(&dummy_ctx(), &[]);
+        assert!(results.is_empty(), "empty batch must return empty results");
+    }
+
+    /// `handle_batch_preverified` skips invalid txs without aborting
+    /// the batch (same semantics as `handle_batch`).
+    #[test]
+    fn preverified_skips_invalid_txs() {
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let valid_tx = signed_transfer_tx(&pk, 0, recipient, 1_000_000_000);
+        let garbage = vec![0xff_u8; 10];
+
+        let m = make_module();
+        fund(&m, &addr);
+
+        // Pre-verify: the valid tx succeeds, the garbage fails.
+        let raw_txs = vec![valid_tx.clone(), garbage];
+        let preverified: Vec<PreverifiedTx> =
+            m.preverify_batch(&raw_txs).into_iter().filter_map(std::result::Result::ok).collect();
+        assert_eq!(preverified.len(), 1, "only the valid tx should preverify");
+
+        m.begin_block(Height::new(1));
+        let results = m.handle_batch_preverified(&dummy_ctx(), &preverified);
+        m.end_block(Height::new(1));
+
+        assert_eq!(results.len(), 1, "one tx in, one result out");
+        assert!(results[0].is_ok(), "valid tx must succeed");
+        assert_eq!(m.nonce(&addr), 1, "nonce must increment for the valid tx");
     }
 }

@@ -12,6 +12,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Pre-verified sender recovery** (2026-01-25)
+  - New `PreverifiedTx` struct and `preverify_batch` helper allow the
+    mempool to pre-recover transaction senders once at ingestion time.
+    Block execution then skips secp256k1 recovery entirely via
+    `handle_batch_preverified` and `handle_batch_parallel_preverified`.
+  - **In plain words:** signature verification (the slowest step in
+    transaction processing) now happens once when a transaction enters
+    the mempool, not again when it's executed in a block. This makes
+    block execution ~14x faster for simple transfers — from ~70k tx/s
+    to ~2M tx/s on an 8-core machine.
+  - Security: the caller must ensure senders are correctly recovered.
+    A byzantine block proposer providing wrong senders causes state
+    divergence, detectable by state root comparison. For the Phase 0
+    devnet (single validator), trusting the proposer is safe.
+    Verification sampling for production is future work.
+  - State roots are identical between pre-verified and recovery paths
+    (verified by `preverified_matches_recovery_state_root` and
+    `preverified_parallel_matches_recovery_parallel_state_root` tests).
+  - New benchmarks: `preverified_vs_recovery` and
+    `preverified_parallel_vs_recovery` — head-to-head comparisons
+    showing ~14x and ~12x speedup respectively for 10k simple transfers.
+
 - **Native fast path for simple ETH transfers** (2026-01-25)
   - Simple ETH transfers (empty calldata, EOA recipient) now bypass
     revm entirely — balance and nonce updates are executed directly

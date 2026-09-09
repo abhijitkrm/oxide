@@ -4299,3 +4299,115 @@ The path to 1M TPS requires all of these, not just one. The native
 fast path removes the EVM interpreter overhead for the simplest
 workload; the remaining bottlenecks are signature recovery and
 parallel scheduling.
+
+## Session: Pre-Verified Sender Recovery
+
+**Goal:** Eliminate secp256k1 signature recovery from the block
+execution critical path. Recovery was ~30 µs/tx (single-threaded)
+or ~3.7 µs/tx (8-core parallelized) — the dominant cost in batch
+execution. The mempool already recovers senders at ingestion time;
+re-recovering them during block execution is redundant work.
+
+### What was built
+
+**`PreverifiedTx` struct** — a transaction with a pre-recovered
+sender. The mempool calls `preverify_batch` to recover senders once
+at ingestion time, producing `PreverifiedTx` pairs (raw bytes +
+sender address). Block execution then uses `handle_batch_preverified`
+or `handle_batch_parallel_preverified`, which skip secp256k1
+recovery entirely — only RLP decoding (~79 ns/tx) and chain ID
+validation remain in Phase 1.
+
+**New API:**
+- `PreverifiedTx` — public struct (raw bytes + pre-recovered sender)
+- `preverify_batch(&[Vec<u8>])` → `Vec<Result<PreverifiedTx>>` —
+  mempool helper to pre-recover senders
+- `handle_batch_preverified(&[PreverifiedTx])` — serial execution
+  with pre-verified senders
+- `handle_batch_parallel_preverified(&[PreverifiedTx])` — parallel
+  speculative execution with pre-verified senders
+
+**Refactoring:**
+- Extracted shared serial execution loop into `execute_decoded`
+  (used by both `handle_batch` and `handle_batch_preverified`)
+- Extracted shared parallel execution loop into
+  `execute_parallel_decoded` (used by both `handle_batch_parallel`
+  and `handle_batch_parallel_preverified`)
+- Removed single-group fallback to `handle_batch` in the parallel
+  path (it referenced `msgs` which is not available in the shared
+  helper; the parallel path handles single-group correctly via
+  clone + sequential execution)
+
+### Security model
+
+The pre-verified path trusts the caller's pre-recovered senders. A
+byzantine block proposer could provide wrong senders, causing state
+divergence. This is detectable by state root comparison across
+validators. For the Phase 0 devnet (single validator), trusting the
+proposer is safe. For production, pair with verification sampling
+(re-verify a random fraction of senders) — future work.
+
+### Benchmark results
+
+**`preverified_vs_recovery` (serial, single sender, 10k simple
+transfers):**
+
+| Path | Time | TPS |
+|---|---|---|
+| `handle_batch` (recovery) | 70.7 ms | ~142k |
+| `handle_batch_preverified` | 4.8 ms | **~2.08M** |
+| **Speedup** | **14.6x** | |
+
+**`preverified_parallel_vs_recovery` (parallel, 100 senders, 10k
+simple transfers):**
+
+| Path | Time | TPS |
+|---|---|---|
+| `handle_batch_parallel` (recovery) | 73.7 ms | ~136k |
+| `handle_batch_parallel_preverified` | 6.3 ms | **~1.59M** |
+| **Speedup** | **11.7x** | |
+
+Machine: 8-core, load avg ~10. Absolute numbers are inflated by
+system load; relative speedup is the key metric.
+
+### Key insight: serial beats parallel for pre-verified
+
+Without recovery, execution is so fast (~0.3 µs/tx for native
+transfers) that the CacheDB clone overhead in the parallel path
+dominates. For pre-verified simple transfers, the serial path
+(4.8 ms) is faster than the parallel path (6.3 ms) because the
+serial path avoids 100 CacheDB clones.
+
+The parallel path remains valuable for:
+1. Contract calls (revm execution is ~3.7 µs/tx — parallelism helps)
+2. Mixed workloads (some txs need revm, some are native)
+3. Very large batches where clone overhead is amortized
+
+### TPS progress
+
+With pre-verified senders + native fast path, the EVM execution
+layer sustains **~2M tx/s for simple transfers** on an 8-core
+machine. This exceeds the 1M TPS goal for the execution layer
+(not the full system — consensus, networking, and mempool are not
+included).
+
+The remaining bottlenecks for full-system 1M TPS:
+1. **Mempool ingestion** — must pre-recover senders at ~30 µs/tx
+   (parallelizable, but still a cost)
+2. **Consensus** — oxideBFT must finalize blocks fast enough
+3. **Networking** — gossip and block propagation
+4. **Contract calls** — revm execution at ~3.7 µs/tx (no native
+   fast path for arbitrary contracts)
+
+### What's next
+
+- **Verification sampling** — re-verify a random fraction of
+  pre-verified senders for byzantine fault detection
+- **Batch signature verification** — use BLS or aggregated
+  signatures to reduce per-tx recovery cost at the mempool
+- **Mempool integration** — wire `preverify_batch` into the actual
+  mempool ingestion path
+- **Block format** — carry pre-recovered senders in the block
+  format so validators can use the pre-verified path
+- **Parallel execution optimization** — reduce CacheDB clone
+  overhead for the parallel path (copy-on-write at account level)
