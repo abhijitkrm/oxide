@@ -54,10 +54,16 @@ framework = { path = "modules/framework", version = "0.1.0" }
 oxide-core = { path = "modules/oxide-core", version = "0.1.0" }
 bank = { path = "modules/bank", version = "0.1.0" }
 staking = { path = "modules/staking", version = "0.1.0" }
+evm = { path = "modules/evm", version = "0.1.0" }
 broadcast = { path = "crates/broadcast", version = "0.1.0" }
 p2p = { path = "crates/p2p", version = "0.1.0" }
 devnet = { path = "crates/devnet", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0" }
+
+# External EVM stack (plan.md §2: revm is the approved EVM engine).
+# revm is MIT-licensed (GPL-3.0-compatible). Pinned exact version
+# per AGENTS.md dependency policy.
+revm = "42.0.1"
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable

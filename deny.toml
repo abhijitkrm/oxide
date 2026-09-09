@@ -19,6 +19,10 @@ allow = [
   "MPL-2.0",
   "Unicode-3.0",
   "Zlib",
+  # CC0-1.0: public domain dedication. Used by revm's transitive
+  # deps (e.g. alloy-primitives). GPL-3.0-compatible (public domain
+  # is compatible with everything).
+  "CC0-1.0",
   # GPL-family: fine to combine with GPL-3.0-only. Use the valid SPDX
   # identifiers (the bare `GPL-3.0` / `LGPL-3.0` / `AGPL-3.0` forms are
   # deprecated and trigger cargo-deny parse-error warnings).
@@ -45,7 +49,13 @@ yanked = "deny"
 # skill §4) — it never ships in a binary. Ignoring here is a reviewed,
 # documented decision; if a maintained alternative with equivalent
 # ergonomics emerges (postcard, rkyv) we will switch and drop the ignore.
-ignore = ["RUSTSEC-2025-0141"]
+#
+# RUSTSEC-2024-0436: `paste` is unmaintained (the author declared it
+# complete). It is a build-time proc-macro crate (zero runtime, zero
+# unsafe, no network) pulled transitively by revm's alloy deps. No safe
+# upgrade exists; the crate is functionally stable. Ignoring is a
+# reviewed decision; if revm drops the dependency we will drop the ignore.
+ignore = ["RUSTSEC-2025-0141", "RUSTSEC-2024-0436"]
 
 [sources]
 unknown-registry = "deny"

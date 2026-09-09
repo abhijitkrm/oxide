@@ -29,6 +29,8 @@ pub mod module_id {
     pub const BANK: u8 = 1;
     /// The staking module: delegation, validation, slashing.
     pub const STAKING: u8 = 2;
+    /// The EVM module: revm host, precompiles, EIP-1559.
+    pub const EVM: u8 = 3;
 }
 
 /// A shared in-memory key-value store for module state.
