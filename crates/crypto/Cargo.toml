@@ -32,6 +32,10 @@ secp256k1 = { workspace = true }
 # Already a transitive dep via revm. The `sha3` crate's `Keccak256`
 # digest is Ethereum's keccak256 (not NIST SHA3-256). MIT/Apache-2.0.
 sha3 = { workspace = true }
+# ed25519-dalek: Ed25519 signatures for native module authenticity
+# (Phase G). Pure Rust, constant-time. BSD-3-Clause. Used for
+# signing native (non-EVM) transactions: bank, staking, trading.
+ed25519-dalek = { workspace = true }
 
 [lints]
 workspace = true

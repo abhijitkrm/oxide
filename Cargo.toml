@@ -101,6 +101,14 @@ alloy-trie = { version = "0.9.5", features = ["ethereum"] }
 # in the EVM module (trie, tx types). MIT/Apache-2.0 licensed.
 alloy-primitives = { version = "1.0", features = ["std"] }
 
+# ed25519-dalek: Ed25519 signatures for native module authenticity
+# (Phase G). Pure Rust, constant-time, no_std-compatible. Used by
+# Solana, Signal, and many blockchain projects. BSD-3-Clause
+# (GPL-3.0-compatible). This is the native signature scheme for
+# Oxide's non-EVM modules (bank, staking, trading) — faster
+# verification than secp256k1 and no malleability.
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+
 # External storage adapters (plan.md §2.3: StorageBackend adapters).
 # redb is Apache-2.0 (GPL-3.0-compatible), pure Rust, ACID, LMDB-like.
 redb = "4.2.0"

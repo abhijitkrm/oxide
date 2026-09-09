@@ -29,11 +29,16 @@
 
 pub mod bls;
 pub mod bls_signer;
+pub mod ed25519;
 pub mod hash;
 pub mod secp;
 
 pub use bls::{AggregateSignature, PublicKey, Signature, ValidatorIndex};
 pub use bls_signer::{BlsError, BlsSecretKey, aggregate, aggregate_verify, verify};
+pub use ed25519::{
+    Ed25519Error, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, derive_public,
+    generate_keypair_for_test as generate_ed25519_keypair, sign_message, verify_message,
+};
 pub use hash::{Domain, Hasher};
 pub use secp::{
     RecoverableSignature, RecoveryId, SecpError, generate_keypair_for_test, keccak256,
