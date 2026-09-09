@@ -149,6 +149,12 @@ pub struct EvmModule {
     /// The block gas limit. Used to populate the EVM block
     /// environment and enforce block-level gas limits.
     block_gas_limit: u64,
+    /// Phase D: accounts touched in the current block. Tracked
+    /// during `execute` so `end_block` can flush only the changed
+    /// accounts (incremental flush) instead of the full state.
+    /// Cleared after each `end_block` flush.
+    /// Behind a `Mutex` because `Module::handle` takes `&self`.
+    touched: Mutex<std::collections::HashSet<revm::primitives::Address>>,
 }
 
 impl EvmModule {
@@ -172,6 +178,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
+            touched: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -189,6 +196,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
+            touched: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -220,6 +228,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
+            touched: Mutex::new(std::collections::HashSet::new()),
         };
         // Load initial state from the backend into the CacheDB, then
         // install the backend for future flushes.
@@ -332,6 +341,26 @@ impl EvmModule {
         let result = evm
             .transact_commit(tx)
             .map_err(|e| ExecError::ModuleRejected(format!("evm transact failed: {e:?}")))?;
+
+        // Phase D: track touched accounts for incremental flush.
+        // After `transact_commit`, the CacheDB has the updated state.
+        // We mark the caller, the `to` address (if Call), and the
+        // created address (if Create succeeded) as touched. The
+        // coinbase is also touched (it receives the priority fee).
+        // This covers the accounts most likely modified by the tx.
+        // For deeper accuracy (e.g., SSTORE to a third account),
+        // a future optimization can diff the cache before/after.
+        {
+            let mut touched = self.touched.lock().expect("touched mutex not poisoned");
+            touched.insert(caller);
+            if let tx::TxKind::Call(addr) = signed.to() {
+                touched.insert(revm::primitives::Address::from(addr.0));
+            }
+            if let Some(created) = result.created_address() {
+                touched.insert(created);
+            }
+            touched.insert(coinbase);
+        }
 
         Ok(result)
     }
@@ -667,18 +696,33 @@ impl EvmModule {
 
     /// Flush the current `CacheDB` state to the `StorageBackend`.
     ///
-    /// Serializes every account (balance, nonce, code, storage) into
-    /// a single `Op::Set` per account and applies the batch atomically.
-    /// Called from `end_block` when a backend is attached.
+    /// Phase D: incremental flush. Only accounts touched in the
+    /// current block are flushed. This is O(touched) instead of
+    /// O(N) — a major improvement for large states where each
+    /// block modifies only a few accounts.
+    ///
+    /// If no accounts were touched (e.g., empty block), this is a
+    /// no-op.
     ///
     /// # Panics
     ///
     /// Panics if the DB mutex is poisoned.
     fn flush_to_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
         let db = self.db.lock().expect("db mutex not poisoned");
-        let mut ops = Vec::with_capacity(db.cache.accounts.len());
-        for (evm_addr, account) in &db.cache.accounts {
-            // Skip accounts that don't exist (never touched).
+        let mut touched = self.touched.lock().expect("touched mutex not poisoned");
+
+        // If nothing was touched, skip the flush entirely.
+        if touched.is_empty() {
+            return;
+        }
+
+        let mut ops = Vec::with_capacity(touched.len());
+        for evm_addr in touched.iter() {
+            // Skip accounts that don't exist (never touched or
+            // selfdestructed).
+            let Some(account) = db.cache.accounts.get(evm_addr) else {
+                continue;
+            };
             if account.account_state == revm::database::AccountState::NotExisting {
                 continue;
             }
@@ -713,6 +757,9 @@ impl EvmModule {
             ops.push(storage::Op::Set { key, value });
         }
         backend.apply_batch(&ops);
+
+        // Clear the touched set for the next block.
+        touched.clear();
     }
 
     /// Load EVM state from the `StorageBackend` into the `CacheDB`.
