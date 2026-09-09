@@ -12,6 +12,33 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Timeout certificate authentication (TC safety fix)** (2026-01-21)
+  - Timeout certificates are now authenticated with real BLS
+    signatures. `on_timeout()` signs the view with the validator's
+    secret key, `collect_timeout_signature()` verifies each
+    signature, and `on_timeout_certificate()` verifies the TC's
+    aggregate. A byzantine validator can no longer forge a TC to
+    force a spurious view change.
+  - In plain words: the consensus view-change mechanism is now
+    cryptographically authenticated, closing the last safety gap
+    from the C1 audit.
+
+- **oxide-spammer load generator binary** (2026-01-21)
+  - Added the `oxide-spammer` binary (Phase 1 deliverable). It
+    submits bank-transfer txs at a configurable rate and reports
+    submit/exec/total throughput. Usage: `oxide-spammer
+    [--txs=N] [--engine=sequencer|oxideBFT]`.
+  - In plain words: a load-testing tool that fires transactions at
+    the chain and reports the throughput.
+
+- **Broadcast backfill recovery path** (2026-01-21)
+  - Added a `backfill` method to the `BroadcastEngine` trait. A
+    node that missed the original broadcast can now recover the
+    proposal data by hash. Both `PlainGossip` and
+    `ErasureBroadcast` implement backfill.
+  - In plain words: a validator that was offline or partitioned
+    can now recover missed block data from peers.
+
 - **Consensus message fuzz target (L3 fix)** (2026-09-10)
   - Added a fuzz target for consensus message decoding (Vote,
     QuorumCertificate, TimeoutCertificate, BlockHeader). These

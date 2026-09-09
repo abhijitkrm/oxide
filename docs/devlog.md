@@ -2414,3 +2414,110 @@ the height sync is a simulation artifact, not a consensus path.)
 233 tests pass (was 228, +5: 3 p2p partition, 2 devnet
 transport/partition). fmt clean. clippy `-D warnings` clean.
 cargo deny ok.
+
+## 2026-01-21 — Session 19: Phase 1 gap fill (TC safety, spammer, backfill)
+
+### Context
+
+After the full acceptance retest (session 18), a gap analysis
+identified 5 remaining Phase 1 items. This session fills them.
+
+### TC safety: authenticate timeout certificates
+
+The last safety gap from the C1 audit follow-up: timeout
+certificates were unauthenticated. `on_timeout()` returned
+`Signature::ZERO`, `collect_timeout_signature()` did not verify
+the signature, and `on_timeout_certificate()` did not verify the
+TC's aggregate. A byzantine validator could forge a TC and force
+a spurious view change.
+
+Root cause: the pacemaker was stage-2 (state machine only, no
+crypto). Stage 5 added BLS to votes and QCs but not to the
+timeout path.
+
+Fix:
+- `on_timeout()` now signs the view with the real BLS secret key
+  (`Domain::Timeout`), proving the validator is timing out on
+  this specific view.
+- `collect_timeout_signature()` verifies the timeout signature
+  against the voter's public key before collecting. Forged
+  signatures are rejected with `InvalidVoteSignature`.
+- When quorum is reached, the collected signatures are aggregated
+  into the TC's `aggregate_signature` (real BLS aggregation).
+- `on_timeout_certificate()` verifies the TC's aggregate
+  signature against the signer bitmap + validator set. Forged TCs
+  are rejected with `InvalidTcSignature`.
+- Added `InvalidTcSignature` error variant.
+- Added `timeout_signatures` field to `OxideBft` to store
+  verified signatures for aggregation.
+- Updated the multinode fault-injection path to use real timeout
+  signatures.
+- 3 new tests: forged TC rejected, forged timeout sig rejected,
+  valid timeout sig accepted.
+
+Commit: `b80effb`.
+
+### oxide-spammer: load generator binary
+
+The `oxide-spammer` binary was listed as a Phase 1 deliverable
+(plan.md §13) but missing. It submits bank-transfer txs at a
+configurable rate and reports submit/exec/total throughput.
+
+Usage: `oxide-spammer [--txs=N] [--engine=sequencer|oxideBFT]`
+
+Default: 10k bank transfers on the sequencer engine. Builds a
+single-validator devnet in-process, submits txs, runs to finality,
+and reports txs/s. Verified: 1000 txs at 39k tx/s.
+
+Commit: `d86e5dc`.
+
+### Broadcast backfill: recovery path
+
+The broadcast layer had broadcast + erasure but no backfill path
+— a node that missed the original broadcast had no way to recover
+the proposal data. This is a Phase 1 deliverable (plan.md §13:
+"erasure + backfill + PlainGossip").
+
+Fix:
+- Added `backfill(hash) -> Result<Proposal, BroadcastError>` to
+  the `BroadcastEngine` trait.
+- Added `DataUnavailable` and `UnknownHash` error variants.
+- `PlainGossip`: stores proposals on broadcast; backfill returns
+  them by hash (trivial — any peer has the whole block).
+- `ErasureBroadcast`: stores proposals + chunks on broadcast;
+  backfill checks `can_reconstruct` (f+1 chunks) and returns the
+  proposal.
+- 5 new tests covering both adapters and error cases.
+
+Commit: `8c68a38`.
+
+### sim/ directory: Phase 4, not Phase 1
+
+The `sim/` directory and 10k randomized sim scenarios are a Phase
+4 deliverable (plan.md §13, Phase 4: "chaos sim suite... 10k
+randomized sim scenarios"). The Phase 0 "4-node echo sim" is
+already satisfied by `crates/runtime/tests/echo.rs`. The Phase 1
+deterministic sim is covered by the existing devnet multinode
+tests (4-node and 32-node deterministic simulations with fault
+injection).
+
+### MMR bench gate: already passing
+
+The MMR gate is "structure overhead <20ns/op with hash-floor
+decomposition". Measured: `push_amortized` = 170ns, `hash_node_65b`
+= 160ns. Structure overhead = 170-160 = 10ns, well under 20ns. The
+170ns total is dominated by BLAKE3 hashing (the hash floor), not
+MMR structure work. The bench documentation already explains this
+correctly. The `full_build_1m` (246ms) is explicitly marked
+"informational, not gated" — it's BLAKE3-throughput-bound.
+
+### Plan reconciliation
+
+Updated `plan.md` Phase 1 acceptance: removed stale "partition
+pending" wording (the `partition_recovery` test passes), recorded
+TC authentication evidence.
+
+### Verification
+
+241 tests pass (was 236, +5 backfill). fmt clean. clippy
+`-D warnings` clean. cargo deny ok.
