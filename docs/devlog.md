@@ -3079,3 +3079,118 @@ Phase 2 deliverables (14 total):
 14. Uniswap-transfer mix throughput benchmark (≥1 GG/s gate met)
 
 374 tests pass. fmt, clippy -D warnings, cargo deny all clean.
+
+## Session 24 — Self-audit + EVM exploit suite
+
+A full audit of every quality layer (development, benchmarks, unit
+tests, conformance, simulation, fuzzing) plus an adversarial EVM
+exploit suite. **Three real security bugs found and fixed** — one
+consensus-critical.
+
+### Audit results by layer
+
+**Quality gates**: fmt, clippy `-D warnings`, cargo deny — all
+clean. 395 tests pass with all storage features (was 374).
+
+**Simulation (Phase 1 gates, previously `#[ignore]`d)**: all 7
+devnet multinode tests pass on release. Measured throughput:
+16.5k tx/s (large batch), 23.7k tx/s (multi-sender), 20.3k tx/s
+(n=32 full pipeline), 33.6k tx/s (n=32 core-only); block timing
+21.4 ms/block (gate: 50–100 ms). Consistent with the amended
+session-18 gate: single-threaded sim with real BLS measures
+20–48k tx/s; the 200k target is the extrapolated parallelized
+production number.
+
+**Fuzzing**: cargo-fuzz installed (the `fuzz/Cargo.toml` was
+missing `[package.metadata] cargo-fuzz = true` — fixed). All 5
+existing targets run 45–60s each. **Two crashed**:
+
+### Bug 1 (critical): MMR proof-verification overflow
+
+`libFuzzer: deadly signal` — `peak_positions` panicked at
+`crates/storage/src/mmr.rs:155:30` on `2 * (1u64 << height) - 1`
+when a forged proof claims `leaf_count ≥ 2^63`. `Mmr::verify`
+feeds attacker-controlled `proof.leaf_count` straight into the
+pure function; height 63 overflows u64. **Remote DoS**: any peer
+sending a forged MMR proof crashes the node.
+
+Fix: checked arithmetic with `u64::MAX` fallback (which is the
+mathematically correct value at height 63) + saturating add.
+Regression tests: `test_peak_positions_never_panics_on_huge_counts`,
+`test_verify_rejects_insane_leaf_count_without_panic`. Fuzz
+re-verified: 4.9M runs clean (was crashing in seconds).
+
+### Bug 2 (high): types decode OOM
+
+`libFuzzer: out-of-memory (malloc(2221329816))` — a crafted
+`Proposal`/`FinalizedBlock` claiming ~2.9e8 txs made
+`Vec::with_capacity(count)` request a multi-GB allocation before
+the decode loop noticed the bytes ran out. **Remote memory-
+exhaustion DoS**: a 12-byte message could OOM a validator.
+
+Fix: cap the pre-allocation at `reader.remaining()` (each
+`TxBytes` occupies ≥1 wire byte, so remaining is a provably safe
+upper bound). Regression tests:
+`proposal_decode_huge_count_does_not_oom`,
+`finalized_block_decode_huge_count_does_not_oom`. Fuzz
+re-verified: 8.9M runs clean.
+
+### Bug 3 (consensus-critical): EVM state-root nondeterminism
+
+Found by the new exploit suite — not by fuzzing. The
+`state_root_is_deterministic` unit test passed only because fresh
+modules have identical small account sets. The exploit suite's
+adversarial sequence (multiple accounts) exposed it:
+`EvmModule::state_root()` iterated `db.cache.accounts` — a
+`HashMap` — whose iteration order is randomized per instance.
+**Two validators executing the same block would compute different
+state roots**, so execution attestations would never match:
+permanent divergence-detection false positives, no chain
+agreement on state. This would have halted the network at first
+multi-account block in production.
+
+Fix: sort accounts by address before hashing (canonical preimage).
+Exploit test `exploit_state_root_determinism_under_adversarial_sequence`
+now passes; all prior EVM tests unchanged.
+
+### EVM exploit suite (modules/evm/tests/exploits.rs)
+
+17 adversarial tests across 8 attack classes:
+1. Malformed messages (empty, 19-byte, bare-20, 1MB calldata).
+2. Gas griefing (infinite-loop init code; 30M-gas burn bounded).
+3. Zero-address deployment determinism (CREATE address purity).
+4. Fee-market integer overflow (u64::MAX base fee, absurd gas).
+5. Fee manipulation (100 congested blocks; ≤1/8 growth per block).
+6. Precompile abuse (wrong lengths, zero recipient, max amounts,
+   insufficient gas, non-precompile addresses).
+7. State-root determinism under adversarial sequences (Bug 3).
+8. Reentrancy-shaped self-calls (nested CALL completes; atomic
+   transact_commit means no host-callback reentrancy).
+
+All 17 pass.
+
+### New fuzz target: evm-execute
+
+`fuzz/fuzz_targets/evm_execute.rs` — feeds arbitrary bytes to
+`EvmModule::handle` as deploy/call splits, re-executes, and asserts
+the state root stays computable. 329k runs in 46s, 3991 coverage
+features, 1392 corpus entries, zero crashes. This covers the last
+untested trust boundary (user transactions into the EVM).
+
+### Audit gaps found (not fixed, recorded)
+
+- `sim/` directory is referenced by README/AGENTS.md but does
+  not exist (simulation lives in `crates/runtime/tests/echo.rs`
+  and `crates/devnet`).
+- Binaries (oxide-validator, oxide-fullnode, oxide-spammer,
+  oxide-deploy, oxide-bench) have 0 tests.
+- Crates missing benches: consensus, broadcast, mempool, p2p,
+  evm fee.
+- Devnet sim tests are `#[ignore]`d and never run in CI.
+
+### Verification
+
+395 tests pass (was 374, +21: 2 MMR + 2 types regressions + 17
+exploits). fmt, clippy `-D warnings`, cargo deny clean. Fuzz:
+mmr-proof-verify 4.9M runs, types-decode 8.9M runs, evm-execute
+329k runs — all clean after fixes.

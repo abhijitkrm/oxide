@@ -135,7 +135,14 @@ impl<'a> Decode<'a> for Proposal {
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         let height = Height::decode(reader)?;
         let count = read_count(reader)?;
-        let mut txs = Vec::with_capacity(count);
+        // Do not pre-allocate `count` from an untrusted varint: a
+        // forged count of ~2.9e8 requested a multi-GB allocation
+        // before the loop noticed the bytes ran out (fuzz
+        // types-decode, audit session 24 — libFuzzer OOM at
+        // malloc(2221329816)). Each `TxBytes` occupies at least one
+        // wire byte (its length varint), so the remaining input
+        // length is a provably safe capacity bound.
+        let mut txs = Vec::with_capacity(count.min(reader.remaining()));
         for _ in 0..count {
             txs.push(TxBytes::decode(reader)?);
         }
@@ -256,7 +263,10 @@ impl<'a> Decode<'a> for FinalizedBlock {
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         let height = Height::decode(reader)?;
         let count = read_count(reader)?;
-        let mut txs = Vec::with_capacity(count);
+        // Same untrusted-varint bound as `Proposal::decode` (fuzz
+        // types-decode, audit session 24): cap the pre-allocation at
+        // the remaining input — each `TxBytes` needs ≥1 wire byte.
+        let mut txs = Vec::with_capacity(count.min(reader.remaining()));
         for _ in 0..count {
             txs.push(TxBytes::decode(reader)?);
         }
@@ -686,6 +696,45 @@ mod tests {
         expected.extend_from_slice(&[2, 0xbb, 0xcc]); // tx 1
         expected.push(0); // no attestation
         roundtrip(&p, &expected);
+    }
+
+    /// Regression (fuzz types-decode, audit session 24):
+    /// a crafted `Proposal` claiming a huge tx count (varint
+    /// ~2.86e8) must not pre-allocate gigabytes in
+    /// `Vec::with_capacity` before the loop notices the bytes ran
+    /// out. Found by libFuzzer as `out-of-memory (malloc(2221329816))`.
+    ///
+    /// The fix caps the pre-allocation at the remaining input
+    /// length (each `TxBytes` occupies at least one wire byte), so
+    /// a malicious count fails the decode loop cheaply instead of
+    /// crashing the node with an out-of-memory abort.
+    #[test]
+    fn proposal_decode_huge_count_does_not_oom() {
+        // height=0 (8 zero bytes) + varint(286_860_940) + nothing.
+        // The varint encoding of 286_860_940 is 0xFC 0xFF 0xFF
+        // 0x88 ... — we build it via the codec itself so the test
+        // stays correct if the varint encoding changes.
+        let mut crafted = Vec::new();
+        crafted.extend_from_slice(&0u64.to_le_bytes());
+        write::varint(&mut crafted, 286_860_940); // ~2.86e8 txs claimed
+        // Decode must fail (bytes run out) or return an empty
+        // result — never allocate 286M * sizeof(TxBytes) upfront.
+        let mut reader = Reader::new(&crafted);
+        let result = Proposal::decode(&mut reader);
+        // The decode must error: 286M txs cannot fit in 12 bytes.
+        assert!(result.is_err(), "huge count must fail decode, got ok");
+    }
+
+    /// Same regression for `FinalizedBlock`, whose decoder shares
+    /// the vulnerable `Vec::with_capacity(count)` shape.
+    #[test]
+    fn finalized_block_decode_huge_count_does_not_oom() {
+        let mut crafted = Vec::new();
+        crafted.extend_from_slice(&0u64.to_le_bytes());
+        write::varint(&mut crafted, u64::from(u32::MAX)); // 4e9 txs claimed
+        let mut reader = Reader::new(&crafted);
+        let result = FinalizedBlock::decode(&mut reader);
+        assert!(result.is_err(), "huge count must fail decode, got ok");
     }
 
     #[test]

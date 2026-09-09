@@ -216,14 +216,24 @@ impl Module for EvmModule {
         // flat buffer and hash it. Full implementation hashes the EVM
         // state trie (Merkle Patricia Trie).
         //
+        // Determinism (exploit suite, audit session 24): the account
+        // map is a `HashMap`, whose iteration order is randomized per
+        // instance — hashing in map order made the root differ across
+        // processes (two validators executing the same block would
+        // sign *different* state roots, breaking execution
+        // attestations). Sort by address so the hash preimage is
+        // canonical regardless of map order.
+        //
         // # Panics
         //
         // Panics if the DB mutex is poisoned (a thread panicked while
         // holding the lock). This is unrecoverable and indicates a bug.
         use crypto::hash::{Domain, Hasher};
         let db = self.db.lock().expect("db mutex not poisoned");
+        let mut accounts: Vec<_> = db.cache.accounts.iter().collect();
+        accounts.sort_by(|a, b| a.0.cmp(b.0));
         let mut data = Vec::new();
-        for (addr, account) in &db.cache.accounts {
+        for (addr, account) in accounts {
             data.extend_from_slice(addr.as_slice());
             data.extend_from_slice(&account.info.balance.to_be_bytes::<32>());
             data.extend_from_slice(&account.info.nonce.to_be_bytes());

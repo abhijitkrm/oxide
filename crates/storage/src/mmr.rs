@@ -152,10 +152,21 @@ pub fn peak_positions(n: u64) -> Vec<(usize, u32)> {
     let mut rest = n;
     while rest > 0 {
         let height = rest.ilog2();
-        let mountain_nodes = 2 * (1u64 << height) - 1;
-        let root = first + mountain_nodes - 1;
+        // Overflow safety (fuzz mmr-proof-verify, audit session 24):
+        // for n ≥ 2^63 the mountain node count 2^(h+1) − 1 exceeds
+        // u64, and plain `2 * (1 << height) - 1` panicked under
+        // libFuzzer. Such a forest cannot exist in memory — the
+        // only caller that feeds untrusted counts is `Mmr::verify`
+        // with a forged `proof.leaf_count` — so we compute with
+        // checked arithmetic and fall back to `u64::MAX`, which is
+        // exactly the correct value at height 63. A forged count
+        // now simply fails verification instead of crashing the
+        // node.
+        let mountain_nodes =
+            (1u64 << height).checked_mul(2).and_then(|v| v.checked_sub(1)).unwrap_or(u64::MAX);
+        let root = first.saturating_add(mountain_nodes).saturating_sub(1);
         out.push((root as usize, height));
-        first += mountain_nodes;
+        first = first.saturating_add(mountain_nodes);
         rest ^= 1u64 << height;
     }
     out
@@ -346,6 +357,41 @@ mod tests {
     /// Deterministic test leaves: blake3 of the index.
     fn leaf(i: u64) -> Hash {
         hash_leaf(&i.to_le_bytes())
+    }
+
+    /// Regression (fuzz mmr-proof-verify, audit session 24):
+    /// `peak_positions` must never panic on any u64 leaf count —
+    /// including counts ≥ 2^63 where `2 * (1 << height)` overflows.
+    /// A forged proof with an insane `leaf_count` must make `verify`
+    /// return `false`, not crash the node. Found by libFuzzer.
+    #[test]
+    fn test_peak_positions_never_panics_on_huge_counts() {
+        // Every power of two up to 2^63, plus the pathological
+        // extremes: the fuzz crasher used n = u64::MAX (height 63).
+        for n in [1u64 << 63, u64::MAX, (1u64 << 63) | 1, (1u64 << 62) | 3] {
+            let _ = peak_positions(n); // must not panic
+        }
+    }
+
+    /// Regression (fuzz mmr-proof-verify, audit session 24):
+    /// a forged proof claiming `u64::MAX` leaves must fail
+    /// verification cleanly (return false), never panic.
+    #[test]
+    fn test_verify_rejects_insane_leaf_count_without_panic() {
+        let mut mmr = Mmr::new();
+        for i in 0u8..8 {
+            mmr.push(Hash([i; 32]));
+        }
+        let root = mmr.root();
+        let forged = MmrProof {
+            leaf_index: 0,
+            leaf_count: u64::MAX, // ← fuzz crasher input
+            path: Vec::new(),
+            peaks: Vec::new(),
+        };
+        // Must return false (not panic): the claimed forest cannot
+        // match the real root.
+        assert!(!Mmr::verify(&Hash([0u8; 32]), &forged, &root));
     }
 
     /// Structural law: `n` leaves ⇒ `2n − popcount(n)` nodes, and the

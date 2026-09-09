@@ -12,6 +12,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Security audit + EVM exploit suite (session 24)** (2026-01-22)
+  - Self-audit across all quality layers plus 17 adversarial EVM
+    exploit tests. **Three real bugs found and fixed**: (1) MMR proof
+    verification panicked on forged leaf counts ≥ 2^63 (remote DoS);
+    (2) crafted `Proposal`/`FinalizedBlock` messages pre-allocated
+    gigabytes before failing decode (remote OOM); (3) EVM state
+    roots were nondeterministic — two validators executing the same
+    block would sign different roots (consensus-breaking). All
+    fixed with regression tests; fuzz targets re-verified clean.
+  - In plain words: we tried to break our own chain like an attacker
+    would, and found three ways to do it — one crash bug, one
+    memory-hog bug, and one bug that would have made validators
+    disagree about account balances. All three are fixed and locked
+    with tests so they can't come back.
+
 - **Uniswap-transfer throughput benchmark (Phase 2 complete)** (2026-01-22)
   - Added a criterion benchmark measuring sustained EVM execution
     throughput on a realistic Uniswap tx mix (60% ERC20 transfers,
