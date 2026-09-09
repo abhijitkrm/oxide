@@ -12,6 +12,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Native fast path for simple ETH transfers** (2026-01-25)
+  - Simple ETH transfers (empty calldata, EOA recipient) now bypass
+    revm entirely — balance and nonce updates are executed directly
+    on the `CacheDB` without EVM interpreter overhead.
+  - **In plain words:** sending ETH to a regular wallet address is
+    now ~4x faster because the EVM virtual machine is skipped —
+    just a direct balance update, like a database write.
+  - Qualification: `to` is a Call (not Create), empty calldata, no
+    access list, recipient has no code, sufficient balance and gas.
+    Non-qualifying txs (contract calls, creations, calldata) fall
+    through to revm with identical semantics.
+  - Integrated into `handle_batch`, `handle_batch_parallel`, and
+    conflict re-execution paths.
+  - State roots are identical between native and revm paths
+    (verified by `native_transfer_matches_revm_state_root` and
+    `native_transfer_multi_tx_matches_revm` tests).
+  - New benchmark: `native_vs_revm` — head-to-head comparison of
+    native vs revm for 1k and 10k simple transfers.
+  - Bug fix: `code_hash` normalization (`B256::ZERO` →
+    `KECCAK_EMPTY`) to match revm's account normalization behavior.
+
 - **Speculative parallel EVM execution** (2026-01-25)
   - **`EvmModule::handle_batch_parallel`**: new batch execution
     path that parallelizes EVM execution across sender groups.

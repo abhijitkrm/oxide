@@ -76,6 +76,8 @@ pub mod tx;
 // revm imports. The `revm` crate re-exports all sub-crates.
 use revm::Context;
 use revm::context::TxEnv;
+use revm::context::result::{ExecutionResult, Output, SuccessReason};
+use revm::context_interface::result::ResultGas;
 use revm::database::CacheDB;
 use revm::database_interface::{DatabaseRef, EmptyDB};
 use revm::handler::{ExecuteCommitEvm, MainBuilder, MainContext};
@@ -111,6 +113,12 @@ const BLOCK_TIME_SECS: u64 = 15;
 /// Used by test helpers when constructing signed transactions.
 #[cfg(test)]
 const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
+
+/// Intrinsic gas cost for a simple ETH transfer (no calldata).
+/// This is the EVM base transaction cost: 21,000 gas units per
+/// EIP-2028. Used by the native fast path to bypass revm for
+/// simple transfers.
+const TX_GAS_TRANSFER: u64 = 21_000;
 
 /// The EVM module: wraps `revm` and exposes it as an Oxide `Module`.
 ///
@@ -370,6 +378,219 @@ impl EvmModule {
         Ok(result)
     }
 
+    /// Try to execute a simple ETH transfer natively, bypassing revm.
+    ///
+    /// This is the **native fast path**: for simple value transfers
+    /// (empty calldata, recipient is an EOA, no access list), the full
+    /// EVM is unnecessary. A native balance+nonce update is ~10-50x
+    /// faster than revm's stack-machine execution.
+    ///
+    /// # When the native path applies
+    ///
+    /// All of the following must be true:
+    /// 1. `to` is `TxKind::Call` (not `Create`).
+    /// 2. `data` is empty (no calldata).
+    /// 3. Access list is empty (EIP-2930/1559).
+    /// 4. Recipient has no code (`code_hash == KECCAK_EMPTY` or
+    ///    account doesn't exist).
+    /// 5. `gas_limit >= 21000` (intrinsic gas for a simple transfer).
+    /// 6. Sender nonce matches the tx nonce.
+    /// 7. Sender has sufficient balance for `value + gas_limit *
+    ///    effective_gas_price`.
+    /// 8. `effective_gas_price >= base_fee`.
+    /// 9. `value`, `gas_price` fit in `u128` (Ethereum amounts always
+    ///    do, but we check for safety).
+    ///
+    /// If any check fails, returns `None` and the caller falls through
+    /// to revm, which handles the error identically.
+    ///
+    /// # Gas semantics
+    ///
+    /// For a simple transfer: `gas_used = 21000` (intrinsic gas, no
+    /// execution). The effective gas price is computed per EIP-1559:
+    /// - Legacy/EIP-2930: `effective = gas_price`
+    /// - EIP-1559: `effective = min(max_fee, base_fee + priority_fee)`
+    ///
+    /// The coinbase receives `gas_used * (effective - base_fee)` (the
+    /// tip). The base fee portion (`gas_used * base_fee`) is burned
+    /// (removed from supply).
+    ///
+    /// # State changes (identical to revm)
+    ///
+    /// - `sender.balance -= value + gas_used * effective_gas_price`
+    /// - `sender.nonce += 1`
+    /// - `recipient.balance += value`
+    /// - `coinbase.balance += gas_used * (effective_gas_price - base_fee)`
+    ///
+    /// # Arguments
+    ///
+    /// - `signed`: the signed transaction.
+    /// - `caller`: the recovered sender address.
+    /// - `db`: the cache database (reads via `DatabaseRef`, writes
+    ///   via direct `cache.accounts` mutation).
+    /// - `coinbase`: the block's coinbase address (tip recipient).
+    /// - `base_fee`: the block's base fee (wei per gas unit).
+    ///
+    /// # Returns
+    ///
+    /// `Some(ExecutionResult)` if the native path was taken.
+    /// `None` if the tx doesn't qualify (caller should use revm).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the database mutex is poisoned (internal to
+    /// `load_account`).
+    fn try_native_transfer<DB: DatabaseRef>(
+        signed: &tx::SignedTx,
+        caller: revm::primitives::Address,
+        db: &mut CacheDB<DB>,
+        coinbase: revm::primitives::Address,
+        base_fee: u64,
+    ) -> Option<ExecutionResult> {
+        // ── Qualification checks ──────────────────────────────
+
+        // 1. Must be a Call (not Create).
+        let recipient = match signed.to() {
+            tx::TxKind::Create => return None,
+            tx::TxKind::Call(addr) => addr,
+        };
+
+        // 2. Empty calldata.
+        if !signed.data().is_empty() {
+            return None;
+        }
+
+        // 3. Empty access list.
+        if !signed.access_list().is_empty() {
+            return None;
+        }
+
+        // 4. Recipient has no code (is an EOA).
+        //    Check the cache directly — avoids the `AccountInfo`
+        //    clone from `basic_ref`. If the account is not in the
+        //    cache, it doesn't exist yet (no code, is an EOA).
+        //    `B256::ZERO` is a sentinel used by test setup; treat
+        //    it the same as `KECCAK_EMPTY` (no code).
+        let recipient_has_code = match db.cache.accounts.get(&recipient) {
+            Some(account) => {
+                account.info.code_hash != revm::primitives::KECCAK_EMPTY
+                    && account.info.code_hash != revm::primitives::B256::ZERO
+            }
+            None => false, // Account doesn't exist — no code.
+        };
+        if recipient_has_code {
+            return None; // Recipient is a contract — needs EVM.
+        }
+
+        // 5. Gas limit >= intrinsic gas (21000 for a simple transfer).
+        let gas_limit = signed.gas_limit();
+        if gas_limit < TX_GAS_TRANSFER {
+            return None; // Let revm handle the error.
+        }
+
+        // 9. Value and gas price must fit in u128.
+        let value_u128: u128 = match signed.value().try_into() {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        let max_fee: u128 = match signed.max_fee_per_gas().try_into() {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        let priority_fee: u128 = match signed.max_priority_fee_per_gas().try_into() {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+
+        // Compute effective gas price per EIP-1559.
+        let effective_gas_price = std::cmp::min(max_fee, u128::from(base_fee) + priority_fee);
+
+        // 8. Effective gas price >= base fee.
+        if effective_gas_price < u128::from(base_fee) {
+            return None; // Let revm handle the error.
+        }
+
+        // ── Read + validate sender ─────────────────────────────
+        //
+        // We load the sender account, check nonce and balance, then
+        // modify in place. The `load_account` call returns a `&mut
+        // DbAccount` that borrows `db`; we scope it so the borrow is
+        // released before we load other accounts.
+        {
+            let sender_account = db.load_account(caller).ok()?;
+
+            // 6. Nonce must match.
+            if sender_account.info.nonce != signed.nonce() {
+                return None;
+            }
+
+            // 7. Sufficient balance for value + gas reserve.
+            //    The EVM deducts `gas_limit * effective_gas_price`
+            //    upfront as a gas reserve, then refunds the unused
+            //    portion. The sender must have enough for both the
+            //    reserve and the value transfer.
+            let gas_reserve = u128::from(gas_limit) * effective_gas_price;
+            let total_needed = value_u128 + gas_reserve;
+            if sender_account.info.balance < revm::primitives::U256::from(total_needed) {
+                return None;
+            }
+
+            // ── All checks passed — execute natively ───────────
+            //
+            // Net gas cost = gas_used * effective_gas_price
+            // (gas_limit - gas_used is refunded).
+            let gas_cost = u128::from(TX_GAS_TRANSFER) * effective_gas_price;
+            sender_account.info.balance -= revm::primitives::U256::from(value_u128 + gas_cost);
+            sender_account.info.nonce += 1;
+            // Normalize code_hash: revm sets KECCAK_EMPTY for EOAs
+            // during execution. Test setup (fund_account_for_test)
+            // may use B256::ZERO as a sentinel; revm fixes it, so we
+            // must too to produce identical state roots.
+            if sender_account.info.code_hash == revm::primitives::B256::ZERO {
+                sender_account.info.code_hash = revm::primitives::KECCAK_EMPTY;
+            }
+            sender_account.account_state = revm::database::AccountState::Touched;
+        }
+
+        // ── Update recipient ───────────────────────────────────
+        {
+            let recipient_account = db.load_account(recipient).ok()?;
+            recipient_account.info.balance += signed.value();
+            if recipient_account.info.code_hash == revm::primitives::B256::ZERO {
+                recipient_account.info.code_hash = revm::primitives::KECCAK_EMPTY;
+            }
+            recipient_account.account_state = revm::database::AccountState::Touched;
+        }
+
+        // ── Update coinbase (tip only, base fee is burned) ─────
+        let tip = effective_gas_price - u128::from(base_fee);
+        if tip > 0 {
+            let coinbase_tip = u128::from(TX_GAS_TRANSFER) * tip;
+            let coinbase_account = db.load_account(coinbase).ok()?;
+            coinbase_account.info.balance += revm::primitives::U256::from(coinbase_tip);
+            if coinbase_account.info.code_hash == revm::primitives::B256::ZERO {
+                coinbase_account.info.code_hash = revm::primitives::KECCAK_EMPTY;
+            }
+            coinbase_account.account_state = revm::database::AccountState::Touched;
+        }
+
+        // ── Build ExecutionResult ──────────────────────────────
+        //
+        // Identical to what revm produces for a successful simple
+        // transfer: Success with gas_used=21000, no logs, no output.
+        let result = ExecutionResult::Success {
+            reason: SuccessReason::Stop,
+            gas: ResultGas::default()
+                .with_total_gas_spent(TX_GAS_TRANSFER)
+                .with_refunded(0)
+                .with_floor_gas(0),
+            logs: Vec::new(),
+            output: Output::Call(revm::primitives::Bytes::new()),
+        };
+
+        Some(result)
+    }
+
     /// Build a revm `TxEnv` from a signed transaction and recovered
     /// caller address.
     ///
@@ -468,6 +689,16 @@ impl EvmModule {
         // Phase 2: execute all txs sequentially under a single lock.
         // The CacheDB is a single-writer structure — parallel execution
         // would require partitioning the state, which is future work.
+        //
+        // For each tx, try the **native fast path** first (simple ETH
+        // transfers bypass revm entirely). Only fall through to revm
+        // for contract calls, creations, and txs with calldata.
+        //
+        // For all-native batches (simple transfers to EOAs), the EVM
+        // context is never constructed — zero revm overhead. For mixed
+        // batches, the EVM context is built per non-native tx inside a
+        // scoped block; the ~100 ns rebuild cost is negligible vs the
+        // ~3.7 µs EVM execution cost.
         let mut results = Vec::with_capacity(msgs.len());
 
         // Acquire the DB lock once for the entire batch.
@@ -476,22 +707,6 @@ impl EvmModule {
         let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
         let block_timestamp =
             *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned");
-
-        // Build the EVM context ONCE and reuse it across all txs.
-        // Profiling shows context rebuild is ~100 ns/tx; for 1000 txs
-        // that's 100 µs wasted. The context (cfg, block env) is the
-        // same for all txs in a block — only the tx env changes.
-        let mut evm = Context::mainnet()
-            .with_db(&mut *db)
-            .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(self.spec))
-            .modify_block_chained(|block| {
-                block.number = revm::primitives::U256::from(block_number);
-                block.beneficiary = coinbase;
-                block.timestamp = revm::primitives::U256::from(block_timestamp);
-                block.gas_limit = self.block_gas_limit;
-                block.basefee = self.base_fee;
-            })
-            .build_mainnet_with_inspector(NoOpInspector);
 
         // Accumulate touched accounts in a local set to avoid
         // locking the mutex per tx. Merge once at the end.
@@ -507,6 +722,28 @@ impl EvmModule {
                 }
             };
 
+            // Try the native fast path first. For simple ETH
+            // transfers (empty calldata, EOA recipient), this
+            // bypasses revm entirely — just balance + nonce
+            // updates. The native path accesses the CacheDB
+            // directly, so no EVM context is needed.
+            if let Some(result) =
+                Self::try_native_transfer(&signed, caller, &mut *db, coinbase, self.base_fee)
+            {
+                local_touched.insert(caller);
+                if let tx::TxKind::Call(addr) = signed.to() {
+                    local_touched.insert(revm::primitives::Address::from(addr.0));
+                }
+                local_touched.insert(coinbase);
+                results.push(Self::exec_result_to_events(Ok(result), self.base_fee));
+                continue;
+            }
+
+            // Fall through to revm for non-native txs (contract
+            // calls, creations, txs with calldata, etc.). Build
+            // the EVM context in a scoped block — the `&mut *db`
+            // borrow is released when the block exits, allowing
+            // the next tx to use the native path if it qualifies.
             let tx = match Self::build_tx_env(&signed, caller) {
                 Ok(t) => t,
                 Err(e) => {
@@ -515,13 +752,26 @@ impl EvmModule {
                 }
             };
 
-            let result = match evm.transact_commit(tx) {
-                Ok(r) => r,
-                Err(e) => {
-                    results.push(Err(ExecError::ModuleRejected(format!(
-                        "evm transact failed: {e:?}"
-                    ))));
-                    continue;
+            let result = {
+                let mut evm = Context::mainnet()
+                    .with_db(&mut *db)
+                    .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(self.spec))
+                    .modify_block_chained(|block| {
+                        block.number = revm::primitives::U256::from(block_number);
+                        block.beneficiary = coinbase;
+                        block.timestamp = revm::primitives::U256::from(block_timestamp);
+                        block.gas_limit = self.block_gas_limit;
+                        block.basefee = self.base_fee;
+                    })
+                    .build_mainnet_with_inspector(NoOpInspector);
+                match evm.transact_commit(tx) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        results.push(Err(ExecError::ModuleRejected(format!(
+                            "evm transact failed: {e:?}"
+                        ))));
+                        continue;
+                    }
                 }
             };
 
@@ -535,22 +785,7 @@ impl EvmModule {
             }
             local_touched.insert(coinbase);
 
-            // Build receipt + event (same as handle()).
-            let receipt = receipts::Receipt::from_execution_result(&result);
-            let status_str = if receipt.status { "success" } else { "revert" };
-            let contract_info =
-                receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
-            let log_count = receipt.logs.len();
-
-            results.push(Ok(vec![Event {
-                module: "evm",
-                kind: "evm_call".to_string(),
-                data: format!(
-                    "gas_used={} status={} base_fee={} logs={}{}",
-                    receipt.gas_used, status_str, self.base_fee, log_count, contract_info
-                )
-                .into_bytes(),
-            }]));
+            results.push(Self::exec_result_to_events(Ok(result), self.base_fee));
         }
 
         // Merge local touched set into the global one (single lock).
@@ -760,24 +995,12 @@ impl EvmModule {
                     }
                 }
 
-                // Build the EVM context ONCE and reuse it across
-                // all txs in the group — same optimization as
-                // `handle_batch`. Context rebuild is ~100 ns/tx;
-                // for 100 txs per group that's 10 µs wasted per
-                // group, or 1 ms for 100 groups.
-                let mut evm = Context::mainnet()
-                    .with_db(&mut db)
-                    .modify_cfg_chained(|cfg| {
-                        cfg.set_spec_and_mainnet_gas_params(self.spec);
-                    })
-                    .modify_block_chained(|block| {
-                        block.number = revm::primitives::U256::from(block_number);
-                        block.beneficiary = coinbase;
-                        block.timestamp = revm::primitives::U256::from(block_timestamp);
-                        block.gas_limit = self.block_gas_limit;
-                        block.basefee = self.base_fee;
-                    })
-                    .build_mainnet_with_inspector(NoOpInspector);
+                // Build the EVM context lazily — only needed for
+                // non-native txs (contract calls, creations, txs
+                // with calldata). For groups where all txs are
+                // simple transfers, the EVM is never built.
+                // Context rebuild is ~100 ns; negligible vs the
+                // ~3.7 µs EVM execution cost for non-native txs.
 
                 let mut tx_results: Vec<(
                     usize,
@@ -786,6 +1009,17 @@ impl EvmModule {
 
                 for (idx, signed) in txs {
                     let caller = *sender;
+
+                    // Try the native fast path first. For simple
+                    // ETH transfers, this bypasses revm entirely.
+                    if let Some(result) =
+                        Self::try_native_transfer(signed, caller, &mut db, coinbase, self.base_fee)
+                    {
+                        tx_results.push((*idx, Ok(result)));
+                        continue;
+                    }
+
+                    // Fall through to revm.
                     let tx_env = match Self::build_tx_env(signed, caller) {
                         Ok(t) => t,
                         Err(e) => {
@@ -794,10 +1028,22 @@ impl EvmModule {
                         }
                     };
 
-                    // Execute with `transact_commit` — reuses the
-                    // EVM context (cfg, block env) across all txs in
-                    // the group. Only the tx env changes per tx.
-                    let result = evm.transact_commit(tx_env);
+                    let result = {
+                        let mut evm = Context::mainnet()
+                            .with_db(&mut db)
+                            .modify_cfg_chained(|cfg| {
+                                cfg.set_spec_and_mainnet_gas_params(self.spec);
+                            })
+                            .modify_block_chained(|block| {
+                                block.number = revm::primitives::U256::from(block_number);
+                                block.beneficiary = coinbase;
+                                block.timestamp = revm::primitives::U256::from(block_timestamp);
+                                block.gas_limit = self.block_gas_limit;
+                                block.basefee = self.base_fee;
+                            })
+                            .build_mainnet_with_inspector(NoOpInspector);
+                        evm.transact_commit(tx_env)
+                    };
 
                     match result {
                         Ok(r) => {
@@ -890,24 +1136,32 @@ impl EvmModule {
                 // against the main DB. The speculative execution
                 // assumed stale state for the conflicting account.
                 //
-                // Build the EVM context ONCE per conflicting group
-                // and reuse it across all txs — same optimization as
-                // `handle_batch` and the parallel execution phase.
-                let mut evm = Context::mainnet()
-                    .with_db(&mut *db)
-                    .modify_cfg_chained(|cfg| {
-                        cfg.set_spec_and_mainnet_gas_params(self.spec);
-                    })
-                    .modify_block_chained(|block| {
-                        block.number = revm::primitives::U256::from(block_number);
-                        block.beneficiary = coinbase;
-                        block.timestamp = revm::primitives::U256::from(block_timestamp);
-                        block.gas_limit = self.block_gas_limit;
-                        block.basefee = self.base_fee;
-                    })
-                    .build_mainnet_with_inspector(NoOpInspector);
+                // Try the native fast path first for each tx; fall
+                // through to revm only for non-native txs. Build the
+                // EVM context lazily — only if a non-native tx is
+                // encountered.
                 for (idx, signed) in groups.get(&gr.sender).expect("group exists") {
                     let caller = gr.sender;
+
+                    // Try native fast path first.
+                    if let Some(result) =
+                        Self::try_native_transfer(signed, caller, &mut *db, coinbase, self.base_fee)
+                    {
+                        all_touched.insert(caller);
+                        if let tx::TxKind::Call(addr) = signed.to() {
+                            all_touched.insert(revm::primitives::Address::from(addr.0));
+                        }
+                        all_touched.insert(coinbase);
+                        committed_touched.insert(caller);
+                        if let tx::TxKind::Call(addr) = signed.to() {
+                            committed_touched.insert(revm::primitives::Address::from(addr.0));
+                        }
+                        committed_touched.insert(coinbase);
+                        reexec_results.insert(*idx, Ok(result));
+                        continue;
+                    }
+
+                    // Fall through to revm.
                     let tx_env = match Self::build_tx_env(signed, caller) {
                         Ok(t) => t,
                         Err(e) => {
@@ -915,7 +1169,22 @@ impl EvmModule {
                             continue;
                         }
                     };
-                    let result = evm.transact_commit(tx_env);
+                    let result = {
+                        let mut evm = Context::mainnet()
+                            .with_db(&mut *db)
+                            .modify_cfg_chained(|cfg| {
+                                cfg.set_spec_and_mainnet_gas_params(self.spec);
+                            })
+                            .modify_block_chained(|block| {
+                                block.number = revm::primitives::U256::from(block_number);
+                                block.beneficiary = coinbase;
+                                block.timestamp = revm::primitives::U256::from(block_timestamp);
+                                block.gas_limit = self.block_gas_limit;
+                                block.basefee = self.base_fee;
+                            })
+                            .build_mainnet_with_inspector(NoOpInspector);
+                        evm.transact_commit(tx_env)
+                    };
                     match result {
                         Ok(r) => {
                             all_touched.insert(caller);
@@ -2137,6 +2406,94 @@ mod tests {
 
         assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
         assert_eq!(serial_root, parallel_root, "state roots must match");
+    }
+
+    /// The native fast path (simple transfers bypass revm) must
+    /// produce identical state roots to the revm path. This is the
+    /// correctness invariant: native is an optimization, not a
+    /// semantic change.
+    #[test]
+    fn native_transfer_matches_revm_state_root() {
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        // Path 1: handle() — uses revm for every tx.
+        let m1 = make_module();
+        fund(&m1, &addr);
+        let tx = signed_transfer_tx(&pk, 0, recipient, 1_000_000_000);
+        m1.begin_block(Height::new(1));
+        m1.handle(&dummy_ctx(), &tx).expect("revm tx must succeed");
+        m1.end_block(Height::new(1));
+        let root1 = m1.state_root();
+
+        // Path 2: handle_batch() — uses native fast path for simple
+        // transfers (empty calldata, EOA recipient).
+        let m2 = make_module();
+        fund(&m2, &addr);
+        m2.begin_block(Height::new(1));
+        m2.handle_batch(&dummy_ctx(), std::slice::from_ref(&tx));
+        m2.end_block(Height::new(1));
+        let root2 = m2.state_root();
+
+        assert_eq!(root1, root2, "revm and native state roots must match");
+    }
+
+    /// Native fast path with multiple transfers from the same sender.
+    /// Verifies nonce sequencing and balance deductions match revm.
+    #[test]
+    fn native_transfer_multi_tx_matches_revm() {
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let txs: Vec<Vec<u8>> =
+            (0..5).map(|nonce| signed_transfer_tx(&pk, nonce, recipient, 1_000_000_000)).collect();
+
+        // Path 1: handle() per tx — uses revm.
+        let m1 = make_module();
+        fund(&m1, &addr);
+        m1.begin_block(Height::new(1));
+        for raw in &txs {
+            m1.handle(&dummy_ctx(), raw).expect("revm tx must succeed");
+        }
+        m1.end_block(Height::new(1));
+        let root1 = m1.state_root();
+
+        // Path 2: handle_batch() — uses native fast path.
+        let m2 = make_module();
+        fund(&m2, &addr);
+        m2.begin_block(Height::new(1));
+        m2.handle_batch(&dummy_ctx(), &txs);
+        m2.end_block(Height::new(1));
+        let root2 = m2.state_root();
+
+        assert_eq!(root1, root2, "revm and native state roots must match");
+    }
+
+    /// Native fast path should NOT activate for contract calls
+    /// (non-empty calldata). The tx must fall through to revm.
+    #[test]
+    fn native_transfer_skipped_for_calldata() {
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        // Build a tx with non-empty calldata — should NOT take the
+        // native fast path.
+        let tx = signed_tx(&pk, 0, tx::TxKind::Call(recipient), &[0x01, 0x02, 0x03]);
+
+        // handle_batch should still succeed (falls through to revm).
+        let m = make_module();
+        fund(&m, &addr);
+        m.begin_block(Height::new(1));
+        let results = m.handle_batch(&dummy_ctx(), &[tx]);
+        m.end_block(Height::new(1));
+
+        // The tx should succeed (revm handles the call to a
+        // non-existent contract — it just executes the CALL opcode
+        // with no code to run, which succeeds).
+        assert!(
+            results.iter().all(std::result::Result::is_ok),
+            "calldata tx should succeed via revm fallback"
+        );
     }
 
     /// Parallel execution with conflicting recipients (two senders

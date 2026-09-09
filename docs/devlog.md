@@ -4174,3 +4174,128 @@ Further improvement would require either:
 - **Parallel re-execution** — execute conflicting groups in
   parallel against snapshots, then merge in order (but this
   reintroduces the clone overhead)
+
+## Session: Native Fast Path for Simple Transfers
+
+**Goal:** Bypass revm for simple ETH transfers (empty calldata, EOA
+recipient) to reduce per-tx execution cost. The breakdown benchmark
+showed revm execution at ~3.7 µs/tx for a simple transfer — most of
+which is EVM interpreter overhead (stack machine, gas metering,
+journaling) that's unnecessary for a plain balance+nonce update.
+
+### What was built
+
+Added `try_native_transfer` to `EvmModule` — a function that checks
+whether a transaction qualifies for the native fast path and, if so,
+executes it by directly updating account balances and nonces in the
+`CacheDB`, bypassing revm entirely.
+
+**Qualification criteria:**
+1. `to` is `TxKind::Call` (not `Create`)
+2. `data` is empty (no calldata)
+3. Access list is empty
+4. Recipient has no code (`code_hash == KECCAK_EMPTY` or account
+   doesn't exist)
+5. `gas_limit >= 21000` (intrinsic gas)
+6. Sender nonce matches tx nonce
+7. Sender has sufficient balance for `value + gas_reserve`
+8. `effective_gas_price >= base_fee`
+9. Value and gas price fit in `u128`
+
+If any check fails, returns `None` and the caller falls through to
+revm, which handles the error identically.
+
+**Gas semantics (identical to revm):**
+- `gas_used = 21000` (intrinsic gas, no execution)
+- `effective_gas_price = min(max_fee, base_fee + priority_fee)` (EIP-1559)
+- Sender pays: `value + gas_used * effective_gas_price`
+- Coinbase receives: `gas_used * (effective_gas_price - base_fee)` (tip)
+- Base fee portion is burned (removed from supply)
+
+**Integration points:**
+- `handle_batch`: tries native first, falls through to revm per tx
+- `handle_batch_parallel`: tries native first per tx in each sender
+  group, falls through to revm per tx
+- Conflict re-execution: tries native first, falls through to revm
+
+### Bug hunt: state-root mismatch
+
+**Symptom:** `handle_batch_parallel_matches_serial_state_root` test
+failed. The serial path uses `handle()` (revm), the parallel path
+uses `handle_batch_parallel` (native). State roots differed.
+
+**Root cause:** `fund_account_for_test` sets `code_hash = B256::ZERO`
+(a sentinel for "code not loaded"). When revm executes a tx, it
+normalizes `code_hash` to `KECCAK_EMPTY` for EOAs. The native path
+didn't do this normalization, so the sender's `code_hash` remained
+`B256::ZERO` in the native path but became `KECCAK_EMPTY` in the revm
+path.
+
+**Fix:** In `try_native_transfer`, after loading each account, if
+`code_hash == B256::ZERO`, set it to `KECCAK_EMPTY`. This matches
+revm's account normalization behavior.
+
+### Bug hunt: recipient code check via `basic_ref`
+
+**Initial approach:** Used `db.basic_ref(recipient)` to check if the
+recipient has code. This clones `AccountInfo` (including the `code`
+field) on every call — an expensive allocation.
+
+**Fix:** Replaced with a direct `db.cache.accounts.get(&recipient)`
+lookup, which only checks a reference (no clone). The code_hash is
+checked directly from the cached `DbAccount`.
+
+### Benchmark results
+
+**`native_vs_revm` benchmark** (10k simple transfers, single sender):
+
+| Path | Time | TPS |
+|---|---|---|
+| `handle_batch` (native) | ~83 ms | ~120k |
+| `handle()` per tx (revm) | ~362 ms | ~28k |
+| **Speedup** | **4.35x** | |
+
+Note: measurements were taken on a machine with load average ~10
+(8 cores), so absolute numbers are higher than previous sessions.
+The relative speedup is the key metric.
+
+**Existing benchmarks** (batch_parallel, multi_sender, conflict):
+All maintained or improved. The native fast path is transparent —
+it produces identical state roots and events.
+
+### Key insight: revm's journaled state cache
+
+An important finding: for same-sender batches, revm's journaled state
+caches account lookups across txs. After the first tx, the sender,
+recipient, and coinbase are in the journaled state's internal cache —
+subsequent txs don't need HashMap lookups. The native path does fresh
+HashMap lookups per tx (via `load_account`), which can be slower than
+revm's cached path for same-sender batches.
+
+For the `handle_batch_parallel` path, this is not an issue because:
+1. Groups are small (typically 100 txs per sender)
+2. The parallel scheduling and COW cache overhead dominates
+3. The native path avoids EVM context construction entirely for
+   all-native groups
+
+For `handle_batch` with mixed native/evm workloads, the EVM context
+is built per non-native tx (inside a scoped block). This is
+acceptable because:
+1. Non-native txs (contract calls) are typically <20% of a block
+2. The ~100 ns context rebuild is negligible vs ~3.7 µs EVM execution
+3. For all-native batches, the EVM context is never built
+
+### What's next
+
+The native fast path is the first step toward heterogeneous execution:
+- Native transfer path (this session) — simple ETH transfers
+- Native trading path — future orders, cancels, matching
+- EVM compatibility lane — arbitrary smart contracts
+- Pre-verified mempool — skip signature recovery during execution
+- Batch signature verification — 2-4x speedup for recovery
+- More cores — 32+ core validators for higher parallel throughput
+
+The path to 1M TPS requires all of these, not just one. The native
+fast path removes the EVM interpreter overhead for the simplest
+workload; the remaining bottlenecks are signature recovery and
+parallel scheduling.

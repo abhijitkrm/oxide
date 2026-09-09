@@ -455,6 +455,83 @@ fn bench_batch_parallel_conflict(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: native fast path vs revm for simple transfers.
+///
+/// This is the "prove it was worth building" comparison. The native
+/// fast path bypasses revm for simple ETH transfers (empty calldata,
+/// EOA recipient) — just balance + nonce updates. This benchmark
+/// compares:
+///
+/// - `handle_batch` (native fast path): parallel sender recovery +
+///   native balance/nonce updates. No revm execution.
+/// - `handle` per tx (revm only): parallel sender recovery + full
+///   revm EVM execution per tx.
+///
+/// Gate: native path must be ≥ 3x faster than revm for 10k simple
+/// transfers. Expected: ~10-50x based on breakdown analysis (revm
+/// execution is ~3.7 µs/tx; native is ~0.1-0.3 µs/tx).
+///
+/// Workload: 10k simple transfers from a single sender to a single
+/// recipient. This is the best case for the native fast path — all
+/// txs qualify (empty calldata, EOA recipient).
+fn bench_native_vs_revm(c: &mut Criterion) {
+    let key = TestKey::new();
+    let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+    let mut group = c.benchmark_group("native_vs_revm");
+
+    for &n_txs in &[1000u64, 10000] {
+        // Native fast path (handle_batch).
+        group.bench_function(format!("{n_txs}_txs_native"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    fund(&module, &key.addr);
+                    let txs: Vec<Vec<u8>> = (0u64..n_txs)
+                        .map(|i| signed_transfer(&key.privkey, i, recipient, 1_000_000_000))
+                        .collect();
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch(&dummy_ctx(), &txs);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+
+        // revm only (handle per tx — no native fast path).
+        group.bench_function(format!("{n_txs}_txs_revm"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    fund(&module, &key.addr);
+                    let txs: Vec<Vec<u8>> = (0u64..n_txs)
+                        .map(|i| signed_transfer(&key.privkey, i, recipient, 1_000_000_000))
+                        .collect();
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    for raw in &txs {
+                        module.handle(&dummy_ctx(), raw).expect("tx must succeed");
+                    }
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_tps_simple_transfer,
@@ -465,5 +542,6 @@ criterion_group!(
     bench_batch_parallel,
     bench_batch_parallel_multi_sender,
     bench_batch_parallel_conflict,
+    bench_native_vs_revm,
 );
 criterion_main!(benches);
