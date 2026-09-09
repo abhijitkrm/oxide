@@ -36,10 +36,12 @@
 //! - MMR proofs are self-contained (leaf index, leaf count, path,
 //!   peaks) and verify against the root alone — no trusted node needed.
 
+pub mod auth_journal;
 pub mod backend;
 pub mod journal;
 pub mod mmr;
 
+pub use auth_journal::{AuthenticatedJournal, AuthenticatedReplay, replay_verified};
 pub use backend::{Caps, Op, StorageBackend, Volatile};
 pub use journal::{JournalConfig, JournalWriter, Location, Replay, ReplayRecord, replay};
 pub use mmr::{Mmr, MmrProof, PathStep};

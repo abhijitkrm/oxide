@@ -2308,3 +2308,41 @@ to parallel execution and the trait can be redesigned.
 ### Verification
 
 224 tests pass. fmt clean. clippy `-D warnings` clean. cargo deny ok.
+
+## Session 18h — M1 fix: authenticated journal (journal + MMR integration)
+
+The M1 audit finding: the journal and MMR were separate. Every
+journal record should contribute to the authenticated log root,
+and replay should verify against the MMR root. Without this, a
+tampered journal record could go undetected if the CRC check is
+bypassed (e.g., by replacing the segment file).
+
+### What changed
+
+**`storage/src/auth_journal.rs` (new):**
+- `AuthenticatedJournal` wraps `JournalWriter` + `Mmr`. Every
+  `append(payload)` writes to the journal and pushes
+  `hash_leaf(payload)` to the MMR. The MMR root commits the
+  entire log.
+- `replay_verified(dir, expected_root)` replays the journal,
+  reconstructs the MMR from the replayed records, and verifies
+  the root matches `expected_root`. A mismatch means the journal
+  was tampered with.
+- 4 new tests:
+  - `authenticated_journal_root_is_deterministic`: replay
+    produces the same root as the writer.
+  - `tampered_journal_detected`: appending a record directly to
+    the segment file (bypassing the MMR) produces a different
+    root and is detected.
+  - `empty_journal_has_zero_root`: an empty journal has a zero
+    MMR root.
+  - `root_changes_after_each_append`: the root changes after
+    each append.
+
+**`storage/src/lib.rs`:**
+- Added `pub mod auth_journal` and re-exports.
+
+### Verification
+
+228 tests pass (was 224, +4 auth_journal tests). fmt clean.
+clippy `-D warnings` clean. cargo deny ok.
