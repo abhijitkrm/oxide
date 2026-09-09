@@ -65,6 +65,10 @@ storage = { path = "crates/storage", version = "0.1.0" }
 # per AGENTS.md dependency policy.
 revm = "42.0.1"
 
+# External storage adapters (plan.md §2.3: StorageBackend adapters).
+# redb is Apache-2.0 (GPL-3.0-compatible), pure Rust, ACID, LMDB-like.
+redb = "4.2.0"
+
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable
 # because perf gates (README.md → Roadmap) are release-profile measurements.

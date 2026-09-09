@@ -80,7 +80,13 @@ pub trait StorageBackend {
     fn capabilities(&self) -> Caps;
 
     /// Point read of a key's current value.
-    fn get(&self, key: &Hash) -> Option<&[u8]>;
+    ///
+    /// Returns owned bytes because disk-backed adapters (`redb`, `MDBX`,
+    /// `RocksDB`) read from disk and cannot return a reference into
+    /// their internal buffers without complex lifetime gymnastics.
+    /// The copy is on the cold-path query API (spec §4), not the
+    /// hot-path commit pipeline.
+    fn get(&self, key: &Hash) -> Option<Vec<u8>>;
 
     /// All key-value pairs whose 32-byte key starts with `prefix`
     /// (any length ≤ 32 — module namespaces are short), in key order
@@ -167,8 +173,8 @@ impl StorageBackend for Volatile {
         Caps { authenticated: false }
     }
 
-    fn get(&self, key: &Hash) -> Option<&[u8]> {
-        self.map.get(key).map(std::vec::Vec::as_slice)
+    fn get(&self, key: &Hash) -> Option<Vec<u8>> {
+        self.map.get(key).cloned()
     }
 
     fn range(&self, prefix: &[u8]) -> Vec<(Hash, Vec<u8>)> {
@@ -220,10 +226,10 @@ mod tests {
         let k = key(1);
         assert_eq!(store.get(&k), None);
         store.apply_batch(&[Op::Set { key: k, value: b"v1".to_vec() }]);
-        assert_eq!(store.get(&k), Some(b"v1".as_slice()));
+        assert_eq!(store.get(&k), Some(b"v1".to_vec()));
         // Upsert semantics: a second Set overwrites.
         store.apply_batch(&[Op::Set { key: k, value: b"v2".to_vec() }]);
-        assert_eq!(store.get(&k), Some(b"v2".as_slice()));
+        assert_eq!(store.get(&k), Some(b"v2".to_vec()));
         store.apply_batch(&[Op::Delete { key: k }]);
         assert_eq!(store.get(&k), None);
         // Delete of an absent key is a tombstone no-op, not an error.
@@ -242,7 +248,7 @@ mod tests {
             Op::Set { key: k, value: b"second".to_vec() },
             Op::Delete { key: key(8) },
         ]);
-        assert_eq!(store.get(&k), Some(b"second".as_slice()));
+        assert_eq!(store.get(&k), Some(b"second".to_vec()));
     }
 
     /// Prefix range: only matching keys, in deterministic order, up to

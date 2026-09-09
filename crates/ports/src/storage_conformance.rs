@@ -86,15 +86,15 @@ fn batch_atomicity<B: StorageBackend>(make_backend: &impl Fn() -> B) {
         Op::Set { key: k1, value: b"second".to_vec() },
         Op::Set { key: k2, value: b"v2".to_vec() },
     ]);
-    assert_eq!(store.get(&k1).map(<[u8]>::to_vec), Some(b"second".to_vec()));
-    assert_eq!(store.get(&k2).map(<[u8]>::to_vec), Some(b"v2".to_vec()));
+    assert_eq!(store.get(&k1), Some(b"second".to_vec()));
+    assert_eq!(store.get(&k2), Some(b"v2".to_vec()));
 
     // Batch with a Delete then re-Set — the re-Set wins (applied in order).
     store.apply_batch(&[
         Op::Delete { key: k1 },
         Op::Set { key: k1, value: b"resurrected".to_vec() },
     ]);
-    assert_eq!(store.get(&k1).map(<[u8]>::to_vec), Some(b"resurrected".to_vec()));
+    assert_eq!(store.get(&k1), Some(b"resurrected".to_vec()));
 }
 
 /// Deterministic iteration order: `range` returns keys in lexicographic

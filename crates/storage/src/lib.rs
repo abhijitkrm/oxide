@@ -41,7 +41,13 @@ pub mod backend;
 pub mod journal;
 pub mod mmr;
 
+#[cfg(feature = "redb")]
+pub mod redb_backend;
+
 pub use auth_journal::{AuthenticatedJournal, AuthenticatedReplay, replay_verified};
 pub use backend::{Caps, Op, StorageBackend, Volatile};
 pub use journal::{JournalConfig, JournalWriter, Location, Replay, ReplayRecord, replay};
 pub use mmr::{Mmr, MmrProof, PathStep};
+
+#[cfg(feature = "redb")]
+pub use redb_backend::RedbBackend;
