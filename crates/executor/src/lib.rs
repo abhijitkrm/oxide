@@ -259,9 +259,42 @@ impl AppInterface for Executor {
     }
 
     fn process_proposal(&self, proposal: &Proposal) -> Verdict {
-        // v0: accept all proposals. Real validation (nonce, fee, sig)
-        // arrives with the modules framework.
-        let _ = proposal;
+        // M2 fix: validate each tx's static structure. Previously
+        // this accepted all proposals unconditionally, which meant
+        // a byzantine leader could propose a block with malformed
+        // txs and they'd be silently skipped during execution.
+        //
+        // Static validity checks (no state access):
+        // 1. Each tx must be long enough to have a sender, nonce,
+        //    fee, and module ID (≥ 37 bytes).
+        // 2. Each tx's module ID must be a registered module.
+        //
+        // Dynamic checks (nonce ordering, balance, signature) are
+        // not done here — they require state access and are checked
+        // during execution. Signature verification arrives when the
+        // tx envelope format includes signatures (Phase 2).
+        for tx in &proposal.txs {
+            let bytes = tx.as_bytes();
+            // Check that the tx context is parseable (sender, nonce,
+            // fee). This also implicitly checks the minimum size
+            // (TX_MIN_SIZE = 36 bytes).
+            if parse_tx_context(bytes).is_none() {
+                return Verdict::Reject {
+                    reason: "tx context (sender/nonce/fee) is malformed".to_string(),
+                };
+            }
+            // Check that the tx has a module ID byte.
+            if bytes.len() < MODULE_ID_OFFSET + 1 {
+                return Verdict::Reject { reason: "tx too short for module ID".to_string() };
+            }
+            // Check that the module is registered.
+            let Some(module_id) = parse_module_id(bytes) else {
+                return Verdict::Reject { reason: "tx has no module ID".to_string() };
+            };
+            if !self.modules.contains_key(&module_id) {
+                return Verdict::Reject { reason: format!("unknown module ID {module_id}") };
+            }
+        }
         Verdict::Accept
     }
 
@@ -436,5 +469,66 @@ mod tests {
         let root2 = executor.attest_state(Height::new(2)).root;
         assert_ne!(root0, root1, "state roots should differ across blocks");
         assert_ne!(root1, root2, "state roots should differ across blocks");
+    }
+
+    // ---- M2 fix: process_proposal validation tests ----
+
+    #[test]
+    fn process_proposal_accepts_valid_tx() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let tx = make_tx(1, &[42]);
+        let proposal = Proposal { height: Height::new(0), txs: vec![tx], attestation: None };
+        assert!(matches!(executor.process_proposal(&proposal), Verdict::Accept));
+    }
+
+    #[test]
+    fn process_proposal_rejects_too_short_tx() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let proposal = Proposal {
+            height: Height::new(0),
+            txs: vec![TxBytes::new(vec![1, 2, 3])], // way too short
+            attestation: None,
+        };
+        match executor.process_proposal(&proposal) {
+            Verdict::Reject { reason } => assert!(reason.contains("malformed")),
+            Verdict::Accept => panic!("should reject too-short tx"),
+        }
+    }
+
+    #[test]
+    fn process_proposal_rejects_unknown_module() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let tx = make_tx(99, &[1]); // module 99 is not registered
+        let proposal = Proposal { height: Height::new(0), txs: vec![tx], attestation: None };
+        match executor.process_proposal(&proposal) {
+            Verdict::Reject { reason } => assert!(reason.contains("unknown module")),
+            Verdict::Accept => panic!("should reject unknown module"),
+        }
+    }
+
+    #[test]
+    fn process_proposal_rejects_malformed_context() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        // A tx with 37 bytes (minimum for module ID) but with a
+        // malformed sender (not a valid address — but actually
+        // any 20 bytes is a valid Address, so we need to test a
+        // different malformation). Let's use a tx that's exactly
+        // 36 bytes (no module ID byte) — this should be rejected
+        // as "too short for module ID".
+        let mut bytes = vec![0u8; 36]; // 20 + 8 + 8, no module ID
+        bytes.push(1); // add module ID
+        // Actually this is valid. Let's make a tx with a bad nonce
+        // section — but u64::from_le_bytes never fails on 8 bytes.
+        // The real malformation is a tx shorter than 36 bytes.
+        let short_tx = TxBytes::new(vec![0u8; 30]); // < 36 bytes
+        let proposal = Proposal { height: Height::new(0), txs: vec![short_tx], attestation: None };
+        match executor.process_proposal(&proposal) {
+            Verdict::Reject { reason } => assert!(reason.contains("malformed")),
+            Verdict::Accept => panic!("should reject malformed tx"),
+        }
     }
 }

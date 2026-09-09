@@ -2164,3 +2164,38 @@ target is an extrapolation to parallelized production."
 ### Verification
 
 220 tests pass. fmt clean. clippy `-D warnings` clean. cargo deny ok.
+
+## Session 18d — M2 fix: process_proposal validation
+
+The M2 audit finding: `process_proposal` accepted all proposals
+unconditionally. A byzantine leader could propose a block with
+malformed txs and they'd be silently skipped during execution.
+
+### What changed
+
+**`executor/src/lib.rs`:**
+- `process_proposal` now validates each tx's static structure:
+  1. The tx context (sender, nonce, fee) must be parseable. This
+     also implicitly checks the minimum size (TX_MIN_SIZE = 36).
+  2. The tx must have a module ID byte.
+  3. The module ID must be a registered module.
+- A proposal with any malformed tx is rejected with
+  `Verdict::Reject { reason }`.
+- Dynamic checks (nonce ordering, balance, signature) are not
+  done here — they require state access and are checked during
+  execution. Signature verification arrives when the tx envelope
+  format includes signatures (Phase 2).
+
+**Tests:**
+- 4 new tests in `executor/src/lib.rs`:
+  - `process_proposal_accepts_valid_tx`: a valid tx is accepted.
+  - `process_proposal_rejects_too_short_tx`: a 3-byte tx is rejected.
+  - `process_proposal_rejects_unknown_module`: a tx for an
+    unregistered module is rejected.
+  - `process_proposal_rejects_malformed_context`: a tx shorter than
+    36 bytes is rejected as malformed.
+
+### Verification
+
+224 tests pass (was 220, +4 M2 tests). fmt clean. clippy
+`-D warnings` clean. cargo deny ok.
