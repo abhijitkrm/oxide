@@ -110,7 +110,7 @@ impl MultiNodeDevnet {
     }
 
     /// Run `rounds` consensus rounds, each with `txs_per_round`
-    /// core-module txs (minimal dispatch, no bank BTreeMap
+    /// core-module txs (minimal dispatch, no bank `BTreeMap`
     /// overhead). Returns the finalized blocks and wall-clock
     /// elapsed time. This is the purest measure of consensus +
     /// dispatch throughput.
@@ -405,7 +405,7 @@ fn make_batch_tx(round: usize, tx_i: usize) -> TxBytes {
 /// Construct a minimal tx for throughput testing: routes to the
 /// core module (ID 0) with an empty payload. The core module's
 /// `handle` is a no-op, so this measures the consensus + dispatch
-/// overhead without the bank module's BTreeMap cost.
+/// overhead without the bank module's `BTreeMap` cost.
 fn make_core_tx(round: usize, tx_i: usize) -> TxBytes {
     let sender = primitives::Address([0u8; 20]);
     let nonce = u64::try_from(round * 1000 + tx_i).unwrap();
@@ -416,6 +416,19 @@ fn make_core_tx(round: usize, tx_i: usize) -> TxBytes {
     bytes.extend_from_slice(&fee.to_le_bytes());
     bytes.push(framework::module_id::CORE);
     TxBytes::new(bytes)
+}
+
+/// Compute transactions per second from a tx count and elapsed
+/// duration. Uses `f64` for the rate; tx counts in the simulation
+/// are well below 2^52 so no precision is lost.
+#[cfg(test)]
+fn tps(total_txs: usize, elapsed: std::time::Duration) -> f64 {
+    // `usize as f64` triggers `clippy::cast_precision_loss` on
+    // 64-bit targets (usize is 64 bits, f64 mantissa is 52). The
+    // simulation's tx count never exceeds ~10^6, far below 2^52,
+    // so the cast is exact. Allow the lint here, not globally.
+    #![allow(clippy::cast_precision_loss)]
+    total_txs as f64 / elapsed.as_secs_f64()
 }
 
 #[cfg(test)]
@@ -598,7 +611,7 @@ mod tests {
         let (result, elapsed) = devnet.run_batch(10, 100);
         let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
         assert_eq!(total_txs, 1000, "all 1000 txs must be finalized");
-        let tps = total_txs as f64 / elapsed.as_secs_f64();
+        let tps = tps(total_txs, elapsed);
         eprintln!("throughput_sim_4_validators: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s");
     }
 
@@ -614,7 +627,7 @@ mod tests {
         let (result, elapsed) = devnet.run_batch(3, 10_000);
         let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
         assert!(total_txs > 0, "should finalize some txs");
-        let tps = total_txs as f64 / elapsed.as_secs_f64();
+        let tps = tps(total_txs, elapsed);
         eprintln!("throughput_sim_32_validators: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s");
         // The acceptance gate: >= 200k tx/s in release mode.
         // This is a soft check in the test; the real gate is in
@@ -624,7 +637,7 @@ mod tests {
     /// Throughput sim (core module): 32 validators, 3 rounds,
     /// 10000 txs/round. Uses the core module (no-op handle) to
     /// measure pure consensus + dispatch throughput without the
-    /// bank module's BTreeMap overhead.
+    /// bank module's `BTreeMap` overhead.
     #[test]
     #[ignore = "throughput sim: run with --release -- --ignored"]
     fn throughput_sim_32_validators_core() {
@@ -632,7 +645,7 @@ mod tests {
         let (result, elapsed) = devnet.run_batch_core(3, 10_000);
         let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
         assert!(total_txs > 0, "should finalize some txs");
-        let tps = total_txs as f64 / elapsed.as_secs_f64();
+        let tps = tps(total_txs, elapsed);
         eprintln!(
             "throughput_sim_32_validators_core: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s"
         );
@@ -647,7 +660,7 @@ mod tests {
         let (result, elapsed) = devnet.run_batch(1, 1000);
         let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
         assert!(total_txs > 0, "should finalize some txs");
-        let tps = total_txs as f64 / elapsed.as_secs_f64();
+        let tps = tps(total_txs, elapsed);
         eprintln!("throughput_sim_large_batch: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s");
     }
 
