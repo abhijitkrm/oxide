@@ -44,6 +44,9 @@ pub mod mmr;
 #[cfg(feature = "redb")]
 pub mod redb_backend;
 
+#[cfg(feature = "rocksdb")]
+pub mod rocksdb_backend;
+
 pub use auth_journal::{AuthenticatedJournal, AuthenticatedReplay, replay_verified};
 pub use backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend, Volatile};
 pub use journal::{JournalConfig, JournalWriter, Location, Replay, ReplayRecord, replay};
@@ -51,3 +54,6 @@ pub use mmr::{Mmr, MmrProof, PathStep};
 
 #[cfg(feature = "redb")]
 pub use redb_backend::RedbBackend;
+
+#[cfg(feature = "rocksdb")]
+pub use rocksdb_backend::RocksDbBackend;

@@ -72,6 +72,9 @@ revm = "42.0.1"
 # External storage adapters (plan.md §2.3: StorageBackend adapters).
 # redb is Apache-2.0 (GPL-3.0-compatible), pure Rust, ACID, LMDB-like.
 redb = "4.2.0"
+# RocksDB is Apache-2.0 (GPL-3.0-compatible), the industry-standard
+# LSM KV store. C++ binding via the official `rocksdb` crate.
+rocksdb = "0.24.0"
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable

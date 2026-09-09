@@ -25,11 +25,17 @@ blake3 = "1"
 # adapter). Optional, behind the "redb" feature, so the default build
 # stays dependency-light. Apache-2.0 (GPL-3.0-compatible).
 redb = { workspace = true, optional = true }
+# RocksDB: industry-standard LSM KV store (plan.md §2.3 StorageBackend
+# adapter). Optional, behind the "rocksdb" feature. Apache-2.0
+# (GPL-3.0-compatible). C++ binding — requires a C++ compiler.
+rocksdb = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enable the redb StorageBackend adapter.
 redb = ["dep:redb"]
+# Enable the RocksDB StorageBackend adapter.
+rocksdb = ["dep:rocksdb"]
 
 [dev-dependencies]
 criterion = "0.7.0"
