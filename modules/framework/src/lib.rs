@@ -114,7 +114,7 @@ mod tests {
             module_id::CORE
         }
         fn begin_block(&self, _h: Height) {}
-        fn handle(&self, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+        fn handle(&self, _ctx: &executor::TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             self.store.lock().unwrap().insert(b"last".to_vec(), msg.to_vec());
             Ok(vec![])
         }

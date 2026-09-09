@@ -34,6 +34,17 @@ use executor::Executor;
 use ports::{AppInterface, ConsensusEngine};
 use types::{FinalizedBlock, TxBytes};
 
+/// The sender address used in devnet bank-transfer txs. All
+/// transfers in the simulation come from this address.
+const GENESIS_SENDER: primitives::Address = primitives::Address([0u8; 20]);
+
+/// The genesis balance minted to the sender on each validator's
+/// bank module. Large enough that the simulation never exhausts
+/// it (the max transfer in any round is `rounds` tokens; the
+/// throughput test sends 1 token per tx, up to ~30k txs).
+/// Source: plan.md §13 (Phase 1 gate: 200k tx/s sim).
+const GENESIS_BALANCE: u64 = 1_000_000_000_000; // 10^12
+
 /// A multi-node devnet: N validators running oxideBFT with the real
 /// app stack.
 ///
@@ -95,7 +106,13 @@ impl MultiNodeDevnet {
         for (i, key) in secret_keys.iter().cloned().enumerate() {
             let mut executor = Executor::new(max_mempool_entries);
             executor.register_module(Arc::new(core::CoreModule::new()));
-            executor.register_module(Arc::new(bank::BankModule::new()));
+            // Genesis-mint to the sender address so bank transfers
+            // can debit (C2 fix: the bank now debits the sender, so
+            // the sender needs an initial balance). The bank module
+            // is minted before registration.
+            let bank = bank::BankModule::new();
+            bank.mint(&GENESIS_SENDER, GENESIS_BALANCE);
+            executor.register_module(Arc::new(bank));
             executor.register_module(Arc::new(staking::StakingModule::new()));
             let app: Arc<Executor> = Arc::new(executor);
             let app_dyn: Arc<dyn AppInterface> = app.clone();

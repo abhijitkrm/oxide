@@ -2017,3 +2017,73 @@ block. BFT safety was vacuous.
 
 218 tests pass (was 214, +4 forgery tests). fmt clean. clippy
 `-D warnings` clean. cargo deny ok.
+
+## Session 18b — C2 fix: tx context + bank debit/balance check
+
+The C2 audit finding: `BankModule::handle` credited the recipient
+and never debited anyone — the bank was a money printer. The root
+cause: the executor never passed tx context (sender) to modules,
+so `handle` had no way to know who sent the tx.
+
+### What changed
+
+**`executor/src/lib.rs`:**
+- Added `TxContext` struct: `{ sender: Address, nonce: u64, fee: u64 }`.
+  Carries the sender identity parsed from the tx envelope.
+- Changed `Module::handle` signature from `handle(&self, msg)` to
+  `handle(&self, ctx: &TxContext, msg)`. Modules now have the
+  sender's identity and can enforce balance checks, nonce ordering,
+  and fee deduction.
+- Added `parse_tx_context` helper that extracts sender/nonce/fee
+  from the v0 tx envelope (`[sender: 20B][nonce: 8B LE][fee: 8B LE]
+  [module_id: 1B][payload]`).
+- Updated `execute_block` to parse the tx context and pass it to
+  `module.handle`.
+
+**`modules/bank/src/lib.rs`:**
+- `handle` now debits the sender and credits the recipient. If the
+  sender has insufficient balance, the transfer is rejected with
+  `ExecError::ModuleRejected("insufficient balance")`. The bank is
+  no longer a money printer — it's a real token system.
+- Updated all tests to pass `TxContext` and to mint to the sender
+  before transfers.
+- New test: `insufficient_balance_rejected` — a sender with 50
+  tokens cannot transfer 100; the transfer is rejected and balances
+  are unchanged.
+- New test: `zero_balance_transfer_rejected` — a sender with no
+  balance cannot transfer at all.
+
+**`modules/staking/src/lib.rs`, `modules/core/src/lib.rs`:**
+- Updated `handle` signature to accept `&TxContext`. The staking
+  module doesn't use the sender yet (delegation doesn't debit) —
+  that arrives when staking integrates with bank for real
+  delegation (debit from delegator, credit to validator stake).
+
+**`modules/framework/src/lib.rs`:**
+- Updated the test `DummyModule::handle` to accept `&TxContext`.
+
+**`devnet/src/multinode.rs`:**
+- Genesis-mints 10^12 tokens to the sender address (`[0u8; 20]`) on
+  each validator's bank module during construction. This is
+  necessary because the bank now debits the sender — without an
+  initial balance, all transfers would fail.
+- Added `GENESIS_SENDER` and `GENESIS_BALANCE` constants with
+  documentation.
+
+**`storage/tests/journal_replay.rs`:**
+- Updated `build_executor` to genesis-mint to the sender address
+  before registering the bank module.
+
+### Impact on throughput
+
+The bank now does two writes per transfer (debit + credit) instead
+of one (credit only). This is the correct behavior — the previous
+"mint to recipient" was a bug that understated per-tx cost. The
+throughput numbers from session 16 are now slightly lower; the
+gate (H1) was already failing as written, so this doesn't change
+the gate status.
+
+### Verification
+
+220 tests pass (was 218, +2 new bank tests). fmt clean. clippy
+`-D warnings` clean. cargo deny ok.

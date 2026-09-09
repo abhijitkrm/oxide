@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use executor::{Event, ExecError, Module};
+use executor::{Event, ExecError, Module, TxContext};
 use framework::{KVStore, module_id, subtree_root};
 use primitives::{Address, Hash, Height};
 
@@ -102,15 +102,26 @@ impl Module for BankModule {
 
     fn begin_block(&self, _height: Height) {}
 
-    fn handle(&self, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+    fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (to, amount) = Self::parse_transfer(msg).ok_or(ExecError::Malformed)?;
 
-        // In v0, the sender is not yet passed to `handle` (the executor
-        // doesn't extract it from the tx envelope). For now, we accept
-        // the transfer as a "mint to recipient" — the real sender
-        // extraction arrives when the executor passes the tx context.
-        // This is a known limitation documented in the devlog.
+        // C2 fix: debit the sender, credit the recipient. Before
+        // this fix, `handle` had no sender context and could only
+        // mint to the recipient — the bank was a money printer.
+        // Now we debit the sender first and reject if insufficient.
         let mut store = self.store.lock().unwrap();
+
+        // Debit sender.
+        let sender_key = Self::balance_key(&ctx.sender);
+        let sender_bal = store
+            .get(&sender_key[..])
+            .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
+        let new_sender_bal = sender_bal
+            .checked_sub(amount)
+            .ok_or(ExecError::ModuleRejected("insufficient balance".to_string()))?;
+        store.insert(sender_key, new_sender_bal.to_le_bytes().to_vec());
+
+        // Credit recipient.
         let to_key = Self::balance_key(&to);
         let to_bal = store
             .get(&to_key[..])
@@ -138,28 +149,53 @@ mod tests {
         Address([byte; 20])
     }
 
+    fn ctx(sender_byte: u8) -> TxContext {
+        TxContext { sender: addr(sender_byte), nonce: 0, fee: 0 }
+    }
+
     #[test]
-    fn transfer_increments_recipient_balance() {
+    fn transfer_debits_sender_credits_recipient() {
         let bank = BankModule::new();
+        let from = addr(1);
         let to = addr(2);
+        bank.mint(&from, 1000);
         let msg = msg::transfer(to, 100);
-        bank.handle(&msg).unwrap();
+        bank.handle(&ctx(1), &msg).unwrap();
+        assert_eq!(bank.balance(&from), 900);
         assert_eq!(bank.balance(&to), 100);
     }
 
     #[test]
     fn multiple_transfers_accumulate() {
         let bank = BankModule::new();
+        let from = addr(1);
         let to = addr(3);
-        bank.handle(&msg::transfer(to, 50)).unwrap();
-        bank.handle(&msg::transfer(to, 30)).unwrap();
+        bank.mint(&from, 1000);
+        bank.handle(&ctx(1), &msg::transfer(to, 50)).unwrap();
+        bank.handle(&ctx(1), &msg::transfer(to, 30)).unwrap();
+        assert_eq!(bank.balance(&from), 920);
         assert_eq!(bank.balance(&to), 80);
+    }
+
+    #[test]
+    fn insufficient_balance_rejected() {
+        let bank = BankModule::new();
+        let from = addr(1);
+        let to = addr(2);
+        bank.mint(&from, 50);
+        let msg = msg::transfer(to, 100);
+        let err = bank.handle(&ctx(1), &msg).unwrap_err();
+        assert_eq!(err, ExecError::ModuleRejected("insufficient balance".to_string()));
+        // Sender balance unchanged.
+        assert_eq!(bank.balance(&from), 50);
+        // Recipient got nothing.
+        assert_eq!(bank.balance(&to), 0);
     }
 
     #[test]
     fn malformed_message_rejected() {
         let bank = BankModule::new();
-        assert_eq!(bank.handle(&[1, 2, 3]), Err(ExecError::Malformed));
+        assert_eq!(bank.handle(&ctx(1), &[1, 2, 3]), Err(ExecError::Malformed));
     }
 
     #[test]
@@ -173,9 +209,19 @@ mod tests {
     #[test]
     fn state_root_changes_after_transfer() {
         let bank = BankModule::new();
+        bank.mint(&addr(1), 1000);
         let root0 = bank.state_root();
-        bank.handle(&msg::transfer(addr(1), 100)).unwrap();
+        bank.handle(&ctx(1), &msg::transfer(addr(2), 100)).unwrap();
         let root1 = bank.state_root();
         assert_ne!(root0, root1);
+    }
+
+    #[test]
+    fn zero_balance_transfer_rejected() {
+        // A sender with no balance cannot transfer.
+        let bank = BankModule::new();
+        let to = addr(2);
+        let err = bank.handle(&ctx(1), &msg::transfer(to, 1)).unwrap_err();
+        assert_eq!(err, ExecError::ModuleRejected("insufficient balance".to_string()));
     }
 }

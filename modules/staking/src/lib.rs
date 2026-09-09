@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use executor::{Event, ExecError, Module};
+use executor::{Event, ExecError, Module, TxContext};
 use framework::{KVStore, module_id, subtree_root};
 use primitives::{Address, Hash, Height};
 
@@ -115,7 +115,7 @@ impl Module for StakingModule {
 
     fn begin_block(&self, _height: Height) {}
 
-    fn handle(&self, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+    fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (validator, amount) = Self::parse_delegate(msg).ok_or(ExecError::Malformed)?;
 
         let mut validators = self.validators.lock().unwrap();
@@ -146,11 +146,15 @@ mod tests {
         Address([byte; 20])
     }
 
+    fn ctx() -> TxContext {
+        TxContext { sender: addr(0), nonce: 0, fee: 0 }
+    }
+
     #[test]
     fn delegate_increases_stake() {
         let staking = StakingModule::new();
         let v = addr(1);
-        staking.handle(&msg::delegate(v, 1000)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         assert_eq!(staking.stake(&v), 1000);
     }
 
@@ -158,17 +162,17 @@ mod tests {
     fn multiple_delegates_accumulate() {
         let staking = StakingModule::new();
         let v = addr(1);
-        staking.handle(&msg::delegate(v, 100)).unwrap();
-        staking.handle(&msg::delegate(v, 200)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v, 100)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v, 200)).unwrap();
         assert_eq!(staking.stake(&v), 300);
     }
 
     #[test]
     fn top_validators_sorted_by_stake() {
         let staking = StakingModule::new();
-        staking.handle(&msg::delegate(addr(1), 100)).unwrap();
-        staking.handle(&msg::delegate(addr(2), 500)).unwrap();
-        staking.handle(&msg::delegate(addr(3), 300)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(addr(1), 100)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(addr(2), 500)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(addr(3), 300)).unwrap();
         let top = staking.top_validators(2);
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].address, addr(2), "highest stake first");
@@ -179,7 +183,7 @@ mod tests {
     #[test]
     fn zero_stake_validators_excluded() {
         let staking = StakingModule::new();
-        staking.handle(&msg::delegate(addr(1), 100)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(addr(1), 100)).unwrap();
         let top = staking.top_validators(10);
         assert_eq!(top.len(), 1, "only non-zero-stake validators");
     }
@@ -187,14 +191,14 @@ mod tests {
     #[test]
     fn malformed_message_rejected() {
         let staking = StakingModule::new();
-        assert_eq!(staking.handle(&[1, 2, 3]), Err(ExecError::Malformed));
+        assert_eq!(staking.handle(&ctx(), &[1, 2, 3]), Err(ExecError::Malformed));
     }
 
     #[test]
     fn state_root_changes_after_delegate() {
         let staking = StakingModule::new();
         let root0 = staking.state_root();
-        staking.handle(&msg::delegate(addr(1), 100)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(addr(1), 100)).unwrap();
         let root1 = staking.state_root();
         assert_ne!(root0, root1);
     }

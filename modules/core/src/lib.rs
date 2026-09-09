@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use executor::{Event, ExecError, Module};
+use executor::{Event, ExecError, Module, TxContext};
 use framework::{KVStore, module_id, subtree_root};
 use primitives::{Hash, Height};
 
@@ -74,7 +74,7 @@ impl Module for CoreModule {
         store.insert(b"height".to_vec(), height.value().to_le_bytes().to_vec());
     }
 
-    fn handle(&self, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+    fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         // The core module has no user-facing messages in v0.
         Ok(vec![])
     }

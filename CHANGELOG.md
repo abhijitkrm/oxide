@@ -12,6 +12,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Bank module: sender debit + balance check (C2 fix)** (2026-09-10)
+  - The bank module now debits the sender and credits the recipient
+    on transfers. A sender with insufficient balance is rejected.
+    The executor passes the sender's identity (parsed from the tx
+    envelope) to modules via a new `TxContext` parameter on
+    `Module::handle`.
+  - 2 new tests: `insufficient_balance_rejected`,
+    `zero_balance_transfer_rejected`.
+
+  **In plain words:** Oxide's bank module is now a real token
+  system, not a money printer. Before this fix, every "transfer"
+  just created new tokens for the recipient — the sender was never
+  debited. Now the sender's balance is checked and debited, so you
+  can't spend tokens you don't have. This is the basic accounting
+  invariant that any blockchain must enforce.
+
 - **BLS signature verification in the consensus vote path (C1 fix)** (2026-09-10)
   - The oxideBFT engine now verifies every vote's BLS signature in
     `collect_vote` and every QC's aggregate signature in

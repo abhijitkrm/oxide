@@ -47,6 +47,24 @@ pub enum ExecError {
     OutOfGas,
 }
 
+/// Transaction context passed to modules during `handle`.
+///
+/// Carries the sender, nonce, and fee parsed from the tx envelope.
+/// This is the C2 fix: before, `handle` received only the message
+/// bytes and had no way to know who sent the tx — so the bank module
+/// could only mint to the recipient, never debit the sender. Now
+/// modules have the sender's identity and can enforce balance
+/// checks, nonce ordering, and fee deduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxContext {
+    /// The sender's address (20 bytes, parsed from the tx envelope).
+    pub sender: primitives::Address,
+    /// The tx nonce (8 bytes LE, parsed from the tx envelope).
+    pub nonce: u64,
+    /// The tx fee (8 bytes LE, parsed from the tx envelope).
+    pub fee: u64,
+}
+
 /// A module: a Cosmos-SDK-style state machine that handles messages.
 ///
 /// Each module owns a subtree of the storage and exposes `handle` for
@@ -64,12 +82,16 @@ pub trait Module: Send + Sync {
 
     /// Handle a message. Returns events on success, or an error.
     ///
+    /// The `ctx` carries the sender, nonce, and fee parsed from the
+    /// tx envelope (C2 fix). Modules use `ctx.sender` to debit
+    /// balances, check nonces, and attribute fees.
+    ///
     /// # Errors
     ///
     /// Returns [`ExecError::Malformed`] if the message can't be parsed,
     /// [`ExecError::ModuleRejected`] if the module rejects the message,
     /// or [`ExecError::OutOfGas`] if the message exceeds the gas budget.
-    fn handle(&self, msg: &[u8]) -> Result<Vec<Event>, ExecError>;
+    fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError>;
 
     /// Called at the end of each block, after all txs.
     fn end_block(&self, height: Height);
@@ -110,6 +132,25 @@ fn module_payload(bytes: &[u8]) -> &[u8] {
     }
     &bytes[MODULE_ID_OFFSET + 1..]
 }
+
+/// Parse the tx context (sender, nonce, fee) from the tx envelope.
+///
+/// The v0 tx format is: `[sender: 20B][nonce: 8B LE][fee: 8B LE]
+/// [module_id: 1B][module_payload: ...]`. This extracts the first
+/// 36 bytes into a `TxContext`. Returns `None` if the tx is too
+/// short or the sender is not a valid 20-byte address.
+fn parse_tx_context(bytes: &[u8]) -> Option<TxContext> {
+    if bytes.len() < TX_MIN_SIZE {
+        return None;
+    }
+    let sender = primitives::Address::from_slice(&bytes[..20]).ok()?;
+    let nonce = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
+    let fee = u64::from_le_bytes(bytes[28..36].try_into().ok()?);
+    Some(TxContext { sender, nonce, fee })
+}
+
+/// Minimum tx size: sender (20) + nonce (8) + fee (8) = 36 bytes.
+const TX_MIN_SIZE: usize = 20 + 8 + 8;
 
 /// The executor: a sequential block executor with a module router.
 ///
@@ -171,12 +212,17 @@ impl Executor {
         // Execute each tx sequentially.
         for tx in &block.txs {
             let bytes = tx.as_bytes();
+            // Parse the tx context (sender, nonce, fee) from the
+            // envelope (C2 fix). Skip malformed txs.
+            let Some(ctx) = parse_tx_context(bytes) else {
+                continue; // skip malformed txs
+            };
             let Some(module_id) = parse_module_id(bytes) else {
                 continue; // skip malformed txs
             };
             let payload = module_payload(bytes);
             if let Some(module) = self.modules.get(&module_id) {
-                if let Ok(events) = module.handle(payload) {
+                if let Ok(events) = module.handle(&ctx, payload) {
                     self.events.lock().unwrap().extend(events);
                 }
             }
@@ -263,7 +309,7 @@ mod tests {
 
         fn begin_block(&self, _height: Height) {}
 
-        fn handle(&self, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             let mut c = self.count.lock().unwrap();
             *c += 1;
             Ok(vec![Event { module: "counter", kind: "increment".to_string(), data: vec![] }])

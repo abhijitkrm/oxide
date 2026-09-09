@@ -44,11 +44,14 @@ fn bank_tx(nonce: u64, amount: u64) -> types::TxBytes {
 }
 
 /// Build an executor with core/bank/staking modules (same as the
-/// devnet multi-node runner).
+/// devnet multi-node runner). Genesis-mints to the sender address
+/// so bank transfers can debit (C2 fix).
 fn build_executor() -> Arc<Executor> {
     let mut executor = Executor::new(10_000);
     executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-    executor.register_module(Arc::new(bank::BankModule::new()));
+    let bank = bank::BankModule::new();
+    bank.mint(&primitives::Address([0u8; 20]), 1_000_000_000_000);
+    executor.register_module(Arc::new(bank));
     executor.register_module(Arc::new(staking::StakingModule::new()));
     Arc::new(executor)
 }
