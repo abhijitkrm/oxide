@@ -12,6 +12,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **redb StorageBackend adapter (Phase 2)** (2026-01-22)
+  - Added the first disk-backed `StorageBackend` adapter: `redb`
+    (pure Rust, ACID, LMDB-like). `RedbBackend` wraps a `redb`
+    database file with atomic batch writes, MVCC reads, and
+    crash safety. Passes the `storage-conformance` suite. Behind
+    the `redb` feature flag on the storage crate.
+  - In plain words: the chain can now persist state to disk
+    using a pure-Rust database, with crash safety guaranteed
+    by ACID transactions.
+
 - **Storage-conformance suite (Phase 2 start)** (2026-01-22)
   - Added the `storage-conformance` suite — the gate every
     `StorageBackend` adapter must pass before node wiring lets a

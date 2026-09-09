@@ -2599,3 +2599,36 @@ Two commits:
 
 256 tests pass (was 241, +15: 1 storage conformance, 14 EVM).
 fmt, clippy `-D warnings`, cargo deny all clean.
+
+### redb StorageBackend adapter
+
+The first disk-backed `StorageBackend` adapter: `redb` (pure
+Rust, ACID, LMDB-like). This is the second Phase 2 storage
+deliverable (plan.md §2.3).
+
+redb adapter (`crates/storage/src/redb_backend.rs`):
+- `RedbBackend` wraps a `redb::Database` file.
+- `apply_batch` runs inside a single write transaction (atomic
+  per batch, per the `StorageBackend` contract).
+- `get` and `range` use read transactions (MVCC, non-blocking).
+- Crash-safe: redb is ACID-compliant, so a crash mid-batch
+  leaves the database in its pre-batch state.
+- 5 unit tests + passes the `storage-conformance` suite.
+
+Trait change: `StorageBackend::get()` now returns
+`Option<Vec<u8>>` (owned) instead of `Option<&[u8]>` (borrowed).
+Disk-backed adapters (redb, MDBX, RocksDB) read from disk and
+cannot return a reference into their internal buffers. The
+copy is on the cold-path query API (spec §4), not the hot-path
+commit pipeline. `Volatile` and all callers updated.
+
+redb is behind the `redb` feature flag on the storage crate,
+so the default build stays dependency-light. Apache-2.0
+(GPL-3.0-compatible).
+
+Commit: `45685e1`.
+
+### Verification
+
+262 tests pass with `--features storage/redb` (was 256, +6
+redb). fmt, clippy `-D warnings`, cargo deny all clean.
