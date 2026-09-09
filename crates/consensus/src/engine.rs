@@ -119,6 +119,10 @@ pub enum ConsensusError {
     /// bitmap + validator set. The leader may be byzantine or the QC
     /// may be corrupted in transit.
     InvalidQcSignature,
+    /// A timeout certificate's aggregate signature did not verify
+    /// against the signer bitmap + validator set. A forged TC could
+    /// allow an attacker to force a spurious view change.
+    InvalidTcSignature,
     /// The signer bitmap references a validator index that is out of
     /// bounds for the current validator set.
     SignerOutOfBounds,
@@ -131,6 +135,7 @@ impl std::fmt::Display for ConsensusError {
                 write!(f, "invalid vote signature from validator {voter}")
             }
             Self::InvalidQcSignature => write!(f, "invalid QC aggregate signature"),
+            Self::InvalidTcSignature => write!(f, "invalid TC aggregate signature"),
             Self::SignerOutOfBounds => {
                 write!(f, "signer bitmap references out-of-bounds validator")
             }
@@ -197,6 +202,11 @@ pub struct OxideBft {
     votes: Vec<Option<Vote>>,
     /// Number of votes collected in the current view.
     vote_count: usize,
+    /// Collected timeout signatures for the current view (TC safety).
+    /// `None` = no timeout signature from that validator. Indexed by
+    /// `ValidatorIndex`. Used to aggregate the TC's signature when
+    /// quorum is reached.
+    timeout_signatures: Vec<Option<Signature>>,
     /// Whether to verify BLS signatures on votes and QCs (C1 fix).
     ///
     /// `true` (production): every vote's signature is verified in
@@ -251,6 +261,7 @@ impl OxideBft {
             epoch,
             votes: vec![None; n],
             vote_count: 0,
+            timeout_signatures: vec![None; n],
             verify_signatures: true,
         }
     }
@@ -774,10 +785,18 @@ impl OxideBft {
     /// (no one to timeout). In multi-validator mode, the simulation
     /// collects these and forms a TC.
     ///
-    /// Stage 5 replaces the placeholder signature with real BLS.
+    /// The signed message is the view's little-endian bytes, signed
+    /// with `Domain::Timeout`. This proves the validator is timing
+    /// out on this specific view, preventing replay across views.
     pub fn on_timeout(&mut self) -> Option<Signature> {
         let _ = self.pacemaker.on_local_timeout();
-        Some(Signature::ZERO)
+        match &self.secret_key {
+            Some(sk) => {
+                let msg = self.current_view.value().to_le_bytes();
+                Some(sk.sign(crypto::hash::Domain::Timeout, &msg))
+            }
+            None => Some(Signature::ZERO),
+        }
     }
 
     /// Validator: collect a timeout signature from `voter` for the
@@ -789,37 +808,136 @@ impl OxideBft {
     /// the leader is faulty, followers collect timeout signatures
     /// from each other; the first to reach quorum forms a TC and
     /// broadcasts it.
+    ///
+    /// # Signature verification (TC safety fix)
+    ///
+    /// When `verify_signatures` is `true` (production), the timeout
+    /// signature is verified against the voter's public key from the
+    /// validator set. A forged timeout signature is rejected with
+    /// [`ConsensusError::InvalidVoteSignature`]. The signed message
+    /// is the view's little-endian bytes, signed with
+    /// `Domain::Timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsensusError::InvalidVoteSignature`] if the
+    /// signature does not verify, or [`ConsensusError::SignerOutOfBounds`]
+    /// if the voter index is out of bounds.
     pub fn collect_timeout_signature(
         &mut self,
         voter: ValidatorIndex,
         signature: Signature,
-    ) -> Option<TimeoutCertificate> {
+    ) -> Result<Option<TimeoutCertificate>, ConsensusError> {
+        // Verify the timeout signature before collecting (TC safety).
+        if self.verify_signatures {
+            let pk = self
+                .validator_set
+                .validator(voter)
+                .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+            let msg = self.current_view.value().to_le_bytes();
+            crypto::bls_signer::verify(&signature, crypto::hash::Domain::Timeout, &msg, pk)
+                .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+        }
+        // Store the verified signature so the pacemaker can aggregate
+        // it when forming the TC.
+        self.timeout_signatures[usize::from(voter)] = Some(signature);
         let events = self.pacemaker.on_timeout_signature(voter, signature);
-        let tc = events.iter().find_map(|e| {
+        let mut tc = events.iter().find_map(|e| {
             if let crate::pacemaker::PacemakerEvent::TimeoutCertificateFormed(tc) = e {
                 Some(tc.clone())
             } else {
                 None
             }
         });
-        // Sync the engine's current_view from the pacemaker if the
-        // view advanced (the pacemaker advances internally on TC
-        // formation).
-        if tc.is_some() {
+        // If a TC was formed, aggregate the collected signatures and
+        // replace the placeholder aggregate in the TC.
+        if let Some(ref mut tc) = tc {
+            if self.secret_key.is_some() {
+                let sigs: Vec<Signature> =
+                    self.timeout_signatures.iter().filter_map(|s| *s).collect();
+                if !sigs.is_empty() {
+                    if let Ok(agg) = crypto::aggregate(&sigs) {
+                        tc.aggregate_signature = agg;
+                    }
+                }
+            }
+            // Clear stored timeout signatures for the next view.
+            self.timeout_signatures.fill(None);
             self.current_view = self.pacemaker.current_view();
         }
-        tc
+        Ok(tc)
     }
 
     /// Validator: process a timeout certificate. Advances the view
     /// if the TC is for the current view. The new leader must extend
     /// the highest QC (tail-fork resistance).
-    pub fn on_timeout_certificate(&mut self, tc: &TimeoutCertificate) {
+    ///
+    /// # Signature verification (TC safety fix)
+    ///
+    /// When `verify_signatures` is `true` (production), the TC's
+    /// aggregate signature is verified against the signer bitmap +
+    /// validator set public keys. A forged TC is rejected with
+    /// [`ConsensusError::InvalidTcSignature`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsensusError::InvalidTcSignature`] if the TC's
+    /// aggregate signature does not verify, or
+    /// [`ConsensusError::SignerOutOfBounds`] if the bitmap references
+    /// an out-of-bounds validator.
+    pub fn on_timeout_certificate(
+        &mut self,
+        tc: &TimeoutCertificate,
+    ) -> Result<(), ConsensusError> {
+        // Verify the TC's aggregate signature (TC safety).
+        if self.verify_signatures {
+            self.verify_tc_signature(tc)?;
+        }
         if let Some(crate::pacemaker::PacemakerEvent::AdvanceView { new_view, .. }) =
             self.pacemaker.on_timeout_certificate(tc)
         {
             self.current_view = new_view;
         }
+        Ok(())
+    }
+
+    /// Verify a TC's aggregate signature against the signer bitmap
+    /// and the validator set's public keys. The signed message is
+    /// the TC's view as little-endian bytes, signed with
+    /// `Domain::Timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsensusError::SignerOutOfBounds`] if the bitmap
+    /// references an out-of-bounds validator, or
+    /// [`ConsensusError::InvalidTcSignature`] if the aggregate does
+    /// not verify.
+    fn verify_tc_signature(&self, tc: &TimeoutCertificate) -> Result<(), ConsensusError> {
+        let mut signer_pks: Vec<crypto::bls::PublicKey> = Vec::new();
+        for (i, byte) in tc.signer_bitmap.iter().enumerate() {
+            for bit in 0..8 {
+                if (byte >> bit) & 1 == 1 {
+                    let idx = u16::try_from(i * 8 + bit)
+                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                    let pk = self
+                        .validator_set
+                        .validator(idx)
+                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                    signer_pks.push(*pk);
+                }
+            }
+        }
+        if signer_pks.is_empty() {
+            return Err(ConsensusError::InvalidTcSignature);
+        }
+        let msg = tc.view.value().to_le_bytes();
+        crypto::aggregate_verify(
+            &tc.aggregate_signature,
+            crypto::hash::Domain::Timeout,
+            &msg,
+            &signer_pks,
+        )
+        .map_err(|_| ConsensusError::InvalidTcSignature)
     }
 
     /// Drive one propose-vote-QC-commit cycle (single-validator mode).
@@ -1382,6 +1500,74 @@ mod tests {
         leader.collect_vote(1, valid_vote).expect("valid vote must be accepted");
     }
 
+    #[test]
+    fn on_timeout_certificate_rejects_forged_tc() {
+        // 4 validators with real BLS keys. A TC with a forged aggregate
+        // signature (all zeros) must be rejected by on_timeout_certificate.
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut engine =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        // Forge a TC: all-zero aggregate signature, but the signer
+        // bitmap claims all 4 validators signed.
+        let forged_tc = TimeoutCertificate {
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111], // all 4 validators
+            aggregate_signature: AggregateSignature::ZERO, // forged
+        };
+
+        let err =
+            engine.on_timeout_certificate(&forged_tc).expect_err("forged TC must be rejected");
+        assert_eq!(err, ConsensusError::InvalidTcSignature);
+    }
+
+    #[test]
+    fn collect_timeout_signature_rejects_forged_signature() {
+        // 4 validators with real BLS keys. A forged timeout signature
+        // (signed by the wrong key) must be rejected.
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut engine =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        // Validator 1 times out and signs the view.
+        let _ = engine.on_timeout();
+
+        // Forge a timeout signature: sign with validator 2's key but
+        // claim it's from validator 1.
+        let forged_sig = keys[2].sign(crypto::hash::Domain::Timeout, &0u64.to_le_bytes());
+        let err = engine
+            .collect_timeout_signature(1, forged_sig)
+            .expect_err("forged timeout signature must be rejected");
+        assert_eq!(err, ConsensusError::InvalidVoteSignature { voter: 1 });
+    }
+
+    #[test]
+    fn collect_timeout_signature_accepts_valid_signature() {
+        // 4 validators with real BLS keys. A valid timeout signature
+        // (signed by the claimed voter's key) must be accepted.
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut engine =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        // Validator 1 signs the timeout for view 0.
+        let valid_sig = keys[1].sign(crypto::hash::Domain::Timeout, &0u64.to_le_bytes());
+        let result = engine.collect_timeout_signature(1, valid_sig);
+        assert!(result.is_ok(), "valid timeout signature must be accepted");
+    }
+
     // ---- Epoch rotation tests (stage 6) ----
     //
     // These tests exercise the two-phase epoch handoff: schedule a
@@ -1697,9 +1883,9 @@ mod tests {
         v1.current_view = v1.pacemaker.current_view();
 
         // All other validators receive the TC and advance the view.
-        v2.on_timeout_certificate(&tc);
-        v3.on_timeout_certificate(&tc);
-        v0.on_timeout_certificate(&tc);
+        let _ = v2.on_timeout_certificate(&tc);
+        let _ = v3.on_timeout_certificate(&tc);
+        let _ = v0.on_timeout_certificate(&tc);
 
         // All validators should now be at view 1.
         assert_eq!(v1.current_view(), View::new(1), "v1 should be at view 1");

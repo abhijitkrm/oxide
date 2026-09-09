@@ -388,25 +388,34 @@ impl MultiNodeDevnet {
         // Collect timeout signatures: each non-leader validator
         // collects signatures from all other non-leader validators.
         // The first to reach quorum forms a TC.
+        //
+        // TC safety fix: each validator signs the view with its real
+        // BLS key (on_timeout), and the collector verifies the
+        // signature before collecting.
         let non_leader_indices: Vec<usize> = (0..self.n).filter(|&i| i != leader_idx).collect();
+        // Collect each non-leader's real timeout signature.
+        let timeout_sigs: Vec<crypto::bls::Signature> = non_leader_indices
+            .iter()
+            .map(|&i| self.engines[i].on_timeout().unwrap_or(crypto::bls::Signature::ZERO))
+            .collect();
         let mut formed_tc: Option<types::TimeoutCertificate> = None;
-        for &collector_i in &non_leader_indices {
-            for &signer_i in &non_leader_indices {
+        for (collector_idx, &collector_i) in non_leader_indices.iter().enumerate() {
+            for (signer_idx, &signer_i) in non_leader_indices.iter().enumerate() {
                 if signer_i == collector_i {
                     continue;
                 }
-                if let Some(tc) = self.engines[collector_i].collect_timeout_signature(
+                if let Ok(Some(tc)) = self.engines[collector_i].collect_timeout_signature(
                     u16::try_from(signer_i).unwrap(),
-                    crypto::bls::Signature::ZERO,
+                    timeout_sigs[signer_idx],
                 ) {
                     formed_tc = Some(tc);
                 }
             }
             // Self-signature (the validator that timed out also
             // signs its own timeout).
-            if let Some(tc) = self.engines[collector_i].collect_timeout_signature(
+            if let Ok(Some(tc)) = self.engines[collector_i].collect_timeout_signature(
                 u16::try_from(collector_i).unwrap(),
-                crypto::bls::Signature::ZERO,
+                timeout_sigs[collector_idx],
             ) {
                 formed_tc = Some(tc);
             }
@@ -421,7 +430,7 @@ impl MultiNodeDevnet {
         // All validators (including the faulty leader) receive the
         // TC and advance the view.
         for engine in &mut self.engines {
-            engine.on_timeout_certificate(&tc);
+            let _ = engine.on_timeout_certificate(&tc);
         }
     }
 
