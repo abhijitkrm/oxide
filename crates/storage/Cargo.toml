@@ -25,6 +25,25 @@ blake3 = "1"
 [dev-dependencies]
 criterion = "0.7.0"
 proptest = "1"
+# Integration test for journal replay (Phase 1 acceptance gate):
+# write finalized blocks to the journal, replay them, re-execute
+# through the real executor + modules, and verify the state root
+# matches bit-exact.
+#
+# NOTE: the `core` module crate is renamed to `oxide_core` here because
+# a dependency named `core` shadows Rust's `core` crate, which breaks
+# proptest's `proptest!` macro (it internally references `::core::concat!`
+# etc.). The devnet crate can use `core` directly because it doesn't
+# depend on proptest.
+executor = { workspace = true }
+consensus = { workspace = true }
+codec = { workspace = true }
+types = { workspace = true }
+framework = { workspace = true }
+oxide_core = { package = "core", path = "../../modules/core", version = "0.1.0" }
+bank = { workspace = true }
+staking = { workspace = true }
+ports = { workspace = true }
 
 [[bench]]
 name = "journal"

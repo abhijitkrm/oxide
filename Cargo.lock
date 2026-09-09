@@ -912,10 +912,19 @@ dependencies = [
 name = "storage"
 version = "0.1.0"
 dependencies = [
+ "bank",
  "blake3",
+ "codec",
+ "consensus",
+ "core",
  "criterion",
+ "executor",
+ "framework",
+ "ports",
  "primitives",
  "proptest",
+ "staking",
+ "types",
 ]
 
 [[package]]

@@ -12,6 +12,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Journal replay: state root bit-exact (Phase 1 final gate)** (2026-09-09)
+  - `storage` crate gains a journal-replay integration test
+    (`tests/journal_replay.rs`) that writes finalized blocks to
+    the journal, replays them, re-executes through a fresh
+    executor (core/bank/staking modules), and verifies the state
+    root matches bit-exact after each block.
+  - 7 tests: bit-exact replay, empty directory, missing
+    directory, torn tail, bad CRC, multi-segment replay,
+    deterministic state roots.
+  - 214 total tests.
+
+  **In plain words:** Oxide can now persist finalized blocks to
+  its append-only journal, replay them from disk, and reproduce
+  the exact same state root — byte for byte. This is the
+  durability guarantee: any node can shut down, restart, replay
+  the journal, and arrive at the identical state. This completes
+  the final Phase 1 acceptance gate.
+
 - **Throughput simulator** (2026-09-09)
   - `devnet` multi-node runner gains `run_batch` and
     `run_batch_core`: run N rounds with M txs per round, return
