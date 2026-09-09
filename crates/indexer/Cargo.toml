@@ -1,0 +1,22 @@
+# Oxide blockchain — `indexer` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention)
+
+[package]
+name = "indexer"
+description = "Oxide indexer/explorer v0 — indexes finalized blocks for block explorer queries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+types = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

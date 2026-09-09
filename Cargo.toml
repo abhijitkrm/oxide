@@ -57,6 +57,8 @@ staking = { path = "modules/staking", version = "0.1.0" }
 evm = { path = "modules/evm", version = "0.1.0" }
 # RPC server (plan.md §13: JSON-RPC + WebSocket for MetaMask/Foundry).
 rpc = { path = "crates/rpc", version = "0.1.0" }
+# Indexer/explorer (plan.md §13: indexes finalized blocks for explorer).
+indexer = { path = "crates/indexer", version = "0.1.0" }
 broadcast = { path = "crates/broadcast", version = "0.1.0" }
 p2p = { path = "crates/p2p", version = "0.1.0" }
 devnet = { path = "crates/devnet", version = "0.1.0" }
