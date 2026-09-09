@@ -2930,3 +2930,84 @@ precompiles. Phase 2 is substantially complete except for:
 - WebSocket subscriptions (eth_subscribe)
 - MetaMask/Foundry/Blockscout integration tests
 - ≥1 GG/s Uniswap-transfer benchmark (requires 16-core rig)
+
+### WebSocket subscriptions
+
+WebSocket subscription support (plan.md §13) enables real-time
+notifications for wallets and explorers — the foundation for
+MetaMask live updates and Blockscout real-time block display.
+
+Subscription types (`crates/rpc/src/lib.rs`):
+- `SubscriptionType`: `NewHeads`, `Logs` (EIP-1193).
+- `Subscription`: id + type, created by `eth_subscribe`.
+- `SubscriptionManager`: assigns unique hex IDs, builds
+  notifications. `Send + Sync` for `Arc`-sharing across
+  WebSocket connections.
+- `SubscriptionNotification`: the `eth_subscription` JSON-RPC
+  notification envelope.
+- `new_heads_notification`: builds a newHeads notification
+  with block number, hash, gasUsed.
+- `logs_notification`: builds a logs notification with
+  address, data, topics.
+
+RPC methods added:
+- `eth_subscribe`: creates a subscription, returns hex ID.
+- `eth_unsubscribe`: cancels a subscription (returns true).
+
+11 unit tests: newHeads/logs subscribe, unknown type error,
+missing type error, non-string type error, unsubscribe
+success/missing-ID, unique IDs, newHeads/logs notification
+content, notification JSON serialization.
+
+Commit: `5a2a094`.
+
+### MetaMask/Foundry/Blockscout integration tests
+
+Integration tests (plan.md §13 acceptance gate) that simulate
+the exact JSON-RPC calls MetaMask, Foundry, and Blockscout make
+when connecting to an Oxide node.
+
+Integration tests (`crates/rpc/tests/integration.rs`):
+- MetaMask: `eth_chainId` (hex string), `net_version`
+  (decimal), `eth_blockNumber` (hex), `eth_getBalance`
+  (hex wei), `eth_getTransactionCount` (hex),
+  `eth_gasPrice` (hex wei).
+- Foundry: `eth_chainId`, `eth_blockNumber`,
+  `eth_getBalance`, `web3_clientVersion` (oxide/ prefix).
+- Blockscout: `eth_blockNumber`, `net_version`,
+  `web3_clientVersion`, `eth_subscribe` (newHeads).
+- Cross-tool: unknown method (-32601), invalid JSON
+  (-32700), jsonrpc field, response ID echo.
+
+These verify the RPC server responds with the exact format
+these tools expect — hex strings with 0x prefix, decimal
+strings for net_version, correct error codes.
+
+18 integration tests.
+
+Commit: `890309b`.
+
+### Verification (final session)
+
+374 tests pass with --features storage/redb,storage/rocksdb,
+storage/mdbx (was 345, +29 WebSocket + integration). fmt,
+clippy -D warnings, cargo deny all clean.
+
+Phase 2 is now substantially complete:
+1. storage-conformance suite (Volatile + redb + RocksDB + MDBX)
+2. modules/evm with full revm execution
+3. All 4 StorageBackend adapters (Volatile, redb, RocksDB, MDBX)
+4. Parallel OCC scheduler
+5. JSON-RPC server (10 endpoints + WebSocket subscriptions)
+6. Snapshot export/import + conformance
+7. Divergence detection (exec-cert mismatch)
+8. Indexer/explorer v0
+9. Dynamic EIP-1559 base fee adjustment
+10. EVM precompiles (native module bridge)
+11. Storage backend perf report card (benchmarked)
+12. WebSocket subscriptions (eth_subscribe/unsubscribe)
+13. MetaMask/Foundry/Blockscout integration tests
+
+The only remaining Phase 2 item is the ≥1 GG/s Uniswap-transfer
+benchmark, which requires a 16-core benchmark rig (not available
+in this dev environment).

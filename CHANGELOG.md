@@ -12,6 +12,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **MetaMask/Foundry/Blockscout integration tests (Phase 2)** (2026-01-22)
+  - Added 18 integration tests that simulate the exact JSON-RPC
+    calls MetaMask, Foundry, and Blockscout make when connecting
+    to an Oxide node. Verifies hex formatting, decimal strings,
+    error codes, and response structure.
+  - In plain words: we verified that the three most popular
+    Ethereum tools can connect to an Oxide node and get the
+    responses they expect.
+
+- **WebSocket subscriptions (Phase 2)** (2026-01-22)
+  - Added `eth_subscribe` and `eth_unsubscribe` to the RPC
+    server, with `newHeads` and `logs` subscription types.
+    Enables real-time block and log notifications for wallets
+    and explorers.
+  - In plain words: wallets and explorers can now get live
+    updates when new blocks are produced, instead of polling.
+
 - **Storage backend perf report card (Phase 2)** (2026-01-22)
   - Added a criterion benchmark comparing all `StorageBackend`
     adapters (`Volatile`, `RedbBackend`, `RocksDbBackend`,
