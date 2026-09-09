@@ -71,6 +71,26 @@ pub trait BroadcastEngine: Send {
     /// errors / timeouts.
     fn broadcast(&mut self, proposal: &Proposal) -> Result<(), BroadcastError>;
 
+    /// Backfill: recover a previously-broadcast proposal's data that
+    /// this node did not receive (or lost). The adapter requests
+    /// chunks from peers who have them and reconstructs the data.
+    ///
+    /// This is the recovery path for a validator that was offline,
+    /// partitioned, or otherwise missed the original broadcast. For
+    /// `PlainGossip`, backfill is trivial (any peer has the whole
+    /// block). For `ErasureBroadcast`, backfill requests `f+1`
+    /// chunks from any peers and reconstructs.
+    ///
+    /// Returns the recovered proposal data, or an error if the data
+    /// is unrecoverable (no peer has enough chunks).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::DataUnavailable`] if no peer has
+    /// enough data to reconstruct, or [`BroadcastError::UnknownHash`]
+    /// if the hash was never broadcast.
+    fn backfill(&mut self, hash: &primitives::Hash) -> Result<Proposal, BroadcastError>;
+
     /// The capabilities this adapter provides. Checked at wiring time
     /// (config validation) and by the conformance suite.
     fn capabilities(&self) -> BroadcastCaps;
@@ -85,4 +105,12 @@ pub enum BroadcastError {
     /// Dissemination failed (peer errors, timeouts). Phase 1 splits
     /// this into per-cause variants; v0 surfaces the single case.
     DisseminationFailed,
+    /// Backfill failed: no peer has enough data to reconstruct the
+    /// proposal. The data is permanently lost (or all holders are
+    /// offline). This is a liveness failure — the chain cannot
+    /// finalize this block until the data is recovered.
+    DataUnavailable,
+    /// Backfill was requested for a hash that was never broadcast.
+    /// The caller may have a stale or forged hash.
+    UnknownHash,
 }

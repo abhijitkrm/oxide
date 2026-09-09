@@ -43,6 +43,9 @@ const ERASURE_MAX_BYTES: u64 = 16 << 20;
 /// No erasure coding, no proof of availability. Assumes a small,
 /// honest devnet where every peer receives every block. This is the
 /// simplest adapter that satisfies the `BroadcastEngine` contract.
+///
+/// Backfill is trivial: any peer that received the broadcast has the
+/// whole block, so a single request suffices.
 pub struct PlainGossip {
     /// Peers that have received each proposal, keyed by proposal
     /// hash. Used for testing and conformance — the real adapter
@@ -50,13 +53,17 @@ pub struct PlainGossip {
     delivered: HashMap<Hash, usize>,
     /// Number of peers in the devnet.
     peer_count: usize,
+    /// Proposals stored for backfill, keyed by proposal hash. The
+    /// adapter retains the proposal so a node that missed the
+    /// broadcast can recover it via `backfill`.
+    proposals: HashMap<Hash, Proposal>,
 }
 
 impl PlainGossip {
     /// Construct a `PlainGossip` adapter for a devnet with `peer_count`
     /// peers.
     pub fn new(peer_count: usize) -> Self {
-        Self { delivered: HashMap::new(), peer_count }
+        Self { delivered: HashMap::new(), peer_count, proposals: HashMap::new() }
     }
 }
 
@@ -66,10 +73,14 @@ impl BroadcastEngine for PlainGossip {
         if payload_size > PLAIN_GOSSIP_MAX_BYTES {
             return Err(BroadcastError::PayloadTooLarge);
         }
-        // Record delivery to all peers.
         let hash = proposal_hash(proposal);
         self.delivered.insert(hash, self.peer_count);
+        self.proposals.insert(hash, proposal.clone());
         Ok(())
+    }
+
+    fn backfill(&mut self, hash: &Hash) -> Result<Proposal, BroadcastError> {
+        self.proposals.get(hash).cloned().ok_or(BroadcastError::UnknownHash)
     }
 
     fn capabilities(&self) -> BroadcastCaps {
@@ -95,11 +106,19 @@ impl PlainGossip {
 /// v0 uses a simple replication-based scheme (each chunk sent to
 /// `f+1` validators). The real Reed-Solomon implementation arrives in
 /// Phase 2. This is sufficient for the conformance suite and devnet.
+///
+/// Backfill: a node that missed the broadcast requests chunks from
+/// peers. With `f+1` chunks (the replication factor), the data is
+/// recoverable. The adapter stores the original proposal keyed by
+/// hash, so backfill returns it directly. In a real network, this
+/// would request chunks from `f+1` distinct peers and reconstruct.
 pub struct ErasureBroadcast {
     /// Maximum fault tolerance (f). Reconstruction needs `f+1` chunks.
     f: usize,
     /// Chunks stored per validator, keyed by proposal hash.
     stored: HashMap<Hash, Vec<Vec<u8>>>,
+    /// Original proposals stored for backfill, keyed by hash.
+    proposals: HashMap<Hash, Proposal>,
 }
 
 impl ErasureBroadcast {
@@ -111,7 +130,7 @@ impl ErasureBroadcast {
     /// Panics if `n < 3f+1` (BFT quorum requirement).
     pub fn new(num_validators: usize, f: usize) -> Self {
         assert!(num_validators > 3 * f, "BFT requires n >= 3f+1: got n={num_validators}, f={f}");
-        Self { f, stored: HashMap::new() }
+        Self { f, stored: HashMap::new(), proposals: HashMap::new() }
     }
 
     /// Split a proposal's data into chunks. v0 uses simple
@@ -137,7 +156,19 @@ impl BroadcastEngine for ErasureBroadcast {
         let hash = proposal_hash(proposal);
         // Store the chunk (simulating distribution to f+1 validators).
         self.stored.insert(hash, vec![chunk; self.f + 1]);
+        self.proposals.insert(hash, proposal.clone());
         Ok(())
+    }
+
+    fn backfill(&mut self, hash: &Hash) -> Result<Proposal, BroadcastError> {
+        // Check that we have enough chunks to reconstruct.
+        if !self.stored.contains_key(hash) {
+            return Err(BroadcastError::UnknownHash);
+        }
+        if !self.can_reconstruct(hash) {
+            return Err(BroadcastError::DataUnavailable);
+        }
+        self.proposals.get(hash).cloned().ok_or(BroadcastError::DataUnavailable)
     }
 
     fn capabilities(&self) -> BroadcastCaps {
@@ -247,5 +278,67 @@ mod tests {
         let mut gossip = PlainGossip::new(4);
         let proposal = make_proposal(0, vec![]);
         assert!(gossip.broadcast(&proposal).is_ok());
+    }
+
+    #[test]
+    fn plain_gossip_backfill_recovers_broadcast_proposal() {
+        // A node that missed the broadcast can recover the proposal
+        // via backfill. PlainGossip stores the proposal on broadcast;
+        // backfill returns it by hash.
+        let mut gossip = PlainGossip::new(4);
+        let proposal = make_proposal(7, vec![vec![0xAA; 32]]);
+        assert!(gossip.broadcast(&proposal).is_ok());
+        let hash = proposal_hash(&proposal);
+        let recovered = gossip.backfill(&hash).expect("backfill must recover the proposal");
+        assert_eq!(recovered.height, proposal.height);
+        assert_eq!(recovered.txs.len(), proposal.txs.len());
+        assert_eq!(recovered.txs[0].as_bytes(), proposal.txs[0].as_bytes());
+    }
+
+    #[test]
+    fn plain_gossip_backfill_unknown_hash_errors() {
+        let mut gossip = PlainGossip::new(4);
+        let bogus = Hash::ZERO;
+        let err = gossip.backfill(&bogus).expect_err("unknown hash must error");
+        assert_eq!(err, BroadcastError::UnknownHash);
+    }
+
+    #[test]
+    fn erasure_backfill_recovers_broadcast_proposal() {
+        // A node that missed the erasure broadcast can recover the
+        // proposal via backfill. ErasureBroadcast stores the proposal
+        // and f+1 chunks; backfill returns the proposal if enough
+        // chunks exist.
+        let mut erasure = ErasureBroadcast::new(4, 1);
+        let proposal = make_proposal(3, vec![vec![0xBB; 64], vec![0xCC; 32]]);
+        assert!(erasure.broadcast(&proposal).is_ok());
+        let hash = proposal_hash(&proposal);
+        assert!(erasure.can_reconstruct(&hash), "f+1 chunks stored");
+        let recovered = erasure.backfill(&hash).expect("backfill must recover the proposal");
+        assert_eq!(recovered.height, proposal.height);
+        assert_eq!(recovered.txs.len(), proposal.txs.len());
+    }
+
+    #[test]
+    fn erasure_backfill_unknown_hash_errors() {
+        let mut erasure = ErasureBroadcast::new(4, 1);
+        let bogus = Hash::ZERO;
+        let err = erasure.backfill(&bogus).expect_err("unknown hash must error");
+        assert_eq!(err, BroadcastError::UnknownHash);
+    }
+
+    #[test]
+    fn erasure_backfill_data_unavailable_when_no_chunks() {
+        // Simulate a node that lost all chunks: manually clear the
+        // stored chunks but keep the hash known. Backfill should
+        // return DataUnavailable.
+        let mut erasure = ErasureBroadcast::new(4, 1);
+        let proposal = make_proposal(5, vec![vec![0xDD; 16]]);
+        assert!(erasure.broadcast(&proposal).is_ok());
+        let hash = proposal_hash(&proposal);
+        // Wipe the chunks to simulate total chunk loss.
+        erasure.stored.insert(hash, vec![]);
+        let err = erasure.backfill(&hash).expect_err("no chunks must error");
+        assert_eq!(err, BroadcastError::DataUnavailable);
     }
 }
