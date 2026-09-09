@@ -578,6 +578,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-spammer"
+version = "0.1.0"
+dependencies = [
+ "bank",
+ "devnet",
+ "framework",
+ "ports",
+ "primitives",
+ "types",
+]
+
+[[package]]
 name = "oxide-validator"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,26 @@
+# Oxide blockchain — `oxide-spammer` binary
+# (workspace: github.com/abhijitkrm/oxide)
+
+[package]
+name = "oxide-spammer"
+description = "Load generator — submits txs at a configurable rate and reports throughput."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxide-spammer"
+path = "src/main.rs"
+
+[dependencies]
+devnet = { workspace = true }
+primitives = { workspace = true }
+types = { workspace = true }
+ports = { workspace = true }
+framework = { workspace = true }
+bank = { workspace = true }
+
+[lints]
+workspace = true
