@@ -12,6 +12,60 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Indexer/explorer v0 (Phase 2)** (2026-01-22)
+  - Added the `indexer` crate — an in-memory index of finalized
+    blocks, transactions, and events for block explorer queries.
+    Provides `get_block_by_height`, `get_block_by_hash`, `get_tx`,
+    `get_events_by_module`, and `get_block_range` APIs. The
+    foundation for a Blockscout-style explorer.
+  - In plain words: a read-only index that block explorers query
+    to display blocks, transactions, and events without hitting
+    the node's hot path.
+
+- **Divergence detection (Phase 2)** (2026-01-22)
+  - Added execution divergence detection — the network detects a
+    corrupt executor by comparing the state roots validators
+    produce after executing the same block. `detect_divergence`
+    groups attestations by state root, finds the majority (≥ 2f+1),
+    and flags divergent validators. Satisfies the plan.md §13
+    acceptance gate: "corrupt one executor → network detects via
+    exec-cert mismatch".
+  - In plain words: if a validator's executor produces a wrong
+    state root, the network detects it by comparing roots across
+    validators and flags the divergent validator.
+
+- **Snapshot export/import (Phase 2)** (2026-01-22)
+  - Added `Snapshot` export/import to the `StorageBackend` trait.
+    A snapshot is a point-in-time copy of all state, used for
+    fast state sync (import a snapshot to skip replaying the
+    journal from genesis). `Volatile` and `RedbBackend` both
+    support snapshots. The conformance suite verifies export →
+    import → export round-trip is lossless.
+  - In plain words: a new node can download a snapshot of the
+    chain state and start immediately, instead of replaying
+    every block from genesis.
+
+- **JSON-RPC server (Phase 2)** (2026-01-22)
+  - Added the `rpc` crate — a JSON-RPC 2.0 server with 8
+    Ethereum-compatible endpoints (`eth_chainId`,
+    `eth_blockNumber`, `eth_gasPrice`, `net_version`,
+    `web3_clientVersion`, `eth_getBalance`,
+    `eth_getTransactionCount`, `eth_sendRawTransaction`). The
+    foundation for MetaMask/Foundry/Blockscout integration.
+  - In plain words: wallets and dev tools can now connect to
+    an Oxide node using standard Ethereum JSON-RPC.
+
+- **Parallel OCC scheduler (Phase 2)** (2026-01-22)
+  - Added a Block-STM-style parallel optimistic concurrency
+    control scheduler for EVM execution. Executes transactions
+    speculatively in parallel, validates in block order,
+    re-executes on conflict. Final state is byte-identical to
+    sequential execution. This is the parallelism needed for
+    the ≥1 GG/s acceptance gate.
+  - In plain words: the chain can now execute independent
+    transactions in parallel across CPU cores, dramatically
+    increasing throughput while preserving sequential semantics.
+
 - **redb StorageBackend adapter (Phase 2)** (2026-01-22)
   - Added the first disk-backed `StorageBackend` adapter: `redb`
     (pure Rust, ACID, LMDB-like). `RedbBackend` wraps a `redb`

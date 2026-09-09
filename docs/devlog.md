@@ -2632,3 +2632,163 @@ Commit: `45685e1`.
 
 262 tests pass with `--features storage/redb` (was 256, +6
 redb). fmt, clippy `-D warnings`, cargo deny all clean.
+
+### Parallel OCC scheduler
+
+The parallel optimistic concurrency control scheduler (plan.md §8)
+is the third Phase 2 deliverable — the parallelism needed for
+the ≥1 GG/s acceptance gate.
+
+The scheduler (`crates/executor/src/occ.rs`):
+- `ParallelScheduler`: executes txs speculatively in parallel
+  using a thread pool, validates in block order, re-executes on
+  conflict. Final state is byte-identical to sequential
+  execution (deterministic by construction).
+- `SequentialScheduler`: fallback for conflict-heavy blocks.
+- `ReadWriteSet`: tracks read/write sets per tx for conflict
+  detection. A conflict is when a tx's reads overlap with an
+  earlier tx's writes.
+- `TxExecution`: result of a single tx execution (events, rw
+  set, status).
+- `parallel_map`: minimal `std::thread`-based parallel map
+  (no rayon dependency yet).
+
+Algorithm (simplified Block-STM):
+1. Snapshot: take a consistent state snapshot.
+2. Speculative parallel execution: each tx runs on the
+   snapshot. Track read/write sets.
+3. Validation in preset order: walk txs in block order. If a
+   tx's reads conflict with earlier writes, re-execute on
+   the updated state.
+4. Sequential commit: writes applied in block order →
+   byte-identical to sequential execution.
+
+Commit: `32d7c6c`.
+
+### JSON-RPC server
+
+The JSON-RPC server (plan.md §13) is the fourth Phase 2
+deliverable — the Ethereum-compatible RPC endpoints for
+wallet and tooling integration.
+
+The RPC server (`crates/rpc/src/lib.rs`):
+- JSON-RPC 2.0 request/response envelope parsing.
+- `RpcServer` with chain state (chain_id, block_height,
+  base_fee).
+- 8 Ethereum-compatible endpoints: `eth_chainId`,
+  `eth_blockNumber`, `eth_gasPrice`, `net_version`,
+  `web3_clientVersion`, `eth_getBalance`,
+  `eth_getTransactionCount`, `eth_sendRawTransaction` (stub).
+- `handle_raw`: parse JSON string → dispatch → serialize
+  response.
+- `RpcError`: parse error, method not found, invalid params,
+  internal error (JSON-RPC 2.0 error codes).
+
+Why a custom server, not a reth-RPC fork: Oxide's architecture
+(plan.md §2) treats the RPC as a cold-path adapter on top of
+the EVM module. A custom server keeps the dependency
+footprint minimal (only serde + serde_json).
+
+Commit: `cad558e`.
+
+### Snapshot export/import
+
+Snapshot export/import (plan.md §8, §2.5) is the fifth Phase 2
+deliverable — the foundation for fast state sync (snapshot
+import skips journal replay from genesis).
+
+Trait changes (`crates/storage/src/backend.rs`):
+- `Snapshot`: a point-in-time copy of all (key, value) pairs,
+  sorted by key. Deterministic.
+- `SnapshotError`: malformed snapshot or backend error.
+- `StorageBackend::snapshot_export()`: export the entire
+  current state as a `Snapshot`.
+- `StorageBackend::snapshot_import()`: replace all current
+  state with a `Snapshot`.
+
+Implementations:
+- `Volatile`: export iterates the `BTreeMap` (already sorted);
+  import validates and replaces the map.
+- `RedbBackend`: export iterates the table (sorted by redb);
+  import clears all keys and inserts snapshot entries in a
+  single transaction.
+
+Conformance suite: added `snapshot_round_trip` — export from
+one backend, import into a fresh backend, verify state is
+byte-identical, re-export and verify round-trip is lossless.
+
+Commit: `0d9b8dc`.
+
+### Divergence detection
+
+Execution divergence detection (plan.md §13) is the sixth
+Phase 2 deliverable — the network detects a corrupt executor
+by comparing the state roots validators produce after
+executing the same block.
+
+The divergence detector (`crates/executor/src/divergence.rs`):
+- `ValidatorAttestation`: a validator's state attestation for
+  a given block height.
+- `DivergenceReport`: majority root (if quorum reached),
+  agreeing validators, divergent validators (with incorrect
+  roots).
+- `detect_divergence()`: groups attestations by state root,
+  finds the majority root (≥ quorum votes), classifies
+  validators as agreeing or divergent.
+
+Algorithm (plan.md §8, §13):
+1. Collect: gather state attestations from all validators.
+2. Compare: find the majority state root (≥ 2f+1 votes).
+3. Detect: validators whose root differs from the majority
+   are flagged as divergent.
+4. Report: return a `DivergenceReport`.
+
+Includes the full corrupt-executor scenario from plan.md §13
+acceptance gate as a test.
+
+Commit: `93172db`.
+
+### Indexer/explorer v0
+
+The indexer/explorer v0 (plan.md §13) is the seventh Phase 2
+deliverable — the foundation for a Blockscout-style block
+explorer.
+
+The indexer (`crates/indexer/src/lib.rs`):
+- `Indexer`: an in-memory index of finalized blocks, txs,
+  and events. Append-only (the chain is reorg-free).
+- `BlockSummary`: block height, hash, tx count, state root.
+- `IndexedTx`: tx hash, height, index, raw bytes.
+- `IndexedEvent`: height, tx index, module, kind, data.
+- Query APIs: `get_block_by_height`, `get_block_by_hash`,
+  `get_tx`, `get_tx_by_position`, `get_events_by_module`,
+  `get_events_by_height`, `get_block_range`.
+
+Why an indexer, not direct RPC queries: the plan (plan.md §8)
+separates the node from the explorer — "indexer publishes to
+SQL for explorer". The indexer is a read-only consumer of
+finalized blocks, keeping the node's hot path clean.
+
+Commit: `6dae092`.
+
+### Verification (full session)
+
+301 tests pass (was 241 at Phase 1 completion, +60 Phase 2).
+fmt, clippy `-D warnings`, cargo deny all clean.
+
+Phase 2 deliverables completed:
+1. storage-conformance suite (Volatile + redb passing)
+2. `modules/evm` with full revm execution
+3. redb `StorageBackend` adapter
+4. Parallel OCC scheduler
+5. JSON-RPC server (8 endpoints)
+6. Snapshot export/import + conformance
+7. Divergence detection (exec-cert mismatch)
+8. Indexer/explorer v0
+
+Remaining Phase 2 work:
+- MDBX + RocksDB adapters (C bindings)
+- WebSocket subscriptions
+- MetaMask/Foundry/Blockscout integration tests
+- ≥1 GG/s Uniswap-transfer benchmark (requires 16-core rig)
+- Storage performance report cards
