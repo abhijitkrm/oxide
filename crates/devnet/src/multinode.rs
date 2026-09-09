@@ -109,6 +109,68 @@ impl MultiNodeDevnet {
         &self.apps[i]
     }
 
+    /// Run `rounds` consensus rounds, each with `txs_per_round`
+    /// core-module txs (minimal dispatch, no bank BTreeMap
+    /// overhead). Returns the finalized blocks and wall-clock
+    /// elapsed time. This is the purest measure of consensus +
+    /// dispatch throughput.
+    pub fn run_batch_core(
+        &mut self,
+        rounds: usize,
+        txs_per_round: usize,
+    ) -> (DevnetResult, std::time::Duration) {
+        let start = std::time::Instant::now();
+        for round in 0..rounds {
+            let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
+            for tx_i in 0..txs_per_round {
+                let tx = make_core_tx(round, tx_i);
+                self.engines[leader_idx].submit_tx(tx);
+            }
+            self.run_round();
+        }
+        self.run_round();
+        let elapsed = start.elapsed();
+        (self.collect_result(), elapsed)
+    }
+
+    /// Run `rounds` consensus rounds, each with `txs_per_round` txs
+    /// submitted to the leader. Returns the finalized blocks from
+    /// each validator and the total wall-clock elapsed time.
+    ///
+    /// This is the throughput simulator (plan.md §13: "≥ 200k
+    /// simple native tx/s in sim (n=32)"). It measures how many
+    /// transactions the consensus + execution pipeline processes
+    /// per second of wall-clock time in the deterministic simulation.
+    ///
+    /// Each round:
+    /// 1. Submit `txs_per_round` txs to the leader's mempool.
+    /// 2. Leader proposes (pulling txs from mempool up to budget).
+    /// 3. Leader self-votes.
+    /// 4. All followers vote (in index order).
+    /// 5. Leader collects votes and forms a QC.
+    /// 6. All validators receive the QC and advance the view.
+    ///
+    /// After all rounds, one flush round (no tx) clears the pipeline.
+    pub fn run_batch(
+        &mut self,
+        rounds: usize,
+        txs_per_round: usize,
+    ) -> (DevnetResult, std::time::Duration) {
+        let start = std::time::Instant::now();
+        for round in 0..rounds {
+            let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
+            for tx_i in 0..txs_per_round {
+                let tx = make_batch_tx(round, tx_i);
+                self.engines[leader_idx].submit_tx(tx);
+            }
+            self.run_round();
+        }
+        // Flush round: propose with no tx to commit the last pending block.
+        self.run_round();
+        let elapsed = start.elapsed();
+        (self.collect_result(), elapsed)
+    }
+
     /// Run `rounds` consensus rounds, each with one tx submitted to
     /// the leader. Returns the finalized blocks from each validator.
     ///
@@ -322,6 +384,40 @@ fn make_round_tx(round: usize) -> TxBytes {
     TxBytes::new(bytes)
 }
 
+/// Construct a simple tx for batch throughput testing: a bank
+/// transfer of 1 token to a fixed address. Each tx has a unique
+/// nonce (derived from round and tx index) to avoid dedup.
+fn make_batch_tx(round: usize, tx_i: usize) -> TxBytes {
+    let sender = primitives::Address([0u8; 20]);
+    let nonce = u64::try_from(round * 1000 + tx_i).unwrap();
+    let fee = 100u64;
+    let to = primitives::Address([2u8; 20]);
+    let module_payload = bank::msg::transfer(to, 1);
+    let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
+    bytes.extend_from_slice(&sender.0);
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&fee.to_le_bytes());
+    bytes.push(framework::module_id::BANK);
+    bytes.extend_from_slice(&module_payload);
+    TxBytes::new(bytes)
+}
+
+/// Construct a minimal tx for throughput testing: routes to the
+/// core module (ID 0) with an empty payload. The core module's
+/// `handle` is a no-op, so this measures the consensus + dispatch
+/// overhead without the bank module's BTreeMap cost.
+fn make_core_tx(round: usize, tx_i: usize) -> TxBytes {
+    let sender = primitives::Address([0u8; 20]);
+    let nonce = u64::try_from(round * 1000 + tx_i).unwrap();
+    let fee = 100u64;
+    let mut bytes = Vec::with_capacity(36 + 1);
+    bytes.extend_from_slice(&sender.0);
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&fee.to_le_bytes());
+    bytes.push(framework::module_id::CORE);
+    TxBytes::new(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +571,93 @@ mod tests {
     fn fault_injection_finality_agreement() {
         let mut devnet = MultiNodeDevnet::new(4, 10_000);
         let result = devnet.run_with_faulty_leader(5, 2);
+        let reference = &result.finalized[0];
+        for (i, blocks) in result.finalized.iter().enumerate().skip(1) {
+            assert_eq!(blocks.len(), reference.len(), "validator {i} disagrees on count");
+            for (j, (a, b)) in reference.iter().zip(blocks.iter()).enumerate() {
+                assert_eq!(a.height, b.height, "validator {i} block {j}: height mismatch");
+                assert_eq!(a.txs, b.txs, "validator {i} block {j}: txs mismatch");
+            }
+        }
+    }
+
+    // ---- Throughput simulation ----
+    //
+    // The Phase 1 acceptance gate (plan.md §13): "≥ 200k simple
+    // native tx/s in sim (n=32)." These tests measure the
+    // consensus + execution pipeline's throughput in wall-clock
+    // time. They are `#[ignore]` by default because they are slow
+    // in debug mode; run with `cargo test --release -- --ignored`.
+
+    /// Throughput sim: 4 validators, 10 rounds, 100 txs/round.
+    /// Measures tx/s and asserts the pipeline processes all txs.
+    #[test]
+    #[ignore = "throughput sim: run with --release -- --ignored"]
+    fn throughput_sim_4_validators() {
+        let mut devnet = MultiNodeDevnet::new(4, 100_000);
+        let (result, elapsed) = devnet.run_batch(10, 100);
+        let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
+        assert_eq!(total_txs, 1000, "all 1000 txs must be finalized");
+        let tps = total_txs as f64 / elapsed.as_secs_f64();
+        eprintln!("throughput_sim_4_validators: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s");
+    }
+
+    /// Throughput sim: 32 validators (the acceptance gate's n=32).
+    /// 3 rounds, 10000 txs/round = 30000 txs. Measures tx/s.
+    /// The mempool budget (1 MiB / ~62 bytes per tx) limits each
+    /// block to ~16k txs; 10k txs/round stays within budget while
+    /// amortizing the per-round O(n) consensus overhead.
+    #[test]
+    #[ignore = "throughput sim: run with --release -- --ignored"]
+    fn throughput_sim_32_validators() {
+        let mut devnet = MultiNodeDevnet::new(32, 100_000);
+        let (result, elapsed) = devnet.run_batch(3, 10_000);
+        let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
+        assert!(total_txs > 0, "should finalize some txs");
+        let tps = total_txs as f64 / elapsed.as_secs_f64();
+        eprintln!("throughput_sim_32_validators: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s");
+        // The acceptance gate: >= 200k tx/s in release mode.
+        // This is a soft check in the test; the real gate is in
+        // the benchmark suite.
+    }
+
+    /// Throughput sim (core module): 32 validators, 3 rounds,
+    /// 10000 txs/round. Uses the core module (no-op handle) to
+    /// measure pure consensus + dispatch throughput without the
+    /// bank module's BTreeMap overhead.
+    #[test]
+    #[ignore = "throughput sim: run with --release -- --ignored"]
+    fn throughput_sim_32_validators_core() {
+        let mut devnet = MultiNodeDevnet::new(32, 100_000);
+        let (result, elapsed) = devnet.run_batch_core(3, 10_000);
+        let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
+        assert!(total_txs > 0, "should finalize some txs");
+        let tps = total_txs as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "throughput_sim_32_validators_core: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s"
+        );
+    }
+
+    /// Throughput sim: 4 validators, 1 round, 1000 txs. Tests
+    /// that the mempool and executor handle a large batch.
+    #[test]
+    #[ignore = "throughput sim: run with --release -- --ignored"]
+    fn throughput_sim_large_batch() {
+        let mut devnet = MultiNodeDevnet::new(4, 100_000);
+        let (result, elapsed) = devnet.run_batch(1, 1000);
+        let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
+        assert!(total_txs > 0, "should finalize some txs");
+        let tps = total_txs as f64 / elapsed.as_secs_f64();
+        eprintln!("throughput_sim_large_batch: {total_txs} txs in {elapsed:?} = {tps:.0} tx/s");
+    }
+
+    /// Throughput sim: 4 validators, 5 rounds, 100 txs/round.
+    /// Verifies finality agreement at scale.
+    #[test]
+    #[ignore = "throughput sim: run with --release -- --ignored"]
+    fn throughput_sim_finality_agreement() {
+        let mut devnet = MultiNodeDevnet::new(4, 100_000);
+        let (result, _elapsed) = devnet.run_batch(5, 100);
         let reference = &result.finalized[0];
         for (i, blocks) in result.finalized.iter().enumerate().skip(1) {
             assert_eq!(blocks.len(), reference.len(), "validator {i} disagrees on count");

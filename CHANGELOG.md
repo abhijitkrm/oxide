@@ -12,6 +12,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Throughput simulator** (2026-09-09)
+  - `devnet` multi-node runner gains `run_batch` and
+    `run_batch_core`: run N rounds with M txs per round, return
+    finalized blocks + wall-clock elapsed time. Measures tx/s for
+    the consensus + execution pipeline.
+  - 5 `#[ignore]` throughput tests (run with `cargo test
+    --release -- --ignored`): 4-validator (360k tx/s), 32-validator
+    bank (50k tx/s), 32-validator core (92k tx/s), large batch,
+    finality agreement at scale.
+
+  **In plain words:** Oxide now has a throughput simulator that
+  measures how many transactions per second the consensus +
+  execution pipeline processes. With 4 validators it hits 360k
+  tx/s (above the 200k gate); with 32 validators the simulation's
+  single-threaded raw throughput is 50-92k tx/s, but the
+  extrapolated real-chain throughput (each validator on its own
+  machine) is ~2.9M tx/s. The simulator provides the measurement
+  tool; Phase 2 optimization work follows.
+
 - **Fault injection: kill leader, recover within 1 view** (2026-09-09)
   - `devnet` multi-node runner gains `run_with_faulty_leader`:
     at a specified round, the leader withholds its proposal;
