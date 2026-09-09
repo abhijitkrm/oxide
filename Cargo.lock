@@ -231,18 +231,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
-name = "core"
-version = "0.1.0"
-dependencies = [
- "codec",
- "crypto",
- "executor",
- "framework",
- "primitives",
- "types",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,11 +322,11 @@ dependencies = [
  "broadcast",
  "codec",
  "consensus",
- "core",
  "crypto",
  "executor",
  "framework",
  "mempool",
+ "oxide-core",
  "p2p",
  "ports",
  "primitives",
@@ -562,6 +550,18 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "oxide-bench"
 version = "0.1.0"
+
+[[package]]
+name = "oxide-core"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "crypto",
+ "executor",
+ "framework",
+ "primitives",
+ "types",
+]
 
 [[package]]
 name = "oxide-deploy"
@@ -916,10 +916,10 @@ dependencies = [
  "blake3",
  "codec",
  "consensus",
- "core",
  "criterion",
  "executor",
  "framework",
+ "oxide-core",
  "ports",
  "primitives",
  "proptest",

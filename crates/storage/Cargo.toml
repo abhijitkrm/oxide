@@ -30,17 +30,17 @@ proptest = "1"
 # through the real executor + modules, and verify the state root
 # matches bit-exact.
 #
-# NOTE: the `core` module crate is renamed to `oxide_core` here because
-# a dependency named `core` shadows Rust's `core` crate, which breaks
-# proptest's `proptest!` macro (it internally references `::core::concat!`
-# etc.). The devnet crate can use `core` directly because it doesn't
-# depend on proptest.
+# The `oxide-core` module crate (package `oxide-core`, crate name
+# `oxide_core`) was previously named `core`, which shadowed Rust's
+# `core` crate and broke proptest's `proptest!` macro (it internally
+# references `::core::concat!` etc.). The rename to `oxide-core`
+# (L2 fix) eliminates the collision entirely.
 executor = { workspace = true }
 consensus = { workspace = true }
 codec = { workspace = true }
 types = { workspace = true }
 framework = { workspace = true }
-oxide_core = { package = "core", path = "../../modules/core", version = "0.1.0" }
+oxide-core = { workspace = true }
 bank = { workspace = true }
 staking = { workspace = true }
 ports = { workspace = true }

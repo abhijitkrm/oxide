@@ -101,7 +101,7 @@ impl MultiNodeDevnet {
         let mut apps = Vec::with_capacity(n);
         for (i, key) in secret_keys.iter().cloned().enumerate() {
             let mut executor = Executor::new(max_mempool_entries);
-            executor.register_module(Arc::new(core::CoreModule::new()));
+            executor.register_module(Arc::new(oxide_core::CoreModule::new()));
             // Genesis-mint to the sender address so bank transfers
             // can debit (C2 fix: the bank now debits the sender, so
             // the sender needs an initial balance). The bank module

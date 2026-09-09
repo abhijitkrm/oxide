@@ -20,7 +20,7 @@ consensus = { workspace = true }
 mempool = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
-core = { workspace = true }
+oxide-core = { workspace = true }
 bank = { workspace = true }
 staking = { workspace = true }
 broadcast = { workspace = true }

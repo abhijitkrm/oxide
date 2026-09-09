@@ -1,8 +1,8 @@
-# Oxide blockchain — `core` module
+# Oxide blockchain — `oxide-core` module
 # (workspace: github.com/abhijitkrm/oxide; bare-name convention)
 
 [package]
-name = "core"
+name = "oxide-core"
 description = "Core module — chain parameters, metadata, genesis state."
 version.workspace = true
 edition.workspace = true

@@ -98,7 +98,7 @@ impl DevnetNode {
     pub fn assemble(config: &NodeConfig) -> Self {
         // Build the executor with standard modules.
         let mut executor = Executor::new(config.max_mempool_entries);
-        executor.register_module(Arc::new(core::CoreModule::new()));
+        executor.register_module(Arc::new(oxide_core::CoreModule::new()));
         // Genesis-mint to the sender address so bank transfers can
         // debit (C2 fix: the bank now debits the sender).
         let bank = bank::BankModule::new();
