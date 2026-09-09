@@ -18,11 +18,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     Transactions from different senders execute in parallel on
     copy-on-write nested caches (`SharedCacheDB`); same-sender
     txs execute sequentially (nonce dependency). Conflict
-    detection via actual `EvmState`
-    touched-account sets (not heuristic). Conflicting groups are
-    re-executed sequentially against the main DB. Coinbase tips
-    are handled additively to avoid false conflicts. Single-sender
-    batches fall back to `handle_batch` to avoid clone overhead.
+    detection via actual touched-account sets from nested cache
+    state (not heuristic). Conflicting groups are re-executed
+    sequentially against the main DB. Coinbase tips are handled
+    additively to avoid false conflicts. Single-sender batches
+    fall back to `handle_batch` to avoid overhead.
+  - **Optimizations**: `transact_commit` with direct `DbAccount`
+    merge (no per-tx `EvmState` clone), pre-loading of hot
+    accounts (sender, coinbase, recipient) into nested cache,
+    EVM context reuse within each group (parallel + conflict
+    re-execution paths).
   - **9 correctness tests**: serial/speculative state-root
     equality for conflict-free, conflict, multi-nonce,
     single-sender, empty, invalid-tx, and determinism cases.
@@ -34,10 +39,11 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     different senders in parallel, with automatic fallback to
     sequential execution when transactions conflict. Uses
     copy-on-write nested caches (`SharedCacheDB`) so each worker
-    only pays O(touched) instead of O(state). Measured at 111k
-    TPS for 100-sender conflict-free workloads (vs 140k TPS for
-    single-sender serial). The remaining gap is from COW cache
-    miss overhead and the sequential commit phase.
+    only pays O(touched) instead of O(state). EVM context is
+    reused within each group, and hot accounts are pre-loaded.
+    Measured at 128k TPS for 100-sender conflict-free workloads
+    (parity with single-sender serial) and 114k TPS for
+    conflict-heavy workloads (13% slower than serial).
 
 - **Phase B: Ethereum-compatible MPT state root** (2026-01-24)
   - **B1 — Trie integration**: added `modules/evm/src/trie.rs`

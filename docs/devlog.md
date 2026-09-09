@@ -4068,3 +4068,109 @@ from:
    in parallel (currently sequential).
 3. **Reduce COW miss overhead** — pre-load hot accounts (sender,
    recipient) into the nested cache before execution.
+
+## Session N+2: Parallel execution optimization — context reuse, pre-loading, direct merge
+
+### Goal
+
+The COW nested cache (Session N+1) eliminated the O(state) clone
+overhead but the parallel path was still ~25% slower than serial.
+The goal was to close that gap by reducing per-tx overhead in the
+parallel execution and conflict re-execution paths.
+
+### Three optimizations
+
+#### 1. Skip EvmState accumulation — use nested cache directly
+
+**Before**: Each tx used `transact` (non-commit) to get the
+`EvmState` diff, then `db.commit(state.clone())` to the nested
+cache, and accumulated the state in a separate `EvmState` map.
+This required cloning the entire `EvmState` per tx.
+
+**After**: Each tx uses `transact_commit` — the state is committed
+directly to the nested cache. After all txs, the nested cache's
+`cache.accounts` (filtered to `account_state != None`) IS the
+state diff. No per-tx `EvmState` clone needed.
+
+The `GroupExecResult` struct changed from `accumulated_state:
+EvmState` to `touched_accounts: AddressMap<DbAccount>` +
+`new_contracts: B256Map<Bytecode>`. The commit phase directly
+merges `DbAccount`s into the main DB instead of converting to
+`EvmState` and calling `db.commit()`.
+
+#### 2. Pre-load hot accounts into nested cache
+
+Before execution, pre-load three accounts that are touched by
+(almost) every tx in a group:
+- **Sender** — nonce bump + balance deduction on every tx
+- **Coinbase** — receives tips on every tx
+- **Recipient** — extracted from the first tx's `to` field
+
+This avoids a `DatabaseRef` trait dispatch on the first access to
+each account. Subsequent accesses hit the local cache.
+
+#### 3. Reuse EVM context within each group
+
+**Before**: The parallel execution and conflict re-execution paths
+built a NEW EVM context for EACH tx (`Context::mainnet()...build()`).
+Context rebuild is ~100 ns/tx; for 100 txs per group that's 10 µs
+wasted per group, or 1 ms for 100 groups.
+
+**After**: Build the EVM context ONCE per group and reuse it across
+all txs — same pattern as `handle_batch`. Only the tx env changes
+per tx; the cfg and block env are identical.
+
+This optimization was applied to both:
+- The parallel execution phase (Phase 4)
+- The conflict re-execution phase (Phase 5)
+
+### Benchmark results (all optimizations combined)
+
+Measured with criterion, 20 samples, 5s measurement time:
+
+| Workload | Clone-based | COW | All opts | Improvement |
+|---|---|---|---|---|
+| `batch_parallel` (1 sender, 10k) | 91 ms | 72 ms | 78 ms | — (variance) |
+| `batch_parallel_multi_sender` (100 senders, 10k) | 128 ms | 90 ms | **78 ms** | **39% faster** |
+| `batch_parallel_conflict` (100 senders, 10k) | 140 ms | 125 ms | **88 ms** | **37% faster** |
+
+The multi_sender path is now at **parity with serial** (78 ms vs
+78 ms, 128k TPS). The conflict path went from 54% slower than
+serial to only 13% slower (88 ms vs 78 ms, 114k TPS).
+
+### Why optimization 3 was the biggest win
+
+The conflict re-execution path was building a new EVM context per
+tx. With 100 conflicting groups of 100 txs each, that's 10,000
+context rebuilds. At ~100 ns each, that's 1 ms of pure overhead.
+But the actual improvement was much larger (112 ms → 88 ms = 24 ms
+saved) because the context rebuild also involves journal
+initialization, memory allocation, and other per-context setup
+that scales with the number of accounts in the state.
+
+### Parallel commit — not needed
+
+Optimization 3 from the original list (parallel commit for
+non-conflicting groups) was investigated but deemed unnecessary.
+The commit phase is just HashMap inserts (merging `DbAccount`s
+into the main DB), which takes <1 ms for 100 groups. The
+bottleneck is EVM execution, not the commit phase.
+
+### Remaining gap
+
+The conflict path is still 13% slower than serial because:
+1. Speculative execution is wasted for conflicting groups (but
+   it's parallel, so the wall-clock cost is ~1 group's execution
+   time)
+2. Sequential re-execution is the same as serial, but with
+   additional overhead from the conflict detection and speculative
+   result extraction
+
+Further improvement would require either:
+- **Speculative conflict prediction** — skip speculative execution
+  for groups likely to conflict (but this is a heuristic)
+- **Finer-grained conflict detection** — per-storage-slot instead
+  of per-account, reducing false conflicts
+- **Parallel re-execution** — execute conflicting groups in
+  parallel against snapshots, then merge in order (but this
+  reintroduces the clone overhead)

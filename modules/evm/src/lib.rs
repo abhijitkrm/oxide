@@ -77,12 +77,11 @@ pub mod tx;
 use revm::Context;
 use revm::context::TxEnv;
 use revm::database::CacheDB;
-use revm::database_interface::{DatabaseCommit, DatabaseRef, EmptyDB};
-use revm::handler::{ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
+use revm::database_interface::{DatabaseRef, EmptyDB};
+use revm::handler::{ExecuteCommitEvm, MainBuilder, MainContext};
 use revm::inspector::NoOpInspector;
 use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
-use revm::state::EvmState;
 use std::sync::Arc;
 
 /// The EVM module's dispatch ID in the module router.
@@ -729,9 +728,10 @@ impl EvmModule {
             *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned");
 
         // Phase 4: execute each group in parallel on its own COW
-        // nested cache. Each group's txs execute sequentially
-        // (transact + commit to nested cache), accumulating the
-        // group's EvmState diff.
+        // nested cache. Each group's txs execute sequentially via
+        // `transact_commit` (no per-tx EvmState clone). After
+        // execution, the nested cache's touched accounts are
+        // extracted directly as the group's state diff.
         let group_results: Vec<GroupExecResult> = group_order
             .par_iter()
             .map(|sender| {
@@ -739,7 +739,46 @@ impl EvmModule {
                 // COW nested cache: empty local cache, reads from
                 // the shared parent on miss.
                 let mut db: CacheDB<SharedCacheDB> = CacheDB::new(SharedCacheDB(snapshot.clone()));
-                let mut accumulated_state: EvmState = EvmState::default();
+
+                // Pre-load hot accounts into the nested cache before
+                // execution. This avoids `DatabaseRef` trait dispatch
+                // on the first access to each account. Three accounts
+                // are touched by (almost) every tx in a group:
+                //
+                // 1. **Sender** — nonce bump + balance deduction on
+                //    every tx.
+                // 2. **Coinbase** — receives tips on every tx.
+                // 3. **Recipient** — if all txs in the group send to
+                //    the same recipient (common in CLOB/transfer
+                //    workloads), pre-loading avoids a miss on tx #1.
+                //    We extract the recipient from the first valid tx.
+                let _ = db.load_account(*sender);
+                let _ = db.load_account(coinbase);
+                if let Some((_, first_signed)) = txs.first() {
+                    if let tx::TxKind::Call(addr) = first_signed.to() {
+                        let _ = db.load_account(revm::primitives::Address::from(addr.0));
+                    }
+                }
+
+                // Build the EVM context ONCE and reuse it across
+                // all txs in the group — same optimization as
+                // `handle_batch`. Context rebuild is ~100 ns/tx;
+                // for 100 txs per group that's 10 µs wasted per
+                // group, or 1 ms for 100 groups.
+                let mut evm = Context::mainnet()
+                    .with_db(&mut db)
+                    .modify_cfg_chained(|cfg| {
+                        cfg.set_spec_and_mainnet_gas_params(self.spec);
+                    })
+                    .modify_block_chained(|block| {
+                        block.number = revm::primitives::U256::from(block_number);
+                        block.beneficiary = coinbase;
+                        block.timestamp = revm::primitives::U256::from(block_timestamp);
+                        block.gas_limit = self.block_gas_limit;
+                        block.basefee = self.base_fee;
+                    })
+                    .build_mainnet_with_inspector(NoOpInspector);
+
                 let mut tx_results: Vec<(
                     usize,
                     Result<revm::context::result::ExecutionResult, ExecError>,
@@ -755,41 +794,14 @@ impl EvmModule {
                         }
                     };
 
-                    // Execute with `transact` (non-commit) to obtain
-                    // the EvmState diff. Then commit to the clone so
-                    // the next tx sees the updated state.
-                    let exec_result = {
-                        let mut evm = Context::mainnet()
-                            .with_db(&mut db)
-                            .modify_cfg_chained(|cfg| {
-                                cfg.set_spec_and_mainnet_gas_params(self.spec);
-                            })
-                            .modify_block_chained(|block| {
-                                block.number = revm::primitives::U256::from(block_number);
-                                block.beneficiary = coinbase;
-                                block.timestamp = revm::primitives::U256::from(block_timestamp);
-                                block.gas_limit = self.block_gas_limit;
-                                block.basefee = self.base_fee;
-                            })
-                            .build_mainnet_with_inspector(NoOpInspector);
-                        evm.transact(tx_env)
-                    };
+                    // Execute with `transact_commit` — reuses the
+                    // EVM context (cfg, block env) across all txs in
+                    // the group. Only the tx env changes per tx.
+                    let result = evm.transact_commit(tx_env);
 
-                    match exec_result {
-                        Ok(result_and_state) => {
-                            let revm::context_interface::result::ExecResultAndState {
-                                result,
-                                state,
-                            } = result_and_state;
-                            // Commit to the clone so the next tx sees
-                            // the updated state.
-                            db.commit(state.clone());
-                            // Accumulate state: later txs overwrite
-                            // earlier txs for the same account.
-                            for (addr, account) in state {
-                                accumulated_state.insert(addr, account);
-                            }
-                            tx_results.push((*idx, Ok(result)));
+                    match result {
+                        Ok(r) => {
+                            tx_results.push((*idx, Ok(r)));
                         }
                         Err(e) => {
                             tx_results.push((
@@ -802,13 +814,28 @@ impl EvmModule {
                     }
                 }
 
-                // Compute the coinbase balance delta for this group.
-                // The clone's coinbase balance = snapshot's coinbase
-                // balance + tips received by this group. The delta is
-                // strictly additive (the coinbase only receives tips).
-                let coinbase_after = db
+                // Extract the nested cache's touched accounts and
+                // new contracts as the group's state diff. Only
+                // accounts with `account_state != None` were
+                // actually modified (touched, created, or
+                // selfdestructed) — accounts that were only loaded
+                // (read) have `account_state = None` and are
+                // excluded.
+                let touched_accounts: revm::primitives::AddressMap<revm::database::DbAccount> = db
                     .cache
                     .accounts
+                    .into_iter()
+                    .filter(|(_, a)| a.account_state != revm::database::AccountState::None)
+                    .collect();
+
+                let new_contracts = db.cache.contracts;
+
+                // Compute the coinbase balance delta for this group.
+                // The nested cache's coinbase balance = parent's
+                // coinbase balance + tips received by this group.
+                // The delta is strictly additive (the coinbase only
+                // receives tips).
+                let coinbase_after = touched_accounts
                     .get(&coinbase)
                     .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
                 let coinbase_before = snapshot
@@ -818,7 +845,13 @@ impl EvmModule {
                     .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
                 let coinbase_delta = coinbase_after - coinbase_before;
 
-                GroupExecResult { sender: *sender, tx_results, accumulated_state, coinbase_delta }
+                GroupExecResult {
+                    sender: *sender,
+                    tx_results,
+                    touched_accounts,
+                    new_contracts,
+                    coinbase_delta,
+                }
             })
             .collect();
 
@@ -848,7 +881,7 @@ impl EvmModule {
         for gr in &group_results {
             // Touched accounts for this group, excluding coinbase.
             let group_touched: std::collections::HashSet<revm::primitives::Address> =
-                gr.accumulated_state.keys().filter(|addr| **addr != coinbase).copied().collect();
+                gr.touched_accounts.keys().filter(|addr| **addr != coinbase).copied().collect();
 
             let has_conflict = group_touched.iter().any(|addr| committed_touched.contains(addr));
 
@@ -856,6 +889,23 @@ impl EvmModule {
                 // Conflict: re-execute this group's txs sequentially
                 // against the main DB. The speculative execution
                 // assumed stale state for the conflicting account.
+                //
+                // Build the EVM context ONCE per conflicting group
+                // and reuse it across all txs — same optimization as
+                // `handle_batch` and the parallel execution phase.
+                let mut evm = Context::mainnet()
+                    .with_db(&mut *db)
+                    .modify_cfg_chained(|cfg| {
+                        cfg.set_spec_and_mainnet_gas_params(self.spec);
+                    })
+                    .modify_block_chained(|block| {
+                        block.number = revm::primitives::U256::from(block_number);
+                        block.beneficiary = coinbase;
+                        block.timestamp = revm::primitives::U256::from(block_timestamp);
+                        block.gas_limit = self.block_gas_limit;
+                        block.basefee = self.base_fee;
+                    })
+                    .build_mainnet_with_inspector(NoOpInspector);
                 for (idx, signed) in groups.get(&gr.sender).expect("group exists") {
                     let caller = gr.sender;
                     let tx_env = match Self::build_tx_env(signed, caller) {
@@ -865,22 +915,7 @@ impl EvmModule {
                             continue;
                         }
                     };
-                    let result = {
-                        let mut evm = Context::mainnet()
-                            .with_db(&mut *db)
-                            .modify_cfg_chained(|cfg| {
-                                cfg.set_spec_and_mainnet_gas_params(self.spec);
-                            })
-                            .modify_block_chained(|block| {
-                                block.number = revm::primitives::U256::from(block_number);
-                                block.beneficiary = coinbase;
-                                block.timestamp = revm::primitives::U256::from(block_timestamp);
-                                block.gas_limit = self.block_gas_limit;
-                                block.basefee = self.base_fee;
-                            })
-                            .build_mainnet_with_inspector(NoOpInspector);
-                        evm.transact_commit(tx_env)
-                    };
+                    let result = evm.transact_commit(tx_env);
                     match result {
                         Ok(r) => {
                             all_touched.insert(caller);
@@ -910,18 +945,24 @@ impl EvmModule {
                     }
                 }
             } else {
-                // No conflict: commit the group's accumulated state
-                // directly. Correct because no other group touched
-                // these accounts.
+                // No conflict: directly merge the group's touched
+                // accounts and new contracts into the main DB. This
+                // avoids the `EvmState` → `commit_account` conversion
+                // — we insert `DbAccount`s directly, which is what
+                // `commit_account` would produce anyway.
                 //
-                // Exclude the coinbase from the commit — it is
+                // Exclude the coinbase from the merge — it is
                 // handled additively via `coinbase_delta` at the
                 // end. Including it here would double-count the
-                // tips (once from the state commit, once from the
-                // delta).
-                let mut state_to_commit = gr.accumulated_state.clone();
-                state_to_commit.remove(&coinbase);
-                db.commit(state_to_commit);
+                // tips (once from the merge, once from the delta).
+                for (addr, account) in &gr.touched_accounts {
+                    if *addr != coinbase {
+                        db.cache.accounts.insert(*addr, account.clone());
+                    }
+                }
+                for (hash, bytecode) in &gr.new_contracts {
+                    db.cache.contracts.entry(*hash).or_insert_with(|| bytecode.clone());
+                }
                 committed_touched.extend(group_touched.iter().copied());
                 all_touched.extend(group_touched.iter().copied());
 
@@ -1108,19 +1149,24 @@ impl DatabaseRef for SharedCacheDB {
 
 /// The result of executing a single sender group in parallel.
 ///
-/// Each group executes on its own clone of the main `CacheDB`. The
-/// `accumulated_state` is the union of all `EvmState` diffs from the
-/// group's transactions — the final state of every account touched by
-/// the group. The `coinbase_delta` is the group's tip contribution
-/// (additive, applied once at the end).
+/// Each group executes on its own COW nested cache. After
+/// execution, the nested cache's touched accounts and new
+/// contracts are extracted as the group's state diff — no
+/// per-tx `EvmState` cloning needed. The `coinbase_delta` is the
+/// group's tip contribution (additive, applied once at the end).
 struct GroupExecResult {
     /// The sender address for this group.
     sender: revm::primitives::Address,
     /// Per-tx results, indexed by original position in the batch.
     tx_results: Vec<(usize, Result<revm::context::result::ExecutionResult, ExecError>)>,
-    /// Accumulated state diff for the group (final state of all
-    /// touched accounts).
-    accumulated_state: EvmState,
+    /// Touched accounts from the nested cache (final state of all
+    /// accounts modified by this group). Extracted directly from
+    /// `CacheDB::cache::accounts`, filtered to only touched
+    /// accounts (`account_state != None`).
+    touched_accounts: revm::primitives::AddressMap<revm::database::DbAccount>,
+    /// New contracts created by this group, extracted from
+    /// `CacheDB::cache::contracts`.
+    new_contracts: revm::primitives::B256Map<revm::bytecode::Bytecode>,
     /// The coinbase balance delta for this group (tips received).
     coinbase_delta: revm::primitives::U256,
 }
