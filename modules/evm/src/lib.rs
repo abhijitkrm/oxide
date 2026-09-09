@@ -45,6 +45,7 @@ use framework::module_id;
 use primitives::{Address, Hash, Height};
 
 pub mod fee;
+pub mod precompiles;
 
 // revm imports. The `revm` crate re-exports all sub-crates.
 use revm::Context;
