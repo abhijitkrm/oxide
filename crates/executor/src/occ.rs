@@ -299,7 +299,7 @@ mod tests {
         rw.record_write(b"key2", b"value2".to_vec());
         assert!(rw.reads.contains(b"key1".as_slice()));
         assert_eq!(
-            rw.writes.get(b"key2".as_slice()).map(|v| v.as_slice()),
+            rw.writes.get(b"key2".as_slice()).map(|v: &Vec<u8>| v.as_slice()),
             Some(b"value2".as_slice())
         );
     }
@@ -323,7 +323,10 @@ mod tests {
     #[test]
     fn parallel_scheduler_no_conflicts() {
         let scheduler = ParallelScheduler::new(0);
-        let exec = |i: usize| make_execution(&[&[i as u8]], &[(&[i as u8], &[i as u8])]);
+        let exec = |i: usize| {
+            let key = u8::try_from(i).unwrap();
+            make_execution(&[&[key]], &[(&[key], &[key])])
+        };
         let results = scheduler.schedule(4, exec);
         assert_eq!(results.len(), 4);
         // All txs should succeed (no conflicts).
@@ -340,7 +343,8 @@ mod tests {
             // tx0 reads key0, writes key0.
             // tx1 reads key0, writes key1.
             // tx1 conflicts with tx0 (reads key0, tx0 writes key0).
-            make_execution(&[&[0u8]], &[(&[i as u8], &[i as u8])])
+            let key = u8::try_from(i).unwrap();
+            make_execution(&[&[0u8]], &[(&[key], &[key])])
         };
         let results = scheduler.schedule(3, exec);
         assert_eq!(results.len(), 3);
@@ -386,7 +390,10 @@ mod tests {
     fn parallel_scheduler_deterministic() {
         // Two runs with the same input must produce the same output.
         let scheduler = ParallelScheduler::new(0);
-        let exec = |i: usize| make_execution(&[&[i as u8]], &[(&[i as u8], &[i as u8])]);
+        let exec = |i: usize| {
+            let key = u8::try_from(i).unwrap();
+            make_execution(&[&[key]], &[(&[key], &[key])])
+        };
         let r1 = scheduler.schedule(5, exec);
         let r2 = scheduler.schedule(5, exec);
         assert_eq!(r1.len(), r2.len());
