@@ -28,6 +28,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+pub mod divergence;
 pub mod occ;
 
 use ports::AppInterface;
