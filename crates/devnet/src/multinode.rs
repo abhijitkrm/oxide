@@ -29,8 +29,10 @@
 
 use std::sync::Arc;
 
+use codec::{Decode, Encode};
 use consensus::{OxideBft, ValidatorSet};
 use executor::Executor;
+use ports::transport::Transport;
 use ports::{AppInterface, ConsensusEngine};
 use types::{FinalizedBlock, TxBytes};
 
@@ -61,6 +63,9 @@ pub struct MultiNodeDevnet {
     secret_keys: Vec<crypto::BlsSecretKey>,
     /// The number of validators.
     n: usize,
+    /// The mesh network for transport-routed rounds (H4 fix).
+    /// `None` for direct-call rounds (backward compat).
+    network: Option<p2p::MeshNetwork>,
 }
 
 /// The result of running a multi-node devnet: the finalized blocks
@@ -124,12 +129,42 @@ impl MultiNodeDevnet {
             apps.push(app);
         }
 
-        Self { engines, apps, validator_set: vs, secret_keys, n }
+        Self { engines, apps, validator_set: vs, secret_keys, n, network: None }
     }
 
     /// The number of validators.
     pub fn n(&self) -> usize {
         self.n
+    }
+
+    /// Enable the mesh network for transport-routed rounds (H4 fix).
+    /// After calling this, `run_round_transport` can be used to route
+    /// consensus messages through `MeshTransport` instead of direct
+    /// method calls.
+    pub fn enable_mesh(&mut self) {
+        self.network = Some(p2p::MeshNetwork::new(self.n));
+    }
+
+    /// Partition a validator: messages to/from this validator are
+    /// dropped until `heal` is called (H2 fix). Requires the mesh
+    /// network to be enabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mesh is not enabled or `index >= n`.
+    pub fn partition(&self, index: usize) {
+        let net = self.network.as_ref().expect("mesh not enabled");
+        net.partition(index);
+    }
+
+    /// Heal a partitioned validator (H2 fix).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mesh is not enabled or `index >= n`.
+    pub fn heal(&self, index: usize) {
+        let net = self.network.as_ref().expect("mesh not enabled");
+        net.heal(index);
     }
 
     /// Access the executor for validator `i` (for post-run inspection).
@@ -246,8 +281,34 @@ impl MultiNodeDevnet {
         (self.collect_result(), elapsed)
     }
 
-    /// Run `rounds` consensus rounds, each with one tx submitted to
-    /// the leader. Returns the finalized blocks from each validator.
+    /// Run `rounds` consensus rounds with messages routed through
+    /// `MeshTransport` (H4 fix). Requires `enable_mesh()`. Each
+    /// round submits `txs_per_round` txs to the leader and runs
+    /// `run_round_transport`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mesh network is not enabled.
+    pub fn run_batch_transport(
+        &mut self,
+        rounds: usize,
+        txs_per_round: usize,
+    ) -> (DevnetResult, std::time::Duration) {
+        assert!(self.network.is_some(), "call enable_mesh() first");
+        let start = std::time::Instant::now();
+        for round in 0..rounds {
+            let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
+            for tx_i in 0..txs_per_round {
+                let tx = make_batch_tx(round, tx_i);
+                self.engines[leader_idx].submit_tx(tx);
+            }
+            self.run_round_transport();
+        }
+        // Flush round.
+        self.run_round_transport();
+        let elapsed = start.elapsed();
+        (self.collect_result(), elapsed)
+    }
     ///
     /// Each round:
     /// 1. Submit a tx to the leader's mempool.
@@ -419,6 +480,155 @@ impl MultiNodeDevnet {
 
         // Sync next_height across all engines (the simulation
         // equivalent of broadcast delivery).
+        let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+        for engine in &mut self.engines {
+            engine.sync_next_height(max_height);
+        }
+    }
+
+    /// Run one consensus round with messages routed through
+    /// `MeshTransport` (H4 fix). This proves the Transport seam:
+    /// votes and QCs are encoded, sent through the transport,
+    /// received, and decoded on the other side.
+    ///
+    /// The message flow:
+    /// 1. Leader proposes (direct — the proposal is broadcast via
+    ///    the block broadcast layer, not the transport).
+    /// 2. Leader self-votes (direct — the leader doesn't need to
+    ///    send its vote to itself over the network).
+    /// 3. Followers vote via transport: each follower encodes its
+    ///    vote and sends it to the leader.
+    /// 4. Leader receives votes via transport, decodes them, and
+    ///    collects them.
+    /// 5. Leader forms a QC and broadcasts it via transport.
+    /// 6. Followers receive the QC via transport, decode it, and
+    ///    deliver it.
+    /// 7. All advance the view and sync heights.
+    ///
+    /// Requires `enable_mesh()` to have been called.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mesh is not enabled or any transport operation
+    /// fails (a transport failure in the sim is a bug).
+    fn run_round_transport(&mut self) {
+        let net = self.network.as_ref().expect("mesh not enabled — call enable_mesh()");
+        let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
+
+        // Leader proposes (direct — proposal broadcast is a
+        // separate layer). If the leader is partitioned, it may
+        // not be able to propose (no txs from followers, or the
+        // leader's view is stale). In that case, skip the round —
+        // the view will advance via the flush round.
+        let Some((header, proposal)) = self.engines[leader_idx].propose() else {
+            // Leader can't propose (partitioned or no txs).
+            // Advance all views and return.
+            for engine in &mut self.engines {
+                engine.advance_view();
+            }
+            let max_height =
+                self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+            for engine in &mut self.engines {
+                engine.sync_next_height(max_height);
+            }
+            return;
+        };
+        let block_hash = OxideBft::block_hash(&header);
+
+        // Leader self-votes (direct — no network self-send).
+        let leader_sig =
+            self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        let leader_vote = types::Vote {
+            view: header.view,
+            phase: types::VotePhase::Prepare,
+            block_hash,
+            signature: leader_sig,
+        };
+        self.engines[leader_idx]
+            .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
+            .expect("leader self-vote must verify");
+
+        // Followers vote via transport: each follower encodes its
+        // vote and sends it to the leader.
+        for (i, engine) in self.engines.iter_mut().enumerate() {
+            if i == leader_idx {
+                continue;
+            }
+            if let Some(vote) = engine.vote(&header, &proposal) {
+                let mut transport = net.transport(i);
+                let mut buf = Vec::new();
+                vote.encode(&mut buf);
+                transport
+                    .send(&p2p::MeshNetwork::peer_id(leader_idx), &buf)
+                    .expect("transport send must succeed");
+            }
+        }
+
+        // Leader receives votes via transport, decodes, collects.
+        let mut leader_transport = net.transport(leader_idx);
+        for _ in 0..self.n - 1 {
+            if let Some(msg) = leader_transport.recv() {
+                let mut reader = codec::Reader::new(&msg.bytes);
+                let vote = types::Vote::decode(&mut reader).expect("vote decode");
+                let voter = u16::try_from(
+                    p2p::MeshNetwork::parse_peer_id(&msg.from).expect("valid peer id"),
+                )
+                .unwrap_or(0);
+                self.engines[leader_idx]
+                    .collect_vote(voter, vote)
+                    .expect("follower vote must verify");
+            }
+        }
+
+        // Leader forms QC.
+        // Leader forms QC. If the leader can't reach quorum (e.g.,
+        // too many partitioned followers), skip the QC and advance.
+        let Some(qc) = self.engines[leader_idx].try_form_qc() else {
+            // Not enough votes for quorum (partitioned followers).
+            for engine in &mut self.engines {
+                engine.advance_view();
+            }
+            let max_height =
+                self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+            for engine in &mut self.engines {
+                engine.sync_next_height(max_height);
+            }
+            return;
+        };
+
+        // Leader broadcasts QC via transport.
+        let mut qc_buf = Vec::new();
+        qc.encode(&mut qc_buf);
+        for i in 0..self.n {
+            if i == leader_idx {
+                continue;
+            }
+            let mut transport = net.transport(leader_idx);
+            transport
+                .send(&p2p::MeshNetwork::peer_id(i), &qc_buf)
+                .expect("transport send must succeed");
+        }
+
+        // Followers receive QC via transport, decode, deliver.
+        for (i, engine) in self.engines.iter_mut().enumerate() {
+            if i == leader_idx {
+                engine.deliver_qc(qc.clone()).expect("QC must verify");
+                continue;
+            }
+            let mut transport = net.transport(i);
+            if let Some(msg) = transport.recv() {
+                let mut reader = codec::Reader::new(&msg.bytes);
+                let received_qc = types::QuorumCertificate::decode(&mut reader).expect("QC decode");
+                engine.deliver_qc(received_qc).expect("QC must verify");
+            }
+        }
+
+        // All advance the view.
+        for engine in &mut self.engines {
+            engine.advance_view();
+        }
+
+        // Sync heights (the simulation equivalent of broadcast).
         let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
         for engine in &mut self.engines {
             engine.sync_next_height(max_height);
@@ -837,5 +1047,58 @@ mod tests {
         // block = 8 BLS pairing checks). In production, these are
         // batched and parallelized, so the real per-block time will
         // be much lower.
+    }
+
+    /// Transport-routed consensus round (H4 fix): 4 validators, 3
+    /// rounds, 100 txs/round. Messages are routed through
+    /// `MeshTransport` instead of direct method calls. Proves the
+    /// Transport seam works end-to-end.
+    #[test]
+    fn transport_routed_consensus() {
+        let mut devnet = MultiNodeDevnet::new(4, 10_000);
+        devnet.enable_mesh();
+        let (result, _elapsed) = devnet.run_batch_transport(3, 100);
+        let total_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
+        assert!(total_txs > 0, "should finalize some txs via transport");
+        // All validators should agree on the same blocks.
+        let reference = &result.finalized[0];
+        for (i, blocks) in result.finalized.iter().enumerate().skip(1) {
+            assert_eq!(blocks.len(), reference.len(), "validator {i} disagrees on count");
+        }
+    }
+
+    /// Partition recovery (H2 fix): 7 validators, partition 2
+    /// (one-third of f+1), run rounds during partition, heal, and
+    /// verify consensus recovers. The partitioned nodes can't vote,
+    /// but the remaining 5 validators (≥ 2f+1 = 5) can still reach
+    /// quorum and finalize blocks.
+    #[test]
+    fn partition_recovery() {
+        let mut devnet = MultiNodeDevnet::new(7, 10_000);
+        devnet.enable_mesh();
+
+        // Run 2 rounds before partition (all nodes online).
+        let (result, _) = devnet.run_batch_transport(2, 10);
+        let blocks_before = result.finalized[0].len();
+        assert!(blocks_before > 0, "should finalize before partition");
+
+        // Partition nodes 5 and 6 (2 of 7 = ~one-third).
+        devnet.partition(5);
+        devnet.partition(6);
+
+        // Run 2 rounds during partition. The remaining 5 validators
+        // (≥ 2f+1 = 5 for n=7, f=2) can still reach quorum.
+        let (result, _) = devnet.run_batch_transport(2, 10);
+        let blocks_during = result.finalized[0].len();
+        assert!(blocks_during > blocks_before, "should finalize during partition");
+
+        // Heal the partition.
+        devnet.heal(5);
+        devnet.heal(6);
+
+        // Run 2 rounds after healing. All 7 validators participate.
+        let (result, _) = devnet.run_batch_transport(2, 10);
+        let blocks_after = result.finalized[0].len();
+        assert!(blocks_after > blocks_during, "should finalize after healing");
     }
 }

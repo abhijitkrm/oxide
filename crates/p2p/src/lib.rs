@@ -62,6 +62,9 @@ const MESH_MAX_MESSAGE_BYTES: u64 = 16 << 20;
 struct MeshNetworkInner {
     /// One FIFO queue per node, indexed by node index.
     queues: Vec<Mutex<VecDeque<InboundMessage>>>,
+    /// Partitioned nodes: messages to/from these nodes are dropped.
+    /// Used by the H2 partition-injection simulation.
+    partitioned: Mutex<Vec<bool>>,
 }
 
 /// The shared mesh network. Clone this to hand out `MeshTransport`
@@ -82,7 +85,10 @@ impl MeshNetwork {
     pub fn new(n: usize) -> Self {
         assert!(n > 0, "mesh must have at least one node");
         let queues = (0..n).map(|_| Mutex::new(VecDeque::new())).collect();
-        Self { inner: Arc::new(MeshNetworkInner { queues }), n }
+        Self {
+            inner: Arc::new(MeshNetworkInner { queues, partitioned: Mutex::new(vec![false; n]) }),
+            n,
+        }
     }
 
     /// The number of nodes in the mesh.
@@ -99,7 +105,7 @@ impl MeshNetwork {
 
     /// Parse a `PeerId` back to a node index. Returns `None` if the
     /// bytes are not a valid little-endian `usize`.
-    fn parse_peer_id(pid: &PeerId) -> Option<usize> {
+    pub fn parse_peer_id(pid: &PeerId) -> Option<usize> {
         match pid.len() {
             1 => Some(usize::from(pid[0])),
             2 => Some(u16::from_le_bytes([pid[0], pid[1]]) as usize),
@@ -123,6 +129,36 @@ impl MeshNetwork {
     pub fn transport(&self, index: usize) -> MeshTransport {
         assert!(index < self.n, "node index {index} out of range (n={})", self.n);
         MeshTransport { network: self.clone(), index }
+    }
+
+    /// Partition a node: messages to/from this node are dropped
+    /// until `heal` is called. Used by the H2 partition-injection
+    /// simulation to test consensus recovery after a network
+    /// partition.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= n`.
+    pub fn partition(&self, index: usize) {
+        assert!(index < self.n, "node index {index} out of range (n={})", self.n);
+        self.inner.partitioned.lock().unwrap()[index] = true;
+    }
+
+    /// Heal a partitioned node: messages to/from this node are
+    /// delivered again. Used by the H2 partition-injection
+    /// simulation to test consensus recovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= n`.
+    pub fn heal(&self, index: usize) {
+        assert!(index < self.n, "node index {index} out of range (n={})", self.n);
+        self.inner.partitioned.lock().unwrap()[index] = false;
+    }
+
+    /// Check if a node is partitioned.
+    fn is_partitioned(&self, index: usize) -> bool {
+        self.inner.partitioned.lock().unwrap()[index]
     }
 }
 
@@ -161,12 +197,19 @@ impl Transport for MeshTransport {
         if bytes.len() as u64 > MESH_MAX_MESSAGE_BYTES {
             return Err(TransportError::MessageTooLarge);
         }
+        // H2 partition: drop messages to/from partitioned nodes.
+        if self.network.is_partitioned(target) || self.network.is_partitioned(self.index) {
+            return Ok(()); // silently drop — simulates a network partition
+        }
         let msg = InboundMessage { from: self.peer_id(), bytes: bytes.to_vec() };
         self.network.inner.queues[target].lock().unwrap().push_back(msg);
         Ok(())
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
+        // H2 partition: partitioned nodes still receive from their
+        // queue (messages sent before the partition), but no new
+        // messages arrive while partitioned (send drops them).
         self.network.inner.queues[self.index].lock().unwrap().pop_front()
     }
 
@@ -309,5 +352,76 @@ mod tests {
         t0.send(&MeshNetwork::peer_id(0), b"self").unwrap();
         let msg = t0.recv().expect("should receive self-message");
         assert_eq!(msg.bytes, b"self");
+    }
+
+    // ---- H2 partition tests ----
+
+    /// Partitioned node: messages to a partitioned node are dropped.
+    #[test]
+    fn mesh_partition_drops_messages_to_partitioned() {
+        let net = MeshNetwork::new(3);
+        let mut t0 = net.transport(0);
+        let mut t1 = net.transport(1);
+
+        // Partition node 1.
+        net.partition(1);
+        // t0 sends to t1 — message is dropped (partitioned).
+        t0.send(&MeshNetwork::peer_id(1), b"hello").unwrap();
+        assert!(t1.recv().is_none(), "partitioned node should not receive");
+
+        // Heal node 1.
+        net.heal(1);
+        // t0 sends again — message is delivered.
+        t0.send(&MeshNetwork::peer_id(1), b"hello").unwrap();
+        let msg = t1.recv().expect("healed node should receive");
+        assert_eq!(msg.bytes, b"hello");
+    }
+
+    /// Partitioned sender: messages from a partitioned node are dropped.
+    #[test]
+    fn mesh_partition_drops_messages_from_partitioned() {
+        let net = MeshNetwork::new(3);
+        let mut t0 = net.transport(0);
+        let mut t1 = net.transport(1);
+
+        // Partition node 0 (the sender).
+        net.partition(0);
+        // t0 sends to t1 — message is dropped (sender partitioned).
+        t0.send(&MeshNetwork::peer_id(1), b"hello").unwrap();
+        assert!(t1.recv().is_none(), "partitioned sender's messages dropped");
+
+        // Heal node 0.
+        net.heal(0);
+        t0.send(&MeshNetwork::peer_id(1), b"hello").unwrap();
+        let msg = t1.recv().expect("healed sender's messages delivered");
+        assert_eq!(msg.bytes, b"hello");
+    }
+
+    /// Partition one-third of validators, then heal: consensus
+    /// should recover. This is the H2 simulation scenario.
+    #[test]
+    fn mesh_partition_one_third_then_heal() {
+        let net = MeshNetwork::new(6);
+        let mut transports: Vec<_> = (0..6).map(|i| net.transport(i)).collect();
+
+        // Partition nodes 4 and 5 (2 of 6 = one-third).
+        net.partition(4);
+        net.partition(5);
+
+        // Nodes 0-3 can still communicate.
+        transports[0].send(&MeshNetwork::peer_id(1), b"alive").unwrap();
+        assert_eq!(transports[1].recv().unwrap().bytes, b"alive");
+
+        // Messages to partitioned nodes are dropped.
+        transports[0].send(&MeshNetwork::peer_id(4), b"to-partitioned").unwrap();
+        assert!(transports[4].recv().is_none());
+
+        // Heal.
+        net.heal(4);
+        net.heal(5);
+
+        // Now all nodes can communicate.
+        transports[0].send(&MeshNetwork::peer_id(4), b"healed").unwrap();
+        assert_eq!(transports[4].recv().unwrap().bytes, b"healed");
     }
 }

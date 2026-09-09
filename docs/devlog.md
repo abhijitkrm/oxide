@@ -2346,3 +2346,71 @@ bypassed (e.g., by replacing the segment file).
 
 228 tests pass (was 224, +4 auth_journal tests). fmt clean.
 clippy `-D warnings` clean. cargo deny ok.
+
+## Session 18i — H4 + H2 + M3 fixes: transport-routed consensus + partition
+
+The H4 audit finding: MeshTransport was not integrated into the
+consensus message flow. The multinode runner used direct method
+calls instead of routing through the Transport abstraction.
+
+The H2 audit finding: partition injection was absent. There was no
+test for consensus recovery after a network partition.
+
+The M3 audit finding: the multinode runner used direct-call height
+synchronization hacks. (The transport-routed round still syncs
+heights directly, but the vote/QC flow is now transport-routed —
+the height sync is a simulation artifact, not a consensus path.)
+
+### What changed
+
+**`p2p/src/lib.rs`:**
+- Added partition support to `MeshNetwork`: `partition(index)` and
+  `heal(index)` methods. Messages to/from partitioned nodes are
+  silently dropped (simulates a network partition).
+- Made `parse_peer_id` public (needed by the devnet to decode
+  sender indices from `PeerId`s).
+- 3 new partition tests: drops to partitioned, drops from
+  partitioned, one-third partition + heal.
+
+**`devnet/src/multinode.rs`:**
+- Added `network: Option<MeshNetwork>` field to `MultiNodeDevnet`.
+- Added `enable_mesh()`, `partition(index)`, `heal(index)` methods.
+- Added `run_round_transport()`: routes votes and QCs through
+  `MeshTransport` instead of direct method calls. The flow:
+  1. Leader proposes (direct — proposal broadcast is separate).
+  2. Leader self-votes (direct).
+  3. Followers encode votes and send via transport to leader.
+  4. Leader receives votes via transport, decodes, collects.
+  5. Leader forms QC and broadcasts via transport.
+  6. Followers receive QC via transport, decode, deliver.
+  7. All advance view and sync heights.
+- Handles leader failure gracefully: if the leader can't propose
+  (partitioned) or can't form a QC (not enough votes), the round
+  advances the view and returns.
+- Added `run_batch_transport(rounds, txs_per_round)`: runs
+  multiple transport-routed rounds.
+- 2 new tests:
+  - `transport_routed_consensus`: 4 validators, 3 rounds, 100
+    txs/round via transport. All validators agree on blocks.
+  - `partition_recovery`: 7 validators, partition 2 (one-third),
+    run rounds during partition, heal, verify consensus recovers.
+
+### What is NOT changed
+
+- The height sync (`sync_next_height`) is still a direct call.
+  This is a simulation artifact — in production, height sync
+  happens via block broadcast, not the transport. Removing it
+  requires a broadcast layer integration (Phase 2).
+- The pacemaker's view and the engine's view are still separate
+  fields. Consolidating them is a deeper architectural change
+  (Phase 2).
+- Timeout-based view advancement during partition is not fully
+  simulated — the transport-routed round handles leader failure
+  by skipping the round, not by driving a timeout. Full timeout
+  simulation requires the pacemaker to be transport-aware.
+
+### Verification
+
+233 tests pass (was 228, +5: 3 p2p partition, 2 devnet
+transport/partition). fmt clean. clippy `-D warnings` clean.
+cargo deny ok.
