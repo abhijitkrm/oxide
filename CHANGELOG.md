@@ -16,8 +16,9 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **`EvmModule::handle_batch_parallel`**: new batch execution
     path that parallelizes EVM execution across sender groups.
     Transactions from different senders execute in parallel on
-    isolated `CacheDB` clones; same-sender txs execute sequentially
-    (nonce dependency). Conflict detection via actual `EvmState`
+    copy-on-write nested caches (`SharedCacheDB`); same-sender
+    txs execute sequentially (nonce dependency). Conflict
+    detection via actual `EvmState`
     touched-account sets (not heuristic). Conflicting groups are
     re-executed sequentially against the main DB. Coinbase tips
     are handled additively to avoid false conflicts. Single-sender
@@ -31,11 +32,12 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     serial baseline.
   - **In plain words**: the EVM can now execute transactions from
     different senders in parallel, with automatic fallback to
-    sequential execution when transactions conflict. The current
-    implementation is correct but not yet faster than serial
-    execution because cloning the in-memory state per sender group
-    is expensive. The next optimization (copy-on-write nested
-    caches) will reduce this cost from O(state) to O(touched).
+    sequential execution when transactions conflict. Uses
+    copy-on-write nested caches (`SharedCacheDB`) so each worker
+    only pays O(touched) instead of O(state). Measured at 111k
+    TPS for 100-sender conflict-free workloads (vs 140k TPS for
+    single-sender serial). The remaining gap is from COW cache
+    miss overhead and the sequential commit phase.
 
 - **Phase B: Ethereum-compatible MPT state root** (2026-01-24)
   - **B1 — Trie integration**: added `modules/evm/src/trie.rs`

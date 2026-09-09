@@ -4014,3 +4014,57 @@ The clone cost dominates the parallelism gain.
    detection (per-storage-slot) would reduce false conflicts.
 3. **Pipeline recovery and execution** — start executing early
    groups while later groups are still being recovered.
+
+## Session N+1: Copy-on-write nested caches for parallel execution
+
+### Goal
+
+The previous session's speculative parallel execution was correct
+but slower than serial because `CacheDB::clone()` per group was
+O(state). The goal was to replace the full clone with a
+copy-on-write nested cache that shares the parent's state via
+`DatabaseRef`, reducing per-group cost from O(state) to O(touched).
+
+### Implementation
+
+Created `SharedCacheDB(Arc<CacheDB<EmptyDB>>)` — a newtype wrapper
+that implements `DatabaseRef` by delegating to the inner `CacheDB`.
+Each group gets `CacheDB::new(SharedCacheDB(arc_clone))`:
+- Fresh, empty local cache
+- Reads fall through to the shared parent on cache miss
+- Writes stay local
+- Per-group init: O(1) (Arc clone + empty HashMap)
+- Per-group memory: O(touched) (only modified accounts)
+
+### Why not `CacheDB::nest()`?
+
+`nest()` consumes `self`, so it can only create one nested cache.
+We need N nested caches (one per sender group) sharing the same
+parent. `SharedCacheDB(Arc<...>)` lets us share the parent across
+all workers via cheap `Arc` clones.
+
+### Benchmark results (before → after COW)
+
+| Workload | Before COW | After COW | Change |
+|---|---|---|---|
+| `batch_parallel` (1 sender, 10k txs) | 91 ms | 72 ms | — (variance) |
+| `batch_parallel_multi_sender` (100 senders, 10k txs) | 128 ms | 90 ms | 30% faster |
+| `batch_parallel_conflict` (100 senders, 10k txs) | 140 ms | 125 ms | 11% faster |
+
+The multi-sender COW path is now 111k TPS, only 25% slower than
+the single-sender serial path (140k TPS). The remaining gap is
+from:
+1. COW cache miss overhead (each read checks local cache, then
+   parent via `DatabaseRef` trait dispatch)
+2. Sequential commit phase (committing 100 groups in order)
+3. `EvmState` accumulation (cloning state for each tx)
+
+### Remaining optimization opportunities
+
+1. **Skip `EvmState` accumulation** — use the nested cache's
+   `cache.accounts` directly as the state diff, avoiding the
+   per-tx `EvmState` clone.
+2. **Parallel commit** — non-conflicting groups could be committed
+   in parallel (currently sequential).
+3. **Reduce COW miss overhead** — pre-load hot accounts (sender,
+   recipient) into the nested cache before execution.

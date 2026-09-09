@@ -77,12 +77,13 @@ pub mod tx;
 use revm::Context;
 use revm::context::TxEnv;
 use revm::database::CacheDB;
-use revm::database_interface::{DatabaseCommit, EmptyDB};
+use revm::database_interface::{DatabaseCommit, DatabaseRef, EmptyDB};
 use revm::handler::{ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 use revm::inspector::NoOpInspector;
 use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
 use revm::state::EvmState;
+use std::sync::Arc;
 
 /// The EVM module's dispatch ID in the module router.
 ///
@@ -711,29 +712,33 @@ impl EvmModule {
             return self.handle_batch(ctx, msgs);
         }
 
-        // Phase 3: snapshot the main DB. Each group will clone this
-        // snapshot for its own isolated execution.
-        //
-        // Limitation: for large state, this clone is O(state) per
-        // group. A future COW/nested-cache optimization will reduce
-        // this to O(touched) per group.
-        let snapshot = {
+        // Phase 3: snapshot the main DB into an `Arc` for
+        // copy-on-write sharing. Each group gets a
+        // `CacheDB::new(SharedCacheDB(arc_clone))` — a fresh, empty
+        // local cache backed by the shared parent via
+        // `DatabaseRef`. Reads fall through to the parent on cache
+        // miss; writes stay local. Per-group cost is O(1) init +
+        // O(touched) memory, vs O(state) for a full clone.
+        let snapshot = Arc::new({
             let db = self.db.lock().expect("db mutex not poisoned");
             db.clone()
-        };
+        });
         let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
         let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
         let block_timestamp =
             *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned");
 
-        // Phase 4: execute each group in parallel on its own clone.
-        // Each group's txs execute sequentially (transact + commit to
-        // clone), accumulating the group's EvmState diff.
+        // Phase 4: execute each group in parallel on its own COW
+        // nested cache. Each group's txs execute sequentially
+        // (transact + commit to nested cache), accumulating the
+        // group's EvmState diff.
         let group_results: Vec<GroupExecResult> = group_order
             .par_iter()
             .map(|sender| {
                 let txs = groups.get(sender).expect("group exists");
-                let mut db = snapshot.clone();
+                // COW nested cache: empty local cache, reads from
+                // the shared parent on miss.
+                let mut db: CacheDB<SharedCacheDB> = CacheDB::new(SharedCacheDB(snapshot.clone()));
                 let mut accumulated_state: EvmState = EvmState::default();
                 let mut tx_results: Vec<(
                     usize,
@@ -1037,6 +1042,67 @@ impl EvmModule {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+/// A shared reference to a `CacheDB<EmptyDB>` for copy-on-write
+/// nested caches.
+///
+/// This wrapper implements [`DatabaseRef`] by delegating to the
+/// inner `CacheDB`. It is the key to efficient parallel speculative
+/// execution: each worker gets a
+/// `CacheDB::new(SharedCacheDB(arc_clone))`, which starts with an
+/// empty local cache and reads from the shared parent on cache miss.
+/// Per-worker initialization cost is O(1) instead of O(state), and
+/// per-worker memory is O(touched) instead of O(state).
+///
+/// # Why not `CacheDB::nest()`?
+///
+/// `nest()` consumes `self`, so it can only create one nested
+/// cache. We need N nested caches (one per sender group) sharing
+/// the same parent. `SharedCacheDB(Arc<...>)` lets us share the
+/// parent across all workers via cheap `Arc` clones.
+///
+/// # Error type
+///
+/// The error type is [`Infallible`] — `EmptyDB` never returns
+/// errors, and `CacheDB<EmptyDB>` delegates to it on cache miss.
+/// The shared parent is read-only, so no errors can arise from
+/// concurrent reads.
+#[derive(Debug, Clone)]
+struct SharedCacheDB(Arc<CacheDB<EmptyDB>>);
+
+impl DatabaseRef for SharedCacheDB {
+    type Error = std::convert::Infallible;
+
+    #[inline]
+    fn basic_ref(
+        &self,
+        address: revm::primitives::Address,
+    ) -> Result<Option<revm::database::state::AccountInfo>, Self::Error> {
+        self.0.basic_ref(address)
+    }
+
+    #[inline]
+    fn code_by_hash_ref(
+        &self,
+        code_hash: revm::primitives::B256,
+    ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+        self.0.code_by_hash_ref(code_hash)
+    }
+
+    #[inline]
+    fn storage_ref(
+        &self,
+        address: revm::primitives::Address,
+        index: revm::primitives::U256,
+    ) -> Result<revm::primitives::U256, Self::Error> {
+        self.0.storage_ref(address, index)
+    }
+
+    #[inline]
+    fn block_hash_ref(&self, number: u64) -> Result<revm::primitives::B256, Self::Error> {
+        self.0.block_hash_ref(number)
     }
 }
 
