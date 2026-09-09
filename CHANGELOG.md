@@ -12,6 +12,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **BLS signature verification in the consensus vote path (C1 fix)** (2026-09-10)
+  - The oxideBFT engine now verifies every vote's BLS signature in
+    `collect_vote` and every QC's aggregate signature in
+    `deliver_qc`. A forged vote or QC is rejected with
+    `ConsensusError`. The multi-node devnet uses real BLS keys and
+    real verification.
+  - 4 new forgery-rejection tests prove the fix works.
+
+  **In plain words:** Oxide's consensus engine now checks the
+  cryptographic signature on every vote and every quorum
+  certificate. Before this fix, any node could fabricate votes and
+  forge a quorum certificate for an arbitrary block — the BFT
+  safety guarantee was vacuous. Now a forged vote or QC is
+  mathematically rejected. This is the cryptographic foundation
+  that makes the blockchain tamper-proof.
+
 - **Journal replay: state root bit-exact (Phase 1 final gate)** (2026-09-09)
   - `storage` crate gains a journal-replay integration test
     (`tests/journal_replay.rs`) that writes finalized blocks to

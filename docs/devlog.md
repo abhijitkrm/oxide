@@ -1940,3 +1940,80 @@ Cross-cutting: none of the consensus path is authenticated (C1).
 Recommendation recorded: complete both P0s before starting Phase 2
 work — building on unauthenticated consensus and a mint-only bank
 means every later test inherits the flaw.
+
+## Session 18 — C1 fix: BLS verification in the production vote path
+
+The C1 audit finding: `crypto::aggregate_verify` was called in
+exactly two places — both tests. The production path
+`collect_vote` → `try_form_qc` → `deliver_qc` stored votes by
+index and formed QCs with zero authentication. Any single node
+could fabricate all 3f+1 votes and form a "QC" for an arbitrary
+block. BFT safety was vacuous.
+
+### What changed
+
+**`consensus/src/engine.rs`:**
+- Added `ConsensusError` enum with `InvalidVoteSignature`,
+  `InvalidQcSignature`, and `SignerOutOfBounds` variants. These
+  indicate byzantine behavior (forged signatures), distinct from
+  operational errors.
+- Added `verify_signatures: bool` field to `OxideBft`, defaulting
+  to `true` (production). Conformance tests call
+  `without_signature_verification()` to skip; the multi-node
+  simulation uses real keys + verification.
+- `collect_vote` now returns `Result<(), ConsensusError>` and
+  verifies each vote's BLS signature against the voter's public
+  key from the validator set. The signed message is the block
+  hash under `Domain::Vote`.
+- `deliver_qc` now returns `Result<(), ConsensusError>` and
+  verifies the QC's aggregate signature against the public keys
+  of the signers identified by the signer bitmap. A forged QC
+  (wrong aggregate, or aggregate over a different message) is
+  rejected.
+- Added `verify_qc_signature` helper that extracts signer PKs
+  from the bitmap and calls `crypto::aggregate_verify`.
+
+**`devnet/src/multinode.rs`:**
+- The multi-node runner now generates real BLS secret keys for
+  each validator (deterministic, from fixed IKM) and sets them
+  on each engine via `with_secret_key`. The validator set
+  contains the real public keys.
+- The leader self-vote is now signed with the leader's real BLS
+  key (was `Signature::ZERO`).
+- All `collect_vote` and `deliver_qc` calls handle the `Result`
+  and panic on error (a verification failure in the sim is a
+  bug, not byzantine behavior).
+- Added `secret_keys` field to `MultiNodeDevnet` for timeout
+  signature signing (future work).
+
+**Tests:**
+- 4 new forgery-rejection tests in `consensus/src/engine.rs`:
+  - `collect_vote_rejects_forged_signature`: a vote signed by
+    key[2] but claimed from validator 1 is rejected.
+  - `collect_vote_rejects_out_of_bounds_voter`: voter index 99
+    (n=4) is rejected.
+  - `deliver_qc_rejects_forged_aggregate`: a QC with all-zero
+    aggregate but a full signer bitmap is rejected.
+  - `collect_vote_accepts_valid_signature`: a valid vote (signed
+    by the claimed voter's key) is accepted.
+- Updated all existing test callers to handle `Result` returns.
+  Conformance-mode tests (no BLS keys) call
+  `without_signature_verification()`.
+- The `bls_signed_vote_verifies` test now uses a validator set
+  with the real PK (was using a fake `pk(1)`).
+
+### What is NOT changed
+
+- Timeout signatures are still `Signature::ZERO` — the pacemaker
+  counts bits but does not verify timeout signatures. This is a
+  separate gap (the pacemaker needs a `verify_timeout_signature`
+  path). The C1 fix is specifically about vote/QC verification.
+- The `try_form_qc` function does not re-verify signatures — it
+  aggregates already-verified signatures. The protection against a
+  byzantine leader fabricating the aggregate is in `deliver_qc`,
+  where the receiver verifies the QC.
+
+### Verification
+
+218 tests pass (was 214, +4 forgery tests). fmt clean. clippy
+`-D warnings` clean. cargo deny ok.

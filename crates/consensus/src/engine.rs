@@ -100,6 +100,46 @@ impl std::fmt::Display for EpochRotationError {
 
 impl std::error::Error for EpochRotationError {}
 
+/// Errors from consensus message verification (C1 fix).
+///
+/// These are distinct from operational errors (io, codec): they
+/// indicate byzantine behavior — a peer sent a vote or QC with an
+/// invalid signature. The caller should penalize the peer, not
+/// retry the operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsensusError {
+    /// A vote's signature did not verify against the claimed voter's
+    /// public key. The voter index may be out of bounds or the
+    /// signature may be forged.
+    InvalidVoteSignature {
+        /// The validator index that allegedly signed.
+        voter: ValidatorIndex,
+    },
+    /// A QC's aggregate signature did not verify against the signer
+    /// bitmap + validator set. The leader may be byzantine or the QC
+    /// may be corrupted in transit.
+    InvalidQcSignature,
+    /// The signer bitmap references a validator index that is out of
+    /// bounds for the current validator set.
+    SignerOutOfBounds,
+}
+
+impl std::fmt::Display for ConsensusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidVoteSignature { voter } => {
+                write!(f, "invalid vote signature from validator {voter}")
+            }
+            Self::InvalidQcSignature => write!(f, "invalid QC aggregate signature"),
+            Self::SignerOutOfBounds => {
+                write!(f, "signer bitmap references out-of-bounds validator")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConsensusError {}
+
 /// The oxideBFT consensus engine.
 ///
 /// Implements `ports::ConsensusEngine`. In single-validator mode
@@ -157,6 +197,17 @@ pub struct OxideBft {
     votes: Vec<Option<Vote>>,
     /// Number of votes collected in the current view.
     vote_count: usize,
+    /// Whether to verify BLS signatures on votes and QCs (C1 fix).
+    ///
+    /// `true` (production): every vote's signature is verified in
+    /// `collect_vote`, and every QC's aggregate is verified in
+    /// `deliver_qc`. A forged vote or QC is rejected with
+    /// [`ConsensusError`].
+    ///
+    /// `false` (conformance mode): signature verification is skipped.
+    /// Used only by pure-logic tests that don't set BLS keys. The
+    /// multi-node simulation uses real keys + verification.
+    verify_signatures: bool,
 }
 
 impl OxideBft {
@@ -200,6 +251,7 @@ impl OxideBft {
             epoch,
             votes: vec![None; n],
             vote_count: 0,
+            verify_signatures: true,
         }
     }
 
@@ -209,6 +261,23 @@ impl OxideBft {
     #[must_use]
     pub fn with_secret_key(mut self, sk: crypto::BlsSecretKey) -> Self {
         self.secret_key = Some(sk);
+        self
+    }
+
+    /// Disable BLS signature verification (conformance mode only).
+    ///
+    /// By default, the engine verifies every vote signature in
+    /// `collect_vote` and every QC aggregate in `deliver_qc`. This
+    /// is the production setting — a forged vote or QC is rejected
+    /// with [`ConsensusError`].
+    ///
+    /// Conformance tests that don't set BLS keys (votes carry
+    /// `Signature::ZERO`) call this to skip verification. The
+    /// multi-node simulation does NOT call this — it uses real keys
+    /// and real verification.
+    #[must_use]
+    pub fn without_signature_verification(mut self) -> Self {
+        self.verify_signatures = false;
         self
     }
 
@@ -481,12 +550,52 @@ impl OxideBft {
     /// Leader: collect a vote from validator `voter`. Stores the vote
     /// for later QC formation. The `voter` index identifies which
     /// slot in the signer bitmap to set.
-    pub fn collect_vote(&mut self, voter: ValidatorIndex, vote: Vote) {
+    ///
+    /// # Signature verification (C1 fix)
+    ///
+    /// When `verify_signatures` is `true` (production), the vote's
+    /// signature is verified against the voter's public key from the
+    /// validator set. A forged vote is rejected with
+    /// [`ConsensusError::InvalidVoteSignature`]. The signed message
+    /// is the vote's `block_hash` (32 bytes) under `Domain::Vote`.
+    ///
+    /// # Errors
+    /// Returns [`ConsensusError::InvalidVoteSignature`] if the
+    /// voter index is out of bounds or the signature does not verify.
+    pub fn collect_vote(
+        &mut self,
+        voter: ValidatorIndex,
+        vote: Vote,
+    ) -> Result<(), ConsensusError> {
         let idx = usize::from(voter);
-        if idx < self.votes.len() && self.votes[idx].is_none() {
-            self.votes[idx] = Some(vote);
-            self.vote_count += 1;
+        if idx >= self.votes.len() {
+            return Err(ConsensusError::InvalidVoteSignature { voter });
         }
+        // Already collected — idempotent (not an error, just a no-op).
+        if self.votes[idx].is_some() {
+            return Ok(());
+        }
+
+        // C1 fix: verify the vote's BLS signature against the voter's
+        // public key. The signed message is the block hash (32 bytes)
+        // under Domain::Vote — the same domain used by `sign_vote`.
+        if self.verify_signatures {
+            let pk = self
+                .validator_set
+                .validator(voter)
+                .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+            crypto::verify(
+                &vote.signature,
+                crypto::hash::Domain::Vote,
+                vote.block_hash.as_bytes(),
+                pk,
+            )
+            .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+        }
+
+        self.votes[idx] = Some(vote);
+        self.vote_count += 1;
+        Ok(())
     }
 
     /// Leader: try to form a QC from collected votes. Returns the QC
@@ -543,7 +652,29 @@ impl OxideBft {
     /// The QC's block must already be stored (via `propose` or
     /// `vote`); if not, the QC is accepted but no commit check runs
     /// (the block will be committed when it's eventually received).
-    pub fn deliver_qc(&mut self, qc: QuorumCertificate) {
+    ///
+    /// # Signature verification (C1 fix)
+    ///
+    /// When `verify_signatures` is `true` (production), the QC's
+    /// aggregate signature is verified against the public keys of
+    /// the signers identified by the signer bitmap. A forged QC is
+    /// rejected with [`ConsensusError::InvalidQcSignature`]. The
+    /// signed message is the QC's `block_hash` under `Domain::Vote`.
+    ///
+    /// # Errors
+    /// Returns [`ConsensusError::InvalidQcSignature`] if the
+    /// aggregate signature does not verify, or
+    /// [`ConsensusError::SignerOutOfBounds`] if the bitmap references
+    /// a validator past the end of the set.
+    pub fn deliver_qc(&mut self, qc: QuorumCertificate) -> Result<(), ConsensusError> {
+        // C1 fix: verify the QC's aggregate signature against the
+        // signer bitmap + validator set. The signed message is the
+        // block hash (32 bytes) under Domain::Vote — the same domain
+        // used by `sign_vote` and verified in `collect_vote`.
+        if self.verify_signatures {
+            self.verify_qc_signature(&qc)?;
+        }
+
         // Update the highest QC.
         self.high_qc = Some(qc.clone());
 
@@ -559,7 +690,7 @@ impl OxideBft {
                     self.commit_block(pending_hash);
                     // The QC's block becomes the new pending block.
                     self.pending = Some(PendingBlock { hash: qc.block_hash, proposal });
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -569,6 +700,47 @@ impl OxideBft {
         if let Some((_, proposal)) = self.blocks.get(&qc.block_hash).cloned() {
             self.pending = Some(PendingBlock { hash: qc.block_hash, proposal });
         }
+        Ok(())
+    }
+
+    /// Verify a QC's aggregate signature against the signer bitmap
+    /// and the validator set's public keys.
+    ///
+    /// Extracts the public keys of the signers from the bitmap, then
+    /// calls `crypto::aggregate_verify` with the QC's aggregate
+    /// signature, the block hash as the message, and `Domain::Vote`.
+    ///
+    /// # Errors
+    /// Returns [`ConsensusError::SignerOutOfBounds`] if the bitmap
+    /// references a validator past the end of the set, or
+    /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
+    /// not verify.
+    fn verify_qc_signature(&self, qc: &QuorumCertificate) -> Result<(), ConsensusError> {
+        // Extract the signer public keys from the bitmap.
+        let mut signer_pks: Vec<crypto::bls::PublicKey> = Vec::new();
+        for (i, byte) in qc.signer_bitmap.iter().enumerate() {
+            for bit in 0..8 {
+                if (byte >> bit) & 1 == 1 {
+                    let idx = u16::try_from(i * 8 + bit)
+                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                    let pk = self
+                        .validator_set
+                        .validator(idx)
+                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                    signer_pks.push(*pk);
+                }
+            }
+        }
+        if signer_pks.is_empty() {
+            return Err(ConsensusError::InvalidQcSignature);
+        }
+        crypto::aggregate_verify(
+            &qc.aggregate_signature,
+            crypto::hash::Domain::Vote,
+            qc.block_hash.as_bytes(),
+            &signer_pks,
+        )
+        .map_err(|_| ConsensusError::InvalidQcSignature)
     }
 
     /// Commit `block_hash`: look up the block, create a
@@ -686,8 +858,16 @@ impl OxideBft {
             aggregate_signature,
         };
 
-        // Deliver the QC (checks 2-chain commit).
-        self.deliver_qc(qc);
+        // Deliver the QC (checks 2-chain commit). In single-validator
+        // mode the QC was self-formed: the aggregate signature is
+        // built from our own `sign_vote` output, and the signer
+        // bitmap contains only our own index. Verification cannot
+        // fail unless the BLS signing or verification logic is
+        // broken — a true invariant violation that must abort loud.
+        // Invariant: `sign_vote` and `verify` use the same domain
+        // (Domain::Vote) and the same message (block_hash); the
+        // secret key's public key is in the validator set.
+        self.deliver_qc(qc).expect("self-formed QC must verify (invariant: signing and verification use the same domain + message + key)");
 
         // Advance the view.
         self.advance_view();
@@ -738,7 +918,7 @@ mod tests {
 
     fn make_engine() -> OxideBft {
         let app = Arc::new(MockApp::new());
-        OxideBft::new(app, single_validator_set())
+        OxideBft::new(app, single_validator_set()).without_signature_verification()
     }
 
     #[test]
@@ -845,7 +1025,7 @@ mod tests {
 
     fn make_multi_engine(idx: ValidatorIndex) -> OxideBft {
         let app = Arc::new(MockApp::new());
-        OxideBft::with_index(app, four_validator_set(), idx)
+        OxideBft::with_index(app, four_validator_set(), idx).without_signature_verification()
     }
 
     /// Drive one happy-path round with 4 validators:
@@ -878,14 +1058,14 @@ mod tests {
             block_hash,
             signature: Signature::ZERO,
         };
-        leader.collect_vote(leader_idx, leader_vote);
+        leader.collect_vote(leader_idx, leader_vote).expect("conformance: no verification");
 
         // 3. Followers vote.
         for (i, follower) in followers.iter_mut().enumerate() {
             if let Some(vote) = follower.vote(&header, &proposal) {
                 // Voter index is i+1 (leader is 0, followers are 1..n).
                 let voter_idx = u16::try_from(i + 1).expect("validator index fits u16");
-                leader.collect_vote(voter_idx, vote);
+                leader.collect_vote(voter_idx, vote).expect("conformance: no verification");
             }
         }
 
@@ -893,9 +1073,9 @@ mod tests {
         let qc = leader.try_form_qc().expect("quorum should be reached");
 
         // 5. All validators receive the QC.
-        leader.deliver_qc(qc.clone());
+        leader.deliver_qc(qc.clone()).expect("conformance: no verification");
         for follower in followers.iter_mut() {
-            follower.deliver_qc(qc.clone());
+            follower.deliver_qc(qc.clone()).expect("conformance: no verification");
         }
 
         // 6. Advance the view on all validators.
@@ -991,11 +1171,13 @@ mod tests {
 
     #[test]
     fn bls_signed_vote_verifies() {
-        // Single validator with a real BLS key.
+        // Single validator with a real BLS key. The validator set
+        // must contain the real PK derived from the secret key so
+        // that deliver_qc's signature verification passes.
         let key = bls_key(1);
         let pk = key.public_key();
         let app = Arc::new(MockApp::new());
-        let vs = single_validator_set();
+        let vs = ValidatorSet::new(vec![pk], vec![1]).expect("1 validator with real PK");
         let mut engine = OxideBft::new(app, vs).with_secret_key(key);
         engine.submit_tx(TxBytes::new(vec![1]));
         engine.run_until_idle();
@@ -1046,20 +1228,24 @@ mod tests {
 
         // Leader self-votes.
         let leader_sig = keys[0].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
-        leader.collect_vote(
-            0,
-            Vote {
-                view: header.view,
-                phase: VotePhase::Prepare,
-                block_hash,
-                signature: leader_sig,
-            },
-        );
+        leader
+            .collect_vote(
+                0,
+                Vote {
+                    view: header.view,
+                    phase: VotePhase::Prepare,
+                    block_hash,
+                    signature: leader_sig,
+                },
+            )
+            .expect("valid self-vote must verify");
 
         // Followers vote.
         for (i, follower) in followers.iter_mut().enumerate() {
             if let Some(vote) = follower.vote(&header, &proposal) {
-                leader.collect_vote(u16::try_from(i + 1).expect("validator index fits u16"), vote);
+                leader
+                    .collect_vote(u16::try_from(i + 1).expect("validator index fits u16"), vote)
+                    .expect("valid follower vote must verify");
             }
         }
 
@@ -1079,6 +1265,121 @@ mod tests {
             &pks,
         );
         assert!(result.is_ok(), "QC aggregate signature must verify against all 4 keys");
+    }
+
+    // ---- C1 fix: signature verification tests ----
+    //
+    // These tests prove the production vote path rejects forged
+    // votes and QCs (the C1 audit finding). A forged vote has a
+    // signature that does not verify against the claimed voter's
+    // public key. A forged QC has an aggregate signature that does
+    // not verify against the signer bitmap's public keys.
+
+    #[test]
+    fn collect_vote_rejects_forged_signature() {
+        // 4 validators with real BLS keys. The leader has verification
+        // enabled (the default). A vote with a forged signature (signed
+        // by a different key) must be rejected.
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut leader = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+            .with_secret_key(keys[0].clone());
+
+        // Submit a tx and propose.
+        leader.submit_tx(TxBytes::new(vec![42]));
+        let (header, _proposal) = leader.propose().expect("propose");
+        let block_hash = OxideBft::block_hash(&header);
+
+        // Forge a vote: sign with key[2] but claim it's from validator 1.
+        // The signature will verify against key[2]'s PK, not key[1]'s PK.
+        let forged_sig = keys[2].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        let forged_vote = Vote {
+            view: header.view,
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature: forged_sig,
+        };
+
+        // collect_vote must reject the forged vote.
+        let err = leader.collect_vote(1, forged_vote).expect_err("forged vote must be rejected");
+        assert_eq!(err, ConsensusError::InvalidVoteSignature { voter: 1 });
+    }
+
+    #[test]
+    fn collect_vote_rejects_out_of_bounds_voter() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut leader =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        let block_hash = Hash::ZERO;
+        let vote = Vote {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature: Signature::ZERO,
+        };
+
+        // Voter index 99 is out of bounds (n=4).
+        let err = leader.collect_vote(99, vote).expect_err("out-of-bounds voter must be rejected");
+        assert_eq!(err, ConsensusError::InvalidVoteSignature { voter: 99 });
+    }
+
+    #[test]
+    fn deliver_qc_rejects_forged_aggregate() {
+        // 4 validators with real BLS keys. A QC with a forged aggregate
+        // signature (all zeros) must be rejected by deliver_qc.
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut engine =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        // Forge a QC: all-zero aggregate signature, but the signer
+        // bitmap claims all 4 validators signed.
+        let forged_qc = QuorumCertificate {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111], // all 4 validators
+            aggregate_signature: AggregateSignature::ZERO, // forged
+        };
+
+        let err = engine.deliver_qc(forged_qc).expect_err("forged QC must be rejected");
+        assert_eq!(err, ConsensusError::InvalidQcSignature);
+    }
+
+    #[test]
+    fn collect_vote_accepts_valid_signature() {
+        // 4 validators with real BLS keys. A valid vote (signed by
+        // the claimed voter's key) must be accepted.
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut leader =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        leader.submit_tx(TxBytes::new(vec![42]));
+        let (header, _proposal) = leader.propose().expect("propose");
+        let block_hash = OxideBft::block_hash(&header);
+
+        // Validator 1 signs its own vote with its own key.
+        let valid_sig = keys[1].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        let valid_vote =
+            Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature: valid_sig };
+
+        leader.collect_vote(1, valid_vote).expect("valid vote must be accepted");
     }
 
     // ---- Epoch rotation tests (stage 6) ----
@@ -1425,6 +1726,7 @@ mod tests {
     /// A deterministic multi-node simulation. Creates N validators,
     /// drives `rounds` happy-path rounds with txs, and returns the
     /// finalized blocks from each validator.
+    #[allow(clippy::too_many_lines)] // test helper: the .expect() calls for C1 verification added 4 lines
     fn run_simulation(n: usize, txs_per_round: usize, rounds: usize) -> Vec<Vec<FinalizedBlock>> {
         let pks: Vec<crypto::bls::PublicKey> = (1..=u8::try_from(n).unwrap()).map(pk).collect();
         let stakes = vec![1u64; n];
@@ -1437,6 +1739,7 @@ mod tests {
                     vs.clone(),
                     u16::try_from(i).unwrap(),
                 )
+                .without_signature_verification()
             })
             .collect();
 
@@ -1469,7 +1772,9 @@ mod tests {
                 block_hash,
                 signature: Signature::ZERO,
             };
-            engines[leader_idx].collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote);
+            engines[leader_idx]
+                .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
+                .expect("conformance: no verification");
 
             // All followers vote (deterministic order: 0, 1, 2, ...).
             // Collect votes first to avoid double mutable borrow.
@@ -1483,7 +1788,9 @@ mod tests {
                 }
             }
             for (voter, vote) in follower_votes {
-                engines[leader_idx].collect_vote(voter, vote);
+                engines[leader_idx]
+                    .collect_vote(voter, vote)
+                    .expect("conformance: no verification");
             }
 
             // Leader forms QC.
@@ -1493,7 +1800,7 @@ mod tests {
 
             // All validators receive the QC (deterministic order).
             for engine in &mut engines {
-                engine.deliver_qc(qc.clone());
+                engine.deliver_qc(qc.clone()).expect("conformance: no verification");
             }
 
             // All validators advance the view (deterministic order).
@@ -1525,7 +1832,9 @@ mod tests {
             block_hash,
             signature: Signature::ZERO,
         };
-        engines[leader_idx].collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote);
+        engines[leader_idx]
+            .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
+            .expect("conformance: no verification");
         let mut follower_votes = Vec::new();
         for (i, engine) in engines.iter_mut().enumerate() {
             if i == leader_idx {
@@ -1536,11 +1845,11 @@ mod tests {
             }
         }
         for (voter, vote) in follower_votes {
-            engines[leader_idx].collect_vote(voter, vote);
+            engines[leader_idx].collect_vote(voter, vote).expect("conformance: no verification");
         }
         let qc = engines[leader_idx].try_form_qc().expect("flush quorum");
         for engine in &mut engines {
-            engine.deliver_qc(qc.clone());
+            engine.deliver_qc(qc.clone()).expect("conformance: no verification");
         }
         for engine in &mut engines {
             engine.advance_view();

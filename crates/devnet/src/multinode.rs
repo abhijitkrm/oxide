@@ -48,6 +48,10 @@ pub struct MultiNodeDevnet {
     apps: Vec<Arc<Executor>>,
     /// The shared validator set.
     validator_set: ValidatorSet,
+    /// The BLS secret keys for each validator (used to sign timeout
+    /// messages during view changes). Stored alongside the engines
+    /// so the runner can produce real timeout signatures.
+    secret_keys: Vec<crypto::BlsSecretKey>,
     /// The number of validators.
     n: usize,
 }
@@ -65,7 +69,9 @@ impl MultiNodeDevnet {
     ///
     /// Each validator gets a fresh [`Executor`] with core, bank, and
     /// staking modules registered. The engines share a single
-    /// [`ValidatorSet`] with equal stakes.
+    /// [`ValidatorSet`] with equal stakes. Each validator gets a real
+    /// BLS secret key (deterministic, from fixed IKM) so that vote
+    /// and QC signatures are real and verified by the engine (C1 fix).
     ///
     /// # Panics
     ///
@@ -73,25 +79,33 @@ impl MultiNodeDevnet {
     /// (impossible with equal stakes ≥ 1).
     pub fn new(n: usize, max_mempool_entries: usize) -> Self {
         assert!(n > 0, "devnet must have at least one validator");
-        let pks: Vec<crypto::bls::PublicKey> = (1..=u8::try_from(n).unwrap()).map(pk).collect();
+        // Generate real BLS keys for each validator. The IKM is
+        // deterministic (byte i repeated 32 times) so the same `n`
+        // always produces the same keys — the simulation is
+        // reproducible (determinism contract).
+        let secret_keys: Vec<crypto::BlsSecretKey> =
+            (1..=u8::try_from(n).unwrap()).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
         let stakes = vec![1u64; n];
         let vs = ValidatorSet::new(pks, stakes).expect("validator set");
 
         let mut engines = Vec::with_capacity(n);
         let mut apps = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, key) in secret_keys.iter().cloned().enumerate() {
             let mut executor = Executor::new(max_mempool_entries);
             executor.register_module(Arc::new(core::CoreModule::new()));
             executor.register_module(Arc::new(bank::BankModule::new()));
             executor.register_module(Arc::new(staking::StakingModule::new()));
             let app: Arc<Executor> = Arc::new(executor);
             let app_dyn: Arc<dyn AppInterface> = app.clone();
-            let engine = OxideBft::with_index(app_dyn, vs.clone(), u16::try_from(i).unwrap());
+            let engine = OxideBft::with_index(app_dyn, vs.clone(), u16::try_from(i).unwrap())
+                .with_secret_key(key);
             engines.push(engine);
             apps.push(app);
         }
 
-        Self { engines, apps, validator_set: vs, n }
+        Self { engines, apps, validator_set: vs, secret_keys, n }
     }
 
     /// The number of validators.
@@ -303,14 +317,19 @@ impl MultiNodeDevnet {
             .unwrap_or_else(|| panic!("leader {leader_idx} should propose"));
         let block_hash = OxideBft::block_hash(&header);
 
-        // Leader self-votes.
+        // Leader self-votes. The leader signs its own block with its
+        // real BLS key (C1 fix: all votes carry real signatures).
+        let leader_sig =
+            self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
         let leader_vote = types::Vote {
             view: header.view,
             phase: types::VotePhase::Prepare,
             block_hash,
-            signature: crypto::bls::Signature::ZERO,
+            signature: leader_sig,
         };
-        self.engines[leader_idx].collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote);
+        self.engines[leader_idx]
+            .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
+            .expect("leader self-vote must verify");
 
         // Followers vote in index order (deterministic).
         let mut follower_votes = Vec::new();
@@ -323,7 +342,7 @@ impl MultiNodeDevnet {
             }
         }
         for (voter, vote) in follower_votes {
-            self.engines[leader_idx].collect_vote(voter, vote);
+            self.engines[leader_idx].collect_vote(voter, vote).expect("follower vote must verify");
         }
 
         // Leader forms QC.
@@ -331,7 +350,7 @@ impl MultiNodeDevnet {
 
         // All validators receive the QC and advance the view.
         for engine in &mut self.engines {
-            engine.deliver_qc(qc.clone());
+            engine.deliver_qc(qc.clone()).expect("QC must verify");
         }
         for engine in &mut self.engines {
             engine.advance_view();
@@ -361,10 +380,13 @@ impl MultiNodeDevnet {
     }
 }
 
-/// Construct a test public key from a single byte (deterministic,
-/// non-cryptographic — for simulation only).
-fn pk(byte: u8) -> crypto::bls::PublicKey {
-    crypto::bls::PublicKey([byte; crypto::bls::PublicKey::LEN])
+/// Construct a deterministic BLS secret key from a single byte
+/// (the byte repeated 32 times as IKM). The same byte always
+/// produces the same key — the simulation is reproducible
+/// (determinism contract). Used for real vote/QC signatures.
+fn bls_key(byte: u8) -> crypto::BlsSecretKey {
+    let ikm = vec![byte; 32];
+    crypto::BlsSecretKey::from_ikm(&ikm).expect("BLS key generation from valid IKM")
 }
 
 /// Construct a simple tx for round `r`: a bank transfer of `r+1`
