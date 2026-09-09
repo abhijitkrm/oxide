@@ -12,6 +12,47 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Storage backend perf report card (Phase 2)** (2026-01-22)
+  - Added a criterion benchmark comparing all `StorageBackend`
+    adapters (`Volatile`, `RedbBackend`, `RocksDbBackend`,
+    `MdbxBackend`) on `apply_batch` (block commit) and `get`
+    (point read). Results: RocksDB leads writes (4M elem/s),
+    MDBX leads reads (3M elem/s), redb is safest (no C dep).
+  - In plain words: we measured how fast each storage backend
+    runs, so users can choose the right one for their hardware.
+
+- **EVM precompiles (Phase 2)** (2026-01-22)
+  - Added EVM precompiles that bridge EVM smart contracts to
+    native Oxide modules (bank, staking). EVM contracts can now
+    call `BANK_TRANSFER`, `BANK_BALANCE`, and `STAKING_DELEGATE`
+    via precompile addresses (`0x0B_01`, `0x0B_02`, `0x0C_01`).
+  - In plain words: smart contracts can now use the chain's
+    native features (banking, staking) without re-implementing
+    them in Solidity.
+
+- **Dynamic EIP-1559 base fee (Phase 2)** (2026-01-22)
+  - Added the EIP-1559 dynamic base fee adjustment algorithm.
+    The base fee now adjusts up when blocks are congested and
+    down when underutilized, matching Ethereum's fee market.
+  - In plain words: gas prices now respond to demand
+    automatically — high demand raises the price, low demand
+    lowers it.
+
+- **MDBX StorageBackend adapter (Phase 2)** (2026-01-22)
+  - Added the `MDBX` `StorageBackend` adapter — the LMDB-
+    compatible, improved B-tree KV store. Completes the
+    plan.md §2.3 adapter set: Volatile, redb, RocksDB, MDBX.
+    Behind the `mdbx` feature flag. MPL-2.0. C binding.
+  - In plain words: users can now choose MDBX (fast reads via
+    memory-mapped B-trees) as their storage backend.
+
+- **RocksDB StorageBackend adapter (Phase 2)** (2026-01-22)
+  - Added the `RocksDB` `StorageBackend` adapter — the
+    industry-standard LSM KV store. Behind the `rocksdb`
+    feature flag. Apache-2.0. C++ binding.
+  - In plain words: users can now choose RocksDB (fast writes
+    via log-structured merge-trees) as their storage backend.
+
 - **Indexer/explorer v0 (Phase 2)** (2026-01-22)
   - Added the `indexer` crate — an in-memory index of finalized
     blocks, transactions, and events for block explorer queries.

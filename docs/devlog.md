@@ -2792,3 +2792,141 @@ Remaining Phase 2 work:
 - MetaMask/Foundry/Blockscout integration tests
 - ≥1 GG/s Uniswap-transfer benchmark (requires 16-core rig)
 - Storage performance report cards
+
+### RocksDB StorageBackend adapter
+
+The RocksDB adapter (plan.md §2.3) is the second disk-backed
+StorageBackend — the industry-standard LSM KV store.
+
+RocksDB adapter (`crates/storage/src/rocksdb_backend.rs`):
+- `RocksDbBackend` wraps a `rocksdb::DB` file.
+- `apply_batch` uses a single `WriteBatch` (atomic per batch).
+- Crash-safe: RocksDB is ACID-compliant with WAL.
+- Full snapshot export/import support.
+- 6 unit tests + conformance suite passing.
+
+RocksDB is behind the `rocksdb` feature flag. Apache-2.0
+(GPL-3.0-compatible). C++ binding — requires a C++ compiler.
+
+Commit: `dfe3704`.
+
+### MDBX StorageBackend adapter
+
+The MDBX adapter (plan.md §2.3) is the third disk-backed
+StorageBackend — the LMDB-compatible, improved B-tree store.
+This completes the plan.md §2.3 adapter set: Volatile, redb,
+RocksDB, MDBX.
+
+MDBX adapter (`crates/storage/src/mdbx_backend.rs`):
+- `MdbxBackend` wraps a `libmdbx::Database` file.
+- `apply_batch` uses a single read-write transaction.
+- Crash-safe: MDBX is ACID-compliant.
+- Full snapshot export/import support.
+- 5 unit tests + conformance suite passing.
+
+MDBX is behind the `mdbx` feature flag. MPL-2.0
+(GPL-3.0-compatible). C binding. The single-writer model fits
+Oxide's single-writer commit pipeline (plan.md §8).
+
+Commit: `245d9c8`.
+
+### Dynamic EIP-1559 base fee adjustment
+
+The EIP-1559 fee market (plan.md §13) replaces the fixed base
+fee with the standard Ethereum dynamic adjustment algorithm.
+
+Fee module (`modules/evm/src/fee.rs`):
+- `BaseFeeState`: tracks the current base fee and block gas
+  limit.
+- `update(gas_used)`: computes the new base fee using the
+  EIP-1559 formula: delta = base_fee * (gas_used - target) /
+  target / elasticity. Congested blocks increase the fee,
+  underutilized blocks decrease it.
+- Uses u128 intermediate arithmetic to avoid overflow.
+- Elasticity multiplier = 8 (Ethereum's value).
+
+11 unit tests: target no-change, congestion increase,
+underutilization decrease, floor at 1 (integer division),
+min-1 increase, elasticity rate, compounding, oscillation
+convergence, overflow safety, target gas calculation.
+
+Commit: `7886d78`.
+
+### EVM precompiles (native module bridge)
+
+Native precompiles (plan.md §2, §13) bridge EVM smart contracts
+to native Oxide modules (bank, staking). This lets EVM
+contracts invoke native chain functionality via precompile
+addresses.
+
+Precompiles (`modules/evm/src/precompiles.rs`):
+- `PrecompileResult`: output, gas_used, success.
+- `precompile_address(module_id, op_id)`: encodes a precompile
+  address as `0x0000...OOXX`.
+- `execute_precompile`: dispatches to the native handler.
+- 3 precompiles:
+  - `BANK_TRANSFER` (0x0B_01): transfer native tokens. Gas 21k.
+  - `BANK_BALANCE` (0x0B_02): query balance. Gas 1k.
+  - `STAKING_DELEGATE` (0x0C_01): delegate. Gas 50k.
+
+Address scheme: `0x0000...OOXX` (OO=module, XX=op), keeping
+them separate from Ethereum's standard precompiles (0x01-0x0A).
+
+14 unit tests: address encoding/decoding, module-zero
+rejection, is_precompile, bank transfer success/failure, bank
+balance, staking delegate, unknown precompile, non-precompile.
+
+Commit: `9a492aa`.
+
+### Storage backend performance report card
+
+The perf report card (plan.md §13) benchmarks all StorageBackend
+adapters on the two operations that matter: `apply_batch` (block
+commit) and `get` (point read).
+
+Benchmark (`crates/storage/benches/backend.rs`):
+- `bench_apply_batch`: 1k-key batch write across all backends.
+- `bench_get`: point read across all backends.
+- Uses `iter_with_setup` for fresh backend per iteration.
+
+Results (1k keys, 64-byte values, macOS dev machine):
+```
+apply_batch (1k keys):
+  Volatile:    74 µs  (13.5M elem/s)
+  RocksDB:    250 µs  (4.0M elem/s)
+  MDBX:       349 µs  (2.9M elem/s)
+  redb:       5.1 ms  (197K elem/s)
+get (1 key):
+  Volatile:    31 ns   (32.7M elem/s)
+  MDBX:       329 ns   (3.0M elem/s)
+  RocksDB:    470 ns   (2.1M elem/s)
+  redb:       1.2 µs   (825K elem/s)
+```
+
+Analysis: Volatile (in-memory) is fastest, as expected. Among
+disk backends, RocksDB leads on writes (LSM optimized for batch
+writes), MDBX leads on reads (B-tree with mmap). redb is slower
+(pure Rust, no mmap) but is the safest option (no C dependency).
+All four pass storage-conformance.
+
+Commit: `8ce2f3a`.
+
+### Verification (extended session)
+
+345 tests pass with --features storage/redb,storage/rocksdb,
+storage/mdbx (was 301 at Phase 2 v0 completion, +44 extended).
+fmt, clippy -D warnings, cargo deny all clean.
+
+Phase 2 extended deliverables completed:
+1. RocksDB StorageBackend adapter (+ conformance)
+2. MDBX StorageBackend adapter (+ conformance)
+3. Dynamic EIP-1559 base fee adjustment
+4. EVM precompiles (native module bridge)
+5. Storage backend performance report card (benchmarked)
+
+All four StorageBackend adapters now ship with conformance +
+benchmarks. The EVM module has dynamic fees and native
+precompiles. Phase 2 is substantially complete except for:
+- WebSocket subscriptions (eth_subscribe)
+- MetaMask/Foundry/Blockscout integration tests
+- ≥1 GG/s Uniswap-transfer benchmark (requires 16-core rig)
