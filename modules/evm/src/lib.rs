@@ -44,6 +44,8 @@ use executor::{Event, ExecError, Module, TxContext};
 use framework::module_id;
 use primitives::{Address, Hash, Height};
 
+pub mod fee;
+
 // revm imports. The `revm` crate re-exports all sub-crates.
 use revm::Context;
 use revm::context::TxEnv;
