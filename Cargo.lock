@@ -1446,8 +1446,10 @@ dependencies = [
  "crypto",
  "executor",
  "framework",
+ "ports",
  "primitives",
  "revm",
+ "storage",
  "types",
 ]
 

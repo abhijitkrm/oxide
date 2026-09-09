@@ -5,6 +5,15 @@
 //! in the Oxide module router. Native messages (bank, staking,
 //! trading) and EVM transactions share the same block and gas meter.
 //!
+//! # Reference implementation
+//!
+//! **reth** (<https://github.com/paradigmxyz/reth>) is the canonical
+//! EVM reference for Oxide — analogous to how cosmos-evm uses geth.
+//! When verifying EVM correctness (state persistence, replay
+//! integrity, gas accounting, nonce progression, JSON-RPC parity),
+//! we consult reth's execution pipeline and test suites. See
+//! `plan.md` §16 for the full reference framework.
+//!//!
 //! # What this module does
 //!
 //! - Receives raw EVM call data via the module router's `handle`
@@ -31,9 +40,10 @@
 //! - EIP-1559 gas metering (base fee + priority fee).
 //! - Basic transaction execution (call + deploy).
 //! - Account state in `CacheDB` (in-memory).
+//! - Optional `StorageBackend` persistence (flush after each block,
+//!   load on construction — added session 26).
 //!
 //! Future phases add:
-//! - `StorageBackend`-backed persistence (replacing `CacheDB`).
 //! - Precompiles that call into native modules (bank, trading).
 //! - Parallel OCC scheduler for cross-tx parallelism.
 //! - JSON-RPC + WebSocket server.
@@ -45,6 +55,7 @@ use framework::module_id;
 use primitives::{Address, Hash, Height};
 
 pub mod fee;
+mod persist;
 pub mod precompiles;
 
 // revm imports. The `revm` crate re-exports all sub-crates.
@@ -71,9 +82,12 @@ const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
 
 /// The EVM module: wraps `revm` and exposes it as an Oxide `Module`.
 ///
-/// State is stored in a `CacheDB<EmptyDB>` (in-memory). The EVM
-/// account state (balance, nonce, code, storage) lives in the cache.
-/// Phase 2 later wires this to the `StorageBackend` for persistence.
+/// State is stored in a `CacheDB<EmptyDB>` (in-memory) during
+/// execution. When a `StorageBackend` is attached via
+/// [`EvmModule::with_storage`], the cache is flushed to durable
+/// storage after each block (`end_block`) and loaded on construction.
+/// This makes the EVM state persistent across restarts and shareable
+/// between nodes — the foundation for standalone-chain operation.
 pub struct EvmModule {
     /// The in-memory EVM database (account state, code, storage).
     /// Behind a `Mutex` because `Module::handle` takes `&self`.
@@ -87,6 +101,11 @@ pub struct EvmModule {
     /// The EVM hardfork spec to use for execution.
     /// `SpecId::PRAGUE` is the latest stable mainnet spec in revm 42.
     spec: SpecId,
+    /// Optional durable storage backend. When `Some`, the EVM state
+    /// (accounts, code, storage) is flushed here after each block
+    /// and loaded on construction. When `None`, the module is
+    /// purely in-memory (useful for tests and single-block sims).
+    backend: Mutex<Option<Box<dyn storage::StorageBackend + Send>>>,
 }
 
 impl EvmModule {
@@ -105,6 +124,7 @@ impl EvmModule {
             chain_id,
             base_fee,
             spec: SpecId::PRAGUE,
+            backend: Mutex::new(None),
         }
     }
 
@@ -112,7 +132,45 @@ impl EvmModule {
     /// EVM behavior).
     #[must_use]
     pub fn with_spec(chain_id: u64, base_fee: u64, spec: SpecId) -> Self {
-        Self { db: Mutex::new(CacheDB::new(EmptyDB::new())), chain_id, base_fee, spec }
+        Self {
+            db: Mutex::new(CacheDB::new(EmptyDB::new())),
+            chain_id,
+            base_fee,
+            spec,
+            backend: Mutex::new(None),
+        }
+    }
+
+    /// Construct with a durable `StorageBackend`. Initial EVM state
+    /// (accounts, code, storage) is loaded from the backend into the
+    /// in-memory `CacheDB`. After each block, `end_block` flushes the
+    /// updated state back to the backend.
+    ///
+    /// This is the standalone-chain constructor: state persists
+    /// across restarts and can be shared between nodes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DB mutex is poisoned during `load_from_storage`.
+    /// This is unrecoverable and indicates a bug.
+    #[must_use]
+    pub fn with_storage(
+        chain_id: u64,
+        base_fee: u64,
+        backend: Box<dyn storage::StorageBackend + Send>,
+    ) -> Self {
+        let module = Self {
+            db: Mutex::new(CacheDB::new(EmptyDB::new())),
+            chain_id,
+            base_fee,
+            spec: SpecId::PRAGUE,
+            backend: Mutex::new(None),
+        };
+        // Load initial state from the backend into the CacheDB, then
+        // install the backend for future flushes.
+        module.load_from_storage(&*backend);
+        *module.backend.lock().expect("backend mutex not poisoned") = Some(backend);
+        module
     }
 
     /// The chain ID (EIP-155).
@@ -156,6 +214,7 @@ impl EvmModule {
             .caller(caller)
             .kind(if is_deploy { TxKind::Create } else { TxKind::Call(to) })
             .data(revm::primitives::Bytes::copy_from_slice(calldata))
+            .nonce(ctx.nonce)
             .build()
             .map_err(|_| ExecError::Malformed)?;
 
@@ -169,7 +228,7 @@ impl EvmModule {
 
         let result = evm
             .transact_commit(tx)
-            .map_err(|_| ExecError::ModuleRejected("evm transact failed".to_string()))?;
+            .map_err(|e| ExecError::ModuleRejected(format!("evm transact failed: {e:?}")))?;
 
         let gas_used = result.tx_gas_used();
         let success = result.is_success();
@@ -206,8 +265,13 @@ impl Module for EvmModule {
     }
 
     fn end_block(&self, _height: Height) {
-        // No per-block cleanup in v0. Future: dynamic base fee
-        // adjustment based on parent block gas usage.
+        // If a StorageBackend is attached, flush the current CacheDB
+        // state to durable storage. This makes the EVM state
+        // persistent across restarts and shareable between nodes.
+        let mut backend_guard = self.backend.lock().expect("backend mutex not poisoned");
+        if let Some(ref mut backend) = *backend_guard {
+            self.flush_to_storage(backend.as_mut());
+        }
     }
 
     fn state_root(&self) -> Hash {
@@ -274,6 +338,129 @@ impl EvmModule {
         let db = self.db.lock().expect("db mutex not poisoned");
         let evm_addr = alloy_primitives_address(addr.0);
         db.cache.accounts.get(&evm_addr).map_or(0, |a| a.info.nonce)
+    }
+
+    /// Extract the `StorageBackend` for testing. The backend is
+    /// removed from the module (set to `None`), so subsequent
+    /// `end_block` calls will not flush. The returned backend can
+    /// be passed to `EvmModule::with_storage` to create a new
+    /// module with the same persisted state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the backend mutex is poisoned or no backend is
+    /// attached (the module was constructed with `new`, not
+    /// `with_storage`).
+    #[doc(hidden)]
+    pub fn backend_for_test(&self) -> Box<dyn storage::StorageBackend + Send> {
+        let mut guard = self.backend.lock().expect("backend mutex not poisoned");
+        guard.take().expect("backend_for_test: no storage backend attached")
+    }
+
+    /// Flush the current `CacheDB` state to the `StorageBackend`.
+    ///
+    /// Serializes every account (balance, nonce, code, storage) into
+    /// a single `Op::Set` per account and applies the batch atomically.
+    /// Called from `end_block` when a backend is attached.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DB mutex is poisoned.
+    fn flush_to_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
+        let db = self.db.lock().expect("db mutex not poisoned");
+        let mut ops = Vec::with_capacity(db.cache.accounts.len());
+        for (evm_addr, account) in &db.cache.accounts {
+            // Skip accounts that don't exist (never touched).
+            if account.account_state == revm::database::AccountState::NotExisting {
+                continue;
+            }
+            let oxide_addr = Address(evm_addr.0.into());
+            let key = persist::account_key(&oxide_addr);
+
+            // Extract code bytes if present. Accounts with
+            // `KECCAK_EMPTY` code hash are EOAs — their `code` field
+            // is `Some(Bytecode::default())` which contains a single
+            // STOP opcode, but they have no real code. Skip the code
+            // bytes for these accounts so they reload as true EOAs
+            // (revm's EIP-3607 check rejects callers with any code).
+            let code_bytes: Vec<u8> = if account.info.code_hash == revm::primitives::KECCAK_EMPTY {
+                Vec::new()
+            } else {
+                account.info.code.as_ref().map_or(Vec::new(), |bc| bc.bytes_slice().to_vec())
+            };
+
+            // Extract storage slots as (slot, value) pairs.
+            // `DbAccount.storage` is `U256Map<U256>` — values are
+            // plain `U256`, not an enum with Original/Pending variants.
+            let storage_slots: Vec<(revm::primitives::U256, revm::primitives::U256)> =
+                account.storage.iter().map(|(slot, val)| (*slot, *val)).collect();
+
+            let value = persist::serialize_account(
+                account.info.balance,
+                account.info.nonce,
+                account.info.code_hash,
+                &code_bytes,
+                &storage_slots,
+            );
+            ops.push(storage::Op::Set { key, value });
+        }
+        backend.apply_batch(&ops);
+    }
+
+    /// Load EVM state from the `StorageBackend` into the `CacheDB`.
+    ///
+    /// Reads all account entries (namespace prefix `0x01`) and
+    /// populates the cache with balances, nonces, code, and storage.
+    /// Called from `with_storage` on construction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DB mutex is poisoned.
+    fn load_from_storage(&self, backend: &(dyn storage::StorageBackend + Send)) {
+        let entries = backend.range(&persist::account_prefix());
+        if entries.is_empty() {
+            return;
+        }
+        let mut db = self.db.lock().expect("db mutex not poisoned");
+        for (key, value) in entries {
+            let Some(oxide_addr) = persist::key_to_address(&key) else { continue };
+            let Some(account) = persist::deserialize_account(&value) else {
+                continue;
+            };
+            let evm_addr = alloy_primitives_address(oxide_addr.0);
+
+            // Insert account info into the cache.
+            let info = revm::database::state::AccountInfo {
+                balance: account.balance,
+                nonce: account.nonce,
+                code_hash: account.code_hash,
+                account_id: None,
+                // revm's `Bytecode::default()` contains a STOP opcode,
+                // which makes `is_empty()` return false and triggers
+                // EIP-3607 `RejectCallerWithCode`. Use `new_raw` with
+                // empty bytes to create a truly empty bytecode.
+                code: if account.code.is_empty() {
+                    Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new()))
+                } else {
+                    Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
+                        account.code.iter().copied(),
+                    )))
+                },
+            };
+            db.cache.accounts.insert(
+                evm_addr,
+                revm::database::DbAccount {
+                    info,
+                    // `None` = account exists in cache but EVM hasn't
+                    // interacted with it in this block. This is correct
+                    // for loaded state — revm will read storage from
+                    // the `DbAccount.storage` field. `StorageCleared`
+                    // would incorrectly zero out the storage.
+                    account_state: revm::database::AccountState::None,
+                    storage: account.storage.into_iter().collect(),
+                },
+            );
+        }
     }
 }
 

@@ -18,7 +18,23 @@
 //! throughput target (throughput depends on hardware).
 
 #![allow(missing_docs)]
-#![cfg(feature = "redb")]
+
+/// Fallback `main` for when no storage features are enabled.
+/// The actual benchmarks are behind `#[cfg(feature = "...")]` guards
+/// on each function. Without this, `cargo build --benches` fails
+/// with "main function not found" when no features are enabled.
+#[cfg(not(any(feature = "redb", feature = "rocksdb", feature = "mdbx")))]
+fn main() {
+    eprintln!(
+        "This benchmark requires at least one storage feature: \
+         cargo bench --features redb|rocksdb|mdbx"
+    );
+}
+
+#[cfg(any(feature = "redb", feature = "rocksdb", feature = "mdbx"))]
+criterion_group!(benches, bench_apply_batch, bench_get);
+#[cfg(any(feature = "redb", feature = "rocksdb", feature = "mdbx"))]
+criterion_main!(benches);
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use primitives::Hash;
@@ -197,6 +213,3 @@ fn bench_get(c: &mut Criterion) {
 
     group.finish();
 }
-
-criterion_group!(benches, bench_apply_batch, bench_get);
-criterion_main!(benches);

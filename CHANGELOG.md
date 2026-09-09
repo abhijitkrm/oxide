@@ -12,6 +12,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **EVM standalone-chain validation + reth reference** (2026-01-23)
+  - Wired the EVM module to `StorageBackend` for durable state
+    persistence: `EvmModule::with_storage()` loads state on
+    construction and flushes after each block. State survives
+    restarts and produces identical roots on replay.
+  - Added 8 new EVM tests: 5 multi-block integrity tests (100-block
+    state root evolution, nonce progression, gas accounting,
+    persistence round-trip, restart survival), 2 replay integrity
+    tests (deterministic roots, storage-backed replay matches
+    in-memory), and 1 standalone EVM-only chain test (50 finalized
+    blocks via `Executor` with no native modules).
+  - Added 1 ignored load test: 10,000 EVM transactions across 100
+    blocks (3,949 txs/s on M1 debug build).
+  - Established **reth** as the canonical EVM reference for Oxide
+    (analogous to cosmos-evm using geth). Added
+    `.devin/skills/evm-reference/SKILL.md`, updated `plan.md` §16,
+    `AGENTS.md`, and EVM module docs.
+  - In plain words: the EVM can now run as a standalone blockchain
+    without any native modules. State persists across restarts,
+    replays produce identical roots, and the system sustains ~4k
+    txs/s under load. reth is now our reference for verifying EVM
+    correctness.
+
 - **Audit gap fixes: sim crate, binary tests, benchmarks, CI** (2026-01-22)
   - Resolved all 4 structural gaps from the session-24 audit: created
     the `sim/` workspace crate, added 9 smoke tests across 5 binaries,

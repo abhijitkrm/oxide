@@ -3269,3 +3269,127 @@ entries. The oxide-bench registry now lists all 11 bench crates.
 405 tests pass (was 395, +10: 9 binary smoke + 1 sim). fmt, clippy
 `-D warnings`, cargo deny all clean. All 5 new bench crates compile
 and pass clippy. CI and nightly workflows updated.
+
+## 2026-01-23 — Session 26: EVM standalone-chain validation + reth reference
+
+### reth as canonical EVM reference
+
+Established **reth** (https://github.com/paradigmxyz/reth) as the
+canonical EVM reference implementation for Oxide — analogous to how
+cosmos-evm uses geth. This is reference-only (no forking, no copying);
+we study reth's design and verify our behavior matches. Both Oxide
+and reth use the `revm` crate as the shared execution engine, so core
+EVM semantics are identical. What differs is the host: state
+persistence, block sequencing, transaction routing, and JSON-RPC.
+
+- Added reth to `plan.md` §16 as the first entry (elevated from a
+  parallel-execution footnote to the EVM reference role).
+- Created `.devin/skills/evm-reference/SKILL.md` — when and how to
+  consult reth, with a subsystem mapping table.
+- Updated `AGENTS.md` with the reth reference policy.
+- Updated `modules/evm/src/lib.rs` module docs to cite reth.
+
+### Part 1: EVM state persistence via StorageBackend
+
+The EVM module previously stored all state in `CacheDB<EmptyDB>` —
+process-local, no durability. Added an optional `StorageBackend`
+layer that is flushed after each block and loaded on construction.
+
+- New `modules/evm/src/persist.rs`: key scheme (`0x01` namespace +
+  20-byte address, zero-padded to 32 bytes), account serialization
+  (balance, nonce, code_hash, code, storage slots — all big-endian
+  for deterministic serialization).
+- `EvmModule::with_storage(chain_id, base_fee, backend)`: constructs
+  the module with a `StorageBackend`, loads initial state into the
+  `CacheDB`, and flushes after each `end_block`.
+- `flush_to_storage`: iterates all `CacheDB` accounts, serializes
+  each into a single `Op::Set`, and applies the batch atomically.
+  Skips `NotExisting` accounts. Skips code bytes for EOAs
+  (`code_hash == KECCAK_EMPTY`) to avoid reloading the STOP opcode
+  in `Bytecode::default()` as "code" (triggers EIP-3607
+  `RejectCallerWithCode`).
+- `load_from_storage`: `range([0x01])` scans all EVM accounts,
+  deserializes each, and inserts into the `CacheDB` with
+  `AccountState::None` (not `StorageCleared`, which would zero
+  storage). Code is set to `Some(Bytecode::new_raw(Bytes::new()))`
+  for accounts with code, `None` for EOAs.
+
+**Bug found and fixed during implementation**: `Bytecode::default()`
+in revm 42 contains a single STOP opcode (`original_len: 0` but
+`bytecode: [0x00]`). When flushed and reloaded, this STOP opcode
+was treated as "account has code", triggering EIP-3607's
+`RejectCallerWithCode` on subsequent transactions from that account.
+Fix: check `code_hash == KECCAK_EMPTY` in `flush_to_storage` and
+skip code bytes for EOAs.
+
+**Bug found and fixed**: `TxEnv` did not set the nonce from
+`TxContext`, so multiple deploys from the same sender failed (revm
+defaulted to nonce 0, causing contract address collisions). Fix:
+added `.nonce(ctx.nonce)` to the `TxEnv` builder.
+
+### Part 2: Multi-block execution + integrity tests (5 tests)
+
+`modules/evm/tests/multiblock.rs`:
+- `multi_block_100_blocks_state_root_evolution`: 100 blocks, each
+  with one deploy. State root evolves and is deterministic across
+  independent runs.
+- `multi_block_nonce_progression_across_blocks`: 10 blocks, nonce
+  increments per deploy.
+- `multi_block_gas_accounting_per_block`: 10 blocks, same tx → same
+  gas in every block (EVM determinism).
+- `state_persistence_round_trip`: 5 blocks with `Volatile` backend,
+  extract backend, create new module, verify state root and nonce
+  match.
+- `state_persistence_survives_restart`: 3 blocks, extract backend,
+  drop module, create new module, verify state matches, continue
+  executing (state evolves from loaded state).
+
+### Part 3: Load test (1 ignored test)
+
+`modules/evm/tests/load.rs`:
+- `load_10k_evm_txs_across_100_blocks`: 10,000 deploy transactions
+  across 100 blocks with `Volatile` storage. Measures throughput,
+  verifies state root evolution, no panics.
+- Result on M1 8-core: **3,949 txs/s, 39.5 blocks/s** (debug build).
+  Release build will be significantly faster.
+
+### Part 4: Replay integrity tests (2 tests)
+
+`modules/evm/tests/replay.rs`:
+- `replay_produces_identical_state_roots`: two independent modules
+  execute the same 20 blocks; state roots match at every block.
+- `storage_backed_replay_matches_in_memory_replay`: 10 blocks with
+  storage, reload, continue to 20 blocks. Fresh 20-block in-memory
+  chain produces identical roots at every block — storage reload
+  does not change the state root trajectory.
+
+### Part 5: Standalone EVM-only chain test (1 ignored test)
+
+`modules/evm/tests/standalone.rs`:
+- `standalone_evm_only_50_blocks`: registers ONLY the EVM module in
+  an `Executor` (no bank, staking, core, or trading). Runs 50
+  finalized blocks through the full `AppInterface` pipeline
+  (ingest_tx → prepare_proposal → finalize_block → attest_state).
+  Verifies nonzero, evolving state roots. The EVM can operate as
+  the sole application state machine.
+
+### Pre-existing fix: storage bench `backend` compilation
+
+`crates/storage/benches/backend.rs` had `#![cfg(feature = "redb")]`
+which made the entire bench crate empty when no storage features
+were enabled, causing "main function not found" on `cargo build
+--benches` / `cargo test --workspace --all-targets`. Fixed by
+removing the crate-level `cfg` and adding a conditional fallback
+`main` + conditional `criterion_main!`.
+
+### Verification
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --lib --tests --bins -- -D warnings`:
+  clean.
+- `cargo test --workspace --all-targets`: all pass (0 failures).
+  EVM: 63 non-ignored + 2 ignored = 65 tests.
+- `cargo test -p evm -- --ignored`: both load and standalone tests
+  pass.
+- `cargo deny check`: only pre-existing warnings (duplicates,
+  license-not-encountered).

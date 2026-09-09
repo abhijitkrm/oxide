@@ -63,6 +63,11 @@ nightly adds fuzz and long simulations.
   matter how small — decisions, dead ends, bug hunts with root cause),
   and `CHANGELOG.md` is updated for anything user-visible. This is part
   of the pre-commit checklist (`.devin/skills/git-conventions`).
+- **EVM reference:** reth (https://github.com/paradigmxyz/reth) is the
+  canonical EVM reference implementation for Oxide — analogous to how
+  cosmos-evm uses geth. When verifying EVM correctness (state
+  persistence, replay, gas, nonce, RPC parity), consult reth's design
+  and test suites. See `plan.md` §16.
 
 - Edition 2024; workspace lint level strict (`clippy::all -D warnings`).
 - **Naming: keep code identifiers generic — no `Oxide` prefix on types,

@@ -18,9 +18,11 @@ types = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
 revm = { workspace = true }
+storage = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.7.0"
+ports = { workspace = true }
 
 [[bench]]
 name = "fee"
