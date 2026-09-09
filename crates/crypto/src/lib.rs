@@ -30,7 +30,12 @@
 pub mod bls;
 pub mod bls_signer;
 pub mod hash;
+pub mod secp;
 
 pub use bls::{AggregateSignature, PublicKey, Signature, ValidatorIndex};
 pub use bls_signer::{BlsError, BlsSecretKey, aggregate, aggregate_verify, verify};
 pub use hash::{Domain, Hasher};
+pub use secp::{
+    RecoverableSignature, RecoveryId, SecpError, generate_keypair_for_test, keccak256,
+    recover_sender, sign,
+};

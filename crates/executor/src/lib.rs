@@ -83,11 +83,38 @@ pub trait Module: Send + Sync {
     /// Called at the beginning of each block, before any txs.
     fn begin_block(&self, height: Height);
 
+    /// Validate a message for mempool admission. This is the
+    /// admission gate: it runs *before* `handle`, on every tx
+    /// submitted to the mempool. It must be:
+    ///
+    /// - **Pure:** no state mutation, no side effects. It may read
+    ///   module state (e.g. to check the sender's nonce and balance)
+    ///   but must not write.
+    /// - **Cheap:** it runs on every submitted tx, so it must be
+    ///   fast enough to handle the full mempool ingress rate.
+    /// - **Conservative:** a tx that passes `validate` may still fail
+    ///   in `handle` (e.g. out-of-gas, revert). But a tx that fails
+    ///   `validate` must never reach `handle`.
+    ///
+    /// The default implementation accepts all well-formed messages.
+    /// Modules override this to enforce signature, nonce, gas, and
+    /// balance checks before the tx enters the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Malformed`] if the message can't be
+    /// parsed, [`ExecError::ModuleRejected`] if the message is
+    /// well-formed but fails a validation rule (bad nonce,
+    /// insufficient balance, etc.).
+    fn validate(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<(), ExecError> {
+        Ok(())
+    }
+
     /// Handle a message. Returns events on success, or an error.
     ///
     /// The `ctx` carries the sender, nonce, and fee parsed from the
-    /// tx envelope (C2 fix). Modules use `ctx.sender` to debit
-    /// balances, check nonces, and attribute fees.
+    /// tx envelope. Modules use `ctx.sender` to debit balances, check
+    /// nonces, and attribute fees.
     ///
     /// # Errors
     ///
@@ -257,6 +284,27 @@ impl Executor {
 
 impl AppInterface for Executor {
     fn ingest_tx(&self, tx: TxBytes) -> MempoolAck {
+        // A4: route mempool admission through `Module::validate`.
+        // Before storing the tx in the mempool, we parse the envelope,
+        // find the target module, and call its `validate` method. This
+        // rejects invalid txs (bad signature, wrong chain ID, bad
+        // nonce, insufficient balance) before they enter the pool —
+        // keeping the pool clean and the execution path fast.
+        let bytes = tx.as_bytes();
+        let Some(ctx) = parse_tx_context(bytes) else {
+            return MempoolAck::Rejected { reason: "malformed: tx context".to_string() };
+        };
+        let Some(module_id) = parse_module_id(bytes) else {
+            return MempoolAck::Rejected { reason: "malformed: no module ID".to_string() };
+        };
+        let Some(module) = self.modules.get(&module_id) else {
+            return MempoolAck::Rejected { reason: format!("unknown module {module_id}") };
+        };
+        let payload = module_payload(bytes);
+        if let Err(e) = module.validate(&ctx, payload) {
+            return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
+        }
+
         match self.mempool.lock().unwrap().submit(tx) {
             Ok(()) => MempoolAck::Accepted,
             Err(e) => MempoolAck::Rejected { reason: format!("{e:?}") },

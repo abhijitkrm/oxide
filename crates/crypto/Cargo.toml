@@ -20,6 +20,18 @@ codec = { workspace = true }
 # implementation rather than each inlining blake3 calls.
 blake3 = "1"
 blst = "0.3.17"
+# secp256k1: ECDSA signature recovery for EVM transactions (Phase A).
+# Already a transitive dep via revm; declared explicitly here with the
+# features we need. This is reth's exact choice — the C-vetted
+# libsecp256k1 binding. MIT-0 licensed (GPL-3.0-compatible).
+# Features: global-context (thread-safe global context), recovery
+# (ecdsa recover for sender recovery from signed txs), rand (test
+# signing key generation).
+secp256k1 = { workspace = true }
+# sha3: Keccak-256 for EVM tx hashing and address derivation (Phase A).
+# Already a transitive dep via revm. The `sha3` crate's `Keccak256`
+# digest is Ethereum's keccak256 (not NIST SHA3-256). MIT/Apache-2.0.
+sha3 = { workspace = true }
 
 [lints]
 workspace = true
@@ -33,4 +45,8 @@ harness = false
 
 [[bench]]
 name = "bls"
+harness = false
+
+[[bench]]
+name = "tx_recover"
 harness = false

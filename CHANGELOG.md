@@ -12,6 +12,55 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Phase A: EVM transaction authenticity, mempool admission, gas economics** (2026-01-24)
+  - **A1 — secp256k1 + Keccak in the crypto crate**: added
+    `recover_sender`, `sign`, `generate_keypair_for_test`, and
+    `keccak256` to `crates/crypto/src/secp.rs`. The EVM module now
+    recovers the sender from the signature — the outer executor
+    envelope is no longer trusted for EVM caller identity. 34 new
+    crypto unit tests.
+  - **A2 — signed Ethereum transaction types**: `modules/evm/src/tx.rs`
+    now defines `TxLegacy`, `TxEip2930`, `TxEip1559`, and a
+    `SignedTx` RLP envelope with `recover_sender()`, `chain_id()`,
+    `nonce()`, `gas_limit()`, `to()`, `value()`, `data()`,
+    `max_fee_per_gas()`, and `max_priority_fee_per_gas()` accessors.
+    Legacy, EIP-2930, and EIP-1559 transactions are all supported.
+  - **A3 — signed-only EVM execution**: `EvmModule::handle` now
+    decodes a signed transaction, recovers the sender, enforces the
+    chain ID, and executes via `transact_commit`. The envelope sender
+    is deliberately ignored. All unit, integration, replay,
+    persistence, exploit, load, and standalone tests migrated to
+    deterministic signed transactions.
+  - **A4 — mempool admission through `Module::validate`**: added a
+    `validate` hook to the executor's `Module` trait. `ingest_tx`
+    now parses the envelope, resolves the module, invokes
+    `module.validate`, and rejects invalid transactions before they
+    enter the mempool. EVM validation checks RLP decodability,
+    signature recovery, chain ID, nonce ordering, gas limit, and
+    balance affordability — without mutating state. 8 new
+    validation tests.
+  - **A5 — gas economics**: `build_tx_env` now wires `gas_price` and
+    `gas_priority_fee` from the signed transaction into revm. revm's
+    internal gas accounting charges the sender, burns the base-fee
+    component, and tips the coinbase.
+  - **A6 — block context + coinbase**: `EvmModule` now holds
+    `coinbase`, `block_height`, `block_timestamp`, and
+    `block_gas_limit`. `begin_block` sets the height and timestamp;
+    `execute` wires them into revm's `BlockEnv` via
+    `modify_block_chained`. `set_coinbase()` / `coinbase()` accessors
+    expose the fee recipient.
+  - **Benchmark**: `crates/crypto/benches/tx_recover.rs` — secp256k1
+    ECDSA recovery at 35 µs (acceptance gate: < 100 µs; 3x headroom).
+    At 35 µs/recovery, a single thread authenticates ~28k txs/s.
+  - **In plain words**: the EVM module now executes only
+    cryptographically signed transactions. The sender is recovered
+    from the secp256k1 signature — the outer envelope is no longer
+    trusted. Invalid transactions are rejected at mempool admission
+    (not just at execution). EIP-1559 gas economics (charge, burn,
+    tip) and block context (coinbase, base fee, block number,
+    timestamp) are wired into revm. A single thread can authenticate
+    ~28k transactions per second.
+
 - **EVM standalone-chain validation + reth reference** (2026-01-23)
   - Wired the EVM module to `StorageBackend` for durable state
     persistence: `EvmModule::with_storage()` loads state on

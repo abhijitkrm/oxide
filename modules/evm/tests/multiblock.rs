@@ -10,46 +10,71 @@
 //! invariants reth guarantees: state evolves monotonically, nonces
 //! increment per-tx, gas is accounted per-block, and state persists
 //! across restarts.
+//!
+//! Phase A: all transactions are now signed (secp256k1 recovery).
+//! The sender is recovered from the signature, not trusted from the
+//! envelope.
 
+use crypto::secp;
 use evm::EvmModule;
+use evm::tx::{SignedTx, TxFields, TxKind, TxLegacy};
 use executor::{Module, TxContext};
 use primitives::{Address, Hash, Height};
+use revm::primitives::{Bytes, U256};
 use storage::Volatile;
 
 /// Simple deploy bytecode: PUSH1 0x01, PUSH1 0x00, SSTORE, STOP.
 /// Stores the value 1 at storage slot 0 of the new contract.
 const DEPLOY_BYTECODE: &[u8] = &[0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
 
-/// Build an EVM deploy message: `to = zeros` (deploy) + calldata.
-fn deploy_msg(calldata: &[u8]) -> Vec<u8> {
-    let mut msg = vec![0u8; 20]; // `to` = all zeros = deploy
-    msg.extend_from_slice(calldata);
-    msg
+/// Default gas limit for test transactions.
+const GAS_LIMIT: u64 = 30_000_000;
+
+/// A test keypair (private key + address).
+struct TestKey {
+    privkey: [u8; 32],
+    addr: Address,
 }
 
-/// Build an EVM call message: `to = address` + calldata.
-#[allow(dead_code)]
-fn call_msg(to: Address, calldata: &[u8]) -> Vec<u8> {
-    let mut msg = to.0.to_vec();
-    msg.extend_from_slice(calldata);
-    msg
+impl TestKey {
+    fn new() -> Self {
+        let (privkey, addr) = secp::generate_keypair_for_test();
+        Self { privkey, addr: Address(addr.0) }
+    }
 }
 
-/// A fixed sender address for test txs.
-fn sender() -> Address {
-    Address([0x11; 20])
+/// Build a signed deploy tx (RLP-encoded).
+fn signed_deploy(privkey: &[u8], nonce: u64) -> Vec<u8> {
+    let tx = TxLegacy {
+        fields: TxFields {
+            nonce,
+            gas_limit: GAS_LIMIT,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            data: Bytes::copy_from_slice(DEPLOY_BYTECODE),
+            chain_id: 1,
+        },
+        gas_price: U256::from(1_000_000_000),
+    };
+    SignedTx::sign_legacy(tx, privkey).expect("sign must succeed").encode_to_bytes()
 }
 
-/// Build a `TxContext` for a given nonce.
-fn ctx(nonce: u64) -> TxContext {
-    TxContext { sender: sender(), nonce, fee: 100 }
+/// A `TxContext` with a dummy sender (the EVM module recovers the
+/// real sender from the signature).
+fn dummy_ctx() -> TxContext {
+    TxContext { sender: Address([0u8; 20]), nonce: 0, fee: 0 }
 }
 
 /// Execute a single-tx block on the module: begin, handle, end.
-fn exec_block(module: &EvmModule, height: u64, msg: &[u8], nonce: u64) {
+fn exec_block(module: &EvmModule, height: u64, msg: &[u8]) {
     module.begin_block(Height::new(height));
-    module.handle(&ctx(nonce), msg).expect("handle must succeed");
+    module.handle(&dummy_ctx(), msg).expect("handle must succeed");
     module.end_block(Height::new(height));
+}
+
+/// Fund the test key's account with a large balance.
+fn fund(module: &EvmModule, key: &TestKey) {
+    module.fund_account_for_test(&key.addr, u128::MAX);
 }
 
 /// Execute 100 blocks, each with one deploy tx. State root must
@@ -57,12 +82,14 @@ fn exec_block(module: &EvmModule, height: u64, msg: &[u8], nonce: u64) {
 /// (re-running produces the same sequence).
 #[test]
 fn multi_block_100_blocks_state_root_evolution() {
+    let key = TestKey::new();
     let module = EvmModule::new(1, 7);
+    fund(&module, &key);
     let mut roots = Vec::with_capacity(100);
 
     for i in 0..100u64 {
-        let msg = deploy_msg(DEPLOY_BYTECODE);
-        exec_block(&module, i, &msg, i);
+        let msg = signed_deploy(&key.privkey, i);
+        exec_block(&module, i, &msg);
         roots.push(module.state_root());
     }
 
@@ -73,9 +100,10 @@ fn multi_block_100_blocks_state_root_evolution() {
 
     // Determinism: re-run with a fresh module and verify same roots.
     let module2 = EvmModule::new(1, 7);
+    fund(&module2, &key);
     for i in 0..100u64 {
-        let msg = deploy_msg(DEPLOY_BYTECODE);
-        exec_block(&module2, i, &msg, i);
+        let msg = signed_deploy(&key.privkey, i);
+        exec_block(&module2, i, &msg);
         assert_eq!(
             module2.state_root(),
             roots[usize::try_from(i).expect("fits in usize")],
@@ -87,26 +115,31 @@ fn multi_block_100_blocks_state_root_evolution() {
 /// Nonce must increment by 1 per deploy and persist across blocks.
 #[test]
 fn multi_block_nonce_progression_across_blocks() {
+    let key = TestKey::new();
     let module = EvmModule::new(1, 7);
+    fund(&module, &key);
 
     for i in 0..10u64 {
-        assert_eq!(module.nonce(&sender()), i, "nonce before block {i}");
-        let msg = deploy_msg(DEPLOY_BYTECODE);
-        exec_block(&module, i, &msg, i);
+        assert_eq!(module.nonce(&key.addr), i, "nonce before block {i}");
+        let msg = signed_deploy(&key.privkey, i);
+        exec_block(&module, i, &msg);
     }
 
-    assert_eq!(module.nonce(&sender()), 10, "nonce must be 10 after 10 deploys");
+    assert_eq!(module.nonce(&key.addr), 10, "nonce must be 10 after 10 deploys");
 }
 
 /// Gas used must be consistent for the same tx across blocks.
 #[test]
 fn multi_block_gas_accounting_per_block() {
+    let key = TestKey::new();
     let module = EvmModule::new(1, 7);
+    fund(&module, &key);
     let mut gas_used_per_block = Vec::with_capacity(10);
 
     for i in 0..10u64 {
         module.begin_block(Height::new(i));
-        let events = module.handle(&ctx(i), &deploy_msg(DEPLOY_BYTECODE)).expect("handle");
+        let msg = signed_deploy(&key.privkey, i);
+        let events = module.handle(&dummy_ctx(), &msg).expect("handle");
         module.end_block(Height::new(i));
 
         // Extract gas_used from the event data: "gas_used=N status=..."
@@ -132,13 +165,15 @@ fn multi_block_gas_accounting_per_block() {
 /// and verify the state root matches.
 #[test]
 fn state_persistence_round_trip() {
+    let key = TestKey::new();
     let backend = Box::new(Volatile::new());
     let module = EvmModule::with_storage(1, 7, backend);
+    fund(&module, &key);
 
     // Execute 5 blocks of deploys.
     for i in 0..5u64 {
-        let msg = deploy_msg(DEPLOY_BYTECODE);
-        exec_block(&module, i, &msg, i);
+        let msg = signed_deploy(&key.privkey, i);
+        exec_block(&module, i, &msg);
     }
     let root_after = module.state_root();
     assert_ne!(root_after, Hash::ZERO, "state root must be non-zero");
@@ -152,23 +187,25 @@ fn state_persistence_round_trip() {
     assert_eq!(module2.state_root(), root_after, "state root must match after round-trip");
 
     // Nonces must also match.
-    assert_eq!(module2.nonce(&sender()), 5, "nonce must be 5 after 5 deploys");
+    assert_eq!(module2.nonce(&key.addr), 5, "nonce must be 5 after 5 deploys");
 }
 
 /// State must survive a "restart": execute blocks, drop the module,
 /// create a new one with the same storage, and continue executing.
 #[test]
 fn state_persistence_survives_restart() {
+    let key = TestKey::new();
     let backend = Box::new(Volatile::new());
     let module = EvmModule::with_storage(1, 7, backend);
+    fund(&module, &key);
 
     // Execute 3 blocks.
     for i in 0..3u64 {
-        let msg = deploy_msg(DEPLOY_BYTECODE);
-        exec_block(&module, i, &msg, i);
+        let msg = signed_deploy(&key.privkey, i);
+        exec_block(&module, i, &msg);
     }
     let root_before_restart = module.state_root();
-    let nonce_before_restart = module.nonce(&sender());
+    let nonce_before_restart = module.nonce(&key.addr);
 
     // Simulate restart: extract backend, drop module, create new one.
     let backend_ref = module.backend_for_test();
@@ -177,15 +214,15 @@ fn state_persistence_survives_restart() {
 
     // State must match what we had before the restart.
     assert_eq!(module2.state_root(), root_before_restart, "state root must survive restart");
-    assert_eq!(module2.nonce(&sender()), nonce_before_restart, "nonce must survive restart");
+    assert_eq!(module2.nonce(&key.addr), nonce_before_restart, "nonce must survive restart");
 
     // Continue executing — state must evolve from the loaded state.
-    let msg = deploy_msg(DEPLOY_BYTECODE);
-    exec_block(&module2, 3, &msg, 3);
+    let msg = signed_deploy(&key.privkey, 3);
+    exec_block(&module2, 3, &msg);
     let root_after_continue = module2.state_root();
     assert_ne!(
         root_after_continue, root_before_restart,
         "state must evolve after restart + new block"
     );
-    assert_eq!(module2.nonce(&sender()), 4, "nonce must be 4 after continuing");
+    assert_eq!(module2.nonce(&key.addr), 4, "nonce must be 4 after continuing");
 }

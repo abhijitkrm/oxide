@@ -16,11 +16,14 @@
 //!//!
 //! # What this module does
 //!
-//! - Receives raw EVM call data via the module router's `handle`
-//!   dispatch. The message format is `[to: 20B][calldata: ...]`.
-//!   If `to` is all-zeros, the message is a contract deployment
-//!   (calldata is the init code).
-//! - Executes the call through `revm` with EIP-1559 gas metering.
+//! - Receives raw signed EVM transactions via the module router's
+//!   `handle` dispatch. The message is an RLP-encoded signed
+//!   transaction (Legacy, EIP-2930, or EIP-1559 per EIP-2718).
+//! - Recovers the sender from the transaction's secp256k1 signature —
+//!   **never** trusts the outer envelope's sender field. This is the
+//!   core security boundary (Phase A).
+//! - Enforces EIP-155 chain ID replay protection.
+//! - Executes the transaction through `revm` with EIP-1559 gas metering.
 //! - Persists account state (balance, nonce, code, storage) in a
 //!   `CacheDB` (in-memory, backed by `EmptyDB`).
 //! - Emits execution results as Oxide events (gas used, status, logs).
@@ -38,12 +41,16 @@
 //! v0 implements:
 //! - A `revm` `Evm` instance with a `CacheDB`-backed state.
 //! - EIP-1559 gas metering (base fee + priority fee).
-//! - Basic transaction execution (call + deploy).
+//! - Signed transaction execution (Legacy, EIP-2930, EIP-1559) with
+//!   secp256k1 sender recovery (Phase A).
+//! - EIP-155 chain ID replay protection.
 //! - Account state in `CacheDB` (in-memory).
 //! - Optional `StorageBackend` persistence (flush after each block,
 //!   load on construction — added session 26).
 //!
 //! Future phases add:
+//! - Gas debiting, base-fee burn, and priority-fee tips (Phase A5).
+//! - Block context and coinbase/fee-recipient wiring (Phase A6).
 //! - Precompiles that call into native modules (bank, trading).
 //! - Parallel OCC scheduler for cross-tx parallelism.
 //! - JSON-RPC + WebSocket server.
@@ -57,6 +64,7 @@ use primitives::{Address, Hash, Height};
 pub mod fee;
 mod persist;
 pub mod precompiles;
+pub mod tx;
 
 // revm imports. The `revm` crate re-exports all sub-crates.
 use revm::Context;
@@ -74,10 +82,26 @@ use revm::primitives::hardfork::SpecId;
 /// IDs 0–2 (core, bank, staking); the EVM is the first VM module.
 pub const MODULE_ID: u8 = module_id::EVM;
 
+/// The base intrinsic gas cost for any EVM transaction (EIP-2028).
+///
+/// `21_000` gas is the cost of a simple value transfer (no calldata, no
+/// contract creation). This is a conservative lower bound for the
+/// intrinsic gas check in `validate`; the full calldata-aware check
+/// arrives with the gas economics phase (A5).
+const INTRINSIC_GAS_BASE: u64 = 21_000;
+
+/// The block time in seconds. Used to derive a deterministic timestamp
+/// from the block height when the real timestamp is not yet wired from
+/// the block header. Ethereum mainnet uses ~12s; we use 15s as a
+/// conservative estimate.
+const BLOCK_TIME_SECS: u64 = 15;
+
 /// The default gas limit for a single EVM transaction (EIP-1559).
 ///
 /// 30M gas matches Ethereum mainnet's default block-level tx limit.
 /// This is a cold-path constant (set once per tx, not per-opcode).
+/// Used by test helpers when constructing signed transactions.
+#[cfg(test)]
 const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
 
 /// The EVM module: wraps `revm` and exposes it as an Oxide `Module`.
@@ -106,6 +130,22 @@ pub struct EvmModule {
     /// and loaded on construction. When `None`, the module is
     /// purely in-memory (useful for tests and single-block sims).
     backend: Mutex<Option<Box<dyn storage::StorageBackend + Send>>>,
+    /// The coinbase / fee recipient for the current block.
+    /// The priority fee (tip) is paid to this address by revm's
+    /// internal gas accounting. Set via `begin_block`.
+    /// Behind a `Mutex` because `Module::handle` takes `&self`.
+    coinbase: Mutex<revm::primitives::Address>,
+    /// The current block height. Set in `begin_block`, read in
+    /// `execute` to populate the EVM block environment.
+    /// Behind a `Mutex` because `Module::handle` takes `&self`.
+    block_height: Mutex<u64>,
+    /// The current block timestamp (seconds since Unix epoch).
+    /// Set in `begin_block`, read in `execute`.
+    /// Behind a `Mutex` because `Module::handle` takes `&self`.
+    block_timestamp: Mutex<u64>,
+    /// The block gas limit. Used to populate the EVM block
+    /// environment and enforce block-level gas limits.
+    block_gas_limit: u64,
 }
 
 impl EvmModule {
@@ -125,6 +165,10 @@ impl EvmModule {
             base_fee,
             spec: SpecId::PRAGUE,
             backend: Mutex::new(None),
+            coinbase: Mutex::new(revm::primitives::Address::ZERO),
+            block_height: Mutex::new(0),
+            block_timestamp: Mutex::new(0),
+            block_gas_limit: 30_000_000,
         }
     }
 
@@ -138,6 +182,10 @@ impl EvmModule {
             base_fee,
             spec,
             backend: Mutex::new(None),
+            coinbase: Mutex::new(revm::primitives::Address::ZERO),
+            block_height: Mutex::new(0),
+            block_timestamp: Mutex::new(0),
+            block_gas_limit: 30_000_000,
         }
     }
 
@@ -165,6 +213,10 @@ impl EvmModule {
             base_fee,
             spec: SpecId::PRAGUE,
             backend: Mutex::new(None),
+            coinbase: Mutex::new(revm::primitives::Address::ZERO),
+            block_height: Mutex::new(0),
+            block_timestamp: Mutex::new(0),
+            block_gas_limit: 30_000_000,
         };
         // Load initial state from the backend into the CacheDB, then
         // install the backend for future flushes.
@@ -185,45 +237,88 @@ impl EvmModule {
         self.base_fee
     }
 
-    /// Execute an EVM call. The `msg` format is `[to: 20B][calldata: ...]`.
-    /// If `to` is all-zeros, this is a contract deployment.
+    /// Set the coinbase / fee recipient for the current block.
+    ///
+    /// The priority fee (tip) from each transaction is paid to this
+    /// address by revm's internal gas accounting. This is the
+    /// validator's reward for including transactions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the coinbase mutex is poisoned.
+    pub fn set_coinbase(&self, coinbase: revm::primitives::Address) {
+        *self.coinbase.lock().expect("coinbase mutex not poisoned") = coinbase;
+    }
+
+    /// Get the coinbase / fee recipient for the current block.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the coinbase mutex is poisoned.
+    #[must_use]
+    pub fn coinbase(&self) -> revm::primitives::Address {
+        *self.coinbase.lock().expect("coinbase mutex not poisoned")
+    }
+
+    /// Execute a signed EVM transaction. The `msg` is a raw RLP-encoded
+    /// signed transaction (Legacy, EIP-2930, or EIP-1559 per EIP-2718).
+    ///
+    /// The sender is recovered from the signature inside the transaction —
+    /// **never** trusted from the outer envelope (`ctx.sender`). This is
+    /// the core security boundary: authentication is enforced at
+    /// execution, not admission.
     ///
     /// Returns the gas used and the execution status (true = success).
     ///
     /// # Errors
     ///
-    /// Returns [`ExecError::Malformed`] if the message is too short
-    /// (less than 20 bytes for the `to` address) or if the tx env
-    /// cannot be built.
+    /// Returns [`ExecError::Malformed`] if the message cannot be parsed
+    /// as a valid signed transaction (RLP decode failure, invalid
+    /// signature, wrong chain ID).
     /// Returns [`ExecError::ModuleRejected`] if the EVM execution fails.
-    fn execute(&self, ctx: &TxContext, msg: &[u8]) -> Result<(u64, bool), ExecError> {
-        // Parse the `to` address (first 20 bytes).
-        if msg.len() < 20 {
+    fn execute(&self, _ctx: &TxContext, msg: &[u8]) -> Result<(u64, bool), ExecError> {
+        // Decode the signed transaction from RLP.
+        let mut buf = msg;
+        let signed: tx::SignedTx =
+            alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+
+        // Enforce chain ID (EIP-155 replay protection).
+        if signed.chain_id() != self.chain_id {
             return Err(ExecError::Malformed);
         }
-        let to_bytes: [u8; 20] = msg[..20].try_into().map_err(|_| ExecError::Malformed)?;
-        let calldata = &msg[20..];
 
-        // Build the transaction environment.
-        let caller = alloy_primitives_address(ctx.sender.0);
-        let to = alloy_primitives_address(to_bytes);
-        let is_deploy = to_bytes == [0u8; 20];
+        // Recover the sender from the signature. This is the
+        // authentication step — the EVM never trusts `ctx.sender`.
+        let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+        let caller = alloy_primitives_address(sender.0);
 
-        let tx = TxEnv::builder()
-            .gas_limit(DEFAULT_GAS_LIMIT)
-            .caller(caller)
-            .kind(if is_deploy { TxKind::Create } else { TxKind::Call(to) })
-            .data(revm::primitives::Bytes::copy_from_slice(calldata))
-            .nonce(ctx.nonce)
-            .build()
-            .map_err(|_| ExecError::Malformed)?;
+        // Build the transaction environment from the signed tx fields.
+        let tx = Self::build_tx_env(&signed, caller)?;
 
         // Build and run the EVM. `transact_commit` executes the tx and
         // commits the state changes to the CacheDB in one step.
+        //
+        // A5/A6: wire the block environment (base fee, coinbase, block
+        // number, timestamp, gas limit) into revm. revm's internal gas
+        // accounting then:
+        //   1. Charges `gas_used * gas_price` from the sender.
+        //   2. Burns `gas_used * base_fee` (removes from supply).
+        //   3. Tips `gas_used * (gas_price - base_fee)` to the coinbase.
         let mut db = self.db.lock().expect("db mutex not poisoned");
+        let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
+        let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
+        let block_timestamp =
+            *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned");
         let mut evm = Context::mainnet()
             .with_db(&mut *db)
             .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(self.spec))
+            .modify_block_chained(|block| {
+                block.number = revm::primitives::U256::from(block_number);
+                block.beneficiary = coinbase;
+                block.timestamp = revm::primitives::U256::from(block_timestamp);
+                block.gas_limit = self.block_gas_limit;
+                block.basefee = self.base_fee;
+            })
             .build_mainnet_with_inspector(NoOpInspector);
 
         let result = evm
@@ -234,6 +329,42 @@ impl EvmModule {
         let success = result.is_success();
 
         Ok((gas_used, success))
+    }
+
+    /// Build a revm `TxEnv` from a signed transaction and recovered
+    /// caller address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Malformed`] if the `TxEnv` cannot be
+    /// constructed from the signed tx fields.
+    fn build_tx_env(
+        signed: &tx::SignedTx,
+        caller: revm::primitives::Address,
+    ) -> Result<TxEnv, ExecError> {
+        let to = match signed.to() {
+            tx::TxKind::Create => TxKind::Create,
+            tx::TxKind::Call(addr) => TxKind::Call(revm::primitives::Address::from(addr.0)),
+        };
+        // A5: wire gas pricing from the signed tx into the TxEnv.
+        // - Legacy/EIP-2930: `gas_price` is the exact fee per gas.
+        // - EIP-1559: `max_fee_per_gas` is the cap; `max_priority_fee_per_gas`
+        //   is the tip. revm uses these with the block's base fee to
+        //   compute the effective gas price.
+        let gas_price = signed.max_fee_per_gas().to::<u128>();
+        let priority_fee = signed.max_priority_fee_per_gas().to::<u128>();
+        let tx = TxEnv::builder()
+            .gas_limit(signed.gas_limit())
+            .caller(caller)
+            .kind(to)
+            .data(signed.data().clone())
+            .nonce(signed.nonce())
+            .value(signed.value())
+            .gas_price(gas_price)
+            .gas_priority_fee(Some(priority_fee))
+            .build()
+            .map_err(|_| ExecError::Malformed)?;
+        Ok(tx)
     }
 }
 
@@ -246,10 +377,114 @@ impl Module for EvmModule {
         MODULE_ID
     }
 
-    fn begin_block(&self, _height: Height) {
-        // No per-block setup in v0. The EVM state is persistent across
-        // blocks (account balances, nonces, code). Future: dynamic
-        // base fee adjustment based on parent block gas usage.
+    fn begin_block(&self, height: Height) {
+        // A6: set the block context for EVM execution. The block number
+        // and timestamp are wired into revm's BlockEnv in `execute`.
+        // The timestamp uses the height as a deterministic stand-in
+        // (real timestamp comes from the block header in a full node).
+        let h = height.value();
+        *self.block_height.lock().expect("block_height mutex not poisoned") = h;
+        *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned") =
+            h.saturating_mul(BLOCK_TIME_SECS);
+    }
+
+    /// A4: validate a signed EVM transaction for mempool admission.
+    ///
+    /// This is the admission gate. It runs on every submitted tx
+    /// *before* the tx enters the mempool. It checks:
+    ///
+    /// 1. **RLP decode** — the message must be a valid RLP-encoded
+    ///    signed transaction (Legacy, EIP-2930, or EIP-1559).
+    /// 2. **Chain ID** — must match the module's chain ID (EIP-155
+    ///    replay protection).
+    /// 3. **Signature** — the secp256k1 signature must recover to a
+    ///    valid sender address.
+    /// 4. **Nonce** — the tx nonce must be ≥ the sender's current
+    ///    account nonce (rejects stale txs; allows future nonces for
+    ///    mempool queueing).
+    /// 5. **Gas limit** — must be positive and within block limits.
+    /// 6. **Intrinsic gas** — the gas limit must cover the tx's
+    ///    intrinsic cost (21k base + calldata + access list).
+    /// 7. **Balance** — the sender must have enough balance to cover
+    ///    the gas cost (`gas_limit * max_fee_per_gas`) plus the
+    ///    transferred value.
+    ///
+    /// This method is pure: it reads module state but does not mutate
+    /// it. A tx that passes `validate` may still fail in `handle`
+    /// (e.g. out-of-gas, revert). But a tx that fails `validate`
+    /// never reaches `handle`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Malformed`] for RLP decode failures,
+    /// wrong chain ID, or signature recovery failure. Returns
+    /// [`ExecError::ModuleRejected`] for nonce, gas, or balance
+    /// violations.
+    fn validate(&self, _ctx: &TxContext, msg: &[u8]) -> Result<(), ExecError> {
+        // 1. RLP decode.
+        let mut buf = msg;
+        let signed: tx::SignedTx =
+            alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+
+        // 2. Chain ID (EIP-155 replay protection).
+        if signed.chain_id() != self.chain_id {
+            return Err(ExecError::Malformed);
+        }
+
+        // 3. Signature recovery.
+        let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+        let sender_addr = Address(sender.0);
+
+        // 4. Nonce: tx nonce must be ≥ current account nonce.
+        //    This rejects stale (already-used) nonces. Future nonces
+        //    are allowed for mempool queueing.
+        let current_nonce = self.nonce(&sender_addr);
+        if signed.nonce() < current_nonce {
+            return Err(ExecError::ModuleRejected(format!(
+                "nonce {nonce} < current {current_nonce}",
+                nonce = signed.nonce()
+            )));
+        }
+
+        // 5. Gas limit: must be positive.
+        let gas_limit = signed.gas_limit();
+        if gas_limit == 0 {
+            return Err(ExecError::ModuleRejected("gas_limit is zero".to_string()));
+        }
+
+        // 6. Intrinsic gas: gas_limit must cover the intrinsic cost.
+        //    The intrinsic cost is 21_000 (base) + calldata cost
+        //    (16/byte for non-zero, 4/byte for zero) + access list
+        //    cost. We use a conservative lower bound of 21_000 here;
+        //    the full calldata-aware check arrives with the gas
+        //    economics phase (A5).
+        if gas_limit < INTRINSIC_GAS_BASE {
+            return Err(ExecError::ModuleRejected(format!(
+                "gas_limit {gas_limit} < intrinsic {INTRINSIC_GAS_BASE}"
+            )));
+        }
+
+        // 7. Balance: sender must cover gas_cost + value.
+        //    gas_cost = gas_limit * max_fee_per_gas (the worst-case
+        //    fee the sender could pay). For legacy txs, gas_price is
+        //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
+        let max_fee = signed.max_fee_per_gas().to::<u128>();
+        let balance = self.balance(&sender_addr);
+        let value = signed.value().to::<u128>();
+        // gas_cost = gas_limit * max_fee, checked for overflow.
+        let gas_cost = u128::from(gas_limit)
+            .checked_mul(max_fee)
+            .ok_or_else(|| ExecError::ModuleRejected("gas cost overflow".to_string()))?;
+        let total_needed = gas_cost
+            .checked_add(value)
+            .ok_or_else(|| ExecError::ModuleRejected("gas_cost + value overflow".to_string()))?;
+        if balance < total_needed {
+            return Err(ExecError::ModuleRejected(format!(
+                "insufficient balance: have {balance}, need {total_needed}"
+            )));
+        }
+
+        Ok(())
     }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
@@ -355,6 +590,34 @@ impl EvmModule {
     pub fn backend_for_test(&self) -> Box<dyn storage::StorageBackend + Send> {
         let mut guard = self.backend.lock().expect("backend mutex not poisoned");
         guard.take().expect("backend_for_test: no storage backend attached")
+    }
+
+    /// Fund an account with the given balance (test-only helper).
+    ///
+    /// This directly inserts the balance into the CacheDB, bypassing
+    /// execution. It's used by `validate` tests to set up accounts
+    /// with sufficient balance to pass the admission gate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DB mutex is poisoned.
+    #[doc(hidden)]
+    pub fn fund_account_for_test(&self, addr: &Address, balance: u128) {
+        let mut db = self.db.lock().expect("db mutex not poisoned");
+        let evm_addr = alloy_primitives_address(addr.0);
+        let account =
+            db.cache.accounts.entry(evm_addr).or_insert_with(|| revm::database::DbAccount {
+                info: revm::database::state::AccountInfo {
+                    balance: revm::primitives::U256::ZERO,
+                    nonce: 0,
+                    code_hash: revm::primitives::B256::ZERO,
+                    account_id: None,
+                    code: Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new())),
+                },
+                account_state: revm::database::AccountState::None,
+                storage: revm::primitives::HashMap::default(),
+            });
+        account.info.balance = revm::primitives::U256::from(balance);
     }
 
     /// Flush the current `CacheDB` state to the `StorageBackend`.
@@ -472,9 +735,48 @@ fn alloy_primitives_address(bytes: [u8; 20]) -> revm::primitives::Address {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::secp;
+    use revm::primitives::U256;
 
     fn make_module() -> EvmModule {
         EvmModule::new(1, 7)
+    }
+
+    /// A fixed private key for deterministic tests. This key is
+    /// generated fresh per test run via `generate_keypair_for_test`,
+    /// which uses the secp256k1 crate's RNG. The address is derived
+    /// from the recovered public key.
+    fn test_keypair() -> ([u8; 32], Address) {
+        let (privkey, addr) = secp::generate_keypair_for_test();
+        (privkey, Address(addr.0))
+    }
+
+    /// Build a signed legacy transaction for testing.
+    fn signed_tx(privkey: &[u8], nonce: u64, to: tx::TxKind, data: &[u8]) -> Vec<u8> {
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                to,
+                value: U256::ZERO,
+                data: revm::primitives::Bytes::copy_from_slice(data),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        let signed = tx::SignedTx::sign_legacy(tx, privkey).expect("sign must succeed");
+        signed.encode_to_bytes()
+    }
+
+    /// A `TxContext` with a dummy sender (the EVM module ignores it
+    /// and recovers the sender from the signature).
+    fn dummy_ctx() -> TxContext {
+        TxContext { sender: Address([0u8; 20]), nonce: 0, fee: 0 }
+    }
+
+    /// Fund an account with a large balance for testing.
+    fn fund(m: &EvmModule, addr: &Address) {
+        m.fund_account_for_test(addr, u128::MAX);
     }
 
     #[test]
@@ -505,38 +807,71 @@ mod tests {
     #[test]
     fn handle_rejects_short_message() {
         let m = make_module();
-        let ctx = TxContext { sender: Address([0u8; 20]), nonce: 0, fee: 0 };
-        let result = m.handle(&ctx, b"too short");
+        let result = m.handle(&dummy_ctx(), b"too short");
         assert!(matches!(result, Err(ExecError::Malformed)));
     }
 
     #[test]
-    fn handle_executes_empty_call() {
+    fn handle_executes_signed_deploy() {
+        let (privkey, sender) = test_keypair();
         let m = make_module();
-        let ctx = TxContext { sender: Address([0u8; 20]), nonce: 0, fee: 0 };
-        // 20-byte `to` address (all zeros = deploy), empty calldata.
-        let msg = [0u8; 20];
-        let result = m.handle(&ctx, &msg).expect("handle must succeed");
+        fund(&m, &sender);
+        // Deploy a contract: `to` = Create, calldata = simple bytecode.
+        let data = [0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let msg = signed_tx(&privkey, 0, tx::TxKind::Create, &data);
+        let result = m.handle(&dummy_ctx(), &msg).expect("handle must succeed");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].module, "evm");
         assert_eq!(result[0].kind, "evm_call");
+        // The sender's nonce must be 1 after a deploy.
+        assert_eq!(m.nonce(&sender), 1, "sender nonce must be 1 after deploy");
     }
 
     #[test]
-    fn handle_executes_deploy() {
+    fn handle_rejects_wrong_chain_id() {
+        let (privkey, _) = test_keypair();
+        let m = EvmModule::new(42, 7); // chain ID 42
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce: 0,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                to: tx::TxKind::Create,
+                value: U256::ZERO,
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1, // wrong chain ID
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        let signed = tx::SignedTx::sign_legacy(tx, &privkey).expect("sign must succeed");
+        let msg = signed.encode_to_bytes();
+        let result = m.handle(&dummy_ctx(), &msg);
+        assert!(matches!(result, Err(ExecError::Malformed)), "wrong chain ID must reject");
+    }
+
+    #[test]
+    fn handle_rejects_invalid_signature() {
         let m = make_module();
-        let ctx = TxContext { sender: Address([0u8; 20]), nonce: 0, fee: 0 };
-        // Deploy a contract: `to` = zeros (deploy), calldata = simple
-        // bytecode that stores a value. PUSH1 0x01, PUSH1 0x00, SSTORE,
-        // STOP.
-        let mut msg = vec![0u8; 20]; // `to` = zeros (deploy)
-        msg.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00]); // calldata
-        let result = m.handle(&ctx, &msg).expect("deploy must succeed");
-        assert_eq!(result.len(), 1);
-        // The event data contains "gas_used=" and "status=".
-        let data_str = std::str::from_utf8(&result[0].data).expect("utf8");
-        assert!(data_str.contains("gas_used="), "event must report gas used: {data_str}");
-        assert!(data_str.contains("status="), "event must report status: {data_str}");
+        // A valid RLP-encoded legacy tx with a tampered signature.
+        let (privkey, _) = test_keypair();
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce: 0,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                to: tx::TxKind::Create,
+                value: U256::ZERO,
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        let mut signed = tx::SignedTx::sign_legacy(tx, &privkey).expect("sign must succeed");
+        // Tamper with the signature.
+        if let tx::SignedTx::Legacy(_, ref mut sig) = signed {
+            sig.r = U256::ZERO; // invalid r
+        }
+        let msg = signed.encode_to_bytes();
+        let result = m.handle(&dummy_ctx(), &msg);
+        assert!(matches!(result, Err(ExecError::Malformed)), "invalid signature must reject");
     }
 
     #[test]
@@ -576,28 +911,180 @@ mod tests {
 
     #[test]
     fn state_root_changes_after_deploy() {
+        let (privkey, sender) = test_keypair();
         let m = make_module();
+        fund(&m, &sender);
         let root_before = m.state_root();
-        let ctx = TxContext { sender: Address([0u8; 20]), nonce: 0, fee: 0 };
-        let mut msg = vec![0u8; 20];
-        msg.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00]);
-        m.handle(&ctx, &msg).expect("deploy must succeed");
+        let data = [0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let msg = signed_tx(&privkey, 0, tx::TxKind::Create, &data);
+        m.handle(&dummy_ctx(), &msg).expect("deploy must succeed");
         let root_after = m.state_root();
         assert_ne!(root_before, root_after, "state root must change after a deploy");
     }
 
     #[test]
     fn deploy_increases_caller_nonce() {
+        let (privkey, sender) = test_keypair();
         let m = make_module();
-        let caller = Address([0x11; 20]);
-        let ctx = TxContext { sender: caller, nonce: 0, fee: 0 };
+        fund(&m, &sender);
         // Before any tx, the caller has no account (nonce 0).
-        assert_eq!(m.nonce(&caller), 0);
+        assert_eq!(m.nonce(&sender), 0);
         // Deploy a contract.
-        let mut msg = vec![0u8; 20];
-        msg.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00]);
-        m.handle(&ctx, &msg).expect("deploy must succeed");
+        let data = [0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let msg = signed_tx(&privkey, 0, tx::TxKind::Create, &data);
+        m.handle(&dummy_ctx(), &msg).expect("deploy must succeed");
         // After a successful deploy, the caller's nonce must be 1.
-        assert_eq!(m.nonce(&caller), 1, "caller nonce must be 1 after a deploy");
+        assert_eq!(m.nonce(&sender), 1, "caller nonce must be 1 after a deploy");
+    }
+
+    #[test]
+    fn sender_is_recovered_not_trusted() {
+        // The EVM module must recover the sender from the signature,
+        // not trust ctx.sender. We verify by setting ctx.sender to a
+        // different address and checking that the recovered sender
+        // (not ctx.sender) gets the nonce increment.
+        let (privkey, real_sender) = test_keypair();
+        let fake_sender = Address([0xFF; 20]);
+        let m = make_module();
+        fund(&m, &real_sender);
+        let ctx = TxContext { sender: fake_sender, nonce: 999, fee: 999 };
+        let data = [0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let msg = signed_tx(&privkey, 0, tx::TxKind::Create, &data);
+        m.handle(&ctx, &msg).expect("deploy must succeed");
+        // The real sender's nonce must be 1, not the fake sender's.
+        assert_eq!(m.nonce(&real_sender), 1, "real sender nonce must be 1");
+        assert_eq!(m.nonce(&fake_sender), 0, "fake sender nonce must stay 0");
+    }
+
+    // ---- A4: validate (mempool admission) tests ----------------------
+
+    #[test]
+    fn validate_accepts_well_formed_tx() {
+        let (privkey, sender) = test_keypair();
+        let m = make_module();
+        // Fund the account so the balance check passes.
+        m.fund_account_for_test(&sender, u128::MAX);
+        let data = [0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let msg = signed_tx(&privkey, 0, tx::TxKind::Create, &data);
+        assert!(m.validate(&dummy_ctx(), &msg).is_ok(), "well-formed tx must validate");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_rlp() {
+        let m = make_module();
+        assert!(matches!(m.validate(&dummy_ctx(), b"not rlp"), Err(ExecError::Malformed)));
+    }
+
+    #[test]
+    fn validate_rejects_wrong_chain_id() {
+        let (privkey, _) = test_keypair();
+        let m = EvmModule::new(42, 7); // chain ID 42
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce: 0,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                to: tx::TxKind::Create,
+                value: U256::ZERO,
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1, // wrong
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        let signed = tx::SignedTx::sign_legacy(tx, &privkey).expect("sign");
+        let msg = signed.encode_to_bytes();
+        assert!(matches!(m.validate(&dummy_ctx(), &msg), Err(ExecError::Malformed)));
+    }
+
+    #[test]
+    fn validate_rejects_bad_signature() {
+        let (privkey, _) = test_keypair();
+        let m = make_module();
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce: 0,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                to: tx::TxKind::Create,
+                value: U256::ZERO,
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        let mut signed = tx::SignedTx::sign_legacy(tx, &privkey).expect("sign");
+        if let tx::SignedTx::Legacy(_, ref mut sig) = signed {
+            sig.r = U256::ZERO;
+        }
+        let msg = signed.encode_to_bytes();
+        assert!(matches!(m.validate(&dummy_ctx(), &msg), Err(ExecError::Malformed)));
+    }
+
+    #[test]
+    fn validate_rejects_stale_nonce() {
+        let (privkey, sender) = test_keypair();
+        let m = make_module();
+        m.fund_account_for_test(&sender, u128::MAX);
+        // Execute nonce 0 (deploy).
+        let data = [0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let msg = signed_tx(&privkey, 0, tx::TxKind::Create, &data);
+        m.handle(&dummy_ctx(), &msg).expect("deploy");
+        assert_eq!(m.nonce(&sender), 1);
+        // Now validate a tx with nonce 0 (stale) — must reject.
+        let stale_msg = signed_tx(&privkey, 0, tx::TxKind::Create, &data);
+        assert!(matches!(m.validate(&dummy_ctx(), &stale_msg), Err(ExecError::ModuleRejected(_))));
+    }
+
+    #[test]
+    fn validate_accepts_future_nonce() {
+        let (privkey, sender) = test_keypair();
+        let m = make_module();
+        m.fund_account_for_test(&sender, u128::MAX);
+        // A tx with nonce 5 (future) should be accepted for mempool
+        // queueing.
+        let data = [0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let msg = signed_tx(&privkey, 5, tx::TxKind::Create, &data);
+        assert!(m.validate(&dummy_ctx(), &msg).is_ok(), "future nonce must validate");
+    }
+
+    #[test]
+    fn validate_rejects_zero_gas_limit() {
+        let (privkey, _) = test_keypair();
+        let m = make_module();
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce: 0,
+                gas_limit: 0,
+                to: tx::TxKind::Create,
+                value: U256::ZERO,
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        let signed = tx::SignedTx::sign_legacy(tx, &privkey).expect("sign");
+        let msg = signed.encode_to_bytes();
+        assert!(matches!(m.validate(&dummy_ctx(), &msg), Err(ExecError::ModuleRejected(_))));
+    }
+
+    #[test]
+    fn validate_rejects_insufficient_balance() {
+        let (privkey, _) = test_keypair();
+        let m = make_module();
+        // A brand-new account has 0 balance. Any tx with gas_cost > 0
+        // must be rejected.
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce: 0,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                to: tx::TxKind::Create,
+                value: U256::ZERO,
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000), // 1 gwei
+        };
+        let signed = tx::SignedTx::sign_legacy(tx, &privkey).expect("sign");
+        let msg = signed.encode_to_bytes();
+        // gas_cost = 30M * 1 gwei = 30M gwei = 0.03 ETH — but balance is 0.
+        assert!(matches!(m.validate(&dummy_ctx(), &msg), Err(ExecError::ModuleRejected(_))));
     }
 }

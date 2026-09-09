@@ -69,6 +69,25 @@ storage = { path = "crates/storage", version = "0.1.0" }
 # per AGENTS.md dependency policy.
 revm = "42.0.1"
 
+# secp256k1: ECDSA signature recovery for EVM transactions (Phase A).
+# Already a transitive dep via revm; declared explicitly with the
+# features we need. This is reth's exact choice — the C-vetted libsecp256k1
+# binding, ~2-3x faster than pure-Rust k256. MIT-0 licensed.
+# Features: global-context (thread-safe global context, no per-call init),
+# recovery (ecdsa recover), rand (test signing key generation).
+secp256k1 = { version = "0.31.1", features = ["global-context", "recovery", "rand"] }
+
+# alloy-rlp: Ethereum RLP encoding/decoding (Phase A signed tx types).
+# Already a transitive dep via revm/alloy-primitives. MIT-licensed.
+# Used for signed EVM transaction envelopes (Legacy, EIP-2930, EIP-1559).
+alloy-rlp = "0.3.16"
+
+# sha3: Keccak-256 hashing for EVM transactions and address derivation
+# (Phase A). Already a transitive dep via revm. The `sha3` crate's
+# `Keccak256` digest is Ethereum's keccak256 (not NIST SHA3-256 —
+# the padding differs). MIT/Apache-2.0 licensed.
+sha3 = "0.11.0"
+
 # External storage adapters (plan.md §2.3: StorageBackend adapters).
 # redb is Apache-2.0 (GPL-3.0-compatible), pure Rust, ACID, LMDB-like.
 redb = "4.2.0"

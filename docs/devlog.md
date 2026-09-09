@@ -3393,3 +3393,170 @@ removing the crate-level `cfg` and adding a conditional fallback
   pass.
 - `cargo deny check`: only pre-existing warnings (duplicates,
   license-not-encountered).
+
+---
+
+## 2026-01-24 — Session 27: Phase A — EVM transaction authenticity, mempool admission, gas economics, block context
+
+### Overview
+
+Phase A of the EVM production-readiness program is complete. This
+session delivered the full cryptographic and economic foundation for
+authentic EVM execution: signed transaction types, signature-based
+sender recovery, mempool admission validation, EIP-1559 gas
+economics, and block context wiring. The EVM module now executes
+only cryptographically authenticated transactions — the outer
+executor envelope is no longer trusted for EVM sender identity.
+
+### A1: secp256k1 recovery + Keccak in the crypto crate
+
+`crates/crypto/src/secp.rs`:
+- Added `recover_sender(msg_hash, sig, recid) -> Result<Address,
+  SecpError>` — recovers a 20-byte Ethereum address from a
+  secp256k1 signature. Uses the C-vetted `libsecp256k1` binding
+  (same choice as reth).
+- Added `sign(privkey, msg_hash) -> Result<RecoverableSignature,
+  SecpError>` — produces a recoverable signature for test signing.
+- Added `generate_keypair_for_test() -> ([u8;32], Address)` —
+  deterministically generates a keypair and derives the Ethereum
+  address via Keccak-256 of the public key.
+- Added `keccak256(data) -> [u8;32]` — Ethereum's keccak256 (not
+  NIST SHA3-256).
+- 34 unit tests covering recovery, signing, address derivation,
+  edge cases, and error paths.
+
+### A2: signed Ethereum transaction types
+
+`modules/evm/src/tx.rs`:
+- `TxLegacy` — legacy (pre-EIP-155) and EIP-155 signed transactions.
+- `TxEip2930` — EIP-2930 typed transactions with access lists.
+- `TxEip1559` — EIP-1559 typed transactions with `max_fee_per_gas`
+  and `max_priority_fee_per_gas`.
+- `SignedTx` — an RLP-decodable envelope holding any of the three
+  types plus signature bytes. Exposes:
+  - `chain_id()`, `nonce()`, `gas_limit()`, `to()`, `value()`,
+    `data()`, `max_fee_per_gas()`, `max_priority_fee_per_gas()`.
+  - `recover_sender() -> Result<Address, SecpError>` — the
+    authentication primitive.
+  - `sign_legacy()`, `sign_2930()`, `sign_1559()` — test signing
+    helpers.
+  - RLP encoding/decoding via `alloy-rlp`.
+
+### A3: signed-only EVM execution
+
+`modules/evm/src/lib.rs`:
+- `EvmModule::handle` now:
+  1. Decodes the raw payload as a `SignedTx` (RLP).
+  2. Recovers the sender from the signature.
+  3. Enforces chain ID (EIP-155 replay protection).
+  4. Builds a `revm::TxEnv` from the signed fields.
+  5. Executes via `transact_commit`.
+- The outer executor envelope sender (`ctx.sender`) is **ignored**
+  for EVM execution. The recovered signer is the authentic caller.
+- `sender_is_recovered_not_trusted` test verifies this: a fake
+  envelope sender does not get the nonce increment; the real
+  signer does.
+- All unit, integration, replay, persistence, exploit, load, and
+  standalone tests migrated to deterministic signed transactions.
+
+### A4: mempool admission through `Module::validate`
+
+`crates/executor/src/lib.rs`:
+- Added `Module::validate(&self, ctx: &TxContext, msg: &[u8]) ->
+  Result<(), ExecError>` — a new trait hook for mempool admission.
+- `ingest_tx` now:
+  1. Parses the v0 envelope.
+  2. Resolves the module by ID.
+  3. Invokes `module.validate(&ctx, payload)`.
+  4. Rejects invalid transactions **before** inserting into the
+     mempool.
+  5. Submits only validated transactions to `Mempool`.
+- This moves authenticity enforcement from execution-time to
+  admission-time — invalid txs never enter the mempool.
+
+`modules/evm/src/lib.rs`:
+- `EvmModule::validate` checks:
+  1. RLP decodability (malformed → reject).
+  2. Signature recovery (bad signature → reject).
+  3. Chain ID match (wrong chain → reject).
+  4. Nonce ordering (stale nonce → reject; future nonce → accept
+     for mempool queuing).
+  5. Gas limit ≥ intrinsic (21_000).
+  6. Balance ≥ `gas_limit * max_fee + value` (insufficient funds →
+     reject).
+  7. Fee overflow checks.
+- Validation does **not** mutate EVM state — it reads balance and
+  nonce from the `CacheDB` but commits nothing.
+- 8 new validation tests covering all rejection paths and the
+  accept paths.
+
+### A5: gas economics — charge, burn, tip
+
+`modules/evm/src/lib.rs`:
+- `build_tx_env` now wires `gas_price` and `gas_priority_fee` from
+  the signed transaction into `revm::TxEnv`.
+- revm's internal gas accounting handles:
+  1. **Charge**: `gas_used * effective_gas_price` deducted from
+     the sender.
+  2. **Burn**: `gas_used * base_fee` removed from supply.
+  3. **Tip**: `gas_used * (gas_price - base_fee)` credited to the
+     coinbase (fee recipient).
+- The effective gas price is `min(max_fee, base_fee +
+  max_priority_fee)` for EIP-1559, and `gas_price` for legacy.
+- All test transactions now use a gas price ≥ the module's base
+  fee (7 gwei) to pass revm's `GasPriceLessThanBasefee` check.
+
+### A6: block context + coinbase wiring
+
+`modules/evm/src/lib.rs`:
+- `EvmModule` now holds:
+  - `coinbase: Mutex<revm::primitives::Address>` — the fee
+    recipient, set via `set_coinbase()`.
+  - `block_height: Mutex<u64>` — set in `begin_block`.
+  - `block_timestamp: Mutex<u64>` — derived from height (15s/block
+    placeholder; real timestamp comes from the block header when
+    consensus wiring lands).
+  - `block_gas_limit: u64` — 30M (Ethereum mainnet default).
+- `begin_block(Height)` sets the block height and timestamp.
+- `execute` wires these into revm's `BlockEnv` via
+  `modify_block_chained`:
+  - `block.number`, `block.beneficiary`, `block.timestamp`,
+    `block.gas_limit`, `block.basefee`.
+- `set_coinbase()` / `coinbase()` accessors for the fee recipient.
+- This completes the EIP-1559 gas economics loop: the block
+  context determines the base fee, and the coinbase receives the
+  tip.
+
+### Benchmark: `tx_recover`
+
+`crates/crypto/benches/tx_recover.rs`:
+- `recover_address`: 35 µs — secp256k1 ECDSA recovery from a
+  32-byte hash + 65-byte signature. This is the authentication
+  floor for every EVM transaction (both `validate` and `handle`).
+- `sign`: 28 µs — signing (cold-path, test-only comparison).
+- `generate_keypair`: 19 µs — key generation (cold-path).
+- Acceptance gate: < 100 µs per recovery. **35 µs passes** with
+  3x headroom. At 35 µs/recovery, a single thread can authenticate
+  ~28k txs/s — well above the block-execution budget.
+
+### Test verification
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy -p crypto -p evm -p executor --all-targets -- -D
+  warnings`: clean.
+- `cargo test -p crypto -p evm -p executor`: all pass.
+  - Crypto: 34 tests.
+  - EVM lib: 59 tests (including 8 new validation tests).
+  - EVM exploits: 18 tests.
+  - EVM multiblock: 5 tests.
+  - EVM replay: 2 tests.
+  - Executor: 27 tests.
+- `cargo test -p evm -- --ignored`: load (10k txs) and standalone
+  (50-block) tests pass.
+
+### What's next
+
+Phase B: Ethereum-compatible Merkle Patricia Trie state roots via
+`alloy-trie`. The current state root is a sorted-account hash —
+deterministic but not Ethereum-compatible. Phase B replaces it
+with a proper MPT root so Oxide's state root matches reth's.

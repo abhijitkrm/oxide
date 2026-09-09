@@ -14,37 +14,58 @@
 //! `.devin/skills/evm-reference/SKILL.md`) — same concept: the EVM
 //! execution engine should produce correct state roots without
 //! depending on external modules.
+//!
+//! Phase A: all transactions are now signed (secp256k1 recovery).
+//! The tx envelope format is: `[sender: 20B][nonce: 8B LE][fee: 8B LE]
+//! [module_id: 1B][signed_evm_tx: ...]`. The EVM module recovers the
+//! sender from the signature, ignoring the envelope's sender field.
 
 #![allow(clippy::cast_precision_loss)]
 
+use crypto::secp;
 use evm::EvmModule;
+use evm::tx::{SignedTx, TxFields, TxKind, TxLegacy};
 use executor::Executor;
 use ports::AppInterface;
 use primitives::{Address, Hash, Height};
+use revm::primitives::{Bytes, U256};
 use std::sync::Arc;
 use storage::Volatile;
 use types::{BlockBudget, FinalizedBlock, TxBytes};
 
 /// Simple deploy bytecode: PUSH1 0x01, PUSH1 0x00, SSTORE, STOP.
 const DEPLOY_BYTECODE: &[u8] = &[0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+const GAS_LIMIT: u64 = 30_000_000;
 
-/// A fixed sender address.
-fn sender() -> Address {
-    Address([0x11; 20])
+/// Build a signed deploy tx (RLP-encoded).
+fn signed_deploy(privkey: &[u8], nonce: u64) -> Vec<u8> {
+    let tx = TxLegacy {
+        fields: TxFields {
+            nonce,
+            gas_limit: GAS_LIMIT,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            data: Bytes::copy_from_slice(DEPLOY_BYTECODE),
+            chain_id: 1,
+        },
+        gas_price: U256::from(1_000_000_000),
+    };
+    SignedTx::sign_legacy(tx, privkey).expect("sign must succeed").encode_to_bytes()
 }
 
 /// Build a tx in the v0 envelope format:
 /// `[sender: 20B][nonce: 8B LE][fee: 8B LE][module_id: 1B][payload]`.
 ///
-/// The EVM module's payload is `[to: 20B][calldata: ...]`.
-fn make_evm_tx(nonce: u64, to: [u8; 20], calldata: &[u8]) -> TxBytes {
-    let mut bytes = Vec::with_capacity(36 + 1 + 20 + calldata.len());
-    bytes.extend_from_slice(&sender().0);
+/// The EVM module's payload is a signed EVM transaction (RLP-encoded).
+/// The envelope's sender field is ignored by the EVM module — it
+/// recovers the sender from the signature.
+fn make_evm_tx(envelope_sender: Address, nonce: u64, signed_evm_tx: &[u8]) -> TxBytes {
+    let mut bytes = Vec::with_capacity(36 + 1 + signed_evm_tx.len());
+    bytes.extend_from_slice(&envelope_sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&100u64.to_le_bytes());
     bytes.push(framework::module_id::EVM);
-    bytes.extend_from_slice(&to);
-    bytes.extend_from_slice(calldata);
+    bytes.extend_from_slice(signed_evm_tx);
     TxBytes::new(bytes)
 }
 
@@ -57,9 +78,14 @@ fn make_evm_tx(nonce: u64, to: [u8; 20], calldata: &[u8]) -> TxBytes {
 #[test]
 #[ignore = "standalone chain test takes >1s; run with cargo test -- --ignored"]
 fn standalone_evm_only_50_blocks() {
+    // Generate a test keypair for signing transactions.
+    let (privkey, sender) = secp::generate_keypair_for_test();
+    let sender_addr = Address(sender.0);
+
     // Create an EVM module with durable storage.
     let backend = Box::new(Volatile::new());
     let evm = EvmModule::with_storage(1, 7, backend);
+    evm.fund_account_for_test(&sender_addr, u128::MAX);
 
     // Register ONLY the EVM module — no bank, staking, core, or
     // trading modules. This proves the EVM can run standalone.
@@ -71,8 +97,11 @@ fn standalone_evm_only_50_blocks() {
     let mut roots = Vec::with_capacity(num_blocks_usize);
 
     for block in 0..num_blocks {
-        // Build an EVM deploy tx: `to = zeros` (deploy) + bytecode.
-        let tx = make_evm_tx(block, [0u8; 20], DEPLOY_BYTECODE);
+        // Build a signed EVM deploy tx.
+        let signed = signed_deploy(&privkey, block);
+        // Wrap in the v0 envelope. The envelope sender is a dummy —
+        // the EVM module recovers the real sender from the signature.
+        let tx = make_evm_tx(Address([0u8; 20]), block, &signed);
         executor.ingest_tx(tx);
 
         // Prepare and finalize the block.

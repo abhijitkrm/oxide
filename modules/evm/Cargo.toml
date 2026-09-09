@@ -19,6 +19,9 @@ executor = { workspace = true }
 framework = { workspace = true }
 revm = { workspace = true }
 storage = { workspace = true }
+# alloy-rlp: Ethereum RLP encoding for signed tx types (Phase A).
+# Already a transitive dep via revm/alloy-primitives. MIT-licensed.
+alloy-rlp = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.7.0"

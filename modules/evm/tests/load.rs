@@ -9,34 +9,47 @@
 //! `.devin/skills/evm-reference/SKILL.md`) — we verify the same
 //! invariants: sustained throughput, monotonic state evolution, and
 //! no panics under load.
+//!
+//! Phase A: all transactions are now signed (secp256k1 recovery).
 
 #![allow(clippy::cast_precision_loss)]
 
+use crypto::secp;
 use evm::EvmModule;
+use evm::tx::{SignedTx, TxFields, TxKind, TxLegacy};
 use executor::{Module, TxContext};
 use primitives::{Address, Height};
+use revm::primitives::{Bytes, U256};
 use std::time::Instant;
 use storage::Volatile;
 
 /// Simple deploy bytecode: PUSH1 0x01, PUSH1 0x00, SSTORE, STOP.
 const DEPLOY_BYTECODE: &[u8] = &[0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+const GAS_LIMIT: u64 = 30_000_000;
 
-/// Build an EVM deploy message.
-fn deploy_msg(calldata: &[u8]) -> Vec<u8> {
-    let mut msg = vec![0u8; 20];
-    msg.extend_from_slice(calldata);
-    msg
+/// Build a signed deploy tx.
+fn signed_deploy(privkey: &[u8], nonce: u64) -> Vec<u8> {
+    let tx = TxLegacy {
+        fields: TxFields {
+            nonce,
+            gas_limit: GAS_LIMIT,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            data: Bytes::copy_from_slice(DEPLOY_BYTECODE),
+            chain_id: 1,
+        },
+        gas_price: U256::from(1_000_000_000),
+    };
+    SignedTx::sign_legacy(tx, privkey).expect("sign must succeed").encode_to_bytes()
 }
 
-/// Build an EVM call message to a deployed contract.
-#[allow(dead_code)]
-fn call_msg(to: Address) -> Vec<u8> {
-    to.0.to_vec()
+fn dummy_ctx() -> TxContext {
+    TxContext { sender: Address([0u8; 20]), nonce: 0, fee: 0 }
 }
 
-/// A fixed sender address.
-fn sender() -> Address {
-    Address([0x11; 20])
+/// Fund an account with a large balance.
+fn fund(module: &EvmModule, addr: &Address) {
+    module.fund_account_for_test(addr, u128::MAX);
 }
 
 /// Run 10,000 EVM transactions across 100 blocks with a Volatile
@@ -46,8 +59,11 @@ fn sender() -> Address {
 #[test]
 #[ignore = "load test takes ~2.5s; run with cargo test -- --ignored"]
 fn load_10k_evm_txs_across_100_blocks() {
+    let (privkey, sender) = secp::generate_keypair_for_test();
+    let sender = Address(sender.0);
     let backend = Box::new(Volatile::new());
     let module = EvmModule::with_storage(1, 7, backend);
+    fund(&module, &sender);
 
     let total_txs = 10_000u64;
     let blocks = 100u64;
@@ -61,13 +77,12 @@ fn load_10k_evm_txs_across_100_blocks() {
         module.begin_block(Height::new(block));
         for tx_in_block in 0..txs_per_block {
             let tx_index = block * txs_per_block + tx_in_block;
-            let ctx = TxContext { sender: sender(), nonce: tx_index, fee: 100 };
             // All txs are deploys (simplest workload that creates
             // state). A more realistic mix would include calls to
             // previously deployed contracts, but deploys are the
             // heaviest EVM operation and stress the system more.
-            let msg = deploy_msg(DEPLOY_BYTECODE);
-            module.handle(&ctx, &msg).expect("handle must succeed");
+            let msg = signed_deploy(&privkey, tx_index);
+            module.handle(&dummy_ctx(), &msg).expect("handle must succeed");
         }
         module.end_block(Height::new(block));
         state_roots.push(module.state_root());
@@ -100,7 +115,8 @@ fn load_10k_evm_txs_across_100_blocks() {
         elapsed.as_secs_f64()
     );
     eprintln!(
-        "load test: {txs_per_block} txs/block, final state root = {}",
+        "load test: {txs_per_block} txs/block, final sender nonce = {}, final state root = {}",
+        module.nonce(&sender),
         state_roots[blocks_usize - 1]
     );
 }
