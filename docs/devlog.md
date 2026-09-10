@@ -4854,3 +4854,132 @@ machinery and provide a fallback `main()` for no-feature builds.
 - **`rustls::StreamOwned::set_read_timeout`**: doesn't exist. The
   underlying socket is at `tls_stream.sock`. Fixed by accessing
   `tls_stream.sock.set_read_timeout(...)`.
+
+## 2026-09-09 — Session 5: Finishing the blockchain infrastructure
+
+### State sync protocol
+
+Added `p2p::sync` module — a chunked snapshot sync protocol that
+allows new nodes to join the network by downloading a state snapshot
+from existing peers, rather than replaying the entire journal from
+genesis.
+
+Design:
+- `SyncRequest`/`SyncResponse`/`ChunkResponse` wire messages.
+- `SnapshotServer` holds a pre-chunked snapshot and serves chunks.
+- `SnapshotClient` downloads chunks sequentially, assembles them,
+  and verifies the state root.
+- Chunks are at most 1 MiB (CHUNK_SIZE) to stay within the
+  transport's 16 MiB max message size.
+- Snapshots are limited to 64 GiB (65,536 chunks × 1 MiB).
+- State root verification after assembly (simple hash, not a full
+  Merkle tree — that's the storage layer's job).
+
+20 unit tests covering: round-trip encode/decode, chunking,
+assembly, state root verification, error cases (malformed, wrong
+height, root mismatch, out-of-range).
+
+### Chaos sim suite
+
+Added three modules to the `oxide-sim` crate:
+
+1. `network.rs` — network models for deterministic simulation:
+   - `DeterministicRng` (xorshift64) for reproducible randomness.
+   - `DelayModel`: None, Uniform, Gaussian (Box-Muller transform).
+   - `LossModel`: None, Random (probability-based), Partition.
+   - `NetworkModel`: combined delay + loss, applied per message.
+   - 14 unit tests.
+
+2. `byzantine.rs` — byzantine strategy framework:
+   - `ByzantineStrategy` enum: Honest, Equivocate, Withhold, Spam,
+     Censor, DoubleVote.
+   - `ByzantineScenario`: assigns strategies to specific nodes,
+     tracks BFT bounds (≤ f byzantine for n nodes).
+   - 7 unit tests.
+
+3. `swarm.rs` — swarm harness:
+   - `Swarm`: configuration container combining network model +
+     byzantine scenario.
+   - `SwarmResult`: safety and liveness checking.
+   - `ScenarioRunner`: convenience wrapper for running scenarios.
+   - `scenarios` module: 8 predefined scenarios (minimal, withhold,
+     equivocate, network delay, network loss, spam, censor,
+     10-node).
+   - 14 unit tests.
+
+Total: 35 new sim tests.
+
+### Governance module
+
+Added `modules/governance` — the Cosmos-SDK-style `x/gov` analog.
+
+Design:
+- `Proposal` struct: ID, proposer, param_key, param_val, yes/no
+  votes, finalized/passed status.
+- `Vote` enum: Yes/No.
+- `GovernanceModule` implements `Module` trait.
+- Messages: `Propose` (key-value pair), `Vote` (proposal ID + vote).
+- `end_block` finalizes all pending proposals: simple majority
+  (yes > no) passes.
+- Module ID: `GOVERNANCE = 4` (added to `framework::module_id`).
+
+Phase 4 scope: no timelock, no veto, no proposal deposits. This is
+the minimum needed for on-chain parameter changes.
+
+13 unit tests covering: propose, vote, finalize, pass/fail/tie,
+malformed messages, state root changes, multiple proposals.
+
+### Peer reputation and banning
+
+Added `p2p::reputation` module — a peer reputation system that
+tracks behavior and bans misbehaving peers.
+
+Design:
+- `PeerReputation`: per-peer score, ban status, ban duration.
+- `ReputationEvent` enum: ValidMessage (+1), HandshakeSuccess (+5),
+  InvalidMessage (-10), Timeout (-5), Disconnect (-3),
+  DuplicateMessage (-2), OversizedMessage (-10).
+- `PeerReputationStore`: thread-safe store, checked on connect,
+  updated on message processing.
+- Ban threshold: score ≤ -50 triggers a 5-minute ban.
+- Ban expiration: peers can reconnect after the ban duration.
+- Score clamping: [-100, 100] to prevent overflow/underflow.
+
+23 unit tests covering: score changes, ban trigger, clamping,
+expiration, unban, all event types, mixed events, store operations.
+
+### Fuzz campaign
+
+Added `sync-decode` fuzz target for the state sync protocol's
+decode paths (`SyncRequest::decode`, `SyncResponse::decode`,
+`ChunkResponse::decode`).
+
+**Bug found and fixed**: The fuzzer immediately found an OOM bug in
+`ChunkResponse::decode` — an untrusted `entry_count` from the wire
+caused `Vec::with_capacity(entry_count)` to try to allocate 206 GB.
+Fixed by:
+- Capping `entry_count` to `MAX_ENTRIES_PER_CHUNK` (65,536) and the
+  byte-budget-derived maximum (`remaining / 8`).
+- Capping `key_len` to `MAX_KEY_LEN` (1,024).
+- Capping `val_len` to `MAX_VAL_LEN` (1 MiB = `CHUNK_SIZE`).
+
+After the fix, the fuzzer ran 14 million executions in 60 seconds
+with no crashes.
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: 587+ tests pass (was 374 in Phase 2).
+- `cargo bench --workspace --no-run`: all benchmarks compile.
+- `cargo +nightly fuzz run sync-decode -- -max_total_time=60`:
+  14M executions, no crashes.
+
+### New test counts
+
+| Crate | Tests | New |
+|---|---|---|
+| p2p | 72 | +43 (sync + reputation) |
+| oxide-sim | 35 | +35 (network + byzantine + swarm) |
+| governance | 13 | +13 (new module) |
+| Total workspace | 587+ | +91 |

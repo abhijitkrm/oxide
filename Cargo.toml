@@ -55,6 +55,7 @@ oxide-core = { path = "modules/oxide-core", version = "0.1.0" }
 bank = { path = "modules/bank", version = "0.1.0" }
 staking = { path = "modules/staking", version = "0.1.0" }
 evm = { path = "modules/evm", version = "0.1.0" }
+governance = { path = "modules/governance", version = "0.1.0" }
 # RPC server (plan.md §13: JSON-RPC + WebSocket for MetaMask/Foundry).
 rpc = { path = "crates/rpc", version = "0.1.0" }
 # Indexer/explorer (plan.md §13: indexes finalized blocks for explorer).

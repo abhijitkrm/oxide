@@ -53,6 +53,10 @@ pub mod tls;
 
 pub mod discovery;
 
+pub mod sync;
+
+pub mod reputation;
+
 /// The default maximum message size for the mesh: 16 MiB. Matches
 /// the broadcast crate's `ERASURE_MAX_BYTES` — a full erasure-coded
 /// block chunk fits in one mesh message.

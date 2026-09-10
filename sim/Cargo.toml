@@ -16,6 +16,12 @@ types = { workspace = true }
 codec = { workspace = true }
 crypto = { workspace = true }
 primitives = { workspace = true }
+p2p = { workspace = true }
+executor = { workspace = true }
+framework = { workspace = true }
+bank = { workspace = true }
+oxide-core = { workspace = true }
+staking = { workspace = true }
 
 [lints]
 workspace = true

@@ -31,6 +31,8 @@ pub mod module_id {
     pub const STAKING: u8 = 2;
     /// The EVM module: revm host, precompiles, EIP-1559.
     pub const EVM: u8 = 3;
+    /// The governance module: parameter changes, market listing.
+    pub const GOVERNANCE: u8 = 4;
 }
 
 /// A shared in-memory key-value store for module state.

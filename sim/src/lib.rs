@@ -36,6 +36,10 @@
 //! `AGENTS.md` real, and to provide a library home for the echo sim
 //! pattern that other crates can depend on.
 
+pub mod byzantine;
+pub mod network;
+pub mod swarm;
+
 // Re-export the echo simulation entry point. The implementation lives
 // in `crates/runtime/tests/echo.rs` as an integration test; this
 // wrapper provides a library API for programmatic access. The test

@@ -1,0 +1,22 @@
+# Oxide blockchain — `governance` module
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention)
+
+[package]
+name = "governance"
+description = "Governance module — parameter changes, market listing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
+types = { workspace = true }
+executor = { workspace = true }
+framework = { workspace = true }
+
+[lints]
+workspace = true

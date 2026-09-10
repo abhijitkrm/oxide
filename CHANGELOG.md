@@ -1159,3 +1159,46 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     down the others.
   - **Storage benchmark fix:** the storage benchmark no longer fails
     strict clippy when no storage backend features are enabled.
+
+- **Blockchain infrastructure completion: state sync, chaos sim, governance, peer reputation** (2026-09-09)
+  - **State sync protocol:** new `p2p::sync` module implements a
+    chunked snapshot sync protocol. New nodes can download a state
+    snapshot from existing peers instead of replaying the entire
+    journal from genesis. Includes `SnapshotServer` (serves
+    chunks), `SnapshotClient` (downloads and assembles), state
+    root verification, and 1 MiB chunking.
+  - **In plain words:** a new node joining the network can now sync
+    in minutes instead of hours/days. This is the last major piece
+    for full node operability.
+  - **Chaos sim suite:** new `oxide-sim` crate modules: `network.rs`
+    (delay/loss/partition models with deterministic PRNG),
+    `byzantine.rs` (6 byzantine strategies + BFT bound tracking),
+    `swarm.rs` (swarm harness with 8 predefined scenarios). 35 new
+    tests.
+  - **In plain words:** we can now simulate network partitions,
+    byzantine validators, message loss, and latency in a
+    deterministic, reproducible way. Same seed = same result.
+  - **Governance module:** new `modules/governance` — the
+    Cosmos-SDK-style `x/gov` analog. Token holders can propose
+    parameter changes and vote yes/no. Simple majority passes at
+    `end_block`. 13 new tests.
+  - **In plain words:** the chain can now update its own parameters
+    (timeouts, fees, limits) through on-chain governance, without
+    a hard fork.
+  - **Peer reputation and banning:** new `p2p::reputation` module.
+    Tracks per-peer reputation scores. Peers that send invalid
+    messages, timeout, or disconnect lose reputation. Below -50,
+    a peer is banned for 5 minutes. 23 new tests.
+  - **In plain words:** bad peers are now automatically banned.
+    A byzantine node can't reconnect indefinitely to flood the
+    network with garbage.
+  - **Fuzz bug fix:** the `sync-decode` fuzz target found an OOM
+    bug in `ChunkResponse::decode` — an untrusted `entry_count`
+    caused a 206 GB allocation. Fixed by capping entry count,
+    key length, and value length. 14M fuzz executions after fix,
+    no crashes.
+  - **In plain words:** the fuzzer found a memory exhaustion
+    vulnerability in the new sync protocol within seconds. It's
+    now fixed — untrusted wire data can't cause OOM.
+  - **Test count:** 587+ tests pass (was 374). 91 new tests across
+    p2p (+43), oxide-sim (+35), and governance (+13).

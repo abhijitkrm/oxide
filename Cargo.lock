@@ -1813,6 +1813,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
+name = "governance"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "crypto",
+ "executor",
+ "framework",
+ "primitives",
+ "types",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2409,13 +2421,19 @@ dependencies = [
 name = "oxide-sim"
 version = "0.1.0"
 dependencies = [
+ "bank",
  "codec",
  "consensus",
  "crypto",
  "devnet",
+ "executor",
+ "framework",
+ "oxide-core",
+ "p2p",
  "ports",
  "primitives",
  "runtime",
+ "staking",
  "types",
 ]
 

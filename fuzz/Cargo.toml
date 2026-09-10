@@ -23,6 +23,7 @@ storage = { path = "../crates/storage" }
 types = { path = "../crates/types" }
 executor = { path = "../crates/executor" }
 evm = { path = "../modules/evm" }
+p2p = { path = "../crates/p2p" }
 
 [[bin]]
 name = "codec-decode"
@@ -57,5 +58,11 @@ doc = false
 [[bin]]
 name = "evm-execute"
 path = "fuzz_targets/evm_execute.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sync-decode"
+path = "fuzz_targets/sync_decode.rs"
 test = false
 doc = false
