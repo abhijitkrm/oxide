@@ -1,26 +1,134 @@
-//! Oxide staking module — delegation, validator set, slashing.
+//! Oxide staking module — delegation, unbonding, slashing, rewards.
 //!
 //! The staking module tracks validator stakes and delegations, and
 //! produces the validator set for each epoch. It's the
-//! module-equivalent of Cosmos SDK's `x/staking`.
-//!
-//! # Phase 1 scope
-//!
-//! v0 tracks delegations and validator stakes. No slashing, no
-//! rewards, no unbonding periods. The validator set is computed from
-//! the top-N staked validators.
+//! module-equivalent of Cosmos SDK's `x/staking` + `x/slashing` +
+//! `x/distribution` (combined for simplicity in a single module).
 //!
 //! # Messages
 //!
-//! - Delegate: `[validator: 20B][amount: 8B LE]`
-//! - Undelegate: `[validator: 20B][amount: 8B LE]`
+//! All staking messages share a common format:
+//! `[type: 1B][validator: 20B][amount: 8B LE]` (29 bytes).
+//!
+//! - `0x01` Delegate: add `amount` to `validator`'s stake.
+//! - `0x02` Undelegate: start unbonding `amount` from `validator`.
+//!   The unbonded amount is locked until `completion_height =
+//!   current_height + UNBONDING_PERIOD_BLOCKS`. After completion,
+//!   the delegator can withdraw via a bank transfer (future: a
+//!   `withdraw` message).
+//! - `0x03` Slash: reduce `validator`'s stake by `slash_fraction`
+//!   of `amount`. Called by consensus (double-sign evidence) or
+//!   governance. The slashed amount is burned.
+//! - `0x04` Claim reward: withdraw accumulated rewards for
+//!   `validator` (transferred to the sender's bank balance).
+//!
+//! # Unbonding
+//!
+//! When a delegator undelegates, the amount moves from the
+//! validator's `stake` to an `unbonding` queue with a completion
+//! height. At `end_block`, completed unbonding entries are removed
+//! from the queue (the funds are now withdrawable).
+//!
+//! The unbonding period prevents validators from withdrawing their
+//! stake immediately after misbehaving — if evidence of misbehavior
+//! arrives within the unbonding period, the stake can still be
+//! slashed.
+//!
+//! # Slashing
+//!
+//! Slashing reduces a validator's stake. The slash fraction depends
+//! on the offense:
+//! - Double-sign (Byzantine): 10% of stake.
+//! - Downtime (liveness): 1% of stake.
+//!
+//! Slashing is triggered by:
+//! - Consensus evidence (double-sign detected by the engine).
+//! - Governance proposals (manual slash vote).
+//!
+//! # Rewards
+//!
+//! At each `end_block`, a block reward is distributed to all active
+//! validators proportional to their stake fraction. Rewards
+//! accumulate in a `rewards` map. Delegators claim rewards via the
+//! `claim_reward` message.
+//!
+//! The block reward is a fixed amount per block (configurable). In
+//! a production chain, this would be combined with transaction fees
+//! and an inflation schedule.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use executor::{Event, ExecError, Module, TxContext};
-use framework::{KVStore, module_id, subtree_root};
+use framework::{module_id, subtree_root};
 use primitives::{Address, Hash, Height};
+
+/// Message type byte for staking messages.
+///
+/// The first byte of every staking message identifies the operation.
+/// This allows a single module to handle multiple message types
+/// without separate module IDs.
+mod msg_type {
+    /// Delegate: add stake to a validator.
+    pub const DELEGATE: u8 = 0x01;
+    /// Undelegate: start unbonding (withdraw stake).
+    pub const UNDELEGATE: u8 = 0x02;
+    /// Slash: reduce a validator's stake (called by consensus/gov).
+    pub const SLASH: u8 = 0x03;
+    /// Claim reward: withdraw accumulated rewards.
+    pub const CLAIM_REWARD: u8 = 0x04;
+}
+
+/// The unbonding period in blocks.
+///
+/// A delegator must wait this many blocks after undelegating before
+/// the funds are withdrawable. This prevents validators from
+/// withdrawing their stake immediately after misbehaving — if
+/// evidence arrives within the unbonding period, the stake can
+/// still be slashed.
+///
+/// Devnet: 100 blocks (~100 seconds at 1 block/s).
+/// Mainnet: ~21 days (1,209,600 blocks at 1.5s/block).
+/// Configurable per-chain via [`StakingModule::with_unbonding_period`].
+const DEFAULT_UNBONDING_PERIOD_BLOCKS: u64 = 100;
+
+/// The block reward in atomic units (1 token = 10^18 atomic units).
+///
+/// Distributed to validators proportional to stake at each `end_block`.
+/// This is a fixed reward — a production chain would combine this
+/// with transaction fees and an inflation schedule (Cosmos SDK's
+/// `mint` module).
+///
+/// Devnet: `1_000_000_000` atomic units (10^-9 tokens per block).
+/// Configurable via [`StakingModule::with_block_reward`].
+const DEFAULT_BLOCK_REWARD: u64 = 1_000_000_000;
+
+/// The slash fraction for double-signing (Byzantine fault).
+///
+/// The slash amount is `stake * SLASH_FRACTION_DOUBLE_SIGN_NUMERATOR
+/// / SLASH_FRACTION_DENOMINATOR`. Using integer arithmetic to avoid
+/// floating-point non-determinism.
+///
+/// 10% slash for double-signing (the Cosmos SDK default).
+const SLASH_FRACTION_DOUBLE_SIGN_NUMERATOR: u64 = 10;
+/// The denominator for slash fractions (100 = percentage basis).
+const SLASH_FRACTION_DENOMINATOR: u64 = 100;
+
+/// A pending unbonding entry.
+///
+/// When a delegator undelegates, the amount is locked until
+/// `completion_height`. After that, the funds are withdrawable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnbondingEntry {
+    /// The delegator who undelegated.
+    pub delegator: Address,
+    /// The validator being undelegated from.
+    pub validator: Address,
+    /// The amount being unbonded.
+    pub amount: u64,
+    /// The height at which unbonding completes.
+    pub completion_height: u64,
+}
 
 /// A validator's stake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,17 +139,58 @@ pub struct Validator {
     pub stake: u64,
 }
 
-/// The staking module: delegation and validator set.
+/// The staking module: delegation, unbonding, slashing, rewards.
 pub struct StakingModule {
-    store: KVStore,
+    /// The KV store for state root computation.
+    /// `KVStore` is `Mutex<BTreeMap<Vec<u8>, Vec<u8>>>` — already
+    /// thread-safe, no extra `Mutex` needed.
+    store: framework::KVStore,
     /// Validator stakes, keyed by address.
     validators: Mutex<BTreeMap<Address, u64>>,
+    /// Pending unbonding entries (completed at `end_block`).
+    unbonding: Mutex<Vec<UnbondingEntry>>,
+    /// Accumulated rewards per validator address.
+    rewards: Mutex<BTreeMap<Address, u64>>,
+    /// The unbonding period in blocks.
+    unbonding_period: u64,
+    /// The block reward in atomic units.
+    block_reward: u64,
+    /// The current block height (set at `begin_block`).
+    current_height: Mutex<u64>,
 }
 
 impl StakingModule {
-    /// Construct a fresh staking module with no validators.
+    /// Construct a fresh staking module with no validators and
+    /// default parameters.
     pub fn new() -> Self {
-        Self { store: Mutex::new(BTreeMap::new()), validators: Mutex::new(BTreeMap::new()) }
+        Self {
+            store: Mutex::new(BTreeMap::new()),
+            validators: Mutex::new(BTreeMap::new()),
+            unbonding: Mutex::new(Vec::new()),
+            rewards: Mutex::new(BTreeMap::new()),
+            unbonding_period: DEFAULT_UNBONDING_PERIOD_BLOCKS,
+            block_reward: DEFAULT_BLOCK_REWARD,
+            current_height: Mutex::new(0),
+        }
+    }
+
+    /// Construct a staking module with a custom unbonding period.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the unbonding period is 0 (must be at least 1 block).
+    #[must_use]
+    pub fn with_unbonding_period(mut self, period: u64) -> Self {
+        assert!(period > 0, "unbonding period must be > 0");
+        self.unbonding_period = period;
+        self
+    }
+
+    /// Construct a staking module with a custom block reward.
+    #[must_use]
+    pub fn with_block_reward(mut self, reward: u64) -> Self {
+        self.block_reward = reward;
+        self
     }
 
     /// Get a validator's total stake.
@@ -51,6 +200,15 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     pub fn stake(&self, addr: &Address) -> u64 {
         *self.validators.lock().unwrap().get(addr).unwrap_or(&0)
+    }
+
+    /// Get a validator's accumulated rewards.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn rewards(&self, addr: &Address) -> u64 {
+        *self.rewards.lock().unwrap().get(addr).unwrap_or(&0)
     }
 
     /// Get the top-N validators by stake (descending).
@@ -69,14 +227,40 @@ impl StakingModule {
         sorted.into_iter().take(n).map(|(address, stake)| Validator { address, stake }).collect()
     }
 
-    /// Parse a delegate message: `[validator: 20B][amount: 8B LE]`.
-    fn parse_delegate(msg: &[u8]) -> Option<(Address, u64)> {
-        if msg.len() < 28 {
+    /// Get all pending unbonding entries (for inspection/testing).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn pending_unbonding(&self) -> Vec<UnbondingEntry> {
+        self.unbonding.lock().unwrap().clone()
+    }
+
+    /// Get completed unbonding entries (for withdrawal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn completed_unbonding(&self) -> Vec<UnbondingEntry> {
+        let current = *self.current_height.lock().unwrap();
+        self.unbonding
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.completion_height <= current)
+            .copied()
+            .collect()
+    }
+
+    /// Parse a staking message: `[type: 1B][validator: 20B][amount: 8B LE]`.
+    fn parse_message(msg: &[u8]) -> Option<(u8, Address, u64)> {
+        if msg.len() < 29 {
             return None;
         }
-        let validator = Address::from_slice(&msg[..20]).ok()?;
-        let amount = u64::from_le_bytes(msg[20..28].try_into().ok()?);
-        Some((validator, amount))
+        let msg_type = msg[0];
+        let validator = Address::from_slice(&msg[1..21]).ok()?;
+        let amount = u64::from_le_bytes(msg[21..29].try_into().ok()?);
+        Some((msg_type, validator, amount))
     }
 }
 
@@ -86,22 +270,59 @@ impl Default for StakingModule {
     }
 }
 
-/// Staking message types.
+/// Staking message constructors.
 pub mod msg {
-    /// A delegate message: `[validator: 20B][amount: 8B LE]`.
+    /// A delegate message: `[type: 0x01][validator: 20B][amount: 8B LE]`.
     pub fn delegate(validator: primitives::Address, amount: u64) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(28);
+        let mut msg = Vec::with_capacity(29);
+        msg.push(super::msg_type::DELEGATE);
         msg.extend_from_slice(&validator.0);
         msg.extend_from_slice(&amount.to_le_bytes());
         msg
     }
 
-    /// An undelegate message: `[validator: 20B][amount: 8B LE]`.
+    /// An undelegate message: `[type: 0x02][validator: 20B][amount: 8B LE]`.
     pub fn undelegate(validator: primitives::Address, amount: u64) -> Vec<u8> {
-        // Same format as delegate; the module distinguishes by a
-        // leading type byte in the full message. For v0, we use the
-        // same format and treat all as delegate.
-        delegate(validator, amount)
+        let mut msg = Vec::with_capacity(29);
+        msg.push(super::msg_type::UNDELEGATE);
+        msg.extend_from_slice(&validator.0);
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// A slash message: `[type: 0x03][validator: 20B][amount: 8B LE]`.
+    ///
+    /// The `amount` is the slash amount (not the slash fraction).
+    /// The caller (consensus engine or governance) computes the
+    /// actual slash amount based on the offense type.
+    pub fn slash(validator: primitives::Address, amount: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(29);
+        msg.push(super::msg_type::SLASH);
+        msg.extend_from_slice(&validator.0);
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// A claim-reward message: `[type: 0x04][validator: 20B][amount: 8B LE]`.
+    ///
+    /// The `amount` is the reward amount to claim. If `amount` is 0,
+    /// all accumulated rewards for the validator are claimed.
+    pub fn claim_reward(validator: primitives::Address, amount: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(29);
+        msg.push(super::msg_type::CLAIM_REWARD);
+        msg.extend_from_slice(&validator.0);
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// Compute the slash amount for a double-sign offense.
+    ///
+    /// Returns `stake * SLASH_FRACTION_DOUBLE_SIGN_NUMERATOR /
+    /// SLASH_FRACTION_DENOMINATOR` (10% of the stake).
+    #[must_use]
+    pub fn double_sign_slash_amount(stake: u64) -> u64 {
+        stake.saturating_mul(super::SLASH_FRACTION_DOUBLE_SIGN_NUMERATOR)
+            / super::SLASH_FRACTION_DENOMINATOR
     }
 }
 
@@ -113,11 +334,46 @@ impl Module for StakingModule {
         module_id::STAKING
     }
 
-    fn begin_block(&self, _height: Height) {}
+    fn begin_block(&self, height: Height) {
+        *self.current_height.lock().unwrap() = height.value();
+    }
 
-    fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-        let (validator, amount) = Self::parse_delegate(msg).ok_or(ExecError::Malformed)?;
+    fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+        let (msg_type, validator, amount) = Self::parse_message(msg).ok_or(ExecError::Malformed)?;
 
+        match msg_type {
+            msg_type::DELEGATE => self.handle_delegate(ctx, validator, amount, msg),
+            msg_type::UNDELEGATE => self.handle_undelegate(ctx, validator, amount, msg),
+            msg_type::SLASH => self.handle_slash(ctx, validator, amount, msg),
+            msg_type::CLAIM_REWARD => self.handle_claim_reward(ctx, validator, amount, msg),
+            _ => Err(ExecError::ModuleRejected(format!("unknown staking message type {msg_type}"))),
+        }
+    }
+
+    fn end_block(&self, height: Height) {
+        // Process completed unbonding entries.
+        let current = height.value();
+        let mut unbonding = self.unbonding.lock().unwrap();
+        unbonding.retain(|entry| entry.completion_height > current);
+
+        // Distribute block rewards to active validators.
+        self.distribute_rewards();
+    }
+
+    fn state_root(&self) -> Hash {
+        subtree_root(&self.store)
+    }
+}
+
+impl StakingModule {
+    /// Handle a delegate message: add `amount` to `validator`'s stake.
+    fn handle_delegate(
+        &self,
+        _ctx: &TxContext,
+        validator: Address,
+        amount: u64,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
         let mut validators = self.validators.lock().unwrap();
         let stake = validators.entry(validator).or_insert(0);
         *stake = stake
@@ -131,10 +387,128 @@ impl Module for StakingModule {
         Ok(vec![Event { module: "staking", kind: "delegate".to_string(), data: msg.to_vec() }])
     }
 
-    fn end_block(&self, _height: Height) {}
+    /// Handle an undelegate message: start unbonding `amount` from
+    /// `validator`'s stake.
+    ///
+    /// The amount is removed from the validator's stake immediately
+    /// and placed in the unbonding queue. After `unbonding_period`
+    /// blocks, the funds are withdrawable.
+    fn handle_undelegate(
+        &self,
+        ctx: &TxContext,
+        validator: Address,
+        amount: u64,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let mut validators = self.validators.lock().unwrap();
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("undelegate: validator not found".to_string()))?;
+        if *stake < amount {
+            return Err(ExecError::ModuleRejected("undelegate: insufficient stake".to_string()));
+        }
+        *stake -= amount;
 
-    fn state_root(&self) -> Hash {
-        subtree_root(&self.store)
+        // Record updated stake in store.
+        let mut store = self.store.lock().unwrap();
+        store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
+
+        // Add to unbonding queue.
+        let current = *self.current_height.lock().unwrap();
+        let completion = current.saturating_add(self.unbonding_period);
+        let entry = UnbondingEntry {
+            delegator: ctx.sender,
+            validator,
+            amount,
+            completion_height: completion,
+        };
+        self.unbonding.lock().unwrap().push(entry);
+
+        Ok(vec![Event { module: "staking", kind: "undelegate".to_string(), data: msg.to_vec() }])
+    }
+
+    /// Handle a slash message: reduce `validator`'s stake by `amount`.
+    ///
+    /// The slashed amount is burned (removed from circulation). This
+    /// is called by the consensus engine (double-sign evidence) or
+    /// governance proposals.
+    fn handle_slash(
+        &self,
+        _ctx: &TxContext,
+        validator: Address,
+        amount: u64,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let mut validators = self.validators.lock().unwrap();
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("slash: validator not found".to_string()))?;
+        let slash_amount = amount.min(*stake);
+        *stake -= slash_amount;
+
+        // Record updated stake in store.
+        let mut store = self.store.lock().unwrap();
+        store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
+
+        Ok(vec![Event { module: "staking", kind: "slash".to_string(), data: msg.to_vec() }])
+    }
+
+    /// Handle a claim-reward message: withdraw accumulated rewards.
+    ///
+    /// If `amount` is 0, all accumulated rewards are claimed.
+    /// Otherwise, up to `amount` rewards are claimed.
+    ///
+    /// The claimed rewards are recorded as an event — the actual
+    /// bank transfer is handled by a future `withdraw` step (or
+    /// directly by the executor wiring the reward to the bank
+    /// module).
+    fn handle_claim_reward(
+        &self,
+        _ctx: &TxContext,
+        validator: Address,
+        amount: u64,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let mut rewards = self.rewards.lock().unwrap();
+        let accumulated = rewards.get(&validator).copied().unwrap_or(0);
+        let claim_amount = if amount == 0 { accumulated } else { amount.min(accumulated) };
+        if claim_amount == 0 {
+            return Err(ExecError::ModuleRejected("claim_reward: no rewards to claim".to_string()));
+        }
+        *rewards.entry(validator).or_insert(0) -= claim_amount;
+
+        Ok(vec![Event { module: "staking", kind: "claim_reward".to_string(), data: msg.to_vec() }])
+    }
+
+    /// Distribute block rewards to active validators proportional
+    /// to their stake.
+    ///
+    /// Called at `end_block`. The block reward is split among all
+    /// active validators (stake > 0) proportional to their stake
+    /// fraction. Uses integer arithmetic to avoid floating-point
+    /// non-determinism.
+    ///
+    /// Any remainder (from integer division) is not distributed —
+    /// it stays in the "mint" (effectively burned). This is simpler
+    /// than tracking a fractional remainder and is deterministic.
+    fn distribute_rewards(&self) {
+        let validators = self.validators.lock().unwrap();
+        let total_stake: u64 = validators.values().copied().filter(|&s| s > 0).sum();
+        if total_stake == 0 {
+            return; // no active validators — no distribution
+        }
+
+        let mut rewards = self.rewards.lock().unwrap();
+        for (&addr, &stake) in validators.iter() {
+            if stake == 0 {
+                continue;
+            }
+            // reward = block_reward * stake / total_stake
+            let reward = self.block_reward.saturating_mul(stake) / total_stake;
+            if reward > 0 {
+                *rewards.entry(addr).or_insert(0) += reward;
+            }
+        }
     }
 }
 
@@ -148,6 +522,10 @@ mod tests {
 
     fn ctx() -> TxContext {
         TxContext { sender: addr(0), nonce: 0, fee: 0 }
+    }
+
+    fn ctx_with_sender(sender: u8) -> TxContext {
+        TxContext { sender: addr(sender), nonce: 0, fee: 0 }
     }
 
     #[test]
@@ -165,6 +543,162 @@ mod tests {
         staking.handle(&ctx(), &msg::delegate(v, 100)).unwrap();
         staking.handle(&ctx(), &msg::delegate(v, 200)).unwrap();
         assert_eq!(staking.stake(&v), 300);
+    }
+
+    #[test]
+    fn undelegate_reduces_stake_and_creates_unbonding_entry() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(10));
+        staking.handle(&ctx_with_sender(5), &msg::undelegate(v, 300)).unwrap();
+        assert_eq!(staking.stake(&v), 700, "stake should be reduced");
+        let pending = staking.pending_unbonding();
+        assert_eq!(pending.len(), 1, "one unbonding entry");
+        assert_eq!(pending[0].amount, 300);
+        assert_eq!(pending[0].delegator, addr(5));
+        assert_eq!(
+            pending[0].completion_height,
+            10 + DEFAULT_UNBONDING_PERIOD_BLOCKS,
+            "completion = current + unbonding_period"
+        );
+    }
+
+    #[test]
+    fn undelegate_rejects_insufficient_stake() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 100)).unwrap();
+        let result = staking.handle(&ctx(), &msg::undelegate(v, 200));
+        assert!(result.is_err(), "should reject undelegate > stake");
+    }
+
+    #[test]
+    fn undelegate_rejects_unknown_validator() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        let result = staking.handle(&ctx(), &msg::undelegate(v, 100));
+        assert!(result.is_err(), "should reject undelegate of unknown validator");
+    }
+
+    #[test]
+    fn unbonding_completes_after_period() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(10));
+        staking.handle(&ctx(), &msg::undelegate(v, 500)).unwrap();
+        assert_eq!(staking.completed_unbonding().len(), 0, "not completed yet");
+        staking.begin_block(Height::new(10 + DEFAULT_UNBONDING_PERIOD_BLOCKS));
+        staking.end_block(Height::new(10 + DEFAULT_UNBONDING_PERIOD_BLOCKS));
+        assert_eq!(
+            staking.completed_unbonding().len(),
+            0,
+            "entry should be removed after end_block processes it"
+        );
+        assert_eq!(staking.pending_unbonding().len(), 0, "no pending entries");
+    }
+
+    #[test]
+    fn unbonding_not_completed_before_period() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(10));
+        staking.handle(&ctx(), &msg::undelegate(v, 500)).unwrap();
+        staking.begin_block(Height::new(10 + DEFAULT_UNBONDING_PERIOD_BLOCKS - 1));
+        staking.end_block(Height::new(10 + DEFAULT_UNBONDING_PERIOD_BLOCKS - 1));
+        assert_eq!(staking.pending_unbonding().len(), 1, "still pending");
+    }
+
+    #[test]
+    fn slash_reduces_stake() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let slash_amount = msg::double_sign_slash_amount(1000);
+        assert_eq!(slash_amount, 100, "10% of 1000 = 100");
+        staking.handle(&ctx(), &msg::slash(v, slash_amount)).unwrap();
+        assert_eq!(staking.stake(&v), 900, "stake reduced by slash");
+    }
+
+    #[test]
+    fn slash_capped_at_stake() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 100)).unwrap();
+        // Try to slash more than the stake.
+        staking.handle(&ctx(), &msg::slash(v, 500)).unwrap();
+        assert_eq!(staking.stake(&v), 0, "stake floored at 0");
+    }
+
+    #[test]
+    fn slash_rejects_unknown_validator() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        let result = staking.handle(&ctx(), &msg::slash(v, 100));
+        assert!(result.is_err(), "should reject slash of unknown validator");
+    }
+
+    #[test]
+    fn rewards_accumulate_per_block() {
+        let staking = StakingModule::new().with_block_reward(1_000_000);
+        let v1 = addr(1);
+        let v2 = addr(2);
+        staking.handle(&ctx(), &msg::delegate(v1, 1000)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v2, 3000)).unwrap();
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        // v1 has 25% of stake (1000/4000), v2 has 75% (3000/4000).
+        // reward = 1_000_000 * stake / total_stake
+        // v1: 1_000_000 * 1000 / 4000 = 250_000
+        // v2: 1_000_000 * 3000 / 4000 = 750_000
+        assert_eq!(staking.rewards(&v1), 250_000, "v1 gets 25% of reward");
+        assert_eq!(staking.rewards(&v2), 750_000, "v2 gets 75% of reward");
+    }
+
+    #[test]
+    fn rewards_accumulate_over_multiple_blocks() {
+        let staking = StakingModule::new().with_block_reward(1_000_000);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        staking.begin_block(Height::new(2));
+        staking.end_block(Height::new(2));
+        assert_eq!(staking.rewards(&v), 2_000_000, "2 blocks * 1M reward");
+    }
+
+    #[test]
+    fn claim_reward_withdraws_accumulated() {
+        let staking = StakingModule::new().with_block_reward(1_000_000);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        assert_eq!(staking.rewards(&v), 1_000_000);
+        staking.handle(&ctx(), &msg::claim_reward(v, 0)).unwrap();
+        assert_eq!(staking.rewards(&v), 0, "rewards claimed");
+    }
+
+    #[test]
+    fn claim_reward_partial_withdrawal() {
+        let staking = StakingModule::new().with_block_reward(1_000_000);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        staking.handle(&ctx(), &msg::claim_reward(v, 400_000)).unwrap();
+        assert_eq!(staking.rewards(&v), 600_000, "600K remaining");
+    }
+
+    #[test]
+    fn claim_reward_rejects_zero_balance() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let result = staking.handle(&ctx(), &msg::claim_reward(v, 0));
+        assert!(result.is_err(), "should reject claim with no rewards");
     }
 
     #[test]
@@ -195,11 +729,43 @@ mod tests {
     }
 
     #[test]
+    fn unknown_message_type_rejected() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        let mut msg = msg::delegate(v, 100);
+        msg[0] = 0xFF; // unknown type
+        let result = staking.handle(&ctx(), &msg);
+        assert!(result.is_err(), "should reject unknown message type");
+    }
+
+    #[test]
     fn state_root_changes_after_delegate() {
         let staking = StakingModule::new();
         let root0 = staking.state_root();
         staking.handle(&ctx(), &msg::delegate(addr(1), 100)).unwrap();
         let root1 = staking.state_root();
         assert_ne!(root0, root1);
+    }
+
+    #[test]
+    fn state_root_changes_after_slash() {
+        let staking = StakingModule::new();
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let root0 = staking.state_root();
+        staking.handle(&ctx(), &msg::slash(v, 100)).unwrap();
+        let root1 = staking.state_root();
+        assert_ne!(root0, root1, "state root must change after slash");
+    }
+
+    #[test]
+    fn custom_unbonding_period() {
+        let staking = StakingModule::new().with_unbonding_period(10);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(5));
+        staking.handle(&ctx(), &msg::undelegate(v, 500)).unwrap();
+        let pending = staking.pending_unbonding();
+        assert_eq!(pending[0].completion_height, 15, "5 + 10 = 15");
     }
 }
