@@ -4411,3 +4411,88 @@ The remaining bottlenecks for full-system 1M TPS:
   format so validators can use the pre-verified path
 - **Parallel execution optimization** — reduce CacheDB clone
   overhead for the parallel path (copy-on-write at account level)
+
+## Session: Wire EVM Pipeline — Connect Mempool to Execution
+
+**Goal:** Connect the EVM execution layer to the executor/mempool/
+consensus pipeline. The pieces were built in isolation (EVM module,
+executor, mempool, consensus) but never wired together. The 2M TPS
+number was real for the EVM in isolation, but there was no path from
+mempool ingestion to EVM execution.
+
+### The problem
+
+The executor's `execute_block` called `module.handle(ctx, payload)`
+per tx — one at a time, no batch path. The EVM module had
+`handle_batch` (parallel sender recovery, native fast path) and
+`handle_batch_preverified` (skip recovery) as inherent methods, but
+the executor never called them. The mempool used a v0 test tx format
+that was incompatible with EVM signed transactions.
+
+### What was built
+
+**1. `handle_batch` on the `Module` trait** — added a `handle_batch`
+method to the `Module` trait with a default implementation that loops
+`handle` per tx. Modules with batch-optimized paths override it.
+
+**2. EVM `handle_batch` trait impl** — `EvmModule` overrides
+`handle_batch` to delegate to the inherent `handle_batch` method
+(parallel sender recovery + native fast path). The trait method
+receives `&[(TxContext, &[u8])]`; the EVM impl extracts the RLP
+bytes and passes them to the inherent method.
+
+**3. Executor groups txs by module** — `execute_block` now groups
+txs by module ID, preserving block order within each group, and
+calls `handle_batch` per module group. This lets the EVM amortize
+sender recovery across the whole batch instead of doing it per-tx.
+
+**4. `wrap_evm_tx_envelope`** — a public function that wraps an
+RLP-encoded signed EVM transaction in the v0 tx envelope format
+(`[sender:20B][nonce:8B][fee:8B][module_id:1B][rlp_signed_tx]`).
+The mempool uses the sender/nonce/fee for fee-priority selection
+and nonce ordering; the EVM ignores them and recovers the sender
+from the signature.
+
+**5. Integration tests** — three tests proving the pipeline works
+end-to-end:
+- `evm_txs_through_executor_pipeline`: submit EVM txs → mempool →
+  propose → finalize → non-zero state root
+- `evm_txs_through_sequencer_engine_pipeline`: same but driven by
+  SequencerEngine (full consensus path)
+- `evm_pipeline_state_root_differs_from_empty_block`: 5 EVM txs
+  produce a different state root than an empty block
+
+### What's connected now
+
+```
+tx arrives → wrap_evm_tx_envelope → ingest_tx →
+  mempool.submit → prepare_proposal → process_proposal →
+    finalize_block → execute_block →
+      group by module_id → EvmModule::handle_batch →
+        parallel sender recovery + native fast path → state root
+```
+
+### What's still not connected
+
+- `preverify_batch` is not called by the mempool yet (the mempool
+  doesn't pre-recover senders; execution still does recovery)
+- `handle_batch_preverified` is not used by the executor (no
+  pre-verified path through the pipeline yet)
+- `handle_batch_parallel` and `handle_batch_parallel_preverified`
+  are not used by the executor (no parallel speculative path)
+- No real networking (transport is in-process mesh)
+- No multi-node devnet (single-node only)
+
+### Design decision: why grouping by module is correct
+
+The executor groups txs by module ID and executes each group as a
+batch. This changes the event ordering (events are grouped by module
+instead of interleaved by block order), but state roots are identical
+because modules are independent — each module owns its storage
+subtree, and cross-module state access doesn't exist.
+
+This is the same insight as Cosmos SDK's module router: each module
+is a independent state machine, and the router dispatches messages
+to modules. The execution order across modules doesn't matter for
+state roots, only the order within each module matters (for nonce
+dependencies).

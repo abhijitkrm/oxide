@@ -12,6 +12,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **EVM pipeline wired to executor and mempool** (2026-01-25)
+  - The EVM module is now connected to the executor/mempool/consensus
+    pipeline. Signed EVM transactions can be submitted through the
+    mempool, proposed in a block, finalized by consensus, and executed
+    by the EVM module — producing a state root end-to-end.
+  - **In plain words:** the blockchain pipeline now works end-to-end
+    for EVM transactions. You can submit a signed Ethereum transaction,
+    and it flows through the mempool → block proposal → consensus
+    finalization → EVM execution → state root. Previously the pieces
+    existed but were never connected.
+  - New `handle_batch` method on the `Module` trait lets modules with
+    batch-optimized paths (like EVM's parallel sender recovery) amortize
+    per-tx overhead across the whole block.
+  - New `wrap_evm_tx_envelope` helper wraps RLP-encoded signed EVM
+    transactions in the mempool's v0 envelope format.
+  - 3 integration tests prove the pipeline works: executor pipeline,
+    SequencerEngine pipeline, and state root differs from empty block.
+
 - **Pre-verified sender recovery** (2026-01-25)
   - New `PreverifiedTx` struct and `preverify_batch` helper allow the
     mempool to pre-recover transaction senders once at ingestion time.

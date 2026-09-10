@@ -92,6 +92,43 @@ use std::sync::Arc;
 /// IDs 0–2 (core, bank, staking); the EVM is the first VM module.
 pub const MODULE_ID: u8 = module_id::EVM;
 
+/// Wrap an RLP-encoded signed EVM transaction in the Oxide v0 tx
+/// envelope format for mempool submission.
+///
+/// The v0 envelope is:
+/// `[sender:20B][nonce:8B LE][fee:8B LE][module_id:1B][payload]`
+///
+/// For EVM, the `payload` is the raw RLP-encoded signed transaction.
+/// The `sender`, `nonce`, and `fee` fields are used by the mempool
+/// for fee-priority selection and nonce ordering. The EVM module
+/// ignores them during execution — it recovers the sender from the
+/// secp256k1 signature in the RLP payload.
+///
+/// # Arguments
+///
+/// - `sender`: the recovered sender address (20 bytes).
+/// - `nonce`: the transaction's nonce (for mempool nonce ordering).
+/// - `fee`: the transaction's fee (for mempool fee-priority ranking).
+/// - `rlp_signed_tx`: the RLP-encoded signed EVM transaction bytes.
+///
+/// # Returns
+///
+/// The v0 envelope bytes, ready for `Executor::ingest_tx`.
+pub fn wrap_evm_tx_envelope(
+    sender: &primitives::Address,
+    nonce: u64,
+    fee: u64,
+    rlp_signed_tx: &[u8],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(20 + 8 + 8 + 1 + rlp_signed_tx.len());
+    bytes.extend_from_slice(&sender.0);
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&fee.to_le_bytes());
+    bytes.push(MODULE_ID);
+    bytes.extend_from_slice(rlp_signed_tx);
+    bytes
+}
+
 /// The base intrinsic gas cost for any EVM transaction (EIP-2028).
 ///
 /// `21_000` gas is the cost of a simple value transfer (no calldata, no
@@ -1862,6 +1899,30 @@ impl Module for EvmModule {
         }])
     }
 
+    /// Batch execution: delegate to the inherent `handle_batch` which
+    /// recovers senders in parallel via rayon and uses the native fast
+    /// path for simple transfers.
+    ///
+    /// The `ctx` (sender, nonce, fee) from the tx envelope is ignored
+    /// — the EVM recovers the sender from the secp256k1 signature in
+    /// the RLP-encoded payload. The envelope's sender/nonce/fee fields
+    /// exist only for the mempool's v0 format compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Individual transactions may fail independently. A failed
+    /// transaction does not abort the batch.
+    fn handle_batch(&self, msgs: &[(TxContext, &[u8])]) -> Vec<Result<Vec<Event>, ExecError>> {
+        // Extract the raw RLP bytes from each (ctx, payload) pair.
+        // The payload IS the RLP-encoded signed transaction.
+        let raw_txs: Vec<Vec<u8>> = msgs.iter().map(|(_, payload)| payload.to_vec()).collect();
+        let ctx = TxContext { sender: primitives::Address([0u8; 20]), nonce: 0, fee: 0 };
+        // Call the inherent `handle_batch` (2 args: ctx, msgs) — Rust
+        // resolves to the inherent method, not the trait method (1 arg)
+        // because the signatures differ.
+        self.handle_batch(&ctx, &raw_txs)
+    }
+
     fn end_block(&self, _height: Height) {
         // If a StorageBackend is attached, flush the current CacheDB
         // state to durable storage. This makes the EVM state
@@ -3138,5 +3199,174 @@ mod tests {
         assert_eq!(results.len(), 1, "one tx in, one result out");
         assert!(results[0].is_ok(), "valid tx must succeed");
         assert_eq!(m.nonce(&addr), 1, "nonce must increment for the valid tx");
+    }
+
+    // ── EVM integration: full pipeline ingest→propose→finalize ──
+
+    /// Build a signed legacy EVM transfer tx (test helper for
+    /// integration tests).
+    fn pipeline_signed_transfer(
+        privkey: &[u8],
+        nonce: u64,
+        to: revm::primitives::Address,
+        value: u128,
+    ) -> Vec<u8> {
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce,
+                gas_limit: 100_000,
+                to: tx::TxKind::Call(to),
+                value: U256::from(value),
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        tx::SignedTx::sign_legacy(tx, privkey).expect("sign must succeed").encode_to_bytes()
+    }
+
+    /// The full EVM pipeline: submit signed EVM txs through the
+    /// executor's mempool, propose a block, finalize it, and verify
+    /// the state root is non-zero (the EVM executed the txs).
+    ///
+    /// This is the integration test that proves the pipeline is wired:
+    /// `ingest_tx` → mempool → `prepare_proposal` → `process_proposal`
+    /// → `finalize_block` → `execute_block` → EVM `handle_batch` →
+    /// state root.
+    #[test]
+    fn evm_txs_through_executor_pipeline() {
+        use ports::AppInterface;
+        use std::sync::Arc;
+
+        let (privkey, addr) = test_keypair();
+        let oxide_addr = Address(addr.0);
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        // Build the executor with an EVM module.
+        let evm_module = EvmModule::new(1, 7);
+        evm_module.fund_account_for_test(&oxide_addr, u128::MAX);
+        let mut executor = executor::Executor::new(1000);
+        executor.register_module(Arc::new(evm_module));
+
+        // Build 3 signed EVM transfer txs and wrap them in the v0
+        // envelope format for the mempool.
+        for nonce in 0..3u64 {
+            let rlp = pipeline_signed_transfer(&privkey, nonce, recipient, 1_000_000_000);
+            let envelope = wrap_evm_tx_envelope(&oxide_addr, nonce, 1_000_000_000, &rlp);
+            let ack = executor.ingest_tx(types::TxBytes::new(envelope));
+            assert!(
+                matches!(ack, types::MempoolAck::Accepted),
+                "EVM tx {nonce} must be accepted by mempool"
+            );
+        }
+
+        // Prepare a proposal — the mempool should select all 3 txs.
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        assert_eq!(proposal.txs.len(), 3, "mempool must select all 3 EVM txs");
+
+        // Process the proposal — should be accepted (all txs are valid).
+        match executor.process_proposal(&proposal) {
+            types::Verdict::Accept => {}
+            types::Verdict::Reject { reason } => panic!("proposal must be accepted: {reason}"),
+        }
+
+        // Finalize the block — executes the EVM txs.
+        let block = types::FinalizedBlock { height: Height::new(0), txs: proposal.txs };
+        let ack = executor.finalize_block(&block);
+        assert_eq!(ack.height, Height::new(0));
+
+        // The state root must be non-zero — the EVM executed the txs
+        // and changed the state (sender balance decreased, recipient
+        // balance increased, nonce advanced).
+        let attestation = executor.attest_state(Height::new(0));
+        assert_ne!(
+            attestation.root,
+            primitives::Hash::ZERO,
+            "state root must be non-zero after EVM execution"
+        );
+    }
+
+    /// EVM txs through the full `SequencerEngine` pipeline: submit →
+    /// propose → finalize → attest, driven by the consensus engine.
+    #[test]
+    fn evm_txs_through_sequencer_engine_pipeline() {
+        use ports::ConsensusEngine;
+        use std::sync::Arc;
+
+        let (privkey, addr) = test_keypair();
+        let oxide_addr = Address(addr.0);
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let evm_module = EvmModule::new(1, 7);
+        evm_module.fund_account_for_test(&oxide_addr, u128::MAX);
+        let mut executor = executor::Executor::new(1000);
+        executor.register_module(Arc::new(evm_module));
+
+        let app: Arc<dyn ports::AppInterface> = Arc::new(executor);
+        let mut engine = consensus::SequencerEngine::new(app);
+
+        // Submit 3 EVM txs through the engine.
+        for nonce in 0..3u64 {
+            let rlp = pipeline_signed_transfer(&privkey, nonce, recipient, 1_000_000_000);
+            let envelope = wrap_evm_tx_envelope(&oxide_addr, nonce, 1_000_000_000, &rlp);
+            engine.submit_tx(types::TxBytes::new(envelope));
+        }
+        engine.run_until_idle();
+
+        // The engine should have finalized a block.
+        assert!(engine.finalized_height().is_some(), "engine must finalize a block");
+
+        // The state root must be non-zero.
+        let app = engine.app();
+        let attestation = app.attest_state(Height::new(0));
+        assert_ne!(
+            attestation.root,
+            primitives::Hash::ZERO,
+            "state root must be non-zero after EVM execution through engine"
+        );
+    }
+
+    /// EVM pipeline with 5 txs produces a different state root than
+    /// an empty block. This proves the EVM txs are actually executed
+    /// through the pipeline (not silently skipped).
+    #[test]
+    fn evm_pipeline_state_root_differs_from_empty_block() {
+        use ports::AppInterface;
+        use std::sync::Arc;
+
+        let (privkey, addr) = test_keypair();
+        let oxide_addr = Address(addr.0);
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        // Path 1: executor with 5 EVM txs.
+        let evm_module = EvmModule::new(1, 7);
+        evm_module.fund_account_for_test(&oxide_addr, u128::MAX);
+        let mut executor = executor::Executor::new(1000);
+        executor.register_module(Arc::new(evm_module));
+
+        for nonce in 0..5u64 {
+            let rlp = pipeline_signed_transfer(&privkey, nonce, recipient, 1_000_000_000);
+            let envelope = wrap_evm_tx_envelope(&oxide_addr, nonce, 1_000_000_000, &rlp);
+            executor.ingest_tx(types::TxBytes::new(envelope));
+        }
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        assert_eq!(proposal.txs.len(), 5, "mempool must select all 5 EVM txs");
+        let block = types::FinalizedBlock { height: Height::new(1), txs: proposal.txs };
+        executor.finalize_block(&block);
+        let tx_root = executor.attest_state(Height::new(1)).root;
+
+        // Path 2: executor with an empty block (same EVM module, same
+        // funding, but no txs).
+        let evm_module_empty = EvmModule::new(1, 7);
+        evm_module_empty.fund_account_for_test(&oxide_addr, u128::MAX);
+        let mut exec_empty = executor::Executor::new(1000);
+        exec_empty.register_module(Arc::new(evm_module_empty));
+        let empty_block = types::FinalizedBlock { height: Height::new(1), txs: vec![] };
+        exec_empty.finalize_block(&empty_block);
+        let empty_root = exec_empty.attest_state(Height::new(1)).root;
+
+        assert_ne!(tx_root, empty_root, "pipeline with 5 EVM txs must differ from empty block");
     }
 }

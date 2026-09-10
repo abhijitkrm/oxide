@@ -38,6 +38,7 @@ rayon = { workspace = true }
 [dev-dependencies]
 criterion = "0.7.0"
 ports = { workspace = true }
+consensus = { workspace = true }
 
 [[bench]]
 name = "fee"

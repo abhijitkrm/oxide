@@ -123,6 +123,28 @@ pub trait Module: Send + Sync {
     /// or [`ExecError::OutOfGas`] if the message exceeds the gas budget.
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError>;
 
+    /// Handle a batch of messages. Returns a vector of results, one
+    /// per input message, in the same order as the input.
+    ///
+    /// The default implementation loops over the messages and calls
+    /// [`handle`](Self::handle) for each. Modules with a faster batch
+    /// path (e.g. EVM with parallel sender recovery or pre-verified
+    /// senders) override this to avoid per-tx overhead.
+    ///
+    /// Each message is paired with its `TxContext` (parsed from the
+    /// tx envelope by the executor). The module receives the
+    /// *payload* — the bytes after the `[sender:20B][nonce:8B]
+    /// [fee:8B][module_id:1B]` envelope header.
+    ///
+    /// # Errors
+    ///
+    /// Each result is either a vector of events (success) or an
+    /// `ExecError` (failure). A failed message does not abort the
+    /// batch — subsequent messages are still executed.
+    fn handle_batch(&self, msgs: &[(TxContext, &[u8])]) -> Vec<Result<Vec<Event>, ExecError>> {
+        msgs.iter().map(|(ctx, msg)| self.handle(ctx, msg)).collect()
+    }
+
     /// Called at the end of each block, after all txs.
     fn end_block(&self, height: Height);
 
@@ -229,8 +251,20 @@ impl Executor {
         );
     }
 
-    /// Execute a finalized block: call `begin_block`, handle each tx,
-    /// call `end_block`, compute the state root.
+    /// Execute a finalized block: call `begin_block`, group txs by
+    /// module, call `handle_batch` per module group, call `end_block`,
+    /// compute the state root.
+    ///
+    /// Txs are grouped by module ID, preserving block order within
+    /// each group. Each module's group is passed to `handle_batch`
+    /// in one call — this lets modules with batch-optimized paths
+    /// (e.g. EVM parallel sender recovery, pre-verified senders)
+    /// amortize per-tx overhead across the whole group.
+    ///
+    /// Modules are independent (each owns its storage subtree), so
+    /// grouping by module produces identical state roots to the
+    /// per-tx interleaved execution. Events are grouped by module
+    /// rather than interleaved, but state roots are unchanged.
     fn execute_block(&self, block: &FinalizedBlock) -> Hash {
         self.events.lock().unwrap().clear();
 
@@ -239,29 +273,38 @@ impl Executor {
             module.begin_block(block.height);
         }
 
-        // Execute each tx sequentially.
+        // Group txs by module ID, preserving block order within each
+        // group. Each entry is (ctx, payload_bytes). We collect the
+        // payload as a Vec<u8> so we can pass a slice of slices to
+        // handle_batch.
         //
-        // L1 fix: collect events in a local Vec instead of locking
-        // `self.events` on every tx. The hot path (per-tx execution)
-        // is now lock-free; the lock is taken once per block to
-        // publish the collected events. This reduces lock acquisitions
-        // from O(txs) to O(1) per block.
-        let mut block_events: Vec<Event> = Vec::new();
+        // We use a BTreeMap so module groups are processed in a
+        // deterministic order (sorted by module ID).
+        let mut groups: BTreeMap<u8, Vec<(TxContext, Vec<u8>)>> = BTreeMap::new();
         for tx in &block.txs {
             let bytes = tx.as_bytes();
-            // Parse the tx context (sender, nonce, fee) from the
-            // envelope (C2 fix). Skip malformed txs.
             let Some(ctx) = parse_tx_context(bytes) else {
                 continue; // skip malformed txs
             };
             let Some(module_id) = parse_module_id(bytes) else {
                 continue; // skip malformed txs
             };
-            let payload = module_payload(bytes);
-            if let Some(module) = self.modules.get(&module_id) {
-                if let Ok(events) = module.handle(&ctx, payload) {
-                    block_events.extend(events);
-                }
+            let payload = module_payload(bytes).to_vec();
+            groups.entry(module_id).or_default().push((ctx, payload));
+        }
+
+        // Execute each module's txs as a batch.
+        let mut block_events: Vec<Event> = Vec::new();
+        for (module_id, group) in &groups {
+            let Some(module) = self.modules.get(module_id) else {
+                continue; // unknown module — skip
+            };
+            // Build the (ctx, &msg) slice for handle_batch.
+            let batch: Vec<(TxContext, &[u8])> =
+                group.iter().map(|(ctx, payload)| (*ctx, payload.as_slice())).collect();
+            let results = module.handle_batch(&batch);
+            for events in results.into_iter().flatten() {
+                block_events.extend(events);
             }
         }
         // Publish all events from this block in one lock acquisition.
