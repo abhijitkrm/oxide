@@ -1,0 +1,353 @@
+//! Genesis file format — JSON genesis state for chain initialization.
+//!
+//! A genesis file defines the initial state of the chain at height 0:
+//! - Chain ID and consensus parameters
+//! - Pre-funded accounts (bank balances)
+//! - Initial validator set (addresses + stakes)
+//! - Staking parameters (unbonding period, block reward)
+//!
+//! # Format
+//!
+//! The genesis file is JSON (not TOML) to match the Ethereum
+//! convention (`genesis.json`) and enable tooling compatibility
+//! (Foundry, Hardhat, Blockscout all expect JSON genesis).
+//!
+//! # Example
+//!
+//! ```json
+//! {
+//!   "chain_id": 1,
+//!   "consensus": {
+//!     "engine": "oxidebft",
+//!     "base_timeout_ms": 2000,
+//!     "max_timeout_ms": 30000
+//!   },
+//!   "bank": {
+//!     "balances": {
+//!       "0x0000000000000000000000000000000000000000": 1000000000000,
+//!       "0x0101010101010101010101010101010101010101": 500000000000
+//!     }
+//!   },
+//!   "staking": {
+//!     "validators": [
+//!       { "address": "0x0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a", "stake": 1000000 },
+//!       { "address": "0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", "stake": 1000000 }
+//!     ],
+//!     "unbonding_period_blocks": 100,
+//!     "block_reward": 1000000000
+//!   }
+//! }
+//! ```
+
+use serde::{Deserialize, Serialize};
+
+use crate::ConsensusEngineKind;
+
+/// The genesis state — the initial state of the chain at height 0.
+///
+/// This is the JSON-serializable genesis file format. It's separate
+/// from the node [`crate::Config`] (which is TOML and controls
+/// runtime parameters, not chain state).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Genesis {
+    /// The EIP-155 chain ID.
+    pub chain_id: u64,
+    /// Consensus engine and parameters.
+    #[serde(default)]
+    pub consensus: GenesisConsensus,
+    /// Bank module: pre-funded account balances.
+    #[serde(default)]
+    pub bank: GenesisBank,
+    /// Staking module: initial validator set and parameters.
+    #[serde(default)]
+    pub staking: GenesisStaking,
+}
+
+/// Consensus parameters in the genesis file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenesisConsensus {
+    /// The consensus engine to use.
+    #[serde(default = "default_engine")]
+    pub engine: ConsensusEngineKind,
+    /// Base timeout for the first view (milliseconds).
+    #[serde(default = "default_base_timeout_ms")]
+    pub base_timeout_ms: u64,
+    /// Maximum timeout for exponential backoff (milliseconds).
+    #[serde(default = "default_max_timeout_ms")]
+    pub max_timeout_ms: u64,
+}
+
+impl Default for GenesisConsensus {
+    fn default() -> Self {
+        Self {
+            engine: default_engine(),
+            base_timeout_ms: default_base_timeout_ms(),
+            max_timeout_ms: default_max_timeout_ms(),
+        }
+    }
+}
+
+fn default_engine() -> ConsensusEngineKind {
+    ConsensusEngineKind::OxideBft
+}
+fn default_base_timeout_ms() -> u64 {
+    2_000
+}
+fn default_max_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Bank module genesis state: pre-funded account balances.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenesisBank {
+    /// Pre-funded account balances, keyed by hex address.
+    /// Address format: `0x` + 40 hex chars (20 bytes).
+    pub balances: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Staking module genesis state: initial validator set and parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenesisStaking {
+    /// The initial validator set.
+    #[serde(default)]
+    pub validators: Vec<GenesisValidator>,
+    /// The unbonding period in blocks.
+    #[serde(default = "default_unbonding_period")]
+    pub unbonding_period_blocks: u64,
+    /// The block reward in atomic units.
+    #[serde(default = "default_block_reward")]
+    pub block_reward: u64,
+}
+
+impl Default for GenesisStaking {
+    fn default() -> Self {
+        Self {
+            validators: Vec::new(),
+            unbonding_period_blocks: default_unbonding_period(),
+            block_reward: default_block_reward(),
+        }
+    }
+}
+
+fn default_unbonding_period() -> u64 {
+    100
+}
+fn default_block_reward() -> u64 {
+    1_000_000_000
+}
+
+/// A validator in the genesis validator set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenesisValidator {
+    /// The validator's address as a hex string (`0x` + 40 hex chars).
+    pub address: String,
+    /// The validator's initial stake.
+    pub stake: u64,
+}
+
+impl Genesis {
+    /// Create a new genesis with the given chain ID and defaults.
+    #[must_use]
+    pub fn new(chain_id: u64) -> Self {
+        Self {
+            chain_id,
+            consensus: GenesisConsensus::default(),
+            bank: GenesisBank::default(),
+            staking: GenesisStaking::default(),
+        }
+    }
+
+    /// Parse a genesis from a JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the JSON is invalid or doesn't match the
+    /// genesis schema.
+    pub fn from_json_str(s: &str) -> Result<Self, GenesisError> {
+        serde_json::from_str(s).map_err(|e| GenesisError::Parse(e.to_string()))
+    }
+
+    /// Parse a genesis from a JSON file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the file cannot be read or parsed.
+    pub fn from_json_file(path: &std::path::Path) -> Result<Self, GenesisError> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| GenesisError::FileRead(path.display().to_string(), e.to_string()))?;
+        Self::from_json_str(&contents)
+    }
+
+    /// Serialize the genesis to a JSON string (pretty-printed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if serialization fails (shouldn't happen for
+    /// well-formed genesis).
+    pub fn to_json_string(&self) -> Result<String, GenesisError> {
+        serde_json::to_string_pretty(self).map_err(|e| GenesisError::Serialize(e.to_string()))
+    }
+
+    /// Write the genesis to a JSON file (pretty-printed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the file cannot be written or serialization fails.
+    pub fn to_json_file(&self, path: &std::path::Path) -> Result<(), GenesisError> {
+        let json = self.to_json_string()?;
+        std::fs::write(path, json)
+            .map_err(|e| GenesisError::FileWrite(path.display().to_string(), e.to_string()))
+    }
+
+    /// Generate a default devnet genesis with the given chain ID,
+    /// N validators, and pre-funded senders.
+    ///
+    /// This is the genesis used by the devnet. Validators get
+    /// addresses `[0x0a; 20]`, `[0x0b; 20]`, etc. Pre-funded senders
+    /// get addresses `[0x00; 20]`, `[0x01; 20]`, etc.
+    #[must_use]
+    pub fn devnet(chain_id: u64, num_validators: usize, num_prefunded: u8, balance: u64) -> Self {
+        let mut genesis = Self::new(chain_id);
+
+        // Pre-fund senders [0x00; 20] through [n-1; 20].
+        // Each address is 20 bytes of the same value: [i; 20].
+        // Hex: 0x + 40 hex chars (2 per byte * 20 bytes).
+        for i in 0..num_prefunded {
+            let byte_hex = format!("{i:02x}");
+            let addr = format!("0x{}", byte_hex.repeat(20));
+            genesis.bank.insert(addr, balance);
+        }
+
+        // Create validators [0x0a; 20], [0x0b; 20], etc.
+        for i in 0..num_validators {
+            let byte = 0x0a + u8::try_from(i).unwrap_or(0xFF);
+            let addr = format!(
+                "0x{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}"
+            );
+            genesis.staking.validators.push(GenesisValidator { address: addr, stake: 1_000_000 });
+        }
+
+        genesis
+    }
+
+    /// Add a pre-funded account balance.
+    ///
+    /// `address` must be a hex string with `0x` prefix (20 bytes).
+    pub fn add_balance(&mut self, address: &str, balance: u64) {
+        self.bank.insert(address.to_string(), balance);
+    }
+
+    /// Add a validator to the genesis validator set.
+    ///
+    /// `address` must be a hex string with `0x` prefix (20 bytes).
+    pub fn add_validator(&mut self, address: &str, stake: u64) {
+        self.staking.validators.push(GenesisValidator { address: address.to_string(), stake });
+    }
+}
+
+impl GenesisBank {
+    /// Get the balance for a hex address, or 0 if not present.
+    pub fn balance(&self, address: &str) -> u64 {
+        self.balances.get(address).and_then(serde_json::Value::as_u64).unwrap_or(0)
+    }
+
+    /// Insert a balance for a hex address.
+    pub fn insert(&mut self, address: String, balance: u64) {
+        self.balances.insert(address, serde_json::Value::Number(balance.into()));
+    }
+}
+
+/// Genesis file loading/parsing errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenesisError {
+    /// The genesis file could not be read.
+    FileRead(String, String),
+    /// The genesis file could not be written.
+    FileWrite(String, String),
+    /// The genesis JSON could not be parsed.
+    Parse(String),
+    /// The genesis could not be serialized.
+    Serialize(String),
+}
+
+impl std::fmt::Display for GenesisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileRead(path, reason) => write!(f, "cannot read genesis file {path}: {reason}"),
+            Self::FileWrite(path, reason) => {
+                write!(f, "cannot write genesis file {path}: {reason}")
+            }
+            Self::Parse(reason) => write!(f, "cannot parse genesis: {reason}"),
+            Self::Serialize(reason) => write!(f, "cannot serialize genesis: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for GenesisError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn genesis_roundtrips_json() {
+        let mut genesis = Genesis::new(42);
+        genesis.add_balance("0x0000000000000000000000000000000000000000", 1_000_000);
+        genesis.add_validator("0x0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a", 1_000_000);
+        genesis.staking.unbonding_period_blocks = 200;
+        genesis.staking.block_reward = 2_000_000_000;
+
+        let json = genesis.to_json_string().unwrap();
+        let parsed = Genesis::from_json_str(&json).unwrap();
+        assert_eq!(genesis, parsed);
+    }
+
+    #[test]
+    fn genesis_from_json_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("oxide_genesis_test.json");
+        let genesis = Genesis::devnet(1, 4, 32, 1_000_000_000_000);
+        genesis.to_json_file(&path).unwrap();
+        let loaded = Genesis::from_json_file(&path).unwrap();
+        assert_eq!(genesis, loaded);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn devnet_genesis_has_validators_and_balances() {
+        let genesis = Genesis::devnet(1, 4, 32, 1_000_000_000_000);
+        assert_eq!(genesis.chain_id, 1);
+        assert_eq!(genesis.staking.validators.len(), 4);
+        assert_eq!(genesis.bank.balances.len(), 32);
+        assert_eq!(genesis.consensus.engine, ConsensusEngineKind::OxideBft);
+    }
+
+    #[test]
+    fn genesis_balance_lookup() {
+        let mut genesis = Genesis::new(1);
+        genesis.add_balance("0x0101010101010101010101010101010101010101", 500_000);
+        assert_eq!(genesis.bank.balance("0x0101010101010101010101010101010101010101"), 500_000);
+        assert_eq!(genesis.bank.balance("0x0202020202020202020202020202020202020202"), 0);
+    }
+
+    #[test]
+    fn genesis_parse_error_on_invalid_json() {
+        let result = Genesis::from_json_str("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn genesis_default_consensus_is_oxidebft() {
+        let genesis = Genesis::new(1);
+        assert_eq!(genesis.consensus.engine, ConsensusEngineKind::OxideBft);
+    }
+
+    #[test]
+    fn genesis_validators_have_stakes() {
+        let genesis = Genesis::devnet(1, 3, 0, 0);
+        for v in &genesis.staking.validators {
+            assert!(v.stake > 0, "validator stake must be positive");
+            assert!(v.address.starts_with("0x"), "address must be hex");
+        }
+    }
+}

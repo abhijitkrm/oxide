@@ -1097,6 +1097,7 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "toml",
 ]
 
@@ -2646,6 +2647,7 @@ dependencies = [
  "rpc",
  "staking",
  "tokio",
+ "toml",
  "types",
 ]
 

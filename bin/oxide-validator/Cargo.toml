@@ -30,6 +30,7 @@ oxide-core = { workspace = true }
 staking = { workspace = true }
 rpc = { workspace = true }
 tokio = { workspace = true }
+toml = "0.8"
 
 [lints]
 workspace = true

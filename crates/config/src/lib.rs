@@ -62,6 +62,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod genesis;
+
 // ── Top-level config ─────────────────────────────────────────────
 
 /// The top-level node configuration.

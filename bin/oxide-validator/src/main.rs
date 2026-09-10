@@ -40,6 +40,30 @@ use devnet::{ConsensusConfig, DevnetNode, NodeConfig};
 use ports::{AppInterface, ConsensusEngine};
 
 fn main() {
+    // Subcommand dispatch (first positional arg).
+    let args: Vec<String> = env::args().collect();
+    if let Some(subcmd) = args.get(1).map(String::as_str) {
+        match subcmd {
+            "version" => {
+                print_version();
+                return;
+            }
+            "init" => {
+                run_init();
+                return;
+            }
+            "genesis" => {
+                run_genesis(&args[2..]);
+                return;
+            }
+            "help" | "--help" | "-h" => {
+                print_help();
+                return;
+            }
+            _ => {} // fall through to normal mode
+        }
+    }
+
     // Check for devnet-node mode.
     if let Some(node_index_str) = parse_cli_flag("--devnet-node") {
         run_devnet_node(&node_index_str);
@@ -285,4 +309,128 @@ fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
     bytes.push(module_id);
     bytes.extend_from_slice(module_payload);
     types::TxBytes::new(bytes)
+}
+
+// ── Subcommands ───────────────────────────────────────────────────
+
+/// Print the version string.
+fn print_version() {
+    println!("oxide-validator {}", env!("CARGO_PKG_VERSION"));
+    println!("consensus: oxideBFT (2-chain HotStuff with BLS QCs)");
+    println!("evm: revm-based, EIP-1559 compatible");
+    println!("license: GPL-3.0");
+}
+
+/// Print help text.
+fn print_help() {
+    println!("oxide-validator — Oxide blockchain validator node");
+    println!();
+    println!("USAGE:");
+    println!("    oxide-validator [SUBCOMMAND] [FLAGS]");
+    println!();
+    println!("SUBCOMMANDS:");
+    println!("    (default)    Run a single-node devnet");
+    println!("    init         Initialize a new node directory with config + genesis");
+    println!("    genesis      Generate a genesis file");
+    println!("    version      Print version information");
+    println!("    help         Print this help message");
+    println!();
+    println!("FLAGS:");
+    println!("    --config <path>          Load config from TOML file");
+    println!("    --engine <kind>           Consensus engine (sequencer|oxidebft)");
+    println!("    --devnet-node <i>         Devnet node index (multi-process mode)");
+    println!("    --num-nodes <N>           Total devnet nodes");
+    println!("    --base-port <port>        Base TCP port for devnet");
+    println!();
+    println!("EXAMPLES:");
+    println!("    oxide-validator init --chain-id 1");
+    println!("    oxide-validator genesis --chain-id 1 --validators 4");
+    println!("    oxide-validator --config config/devnet.toml");
+    println!("    oxide-validator --engine oxidebft");
+}
+
+/// `oxide-validator init` — initialize a new node directory.
+///
+/// Creates a node directory with:
+/// - `config.toml` — default node configuration
+/// - `genesis.json` — default genesis file
+///
+/// Flags:
+/// - `--chain-id <id>`: chain ID (default: 1)
+/// - `--validators <N>`: number of validators (default: 4)
+/// - `--dir <path>`: target directory (default: ./oxide-node)
+fn run_init() {
+    let chain_id: u64 = parse_cli_flag("--chain-id").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let num_validators: usize =
+        parse_cli_flag("--validators").and_then(|s| s.parse().ok()).unwrap_or(4);
+    let dir = parse_cli_flag("--dir").unwrap_or_else(|| "oxide-node".to_string());
+
+    let dir_path = PathBuf::from(&dir);
+    if dir_path.exists() {
+        eprintln!("oxide-validator init: directory {dir} already exists");
+        std::process::exit(1);
+    }
+    std::fs::create_dir_all(&dir_path).expect("create node directory");
+
+    // Write config.toml.
+    let config = config::Config::default();
+    let config_toml = toml::to_string(&config).expect("serialize config");
+    let config_path = dir_path.join("config.toml");
+    std::fs::write(&config_path, config_toml).expect("write config.toml");
+    println!("oxide-validator init: wrote {}", config_path.display());
+
+    // Write genesis.json.
+    let genesis = config::genesis::Genesis::devnet(chain_id, num_validators, 32, 1_000_000_000_000);
+    let genesis_path = dir_path.join("genesis.json");
+    genesis.to_json_file(&genesis_path).expect("write genesis.json");
+    println!("oxide-validator init: wrote {}", genesis_path.display());
+
+    println!();
+    println!("oxide-validator init: node directory initialized at {dir}");
+    println!("oxide-validator init: next steps:");
+    println!("  oxide-validator --config {dir}/config.toml");
+}
+
+/// `oxide-validator genesis` — generate a genesis file.
+///
+/// Flags:
+/// - `--chain-id <id>`: chain ID (default: 1)
+/// - `--validators <N>`: number of validators (default: 4)
+/// - `--output <path>`: output file (default: genesis.json)
+fn run_genesis(args: &[String]) {
+    let mut chain_id: u64 = 1;
+    let mut num_validators: usize = 4;
+    let mut output = "genesis.json".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--chain-id" => {
+                if let Some(v) = args.get(i + 1) {
+                    chain_id = v.parse().unwrap_or(1);
+                }
+                i += 2;
+            }
+            "--validators" => {
+                if let Some(v) = args.get(i + 1) {
+                    num_validators = v.parse().unwrap_or(4);
+                }
+                i += 2;
+            }
+            "--output" | "-o" => {
+                if let Some(v) = args.get(i + 1) {
+                    output.clone_from(v);
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let genesis = config::genesis::Genesis::devnet(chain_id, num_validators, 32, 1_000_000_000_000);
+    let path = PathBuf::from(&output);
+    genesis.to_json_file(&path).expect("write genesis file");
+    println!(
+        "oxide-validator genesis: wrote {} (chain_id={chain_id}, validators={num_validators})",
+        path.display()
+    );
 }
