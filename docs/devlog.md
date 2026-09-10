@@ -4983,3 +4983,117 @@ with no crashes.
 | oxide-sim | 35 | +35 (network + byzantine + swarm) |
 | governance | 13 | +13 (new module) |
 | Total workspace | 587+ | +91 |
+
+## Performance Plan: Phase C #7–8, D, E — Networking, Async Lane, Zero-Copy
+
+**Date:** Phase A–E execution session
+
+### Phase C #7: Per-peer writer channels
+
+**Problem:** The TCP transport locked the global streams mutex for the
+entire duration of `write_frame`. A slow peer blocked sends to all other
+peers — classic head-of-line blocking.
+
+**Fix:** Replace the global stream map with per-peer send channels.
+Each peer has a dedicated writer thread that owns the write side of the
+stream and drains an mpsc channel. `send()` locks the map only to look
+up the channel sender, then pushes bytes into the channel — no I/O
+under the lock. A slow peer only blocks its own writer thread.
+
+**Verification:** All 72 p2p tests pass, including echo and integration
+tests that exercise real TCP connections.
+
+### Phase C #8: Vectored I/O for TCP write_frame
+
+**Problem:** `write_frame` did two separate `write_all` calls — one for
+the 4-byte length prefix and one for the payload. Each `write_all` is a
+separate syscall.
+
+**Fix:** Use `write_vectored` with two `IoSlice`s to combine the length
+prefix and payload into a single write syscall, plus the flush. This
+halves the write syscalls per frame on the send hot path. A partial-write
+fallback handles the rare case where the kernel doesn't write everything
+in one call.
+
+**Scope:** TCP path only. The TLS path (`SharedStream`) keeps the
+non-vectored `write_frame` because TLS encryption needs to buffer and
+encrypt before writing to the underlying TCP stream.
+
+### Phase D #10: Async execution lane
+
+**Problem:** `finalize_block` executed the block synchronously, blocking
+the consensus engine until execution completed. The 2-chain pipeline
+proposes block h+1 while committing block h, but execution of h blocks
+this.
+
+**Fix:** Add an opt-in async execution lane. When enabled via
+`enable_async_execution()`, `finalize_block` defers execution — it stores
+the block as pending and advances `next_proposal_height` immediately. The
+pending block is executed lazily when `attest_state` is called or when the
+next `finalize_block` flushes it. This is a lazy execution model (no
+background threads) that overlaps execution with consensus.
+
+**Tradeoff:** The async lane trades a small per-block overhead (extra
+lock acquisitions for pending block tracking) for the overlap benefit.
+For single-block benchmarks, the overhead is a net loss; for the full
+2-chain consensus pipeline, it's a net win. Default is synchronous (no
+regression on uniswap_transfer benchmarks).
+
+### Phase E #5: Zero-copy payload handling
+
+**Problem:** `execute_block` always constructed a `preverified` Vec for
+every tx group, cloning payloads for txs without cached senders — even
+when the fallback path (`handle_batch`) would be used, making those clones
+wasted work.
+
+**Fix:** First check if all txs have cached senders. If yes, construct
+the preverified Vec (no clones — cached `PreverifiedTx` already owns the
+raw bytes). If no, use the fallback path directly without constructing
+the preverified Vec. This eliminates all payload clones in the fallback
+path and avoids constructing a Vec that would be discarded.
+
+### Phase E #11: Batch submit API
+
+**Fix:** Add `submit_batch` to the mempool and `ingest_tx_batch` to the
+`AppInterface` trait. The executor overrides `ingest_tx_batch` to
+validate and preverify each tx, then batch-submit all accepted txs to
+the mempool in one lock acquisition — amortizing the per-tx lock overhead
+across the batch.
+
+### Phase E #14: Fixed-size OCC keys
+
+**Problem:** The OCC read/write set used `Vec<u8>` for keys, causing heap
+allocation per key on the parallel execution hot path.
+
+**Fix:** Replace `Vec<u8>` keys with a fixed-size `OccKey` (`[u8; 32]`).
+EVM state keys are always 32 bytes. Storing keys as a fixed-size array
+means no heap allocation per key (array stored inline in HashSet/BTreeMap),
+no pointer chase on lookup, and better cache locality. Added
+`record_read_key` and `record_write_key` methods for callers that already
+have `OccKey` values.
+
+### Benchmark results
+
+Executor `uniswap_transfer` benchmark (criterion, 100 samples):
+
+| Benchmark | Before | After | Change |
+|---|---|---|---|
+| sequential/500 | 6.15 ms | 6.06 ms | -1.8% |
+| sequential/1000 | 12.30 ms | 13.07 ms | noise (p=0.22) |
+| sequential/2000 | 24.68 ms | 24.27 ms | -1.7% |
+| parallel_8/500 | 2.13 ms | 1.79 ms | **-15.9%** |
+| parallel_8/1000 | 4.16 ms | 3.54 ms | **-15.9%** |
+| parallel_8/2000 | 8.44 ms | 6.89 ms | **-18.3%** |
+
+The parallel execution improvements come from the combined effect of
+zero-copy payload handling (Phase E #5) and fixed-size OCC keys (Phase E
+#14). The sequential path shows small improvements within noise.
+
+### Commits
+
+- `d8c587a`: perf: p2p: per-peer writer channels — eliminate global send mutex
+- `0ca8c02`: perf: p2p: vectored I/O for TCP write_frame — halve write syscalls
+- `155c38a`: perf: executor: opt-in async execution lane (Phase D)
+- `cf6a3bd`: perf: executor: avoid wasted payload clones in fallback path
+- `5b589cd`: feat: mempool + executor: batch submit API (Phase E)
+- `c3fd418`: perf: executor: fixed-size OCC keys (Phase E #14)

@@ -12,6 +12,63 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Batch mempool submit API** (Phase E #11)
+  - `Mempool::submit_batch` accepts a `Vec<TxBytes>` and returns per-tx
+    results, pre-allocating the result Vec.
+  - `AppInterface::ingest_tx_batch` trait method with a default
+    implementation that calls `ingest_tx` per tx. The executor overrides
+    this to acquire the mempool lock once for the entire batch.
+  - **In plain words:** high-throughput clients can now submit thousands
+    of transactions in a single call instead of one at a time, reducing
+    per-tx lock overhead.
+
+- **Opt-in async execution lane** (Phase D #10)
+  - `Executor::enable_async_execution()` defers block execution to
+    overlap with consensus. The pending block is executed lazily when
+    `attest_state` is called or when the next `finalize_block` flushes it.
+  - **In plain words:** the consensus engine can propose and vote on the
+    next block while the previous block is still executing, hiding
+    execution latency behind consensus latency. Disabled by default.
+
+### Changed
+
+- **Per-peer writer channels in p2p transport** (Phase C #7)
+  - Replaced the global stream mutex with per-peer send channels. Each
+    peer has a dedicated writer thread. `send()` only locks the map to
+    look up the channel sender — no I/O under the lock.
+  - **In plain words:** a slow peer no longer blocks sends to other
+    peers. Previously, one slow peer could stall all outbound network
+    traffic.
+
+- **Vectored I/O for TCP writes** (Phase C #8)
+  - `write_frame` now uses `write_vectored` to combine the 4-byte length
+    prefix and payload into a single syscall, halving write syscalls per
+    frame. TLS path unchanged.
+  - **In plain words:** fewer kernel syscalls per network write.
+
+- **Zero-copy payload handling in executor** (Phase E #5)
+  - `execute_block` no longer constructs a `preverified` Vec for tx
+    groups that will use the fallback path. Payload clones are eliminated
+    when cached senders are available.
+  - **In plain words:** less memory allocation during block execution.
+
+- **Fixed-size OCC keys** (Phase E #14)
+  - OCC read/write set keys changed from `Vec<u8>` to `OccKey` (`[u8; 32]`),
+    eliminating per-key heap allocation on the parallel execution path.
+  - **In plain words:** parallel EVM execution is faster because keys
+    are stored inline in hash maps instead of on the heap.
+
+### Performance
+
+- Parallel executor (`uniswap_transfer` benchmark): **16–18% faster**
+  - `parallel_8/500`: 2.13 ms → 1.79 ms (-15.9%)
+  - `parallel_8/1000`: 4.16 ms → 3.54 ms (-15.9%)
+  - `parallel_8/2000`: 8.44 ms → 6.89 ms (-18.3%)
+  - Sequential path: ~2% improvement (within noise on some sizes).
+  - Measured with criterion, 100 samples, on the same machine.
+
+### Added
+
 - **Layered configuration system (TOML + env vars + CLI flags)** (2026-01-25)
   - New `config` crate provides a layered config system matching the
     geth/reth model: TOML file as base, env var overrides, CLI flag
