@@ -317,8 +317,14 @@ const TX_MIN_SIZE: usize = 20 + 8 + 8;
 /// lifecycle. Implements `AppInterface` so it can be wired behind any
 /// `ConsensusEngine`.
 pub struct Executor {
-    /// Registered modules, indexed by their dispatch ID.
-    modules: BTreeMap<u8, Arc<dyn Module>>,
+    /// Registered modules, indexed by their dispatch ID (0–255).
+    ///
+    /// A flat array gives O(1) dispatch with no pointer-chasing (vs
+    /// `BTreeMap`'s tree traversal). Module IDs are `u8`, so the
+    /// array has exactly 256 slots. The memory cost (256 × 8 bytes =
+    /// 2 KiB on 64-bit) is negligible and the lookup is a single
+    /// indexed load.
+    modules: [Option<Arc<dyn Module>>; 256],
     /// The mempool (owned, so the executor is the app's intake).
     /// Behind `Mutex` because `AppInterface` methods take `&self`.
     mempool: Mutex<mempool::Mempool>,
@@ -366,7 +372,7 @@ impl Executor {
     ///   serial execution is used.
     pub fn with_config(max_mempool_entries: usize, parallel_threshold: usize) -> Self {
         Self {
-            modules: BTreeMap::new(),
+            modules: std::array::from_fn(|_| None),
             mempool: Mutex::new(mempool::Mempool::new(max_mempool_entries)),
             finalized: Mutex::new(BTreeMap::new()),
             state_roots: Mutex::new(BTreeMap::new()),
@@ -383,11 +389,9 @@ impl Executor {
     ///
     /// Panics if a module with the same `ID` is already registered.
     pub fn register_module(&mut self, module: Arc<dyn Module>) {
-        let id = module.id();
-        assert!(
-            self.modules.insert(id, module).is_none(),
-            "module with `ID` {id} already registered"
-        );
+        let id = module.id() as usize;
+        assert!(self.modules[id].is_none(), "module with `ID` {id} already registered");
+        self.modules[id] = Some(module);
     }
 
     /// Execute a finalized block: call `begin_block`, group txs by
@@ -405,10 +409,16 @@ impl Executor {
     /// per-tx interleaved execution. Events are grouped by module
     /// rather than interleaved, but state roots are unchanged.
     fn execute_block(&self, block: &FinalizedBlock) -> Hash {
+        // Single lock acquisition for the events vector: clear at start,
+        // extend after execution. The lock is released between the clear
+        // and the extend because module execution can take milliseconds
+        // and we don't want to hold the lock during that time. The
+        // clear is here only to discard stale events from a previous
+        // block; the extend publishes this block's events.
         self.events.lock().unwrap().clear();
 
         // begin_block for all modules.
-        for module in self.modules.values() {
+        for module in self.modules.iter().flatten() {
             module.begin_block(block.height);
         }
 
@@ -437,13 +447,12 @@ impl Executor {
 
         // Clear the preverify cache after the block is executed —
         // the cached senders are no longer needed (re-execution would
-        // re-preverify). We drain into a local to avoid holding the
-        // lock during execution.
-        let mut preverify_cache = self.preverify_cache.lock().unwrap().clone();
-        self.preverify_cache.lock().unwrap().clear();
+        // re-preverify). We move the cache out in one lock acquisition
+        // (zero-copy: `mem::take` swaps in an empty map, no clone).
+        let mut preverify_cache = std::mem::take(&mut *self.preverify_cache.lock().unwrap());
 
         for (module_id, group) in &groups {
-            let Some(module) = self.modules.get(module_id) else {
+            let Some(module) = self.modules[*module_id as usize].as_ref() else {
                 continue; // unknown module — skip
             };
 
@@ -488,13 +497,13 @@ impl Executor {
         self.events.lock().unwrap().extend(block_events);
 
         // end_block for all modules.
-        for module in self.modules.values() {
+        for module in self.modules.iter().flatten() {
             module.end_block(block.height);
         }
 
         // Compute the state root: hash all module state roots.
         let mut root_data = Vec::new();
-        for module in self.modules.values() {
+        for module in self.modules.iter().flatten() {
             let mr = module.state_root();
             root_data.extend_from_slice(mr.as_bytes());
         }
@@ -517,7 +526,7 @@ impl AppInterface for Executor {
         let Some(module_id) = parse_module_id(bytes) else {
             return MempoolAck::Rejected { reason: "malformed: no module ID".to_string() };
         };
-        let Some(module) = self.modules.get(&module_id) else {
+        let Some(module) = self.modules[module_id as usize].as_ref() else {
             return MempoolAck::Rejected { reason: format!("unknown module {module_id}") };
         };
         let payload = module_payload(bytes);
@@ -588,7 +597,7 @@ impl AppInterface for Executor {
             let Some(module_id) = parse_module_id(bytes) else {
                 return Verdict::Reject { reason: "tx has no module ID".to_string() };
             };
-            if !self.modules.contains_key(&module_id) {
+            if self.modules[module_id as usize].is_none() {
                 return Verdict::Reject { reason: format!("unknown module ID {module_id}") };
             }
         }

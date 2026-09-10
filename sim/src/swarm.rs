@@ -185,9 +185,9 @@ impl ScenarioRunner {
 /// - Network asynchrony.
 /// - Message spam.
 pub mod scenarios {
+    use super::Swarm;
     use crate::byzantine::{ByzantineScenario, ByzantineStrategy};
     use crate::network::NetworkModel;
-    use super::Swarm;
 
     /// 7 nodes, 1 byzantine (withhold), perfect network.
     /// Tests liveness with one non-voting node.

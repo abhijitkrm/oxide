@@ -498,8 +498,8 @@ impl SnapshotServer {
     /// Returns `Err` if the chunk index is out of range.
     pub fn chunk(&self, index: u32) -> Result<ChunkResponse, SyncError> {
         let num_chunks = u32::try_from(self.chunks.len()).unwrap_or(u32::MAX);
-        let idx = usize::try_from(index)
-            .map_err(|_| SyncError::ChunkOutOfRange(index, num_chunks))?;
+        let idx =
+            usize::try_from(index).map_err(|_| SyncError::ChunkOutOfRange(index, num_chunks))?;
         if idx >= self.chunks.len() {
             return Err(SyncError::ChunkOutOfRange(index, num_chunks));
         }

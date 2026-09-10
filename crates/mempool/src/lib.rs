@@ -32,7 +32,7 @@
 //! per-account nonce tracking. No rate limiting, no eviction policy
 //! beyond size cap, no mempool gossip. Those arrive in Phase 2+.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use primitives::{Address, Hash};
 use types::TxBytes;
@@ -83,10 +83,6 @@ pub struct Mempool {
     /// Maximum number of transactions in the pool. Beyond this, the
     /// lowest-fee entries are evicted.
     max_entries: usize,
-    /// Set of known tx hashes (for fast dedup without touching the
-    /// full entry). This is redundant with `by_hash.keys()` but kept
-    /// as a `HashSet` for O(1) `contains` without borrowing.
-    known: HashSet<Hash>,
 }
 
 /// Fee density: fee per byte. Higher is better. We use a tuple
@@ -155,7 +151,6 @@ impl Mempool {
             by_sender: HashMap::new(),
             by_fee: BTreeMap::new(),
             max_entries,
-            known: HashSet::new(),
         }
     }
 
@@ -176,7 +171,7 @@ impl Mempool {
         let hash = Hasher::hash_one(Domain::Transaction, bytes);
 
         // Dedup: if we've seen this hash, it's a duplicate.
-        if self.known.contains(&hash) {
+        if self.by_hash.contains_key(&hash) {
             return Err(MempoolError::Duplicate);
         }
 
@@ -206,7 +201,6 @@ impl Mempool {
         self.by_hash.insert(hash, entry);
         self.by_sender.entry(sender).or_default().insert(nonce, hash);
         self.by_fee.entry(density).or_default().push(hash);
-        self.known.insert(hash);
         Ok(())
     }
 
@@ -230,7 +224,6 @@ impl Mempool {
                     self.by_sender.remove(&entry.sender);
                 }
             }
-            self.known.remove(&hash);
         }
         true
     }
@@ -329,7 +322,6 @@ impl Mempool {
                     self.by_sender.remove(&entry.sender);
                 }
             }
-            self.known.remove(hash);
         }
     }
 
@@ -345,7 +337,7 @@ impl Mempool {
 
     /// Check whether a transaction with the given hash is in the pool.
     pub fn contains(&self, hash: &Hash) -> bool {
-        self.known.contains(hash)
+        self.by_hash.contains_key(hash)
     }
 }
 
