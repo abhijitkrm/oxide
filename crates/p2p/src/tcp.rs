@@ -91,7 +91,34 @@ impl PeerStream for TcpStream {
     }
 
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
-        write_frame(self, bytes)
+        // Vectored I/O: combine the 4-byte length prefix and the
+        // payload into a single `write_vectored` call. This reduces
+        // the syscall count from 2 (length + payload) to 1, plus
+        // the flush. On the send hot path (50-100ms cadence), this
+        // halves the write syscalls per frame.
+        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let len_bytes = len.to_be_bytes();
+        let slices = [io::IoSlice::new(&len_bytes), io::IoSlice::new(bytes)];
+        let mut written = self.write_vectored(&slices)?;
+        // Handle partial writes: if the kernel didn't write everything
+        // in one call, fall back to write_all for the remainder.
+        let total = 4 + bytes.len();
+        while written < total {
+            if written < 4 {
+                // Still writing the length prefix.
+                let remaining_len = &len_bytes[written..];
+                self.write_all(remaining_len)?;
+                written = 4;
+            }
+            if written >= 4 && written < total {
+                // Writing the payload remainder.
+                let payload_offset = written - 4;
+                self.write_all(&bytes[payload_offset..])?;
+                written = total;
+            }
+        }
+        self.flush()?;
+        Ok(())
     }
 }
 
