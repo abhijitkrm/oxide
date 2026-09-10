@@ -222,10 +222,20 @@ pub type TcpAddr = String;
 /// lifetime. Call [`shutdown`](TcpTransport::shutdown) to gracefully
 /// close all connections and stop the accept thread.
 pub struct TcpTransport {
-    /// Outbound connections: peer ID → stream (plain TCP or TLS).
+    /// Outbound send channels: peer ID → channel sender.
+    ///
+    /// Each peer has a dedicated writer thread that owns the write
+    /// side of the stream. `send()` pushes bytes into the channel
+    /// (O(1), no I/O under the lock), and the writer thread drains
+    /// the channel and writes to the stream. This eliminates the
+    /// global send mutex — a slow peer no longer blocks sends to
+    /// other peers.
+    ///
     /// Behind `Mutex` because `send()` takes `&mut self` but the
-    /// accept thread may insert new connections concurrently.
-    streams: Arc<Mutex<HashMap<PeerId, Box<dyn PeerStream>>>>,
+    /// accept thread may insert new connections concurrently. The
+    /// lock is held only to look up the channel sender, not during
+    /// I/O.
+    streams: Arc<Mutex<HashMap<PeerId, mpsc::Sender<Vec<u8>>>>>,
     /// Inbound message channel. Reader threads write; `recv()`
     /// reads.
     inbound_rx: Mutex<mpsc::Receiver<InboundMessage>>,
@@ -340,7 +350,7 @@ impl TcpTransport {
         let listener = TcpListener::bind(listen_addr)
             .unwrap_or_else(|e| panic!("failed to bind TCP transport to {listen_addr}: {e}"));
 
-        let streams: Arc<Mutex<HashMap<PeerId, Box<dyn PeerStream>>>> =
+        let streams: Arc<Mutex<HashMap<PeerId, mpsc::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -388,8 +398,10 @@ impl TcpTransport {
                         let Some((peer_id, write_stream, reader_stream)) = result else {
                             continue; // connection closed before ID
                         };
-                        // Register the write stream for outbound sends.
-                        accept_streams.lock().unwrap().insert(peer_id.clone(), write_stream);
+                        // Spawn a writer thread and register its
+                        // channel sender for outbound sends.
+                        let writer_tx = spawn_writer(write_stream, &accept_shutdown);
+                        accept_streams.lock().unwrap().insert(peer_id.clone(), writer_tx);
                         // Spawn a reader thread for this connection.
                         let tx = accept_tx.clone();
                         let reader_shutdown = accept_shutdown.clone();
@@ -470,8 +482,10 @@ impl TcpTransport {
                             let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
                             let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
                             let write_stream = Box::new(shared) as Box<dyn PeerStream>;
-                            // Register the stream for outbound sends.
-                            cs.lock().unwrap().insert(pid.clone(), write_stream);
+                            // Spawn a writer thread and register its
+                            // channel sender for outbound sends.
+                            let writer_tx = spawn_writer(write_stream, &rshut);
+                            cs.lock().unwrap().insert(pid.clone(), writer_tx);
                             // Reader loop for this connection.
                             reader_loop(reader_stream, pid, ct, max_message_bytes, rshut);
                             return;
@@ -487,8 +501,10 @@ impl TcpTransport {
                     // Clone for the map; the reader keeps the original.
                     let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
                     let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
-                    // Register the stream for outbound sends.
-                    cs.lock().unwrap().insert(pid.clone(), write_stream);
+                    // Spawn a writer thread and register its
+                    // channel sender for outbound sends.
+                    let writer_tx = spawn_writer(write_stream, &rshut);
+                    cs.lock().unwrap().insert(pid.clone(), writer_tx);
                     // Reader loop for this connection.
                     reader_loop(reader_stream, pid, ct, max_message_bytes, rshut);
                 });
@@ -603,7 +619,8 @@ impl TcpTransport {
                     let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
                     let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
                     let write_stream = Box::new(shared) as Box<dyn PeerStream>;
-                    streams.lock().unwrap().insert(pid.clone(), write_stream);
+                    let writer_tx = spawn_writer(write_stream, &shutdown);
+                    streams.lock().unwrap().insert(pid.clone(), writer_tx);
                     reader_loop(reader_stream, pid, tx, max_message_bytes, shutdown);
                     return;
                 }
@@ -615,7 +632,8 @@ impl TcpTransport {
             let _ = stream.set_read_timeout(Some(read_timeout));
             let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
             let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
-            streams.lock().unwrap().insert(pid.clone(), write_stream);
+            let writer_tx = spawn_writer(write_stream, &shutdown);
+            streams.lock().unwrap().insert(pid.clone(), writer_tx);
             reader_loop(reader_stream, pid, tx, max_message_bytes, shutdown);
         });
     }
@@ -626,11 +644,16 @@ impl Transport for TcpTransport {
         if bytes.len() as u64 > self.config.max_message_bytes {
             return Err(TransportError::MessageTooLarge);
         }
-        let mut streams = self.streams.lock().unwrap();
-        let Some(stream) = streams.get_mut(peer) else {
+        // Look up the per-peer send channel and send bytes into it.
+        // The lock is held only for the lookup, not during I/O —
+        // the writer thread handles the actual write asynchronously.
+        let streams = self.streams.lock().unwrap();
+        let Some(sender) = streams.get(peer) else {
             return Err(TransportError::UnknownPeer);
         };
-        stream.write_frame(bytes).map_err(|_| TransportError::ChannelClosed)
+        // Clone the bytes into a Vec for the channel. The writer
+        // thread owns the stream and writes the frame.
+        sender.send(bytes.to_vec()).map_err(|_| TransportError::ChannelClosed)
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
@@ -714,6 +737,54 @@ fn reader_loop(
             Err(_) => return, // connection closed or error
         }
     }
+}
+
+/// The writer loop: drains the outbound channel and writes frames
+/// to the peer's stream. Exits when the channel is closed (the
+/// `send()` side was dropped) or an I/O error occurs.
+///
+/// This decouples `send()` from I/O — the global `streams` mutex is
+/// not held during writes. A slow peer only blocks its own writer
+/// thread, not sends to other peers.
+fn writer_loop(
+    mut stream: Box<dyn PeerStream>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        // Use recv_timeout to avoid blocking forever, so we can
+        // check the shutdown flag periodically.
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(bytes) => {
+                if stream.write_frame(&bytes).is_err() {
+                    return; // connection closed or error
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // No data — loop and check shutdown flag.
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return; // channel closed — transport shut down
+            }
+        }
+    }
+}
+
+/// Spawn a writer thread for a peer and return the channel sender.
+///
+/// The writer thread owns the write stream and drains the channel.
+/// The returned sender is stored in the `streams` map for `send()`
+/// to use.
+fn spawn_writer(
+    write_stream: Box<dyn PeerStream>,
+    shutdown: &Arc<AtomicBool>,
+) -> mpsc::Sender<Vec<u8>> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let shutdown = Arc::clone(shutdown);
+    thread::spawn(move || {
+        writer_loop(write_stream, rx, shutdown);
+    });
+    tx
 }
 
 /// The result of accepting a connection: the peer's ID, a write
