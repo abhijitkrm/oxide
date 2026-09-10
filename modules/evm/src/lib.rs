@@ -202,7 +202,13 @@ pub struct PreverifiedTx {
 pub struct EvmModule {
     /// The in-memory EVM database (account state, code, storage).
     /// Behind a `Mutex` because `Module::handle` takes `&self`.
-    db: Mutex<CacheDB<EmptyDB>>,
+    ///
+    /// Wrapped in `Arc` so the parallel execution path can take an
+    /// O(1) snapshot via `Arc::clone` instead of an `O(total_state)`
+    /// deep clone. Mutable access uses `Arc::make_mut`, which is
+    /// free when the refcount is 1 (no outstanding snapshots) and
+    /// only clones when a snapshot is actually held.
+    db: Mutex<Arc<CacheDB<EmptyDB>>>,
     /// The chain ID for EIP-155 signed transactions.
     chain_id: u64,
     /// The base fee for EIP-1559 gas metering (wei per gas unit).
@@ -270,7 +276,7 @@ impl EvmModule {
     #[must_use]
     pub fn new(chain_id: u64, base_fee: u64) -> Self {
         Self {
-            db: Mutex::new(CacheDB::new(EmptyDB::new())),
+            db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
             base_fee,
             spec: SpecId::PRAGUE,
@@ -290,7 +296,7 @@ impl EvmModule {
     #[must_use]
     pub fn with_spec(chain_id: u64, base_fee: u64, spec: SpecId) -> Self {
         Self {
-            db: Mutex::new(CacheDB::new(EmptyDB::new())),
+            db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
             base_fee,
             spec,
@@ -324,7 +330,7 @@ impl EvmModule {
         backend: Box<dyn storage::StorageBackend + Send>,
     ) -> Self {
         let module = Self {
-            db: Mutex::new(CacheDB::new(EmptyDB::new())),
+            db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
             base_fee,
             spec: SpecId::PRAGUE,
@@ -428,7 +434,8 @@ impl EvmModule {
         //   1. Charges `gas_used * gas_price` from the sender.
         //   2. Burns `gas_used * base_fee` (removes from supply).
         //   3. Tips `gas_used * (gas_price - base_fee)` to the coinbase.
-        let mut db = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let db = Arc::make_mut(&mut *db_guard);
         let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
         let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
         let block_timestamp =
@@ -946,7 +953,8 @@ impl EvmModule {
         let mut results = Vec::with_capacity(decoded.len());
 
         // Acquire the DB lock once for the entire batch.
-        let mut db = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let db = Arc::make_mut(&mut *db_guard);
         let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
         let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
         let block_timestamp =
@@ -1290,10 +1298,13 @@ impl EvmModule {
         // `DatabaseRef`. Reads fall through to the parent on cache
         // miss; writes stay local. Per-group cost is O(1) init +
         // O(touched) memory, vs O(state) for a full clone.
-        let snapshot = Arc::new({
-            let db = self.db.lock().expect("db mutex not poisoned");
-            db.clone()
-        });
+        //
+        // The snapshot is an O(1) `Arc::clone` — no deep clone of
+        // the CacheDB. Each parallel group gets a fresh empty
+        // `CacheDB<SharedCacheDB>` backed by the shared snapshot via
+        // `DatabaseRef`. Reads fall through to the parent on cache
+        // miss; writes stay local.
+        let snapshot = self.db.lock().expect("db mutex not poisoned").clone();
         let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
         let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
         let block_timestamp =
@@ -1447,7 +1458,8 @@ impl EvmModule {
         // accounts (excluding the coinbase, which is handled
         // additively), we re-execute the group sequentially against
         // the main DB to preserve Ethereum semantics.
-        let mut db = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let db = Arc::make_mut(&mut *db_guard);
         let mut committed_touched: std::collections::HashSet<revm::primitives::Address> =
             std::collections::HashSet::new();
         let mut total_coinbase_delta = revm::primitives::U256::ZERO;
@@ -2202,7 +2214,8 @@ impl EvmModule {
     /// Panics if the DB mutex is poisoned.
     #[doc(hidden)]
     pub fn fund_account_for_test(&self, addr: &Address, balance: u128) {
-        let mut db = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let db = Arc::make_mut(&mut *db_guard);
         let evm_addr = alloy_primitives_address(addr.0);
         let account =
             db.cache.accounts.entry(evm_addr).or_insert_with(|| revm::database::DbAccount {
@@ -2302,7 +2315,8 @@ impl EvmModule {
         if entries.is_empty() {
             return;
         }
-        let mut db = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let db = Arc::make_mut(&mut *db_guard);
         for (key, value) in entries {
             let Some(oxide_addr) = persist::key_to_address(&key) else { continue };
             let Some(account) = persist::deserialize_account(&value) else {
