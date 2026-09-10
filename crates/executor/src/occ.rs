@@ -49,17 +49,84 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
+/// A fixed-size OCC key (32 bytes).
+///
+/// Phase E #14: eliminate per-key heap allocation by using a
+/// fixed-size `[u8; 32]` instead of `Vec<u8>`. EVM state keys are
+/// always 32 bytes (keccak256 of storage slot, or padded account
+/// address). Storing keys as a fixed-size array means:
+/// - No heap allocation per key (the array is stored inline in
+///   the HashSet/BTreeMap bucket).
+/// - No pointer chase on lookup (the key is in the bucket, not
+///   on the heap).
+/// - Better cache locality (contiguous key storage).
+///
+/// For keys shorter than 32 bytes (e.g. 20-byte addresses), the
+/// `from_slice` constructor zero-pads to 32 bytes. This is
+/// deterministic and preserves equality semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OccKey([u8; 32]);
+
+impl OccKey {
+    /// Construct a fixed-size key from a byte slice.
+    ///
+    /// If the slice is exactly 32 bytes, it is copied directly.
+    /// If it is shorter, it is zero-padded to 32 bytes. If it is
+    /// longer, it is truncated to the first 32 bytes.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic. Shorter keys are zero-padded; longer keys
+    /// are truncated. Callers should use 32-byte keys for EVM
+    /// state access (the common case).
+    #[must_use]
+    pub fn from_slice(s: &[u8]) -> Self {
+        let mut key = [0u8; 32];
+        let len = s.len().min(32);
+        key[..len].copy_from_slice(&s[..len]);
+        Self(key)
+    }
+
+    /// Construct a key from a 32-byte array (no copy needed).
+    #[must_use]
+    pub fn from_array(arr: [u8; 32]) -> Self {
+        Self(arr)
+    }
+
+    /// Return the key as a byte slice.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for OccKey {
+    fn from(arr: [u8; 32]) -> Self {
+        Self(arr)
+    }
+}
+
+impl From<&[u8]> for OccKey {
+    fn from(s: &[u8]) -> Self {
+        Self::from_slice(s)
+    }
+}
+
 /// A read/write set pair for a single transaction execution.
 ///
 /// Tracks which state keys a tx read and which it wrote. Used by the
 /// validator to detect conflicts: if a tx's read set overlaps with an
 /// earlier tx's write set, the tx must be re-executed.
+///
+/// Phase E #14: keys are fixed-size [`OccKey`] (32 bytes) to avoid
+/// per-key heap allocation. Values remain `Vec<u8>` because EVM
+/// state values are variable-length (RLP-encoded).
 #[derive(Debug, Clone, Default)]
 pub struct ReadWriteSet {
     /// Keys this tx read (for conflict detection).
-    pub reads: HashSet<Vec<u8>>,
+    pub reads: HashSet<OccKey>,
     /// Keys this tx wrote (for commit ordering).
-    pub writes: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub writes: BTreeMap<OccKey, Vec<u8>>,
 }
 
 impl ReadWriteSet {
@@ -71,12 +138,22 @@ impl ReadWriteSet {
 
     /// Record a read of `key`.
     pub fn record_read(&mut self, key: &[u8]) {
-        self.reads.insert(key.to_vec());
+        self.reads.insert(OccKey::from_slice(key));
+    }
+
+    /// Record a read of a fixed-size `key` (no slice conversion).
+    pub fn record_read_key(&mut self, key: OccKey) {
+        self.reads.insert(key);
     }
 
     /// Record a write of `key` → `value`.
     pub fn record_write(&mut self, key: &[u8], value: Vec<u8>) {
-        self.writes.insert(key.to_vec(), value);
+        self.writes.insert(OccKey::from_slice(key), value);
+    }
+
+    /// Record a write of a fixed-size `key` → `value`.
+    pub fn record_write_key(&mut self, key: OccKey, value: Vec<u8>) {
+        self.writes.insert(key, value);
     }
 
     /// Check if this tx's reads conflict with `other`'s writes.
@@ -183,14 +260,16 @@ impl ParallelScheduler {
                 // Conflict: re-execute on the sequential state.
                 let re_exec = execute(i);
                 // Apply the re-executed writes to the cumulative set.
+                // Use `record_write_key` to avoid re-converting the
+                // already-typed OccKey back to a slice.
                 for (k, v) in &re_exec.rw_set.writes {
-                    cumulative_writes.record_write(k, v.clone());
+                    cumulative_writes.record_write_key(*k, v.clone());
                 }
                 committed.push(re_exec);
             } else {
                 // No conflict: commit the speculative result.
                 for (k, v) in &spec_tx.rw_set.writes {
-                    cumulative_writes.record_write(k, v.clone());
+                    cumulative_writes.record_write_key(*k, v.clone());
                 }
                 committed.push(spec_tx);
             }
@@ -297,11 +376,41 @@ mod tests {
         let mut rw = ReadWriteSet::new();
         rw.record_read(b"key1");
         rw.record_write(b"key2", b"value2".to_vec());
-        assert!(rw.reads.contains(b"key1".as_slice()));
+        assert!(rw.reads.contains(&OccKey::from_slice(b"key1")));
         assert_eq!(
-            rw.writes.get(b"key2".as_slice()).map(|v: &Vec<u8>| v.as_slice()),
+            rw.writes.get(&OccKey::from_slice(b"key2")).map(|v: &Vec<u8>| v.as_slice()),
             Some(b"value2".as_slice())
         );
+    }
+
+    #[test]
+    fn occkey_from_slice_32_bytes() {
+        let arr = [0xABu8; 32];
+        let key = OccKey::from_slice(&arr);
+        assert_eq!(key.as_bytes(), &arr[..]);
+    }
+
+    #[test]
+    fn occkey_from_slice_short_pads_zeros() {
+        let key = OccKey::from_slice(b"short");
+        assert_eq!(&key.as_bytes()[..5], b"short");
+        assert_eq!(&key.as_bytes()[5..], &[0u8; 27]);
+    }
+
+    #[test]
+    fn occkey_from_slice_long_truncates() {
+        let input = [0xFFu8; 40];
+        let key = OccKey::from_slice(&input);
+        assert_eq!(&key.as_bytes()[..32], &input[..32]);
+    }
+
+    #[test]
+    fn occkey_equality_preserved() {
+        let k1 = OccKey::from_slice(b"key1");
+        let k2 = OccKey::from_slice(b"key1");
+        assert_eq!(k1, k2);
+        let k3 = OccKey::from_slice(b"key2");
+        assert_ne!(k1, k3);
     }
 
     #[test]
