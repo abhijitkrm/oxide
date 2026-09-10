@@ -259,43 +259,43 @@ impl Mempool {
             }
         }
 
-        // Iterate fee densities highest-first. We collect the hashes
-        // to remove first, then remove them after iteration (can't
-        // mutate while iterating).
+        // Iterate fee densities highest-first by walking the BTreeMap
+        // in reverse. The BTreeMap is already sorted by `FeeDensity`
+        // (ascending), so reverse iteration gives us highest-first
+        // without collecting into a Vec and sorting — O(n) iteration
+        // with zero allocation, vs the old O(n log n) sort.
+        //
+        // We collect hashes to remove after iteration (can't mutate
+        // `by_fee` while iterating it).
         let mut to_remove: Vec<Hash> = Vec::new();
 
-        // Collect all (density, hash) pairs in fee-descending order.
-        let mut all_entries: Vec<(FeeDensity, Hash)> = Vec::new();
-        for (&density, hashes) in &self.by_fee {
+        for (_density, hashes) in self.by_fee.iter().rev() {
             for &hash in hashes {
-                all_entries.push((density, hash));
+                if total_bytes >= max_bytes {
+                    break;
+                }
+                let Some(entry) = self.by_hash.get(&hash) else {
+                    continue;
+                };
+                // Check nonce ordering: the tx's nonce must equal the
+                // sender's next expected nonce.
+                let expected = next_nonce.entry(entry.sender).or_insert(0);
+                if entry.nonce != *expected {
+                    continue;
+                }
+                // Check byte budget.
+                if total_bytes + entry.size > max_bytes {
+                    continue;
+                }
+                // Select this tx.
+                total_bytes += entry.size;
+                selected.push(entry.tx.clone());
+                *expected += 1;
+                to_remove.push(hash);
             }
-        }
-        // Sort by density descending (highest fee/byte first).
-        all_entries.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
-
-        for (_, hash) in all_entries {
             if total_bytes >= max_bytes {
                 break;
             }
-            let Some(entry) = self.by_hash.get(&hash) else {
-                continue;
-            };
-            // Check nonce ordering: the tx's nonce must equal the
-            // sender's next expected nonce.
-            let expected = next_nonce.entry(entry.sender).or_insert(0);
-            if entry.nonce != *expected {
-                continue;
-            }
-            // Check byte budget.
-            if total_bytes + entry.size > max_bytes {
-                continue;
-            }
-            // Select this tx.
-            total_bytes += entry.size;
-            selected.push(entry.tx.clone());
-            *expected += 1;
-            to_remove.push(hash);
         }
 
         // Remove selected entries from the pool.
