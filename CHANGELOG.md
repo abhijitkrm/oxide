@@ -1259,3 +1259,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     now fixed — untrusted wire data can't cause OOM.
   - **Test count:** 587+ tests pass (was 374). 91 new tests across
     p2p (+43), oxide-sim (+35), and governance (+13).
+
+- **Pipelined TCP TPS harness** (devnet)
+  - `run_pipelined` replaces the sequential `run_batch` driver in the
+    networked TPS tests. It overlaps vote collection, QC formation, and
+    QC delivery across views via a tick-based event loop that drains all
+    TCP transports concurrently, forms QCs as soon as quorum is reached,
+    and advances views independently per engine.
+  - Added 1-byte message type tags (`MSG_VOTE` / `MSG_QC`) to
+    disambiguate votes from QCs on the TCP inbound channel (the `Vote`
+    decoder otherwise succeeds on QC bytes by reading the epoch+bitmap
+    as the 96-byte BLS signature).
+  - Gated `propose()` on `high_qc` availability for view > 0 (tail-fork
+    resistance, oxidebft-spec.md §4).
+  - Disabled Nagle's algorithm (`TCP_NODELAY`) on all TCP connections
+    (accept + both connect paths, plain + TLS).
+  - **In plain words:** the networked TPS benchmark no longer serializes
+    a pipelined protocol. The 10,000-tx test improved ~2.6× (7,883 →
+    20,714 tx/s) and the four-validator case now finalizes all blocks
+    instead of hanging. Measured TPS still *falls* with more validators
+    because each round needs more TCP round-trips, but the decline is
+    now a real network/protocol cost, not a driver artifact.

@@ -31,6 +31,7 @@
 //! `authenticated = false`, `encrypted = false`. This is for local
 //! devnet only — do not use across untrusted networks.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use codec::{Decode, Encode};
@@ -48,6 +49,16 @@ const GENESIS_BALANCE: u64 = 1_000_000_000_000;
 /// Default uses ports 20000+, but tests should pass a unique base
 /// port to avoid collisions when running in parallel.
 const DEFAULT_BASE_PORT: u16 = 20000;
+
+/// Message type tag: vote. Prepended to vote messages in the pipelined
+/// driver so the receiver can distinguish votes from QCs without
+/// ambiguity (both start with view + phase + `block_hash`, and the `Vote`
+/// decoder can succeed on QC bytes by reading the epoch + bitmap as
+/// the 96-byte signature).
+const MSG_VOTE: u8 = 0x01;
+
+/// Message type tag: QC.
+const MSG_QC: u8 = 0x02;
 
 /// A TCP-based multi-node devnet: N validators running oxideBFT with
 /// real TCP transport.
@@ -72,6 +83,47 @@ pub struct TcpMultiNodeDevnet {
 pub struct TcpDevnetResult {
     /// Finalized blocks per validator.
     pub finalized: Vec<Vec<FinalizedBlock>>,
+}
+
+/// Mutable state shared across ticks of the pipelined event loop.
+///
+/// This is extracted from `run_pipelined` to keep each phase function
+/// small and to avoid passing half a dozen locals through every call.
+/// All fields are private to the module; phases mutate them via `&mut`.
+struct PipelineState {
+    /// Pending proposals, indexed by view (in-process — all engines
+    /// see them via `propose()` / `vote()`).
+    proposals: Vec<(types::BlockHeader, types::Proposal)>,
+    /// Views that have been proposed (prevents duplicate proposals).
+    proposed_views: HashSet<u64>,
+    /// `(engine_idx, view)` pairs that have voted (prevents double-voting).
+    voted: HashSet<(usize, u64)>,
+    /// Number of QCs formed across all ticks.
+    qcs_formed: u64,
+}
+
+impl PipelineState {
+    fn new() -> Self {
+        Self {
+            proposals: Vec::new(),
+            proposed_views: HashSet::new(),
+            voted: HashSet::new(),
+            qcs_formed: 0,
+        }
+    }
+
+    /// Remove proposals that all `n` engines have voted on.
+    ///
+    /// This keeps Phase 2 iteration `O(pipeline_depth)` instead of
+    /// `O(rounds)`. Blocks are already stored in each engine's `blocks`
+    /// `HashMap` (via `vote()` / `propose()`), so removing the proposal
+    /// from the vector is safe.
+    fn compact_proposals(&mut self, n: usize) {
+        self.proposals.retain(|(header, _)| {
+            let view = header.view.value();
+            (0..n).any(|i| !self.voted.contains(&(i, view)))
+        });
+    }
 }
 
 impl TcpMultiNodeDevnet {
@@ -259,6 +311,246 @@ impl TcpMultiNodeDevnet {
         self.run_round_tcp();
         let elapsed = start.elapsed();
         (self.collect_result(), elapsed)
+    }
+
+    /// Run `rounds` consensus rounds with `txs_per_round` txs, using a
+    /// **pipelined** event loop that overlaps vote collection, QC
+    /// formation, and QC delivery across views.
+    ///
+    /// Unlike [`run_batch`](Self::run_batch), which processes one round
+    /// at a time with blocking polls (1ms `thread::sleep` per poll
+    /// iteration), this method:
+    ///
+    /// 1. Submits all transactions upfront to each view's leader.
+    /// 2. Runs a tick-based loop where each tick:
+    ///    - Proposes for any view whose leader has the `high_qc`.
+    ///    - Votes on any seen proposal (votes sent via TCP).
+    ///    - Drains **all** inbound TCP messages concurrently.
+    ///    - Forms QCs as soon as quorum is reached.
+    ///    - Delivers QCs via TCP, advancing views **independently**.
+    ///
+    /// This overlaps round N+1's proposal with round N's QC delivery,
+    /// eliminating the sequential bottleneck. The leader for view V+1
+    /// proposes as soon as it receives QC V via TCP — it does not wait
+    /// for all followers to acknowledge QC V.
+    ///
+    /// # Performance
+    ///
+    /// The previous `run_batch` driver slept 1ms per poll iteration
+    /// (macOS scheduler granularity makes this 1–10ms in practice),
+    /// and delivered QCs sequentially per follower. With 4 validators,
+    /// each round took ~25ms. This pipelined driver uses
+    /// `std::hint::spin_loop` (no scheduler delay) and drains all
+    /// transports concurrently, reducing each round to ~100–300μs
+    /// (two TCP loopback round-trips).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a TCP send fails (vote or QC), or if the leader's
+    /// self-delivered QC fails verification. These are test-only
+    /// assertions — in production, the transport handles retries.
+    pub fn run_pipelined(
+        &mut self,
+        rounds: usize,
+        txs_per_round: usize,
+    ) -> (TcpDevnetResult, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let target_blocks = u64::try_from(rounds).unwrap_or(u64::MAX);
+
+        // Submit all txs upfront to each view's leader. Each view's
+        // leader is determined by `validator_set.leader(view)`, which
+        // rotates round-robin. The leader's mempool holds that round's
+        // txs; `propose()` pulls them via `prepare_proposal`.
+        for round in 0..rounds {
+            let view = primitives::View::new(round as u64);
+            let leader_idx = usize::from(self.validator_set.leader(view));
+            for tx_i in 0..txs_per_round {
+                let tx = make_batch_tx(round, tx_i);
+                self.engines[leader_idx].submit_tx(tx);
+            }
+        }
+
+        // Pipelined state: shared between the main loop and flush loop.
+        let mut state = PipelineState::new();
+
+        // Main loop: run until all `rounds` QCs are formed.
+        let deadline = start + std::time::Duration::from_secs(30);
+        loop {
+            if state.qcs_formed >= target_blocks {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            self.pipelined_tick(&mut state, target_blocks);
+            std::hint::spin_loop();
+        }
+
+        // Flush round: propose one more empty block to commit the last
+        // pending block (2-chain rule). Runs until all `target_blocks`
+        // blocks are finalized.
+        let flush_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let max_finalized = self.engines[0].finalized_height().map_or(0, primitives::Id::value);
+            if max_finalized + 1 >= target_blocks {
+                break;
+            }
+            if std::time::Instant::now() > flush_deadline {
+                break;
+            }
+            self.pipelined_tick(&mut state, u64::MAX);
+            std::hint::spin_loop();
+        }
+
+        // Final height sync (cleanup, same as `run_batch`).
+        let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+        for engine in &mut self.engines {
+            engine.sync_next_height(max_height);
+        }
+
+        let elapsed = start.elapsed();
+        (self.collect_result(), elapsed)
+    }
+
+    /// One tick of the pipelined event loop.
+    ///
+    /// Each tick runs five phases: propose, vote, drain, form QC,
+    /// advance views. The `state` tracks proposals, votes, and QCs
+    /// across ticks. The `view_cap` limits which views may be proposed
+    /// (the main loop caps at `target_blocks`; the flush loop uses
+    /// `u64::MAX`).
+    fn pipelined_tick(&mut self, state: &mut PipelineState, view_cap: u64) {
+        self.propose_phase(state, view_cap);
+        self.vote_phase(state);
+        state.compact_proposals(self.n);
+        self.drain_transports();
+        self.form_qc_phase(state);
+        self.advance_views_phase();
+    }
+
+    /// Phase 1: any leader with the `high_qc` that hasn't proposed yet.
+    fn propose_phase(&mut self, state: &mut PipelineState, view_cap: u64) {
+        for (i, engine) in self.engines.iter_mut().enumerate() {
+            let view = engine.current_view().value();
+            if view >= view_cap || state.proposed_views.contains(&view) {
+                continue;
+            }
+            let leader_idx = usize::from(self.validator_set.leader(engine.current_view()));
+            if i != leader_idx {
+                continue;
+            }
+            // At genesis (view 0), no `high_qc` is needed. For view > 0,
+            // the leader must have the QC from the previous view
+            // (tail-fork resistance, oxidebft-spec.md §4).
+            if view > 0 && engine.high_qc().is_none() {
+                continue;
+            }
+            if let Some((header, proposal)) = engine.propose() {
+                state.proposed_views.insert(view);
+                state.proposals.push((header, proposal));
+            }
+        }
+    }
+
+    /// Phase 2: any engine that hasn't voted, vote on the proposal.
+    fn vote_phase(&mut self, state: &mut PipelineState) {
+        for (i, engine) in self.engines.iter_mut().enumerate() {
+            for (header, proposal) in &state.proposals {
+                let view = header.view.value();
+                if state.voted.contains(&(i, view)) {
+                    continue;
+                }
+                let leader_idx = usize::from(self.validator_set.leader(header.view));
+                if i == leader_idx {
+                    // Leader self-votes directly (no network).
+                    let block_hash = OxideBft::block_hash(header);
+                    let sig =
+                        self.secret_keys[i].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+                    let leader_vote = types::Vote {
+                        view: header.view,
+                        phase: types::VotePhase::Prepare,
+                        block_hash,
+                        signature: sig,
+                    };
+                    let _ = engine.collect_vote(u16::try_from(i).unwrap(), leader_vote);
+                    state.voted.insert((i, view));
+                } else if let Some(vote) = engine.vote(header, proposal) {
+                    let mut buf = Vec::with_capacity(1 + 137);
+                    buf.push(MSG_VOTE);
+                    vote.encode(&mut buf);
+                    self.transports[i]
+                        .send(&vec![u8::try_from(leader_idx).unwrap()], &buf)
+                        .expect("TCP send vote to leader");
+                    state.voted.insert((i, view));
+                }
+            }
+        }
+    }
+
+    /// Phase 3: drain all inbound TCP messages concurrently.
+    ///
+    /// Each message is decoded by its 1-byte type tag:
+    /// `MSG_VOTE` → `collect_vote` on the receiving engine.
+    /// `MSG_QC` → `deliver_qc` on the receiving engine.
+    fn drain_transports(&mut self) {
+        for (i, transport) in self.transports.iter_mut().enumerate() {
+            while let Some(msg) = transport.recv() {
+                if msg.bytes.is_empty() {
+                    continue;
+                }
+                let tag = msg.bytes[0];
+                let mut reader = codec::Reader::new(&msg.bytes[1..]);
+                match tag {
+                    MSG_VOTE => {
+                        if let Ok(vote) = types::Vote::decode(&mut reader) {
+                            let voter_idx = u16::from(msg.from[0]);
+                            let _ = self.engines[i].collect_vote(voter_idx, vote);
+                        }
+                    }
+                    MSG_QC => {
+                        if let Ok(qc) = types::QuorumCertificate::decode(&mut reader) {
+                            let _ = self.engines[i].deliver_qc(qc);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Phase 4: any leader with quorum, form QC and broadcast.
+    fn form_qc_phase(&mut self, state: &mut PipelineState) {
+        for (i, engine) in self.engines.iter_mut().enumerate() {
+            if let Some(qc) = engine.try_form_qc() {
+                state.qcs_formed += 1;
+                let mut qc_buf = Vec::with_capacity(1 + 150);
+                qc_buf.push(MSG_QC);
+                qc.encode(&mut qc_buf);
+                for j in 0..self.n {
+                    if j != i {
+                        self.transports[i]
+                            .send(&vec![u8::try_from(j).unwrap()], &qc_buf)
+                            .expect("TCP send QC to follower");
+                    }
+                }
+                engine.deliver_qc(qc).expect("leader self-deliver QC");
+            }
+        }
+    }
+
+    /// Phase 5: advance views for engines with a `high_qc`, sync heights.
+    fn advance_views_phase(&mut self) {
+        for engine in &mut self.engines {
+            if let Some(hqc) = engine.high_qc() {
+                if hqc.view == engine.current_view() {
+                    engine.advance_view();
+                }
+            }
+        }
+        let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+        for engine in &mut self.engines {
+            engine.sync_next_height(max_height);
+        }
     }
 
     /// Run one consensus round with messages routed through TCP.

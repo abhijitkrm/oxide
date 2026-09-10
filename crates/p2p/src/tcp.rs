@@ -492,6 +492,7 @@ impl TcpTransport {
                     {
                         if let Some(ref tls_config) = ctls {
                             // Initiate TLS as client.
+                            let _ = stream.set_nodelay(true);
                             let server_name = rustls::pki_types::ServerName::try_from("localhost")
                                 .expect("localhost is a valid server name");
                             let client_conn = rustls::ClientConnection::new(
@@ -520,6 +521,8 @@ impl TcpTransport {
                     }
                     // Plain TCP path.
                     let mut stream = stream;
+                    // Disable Nagle (same rationale as accept path).
+                    let _ = stream.set_nodelay(true);
                     // Send our peer ID as the first frame.
                     if write_frame(&mut stream, &oid).is_err() {
                         return; // connection failed
@@ -631,6 +634,7 @@ impl TcpTransport {
             #[cfg(feature = "tls")]
             {
                 if let Some(ref tls_config) = tls {
+                    let _ = stream.set_nodelay(true);
                     let server_name = rustls::pki_types::ServerName::try_from("localhost")
                         .expect("localhost is a valid server name");
                     let client_conn = rustls::ClientConnection::new(
@@ -653,6 +657,7 @@ impl TcpTransport {
                 }
             }
             let mut stream = stream;
+            let _ = stream.set_nodelay(true);
             if write_frame(&mut stream, &our_id).is_err() {
                 return;
             }
@@ -828,6 +833,12 @@ fn accept_plain_connection(
     max_message_bytes: u64,
     read_timeout: Duration,
 ) -> AcceptResult {
+    // Disable Nagle's algorithm: consensus messages are small and
+    // latency-sensitive (vote → QC → next proposal). Nagle buffers
+    // small writes waiting for more data, interacting with delayed
+    // ACK to add 25–40ms per round-trip on macOS. TCP_NODELAY sends
+    // each write immediately.
+    let _ = stream.set_nodelay(true);
     let peer_id = read_frame(&mut stream, max_message_bytes).ok()?;
     let _ = stream.set_read_timeout(Some(read_timeout));
     let write_stream = Box::new(stream.try_clone().ok()?) as Box<dyn PeerStream>;
@@ -848,6 +859,8 @@ fn accept_tls_connection(
     max_message_bytes: u64,
     read_timeout: Duration,
 ) -> AcceptResult {
+    // Disable Nagle (same rationale as plain accept).
+    let _ = stream.set_nodelay(true);
     let server_conn = rustls::ServerConnection::new(tls_config.server_config.clone()).ok()?;
     let mut tls_stream = rustls::StreamOwned::new(server_conn, stream);
     let _ = tls_stream.sock.set_read_timeout(Some(read_timeout));

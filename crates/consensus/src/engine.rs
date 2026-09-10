@@ -306,6 +306,17 @@ impl OxideBft {
         self.current_view
     }
 
+    /// The highest QC the engine has seen, if any.
+    ///
+    /// Used by pipelined drivers to check whether the leader for the
+    /// next view has the QC needed to propose (the QC's view must
+    /// match `current_view` — the leader builds the next block on
+    /// this QC as `prev_block`).
+    #[must_use]
+    pub fn high_qc(&self) -> Option<&QuorumCertificate> {
+        self.high_qc.as_ref()
+    }
+
     /// Current epoch.
     #[must_use]
     pub fn epoch(&self) -> Epoch {

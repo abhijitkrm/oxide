@@ -69,9 +69,10 @@ fn run_networked_tps(n_validators: usize, rounds: usize, txs_per_round: usize, b
         n_validators * (n_validators - 1),
     );
 
-    // Run the consensus rounds.
-    eprintln!("networked TPS test: running {rounds} rounds...");
-    let (result, elapsed) = devnet.run_batch(rounds, txs_per_round);
+    // Run the consensus rounds (pipelined: overlaps vote collection
+    // and QC delivery across views — no 1ms sleep polls).
+    eprintln!("networked TPS test: running {rounds} rounds (pipelined)...");
+    let (result, elapsed) = devnet.run_pipelined(rounds, txs_per_round);
     eprintln!("networked TPS test: completed in {:.3}s", elapsed.as_secs_f64());
 
     // Verify all validators agree on the same finalized blocks.

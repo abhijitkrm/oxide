@@ -5097,3 +5097,80 @@ zero-copy payload handling (Phase E #5) and fixed-size OCC keys (Phase E
 - `cf6a3bd`: perf: executor: avoid wasted payload clones in fallback path
 - `5b589cd`: feat: mempool + executor: batch submit API (Phase E)
 - `c3fd418`: perf: executor: fixed-size OCC keys (Phase E #14)
+
+### Pipelined TCP TPS harness (oxideBFT)
+
+**Problem:** The `run_batch` driver in `crates/devnet/src/tcp_multinode.rs`
+processed one consensus round at a time: leader proposes → all followers
+vote → leader polls for every vote (1ms `thread::sleep` per poll) → leader
+forms QC → leader delivers QC to each follower sequentially → all engines
+advance view → next round. Each additional validator added vote messages,
+QC deliveries, and polling iterations to the critical path, so measured
+TPPS *fell* as validator count rose (41k → 9.7k → 5.7k for 1/4/7
+validators). That made it look like HotStuff scales worse with more
+validators, when in fact the harness was serializing a pipelined protocol.
+
+**Root cause 1 — sequential driver:** The harness did not exploit the
+oxideBFT engine's existing pipeline. The engine already advances
+`next_height` on proposal (not finalization) and carries a `high_qc`
+into the next proposal, but the driver waited for full round completion
+before starting the next proposal.
+
+**Root cause 2 — vote/QC message ambiguity on TCP:** The inbound channel
+carried both `Vote` and `QuorumCertificate` messages with no type tag.
+The `Vote` decoder reads exactly 96 bytes for the BLS signature, and a
+`QuorumCertificate` has ≥106 bytes after `block_hash` (epoch + bitmap +
+aggregate signature). So `Vote::decode` *succeeds* on QC bytes by
+consuming the epoch+bitmap as the signature — QCs were silently
+misinterpreted as votes, so multi-validator runs never formed QCs.
+
+**Root cause 3 — missing high-QC gate on propose:** The leader for view
+V+1 proposed before it had received QC V via TCP. The resulting block
+carried `high_qc = None`, and followers that *did* have a high QC
+rejected the vote via tail-fork resistance (oxidebft-spec.md §4). This
+broke the pipelining dependency: block V+1 must extend QC V.
+
+**Fixes:**
+1. Added `run_pipelined`: a tick-based event loop that overlaps vote
+   collection, QC formation, and QC delivery across views. All transports
+   are drained concurrently each tick; QCs are formed as soon as quorum
+   is reached; views advance independently per engine.
+2. Added 1-byte message type tags (`MSG_VOTE` / `MSG_QC`) to all TCP
+   vote/QC sends, with tag-checked decoding on receive.
+3. Gated `propose()` on `engine.high_qc().is_some()` for view > 0, so
+   the leader waits for the previous QC before proposing.
+4. Added a flush round to commit the final pending block (2-chain rule
+   needs one more QC after the last target block).
+5. Replaced `thread::sleep(1ms)` with `std::hint::spin_loop` (the TCP
+   reader/writer threads are on separate OS cores and don't need this
+   thread to yield).
+6. Compacted the `proposals` vector each tick to keep Phase 2 iteration
+   `O(pipeline_depth)` instead of `O(rounds)`.
+7. Disabled Nagle's algorithm (`TCP_NODELAY`) on all TCP connections
+   (accept + both connect paths, plain + TLS) — consensus messages are
+   small and latency-sensitive; Nagle + delayed ACK adds 25–40ms per
+   round-trip on macOS.
+8. Refactored `run_pipelined` into phase helpers (`propose_phase`,
+   `vote_phase`, `drain_transports`, `form_qc_phase`, `advance_views_phase`)
+   and a `PipelineState` struct to satisfy the clippy function-length gate.
+
+**Results (release build, TCP loopback, macOS):**
+
+| Test | Validators | Txs | Pipelined tx/s | Blocks/s |
+|---|---:|---:|---:|---:|
+| single | 1 | 1,000 | 30,752 | 307.5 |
+| default | 4 | 1,000 | 9,431 | 94.3 |
+| 7-val | 7 | 1,000 | 5,596 | 56.0 |
+| 10k | 4 | 10,000 | 20,714 | 103.6 |
+
+The 10k case improved ~2.6× over the sequential driver (7,883 → 20,714
+tx/s). Small cases are dominated by per-round TCP round-trips and the
+flush round, so they don't yet show the pipeline's full benefit. All
+four networked TPS tests pass; all 24 devnet unit tests pass; full
+workspace test suite passes; clippy + fmt clean.
+
+**What's still honest:** These numbers include TCP loopback, consensus,
+QC formation/verification, and bank-module execution, but they run on
+a single process with the driver directly invoking consensus methods.
+A real multi-process deployment would add process boundaries, but the
+protocol-level pipelining is now actually exercised.
