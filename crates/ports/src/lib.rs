@@ -68,6 +68,14 @@ pub trait AppInterface: Send + Sync {
     /// double-counted.
     fn ingest_tx(&self, tx: TxBytes) -> MempoolAck;
 
+    /// Batch mempool intake. Default implementation calls
+    /// [`ingest_tx`](Self::ingest_tx) per tx. Apps with a locked
+    /// mempool can override this to acquire the lock once for the
+    /// entire batch, amortizing the per-tx lock overhead.
+    fn ingest_tx_batch(&self, txs: Vec<TxBytes>) -> Vec<MempoolAck> {
+        txs.into_iter().map(|tx| self.ingest_tx(tx)).collect()
+    }
+
     /// Leader hook: assemble the next proposal within `budget`. The
     /// proposal's height is the app's next chain height (the app is the
     /// ledger's source of truth); the engine and app advance height in

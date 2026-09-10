@@ -204,6 +204,27 @@ impl Mempool {
         Ok(())
     }
 
+    /// Submit a batch of transactions to the pool. Returns a Vec of
+    /// results, one per input tx, in order. Each result is `Ok(())`
+    /// if accepted, `Err(MempoolError)` if rejected.
+    ///
+    /// This is the batch equivalent of [`submit`](Self::submit). It
+    /// amortizes the per-tx overhead (hash computation, index lookups)
+    /// across the batch and pre-allocates the result Vec.
+    ///
+    /// # Errors
+    ///
+    /// Each tx is processed independently — a rejection for one tx
+    /// does not affect the others. See [`submit`](Self::submit) for
+    /// the per-tx error cases.
+    pub fn submit_batch(&mut self, txs: Vec<TxBytes>) -> Vec<Result<(), MempoolError>> {
+        let mut results = Vec::with_capacity(txs.len());
+        for tx in txs {
+            results.push(self.submit(tx));
+        }
+        results
+    }
+
     /// Evict the lowest-fee entry from the pool. Returns `true` if an
     /// entry was evicted, `false` if the pool was empty.
     fn evict_lowest_fee(&mut self) -> bool {
@@ -369,6 +390,32 @@ mod tests {
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 1);
         assert_eq!(pool.len(), 0, "selected txs are removed");
+    }
+
+    #[test]
+    fn submit_batch_accepts_multiple() {
+        let mut pool = Mempool::new(100);
+        let txs = vec![
+            build_tx(addr(1), 0, 100, &[1]),
+            build_tx(addr(1), 1, 200, &[2]),
+            build_tx(addr(2), 0, 150, &[3]),
+        ];
+        let results = pool.submit_batch(txs);
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(Result::is_ok), "all txs should be accepted");
+        assert_eq!(pool.len(), 3);
+    }
+
+    #[test]
+    fn submit_batch_handles_duplicates() {
+        let mut pool = Mempool::new(100);
+        let tx = build_tx(addr(1), 0, 100, &[1]);
+        let txs = vec![tx.clone(), tx];
+        let results = pool.submit_batch(txs);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok(), "first tx should be accepted");
+        assert!(results[1].is_err(), "duplicate should be rejected");
+        assert_eq!(pool.len(), 1);
     }
 
     #[test]

@@ -633,6 +633,62 @@ impl AppInterface for Executor {
         }
     }
 
+    /// Phase E: batch mempool intake. Acquires the mempool lock once
+    /// for the entire batch, amortizing the per-tx lock overhead.
+    /// Validation and preverify are still per-tx (they call into
+    /// module code), but the mempool insertion is batched.
+    fn ingest_tx_batch(&self, txs: Vec<TxBytes>) -> Vec<MempoolAck> {
+        let mut results = Vec::with_capacity(txs.len());
+        // Validate and preverify each tx, collecting the accepted
+        // ones for batch submission to the mempool.
+        let mut accepted_txs: Vec<TxBytes> = Vec::with_capacity(txs.len());
+        for tx in txs {
+            let bytes = tx.as_bytes();
+            let Some(ctx) = parse_tx_context(bytes) else {
+                results.push(MempoolAck::Rejected { reason: "malformed: tx context".to_string() });
+                continue;
+            };
+            let Some(module_id) = parse_module_id(bytes) else {
+                results
+                    .push(MempoolAck::Rejected { reason: "malformed: no module ID".to_string() });
+                continue;
+            };
+            let Some(module) = self.modules[module_id as usize].as_ref() else {
+                results
+                    .push(MempoolAck::Rejected { reason: format!("unknown module {module_id}") });
+                continue;
+            };
+            let payload = module_payload(bytes);
+            if let Err(e) = module.validate(&ctx, payload) {
+                results.push(MempoolAck::Rejected { reason: format!("validate: {e:?}") });
+                continue;
+            }
+            // Pre-recover the sender at ingestion time.
+            let preverify_result = module.preverify_batch(&[payload]);
+            if let Ok(preverified) = &preverify_result[0] {
+                let tx_hash = crypto::hash::Hasher::hash_one(
+                    crypto::hash::Domain::Transaction,
+                    tx.as_bytes(),
+                );
+                self.preverify_cache.lock().unwrap().insert(tx_hash, preverified.clone());
+            }
+            accepted_txs.push(tx);
+            results.push(MempoolAck::Accepted);
+        }
+        // Batch-submit all accepted txs to the mempool in one lock
+        // acquisition.
+        if !accepted_txs.is_empty() {
+            let mut mempool = self.mempool.lock().unwrap();
+            for (i, tx) in accepted_txs.into_iter().enumerate() {
+                if let Err(e) = mempool.submit(tx) {
+                    // Overwrite the Accepted result with the rejection.
+                    results[i] = MempoolAck::Rejected { reason: format!("{e:?}") };
+                }
+            }
+        }
+        results
+    }
+
     fn prepare_proposal(&self, budget: &types::BlockBudget) -> Proposal {
         // Select txs from the mempool by fee priority.
         let txs = self.mempool.lock().unwrap().select(budget.max_bytes);
