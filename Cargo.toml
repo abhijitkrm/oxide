@@ -131,6 +131,26 @@ rocksdb = "0.24.0"
 # wrapper for MDBX (LMDB-compatible, improved). C binding.
 libmdbx = "0.6.6"
 
+# tokio: async runtime for the RPC HTTP/WS server and future async
+# networking. MIT-licensed (GPL-3.0-compatible). Used by axum, hyper,
+# and all major Rust blockchain nodes (reth, cosmos-sdk-rust).
+# Not used in hot-path crates (consensus, executor, mempool) — only
+# in the RPC server and node binaries.
+tokio = { version = "1.44", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
+
+# axum: ergonomic HTTP server framework built on hyper + tokio.
+# MIT-licensed (GPL-3.0-compatible). Used for the JSON-RPC HTTP
+# endpoint. Version 0.8.4 published 2025-04-30 (well-vetted).
+axum = "0.8.4"
+
+# tower: service abstraction used by axum for middleware.
+# MIT-licensed (GPL-3.0-compatible). Required by axum's serve().
+tower = "0.5"
+
+# hyper: low-level HTTP implementation. MIT-licensed.
+# Direct dep for hyper::body::Incoming body reading in the RPC server.
+hyper = "1.5"
+
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable
 # because perf gates (README.md → Roadmap) are release-profile measurements.

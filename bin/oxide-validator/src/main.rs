@@ -51,12 +51,18 @@ fn main() {
 }
 
 /// Run a single-node devnet (normal mode).
+///
+/// Assembles the stack, runs a smoke-test transaction, then starts
+/// the JSON-RPC HTTP server (Ethereum-compatible endpoint for
+/// MetaMask/Foundry/Blockscout). The RPC server runs on a tokio
+/// runtime in a separate thread so the main thread can continue
+/// to drive consensus if needed.
 fn run_single_node() {
-    let config = load_config();
-    println!("oxide-validator: starting with engine = {}", config.consensus.as_str());
-    println!("oxide-validator: mempool size = {}", config.max_mempool_entries);
+    let (node_config, rpc_config) = load_config();
+    println!("oxide-validator: starting with engine = {}", node_config.consensus.as_str());
+    println!("oxide-validator: mempool size = {}", node_config.max_mempool_entries);
 
-    let mut node = DevnetNode::assemble(&config);
+    let mut node = DevnetNode::assemble(&node_config);
     println!("oxide-validator: assembled stack (executor + core/bank/staking modules)");
 
     // Submit a smoke-test bank transfer.
@@ -75,6 +81,28 @@ fn run_single_node() {
     }
 
     println!("oxide-validator: smoke test complete");
+
+    // Start the JSON-RPC HTTP server.
+    // The RPC server runs on a tokio multi-thread runtime in a
+    // separate thread so it doesn't block the main thread.
+    println!("oxide-validator: starting RPC server on http://{}", rpc_config.listen_addr);
+
+    let rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
+    let http_server = rpc::server::HttpServer::new(rpc_server, rpc_config.listen_addr.clone());
+
+    // Run the tokio runtime in a separate thread.
+    let handle = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(http_server.serve());
+    });
+
+    println!("oxide-validator: RPC server running. Press Ctrl+C to stop.");
+
+    // Wait for the RPC server thread (runs forever until killed).
+    let _ = handle.join();
 }
 
 /// Run a single validator node in multi-process devnet mode.
@@ -191,7 +219,7 @@ fn bls_key(byte: u8) -> crypto::BlsSecretKey {
 /// Load the node configuration from CLI flags, env vars, and TOML file.
 ///
 /// Priority: CLI > env vars > TOML > defaults.
-fn load_config() -> NodeConfig {
+fn load_config() -> (NodeConfig, config::RpcConfig) {
     let mut config = config::Config::default();
 
     // 1. Load from TOML file if --config is given.
@@ -220,6 +248,9 @@ fn load_config() -> NodeConfig {
         }
     }
 
+    // Extract the RPC config (defaults to 127.0.0.1:8545 if not set).
+    let rpc_config = config.rpc.clone().unwrap_or_default();
+
     // Convert the config crate's ConsensusEngineKind to devnet's
     // ConsensusConfig.
     let consensus = match config.consensus.engine {
@@ -227,7 +258,7 @@ fn load_config() -> NodeConfig {
         config::ConsensusEngineKind::OxideBft => ConsensusConfig::OxideBft,
     };
 
-    NodeConfig { consensus, max_mempool_entries: config.executor.max_mempool_entries }
+    (NodeConfig { consensus, max_mempool_entries: config.executor.max_mempool_entries }, rpc_config)
 }
 
 /// Parse a `--flag value` pair from CLI args.

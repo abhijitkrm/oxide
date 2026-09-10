@@ -39,6 +39,8 @@
 //! `eth_getTransactionReceipt`, `eth_getLogs`, and full
 //! Foundry/MetaMask compatibility.
 
+pub mod server;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

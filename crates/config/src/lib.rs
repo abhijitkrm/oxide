@@ -85,6 +85,29 @@ pub struct Config {
     /// Genesis state configuration.
     #[serde(default)]
     pub genesis: GenesisConfig,
+
+    /// RPC server configuration (JSON-RPC HTTP endpoint).
+    /// If `None`, the node does not start an RPC server.
+    #[serde(default)]
+    pub rpc: Option<RpcConfig>,
+}
+
+/// RPC server configuration (JSON-RPC HTTP endpoint for
+/// MetaMask/Foundry/Blockscout integration).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcConfig {
+    /// The listen address for the HTTP server (e.g. "127.0.0.1:8545").
+    pub listen_addr: String,
+    /// The chain ID for EIP-155 replay protection.
+    pub chain_id: u64,
+    /// The base fee in wei per gas (EIP-1559).
+    pub base_fee: u64,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self { listen_addr: "127.0.0.1:8545".to_string(), chain_id: 1, base_fee: 1_000_000_000 }
+    }
 }
 
 impl Config {

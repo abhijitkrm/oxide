@@ -22,6 +22,18 @@ hex = "0.4"
 # sha3: keccak-256 for `web3_sha3` and tx hash computation.
 # MIT/Apache-2.0 licensed. Already a transitive dep via revm.
 sha3 = { workspace = true }
+# tokio: async runtime for the HTTP server.
+# MIT-licensed (GPL-3.0-compatible). Not on the hot path.
+tokio = { workspace = true }
+# axum: HTTP server framework for the JSON-RPC endpoint.
+# MIT-licensed (GPL-3.0-compatible).
+axum = { workspace = true }
+# tower: service abstraction required by axum's serve().
+# MIT-licensed (GPL-3.0-compatible).
+tower = { workspace = true }
+# hyper: low-level HTTP types (body reading).
+# MIT-licensed (GPL-3.0-compatible).
+hyper = { workspace = true }
 
 [lints]
 workspace = true
