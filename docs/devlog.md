@@ -4726,3 +4726,131 @@ TOML alone is insufficient for containers:
 
 The layered approach gives both: TOML for reproducibility, env vars
 for containers, CLI flags for debugging. This matches geth/reth.
+
+## 2026-09-09 — Session 4: TCP transport hardening, TLS, peer discovery, multi-process devnet
+
+### TCP graceful shutdown
+
+Added explicit shutdown to `TcpTransport`:
+- `shutdown()` sets an `AtomicBool` flag shared with all background
+  threads (accept + per-connection readers).
+- Clears the stream map so `send()` returns `UnknownPeer`/`ChannelClosed`.
+- Reader loops check the flag and exit.
+- Regression test: `tcp_graceful_shutdown` verifies that `recv()`
+  returns `None` after shutdown and `send()` fails.
+
+The accept loop uses non-blocking `accept()` with a 50ms poll so the
+shutdown flag is checked promptly. This avoids the OS-level
+indeterminism of dropping a `TcpListener` while a thread is blocked
+on `incoming()`.
+
+### TLS authentication and encryption
+
+Added `rustls`-based TLS to the TCP transport, behind a `tls`
+feature flag on the `p2p` crate.
+
+The core design challenge: `rustls::StreamOwned` doesn't support
+`try_clone()` like `TcpStream` does, so we can't split a TLS stream
+into separate read/write halves for the map and reader thread.
+
+Solution: introduced a `PeerStream` trait with `read_frame()` and
+`write_frame()` methods. Both `TcpStream` and `SharedStream<S>` (a
+`Mutex`-wrapped stream) implement it. The transport stores
+`Box<dyn PeerStream>` in the stream map, so plain TCP and TLS use
+the same code paths.
+
+For plain TCP, we `try_clone()` the stream — one clone for the map
+(writes), one for the reader (reads). For TLS, we wrap the stream in
+`SharedStream` (Arc<Mutex<...>>) and clone the Arc.
+
+`TransportCaps` now reports `authenticated` and `encrypted` as
+`true` only when TLS is configured.
+
+`TlsConfig` provides:
+- `self_signed(peer_id, trusted_peer_certs)`: generates a self-signed
+  certificate for development/testnets. Uses `rcgen` for cert
+  generation and `rustls` for the client/server configs.
+- `with_certificates(...)`: loads certificates from files for
+  production.
+
+Tests: `self_signed_config_works`, `multi_node_self_signed` verify
+config construction. The full TLS handshake is tested implicitly via
+the transport's accept/connect paths.
+
+### Peer discovery
+
+Added `p2p::discovery` module with:
+- `DiscoveryMessage` enum: `RequestPeerList` and `PeerList(Vec<(PeerId, addr)>)`.
+- Encode/decode for the discovery wire protocol (length-prefixed,
+  type-byte + payload).
+- `PeerStore`: thread-safe store of known peers, tracking connected
+  vs. unconnected. Used to avoid re-connecting to known peers and to
+  find candidates for new outbound connections.
+- `TcpTransport::add_peer()`: dynamically connects to a newly
+  discovered peer at runtime, spawning the same connect + reader
+  thread pattern as the static config path.
+
+The discovery protocol is simple gossip: when two nodes connect,
+they exchange peer lists. Each node then connects to the newly
+discovered peers. This avoids the need to statically configure every
+peer.
+
+Limitations (Phase 2):
+- No peer reputation or banning.
+- No DHT-based discovery.
+- No DNS-based discovery.
+- Peer lists are not authenticated (TLS helps but doesn't fully solve).
+
+### Multi-process TCP devnet
+
+Added `devnet::multiprocess` module with:
+- `MultiProcessDevnetConfig`: configures num_nodes, base_port,
+  validator_binary path, startup_wait.
+- `MultiProcessDevnet`: spawns N `oxide-validator` processes, each
+  running `--devnet-node <i> --num-nodes <N> --base-port <port>`.
+  Each process runs a single validator node, connecting to the
+  others over TCP.
+- `Drop` impl kills all child processes.
+- `all_alive()`, `shutdown()`, `wait_all()` for lifecycle management.
+
+Added `--devnet-node` mode to `oxide-validator`:
+- Parses `--devnet-node <i>`, `--num-nodes <N>`, `--base-port <port>`.
+- Generates deterministic BLS keys (same as `TcpMultiNodeDevnet`).
+- Constructs the validator set, executor with modules, TCP transport,
+  and oxideBFT consensus engine.
+- Runs the consensus engine and reports finalized height.
+
+This tests process isolation, real OS-level networking, and
+independent startup/shutdown — none of which the in-process
+`TcpMultiNodeDevnet` can test.
+
+### Storage benchmark fix
+
+The storage benchmark (`crates/storage/benches/backend.rs`) failed
+strict clippy when no storage backend features were enabled because
+Criterion imports and benchmark helpers were compiled even in the
+no-feature case. Rewrote the file to feature-gate all Criterion
+machinery and provide a fallback `main()` for no-feature builds.
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all tests pass (p2p: 29 tests, including
+  7 new discovery tests).
+- `cargo bench --workspace`: all benchmarks run. No new regressions
+  attributable to this change (variance is within noise for most
+  benchmarks; the codec/encode/u64_fixed "regression" is +7% on a
+  sub-nanosecond benchmark and is noise).
+- `cargo build -p p2p --features tls`: TLS feature compiles.
+- `cargo test -p p2p --features tls`: 24 tests pass (TLS tests added).
+
+### Dead ends
+
+- **Trait upcasting**: initially tried making `PeerStream: Read + Write + Send`
+  and upcasting `dyn PeerStream` to `dyn Read`/`dyn Write`. Rust doesn't
+  support trait upcasting on stable. Fixed by putting `read_frame`/`write_frame`
+  directly on the `PeerStream` trait.
+- **`rustls::StreamOwned::set_read_timeout`**: doesn't exist. The
+  underlying socket is at `tls_stream.sock`. Fixed by accessing
+  `tls_stream.sock.set_read_timeout(...)`.

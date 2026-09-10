@@ -70,6 +70,10 @@ config = { path = "crates/config", version = "0.1.0" }
 # per AGENTS.md dependency policy.
 revm = "42.0.1"
 
+# thiserror: ergonomic error enums (used across infrastructure crates).
+# MIT-OR-APACHE-2.0 licensed (GPL-3.0-compatible).
+thiserror = "2"
+
 # secp256k1: ECDSA signature recovery for EVM transactions (Phase A).
 # Already a transitive dep via revm; declared explicitly with the
 # features we need. This is reth's exact choice — the C-vetted libsecp256k1

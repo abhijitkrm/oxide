@@ -9,29 +9,49 @@
 //! 3. TOML config file (the base)
 //! 4. Defaults (lowest priority — built into the `Config` struct)
 //!
+//! ## Modes
+//!
+//! - **Normal mode** (default): runs a single-node devnet using
+//!   `DevnetNode::assemble`.
+//! - **Devnet node mode** (`--devnet-node <i>`): runs a single
+//!   validator node that connects to other validator processes over
+//!   TCP. Used by the multi-process devnet launcher.
+//!
 //! Usage:
 //!
 //! ```sh
-//! # Default config (sequencer, 10k mempool)
+//! # Normal mode (single-node devnet)
 //! oxide-validator
 //!
 //! # From a TOML config file
 //! oxide-validator --config config/devnet.toml
 //!
-//! # Override the engine via CLI flag
-//! oxide-validator --engine oxideBFT
-//!
-//! # Override the mempool size via env var
-//! OXIDE_EXECUTOR_MAX_MEMPOOL_ENTRIES=50000 oxide-validator
+//! # Devnet node mode (multi-process)
+//! oxide-validator --devnet-node 0 --num-nodes 4 --base-port 22000
 //! ```
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use devnet::{ConsensusConfig, DevnetNode, NodeConfig};
-use ports::AppInterface;
+use ports::{AppInterface, ConsensusEngine};
 
 fn main() {
+    // Check for devnet-node mode.
+    if let Some(node_index_str) = parse_cli_flag("--devnet-node") {
+        run_devnet_node(&node_index_str);
+        return;
+    }
+
+    // Normal mode: single-node devnet.
+    run_single_node();
+}
+
+/// Run a single-node devnet (normal mode).
+fn run_single_node() {
     let config = load_config();
     println!("oxide-validator: starting with engine = {}", config.consensus.as_str());
     println!("oxide-validator: mempool size = {}", config.max_mempool_entries);
@@ -55,6 +75,117 @@ fn main() {
     }
 
     println!("oxide-validator: smoke test complete");
+}
+
+/// Run a single validator node in multi-process devnet mode.
+///
+/// This mode is used by the `MultiProcessDevnet` launcher. Each
+/// process runs one validator node, connecting to the other nodes
+/// over TCP.
+///
+/// # CLI flags
+///
+/// - `--devnet-node <i>`: this node's index (0-based).
+/// - `--num-nodes <N>`: total number of validator nodes.
+/// - `--base-port <port>`: base TCP port. Node `i` listens on
+///   `127.0.0.1:{base_port + i}`.
+fn run_devnet_node(node_index_str: &str) {
+    let node_index: usize =
+        node_index_str.parse().unwrap_or_else(|e| panic!("invalid --devnet-node index: {e}"));
+    let num_nodes: usize = parse_cli_flag("--num-nodes").and_then(|s| s.parse().ok()).unwrap_or(4);
+    let base_port: u16 =
+        parse_cli_flag("--base-port").and_then(|s| s.parse().ok()).unwrap_or(22000);
+
+    println!(
+        "oxide-validator[{node_index}]: devnet node mode — index={node_index}, num_nodes={num_nodes}, base_port={base_port}"
+    );
+
+    // Generate BLS keys for all nodes (deterministic, same as
+    // TcpMultiNodeDevnet). We need all public keys to construct the
+    // validator set, but only use our own secret key.
+    let secret_keys: Vec<crypto::BlsSecretKey> =
+        (1..=u8::try_from(num_nodes).expect("num_nodes fits in u8")).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let stakes = vec![1u64; num_nodes];
+    let validator_set = consensus::ValidatorSet::new(pks, stakes).expect("validator set");
+
+    let our_key = secret_keys[node_index].clone();
+    let listen_port = base_port + u16::try_from(node_index).expect("port fits in u16");
+    let listen_addr = format!("127.0.0.1:{listen_port}");
+
+    // Build peer list: all other nodes.
+    let peers: Vec<(Vec<u8>, String)> = (0..num_nodes)
+        .filter(|&i| i != node_index)
+        .map(|i| {
+            let port = base_port + u16::try_from(i).expect("port fits in u16");
+            (vec![u8::try_from(i).expect("peer id fits in u8")], format!("127.0.0.1:{port}"))
+        })
+        .collect();
+
+    println!("oxide-validator[{node_index}]: listening on {listen_addr}, {} peers", peers.len());
+
+    // Create the executor with modules.
+    let mut executor = executor::Executor::new(10_000);
+    executor.register_module(Arc::new(oxide_core::CoreModule::new()));
+    let bank_module = bank::BankModule::new();
+    for sender_byte in 0u8..32 {
+        bank_module.mint(&primitives::Address([sender_byte; 20]), 1_000_000_000_000);
+    }
+    executor.register_module(Arc::new(bank_module));
+    executor.register_module(Arc::new(staking::StakingModule::new()));
+    let app: Arc<executor::Executor> = Arc::new(executor);
+    let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
+
+    // Create the TCP transport. Keep it alive for the lifetime of
+    // the node — the transport runs background threads.
+    let _transport = p2p::tcp::TcpTransport::new(
+        &listen_addr,
+        vec![u8::try_from(node_index).expect("peer id fits in u8")],
+        peers,
+    );
+
+    // Give connections time to establish.
+    thread::sleep(Duration::from_millis(500));
+
+    // Create the consensus engine.
+    let mut engine = consensus::OxideBft::with_index(
+        app_dyn,
+        validator_set,
+        u16::try_from(node_index).expect("index fits in u16"),
+    )
+    .with_secret_key(our_key);
+
+    println!("oxide-validator[{node_index}]: consensus engine started, waiting for blocks...");
+
+    // Submit a smoke-test transaction.
+    let to = primitives::Address([2u8; 20]);
+    let module_payload = bank::msg::transfer(to, 100);
+    let tx = build_tx(framework::module_id::BANK, &module_payload);
+    engine.submit_tx(tx);
+
+    // Run the engine until idle, then report the finalized height.
+    engine.run_until_idle();
+    let height = engine.finalized_height();
+    println!("oxide-validator[{node_index}]: finalized height = {height:?}");
+
+    // Keep running until killed (in a real node, this would be the
+    // main event loop).
+    println!("oxide-validator[{node_index}]: node running (press Ctrl+C to stop)");
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        let height = engine.finalized_height();
+        if height.is_some() {
+            println!("oxide-validator[{node_index}]: height = {height:?}");
+        }
+    }
+}
+
+/// Generate a BLS secret key from a single byte (same as
+/// `devnet::tcp_multinode::bls_key`).
+fn bls_key(byte: u8) -> crypto::BlsSecretKey {
+    let ikm = vec![byte; 32];
+    crypto::BlsSecretKey::from_ikm(&ikm).expect("BLS key generation from valid IKM")
 }
 
 /// Load the node configuration from CLI flags, env vars, and TOML file.

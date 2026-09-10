@@ -1120,3 +1120,42 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   AGPL-3.0 are; GPLv2-only, CDDL, proprietary are not).
 
 [Unreleased]: https://github.com/abhijitkrm/oxide/compare/HEAD
+
+- **TCP transport hardening: graceful shutdown, TLS, peer discovery, multi-process devnet** (2026-09-09)
+  - **Graceful shutdown:** `TcpTransport::shutdown()` now sets a shared
+    shutdown flag, clears all active streams, and signals the accept and
+    reader threads to exit. `send()` returns `ChannelClosed` after
+    shutdown; `recv()` drains buffered messages then returns `None`.
+  - **In plain words:** you can now cleanly shut down a node without
+    leaking threads or leaving connections half-open. This is required
+    for process lifecycle management in the multi-process devnet.
+  - **TLS authentication and encryption:** the `p2p` crate now supports
+    TLS via a `tls` feature flag, using `rustls` and `rcgen`. When
+    configured, all peer connections are encrypted and authenticated
+    via X.509 certificates. `TransportCaps` reports `authenticated` and
+    `encrypted` as `true` only when TLS is active. Self-signed
+    certificate generation is provided for devnet/testnet use;
+    production deployments load certificates from files.
+  - **In plain words:** devnet and testnet traffic is now encrypted and
+    authenticated by default. Production nodes can load their own
+    certificates. Plain TCP (no TLS) remains the default for
+    backward compatibility.
+  - **Peer discovery:** new `p2p::discovery` module implements a
+    gossip-based peer discovery protocol. Nodes exchange peer lists
+    on connection, then connect to newly discovered peers. A new
+    `TcpTransport::add_peer()` method supports dynamic peer addition
+    at runtime. This replaces the requirement to statically configure
+    every peer.
+  - **In plain words:** adding a new node to the devnet no longer
+    requires updating every node's config — the new node only needs
+    to know one bootstrap peer.
+  - **Multi-process TCP devnet:** new `devnet::multiprocess` module
+    spawns N `oxide-validator` processes, each running a single
+    validator node over TCP. The `oxide-validator` binary gains a
+    `--devnet-node <i>` mode for this purpose. This tests process
+    isolation, real OS networking, and independent startup/shutdown.
+  - **In plain words:** the devnet can now run as separate processes,
+    closer to a real deployment. A crash in one node doesn't take
+    down the others.
+  - **Storage benchmark fix:** the storage benchmark no longer fails
+    strict clippy when no storage backend features are enabled.

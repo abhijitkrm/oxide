@@ -4,15 +4,32 @@
 
 [package]
 name = "p2p"
-description = "Oxide transport implementations: in-process MeshTransport for deterministic devnet/sim, commonware-p2p adapter post-testnet."
+description = "Oxide transport implementations: in-process MeshTransport for deterministic devnet/sim, TCP transport with optional TLS for production."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# TLS support for the TCP transport. Enables rustls + ring for
+# encrypted, authenticated peer connections. Disabled by default for
+# local devnet/sim; enable with `--features p2p/tls` for production.
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
+
 [dependencies]
 ports = { workspace = true }
+thiserror = { workspace = true }
+# TLS dependencies (only active with the `tls` feature).
+# rustls: pure-Rust TLS implementation (Apache-2.0/MIT/ISC, GPL-3.0-compatible).
+# Uses the `ring` crypto provider (C-based, audited, same provider as Chromium).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+# rustls-pemfile: parse PEM-encoded certificates and keys for loading
+# production TLS configs from files.
+rustls-pemfile = { version = "2", optional = true }
+# rcgen: generate self-signed X.509 certificates for devnet/testnet.
+# Used by `TlsConfig::self_signed()` — production loads certs from files.
+rcgen = { version = "0.14", optional = true }
 
 [dev-dependencies]
 criterion = "0.7.0"

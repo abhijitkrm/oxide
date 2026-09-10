@@ -42,13 +42,119 @@
 //! local devnet only — do not use across untrusted networks.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use ports::transport::{InboundMessage, PeerId, Transport, TransportCaps, TransportError};
+
+#[cfg(feature = "tls")]
+use crate::tls::TlsConfig;
+
+/// A trait that abstracts over plain TCP and TLS streams.
+///
+/// Both `TcpStream` and `SharedStream<rustls::StreamOwned<...>>`
+/// implement this trait, allowing the transport to store either
+/// type in the same `HashMap`.
+///
+/// This is not a hot-path type — connections are established once at
+/// startup, not per message. The dynamic dispatch cost is negligible.
+///
+/// The trait provides `read_frame` and `write_frame` methods directly
+/// (instead of extending `Read + Write`) because Rust does not
+/// support trait upcasting from `dyn PeerStream` to `dyn Read` or
+/// `dyn Write` on stable. Putting the frame methods on the trait
+/// avoids the upcasting issue entirely.
+pub trait PeerStream: Send {
+    /// Read a length-prefixed frame from the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on I/O error, EOF, timeout, or if the frame
+    /// exceeds `max_message_bytes`.
+    fn read_frame(&mut self, max_message_bytes: u64) -> io::Result<Vec<u8>>;
+
+    /// Write a length-prefixed frame to the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on I/O error.
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()>;
+}
+
+impl PeerStream for TcpStream {
+    fn read_frame(&mut self, max_message_bytes: u64) -> io::Result<Vec<u8>> {
+        read_frame(self, max_message_bytes)
+    }
+
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        write_frame(self, bytes)
+    }
+}
+
+/// A shared, thread-safe wrapper around a stream type.
+///
+/// Used for TLS streams, which cannot be `try_clone()`d like
+/// `TcpStream`. The underlying stream is behind an `Arc<Mutex<...>>`,
+/// so both the reader thread and the send path can access it.
+///
+/// # Lock discipline
+///
+/// The reader thread sets a short read timeout (via the stream's
+/// `set_read_timeout`) before each `read_frame` call, so the mutex
+/// is not held indefinitely. The writer (send path) acquires the
+/// lock only for the duration of a `write_frame` call.
+#[cfg(feature = "tls")]
+struct SharedStream<S: Read + Write + Send> {
+    inner: Arc<Mutex<S>>,
+}
+
+#[cfg(feature = "tls")]
+impl<S: Read + Write + Send> Clone for SharedStream<S> {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+#[cfg(feature = "tls")]
+impl<S: Read + Write + Send> Read for SharedStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.lock().unwrap().read(buf)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl<S: Read + Write + Send> Write for SharedStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.lock().unwrap().flush()
+    }
+}
+
+#[cfg(feature = "tls")]
+impl<S: Read + Write + Send> PeerStream for SharedStream<S> {
+    fn read_frame(&mut self, max_message_bytes: u64) -> io::Result<Vec<u8>> {
+        let mut stream = self.inner.lock().unwrap();
+        read_frame(&mut *stream, max_message_bytes)
+    }
+
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut stream = self.inner.lock().unwrap();
+        write_frame(&mut *stream, bytes)
+    }
+}
+
+/// The read timeout used by TLS reader threads. Short enough that
+/// the writer can acquire the lock between read attempts, long
+/// enough that idle connections don't busy-poll.
+#[cfg(feature = "tls")]
+const TLS_READER_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The default maximum message size for the TCP transport: 16 MiB.
 /// Matches the mesh transport and the broadcast crate's
@@ -113,20 +219,34 @@ pub type TcpAddr = String;
 /// - One reader thread per accepted/connected peer.
 ///
 /// All threads are detached — the transport lives for the process
-/// lifetime. There is no graceful shutdown in v0; Phase 2 adds
-/// `close()`.
+/// lifetime. Call [`shutdown`](TcpTransport::shutdown) to gracefully
+/// close all connections and stop the accept thread.
 pub struct TcpTransport {
-    /// Outbound connections: peer ID → TCP stream. Behind `Mutex`
-    /// because `send()` takes `&mut self` but the accept thread may
-    /// insert new connections concurrently.
-    streams: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    /// Outbound connections: peer ID → stream (plain TCP or TLS).
+    /// Behind `Mutex` because `send()` takes `&mut self` but the
+    /// accept thread may insert new connections concurrently.
+    streams: Arc<Mutex<HashMap<PeerId, Box<dyn PeerStream>>>>,
     /// Inbound message channel. Reader threads write; `recv()`
     /// reads.
     inbound_rx: Mutex<mpsc::Receiver<InboundMessage>>,
+    /// Inbound message channel sender. Stored so `add_peer` can
+    /// spawn new reader threads that write to the same channel.
+    inbound_tx: mpsc::Sender<InboundMessage>,
     /// This node's peer ID.
     peer_id: PeerId,
     /// The transport configuration (max message size, timeouts).
     config: TcpTransportConfig,
+    /// Shutdown flag. When set, the accept thread stops accepting
+    /// and reader threads exit. Set by [`shutdown`](Self::shutdown).
+    shutdown: Arc<AtomicBool>,
+    /// The TCP listener. Stored so we can close it on shutdown
+    /// (dropping a `TcpListener` unblocks `incoming()`). Currently
+    /// moved into the accept thread, so this is always `None`.
+    #[allow(dead_code)]
+    listener: Option<TcpListener>,
+    /// TLS configuration, if TLS is enabled. `None` for plain TCP.
+    #[cfg(feature = "tls")]
+    tls: Option<Arc<TlsConfig>>,
 }
 
 impl TcpTransport {
@@ -173,39 +293,123 @@ impl TcpTransport {
         peers: Vec<(PeerId, TcpAddr)>,
         config: TcpTransportConfig,
     ) -> Self {
+        #[cfg(feature = "tls")]
+        {
+            Self::build(listen_addr, peer_id, peers, config, None)
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            Self::build(listen_addr, peer_id, peers, config)
+        }
+    }
+
+    /// Construct a TCP transport with TLS encryption.
+    ///
+    /// When TLS is enabled, all peer connections are encrypted and
+    /// authenticated via X.509 certificates. See [`TlsConfig`] for
+    /// certificate management.
+    ///
+    /// # Arguments
+    ///
+    /// Same as [`with_config`](Self::with_config), plus:
+    /// - `tls`: the TLS configuration (server + client configs).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listen address cannot be bound.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(
+        listen_addr: &str,
+        peer_id: PeerId,
+        peers: Vec<(PeerId, TcpAddr)>,
+        config: TcpTransportConfig,
+        tls: TlsConfig,
+    ) -> Self {
+        Self::build(listen_addr, peer_id, peers, config, Some(Arc::new(tls)))
+    }
+
+    /// Internal constructor shared by `with_config` and `with_tls`.
+    #[allow(clippy::too_many_lines)]
+    fn build(
+        listen_addr: &str,
+        peer_id: PeerId,
+        peers: Vec<(PeerId, TcpAddr)>,
+        config: TcpTransportConfig,
+        #[cfg(feature = "tls")] tls: Option<Arc<TlsConfig>>,
+    ) -> Self {
         let listener = TcpListener::bind(listen_addr)
             .unwrap_or_else(|e| panic!("failed to bind TCP transport to {listen_addr}: {e}"));
 
-        let streams: Arc<Mutex<HashMap<PeerId, TcpStream>>> = Arc::new(Mutex::new(HashMap::new()));
+        let streams: Arc<Mutex<HashMap<PeerId, Box<dyn PeerStream>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let max_message_bytes = config.max_message_bytes;
         let connect_timeout = config.connect_timeout;
         let read_timeout = config.read_timeout;
 
-        // Spawn the accept thread: accepts incoming connections,
-        // reads the peer's ID (first frame), and spawns a reader
-        // thread for each connection.
+        // Set the listener to non-blocking mode so the accept thread
+        // can periodically check the shutdown flag.
+        listener.set_nonblocking(true).expect("set_nonblocking on listener must succeed");
+
+        // Spawn the accept thread: accepts incoming connections in
+        // non-blocking mode, checks the shutdown flag between polls.
         let accept_streams = streams.clone();
         let accept_tx = inbound_tx.clone();
+        let accept_shutdown = shutdown.clone();
+        #[cfg(feature = "tls")]
+        let accept_tls = tls.clone();
         thread::spawn(move || {
-            for stream_result in listener.incoming() {
-                let Ok(mut stream) = stream_result else {
-                    continue; // accept error — try next
-                };
-                // Read the peer's ID as the first frame.
-                let Ok(peer_id) = read_frame(&mut stream, max_message_bytes) else {
-                    continue; // connection closed before ID
-                };
-                // Set read timeout for the reader thread.
-                let _ = stream.set_read_timeout(Some(read_timeout));
-                // Register the stream for outbound sends.
-                accept_streams.lock().unwrap().insert(peer_id.clone(), stream.try_clone().unwrap());
-                // Spawn a reader thread for this connection.
-                let tx = accept_tx.clone();
-                thread::spawn(move || {
-                    reader_loop(stream, peer_id, tx, max_message_bytes);
-                });
+            while !accept_shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // Switch back to blocking mode for the stream.
+                        let _ = stream.set_nonblocking(false);
+
+                        // Read the peer's ID and produce two stream
+                        // handles: one for the map (writes), one for
+                        // the reader thread (reads).
+                        #[cfg(feature = "tls")]
+                        let result = if let Some(ref tls_config) = accept_tls {
+                            accept_tls_connection(
+                                stream,
+                                tls_config,
+                                max_message_bytes,
+                                read_timeout,
+                            )
+                        } else {
+                            accept_plain_connection(stream, max_message_bytes, read_timeout)
+                        };
+                        #[cfg(not(feature = "tls"))]
+                        let result =
+                            accept_plain_connection(stream, max_message_bytes, read_timeout);
+
+                        let Some((peer_id, write_stream, reader_stream)) = result else {
+                            continue; // connection closed before ID
+                        };
+                        // Register the write stream for outbound sends.
+                        accept_streams.lock().unwrap().insert(peer_id.clone(), write_stream);
+                        // Spawn a reader thread for this connection.
+                        let tx = accept_tx.clone();
+                        let reader_shutdown = accept_shutdown.clone();
+                        thread::spawn(move || {
+                            reader_loop(
+                                reader_stream,
+                                peer_id,
+                                tx,
+                                max_message_bytes,
+                                reader_shutdown,
+                            );
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
             }
         });
 
@@ -214,17 +418,29 @@ impl TcpTransport {
         // reader loop.
         let connect_streams = streams.clone();
         let connect_tx = inbound_tx.clone();
+        let connect_shutdown = shutdown.clone();
         let our_id = peer_id.clone();
+        #[cfg(feature = "tls")]
+        let connect_tls = tls.clone();
         thread::spawn(move || {
             for (peer_id, addr) in peers {
+                if connect_shutdown.load(Ordering::Relaxed) {
+                    return; // shutting down — don't start new connections
+                }
                 let pid = peer_id.clone();
                 let oid = our_id.clone();
                 let cs = connect_streams.clone();
                 let ct = connect_tx.clone();
+                let rshut = connect_shutdown.clone();
+                #[cfg(feature = "tls")]
+                let ctls = connect_tls.clone();
                 thread::spawn(move || {
                     // Retry connection — the peer may not be
                     // listening yet (devnet startup race).
                     let stream = loop {
+                        if rshut.load(Ordering::Relaxed) {
+                            return; // shutting down
+                        }
                         if let Ok(s) = TcpStream::connect_timeout(
                             &addr.parse().unwrap_or_else(|_| panic!("invalid TCP address: {addr}")),
                             connect_timeout,
@@ -233,26 +449,175 @@ impl TcpTransport {
                         }
                         thread::sleep(Duration::from_millis(100));
                     };
+                    #[cfg(feature = "tls")]
+                    {
+                        if let Some(ref tls_config) = ctls {
+                            // Initiate TLS as client.
+                            let server_name = rustls::pki_types::ServerName::try_from("localhost")
+                                .expect("localhost is a valid server name");
+                            let client_conn = rustls::ClientConnection::new(
+                                tls_config.client_config.clone(),
+                                server_name,
+                            )
+                            .expect("client connection must be valid");
+                            let mut tls_stream = rustls::StreamOwned::new(client_conn, stream);
+                            // Send our peer ID as the first frame.
+                            if write_frame(&mut tls_stream, &oid).is_err() {
+                                return; // connection failed
+                            }
+                            let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
+                            // Wrap in SharedStream for shared access.
+                            let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
+                            let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
+                            let write_stream = Box::new(shared) as Box<dyn PeerStream>;
+                            // Register the stream for outbound sends.
+                            cs.lock().unwrap().insert(pid.clone(), write_stream);
+                            // Reader loop for this connection.
+                            reader_loop(reader_stream, pid, ct, max_message_bytes, rshut);
+                            return;
+                        }
+                    }
+                    // Plain TCP path.
                     let mut stream = stream;
                     // Send our peer ID as the first frame.
                     if write_frame(&mut stream, &oid).is_err() {
                         return; // connection failed
                     }
                     let _ = stream.set_read_timeout(Some(read_timeout));
+                    // Clone for the map; the reader keeps the original.
+                    let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
+                    let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
                     // Register the stream for outbound sends.
-                    cs.lock().unwrap().insert(pid.clone(), stream.try_clone().unwrap());
+                    cs.lock().unwrap().insert(pid.clone(), write_stream);
                     // Reader loop for this connection.
-                    reader_loop(stream, pid, ct, max_message_bytes);
+                    reader_loop(reader_stream, pid, ct, max_message_bytes, rshut);
                 });
             }
         });
 
-        Self { streams, inbound_rx: Mutex::new(inbound_rx), peer_id, config }
+        Self {
+            streams,
+            inbound_rx: Mutex::new(inbound_rx),
+            inbound_tx,
+            peer_id,
+            config,
+            shutdown,
+            listener: None, // listener moved into accept thread
+            #[cfg(feature = "tls")]
+            tls,
+        }
     }
 
     /// This node's peer ID.
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
+    }
+
+    /// Gracefully shut down the transport.
+    ///
+    /// Sets the shutdown flag, closes all peer connections, and
+    /// signals the accept thread to stop. Reader threads will exit
+    /// when their streams are closed or when they check the flag.
+    ///
+    /// After `shutdown()` is called, `send()` will return
+    /// [`TransportError::ChannelClosed`] and `recv()` will return
+    /// `None` once all buffered messages are drained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the streams mutex is poisoned (a reader thread
+    /// panicked while holding the lock).
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Close all streams — this causes reader threads to get
+        // errors on their next read and exit.
+        self.streams.lock().unwrap().clear();
+    }
+
+    /// Returns `true` if the transport has been shut down.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Dynamically add a peer to the transport.
+    ///
+    /// Spawns a background thread that connects to the peer and
+    /// enters the reader loop, just like the statically configured
+    /// peers. This is used by the discovery protocol to connect to
+    /// newly discovered peers at runtime.
+    ///
+    /// Does nothing if the peer is already connected or if the
+    /// transport is shutting down.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the streams mutex is poisoned, or if the peer
+    /// address is not a valid `SocketAddr`.
+    pub fn add_peer(&self, peer_id: PeerId, addr: TcpAddr) {
+        // Check if already connected.
+        if self.streams.lock().unwrap().contains_key(&peer_id) {
+            return;
+        }
+        if self.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let connect_timeout = self.config.connect_timeout;
+        let read_timeout = self.config.read_timeout;
+        let max_message_bytes = self.config.max_message_bytes;
+        let streams = self.streams.clone();
+        let tx = self.inbound_tx.clone();
+        let shutdown = self.shutdown.clone();
+        let our_id = self.peer_id.clone();
+        #[cfg(feature = "tls")]
+        let tls = self.tls.clone();
+        let pid = peer_id.clone();
+        thread::spawn(move || {
+            // Retry connection — the peer may not be listening yet.
+            let stream = loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Ok(s) = TcpStream::connect_timeout(
+                    &addr.parse().unwrap_or_else(|_| panic!("invalid TCP address: {addr}")),
+                    connect_timeout,
+                ) {
+                    break s;
+                }
+                thread::sleep(Duration::from_millis(100));
+            };
+            #[cfg(feature = "tls")]
+            {
+                if let Some(ref tls_config) = tls {
+                    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+                        .expect("localhost is a valid server name");
+                    let client_conn = rustls::ClientConnection::new(
+                        tls_config.client_config.clone(),
+                        server_name,
+                    )
+                    .expect("client connection must be valid");
+                    let mut tls_stream = rustls::StreamOwned::new(client_conn, stream);
+                    if write_frame(&mut tls_stream, &our_id).is_err() {
+                        return;
+                    }
+                    let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
+                    let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
+                    let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
+                    let write_stream = Box::new(shared) as Box<dyn PeerStream>;
+                    streams.lock().unwrap().insert(pid.clone(), write_stream);
+                    reader_loop(reader_stream, pid, tx, max_message_bytes, shutdown);
+                    return;
+                }
+            }
+            let mut stream = stream;
+            if write_frame(&mut stream, &our_id).is_err() {
+                return;
+            }
+            let _ = stream.set_read_timeout(Some(read_timeout));
+            let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
+            let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
+            streams.lock().unwrap().insert(pid.clone(), write_stream);
+            reader_loop(reader_stream, pid, tx, max_message_bytes, shutdown);
+        });
     }
 }
 
@@ -265,7 +630,7 @@ impl Transport for TcpTransport {
         let Some(stream) = streams.get_mut(peer) else {
             return Err(TransportError::UnknownPeer);
         };
-        write_frame(stream, bytes).map_err(|_| TransportError::ChannelClosed)
+        stream.write_frame(bytes).map_err(|_| TransportError::ChannelClosed)
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
@@ -274,14 +639,20 @@ impl Transport for TcpTransport {
 
     fn capabilities(&self) -> TransportCaps {
         TransportCaps {
+            #[cfg(feature = "tls")]
+            authenticated: self.tls.is_some(),
+            #[cfg(not(feature = "tls"))]
             authenticated: false,
+            #[cfg(feature = "tls")]
+            encrypted: self.tls.is_some(),
+            #[cfg(not(feature = "tls"))]
             encrypted: false,
             max_message_bytes: self.config.max_message_bytes,
         }
     }
 }
 
-/// Read a length-prefixed frame from a TCP stream.
+/// Read a length-prefixed frame from any readable stream.
 ///
 /// Frame format: `[length: 4 bytes BE u32][payload: length bytes]`.
 ///
@@ -289,7 +660,7 @@ impl Transport for TcpTransport {
 ///
 /// Returns `Err` on I/O error, EOF, or if the frame exceeds
 /// `max_message_bytes`.
-fn read_frame(stream: &mut TcpStream, max_message_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
+fn read_frame<R: Read>(stream: &mut R, max_message_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u64::from(u32::from_be_bytes(len_buf));
@@ -304,10 +675,10 @@ fn read_frame(stream: &mut TcpStream, max_message_bytes: u64) -> Result<Vec<u8>,
     Ok(payload)
 }
 
-/// Write a length-prefixed frame to a TCP stream.
+/// Write a length-prefixed frame to any writable stream.
 ///
 /// Frame format: `[length: 4 bytes BE u32][payload: length bytes]`.
-fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), std::io::Error> {
+fn write_frame<W: Write>(stream: &mut W, bytes: &[u8]) -> Result<(), std::io::Error> {
     let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(bytes)?;
@@ -316,25 +687,77 @@ fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), std::io::Erro
 }
 
 /// The reader loop: reads frames from a peer's stream and sends
-/// them to the inbound channel. Exits when the stream is closed
-/// or an error occurs.
+/// them to the inbound channel. Exits when the stream is closed,
+/// an error occurs, or the shutdown flag is set.
 fn reader_loop(
-    mut stream: TcpStream,
+    mut stream: Box<dyn PeerStream>,
     peer_id: PeerId,
     tx: mpsc::Sender<InboundMessage>,
     max_message_bytes: u64,
+    shutdown: Arc<AtomicBool>,
 ) {
     loop {
-        match read_frame(&mut stream, max_message_bytes) {
+        if shutdown.load(Ordering::Relaxed) {
+            return; // shutting down
+        }
+        match stream.read_frame(max_message_bytes) {
             Ok(bytes) => {
                 let msg = InboundMessage { from: peer_id.clone(), bytes };
                 if tx.send(msg).is_err() {
                     return; // channel closed — transport shut down
                 }
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                // Read timeout (TLS poll timeout) — loop will check
+                // the shutdown flag and retry.
+            }
             Err(_) => return, // connection closed or error
         }
     }
+}
+
+/// The result of accepting a connection: the peer's ID, a write
+/// stream (for the map), and a reader stream (for the reader thread).
+type AcceptResult = Option<(PeerId, Box<dyn PeerStream>, Box<dyn PeerStream>)>;
+
+/// Accept a plain TCP connection: read the peer's ID, clone the
+/// stream for the map and the reader.
+///
+/// Returns `(peer_id, write_stream, reader_stream)` on success,
+/// `None` if the peer ID couldn't be read.
+fn accept_plain_connection(
+    mut stream: TcpStream,
+    max_message_bytes: u64,
+    read_timeout: Duration,
+) -> AcceptResult {
+    let peer_id = read_frame(&mut stream, max_message_bytes).ok()?;
+    let _ = stream.set_read_timeout(Some(read_timeout));
+    let write_stream = Box::new(stream.try_clone().ok()?) as Box<dyn PeerStream>;
+    let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
+    Some((peer_id, write_stream, reader_stream))
+}
+
+/// Accept a TLS connection: perform the TLS handshake, read the
+/// peer's ID, and create shared stream handles for the map and
+/// the reader.
+///
+/// Returns `(peer_id, write_stream, reader_stream)` on success,
+/// `None` if the handshake or ID read fails.
+#[cfg(feature = "tls")]
+fn accept_tls_connection(
+    stream: TcpStream,
+    tls_config: &TlsConfig,
+    max_message_bytes: u64,
+    read_timeout: Duration,
+) -> AcceptResult {
+    let server_conn = rustls::ServerConnection::new(tls_config.server_config.clone()).ok()?;
+    let mut tls_stream = rustls::StreamOwned::new(server_conn, stream);
+    let _ = tls_stream.sock.set_read_timeout(Some(read_timeout));
+    let peer_id = read_frame(&mut tls_stream, max_message_bytes).ok()?;
+    let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
+    let write_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
+    let reader_stream = Box::new(shared) as Box<dyn PeerStream>;
+    Some((peer_id, write_stream, reader_stream))
 }
 
 #[cfg(test)]
@@ -541,5 +964,47 @@ mod tests {
         // Capabilities reflect the custom limit.
         let caps = transport_a.capabilities();
         assert_eq!(caps.max_message_bytes, 1024);
+    }
+
+    /// Graceful shutdown: `shutdown()` closes connections and sets the flag.
+    #[test]
+    fn tcp_graceful_shutdown() {
+        let addr_a = "127.0.0.1:19070";
+        let addr_b = "127.0.0.1:19071";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        let mut transport_a =
+            TcpTransport::new(addr_a, id_a.clone(), vec![(id_b.clone(), addr_b.to_string())]);
+        let mut transport_b =
+            TcpTransport::new(addr_b, id_b.clone(), vec![(id_a.clone(), addr_a.to_string())]);
+
+        thread::sleep(Duration::from_millis(500));
+
+        // Verify communication works before shutdown.
+        transport_a.send(&id_b, b"before shutdown").unwrap();
+        let msg = poll_recv(&mut transport_b, Duration::from_secs(5));
+        assert!(msg.is_some(), "B should receive before shutdown");
+
+        // Shut down A.
+        transport_a.shutdown();
+        assert!(transport_a.is_shutdown(), "A should be marked as shut down");
+
+        // Sending after shutdown should fail (streams are cleared).
+        let result = transport_a.send(&id_b, b"after shutdown");
+        assert_eq!(result, Err(TransportError::UnknownPeer));
+
+        // B should still work (only A was shut down).
+        transport_b.send(&id_a, b"from B").ok(); // may fail if A closed the connection
+    }
+
+    /// Shutdown before connections are established: no panic.
+    #[test]
+    fn tcp_shutdown_before_connect() {
+        let addr = "127.0.0.1:19080";
+        let id = vec![0u8];
+        let transport = TcpTransport::new(addr, id, vec![]);
+        transport.shutdown();
+        assert!(transport.is_shutdown());
     }
 }

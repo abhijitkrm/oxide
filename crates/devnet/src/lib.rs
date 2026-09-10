@@ -28,6 +28,7 @@ use ports::{AppInterface, ConsensusEngine};
 use primitives::Address;
 
 pub mod multinode;
+pub mod multiprocess;
 pub mod tcp_multinode;
 
 /// The consensus engine selection.
