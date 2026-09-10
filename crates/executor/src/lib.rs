@@ -334,6 +334,22 @@ pub struct Executor {
     state_roots: Mutex<BTreeMap<u64, Hash>>,
     /// The next proposal height.
     next_proposal_height: Mutex<u64>,
+    /// Phase D: the most recently finalized block that hasn't been
+    /// executed yet. Execution is deferred until `attest_state` or
+    /// the next `finalize_block` flushes it.
+    ///
+    /// This is the "async execution lane": the consensus engine can
+    /// commit block h and immediately proceed to propose/vote/commit
+    /// block h+1 while block h's execution is deferred. When the
+    /// state root for h is needed (via `attest_state`), or when h+1
+    /// is committed (the next `finalize_block`), the pending block
+    /// is executed synchronously.
+    ///
+    /// This overlaps execution with consensus without spawning
+    /// threads — the execution happens lazily when the state root
+    /// is actually needed. Blocks are still executed in order (the
+    /// next `finalize_block` flushes the pending block first).
+    pending_block: Mutex<Option<FinalizedBlock>>,
     /// Pending events from the current block (cleared each block).
     events: Mutex<Vec<Event>>,
     /// Pre-recovered senders, keyed by tx hash. Populated at
@@ -350,6 +366,16 @@ pub struct Executor {
     /// path. Configurable via [`Executor::with_config`]. Default:
     /// [`DEFAULT_PARALLEL_THRESHOLD`] (100 txs).
     parallel_threshold: usize,
+    /// Phase D: enable the async execution lane. When `true`,
+    /// `finalize_block` defers execution to overlap with consensus.
+    /// When `false` (default), execution is synchronous.
+    ///
+    /// The async lane trades a small per-block overhead (extra lock
+    /// acquisitions for pending block tracking) for the ability to
+    /// overlap execution of block h-1 with consensus for block h.
+    /// For single-block benchmarks, the overhead is a net loss;
+    /// for the full consensus pipeline, it's a net win.
+    async_execution: bool,
 }
 
 impl Executor {
@@ -377,9 +403,11 @@ impl Executor {
             finalized: Mutex::new(BTreeMap::new()),
             state_roots: Mutex::new(BTreeMap::new()),
             next_proposal_height: Mutex::new(0),
+            pending_block: Mutex::new(None),
             events: Mutex::new(Vec::new()),
             preverify_cache: Mutex::new(HashMap::new()),
             parallel_threshold,
+            async_execution: false,
         }
     }
 
@@ -392,6 +420,40 @@ impl Executor {
         let id = module.id() as usize;
         assert!(self.modules[id].is_none(), "module with `ID` {id} already registered");
         self.modules[id] = Some(module);
+    }
+
+    /// Phase D: enable the async execution lane.
+    ///
+    /// When enabled, `finalize_block` defers execution to overlap
+    /// with consensus. The pending block is executed lazily when
+    /// `attest_state` is called or when the next `finalize_block`
+    /// flushes it.
+    ///
+    /// This trades a small per-block overhead for the ability to
+    /// overlap execution of block h-1 with consensus for block h.
+    /// For the full consensus pipeline (2-chain), this can hide
+    /// execution latency behind consensus latency.
+    pub fn enable_async_execution(&mut self) {
+        self.async_execution = true;
+    }
+
+    /// Phase D: flush any pending block — execute it and store its
+    /// state root.
+    ///
+    /// This is the "drain" side of the async execution lane. When
+    /// `finalize_block` defers execution, the block is stored as
+    /// pending. This method executes the pending block (if any) and
+    /// stores its state root.
+    ///
+    /// Called by `finalize_block` (before storing a new pending
+    /// block) and by `attest_state` (before returning the state
+    /// root).
+    fn flush_pending(&self) {
+        let pending = self.pending_block.lock().unwrap().take();
+        if let Some(block) = pending {
+            let root = self.execute_block(&block);
+            self.state_roots.lock().unwrap().insert(block.height.value(), root);
+        }
     }
 
     /// Execute a finalized block: call `begin_block`, group txs by
@@ -605,15 +667,41 @@ impl AppInterface for Executor {
     }
 
     fn finalize_block(&self, block: &FinalizedBlock) -> CommitAck {
-        // Execute the block and record the state root.
-        let root = self.execute_block(block);
-        self.state_roots.lock().unwrap().insert(block.height.value(), root);
-        self.finalized.lock().unwrap().insert(block.height.value(), block.clone());
-        *self.next_proposal_height.lock().unwrap() = block.height.value() + 1;
+        if self.async_execution {
+            // Phase D: async execution lane — defer execution.
+            //
+            // Flush any previously pending block (execute it and
+            // store its state root) before storing the new block as
+            // pending. This ensures blocks are executed in order and
+            // the state is consistent when the new block is
+            // eventually executed.
+            self.flush_pending();
+
+            // Store the new block as pending and advance the proposal
+            // height immediately. The consensus engine can proceed to
+            // propose/vote/commit the next block while this block's
+            // execution is deferred.
+            *self.pending_block.lock().unwrap() = Some(block.clone());
+            self.finalized.lock().unwrap().insert(block.height.value(), block.clone());
+            *self.next_proposal_height.lock().unwrap() = block.height.value() + 1;
+        } else {
+            // Synchronous execution (default): execute the block
+            // immediately and store the state root.
+            let root = self.execute_block(block);
+            self.state_roots.lock().unwrap().insert(block.height.value(), root);
+            self.finalized.lock().unwrap().insert(block.height.value(), block.clone());
+            *self.next_proposal_height.lock().unwrap() = block.height.value() + 1;
+        }
         CommitAck { height: block.height }
     }
 
     fn attest_state(&self, height: Height) -> StateAttestation {
+        // Phase D: flush any pending block before attesting state.
+        // This ensures the state root for the requested height is
+        // available (if it was deferred). When async execution is
+        // disabled, flush_pending is a no-op (pending_block is
+        // always None).
+        self.flush_pending();
         let root =
             self.state_roots.lock().unwrap().get(&height.value()).copied().unwrap_or(Hash::ZERO);
         StateAttestation { height, root }
