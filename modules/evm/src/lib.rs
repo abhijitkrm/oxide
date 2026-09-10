@@ -236,9 +236,26 @@ pub struct EvmModule {
     /// Phase D: accounts touched in the current block. Tracked
     /// during `execute` so `end_block` can flush only the changed
     /// accounts (incremental flush) instead of the full state.
-    /// Cleared after each `end_block` flush.
+    /// Cleared at the start of each `begin_block` (after
+    /// `state_root` has consumed the set for incremental updates).
     /// Behind a `Mutex` because `Module::handle` takes `&self`.
     touched: Mutex<std::collections::HashSet<revm::primitives::Address>>,
+    /// Per-account storage root cache. Updated incrementally in
+    /// `state_root` — only touched accounts have their storage
+    /// roots recomputed; the rest are reused from the cache.
+    ///
+    /// This turns the per-block state root computation from
+    /// `O(total_state)` to `O(touched + log(total_accounts))` for the
+    /// storage root portion. The state trie itself is still rebuilt
+    /// from scratch (alloy-trie's `HashBuilder` is `O(n)` but very
+    /// fast — the dominant cost was per-account storage root
+    /// computation, not the trie assembly).
+    storage_root_cache:
+        Mutex<std::collections::HashMap<revm::primitives::Address, alloy_primitives::B256>>,
+    /// Cached state root from the last `state_root` call. If no
+    /// accounts were touched since the last computation, the cached
+    /// root is returned directly (O(1) fast path).
+    cached_state_root: Mutex<Option<alloy_primitives::B256>>,
 }
 
 impl EvmModule {
@@ -263,6 +280,8 @@ impl EvmModule {
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
             touched: Mutex::new(std::collections::HashSet::new()),
+            storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            cached_state_root: Mutex::new(None),
         }
     }
 
@@ -281,6 +300,8 @@ impl EvmModule {
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
             touched: Mutex::new(std::collections::HashSet::new()),
+            storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            cached_state_root: Mutex::new(None),
         }
     }
 
@@ -313,6 +334,8 @@ impl EvmModule {
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
             touched: Mutex::new(std::collections::HashSet::new()),
+            storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            cached_state_root: Mutex::new(None),
         };
         // Load initial state from the backend into the CacheDB, then
         // install the backend for future flushes.
@@ -1772,6 +1795,13 @@ impl Module for EvmModule {
         *self.block_height.lock().expect("block_height mutex not poisoned") = h;
         *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned") =
             h.saturating_mul(BLOCK_TIME_SECS);
+
+        // Clear the touched set from the previous block. The set was
+        // consumed by `state_root` (for incremental storage root
+        // updates) and by `flush_to_storage` (for dirty-only writes).
+        // Clearing here (not in `end_block`) lets `state_root` see
+        // which accounts were touched in this block.
+        self.touched.lock().expect("touched mutex not poisoned").clear();
     }
 
     /// A4: validate a signed EVM transaction for mempool admission.
@@ -2026,34 +2056,67 @@ impl Module for EvmModule {
         // is computed from its individual storage trie (keyed by
         // keccak256(slot)).
         //
-        // This replaces the Phase 2 sorted-account BLAKE3 hash with
-        // a proper keccak MPT root — matching Ethereum mainnet and
-        // reth for identical state. The root is deterministic
-        // regardless of HashMap iteration order (alloy-trie sorts
-        // internally by hashed key).
+        // # Incremental storage root cache
+        //
+        // The dominant cost of `state_root` is per-account storage
+        // root computation (O(storage_size) per account). We cache
+        // each account's storage root and only recompute it for
+        // accounts in the `touched` set. This turns the per-block
+        // cost from O(total_storage) to O(touched_storage +
+        // total_accounts) — the trie assembly is still O(n) but
+        // the storage root computation (the expensive part) is
+        // incremental.
         //
         // # Panics
         //
         // Panics if the DB mutex is poisoned (a thread panicked while
         // holding the lock). This is unrecoverable and indicates a bug.
+        let touched = self.touched.lock().expect("touched mutex not poisoned");
+
+        // Fast path: if nothing was touched since the last
+        // computation, return the cached root. This makes consecutive
+        // `state_root` calls with no intervening execution O(1).
+        if touched.is_empty() {
+            if let Some(cached) =
+                *self.cached_state_root.lock().expect("cached_state_root mutex not poisoned")
+            {
+                return Hash(cached.0);
+            }
+        }
+
         let db = self.db.lock().expect("db mutex not poisoned");
+        let mut storage_root_cache =
+            self.storage_root_cache.lock().expect("storage_root_cache mutex not poisoned");
 
         // Build the account iterator: for each account, compute its
-        // storage root and build a TrieAccount.
+        // storage root (incrementally) and build a TrieAccount.
         let accounts = db.cache.accounts.iter().map(|(addr, account)| {
             // Compute the storage root for this account.
-            // The storage trie is keyed by keccak256(slot) with
-            // RLP-encoded U256 values. Empty storage → EMPTY_ROOT.
+            //
+            // If the account was touched in this block, recompute
+            // its storage root from scratch and update the cache.
+            // Otherwise, reuse the cached storage root (O(1)).
             let storage_root = if account.storage.is_empty() {
                 trie::EMPTY_ROOT
-            } else {
-                // Convert U256 storage keys to B256 (big-endian 32
-                // bytes) for the trie. alloy-trie hashes them
-                // internally with keccak256.
+            } else if touched.contains(addr) {
+                // Recompute for touched accounts.
                 let storage_iter = account.storage.iter().map(|(slot, value)| {
                     (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
                 });
-                trie::storage_root(storage_iter)
+                let root = trie::storage_root(storage_iter);
+                storage_root_cache.insert(*addr, root);
+                root
+            } else {
+                // Reuse cached storage root for untouched accounts.
+                storage_root_cache.get(addr).copied().unwrap_or_else(|| {
+                    // Cache miss (first computation or cache evicted).
+                    let storage_iter = account.storage.iter().map(|(slot, value)| {
+                        (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
+                    });
+                    let root = trie::storage_root(storage_iter);
+                    storage_root_cache.insert(*addr, root);
+                    root
+                })
             };
 
             // Build the TrieAccount for the MPT.
@@ -2069,6 +2132,9 @@ impl Module for EvmModule {
 
         // Compute the state root via alloy-trie.
         let root = trie::state_root(accounts);
+
+        // Cache the state root for the next call's fast path.
+        *self.cached_state_root.lock().expect("cached_state_root mutex not poisoned") = Some(root);
 
         // Convert the alloy B256 root to Oxide's Hash type.
         Hash(root.0)
@@ -2168,7 +2234,7 @@ impl EvmModule {
     /// Panics if the DB mutex is poisoned.
     fn flush_to_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
         let db = self.db.lock().expect("db mutex not poisoned");
-        let mut touched = self.touched.lock().expect("touched mutex not poisoned");
+        let touched = self.touched.lock().expect("touched mutex not poisoned");
 
         // If nothing was touched, skip the flush entirely.
         if touched.is_empty() {
@@ -2217,8 +2283,9 @@ impl EvmModule {
         }
         backend.apply_batch(&ops);
 
-        // Clear the touched set for the next block.
-        touched.clear();
+        // The touched set is cleared in `begin_block` (not here) so
+        // that `state_root` can use it for incremental storage root
+        // updates.
     }
 
     /// Load EVM state from the `StorageBackend` into the `CacheDB`.
