@@ -518,25 +518,38 @@ impl Executor {
                 continue; // unknown module — skip
             };
 
-            // Look up pre-recovered senders from the cache. If all
-            // txs in this group have cached senders, use the
-            // pre-verified execution path (skip secp256k1 recovery).
-            // Otherwise, fall back to `handle_batch` (which recovers
-            // senders internally).
-            let preverified: Vec<PreverifiedTx> = group
-                .iter()
-                .map(|(_ctx, payload)| {
-                    let tx_hash = Hasher::hash_one(Domain::Transaction, payload);
-                    preverify_cache
-                        .remove(&tx_hash)
-                        .unwrap_or(PreverifiedTx { raw: payload.clone(), sender: [0u8; 20] })
-                })
-                .collect();
+            // Phase E: zero-copy payload handling.
+            //
+            // First, check if all txs in this group have cached
+            // senders. If yes, construct the preverified Vec (no
+            // payload clones — the cached PreverifiedTx already
+            // owns the raw bytes). If no, use the fallback path
+            // directly (no preverified Vec constructed, no wasted
+            // clones).
+            //
+            // Previously, the preverified Vec was always
+            // constructed, cloning payloads for txs without cached
+            // senders — even when the fallback path would be used,
+            // making those clones wasted work.
+            let all_cached = group.iter().all(|(_ctx, payload)| {
+                let tx_hash = Hasher::hash_one(Domain::Transaction, payload);
+                preverify_cache.contains_key(&tx_hash)
+            });
 
-            // Check if all senders are non-zero (pre-recovered).
-            let all_preverified = preverified.iter().all(|pv| pv.sender != [0u8; 20]);
+            let results = if all_cached {
+                // All senders are pre-recovered — construct the
+                // preverified Vec from the cache (no payload clones).
+                let preverified: Vec<PreverifiedTx> = group
+                    .iter()
+                    .map(|(_ctx, payload)| {
+                        let tx_hash = Hasher::hash_one(Domain::Transaction, payload);
+                        preverify_cache.remove(&tx_hash).unwrap_or_else(|| PreverifiedTx {
+                            raw: payload.clone(),
+                            sender: [0u8; 20],
+                        })
+                    })
+                    .collect();
 
-            let results = if all_preverified {
                 // Use the pre-verified path. For large batches, use
                 // the parallel speculative path; for small batches,
                 // serial is faster (avoids rayon overhead).
@@ -546,7 +559,8 @@ impl Executor {
                     module.handle_batch_preverified(&group[0].0, &preverified)
                 }
             } else {
-                // Fall back to the recovery path.
+                // Fall back to the recovery path — no preverified
+                // Vec constructed, no payload clones.
                 let batch: Vec<(TxContext, &[u8])> =
                     group.iter().map(|(ctx, payload)| (*ctx, payload.as_slice())).collect();
                 module.handle_batch(&batch)
