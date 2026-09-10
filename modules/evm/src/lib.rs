@@ -1923,6 +1923,89 @@ impl Module for EvmModule {
         self.handle_batch(&ctx, &raw_txs)
     }
 
+    /// Pre-recover senders from RLP-encoded signed EVM transactions.
+    ///
+    /// Delegates to the inherent `preverify_batch` which uses rayon
+    /// to parallelize secp256k1 recovery across cores. The
+    /// pre-recovered senders are cached by the executor and reused
+    /// at block execution time to skip recovery entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(ExecError::Malformed)` for each transaction
+    /// that cannot be RLP-decoded, has a wrong chain ID, or whose
+    /// signature is invalid.
+    fn preverify_batch(&self, msgs: &[&[u8]]) -> Vec<Result<executor::PreverifiedTx, ExecError>> {
+        // Delegate to the inherent `preverify_batch` (which returns
+        // `evm::PreverifiedTx`) and convert to the executor's
+        // `PreverifiedTx` (which uses a generic `[u8; 20]` sender).
+        let raw_vec: Vec<Vec<u8>> = msgs.iter().map(|b| b.to_vec()).collect();
+        let results = EvmModule::preverify_batch(self, &raw_vec);
+        results
+            .into_iter()
+            .map(|r| {
+                r.map(|pv| executor::PreverifiedTx { raw: pv.raw, sender: pv.sender.into_array() })
+            })
+            .collect()
+    }
+
+    /// Execute a batch of pre-verified EVM transactions (serial).
+    ///
+    /// Delegates to the inherent `handle_batch_preverified` which
+    /// skips secp256k1 recovery entirely — only RLP decoding and
+    /// chain ID validation remain. This is the highest-throughput
+    /// serial execution path.
+    ///
+    /// # Errors
+    ///
+    /// Individual transactions may fail independently. A failed
+    /// transaction does not abort the batch.
+    fn handle_batch_preverified(
+        &self,
+        ctx: &TxContext,
+        txs: &[executor::PreverifiedTx],
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
+        // Convert the executor's `PreverifiedTx` (generic [u8; 20]
+        // sender) to the EVM's `PreverifiedTx` (revm Address sender).
+        let evm_txs: Vec<PreverifiedTx> = txs
+            .iter()
+            .map(|pv| PreverifiedTx {
+                raw: pv.raw.clone(),
+                sender: revm::primitives::Address::from(pv.sender),
+            })
+            .collect();
+        // Call the inherent `handle_batch_preverified` (3 args).
+        EvmModule::handle_batch_preverified(self, ctx, &evm_txs)
+    }
+
+    /// Execute a batch of pre-verified EVM transactions in parallel.
+    ///
+    /// Delegates to the inherent `handle_batch_parallel_preverified`
+    /// which groups transactions by sender and executes each group on
+    /// a separate rayon thread. Results are merged in original block
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Individual transactions may fail independently. A failed
+    /// transaction does not abort the batch.
+    fn handle_batch_parallel_preverified(
+        &self,
+        ctx: &TxContext,
+        txs: &[executor::PreverifiedTx],
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
+        // Convert the executor's `PreverifiedTx` to the EVM's.
+        let evm_txs: Vec<PreverifiedTx> = txs
+            .iter()
+            .map(|pv| PreverifiedTx {
+                raw: pv.raw.clone(),
+                sender: revm::primitives::Address::from(pv.sender),
+            })
+            .collect();
+        // Call the inherent `handle_batch_parallel_preverified` (3 args).
+        EvmModule::handle_batch_parallel_preverified(self, ctx, &evm_txs)
+    }
+
     fn end_block(&self, _height: Height) {
         // If a StorageBackend is attached, flush the current CacheDB
         // state to durable storage. This makes the EVM state

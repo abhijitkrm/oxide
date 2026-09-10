@@ -28,6 +28,7 @@ use ports::{AppInterface, ConsensusEngine};
 use primitives::Address;
 
 pub mod multinode;
+pub mod tcp_multinode;
 
 /// The consensus engine selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

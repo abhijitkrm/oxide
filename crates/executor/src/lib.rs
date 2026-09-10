@@ -25,7 +25,7 @@
 //! module `begin_block` / `handle` / `end_block` hooks. Each module
 //! owns a subtree of the storage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 pub mod divergence;
@@ -66,6 +66,28 @@ pub struct TxContext {
     pub nonce: u64,
     /// The tx fee (8 bytes LE, parsed from the tx envelope).
     pub fee: u64,
+}
+
+/// A transaction with a pre-recovered sender.
+///
+/// The sender is recovered from the transaction's signature at
+/// mempool ingestion time (via `Module::preverify_batch`). The
+/// execution layer trusts this sender without re-verifying —
+/// skipping secp256k1 recovery on the block execution hot path.
+///
+/// # Security
+///
+/// The pre-recovered sender must come from a trusted source (the
+/// local mempool's `preverify_batch` call). A byzantine proposer
+/// could provide wrong senders, but this is detectable by state
+/// root comparison across validators. For production multi-validator
+/// deployment, pair this with verification sampling.
+#[derive(Debug, Clone)]
+pub struct PreverifiedTx {
+    /// The raw module payload bytes (e.g. RLP-encoded signed EVM tx).
+    pub raw: Vec<u8>,
+    /// The sender recovered from the signature (20 bytes).
+    pub sender: [u8; 20],
 }
 
 /// A module: a Cosmos-SDK-style state machine that handles messages.
@@ -145,6 +167,80 @@ pub trait Module: Send + Sync {
         msgs.iter().map(|(ctx, msg)| self.handle(ctx, msg)).collect()
     }
 
+    /// Pre-recover senders from a batch of raw transaction payloads.
+    ///
+    /// This is called at mempool ingestion time to amortize
+    /// secp256k1 recovery (the single most expensive per-tx
+    /// operation, ~30 µs/tx) across the tx's lifetime in the pool.
+    /// The pre-recovered senders are cached and reused at block
+    /// execution time via [`handle_batch_preverified`](Self::handle_batch_preverified),
+    /// skipping recovery entirely on the execution hot path.
+    ///
+    /// The default implementation returns `PreverifiedTx` with a
+    /// zero sender (no pre-recovery). Modules that support
+    /// pre-verification (e.g. EVM) override this to recover the
+    /// sender from the transaction's signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(ExecError::Malformed)` for each transaction
+    /// that cannot be parsed or whose signature is invalid.
+    fn preverify_batch(&self, msgs: &[&[u8]]) -> Vec<Result<PreverifiedTx, ExecError>> {
+        msgs.iter().map(|raw| Ok(PreverifiedTx { raw: raw.to_vec(), sender: [0u8; 20] })).collect()
+    }
+
+    /// Execute a batch of transactions with pre-recovered senders.
+    ///
+    /// This is the highest-throughput serial execution path. The
+    /// caller has already recovered the sender for each tx via
+    /// [`preverify_batch`](Self::preverify_batch). This method
+    /// skips secp256k1 recovery entirely — only RLP decoding and
+    /// chain ID validation remain.
+    ///
+    /// The default implementation falls back to [`handle_batch`](Self::handle_batch).
+    /// Modules with a pre-verified path (e.g. EVM) override this
+    /// to skip sender recovery.
+    ///
+    /// # Errors
+    ///
+    /// Each result is either a vector of events (success) or an
+    /// `ExecError` (failure). A failed transaction does not abort
+    /// the batch.
+    fn handle_batch_preverified(
+        &self,
+        ctx: &TxContext,
+        txs: &[PreverifiedTx],
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
+        let batch: Vec<(TxContext, &[u8])> =
+            txs.iter().map(|pv| (*ctx, pv.raw.as_slice())).collect();
+        self.handle_batch(&batch)
+    }
+
+    /// Execute a batch of pre-verified transactions in parallel.
+    ///
+    /// This is the speculative parallel execution path. Transactions
+    /// are grouped by sender to avoid write conflicts, and each
+    /// group is executed on a separate rayon thread. Results are
+    /// merged in original block order.
+    ///
+    /// The default implementation falls back to
+    /// [`handle_batch_preverified`](Self::handle_batch_preverified)
+    /// (serial). Modules with a parallel path (e.g. EVM) override
+    /// this to use rayon for speculative parallel execution.
+    ///
+    /// # Errors
+    ///
+    /// Each result is either a vector of events (success) or an
+    /// `ExecError` (failure). A failed transaction does not abort
+    /// the batch.
+    fn handle_batch_parallel_preverified(
+        &self,
+        ctx: &TxContext,
+        txs: &[PreverifiedTx],
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
+        self.handle_batch_preverified(ctx, txs)
+    }
+
     /// Called at the end of each block, after all txs.
     fn end_block(&self, height: Height);
 
@@ -201,6 +297,13 @@ fn parse_tx_context(bytes: &[u8]) -> Option<TxContext> {
     Some(TxContext { sender, nonce, fee })
 }
 
+/// Minimum tx batch size to use the parallel speculative execution
+/// path. Below this threshold, serial execution is faster (avoids
+/// rayon thread-pool overhead). Source: benchmark results showing
+/// parallel execution wins above ~100 txs due to `CacheDB` clone cost.
+/// See `modules/evm/benches/tps_rw.rs`.
+const PARALLEL_THRESHOLD: usize = 100;
+
 /// Minimum tx size: sender (20) + nonce (8) + fee (8) = 36 bytes.
 const TX_MIN_SIZE: usize = 20 + 8 + 8;
 
@@ -223,6 +326,16 @@ pub struct Executor {
     next_proposal_height: Mutex<u64>,
     /// Pending events from the current block (cleared each block).
     events: Mutex<Vec<Event>>,
+    /// Pre-recovered senders, keyed by tx hash. Populated at
+    /// `ingest_tx` time via `Module::preverify_batch`. Consumed at
+    /// `execute_block` time to skip secp256k1 recovery on the
+    /// execution hot path.
+    ///
+    /// Entries are removed after the block containing the tx is
+    /// finalized (they are no longer needed — re-execution would
+    /// re-preverify). This bounds the cache size to the mempool's
+    /// capacity.
+    preverify_cache: Mutex<HashMap<Hash, PreverifiedTx>>,
 }
 
 impl Executor {
@@ -235,6 +348,7 @@ impl Executor {
             state_roots: Mutex::new(BTreeMap::new()),
             next_proposal_height: Mutex::new(0),
             events: Mutex::new(Vec::new()),
+            preverify_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -295,14 +409,52 @@ impl Executor {
 
         // Execute each module's txs as a batch.
         let mut block_events: Vec<Event> = Vec::new();
+
+        // Clear the preverify cache after the block is executed —
+        // the cached senders are no longer needed (re-execution would
+        // re-preverify). We drain into a local to avoid holding the
+        // lock during execution.
+        let mut preverify_cache = self.preverify_cache.lock().unwrap().clone();
+        self.preverify_cache.lock().unwrap().clear();
+
         for (module_id, group) in &groups {
             let Some(module) = self.modules.get(module_id) else {
                 continue; // unknown module — skip
             };
-            // Build the (ctx, &msg) slice for handle_batch.
-            let batch: Vec<(TxContext, &[u8])> =
-                group.iter().map(|(ctx, payload)| (*ctx, payload.as_slice())).collect();
-            let results = module.handle_batch(&batch);
+
+            // Look up pre-recovered senders from the cache. If all
+            // txs in this group have cached senders, use the
+            // pre-verified execution path (skip secp256k1 recovery).
+            // Otherwise, fall back to `handle_batch` (which recovers
+            // senders internally).
+            let preverified: Vec<PreverifiedTx> = group
+                .iter()
+                .map(|(_ctx, payload)| {
+                    let tx_hash = Hasher::hash_one(Domain::Transaction, payload);
+                    preverify_cache
+                        .remove(&tx_hash)
+                        .unwrap_or(PreverifiedTx { raw: payload.clone(), sender: [0u8; 20] })
+                })
+                .collect();
+
+            // Check if all senders are non-zero (pre-recovered).
+            let all_preverified = preverified.iter().all(|pv| pv.sender != [0u8; 20]);
+
+            let results = if all_preverified {
+                // Use the pre-verified path. For large batches, use
+                // the parallel speculative path; for small batches,
+                // serial is faster (avoids rayon overhead).
+                if group.len() >= PARALLEL_THRESHOLD {
+                    module.handle_batch_parallel_preverified(&group[0].0, &preverified)
+                } else {
+                    module.handle_batch_preverified(&group[0].0, &preverified)
+                }
+            } else {
+                // Fall back to the recovery path.
+                let batch: Vec<(TxContext, &[u8])> =
+                    group.iter().map(|(ctx, payload)| (*ctx, payload.as_slice())).collect();
+                module.handle_batch(&batch)
+            };
             for events in results.into_iter().flatten() {
                 block_events.extend(events);
             }
@@ -346,6 +498,23 @@ impl AppInterface for Executor {
         let payload = module_payload(bytes);
         if let Err(e) = module.validate(&ctx, payload) {
             return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
+        }
+
+        // Pre-recover the sender at ingestion time and cache it.
+        // This amortizes secp256k1 recovery (~30 µs/tx) across the
+        // tx's lifetime in the mempool. At block execution time, the
+        // cached sender is used to skip recovery entirely — the
+        // execution hot path sees only RLP decode + chain ID check.
+        //
+        // For modules without a preverify implementation (default
+        // returns a zero sender), this is a no-op that stores a
+        // placeholder. The execution path falls back to `handle_batch`
+        // when the sender is zero.
+        let preverify_result = module.preverify_batch(&[payload]);
+        if let Ok(preverified) = &preverify_result[0] {
+            let tx_hash =
+                crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, tx.as_bytes());
+            self.preverify_cache.lock().unwrap().insert(tx_hash, preverified.clone());
         }
 
         match self.mempool.lock().unwrap().submit(tx) {

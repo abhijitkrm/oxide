@@ -46,6 +46,8 @@ use std::sync::{Arc, Mutex};
 
 use ports::transport::{InboundMessage, PeerId, Transport, TransportCaps, TransportError};
 
+pub mod tcp;
+
 /// The default maximum message size for the mesh: 16 MiB. Matches
 /// the broadcast crate's `ERASURE_MAX_BYTES` — a full erasure-coded
 /// block chunk fits in one mesh message.

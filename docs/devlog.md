@@ -4496,3 +4496,126 @@ is a independent state machine, and the router dispatches messages
 to modules. The execution order across modules doesn't matter for
 state roots, only the order within each module matters (for nonce
 dependencies).
+
+## Session: Full Pipeline — Preverified Path + TCP Transport + Multi-Node Devnet
+
+**Goal:** Close all remaining integration gaps: wire the preverified
+sender path through the pipeline, implement real TCP transport, and
+build a multi-node devnet runner.
+
+### 1. Preverified sender pipeline (items 1-5)
+
+**Problem:** The preverify_batch and handle_batch_preverified methods
+existed on EvmModule but were never called by the executor or mempool.
+The execution path always did secp256k1 recovery (~30 µs/tx) even
+though the mempool had already recovered the sender at ingestion time.
+
+**What was built:**
+
+- **`PreverifiedTx` in the executor crate** — a module-agnostic
+  representation of a tx with a pre-recovered sender (raw bytes + 20-byte
+  sender). The EVM module converts between this and its internal
+  `evm::PreverifiedTx` (which uses `revm::primitives::Address`).
+
+- **`preverify_batch` on the `Module` trait** — default returns a
+  zero sender (no pre-recovery). The EVM module overrides it to
+  delegate to the inherent `preverify_batch` (parallel rayon recovery).
+
+- **`handle_batch_preverified` on the `Module` trait** — default
+  falls back to `handle_batch`. The EVM module overrides it to delegate
+  to the inherent `handle_batch_preverified` (skip recovery, decode
+  only).
+
+- **`handle_batch_parallel_preverified` on the `Module` trait** —
+  default falls back to serial. The EVM module overrides it to delegate
+  to the inherent `handle_batch_parallel_preverified` (rayon parallel
+  speculative execution).
+
+- **Preverify cache in the executor** — `ingest_tx` now calls
+  `module.preverify_batch(&[payload])` at ingestion time and caches the
+  pre-recovered sender by tx hash. At `execute_block` time, the cache
+  is drained and the pre-recovered senders are passed to
+  `handle_batch_preverified` (or `handle_batch_parallel_preverified`
+  for batches ≥ 100 txs).
+
+**What's connected now:**
+
+```
+tx → ingest_tx → validate → preverify_batch (rayon recovery) →
+  cache sender → mempool.submit →
+    prepare_proposal → finalize_block → execute_block →
+      drain preverify cache →
+        if all senders pre-recovered:
+          handle_batch_preverified (skip recovery, decode only)
+          or handle_batch_parallel_preverified (rayon parallel, ≥100 txs)
+        else:
+          handle_batch (fallback: recover senders internally)
+```
+
+**Design decision: parallel threshold.** The executor uses the
+parallel speculative path (`handle_batch_parallel_preverified`) when
+the batch has ≥ 100 txs. Below that threshold, serial is faster
+because it avoids rayon thread-pool overhead. The threshold is
+documented as `PARALLEL_THRESHOLD` with a comment referencing the
+benchmark results.
+
+### 2. TCP transport (item 6)
+
+**Problem:** The in-process `MeshTransport` proved the `Transport`
+seam but didn't exercise real network I/O. The multi-node devnet
+couldn't validate that consensus works over a real network stack.
+
+**What was built:**
+
+- **`p2p::tcp::TcpTransport`** — a real TCP transport using
+  `std::net::TcpStream` and background threads. Each node:
+  1. Listens on a TCP port for incoming connections.
+  2. Connects to peer addresses (with retry for startup races).
+  3. Exchanges length-prefixed frames (4-byte BE length + payload).
+  4. Queues inbound messages in a channel for `recv()`.
+
+- **Threading model:** One accept thread per transport, one reader
+  thread per peer connection. All threads are detached (v0 has no
+  graceful shutdown).
+
+- **Framing:** `[length: 4 bytes BE u32][payload: length bytes]`.
+  Capped at 16 MiB (`TCP_MAX_MESSAGE_BYTES`).
+
+- **Tests:** 6 tests covering basic send/recv, FIFO order, 3-node
+  mesh, unknown peer, message too large, and capabilities.
+
+### 3. Multi-node TCP devnet (item 7)
+
+**Problem:** The existing `MultiNodeDevnet` used the in-process
+`MeshTransport`. A TCP-based runner was needed to validate the full
+network path.
+
+**What was built:**
+
+- **`devnet::tcp_multinode::TcpMultiNodeDevnet`** — a multi-node
+  devnet runner that uses `TcpTransport` for real network I/O. Each
+  validator:
+  1. Gets a `TcpTransport` listening on `127.0.0.1:{base_port + i}`.
+  2. Connects to all other validators (full mesh).
+  3. Runs oxideBFT with real BLS signatures.
+
+- **Round loop:** The `run_round_tcp` method routes votes and QCs
+  through TCP instead of direct method calls. The leader proposes,
+  followers vote via TCP, the leader forms a QC and broadcasts it via
+  TCP.
+
+- **Configurable base port:** `with_base_port` allows tests to use
+  unique ports to avoid collisions when running in parallel.
+
+- **Tests:** 4 tests covering 4-validator liveness, finality
+  agreement, bank module execution, and single validator.
+
+### What's still not done
+
+- The TCP transport has no TLS/authentication/encryption (Phase 2).
+- The TCP devnet runs in a single process (Phase 2: multi-process).
+- The preverify cache is not shared across validators (each validator
+  pre-verifies independently — this is correct for security but means
+  each validator pays the recovery cost).
+- No graceful shutdown for TCP connections.
+- No peer discovery (peers are statically configured).

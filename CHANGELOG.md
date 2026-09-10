@@ -12,6 +12,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Preverified sender pipeline + TCP transport + multi-node devnet** (2026-01-25)
+  - The preverified sender path is now wired through the full pipeline:
+    `ingest_tx` pre-recovers senders at mempool ingestion time, caches
+    them, and `execute_block` uses `handle_batch_preverified` (or
+    `handle_batch_parallel_preverified` for batches ≥ 100 txs) to skip
+    secp256k1 recovery on the execution hot path.
+  - **In plain words:** when you submit an EVM transaction, the
+    sender's signature is recovered once at submission time and cached.
+    When the block is executed, the cached sender is reused — no
+    signature recovery happens during execution. This brings the 14x
+    speedup from the pre-verified work into the actual pipeline. For
+    large blocks (≥ 100 txs), the executor uses the parallel
+    speculative path (rayon) for even higher throughput.
+  - Real TCP transport (`p2p::tcp::TcpTransport`) replaces the
+    in-process mesh for multi-node devnet operation. Length-prefixed
+    framing, thread-per-peer I/O, and a background accept thread.
+  - TCP-based multi-node devnet runner (`devnet::tcp_multinode`)
+    validates that oxideBFT consensus works over real TCP connections.
+  - New `Module` trait methods: `preverify_batch`,
+    `handle_batch_preverified`, `handle_batch_parallel_preverified`.
+  - New `PreverifiedTx` struct in the executor crate (module-agnostic).
+  - 10 new tests: 6 TCP transport tests, 4 TCP multi-node devnet tests.
+
 - **EVM pipeline wired to executor and mempool** (2026-01-25)
   - The EVM module is now connected to the executor/mempool/consensus
     pipeline. Signed EVM transactions can be submitted through the
