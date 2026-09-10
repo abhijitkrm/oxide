@@ -55,14 +55,20 @@ use crate::validator::ValidatorSet;
 /// Origin: plan.md §4 performance budget — a stuck leader must not
 /// stall the chain for more than a few seconds before the next leader
 /// takes over. 30s is the hard cap; the base is 2s (WAN RTT budget).
-const MAX_TIMEOUT_MS: u64 = 30_000;
+///
+/// This is the default value used when no explicit config is provided.
+/// Production code should use [`Pacemaker::with_config`] to set this
+/// from the [`config`](::config) crate's `ConsensusConfig`.
+pub(crate) const DEFAULT_MAX_TIMEOUT_MS: u64 = 30_000;
 
 /// Base timeout duration (milliseconds) for the first view. Origin:
 /// plan.md §4 — steady-state blocks are 50–100ms, but a view timeout
 /// must accommodate WAN RTT (~30ms) + vote aggregation (~15ms) + jitter.
 /// 2s gives ample headroom for a first timeout; backoff handles
 /// sustained faults.
-const BASE_TIMEOUT_MS: u64 = 2_000;
+///
+/// This is the default value used when no explicit config is provided.
+pub(crate) const DEFAULT_BASE_TIMEOUT_MS: u64 = 2_000;
 
 /// The pacemaker's current state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,15 +138,53 @@ pub struct Pacemaker {
     own_timeout_sent: bool,
     /// Current timeout duration (milliseconds), doubled on each
     /// consecutive timeout (exponential backoff, capped at
-    /// `MAX_TIMEOUT_MS`).
+    /// `max_timeout_ms`).
     current_timeout_ms: u64,
+    /// Base timeout duration (milliseconds) for the first view.
+    /// Configurable via [`Pacemaker::with_config`]. Default:
+    /// [`DEFAULT_BASE_TIMEOUT_MS`] (2000 ms).
+    base_timeout_ms: u64,
+    /// Maximum timeout duration (milliseconds) for exponential
+    /// backoff. Configurable via [`Pacemaker::with_config`]. Default:
+    /// [`DEFAULT_MAX_TIMEOUT_MS`] (30000 ms).
+    max_timeout_ms: u64,
 }
 
 impl Pacemaker {
     /// Construct a pacemaker for `validator_set`, starting at
-    /// `initial_view` in `epoch`.
+    /// `initial_view` in `epoch`, with default timeouts.
+    ///
+    /// For custom timeouts, use [`Pacemaker::with_config`].
     #[must_use]
     pub fn new(validator_set: ValidatorSet, initial_view: View, epoch: Epoch) -> Self {
+        Self::with_config(
+            validator_set,
+            initial_view,
+            epoch,
+            DEFAULT_BASE_TIMEOUT_MS,
+            DEFAULT_MAX_TIMEOUT_MS,
+        )
+    }
+
+    /// Construct a pacemaker with explicit timeout config.
+    ///
+    /// # Arguments
+    ///
+    /// - `validator_set`: the validator set for quorum calculations.
+    /// - `initial_view`: the starting view number.
+    /// - `epoch`: the starting epoch.
+    /// - `base_timeout_ms`: the base timeout duration for the first
+    ///   view, in milliseconds.
+    /// - `max_timeout_ms`: the maximum timeout duration for
+    ///   exponential backoff, in milliseconds.
+    #[must_use]
+    pub fn with_config(
+        validator_set: ValidatorSet,
+        initial_view: View,
+        epoch: Epoch,
+        base_timeout_ms: u64,
+        max_timeout_ms: u64,
+    ) -> Self {
         let bitmap_len = validator_set.n().div_ceil(8);
         Self {
             validator_set,
@@ -150,7 +194,9 @@ impl Pacemaker {
             timeout_signers: vec![0u8; bitmap_len],
             timeout_signer_count: 0,
             own_timeout_sent: false,
-            current_timeout_ms: BASE_TIMEOUT_MS,
+            current_timeout_ms: base_timeout_ms,
+            base_timeout_ms,
+            max_timeout_ms,
         }
     }
 
@@ -310,7 +356,7 @@ impl Pacemaker {
         self.reset_view_state();
         // Reset backoff: progress means the current leader is working,
         // so the next timeout should be the base duration again.
-        self.current_timeout_ms = BASE_TIMEOUT_MS;
+        self.current_timeout_ms = self.base_timeout_ms;
         // Always reset the timer on progress, whether or not we were
         // timed out — a valid proposal resets the view timer.
         let _ = was_timed_out;
@@ -325,8 +371,8 @@ impl Pacemaker {
         self.state = PacemakerState::Active;
         self.reset_view_state();
         // Exponential backoff: double the timeout on each consecutive
-        // timeout, capped at MAX_TIMEOUT_MS.
-        self.current_timeout_ms = (self.current_timeout_ms * 2).min(MAX_TIMEOUT_MS);
+        // timeout, capped at DEFAULT_MAX_TIMEOUT_MS.
+        self.current_timeout_ms = (self.current_timeout_ms * 2).min(self.max_timeout_ms);
         vec![PacemakerEvent::AdvanceView { old_view, new_view: self.current_view, tc }]
     }
 
@@ -383,7 +429,7 @@ mod tests {
         let pm = Pacemaker::new(vs4(), View::new(0), Epoch::new(0));
         assert_eq!(pm.current_view(), View::new(0));
         assert_eq!(pm.state(), PacemakerState::Active);
-        assert_eq!(pm.timeout_duration_ms(), BASE_TIMEOUT_MS);
+        assert_eq!(pm.timeout_duration_ms(), DEFAULT_BASE_TIMEOUT_MS);
     }
 
     #[test]
@@ -503,10 +549,10 @@ mod tests {
         let _ = pm.on_timeout_signature(2, sig(3));
         // Now at view 1 with doubled timeout.
         assert_eq!(pm.current_view(), View::new(1));
-        assert_eq!(pm.timeout_duration_ms(), BASE_TIMEOUT_MS * 2);
+        assert_eq!(pm.timeout_duration_ms(), DEFAULT_BASE_TIMEOUT_MS * 2);
         // Progress resets the backoff.
         pm.on_progress();
-        assert_eq!(pm.timeout_duration_ms(), BASE_TIMEOUT_MS);
+        assert_eq!(pm.timeout_duration_ms(), DEFAULT_BASE_TIMEOUT_MS);
         assert_eq!(pm.state(), PacemakerState::Active);
     }
 
@@ -524,8 +570,8 @@ mod tests {
         }
         // After 10 consecutive timeouts, the backoff should be capped.
         assert!(
-            pm.timeout_duration_ms() <= MAX_TIMEOUT_MS,
-            "backoff must cap at {MAX_TIMEOUT_MS}, got {}",
+            pm.timeout_duration_ms() <= DEFAULT_MAX_TIMEOUT_MS,
+            "backoff must cap at {DEFAULT_MAX_TIMEOUT_MS}, got {}",
             pm.timeout_duration_ms()
         );
     }

@@ -85,6 +85,41 @@ impl TcpMultiNodeDevnet {
         Self::with_base_port(n, max_mempool_entries, DEFAULT_BASE_PORT)
     }
 
+    /// Assemble a TCP-based multi-node devnet from a [`config::Config`].
+    ///
+    /// Uses the config's `genesis.num_validators`, `genesis.base_port`,
+    /// `genesis.genesis_balance`, `executor.max_mempool_entries`,
+    /// `executor.parallel_threshold`, and `network` settings to
+    /// construct the devnet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_validators == 0` or if any TCP port cannot be bound.
+    pub fn from_config(config: &config::Config) -> Self {
+        let n = config.genesis.num_validators;
+        let base_port = config.genesis.base_port;
+        let genesis_balance = config.genesis.genesis_balance;
+        let num_senders = config.genesis.num_prefunded_senders;
+        let max_mempool = config.executor.max_mempool_entries;
+        let parallel_threshold = config.executor.parallel_threshold;
+
+        let tcp_config = p2p::tcp::TcpTransportConfig {
+            max_message_bytes: config.network.max_message_bytes,
+            connect_timeout: config.network.connect_timeout(),
+            read_timeout: config.network.read_timeout(),
+        };
+
+        Self::build(
+            n,
+            base_port,
+            genesis_balance,
+            num_senders,
+            max_mempool,
+            parallel_threshold,
+            tcp_config,
+        )
+    }
+
     /// Assemble a TCP-based multi-node devnet with `n` validators,
     /// using a custom base port. Each node listens on
     /// `127.0.0.1:{base_port + i}`.
@@ -96,6 +131,27 @@ impl TcpMultiNodeDevnet {
     ///
     /// Panics if `n == 0` or if any TCP port cannot be bound.
     pub fn with_base_port(n: usize, max_mempool_entries: usize, base_port: u16) -> Self {
+        Self::build(
+            n,
+            base_port,
+            GENESIS_BALANCE,
+            32,
+            max_mempool_entries,
+            executor::DEFAULT_PARALLEL_THRESHOLD,
+            p2p::tcp::TcpTransportConfig::default(),
+        )
+    }
+
+    /// Internal constructor with all parameters explicit.
+    fn build(
+        n: usize,
+        base_port: u16,
+        genesis_balance: u64,
+        num_senders: u8,
+        max_mempool_entries: usize,
+        parallel_threshold: usize,
+        tcp_config: p2p::tcp::TcpTransportConfig,
+    ) -> Self {
         assert!(n > 0, "devnet must have at least one validator");
 
         let secret_keys: Vec<crypto::BlsSecretKey> =
@@ -118,11 +174,11 @@ impl TcpMultiNodeDevnet {
         let mut transports = Vec::with_capacity(n);
 
         for (i, key) in secret_keys.iter().cloned().enumerate() {
-            let mut executor = Executor::new(max_mempool_entries);
+            let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold);
             executor.register_module(Arc::new(oxide_core::CoreModule::new()));
             let bank = bank::BankModule::new();
-            for sender_byte in 0u8..32 {
-                bank.mint(&primitives::Address([sender_byte; 20]), GENESIS_BALANCE);
+            for sender_byte in 0u8..num_senders {
+                bank.mint(&primitives::Address([sender_byte; 20]), genesis_balance);
             }
             executor.register_module(Arc::new(bank));
             executor.register_module(Arc::new(staking::StakingModule::new()));
@@ -138,8 +194,12 @@ impl TcpMultiNodeDevnet {
 
             let port = base_port + u16::try_from(i).unwrap();
             let listen_addr = format!("127.0.0.1:{port}");
-            let transport =
-                p2p::tcp::TcpTransport::new(&listen_addr, vec![u8::try_from(i).unwrap()], peers);
+            let transport = p2p::tcp::TcpTransport::with_config(
+                &listen_addr,
+                vec![u8::try_from(i).unwrap()],
+                peers,
+                tcp_config.clone(),
+            );
 
             let engine = OxideBft::with_index(app_dyn, vs.clone(), u16::try_from(i).unwrap())
                 .with_secret_key(key);
@@ -418,5 +478,28 @@ mod tests {
         let mut devnet = TcpMultiNodeDevnet::with_base_port(1, 10_000, 21300);
         let (result, _) = devnet.run_batch(3, 10);
         assert!(!result.finalized[0].is_empty(), "single validator should finalize over TCP");
+    }
+
+    /// The `from_config` constructor respects config values.
+    #[test]
+    fn tcp_multinode_from_config() {
+        let config = config::Config {
+            network: config::NetworkConfig {
+                listen_addr: "127.0.0.1:21400".to_string(),
+                peers: vec!["127.0.0.1:21401".to_string()],
+                ..Default::default()
+            },
+            genesis: config::GenesisConfig {
+                num_validators: 2,
+                base_port: 21400,
+                genesis_balance: 500_000_000_000,
+                num_prefunded_senders: 16,
+            },
+            executor: config::ExecutorConfig { max_mempool_entries: 5_000, parallel_threshold: 50 },
+            ..Default::default()
+        };
+        let mut devnet = TcpMultiNodeDevnet::from_config(&config);
+        let (result, _) = devnet.run_batch(2, 5);
+        assert!(!result.finalized[0].is_empty(), "from_config devnet should finalize");
     }
 }

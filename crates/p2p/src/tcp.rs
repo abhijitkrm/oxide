@@ -53,18 +53,47 @@ use ports::transport::{InboundMessage, PeerId, Transport, TransportCaps, Transpo
 /// The default maximum message size for the TCP transport: 16 MiB.
 /// Matches the mesh transport and the broadcast crate's
 /// `ERASURE_MAX_BYTES`.
-const TCP_MAX_MESSAGE_BYTES: u64 = 16 << 20;
+const DEFAULT_MAX_MESSAGE_BYTES: u64 = 16 << 20;
 
-/// The connect timeout for outbound TCP connections. Short enough
-/// that a dead peer is detected quickly during devnet startup.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The default connect timeout for outbound TCP connections. Short
+/// enough that a dead peer is detected quickly during devnet startup.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The read timeout for reader threads. This is a safety net —
-/// normally the reader blocks indefinitely on `read_exact`. The
+/// The default read timeout for reader threads. This is a safety net
+/// — normally the reader blocks indefinitely on `read_exact`. The
 /// timeout prevents a stalled connection from holding a thread
 /// forever. Set to 30s; if no data arrives in 30s, the reader
 /// assumes the connection is dead and exits.
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Configuration for a [`TcpTransport`] instance.
+///
+/// All values that were previously hardcoded as `const` are now
+/// fields on this struct. Loaded from the [`config`](::config) crate's
+/// [`NetworkConfig`](::config::NetworkConfig).
+#[derive(Debug, Clone)]
+pub struct TcpTransportConfig {
+    /// The maximum message size the transport accepts, in bytes.
+    /// Messages larger than this are rejected with
+    /// [`TransportError::MessageTooLarge`].
+    pub max_message_bytes: u64,
+
+    /// The connect timeout for outbound TCP connections.
+    pub connect_timeout: Duration,
+
+    /// The read timeout for reader threads.
+    pub read_timeout: Duration,
+}
+
+impl Default for TcpTransportConfig {
+    fn default() -> Self {
+        Self {
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+        }
+    }
+}
 
 /// A peer's TCP address (host:port).
 pub type TcpAddr = String;
@@ -96,20 +125,17 @@ pub struct TcpTransport {
     inbound_rx: Mutex<mpsc::Receiver<InboundMessage>>,
     /// This node's peer ID.
     peer_id: PeerId,
+    /// The transport configuration (max message size, timeouts).
+    config: TcpTransportConfig,
 }
 
 impl TcpTransport {
-    /// Construct a TCP transport for a node.
+    /// Construct a TCP transport for a node with default config.
     ///
     /// # Arguments
     ///
     /// - `listen_addr`: the address to listen on (e.g. "127.0.0.1:9000").
-    /// - `peer_id`: this node's peer ID (used as `from` in inbound
-    ///   messages... wait, no — `from` is the *sender's* peer ID).
-    ///   This is this node's own ID, used for... actually, the
-    ///   `from` field in `InboundMessage` is set by the reader
-    ///   thread from the peer's ID. This field is kept for
-    ///   potential future use (e.g. filtering self-messages).
+    /// - `peer_id`: this node's peer ID.
     /// - `peers`: a list of `(peer_id, addr)` tuples for peers to
     ///   connect to. The transport connects to each peer in the
     ///   background. Incoming connections from unknown peers are
@@ -120,11 +146,42 @@ impl TcpTransport {
     ///
     /// Panics if the listen address cannot be bound.
     pub fn new(listen_addr: &str, peer_id: PeerId, peers: Vec<(PeerId, TcpAddr)>) -> Self {
+        Self::with_config(listen_addr, peer_id, peers, TcpTransportConfig::default())
+    }
+
+    /// Construct a TCP transport for a node with explicit config.
+    ///
+    /// Use this constructor when you need to override the default
+    /// timeouts or max message size (e.g. from a TOML config file via
+    /// the [`config`](::config) crate).
+    ///
+    /// # Arguments
+    ///
+    /// - `listen_addr`: the address to listen on (e.g. "127.0.0.1:9000").
+    /// - `peer_id`: this node's peer ID.
+    /// - `peers`: a list of `(peer_id, addr)` tuples for peers to
+    ///   connect to.
+    /// - `config`: the transport configuration (timeouts, max message
+    ///   size).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listen address cannot be bound.
+    pub fn with_config(
+        listen_addr: &str,
+        peer_id: PeerId,
+        peers: Vec<(PeerId, TcpAddr)>,
+        config: TcpTransportConfig,
+    ) -> Self {
         let listener = TcpListener::bind(listen_addr)
             .unwrap_or_else(|e| panic!("failed to bind TCP transport to {listen_addr}: {e}"));
 
         let streams: Arc<Mutex<HashMap<PeerId, TcpStream>>> = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>();
+
+        let max_message_bytes = config.max_message_bytes;
+        let connect_timeout = config.connect_timeout;
+        let read_timeout = config.read_timeout;
 
         // Spawn the accept thread: accepts incoming connections,
         // reads the peer's ID (first frame), and spawns a reader
@@ -137,17 +194,17 @@ impl TcpTransport {
                     continue; // accept error — try next
                 };
                 // Read the peer's ID as the first frame.
-                let Ok(peer_id) = read_frame(&mut stream) else {
+                let Ok(peer_id) = read_frame(&mut stream, max_message_bytes) else {
                     continue; // connection closed before ID
                 };
                 // Set read timeout for the reader thread.
-                let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+                let _ = stream.set_read_timeout(Some(read_timeout));
                 // Register the stream for outbound sends.
                 accept_streams.lock().unwrap().insert(peer_id.clone(), stream.try_clone().unwrap());
                 // Spawn a reader thread for this connection.
                 let tx = accept_tx.clone();
                 thread::spawn(move || {
-                    reader_loop(stream, peer_id, tx);
+                    reader_loop(stream, peer_id, tx, max_message_bytes);
                 });
             }
         });
@@ -170,7 +227,7 @@ impl TcpTransport {
                     let stream = loop {
                         if let Ok(s) = TcpStream::connect_timeout(
                             &addr.parse().unwrap_or_else(|_| panic!("invalid TCP address: {addr}")),
-                            CONNECT_TIMEOUT,
+                            connect_timeout,
                         ) {
                             break s;
                         }
@@ -181,16 +238,16 @@ impl TcpTransport {
                     if write_frame(&mut stream, &oid).is_err() {
                         return; // connection failed
                     }
-                    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+                    let _ = stream.set_read_timeout(Some(read_timeout));
                     // Register the stream for outbound sends.
                     cs.lock().unwrap().insert(pid.clone(), stream.try_clone().unwrap());
                     // Reader loop for this connection.
-                    reader_loop(stream, pid, ct);
+                    reader_loop(stream, pid, ct, max_message_bytes);
                 });
             }
         });
 
-        Self { streams, inbound_rx: Mutex::new(inbound_rx), peer_id }
+        Self { streams, inbound_rx: Mutex::new(inbound_rx), peer_id, config }
     }
 
     /// This node's peer ID.
@@ -201,7 +258,7 @@ impl TcpTransport {
 
 impl Transport for TcpTransport {
     fn send(&mut self, peer: &PeerId, bytes: &[u8]) -> Result<(), TransportError> {
-        if bytes.len() as u64 > TCP_MAX_MESSAGE_BYTES {
+        if bytes.len() as u64 > self.config.max_message_bytes {
             return Err(TransportError::MessageTooLarge);
         }
         let mut streams = self.streams.lock().unwrap();
@@ -219,7 +276,7 @@ impl Transport for TcpTransport {
         TransportCaps {
             authenticated: false,
             encrypted: false,
-            max_message_bytes: TCP_MAX_MESSAGE_BYTES,
+            max_message_bytes: self.config.max_message_bytes,
         }
     }
 }
@@ -231,12 +288,12 @@ impl Transport for TcpTransport {
 /// # Errors
 ///
 /// Returns `Err` on I/O error, EOF, or if the frame exceeds
-/// `TCP_MAX_MESSAGE_BYTES`.
-fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
+/// `max_message_bytes`.
+fn read_frame(stream: &mut TcpStream, max_message_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u64::from(u32::from_be_bytes(len_buf));
-    if len > TCP_MAX_MESSAGE_BYTES {
+    if len > max_message_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame exceeds max message size",
@@ -261,9 +318,14 @@ fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), std::io::Erro
 /// The reader loop: reads frames from a peer's stream and sends
 /// them to the inbound channel. Exits when the stream is closed
 /// or an error occurs.
-fn reader_loop(mut stream: TcpStream, peer_id: PeerId, tx: mpsc::Sender<InboundMessage>) {
+fn reader_loop(
+    mut stream: TcpStream,
+    peer_id: PeerId,
+    tx: mpsc::Sender<InboundMessage>,
+    max_message_bytes: u64,
+) {
     loop {
-        match read_frame(&mut stream) {
+        match read_frame(&mut stream, max_message_bytes) {
             Ok(bytes) => {
                 let msg = InboundMessage { from: peer_id.clone(), bytes };
                 if tx.send(msg).is_err() {
@@ -423,7 +485,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(500));
 
-        let huge = vec![0u8; usize::try_from(TCP_MAX_MESSAGE_BYTES + 1).unwrap_or(usize::MAX)];
+        let huge = vec![0u8; usize::try_from(DEFAULT_MAX_MESSAGE_BYTES + 1).unwrap_or(usize::MAX)];
         let result = transport_a.send(&id_b, &huge);
         assert_eq!(result, Err(TransportError::MessageTooLarge));
     }
@@ -441,5 +503,43 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The `with_config` constructor respects custom max message size.
+    #[test]
+    fn tcp_with_config_custom_max_message_bytes() {
+        let addr_a = "127.0.0.1:19060";
+        let addr_b = "127.0.0.1:19061";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        let custom_config = TcpTransportConfig {
+            max_message_bytes: 1024, // 1 KiB — very small for testing
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(30),
+        };
+
+        let mut transport_a = TcpTransport::with_config(
+            addr_a,
+            id_a.clone(),
+            vec![(id_b.clone(), addr_b.to_string())],
+            custom_config,
+        );
+        let _transport_b =
+            TcpTransport::new(addr_b, id_b.clone(), vec![(id_a.clone(), addr_a.to_string())]);
+
+        thread::sleep(Duration::from_millis(500));
+
+        // A small message (100 bytes) fits under the 1 KiB limit.
+        let small = vec![0u8; 100];
+        assert!(transport_a.send(&id_b, &small).is_ok());
+
+        // A large message (2 KiB) exceeds the 1 KiB limit.
+        let large = vec![0u8; 2048];
+        assert_eq!(transport_a.send(&id_b, &large), Err(TransportError::MessageTooLarge));
+
+        // Capabilities reflect the custom limit.
+        let caps = transport_a.capabilities();
+        assert_eq!(caps.max_message_bytes, 1024);
     }
 }

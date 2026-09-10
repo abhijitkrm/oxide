@@ -1,31 +1,42 @@
 //! oxide-validator — the validator node binary.
 //!
 //! Assembles and runs a full Oxide validator node: consensus engine +
-//! executor + modules. The engine is selected by config (default:
-//! `sequencer` for local devnet; `oxideBFT` for production).
+//! executor + modules. Configuration is loaded from (in priority
+//! order):
 //!
-//! Usage: `oxide-validator [--engine sequencer|oxideBFT]`
+//! 1. CLI flags (highest priority — overrides everything)
+//! 2. Environment variables (overrides TOML)
+//! 3. TOML config file (the base)
+//! 4. Defaults (lowest priority — built into the `Config` struct)
 //!
-//! In v0, the validator runs in-process (no networking). It submits
-//! a smoke-test transaction, finalizes a block, and reports the state
-//! root. Multi-node networking arrives in Phase 2.
+//! Usage:
+//!
+//! ```sh
+//! # Default config (sequencer, 10k mempool)
+//! oxide-validator
+//!
+//! # From a TOML config file
+//! oxide-validator --config config/devnet.toml
+//!
+//! # Override the engine via CLI flag
+//! oxide-validator --engine oxideBFT
+//!
+//! # Override the mempool size via env var
+//! OXIDE_EXECUTOR_MAX_MEMPOOL_ENTRIES=50000 oxide-validator
+//! ```
 
 use std::env;
+use std::path::PathBuf;
 
 use devnet::{ConsensusConfig, DevnetNode, NodeConfig};
 use ports::AppInterface;
 
 fn main() {
-    let engine = env::args()
-        .nth(1)
-        .and_then(|s| ConsensusConfig::parse(&s))
-        .unwrap_or(ConsensusConfig::Sequencer);
+    let config = load_config();
+    println!("oxide-validator: starting with engine = {}", config.consensus.as_str());
+    println!("oxide-validator: mempool size = {}", config.max_mempool_entries);
 
-    println!("oxide-validator: starting with engine = {}", engine.as_str());
-
-    let config = NodeConfig { consensus: engine, max_mempool_entries: 10_000 };
     let mut node = DevnetNode::assemble(&config);
-
     println!("oxide-validator: assembled stack (executor + core/bank/staking modules)");
 
     // Submit a smoke-test bank transfer.
@@ -44,6 +55,61 @@ fn main() {
     }
 
     println!("oxide-validator: smoke test complete");
+}
+
+/// Load the node configuration from CLI flags, env vars, and TOML file.
+///
+/// Priority: CLI > env vars > TOML > defaults.
+fn load_config() -> NodeConfig {
+    let mut config = config::Config::default();
+
+    // 1. Load from TOML file if --config is given.
+    let config_path = parse_cli_flag("--config");
+    if let Some(path) = config_path.clone() {
+        let path = PathBuf::from(path);
+        match config::Config::from_toml_file(&path) {
+            Ok(loaded) => config = loaded,
+            Err(e) => {
+                eprintln!("oxide-validator: failed to load config from {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // 2. Env vars are applied automatically by `from_toml_file`. For
+    //    the default config (no --config), apply env vars manually.
+    if config_path.is_none() {
+        config.apply_env_vars();
+    }
+
+    // 3. CLI flags override everything.
+    if let Some(engine_str) = parse_cli_flag("--engine") {
+        if let Some(engine) = config::ConsensusEngineKind::parse(&engine_str) {
+            config.consensus.engine = engine;
+        }
+    }
+
+    // Convert the config crate's ConsensusEngineKind to devnet's
+    // ConsensusConfig.
+    let consensus = match config.consensus.engine {
+        config::ConsensusEngineKind::Sequencer => ConsensusConfig::Sequencer,
+        config::ConsensusEngineKind::OxideBft => ConsensusConfig::OxideBft,
+    };
+
+    NodeConfig { consensus, max_mempool_entries: config.executor.max_mempool_entries }
+}
+
+/// Parse a `--flag value` pair from CLI args.
+///
+/// Returns the value if the flag is found, `None` otherwise.
+fn parse_cli_flag(flag: &str) -> Option<String> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == flag {
+            return args.next();
+        }
+    }
+    None
 }
 
 fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {

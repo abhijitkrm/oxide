@@ -12,6 +12,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Layered configuration system (TOML + env vars + CLI flags)** (2026-01-25)
+  - New `config` crate provides a layered config system matching the
+    geth/reth model: TOML file as base, env var overrides, CLI flag
+    overrides (highest priority). No more recompiling to change a
+    timeout or mempool size.
+  - **In plain words:** you can now run `oxide-validator --config
+    config/devnet.toml` instead of recompiling with different
+    hardcoded constants. Env vars (`OXIDE_NETWORK_LISTEN_ADDR`,
+    `OXIDE_CONSENSUS_BASE_TIMEOUT_MS`, etc.) override the TOML file,
+    and CLI flags (`--engine oxideBFT`) override everything. This
+    enables Docker/K8s deployments without mounting config files.
+  - Example config files: `config/devnet.toml`, `config/testnet.toml`,
+    `config/mainnet.toml`.
+  - All previously hardcoded `const` values are now configurable:
+    TCP timeouts (5s/30s), max message size (16 MiB), pacemaker
+    timeouts (2s/30s), parallel threshold (100), genesis balance,
+    base port, mempool size.
+  - New `with_config` constructors on `TcpTransport`, `Executor`,
+    `Pacemaker`, and `TcpMultiNodeDevnet`. Original constructors
+    delegate with defaults.
+  - `oxide-validator` and `oxide-fullnode` binaries load config from
+    `--config path.toml`, apply env vars, then `--engine` CLI flag.
+  - 9 new tests: 7 config crate tests, 1 TCP transport config test,
+    1 devnet `from_config` test.
+
 - **Preverified sender pipeline + TCP transport + multi-node devnet** (2026-01-25)
   - The preverified sender path is now wired through the full pipeline:
     `ingest_tx` pre-recovers senders at mempool ingestion time, caches

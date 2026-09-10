@@ -1,0 +1,51 @@
+# Oxide devnet configuration — local 4-node devnet on loopback.
+#
+# Usage: oxide-validator --config config/devnet.toml
+#
+# This is the default config for local development. It runs 4 validators
+# on 127.0.0.1 with oxideBFT consensus over TCP. All values are tuned
+# for local development, not production.
+
+[network]
+# Listen on loopback for local devnet. Production uses 0.0.0.0.
+listen_addr = "127.0.0.1:20000"
+# Peer addresses for the other 3 validators in the devnet.
+peers = [
+    "127.0.0.1:20001",
+    "127.0.0.1:20002",
+    "127.0.0.1:20003",
+]
+# Short connect timeout for fast devnet startup.
+connect_timeout_secs = 5
+# Short read timeout — devnet connections are local.
+read_timeout_secs = 30
+# 16 MiB max message size (matches broadcast erasure chunk size).
+max_message_bytes = 16777216
+
+[consensus]
+# Use oxideBFT for the devnet (real consensus, not the sequencer fallback).
+engine = "oxidebft"
+# 2s base timeout — generous for local loopback.
+base_timeout_ms = 2000
+# 30s max timeout — hard cap for backoff.
+max_timeout_ms = 30000
+# 1 MiB max block size.
+max_block_bytes = 1048576
+# 1 billion gas max block gas.
+max_block_gas = 1000000000
+
+[executor]
+# 10k mempool entries — enough for devnet throughput tests.
+max_mempool_entries = 10000
+# Use parallel execution for batches >= 100 txs.
+parallel_threshold = 100
+
+[genesis]
+# 1 trillion genesis balance per sender.
+genesis_balance = 1000000000000
+# 32 pre-funded sender addresses.
+num_prefunded_senders = 32
+# 4 validators in the devnet.
+num_validators = 4
+# Base TCP port for the devnet.
+base_port = 20000

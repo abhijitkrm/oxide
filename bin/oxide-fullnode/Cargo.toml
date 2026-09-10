@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 devnet = { workspace = true }
+config = { workspace = true }
 
 [lints]
 workspace = true

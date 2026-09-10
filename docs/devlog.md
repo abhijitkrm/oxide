@@ -4619,3 +4619,110 @@ network path.
   each validator pays the recovery cost).
 - No graceful shutdown for TCP connections.
 - No peer discovery (peers are statically configured).
+
+## Session: Layered Configuration System (TOML + env vars + CLI flags)
+
+**Goal:** Replace all hardcoded `const` values with a production-grade
+layered config system. No more recompiling to change a timeout.
+
+**Problem:** The codebase had ~15 hardcoded `const` values across 6
+crates: TCP timeouts (5s/30s), max message size (16 MiB), pacemaker
+timeouts (2s/30s), parallel threshold (100), genesis balance, base
+port, mempool size. Changing any value required recompiling. The
+existing `NodeConfig` only covered consensus engine + mempool size.
+
+**What was built:**
+
+### 1. New `config` crate (`crates/config/`)
+
+A layered config system matching the geth/reth model:
+
+- **TOML file** — the base config (reproducible, auditable)
+- **Env vars** — overrides for Docker/K8s deployments
+- **CLI flags** — overrides for ad-hoc debugging
+- **Defaults** — built into `Default` impls
+
+Priority: CLI > env vars > TOML > defaults.
+
+**Config struct:**
+
+```toml
+[network]
+listen_addr = "127.0.0.1:20000"
+peers = ["127.0.0.1:20001", ...]
+connect_timeout_secs = 5
+read_timeout_secs = 30
+max_message_bytes = 16777216
+
+[consensus]
+engine = "oxidebft"
+base_timeout_ms = 2000
+max_timeout_ms = 30000
+max_block_bytes = 1048576
+max_block_gas = 1000000000
+
+[executor]
+max_mempool_entries = 10000
+parallel_threshold = 100
+
+[genesis]
+genesis_balance = 1000000000000
+num_prefunded_senders = 32
+num_validators = 4
+base_port = 20000
+```
+
+**Env var convention:** `OXIDE_` prefix + field path with underscores:
+- `OXIDE_NETWORK_LISTEN_ADDR=0.0.0.0:9000`
+- `OXIDE_CONSENSUS_BASE_TIMEOUT_MS=1000`
+- `OXIDE_EXECUTOR_PARALLEL_THRESHOLD=200`
+
+### 2. Example config files (`config/`)
+
+- `config/devnet.toml` — local 4-node devnet on loopback
+- `config/testnet.toml` — public testnet with WAN-optimized timeouts
+- `config/mainnet.toml` — production mainnet with conservative settings
+
+### 3. Updated crates to accept config
+
+- **`p2p::tcp::TcpTransport`** — new `with_config` constructor takes
+  `TcpTransportConfig` (max message size, connect/read timeouts).
+  Original `new` delegates with defaults.
+- **`executor::Executor`** — new `with_config` constructor takes
+  mempool size + parallel threshold. Original `new` delegates with
+  defaults. `DEFAULT_PARALLEL_THRESHOLD` is now `pub`.
+- **`consensus::Pacemaker`** — new `with_config` constructor takes
+  base/max timeout. Original `new` delegates with defaults.
+- **`devnet::tcp_multinode::TcpMultiNodeDevnet`** — new `from_config`
+  constructor takes a `config::Config`. Original `new` and
+  `with_base_port` delegate with defaults.
+
+### 4. Updated binaries
+
+- **`oxide-validator`** — loads config from `--config path.toml`,
+  applies env vars, then `--engine` CLI flag overrides. Usage:
+  `oxide-validator --config config/devnet.toml`
+- **`oxide-fullnode`** — same layered config loading.
+
+### 5. Tests
+
+- 7 config crate tests: TOML round-trip, partial parse, env var
+  override, engine kind parsing, timeout helpers.
+- 1 new TCP transport test: `with_config` respects custom max
+  message size.
+- 1 new devnet test: `from_config` constructor works.
+
+### Design decision: why not just env vars?
+
+Env vars alone are insufficient for production:
+- No reproducibility (different env = different config)
+- No audit trail (env vars are ephemeral)
+- No version control (can't `git diff` an env var)
+- No documentation (TOML files are self-documenting)
+
+TOML alone is insufficient for containers:
+- Mounting config files in Docker/K8s is extra complexity
+- Env vars are the native config mechanism for containers
+
+The layered approach gives both: TOML for reproducibility, env vars
+for containers, CLI flags for debugging. This matches geth/reth.

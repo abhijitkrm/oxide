@@ -302,7 +302,11 @@ fn parse_tx_context(bytes: &[u8]) -> Option<TxContext> {
 /// rayon thread-pool overhead). Source: benchmark results showing
 /// parallel execution wins above ~100 txs due to `CacheDB` clone cost.
 /// See `modules/evm/benches/tps_rw.rs`.
-const PARALLEL_THRESHOLD: usize = 100;
+///
+/// This is the default value used when no explicit config is provided.
+/// Production code should use [`Executor::with_config`] to set this
+/// from the [`config`](::config) crate's `ExecutorConfig`.
+pub const DEFAULT_PARALLEL_THRESHOLD: usize = 100;
 
 /// Minimum tx size: sender (20) + nonce (8) + fee (8) = 36 bytes.
 const TX_MIN_SIZE: usize = 20 + 8 + 8;
@@ -336,11 +340,31 @@ pub struct Executor {
     /// re-preverify). This bounds the cache size to the mempool's
     /// capacity.
     preverify_cache: Mutex<HashMap<Hash, PreverifiedTx>>,
+    /// Minimum batch size to use the parallel speculative execution
+    /// path. Configurable via [`Executor::with_config`]. Default:
+    /// [`DEFAULT_PARALLEL_THRESHOLD`] (100 txs).
+    parallel_threshold: usize,
 }
 
 impl Executor {
     /// Construct a fresh executor with no modules and an empty mempool.
+    ///
+    /// Uses the default parallel threshold (100 txs). For custom
+    /// configuration, use [`Executor::with_config`].
     pub fn new(max_mempool_entries: usize) -> Self {
+        Self::with_config(max_mempool_entries, DEFAULT_PARALLEL_THRESHOLD)
+    }
+
+    /// Construct a fresh executor with explicit config values.
+    ///
+    /// # Arguments
+    ///
+    /// - `max_mempool_entries`: the maximum number of entries in the
+    ///   mempool.
+    /// - `parallel_threshold`: the minimum batch size to use the
+    ///   parallel speculative execution path. Below this threshold,
+    ///   serial execution is used.
+    pub fn with_config(max_mempool_entries: usize, parallel_threshold: usize) -> Self {
         Self {
             modules: BTreeMap::new(),
             mempool: Mutex::new(mempool::Mempool::new(max_mempool_entries)),
@@ -349,6 +373,7 @@ impl Executor {
             next_proposal_height: Mutex::new(0),
             events: Mutex::new(Vec::new()),
             preverify_cache: Mutex::new(HashMap::new()),
+            parallel_threshold,
         }
     }
 
@@ -444,7 +469,7 @@ impl Executor {
                 // Use the pre-verified path. For large batches, use
                 // the parallel speculative path; for small batches,
                 // serial is faster (avoids rayon overhead).
-                if group.len() >= PARALLEL_THRESHOLD {
+                if group.len() >= self.parallel_threshold {
                     module.handle_batch_parallel_preverified(&group[0].0, &preverified)
                 } else {
                     module.handle_batch_preverified(&group[0].0, &preverified)

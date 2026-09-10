@@ -21,6 +21,7 @@ types = { workspace = true }
 ports = { workspace = true }
 framework = { workspace = true }
 bank = { workspace = true }
+config = { workspace = true }
 
 [lints]
 workspace = true
