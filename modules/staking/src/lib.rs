@@ -199,7 +199,12 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn stake(&self, addr: &Address) -> u64 {
-        *self.validators.lock().unwrap().get(addr).unwrap_or(&0)
+        *self
+            .validators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(addr)
+            .unwrap_or(&0)
     }
 
     /// Get a validator's accumulated rewards.
@@ -208,7 +213,12 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn rewards(&self, addr: &Address) -> u64 {
-        *self.rewards.lock().unwrap().get(addr).unwrap_or(&0)
+        *self
+            .rewards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(addr)
+            .unwrap_or(&0)
     }
 
     /// Get the top-N validators by stake (descending).
@@ -217,7 +227,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn top_validators(&self, n: usize) -> Vec<Validator> {
-        let validators = self.validators.lock().unwrap();
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut sorted: Vec<(Address, u64)> = validators
             .iter()
             .filter(|&(_, &stake)| stake > 0)
@@ -233,7 +243,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn pending_unbonding(&self) -> Vec<UnbondingEntry> {
-        self.unbonding.lock().unwrap().clone()
+        self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// Get completed unbonding entries (for withdrawal).
@@ -242,7 +252,8 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn completed_unbonding(&self) -> Vec<UnbondingEntry> {
-        let current = *self.current_height.lock().unwrap();
+        let current =
+            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.unbonding
             .lock()
             .unwrap()
@@ -335,7 +346,8 @@ impl Module for StakingModule {
     }
 
     fn begin_block(&self, height: Height) {
-        *self.current_height.lock().unwrap() = height.value();
+        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            height.value();
     }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
@@ -353,7 +365,8 @@ impl Module for StakingModule {
     fn end_block(&self, height: Height) {
         // Process completed unbonding entries.
         let current = height.value();
-        let mut unbonding = self.unbonding.lock().unwrap();
+        let mut unbonding =
+            self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         unbonding.retain(|entry| entry.completion_height > current);
 
         // Distribute block rewards to active validators.
@@ -374,14 +387,15 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut validators = self.validators.lock().unwrap();
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stake = validators.entry(validator).or_insert(0);
         *stake = stake
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("stake overflow".to_string()))?;
 
         // Record in store for state root.
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
 
         Ok(vec![Event { module: "staking", kind: "delegate".to_string(), data: msg.to_vec() }])
@@ -400,7 +414,8 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut validators = self.validators.lock().unwrap();
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("undelegate: validator not found".to_string()))?;
@@ -410,11 +425,12 @@ impl StakingModule {
         *stake -= amount;
 
         // Record updated stake in store.
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
 
         // Add to unbonding queue.
-        let current = *self.current_height.lock().unwrap();
+        let current =
+            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let completion = current.saturating_add(self.unbonding_period);
         let entry = UnbondingEntry {
             delegator: ctx.sender,
@@ -422,7 +438,7 @@ impl StakingModule {
             amount,
             completion_height: completion,
         };
-        self.unbonding.lock().unwrap().push(entry);
+        self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(entry);
 
         Ok(vec![Event { module: "staking", kind: "undelegate".to_string(), data: msg.to_vec() }])
     }
@@ -439,7 +455,8 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut validators = self.validators.lock().unwrap();
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("slash: validator not found".to_string()))?;
@@ -447,7 +464,7 @@ impl StakingModule {
         *stake -= slash_amount;
 
         // Record updated stake in store.
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
 
         Ok(vec![Event { module: "staking", kind: "slash".to_string(), data: msg.to_vec() }])
@@ -469,7 +486,7 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut rewards = self.rewards.lock().unwrap();
+        let mut rewards = self.rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let accumulated = rewards.get(&validator).copied().unwrap_or(0);
         let claim_amount = if amount == 0 { accumulated } else { amount.min(accumulated) };
         if claim_amount == 0 {
@@ -492,13 +509,13 @@ impl StakingModule {
     /// it stays in the "mint" (effectively burned). This is simpler
     /// than tracking a fractional remainder and is deterministic.
     fn distribute_rewards(&self) {
-        let validators = self.validators.lock().unwrap();
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let total_stake: u64 = validators.values().copied().filter(|&s| s > 0).sum();
         if total_stake == 0 {
             return; // no active validators — no distribution
         }
 
-        let mut rewards = self.rewards.lock().unwrap();
+        let mut rewards = self.rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (&addr, &stake) in validators.iter() {
             if stake == 0 {
                 continue;

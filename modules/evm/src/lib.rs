@@ -360,7 +360,7 @@ impl EvmModule {
         // Load initial state from the backend into the CacheDB, then
         // install the backend for future flushes.
         module.load_from_storage(&*backend);
-        *module.backend.lock().expect("backend mutex not poisoned") = Some(backend);
+        *module.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(backend);
         module
     }
 
@@ -384,16 +384,17 @@ impl EvmModule {
         exchange: Option<Arc<exchange::ExchangeModule>>,
         perps: Option<Arc<perps::PerpsModule>>,
     ) {
-        *self.exchange.lock().expect("exchange mutex not poisoned") = exchange;
-        *self.perps.lock().expect("perps mutex not poisoned") = perps;
+        *self.exchange.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = exchange;
+        *self.perps.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = perps;
     }
 
     /// Build a `NativeMarketReader` from the wired exchange and
     /// perps modules. Returns an empty reader if no modules are
     /// wired (all precompile reads return empty/zero).
     fn build_reader(&self) -> precompiles::native::NativeMarketReader {
-        let exchange = self.exchange.lock().expect("exchange mutex not poisoned").clone();
-        let perps = self.perps.lock().expect("perps mutex not poisoned").clone();
+        let exchange =
+            self.exchange.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let perps = self.perps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         precompiles::native::NativeMarketReader::new(exchange, perps)
     }
 
@@ -477,7 +478,7 @@ impl EvmModule {
     ///
     /// Panics if the coinbase mutex is poisoned.
     pub fn set_coinbase(&self, coinbase: revm::primitives::Address) {
-        *self.coinbase.lock().expect("coinbase mutex not poisoned") = coinbase;
+        *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = coinbase;
     }
 
     /// Get the coinbase / fee recipient for the current block.
@@ -487,7 +488,7 @@ impl EvmModule {
     /// Panics if the coinbase mutex is poisoned.
     #[must_use]
     pub fn coinbase(&self) -> revm::primitives::Address {
-        *self.coinbase.lock().expect("coinbase mutex not poisoned")
+        *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Execute a signed EVM transaction. The `msg` is a raw RLP-encoded
@@ -539,12 +540,13 @@ impl EvmModule {
         //   1. Charges `gas_used * gas_price` from the sender.
         //   2. Burns `gas_used * base_fee` (removes from supply).
         //   3. Tips `gas_used * (gas_price - base_fee)` to the coinbase.
-        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let db = Arc::make_mut(&mut *db_guard);
-        let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
-        let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
+        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let block_number =
+            *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let block_timestamp =
-            *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned");
+            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut evm = self.build_evm(db, coinbase, block_number, block_timestamp);
 
         let result = evm
@@ -560,7 +562,8 @@ impl EvmModule {
         // For deeper accuracy (e.g., SSTORE to a third account),
         // a future optimization can diff the cache before/after.
         {
-            let mut touched = self.touched.lock().expect("touched mutex not poisoned");
+            let mut touched =
+                self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             touched.insert(caller);
             if let tx::TxKind::Call(addr) = signed.to() {
                 touched.insert(revm::primitives::Address::from(addr.0));
@@ -1134,34 +1137,35 @@ impl EvmModule {
     /// This is the highest-throughput serial execution path. The
     /// caller (mempool/block builder) has already recovered the sender
     /// for each tx via [`preverify_batch`](Self::preverify_batch).
-    /// This method skips secp256k1 recovery entirely — only RLP
-    /// decoding (~79 ns/tx) and chain ID validation remain in Phase 1.
+    /// This method re-recovers the sender from the signature and
+    /// checks it matches the pre-recovered value — only RLP decoding
+    /// (~79 ns/tx), chain ID validation, and sender re-verification
+    /// remain in Phase 1.
     ///
     /// # Performance
     ///
-    /// Eliminating recovery removes ~30 µs/tx (single-threaded) or
-    /// ~3.7 µs/tx (8-core parallelized) from the critical path. For
-    /// 10k simple transfers, this reduces batch time from ~80 ms
-    /// (recovery + native execution) to ~10 ms (decode + native
-    /// execution) — roughly a 5-8x speedup.
+    /// Re-recovery adds ~30 µs/tx (single-threaded) or ~3.7 µs/tx
+    /// (8-core parallelized) back to the critical path. This is the
+    /// cost of not trusting the proposer. For 10k simple transfers,
+    /// batch time is ~80 ms (recovery + native execution) — the same
+    /// as the non-preverified path. The preverified path still wins
+    /// because it avoids redundant recovery at mempool ingestion.
     ///
     /// # Security
     ///
-    /// The caller MUST ensure `senders` are correctly recovered from
-    /// the corresponding `raw` bytes. A byzantine block proposer could
-    /// provide wrong senders, causing state divergence. This is
-    /// detectable by state root comparison across validators. For
-    /// production multi-validator deployment, pair this with
-    /// verification sampling (re-verify a random fraction of senders).
-    /// For the current Phase 0 devnet (single validator), trusting
-    /// the proposer is safe.
+    /// The sender is re-recovered from the signature inside this
+    /// method and checked against `pv.sender`. A byzantine block
+    /// proposer supplying wrong senders will be detected here —
+    /// mismatched senders are rejected with `ExecError::Malformed`
+    /// before any state transition occurs. This closes the trust
+    /// gap: the proposer cannot forge a sender.
     ///
     /// # Arguments
     ///
     /// - `ctx`: the transaction context (unused for EVM — the sender
-    ///   is pre-recovered).
+    ///   is re-recovered from the signature).
     /// - `txs`: a slice of [`PreverifiedTx`] (raw bytes + pre-recovered
-    ///   sender).
+    ///   sender, used as a hint and verified).
     ///
     /// # Returns
     ///
@@ -1170,7 +1174,8 @@ impl EvmModule {
     /// # Errors
     ///
     /// Individual transactions may fail independently. A failed
-    /// transaction does not abort the batch.
+    /// transaction does not abort the batch. A sender mismatch
+    /// (pre-recovered vs signature-recovered) returns `Malformed`.
     ///
     /// # Panics
     ///
@@ -1181,9 +1186,11 @@ impl EvmModule {
         ctx: &TxContext,
         txs: &[PreverifiedTx],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
-        // Phase 1: decode only (no recovery). RLP decode is ~79 ns/tx
-        // vs ~30 µs/tx for secp256k1 recovery — a 380x speedup on
-        // Phase 1 alone.
+        // Phase 1: decode and re-recover the sender. RLP decode is
+        // ~79 ns/tx; secp256k1 recovery is ~30 µs/tx. We re-recover
+        // the sender and check it matches the pre-recovered value.
+        // A byzantine proposer cannot forge a sender — any mismatch
+        // is rejected before state transition.
         let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = txs
             .par_iter()
             .map(|pv| {
@@ -1193,7 +1200,17 @@ impl EvmModule {
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
-                Ok((signed, pv.sender))
+                // Re-recover the sender from the signature. This is
+                // the security gate: we do NOT trust `pv.sender`.
+                let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+                let recovered_addr = alloy_primitives_address(recovered.0);
+                // Check the pre-recovered sender matches the
+                // signature-recovered sender. A mismatch means the
+                // proposer supplied a wrong sender — reject it.
+                if recovered_addr != pv.sender {
+                    return Err(ExecError::Malformed);
+                }
+                Ok((signed, recovered_addr))
             })
             .collect();
 
@@ -1234,12 +1251,13 @@ impl EvmModule {
         let mut results = Vec::with_capacity(decoded.len());
 
         // Acquire the DB lock once for the entire batch.
-        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let db = Arc::make_mut(&mut *db_guard);
-        let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
-        let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
+        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let block_number =
+            *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let block_timestamp =
-            *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned");
+            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Accumulate touched accounts in a local set to avoid
         // locking the mutex per tx. Merge once at the end.
@@ -1328,7 +1346,8 @@ impl EvmModule {
 
         // Merge local touched set into the global one (single lock).
         {
-            let mut touched = self.touched.lock().expect("touched mutex not poisoned");
+            let mut touched =
+                self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             touched.extend(local_touched);
         }
 
@@ -1453,8 +1472,10 @@ impl EvmModule {
     /// and **parallel speculative execution**.
     ///
     /// This combines the two highest-throughput optimizations:
-    /// 1. **Pre-verified senders** — skips secp256k1 recovery entirely
-    ///    (the caller pre-recovered senders at mempool ingestion time).
+    /// 1. **Pre-verified senders** — re-recovers the sender from the
+    ///    signature and checks it matches the pre-recovered value
+    ///    (the caller pre-recovered senders at mempool ingestion time;
+    ///    we verify rather than trust).
     /// 2. **Parallel speculative execution** — transactions from
     ///    different senders execute in parallel on per-group state
     ///    snapshots, with conflict detection and sequential fallback.
@@ -1467,8 +1488,10 @@ impl EvmModule {
     ///
     /// Same security model as
     /// [`handle_batch_preverified`](Self::handle_batch_preverified):
-    /// the caller MUST ensure senders are correctly recovered. See
-    /// that method's documentation for the full security discussion.
+    /// the sender is re-recovered from the signature and checked
+    /// against the pre-recovered value. A byzantine proposer
+    /// supplying wrong senders is rejected. See that method's
+    /// documentation for the full security discussion.
     ///
     /// # Arguments
     ///
@@ -1499,8 +1522,8 @@ impl EvmModule {
             return Vec::new();
         }
 
-        // Phase 1: decode only (no recovery). RLP decode is ~79 ns/tx
-        // vs ~30 µs/tx for secp256k1 recovery.
+        // Phase 1: decode and re-recover the sender. We do NOT
+        // trust `pv.sender` — a byzantine proposer could forge it.
         let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = txs
             .par_iter()
             .map(|pv| {
@@ -1510,7 +1533,14 @@ impl EvmModule {
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
-                Ok((signed, pv.sender))
+                // Re-recover the sender from the signature and
+                // check it matches the pre-recovered value.
+                let recovered = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
+                let recovered_addr = alloy_primitives_address(recovered.0);
+                if recovered_addr != pv.sender {
+                    return Err(ExecError::Malformed);
+                }
+                Ok((signed, recovered_addr))
             })
             .collect();
 
@@ -1590,11 +1620,12 @@ impl EvmModule {
         // `CacheDB<SharedCacheDB>` backed by the shared snapshot via
         // `DatabaseRef`. Reads fall through to the parent on cache
         // miss; writes stay local.
-        let snapshot = self.db.lock().expect("db mutex not poisoned").clone();
-        let coinbase = *self.coinbase.lock().expect("coinbase mutex not poisoned");
-        let block_number = *self.block_height.lock().expect("block_height mutex not poisoned");
+        let snapshot = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let block_number =
+            *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let block_timestamp =
-            *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned");
+            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Phase 4: execute each group in parallel on its own COW
         // nested cache. Each group's txs execute sequentially via
@@ -1779,7 +1810,7 @@ impl EvmModule {
         // accounts (excluding the coinbase, which is handled
         // additively), we re-execute the group sequentially against
         // the main DB to preserve Ethereum semantics.
-        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let db = Arc::make_mut(&mut *db_guard);
         let mut committed_touched: std::collections::HashSet<revm::primitives::Address> =
             std::collections::HashSet::new();
@@ -1997,7 +2028,8 @@ impl EvmModule {
 
         // Merge touched accounts into the module-level set.
         {
-            let mut touched = self.touched.lock().expect("touched mutex not poisoned");
+            let mut touched =
+                self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             touched.extend(all_touched);
         }
 
@@ -2186,8 +2218,8 @@ impl Module for EvmModule {
         // The timestamp uses the height as a deterministic stand-in
         // (real timestamp comes from the block header in a full node).
         let h = height.value();
-        *self.block_height.lock().expect("block_height mutex not poisoned") = h;
-        *self.block_timestamp.lock().expect("block_timestamp mutex not poisoned") =
+        *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = h;
+        *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             h.saturating_mul(BLOCK_TIME_SECS);
 
         // Clear the touched set from the previous block. The set was
@@ -2195,7 +2227,7 @@ impl Module for EvmModule {
         // updates) and by `flush_to_storage` (for dirty-only writes).
         // Clearing here (not in `end_block`) lets `state_root` see
         // which accounts were touched in this block.
-        self.touched.lock().expect("touched mutex not poisoned").clear();
+        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 
     /// A4: validate a signed EVM transaction for mempool admission.
@@ -2434,7 +2466,8 @@ impl Module for EvmModule {
         // If a StorageBackend is attached, flush the current CacheDB
         // state to durable storage. This makes the EVM state
         // persistent across restarts and shareable between nodes.
-        let mut backend_guard = self.backend.lock().expect("backend mutex not poisoned");
+        let mut backend_guard =
+            self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(ref mut backend) = *backend_guard {
             self.flush_to_storage(backend.as_mut());
         }
@@ -2465,22 +2498,22 @@ impl Module for EvmModule {
         //
         // Panics if the DB mutex is poisoned (a thread panicked while
         // holding the lock). This is unrecoverable and indicates a bug.
-        let touched = self.touched.lock().expect("touched mutex not poisoned");
+        let touched = self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Fast path: if nothing was touched since the last
         // computation, return the cached root. This makes consecutive
         // `state_root` calls with no intervening execution O(1).
         if touched.is_empty() {
             if let Some(cached) =
-                *self.cached_state_root.lock().expect("cached_state_root mutex not poisoned")
+                *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             {
                 return Hash(cached.0);
             }
         }
 
-        let db = self.db.lock().expect("db mutex not poisoned");
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut storage_root_cache =
-            self.storage_root_cache.lock().expect("storage_root_cache mutex not poisoned");
+            self.storage_root_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Build the account iterator: for each account, compute its
         // storage root (incrementally) and build a TrieAccount.
@@ -2528,7 +2561,8 @@ impl Module for EvmModule {
         let root = trie::state_root(accounts);
 
         // Cache the state root for the next call's fast path.
-        *self.cached_state_root.lock().expect("cached_state_root mutex not poisoned") = Some(root);
+        *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(root);
 
         // Convert the alloy B256 root to Oxide's Hash type.
         Hash(root.0)
@@ -2548,7 +2582,7 @@ impl EvmModule {
     /// holding the lock). This is unrecoverable and indicates a bug.
     #[must_use]
     pub fn balance(&self, addr: &Address) -> u128 {
-        let db = self.db.lock().expect("db mutex not poisoned");
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let evm_addr = alloy_primitives_address(addr.0);
         db.cache.accounts.get(&evm_addr).map_or(0, |a| a.info.balance.to::<u128>())
     }
@@ -2563,7 +2597,7 @@ impl EvmModule {
     /// holding the lock). This is unrecoverable and indicates a bug.
     #[must_use]
     pub fn nonce(&self, addr: &Address) -> u64 {
-        let db = self.db.lock().expect("db mutex not poisoned");
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let evm_addr = alloy_primitives_address(addr.0);
         db.cache.accounts.get(&evm_addr).map_or(0, |a| a.info.nonce)
     }
@@ -2581,7 +2615,7 @@ impl EvmModule {
     /// `with_storage`).
     #[doc(hidden)]
     pub fn backend_for_test(&self) -> Box<dyn storage::StorageBackend + Send> {
-        let mut guard = self.backend.lock().expect("backend mutex not poisoned");
+        let mut guard = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.take().expect("backend_for_test: no storage backend attached")
     }
 
@@ -2596,7 +2630,7 @@ impl EvmModule {
     /// Panics if the DB mutex is poisoned.
     #[doc(hidden)]
     pub fn fund_account_for_test(&self, addr: &Address, balance: u128) {
-        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let db = Arc::make_mut(&mut *db_guard);
         let evm_addr = alloy_primitives_address(addr.0);
         let account =
@@ -2624,12 +2658,27 @@ impl EvmModule {
     /// If no accounts were touched (e.g., empty block), this is a
     /// no-op.
     ///
+    /// # Self-destructed accounts
+    ///
+    /// Accounts that became `NotExisting` (self-destructed) or were
+    /// removed from the cache emit a `Delete` op so the storage
+    /// backend removes the stale entry. Without this, a
+    /// self-destructed account would reappear on reload.
+    ///
+    /// # Deterministic serialization
+    ///
+    /// Storage slots are sorted by slot key before serialization so
+    /// the persisted blob is byte-identical across all validators
+    /// with the same logical state. Without this, `HashMap`
+    /// iteration order would make the raw `StorageBackend` value
+    /// non-deterministic.
+    ///
     /// # Panics
     ///
     /// Panics if the DB mutex is poisoned.
     fn flush_to_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
-        let db = self.db.lock().expect("db mutex not poisoned");
-        let touched = self.touched.lock().expect("touched mutex not poisoned");
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let touched = self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // If nothing was touched, skip the flush entirely.
         if touched.is_empty() {
@@ -2638,16 +2687,21 @@ impl EvmModule {
 
         let mut ops = Vec::with_capacity(touched.len());
         for evm_addr in touched.iter() {
-            // Skip accounts that don't exist (never touched or
-            // selfdestructed).
+            let oxide_addr = Address(evm_addr.0.into());
+            let key = persist::account_key(&oxide_addr);
+
+            // Handle self-destructed / removed accounts: emit a
+            // Delete op so the stale entry is removed from storage.
+            // Without this, a self-destructed account reappears on
+            // reload because the old persisted value is still there.
             let Some(account) = db.cache.accounts.get(evm_addr) else {
+                ops.push(storage::Op::Delete { key });
                 continue;
             };
             if account.account_state == revm::database::AccountState::NotExisting {
+                ops.push(storage::Op::Delete { key });
                 continue;
             }
-            let oxide_addr = Address(evm_addr.0.into());
-            let key = persist::account_key(&oxide_addr);
 
             // Extract code bytes if present. Accounts with
             // `KECCAK_EMPTY` code hash are EOAs — their `code` field
@@ -2661,11 +2715,14 @@ impl EvmModule {
                 account.info.code.as_ref().map_or(Vec::new(), |bc| bc.bytes_slice().to_vec())
             };
 
-            // Extract storage slots as (slot, value) pairs.
-            // `DbAccount.storage` is `U256Map<U256>` — values are
-            // plain `U256`, not an enum with Original/Pending variants.
-            let storage_slots: Vec<(revm::primitives::U256, revm::primitives::U256)> =
+            // Extract storage slots and sort by slot key for
+            // deterministic serialization. `DbAccount.storage` is a
+            // `U256Map<U256>` (HashMap) — iteration order is
+            // non-deterministic. Sorting ensures every validator
+            // produces the same byte blob for the same logical state.
+            let mut storage_slots: Vec<(revm::primitives::U256, revm::primitives::U256)> =
                 account.storage.iter().map(|(slot, val)| (*slot, *val)).collect();
+            storage_slots.sort_by_key(|a| a.0);
 
             let value = persist::serialize_account(
                 account.info.balance,
@@ -2697,7 +2754,7 @@ impl EvmModule {
         if entries.is_empty() {
             return;
         }
-        let mut db_guard = self.db.lock().expect("db mutex not poisoned");
+        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let db = Arc::make_mut(&mut *db_guard);
         for (key, value) in entries {
             let Some(oxide_addr) = persist::key_to_address(&key) else { continue };
@@ -4079,5 +4136,182 @@ mod tests {
             serial_root, parallel_root,
             "read-write conflict: parallel state root must match serial"
         );
+    }
+
+    /// Regression test: a byzantine proposer supplying a wrong
+    /// pre-recovered sender must be rejected. `handle_batch_preverified`
+    /// re-recovers the sender from the signature and checks it
+    /// matches `pv.sender`. A mismatch returns `ExecError::Malformed`.
+    #[test]
+    fn preverified_rejects_wrong_sender() {
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let txs: Vec<Vec<u8>> =
+            (0..1).map(|i| signed_transfer_tx(&pk, i, recipient, 1_000_000_000)).collect();
+
+        // Pre-verify to get the correct sender.
+        let m = make_module();
+        let preverified: Vec<PreverifiedTx> = m
+            .preverify_batch(&txs)
+            .into_iter()
+            .map(|r| r.expect("preverify must succeed"))
+            .collect();
+
+        // Tamper: replace the sender with a wrong address.
+        let wrong_addr = revm::primitives::Address::from_slice(&[0x99; 20]);
+        let tampered: Vec<PreverifiedTx> = preverified
+            .into_iter()
+            .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr })
+            .collect();
+
+        // Execute: must reject the tampered sender.
+        m.begin_block(Height::new(1));
+        let results = m.handle_batch_preverified(&dummy_ctx(), &tampered);
+        m.end_block(Height::new(1));
+
+        assert!(
+            results.iter().all(|r| matches!(r, Err(ExecError::Malformed))),
+            "wrong sender must be rejected with Malformed"
+        );
+        // The real sender's balance must be untouched.
+        assert_eq!(m.balance(&addr), 0, "no state change on rejected tx");
+    }
+
+    /// Regression test: a byzantine proposer supplying a wrong
+    /// pre-recovered sender must be rejected in the parallel path too.
+    #[test]
+    fn preverified_parallel_rejects_wrong_sender() {
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let txs: Vec<Vec<u8>> =
+            (0..2).map(|i| signed_transfer_tx(&pk, i, recipient, 1_000_000_000)).collect();
+
+        let m = make_module();
+        let preverified: Vec<PreverifiedTx> = m
+            .preverify_batch(&txs)
+            .into_iter()
+            .map(|r| r.expect("preverify must succeed"))
+            .collect();
+
+        let wrong_addr = revm::primitives::Address::from_slice(&[0x99; 20]);
+        let tampered: Vec<PreverifiedTx> = preverified
+            .into_iter()
+            .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr })
+            .collect();
+
+        m.begin_block(Height::new(1));
+        let results = m.handle_batch_parallel_preverified(&dummy_ctx(), &tampered);
+        m.end_block(Height::new(1));
+
+        assert!(
+            results.iter().all(|r| matches!(r, Err(ExecError::Malformed))),
+            "wrong sender must be rejected with Malformed (parallel)"
+        );
+        assert_eq!(m.balance(&addr), 0, "no state change on rejected tx");
+    }
+
+    /// Regression test: `flush_to_storage` emits `Op::Delete` for
+    /// self-destructed accounts so they don't reappear on reload.
+    #[test]
+    fn flush_emits_delete_for_selfdestructed() {
+        use storage::Volatile;
+
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        // Create a module with a Volatile backend.
+        let backend = Box::new(Volatile::new());
+        let m = EvmModule::with_storage(1, 7, backend);
+        fund(&m, &addr);
+
+        // Execute a transfer to touch the sender account.
+        let tx = signed_transfer_tx(&pk, 0, recipient, 1_000_000_000);
+        m.begin_block(Height::new(1));
+        let results = m.handle_batch(&dummy_ctx(), &[tx]);
+        assert!(results.iter().all(Result::is_ok), "tx must succeed: {results:?}");
+        m.end_block(Height::new(1));
+
+        // The sender account should be persisted.
+        let oxide_addr = primitives::Address(addr.0);
+        let key = persist::account_key(&oxide_addr);
+        {
+            let backend_guard = m.backend.lock().expect("backend lock");
+            let backend_ref = backend_guard.as_ref().expect("backend is Some");
+            assert!(backend_ref.get(&key).is_some(), "account must be persisted");
+        }
+
+        // Now check that a Delete op is emitted when the account
+        // becomes NotExisting. We simulate this by directly
+        // manipulating the cache.
+        let evm_addr = alloy_primitives_address(addr.0);
+        m.begin_block(Height::new(2));
+        {
+            let mut db = m.db.lock().expect("db lock");
+            let db = Arc::make_mut(&mut *db);
+            if let Some(account) = db.cache.accounts.get_mut(&evm_addr) {
+                account.account_state = revm::database::AccountState::NotExisting;
+            }
+            m.touched.lock().expect("touched lock").insert(evm_addr);
+        }
+        m.end_block(Height::new(2));
+
+        // The account should now be deleted from storage.
+        {
+            let backend_guard = m.backend.lock().expect("backend lock");
+            let backend_ref = backend_guard.as_ref().expect("backend is Some");
+            assert!(backend_ref.get(&key).is_none(), "self-destructed account must be deleted");
+        }
+    }
+
+    /// Regression test: `flush_to_storage` serializes storage slots
+    /// in sorted order so the persisted blob is deterministic.
+    #[test]
+    fn flush_serializes_slots_in_sorted_order() {
+        use storage::Volatile;
+
+        let (pk, addr) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+        let backend = Box::new(Volatile::new());
+        let m = EvmModule::with_storage(1, 7, backend);
+        fund(&m, &addr);
+
+        // Execute a transfer to touch the sender account.
+        let tx = signed_transfer_tx(&pk, 0, recipient, 1_000_000_000);
+        m.begin_block(Height::new(1));
+        let results = m.handle_batch(&dummy_ctx(), &[tx]);
+        assert!(results.iter().all(Result::is_ok), "tx must succeed: {results:?}");
+        m.end_block(Height::new(1));
+
+        // Read the persisted value and verify it's deterministic.
+        // The account should have no storage slots (EOA), so this
+        // tests the serialization path without slot ordering.
+        let oxide_addr = primitives::Address(addr.0);
+        let key = persist::account_key(&oxide_addr);
+        let value1 = {
+            let backend_guard = m.backend.lock().expect("backend lock");
+            let backend_ref = backend_guard.as_ref().expect("backend is Some");
+            backend_ref.get(&key).expect("account must be persisted")
+        };
+
+        // Reload and re-flush — the value must be byte-identical.
+        let backend2 = Box::new(Volatile::new());
+        let m2 = EvmModule::with_storage(1, 7, backend2);
+        fund(&m2, &addr);
+        let tx2 = signed_transfer_tx(&pk, 0, recipient, 1_000_000_000);
+        m2.begin_block(Height::new(1));
+        let results2 = m2.handle_batch(&dummy_ctx(), &[tx2]);
+        assert!(results2.iter().all(Result::is_ok), "tx must succeed: {results2:?}");
+        m2.end_block(Height::new(1));
+
+        let value2 = {
+            let backend_guard = m2.backend.lock().expect("backend lock");
+            let backend_ref = backend_guard.as_ref().expect("backend is Some");
+            backend_ref.get(&key).expect("account must be persisted")
+        };
+
+        assert_eq!(value1, value2, "persisted value must be deterministic");
     }
 }

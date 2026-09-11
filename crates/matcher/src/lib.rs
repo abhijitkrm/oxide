@@ -66,20 +66,25 @@
 pub mod balance;
 pub mod fix;
 pub mod jsonrpc;
+pub mod market_data;
 pub mod protocol;
 pub mod ring;
+pub mod risk;
 pub mod server;
 pub mod ws;
 
 pub use balance::{BalanceCache, DEFAULT_SHARD_COUNT, ShardedBalanceCache};
-pub use protocol::{OrderRequest, OrderResponse, RejectReason};
-pub use ring::{SpscReceiver, SpscSender, spsc_ring};
+pub use protocol::{
+    ActionRequest, ActionType, OrderAction, OrderRequest, OrderResponse, RejectReason,
+};
+pub use ring::{SpscReceiver, SpscSender, Wakeup, spsc_ring, spsc_ring_with_wakeup};
+pub use risk::{RiskConfig, RiskDecision, RiskEngine};
 
 use primitives::fixed::{Price, Qty};
 use std::sync::Arc;
 use trading::{
     DenseBook, FillEvent, MarketConfig, MatchingEngine, NewOrder, OrderOutcome, OrderType, Side,
-    StpMode,
+    StpMode, TimeInForce,
 };
 
 /// The price scale divisor: notional = price * qty / `PRICE_SCALE`.
@@ -110,6 +115,8 @@ pub struct MatchingServer {
     engine: MatchingEngine,
     /// The balance cache — fast `HashMap`, 1M+ accounts.
     balances: BalanceCache,
+    /// Pre-trade risk engine (rate limits, fat-finger, size caps).
+    risk: RiskEngine,
     /// Reusable fill buffer — zero alloc after the first order.
     fills: Vec<FillEvent>,
     /// Total orders processed.
@@ -120,6 +127,8 @@ pub struct MatchingServer {
     balance_rejections: u64,
     /// Total orders rejected by engine.
     engine_rejections: u64,
+    /// Total orders rejected by the risk engine.
+    risk_rejections: u64,
     /// The pending settlement batch.
     settlement_batch: Vec<SettledFill>,
 }
@@ -138,12 +147,43 @@ impl MatchingServer {
         Self {
             engine,
             balances: BalanceCache::with_capacity(balance_capacity),
+            risk: RiskEngine::with_defaults(),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
             engine_rejections: 0,
+            risk_rejections: 0,
+        }
+    }
+
+    /// Create a new matching server with a custom risk-engine
+    /// configuration. Use this when you need non-default rate
+    /// limits, size caps, or price bands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the matching engine or order book cannot be created
+    /// from the given config.
+    pub fn with_risk_config(
+        cfg: MarketConfig,
+        balance_capacity: usize,
+        risk_config: RiskConfig,
+    ) -> Self {
+        let engine = MatchingEngine::new(cfg, DenseBook::new(cfg).expect("book creation"))
+            .expect("engine creation");
+        Self {
+            engine,
+            balances: BalanceCache::with_capacity(balance_capacity),
+            risk: RiskEngine::new(risk_config),
+            fills: Vec::with_capacity(64),
+            settlement_batch: Vec::with_capacity(10_000),
+            orders_processed: 0,
+            fills_produced: 0,
+            balance_rejections: 0,
+            engine_rejections: 0,
+            risk_rejections: 0,
         }
     }
 
@@ -159,13 +199,32 @@ impl MatchingServer {
     }
 
     /// Submit an order for matching. Performs:
-    /// 1. Balance check (buy orders only).
-    /// 2. Matching via `MatchingEngine::place`.
-    /// 3. Settlement (update balance cache, accumulate fills).
+    /// 1. Risk-engine checks (rate limit, size cap, price band, resting cap).
+    /// 2. Balance check (buy orders only).
+    /// 3. Matching via `MatchingEngine::place`.
+    /// 4. Settlement (update balance cache, accumulate fills).
     ///
     /// Returns the order response (filled, resting, or rejected).
     pub fn submit_order(&mut self, req: &OrderRequest) -> OrderResponse {
         self.orders_processed += 1;
+
+        // ── Risk-engine checks ───────────────────────────────────
+        // Run before the balance check so we reject spam and
+        // fat-finger orders without reserving any balance. The
+        // timestamp is derived from the order count (deterministic
+        // for testing); in production, the caller would pass a
+        // real timestamp. The mid-price comes from the engine's
+        // best bid/ask.
+        let mid = match (self.engine.best_bid(), self.engine.best_ask()) {
+            (Some((bid, _)), Some((ask, _))) => u64::midpoint(bid.0, ask.0),
+            _ => 0, // no mid available — skip price-band check
+        };
+        let now_ms = self.orders_processed; // deterministic stand-in
+        let decision = self.risk.check(&req.owner, now_ms, req.price.0, req.qty.0, mid);
+        if let RiskDecision::Reject(reason) = decision {
+            self.risk_rejections += 1;
+            return OrderResponse::rejected(reason);
+        }
 
         // ── Balance check (buy orders only) ─────────────────────
         // Buy orders pay `price * qty / PRICE_SCALE` in quote.
@@ -251,12 +310,20 @@ impl MatchingServer {
         let fills_count = u32::try_from(self.fills.len()).unwrap_or(u32::MAX);
         match outcome {
             OrderOutcome::Filled => OrderResponse::filled(fills_count),
-            OrderOutcome::Resting { order_id, .. } => OrderResponse::resting(order_id, fills_count),
+            OrderOutcome::Resting { order_id, .. } => {
+                // Track the new resting order for the resting-cap
+                // risk check.
+                self.risk.inc_resting(&req.owner);
+                OrderResponse::resting(order_id, fills_count)
+            }
             OrderOutcome::Killed => {
                 // FOK killed — already credited back above.
                 OrderResponse::rejected(RejectReason::Killed)
             }
             OrderOutcome::CanceledRemainder { order_id, .. } => {
+                // Partial fill + resting remainder: the remainder
+                // is a new resting order.
+                self.risk.inc_resting(&req.owner);
                 OrderResponse::resting(order_id, fills_count)
             }
             OrderOutcome::Rejected(_) => {
@@ -264,6 +331,162 @@ impl MatchingServer {
                 OrderResponse::rejected(RejectReason::EngineRejected)
             }
         }
+    }
+
+    /// Submit an order action (cancel, amend, or replace) for
+    /// processing. This is the entry point for all order-management
+    /// operations beyond new-order submission.
+    ///
+    /// # Cancel
+    ///
+    /// Cancels a resting order by id. The `owner` must match the
+    /// resting order's owner (authorization). On success, returns
+    /// `filled(0)`. On failure (order not found or owner mismatch),
+    /// returns `rejected(OrderNotFound)`. For buy orders, the
+    /// reserved balance is refunded.
+    ///
+    /// # Amend
+    ///
+    /// Cancels the resting order and re-submits with the new price
+    /// and/or quantity. The side is preserved from the original order;
+    /// the re-submission uses Limit/GTC (resting orders are always
+    /// GTC). If the cancel succeeds but the re-submit fails (e.g.
+    /// insufficient balance at the new price), the original order is
+    /// already canceled — this is the documented cancel-then-resubmit
+    /// semantics. Returns the re-submission's response.
+    ///
+    /// # Replace
+    ///
+    /// Cancels the resting order and submits a brand-new order
+    /// atomically. If the cancel fails, the new order is not
+    /// submitted. Returns the new order's response (or the cancel
+    /// rejection).
+    pub fn submit_action(&mut self, action: &OrderAction) -> OrderResponse {
+        self.orders_processed += 1;
+        match action {
+            OrderAction::Cancel { order_id, owner } => self.cancel_order(*order_id, *owner),
+            OrderAction::Amend { order_id, owner, new_price, new_qty } => {
+                self.amend_order(*order_id, *owner, *new_price, *new_qty)
+            }
+            OrderAction::Replace { order_id, owner, new_order } => {
+                self.replace_order(*order_id, *owner, new_order)
+            }
+        }
+    }
+
+    /// Cancel a resting order by id, checking ownership and refunding
+    /// any reserved balance for buy orders.
+    fn cancel_order(&mut self, order_id: u64, owner: primitives::Address) -> OrderResponse {
+        // Authorization: verify the order exists and the requester
+        // owns it. This must happen BEFORE the cancel so an
+        // unauthorized requester cannot remove another account's
+        // order.
+        match self.engine.order_owner(trading::OrderId(order_id)) {
+            Some(real_owner) if real_owner == owner => {}
+            _ => {
+                self.engine_rejections += 1;
+                return OrderResponse::rejected(RejectReason::OrderNotFound);
+            }
+        }
+        let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::OrderNotFound);
+        };
+        // Decrement the resting-order counter for this account.
+        self.risk.dec_resting(&canceled.owner);
+        // Refund the reserved balance for buy orders. The canceled
+        // order's `qty` is the remaining (unfilled) quantity; the
+        // reserved notional was `price * qty / PRICE_SCALE`.
+        if canceled.side == Side::Buy {
+            let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
+            let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
+            self.balances.credit(&canceled.owner, refund);
+        }
+        OrderResponse::filled(0)
+    }
+
+    /// Amend a resting order: cancel + re-submit with new price/qty.
+    fn amend_order(
+        &mut self,
+        order_id: u64,
+        owner: primitives::Address,
+        new_price: Price,
+        new_qty: Qty,
+    ) -> OrderResponse {
+        // Authorization + cancel.
+        match self.engine.order_owner(trading::OrderId(order_id)) {
+            Some(real_owner) if real_owner == owner => {}
+            _ => {
+                self.engine_rejections += 1;
+                return OrderResponse::rejected(RejectReason::OrderNotFound);
+            }
+        }
+        let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::OrderNotFound);
+        };
+        // Decrement resting count for the canceled order.
+        self.risk.dec_resting(&canceled.owner);
+        // Refund the reserved balance for buy orders (the cancel side).
+        if canceled.side == Side::Buy {
+            let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
+            let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
+            self.balances.credit(&canceled.owner, refund);
+        }
+        // Re-submit with the new price/qty, preserving the original
+        // side. Resting orders are always GTC; use Limit/GTC for the
+        // re-submission (a PostOnly order that would cross is rejected
+        // by the engine, which is acceptable amend behavior).
+        let req = OrderRequest {
+            market: 0,
+            side: canceled.side,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: new_price,
+            qty: new_qty,
+            nonce: 0,
+            owner: canceled.owner,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        // Decrement orders_processed to avoid double-counting (the
+        // re-submit via submit_order increments it again).
+        self.orders_processed -= 1;
+        self.submit_order(&req)
+    }
+
+    /// Replace a resting order: cancel + submit a new order atomically.
+    fn replace_order(
+        &mut self,
+        order_id: u64,
+        owner: primitives::Address,
+        new_order: &OrderRequest,
+    ) -> OrderResponse {
+        // Authorization + cancel. If the cancel fails, the new order
+        // is NOT submitted (atomic semantics).
+        match self.engine.order_owner(trading::OrderId(order_id)) {
+            Some(real_owner) if real_owner == owner => {}
+            _ => {
+                self.engine_rejections += 1;
+                return OrderResponse::rejected(RejectReason::OrderNotFound);
+            }
+        }
+        let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::OrderNotFound);
+        };
+        // Decrement resting count for the canceled order.
+        self.risk.dec_resting(&canceled.owner);
+        // Refund the reserved balance for buy orders.
+        if canceled.side == Side::Buy {
+            let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
+            let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
+            self.balances.credit(&canceled.owner, refund);
+        }
+        // Submit the new order. Decrement orders_processed to avoid
+        // double-counting (submit_order increments it again).
+        self.orders_processed -= 1;
+        self.submit_order(new_order)
     }
 
     /// Seal the current settlement batch and return it. The caller
@@ -292,6 +515,12 @@ impl MatchingServer {
         self.engine_rejections
     }
 
+    /// Total orders rejected by the risk engine (rate limit,
+    /// fat-finger, size cap, resting cap).
+    pub fn risk_rejections(&self) -> u64 {
+        self.risk_rejections
+    }
+
     /// Number of resting orders in the book.
     pub fn resting_count(&self) -> u32 {
         self.engine.resting_count()
@@ -300,6 +529,23 @@ impl MatchingServer {
     /// Number of pending fills in the settlement batch.
     pub fn pending_settlements(&self) -> usize {
         self.settlement_batch.len()
+    }
+
+    /// Get a snapshot of the server's stats.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn stats(&self) -> MatcherStats {
+        MatcherStats {
+            orders_processed: self.orders_processed,
+            fills_produced: self.fills_produced,
+            balance_rejections: self.balance_rejections,
+            engine_rejections: self.engine_rejections,
+            risk_rejections: self.risk_rejections,
+            resting_count: self.engine.resting_count(),
+            pending_settlements: self.settlement_batch.len(),
+        }
     }
 }
 
@@ -328,28 +574,44 @@ impl SharedMatcher {
 
     /// Submit an order (called by protocol adapters).
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned (a thread panicked
-    /// while holding the lock).
+    /// Returns an `EngineError` rejection if the internal mutex is
+    /// poisoned (a thread panicked while holding the lock). A poisoned
+    /// mutex means the matching server is in an inconsistent state —
+    /// the operator should restart the process.
     pub fn submit(&self, req: &OrderRequest) -> OrderResponse {
-        self.inner.lock().unwrap().submit_order(req)
+        match self.inner.lock() {
+            Ok(mut guard) => guard.submit_order(req),
+            Err(_) => OrderResponse::rejected(crate::protocol::RejectReason::EngineError),
+        }
+    }
+
+    /// Submit an order action (cancel/amend/replace) (called by
+    /// protocol adapters).
+    ///
+    /// Returns an `EngineError` rejection if the internal mutex is
+    /// poisoned.
+    pub fn submit_action(&self, action: &OrderAction) -> OrderResponse {
+        match self.inner.lock() {
+            Ok(mut guard) => guard.submit_action(action),
+            Err(_) => OrderResponse::rejected(crate::protocol::RejectReason::EngineError),
+        }
     }
 
     /// Get a snapshot of the server's stats.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Returns zeroed stats if the internal mutex is poisoned.
     pub fn stats(&self) -> MatcherStats {
-        let s = self.inner.lock().unwrap();
-        MatcherStats {
-            orders_processed: s.orders_processed(),
-            fills_produced: s.fills_produced(),
-            balance_rejections: s.balance_rejections(),
-            engine_rejections: s.engine_rejections(),
-            resting_count: s.resting_count(),
-            pending_settlements: s.pending_settlements(),
+        match self.inner.lock() {
+            Ok(s) => MatcherStats {
+                orders_processed: s.orders_processed(),
+                fills_produced: s.fills_produced(),
+                balance_rejections: s.balance_rejections(),
+                engine_rejections: s.engine_rejections(),
+                risk_rejections: s.risk_rejections(),
+                resting_count: s.resting_count(),
+                pending_settlements: s.pending_settlements(),
+            },
+            Err(_) => MatcherStats::default(),
         }
     }
 }
@@ -368,11 +630,12 @@ pub trait BatchSealer: Send + Sync {
 impl BatchSealer for SharedMatcher {
     /// Seal via the mutex: lock the server, take the batch.
     ///
-    /// # Panics
-    ///
-    /// Panics if the inner matching server mutex is poisoned.
+    /// Returns an empty vec if the inner mutex is poisoned.
     fn seal_batch(&self) -> Vec<SettledFill> {
-        self.inner.lock().unwrap().seal_batch()
+        match self.inner.lock() {
+            Ok(mut guard) => guard.seal_batch(),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
@@ -386,6 +649,10 @@ enum ControlCommand {
     /// Snapshot matcher stats and send them back via the oneshot
     /// channel. Used by monitoring.
     Stats(std::sync::mpsc::Sender<MatcherStats>),
+    /// Process an order action (cancel/amend/replace) and send the
+    /// response back via the oneshot channel. Used by protocol
+    /// adapters that route through the ring matcher.
+    Action(OrderAction, std::sync::mpsc::Sender<OrderResponse>),
 }
 
 /// A lock-free matching server using SPSC rings (LMAX Disruptor
@@ -458,6 +725,12 @@ impl RingMatcher {
     #[must_use]
     pub fn new(server: MatchingServer, num_rings: usize, ring_capacity: usize) -> Self {
         assert!(num_rings > 0, "must have at least one ring");
+        // Shared wakeup signal for all rings. A push on any ring
+        // signals this, waking the consumer thread from its idle
+        // `wait_for_work` block. This replaces the previous
+        // `std::thread::yield_now()` busy-spin that burned a full
+        // CPU core at 100% when the matcher was idle.
+        let shared_wakeup = Arc::new(ring::Wakeup::new());
         // Create ring pairs: (order_tx, order_rx) and (resp_tx, resp_rx).
         let mut order_senders: Vec<ring::SpscSender<Vec<OrderRequest>>> =
             Vec::with_capacity(num_rings);
@@ -468,8 +741,10 @@ impl RingMatcher {
         let mut response_receivers: Vec<ring::SpscReceiver<Vec<OrderResponse>>> =
             Vec::with_capacity(num_rings);
         for _ in 0..num_rings {
-            let (o_tx, o_rx) = ring::spsc_ring(ring_capacity);
-            let (r_tx, r_rx) = ring::spsc_ring(ring_capacity);
+            let (o_tx, o_rx) =
+                ring::spsc_ring_with_wakeup(ring_capacity, Arc::clone(&shared_wakeup));
+            let (r_tx, r_rx) =
+                ring::spsc_ring_with_wakeup(ring_capacity, Arc::clone(&shared_wakeup));
             order_senders.push(o_tx);
             order_receivers.push(o_rx);
             response_senders.push(r_tx);
@@ -489,14 +764,24 @@ impl RingMatcher {
                         // rings — the batch is atomic).
                         let responses: Vec<OrderResponse> =
                             batch.iter().map(|req| server.submit_order(req)).collect();
-                        // Push the batch response to this
-                        // connection's ring. Clone only on retry
-                        // (the first attempt moves the value).
-                        let mut pending = Some(responses);
-                        while !response_senders[i]
-                            .push(pending.take().expect("response not yet moved"))
-                        {
-                            std::hint::spin_loop();
+                        // Push the batch response to this connection's
+                        // ring. If the ring is full, spin until the
+                        // client drains it. If the client disconnected
+                        // (connection dropped), drop the responses —
+                        // there is nowhere to send them.
+                        let mut pending = responses;
+                        loop {
+                            match response_senders[i].push(pending) {
+                                Ok(()) => break,
+                                Err(crate::ring::PushError::Disconnected(_)) => {
+                                    // Client gone; discard responses.
+                                    break;
+                                }
+                                Err(crate::ring::PushError::Full(returned)) => {
+                                    pending = returned;
+                                    std::hint::spin_loop();
+                                }
+                            }
                         }
                         did_work = true;
                     }
@@ -516,17 +801,28 @@ impl RingMatcher {
                                 fills_produced: server.fills_produced(),
                                 balance_rejections: server.balance_rejections(),
                                 engine_rejections: server.engine_rejections(),
+                                risk_rejections: server.risk_rejections(),
                                 resting_count: server.resting_count(),
                                 pending_settlements: server.pending_settlements(),
                             };
                             let _ = reply.send(stats);
                         }
+                        ControlCommand::Action(action, reply) => {
+                            let resp = server.submit_action(&action);
+                            let _ = reply.send(resp);
+                        }
                     }
                     did_work = true;
                 }
                 if !did_work {
-                    // No work on any ring — yield to avoid busy-spin.
-                    std::thread::yield_now();
+                    // No work on any ring — block on the shared wakeup
+                    // signal until a producer pushes or the 1 ms
+                    // timeout elapses. The timeout ensures the control
+                    // channel (seal/stats) is still serviced
+                    // regularly. This replaces the previous
+                    // `std::thread::yield_now()` busy-spin that burned
+                    // a full CPU core at 100% when idle.
+                    order_receivers[0].wait_for_work(std::time::Duration::from_millis(1));
                 }
             }
         });
@@ -543,30 +839,43 @@ impl RingMatcher {
     /// matcher thread. This reads from THE SAME order book the
     /// protocols write to — there is exactly one book.
     ///
-    /// # Panics
-    ///
-    /// Panics if the control channel is disconnected (matcher thread
-    /// died) or the oneshot reply channel fails.
+    /// Returns an empty vec if the control channel is disconnected
+    /// (matcher thread died) or the reply fails.
     pub fn seal_batch(&self) -> Vec<SettledFill> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.control_tx
-            .send(ControlCommand::Seal(reply_tx))
-            .expect("control channel disconnected: matcher thread died");
-        reply_rx.recv().expect("matcher thread did not reply to seal")
+        if self.control_tx.send(ControlCommand::Seal(reply_tx)).is_err() {
+            return Vec::new();
+        }
+        reply_rx.recv().unwrap_or_default()
     }
 
     /// Snapshot matcher stats via a control-channel command.
     ///
-    /// # Panics
-    ///
-    /// Panics if the control channel is disconnected (matcher thread
-    /// died) or the oneshot reply channel fails.
+    /// Returns zeroed stats if the control channel is disconnected
+    /// (matcher thread died) or the reply fails.
     pub fn stats(&self) -> MatcherStats {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.control_tx
-            .send(ControlCommand::Stats(reply_tx))
-            .expect("control channel disconnected: matcher thread died");
-        reply_rx.recv().expect("matcher thread did not reply to stats")
+        if self.control_tx.send(ControlCommand::Stats(reply_tx)).is_err() {
+            return MatcherStats::default();
+        }
+        reply_rx.recv().unwrap_or_default()
+    }
+
+    /// Submit an order action (cancel/amend/replace) via a
+    /// control-channel command to the matcher thread. This reaches
+    /// THE SAME order book the rings write to — there is exactly one
+    /// book.
+    ///
+    /// Returns an `EngineError` rejection if the control channel is
+    /// disconnected (matcher thread died) or the reply fails.
+    pub fn submit_action(&self, action: OrderAction) -> OrderResponse {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if self.control_tx.send(ControlCommand::Action(action, reply_tx)).is_err() {
+            return OrderResponse::rejected(crate::protocol::RejectReason::EngineError);
+        }
+        reply_rx
+            .recv()
+            .unwrap_or_else(|_| OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
     }
 
     /// Get a connection's order sender (producer side of the order
@@ -603,13 +912,16 @@ impl BatchSealer for RingMatcher {
 }
 
 /// A snapshot of matcher statistics (for monitoring/reporting).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[allow(missing_docs)]
 pub struct MatcherStats {
     pub orders_processed: u64,
     pub fills_produced: u64,
     pub balance_rejections: u64,
     pub engine_rejections: u64,
+    /// Orders rejected by the risk engine (rate limit, fat-finger,
+    /// size cap, resting cap).
+    pub risk_rejections: u64,
     pub resting_count: u32,
     pub pending_settlements: usize,
 }
@@ -623,6 +935,8 @@ pub struct MatcherStats {
 enum MarketMessage {
     /// A batch of orders to match and settle.
     Work(MarketWork),
+    /// An order action (cancel/amend/replace) to process.
+    Action(ActionWork),
     /// Seal this worker's settlement batch and return it.
     Seal(std::sync::mpsc::Sender<Vec<SettledFill>>),
     /// Snapshot this worker's stats.
@@ -639,13 +953,23 @@ struct MarketWork {
     response_tx: std::sync::mpsc::Sender<Vec<OrderResponse>>,
 }
 
+/// An action work item: a single order action (cancel/amend/replace)
+/// routed to the correct market worker.
+struct ActionWork {
+    /// The order action to process.
+    action: OrderAction,
+    /// One-shot channel for the worker to return the response.
+    response_tx: std::sync::mpsc::Sender<OrderResponse>,
+}
+
 /// Per-worker stats (one market).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct WorkerStats {
     orders_processed: u64,
     fills_produced: u64,
     balance_rejections: u64,
     engine_rejections: u64,
+    risk_rejections: u64,
     resting_count: u32,
     pending_settlements: usize,
 }
@@ -762,20 +1086,51 @@ impl MultiMarketMatcher {
             self.num_markets
         );
         let (response_tx, response_rx) = std::sync::mpsc::channel();
-        self.market_senders[market]
+        if self.market_senders[market]
             .send(MarketMessage::Work(MarketWork { orders, response_tx }))
-            .expect("market worker died");
-        response_rx.recv().expect("market worker did not respond")
+            .is_err()
+        {
+            return vec![OrderResponse::rejected(RejectReason::EngineError); 1];
+        }
+        response_rx
+            .recv()
+            .unwrap_or_else(|_| vec![OrderResponse::rejected(RejectReason::EngineError); 1])
     }
 
     /// Submit a single order. Routes to the correct market worker.
     ///
-    /// # Panics
-    ///
-    /// Panics if the market worker thread has died.
+    /// Returns an `EngineError` rejection if the market worker thread
+    /// has died.
     pub fn submit_one(&self, order: OrderRequest) -> OrderResponse {
         let mut responses = self.submit_batch(vec![order]);
         responses.pop().unwrap_or_else(|| OrderResponse::rejected(RejectReason::EngineError))
+    }
+
+    /// Submit an order action (cancel/amend/replace). Routes to the
+    /// market worker that owns the order (determined by the market
+    /// field in the action's new order for Replace, or market 0 for
+    /// Cancel/Amend in v0).
+    ///
+    /// Returns an `EngineError` rejection if the market worker thread
+    /// has died.
+    pub fn submit_action(&self, action: OrderAction) -> OrderResponse {
+        // Cancel/Amend are single-market (v0: market 0). Replace
+        // carries a full OrderRequest with its own market field.
+        let market = match &action {
+            OrderAction::Replace { new_order, .. } => new_order.market as usize,
+            _ => 0,
+        };
+        if market >= self.num_markets {
+            return OrderResponse::rejected(RejectReason::EngineError);
+        }
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        if self.market_senders[market]
+            .send(MarketMessage::Action(ActionWork { action, response_tx }))
+            .is_err()
+        {
+            return OrderResponse::rejected(RejectReason::EngineError);
+        }
+        response_rx.recv().unwrap_or_else(|_| OrderResponse::rejected(RejectReason::EngineError))
     }
 
     /// Seal the settlement batch across ALL markets. Sends a `Seal`
@@ -783,44 +1138,42 @@ impl MultiMarketMatcher {
     /// them. This is the `BatchSealer` implementation for the
     /// multi-market path.
     ///
-    /// # Panics
-    ///
-    /// Panics if any worker thread has died.
+    /// Returns fills only from live workers; dead workers contribute
+    /// nothing.
     pub fn seal_batch(&self) -> Vec<SettledFill> {
         let mut all_fills = Vec::new();
         for tx in &self.market_senders {
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            tx.send(MarketMessage::Seal(reply_tx)).expect("worker died");
-            let fills = reply_rx.recv().expect("worker did not reply to seal");
-            all_fills.extend(fills);
+            if tx.send(MarketMessage::Seal(reply_tx)).is_err() {
+                continue;
+            }
+            if let Ok(fills) = reply_rx.recv() {
+                all_fills.extend(fills);
+            }
         }
         all_fills
     }
 
     /// Snapshot aggregate stats across ALL markets.
     ///
-    /// # Panics
-    ///
-    /// Panics if any worker thread has died.
+    /// Returns partial stats from live workers; dead workers
+    /// contribute zeros.
     pub fn stats(&self) -> MatcherStats {
-        let mut total = MatcherStats {
-            orders_processed: 0,
-            fills_produced: 0,
-            balance_rejections: 0,
-            engine_rejections: 0,
-            resting_count: 0,
-            pending_settlements: 0,
-        };
+        let mut total = MatcherStats::default();
         for tx in &self.market_senders {
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            tx.send(MarketMessage::Stats(reply_tx)).expect("worker died");
-            let s = reply_rx.recv().expect("worker did not reply to stats");
-            total.orders_processed += s.orders_processed;
-            total.fills_produced += s.fills_produced;
-            total.balance_rejections += s.balance_rejections;
-            total.engine_rejections += s.engine_rejections;
-            total.resting_count += s.resting_count;
-            total.pending_settlements += s.pending_settlements;
+            if tx.send(MarketMessage::Stats(reply_tx)).is_err() {
+                continue;
+            }
+            if let Ok(s) = reply_rx.recv() {
+                total.orders_processed += s.orders_processed;
+                total.fills_produced += s.fills_produced;
+                total.balance_rejections += s.balance_rejections;
+                total.engine_rejections += s.engine_rejections;
+                total.risk_rejections += s.risk_rejections;
+                total.resting_count += s.resting_count;
+                total.pending_settlements += s.pending_settlements;
+            }
         }
         total
     }
@@ -894,6 +1247,10 @@ impl MarketWorker {
                     let responses = worker.process_batch(&work.orders);
                     let _ = work.response_tx.send(responses);
                 }
+                Ok(MarketMessage::Action(action_work)) => {
+                    let resp = worker.submit_action(&action_work.action);
+                    let _ = action_work.response_tx.send(resp);
+                }
                 Ok(MarketMessage::Seal(reply)) => {
                     let batch = std::mem::take(&mut worker.settlement_batch);
                     let _ = reply.send(batch);
@@ -904,6 +1261,7 @@ impl MarketWorker {
                         fills_produced: worker.fills_produced,
                         balance_rejections: worker.balance_rejections,
                         engine_rejections: worker.engine_rejections,
+                        risk_rejections: 0, // TODO: wire risk engine into multi-market workers
                         resting_count: worker.engine.resting_count(),
                         pending_settlements: worker.settlement_batch.len(),
                     };
@@ -1017,6 +1375,110 @@ impl MarketWorker {
             }
         }
     }
+
+    /// Submit an order action (cancel/amend/replace). Mirrors
+    /// `MatchingServer::submit_action` but uses the shared
+    /// `ShardedBalanceCache`.
+    fn submit_action(&mut self, action: &OrderAction) -> OrderResponse {
+        self.orders_processed += 1;
+        match action {
+            OrderAction::Cancel { order_id, owner } => self.cancel_order(*order_id, *owner),
+            OrderAction::Amend { order_id, owner, new_price, new_qty } => {
+                self.amend_order(*order_id, *owner, *new_price, *new_qty)
+            }
+            OrderAction::Replace { order_id, owner, new_order } => {
+                self.replace_order(*order_id, *owner, new_order)
+            }
+        }
+    }
+
+    /// Cancel a resting order (multi-market path).
+    fn cancel_order(&mut self, order_id: u64, owner: primitives::Address) -> OrderResponse {
+        match self.engine.order_owner(trading::OrderId(order_id)) {
+            Some(real_owner) if real_owner == owner => {}
+            _ => {
+                self.engine_rejections += 1;
+                return OrderResponse::rejected(RejectReason::OrderNotFound);
+            }
+        }
+        let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::OrderNotFound);
+        };
+        if canceled.side == Side::Buy {
+            let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
+            let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
+            self.balances.credit(&canceled.owner, refund);
+        }
+        OrderResponse::filled(0)
+    }
+
+    /// Amend a resting order (multi-market path).
+    fn amend_order(
+        &mut self,
+        order_id: u64,
+        owner: primitives::Address,
+        new_price: Price,
+        new_qty: Qty,
+    ) -> OrderResponse {
+        match self.engine.order_owner(trading::OrderId(order_id)) {
+            Some(real_owner) if real_owner == owner => {}
+            _ => {
+                self.engine_rejections += 1;
+                return OrderResponse::rejected(RejectReason::OrderNotFound);
+            }
+        }
+        let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::OrderNotFound);
+        };
+        if canceled.side == Side::Buy {
+            let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
+            let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
+            self.balances.credit(&canceled.owner, refund);
+        }
+        let req = OrderRequest {
+            market: 0,
+            side: canceled.side,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: new_price,
+            qty: new_qty,
+            nonce: 0,
+            owner: canceled.owner,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        self.orders_processed -= 1;
+        self.submit_order(&req)
+    }
+
+    /// Replace a resting order (multi-market path).
+    fn replace_order(
+        &mut self,
+        order_id: u64,
+        owner: primitives::Address,
+        new_order: &OrderRequest,
+    ) -> OrderResponse {
+        match self.engine.order_owner(trading::OrderId(order_id)) {
+            Some(real_owner) if real_owner == owner => {}
+            _ => {
+                self.engine_rejections += 1;
+                return OrderResponse::rejected(RejectReason::OrderNotFound);
+            }
+        }
+        let Ok(canceled) = self.engine.cancel(trading::OrderId(order_id)) else {
+            self.engine_rejections += 1;
+            return OrderResponse::rejected(RejectReason::OrderNotFound);
+        };
+        if canceled.side == Side::Buy {
+            let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
+            let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
+            self.balances.credit(&canceled.owner, refund);
+        }
+        self.orders_processed -= 1;
+        self.submit_order(new_order)
+    }
 }
 
 #[cfg(test)]
@@ -1053,6 +1515,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(5_000),
             owner: addr(1),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
 
         let resp = server.submit_order(&req);
@@ -1076,6 +1541,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(9),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         server.submit_order(&maker);
 
@@ -1088,6 +1556,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(1),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let resp = server.submit_order(&taker);
         assert!(!resp.rejected, "should accept sufficient balance");
@@ -1099,7 +1570,15 @@ mod tests {
 
     #[test]
     fn spam_orders_rejected_without_balance() {
-        let mut server = MatchingServer::new(cfg(), 100);
+        // Use unlimited rate limit — this test checks balance
+        // rejection, not rate limiting.
+        let risk_cfg = RiskConfig {
+            max_orders_per_second: 0,
+            max_order_qty: 0,
+            max_price_deviation_bps: 0,
+            max_resting_per_account: 0,
+        };
+        let mut server = MatchingServer::with_risk_config(cfg(), 100, risk_cfg);
 
         // Submit 1000 buy orders with zero balance — all should be rejected.
         for _ in 0..1000 {
@@ -1111,6 +1590,9 @@ mod tests {
                 price: Price(1_500_000_000),
                 qty: Qty(1_000),
                 owner: addr(1),
+                nonce: 0,
+                pubkey: [0u8; 32],
+                signature: [0u8; 64],
             };
             let resp = server.submit_order(&req);
             assert!(resp.rejected, "spam order should be rejected");
@@ -1140,6 +1622,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(9),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let taker = OrderRequest {
             market: 0,
@@ -1149,10 +1634,15 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(1),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let sender = ring.order_sender(0);
         let receiver = ring.response_receiver(0);
-        while !sender.push(vec![maker, taker]) {
+        let mut batch = vec![maker, taker];
+        while let Err(crate::ring::PushError::Full(returned)) = sender.push(batch) {
+            batch = returned;
             std::hint::spin_loop();
         }
         let responses = loop {
@@ -1210,6 +1700,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(9),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let taker0 = OrderRequest {
             market: 0,
@@ -1219,6 +1712,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(1),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let responses = matcher.submit_batch(vec![maker0, taker0]);
         assert_eq!(responses.len(), 2);
@@ -1233,6 +1729,9 @@ mod tests {
             price: Price(1_600_000_000),
             qty: Qty(1_000),
             owner: addr(9),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let taker1 = OrderRequest {
             market: 1,
@@ -1242,6 +1741,9 @@ mod tests {
             price: Price(1_600_000_000),
             qty: Qty(1_000),
             owner: addr(1),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let responses = matcher.submit_batch(vec![maker1, taker1]);
         assert_eq!(responses.len(), 2);
@@ -1277,6 +1779,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(9),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let maker1 = OrderRequest {
             market: 1,
@@ -1286,6 +1791,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(9),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         matcher.submit_batch(vec![maker0]);
         matcher.submit_batch(vec![maker1]);
@@ -1299,6 +1807,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(1),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let taker1 = OrderRequest {
             market: 1,
@@ -1308,6 +1819,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(1),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let resp0 = matcher.submit_one(taker0);
         let resp1 = matcher.submit_one(taker1);

@@ -69,7 +69,10 @@ async fn submit_pair(
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
+        nonce: 0,
         owner: addr_from_index(seller_idx),
+        pubkey: [0u8; 32],
+        signature: [0u8; 64],
     };
     sock.write_all(&encode_request(&maker)).await.expect("write maker");
     sock.read_exact(buf).await.expect("read maker resp");
@@ -84,7 +87,10 @@ async fn submit_pair(
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
+        nonce: 0,
         owner: addr_from_index(buyer_idx),
+        pubkey: [0u8; 32],
+        signature: [0u8; 64],
     };
     sock.write_all(&encode_request(&taker)).await.expect("write taker");
     sock.read_exact(buf).await.expect("read taker resp");

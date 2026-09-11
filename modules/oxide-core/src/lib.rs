@@ -41,7 +41,7 @@ impl CoreModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn current_height(&self) -> u64 {
-        *self.current_height.lock().unwrap()
+        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The current epoch.
@@ -50,7 +50,7 @@ impl CoreModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn current_epoch(&self) -> u64 {
-        *self.current_epoch.lock().unwrap()
+        *self.current_epoch.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -70,7 +70,7 @@ impl Module for CoreModule {
 
     fn begin_block(&self, height: Height) {
         // Record the block height in the store.
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.insert(b"height".to_vec(), height.value().to_le_bytes().to_vec());
     }
 
@@ -80,7 +80,8 @@ impl Module for CoreModule {
     }
 
     fn end_block(&self, height: Height) {
-        *self.current_height.lock().unwrap() = height.value();
+        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            height.value();
     }
 
     fn state_root(&self) -> Hash {

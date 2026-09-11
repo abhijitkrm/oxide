@@ -15,6 +15,9 @@ repository.workspace = true
 # Shared type vocabulary (Hash keys, per plan.md §8 sizing). Internal,
 # hot-path-approved dependency — the same one `codec` uses.
 primitives = { workspace = true }
+# Crypto: domain-separated hashing for state roots in the
+# JournalBackend. Internal crate, hot-path-approved.
+crypto = { workspace = true }
 # BLAKE3 is the consensus hash (docs/storage-spec.md §3). Justification
 # (production-rust skill §5): collision resistance is non-negotiable for
 # an authenticated data structure, implementing our own would be
@@ -45,7 +48,7 @@ mdbx = ["dep:libmdbx"]
 
 [dev-dependencies]
 criterion = "0.7.0"
-proptest = "1"
+proptest = "1.11.0"
 # Integration test for journal replay (Phase 1 acceptance gate):
 # write finalized blocks to the journal, replay them, re-execute
 # through the real executor + modules, and verify the state root

@@ -72,7 +72,10 @@ fn maker_sell(i: u32) -> OrderRequest {
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
+        nonce: 0,
         owner: addr_from_index(i),
+        pubkey: [0u8; 32],
+        signature: [0u8; 64],
     }
 }
 
@@ -85,7 +88,10 @@ fn taker_buy(i: u32) -> OrderRequest {
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
+        nonce: 0,
         owner: addr_from_index(i),
+        pubkey: [0u8; 32],
+        signature: [0u8; 64],
     }
 }
 
@@ -144,7 +150,10 @@ fn bench_protocol_codec(c: &mut Criterion) {
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
+        nonce: 0,
         owner: primitives::Address([0x42; 20]),
+        pubkey: [0u8; 32],
+        signature: [0u8; 64],
     };
 
     let mut group = c.benchmark_group("protocol_codec");

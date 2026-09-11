@@ -55,7 +55,17 @@ yanked = "deny"
 # unsafe, no network) pulled transitively by revm's alloy deps. No safe
 # upgrade exists; the crate is functionally stable. Ignoring is a
 # reviewed decision; if revm drops the dependency we will drop the ignore.
-ignore = ["RUSTSEC-2025-0141", "RUSTSEC-2024-0436"]
+#
+# RUSTSEC-2025-0134: `rustls-pemfile` is unmaintained (the repository
+# was archived August 2025; users are encouraged to use rustls-pki-types
+# directly). It is a transitive dep via `rcgen` (used by `p2p` for
+# self-signed TLS certificate generation at devnet startup). It is not
+# on any hot path and not reachable in production validator binaries
+# (which use the mesh transport, not TLS). The latest version 2.2.0
+# is functionally stable. Ignoring is a reviewed decision; if `rcgen`
+# drops the dependency or a maintained fork emerges we will drop the
+# ignore.
+ignore = ["RUSTSEC-2025-0141", "RUSTSEC-2024-0436", "RUSTSEC-2025-0134"]
 
 [sources]
 unknown-registry = "deny"

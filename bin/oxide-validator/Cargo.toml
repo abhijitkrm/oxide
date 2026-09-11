@@ -32,6 +32,12 @@ rpc = { workspace = true }
 tokio = { workspace = true }
 metrics = { workspace = true }
 toml = "0.8"
+# tracing + tracing-subscriber: structured diagnostic logging and the
+# default fmt subscriber for node startup/shutdown lifecycle events.
+# The subscriber is initialized at startup with `EnvFilter` for
+# `RUST_LOG`-based log-level control.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

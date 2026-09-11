@@ -22,12 +22,15 @@
 //! - `orderId` (string): resting order ID (if resting).
 //! - `rejectReason` (string, optional): rejection reason.
 
-use crate::protocol::{OrderRequest, OrderResponse, RejectReason};
+use crate::protocol::{ActionRequest, ActionType, OrderRequest, OrderResponse, RejectReason};
 use primitives::fixed::{Price, Qty};
 use trading::{OrderType, Side, TimeInForce};
 
 /// The JSON-RPC method name for order placement.
 pub const METHOD_PLACE_ORDER: &str = "oxide_placeOrder";
+
+/// The JSON-RPC method name for order actions (cancel/amend/replace).
+pub const MANAGE_ORDER: &str = "oxide_manageOrder";
 
 /// Parse a JSON-RPC `oxide_placeOrder` request.
 ///
@@ -41,10 +44,24 @@ pub fn parse_jsonrpc_order(params: &serde_json::Value) -> Option<OrderRequest> {
         let tif = parse_tif(map.get("tif")?.as_str()?)?;
         let price = Price(parse_u64_value(map.get("price")?)?);
         let qty = Qty(parse_u64_value(map.get("qty")?)?);
+        let nonce = parse_u64_value(map.get("nonce")?).unwrap_or(0);
         let owner = parse_address(map.get("owner")?.as_str()?)?;
-        Some(OrderRequest { market, side, order_type, tif, price, qty, owner })
+        let pubkey = parse_hex_bytes_32(map.get("pubkey")?.as_str()?)?;
+        let signature = parse_hex_bytes_64(map.get("signature")?.as_str()?)?;
+        Some(OrderRequest {
+            market,
+            side,
+            order_type,
+            tif,
+            price,
+            qty,
+            nonce,
+            owner,
+            pubkey,
+            signature,
+        })
     } else if let serde_json::Value::Array(arr) = params {
-        if arr.len() < 7 {
+        if arr.len() < 10 {
             return None;
         }
         let market = u8::try_from(arr[0].as_u64()?).ok()?;
@@ -53,11 +70,80 @@ pub fn parse_jsonrpc_order(params: &serde_json::Value) -> Option<OrderRequest> {
         let tif = parse_tif(arr[3].as_str()?)?;
         let price = Price(parse_u64_value(&arr[4])?);
         let qty = Qty(parse_u64_value(&arr[5])?);
-        let owner = parse_address(arr[6].as_str()?)?;
-        Some(OrderRequest { market, side, order_type, tif, price, qty, owner })
+        let nonce = parse_u64_value(&arr[6]).unwrap_or(0);
+        let owner = parse_address(arr[7].as_str()?)?;
+        let pubkey = parse_hex_bytes_32(arr[8].as_str()?)?;
+        let signature = parse_hex_bytes_64(arr[9].as_str()?)?;
+        Some(OrderRequest {
+            market,
+            side,
+            order_type,
+            tif,
+            price,
+            qty,
+            nonce,
+            owner,
+            pubkey,
+            signature,
+        })
     } else {
         None
     }
+}
+
+/// Parse a JSON-RPC `oxide_manageOrder` request (cancel/amend/replace).
+///
+/// Accepts named params:
+/// - `action` (string): "cancel", "amend", or "replace".
+/// - `orderId` (string/u64): the order to act on.
+/// - `owner` (string): 0x-prefixed 20-byte address.
+/// - `newPrice` (string/u64, optional): new price (amend/replace).
+/// - `newQty` (string/u64, optional): new qty (amend/replace).
+/// - `side` (string, optional): new order side (replace).
+/// - `type` (string, optional): new order type (replace).
+/// - `tif` (string, optional): new time-in-force (replace).
+/// - `nonce` (string/u64): replay protection nonce.
+/// - `pubkey` (string): 32-byte hex Ed25519 public key.
+/// - `signature` (string): 64-byte hex Ed25519 signature.
+pub fn parse_jsonrpc_action(params: &serde_json::Value) -> Option<ActionRequest> {
+    let serde_json::Value::Object(map) = params else {
+        return None;
+    };
+    let action_type = match map.get("action")?.as_str()? {
+        "cancel" => ActionType::Cancel,
+        "amend" => ActionType::Amend,
+        "replace" => ActionType::Replace,
+        _ => return None,
+    };
+    let order_id = parse_u64_value(map.get("orderId")?)?;
+    let owner = parse_address(map.get("owner")?.as_str()?)?;
+    let nonce = parse_u64_value(map.get("nonce")?).unwrap_or(0);
+    // newPrice/newQty are optional (Cancel doesn't include them).
+    let new_price = Price(map.get("newPrice").and_then(parse_u64_value).unwrap_or(0));
+    let new_qty = Qty(map.get("newQty").and_then(parse_u64_value).unwrap_or(0));
+    let side = map.get("side").and_then(|v| v.as_str()).and_then(parse_side).unwrap_or(Side::Buy);
+    let order_type = map
+        .get("type")
+        .and_then(|v| v.as_str())
+        .and_then(parse_order_type)
+        .unwrap_or(OrderType::Limit);
+    let tif =
+        map.get("tif").and_then(|v| v.as_str()).and_then(parse_tif).unwrap_or(TimeInForce::Gtc);
+    let pubkey = parse_hex_bytes_32(map.get("pubkey")?.as_str()?)?;
+    let signature = parse_hex_bytes_64(map.get("signature")?.as_str()?)?;
+    Some(ActionRequest {
+        action_type,
+        order_id,
+        new_price,
+        new_qty,
+        side,
+        order_type,
+        tif,
+        nonce,
+        owner,
+        pubkey,
+        signature,
+    })
 }
 
 /// Format an order response as a JSON-RPC result value.
@@ -134,6 +220,40 @@ fn parse_address(s: &str) -> Option<primitives::Address> {
     Some(primitives::Address(addr))
 }
 
+/// Parse a 32-byte hex string (Ed25519 public key).
+fn parse_hex_bytes_32(s: &str) -> Option<[u8; 32]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 64 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
+        if i >= 32 {
+            return None;
+        }
+        let hex = std::str::from_utf8(byte).ok()?;
+        buf[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(buf)
+}
+
+/// Parse a 64-byte hex string (Ed25519 signature).
+fn parse_hex_bytes_64(s: &str) -> Option<[u8; 64]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 128 {
+        return None;
+    }
+    let mut buf = [0u8; 64];
+    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
+        if i >= 64 {
+            return None;
+        }
+        let hex = std::str::from_utf8(byte).ok()?;
+        buf[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(buf)
+}
+
 fn reject_reason_str(r: RejectReason) -> &'static str {
     match r {
         RejectReason::InsufficientBalance => "insufficient_balance",
@@ -141,6 +261,13 @@ fn reject_reason_str(r: RejectReason) -> &'static str {
         RejectReason::EngineRejected => "engine_rejected",
         RejectReason::Killed => "killed",
         RejectReason::Malformed => "malformed",
+        RejectReason::BadSignature => "bad_signature",
+        RejectReason::StaleNonce => "stale_nonce",
+        RejectReason::OrderNotFound => "order_not_found",
+        RejectReason::RateLimited => "rate_limited",
+        RejectReason::OrderTooLarge => "order_too_large",
+        RejectReason::FatFinger => "fat_finger",
+        RejectReason::TooManyResting => "too_many_resting",
     }
 }
 
@@ -157,7 +284,10 @@ mod tests {
             "tif": "gtc",
             "price": "1500000000",
             "qty": "1000",
-            "owner": "0x4242424242424242424242424242424242424242"
+            "owner": "0x4242424242424242424242424242424242424242",
+            "nonce": 1,
+            "pubkey": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "signature": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
         });
         let req = parse_jsonrpc_order(&params).expect("parse");
         assert_eq!(req.side, Side::Buy);
@@ -173,7 +303,10 @@ mod tests {
             "gtc",
             "1500000000",
             "1000",
-            "0x4242424242424242424242424242424242424242"
+            1,
+            "0x4242424242424242424242424242424242424242",
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
         ]);
         let req = parse_jsonrpc_order(&params).expect("parse");
         assert_eq!(req.side, Side::Buy);
@@ -186,5 +319,38 @@ mod tests {
         let result = format_jsonrpc_response(&resp);
         assert_eq!(result["status"], "filled");
         assert_eq!(result["fills"], 1);
+    }
+
+    #[test]
+    fn parse_cancel_action() {
+        let params = serde_json::json!({
+            "action": "cancel",
+            "orderId": "7",
+            "owner": "0x4242424242424242424242424242424242424242",
+            "nonce": 2,
+            "pubkey": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "signature": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        });
+        let req = parse_jsonrpc_action(&params).expect("parse");
+        assert_eq!(req.action_type, ActionType::Cancel);
+        assert_eq!(req.order_id, 7);
+    }
+
+    #[test]
+    fn parse_amend_action() {
+        let params = serde_json::json!({
+            "action": "amend",
+            "orderId": "3",
+            "newPrice": "1600000000",
+            "newQty": "2000",
+            "owner": "0x4242424242424242424242424242424242424242",
+            "nonce": 2,
+            "pubkey": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "signature": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        });
+        let req = parse_jsonrpc_action(&params).expect("parse");
+        assert_eq!(req.action_type, ActionType::Amend);
+        assert_eq!(req.new_price.0, 1_600_000_000);
+        assert_eq!(req.new_qty.0, 2_000);
     }
 }

@@ -149,30 +149,30 @@ impl<S: Read + Write + Send> Clone for SharedStream<S> {
 #[cfg(feature = "tls")]
 impl<S: Read + Write + Send> Read for SharedStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.lock().unwrap().read(buf)
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).read(buf)
     }
 }
 
 #[cfg(feature = "tls")]
 impl<S: Read + Write + Send> Write for SharedStream<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.lock().unwrap().write(buf)
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.lock().unwrap().flush()
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).flush()
     }
 }
 
 #[cfg(feature = "tls")]
 impl<S: Read + Write + Send> PeerStream for SharedStream<S> {
     fn read_frame(&mut self, max_message_bytes: u64) -> io::Result<Vec<u8>> {
-        let mut stream = self.inner.lock().unwrap();
+        let mut stream = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         read_frame(&mut *stream, max_message_bytes)
     }
 
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut stream = self.inner.lock().unwrap();
+        let mut stream = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         write_frame(&mut *stream, bytes)
     }
 }
@@ -428,7 +428,10 @@ impl TcpTransport {
                         // Spawn a writer thread and register its
                         // channel sender for outbound sends.
                         let writer_tx = spawn_writer(write_stream, &accept_shutdown);
-                        accept_streams.lock().unwrap().insert(peer_id.clone(), writer_tx);
+                        accept_streams
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(peer_id.clone(), writer_tx);
                         // Spawn a reader thread for this connection.
                         let tx = accept_tx.clone();
                         let reader_shutdown = accept_shutdown.clone();
@@ -513,7 +516,9 @@ impl TcpTransport {
                             // Spawn a writer thread and register its
                             // channel sender for outbound sends.
                             let writer_tx = spawn_writer(write_stream, &rshut);
-                            cs.lock().unwrap().insert(pid.clone(), writer_tx);
+                            cs.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(pid.clone(), writer_tx);
                             // Reader loop for this connection.
                             reader_loop(reader_stream, pid, ct, max_message_bytes, rshut);
                             return;
@@ -534,7 +539,9 @@ impl TcpTransport {
                     // Spawn a writer thread and register its
                     // channel sender for outbound sends.
                     let writer_tx = spawn_writer(write_stream, &rshut);
-                    cs.lock().unwrap().insert(pid.clone(), writer_tx);
+                    cs.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(pid.clone(), writer_tx);
                     // Reader loop for this connection.
                     reader_loop(reader_stream, pid, ct, max_message_bytes, rshut);
                 });
@@ -577,7 +584,7 @@ impl TcpTransport {
         self.shutdown.store(true, Ordering::Relaxed);
         // Close all streams — this causes reader threads to get
         // errors on their next read and exit.
-        self.streams.lock().unwrap().clear();
+        self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 
     /// Returns `true` if the transport has been shut down.
@@ -601,7 +608,12 @@ impl TcpTransport {
     /// address is not a valid `SocketAddr`.
     pub fn add_peer(&self, peer_id: PeerId, addr: TcpAddr) {
         // Check if already connected.
-        if self.streams.lock().unwrap().contains_key(&peer_id) {
+        if self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&peer_id)
+        {
             return;
         }
         if self.shutdown.load(Ordering::Relaxed) {
@@ -651,7 +663,10 @@ impl TcpTransport {
                     let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
                     let write_stream = Box::new(shared) as Box<dyn PeerStream>;
                     let writer_tx = spawn_writer(write_stream, &shutdown);
-                    streams.lock().unwrap().insert(pid.clone(), writer_tx);
+                    streams
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(pid.clone(), writer_tx);
                     reader_loop(reader_stream, pid, tx, max_message_bytes, shutdown);
                     return;
                 }
@@ -665,7 +680,10 @@ impl TcpTransport {
             let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
             let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
             let writer_tx = spawn_writer(write_stream, &shutdown);
-            streams.lock().unwrap().insert(pid.clone(), writer_tx);
+            streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(pid.clone(), writer_tx);
             reader_loop(reader_stream, pid, tx, max_message_bytes, shutdown);
         });
     }
@@ -679,7 +697,7 @@ impl Transport for TcpTransport {
         // Look up the per-peer send channel and send bytes into it.
         // The lock is held only for the lookup, not during I/O —
         // the writer thread handles the actual write asynchronously.
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(sender) = streams.get(peer) else {
             return Err(TransportError::UnknownPeer);
         };
@@ -689,7 +707,7 @@ impl Transport for TcpTransport {
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
-        self.inbound_rx.lock().unwrap().try_recv().ok()
+        self.inbound_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_recv().ok()
     }
 
     fn capabilities(&self) -> TransportCaps {

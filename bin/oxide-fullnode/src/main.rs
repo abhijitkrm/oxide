@@ -74,6 +74,7 @@ fn load_config() -> NodeConfig {
         consensus,
         max_mempool_entries: config.executor.max_mempool_entries,
         parallel_threshold: config.executor.parallel_threshold,
+        evm_persistence: true,
     }
 }
 

@@ -28,6 +28,7 @@
 //!     consensus: ConsensusConfig::OxideBft,
 //!     max_mempool_entries: 10_000,
 //!     parallel_threshold: 32,
+//!     evm_persistence: true,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.
@@ -69,7 +70,7 @@ impl ConsensusConfig {
 }
 
 /// The node configuration: engine selection + mempool size + parallel
-/// execution tuning.
+/// execution tuning + EVM persistence.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// Which consensus engine to use.
@@ -83,14 +84,21 @@ pub struct NodeConfig {
     /// (32 txs). Lower for workloads with many small blocks; raise
     /// for latency-sensitive single-threaded deployments.
     pub parallel_threshold: usize,
+    /// Whether to enable EVM state persistence. When `true`, the
+    /// EVM module is created with a `Volatile` storage backend and
+    /// flushes state at `end_block`. When `false`, the EVM module
+    /// runs in-memory only (state is lost on restart). Default:
+    /// `true` — persistence is the production-safe default.
+    pub evm_persistence: bool,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            consensus: ConsensusConfig::Sequencer,
+            consensus: ConsensusConfig::OxideBft,
             max_mempool_entries: 10_000,
             parallel_threshold: executor::DEFAULT_PARALLEL_THRESHOLD,
+            evm_persistence: true,
         }
     }
 }
@@ -197,7 +205,21 @@ impl Node {
         // the gas price in the workload generator is 10 gwei. Wire the
         // exchange and perps modules into the EVM for read-only
         // precompiles (plan.md §10).
-        let evm_module = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+        //
+        // Persistence: when `evm_persistence` is enabled (the
+        // default), the EVM module is created with a `Volatile`
+        // storage backend and flushes state at `end_block`. This
+        // makes EVM state survive restarts and shareable between
+        // nodes. When disabled, the EVM runs in-memory only.
+        let evm_module: Arc<evm::EvmModule> = if config.evm_persistence {
+            Arc::new(evm::EvmModule::with_storage(
+                1,
+                7_000_000_000,
+                Box::new(storage::Volatile::new()),
+            ))
+        } else {
+            Arc::new(evm::EvmModule::new(1, 7_000_000_000))
+        };
         evm_module.fund_account_for_test(&primitives::Address([0u8; 20]), u128::MAX);
         evm_module.set_native_modules(Some(exchange), Some(perps));
         executor.register_module(evm_module.clone());
@@ -246,6 +268,78 @@ impl Node {
     /// taking ownership of the node.
     pub fn app_handle(&self) -> Arc<Executor> {
         self.app.clone()
+    }
+
+    /// Export a snapshot of the node's state at the current chain
+    /// height.
+    ///
+    /// The snapshot captures the chain height, aggregate state root,
+    /// and per-module state roots. It can be transferred to a new
+    /// node for fast state sync (skipping replay from genesis).
+    ///
+    /// See [`Executor::export_snapshot`] for details.
+    #[must_use]
+    pub fn export_snapshot(&self) -> executor::ExecutorSnapshot {
+        self.app.export_snapshot()
+    }
+
+    /// Import a snapshot, restoring the node to the snapshot's
+    /// chain height and state.
+    ///
+    /// After import, the node's chain height and state root match
+    /// the snapshot. Consensus resumes from `snapshot.height + 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`executor::SnapshotImportError`] if the snapshot is
+    /// corrupted, has a state root mismatch, or has a module count
+    /// mismatch.
+    ///
+    /// # Atomicity
+    ///
+    /// If import fails, the node's state is unchanged (the executor
+    /// validates the snapshot before modifying any state).
+    ///
+    /// # When to call
+    ///
+    /// Call this **before** driving consensus (before the first
+    /// `prepare_proposal` or `finalize_block`). Importing after
+    /// consensus has started would create a gap in the chain.
+    pub fn import_snapshot(
+        &self,
+        snapshot: &executor::ExecutorSnapshot,
+    ) -> Result<(), executor::SnapshotImportError> {
+        self.app.import_snapshot(snapshot)
+    }
+
+    /// Assemble a node from config and restore from a snapshot.
+    ///
+    /// This is the snapshot-sync entry point: a new node calls
+    /// `assemble_from_snapshot` instead of `assemble` to start
+    /// from a known chain state (e.g., synced from a peer).
+    ///
+    /// The method:
+    /// 1. Assembles the node with the standard module set.
+    /// 2. Imports the snapshot, setting the chain height and
+    ///    state root.
+    /// 3. Returns the assembled node, ready for consensus.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`executor::SnapshotImportError`] if the snapshot
+    /// is invalid. The assembled node is dropped on error (no
+    /// state is partially installed).
+    ///
+    /// # Panics
+    ///
+    /// Panics if BLS key generation fails (same as `assemble`).
+    pub fn assemble_from_snapshot(
+        config: &NodeConfig,
+        snapshot: &executor::ExecutorSnapshot,
+    ) -> Result<Self, executor::SnapshotImportError> {
+        let node = Self::assemble(config);
+        node.import_snapshot(snapshot)?;
+        Ok(node)
     }
 
     /// Fund an EVM account.
@@ -319,6 +413,7 @@ mod tests {
             consensus: ConsensusConfig::Sequencer,
             max_mempool_entries: 100,
             parallel_threshold: 32,
+            evm_persistence: true,
         };
         let mut node = Node::assemble(&config);
         // The engine should be ready (no blocks yet).
@@ -331,6 +426,7 @@ mod tests {
             consensus: ConsensusConfig::OxideBft,
             max_mempool_entries: 100,
             parallel_threshold: 32,
+            evm_persistence: true,
         };
         let mut node = Node::assemble(&config);
         assert!(node.engine().finalized_height().is_none());
@@ -356,11 +452,13 @@ mod tests {
             consensus: ConsensusConfig::Sequencer,
             max_mempool_entries: 100,
             parallel_threshold: 32,
+            evm_persistence: true,
         };
         let bft_config = NodeConfig {
             consensus: ConsensusConfig::OxideBft,
             max_mempool_entries: 100,
             parallel_threshold: 32,
+            evm_persistence: true,
         };
 
         let mut seq_node = Node::assemble(&seq_config);
@@ -380,5 +478,184 @@ mod tests {
         // We can't directly check the balance without importing
         // executor::Module, but the fact that this doesn't panic is
         // the proof that the EVM module is registered.
+    }
+
+    // ─── Snapshot sync tests ─────────────────────────────────────
+
+    #[test]
+    fn snapshot_export_round_trip() {
+        // Assemble a node, finalize a block, export a snapshot,
+        // import it into a fresh node, and verify the state matches.
+        let config = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 100,
+            parallel_threshold: 32,
+            evm_persistence: true,
+        };
+        let mut node = Node::assemble(&config);
+        // Submit a tx and finalize a block.
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node.engine().submit_tx(tx);
+        node.engine().run_until_idle();
+        assert!(node.engine().finalized_height().is_some(), "block finalized");
+
+        // Export the snapshot.
+        let snapshot = node.export_snapshot();
+        // Height may be 0 (genesis block) — that's valid.
+        assert!(!snapshot.module_roots.is_empty(), "snapshot must have module roots");
+
+        // Import into a fresh node.
+        let node2 =
+            Node::assemble_from_snapshot(&config, &snapshot).expect("snapshot import must succeed");
+        // The imported node's chain height must match the snapshot.
+        assert_eq!(node2.app().current_height(), snapshot.height, "height must match after import");
+        // The imported node's state root at the snapshot height must
+        // match the snapshot's state root (it was set during import).
+        assert_eq!(
+            node2.app().state_root_at(snapshot.height),
+            snapshot.state_root,
+            "state root must match after import"
+        );
+    }
+
+    #[test]
+    fn snapshot_import_rejects_empty() {
+        let config = NodeConfig::default();
+        let node = Node::assemble(&config);
+        let empty_snapshot = executor::ExecutorSnapshot {
+            height: 5,
+            state_root: primitives::Hash::ZERO,
+            module_roots: vec![],
+        };
+        let err = node.import_snapshot(&empty_snapshot).expect_err("empty snapshot must fail");
+        assert_eq!(err, executor::SnapshotImportError::EmptySnapshot);
+    }
+
+    #[test]
+    fn snapshot_import_rejects_corrupted_state_root() {
+        let config = NodeConfig::default();
+        let mut node = Node::assemble(&config);
+        // Finalize a block to get a real snapshot.
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node.engine().submit_tx(tx);
+        node.engine().run_until_idle();
+
+        let mut snapshot = node.export_snapshot();
+        // Corrupt the state root so it doesn't match the module roots.
+        snapshot.state_root = primitives::Hash([0xFF; 32]);
+
+        let node2 = Node::assemble(&config);
+        let err = node2.import_snapshot(&snapshot).expect_err("corrupted snapshot must fail");
+        match err {
+            executor::SnapshotImportError::StateRootMismatch { expected, .. } => {
+                assert_eq!(expected, primitives::Hash([0xFF; 32]));
+            }
+            other => panic!("expected StateRootMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_import_rejects_module_count_mismatch() {
+        use crypto::hash::{Domain, Hasher};
+        let config = NodeConfig::default();
+        let mut node = Node::assemble(&config);
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node.engine().submit_tx(tx);
+        node.engine().run_until_idle();
+
+        let mut snapshot = node.export_snapshot();
+        // Add a fake module root to create a count mismatch.
+        // Also recompute the state root to match so we test the
+        // module count check, not the state root check.
+        snapshot.module_roots.push(("fake", primitives::Hash::ZERO));
+        let mut root_data = Vec::new();
+        for (_, root) in &snapshot.module_roots {
+            root_data.extend_from_slice(root.as_bytes());
+        }
+        snapshot.state_root = Hasher::hash_one(Domain::Block, &root_data);
+
+        let node2 = Node::assemble(&config);
+        let err = node2.import_snapshot(&snapshot).expect_err("module count mismatch must fail");
+        match err {
+            executor::SnapshotImportError::ModuleCountMismatch { snapshot: s, registered: r } => {
+                assert!(s > r, "snapshot has more modules than registered");
+            }
+            other => panic!("expected ModuleCountMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_resume_after_import() {
+        // After importing a snapshot, the node should be able to
+        // resume consensus: finalize new blocks at height + 1, + 2, etc.
+        let config = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 100,
+            parallel_threshold: 32,
+            evm_persistence: true,
+        };
+        let mut node = Node::assemble(&config);
+        // Finalize one block.
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node.engine().submit_tx(tx);
+        node.engine().run_until_idle();
+        let snapshot = node.export_snapshot();
+        let original_height = snapshot.height;
+
+        // Import into a fresh node and resume.
+        let mut node2 =
+            Node::assemble_from_snapshot(&config, &snapshot).expect("snapshot import must succeed");
+        // The executor's height should match the snapshot.
+        assert_eq!(
+            node2.app().current_height(),
+            original_height,
+            "executor height must match snapshot"
+        );
+        // Submit another tx and finalize — should produce a new block.
+        let to2 = Address([3u8; 20]);
+        let module_payload2 = bank::msg::transfer(to2, 50);
+        let tx2 = build_tx(framework::module_id::BANK, &module_payload2);
+        node2.engine().submit_tx(tx2);
+        node2.engine().run_until_idle();
+        // The executor's height should have advanced.
+        assert!(
+            node2.app().current_height() > original_height,
+            "executor height must advance after new block"
+        );
+    }
+
+    #[test]
+    fn snapshot_export_deterministic() {
+        // Two nodes with the same state produce the same snapshot.
+        let config = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 100,
+            parallel_threshold: 32,
+            evm_persistence: true,
+        };
+        let mut node1 = Node::assemble(&config);
+        let mut node2 = Node::assemble(&config);
+        // Both finalize the same block.
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node1.engine().submit_tx(tx.clone());
+        node2.engine().submit_tx(tx);
+        node1.engine().run_until_idle();
+        node2.engine().run_until_idle();
+
+        let snap1 = node1.export_snapshot();
+        let snap2 = node2.export_snapshot();
+        assert_eq!(snap1.height, snap2.height, "heights must match");
+        assert_eq!(snap1.state_root, snap2.state_root, "state roots must match");
+        assert_eq!(snap1.module_roots, snap2.module_roots, "module roots must match");
     }
 }

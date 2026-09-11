@@ -183,7 +183,7 @@ impl ExchangeModule {
     /// # Panics
     /// Panics if the inner mutex is poisoned.
     pub fn list_market(&self, cfg: MarketConfig) -> Result<u8, ExecError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Find the first empty slot.
         let id =
             inner.markets.iter().position(Option::is_none).ok_or_else(|| {
@@ -213,7 +213,7 @@ impl ExchangeModule {
     /// # Panics
     /// Panics if the inner mutex is poisoned.
     pub fn l1(&self, market: u8) -> Option<L1> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let engine = inner.markets[usize::from(market)].as_ref()?;
         Some((engine.best_bid(), engine.best_ask()))
     }
@@ -390,7 +390,7 @@ impl Module for ExchangeModule {
         let tag = msg[0];
         let body = &msg[1..];
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         match tag {
             TAG_PLACE => {

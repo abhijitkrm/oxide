@@ -239,7 +239,12 @@ impl ShardedBalanceCache {
     #[inline]
     pub fn get(&self, addr: &Address) -> u64 {
         let idx = self.shard_idx(addr);
-        self.shards[idx].lock().unwrap().get(&addr.0).copied().unwrap_or(0)
+        self.shards[idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&addr.0)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Set an account's balance (fund or overwrite). Locks one shard.
@@ -250,7 +255,10 @@ impl ShardedBalanceCache {
     #[inline]
     pub fn set(&self, addr: &Address, amount: u64) {
         let idx = self.shard_idx(addr);
-        self.shards[idx].lock().unwrap().insert(addr.0, amount);
+        self.shards[idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(addr.0, amount);
     }
 
     /// Credit an account (add to balance). Locks one shard.
@@ -261,7 +269,7 @@ impl ShardedBalanceCache {
     #[inline]
     pub fn credit(&self, addr: &Address, amount: u64) {
         let idx = self.shard_idx(addr);
-        let mut shard = self.shards[idx].lock().unwrap();
+        let mut shard = self.shards[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = shard.entry(addr.0).or_insert(0);
         *entry = entry.saturating_add(amount);
     }
@@ -282,7 +290,7 @@ impl ShardedBalanceCache {
     #[inline]
     pub fn check_and_debit(&self, addr: &Address, amount: u64) -> bool {
         let idx = self.shard_idx(addr);
-        let mut shard = self.shards[idx].lock().unwrap();
+        let mut shard = self.shards[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = shard.entry(addr.0).or_insert(0);
         if *entry >= amount {
             *entry -= amount;
@@ -305,7 +313,8 @@ impl ShardedBalanceCache {
         let to_idx = self.shard_idx(to);
         if from_idx == to_idx {
             // Same shard — one lock.
-            let mut shard = self.shards[from_idx].lock().unwrap();
+            let mut shard =
+                self.shards[from_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let from_entry = shard.entry(from.0).or_insert(0);
             *from_entry = from_entry.saturating_sub(amount);
             let to_entry = shard.entry(to.0).or_insert(0);
@@ -317,9 +326,15 @@ impl ShardedBalanceCache {
             // atomic even if other threads are touching these
             // accounts on other markets.
             let (first_lock, second_lock) = if from_idx < to_idx {
-                (self.shards[from_idx].lock().unwrap(), self.shards[to_idx].lock().unwrap())
+                (
+                    self.shards[from_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                    self.shards[to_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                )
             } else {
-                (self.shards[to_idx].lock().unwrap(), self.shards[from_idx].lock().unwrap())
+                (
+                    self.shards[to_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                    self.shards[from_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                )
             };
             let (mut first, mut second) = (first_lock, second_lock);
             // `from` and `to` are in different shards; figure out
@@ -343,7 +358,16 @@ impl ShardedBalanceCache {
     ///
     /// Panics if any shard mutex is poisoned.
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().unwrap().values().filter(|&&b| b > 0).count()).sum()
+        self.shards
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .values()
+                    .filter(|&&b| b > 0)
+                    .count()
+            })
+            .sum()
     }
 
     /// Is the cache empty?

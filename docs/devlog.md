@@ -8151,3 +8151,409 @@ but not yet lock-free.
   all pass.
 - Live binary benchmark: 100M orders × 128 markets × 1000 accounts
   × 16 connections — 11.68M orders/s, 50M fills, 0 rejections.
+
+---
+
+## 2026-09-10 — Session 22: production-readiness Tier 2 + Tier 3 (continued)
+
+### Risk engine (matcher)
+
+- Implemented `crates/matcher/src/risk.rs` — a pre-match risk engine
+  with four controls:
+  1. **Rate limiting**: per-account sliding-window counter (100
+     orders/sec default). Uses a `VecDeque<(timestamp, count)>` —
+     O(1) amortized, no allocation after warmup.
+  2. **Order size cap**: rejects orders above `max_order_qty` (0 =
+     unlimited).
+  3. **Fat-finger price band**: rejects orders whose price deviates
+     more than `max_price_deviation_bps` basis points from the
+     mid-market reference. The reference is derived from
+     `best_bid()`/`best_ask()`; empty books and one-sided books are
+     handled deterministically (no rejection when no reference
+     exists).
+  4. **Resting-order cap**: rejects orders that would push an
+     account above `max_resting_per_account` resting orders. This
+     requires tracking resting counts per account, updated on every
+     path that changes resting state (placement, cancel, amend,
+     replace, canceled remainder).
+- Integrated into `MatchingServer::submit_order` — risk checks run
+  *before* balance reservation so rejected orders do not alter
+  balances. Added `risk_rejections` counter to `MatcherStats`.
+- Added four new `RejectReason` variants (8–11): `RateLimited`,
+  `OrderTooLarge`, `FatFinger`, `TooManyResting`. Updated all four
+  protocol adapters (TCP, WS, JSON-RPC, FIX) with stable string/fix
+  mappings. Existing discriminants 0–7 are unchanged.
+- Tests: 71 matcher tests (including risk engine unit tests for each
+  control, boundary acceptance, and resting-order accounting).
+
+### WS market data publisher
+
+- Created `crates/matcher/src/market_data.rs` — a WebSocket market
+  data publisher supporting L1 (top-of-book), L2 (full depth), and
+  Trades feeds.
+- Subscribers subscribe to specific feeds and markets; the publisher
+  serializes once and broadcasts the same JSON string to all matching
+  subscribers. Slow clients miss updates (intentional — market data
+  is lossy by design, must not back-pressure the matching engine).
+- 11 tests covering serialization, subscription filtering by feed
+  and market, multi-subscriber broadcast, and subscriber count
+  tracking.
+
+### Autonomous oxideBFT event loop
+
+- Created `bin/oxide-validator/src/driver.rs` — a tokio-based
+  consensus driver that continuously drives the consensus engine in
+  a background task.
+- The driver ticks at a configurable block interval (100ms default =
+  10 blocks/sec), calling `engine.run_until_idle()` on each tick.
+  This processes all pending work (proposals, votes, commits) in one
+  batch.
+- Reports metrics atomically: block height, tx count, block count.
+  These are read by the RPC `/metrics` endpoint.
+- Wired into `run_single_node()` — the validator now runs consensus
+  autonomously instead of the one-shot `run_until_idle()` at startup.
+- 3 tests: config defaults, metrics initialization, and end-to-end
+  block finalization via the driver.
+
+### RPC rate limiting
+
+- Added a simple fixed-window rate limiter to `RpcServer`: configurable
+  via `set_rate_limit(max_per_second)`. 0 = unlimited (default).
+- Uses atomic operations — no mutex on the request path. Returns
+  JSON-RPC error code -32005 ("request rate limited") when exceeded.
+- 2 new tests: unlimited by default, excess requests rejected.
+
+### Clippy cleanup
+
+- Replaced all `unwrap_or_else(|e| e.into_inner())` with
+  `unwrap_or_else(std::sync::PoisonError::into_inner)` across the
+  workspace (clippy::redundant_closure_for_method_calls).
+- Fixed clippy errors in matcher, evm, rpc, oxide-validator:
+  let-else patterns, merged identical match arms, inline format args,
+  removed unused async, added missing # Panics/# Errors sections.
+- `cargo clippy --workspace --all-targets -- -D warnings` is now clean.
+
+### Skills updated
+
+- `production-rust/SKILL.md`: added sections 8 (mutex poisoning
+  recovery), 9 (protocol stability), 10 (risk & rate limiting).
+- `performance-first/SKILL.md`: added matcher hot-path invariants
+  and RPC cold-path invariants sections.
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all test suites pass (0 failures).
+
+## Session 25 — Authenticated proposals, exec-certs, JournalBackend, swarm sim, full benchmarks
+
+### Date
+
+2025-01-30
+
+### Summary
+
+Completed five Tier 2/Tier 3 roadmap items and ran the full benchmark
+suite for trading, EVM, consensus, executor, and perps. All gates
+green: fmt, clippy, workspace tests, release build.
+
+### 1. Authenticated leader proposals + exec_cert field
+
+Added `proposer_signature: Option<Signature>` and `exec_cert:
+Option<ExecCertificate>` to `BlockHeader` (`crates/types/src/lib.rs`).
+
+- `ExecCertificate` carries `height`, `state_root`, `epoch`,
+  `signer_bitmap`, `aggregate_signature` — a quorum of validators
+  attesting to the execution result of a specific block.
+- Wire format updated: `[has_proposer_sig u8][proposer_sig 96B if
+  present][has_exec_cert u8][exec_cert ... if present]` after the
+  existing `timestamp` field.
+- All `BlockHeader` construction sites updated (consensus engine +
+  tests).
+- Exact-byte wire test updated for the genesis case; round-trip tests
+  cover the QC and TC cases.
+
+### 2. Divergence detection
+
+Added `ConsensusError::StateDivergence { height, expected_root,
+actual_root }` to `crates/consensus/src/engine.rs`.
+
+- In the `vote` method, when `verify_signatures` is true and the
+  proposal carries an `exec_cert`, the engine calls
+  `self.app.attest_state(cert.height)` and compares the local state
+  root to the certified state root.
+- A mismatch causes the engine to refuse to vote — voting for a block
+  built on divergent state would extend the divergence.
+- Two new tests: `divergence_detection_rejects_mismatched_exec_cert`
+  and `divergence_detection_accepts_matching_exec_cert`.
+
+### 3. JournalBackend (AuthenticatedJournal as StorageBackend)
+
+Implemented `JournalBackend` in `crates/storage/src/auth_journal.rs` —
+a `StorageBackend` backed by `AuthenticatedJournal`.
+
+- In-memory `BTreeMap<Hash, Vec<u8>>` for fast point reads.
+- `apply_batch` applies ops to the map, recomputes the state root,
+  and appends a serialized batch record to the journal (which pushes
+  to the MMR).
+- `capabilities()` returns `Caps { authenticated: true }`.
+- `state_root()` returns a BLAKE3 hash of all (key, value) pairs in
+  sorted key order (domain-separated via `Domain::StateRoot`).
+- `log_root()` returns the MMR root (commits the entire log of batch
+  records).
+- Snapshot export/import supported.
+- Six new tests: capabilities, get/set/delete, state root changes,
+  range prefix, snapshot round-trip, log root advances.
+
+### 4. Deterministic swarm simulation
+
+Implemented `ScenarioRunner::run()` in `sim/src/swarm.rs` — the
+actual simulation execution that was previously just a configuration
+container.
+
+- Creates a `MultiNodeDevnet` with the configured number of nodes.
+- Enables mesh networking for partition support.
+- Applies the network model's `LossModel::Partition` by partitioning
+  the specified nodes.
+- Runs `rounds` consensus rounds via `run_batch`.
+- Collects finalized heights and returns a `SwarmResult` with
+  safety/liveness checks.
+- New `partition_one_7` scenario: 7 nodes, one partitioned, tests
+  liveness when 6 of 7 nodes must finalize.
+- Three new run tests: `run_minimal_4_liveness`,
+  `run_partition_one_7_liveness`, `run_network_delay_7_safety`.
+
+### 5. Full benchmark results
+
+Machine: M2 MacBook Pro (8-core ARM64, 16GB RAM), release profile.
+All numbers are criterion p50 (median) unless noted.
+
+#### Trading / matching engine (`crates/trading/benches/matching.rs`)
+
+| Benchmark | p50 | Throughput |
+|---|---|---|
+| `rest_cancel_pair` | 168 ns | 5.95M ops/s |
+| `match_single_level` | 559 ns | 1.79M matches/s |
+| `match_sweep_10_levels` | 4.36 µs | 229K sweeps/s |
+| `mixed_workload` | 55.1 µs | 18.1K ops/s |
+
+#### Matcher server (`crates/matcher/benches/matcher_throughput.rs`)
+
+| Benchmark | p50 | Throughput |
+|---|---|---|
+| `order_entry/1b_orders_1m_accounts` | 17.77 s | **56.27M orders/s** |
+| `protocol_codec/encode_request` | 5.53 ns | 180.76M elem/s |
+| `protocol_codec/decode_request` | 8.38 ns | 119.31M elem/s |
+| `balance_cache/lookup_1m_accounts` | 127 µs | 7.88K lookups/s |
+
+#### EVM (`modules/evm/benches/`)
+
+| Benchmark | p50 | Throughput |
+|---|---|---|
+| `tps_simple_transfer/1_tx` | 58.9 µs | 16,977 tx/s |
+| `tps_simple_transfer/10_txs_batch` | 555.9 µs | 17,989 tx/s |
+| `tps_contract_deploy/1_deploy` | 54.6 µs | 18,315 deploys/s |
+| `full_block_cycle/10_txs` | 507.4 µs | 19,710 tx/s |
+| `full_block_cycle/100_txs` | 5.08 ms | 19,685 tx/s |
+| `full_block_cycle/1000_txs` | 50.98 ms | 19,615 tx/s |
+| `batch_parallel/100_txs` | 1.37 ms | 72,993 tx/s |
+| `batch_parallel/1000_txs` | 14.38 ms | 69,541 tx/s |
+| `batch_parallel/10000_txs` | 98.15 ms | 101,883 tx/s |
+| `native_vs_revm/1000_txs_native` | 7.92 ms | 126,263 tx/s |
+| `native_vs_revm/1000_txs_revm` | 36.31 ms | 27,540 tx/s |
+| `native_vs_revm/10000_txs_native` | 79.76 ms | 125,376 tx/s |
+| `native_vs_revm/10000_txs_revm` | 357.01 ms | 28,011 tx/s |
+| `secp_recover_only` | 70.6 µs | 14,167 recovers/s |
+| `rlp_decode` | 320.8 ns | 3.11M decodes/s |
+| `state_root_after_100_txs` | 8.64 µs | — |
+| `end_block_after_100_txs` | 1.99 µs | — |
+
+#### Consensus (`crates/consensus/benches/engine.rs`)
+
+| Benchmark | p50 | Throughput |
+|---|---|---|
+| `propose_single` | 61.9 ns | 16.16M proposals/s |
+| `vote_on_proposal` | 3.16 µs | 316K votes/s |
+| `block_hash` | 474.6 ns | 2.11M hashes/s |
+
+#### Executor (`crates/executor/benches/`)
+
+| Benchmark | p50 | Throughput |
+|---|---|---|
+| `block_pipeline/10` | 31.8 µs | 314.7K tx/s |
+| `block_pipeline/100` | 277.6 µs | 360.2K tx/s |
+| `block_pipeline/1000` | 2.78 ms | 359.7K tx/s |
+| `execute_only/100` | 153.0 µs | 653.7K tx/s |
+| `execute_only/1000` | 1.63 ms | 612.5K tx/s |
+| `uniswap_transfer/parallel_8/500` | 3.40 ms | 295 elem/s |
+| `uniswap_transfer/parallel_8/1000` | 6.23 ms | 161 elem/s |
+
+#### Node (`crates/node/benches/`)
+
+| Benchmark | p50 | Throughput |
+|---|---|---|
+| `node_assembly/sequencer` | 7.70 µs | — |
+| `node_assembly/oxidebft` | 125.7 µs | — |
+| `executor_bank_throughput/1000` | 1.52 ms | 657.6K tx/s |
+| `executor_bank_throughput/2000` | 3.22 ms | 620.9K tx/s |
+
+#### Exchange settlement (`modules/exchange/benches/settlement.rs`)
+
+| Benchmark | p50 | Throughput |
+|---|---|---|
+| `settlement_single_fill` | 1.25 µs | 800K fills/s |
+| `settlement_sweep_10_levels` | 5.94 µs | 168K sweeps/s |
+| `raw_engine_single_fill` | 486.8 ns | 2.05M fills/s |
+
+#### Perps settlement (`modules/perps/benches/perps_settlement.rs`)
+
+| Benchmark | p50 | Throughput |
+|---|---|---|
+| `perps_place_with_margin` | 755.3 ns | 1.32M places/s |
+| `perps_deposit` | 302.3 ns | 3.31M deposits/s |
+| `perps_liquidation_check` | 161.5 ns | 6.19M checks/s |
+| `raw_perps_engine_place` | 435.8 ns | 2.29M places/s |
+
+### Key findings
+
+1. **Matching engine: 56.27M orders/s** (raw engine, single-thread,
+   1B orders against 1M accounts). This is the raw matching engine
+   throughput — not end-to-end blockchain TPS. The mixed workload
+   (resting + matching + cancel) runs at 18.1K ops/s per market.
+
+2. **EVM simple transfers: ~17K tx/s single-threaded,
+   ~70K-100K tx/s with parallel batch execution** (Rayon, 8 cores).
+   The bottleneck is secp256k1 sender recovery (~70µs/tx). With
+   preverified (pre-recovered) transactions, the parallel batch
+   throughput reaches ~100K tx/s for 10K-tx batches.
+
+3. **Native vs EVM: native module execution is 4.5× faster than
+   revm** for equivalent transfers (126K tx/s native vs 28K tx/s
+   revm for 1K-tx batches). This validates the dual-VM architecture:
+   trading hot paths use native modules; EVM is for compatibility.
+
+4. **Consensus: 316K votes/s** — the BLS vote verification is the
+   bottleneck at 3.16µs/vote. Block proposal is 62ns (trivial).
+
+5. **Executor block pipeline: 360K tx/s** for 100-1000 tx batches
+   (native bank transfers). The execute-only path (no state root)
+   hits 653K tx/s.
+
+6. **Perps: 1.32M place-with-margin/s**, liquidation checks at
+   6.19M/s — well within HFT requirements.
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all test suites pass (0 failures).
+- `cargo build --workspace --release`: clean.
+- `cargo bench` run for: trading, matcher, evm, consensus, executor,
+  node, exchange, perps.
+
+## Session: Reed-Solomon erasure broadcast + snapshot sync + dependency pinning
+
+### Tier 3: Exact-pin production dependencies
+
+All workspace dependencies in the root `Cargo.toml` are now
+exact-pinned (`=X.Y.Z`) to the versions resolved in `Cargo.lock`.
+This prevents silent transitive upgrades that could introduce
+incompatibilities or supply-chain risks. Dev dependencies
+(`proptest`, `criterion`) are also exact-pinned in each crate
+manifest.
+
+`cargo deny check` passes with all four gates green:
+advisories, bans, licenses, sources. One advisory
+(RUSTSEC-2025-0134: `rustls-pemfile` unmaintained) was reviewed
+and added to the ignore list with a documented justification
+(transitive dep via `rcgen`, used only for devnet TLS cert
+generation, not in production validator binaries).
+
+### Tier 2: Real Reed-Solomon erasure broadcast + PoA
+
+Replaced the placeholder replication-based `ErasureBroadcast` with
+a real Reed-Solomon erasure coding implementation over GF(256).
+
+**Implementation (dependency-free, first-principles):**
+
+- `crates/broadcast/src/gf256.rs`: GF(256) arithmetic with the
+  AES irreducible polynomial (0x11B). Precomputed log/exp tables
+  with period 255 for O(1) multiplication and division. Includes
+  the standard AES test vector (0x57 * 0x83 = 0xC1).
+
+- `crates/broadcast/src/rs.rs`: Reed-Solomon encoder/decoder
+  using a Vandermonde matrix in systematic form (top k rows =
+  identity, so the first k shards are the original data).
+  Reconstruction via Gaussian elimination over GF(256).
+
+- `crates/broadcast/src/lib.rs`: `ErasureBroadcast` now uses
+  the real RS code with k = 2f+1 data shards and m = f parity
+  shards (n = 3f+1 total, one per validator). Any k shards
+  suffice for reconstruction. A proof of availability (Merkle
+  root of shard hashes via BLAKE3) is computed per broadcast.
+
+**Tests (38 total, all passing):**
+
+- GF(256): add, sub, mul, div, inv, pow, commutativity,
+  associativity, distributivity, AES test vector, generator
+  primitivity.
+- RS: encode/reconstruct with all data shards, with missing
+  data shards, mixed loss, exact-k reconstruction, large shards,
+  n=7/f=2 configuration.
+- ErasureBroadcast: stores shards, rejects oversized, tolerates
+  f missing shards, fails with f+1 missing, proof of availability
+  computed and deterministic, backfill recovery, unknown hash
+  error, data unavailable error.
+
+### Tier 2: Snapshot sync wired into node startup
+
+Added snapshot export/import to the executor and wired it into
+the node startup path.
+
+**Implementation:**
+
+- `ExecutorSnapshot`: captures chain height, aggregate state
+  root, and per-module state roots. Deterministic: two executors
+  with the same state produce byte-identical snapshots.
+
+- `Executor::export_snapshot()`: exports the current state.
+  Falls back to recomputing the state root from module roots if
+  the stored root is stale (e.g., async execution not yet flushed).
+
+- `Executor::import_snapshot()`: validates the snapshot's
+  internal consistency (state root matches module roots, module
+  count matches registered modules), then sets the chain height
+  and state root. Atomic: if validation fails, no state is
+  modified.
+
+- `Node::export_snapshot()` / `Node::import_snapshot()`: thin
+  wrappers over the executor methods.
+
+- `Node::assemble_from_snapshot()`: assembles a node from config
+  and restores from a snapshot in one call. The node is ready for
+  consensus immediately after import.
+
+**Tests (6 snapshot tests, all passing):**
+
+- Round-trip: export → import → verify height and state root.
+- Rejects empty snapshot (no module roots).
+- Rejects corrupted state root (doesn't match module roots).
+- Rejects module count mismatch.
+- Resume after import: new blocks finalized at height + 1.
+- Deterministic: two nodes with the same state produce the same
+  snapshot.
+
+**v0 scope note:** The snapshot captures state root metadata
+(height + roots), not individual module key-value state. Full
+key-value state sync is Phase 3. The v0 snapshot sync verifies
+snapshot consistency and sets the chain height so consensus can
+resume from the correct position.
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all test suites pass (0 failures).
+- `cargo build --workspace --release`: clean.
+- `cargo deny check`: advisories ok, bans ok, licenses ok, sources ok.

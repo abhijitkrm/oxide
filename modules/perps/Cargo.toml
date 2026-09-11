@@ -23,6 +23,8 @@ bank = { workspace = true }
 [dev-dependencies]
 # Benchmark harness (criterion gates: plan.md §13 Phase 3 acceptance).
 criterion = "0.7.0"
+# Property-based testing for perps invariants (margin, equity, liquidation).
+proptest = "1.11.0"
 
 [[bench]]
 name = "perps_settlement"

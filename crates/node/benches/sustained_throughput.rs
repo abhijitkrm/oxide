@@ -66,6 +66,7 @@ fn bench_executor_bank_throughput(c: &mut Criterion) {
                     consensus: ConsensusConfig::Sequencer,
                     max_mempool_entries: n + 100,
                     parallel_threshold: 32,
+                    evm_persistence: true,
                 };
                 let mut node = Node::assemble(&config);
 

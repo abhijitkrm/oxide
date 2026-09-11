@@ -319,6 +319,63 @@ impl<'a> Decode<'a> for StateAttestation {
     }
 }
 
+/// Execution certificate: ≥2f+1 validators attest to the state root
+/// of a finalized block (docs/oxidebft-spec.md §6).
+///
+/// This is the consensus-level execution attestation — a quorum
+/// certificate proving that a supermajority of validators executed
+/// the block at `height` and agree on `state_root`. It is embedded in
+/// the *next* block's header as `exec_cert`, so every block carries
+/// proof that the previous block's execution was verified by the
+/// network.
+///
+/// This is distinct from [`StateAttestation`] (a single validator's
+/// attestation) and from [`QuorumCertificate`] (which certifies a
+/// *vote*, not an execution result). The `ExecCertificate` certifies
+/// *execution agreement* — divergence detection uses it to prove that
+/// all honest validators computed the same state root.
+///
+/// Wire form:
+/// ```text
+/// [height u64 LE][state_root 32B][epoch u64 LE]
+/// [signer_bitmap_len varint][signer_bitmap bytes]
+/// [aggregate_signature 96B]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecCertificate {
+    /// The height whose execution is certified.
+    pub height: Height,
+    /// The state root after executing the block at `height`.
+    pub state_root: Hash,
+    /// The epoch the certificate belongs to.
+    pub epoch: Epoch,
+    /// Bitmap of which validators signed (same encoding as QC).
+    pub signer_bitmap: Vec<u8>,
+    /// Aggregate BLS signature over `(height, state_root)`.
+    pub aggregate_signature: AggregateSignature,
+}
+
+impl Encode for ExecCertificate {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        self.height.encode(buf);
+        self.state_root.encode(buf);
+        self.epoch.encode(buf);
+        write::bytes(buf, &self.signer_bitmap);
+        self.aggregate_signature.encode(buf);
+    }
+}
+
+impl<'a> Decode<'a> for ExecCertificate {
+    fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        let height = Height::decode(reader)?;
+        let state_root = Hash::decode(reader)?;
+        let epoch = Epoch::decode(reader)?;
+        let signer_bitmap = reader.read_bytes()?.to_vec();
+        let aggregate_signature = AggregateSignature::decode(reader)?;
+        Ok(Self { height, state_root, epoch, signer_bitmap, aggregate_signature })
+    }
+}
+
 /// The engine-agnostic canonical ledger entry. This is what followers,
 /// indexers, the journal, and RPC consume — *never* an engine's
 /// internal header (oai-spec.md §1). Chained by `prev` into a hash
@@ -567,6 +624,8 @@ impl<'a> Decode<'a> for TimeoutCertificate {
 /// [has_qc u8][qc ... if present]
 /// [has_tc u8][tc ... if present]
 /// [proposer 32B][timestamp u64 LE]
+/// [has_proposer_sig u8][proposer_sig 96B if present]
+/// [has_exec_cert u8][exec_cert ... if present]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHeader {
@@ -591,6 +650,19 @@ pub struct BlockHeader {
     pub proposer: Hash,
     /// Proposal timestamp in milliseconds since Unix epoch.
     pub timestamp: u64,
+    /// The proposer's BLS signature over the block header (excluding
+    /// this signature field). Authenticates that the claimed proposer
+    /// actually created this proposal — prevents a byzantine node
+    /// from fabricating a proposal in another validator's name.
+    /// `None` in conformance mode (no real signing).
+    pub proposer_signature: Option<Signature>,
+    /// Execution certificate for the previous block: ≥2f+1 validators
+    /// attested to the state root of the block at `height - 1`. This
+    /// proves the previous block's execution was verified by the
+    /// network and enables divergence detection — if two honest
+    /// validators disagree on the state root, the `exec_cert` will
+    /// not form. `None` at genesis or before the first exec cert.
+    pub exec_cert: Option<ExecCertificate>,
 }
 
 impl Encode for BlockHeader {
@@ -616,6 +688,20 @@ impl Encode for BlockHeader {
         }
         self.proposer.encode(buf);
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
+        match &self.proposer_signature {
+            Some(sig) => {
+                write::bool(buf, true);
+                sig.encode(buf);
+            }
+            None => write::bool(buf, false),
+        }
+        match &self.exec_cert {
+            Some(cert) => {
+                write::bool(buf, true);
+                cert.encode(buf);
+            }
+            None => write::bool(buf, false),
+        }
     }
 }
 
@@ -632,6 +718,10 @@ impl<'a> Decode<'a> for BlockHeader {
             if reader.read_bool()? { Some(TimeoutCertificate::decode(reader)?) } else { None };
         let proposer = Hash::decode(reader)?;
         let timestamp = reader.read_u64()?;
+        let proposer_signature =
+            if reader.read_bool()? { Some(Signature::decode(reader)?) } else { None };
+        let exec_cert =
+            if reader.read_bool()? { Some(ExecCertificate::decode(reader)?) } else { None };
         Ok(Self {
             height,
             view,
@@ -642,6 +732,8 @@ impl<'a> Decode<'a> for BlockHeader {
             timeout_cert,
             proposer,
             timestamp,
+            proposer_signature,
+            exec_cert,
         })
     }
 }
@@ -910,6 +1002,8 @@ mod tests {
             timeout_cert: None,
             proposer: Hash([0x42; 32]),
             timestamp: 1000,
+            proposer_signature: None,
+            exec_cert: None,
         };
         let mut expected = Vec::new();
         expected.extend_from_slice(&0u64.to_le_bytes()); // height
@@ -921,6 +1015,8 @@ mod tests {
         expected.push(0); // no timeout_cert
         expected.extend_from_slice(&[0x42; 32]); // proposer
         expected.extend_from_slice(&1000u64.to_le_bytes()); // timestamp
+        expected.push(0); // no proposer_signature
+        expected.push(0); // no exec_cert
         roundtrip(&header, &expected);
     }
 
@@ -945,6 +1041,8 @@ mod tests {
             timeout_cert: None,
             proposer: Hash([0x42; 32]),
             timestamp: 2000,
+            proposer_signature: None,
+            exec_cert: None,
         };
         // Encode + round-trip (the QC makes the full wire form long;
         // roundtrip checks both encode-match and decode-match).
@@ -975,6 +1073,8 @@ mod tests {
             timeout_cert: Some(tc),
             proposer: Hash([0x42; 32]),
             timestamp: 3000,
+            proposer_signature: None,
+            exec_cert: None,
         };
         let mut buf = Vec::new();
         header.encode(&mut buf);

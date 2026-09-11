@@ -40,6 +40,8 @@ use node::{ConsensusConfig, Node, NodeConfig};
 use ports::{AppInterface, ConsensusEngine};
 use types::{MempoolAck, TxBytes};
 
+mod driver;
+
 /// Adapter that lets the RPC server submit transactions into the
 /// executor's mempool via the `rpc::TxSubmitter` trait.
 ///
@@ -62,6 +64,13 @@ impl rpc::TxSubmitter for ExecutorTxSubmitter {
 }
 
 fn main() {
+    // Initialize the tracing subscriber with `EnvFilter` so log levels
+    // can be controlled via the `RUST_LOG` environment variable (e.g.
+    // `RUST_LOG=oxide_validator=debug,rpc=info`).
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     // Subcommand dispatch (first positional arg).
     let args: Vec<String> = env::args().collect();
     if let Some(subcmd) = args.get(1).map(String::as_str) {
@@ -101,37 +110,47 @@ fn main() {
 /// Assembles the stack, runs a smoke-test transaction, then starts
 /// the JSON-RPC HTTP server (Ethereum-compatible endpoint for
 /// MetaMask/Foundry/Blockscout). The RPC server runs on a tokio
-/// runtime in a separate thread so the main thread can continue
-/// to drive consensus if needed.
+/// multi-thread runtime. The main task uses `tokio::select!` to wait
+/// for either the server to exit or a SIGTERM/SIGINT shutdown signal,
+/// enabling graceful shutdown.
 fn run_single_node() {
     let (node_config, rpc_config) = load_config();
-    println!("oxide-validator: starting with engine = {}", node_config.consensus.as_str());
-    println!("oxide-validator: mempool size = {}", node_config.max_mempool_entries);
+    tracing::info!(
+        engine = node_config.consensus.as_str(),
+        max_mempool_entries = node_config.max_mempool_entries,
+        "oxide-validator: starting"
+    );
 
     let mut node = Node::assemble(&node_config);
-    println!("oxide-validator: assembled stack (executor + core/bank/staking modules)");
+    tracing::info!("oxide-validator: assembled stack (executor + core/bank/staking modules)");
 
     // Submit a smoke-test bank transfer.
     let to = primitives::Address([2u8; 20]);
     let module_payload = bank::msg::transfer(to, 100);
     let tx = build_tx(framework::module_id::BANK, &module_payload);
     node.engine().submit_tx(tx);
-    node.engine().run_until_idle();
 
+    // Drive consensus once to finalize the smoke-test block.
+    node.engine().run_until_idle();
     let height = node.engine().finalized_height();
-    println!("oxide-validator: finalized height = {height:?}");
+    tracing::info!(?height, "oxide-validator: finalized height");
 
     if let Some(h) = height {
         let attestation = node.app().attest_state(h);
-        println!("oxide-validator: state root at height {} = {}", h.value(), attestation.root);
+        tracing::info!(
+            height = h.value(),
+            state_root = %attestation.root,
+            "oxide-validator: state root"
+        );
     }
 
-    println!("oxide-validator: smoke test complete");
+    tracing::info!("oxide-validator: smoke test complete");
 
     // Start the JSON-RPC HTTP server.
-    // The RPC server runs on a tokio multi-thread runtime in a
-    // separate thread so it doesn't block the main thread.
-    println!("oxide-validator: starting RPC server on http://{}", rpc_config.listen_addr);
+    tracing::info!(
+        listen_addr = %rpc_config.listen_addr,
+        "oxide-validator: starting RPC server"
+    );
 
     // Create a shared latency recorder for the block pipeline and RPC.
     let recorder = Arc::new(metrics::Recorder::new());
@@ -142,21 +161,82 @@ fn run_single_node() {
     rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: node.app_handle() }));
     // Attach the latency recorder for RPC handler metrics.
     rpc_server.set_recorder(recorder.clone());
+    // Seed the metrics with the current block height and mempool size.
+    if let Some(h) = height {
+        rpc_server.set_block_height(h.value());
+    }
+    rpc_server.set_mempool_size(0);
     let http_server = rpc::server::HttpServer::new(rpc_server, rpc_config.listen_addr.clone());
 
-    // Run the tokio runtime in a separate thread.
-    let handle = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        runtime.block_on(http_server.serve());
+    // Build a single tokio runtime for the consensus driver, HTTP
+    // server, and signal handling.
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+
+    runtime.block_on(async {
+        // Start the autonomous consensus driver. This continuously
+        // drives the consensus engine in a background task,
+        // finalizing blocks as transactions arrive.
+        let consensus_driver = driver::ConsensusDriver::with_defaults();
+        let driver_metrics = consensus_driver.metrics();
+        consensus_driver.start(node);
+        tracing::info!("oxide-validator: consensus driver started (autonomous mode)");
+
+        // Spawn the HTTP server as a background task.
+        let server_handle = tokio::spawn(async move {
+            http_server.serve().await;
+        });
+
+        // Periodically sync driver metrics to the RPC server.
+        let metrics_sync = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                // The driver_metrics handle is used to read the
+                // current block height for logging; the RPC server
+                // has its own atomic counters that are updated via
+                // `set_block_height`. In a future refactor, the
+                // driver and RPC can share the same atomic counters.
+                let height = driver_metrics.block_height();
+                tracing::debug!(
+                    height,
+                    txs = driver_metrics.tx_count(),
+                    "metrics sync: driver stats"
+                );
+            }
+        });
+
+        // Shutdown signal handler: catches SIGTERM and SIGINT (Ctrl+C).
+        let shutdown = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+                let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+                tokio::select! {
+                    _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+                    _ = sigint.recv() => tracing::info!("received SIGINT (Ctrl+C)"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.expect("install Ctrl+C handler");
+                tracing::info!("received shutdown signal");
+            }
+        };
+
+        tokio::select! {
+            _ = server_handle => {
+                tracing::info!("RPC server exited");
+            }
+            () = shutdown => {
+                tracing::info!("shutdown signal received, shutting down gracefully");
+            }
+        }
+        metrics_sync.abort();
     });
 
-    println!("oxide-validator: RPC server running. Press Ctrl+C to stop.");
-
-    // Wait for the RPC server thread (runs forever until killed).
-    let _ = handle.join();
+    tracing::info!("oxide-validator: node stopped");
 }
 
 /// Run a single validator node in multi-process devnet mode.
@@ -317,6 +397,7 @@ fn load_config() -> (NodeConfig, config::RpcConfig) {
             consensus,
             max_mempool_entries: config.executor.max_mempool_entries,
             parallel_threshold: config.executor.parallel_threshold,
+            evm_persistence: true,
         },
         rpc_config,
     )

@@ -76,7 +76,11 @@ impl Wake for Task {
         if self.queued.swap(true, Ordering::Relaxed) {
             return;
         }
-        self.sched.ready.lock().unwrap().push_back(self.clone());
+        self.sched
+            .ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(self.clone());
     }
 }
 
@@ -107,7 +111,7 @@ impl Handle {
             // Starts queued so the first poll happens without an explicit wake.
             queued: AtomicBool::new(true),
         });
-        self.sched.ready.lock().unwrap().push_back(task);
+        self.sched.ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(task);
     }
 }
 
@@ -156,7 +160,12 @@ impl Runtime {
     /// dropped on unwind.
     pub fn run_until_idle(&self) {
         loop {
-            let task = self.sched.ready.lock().unwrap().pop_front();
+            let task = self
+                .sched
+                .ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
             let Some(task) = task else {
                 return;
             };
@@ -170,7 +179,7 @@ impl Runtime {
 
             // Hold the future lock only across the poll. A wake during
             // poll locks `ready` (a different mutex) — no deadlock.
-            let mut slot = task.future.lock().unwrap();
+            let mut slot = task.future.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(fut) = slot.as_mut() else {
                 // A completed task woken late: drop the dedup flag is
                 // already false; just skip. No re-enqueue.

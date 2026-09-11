@@ -152,7 +152,8 @@ impl MeshNetwork {
     /// Panics if `index >= n`.
     pub fn partition(&self, index: usize) {
         assert!(index < self.n, "node index {index} out of range (n={})", self.n);
-        self.inner.partitioned.lock().unwrap()[index] = true;
+        self.inner.partitioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[index] =
+            true;
     }
 
     /// Heal a partitioned node: messages to/from this node are
@@ -164,12 +165,13 @@ impl MeshNetwork {
     /// Panics if `index >= n`.
     pub fn heal(&self, index: usize) {
         assert!(index < self.n, "node index {index} out of range (n={})", self.n);
-        self.inner.partitioned.lock().unwrap()[index] = false;
+        self.inner.partitioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[index] =
+            false;
     }
 
     /// Check if a node is partitioned.
     fn is_partitioned(&self, index: usize) -> bool {
-        self.inner.partitioned.lock().unwrap()[index]
+        self.inner.partitioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[index]
     }
 }
 
@@ -213,7 +215,10 @@ impl Transport for MeshTransport {
             return Ok(()); // silently drop — simulates a network partition
         }
         let msg = InboundMessage { from: self.peer_id(), bytes: bytes.to_vec() };
-        self.network.inner.queues[target].lock().unwrap().push_back(msg);
+        self.network.inner.queues[target]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(msg);
         Ok(())
     }
 
@@ -221,7 +226,10 @@ impl Transport for MeshTransport {
         // H2 partition: partitioned nodes still receive from their
         // queue (messages sent before the partition), but no new
         // messages arrive while partitioned (send drops them).
-        self.network.inner.queues[self.index].lock().unwrap().pop_front()
+        self.network.inner.queues[self.index]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
     }
 
     fn capabilities(&self) -> TransportCaps {

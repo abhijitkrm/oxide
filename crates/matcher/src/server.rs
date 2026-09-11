@@ -18,8 +18,11 @@
 //! trait. This is the bridge between off-chain matching and on-chain
 //! settlement.
 
-use crate::protocol::{OrderRequest, OrderResponse, decode_request, encode_response};
-use crate::{MatchingServer, SharedMatcher};
+use crate::protocol::{
+    OrderRequest, OrderResponse, RejectReason, decode_action_request, decode_request,
+    encode_response, is_action_request, verify_action,
+};
+use crate::{MatchingServer, OrderAction, SharedMatcher};
 use exchange::BatchFillEntry;
 use futures_util::{SinkExt, StreamExt};
 use primitives::fixed::Qty;
@@ -36,6 +39,13 @@ use types::TxBytes;
 /// servers. Each connection must use its OWN ring index for the
 /// duration of the request (the matcher thread replies to the same
 /// ring the request came in on).
+///
+/// # Errors
+///
+/// Returns a vector of `EngineError` rejections (one per order) if
+/// the matcher worker thread has died and the ring is disconnected.
+/// This is a terminal condition — the caller should close the
+/// connection.
 async fn submit_batch_ring(
     ring: &crate::RingMatcher,
     ring_counter: &std::sync::atomic::AtomicUsize,
@@ -45,9 +55,22 @@ async fn submit_batch_ring(
         ring_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % ring.num_rings();
     let order_sender = ring.order_sender(ring_idx).clone();
     let response_receiver = ring.response_receiver(ring_idx).clone();
-    let mut pending = Some(orders);
-    while !order_sender.push(pending.take().expect("batch not yet moved")) {
-        tokio::task::yield_now().await;
+    let mut pending = orders;
+    loop {
+        match order_sender.push(pending) {
+            Ok(()) => break,
+            Err(crate::ring::PushError::Disconnected(_)) => {
+                // Worker thread died — no point retrying.
+                return vec![
+                    OrderResponse::rejected(crate::protocol::RejectReason::EngineError,);
+                    1
+                ];
+            }
+            Err(crate::ring::PushError::Full(returned)) => {
+                pending = returned;
+                tokio::task::yield_now().await;
+            }
+        }
     }
     loop {
         if let Some(responses) = response_receiver.pop() {
@@ -65,6 +88,20 @@ async fn submit_one_ring(
 ) -> OrderResponse {
     let mut responses = submit_batch_ring(ring, ring_counter, vec![req]).await;
     responses.pop().unwrap_or(OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
+}
+
+/// Submit an order action (cancel/amend/replace) through the ring
+/// matcher's control channel. Actions are less frequent than new
+/// orders, so the control-channel path (serviced between ring polls)
+/// is the right seam — it reaches THE SAME order book the rings
+/// write to, with no second book.
+fn submit_action_ring(ring: &crate::RingMatcher, action: OrderAction) -> OrderResponse {
+    // The control channel is synchronous (std::sync::mpsc); the
+    // matcher thread services it between ring polls. We send and
+    // recv — the recv blocks the tokio task, but actions are rare
+    // (cancel/amend/replace), so this is acceptable. For a hot-path
+    // action stream, a dedicated ring would be added.
+    ring.submit_action(action)
 }
 
 // ── TxSubmitter trait ────────────────────────────────────────────────
@@ -285,6 +322,7 @@ async fn run_binary_tcp_server_impl(
 /// Handle a single TCP connection: read requests (single or batch),
 /// submit to the matching server (mutex or SPSC ring path), and
 /// write responses. Runs until the client disconnects.
+#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     matcher: Arc<SharedMatcher>,
@@ -327,15 +365,65 @@ async fn handle_connection(
             // available, route through the per-connection
             // SPSC ring (no locks); otherwise use the mutex
             // path (single lock for the whole batch).
-            let responses: Vec<OrderResponse> = if let Some(rm) = &ring_matcher {
-                submit_batch_ring(rm, &ring_counter, orders).await
+            //
+            // Signature verification happens BEFORE submission —
+            // unauthenticated orders are rejected with BadSignature
+            // without touching the matching engine or balances.
+            let verified: Vec<OrderRequest> =
+                orders.iter().filter(|req| crate::protocol::verify_order(req)).copied().collect();
+            let bad_sig_count = orders.len() - verified.len();
+            let mut responses: Vec<OrderResponse> = if let Some(rm) = &ring_matcher {
+                submit_batch_ring(rm, &ring_counter, verified).await
             } else {
-                let mut server = matcher.inner.lock().unwrap();
-                orders.iter().map(|req| server.submit_order(req)).collect()
+                match matcher.inner.lock() {
+                    Ok(mut server) => verified.iter().map(|req| server.submit_order(req)).collect(),
+                    Err(_) => {
+                        vec![OrderResponse::rejected(crate::protocol::RejectReason::EngineError)]
+                    }
+                }
             };
+            // Prepend rejections for orders that failed signature
+            // verification. This preserves the response count == request count.
+            for _ in 0..bad_sig_count {
+                responses.insert(
+                    0,
+                    OrderResponse::rejected(crate::protocol::RejectReason::BadSignature),
+                );
+            }
             // Encode and send the batch response.
             let batch_resp = crate::protocol::encode_batch_response(&responses);
             if socket.write_all(&batch_resp).await.is_err() {
+                break;
+            }
+        } else if is_action_request(&header) {
+            // Action request (cancel/amend/replace): the market byte
+            // is ACTION_FLAG (0xFE). Read the remaining
+            // ACTION_REQUEST_SIZE - 4 bytes and decode.
+            let mut rest = [0u8; crate::protocol::ACTION_REQUEST_SIZE - 4];
+            if socket.read_exact(&mut rest).await.is_err() {
+                break;
+            }
+            let mut full = Vec::with_capacity(crate::protocol::ACTION_REQUEST_SIZE);
+            full.extend_from_slice(&header);
+            full.extend_from_slice(&rest);
+            let Some(action_req) = decode_action_request(&full) else {
+                let rej = OrderResponse::rejected(crate::protocol::RejectReason::Malformed);
+                let _ = socket.write_all(&encode_response(&rej)).await;
+                continue;
+            };
+            // Signature verification before processing.
+            if !verify_action(&action_req) {
+                let rej = OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
+                let _ = socket.write_all(&encode_response(&rej)).await;
+                continue;
+            }
+            let action = crate::protocol::action_request_to_order_action(&action_req);
+            let action_resp = if let Some(rm) = &ring_matcher {
+                submit_action_ring(rm, action)
+            } else {
+                matcher.submit_action(&action)
+            };
+            if socket.write_all(&encode_response(&action_resp)).await.is_err() {
                 break;
             }
         } else {
@@ -439,6 +527,47 @@ async fn run_jsonrpc_tcp_server_impl(
                     continue;
                 };
                 let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
+
+                if method == crate::jsonrpc::MANAGE_ORDER {
+                    // Order action (cancel/amend/replace).
+                    let Some(action_req) = crate::jsonrpc::parse_jsonrpc_action(&params) else {
+                        let _ = writer
+                            .write_all(
+                                br#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params"},"id":null}
+"#,
+                            )
+                            .await;
+                        continue;
+                    };
+                    if !crate::protocol::verify_action(&action_req) {
+                        let _ = writer
+                            .write_all(
+                                br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad signature"},"id":null}
+"#,
+                            )
+                            .await;
+                        continue;
+                    }
+                    let action = crate::protocol::action_request_to_order_action(&action_req);
+                    let resp = if let Some(rm) = &ring_matcher {
+                        submit_action_ring(rm, action)
+                    } else {
+                        matcher.submit_action(&action)
+                    };
+                    let result = crate::jsonrpc::format_jsonrpc_response(&resp);
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "result": result,
+                        "id": id,
+                    });
+                    let mut response_line = serde_json::to_string(&response).unwrap_or_default();
+                    response_line.push('\n');
+                    let _ = writer.write_all(response_line.as_bytes()).await;
+                    continue;
+                }
+
                 if method != "oxide_placeOrder" {
                     let _ = writer
                         .write_all(
@@ -448,8 +577,6 @@ async fn run_jsonrpc_tcp_server_impl(
                         .await;
                     continue;
                 }
-                let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
                 // Parse the order.
                 let Some(order_req) = crate::jsonrpc::parse_jsonrpc_order(&params) else {
                     let _ = writer
@@ -553,7 +680,42 @@ async fn run_fix_server_impl(
                     .find_map(|f| f.strip_prefix("11=").map(str::to_string))
                     .unwrap_or_else(|| "UNKNOWN".to_string());
 
-                // Parse the FIX order.
+                // Determine the FIX MsgType (tag 35) to dispatch.
+                let msg_type = text
+                    .split('\x01')
+                    .find_map(|f| f.strip_prefix("35=").map(str::to_string))
+                    .unwrap_or_default();
+
+                if msg_type == crate::fix::MSG_TYPE_CANCEL
+                    || msg_type == crate::fix::MSG_TYPE_CANCEL_REPLACE
+                {
+                    // Order cancel (F) or cancel-replace (G).
+                    let action_req = if msg_type == crate::fix::MSG_TYPE_CANCEL {
+                        crate::fix::parse_fix_cancel(&text)
+                    } else {
+                        crate::fix::parse_fix_cancel_replace(&text)
+                    };
+                    let Some(action_req) = action_req else {
+                        continue;
+                    };
+                    if !crate::protocol::verify_action(&action_req) {
+                        let resp = OrderResponse::rejected(RejectReason::BadSignature);
+                        let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
+                        let _ = socket.write_all(report.as_bytes()).await;
+                        continue;
+                    }
+                    let action = crate::protocol::action_request_to_order_action(&action_req);
+                    let resp = if let Some(rm) = &ring_matcher {
+                        submit_action_ring(rm, action)
+                    } else {
+                        matcher.submit_action(&action)
+                    };
+                    let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
+                    let _ = socket.write_all(report.as_bytes()).await;
+                    continue;
+                }
+
+                // Default: parse as NewOrderSingle (D).
                 let Some(req) = crate::fix::parse_fix_order(&text) else {
                     continue;
                 };
@@ -640,6 +802,35 @@ async fn run_websocket_server_impl(
                     Message::Close(_) => break,
                     _ => continue,
                 };
+
+                // Check if this is an action request (has "action" field)
+                // or a new order request.
+                if text.contains("\"action\"") {
+                    // Parse as an order action (cancel/amend/replace).
+                    let Some(action_req) = crate::ws::parse_ws_action(&text) else {
+                        let _ = ws_sender
+                            .send(Message::Text(r#"{"error":"invalid action"}"#.into()))
+                            .await;
+                        continue;
+                    };
+                    if !crate::protocol::verify_action(&action_req) {
+                        let resp = OrderResponse::rejected(RejectReason::BadSignature);
+                        let response = crate::ws::format_ws_response(&resp, 0);
+                        let _ = ws_sender.send(Message::Text(response.into())).await;
+                        continue;
+                    }
+                    let action = crate::protocol::action_request_to_order_action(&action_req);
+                    let resp = if let Some(rm) = &ring_matcher {
+                        submit_action_ring(rm, action)
+                    } else {
+                        matcher.submit_action(&action)
+                    };
+                    let response = crate::ws::format_ws_response(&resp, 0);
+                    if ws_sender.send(Message::Text(response.into())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
 
                 // Parse the WebSocket order.
                 let Some(req) = crate::ws::parse_ws_order(&text) else {
@@ -979,6 +1170,30 @@ async fn handle_connection_multi(
             if socket.write_all(&batch_resp).await.is_err() {
                 break;
             }
+        } else if is_action_request(&header) {
+            // Action request (cancel/amend/replace).
+            let mut rest = [0u8; crate::protocol::ACTION_REQUEST_SIZE - 4];
+            if socket.read_exact(&mut rest).await.is_err() {
+                break;
+            }
+            let mut full = Vec::with_capacity(crate::protocol::ACTION_REQUEST_SIZE);
+            full.extend_from_slice(&header);
+            full.extend_from_slice(&rest);
+            let Some(action_req) = decode_action_request(&full) else {
+                let rej = OrderResponse::rejected(crate::protocol::RejectReason::Malformed);
+                let _ = socket.write_all(&encode_response(&rej)).await;
+                continue;
+            };
+            if !verify_action(&action_req) {
+                let rej = OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
+                let _ = socket.write_all(&encode_response(&rej)).await;
+                continue;
+            }
+            let action = crate::protocol::action_request_to_order_action(&action_req);
+            let action_resp = matcher.submit_action(action);
+            if socket.write_all(&encode_response(&action_resp)).await.is_err() {
+                break;
+            }
         } else {
             let mut rest = [0u8; crate::protocol::REQUEST_SIZE - 4];
             if socket.read_exact(&mut rest).await.is_err() {
@@ -1027,13 +1242,36 @@ pub async fn run_jsonrpc_tcp_server_multi(
                     continue;
                 };
                 let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
+
+                if method == crate::jsonrpc::MANAGE_ORDER {
+                    let Some(action_req) = crate::jsonrpc::parse_jsonrpc_action(&params) else {
+                        let _ = writer.write_all(br#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params"},"id":null}
+"#).await;
+                        continue;
+                    };
+                    if !crate::protocol::verify_action(&action_req) {
+                        let _ = writer.write_all(br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad signature"},"id":null}
+"#).await;
+                        continue;
+                    }
+                    let action = crate::protocol::action_request_to_order_action(&action_req);
+                    let resp = matcher.submit_action(action);
+                    let result = crate::jsonrpc::format_jsonrpc_response(&resp);
+                    let response =
+                        serde_json::json!({ "jsonrpc": "2.0", "result": result, "id": id });
+                    let mut response_line = serde_json::to_string(&response).unwrap_or_default();
+                    response_line.push('\n');
+                    let _ = writer.write_all(response_line.as_bytes()).await;
+                    continue;
+                }
+
                 if method != "oxide_placeOrder" {
                     let _ = writer.write_all(br#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":null}
 "#).await;
                     continue;
                 }
-                let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
                 let Some(order_req) = crate::jsonrpc::parse_jsonrpc_order(&params) else {
                     let _ = writer.write_all(br#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params"},"id":null}
 "#).await;
@@ -1077,6 +1315,33 @@ pub async fn run_fix_server_multi(
                     .split('\x01')
                     .find_map(|f| f.strip_prefix("11=").map(str::to_string))
                     .unwrap_or_else(|| "UNKNOWN".to_string());
+                let msg_type = text
+                    .split('\x01')
+                    .find_map(|f| f.strip_prefix("35=").map(str::to_string))
+                    .unwrap_or_default();
+                if msg_type == crate::fix::MSG_TYPE_CANCEL
+                    || msg_type == crate::fix::MSG_TYPE_CANCEL_REPLACE
+                {
+                    let action_req = if msg_type == crate::fix::MSG_TYPE_CANCEL {
+                        crate::fix::parse_fix_cancel(&text)
+                    } else {
+                        crate::fix::parse_fix_cancel_replace(&text)
+                    };
+                    let Some(action_req) = action_req else {
+                        continue;
+                    };
+                    if !crate::protocol::verify_action(&action_req) {
+                        let resp = OrderResponse::rejected(RejectReason::BadSignature);
+                        let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
+                        let _ = socket.write_all(report.as_bytes()).await;
+                        continue;
+                    }
+                    let action = crate::protocol::action_request_to_order_action(&action_req);
+                    let resp = matcher.submit_action(action);
+                    let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
+                    let _ = socket.write_all(report.as_bytes()).await;
+                    continue;
+                }
                 let Some(req) = crate::fix::parse_fix_order(&text) else {
                     continue;
                 };
@@ -1265,6 +1530,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(9),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         server.submit_order(&maker);
 
@@ -1277,6 +1545,9 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(1),
+            nonce: 0,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         server.submit_order(&taker);
 

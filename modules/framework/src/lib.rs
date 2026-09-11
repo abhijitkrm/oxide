@@ -97,7 +97,7 @@ impl Default for ModuleRouter {
 pub fn subtree_root(store: &KVStore) -> Hash {
     use crypto::hash::{Domain, Hasher};
     let mut data = Vec::new();
-    let locked = store.lock().unwrap();
+    let locked = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for (k, v) in locked.iter() {
         data.extend_from_slice(k);
         data.extend_from_slice(&(v.len() as u64).to_le_bytes());
@@ -125,7 +125,10 @@ mod tests {
         }
         fn begin_block(&self, _h: Height) {}
         fn handle(&self, _ctx: &executor::TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-            self.store.lock().unwrap().insert(b"last".to_vec(), msg.to_vec());
+            self.store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(b"last".to_vec(), msg.to_vec());
             Ok(vec![])
         }
         fn end_block(&self, _h: Height) {}
@@ -147,7 +150,10 @@ mod tests {
     fn subtree_root_changes_with_state() {
         let store: KVStore = Mutex::new(BTreeMap::new());
         let root0 = subtree_root(&store);
-        store.lock().unwrap().insert(b"k".to_vec(), b"v".to_vec());
+        store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(b"k".to_vec(), b"v".to_vec());
         let root1 = subtree_root(&store);
         assert_ne!(root0, root1, "state root must change when state changes");
     }

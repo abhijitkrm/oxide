@@ -102,7 +102,10 @@ fn integrity_1b_orders_1m_accounts() {
             tif: TimeInForce::Gtc,
             price: Price(1_500_000_000),
             qty: Qty(1_000),
+            nonce: 0,
             owner: addr_from_index(seller_idx),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let taker = OrderRequest {
             market: 0,
@@ -111,7 +114,10 @@ fn integrity_1b_orders_1m_accounts() {
             tif: TimeInForce::Gtc,
             price: Price(1_500_000_000),
             qty: Qty(1_000),
+            nonce: 0,
             owner: addr_from_index(buyer_idx),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let _ = server.submit_order(&maker);
         let _ = server.submit_order(&taker);
@@ -221,7 +227,10 @@ fn integrity_smoke() {
             tif: TimeInForce::Gtc,
             price: Price(1_500_000_000),
             qty: Qty(1_000),
+            nonce: 0,
             owner: addr_from_index(seller_idx),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let taker = OrderRequest {
             market: 0,
@@ -230,7 +239,10 @@ fn integrity_smoke() {
             tif: TimeInForce::Gtc,
             price: Price(1_500_000_000),
             qty: Qty(1_000),
+            nonce: 0,
             owner: addr_from_index(buyer_idx),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
         };
         let _ = server.submit_order(&maker);
         let _ = server.submit_order(&taker);

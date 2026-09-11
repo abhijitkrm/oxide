@@ -84,7 +84,7 @@ revm = "42.0.1"
 
 # thiserror: ergonomic error enums (used across infrastructure crates).
 # MIT-OR-APACHE-2.0 licensed (GPL-3.0-compatible).
-thiserror = "2"
+thiserror = "2.0.20"
 
 # secp256k1: ECDSA signature recovery for EVM transactions (Phase A).
 # Already a transitive dep via revm; declared explicitly with the
@@ -116,7 +116,7 @@ alloy-trie = { version = "0.9.5", features = ["ethereum"] }
 # alloy-primitives: core Ethereum types (B256, Address, U256, keccak256).
 # Already a transitive dep via revm; declared explicitly for direct use
 # in the EVM module (trie, tx types). MIT/Apache-2.0 licensed.
-alloy-primitives = { version = "1.0", features = ["std"] }
+alloy-primitives = { version = "1.7.2", features = ["std"] }
 
 # ed25519-dalek: Ed25519 signatures for native module authenticity
 # (Phase G). Pure Rust, constant-time, no_std-compatible. Used by
@@ -130,7 +130,7 @@ ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 # recovery. Recovering N senders in parallel across cores turns
 # that 88% into 88%/N_cores. MIT/Apache-2.0. Work-stealing
 # threadpool, mature, used by reth/Foundry.
-rayon = "1.12"
+rayon = "1.12.0"
 
 # External storage adapters (plan.md §2.3: StorageBackend adapters).
 # redb is Apache-2.0 (GPL-3.0-compatible), pure Rust, ACID, LMDB-like.
@@ -147,7 +147,7 @@ libmdbx = "0.6.6"
 # and all major Rust blockchain nodes (reth, cosmos-sdk-rust).
 # Not used in hot-path crates (consensus, executor, mempool) — only
 # in the RPC server and node binaries.
-tokio = { version = "1.44", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
 
 # axum: ergonomic HTTP server framework built on hyper + tokio.
 # MIT-licensed (GPL-3.0-compatible). Used for the JSON-RPC HTTP
@@ -156,28 +156,48 @@ axum = "0.8.4"
 
 # tower: service abstraction used by axum for middleware.
 # MIT-licensed (GPL-3.0-compatible). Required by axum's serve().
-tower = "0.5"
+tower = "0.5.3"
 
 # hyper: low-level HTTP implementation. MIT-licensed.
 # Direct dep for hyper::body::Incoming body reading in the RPC server.
-hyper = "1.5"
+hyper = "1.11.1"
 
 # tokio-tungstenite: async WebSocket server/client for the matching
 # server's WebSocket order-entry protocol. MIT-licensed (GPL-3.0-
 # compatible). Not on the consensus hot path — only in the matcher
 # server's network layer.
-tokio-tungstenite = "0.27"
+tokio-tungstenite = "0.27.0"
 
 # futures-util: Stream/Sink traits for async WebSocket I/O.
 # MIT/Apache-2.0 licensed. Required by tokio-tungstenite's split().
-futures-util = "0.3"
+futures-util = "0.3.34"
 
 # hdrhistogram: high-dynamic-range histograms for latency recording
 # (plan.md §10: "measure everything — HDR histograms per component").
 # Used by the `metrics` crate to record p50/p99/p99.9 latencies for
 # the block pipeline, RPC handlers, and consensus operations.
 # MIT/Apache-2.0 licensed. Published 2023-08-22 (well-vetted).
-hdrhistogram = "7.5"
+hdrhistogram = "7.5.4"
+
+# tracing: structured, async-aware diagnostic logging. MIT-licensed
+# (GPL-3.0-compatible). Used by node binaries for startup, shutdown,
+# and lifecycle events. Not on the hot path — only in the node
+# assembly and binary crates. Published 2024-11-27 (well-vetted).
+tracing = "0.1.41"
+
+# tracing-subscriber: the default `fmt` subscriber for `tracing`.
+# MIT-licensed (GPL-3.0-compatible). Used to initialize the tracing
+# subscriber at node startup with `EnvFilter` for log-level control
+# via the `RUST_LOG` environment variable. Published 2024-11-29
+# (well-vetted).
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+# crossbeam-channel: lock-free bounded MPMC channel for the matcher's
+# SPSC rings. MIT/Apache-2.0 licensed (GPL-3.0-compatible). Replaces
+# the std::sync::mpsc + Mutex wrapper with a truly lock-free channel
+# whose Receiver is Send + Sync (no Mutex needed). Well-vetted
+# (published 2018+, used by tokio, rayon, and most Rust async runtimes).
+crossbeam-channel = "0.5.14"
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable

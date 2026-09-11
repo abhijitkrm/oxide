@@ -108,12 +108,16 @@ impl ports::ConsensusEngine for SequencerEngine {
             match self.app.process_proposal(&proposal) {
                 Verdict::Accept => {}
                 Verdict::Reject { reason } => {
-                    // The sequencer never rejects a non-empty proposal
-                    // in a correct app; a rejection here is a bug in
-                    // the app or the engine. Panic rather than silently
-                    // dropping a block — this is dev-mode, not
-                    // production.
-                    panic!("SequencerEngine: proposal rejected: {reason}");
+                    // Drop the proposal and stop sequencing. The
+                    // sequencer is dev-mode; a rejection means the
+                    // app found the proposal invalid. Panicking here
+                    // would crash the devnet on any app-level
+                    // rejection, which is too fragile for testing.
+                    eprintln!(
+                        "SequencerEngine: proposal rejected (height={:?}): {reason}",
+                        proposal.height
+                    );
+                    break;
                 }
             }
             let block = FinalizedBlock { height: proposal.height, txs: proposal.txs };

@@ -106,3 +106,56 @@ context from the author.
    (failing test first, then fix).
 4. Benchmarks re-run if a hot path was touched; no gate regressions.
 5. No `unwrap` outside permitted zones; unsafe blocks justified with SAFETY comments.
+
+## 8. Mutex Poisoning Recovery
+
+When a thread panics while holding a `Mutex`, the mutex becomes
+*poisoned*. The standard library's `.lock()` returns `Err(PoisonError)`.
+
+- **Never** use `.lock().unwrap()` in production code — a poisoned
+  mutex will panic the caller too, cascading the failure.
+- **Always** use the poisoning-recovery pattern:
+
+  ```rust
+  self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+  ```
+
+  This recovers the inner guard even when poisoned, allowing the
+  process to continue (potentially with inconsistent state) rather
+  than cascading the panic. A poisoned mutex means *a thread already
+  panicked* — the operator should restart the process, but the
+  process should not cascade the panic to unrelated threads.
+
+- In `match self.inner.lock() { Ok(guard) => ..., Err(e) => ... }`
+  patterns, use `Err(e) => e.into_inner()` to recover the guard.
+
+## 9. Protocol Stability
+
+When extending a binary or JSON protocol with new rejection reasons,
+status codes, or message types:
+
+- **Never renumber existing discriminants.** Existing values are
+  part of the wire contract; changing them breaks deployed clients.
+- Add new values *after* the highest existing value.
+- Update encode/decode logic symmetrically — every new encode path
+  must have a matching decode path.
+- Add tests for every new discriminant (both encode and decode).
+- Update all protocol adapters (TCP, WS, JSON-RPC, FIX) to handle
+  the new values — a new rejection reason that one adapter collapses
+  into a generic error is a bug.
+
+## 10. Risk & Rate Limiting
+
+- Risk checks (rate limits, position caps, fat-finger bands) run
+  *before* balance reservation and matching — a rejected order must
+  not alter balances or engine state.
+- Rate limiters on hot paths use deterministic state (no system
+  clocks in the matching engine); the RPC layer may use wall-clock
+  time since it is not consensus-critical.
+- Fat-finger price bands derive their reference price from the
+  matching engine's `best_bid()`/`best_ask()` — handle empty books
+  and one-sided books deterministically (reject or allow, never
+  panic).
+- Resting-order accounting must be updated on every path that
+  changes resting state: successful placement, cancel, amend,
+  replace, and canceled remainder after partial fill.

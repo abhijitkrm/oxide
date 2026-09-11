@@ -25,13 +25,19 @@
 //! (e.g. `QuickFIX`, FIX8); this module only parses the application-
 //! layer order message.
 
-use crate::protocol::{OrderRequest, OrderResponse, RejectReason};
+use crate::protocol::{ActionRequest, ActionType, OrderRequest, OrderResponse, RejectReason};
 use primitives::fixed::{Price, Qty};
 use std::fmt::Write;
 use trading::{OrderType, Side, TimeInForce};
 
 /// FIX `MsgType` for `NewOrderSingle`.
 pub const MSG_TYPE_NEW_ORDER: &str = "D";
+
+/// FIX `MsgType` for `OrderCancelRequest`.
+pub const MSG_TYPE_CANCEL: &str = "F";
+
+/// FIX `MsgType` for `OrderCancelReplaceRequest`.
+pub const MSG_TYPE_CANCEL_REPLACE: &str = "G";
 
 /// Parse a FIX `NewOrderSingle` (MsgType=D) message into an
 /// `OrderRequest`.
@@ -78,7 +84,102 @@ pub fn parse_fix_order(body: &str) -> Option<OrderRequest> {
     let owner_str = tags.get("1")?;
     let owner = parse_fix_address(owner_str)?;
 
-    Some(OrderRequest { market: 0, side, order_type, tif, price, qty, owner })
+    // Nonce (tag 9666): decimal string → u64.
+    // FIX tag 9666 is the standard "AllocNonce" repurposed here for
+    // order replay protection.
+    let nonce_str = tags.get("9666")?;
+    let nonce: u64 = nonce_str.parse().ok()?;
+
+    // PubKey (tag 9700): 32-byte hex Ed25519 public key.
+    let pubkey_str = tags.get("9700")?;
+    let pubkey = parse_fix_pubkey(pubkey_str)?;
+
+    // Signature (tag 9701): 64-byte hex Ed25519 signature.
+    let sig_str = tags.get("9701")?;
+    let signature = parse_fix_signature(sig_str)?;
+
+    Some(OrderRequest {
+        market: 0,
+        side,
+        order_type,
+        tif,
+        price,
+        qty,
+        nonce,
+        owner,
+        pubkey,
+        signature,
+    })
+}
+
+/// Parse a FIX `OrderCancelRequest` (MsgType=F) into an `ActionRequest`.
+///
+/// # Supported FIX tags
+///
+/// | Tag | Name | Mapping |
+/// |-----|------|---------|
+/// | 41  | `OrigClOrdID` | engine order id (decimal) |
+/// | 1   | `Account` | 20-byte hex address (owner) |
+/// | 9666| `AllocNonce` | replay-protection nonce |
+/// | 9700| (custom) | 32-byte hex Ed25519 public key |
+/// | 9701| (custom) | 64-byte hex Ed25519 signature |
+///
+/// Returns `None` if required tags are missing or invalid.
+pub fn parse_fix_cancel(body: &str) -> Option<ActionRequest> {
+    let tags = parse_fix_tags(body);
+    let order_id: u64 = tags.get("41")?.parse().ok()?;
+    let owner_str = tags.get("1")?;
+    let owner = parse_fix_address(owner_str)?;
+    let nonce: u64 = tags.get("9666")?.parse().ok()?;
+    let pubkey_str = tags.get("9700")?;
+    let pubkey = parse_fix_pubkey(pubkey_str)?;
+    let sig_str = tags.get("9701")?;
+    let signature = parse_fix_signature(sig_str)?;
+    Some(ActionRequest {
+        action_type: ActionType::Cancel,
+        order_id,
+        new_price: Price(0),
+        new_qty: Qty(0),
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        tif: TimeInForce::Gtc,
+        nonce,
+        owner,
+        pubkey,
+        signature,
+    })
+}
+
+/// Parse a FIX `OrderCancelReplaceRequest` (MsgType=G) into an
+/// `ActionRequest` (amend). The new price and qty come from tags 44
+/// and 38; the original order id comes from tag 41.
+///
+/// Returns `None` if required tags are missing or invalid.
+pub fn parse_fix_cancel_replace(body: &str) -> Option<ActionRequest> {
+    let tags = parse_fix_tags(body);
+    let order_id: u64 = tags.get("41")?.parse().ok()?;
+    let owner_str = tags.get("1")?;
+    let owner = parse_fix_address(owner_str)?;
+    let new_price = parse_fix_price(tags.get("44")?)?;
+    let new_qty = parse_fix_qty(tags.get("38")?)?;
+    let nonce: u64 = tags.get("9666")?.parse().ok()?;
+    let pubkey_str = tags.get("9700")?;
+    let pubkey = parse_fix_pubkey(pubkey_str)?;
+    let sig_str = tags.get("9701")?;
+    let signature = parse_fix_signature(sig_str)?;
+    Some(ActionRequest {
+        action_type: ActionType::Amend,
+        order_id,
+        new_price,
+        new_qty,
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        tif: TimeInForce::Gtc,
+        nonce,
+        owner,
+        pubkey,
+        signature,
+    })
 }
 
 /// Format an order response as a FIX `ExecutionReport` (MsgType=8).
@@ -151,7 +252,11 @@ fn parse_decimal_to_scaled(s: &str, multiplier: u64) -> Option<u64> {
     let scale_digits = multiplier_str.len() - 1; // e.g. 1e8 → 8 digits.
     let frac_padded = format!("{frac_trimmed:0<scale_digits$}");
     let frac_val: u64 = frac_padded.parse().ok()?;
-    Some(int_val * multiplier + frac_val)
+    // Use u128 intermediate to detect overflow. A malformed FIX
+    // message with a huge integer part must not silently wrap.
+    let int_scaled = u128::from(int_val) * u128::from(multiplier);
+    let total = int_scaled + u128::from(frac_val);
+    u64::try_from(total).ok()
 }
 
 fn parse_fix_address(s: &str) -> Option<primitives::Address> {
@@ -170,13 +275,51 @@ fn parse_fix_address(s: &str) -> Option<primitives::Address> {
     Some(primitives::Address(addr))
 }
 
+/// Parse a 32-byte hex Ed25519 public key.
+fn parse_fix_pubkey(s: &str) -> Option<[u8; 32]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 64 {
+        return None;
+    }
+    let mut pubkey = [0u8; 32];
+    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
+        if i >= 32 {
+            return None;
+        }
+        let hex = std::str::from_utf8(byte).ok()?;
+        pubkey[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(pubkey)
+}
+
+/// Parse a 64-byte hex Ed25519 signature.
+fn parse_fix_signature(s: &str) -> Option<[u8; 64]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 128 {
+        return None;
+    }
+    let mut sig = [0u8; 64];
+    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
+        if i >= 64 {
+            return None;
+        }
+        let hex = std::str::from_utf8(byte).ok()?;
+        sig[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(sig)
+}
+
 fn fix_reject_code(r: RejectReason) -> &'static str {
     match r {
         RejectReason::InsufficientBalance => "0", // BrokerOption.
         RejectReason::EngineError => "99",        // Other.
         RejectReason::EngineRejected => "5",      // UnknownSymbol.
-        RejectReason::Killed => "1",              // UnknownOrder.
         RejectReason::Malformed => "6",           // UnsupportedOrderCharacteristic.
+        RejectReason::BadSignature => "7",        // Unauthorized.
+        RejectReason::Killed | RejectReason::OrderNotFound => "1", // UnknownOrder.
+        RejectReason::StaleNonce | RejectReason::TooManyResting => "8", // DuplicateOrder/TooLateToCancel.
+        RejectReason::RateLimited => "9",                               // OrderRateExceeded.
+        RejectReason::OrderTooLarge | RejectReason::FatFinger => "18",  // InvalidPrice.
     }
 }
 
@@ -186,7 +329,7 @@ mod tests {
 
     #[test]
     fn parse_new_order_single() {
-        let body = "11=ORD001\x0154=1\x0140=2\x0159=0\x0144=15.00\x0138=0.001\x0155=OXIDE\x011=0x4242424242424242424242424242424242424242\x01";
+        let body = "11=ORD001\x0154=1\x0140=2\x0159=0\x0144=15.00\x0138=0.001\x0155=OXIDE\x011=0x4242424242424242424242424242424242424242\x019666=1\x019700=0000000000000000000000000000000000000000000000000000000000000000\x019701=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\x01";
         let req = parse_fix_order(body).expect("parse");
         assert_eq!(req.side, Side::Buy);
         assert_eq!(req.order_type, OrderType::Limit);
@@ -212,5 +355,24 @@ mod tests {
         assert!(msg.contains("150=8")); // ExecType=Rejected.
         assert!(msg.contains("39=8")); // OrdStatus=Rejected.
         assert!(msg.contains("103=0")); // OrdRejReason.
+    }
+
+    #[test]
+    fn parse_order_cancel_request() {
+        let body = "41=7\x011=0x4242424242424242424242424242424242424242\x019666=2\x019700=0000000000000000000000000000000000000000000000000000000000000000\x019701=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\x01";
+        let req = parse_fix_cancel(body).expect("parse");
+        assert_eq!(req.action_type, ActionType::Cancel);
+        assert_eq!(req.order_id, 7);
+        assert_eq!(req.owner.0, [0x42; 20]);
+    }
+
+    #[test]
+    fn parse_order_cancel_replace_request() {
+        let body = "41=3\x0144=16.00\x0138=0.002\x011=0x4242424242424242424242424242424242424242\x019666=2\x019700=0000000000000000000000000000000000000000000000000000000000000000\x019701=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\x01";
+        let req = parse_fix_cancel_replace(body).expect("parse");
+        assert_eq!(req.action_type, ActionType::Amend);
+        assert_eq!(req.order_id, 3);
+        assert_eq!(req.new_price.0, 1_600_000_000);
+        assert_eq!(req.new_qty.0, 2_000);
     }
 }

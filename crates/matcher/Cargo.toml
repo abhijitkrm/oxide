@@ -19,6 +19,7 @@ exchange = { workspace = true }
 framework = { workspace = true }
 executor = { workspace = true }
 ports = { workspace = true }
+crypto = { workspace = true }
 # serde: JSON serialization for JSON-RPC and WebSocket protocols.
 # MIT/Apache-2.0 licensed.
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +32,10 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 # futures-util: Stream/Sink traits for async WebSocket I/O.
 futures-util = { workspace = true }
+# crossbeam-channel: lock-free bounded channel for the SPSC rings.
+# Replaces std::sync::mpsc + Mutex with a truly lock-free channel.
+# MIT/Apache-2.0 licensed (GPL-3.0-compatible).
+crossbeam-channel = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.7.0"

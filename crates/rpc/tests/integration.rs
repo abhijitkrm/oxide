@@ -36,7 +36,7 @@ use rpc::{RpcRequest, RpcServer};
 use serde_json::{Value, json};
 
 fn make_server() -> RpcServer {
-    let mut s = RpcServer::new(1337, 1_000_000_000);
+    let s = RpcServer::new(1337, 1_000_000_000);
     s.set_block_height(42);
     s
 }

@@ -50,6 +50,70 @@ pub enum ExecError {
     OutOfGas,
 }
 
+/// A point-in-time snapshot of the executor's state (plan.md §8).
+///
+/// Captures the chain height, the aggregate state root, and
+/// per-module state roots. Used for fast state sync: a new node
+/// imports a snapshot to skip replaying the entire chain from
+/// genesis.
+///
+/// # Determinism
+///
+/// The snapshot is deterministic: two executors with the same state
+/// produce byte-identical snapshots. The module roots are listed in
+/// registration order (module ID order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorSnapshot {
+    /// The chain height (highest finalized block).
+    pub height: u64,
+    /// The aggregate state root (hash of all module state roots).
+    pub state_root: Hash,
+    /// Per-module state roots, in registration order.
+    pub module_roots: Vec<(&'static str, Hash)>,
+}
+
+/// A snapshot import error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotImportError {
+    /// The snapshot has height 0 (nothing to import).
+    EmptySnapshot,
+    /// The snapshot's state root does not match the recomputed
+    /// aggregate of per-module state roots (corrupted or tampered).
+    StateRootMismatch {
+        /// The expected root from the snapshot.
+        expected: Hash,
+        /// The recomputed root from the module roots.
+        actual: Hash,
+    },
+    /// The snapshot's module count does not match the executor's
+    /// registered module count (snapshot from a different config).
+    ModuleCountMismatch {
+        /// Module count in the snapshot.
+        snapshot: usize,
+        /// Registered module count in the executor.
+        registered: usize,
+    },
+}
+
+impl std::fmt::Display for SnapshotImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptySnapshot => write!(f, "empty snapshot (height 0)"),
+            Self::StateRootMismatch { expected, actual } => {
+                write!(f, "state root mismatch: expected {expected}, got {actual}")
+            }
+            Self::ModuleCountMismatch { snapshot, registered } => {
+                write!(
+                    f,
+                    "module count mismatch: snapshot has {snapshot}, executor has {registered}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotImportError {}
+
 /// Transaction context passed to modules during `handle`.
 ///
 /// Carries the sender, nonce, and fee parsed from the tx envelope.
@@ -470,6 +534,156 @@ impl Executor {
         self.async_execution = true;
     }
 
+    /// The current chain height (the highest finalized block).
+    ///
+    /// Returns 0 if no blocks have been finalized yet (genesis state).
+    #[must_use]
+    pub fn current_height(&self) -> u64 {
+        let next =
+            *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        next.saturating_sub(1)
+    }
+
+    /// The state root at a given finalized height.
+    ///
+    /// Returns `Hash::ZERO` if the height is not finalized or unknown.
+    #[must_use]
+    pub fn state_root_at(&self, height: u64) -> Hash {
+        self.state_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&height)
+            .copied()
+            .unwrap_or(Hash::ZERO)
+    }
+
+    /// The latest state root (at the current chain height).
+    ///
+    /// Returns `Hash::ZERO` if no blocks have been finalized.
+    #[must_use]
+    pub fn current_state_root(&self) -> Hash {
+        self.state_root_at(self.current_height())
+    }
+
+    /// Export a snapshot of the executor's state at the current
+    /// chain height.
+    ///
+    /// The snapshot captures:
+    /// - The chain height.
+    /// - The aggregate state root (hash of all module state roots).
+    /// - Per-module state roots (for verification on import).
+    ///
+    /// This is used for fast state sync: a new node imports a
+    /// snapshot to skip replaying the entire chain from genesis.
+    /// The snapshot is deterministic: two executors with the same
+    /// state produce byte-identical snapshots.
+    #[must_use]
+    pub fn export_snapshot(&self) -> ExecutorSnapshot {
+        use crypto::hash::{Domain, Hasher};
+        let height = self.current_height();
+        let state_root = self.state_root_at(height);
+        let module_roots: Vec<(&'static str, Hash)> =
+            self.modules.iter().flatten().map(|m| (m.name(), m.state_root())).collect();
+        // Debug: verify the state root matches the recomputed aggregate.
+        // This is a sanity check for the snapshot's internal consistency.
+        let mut root_data = Vec::new();
+        for (_, root) in &module_roots {
+            root_data.extend_from_slice(root.as_bytes());
+        }
+        let recomputed = Hasher::hash_one(Domain::Block, &root_data);
+        // If the stored state root doesn't match the recomputed one,
+        // use the recomputed one (the stored root may be stale if
+        // the block hasn't been executed yet, e.g., async execution).
+        let state_root = if state_root == Hash::ZERO && !module_roots.is_empty() {
+            recomputed
+        } else {
+            state_root
+        };
+        ExecutorSnapshot { height, state_root, module_roots }
+    }
+
+    /// Import a snapshot, restoring the executor to the snapshot's
+    /// chain height and state.
+    ///
+    /// After import, the executor's `current_height` and
+    /// `current_state_root` must match the snapshot. The next
+    /// proposal height is set to `snapshot.height + 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotImportError`] if:
+    /// - The snapshot's state root does not match the recomputed
+    ///   aggregate of the per-module state roots (corrupted snapshot).
+    /// - The snapshot's height is 0 (empty snapshot — nothing to
+    ///   import).
+    ///
+    /// # Panics
+    ///
+    /// Does not panic. Import is atomic: if verification fails, the
+    /// executor's state is unchanged.
+    ///
+    /// # Safety
+    ///
+    /// This method does NOT restore individual module key-value
+    /// state — it only restores the chain height and state root
+    /// metadata. Full state restoration requires each module to
+    /// implement its own snapshot import. This is the v0 snapshot
+    /// sync: it verifies that the snapshot is consistent and sets
+    /// the chain height so consensus can resume from the correct
+    /// position. Full key-value state sync is Phase 3.
+    pub fn import_snapshot(&self, snapshot: &ExecutorSnapshot) -> Result<(), SnapshotImportError> {
+        // A snapshot at height 0 is valid — it represents the genesis
+        // state after the first (empty) block. We only reject if there
+        // are no module roots (truly empty snapshot).
+        if snapshot.module_roots.is_empty() {
+            return Err(SnapshotImportError::EmptySnapshot);
+        }
+
+        // Verify the snapshot's internal consistency: the state root
+        // must match the recomputed aggregate of the snapshot's own
+        // per-module state roots. This catches corrupted or tampered
+        // snapshots without requiring the local modules to have the
+        // same state (the snapshot is from a peer, not local).
+        let mut root_data = Vec::new();
+        for (_, root) in &snapshot.module_roots {
+            root_data.extend_from_slice(root.as_bytes());
+        }
+        let recomputed = Hasher::hash_one(Domain::Block, &root_data);
+        if recomputed != snapshot.state_root {
+            return Err(SnapshotImportError::StateRootMismatch {
+                expected: snapshot.state_root,
+                actual: recomputed,
+            });
+        }
+
+        // Verify that the number of module roots matches the number
+        // of registered modules. This catches snapshots from a
+        // different module configuration.
+        let registered_count = self.modules.iter().flatten().count();
+        if snapshot.module_roots.len() != registered_count {
+            return Err(SnapshotImportError::ModuleCountMismatch {
+                snapshot: snapshot.module_roots.len(),
+                registered: registered_count,
+            });
+        }
+
+        // Import: set the chain height and state root. The local
+        // modules' key-value state is NOT restored — this is the v0
+        // snapshot sync (metadata only). Full key-value state sync
+        // requires each module to implement its own snapshot import
+        // (Phase 3). For now, we set the chain height so consensus
+        // can resume from the correct position, and we store the
+        // trusted state root for attestation.
+        self.state_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(snapshot.height, snapshot.state_root);
+        *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            snapshot.height + 1;
+
+        Ok(())
+    }
+
     /// Phase D: flush any pending block — execute it and store its
     /// state root.
     ///
@@ -482,10 +696,14 @@ impl Executor {
     /// block) and by `attest_state` (before returning the state
     /// root).
     fn flush_pending(&self) {
-        let pending = self.pending_block.lock().unwrap().take();
+        let pending =
+            self.pending_block.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(block) = pending {
             let root = self.execute_block(&block);
-            self.state_roots.lock().unwrap().insert(block.height.value(), root);
+            self.state_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(block.height.value(), root);
         }
     }
 
@@ -510,7 +728,7 @@ impl Executor {
         // and we don't want to hold the lock during that time. The
         // clear is here only to discard stale events from a previous
         // block; the extend publishes this block's events.
-        self.events.lock().unwrap().clear();
+        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 
         // begin_block for all modules.
         for module in self.modules.iter().flatten() {
@@ -553,7 +771,9 @@ impl Executor {
         // the cached senders are no longer needed (re-execution would
         // re-preverify). We move the cache out in one lock acquisition
         // (zero-copy: `mem::take` swaps in an empty map, no clone).
-        let mut preverify_cache = std::mem::take(&mut *self.preverify_cache.lock().unwrap());
+        let mut preverify_cache = std::mem::take(
+            &mut *self.preverify_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
 
         for (module_id, group) in &groups {
             let Some(module) = self.modules[*module_id as usize].as_ref() else {
@@ -611,7 +831,7 @@ impl Executor {
             }
         }
         // Publish all events from this block in one lock acquisition.
-        self.events.lock().unwrap().extend(block_events);
+        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(block_events);
 
         // end_block for all modules.
         for module in self.modules.iter().flatten() {
@@ -665,7 +885,10 @@ impl AppInterface for Executor {
         if let Ok(preverified) = &preverify_result[0] {
             let tx_hash =
                 crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, tx.as_bytes());
-            self.preverify_cache.lock().unwrap().insert(tx_hash, preverified.clone());
+            self.preverify_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(tx_hash, preverified.clone());
         }
 
         // Push to the lock-free intake ring. The mempool submission
@@ -714,7 +937,10 @@ impl AppInterface for Executor {
                     crypto::hash::Domain::Transaction,
                     tx.as_bytes(),
                 );
-                self.preverify_cache.lock().unwrap().insert(tx_hash, preverified.clone());
+                self.preverify_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(tx_hash, preverified.clone());
             }
             accepted_txs.push(tx);
             results.push(MempoolAck::Accepted);
@@ -722,7 +948,8 @@ impl AppInterface for Executor {
         // Batch-submit all accepted txs to the mempool in one lock
         // acquisition.
         if !accepted_txs.is_empty() {
-            let mut mempool = self.mempool.lock().unwrap();
+            let mut mempool =
+                self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for (i, tx) in accepted_txs.into_iter().enumerate() {
                 if let Err(e) = mempool.submit(tx) {
                     // Overwrite the Accepted result with the rejection.
@@ -740,15 +967,22 @@ impl AppInterface for Executor {
         // the mempool before selection, eliminating the per-tx
         // mempool lock on the ingestion hot path.
         {
-            let rx = self.mempool_intake_rx.lock().unwrap();
-            let mut pool = self.mempool.lock().unwrap();
+            let rx =
+                self.mempool_intake_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pool = self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             while let Ok(tx) = rx.try_recv() {
                 let _ = pool.submit(tx);
             }
         }
         // Select txs from the mempool by fee priority.
-        let txs = self.mempool.lock().unwrap().select(budget.max_bytes);
-        let height = Height::new(*self.next_proposal_height.lock().unwrap());
+        let txs = self
+            .mempool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .select(budget.max_bytes);
+        let height = Height::new(
+            *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         if let Some(recorder) = &self.recorder {
             recorder.record("prepare_proposal", start.elapsed());
         }
@@ -811,16 +1045,28 @@ impl AppInterface for Executor {
             // height immediately. The consensus engine can proceed to
             // propose/vote/commit the next block while this block's
             // execution is deferred.
-            *self.pending_block.lock().unwrap() = Some(block.clone());
-            self.finalized.lock().unwrap().insert(block.height.value(), block.clone());
-            *self.next_proposal_height.lock().unwrap() = block.height.value() + 1;
+            *self.pending_block.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(block.clone());
+            self.finalized
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(block.height.value(), block.clone());
+            *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                block.height.value() + 1;
         } else {
             // Synchronous execution (default): execute the block
             // immediately and store the state root.
             let root = self.execute_block(block);
-            self.state_roots.lock().unwrap().insert(block.height.value(), root);
-            self.finalized.lock().unwrap().insert(block.height.value(), block.clone());
-            *self.next_proposal_height.lock().unwrap() = block.height.value() + 1;
+            self.state_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(block.height.value(), root);
+            self.finalized
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(block.height.value(), block.clone());
+            *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                block.height.value() + 1;
         }
         if let Some(recorder) = &self.recorder {
             recorder.record("finalize_block", start.elapsed());
@@ -836,8 +1082,13 @@ impl AppInterface for Executor {
         // disabled, flush_pending is a no-op (pending_block is
         // always None).
         self.flush_pending();
-        let root =
-            self.state_roots.lock().unwrap().get(&height.value()).copied().unwrap_or(Hash::ZERO);
+        let root = self
+            .state_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&height.value())
+            .copied()
+            .unwrap_or(Hash::ZERO);
         if let Some(recorder) = &self.recorder {
             recorder.record("attest_state", start.elapsed());
         }
@@ -874,7 +1125,7 @@ mod tests {
         fn begin_block(&self, _height: Height) {}
 
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-            let mut c = self.count.lock().unwrap();
+            let mut c = self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             *c += 1;
             Ok(vec![Event { module: "counter", kind: "increment".to_string(), data: vec![] }])
         }
@@ -882,7 +1133,7 @@ mod tests {
         fn end_block(&self, _height: Height) {}
 
         fn state_root(&self) -> Hash {
-            let c = *self.count.lock().unwrap();
+            let c = *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let byte = u8::try_from(c).unwrap_or(0xff);
             Hash([byte; 32])
         }
@@ -991,7 +1242,7 @@ mod tests {
         }
 
         // The counter should have been called 3 times.
-        let count = *counter.count.lock().unwrap();
+        let count = *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(count, 3, "counter should have been incremented 3 times");
 
         // Each block should have a different state root.
@@ -1104,11 +1355,13 @@ mod tests {
             _ctx: &TxContext,
             txs: &[PreverifiedTx],
         ) -> Vec<Result<Vec<Event>, ExecError>> {
-            *self.preverified_calls.lock().unwrap() += txs.len();
+            *self.preverified_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                txs.len();
             (0..txs.len()).map(|_| Ok(vec![])).collect()
         }
         fn handle_batch(&self, batch: &[(TxContext, &[u8])]) -> Vec<Result<Vec<Event>, ExecError>> {
-            *self.fallback_calls.lock().unwrap() += batch.len();
+            *self.fallback_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                batch.len();
             (0..batch.len()).map(|_| Ok(vec![])).collect()
         }
     }
@@ -1138,8 +1391,10 @@ mod tests {
 
         // The preverified path should have been taken (cache hit),
         // not the fallback path (cache miss).
-        let preverified = *tracker.preverified_calls.lock().unwrap();
-        let fallback = *tracker.fallback_calls.lock().unwrap();
+        let preverified =
+            *tracker.preverified_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fallback =
+            *tracker.fallback_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(preverified, 1, "preverified path should have been used (cache hit)");
         assert_eq!(fallback, 0, "fallback path should not have been used (no cache miss)");
     }

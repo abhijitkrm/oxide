@@ -103,3 +103,29 @@ If no budget is stated, the function is cold-path — say so explicitly
 - Do not introduce `unsafe` for <5% wins.
 - Do not cache-micro-optimize before the algorithmic shape is right
   (O(1) ladder + O(1) intrusive FIFO + O(1) bitboard BBO first).
+
+## Matcher hot-path invariants
+
+- The matching engine's `submit_order` path must not allocate after
+  the first call (reusable fill buffer, pre-sized settlement batch).
+- Risk checks (rate limit, fat-finger, size cap, resting cap) are
+  O(1) and run *before* balance reservation — they must not touch
+  the matching engine or balance cache on rejection.
+- The condvar-based wakeup pattern replaces busy-loop polling: the
+  matcher thread blocks on `condvar.wait_timeout` until signalled
+  by the producer or the timeout elapses. No 10ms yield loops.
+- Resting-order tracking uses a `HashMap` per account — acceptable
+  because it is checked once per order submission, not per fill.
+- Market data publishing serializes once and broadcasts the same
+  string to all subscribers — no per-subscriber serialization on
+  the hot path.
+
+## RPC cold-path invariants
+
+- The RPC server is *not* on the consensus hot path — it may use
+  tokio, serde_json, axum, and other standard async dependencies.
+- Rate limiting uses a simple fixed-window counter with atomic
+  operations — no per-request allocation, no mutex on the hot path.
+- Market data subscribers use `tokio::sync::mpsc::unbounded_channel`
+  — a slow client misses updates (intentional: market data is lossy
+  by design and must not back-pressure the matching engine).

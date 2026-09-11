@@ -319,8 +319,10 @@ impl Default for SubscriptionManager {
 pub struct RpcServer {
     /// The chain ID (EIP-155).
     chain_id: u64,
-    /// The current block height.
-    block_height: u64,
+    /// The current block height (atomic so it can be updated through
+    /// `Arc<RpcServer>` after the server starts, e.g. by the executor
+    /// after each finalized block).
+    block_height: AtomicU64,
     /// The current base fee (wei per gas).
     base_fee: u64,
     /// The client version string.
@@ -337,6 +339,21 @@ pub struct RpcServer {
     /// `eth_sendRawTransaction` records its duration under the
     /// `"rpc_send_raw_tx"` operation. Exposed via `prometheus()`.
     recorder: Option<Arc<metrics::Recorder>>,
+    /// Total transactions processed (atomic counter, exposed via
+    /// `/metrics` as `oxide_tx_count`).
+    tx_count: AtomicU64,
+    /// Current mempool size (atomic gauge, exposed via `/metrics` as
+    /// `oxide_mempool_size`). Updated by the executor or node assembly
+    /// as transactions enter/leave the mempool.
+    mempool_size: AtomicU64,
+    /// Rate limiter: maximum requests per second per client. 0 =
+    /// unlimited. Enforced in `handle_request` before dispatch.
+    max_requests_per_second: u64,
+    /// Rate limiter state: timestamp (ms) of the start of the current
+    /// 1-second window.
+    rate_window_start_ms: AtomicU64,
+    /// Rate limiter state: request count within the current window.
+    rate_window_count: AtomicU64,
 }
 
 impl RpcServer {
@@ -345,12 +362,17 @@ impl RpcServer {
     pub fn new(chain_id: u64, base_fee: u64) -> Self {
         Self {
             chain_id,
-            block_height: 0,
+            block_height: AtomicU64::new(0),
             base_fee,
             client_version: format!("oxide/{}", env!("CARGO_PKG_VERSION")),
             subscriptions: SubscriptionManager::new(),
             tx_submitter: None,
             recorder: None,
+            tx_count: AtomicU64::new(0),
+            mempool_size: AtomicU64::new(0),
+            max_requests_per_second: 0, // unlimited by default
+            rate_window_start_ms: AtomicU64::new(0),
+            rate_window_count: AtomicU64::new(0),
         }
     }
 
@@ -383,8 +405,116 @@ impl RpcServer {
 
     /// Update the block height (called by the executor after each
     /// finalized block).
-    pub fn set_block_height(&mut self, height: u64) {
-        self.block_height = height;
+    ///
+    /// Takes `&self` so it can be called through `Arc<RpcServer>` after
+    /// the HTTP server has started (the value is stored in an
+    /// `AtomicU64`).
+    pub fn set_block_height(&self, height: u64) {
+        self.block_height.store(height, Ordering::Relaxed);
+    }
+
+    /// Get the current block height (atomic load).
+    #[must_use]
+    pub fn block_height(&self) -> u64 {
+        self.block_height.load(Ordering::Relaxed)
+    }
+
+    /// Increment the total transaction counter by one (called after a
+    /// transaction is accepted into the mempool or included in a block).
+    pub fn increment_tx_count(&self) {
+        self.tx_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the total number of transactions processed (atomic load).
+    #[must_use]
+    pub fn tx_count(&self) -> u64 {
+        self.tx_count.load(Ordering::Relaxed)
+    }
+
+    /// Set the current mempool size (called by the executor or node
+    /// assembly as transactions enter/leave the mempool).
+    pub fn set_mempool_size(&self, size: u64) {
+        self.mempool_size.store(size, Ordering::Relaxed);
+    }
+
+    /// Set the maximum requests per second per client. 0 = unlimited.
+    ///
+    /// This is a simple global rate limiter that caps total RPC
+    /// requests per second. In a production deployment behind a load
+    /// balancer, per-IP rate limiting would be handled by the LB;
+    /// this is a defense-in-depth measure for direct exposure.
+    pub fn set_rate_limit(&mut self, max_per_second: u64) {
+        self.max_requests_per_second = max_per_second;
+    }
+
+    /// Check if the current request is within the rate limit. Returns
+    /// `true` if the request is allowed, `false` if rate-limited.
+    ///
+    /// Uses a simple fixed-window counter: requests are counted within
+    /// a 1-second window. When the window rolls over, the counter
+    /// resets. This is less precise than a sliding window but
+    /// sufficient for RPC rate limiting (the consensus hot path is
+    /// not affected).
+    fn check_rate_limit(&self) -> bool {
+        if self.max_requests_per_second == 0 {
+            return true; // unlimited
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        let window_start = self.rate_window_start_ms.load(Ordering::Relaxed);
+        // If the window has expired (more than 1 second old), reset.
+        if window_start == 0 || now.saturating_sub(window_start) >= 1_000 {
+            // Try to reset the window. Use compare_exchange to avoid
+            // a race where two threads both try to reset.
+            let _ = self.rate_window_start_ms.compare_exchange(
+                window_start,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            self.rate_window_count.store(1, Ordering::Relaxed);
+            return true;
+        }
+        // Within the current window — increment and check.
+        let count = self.rate_window_count.fetch_add(1, Ordering::Relaxed);
+        count < self.max_requests_per_second
+    }
+
+    /// Get the current mempool size (atomic load).
+    #[must_use]
+    pub fn mempool_size(&self) -> u64 {
+        self.mempool_size.load(Ordering::Relaxed)
+    }
+
+    /// Generate a Prometheus text exposition of all node metrics.
+    ///
+    /// Exposes the basic node gauges/counters:
+    /// - `oxide_block_height` — current block height (gauge)
+    /// - `oxide_tx_count` — total transactions processed (counter)
+    /// - `oxide_mempool_size` — current mempool size (gauge)
+    ///
+    /// If a latency recorder is attached, its HDR histogram metrics
+    /// (latency percentiles per operation) are appended.
+    #[must_use]
+    pub fn metrics_text(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "# HELP oxide_block_height Current block height");
+        let _ = writeln!(out, "# TYPE oxide_block_height gauge");
+        let _ = writeln!(out, "oxide_block_height {}", self.block_height());
+        let _ = writeln!(out, "# HELP oxide_tx_count Total transactions processed");
+        let _ = writeln!(out, "# TYPE oxide_tx_count counter");
+        let _ = writeln!(out, "oxide_tx_count {}", self.tx_count());
+        let _ = writeln!(out, "# HELP oxide_mempool_size Current mempool size");
+        let _ = writeln!(out, "# TYPE oxide_mempool_size gauge");
+        let _ = writeln!(out, "oxide_mempool_size {}", self.mempool_size());
+        // Append latency histogram metrics if a recorder is attached.
+        let latency = self.prometheus();
+        if !latency.is_empty() {
+            out.push_str(&latency);
+        }
+        out
     }
 
     /// Handle a single JSON-RPC request and produce a response.
@@ -397,6 +527,21 @@ impl RpcServer {
     /// Returns `RpcError` in the response for unknown methods,
     /// invalid params, or internal errors.
     pub fn handle(&self, request: &RpcRequest) -> RpcResponse {
+        // Rate limit check: reject requests exceeding the configured
+        // rate. Returns a -32005 "requests rate limited" error (the
+        // convention used by Ethereum JSON-RPC servers).
+        if !self.check_rate_limit() {
+            return RpcResponse {
+                id: request.id.clone(),
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(RpcError {
+                    code: -32_005,
+                    message: "request rate limited".to_string(),
+                    data: None,
+                }),
+            };
+        }
         let result: Result<Value, RpcError> = match request.method.as_str() {
             // ---- Chain info ----
             "eth_chainId" => Ok(self.eth_chain_id()),
@@ -496,7 +641,7 @@ impl RpcServer {
     /// `eth_blockNumber` — returns the current block height as a hex
     /// string.
     fn eth_block_number(&self) -> Value {
-        json!(format!("0x{:x}", self.block_height))
+        json!(format!("0x{:x}", self.block_height()))
     }
 
     /// `eth_gasPrice` — returns the current gas price (base fee) as
@@ -975,11 +1120,25 @@ mod tests {
 
     #[test]
     fn eth_block_number_returns_hex() {
-        let mut s = make_server();
+        let s = make_server();
         s.set_block_height(100);
         let req = make_request("eth_blockNumber", vec![], json!(1));
         let resp = s.handle(&req);
         assert_eq!(resp.result, Some(json!("0x64")));
+    }
+
+    #[test]
+    fn metrics_text_exposes_basic_gauges() {
+        let s = make_server();
+        s.set_block_height(10);
+        s.increment_tx_count();
+        s.increment_tx_count();
+        s.increment_tx_count();
+        s.set_mempool_size(5);
+        let text = s.metrics_text();
+        assert!(text.contains("oxide_block_height 10"), "text: {text}");
+        assert!(text.contains("oxide_tx_count 3"), "text: {text}");
+        assert!(text.contains("oxide_mempool_size 5"), "text: {text}");
     }
 
     #[test]
@@ -1047,6 +1206,34 @@ mod tests {
         let resp = s.handle(&req);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32601);
+    }
+
+    #[test]
+    fn rate_limiter_unlimited_by_default() {
+        let s = make_server();
+        // With no rate limit set, all requests should succeed.
+        for _ in 0..100 {
+            let req = make_request("eth_chainId", vec![], json!(1));
+            let resp = s.handle(&req);
+            assert!(resp.error.is_none(), "request should succeed with unlimited rate");
+        }
+    }
+
+    #[test]
+    fn rate_limiter_rejects_excess_requests() {
+        let mut s = make_server();
+        s.set_rate_limit(5); // 5 requests per second
+        // The first 5 requests should succeed.
+        for i in 0..5 {
+            let req = make_request("eth_chainId", vec![], json!(i));
+            let resp = s.handle(&req);
+            assert!(resp.error.is_none(), "request {i} should succeed within rate limit");
+        }
+        // The 6th request should be rejected with rate limit error.
+        let req = make_request("eth_chainId", vec![], json!(6));
+        let resp = s.handle(&req);
+        assert!(resp.error.is_some(), "request 6 should be rate-limited");
+        assert_eq!(resp.error.unwrap().code, -32_005);
     }
 
     #[test]
@@ -1342,20 +1529,25 @@ mod tests {
         }
 
         fn count(&self) -> usize {
-            self.submissions.lock().unwrap().len()
+            self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
         }
 
         fn last(&self) -> TxBytes {
-            self.submissions.lock().unwrap().last().cloned().unwrap_or_default()
+            self.submissions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
     impl TxSubmitter for MockSubmitter {
         fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
-            if *self.reject_next.lock().unwrap() {
+            if *self.reject_next.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
                 return Err("mock rejection".to_string());
             }
-            self.submissions.lock().unwrap().push(tx);
+            self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(tx);
             Ok(())
         }
     }
@@ -1460,7 +1652,7 @@ mod tests {
 
         let mut s = make_server();
         let submitter = Arc::new(MockSubmitter::new());
-        *submitter.reject_next.lock().unwrap() = true;
+        *submitter.reject_next.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         s.set_tx_submitter(submitter.clone());
 
         let privkey = [0x02u8; 32];

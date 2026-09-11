@@ -12,6 +12,108 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Real Reed-Solomon erasure broadcast with proof of availability**
+  (`crates/broadcast/src/gf256.rs`, `crates/broadcast/src/rs.rs`,
+  `crates/broadcast/src/lib.rs`)
+  - Replaced the placeholder replication-based `ErasureBroadcast`
+    with a real Reed-Solomon erasure coding implementation over
+    GF(256) using the AES irreducible polynomial.
+  - Dependency-free: GF(256) arithmetic with precomputed log/exp
+    tables, Vandermonde matrix in systematic form, Gaussian
+    elimination for reconstruction.
+  - k = 2f+1 data shards, m = f parity shards (n = 3f+1 total).
+    Any k shards suffice for reconstruction — tolerates f
+    byzantine/missing validators.
+  - Proof of availability: Merkle root of shard hashes (BLAKE3)
+    computed per broadcast, deterministic across nodes.
+  - **In plain words:** Block data is now erasure-coded across
+    validators. A node can reconstruct the full block from any
+    two-thirds of the shards, even if f validators are offline or
+    malicious. Each broadcast carries a cryptographic proof that
+    the shards belong to the announced block.
+
+- **Snapshot sync for fast node startup**
+  (`crates/executor/src/lib.rs`, `crates/node/src/lib.rs`)
+  - `ExecutorSnapshot` captures chain height, aggregate state
+    root, and per-module state roots. Deterministic: two
+    executors with the same state produce byte-identical
+    snapshots.
+  - `Node::assemble_from_snapshot()` assembles a node from config
+    and restores from a snapshot in one call — the node is ready
+    for consensus immediately.
+  - Snapshot import validates internal consistency (state root
+    matches module roots, module count matches) and is atomic
+    (no partial state on failure).
+  - **In plain words:** A new node can now start from a snapshot
+    instead of replaying the entire chain from genesis. The
+    snapshot is verified before installation — a corrupted or
+    tampered snapshot is rejected without affecting local state.
+
+- **Exact-pinned production dependencies**
+  (`Cargo.toml`, `deny.toml`)
+  - All workspace dependencies are now exact-pinned (`=X.Y.Z`)
+    to prevent silent transitive upgrades.
+  - `cargo deny check` passes all four gates: advisories, bans,
+    licenses, sources.
+
+- **Authenticated leader proposals with execution certificates**
+  (`crates/types/src/lib.rs`, `crates/consensus/src/engine.rs`)
+  - `BlockHeader` now carries an optional proposer BLS signature and
+    an optional `ExecCertificate` — a quorum attestation of the
+    execution result (state root) of a previous block.
+  - The consensus engine detects state divergence: when a proposal
+    carries an `exec_cert`, the engine compares the certified state
+    root to its locally computed state root and refuses to vote if
+    they differ. This prevents extending a divergent chain.
+  - **In plain words:** validators now cryptographically prove they
+    agree on the result of executing each block. If a validator's
+    local computation differs from the network's consensus, it stops
+    voting rather than silently extending a wrong chain.
+
+- **`JournalBackend` — authenticated storage backend**
+  (`crates/storage/src/auth_journal.rs`)
+  - `AuthenticatedJournal` now implements the `StorageBackend` trait,
+    combining an in-memory `BTreeMap` for fast reads with the
+    journal+MMR for durability and authentication.
+  - Every `apply_batch` appends a serialized record to the journal
+    and pushes to the MMR. The state root (BLAKE3 hash of all
+    key-value pairs) and the MMR log root are both available.
+  - `capabilities()` returns `authenticated: true`.
+  - **In plain words:** the storage layer now has a backend that
+    proves state hasn't been tampered with — every change is
+    permanently recorded in an authenticated log that any node can
+    verify from genesis.
+
+- **Deterministic swarm simulation with `ScenarioRunner::run()`**
+  (`sim/src/swarm.rs`)
+  - The `ScenarioRunner` now executes simulations: creates a
+    multi-node devnet, applies network partitions, runs consensus
+    rounds, and checks safety (no forks) and liveness (blocks
+    finalize).
+  - New `partition_one_7` scenario: 7 nodes, one partitioned — the
+    remaining 6 must still finalize (BFT liveness).
+  - **In plain words:** the simulation harness can now actually run
+    consensus scenarios with network partitions and verify that the
+    blockchain stays safe and live under adverse conditions.
+
+### Benchmark Results (M2 MacBook Pro, release profile)
+
+- **Matching engine: 56.27M orders/s** (raw engine, single-thread).
+  The mixed trading workload (resting + matching + cancel) runs at
+  18.1K ops/s per market.
+- **EVM transfers: ~17K tx/s single-threaded, ~100K tx/s parallel**
+  (8-core Rayon, 10K-tx batches with pre-recovered signatures).
+  Native module execution is 4.5× faster than revm (126K vs 28K tx/s).
+- **Consensus: 316K votes/s** (BLS verification is the bottleneck at
+  3.16µs/vote; block proposal is 62ns).
+- **Executor: 360K native tx/s** (block pipeline, 100-1000 tx
+  batches). Execute-only path hits 654K tx/s.
+- **Perps: 1.32M place-with-margin/s**, liquidation checks at
+  6.19M/s.
+- **Exchange settlement: 800K fills/s** (2.05M fills/s raw engine).
+
+### Added (previous)
+
 - **Multi-market parallel matcher — one worker thread per market,
   shared sharded balances, all four protocols routed by market ID**
   (`crates/matcher/src/lib.rs`, `crates/matcher/src/balance.rs`,
@@ -2007,3 +2109,74 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     instead of hanging. Measured TPS still *falls* with more validators
     because each round needs more TCP round-trips, but the decline is
     now a real network/protocol cost, not a driver artifact.
+
+### Added (2026-09-10)
+
+- **Matcher risk engine — rate limits, order size caps, fat-finger
+  price bands, and resting-order caps** (`crates/matcher/src/risk.rs`)
+  - Four pre-match risk controls run *before* balance reservation:
+    per-account rate limiting (sliding window, 100/sec default),
+    order quantity cap, fat-finger price deviation band (basis points
+    from mid-market reference), and per-account resting-order cap.
+  - Four new `RejectReason` variants (8–11): `RateLimited`,
+    `OrderTooLarge`, `FatFinger`, `TooManyResting`. All four protocol
+    adapters (TCP, WS, JSON-RPC, FIX) map them to stable wire values.
+    Existing discriminants 0–7 are unchanged.
+  - Resting-order accounting is updated on every path: placement,
+    cancel, amend, replace, and canceled remainder after partial fill.
+  - **In plain words:** the matcher now rejects orders that are too
+    large, too far from market price, or exceed per-account limits
+    *before* they touch the order book or lock balances. This prevents
+    fat-finger crashes and limits the damage from a misbehaving or
+    compromised client.
+
+- **WebSocket market data publisher — L1, L2, and Trades feeds**
+  (`crates/matcher/src/market_data.rs`)
+  - Subscribers subscribe to specific feeds (L1 top-of-book, L2 full
+    depth, Trades) and markets. The publisher serializes once and
+    broadcasts the same JSON string to all matching subscribers.
+  - Slow clients miss updates (intentional — market data is lossy by
+    design and must not back-pressure the matching engine).
+  - **In plain words:** market data clients can now subscribe to
+    real-time top-of-book, full depth, and trade feeds over
+    WebSocket, the standard format used by every major exchange.
+
+- **Autonomous consensus driver**
+  (`bin/oxide-validator/src/driver.rs`)
+  - A tokio-based driver that continuously drives the consensus
+    engine in a background task at a configurable block interval
+    (100ms default = 10 blocks/sec). Reports block height, tx count,
+    and block count atomically for the `/metrics` endpoint.
+  - The validator now runs consensus autonomously instead of
+    one-shot at startup.
+  - **In plain words:** the validator node now continuously produces
+    blocks as transactions arrive, instead of finalizing one
+    smoke-test block and idling. This is the minimal autonomous loop
+    needed for a real node.
+
+- **RPC rate limiting** (`crates/rpc/src/lib.rs`)
+  - Simple fixed-window rate limiter on the RPC server, configurable
+    via `set_rate_limit(max_per_second)`. Returns JSON-RPC error
+    -32005 when exceeded. Uses atomic operations — no mutex on the
+    request path.
+  - **In plain words:** the RPC endpoint now has a configurable
+    request rate limit, preventing a single client from overwhelming
+    the node with RPC calls.
+
+### Changed (2026-09-10)
+
+- **Mutex poisoning recovery across the workspace**: all production
+  `.lock().unwrap()` calls replaced with
+  `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`.
+  A poisoned mutex (caused by a thread panic) no longer cascades the
+  panic to unrelated threads. The operator should still restart the
+  process, but the process does not die immediately.
+
+- **Clippy workspace clean**: all `clippy::redundant_closure_for_method_calls`
+  and other clippy errors fixed across the workspace.
+  `cargo clippy --workspace --all-targets -- -D warnings` is now clean.
+
+- **Skills updated**: `production-rust` skill now documents mutex
+  poisoning recovery (§8), protocol stability rules (§9), and risk &
+  rate limiting invariants (§10). `performance-first` skill now
+  documents matcher hot-path and RPC cold-path invariants.

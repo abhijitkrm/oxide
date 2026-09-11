@@ -58,11 +58,13 @@ impl<M> Mailbox<M> {
     where
         M: Send,
     {
-        self.queue.lock().unwrap().push_back(msg);
+        self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(msg);
         // Take (not peek) the waker: a wake is a one-shot event. Leaving
         // a stale waker here would let a later `send` fire a waker whose
         // task has already been polled and re-registered a new one.
-        if let Some(waker) = self.waker.lock().unwrap().take() {
+        if let Some(waker) =
+            self.waker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+        {
             waker.wake();
         }
     }
@@ -99,13 +101,16 @@ where
         // Try to dequeue first. If a message arrived between the last
         // poll and this one (or was never awaited on), return it
         // without touching the waker slot.
-        if let Some(msg) = self.mailbox.queue.lock().unwrap().pop_front() {
+        if let Some(msg) =
+            self.mailbox.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front()
+        {
             return Poll::Ready(msg);
         }
         // Empty: register our waker, overwriting any previous one. The
         // previous waker, if any, belonged to a poll of this same future
         // (the only consumer) and is now stale.
-        *self.mailbox.waker.lock().unwrap() = Some(cx.waker().clone());
+        *self.mailbox.waker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(cx.waker().clone());
         // Re-check after registering: a `send` between the pop_front
         // above and the waker store would have read the *old* waker slot
         // (now overwritten) and fired it — but `wake` on a waker whose
@@ -113,7 +118,9 @@ where
         // The re-check catches the case where `send` happened before we
         // stored the waker: that send's wake was lost (no waker yet),
         // so we must observe the message ourselves.
-        if let Some(msg) = self.mailbox.queue.lock().unwrap().pop_front() {
+        if let Some(msg) =
+            self.mailbox.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front()
+        {
             return Poll::Ready(msg);
         }
         Poll::Pending

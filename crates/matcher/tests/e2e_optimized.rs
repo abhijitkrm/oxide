@@ -67,7 +67,10 @@ fn make_order(side: Side, owner_idx: u32) -> OrderRequest {
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
+        nonce: 0,
         owner: addr_from_index(owner_idx),
+        pubkey: [0u8; 32],
+        signature: [0u8; 64],
     }
 }
 

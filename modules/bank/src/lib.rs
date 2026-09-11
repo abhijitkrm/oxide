@@ -39,7 +39,7 @@ impl BankModule {
     ///
     /// Panics if the store mutex is poisoned.
     pub fn balance(&self, addr: &Address) -> u64 {
-        let store = self.store.lock().unwrap();
+        let store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store
             .get(&addr.0[..])
             .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])))
@@ -51,7 +51,7 @@ impl BankModule {
     ///
     /// Panics if the store mutex is poisoned or the balance overflows.
     pub fn mint(&self, addr: &Address, amount: u64) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bal = store
             .get(&addr.0[..])
             .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
@@ -72,7 +72,7 @@ impl BankModule {
     ///
     /// Panics if the store mutex is poisoned.
     pub fn debit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bal = store
             .get(&addr.0[..])
             .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
@@ -94,7 +94,7 @@ impl BankModule {
     ///
     /// Panics if the store mutex is poisoned.
     pub fn credit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bal = store
             .get(&addr.0[..])
             .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
@@ -118,7 +118,7 @@ impl BankModule {
     ///
     /// Panics if the store mutex is poisoned.
     pub fn transfer(&self, from: &Address, to: &Address, amount: u64) -> Result<(), ExecError> {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let from_bal = store
             .get(&from.0[..])
             .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
@@ -187,7 +187,7 @@ impl Module for BankModule {
         // this fix, `handle` had no sender context and could only
         // mint to the recipient — the bank was a money printer.
         // Now we debit the sender first and reject if insufficient.
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Debit sender.
         let sender_key = Self::balance_key(&ctx.sender);

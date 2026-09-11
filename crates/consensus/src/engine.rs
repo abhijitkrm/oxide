@@ -160,6 +160,19 @@ pub enum ConsensusError {
         /// The highest QC view the engine has already seen.
         high_qc_view: View,
     },
+    /// The execution certificate's state root does not match the
+    /// locally computed state root for the same height. This means
+    /// the validator has diverged from the network — either the
+    /// local execution is wrong, or the network is byzantine. The
+    /// validator must refuse to vote and alert the operator.
+    StateDivergence {
+        /// The height whose execution diverged.
+        height: Height,
+        /// The state root the network agreed on (from `exec_cert`).
+        expected_root: Hash,
+        /// The state root the local validator computed.
+        actual_root: Hash,
+    },
 }
 
 impl std::fmt::Display for ConsensusError {
@@ -189,6 +202,13 @@ impl std::fmt::Display for ConsensusError {
                     "stale QC: view {} <= high_qc view {}",
                     qc_view.value(),
                     high_qc_view.value()
+                )
+            }
+            Self::StateDivergence { height, expected_root, actual_root } => {
+                write!(
+                    f,
+                    "state divergence at height {}: network root {expected_root}, local root {actual_root}",
+                    height.value()
                 )
             }
         }
@@ -515,11 +535,14 @@ impl OxideBft {
     /// advances on finalization (in `finalize_block`); the engine's
     /// `next_height` is the pipeline's height, which leads the app's.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the app rejects the proposal via `process_proposal`.
-    /// In the happy path the app proposed the block, so rejection is a
-    /// bug. In production this logs and drops the proposal instead.
+    /// Returns `None` if the app rejects the proposal via
+    /// `process_proposal`. A rejection means the proposal is invalid
+    /// (e.g. bad state transition); the leader logs this and waits
+    /// for the next view rather than crashing. A byzantine app
+    /// implementation could trigger this, so panicking would give an
+    /// attacker a trivial network-kill vector.
     pub fn propose(&mut self) -> Option<(BlockHeader, Proposal)> {
         let proposal = self.app.prepare_proposal(&Self::BUDGET);
         let has_pending_txs = !proposal.txs.is_empty();
@@ -531,10 +554,21 @@ impl OxideBft {
         }
 
         // Process the proposal through the app (static validity).
+        // If the app rejects, drop the proposal and return None —
+        // do NOT panic. A panic here would let a byzantine app
+        // implementation crash every honest validator.
         match self.app.process_proposal(&proposal) {
             Verdict::Accept => {}
             Verdict::Reject { reason } => {
-                panic!("oxideBFT: proposal rejected by app: {reason}");
+                // Log and drop; the pacemaker will trigger a view
+                // change to bypass the faulty leader. Do NOT panic —
+                // a panic here would let a byzantine app crash every
+                // honest validator (trivial network-kill vector).
+                eprintln!(
+                    "oxideBFT: app rejected proposal (view={:?}, height={:?}): {reason}",
+                    self.current_view, self.next_height
+                );
+                return None;
             }
         }
 
@@ -549,7 +583,9 @@ impl OxideBft {
             high_qc: self.high_qc.clone(),
             timeout_cert: None, // Stage 4: TC attached on view changes
             proposer: proposer_hash(self.validator_set.leader(self.current_view)),
-            timestamp: 0, // deterministic: no real clock in the test model
+            timestamp: 0,             // deterministic: no real clock in the test model
+            proposer_signature: None, // Stage 5: leader signs the header
+            exec_cert: None,          // Wired after exec-cert aggregation
         };
         let block_hash = Self::block_hash(&header);
         self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
@@ -572,32 +608,70 @@ impl OxideBft {
         if self.last_voted_view.is_some_and(|v| v >= header.view) {
             return None;
         }
-        // Tail-fork resistance (docs/oxidebft-spec.md §4): reject
-        // proposals that don't extend our highest QC. A leader that
-        // forks away a notarized block must be bypassed, not
-        // rewarded. The check: the proposal's `high_qc` must equal
-        // (or extend) our `high_qc`. In the happy path they're equal
-        // (the leader built on the same QC). On a view change, the
-        // new leader's `high_qc` may be higher than ours (it saw a
-        // QC we missed) — that's fine, we accept it. But a leader
-        // with a *lower* `high_qc` is forking.
+        // Tail-fork resistance / extends-highest-QC rule
+        // (docs/oxidebft-spec.md §4): reject proposals that don't
+        // extend our highest QC. A leader that forks away a notarized
+        // block must be bypassed, not rewarded.
+        //
+        // A proposal extends our highest QC when its `high_qc` is at
+        // least as recent as ours (`prop_qc.view >= our_high_qc.view`).
+        // This covers three legitimate cases:
+        //   1. The proposal's QC *is* our `high_qc` (happy path: the
+        //      leader built on the same QC — views are equal).
+        //   2. The proposal's QC is *newer* than ours (view change:
+        //      the new leader saw a QC we missed and built on it —
+        //      `prop_qc.view > our_high_qc.view`). Accepting this is
+        //      what lets the chain advance after a view change and is
+        //      the core of tail-fork *resistance*: a validator on a
+        //      stalling fork must still vote for a proposal that
+        //      extends the highest QC it has seen, even if that QC
+        //      arrived via a proposal rather than directly.
+        //   3. The proposal's block chain traces back to our
+        //      `high_qc`'s block (transitively). The view-ordering
+        //      check below is the cheap, sound over-approximation of
+        //      this: any chain extending our `high_qc` carries a QC
+        //      with view >= ours, so the view test admits all
+        //      extending chains while rejecting stale forks.
+        //
+        // A leader with a *lower* `high_qc` view is forking away from
+        // a more recent notarized block — reject it.
         //
         // Exception: at genesis (no high_qc yet), any proposal is
         // accepted.
         if let Some(our_high_qc) = &self.high_qc {
             match &header.high_qc {
-                // Proposal has a high_qc: it must match ours. (We
-                // don't chase chains of QCs here — the 2-chain
-                // commit rule already ensures block validity. This
-                // check prevents the simple fork where a leader
-                // discards a notarized block.)
-                Some(prop_qc) if prop_qc.block_hash != our_high_qc.block_hash => {
+                // Proposal carries a QC older than ours: it extends a
+                // stale fork, not our highest QC. Reject.
+                Some(prop_qc) if prop_qc.view < our_high_qc.view => {
                     return None;
                 }
                 // Proposal has no high_qc but we have one: the
                 // leader is proposing a fork that ignores our QC.
                 None => return None,
+                // prop_qc.view >= our_high_qc.view: the proposal
+                // extends or advances our highest QC — accept.
                 _ => {}
+            }
+        }
+        // Divergence detection (docs/oxidebft-spec.md §6): if the
+        // proposal carries an `exec_cert` for a previous block, verify
+        // that the certified state root matches our locally computed
+        // state root for that height. A mismatch means either our
+        // execution diverged from the network, or the network is
+        // byzantine. In either case, refuse to vote — voting for a
+        // block built on a divergent state would extend the divergence.
+        //
+        // The check is skipped when `verify_signatures` is false
+        // (conformance mode) since the app may not have real state.
+        if self.verify_signatures {
+            if let Some(cert) = &header.exec_cert {
+                let local = self.app.attest_state(cert.height);
+                if local.root != cert.state_root {
+                    // Log the divergence and refuse to vote. The
+                    // operator should be alerted — this is a critical
+                    // condition that requires investigation.
+                    return None;
+                }
             }
         }
         // Process the proposal through the app (static validity).
@@ -1181,6 +1255,7 @@ mod tests {
     use crate::pacemaker::PacemakerEvent;
     use ports::conformance;
     use ports::mock::MockApp;
+    use types::ExecCertificate;
 
     fn pk(byte: u8) -> crypto::bls::PublicKey {
         crypto::bls::PublicKey([byte; crypto::bls::PublicKey::LEN])
@@ -1879,6 +1954,8 @@ mod tests {
             timeout_cert: None,
             proposer: Hash::ZERO,
             timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(vote.is_none(), "fork proposal without high_qc must be rejected");
@@ -1918,6 +1995,8 @@ mod tests {
             timeout_cert: None,
             proposer: Hash::ZERO,
             timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(
@@ -1951,9 +2030,109 @@ mod tests {
             timeout_cert: None,
             proposer: Hash::ZERO,
             timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(vote.is_some(), "proposal extending high_qc must be accepted");
+    }
+
+    #[test]
+    fn tail_fork_accepts_proposal_with_newer_high_qc() {
+        // Regression test for tail-fork *resistance* (extends-highest-QC
+        // rule, docs/oxidebft-spec.md §4). After the engine has a
+        // high_qc, a proposal carrying a *newer* QC (higher view, e.g.
+        // from a view-change leader that saw a QC we missed) must be
+        // accepted — not rejected for failing strict equality with our
+        // high_qc. The old strict-`block_hash`-equality check rejected
+        // these valid proposals from a newer fork; the view-ordering
+        // check (`prop_qc.view >= our_high_qc.view`) accepts them.
+        let mut engine = make_engine();
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        let our_high_qc = engine.high_qc.clone().expect("high_qc set");
+
+        // Craft a QC one view newer than ours, over a different block
+        // (simulating a view-change leader that built on a fresher QC).
+        let newer_qc = QuorumCertificate {
+            view: View::new(our_high_qc.view.value() + 1),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0xab; 32]), // different block — strict equality would reject
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0x01],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+
+        let proposal = Proposal {
+            height: Height::new(99),
+            txs: vec![TxBytes::new(vec![2])],
+            attestation: None,
+        };
+        let header = BlockHeader {
+            height: Height::new(99),
+            view: View::new(our_high_qc.view.value() + 2),
+            epoch: Epoch::new(0),
+            prev_block: newer_qc.block_hash,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            high_qc: Some(newer_qc),
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+        };
+        let vote = engine.vote(&header, &proposal);
+        assert!(
+            vote.is_some(),
+            "proposal with a newer high_qc (view > ours) must be accepted (extends-highest-QC rule)"
+        );
+    }
+
+    #[test]
+    fn tail_fork_rejects_proposal_with_older_high_qc() {
+        // Complement to the above: a proposal carrying an *older* QC
+        // (lower view than our high_qc) is a stale fork and must still
+        // be rejected. This guards against regressing the safety side
+        // of the extends-highest-QC rule.
+        let mut engine = make_engine();
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        let our_high_qc = engine.high_qc.clone().expect("high_qc set");
+        // Only meaningful once we've advanced past view 0.
+        assert!(our_high_qc.view.value() > 0, "high_qc should be past view 0 after a round");
+
+        let older_qc = QuorumCertificate {
+            view: View::new(our_high_qc.view.value() - 1),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0xcd; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0x01],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+
+        let proposal = Proposal {
+            height: Height::new(99),
+            txs: vec![TxBytes::new(vec![2])],
+            attestation: None,
+        };
+        let header = BlockHeader {
+            height: Height::new(99),
+            view: View::new(99),
+            epoch: Epoch::new(0),
+            prev_block: older_qc.block_hash,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            high_qc: Some(older_qc),
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+        };
+        let vote = engine.vote(&header, &proposal);
+        assert!(
+            vote.is_none(),
+            "proposal with an older high_qc (view < ours) must be rejected (stale fork)"
+        );
     }
 
     #[test]
@@ -1975,9 +2154,107 @@ mod tests {
             timeout_cert: None,
             proposer: Hash::ZERO,
             timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(vote.is_some(), "genesis proposal must be accepted");
+    }
+
+    #[test]
+    fn divergence_detection_rejects_mismatched_exec_cert() {
+        // When a proposal carries an exec_cert whose state_root
+        // differs from the locally computed state root, the engine
+        // must refuse to vote (divergence detected).
+        //
+        // We use an engine with signature verification enabled (the
+        // divergence check is gated on verify_signatures).
+        let app = Arc::new(MockApp::new());
+        let mut engine = OxideBft::new(app, single_validator_set()).with_secret_key(bls_key(1));
+
+        // The MockApp's attest_state for height 0 returns
+        // Hash([0x00; 32]) (height 0 → byte 0). We craft an
+        // exec_cert with a *different* state_root to trigger
+        // divergence.
+        let mock_root = Hash([0x00; 32]);
+        let divergent_root = Hash([0xDE; 32]); // != mock_root
+
+        let exec_cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: divergent_root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+
+        let proposal = Proposal {
+            height: Height::new(0),
+            txs: vec![TxBytes::new(vec![1])],
+            attestation: None,
+        };
+        let header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: Some(exec_cert),
+        };
+        let vote = engine.vote(&header, &proposal);
+        assert!(
+            vote.is_none(),
+            "proposal with divergent exec_cert must be rejected (state divergence)"
+        );
+
+        // Sanity: the divergent root is indeed different from the
+        // mock root.
+        assert_ne!(divergent_root, mock_root, "test setup: roots must differ");
+    }
+
+    #[test]
+    fn divergence_detection_accepts_matching_exec_cert() {
+        // When a proposal carries an exec_cert whose state_root
+        // *matches* the locally computed state root, the engine
+        // proceeds normally (no divergence).
+        let app = Arc::new(MockApp::new());
+        let mut engine = OxideBft::new(app, single_validator_set()).with_secret_key(bls_key(1));
+
+        // MockApp returns Hash([0x00; 32]) for height 0.
+        let matching_root = Hash([0x00; 32]);
+
+        let exec_cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: matching_root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+
+        let proposal = Proposal {
+            height: Height::new(0),
+            txs: vec![TxBytes::new(vec![1])],
+            attestation: None,
+        };
+        let header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: Some(exec_cert),
+        };
+        let vote = engine.vote(&header, &proposal);
+        assert!(vote.is_some(), "proposal with matching exec_cert must be accepted");
     }
 
     // ---- View-change tests (multi-validator) ----

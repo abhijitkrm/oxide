@@ -35,7 +35,7 @@
 //! }
 //! ```
 
-use crate::protocol::{OrderRequest, OrderResponse, RejectReason};
+use crate::protocol::{ActionRequest, ActionType, OrderRequest, OrderResponse, RejectReason};
 use primitives::fixed::{Price, Qty};
 use trading::{OrderType, Side, TimeInForce};
 
@@ -65,9 +65,94 @@ pub fn parse_ws_order(json: &str) -> Option<OrderRequest> {
     };
     let price = Price(extract_u64(json, "price")?);
     let qty = Qty(extract_u64(json, "qty")?);
+    let nonce = extract_u64(json, "nonce").unwrap_or(0);
     let owner_str = extract_str(json, "owner")?;
     let owner = parse_address(&owner_str)?;
-    Some(OrderRequest { market, side, order_type, tif, price, qty, owner })
+    let pubkey_str = extract_str(json, "pubkey")?;
+    let pubkey = parse_hex_32(&pubkey_str)?;
+    let sig_str = extract_str(json, "signature")?;
+    let signature = parse_hex_64(&sig_str)?;
+    Some(OrderRequest {
+        market,
+        side,
+        order_type,
+        tif,
+        price,
+        qty,
+        nonce,
+        owner,
+        pubkey,
+        signature,
+    })
+}
+
+/// Parse a JSON order-action request (cancel/amend/replace) into an
+/// `ActionRequest`.
+///
+/// Message format (cancel):
+/// ```json
+/// {
+///   "method": "oxide_cancelOrder",
+///   "params": {
+///     "orderId": "7",
+///     "owner": "0x4242...4242",
+///     "nonce": 2,
+///     "pubkey": "0x...",
+///     "signature": "0x..."
+///   },
+///   "id": 1
+/// }
+/// ```
+///
+/// For amend, add `"newPrice"` and `"newQty"`. For replace, add
+/// `"newPrice"`, `"newQty"`, `"side"`, `"type"`, and `"tif"`.
+pub fn parse_ws_action(json: &str) -> Option<ActionRequest> {
+    let action_type = match extract_str(json, "action")?.as_str() {
+        "cancel" | "Cancel" | "CANCEL" => ActionType::Cancel,
+        "amend" | "Amend" | "AMEND" => ActionType::Amend,
+        "replace" | "Replace" | "REPLACE" => ActionType::Replace,
+        _ => return None,
+    };
+    let order_id = extract_u64(json, "orderId")?;
+    let owner_str = extract_str(json, "owner")?;
+    let owner = parse_address(&owner_str)?;
+    let nonce = extract_u64(json, "nonce").unwrap_or(0);
+    let new_price = Price(extract_u64(json, "newPrice").unwrap_or(0));
+    let new_qty = Qty(extract_u64(json, "newQty").unwrap_or(0));
+    let side = match extract_str(json, "side").map(|s| s.to_lowercase()) {
+        Some(ref s) if s == "buy" => Side::Buy,
+        Some(ref s) if s == "sell" => Side::Sell,
+        _ => Side::Buy, // Default for cancel/amend (ignored).
+    };
+    let order_type = match extract_str(json, "type").map(|s| s.to_lowercase()) {
+        Some(ref s) if s == "limit" => OrderType::Limit,
+        Some(ref s) if s == "market" => OrderType::Market,
+        Some(ref s) if s == "postonly" || s == "post_only" => OrderType::PostOnly,
+        _ => OrderType::Limit, // Default for cancel/amend (ignored).
+    };
+    let tif = match extract_str(json, "tif").map(|s| s.to_lowercase()) {
+        Some(ref s) if s == "gtc" => TimeInForce::Gtc,
+        Some(ref s) if s == "ioc" => TimeInForce::Ioc,
+        Some(ref s) if s == "fok" => TimeInForce::Fok,
+        _ => TimeInForce::Gtc, // Default for cancel/amend (ignored).
+    };
+    let pubkey_str = extract_str(json, "pubkey")?;
+    let pubkey = parse_hex_32(&pubkey_str)?;
+    let sig_str = extract_str(json, "signature")?;
+    let signature = parse_hex_64(&sig_str)?;
+    Some(ActionRequest {
+        action_type,
+        order_id,
+        new_price,
+        new_qty,
+        side,
+        order_type,
+        tif,
+        nonce,
+        owner,
+        pubkey,
+        signature,
+    })
 }
 
 /// Format an order response as a JSON-RPC response string.
@@ -93,6 +178,13 @@ fn reject_reason_str(r: RejectReason) -> &'static str {
         RejectReason::EngineRejected => "engine rejected",
         RejectReason::Killed => "killed",
         RejectReason::Malformed => "malformed",
+        RejectReason::BadSignature => "bad signature",
+        RejectReason::StaleNonce => "stale nonce",
+        RejectReason::OrderNotFound => "order not found",
+        RejectReason::RateLimited => "rate limited",
+        RejectReason::OrderTooLarge => "order too large",
+        RejectReason::FatFinger => "fat finger",
+        RejectReason::TooManyResting => "too many resting",
     }
 }
 
@@ -144,13 +236,47 @@ fn parse_address(s: &str) -> Option<primitives::Address> {
     Some(primitives::Address(addr))
 }
 
+/// Parse a 32-byte hex string (Ed25519 public key).
+fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 64 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
+        if i >= 32 {
+            return None;
+        }
+        let hex = std::str::from_utf8(byte).ok()?;
+        buf[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(buf)
+}
+
+/// Parse a 64-byte hex string (Ed25519 signature).
+fn parse_hex_64(s: &str) -> Option<[u8; 64]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 128 {
+        return None;
+    }
+    let mut buf = [0u8; 64];
+    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
+        if i >= 64 {
+            return None;
+        }
+        let hex = std::str::from_utf8(byte).ok()?;
+        buf[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_buy_order() {
-        let json = r#"{"method":"oxide_placeOrder","params":{"market":0,"side":"buy","type":"limit","tif":"gtc","price":"1500000000","qty":"1000","owner":"0x4242424242424242424242424242424242424242"},"id":1}"#;
+        let json = r#"{"method":"oxide_placeOrder","params":{"market":0,"side":"buy","type":"limit","tif":"gtc","price":"1500000000","qty":"1000","owner":"0x4242424242424242424242424242424242424242","nonce":1,"pubkey":"0x0000000000000000000000000000000000000000000000000000000000000000","signature":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"},"id":1}"#;
         let req = parse_ws_order(json).expect("parse");
         assert_eq!(req.side, Side::Buy);
         assert_eq!(req.price.0, 1_500_000_000);
@@ -172,5 +298,24 @@ mod tests {
         let resp = OrderResponse::rejected(RejectReason::InsufficientBalance);
         let json = format_ws_response(&resp, 1);
         assert!(json.contains("insufficient balance"));
+    }
+
+    #[test]
+    fn parse_cancel_action() {
+        let json = r#"{"method":"oxide_cancelOrder","params":{"action":"cancel","orderId":"7","owner":"0x4242424242424242424242424242424242424242","nonce":2,"pubkey":"0x0000000000000000000000000000000000000000000000000000000000000000","signature":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"},"id":1}"#;
+        let req = parse_ws_action(json).expect("parse");
+        assert_eq!(req.action_type, ActionType::Cancel);
+        assert_eq!(req.order_id, 7);
+        assert_eq!(req.owner.0, [0x42; 20]);
+    }
+
+    #[test]
+    fn parse_amend_action() {
+        let json = r#"{"method":"oxide_amendOrder","params":{"action":"amend","orderId":"3","newPrice":"1600000000","newQty":"2000","owner":"0x4242424242424242424242424242424242424242","nonce":2,"pubkey":"0x0000000000000000000000000000000000000000000000000000000000000000","signature":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"},"id":1}"#;
+        let req = parse_ws_action(json).expect("parse");
+        assert_eq!(req.action_type, ActionType::Amend);
+        assert_eq!(req.order_id, 3);
+        assert_eq!(req.new_price.0, 1_600_000_000);
+        assert_eq!(req.new_qty.0, 2_000);
     }
 }

@@ -102,7 +102,7 @@ impl GovernanceModule {
     /// Panics if the proposals mutex is poisoned.
     #[must_use]
     pub fn proposal(&self, id: u64) -> Option<Proposal> {
-        self.proposals.lock().unwrap().get(&id).cloned()
+        self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id).cloned()
     }
 
     /// Get the number of proposals.
@@ -112,7 +112,7 @@ impl GovernanceModule {
     /// Panics if the proposals mutex is poisoned.
     #[must_use]
     pub fn num_proposals(&self) -> usize {
-        self.proposals.lock().unwrap().len()
+        self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// Parse a propose message.
@@ -205,7 +205,8 @@ impl Module for GovernanceModule {
             if msg.len() == 9 {
                 // Vote.
                 let (id, vote) = Self::parse_vote(msg).ok_or(ExecError::Malformed)?;
-                let mut proposals = self.proposals.lock().unwrap();
+                let mut proposals =
+                    self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let proposal = proposals
                     .get_mut(&id)
                     .ok_or(ExecError::ModuleRejected("unknown proposal".to_string()))?;
@@ -214,7 +215,8 @@ impl Module for GovernanceModule {
                     Vote::No => proposal.no_votes += 1,
                 }
                 // Store the vote in the KV store.
-                let mut store = self.store.lock().unwrap();
+                let mut store =
+                    self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let vote_key = [id.to_le_bytes().as_slice(), ctx.sender.0.as_slice()].concat();
                 store.insert(vote_key, vec![vote as u8]);
                 return Ok(vec![Event {
@@ -227,7 +229,7 @@ impl Module for GovernanceModule {
 
         // Try to parse as a propose message.
         let (key, val) = Self::parse_propose(msg).ok_or(ExecError::Malformed)?;
-        let mut next_id = self.next_id.lock().unwrap();
+        let mut next_id = self.next_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = *next_id;
         *next_id += 1;
         let proposal = Proposal {
@@ -240,16 +242,18 @@ impl Module for GovernanceModule {
             finalized: false,
             passed: false,
         };
-        let mut proposals = self.proposals.lock().unwrap();
+        let mut proposals =
+            self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         proposals.insert(id, proposal);
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.insert(id.to_le_bytes().to_vec(), msg.to_vec());
         Ok(vec![Event { module: "governance", kind: "propose".to_string(), data: msg.to_vec() }])
     }
 
     fn end_block(&self, _height: Height) {
         // Finalize all proposals at the end of each block.
-        let mut proposals = self.proposals.lock().unwrap();
+        let mut proposals =
+            self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for proposal in proposals.values_mut() {
             Self::finalize_proposal(proposal);
         }

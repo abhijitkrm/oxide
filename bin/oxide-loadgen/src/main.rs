@@ -121,6 +121,9 @@ fn make_order(side: Side, owner_idx: u32, market: u8) -> OrderRequest {
         price: Price(1_500_000_000),
         qty: Qty(1_000),
         owner: addr_from_index(owner_idx),
+        nonce: 0,
+        pubkey: [0u8; 32],
+        signature: [0u8; 64],
     }
 }
 

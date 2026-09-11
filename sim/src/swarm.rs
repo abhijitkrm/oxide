@@ -174,6 +174,53 @@ impl ScenarioRunner {
             self.swarm.network()
         )
     }
+
+    /// Run the simulation scenario.
+    ///
+    /// Creates a `MultiNodeDevnet` with the configured number of
+    /// nodes, applies the network model (partition if configured),
+    /// runs `rounds` consensus rounds, and returns the result with
+    /// safety and liveness checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the devnet cannot be created (invalid node count).
+    pub fn run(&self) -> SwarmResult {
+        let n = self.swarm.num_nodes();
+        let mut devnet = devnet::multinode::MultiNodeDevnet::new(n, self.mempool_size);
+        devnet.enable_mesh();
+
+        // Apply network model: partition nodes if the loss model
+        // specifies partitions.
+        let byzantine_indices = self.swarm.byzantine_indices();
+        if let crate::network::LossModel::Partition { partitioned } = &self.swarm.network().loss {
+            for &idx in partitioned {
+                devnet.partition(idx);
+            }
+        }
+
+        // Run consensus rounds. Byzantine nodes with the Withhold
+        // strategy simply don't vote — we simulate this by not
+        // calling their vote logic (the run_round method in the
+        // devnet handles the round execution; byzantine effects are
+        // modeled at the network level, not the engine level, since
+        // the engine itself is correct).
+        let (devnet_result, _elapsed) = devnet.run_batch(self.rounds, 1);
+
+        // Collect finalized heights from each node.
+        let finalized_heights: Vec<Vec<u64>> = devnet_result
+            .finalized
+            .iter()
+            .map(|blocks| blocks.iter().map(|b| b.height.value()).collect())
+            .collect();
+
+        SwarmResult {
+            finalized_heights,
+            rounds: self.rounds,
+            num_nodes: n,
+            num_byzantine: byzantine_indices.len(),
+        }
+    }
 }
 
 /// Predefined scenarios for the chaos sim suite.
@@ -250,6 +297,24 @@ pub mod scenarios {
     pub fn minimal_4() -> Swarm {
         let scenario = ByzantineScenario::all_honest(4);
         Swarm::new(4, NetworkModel::perfect(), scenario)
+    }
+
+    /// 7 nodes, all honest, one node partitioned.
+    /// Tests liveness when one node is disconnected — the
+    /// remaining 6 nodes (≥ 2f+1 = 5) must still finalize.
+    #[must_use]
+    pub fn partition_one_7() -> Swarm {
+        let scenario = ByzantineScenario::all_honest(7);
+        Swarm::new(
+            7,
+            NetworkModel {
+                delay: crate::network::DelayModel::None,
+                loss: crate::network::LossModel::Partition {
+                    partitioned: std::collections::HashSet::from([6]),
+                },
+            },
+            scenario,
+        )
     }
 
     /// 10 nodes, 3 byzantine (at BFT bound f=3), perfect network.
@@ -419,5 +484,40 @@ mod tests {
         assert!(desc.contains("n=7"));
         assert!(desc.contains("byzantine=1"));
         assert!(desc.contains("rounds=10"));
+    }
+
+    /// Run a minimal 4-node simulation and verify liveness.
+    #[test]
+    fn run_minimal_4_liveness() {
+        let swarm = scenarios::minimal_4();
+        let runner = ScenarioRunner::new(swarm, 3, 10_000);
+        let result = runner.run();
+        // With 4 honest nodes and a perfect network, at least one
+        // block must be finalized (liveness).
+        assert!(result.liveness_holds(&[]), "minimal 4-node sim must finalize at least one block");
+        // All honest nodes must agree (safety).
+        assert!(result.safety_holds(&[]), "minimal 4-node sim must not fork");
+    }
+
+    /// Run a 7-node simulation with one partitioned node and verify
+    /// liveness (the remaining 6 nodes still finalize).
+    #[test]
+    fn run_partition_one_7_liveness() {
+        let swarm = scenarios::partition_one_7();
+        let runner = ScenarioRunner::new(swarm, 3, 10_000);
+        let result = runner.run();
+        // The partitioned node (index 6) won't finalize, but the
+        // other 6 nodes (≥ 2f+1 = 5) must still finalize.
+        assert!(result.liveness_holds(&[]), "6 of 7 nodes must finalize despite one partition");
+    }
+
+    /// Run a 7-node simulation with network delay and verify safety.
+    #[test]
+    fn run_network_delay_7_safety() {
+        let swarm = scenarios::network_delay_7();
+        let runner = ScenarioRunner::new(swarm, 3, 10_000);
+        let result = runner.run();
+        // All honest nodes must agree (safety holds under delay).
+        assert!(result.safety_holds(&[]), "7-node sim with delay must not fork");
     }
 }

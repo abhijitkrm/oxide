@@ -17,6 +17,7 @@
 //!
 //! - `POST /` — JSON-RPC 2.0 request/response (Ethereum-compatible)
 //! - `GET /health` — simple health check (returns 200 OK)
+//! - `GET /metrics` — Prometheus-format node metrics
 //!
 //! # Usage
 //!
@@ -101,6 +102,7 @@ impl HttpServer {
         Router::new()
             .route("/", post(handle_rpc))
             .route("/health", get(health_check))
+            .route("/metrics", get(metrics_handler))
             .with_state(rpc)
     }
 }
@@ -126,6 +128,27 @@ async fn handle_rpc(State(rpc): State<Arc<RpcServer>>, body: String) -> Response
 /// Health check endpoint. Returns 200 OK with "ok".
 async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// Prometheus metrics endpoint (`GET /metrics`).
+///
+/// Returns a Prometheus text-format exposition of node metrics:
+/// `oxide_block_height`, `oxide_tx_count`, `oxide_mempool_size`, and
+/// any latency histograms recorded by the attached `metrics::Recorder`.
+/// The `Content-Type` is `text/plain; version=0.0.4` (the standard
+/// Prometheus exposition format).
+async fn metrics_handler(State(rpc): State<Arc<RpcServer>>) -> Response<String> {
+    let body = rpc.metrics_text();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(body)
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(String::new())
+                .unwrap()
+        })
 }
 
 #[cfg(test)]
@@ -155,6 +178,23 @@ mod tests {
     async fn router_builds() {
         let rpc = Arc::new(RpcServer::new(1, 1_000_000_000));
         let _router = HttpServer::router(rpc);
+    }
+
+    /// Test the `/metrics` endpoint returns Prometheus-format text
+    /// with the basic node gauges.
+    #[tokio::test]
+    async fn metrics_handler_returns_prometheus_text() {
+        let rpc = Arc::new(RpcServer::new(1, 1_000_000_000));
+        rpc.set_block_height(42);
+        rpc.increment_tx_count();
+        rpc.increment_tx_count();
+        rpc.set_mempool_size(7);
+        let response = metrics_handler(State(rpc)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.body();
+        assert!(body.contains("oxide_block_height 42"), "body: {body}");
+        assert!(body.contains("oxide_tx_count 2"), "body: {body}");
+        assert!(body.contains("oxide_mempool_size 7"), "body: {body}");
     }
 
     /// Test that an unknown method returns a method-not-found error.

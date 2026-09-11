@@ -27,7 +27,7 @@ primitives = { workspace = true }
 criterion = "0.7.0"
 # Property-based oracle-equivalence testing (testing-standards skill,
 # layer 2: matching ops == sequential model oracle).
-proptest = "1"
+proptest = "1.11.0"
 
 [[bench]]
 name = "matching"
