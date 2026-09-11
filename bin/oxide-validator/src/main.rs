@@ -12,7 +12,7 @@
 //! ## Modes
 //!
 //! - **Normal mode** (default): runs a single-node devnet using
-//!   `DevnetNode::assemble`.
+//!   `Node::assemble`.
 //! - **Devnet node mode** (`--devnet-node <i>`): runs a single
 //!   validator node that connects to other validator processes over
 //!   TCP. Used by the multi-process devnet launcher.
@@ -36,8 +36,30 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use devnet::{ConsensusConfig, DevnetNode, NodeConfig};
+use node::{ConsensusConfig, Node, NodeConfig};
 use ports::{AppInterface, ConsensusEngine};
+use types::{MempoolAck, TxBytes};
+
+/// Adapter that lets the RPC server submit transactions into the
+/// executor's mempool via the `rpc::TxSubmitter` trait.
+///
+/// The executor already implements `AppInterface::ingest_tx`, which
+/// validates, pre-verifies, and mempools a wrapped transaction. This
+/// adapter translates the `MempoolAck` into the `Result<(), String>`
+/// that the RPC layer expects, keeping the RPC crate free of a direct
+/// dependency on the executor crate.
+struct ExecutorTxSubmitter {
+    executor: Arc<executor::Executor>,
+}
+
+impl rpc::TxSubmitter for ExecutorTxSubmitter {
+    fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
+        match self.executor.ingest_tx(tx) {
+            MempoolAck::Accepted => Ok(()),
+            MempoolAck::Rejected { reason } => Err(reason),
+        }
+    }
+}
 
 fn main() {
     // Subcommand dispatch (first positional arg).
@@ -86,7 +108,7 @@ fn run_single_node() {
     println!("oxide-validator: starting with engine = {}", node_config.consensus.as_str());
     println!("oxide-validator: mempool size = {}", node_config.max_mempool_entries);
 
-    let mut node = DevnetNode::assemble(&node_config);
+    let mut node = Node::assemble(&node_config);
     println!("oxide-validator: assembled stack (executor + core/bank/staking modules)");
 
     // Submit a smoke-test bank transfer.
@@ -111,7 +133,15 @@ fn run_single_node() {
     // separate thread so it doesn't block the main thread.
     println!("oxide-validator: starting RPC server on http://{}", rpc_config.listen_addr);
 
-    let rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
+    // Create a shared latency recorder for the block pipeline and RPC.
+    let recorder = Arc::new(metrics::Recorder::new());
+
+    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
+    // Wire the executor into the RPC so `eth_sendRawTransaction`
+    // decodes, wraps, and submits EVM transactions into the mempool.
+    rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: node.app_handle() }));
+    // Attach the latency recorder for RPC handler metrics.
+    rpc_server.set_recorder(recorder.clone());
     let http_server = rpc::server::HttpServer::new(rpc_server, rpc_config.listen_addr.clone());
 
     // Run the tokio runtime in a separate thread.
@@ -282,7 +312,14 @@ fn load_config() -> (NodeConfig, config::RpcConfig) {
         config::ConsensusEngineKind::OxideBft => ConsensusConfig::OxideBft,
     };
 
-    (NodeConfig { consensus, max_mempool_entries: config.executor.max_mempool_entries }, rpc_config)
+    (
+        NodeConfig {
+            consensus,
+            max_mempool_entries: config.executor.max_mempool_entries,
+            parallel_threshold: config.executor.parallel_threshold,
+        },
+        rpc_config,
+    )
 }
 
 /// Parse a `--flag value` pair from CLI args.

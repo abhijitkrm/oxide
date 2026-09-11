@@ -33,6 +33,12 @@ pub mod module_id {
     pub const EVM: u8 = 3;
     /// The governance module: parameter changes, market listing.
     pub const GOVERNANCE: u8 = 4;
+    /// The exchange module: spot CLOB markets backed by the native
+    /// matching engine (`crates/trading`).
+    pub const EXCHANGE: u8 = 5;
+    /// The perps module: perpetual futures — margin, funding,
+    /// liquidations, insurance fund, ADL (plan.md §9.3).
+    pub const PERPS: u8 = 6;
 }
 
 /// A shared in-memory key-value store for module state.

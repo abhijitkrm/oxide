@@ -1,9 +1,9 @@
-# Oxide blockchain — `devnet` crate
+# Oxide blockchain — `devnet` crate (test harness)
 # (workspace: github.com/abhijitkrm/oxide; bare-name convention)
 
 [package]
 name = "devnet"
-description = "Local devnet stack — config-driven node assembly, engine/backend selection, in-process multi-node runner."
+description = "Test harness — multi-node devnet runners, workload generators, and integration test infrastructure."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,18 +11,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+node = { workspace = true }
 primitives = { workspace = true }
 codec = { workspace = true }
 crypto = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
 consensus = { workspace = true }
-mempool = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
 oxide-core = { workspace = true }
 bank = { workspace = true }
 staking = { workspace = true }
+evm = { workspace = true }
+exchange = { workspace = true }
+trading = { workspace = true }
+revm = { workspace = true }
 broadcast = { workspace = true }
 p2p = { workspace = true }
 config = { workspace = true }

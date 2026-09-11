@@ -2,10 +2,10 @@
 //! gap 2: binaries had zero tests).
 //!
 //! The spammer submits a batch of transactions and verifies they
-//! finalize. This exercises the same `DevnetNode::assemble` +
+//! finalize. This exercises the same `Node::assemble` +
 //! batch-submit path the binary's `main()` uses.
 
-use devnet::{ConsensusConfig, DevnetNode, NodeConfig};
+use node::{ConsensusConfig, Node, NodeConfig};
 use ports::AppInterface;
 use primitives::Address;
 
@@ -26,11 +26,15 @@ fn build_bank_tx(nonce: u64) -> types::TxBytes {
 
 /// Submit 100 bank-transfer txs and verify at least one block
 /// finalizes with a non-zero state root. This is the spammer's
-/// core flow: batch submit → run to completion → verify.
+/// core flow: batch submit -> run to completion -> verify.
 #[test]
 fn smoke_spammer_batch_100_txs() {
-    let config = NodeConfig { consensus: ConsensusConfig::Sequencer, max_mempool_entries: 10_000 };
-    let mut node = DevnetNode::assemble(&config);
+    let config = NodeConfig {
+        consensus: ConsensusConfig::Sequencer,
+        max_mempool_entries: 10_000,
+        ..NodeConfig::default()
+    };
+    let mut node = Node::assemble(&config);
 
     for nonce in 0..100u64 {
         node.engine().submit_tx(build_bank_tx(nonce));

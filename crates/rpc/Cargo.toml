@@ -14,6 +14,7 @@ repository.workspace = true
 primitives = { workspace = true }
 types = { workspace = true }
 evm = { workspace = true }
+metrics = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # hex: hex encoding/decoding for RPC params (addresses, data, hashes).
@@ -34,6 +35,13 @@ tower = { workspace = true }
 # hyper: low-level HTTP types (body reading).
 # MIT-licensed (GPL-3.0-compatible).
 hyper = { workspace = true }
+
+[dev-dependencies]
+# revm: needed only by tests that build and sign EVM transactions to
+# exercise the `eth_sendRawTransaction` → mempool submission path.
+# Already a transitive dep via evm; declared explicitly for direct use
+# in test helpers. MIT/Apache-2.0 licensed.
+revm = { workspace = true }
 
 [lints]
 workspace = true

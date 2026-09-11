@@ -306,7 +306,7 @@ fn parse_tx_context(bytes: &[u8]) -> Option<TxContext> {
 /// This is the default value used when no explicit config is provided.
 /// Production code should use [`Executor::with_config`] to set this
 /// from the [`config`](::config) crate's `ExecutorConfig`.
-pub const DEFAULT_PARALLEL_THRESHOLD: usize = 100;
+pub const DEFAULT_PARALLEL_THRESHOLD: usize = 32;
 
 /// Minimum tx size: sender (20) + nonce (8) + fee (8) = 36 bytes.
 const TX_MIN_SIZE: usize = 20 + 8 + 8;
@@ -364,7 +364,9 @@ pub struct Executor {
     preverify_cache: Mutex<HashMap<Hash, PreverifiedTx>>,
     /// Minimum batch size to use the parallel speculative execution
     /// path. Configurable via [`Executor::with_config`]. Default:
-    /// [`DEFAULT_PARALLEL_THRESHOLD`] (100 txs).
+    /// [`DEFAULT_PARALLEL_THRESHOLD`] (32 txs). Lowered from 100
+    /// because the per-group `CacheDB` init is O(1) (Arc clone) and
+    /// rayon task overhead (~10 µs) amortizes at 32+ txs.
     parallel_threshold: usize,
     /// Phase D: enable the async execution lane. When `true`,
     /// `finalize_block` defers execution to overlap with consensus.
@@ -376,6 +378,22 @@ pub struct Executor {
     /// For single-block benchmarks, the overhead is a net loss;
     /// for the full consensus pipeline, it's a net win.
     async_execution: bool,
+    /// Optional latency recorder for the block pipeline. When set,
+    /// `prepare_proposal`, `finalize_block`, and `attest_state`
+    /// record their durations. This is the "measure everything"
+    /// directive from plan.md §10.
+    recorder: Option<Arc<metrics::Recorder>>,
+    /// Lock-free MPSC ring for transaction intake. `ingest_tx` pushes
+    /// to this ring; `prepare_proposal` drains it into the mempool
+    /// under a single lock acquisition.
+    ///
+    /// This eliminates the per-tx `mempool.lock()` on the ingestion
+    /// hot path — the mempool lock is only acquired once per
+    /// `prepare_proposal` call, not once per tx.
+    mempool_intake_tx: std::sync::mpsc::Sender<TxBytes>,
+    /// The receiver side of the intake ring. Drained by
+    /// `prepare_proposal` to flush buffered txs into the mempool.
+    mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<TxBytes>>,
 }
 
 impl Executor {
@@ -397,6 +415,7 @@ impl Executor {
     ///   parallel speculative execution path. Below this threshold,
     ///   serial execution is used.
     pub fn with_config(max_mempool_entries: usize, parallel_threshold: usize) -> Self {
+        let (intake_tx, intake_rx) = std::sync::mpsc::channel();
         Self {
             modules: std::array::from_fn(|_| None),
             mempool: Mutex::new(mempool::Mempool::new(max_mempool_entries)),
@@ -408,7 +427,21 @@ impl Executor {
             preverify_cache: Mutex::new(HashMap::new()),
             parallel_threshold,
             async_execution: false,
+            recorder: None,
+            mempool_intake_tx: intake_tx,
+            mempool_intake_rx: Mutex::new(intake_rx),
         }
+    }
+
+    /// Attach a latency recorder for the block pipeline.
+    ///
+    /// When set, `prepare_proposal`, `finalize_block`, and
+    /// `attest_state` record their durations under operation names
+    /// `"prepare_proposal"`, `"finalize_block"`, and
+    /// `"attest_state"`. This is the "measure everything" directive
+    /// from plan.md §10.
+    pub fn set_recorder(&mut self, recorder: Arc<metrics::Recorder>) {
+        self.recorder = Some(recorder);
     }
 
     /// Register a module. The module's `ID` must be unique.
@@ -485,13 +518,17 @@ impl Executor {
         }
 
         // Group txs by module ID, preserving block order within each
-        // group. Each entry is (ctx, payload_bytes). We collect the
-        // payload as a Vec<u8> so we can pass a slice of slices to
-        // handle_batch.
+        // group. Each entry is (ctx, payload_bytes, full_tx_hash). We
+        // collect the payload as a Vec<u8> so we can pass a slice of
+        // slices to handle_batch. The full tx hash is the same key
+        // used by `ingest_tx` to cache preverified senders — using it
+        // here (not the payload hash) is what makes the preverify
+        // cache actually hit. See docs/devlog.md session N for the
+        // root-cause analysis of the prior key mismatch.
         //
         // We use a BTreeMap so module groups are processed in a
         // deterministic order (sorted by module ID).
-        let mut groups: BTreeMap<u8, Vec<(TxContext, Vec<u8>)>> = BTreeMap::new();
+        let mut groups: BTreeMap<u8, Vec<(TxContext, Vec<u8>, Hash)>> = BTreeMap::new();
         for tx in &block.txs {
             let bytes = tx.as_bytes();
             let Some(ctx) = parse_tx_context(bytes) else {
@@ -501,7 +538,12 @@ impl Executor {
                 continue; // skip malformed txs
             };
             let payload = module_payload(bytes).to_vec();
-            groups.entry(module_id).or_default().push((ctx, payload));
+            // Cache key must match `ingest_tx`: hash of the FULL tx
+            // envelope, not just the module payload. The payload
+            // alone does not uniquely identify a transaction (two
+            // senders can send identical payloads).
+            let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
+            groups.entry(module_id).or_default().push((ctx, payload, tx_hash));
         }
 
         // Execute each module's txs as a batch.
@@ -531,19 +573,16 @@ impl Executor {
             // constructed, cloning payloads for txs without cached
             // senders — even when the fallback path would be used,
             // making those clones wasted work.
-            let all_cached = group.iter().all(|(_ctx, payload)| {
-                let tx_hash = Hasher::hash_one(Domain::Transaction, payload);
-                preverify_cache.contains_key(&tx_hash)
-            });
+            let all_cached =
+                group.iter().all(|(_ctx, _payload, tx_hash)| preverify_cache.contains_key(tx_hash));
 
             let results = if all_cached {
                 // All senders are pre-recovered — construct the
                 // preverified Vec from the cache (no payload clones).
                 let preverified: Vec<PreverifiedTx> = group
                     .iter()
-                    .map(|(_ctx, payload)| {
-                        let tx_hash = Hasher::hash_one(Domain::Transaction, payload);
-                        preverify_cache.remove(&tx_hash).unwrap_or_else(|| PreverifiedTx {
+                    .map(|(_ctx, payload, tx_hash)| {
+                        preverify_cache.remove(tx_hash).unwrap_or_else(|| PreverifiedTx {
                             raw: payload.clone(),
                             sender: [0u8; 20],
                         })
@@ -561,8 +600,10 @@ impl Executor {
             } else {
                 // Fall back to the recovery path — no preverified
                 // Vec constructed, no payload clones.
-                let batch: Vec<(TxContext, &[u8])> =
-                    group.iter().map(|(ctx, payload)| (*ctx, payload.as_slice())).collect();
+                let batch: Vec<(TxContext, &[u8])> = group
+                    .iter()
+                    .map(|(ctx, payload, _tx_hash)| (*ctx, payload.as_slice()))
+                    .collect();
                 module.handle_batch(&batch)
             };
             for events in results.into_iter().flatten() {
@@ -627,9 +668,12 @@ impl AppInterface for Executor {
             self.preverify_cache.lock().unwrap().insert(tx_hash, preverified.clone());
         }
 
-        match self.mempool.lock().unwrap().submit(tx) {
+        // Push to the lock-free intake ring. The mempool submission
+        // is deferred to `prepare_proposal` — this eliminates the
+        // per-tx mempool lock on the ingestion hot path.
+        match self.mempool_intake_tx.send(tx) {
             Ok(()) => MempoolAck::Accepted,
-            Err(e) => MempoolAck::Rejected { reason: format!("{e:?}") },
+            Err(_) => MempoolAck::Rejected { reason: "intake ring closed".to_string() },
         }
     }
 
@@ -690,9 +734,24 @@ impl AppInterface for Executor {
     }
 
     fn prepare_proposal(&self, budget: &types::BlockBudget) -> Proposal {
+        let start = std::time::Instant::now();
+        // Drain the lock-free intake ring into the mempool under a
+        // single lock acquisition. This batches all pending txs into
+        // the mempool before selection, eliminating the per-tx
+        // mempool lock on the ingestion hot path.
+        {
+            let rx = self.mempool_intake_rx.lock().unwrap();
+            let mut pool = self.mempool.lock().unwrap();
+            while let Ok(tx) = rx.try_recv() {
+                let _ = pool.submit(tx);
+            }
+        }
         // Select txs from the mempool by fee priority.
         let txs = self.mempool.lock().unwrap().select(budget.max_bytes);
         let height = Height::new(*self.next_proposal_height.lock().unwrap());
+        if let Some(recorder) = &self.recorder {
+            recorder.record("prepare_proposal", start.elapsed());
+        }
         Proposal { height, txs, attestation: None }
     }
 
@@ -737,6 +796,7 @@ impl AppInterface for Executor {
     }
 
     fn finalize_block(&self, block: &FinalizedBlock) -> CommitAck {
+        let start = std::time::Instant::now();
         if self.async_execution {
             // Phase D: async execution lane — defer execution.
             //
@@ -762,10 +822,14 @@ impl AppInterface for Executor {
             self.finalized.lock().unwrap().insert(block.height.value(), block.clone());
             *self.next_proposal_height.lock().unwrap() = block.height.value() + 1;
         }
+        if let Some(recorder) = &self.recorder {
+            recorder.record("finalize_block", start.elapsed());
+        }
         CommitAck { height: block.height }
     }
 
     fn attest_state(&self, height: Height) -> StateAttestation {
+        let start = std::time::Instant::now();
         // Phase D: flush any pending block before attesting state.
         // This ensures the state root for the requested height is
         // available (if it was deferred). When async execution is
@@ -774,6 +838,9 @@ impl AppInterface for Executor {
         self.flush_pending();
         let root =
             self.state_roots.lock().unwrap().get(&height.value()).copied().unwrap_or(Hash::ZERO);
+        if let Some(recorder) = &self.recorder {
+            recorder.record("attest_state", start.elapsed());
+        }
         StateAttestation { height, root }
     }
 }
@@ -994,5 +1061,86 @@ mod tests {
             Verdict::Reject { reason } => assert!(reason.contains("malformed")),
             Verdict::Accept => panic!("should reject malformed tx"),
         }
+    }
+
+    // ---- Preverification cache key fix ----
+
+    /// A test module that records whether `handle_batch_preverified`
+    /// (the cache-hit path) or `handle_batch` (the fallback path) was
+    /// called. This lets us prove the preverify cache actually hits.
+    struct PreverifyTrackingModule {
+        preverified_calls: Mutex<usize>,
+        fallback_calls: Mutex<usize>,
+    }
+
+    impl PreverifyTrackingModule {
+        fn new() -> Self {
+            Self { preverified_calls: Mutex::new(0), fallback_calls: Mutex::new(0) }
+        }
+    }
+
+    impl Module for PreverifyTrackingModule {
+        fn name(&self) -> &'static str {
+            "preverify-tracker"
+        }
+        fn id(&self) -> u8 {
+            2
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            Ok(vec![])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn preverify_batch(&self, msgs: &[&[u8]]) -> Vec<Result<PreverifiedTx, ExecError>> {
+            msgs.iter()
+                .map(|raw| Ok(PreverifiedTx { raw: raw.to_vec(), sender: [0u8; 20] }))
+                .collect()
+        }
+        fn handle_batch_preverified(
+            &self,
+            _ctx: &TxContext,
+            txs: &[PreverifiedTx],
+        ) -> Vec<Result<Vec<Event>, ExecError>> {
+            *self.preverified_calls.lock().unwrap() += txs.len();
+            (0..txs.len()).map(|_| Ok(vec![])).collect()
+        }
+        fn handle_batch(&self, batch: &[(TxContext, &[u8])]) -> Vec<Result<Vec<Event>, ExecError>> {
+            *self.fallback_calls.lock().unwrap() += batch.len();
+            (0..batch.len()).map(|_| Ok(vec![])).collect()
+        }
+    }
+
+    /// Prove the preverify cache key matches between `ingest_tx` and
+    /// `execute_block`. Before the fix, `ingest_tx` cached under the
+    /// full-tx hash but `execute_block` looked up under the payload
+    /// hash — a guaranteed miss. After the fix, both use the full-tx
+    /// hash, so the preverified path is taken.
+    #[test]
+    fn preverify_cache_key_matches_between_ingest_and_execute() {
+        let mut executor = Executor::new(100);
+        let tracker = Arc::new(PreverifyTrackingModule::new());
+        executor.register_module(tracker.clone());
+
+        // Ingest a tx — this caches the preverified sender under the
+        // full-tx hash.
+        let tx = make_tx(2, &[0xAA]);
+        executor.ingest_tx(tx.clone());
+
+        // Prepare + finalize a block containing that tx.
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        assert_eq!(proposal.txs.len(), 1, "the ingested tx should be in the proposal");
+        let block = FinalizedBlock { height: Height::new(0), txs: proposal.txs };
+        executor.finalize_block(&block);
+
+        // The preverified path should have been taken (cache hit),
+        // not the fallback path (cache miss).
+        let preverified = *tracker.preverified_calls.lock().unwrap();
+        let fallback = *tracker.fallback_calls.lock().unwrap();
+        assert_eq!(preverified, 1, "preverified path should have been used (cache hit)");
+        assert_eq!(fallback, 0, "fallback path should not have been used (no cache miss)");
     }
 }

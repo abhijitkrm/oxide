@@ -22,6 +22,7 @@
 //! full stack must approach.
 
 #![allow(missing_docs)]
+#![allow(clippy::doc_markdown)]
 
 use std::hint::black_box;
 
@@ -717,6 +718,123 @@ fn bench_preverified_parallel_vs_recovery(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: parallel vs serial for read-write conflict workloads.
+///
+/// This is the differential benchmark for the read-write conflict
+/// detection fix (session: EVM read-write conflict detection). The
+/// `accessed_accounts` tracking we added has a cost: every account
+/// loaded by a speculative group is added to a `HashSet<Address>`,
+/// and conflict detection checks this set against prior committed
+/// writes. This bench proves the overhead doesn't regress throughput
+/// compared to serial execution.
+///
+/// ## Workload
+///
+/// Two senders: sender A transfers ETH to recipient R, sender B
+/// transfers ETH to a different recipient. Both txs are in the same
+/// block. This is the conflict-free multi-sender case — the access
+/// sets don't overlap, so no re-execution is needed. The bench
+/// measures the cost of building and checking the access sets.
+///
+/// ## Gate
+///
+/// Parallel path must not be more than 20% slower than serial for
+/// 1,000 txs. The 20% headroom accounts for the HashSet construction
+/// and membership checks that serial doesn't need. If the overhead
+/// exceeds 20%, the access tracking implementation needs optimization
+/// (e.g., bloom filter, bitset, or a cheaper set structure).
+///
+/// ## Baseline
+///
+/// Serial `handle_batch` (sequential, no access tracking, no
+/// conflict detection). The parallel path adds: per-group HashSet
+/// construction, conflict detection, and COW cache management.
+/// Parity is the goal; a small overhead is acceptable.
+fn bench_read_write_conflict_parallel_vs_serial(c: &mut Criterion) {
+    const N_SENDERS: usize = 100;
+    let keys: Vec<TestKey> = (0..N_SENDERS).map(|_| TestKey::new()).collect();
+    // Each sender transfers to a distinct recipient (conflict-free).
+    let recipients: Vec<revm::primitives::Address> = (0..N_SENDERS)
+        .map(|i| {
+            revm::primitives::Address::from_slice(&[0x42 + u8::try_from(i).unwrap_or(255); 20])
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("read_write_conflict_parallel_vs_serial");
+
+    for &n_txs in &[100usize, 1000, 10000] {
+        // Serial path: handle_batch (sequential, no access tracking).
+        group.bench_function(format!("{n_txs}_txs_serial"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    for key in &keys {
+                        fund(&module, &key.addr);
+                    }
+                    let txs_per_sender = (n_txs / N_SENDERS) as u64;
+                    let mut txs: Vec<Vec<u8>> = Vec::with_capacity(n_txs);
+                    for (i, key) in keys.iter().enumerate() {
+                        for j in 0..txs_per_sender {
+                            txs.push(signed_transfer(
+                                &key.privkey,
+                                j,
+                                recipients[i],
+                                1_000_000_000,
+                            ));
+                        }
+                    }
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch(&dummy_ctx(), &txs);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+
+        // Parallel path: handle_batch_parallel (with access tracking).
+        group.bench_function(format!("{n_txs}_txs_parallel"), |b| {
+            b.iter_batched(
+                || {
+                    let module = EvmModule::new(1, 7_000_000_000);
+                    for key in &keys {
+                        fund(&module, &key.addr);
+                    }
+                    let txs_per_sender = (n_txs / N_SENDERS) as u64;
+                    let mut txs: Vec<Vec<u8>> = Vec::with_capacity(n_txs);
+                    for (i, key) in keys.iter().enumerate() {
+                        for j in 0..txs_per_sender {
+                            txs.push(signed_transfer(
+                                &key.privkey,
+                                j,
+                                recipients[i],
+                                1_000_000_000,
+                            ));
+                        }
+                    }
+                    (module, txs)
+                },
+                |(module, txs)| {
+                    module.begin_block(Height::new(1));
+                    let results = module.handle_batch_parallel(&dummy_ctx(), &txs);
+                    module.end_block(Height::new(1));
+                    let root = module.state_root();
+                    black_box(root);
+                    black_box(results);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_tps_simple_transfer,
@@ -730,5 +848,6 @@ criterion_group!(
     bench_native_vs_revm,
     bench_preverified_vs_recovery,
     bench_preverified_parallel_vs_recovery,
+    bench_read_write_conflict_parallel_vs_serial,
 );
 criterion_main!(benches);

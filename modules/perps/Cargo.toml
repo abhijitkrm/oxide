@@ -1,0 +1,32 @@
+# Oxide blockchain — `perps` module
+# (workspace: github.com/abhijitkumar/oxide; bare-name convention)
+
+[package]
+name = "perps"
+description = "Perpetual futures module — cross/isolated margin, funding, liquidations, insurance fund, ADL (plan.md §9.3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
+types = { workspace = true }
+executor = { workspace = true }
+framework = { workspace = true }
+trading = { workspace = true }
+bank = { workspace = true }
+
+[dev-dependencies]
+# Benchmark harness (criterion gates: plan.md §13 Phase 3 acceptance).
+criterion = "0.7.0"
+
+[[bench]]
+name = "perps_settlement"
+harness = false
+
+[lints]
+workspace = true

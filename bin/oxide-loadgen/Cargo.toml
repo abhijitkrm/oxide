@@ -1,0 +1,24 @@
+# Oxide blockchain — `oxide-loadgen` binary
+# (workspace: github.com/abhijitkrm/oxide)
+
+[package]
+name = "oxide-loadgen"
+description = "Load generator — connects to the matching server via binary TCP and submits orders at scale."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxide-loadgen"
+path = "src/main.rs"
+
+[dependencies]
+matcher = { workspace = true }
+primitives = { workspace = true }
+trading = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

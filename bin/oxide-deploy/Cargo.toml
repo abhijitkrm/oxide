@@ -15,7 +15,7 @@ name = "oxide-deploy"
 path = "src/main.rs"
 
 [dependencies]
-devnet = { workspace = true }
+node = { workspace = true }
 
 [lints]
 workspace = true

@@ -22,6 +22,9 @@ framework = { workspace = true }
 bank = { workspace = true }
 oxide-core = { workspace = true }
 staking = { workspace = true }
+trading = { workspace = true }
+exchange = { workspace = true }
+perps = { workspace = true }
 
 [lints]
 workspace = true

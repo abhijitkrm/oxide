@@ -13,7 +13,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use devnet::{ConsensusConfig, DevnetNode, NodeConfig};
+use node::{ConsensusConfig, Node, NodeConfig};
 
 fn main() {
     println!("oxide-fullnode: starting (follower mode)");
@@ -25,7 +25,7 @@ fn main() {
         config.max_mempool_entries
     );
 
-    let _node = DevnetNode::assemble(&config);
+    let _node = Node::assemble(&config);
 
     println!("oxide-fullnode: assembled stack (executor + core/bank/staking modules)");
     println!("oxide-fullnode: ready (sync not yet implemented — Phase 2)");
@@ -63,14 +63,18 @@ fn load_config() -> NodeConfig {
         }
     }
 
-    // Convert the config crate's ConsensusEngineKind to devnet's
+    // Convert the config crate's ConsensusEngineKind to node's
     // ConsensusConfig.
     let consensus = match config.consensus.engine {
         config::ConsensusEngineKind::Sequencer => ConsensusConfig::Sequencer,
         config::ConsensusEngineKind::OxideBft => ConsensusConfig::OxideBft,
     };
 
-    NodeConfig { consensus, max_mempool_entries: config.executor.max_mempool_entries }
+    NodeConfig {
+        consensus,
+        max_mempool_entries: config.executor.max_mempool_entries,
+        parallel_threshold: config.executor.parallel_threshold,
+    }
 }
 
 /// Parse a `--flag value` pair from CLI args.

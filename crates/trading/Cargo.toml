@@ -1,0 +1,37 @@
+# Oxide blockchain — `trading` crate
+# (workspace: github.com/abhijitkrm/oxide; the crate name carries no
+# `oxide-` prefix: see docs/devlog.md, session 2, for the convention)
+#
+# HFT-grade matching engine core (plan.md §9.1). Hot-path crate policy
+# (production-rust skill §5): std-only at runtime — the single runtime
+# dependency is `primitives` (internal, itself std-only), which supplies
+# the deterministic fixed-point Price/Qty types. Everything else is
+# dev-only (criterion benches, proptest properties).
+
+[package]
+name = "trading"
+description = "HFT-grade central-limit-order-book matching engine: slab-arena order pool, dense tick-ladder book with hierarchical bitboard price discovery, strict price-time priority, and deterministic fill events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Deterministic fixed-point types (Price scale-8, Qty scale-6) and
+# Address. The one internal dependency hot-path crates may share.
+primitives = { workspace = true }
+
+[dev-dependencies]
+# Benchmark harness (criterion gates: plan.md §13 Phase 3 acceptance).
+criterion = "0.7.0"
+# Property-based oracle-equivalence testing (testing-standards skill,
+# layer 2: matching ops == sequential model oracle).
+proptest = "1"
+
+[[bench]]
+name = "matching"
+harness = false
+
+[lints]
+workspace = true

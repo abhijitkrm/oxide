@@ -100,12 +100,12 @@ impl std::fmt::Display for EpochRotationError {
 
 impl std::error::Error for EpochRotationError {}
 
-/// Errors from consensus message verification (C1 fix).
+/// Errors from consensus message verification (C1 fix + hardening).
 ///
 /// These are distinct from operational errors (io, codec): they
 /// indicate byzantine behavior — a peer sent a vote or QC with an
-/// invalid signature. The caller should penalize the peer, not
-/// retry the operation.
+/// invalid signature, conflicting metadata, or insufficient quorum.
+/// The caller should penalize the peer, not retry the operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsensusError {
     /// A vote's signature did not verify against the claimed voter's
@@ -126,6 +126,40 @@ pub enum ConsensusError {
     /// The signer bitmap references a validator index that is out of
     /// bounds for the current validator set.
     SignerOutOfBounds,
+    /// A vote was collected for a different (view, `block_hash`) than
+    /// the votes already collected for this view. A byzantine voter
+    /// could send conflicting votes to different leaders; this check
+    /// prevents mixing votes for different blocks into one QC.
+    ConflictingVote {
+        /// The validator index that sent the conflicting vote.
+        voter: ValidatorIndex,
+        /// The view of the conflicting vote.
+        view: View,
+        /// The block hash the engine expected (from the first vote).
+        expected_block: Hash,
+        /// The block hash the conflicting vote was for.
+        actual_block: Hash,
+    },
+    /// A QC was formed or received whose signer count is below the
+    /// quorum threshold. The aggregate signature may verify, but the
+    /// QC does not represent ≥2f+1 validators — it cannot be trusted
+    /// as a commitment certificate.
+    InsufficientQuorum {
+        /// The number of signers in the QC's bitmap.
+        signers: usize,
+        /// The quorum threshold for the current validator set.
+        threshold: usize,
+    },
+    /// A QC was received whose view is not greater than the engine's
+    /// current `high_qc` view. A byzantine leader could replay an old
+    /// QC to trick the engine into regressing its view. The engine
+    /// rejects stale QCs to enforce monotonic progress.
+    StaleQc {
+        /// The QC's view.
+        qc_view: View,
+        /// The highest QC view the engine has already seen.
+        high_qc_view: View,
+    },
 }
 
 impl std::fmt::Display for ConsensusError {
@@ -138,6 +172,24 @@ impl std::fmt::Display for ConsensusError {
             Self::InvalidTcSignature => write!(f, "invalid TC aggregate signature"),
             Self::SignerOutOfBounds => {
                 write!(f, "signer bitmap references out-of-bounds validator")
+            }
+            Self::ConflictingVote { voter, view, expected_block, actual_block } => {
+                write!(
+                    f,
+                    "conflicting vote from validator {voter} at view {}: expected block {expected_block}, got {actual_block}",
+                    view.value()
+                )
+            }
+            Self::InsufficientQuorum { signers, threshold } => {
+                write!(f, "insufficient quorum: {signers} signers < {threshold} threshold")
+            }
+            Self::StaleQc { qc_view, high_qc_view } => {
+                write!(
+                    f,
+                    "stale QC: view {} <= high_qc view {}",
+                    qc_view.value(),
+                    high_qc_view.value()
+                )
             }
         }
     }
@@ -437,6 +489,14 @@ impl OxideBft {
         Hasher::hash_one(Domain::Block, &buf)
     }
 
+    /// Count the number of set bits in a signer bitmap. This is the
+    /// number of validators who signed the certificate (QC or TC).
+    /// Used for quorum enforcement — a structural property checked
+    /// regardless of whether BLS signature verification is enabled.
+    fn count_signers(bitmap: &[u8]) -> usize {
+        bitmap.iter().map(|b| b.count_ones() as usize).sum()
+    }
+
     /// Leader: propose a block. Calls `app.prepare_proposal`, wraps
     /// the result in a `BlockHeader`, stores it, and returns the
     /// header + proposal. Returns `None` if there is no work (no
@@ -581,9 +641,23 @@ impl OxideBft {
     /// [`ConsensusError::InvalidVoteSignature`]. The signed message
     /// is the vote's `block_hash` (32 bytes) under `Domain::Vote`.
     ///
+    /// # Vote consistency (hardening)
+    ///
+    /// Every vote collected for the current view must agree on
+    /// `(view, block_hash)`. A byzantine voter could send conflicting
+    /// votes for different blocks at the same view to different
+    /// leaders. Without this check, a leader could mix votes for
+    /// different blocks into one QC, producing a QC that appears
+    /// valid but does not represent agreement on a single block.
+    /// The first vote collected sets the expected `(view, block_hash)`;
+    /// subsequent votes for the same view must match.
+    ///
     /// # Errors
     /// Returns [`ConsensusError::InvalidVoteSignature`] if the
-    /// voter index is out of bounds or the signature does not verify.
+    /// voter index is out of bounds or the signature does not verify,
+    /// or [`ConsensusError::ConflictingVote`] if the vote's
+    /// `(view, block_hash)` does not match the first vote collected
+    /// for this view.
     pub fn collect_vote(
         &mut self,
         voter: ValidatorIndex,
@@ -613,6 +687,21 @@ impl OxideBft {
                 pk,
             )
             .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+        }
+
+        // Hardening: check that this vote agrees with the first vote
+        // collected for this view. All votes in a QC must be for the
+        // same (view, block_hash) — otherwise the QC does not
+        // represent agreement on a single block.
+        if let Some(first) = self.votes.iter().find_map(Option::as_ref) {
+            if first.view != vote.view || first.block_hash != vote.block_hash {
+                return Err(ConsensusError::ConflictingVote {
+                    voter,
+                    view: vote.view,
+                    expected_block: first.block_hash,
+                    actual_block: vote.block_hash,
+                });
+            }
         }
 
         self.votes[idx] = Some(vote);
@@ -683,12 +772,49 @@ impl OxideBft {
     /// rejected with [`ConsensusError::InvalidQcSignature`]. The
     /// signed message is the QC's `block_hash` under `Domain::Vote`.
     ///
+    /// # Monotonic view enforcement (hardening)
+    ///
+    /// The QC's view must be strictly greater than the current
+    /// `high_qc`'s view. A byzantine leader could replay an old QC
+    /// to trick the engine into regressing its view or re-committing
+    /// an already-finalized block. The engine rejects stale QCs to
+    /// enforce monotonic progress.
+    ///
     /// # Errors
     /// Returns [`ConsensusError::InvalidQcSignature`] if the
-    /// aggregate signature does not verify, or
+    /// aggregate signature does not verify,
     /// [`ConsensusError::SignerOutOfBounds`] if the bitmap references
-    /// a validator past the end of the set.
+    /// a validator past the end of the set,
+    /// [`ConsensusError::InsufficientQuorum`] if the signer count is
+    /// below the quorum threshold, or
+    /// [`ConsensusError::StaleQc`] if the QC's view is not greater
+    /// than the current `high_qc`'s view.
     pub fn deliver_qc(&mut self, qc: QuorumCertificate) -> Result<(), ConsensusError> {
+        // Hardening: enforce monotonic view progression. A QC for a
+        // view ≤ the current high_qc's view is stale — a byzantine
+        // leader could replay it to regress the engine's state.
+        // Exception: the first QC (when high_qc is None) is always
+        // accepted.
+        if let Some(current_high_qc) = &self.high_qc {
+            if qc.view.value() <= current_high_qc.view.value() {
+                return Err(ConsensusError::StaleQc {
+                    qc_view: qc.view,
+                    high_qc_view: current_high_qc.view,
+                });
+            }
+        }
+
+        // Hardening: enforce quorum threshold regardless of whether
+        // signature verification is enabled. A QC with fewer than
+        // quorum signers is not a valid commitment certificate, even
+        // in conformance mode — the signer count is a structural
+        // property of the QC, not a cryptographic one.
+        let signer_count = Self::count_signers(&qc.signer_bitmap);
+        let threshold = self.validator_set.quorum();
+        if signer_count < threshold {
+            return Err(ConsensusError::InsufficientQuorum { signers: signer_count, threshold });
+        }
+
         // C1 fix: verify the QC's aggregate signature against the
         // signer bitmap + validator set. The signed message is the
         // block hash (32 bytes) under Domain::Vote — the same domain
@@ -731,6 +857,11 @@ impl OxideBft {
     /// Extracts the public keys of the signers from the bitmap, then
     /// calls `crypto::aggregate_verify` with the QC's aggregate
     /// signature, the block hash as the message, and `Domain::Vote`.
+    ///
+    /// The quorum threshold check is performed by the caller
+    /// ([`deliver_qc`](Self::deliver_qc)) via [`count_signers`](Self::count_signers),
+    /// so it is enforced regardless of whether signature verification
+    /// is enabled.
     ///
     /// # Errors
     /// Returns [`ConsensusError::SignerOutOfBounds`] if the bitmap
@@ -900,6 +1031,15 @@ impl OxideBft {
         &mut self,
         tc: &TimeoutCertificate,
     ) -> Result<(), ConsensusError> {
+        // Hardening: enforce quorum threshold regardless of whether
+        // signature verification is enabled. A TC with fewer than
+        // quorum signers is not a valid view-change certificate.
+        let signer_count = Self::count_signers(&tc.signer_bitmap);
+        let threshold = self.validator_set.quorum();
+        if signer_count < threshold {
+            return Err(ConsensusError::InsufficientQuorum { signers: signer_count, threshold });
+        }
+
         // Verify the TC's aggregate signature (TC safety).
         if self.verify_signatures {
             self.verify_tc_signature(tc)?;
@@ -916,6 +1056,11 @@ impl OxideBft {
     /// and the validator set's public keys. The signed message is
     /// the TC's view as little-endian bytes, signed with
     /// `Domain::Timeout`.
+    ///
+    /// The quorum threshold check is performed by the caller
+    /// ([`on_timeout_certificate`](Self::on_timeout_certificate)) via
+    /// [`count_signers`](Self::count_signers), so it is enforced
+    /// regardless of whether signature verification is enabled.
     ///
     /// # Errors
     ///
@@ -2119,5 +2264,181 @@ mod tests {
         assert!(n_blocks > 0, "should have finalized blocks");
         let total_txs: usize = results[0].iter().map(|b| b.txs.len()).sum();
         assert_eq!(total_txs, 3, "all 3 txs must be finalized");
+    }
+
+    // ---- Certificate validation hardening tests ----
+    //
+    // These tests prove the engine rejects byzantine attacks that
+    // the prior validation missed: conflicting votes, insufficient
+    // quorum, and stale QCs.
+
+    #[test]
+    fn collect_vote_rejects_conflicting_vote_for_different_block() {
+        // 4 validators, conformance mode (no BLS). The leader collects
+        // a vote for block A, then receives a vote for block B at the
+        // same view. The conflicting vote must be rejected.
+        let mut leader = make_multi_engine(0);
+
+        // First vote: for block hash A.
+        let vote_a = Vote {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0xAA; 32]),
+            signature: Signature::ZERO,
+        };
+        leader.collect_vote(1, vote_a).expect("first vote accepted");
+
+        // Second vote: for block hash B (different block, same view).
+        let vote_b = Vote {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0xBB; 32]),
+            signature: Signature::ZERO,
+        };
+        let err = leader.collect_vote(2, vote_b).expect_err("conflicting vote must be rejected");
+        assert!(
+            matches!(err, ConsensusError::ConflictingVote { voter, .. } if voter == 2),
+            "expected ConflictingVote from voter 2, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn collect_vote_rejects_conflicting_vote_for_different_view() {
+        // 4 validators, conformance mode. The leader collects a vote
+        // for view 0, then receives a vote for view 1 (different view).
+        let mut leader = make_multi_engine(0);
+
+        let vote_v0 = Vote {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            signature: Signature::ZERO,
+        };
+        leader.collect_vote(1, vote_v0).expect("first vote accepted");
+
+        let vote_v1 = Vote {
+            view: View::new(1),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            signature: Signature::ZERO,
+        };
+        let err = leader.collect_vote(2, vote_v1).expect_err("conflicting vote must be rejected");
+        assert!(
+            matches!(err, ConsensusError::ConflictingVote { voter, view, .. } if voter == 2 && view == View::new(1)),
+            "expected ConflictingVote for view 1, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn deliver_qc_rejects_insufficient_quorum() {
+        // 4 validators (quorum = 3). A QC with only 2 signers has a
+        // valid aggregate signature (in conformance mode) but does
+        // not meet quorum — it must be rejected.
+        let mut engine = make_multi_engine(0);
+
+        // QC with 2 signers (below quorum of 3).
+        let insufficient_qc = QuorumCertificate {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0011], // 2 signers
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+
+        let err = engine
+            .deliver_qc(insufficient_qc)
+            .expect_err("QC with insufficient quorum must be rejected");
+        assert!(
+            matches!(err, ConsensusError::InsufficientQuorum { signers, threshold } if signers == 2 && threshold == 3),
+            "expected InsufficientQuorum (2 < 3), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn deliver_qc_rejects_stale_qc() {
+        // 4 validators, conformance mode. The engine receives a QC
+        // for view 1, then receives a QC for view 0 (stale). The
+        // stale QC must be rejected.
+        let mut engine = make_multi_engine(0);
+
+        // First QC: view 1 (accepted, sets high_qc).
+        let qc_v1 = QuorumCertificate {
+            view: View::new(1),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x11; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111], // 4 signers (≥ quorum)
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.deliver_qc(qc_v1).expect("first QC accepted");
+
+        // Second QC: view 0 (stale — below high_qc's view 1).
+        let stale_qc = QuorumCertificate {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x00; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        let err = engine.deliver_qc(stale_qc).expect_err("stale QC must be rejected");
+        assert!(
+            matches!(err, ConsensusError::StaleQc { qc_view, high_qc_view } if qc_view == View::new(0) && high_qc_view == View::new(1)),
+            "expected StaleQc (view 0 ≤ high_qc view 1), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn deliver_qc_rejects_qc_with_same_view_as_high_qc() {
+        // A QC with the same view as the current high_qc is also
+        // stale (not strictly greater). This prevents replaying the
+        // same QC.
+        let mut engine = make_multi_engine(0);
+
+        let qc = QuorumCertificate {
+            view: View::new(1),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x11; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.deliver_qc(qc.clone()).expect("first QC accepted");
+
+        // Same view, different block — stale.
+        let same_view_qc = QuorumCertificate {
+            view: View::new(1),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x22; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        let err = engine.deliver_qc(same_view_qc).expect_err("same-view QC must be rejected");
+        assert!(matches!(err, ConsensusError::StaleQc { .. }), "expected StaleQc, got {err:?}");
+    }
+
+    #[test]
+    fn on_timeout_certificate_rejects_insufficient_quorum() {
+        // 4 validators (quorum = 3). A TC with only 2 signers must
+        // be rejected even if the aggregate signature verifies (in
+        // conformance mode it always does).
+        let mut engine = make_multi_engine(0);
+
+        let insufficient_tc = TimeoutCertificate {
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0011], // 2 signers
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+
+        let err = engine
+            .on_timeout_certificate(&insufficient_tc)
+            .expect_err("TC with insufficient quorum must be rejected");
+        assert!(
+            matches!(err, ConsensusError::InsufficientQuorum { signers, threshold } if signers == 2 && threshold == 3),
+            "expected InsufficientQuorum (2 < 3), got {err:?}"
+        );
     }
 }

@@ -1,0 +1,19 @@
+# Oxide blockchain — `metrics` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention)
+
+[package]
+name = "metrics"
+description = "HDR histogram latency recording and Prometheus exposition for Oxide node observability."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# hdrhistogram: high-dynamic-range histograms for p50/p99/p99.9
+# latency recording. MIT/Apache-2.0 licensed.
+hdrhistogram = { workspace = true }
+
+[lints]
+workspace = true

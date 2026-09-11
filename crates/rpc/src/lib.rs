@@ -46,6 +46,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use types::TxBytes;
+
+/// A handle that the RPC server uses to submit wrapped Oxide transaction
+/// envelopes into the application's mempool.
+///
+/// The RPC layer is deliberately decoupled from the executor crate: it
+/// only needs the ability to push a wrapped `TxBytes` into the mempool
+/// and learn whether the submission was accepted. Real nodes implement
+/// this trait for their `executor::Executor` (which already implements
+/// `ports::AppInterface::ingest_tx`); tests implement it with a mock
+/// that records submissions.
+///
+/// The trait is `Send + Sync` so an `Arc<dyn TxSubmitter>` can be shared
+/// across the HTTP handler's async tasks.
+pub trait TxSubmitter: Send + Sync {
+    /// Submit a wrapped Oxide transaction envelope to the mempool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(reason)` with a human-readable rejection reason if
+    /// the mempool or validation layer rejected the transaction (bad
+    /// signature, wrong nonce, insufficient balance, duplicate,
+    /// pool full, etc.).
+    fn submit_tx(&self, tx: TxBytes) -> Result<(), String>;
+}
 
 /// The JSON-RPC 2.0 request envelope.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -113,6 +138,17 @@ impl RpcError {
     #[must_use]
     pub fn internal_error(msg: &str) -> Self {
         Self { code: -32603, message: format!("Internal error: {msg}"), data: None }
+    }
+
+    /// Transaction rejected by the mempool or validation layer.
+    ///
+    /// Uses the JSON-RPC application error code `-32000` (the
+    /// conventional "server error" range used by Ethereum clients for
+    /// transaction submission failures such as bad nonce, insufficient
+    /// balance, or pool-full rejections).
+    #[must_use]
+    pub fn transaction_rejected(reason: &str) -> Self {
+        Self { code: -32_000, message: format!("transaction rejected: {reason}"), data: None }
     }
 }
 
@@ -291,6 +327,16 @@ pub struct RpcServer {
     client_version: String,
     /// The subscription manager for WebSocket subscriptions.
     subscriptions: SubscriptionManager,
+    /// Optional mempool submitter. When set, `eth_sendRawTransaction`
+    /// decodes the raw EVM transaction, recovers the sender, wraps it in
+    /// the Oxide envelope, and pushes it into the mempool via this
+    /// handle. When `None`, the RPC returns a computed hash but does not
+    /// submit (the Phase 2 v0 behaviour, kept for stateless tests).
+    tx_submitter: Option<Arc<dyn TxSubmitter>>,
+    /// Optional latency recorder for RPC handler metrics. When set,
+    /// `eth_sendRawTransaction` records its duration under the
+    /// `"rpc_send_raw_tx"` operation. Exposed via `prometheus()`.
+    recorder: Option<Arc<metrics::Recorder>>,
 }
 
 impl RpcServer {
@@ -303,7 +349,36 @@ impl RpcServer {
             base_fee,
             client_version: format!("oxide/{}", env!("CARGO_PKG_VERSION")),
             subscriptions: SubscriptionManager::new(),
+            tx_submitter: None,
+            recorder: None,
         }
+    }
+
+    /// Attach a mempool submitter so `eth_sendRawTransaction` pushes
+    /// decoded transactions into the application's mempool.
+    ///
+    /// Without this call, `eth_sendRawTransaction` computes and returns
+    /// the transaction hash but does not submit the transaction — the
+    /// Phase 2 v0 behaviour, retained for stateless unit tests.
+    pub fn set_tx_submitter(&mut self, submitter: Arc<dyn TxSubmitter>) {
+        self.tx_submitter = Some(submitter);
+    }
+
+    /// Attach a latency recorder for RPC handler metrics.
+    ///
+    /// When set, `eth_sendRawTransaction` records its duration, and
+    /// `prometheus()` returns the recorded metrics in Prometheus text
+    /// format for a `/metrics` endpoint.
+    pub fn set_recorder(&mut self, recorder: Arc<metrics::Recorder>) {
+        self.recorder = Some(recorder);
+    }
+
+    /// Generate a Prometheus text exposition of all recorded metrics.
+    ///
+    /// Returns an empty string if no recorder is attached.
+    #[must_use]
+    pub fn prometheus(&self) -> String {
+        self.recorder.as_ref().map_or(String::new(), |r| r.prometheus())
     }
 
     /// Update the block height (called by the executor after each
@@ -639,8 +714,19 @@ impl RpcServer {
     /// `eth_sendRawTransaction` — submits a raw EVM transaction.
     ///
     /// Params: `[rawTx: String]` (hex-encoded RLP transaction)
+    ///
+    /// When a [`TxSubmitter`] is attached, the raw RLP bytes are decoded
+    /// into an [`evm::tx::SignedTx`], the sender is recovered via
+    /// secp256k1, and the transaction is wrapped in the Oxide envelope
+    /// (`evm::wrap_evm_tx_envelope`) and pushed into the mempool. The
+    /// returned hash is the keccak256 of the raw RLP — the canonical
+    /// Ethereum transaction hash.
+    ///
+    /// When no submitter is attached, the hash is still computed and
+    /// returned, but the transaction is not submitted (Phase 2 v0
+    /// behaviour, retained for stateless unit tests).
     fn eth_send_raw_transaction(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
+        let start = std::time::Instant::now();
         if params.is_empty() {
             return Err(RpcError::invalid_params("missing raw transaction"));
         }
@@ -648,8 +734,45 @@ impl RpcServer {
             .as_str()
             .ok_or_else(|| RpcError::invalid_params("raw tx must be a hex string"))?;
         let raw = hex_decode(raw_hex)?;
-        // Compute the tx hash: keccak256 of the raw RLP.
+        // The canonical Ethereum tx hash is keccak256 of the raw RLP.
         let hash = keccak256(&raw);
+
+        if let Some(submitter) = &self.tx_submitter {
+            // Decode the raw RLP into a signed EVM transaction. This
+            // validates the transaction's structure (legacy, EIP-2930,
+            // or EIP-1559) and lets us recover the sender and extract
+            // the nonce and fee needed for the Oxide envelope.
+            let signed = evm::tx::SignedTx::decode_raw(&raw).map_err(|e| {
+                RpcError::invalid_params(&format!("invalid raw transaction: {e:?}"))
+            })?;
+            // Recover the sender's Ethereum address from the
+            // signature. This is the same recovery the EVM module
+            // performs during execution; doing it here lets the
+            // mempool order by sender nonce without re-decoding.
+            let sender = signed
+                .recover_sender()
+                .map_err(|e| RpcError::invalid_params(&format!("invalid signature: {e:?}")))?;
+            // The envelope fee is the max fee per gas (EIP-1559) or
+            // the gas price (legacy/EIP-2930), truncated to u64. The
+            // mempool uses this for fee-density ranking. Amounts that
+            // do not fit in u64 are rejected — Ethereum gas prices
+            // are always small in practice, but we guard against
+            // malformed input.
+            let fee_u256 = signed.max_fee_per_gas();
+            let fee: u64 = u64::try_from(fee_u256)
+                .map_err(|_| RpcError::invalid_params("fee exceeds u64 range"))?;
+            let nonce = signed.nonce();
+            // Wrap the raw RLP in the Oxide envelope and submit.
+            let envelope = evm::wrap_evm_tx_envelope(&sender, nonce, fee, &raw);
+            submitter
+                .submit_tx(TxBytes::new(envelope))
+                .map_err(|reason| RpcError::transaction_rejected(&reason))?;
+        }
+
+        if let Some(recorder) = &self.recorder {
+            recorder.record("rpc_send_raw_tx", start.elapsed());
+        }
+
         Ok(json!(format!("0x{}", hex::encode(hash))))
     }
 
@@ -1199,5 +1322,172 @@ mod tests {
         let req = make_request("net_listening", vec![], json!(1));
         let resp = s.handle(&req);
         assert_eq!(resp.result, Some(json!(true)));
+    }
+
+    // ---- eth_sendRawTransaction with TxSubmitter -------------------
+
+    /// A mock submitter that records every submitted envelope and can
+    /// be configured to reject.
+    struct MockSubmitter {
+        submissions: std::sync::Mutex<Vec<TxBytes>>,
+        reject_next: std::sync::Mutex<bool>,
+    }
+
+    impl MockSubmitter {
+        fn new() -> Self {
+            Self {
+                submissions: std::sync::Mutex::new(Vec::new()),
+                reject_next: std::sync::Mutex::new(false),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.submissions.lock().unwrap().len()
+        }
+
+        fn last(&self) -> TxBytes {
+            self.submissions.lock().unwrap().last().cloned().unwrap_or_default()
+        }
+    }
+
+    impl TxSubmitter for MockSubmitter {
+        fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
+            if *self.reject_next.lock().unwrap() {
+                return Err("mock rejection".to_string());
+            }
+            self.submissions.lock().unwrap().push(tx);
+            Ok(())
+        }
+    }
+
+    /// Without a submitter, the RPC returns the hash but does not
+    /// submit anything (Phase 2 v0 behaviour).
+    #[test]
+    fn eth_send_raw_transaction_without_submitter_returns_hash_only() {
+        let s = make_server();
+        // Empty tx → keccak256("") = 0xc5d2...
+        let req = make_request("eth_sendRawTransaction", vec![json!("0x")], json!(1));
+        let resp = s.handle(&req);
+        assert!(resp.error.is_none(), "expected success without submitter");
+        let hash = resp.result.unwrap().as_str().unwrap().to_string();
+        assert!(hash.starts_with("0x"));
+        assert_eq!(hash.len(), 66);
+    }
+
+    /// With a submitter, a malformed raw tx (not valid RLP) is rejected
+    /// with an invalid-params error and nothing is submitted.
+    #[test]
+    fn eth_send_raw_transaction_with_submitter_rejects_invalid_rlp() {
+        let mut s = make_server();
+        let submitter = Arc::new(MockSubmitter::new());
+        s.set_tx_submitter(submitter.clone());
+
+        // "0x" decodes to empty bytes, which is not a valid signed tx.
+        let req = make_request("eth_sendRawTransaction", vec![json!("0x")], json!(1));
+        let resp = s.handle(&req);
+        assert!(resp.error.is_some(), "expected error for invalid RLP");
+        assert_eq!(resp.error.unwrap().code, -32602, "expected invalid-params code");
+        assert_eq!(submitter.count(), 0, "nothing should be submitted on decode failure");
+    }
+
+    /// A valid signed EVM transaction is decoded, wrapped in the
+    /// Oxide envelope, and submitted to the mempool. The returned
+    /// hash matches the canonical Ethereum tx hash (keccak256 of the
+    /// raw RLP).
+    #[test]
+    fn eth_send_raw_transaction_with_submitter_submits_envelope() {
+        use evm::tx::{SignedTx, TxEip1559, TxFields, TxKind};
+        use revm::primitives::{Address, Bytes, U256};
+
+        let mut s = make_server();
+        let submitter = Arc::new(MockSubmitter::new());
+        s.set_tx_submitter(submitter.clone());
+
+        // Build and sign a minimal EIP-1559 transaction.
+        let privkey = [0x01u8; 32];
+        let tx = TxEip1559 {
+            fields: TxFields {
+                nonce: 0,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::from([0x42; 20])),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                chain_id: 1,
+            },
+            max_fee_per_gas: U256::from(10_000_000_000u64),
+            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+            access_list: Vec::new(),
+        };
+        let signed = SignedTx::sign_eip1559(tx, &privkey).expect("signing must succeed");
+        let raw = signed.encode_to_bytes();
+        let expected_hash = signed.hash();
+
+        let req = make_request(
+            "eth_sendRawTransaction",
+            vec![json!(format!("0x{}", hex::encode(&raw)))],
+            json!(1),
+        );
+        let resp = s.handle(&req);
+        assert!(resp.error.is_none(), "expected success, got {:?}", resp.error);
+        let returned_hash = resp.result.unwrap().as_str().unwrap().to_string();
+        assert_eq!(
+            returned_hash,
+            format!("0x{}", hex::encode(expected_hash)),
+            "returned hash must match canonical Ethereum tx hash"
+        );
+
+        // The submitter received exactly one envelope.
+        assert_eq!(submitter.count(), 1, "exactly one tx should be submitted");
+        let envelope = submitter.last();
+        let bytes = envelope.as_bytes();
+
+        // The Oxide envelope is: sender(20) + nonce(8) + fee(8) +
+        // module_id(1) + rlp_signed_tx. Verify the structure.
+        assert!(bytes.len() > 37, "envelope must be longer than the header");
+        // Module ID byte is at offset 36 (20 + 8 + 8).
+        assert_eq!(bytes[36], evm::MODULE_ID, "module ID must be EVM");
+        // The RLP payload starts at offset 37.
+        let rlp_payload = &bytes[37..];
+        assert_eq!(rlp_payload, raw.as_slice(), "RLP payload must match the raw tx");
+    }
+
+    /// When the submitter rejects (e.g. mempool full), the RPC returns
+    /// a transaction-rejected error.
+    #[test]
+    fn eth_send_raw_transaction_with_submitter_propagates_rejection() {
+        use evm::tx::{SignedTx, TxEip1559, TxFields, TxKind};
+        use revm::primitives::{Address, Bytes, U256};
+
+        let mut s = make_server();
+        let submitter = Arc::new(MockSubmitter::new());
+        *submitter.reject_next.lock().unwrap() = true;
+        s.set_tx_submitter(submitter.clone());
+
+        let privkey = [0x02u8; 32];
+        let tx = TxEip1559 {
+            fields: TxFields {
+                nonce: 5,
+                gas_limit: 50_000,
+                to: TxKind::Call(Address::from([0x99; 20])),
+                value: U256::from(1_000_000_000u64),
+                data: Bytes::new(),
+                chain_id: 1,
+            },
+            max_fee_per_gas: U256::from(20_000_000_000u64),
+            max_priority_fee_per_gas: U256::from(2_000_000_000u64),
+            access_list: Vec::new(),
+        };
+        let signed = SignedTx::sign_eip1559(tx, &privkey).expect("signing must succeed");
+        let raw = signed.encode_to_bytes();
+
+        let req = make_request(
+            "eth_sendRawTransaction",
+            vec![json!(format!("0x{}", hex::encode(&raw)))],
+            json!(1),
+        );
+        let resp = s.handle(&req);
+        let err = resp.error.expect("expected rejection error");
+        assert_eq!(err.code, -32_000, "expected transaction-rejected code");
+        assert!(err.message.contains("mock rejection"), "error must carry the rejection reason");
     }
 }

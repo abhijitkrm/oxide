@@ -59,6 +59,84 @@ impl BankModule {
         store.insert(addr.0.to_vec(), new_bal.to_le_bytes().to_vec());
     }
 
+    /// Debit `amount` from `addr`. Called by other modules (exchange,
+    /// perps) during cross-module settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::ModuleRejected`] if the balance is
+    /// insufficient or overflows (should not happen with a checked
+    /// debit, but guards against corrupted state).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store mutex is poisoned.
+    pub fn debit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
+        let mut store = self.store.lock().unwrap();
+        let bal = store
+            .get(&addr.0[..])
+            .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
+        let new_bal = bal
+            .checked_sub(amount)
+            .ok_or_else(|| ExecError::ModuleRejected("insufficient balance".to_string()))?;
+        store.insert(addr.0.to_vec(), new_bal.to_le_bytes().to_vec());
+        Ok(())
+    }
+
+    /// Credit `amount` to `addr`. Called by other modules (exchange,
+    /// perps) during cross-module settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::ModuleRejected`] on balance overflow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store mutex is poisoned.
+    pub fn credit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
+        let mut store = self.store.lock().unwrap();
+        let bal = store
+            .get(&addr.0[..])
+            .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
+        let new_bal = bal
+            .checked_add(amount)
+            .ok_or_else(|| ExecError::ModuleRejected("balance overflow".to_string()))?;
+        store.insert(addr.0.to_vec(), new_bal.to_le_bytes().to_vec());
+        Ok(())
+    }
+
+    /// Atomic transfer: debit `from`, credit `to`. Called by other
+    /// modules during settlement. If the debit succeeds but the credit
+    /// fails (overflow), the debit is rolled back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::ModuleRejected`] if the sender has
+    /// insufficient balance or the recipient balance overflows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store mutex is poisoned.
+    pub fn transfer(&self, from: &Address, to: &Address, amount: u64) -> Result<(), ExecError> {
+        let mut store = self.store.lock().unwrap();
+        let from_bal = store
+            .get(&from.0[..])
+            .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
+        let new_from_bal = from_bal
+            .checked_sub(amount)
+            .ok_or_else(|| ExecError::ModuleRejected("insufficient balance".to_string()))?;
+        let to_bal = store
+            .get(&to.0[..])
+            .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
+        let new_to_bal = to_bal
+            .checked_add(amount)
+            .ok_or_else(|| ExecError::ModuleRejected("recipient balance overflow".to_string()))?;
+        // Both checks passed — commit.
+        store.insert(from.0.to_vec(), new_from_bal.to_le_bytes().to_vec());
+        store.insert(to.0.to_vec(), new_to_bal.to_le_bytes().to_vec());
+        Ok(())
+    }
+
     /// Parse a transfer message: `[to: 20B][amount: 8B LE]`.
     fn parse_transfer(msg: &[u8]) -> Option<(Address, u64)> {
         if msg.len() < 28 {
@@ -223,5 +301,56 @@ mod tests {
         let to = addr(2);
         let err = bank.handle(&ctx(1), &msg::transfer(to, 1)).unwrap_err();
         assert_eq!(err, ExecError::ModuleRejected("insufficient balance".to_string()));
+    }
+
+    #[test]
+    fn debit_reduces_balance() {
+        let bank = BankModule::new();
+        let a = addr(1);
+        bank.mint(&a, 1000);
+        bank.debit(&a, 300).unwrap();
+        assert_eq!(bank.balance(&a), 700);
+    }
+
+    #[test]
+    fn debit_insufficient_rejected() {
+        let bank = BankModule::new();
+        let a = addr(1);
+        bank.mint(&a, 50);
+        let err = bank.debit(&a, 100).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        assert_eq!(bank.balance(&a), 50);
+    }
+
+    #[test]
+    fn credit_increases_balance() {
+        let bank = BankModule::new();
+        let a = addr(1);
+        bank.credit(&a, 500).unwrap();
+        assert_eq!(bank.balance(&a), 500);
+    }
+
+    #[test]
+    fn transfer_moves_balance_atomically() {
+        let bank = BankModule::new();
+        let from = addr(1);
+        let to = addr(2);
+        bank.mint(&from, 1000);
+        bank.transfer(&from, &to, 400).unwrap();
+        assert_eq!(bank.balance(&from), 600);
+        assert_eq!(bank.balance(&to), 400);
+    }
+
+    #[test]
+    fn transfer_insufficient_rejected() {
+        let bank = BankModule::new();
+        let from = addr(1);
+        let to = addr(2);
+        bank.mint(&from, 50);
+        let err = bank.transfer(&from, &to, 100).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        // Neither balance changed.
+        assert_eq!(bank.balance(&from), 50);
+        assert_eq!(bank.balance(&to), 0);
     }
 }

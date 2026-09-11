@@ -17,13 +17,20 @@ crypto = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
 mempool = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 consensus = { workspace = true }
 criterion = "0.7.0"
+bank = { workspace = true }
+framework = { workspace = true }
 
 [[bench]]
 name = "uniswap_transfer"
+harness = false
+
+[[bench]]
+name = "block_pipeline"
 harness = false
 
 [lints]

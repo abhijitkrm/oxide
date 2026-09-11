@@ -17,6 +17,12 @@ crypto = { workspace = true }
 types = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
+# Native module readers for read-only EVM precompiles (plan.md §10).
+# These are read-only dependencies — the EVM never mutates native
+# state through precompiles.
+exchange = { workspace = true }
+perps = { workspace = true }
+bank = { workspace = true }
 revm = { workspace = true }
 storage = { workspace = true }
 # alloy-rlp: Ethereum RLP encoding for signed tx types (Phase A).

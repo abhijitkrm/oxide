@@ -15,12 +15,17 @@ name = "oxide-spammer"
 path = "src/main.rs"
 
 [dependencies]
+node = { workspace = true }
 devnet = { workspace = true }
 primitives = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
 framework = { workspace = true }
 bank = { workspace = true }
+evm = { workspace = true }
+executor = { workspace = true }
+crypto = { workspace = true }
+revm = { workspace = true }
 
 [lints]
 workspace = true

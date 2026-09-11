@@ -9,7 +9,7 @@
 
 use std::env;
 
-use devnet::{ConsensusConfig, NodeConfig};
+use node::{ConsensusConfig, NodeConfig};
 
 fn main() {
     let engine = env::args()
@@ -19,10 +19,10 @@ fn main() {
 
     println!("oxide-deploy: deploying local devnet with engine = {}", engine.as_str());
 
-    let _ = NodeConfig { consensus: engine, max_mempool_entries: 10_000 };
+    let _ = NodeConfig { consensus: engine, max_mempool_entries: 10_000, ..NodeConfig::default() };
 
     // Run the smoke test.
-    devnet::run_devnet_smoke_test();
+    node::run_node_smoke_test();
 
     println!("oxide-deploy: devnet smoke test passed");
 }

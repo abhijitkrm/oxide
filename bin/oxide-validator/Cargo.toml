@@ -15,7 +15,7 @@ name = "oxide-validator"
 path = "src/main.rs"
 
 [dependencies]
-devnet = { workspace = true }
+node = { workspace = true }
 primitives = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
@@ -30,6 +30,7 @@ oxide-core = { workspace = true }
 staking = { workspace = true }
 rpc = { workspace = true }
 tokio = { workspace = true }
+metrics = { workspace = true }
 toml = "0.8"
 
 [lints]

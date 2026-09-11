@@ -1,0 +1,46 @@
+# Oxide blockchain — `node` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention)
+
+[package]
+name = "node"
+description = "Production node assembly — config-driven engine selection, module registration, and node lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
+types = { workspace = true }
+ports = { workspace = true }
+consensus = { workspace = true }
+executor = { workspace = true }
+framework = { workspace = true }
+oxide-core = { workspace = true }
+bank = { workspace = true }
+staking = { workspace = true }
+evm = { workspace = true }
+exchange = { workspace = true }
+perps = { workspace = true }
+trading = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.7.0"
+bank = { workspace = true }
+framework = { workspace = true }
+types = { workspace = true }
+primitives = { workspace = true }
+
+[[bench]]
+name = "node_assembly"
+harness = false
+
+[[bench]]
+name = "sustained_throughput"
+harness = false
+
+[lints]
+workspace = true

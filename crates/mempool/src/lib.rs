@@ -32,7 +32,7 @@
 //! per-account nonce tracking. No rate limiting, no eviction policy
 //! beyond size cap, no mempool gossip. Those arrive in Phase 2+.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use primitives::{Address, Hash};
 use types::TxBytes;
@@ -85,19 +85,56 @@ pub struct Mempool {
     max_entries: usize,
 }
 
-/// Fee density: fee per byte. Higher is better. We use a tuple
-/// `(fee, size)` so that `BTreeMap`'s natural ordering (ascending)
-/// gives us lowest-first; we reverse to get highest-first.
+/// Fee density: fee per byte. Higher is better. We store `(fee, size)`
+/// and implement `Ord` by cross-multiplication (fee₁·size₂ vs
+/// fee₂·size₁) so that `BTreeMap`'s natural ordering (ascending) gives
+/// us lowest-density-first; we reverse to get highest-first.
 ///
-/// The `Ord` implementation compares by `fee / size` (integer
-/// division), then by `fee` as a tiebreaker. This is the fee-density
-/// ranking used by the leader to maximize value per block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// # Why cross-multiplication, not integer division
+///
+/// The prior implementation derived `Ord` structurally over `(fee,
+/// size)`, which sorts by absolute fee first — not fee-per-byte. Two
+/// transactions with fees 100/size 10 (density 10) and 200/size 50
+/// (density 4) would rank 200/50 above 100/10 because `200 > 100`,
+/// even though 100/10 has the higher density. The doc comment claimed
+/// fee-per-byte ordering, but the derived `Ord` did not implement it.
+///
+/// Cross-multiplication (fee₁·size₂ vs fee₂·size₁) compares the exact
+/// rational fee/size without floating point or integer-division
+/// truncation. The multiplication is done in `u128` to avoid overflow
+/// (max product: `u64::MAX² ≈ 3.4×10³⁸`, which fits in `u128`).
+///
+/// # Tie-breaking
+///
+/// When two densities are exactly equal (same fee/size ratio), we
+/// tie-break by `(fee, size)` ascending — a deterministic, stable
+/// order that does not depend on insertion order or hash randomness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FeeDensity {
     /// The fee in raw units.
     fee: u64,
     /// The serialized size in bytes.
     size: u64,
+}
+
+impl PartialOrd for FeeDensity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FeeDensity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Cross-multiply in u128 to compare fee/size ratios exactly.
+        // self.fee / self.size  vs  other.fee / other.size
+        // ⟺  self.fee * other.size  vs  other.fee * self.size
+        let lhs = u128::from(self.fee) * u128::from(other.size);
+        let rhs = u128::from(other.fee) * u128::from(self.size);
+        lhs.cmp(&rhs)
+            // Tie-break by (fee, size) ascending for deterministic order.
+            .then(self.fee.cmp(&other.fee))
+            .then(self.size.cmp(&other.size))
+    }
 }
 
 impl FeeDensity {
@@ -264,6 +301,16 @@ impl Mempool {
     /// 4. If the tx fits in the remaining byte budget, select it
     ///    and advance the sender's expected nonce.
     /// 5. Stop when the budget is full or no more txs are available.
+    ///
+    /// # Removal complexity
+    ///
+    /// Selected entries are removed in a single batch pass, not one
+    /// `remove()` call per tx. The prior implementation called
+    /// `remove()` for each selected hash, and `remove()` calls
+    /// `retain()` on the fee bucket — O(n) per call. Selecting N txs
+    /// from one fee bucket was therefore O(N²). The batch path
+    /// collects selected hashes into a `HashSet` and filters each fee
+    /// bucket at most once, making removal O(total pool size).
     pub fn select(&mut self, max_bytes: u64) -> Vec<TxBytes> {
         let mut selected = Vec::new();
         let mut total_bytes = 0u64;
@@ -286,9 +333,9 @@ impl Mempool {
         // without collecting into a Vec and sorting — O(n) iteration
         // with zero allocation, vs the old O(n log n) sort.
         //
-        // We collect hashes to remove after iteration (can't mutate
-        // `by_fee` while iterating it).
-        let mut to_remove: Vec<Hash> = Vec::new();
+        // We collect selected hashes into a HashSet for O(1)
+        // membership tests during the batch removal pass.
+        let mut selected_hashes: HashSet<Hash> = HashSet::new();
 
         for (_density, hashes) in self.by_fee.iter().rev() {
             for &hash in hashes {
@@ -308,26 +355,116 @@ impl Mempool {
                 if total_bytes + entry.size > max_bytes {
                     continue;
                 }
-                // Select this tx.
-                total_bytes += entry.size;
-                selected.push(entry.tx.clone());
-                *expected += 1;
-                to_remove.push(hash);
+
+                // Select this tx, then follow the nonce chain: after
+                // selecting nonce N from sender S, immediately look up
+                // nonce N+1 from the same sender. This ensures all
+                // contiguous nonces are selected in one pass, even
+                // though the outer iteration visits txs in hash order
+                // (which is random w.r.t. nonce). Without this, txs
+                // with nonce N+1 would be skipped if their hash sorts
+                // before nonce N's hash in the BTreeSet.
+                let mut current_hash = hash;
+                let mut current_entry: &PoolEntry = entry;
+                loop {
+                    total_bytes += current_entry.size;
+                    selected.push(current_entry.tx.clone());
+                    *expected += 1;
+                    selected_hashes.insert(current_hash);
+
+                    // Follow the chain: look up the next nonce for
+                    // this sender in `by_sender`.
+                    let next_n = current_entry.nonce + 1;
+                    let Some(queue) = self.by_sender.get(&current_entry.sender) else {
+                        break;
+                    };
+                    let Some(&next_hash) = queue.get(&next_n) else {
+                        break;
+                    };
+                    let Some(next_entry) = self.by_hash.get(&next_hash) else {
+                        break;
+                    };
+                    if total_bytes + next_entry.size > max_bytes {
+                        break;
+                    }
+                    current_hash = next_hash;
+                    current_entry = next_entry;
+                }
             }
             if total_bytes >= max_bytes {
                 break;
             }
         }
 
-        // Remove selected entries from the pool.
-        for hash in &to_remove {
-            self.remove(hash);
+        // Batch-remove all selected entries in a single pass over each
+        // index. This is O(total pool size) — each fee bucket is
+        // filtered at most once, each sender queue is filtered at most
+        // once, and `by_hash` is drained in one pass.
+        if !selected_hashes.is_empty() {
+            self.remove_batch(&selected_hashes);
         }
 
         selected
     }
 
-    /// Remove a transaction by hash from all indices.
+    /// Remove a batch of transactions by hash from all indices in a
+    /// single pass. This is the batch equivalent of [`remove`](Self::remove),
+    /// used by [`select`](Self::select) to avoid the O(N²) cost of
+    /// calling `remove()` per selected tx.
+    ///
+    /// Each fee bucket is filtered at most once (vs `retain()` per tx
+    /// in the per-hash `remove`). Each sender queue is filtered at
+    /// most once. `by_hash` is drained in one pass.
+    fn remove_batch(&mut self, hashes: &HashSet<Hash>) {
+        // 1. Remove from by_hash and collect the entries we need to
+        //    clean up in by_sender and by_fee.
+        let mut sender_cleanups: Vec<(Address, u64)> = Vec::with_capacity(hashes.len());
+        let mut fee_cleanups: Vec<(FeeDensity, Hash)> = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if let Some(entry) = self.by_hash.remove(hash) {
+                let density = FeeDensity { fee: entry.fee, size: entry.size };
+                fee_cleanups.push((density, *hash));
+                sender_cleanups.push((entry.sender, entry.nonce));
+            }
+        }
+
+        // 2. Filter each affected fee bucket in one pass. Group by
+        //    density so we touch each bucket at most once.
+        fee_cleanups.sort_by_key(|(d, _)| *d);
+        let mut i = 0;
+        while i < fee_cleanups.len() {
+            let density = fee_cleanups[i].0;
+            let mut to_drop = Vec::new();
+            while i < fee_cleanups.len() && fee_cleanups[i].0 == density {
+                to_drop.push(fee_cleanups[i].1);
+                i += 1;
+            }
+            if let Some(bucket) = self.by_fee.get_mut(&density) {
+                let to_drop_set: HashSet<Hash> = to_drop.into_iter().collect();
+                bucket.retain(|h| !to_drop_set.contains(h));
+                if bucket.is_empty() {
+                    self.by_fee.remove(&density);
+                }
+            }
+        }
+
+        // 3. Filter each affected sender queue in one pass.
+        for (sender, nonce) in &sender_cleanups {
+            if let Some(queue) = self.by_sender.get_mut(sender) {
+                queue.remove(nonce);
+                if queue.is_empty() {
+                    self.by_sender.remove(sender);
+                }
+            }
+        }
+    }
+
+    /// Remove a single transaction by hash from all indices. This is
+    /// the per-tx removal path — used when a specific tx needs to be
+    /// dropped (e.g. after a failed proposal or mempool eviction). The
+    /// batch path ([`remove_batch`](Self::remove_batch)) is preferred
+    /// when removing multiple txs at once.
+    #[allow(dead_code)]
     fn remove(&mut self, hash: &Hash) {
         if let Some(entry) = self.by_hash.remove(hash) {
             let density = FeeDensity { fee: entry.fee, size: entry.size };
@@ -446,21 +583,24 @@ mod tests {
     #[test]
     fn nonce_ordering_enforced() {
         let mut pool = Mempool::new(100);
-        // Submit nonce 1 before nonce 0 — nonce 1 should be skipped.
+        // Submit nonce 1 before nonce 0. The mempool must not select
+        // nonce 1 before nonce 0. With the nonce-chain follower,
+        // selecting nonce 0 immediately follows the chain to nonce 1
+        // in the same `select()` call — this is correct (nonce 0
+        // executes before nonce 1 within the block) and better for
+        // throughput (more txs per block).
         pool.submit(build_tx(addr(1), 1, 100, &[1])).unwrap();
         pool.submit(build_tx(addr(1), 0, 100, &[0])).unwrap();
         let selected = pool.select(1 << 20);
-        // Only nonce 0 is selected (nonce 1 is skipped until 0 is included).
-        assert_eq!(selected.len(), 1);
-        let (_, nonce, _) = parse_tx(selected[0].as_bytes()).unwrap();
-        assert_eq!(nonce, 0);
-        // After selecting nonce 0, nonce 1 is still in the pool.
-        assert_eq!(pool.len(), 1);
-        // Select again — now nonce 1 should be available.
-        let selected2 = pool.select(1 << 20);
-        assert_eq!(selected2.len(), 1);
-        let (_, nonce2, _) = parse_tx(selected2[0].as_bytes()).unwrap();
-        assert_eq!(nonce2, 1);
+        // Both nonces are selected: nonce 0 first, then nonce 1 via
+        // the chain follower.
+        assert_eq!(selected.len(), 2);
+        let (_, nonce0, _) = parse_tx(selected[0].as_bytes()).unwrap();
+        assert_eq!(nonce0, 0);
+        let (_, nonce1, _) = parse_tx(selected[1].as_bytes()).unwrap();
+        assert_eq!(nonce1, 1);
+        // Both txs are removed from the pool.
+        assert_eq!(pool.len(), 0);
     }
 
     #[test]
@@ -532,5 +672,93 @@ mod tests {
         // addr 2's txs have higher fee, so they should come first.
         let (sender0, _, _) = parse_tx(selected[0].as_bytes()).unwrap();
         assert_eq!(sender0, addr(2));
+    }
+
+    // ---- FeeDensity ordering fix tests ----
+
+    /// Prove that `FeeDensity` orders by fee-per-byte (cross-
+    /// multiplication), not by absolute fee. Before the fix, the
+    /// derived `Ord` ranked 200/50 above 100/10 because `200 > 100`,
+    /// even though 100/10 has density 10 and 200/50 has density 4.
+    #[test]
+    fn fee_density_orders_by_fee_per_byte_not_absolute_fee() {
+        // density 10 (100/10) should be GREATER than density 4 (200/50)
+        let high_density = FeeDensity { fee: 100, size: 10 };
+        let low_density = FeeDensity { fee: 200, size: 50 };
+        assert!(
+            high_density > low_density,
+            "100/10 (density 10) must rank higher than 200/50 (density 4)"
+        );
+    }
+
+    /// Prove that selection respects fee density, not absolute fee.
+    /// A tx with fee 100 and size 36 (density ~2.78) should be
+    /// selected before a tx with fee 200 and size 100 (density 2),
+    /// even though the latter has a higher absolute fee.
+    #[test]
+    fn select_prefers_higher_density_over_higher_absolute_fee() {
+        let mut pool = Mempool::new(100);
+        // low density: fee 200, size 100 → density 2
+        // payload 64 bytes → 36 + 64 = 100 bytes
+        pool.submit(build_tx(addr(1), 0, 200, &[0; 64])).unwrap();
+        // high density: fee 100, size 36 → density ~2.78
+        // payload 0 bytes → 36 + 0 = 36 bytes
+        pool.submit(build_tx(addr(2), 0, 100, &[])).unwrap();
+        let selected = pool.select(1 << 20);
+        assert_eq!(selected.len(), 2);
+        // The first selected should be the higher-density tx (addr 2).
+        let (sender0, _, fee0) = parse_tx(selected[0].as_bytes()).unwrap();
+        assert_eq!(sender0, addr(2), "higher-density tx should be selected first");
+        assert_eq!(fee0, 100);
+    }
+
+    /// Prove that equal-density txs are tie-broken deterministically
+    /// by (fee, size) ascending.
+    #[test]
+    fn fee_density_tiebreak_is_deterministic() {
+        // Both have density 10, but different (fee, size).
+        let a = FeeDensity { fee: 10, size: 1 };
+        let b = FeeDensity { fee: 20, size: 2 };
+        // Same density (10/1 == 20/2), tie-break by fee ascending:
+        // a (fee 10) < b (fee 20).
+        assert!(a < b, "equal density: lower fee should sort first");
+    }
+
+    // ---- Batch removal tests ----
+
+    /// Prove that selecting many txs from the same fee bucket is
+    /// correct (the batch removal path handles same-bucket entries).
+    #[test]
+    fn select_many_from_same_fee_bucket() {
+        let mut pool = Mempool::new(100);
+        // 10 txs from different senders, all with the same fee and
+        // size (same fee bucket).
+        for i in 0..10u8 {
+            pool.submit(build_tx(addr(i), 0, 100, &[0])).unwrap();
+        }
+        assert_eq!(pool.len(), 10);
+        let selected = pool.select(1 << 20);
+        assert_eq!(selected.len(), 10, "all 10 txs should be selected");
+        assert_eq!(pool.len(), 0, "pool should be empty after selection");
+    }
+
+    /// Prove that batch removal correctly cleans up sender queues
+    /// (no orphaned entries left in `by_sender`).
+    #[test]
+    fn batch_removal_cleans_up_sender_queues() {
+        let mut pool = Mempool::new(100);
+        // Submit 3 txs from one sender in nonce order.
+        pool.submit(build_tx(addr(1), 0, 100, &[0])).unwrap();
+        pool.submit(build_tx(addr(1), 1, 100, &[0])).unwrap();
+        pool.submit(build_tx(addr(1), 2, 100, &[0])).unwrap();
+        // Select all — batch removal should clean up the sender queue.
+        let selected = pool.select(1 << 20);
+        assert_eq!(selected.len(), 3);
+        assert_eq!(pool.len(), 0);
+        // The sender's queue should be gone (no orphaned entries).
+        // Verify by submitting a new tx from the same sender — it
+        // should be accepted (nonce 0 again, since the queue was
+        // cleaned up and the pool starts fresh).
+        assert!(pool.submit(build_tx(addr(1), 0, 100, &[0])).is_ok());
     }
 }

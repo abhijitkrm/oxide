@@ -56,6 +56,10 @@ bank = { path = "modules/bank", version = "0.1.0" }
 staking = { path = "modules/staking", version = "0.1.0" }
 evm = { path = "modules/evm", version = "0.1.0" }
 governance = { path = "modules/governance", version = "0.1.0" }
+# Spot CLOB exchange module (plan.md §9.1; wraps the native matching engine).
+exchange = { path = "modules/exchange", version = "0.1.0" }
+# Perpetual futures module (plan.md §9.3; margin/funding/liquidations/ADL).
+perps = { path = "modules/perps", version = "0.1.0" }
 # RPC server (plan.md §13: JSON-RPC + WebSocket for MetaMask/Foundry).
 rpc = { path = "crates/rpc", version = "0.1.0" }
 # Indexer/explorer (plan.md §13: indexes finalized blocks for explorer).
@@ -63,8 +67,15 @@ indexer = { path = "crates/indexer", version = "0.1.0" }
 broadcast = { path = "crates/broadcast", version = "0.1.0" }
 p2p = { path = "crates/p2p", version = "0.1.0" }
 devnet = { path = "crates/devnet", version = "0.1.0" }
+node = { path = "crates/node", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0" }
 config = { path = "crates/config", version = "0.1.0" }
+metrics = { path = "crates/metrics", version = "0.1.0" }
+# HFT-grade matching engine core (plan.md §9.1; hot-path, std-only).
+trading = { path = "crates/trading", version = "0.1.0" }
+# Off-chain matching server (plan.md §9.5; accepts orders via binary TCP,
+# WebSocket, JSON-RPC, FIX; batches fills for on-chain settlement).
+matcher = { path = "crates/matcher", version = "0.1.0" }
 
 # External EVM stack (plan.md §2: revm is the approved EVM engine).
 # revm is MIT-licensed (GPL-3.0-compatible). Pinned exact version
@@ -150,6 +161,23 @@ tower = "0.5"
 # hyper: low-level HTTP implementation. MIT-licensed.
 # Direct dep for hyper::body::Incoming body reading in the RPC server.
 hyper = "1.5"
+
+# tokio-tungstenite: async WebSocket server/client for the matching
+# server's WebSocket order-entry protocol. MIT-licensed (GPL-3.0-
+# compatible). Not on the consensus hot path — only in the matcher
+# server's network layer.
+tokio-tungstenite = "0.27"
+
+# futures-util: Stream/Sink traits for async WebSocket I/O.
+# MIT/Apache-2.0 licensed. Required by tokio-tungstenite's split().
+futures-util = "0.3"
+
+# hdrhistogram: high-dynamic-range histograms for latency recording
+# (plan.md §10: "measure everything — HDR histograms per component").
+# Used by the `metrics` crate to record p50/p99/p99.9 latencies for
+# the block pipeline, RPC handlers, and consensus operations.
+# MIT/Apache-2.0 licensed. Published 2023-08-22 (well-vetted).
+hdrhistogram = "7.5"
 
 [profile.release]
 # Whole-program optimization for the hot paths; slower builds are acceptable

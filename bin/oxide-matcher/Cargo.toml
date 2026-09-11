@@ -1,0 +1,31 @@
+# Oxide blockchain — `oxide-matcher` binary
+# (workspace: github.com/abhijitkrm/oxide)
+
+[package]
+name = "oxide-matcher"
+description = "Off-chain matching server binary — runs the trading engine, accepts orders via binary TCP/WS/JSON-RPC/FIX, batches fills for on-chain settlement."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxide-matcher"
+path = "src/main.rs"
+
+[dependencies]
+matcher = { workspace = true }
+node = { workspace = true }
+primitives = { workspace = true }
+types = { workspace = true }
+trading = { workspace = true }
+bank = { workspace = true }
+exchange = { workspace = true }
+framework = { workspace = true }
+executor = { workspace = true }
+ports = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

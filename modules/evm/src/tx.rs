@@ -370,6 +370,37 @@ impl SignedTx {
         Ok(Self::Eip1559(tx, sig_to_txsig(&sig)))
     }
 
+    /// Decode a signed transaction from raw RLP bytes.
+    ///
+    /// This is a convenience wrapper around [`alloy_rlp::Decodable::decode`]
+    /// that accepts a `&[u8]` slice (the raw bytes a client submits via
+    /// `eth_sendRawTransaction`) and returns the decoded [`SignedTx`].
+    ///
+    /// Unlike `Decodable::decode`, which advances a `&mut &[u8]` cursor,
+    /// this method copies the slice into a local cursor, decodes, and
+    /// verifies there is no trailing garbage. This is the entry point
+    /// used by the RPC layer to parse a client-submitted transaction
+    /// before wrapping it in the Oxide envelope and submitting it to
+    /// the mempool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`alloy_rlp::Error`] if the bytes are not a valid RLP-encoded
+    /// signed transaction (legacy, EIP-2930, or EIP-1559).
+    pub fn decode_raw(raw: &[u8]) -> alloy_rlp::Result<Self> {
+        let mut cursor = raw;
+        let decoded = <Self as alloy_rlp::Decodable>::decode(&mut cursor)?;
+        // Reject trailing bytes — a well-formed transaction has no
+        // extra data after the RLP payload. This prevents a class of
+        // malleability where a client appends junk that is silently
+        // ignored, producing a different hash than the canonical
+        // encoding.
+        if !cursor.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        Ok(decoded)
+    }
+
     /// Encode the signed transaction to a byte vector (RLP).
     #[must_use]
     pub fn encode_to_bytes(&self) -> Vec<u8> {

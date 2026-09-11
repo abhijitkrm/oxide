@@ -71,7 +71,22 @@ const BENCHES: &[BenchTarget] = &[
         description: "Erasure-coded dissemination broadcast/reconstruct",
     },
     BenchTarget { package: "p2p", description: "Mesh transport peer-ID/transport/partition-heal" },
-    BenchTarget { package: "evm", description: "EIP-1559 base-fee adjustment per block" },
+    BenchTarget {
+        package: "evm",
+        description: "EIP-1559 fee + EVM throughput (tps_rw, breakdown, trie_root, fee)",
+    },
+    BenchTarget {
+        package: "trading",
+        description: "Matching engine rest/cancel, single-fill, sweep, mixed workload",
+    },
+    BenchTarget {
+        package: "exchange",
+        description: "Exchange settlement handle() path + head-to-head vs raw engine",
+    },
+    BenchTarget {
+        package: "perps",
+        description: "Perps settlement handle() + margin check + head-to-head vs raw engine",
+    },
 ];
 
 fn print_list() {

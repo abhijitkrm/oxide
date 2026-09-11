@@ -24,6 +24,7 @@ types = { path = "../crates/types" }
 executor = { path = "../crates/executor" }
 evm = { path = "../modules/evm" }
 p2p = { path = "../crates/p2p" }
+trading = { path = "../crates/trading" }
 
 [[bin]]
 name = "codec-decode"
@@ -64,5 +65,17 @@ doc = false
 [[bin]]
 name = "sync-decode"
 path = "fuzz_targets/sync_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "trading-engine"
+path = "fuzz_targets/trading_engine.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "trading-order-validate"
+path = "fuzz_targets/trading_order_validate.rs"
 test = false
 doc = false

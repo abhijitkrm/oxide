@@ -75,6 +75,19 @@ pub struct TcpMultiNodeDevnet {
     secret_keys: Vec<crypto::BlsSecretKey>,
     /// The number of validators.
     n: usize,
+    /// EVM module handles (one per validator) for direct state access.
+    /// These are the same `EvmModule` instances registered in each
+    /// validator's executor, kept here so tests can fund accounts and
+    /// inspect balances/nonces without downcasting from `dyn Module`.
+    evm_modules: Vec<Arc<evm::EvmModule>>,
+    /// Exchange module handles (one per validator) for direct state
+    /// access. Only populated when the devnet is built with
+    /// `with_exchange_and_base_port`; empty for the default bank-only
+    /// devnet. Each validator gets its own `ExchangeModule` instance
+    /// backed by that validator's `BankModule` — all validators
+    /// execute the same blocks, so their exchange state converges
+    /// after finality.
+    exchange_modules: Vec<Arc<exchange::ExchangeModule>>,
 }
 
 /// The result of running a TCP devnet: finalized blocks from each
@@ -194,6 +207,39 @@ impl TcpMultiNodeDevnet {
         )
     }
 
+    /// Assemble a TCP-based multi-node devnet with `n` validators,
+    /// registering the exchange module (backed by each validator's
+    /// bank module) on every validator. Use this for trading TPS
+    /// tests that need the exchange module's `handle()` path through
+    /// the full consensus pipeline.
+    ///
+    /// Each validator gets:
+    /// - Its own `BankModule` (funded with `GENESIS_BALANCE` per
+    ///   prefunded sender).
+    /// - Its own `ExchangeModule::with_bank(bank_clone)` — the
+    ///   exchange settles fills by debiting/crediting the same bank
+    ///   module that consensus executes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` or if any TCP port cannot be bound.
+    pub fn with_exchange_and_base_port(
+        n: usize,
+        max_mempool_entries: usize,
+        base_port: u16,
+    ) -> Self {
+        Self::build_with_modules(
+            n,
+            base_port,
+            GENESIS_BALANCE,
+            32,
+            max_mempool_entries,
+            executor::DEFAULT_PARALLEL_THRESHOLD,
+            p2p::tcp::TcpTransportConfig::default(),
+            true, // register_exchange
+        )
+    }
+
     /// Internal constructor with all parameters explicit.
     fn build(
         n: usize,
@@ -203,6 +249,37 @@ impl TcpMultiNodeDevnet {
         max_mempool_entries: usize,
         parallel_threshold: usize,
         tcp_config: p2p::tcp::TcpTransportConfig,
+    ) -> Self {
+        Self::build_with_modules(
+            n,
+            base_port,
+            genesis_balance,
+            num_senders,
+            max_mempool_entries,
+            parallel_threshold,
+            tcp_config,
+            false, // do not register exchange
+        )
+    }
+
+    /// Internal constructor with all parameters explicit, including
+    /// an optional exchange module registration.
+    ///
+    /// When `register_exchange` is true, each validator gets an
+    /// `ExchangeModule::with_bank(bank_clone)` backed by the same
+    /// `BankModule` that consensus executes. The exchange module
+    /// handles (as `Arc<ExchangeModule>`) are stored in
+    /// `exchange_modules` for post-run inspection.
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_modules(
+        n: usize,
+        base_port: u16,
+        genesis_balance: u64,
+        num_senders: u8,
+        max_mempool_entries: usize,
+        parallel_threshold: usize,
+        tcp_config: p2p::tcp::TcpTransportConfig,
+        register_exchange: bool,
     ) -> Self {
         assert!(n > 0, "devnet must have at least one validator");
 
@@ -224,16 +301,42 @@ impl TcpMultiNodeDevnet {
         let mut engines = Vec::with_capacity(n);
         let mut apps = Vec::with_capacity(n);
         let mut transports = Vec::with_capacity(n);
+        let mut evm_modules = Vec::with_capacity(n);
+        let mut exchange_modules = Vec::with_capacity(n);
 
         for (i, key) in secret_keys.iter().cloned().enumerate() {
             let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold);
             executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-            let bank = bank::BankModule::new();
+            // Create the bank as an `Arc` so the exchange module (if
+            // registered) can share the same bank instance — the
+            // exchange settles fills by debiting/crediting this bank.
+            let bank = Arc::new(bank::BankModule::new());
             for sender_byte in 0u8..num_senders {
                 bank.mint(&primitives::Address([sender_byte; 20]), genesis_balance);
             }
-            executor.register_module(Arc::new(bank));
+            executor.register_module(bank.clone());
             executor.register_module(Arc::new(staking::StakingModule::new()));
+            // Optionally register the exchange module backed by this
+            // validator's bank. Each validator gets its own exchange
+            // instance; state diverges during proposal but converges
+            // after finality (all validators execute the same block).
+            if register_exchange {
+                let ex = Arc::new(exchange::ExchangeModule::with_bank(bank.clone()));
+                executor.register_module(ex.clone());
+                exchange_modules.push(ex);
+            }
+            // Register the EVM module and fund the prefunded senders
+            // so EVM transactions (transfers, deploys, calls) can
+            // debit gas and value. Each validator gets its own EVM
+            // module instance; state diverges until consensus
+            // finalizes a block and all validators execute it.
+            let evm_module = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+            for sender_byte in 0u8..num_senders {
+                evm_module
+                    .fund_account_for_test(&primitives::Address([sender_byte; 20]), u128::MAX);
+            }
+            executor.register_module(evm_module.clone());
+            evm_modules.push(evm_module);
             let app: Arc<Executor> = Arc::new(executor);
             let app_dyn: Arc<dyn AppInterface> = app.clone();
 
@@ -264,7 +367,16 @@ impl TcpMultiNodeDevnet {
         // Give connections time to establish.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        Self { engines, apps, transports, validator_set: vs, secret_keys, n }
+        Self {
+            engines,
+            apps,
+            transports,
+            validator_set: vs,
+            secret_keys,
+            n,
+            evm_modules,
+            exchange_modules,
+        }
     }
 
     /// The number of validators.
@@ -280,6 +392,40 @@ impl TcpMultiNodeDevnet {
     pub fn app(&self, i: usize) -> &Executor {
         assert!(i < self.n, "validator index {i} out of range");
         &self.apps[i]
+    }
+
+    /// Access the exchange module handles (one per validator).
+    /// Empty if the devnet was built without `with_exchange_and_base_port`.
+    pub fn exchange_modules(&self) -> &[Arc<exchange::ExchangeModule>] {
+        &self.exchange_modules
+    }
+
+    /// Fund an EVM account on all validators.
+    ///
+    /// This is used by EVM load tests to fund the secp256k1-derived
+    /// sender addresses that the workload generator creates. The
+    /// `[byte; 20]` prefunded senders are funded at genesis, but
+    /// random keypairs have arbitrary addresses that need explicit
+    /// funding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= n`.
+    pub fn fund_evm_account(&self, addr: &primitives::Address, balance: u128) {
+        for evm in &self.evm_modules {
+            evm.fund_account_for_test(addr, balance);
+        }
+    }
+
+    /// Get the EVM module for validator `i` for direct state inspection
+    /// (balance, nonce, state root).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= n`.
+    pub fn evm_module(&self, i: usize) -> &evm::EvmModule {
+        assert!(i < self.n, "validator index {i} out of range");
+        &self.evm_modules[i]
     }
 
     /// Run `rounds` consensus rounds with `txs_per_round` bank
@@ -387,12 +533,29 @@ impl TcpMultiNodeDevnet {
         }
 
         // Flush round: propose one more empty block to commit the last
-        // pending block (2-chain rule). Runs until all `target_blocks`
-        // blocks are finalized.
+        // pending block (2-chain rule). Runs until ALL validators have
+        // finalized `target_blocks` blocks — checking the minimum
+        // across validators ensures followers aren't left lagging on
+        // the last QC delivery.
+        //
+        // The 2-chain commit rule requires 2 QCs to commit the first
+        // block: block N is committed when block N+1's QC is delivered.
+        // So with `target_blocks=1`, we need the flush loop to propose
+        // a second empty block and form its QC to commit block 0.
+        //
+        // `finalized_height()` returns `None` when no blocks are
+        // committed. We map `None` to `u64::MAX` so the loop doesn't
+        // exit prematurely (the `map_or(0, ...)` pattern treats "no
+        // blocks" the same as "block 0 committed", which is wrong).
         let flush_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let max_finalized = self.engines[0].finalized_height().map_or(0, primitives::Id::value);
-            if max_finalized + 1 >= target_blocks {
+            let min_finalized = self
+                .engines
+                .iter()
+                .map(|e| e.finalized_height().map_or(u64::MAX, primitives::Id::value))
+                .min()
+                .unwrap_or(u64::MAX);
+            if min_finalized != u64::MAX && min_finalized + 1 >= target_blocks {
                 break;
             }
             if std::time::Instant::now() > flush_deadline {
@@ -403,6 +566,116 @@ impl TcpMultiNodeDevnet {
         }
 
         // Final height sync (cleanup, same as `run_batch`).
+        let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+        for engine in &mut self.engines {
+            engine.sync_next_height(max_height);
+        }
+
+        let elapsed = start.elapsed();
+        (self.collect_result(), elapsed)
+    }
+
+    /// Run `rounds` consensus rounds with pre-built txs, using the
+    /// pipelined event loop. Each round's txs are submitted to that
+    /// view's leader before the pipelined loop starts.
+    ///
+    /// This is the EVM-compatible variant of `run_pipelined`: instead
+    /// of building bank-transfer txs internally, it accepts pre-built
+    /// `TxBytes` envelopes (which can be EVM txs, bank txs, or any
+    /// module's txs). The caller is responsible for:
+    ///
+    /// - Using correct nonces (the mempool rejects stale/duplicate
+    ///   nonces per sender).
+    /// - Funding the sender accounts (the EVM module rejects txs from
+    ///   accounts with insufficient balance).
+    /// - Using the correct module ID in the envelope (EVM = 3, bank =
+    ///   1, etc.).
+    ///
+    /// `txs_per_round` txs are submitted per round, drawn from the
+    /// flat `all_txs` slice in order. The total txs submitted is
+    /// `rounds * txs_per_round`, which must be <= `all_txs.len()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rounds * txs_per_round > all_txs.len()`, if a TCP
+    /// send fails, or if the leader's self-delivered QC fails
+    /// verification.
+    pub fn run_pipelined_txs(
+        &mut self,
+        rounds: usize,
+        txs_per_round: usize,
+        all_txs: &[TxBytes],
+    ) -> (TcpDevnetResult, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let target_blocks = u64::try_from(rounds).unwrap_or(u64::MAX);
+        let needed = rounds.checked_mul(txs_per_round).expect("rounds * txs_per_round overflow");
+        assert!(
+            all_txs.len() >= needed,
+            "need {needed} txs for {rounds} rounds × {txs_per_round} txs/round, got {}",
+            all_txs.len()
+        );
+
+        // Submit txs to each view's leader.
+        let mut tx_idx = 0usize;
+        for round in 0..rounds {
+            let view = primitives::View::new(round as u64);
+            let leader_idx = usize::from(self.validator_set.leader(view));
+            for _ in 0..txs_per_round {
+                self.engines[leader_idx].submit_tx(all_txs[tx_idx].clone());
+                tx_idx += 1;
+            }
+        }
+
+        // Pipelined loop (same as run_pipelined).
+        let mut state = PipelineState::new();
+        // Scale the deadline with the workload: 60s base + 5s per 100
+        // rounds. This allows large trading TPS tests (2000+ rounds)
+        // to complete without timing out, while keeping small tests
+        // fast. At ~20 blocks/s, 2000 rounds need ~100s + flush.
+        let deadline_secs = 60 + 5 * u64::try_from(rounds / 100).unwrap_or(0);
+        let deadline = start + std::time::Duration::from_secs(deadline_secs);
+        loop {
+            if state.qcs_formed >= target_blocks {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            self.pipelined_tick(&mut state, target_blocks);
+            std::hint::spin_loop();
+        }
+
+        // Flush round: propose one more empty block to commit the last
+        // pending block (2-chain rule), and continue running until ALL
+        // validators have finalized `target_blocks` blocks. The
+        // original `run_pipelined` only checked the leader's finalized
+        // height, which left followers lagging on the last QC. We check
+        // the minimum finalized height across all validators to ensure
+        // every validator has committed every block.
+        //
+        // `finalized_height()` returns `None` when no blocks are
+        // committed. We map `None` to `u64::MAX` so the loop doesn't
+        // exit prematurely (the `map_or(0, ...)` pattern treats "no
+        // blocks" the same as "block 0 committed", which is wrong).
+        let flush_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let min_finalized = self
+                .engines
+                .iter()
+                .map(|e| e.finalized_height().map_or(u64::MAX, primitives::Id::value))
+                .min()
+                .unwrap_or(u64::MAX);
+            if min_finalized != u64::MAX && min_finalized + 1 >= target_blocks {
+                break;
+            }
+            if std::time::Instant::now() > flush_deadline {
+                break;
+            }
+            self.pipelined_tick(&mut state, u64::MAX);
+            std::hint::spin_loop();
+        }
+
+        // Final height sync.
         let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
         for engine in &mut self.engines {
             engine.sync_next_height(max_height);

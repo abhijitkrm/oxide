@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a9e54c3938ca296472cd611b847f341c3c0de07ae21e539318501fbbe10c807f # shrinks to ops = [Place(NewOrder { side: Buy, order_type: PostOnly, tif: Gtc, price: Price(1017000000), qty: Qty(1000), owner: Address(0x0000000000…), stp: None }), Place(NewOrder { side: Sell, order_type: Limit, tif: Gtc, price: Price(1012000000), qty: Qty(1000), owner: Address(0x0000000000…), stp: CancelNewest })]
