@@ -96,6 +96,99 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     consensus scenarios with network partitions and verify that the
     blockchain stays safe and live under adverse conditions.
 
+- **Byzantine fault injection harness for TCP multi-node devnet**
+  (`crates/devnet/src/byzantine.rs`)
+  - A test harness that wraps `TcpMultiNodeDevnet` and injects
+    Byzantine behavior into specific validators over the real TCP
+    transport.
+  - Supported behaviors: invalid votes, forged signatures,
+    equivocation, malformed/truncated messages, unknown message
+    tags, and non-responsive (no-vote) validators.
+  - `verify_honest_convergence()` checks that all honest
+    validators agree on finalized height and state root after
+    Byzantine injection.
+  - 9 tests: assembly, index validation, 6 injection scenarios,
+    and 2 convergence tests (4 validators with f=1, 7 validators
+    with f=2).
+  - **In plain words:** the testnet can now simulate faulty
+    validators that send bad votes, forge signatures, equivocate,
+    or go silent — and verify that the honest validators still
+    reach consensus and agree on the chain state.
+
+- **Full KV snapshot sync with disk-backed EVM persistence**
+  (`crates/node/src/lib.rs`, `crates/executor/src/lib.rs`,
+  `modules/evm/src/lib.rs`)
+  - `ExecutorSnapshot` now carries per-module state payloads via
+    `module_state: Vec<Vec<u8>>`, enabling complete state transfer
+    (not just metadata).
+  - The `Module` trait has `export_state`/`import_state` default
+    methods; EVM implements them to serialize account/code/storage
+    state.
+  - `NodeConfig.storage_path: Option<PathBuf>` configures a
+    disk-backed redb storage backend. When set, EVM state persists
+    across restarts.
+  - `full_kv_snapshot_sync_restores_evm_state` test: exports EVM
+    state from a source node, imports it into a fresh destination
+    node, and verifies the EVM state root matches.
+  - **In plain words:** a node can now export its full state
+    (including EVM accounts, code, and storage) and transfer it to
+    a new node. A node configured with a disk path persists EVM
+    state to disk and restores it on restart.
+
+- **Per-peer ingress rate limiting for DoS protection**
+  (`crates/p2p/src/rate_limit.rs`)
+  - A token-bucket rate limiter that throttles inbound messages on
+    a per-peer basis. Each peer gets a bounded token budget;
+    messages consume tokens proportional to their size.
+  - Integer-only arithmetic, no allocations on the hot path, lazy
+    idle eviction to bound memory.
+  - 8 tests covering admission, overflow, refill, multi-peer
+    tracking, idle eviction, reset, remove, and capacity cap.
+  - **In plain words:** each peer gets a bandwidth budget. If a
+    peer floods the node with messages, its budget runs out and
+    subsequent messages are dropped until the budget refills.
+
+- **State pruning for the append-only journal**
+  (`crates/storage/src/prune.rs`)
+  - Segment-level pruning that deletes old journal segment files
+    when they exceed a configurable retention window (default:
+    keep last 1000 segments, ~256 GiB).
+  - Always retains the active segment and all segments within the
+    retention window. Reports bytes freed and segments deleted.
+  - `disk_usage()` and `segment_count()` utilities for monitoring.
+  - 12 tests covering parsing, retention, edge cases, and byte
+    accounting.
+  - **In plain words:** old block history files are automatically
+    deleted when they exceed the retention window, keeping disk
+    usage bounded without losing recent history.
+
+- **Full auto-deleveraging (ADL) implementation**
+  (`modules/perps/src/lib.rs`)
+  - Replaced the placeholder ADL event with a full ranking and
+    execution algorithm. When the insurance fund is depleted, ADL
+    deleverages profitable counterparties to cover the shortfall.
+  - Ranks by PnL descending, size descending, address ascending for
+    determinism. Integer-only arithmetic.
+  - Emits `adl_executed` events per counterparty and
+    `adl_shortfall_remaining` if unrecoverable.
+  - 3 stress tests: triggers on fund depletion, ranks by profit,
+    deterministic.
+  - **In plain words:** when the insurance fund runs out, the system
+    automatically reduces the positions of the most profitable traders
+    to cover the losses, in a deterministic order.
+
+- **Oracle robustness for mark prices**
+  (`modules/perps/src/lib.rs`)
+  - Added a 10% maximum mark price change per update to prevent a
+    malicious or buggy oracle from causing cascading liquidations.
+  - `set_mark_price` rejects updates deviating more than 10% from
+    the current mark. `set_mark_price_unchecked` bypasses for
+    testing/genesis.
+  - 7 tests covering accepted/rejected changes, boundary, and
+    deviation calculation.
+  - **In plain words:** the oracle can't move the price by more than
+    10% in a single update, protecting against manipulation and bugs.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).
@@ -632,6 +725,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     not available in revm 42.
 
 ### Fixed
+
+- **Storage backend benchmark had broken closure syntax** (pre-existing,
+  exposed by enabling the `redb` feature)
+  - The `crates/storage/benches/backend.rs` file had mangled closure
+    syntax in the `#[cfg(feature = "redb")]` and `#[cfg(feature =
+    "mdbx")]` sections: `&b, batch | {` instead of `&batch, |b, batch| {`.
+  - The `criterion_group!`/`criterion_main!` macros were inside a
+    `mod bench` module, so `criterion_main!` couldn't generate the
+    crate-level `main` function.
+  - Fix: restructured the bench file to move all bench functions to
+    crate level, fixed all three backend sections (redb, rocksdb,
+    mdbx) in both `bench_apply_batch` and `bench_get`.
+  - **In plain words:** the storage benchmark now compiles and runs
+    correctly when the `redb` feature is enabled.
 
 - **Pipelined devnet flush round left followers lagging** (P0 correctness)
   - `run_pipelined` and `run_pipelined_txs` checked only the leader's

@@ -67,6 +67,7 @@ fn bench_executor_bank_throughput(c: &mut Criterion) {
                     max_mempool_entries: n + 100,
                     parallel_threshold: 32,
                     evm_persistence: true,
+                    storage_path: None,
                 };
                 let mut node = Node::assemble(&config);
 

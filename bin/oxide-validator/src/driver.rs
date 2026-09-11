@@ -236,6 +236,7 @@ mod tests {
             max_mempool_entries: 100,
             parallel_threshold: 32,
             evm_persistence: false,
+            storage_path: None,
         };
         let mut node = Node::assemble(&config);
 

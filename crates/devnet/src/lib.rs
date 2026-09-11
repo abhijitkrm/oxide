@@ -23,6 +23,7 @@
 
 pub use node::{ConsensusConfig, Node, NodeConfig, run_node_smoke_test};
 
+pub mod byzantine;
 pub mod evm_workload;
 pub mod multinode;
 pub mod multiprocess;

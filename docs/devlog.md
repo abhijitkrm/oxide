@@ -8557,3 +8557,158 @@ resume from the correct position.
 - `cargo test --workspace`: all test suites pass (0 failures).
 - `cargo build --workspace --release`: clean.
 - `cargo deny check`: advisories ok, bans ok, licenses ok, sources ok.
+
+## 2026-09-09 — Session: Byzantine fault injection + storage bench fix
+
+### Full KV snapshot sync (gap 2 complete)
+
+- Added `use executor::Module;` to the node test module so the
+  `state_root()` trait method is in scope.
+- The `full_kv_snapshot_sync_restores_evm_state` test now passes:
+  exports EVM state from a source node, imports it into a fresh
+  destination node, and verifies the EVM state root matches.
+- All 14 node tests pass.
+- Fixed `ExecutorSnapshot` `import_state` doc to include `# Errors`
+  section (clippy `missing-errors-doc`).
+
+### Byzantine fault injection harness (gap 3)
+
+- Added `crates/devnet/src/byzantine.rs` — a Byzantine fault
+  injection harness that wraps `TcpMultiNodeDevnet`.
+- Byzantine behaviors supported:
+  - `InvalidVote`: wrong block hash, valid signature.
+  - `Equivocation`: two votes for different blocks in the same view.
+  - `DropMessages`: silent node (not yet wired into the pipelined
+    loop; tested via direct injection).
+  - `MalformedData`: truncated/garbled messages.
+  - `InvalidProposal`: corrupted proposals (planned).
+  - `NoVote`: non-responsive node (tested via convergence).
+  - `ForgedSignature`: invalid BLS signature.
+- Added `pub(crate)` accessor methods to `TcpMultiNodeDevnet`:
+  `engines()`, `engines_mut()`, `transports_mut()`, `secret_keys()`,
+  `apps()`.
+- 9 byzantine tests pass:
+  - Assembly and index validation.
+  - Invalid vote rejection (no crash).
+  - Forged signature rejection (no crash).
+  - Malformed message handling (no crash).
+  - Unknown tag handling (no crash).
+  - Equivocation handling (no crash).
+  - Honest convergence with 1 Byzantine (4 validators, f=1).
+  - Honest convergence with 2 Byzantine (7 validators, f=2).
+- `verify_honest_convergence()` checks that all honest validators
+  agree on finalized height and state root.
+
+### Storage bench fix (pre-existing bug exposed by redb feature)
+
+- The `crates/storage/benches/backend.rs` file had broken closure
+  syntax in the `#[cfg(feature = "redb")]` and `#[cfg(feature =
+  "mdbx")]` sections: `&b, batch | {` instead of `&batch, |b, batch| {`.
+- This was a pre-existing bug that only compiled when the `redb`
+  feature was disabled. Enabling `redb` on the storage crate (via
+  the node dependency) exposed it.
+- Restructured the bench file: moved bench functions from inside a
+  `mod bench` to crate level, so `criterion_main!` generates the
+  crate-level `main` function correctly.
+- Fixed all three backend sections (redb, rocksdb, mdbx) in both
+  `bench_apply_batch` and `bench_get`.
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all test suites pass (0 failures).
+
+### Operational infrastructure (gap 4)
+
+- **Network-level rate limiting** (`crates/p2p/src/rate_limit.rs`):
+  - Per-peer token-bucket rate limiter for ingress DoS protection.
+  - Each peer gets a bounded token budget; messages consume tokens
+    proportional to their size. When the bucket is empty, messages
+    are dropped until the bucket refills.
+  - Integer-only arithmetic (no floating point on the hot path).
+  - Lazy idle eviction: peers that haven't sent in a configurable
+    timeout are evicted from the map to bound memory.
+  - 8 tests: admission, overflow, refill, multi-peer tracking,
+    idle eviction, reset, remove, capacity cap.
+  - **In plain words:** each peer gets a bandwidth budget. If a
+    peer floods the node with messages, its budget runs out and
+    subsequent messages are dropped until the budget refills.
+
+- **State pruning** (`crates/storage/src/prune.rs`):
+  - Segment-level pruning for the append-only journal.
+  - Deletes old journal segment files when they exceed a
+    configurable retention window (default: keep last 1000
+    segments, ~256 GiB at default segment size).
+  - Always retains the active segment and all segments within
+    the retention window.
+  - Reports bytes freed and segments deleted.
+  - `disk_usage()` and `segment_count()` utilities for monitoring.
+  - 12 tests: parsing, retention, edge cases, non-segment file
+    handling, byte accounting.
+  - **In plain words:** old block history files are automatically
+    deleted when they exceed the retention window, keeping disk
+    usage bounded without losing recent history.
+
+- **Existing infrastructure verified:**
+  - Peer discovery: gossip-based `PeerStore` with bootstrap
+    peers (`crates/p2p/src/discovery.rs`).
+  - Reputation/banning: per-peer reputation scores with automatic
+    banning and ban expiration (`crates/p2p/src/reputation.rs`).
+  - Metrics: HDR histogram latency recording with Prometheus
+    exposition (`crates/metrics/src/lib.rs`).
+  - Mempool protection: size cap with fee-priority eviction and
+    dedup (`crates/mempool/src/lib.rs`).
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all test suites pass (0 failures).
+
+### Trading hardening (gap 5)
+
+- **Full ADL implementation** (`modules/perps/src/lib.rs`):
+  - Replaced the placeholder ADL event with a full ranking and
+    execution algorithm.
+  - ADL ranks all open positions by PnL descending (most profitable
+    first), with ties broken by position size descending and address
+    ascending for determinism.
+  - Each counterparty's position is partially or fully closed at the
+    bankruptcy price, realizing their profit to cover the shortfall.
+  - Integer-only arithmetic for determinism.
+  - Emits `adl_executed` events per deleveraged counterparty and
+    `adl_shortfall_remaining` if the shortfall is unrecoverable.
+  - 3 stress tests: ADL triggers on insurance fund depletion, ADL
+    ranks by profit descending, ADL is deterministic.
+
+- **Oracle robustness** (`modules/perps/src/lib.rs`):
+  - Added `MAX_MARK_CHANGE_BPS = 1000` (10%) constant: the maximum
+    allowed mark price change per update.
+  - `set_mark_price` now rejects updates that deviate more than 10%
+    from the current mark, preventing a malicious or buggy oracle
+    from causing cascading liquidations with an extreme price.
+  - Added `set_mark_price_unchecked` for testing and genesis setup
+    where the first mark needs to be set to an arbitrary value.
+  - Added `mark_price_deviation_bps` helper function.
+  - 7 oracle robustness tests: first mark checked against initial,
+    small change accepted, large change rejected, large drop
+    rejected, exact 10% boundary, unchecked bypass, deviation
+    calculation.
+
+- **Existing perps infrastructure verified:**
+  - Liquidation: closes underwater positions, realizes losses,
+    covers shortfalls from the insurance fund.
+  - Insurance fund: absorbs liquidation shortfalls, never goes
+    negative (property test).
+  - Funding: longs pay shorts (or vice versa), margin never goes
+    negative (property test).
+  - Liquidation only triggers when equity <= maintenance (property
+    test).
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all test suites pass (0 failures).
+- Perps module: 31 tests (10 new: 3 ADL + 7 oracle).

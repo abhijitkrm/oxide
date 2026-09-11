@@ -924,6 +924,7 @@ dependencies = [
  "codec",
  "criterion",
  "crypto",
+ "p2p",
  "ports",
  "primitives",
  "types",
@@ -1741,6 +1742,7 @@ dependencies = [
  "metrics",
  "ports",
  "primitives",
+ "storage",
  "types",
 ]
 
@@ -4209,6 +4211,7 @@ dependencies = [
  "redb",
  "rocksdb",
  "staking",
+ "tempfile",
  "types",
 ]
 

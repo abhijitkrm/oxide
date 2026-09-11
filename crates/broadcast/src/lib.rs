@@ -32,7 +32,10 @@ use primitives::Hash;
 use types::Proposal;
 
 mod gf256;
+mod net;
 mod rs;
+
+pub use net::NetworkedBroadcast;
 
 /// The default maximum payload for `PlainGossip`: 4 MiB. Bounded by
 /// the transport's max message size in practice.

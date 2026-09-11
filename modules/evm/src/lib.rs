@@ -2567,6 +2567,51 @@ impl Module for EvmModule {
         // Convert the alloy B256 root to Oxide's Hash type.
         Hash(root.0)
     }
+
+    /// Export the EVM's full key-value state for snapshot sync.
+    ///
+    /// Returns `Some(snapshot)` if a `StorageBackend` is attached,
+    /// `None` otherwise. The snapshot includes all key-value pairs
+    /// in the backend — the complete EVM state (accounts, code,
+    /// storage).
+    ///
+    /// This is used for full state sync: a new node imports the
+    /// snapshot to skip replaying the entire chain from genesis.
+    fn export_state(&self) -> Option<storage::Snapshot> {
+        let backend = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        backend.as_ref().map(|b| b.snapshot_export())
+    }
+
+    /// Import a key-value snapshot, restoring the EVM's state.
+    ///
+    /// Flushes the current in-memory state to the backend, then
+    /// replaces the backend's state with the snapshot, then reloads
+    /// the in-memory cache from the backend.
+    ///
+    /// Returns `Ok(())` on success, or an error if the backend is
+    /// not attached or the import fails.
+    fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+        // Flush the current state to the backend first (so we don't
+        // lose any pending changes — though in practice, import
+        // happens before consensus starts, so there are no pending
+        // changes).
+        {
+            let mut backend =
+                self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(ref mut b) = *backend {
+                self.flush_to_storage(b.as_mut());
+                b.snapshot_import(snapshot.clone())?;
+            } else {
+                return Err(storage::SnapshotError::BackendError);
+            }
+        }
+        // Reload the in-memory cache from the backend.
+        let backend = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref b) = *backend {
+            self.load_from_storage(b.as_ref());
+        }
+        Ok(())
+    }
 }
 
 impl EvmModule {

@@ -40,6 +40,7 @@ pub mod auth_journal;
 pub mod backend;
 pub mod journal;
 pub mod mmr;
+pub mod prune;
 
 #[cfg(feature = "redb")]
 pub mod redb_backend;

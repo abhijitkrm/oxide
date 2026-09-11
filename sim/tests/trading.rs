@@ -138,7 +138,7 @@ fn deterministic_trading_scenario() {
     assert!(pos.size > 0, "position survives funding");
 
     // ── Phase 4: Liquidation ─────────────────────────────────────
-    perps.set_mark_price(0, 1_000_000_000).expect("market exists");
+    perps.set_mark_price_unchecked(0, 1_000_000_000).expect("market exists");
     // Place a larger sell from trader 1 and a matching buy from
     // trader 3 to build up a bigger position.
     place_perps_order(&perps, 1, Side::Sell, 100_000);

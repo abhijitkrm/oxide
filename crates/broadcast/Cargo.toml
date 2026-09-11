@@ -19,6 +19,7 @@ ports = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.7.0"
+p2p = { workspace = true }
 
 [[bench]]
 name = "dissemination"

@@ -208,7 +208,7 @@ fn perps_liquidation_check(c: &mut Criterion) {
         let taker = limit(Side::Buy, 500, 5, 1);
         perps.handle(&ctx(1), &perps::msg::place(mid, taker)).unwrap();
         // Drop mark to 1.0B (entry was 1.5B) → underwater.
-        perps.set_mark_price(mid, 1_000_000_000).unwrap();
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
         perps
     };
 

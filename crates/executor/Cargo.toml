@@ -18,6 +18,9 @@ types = { workspace = true }
 ports = { workspace = true }
 mempool = { workspace = true }
 metrics = { workspace = true }
+# storage: for the `Snapshot` type used by the Module trait's
+# `export_state`/`import_state` methods (full KV snapshot sync).
+storage = { workspace = true }
 
 [dev-dependencies]
 consensus = { workspace = true }

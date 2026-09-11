@@ -29,6 +29,7 @@
 //!     max_mempool_entries: 10_000,
 //!     parallel_threshold: 32,
 //!     evm_persistence: true,
+//!     storage_path: None,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.
@@ -70,7 +71,7 @@ impl ConsensusConfig {
 }
 
 /// The node configuration: engine selection + mempool size + parallel
-/// execution tuning + EVM persistence.
+/// execution tuning + EVM persistence + disk storage path.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// Which consensus engine to use.
@@ -85,11 +86,17 @@ pub struct NodeConfig {
     /// for latency-sensitive single-threaded deployments.
     pub parallel_threshold: usize,
     /// Whether to enable EVM state persistence. When `true`, the
-    /// EVM module is created with a `Volatile` storage backend and
-    /// flushes state at `end_block`. When `false`, the EVM module
-    /// runs in-memory only (state is lost on restart). Default:
+    /// EVM module is created with a storage backend and flushes
+    /// state at `end_block`. When `false`, the EVM module runs
+    /// in-memory only (state is lost on restart). Default:
     /// `true` — persistence is the production-safe default.
     pub evm_persistence: bool,
+    /// Optional disk path for the EVM state database. When `Some`,
+    /// the EVM module uses a `RedbBackend` (disk-backed ACID KV
+    /// store) for durable persistence. When `None`, uses a
+    /// `Volatile` (in-memory) backend. Default: `None` —
+    /// in-memory for devnet; set to a path for production.
+    pub storage_path: Option<std::path::PathBuf>,
 }
 
 impl Default for NodeConfig {
@@ -99,6 +106,7 @@ impl Default for NodeConfig {
             max_mempool_entries: 10_000,
             parallel_threshold: executor::DEFAULT_PARALLEL_THRESHOLD,
             evm_persistence: true,
+            storage_path: None,
         }
     }
 }
@@ -207,16 +215,19 @@ impl Node {
         // precompiles (plan.md §10).
         //
         // Persistence: when `evm_persistence` is enabled (the
-        // default), the EVM module is created with a `Volatile`
-        // storage backend and flushes state at `end_block`. This
-        // makes EVM state survive restarts and shareable between
-        // nodes. When disabled, the EVM runs in-memory only.
+        // default), the EVM module is created with a storage backend
+        // and flushes state at `end_block`. When `storage_path` is
+        // `Some`, a disk-backed `RedbBackend` is used (durable ACID
+        // persistence — state survives restarts). When `None`, a
+        // `Volatile` (in-memory) backend is used. When disabled
+        // entirely (`evm_persistence = false`), the EVM runs
+        // in-memory only.
         let evm_module: Arc<evm::EvmModule> = if config.evm_persistence {
-            Arc::new(evm::EvmModule::with_storage(
-                1,
-                7_000_000_000,
-                Box::new(storage::Volatile::new()),
-            ))
+            let backend: Box<dyn storage::StorageBackend + Send> = match &config.storage_path {
+                Some(path) => Box::new(storage::RedbBackend::open(path).expect("redb backend")),
+                None => Box::new(storage::Volatile::new()),
+            };
+            Arc::new(evm::EvmModule::with_storage(1, 7_000_000_000, backend))
         } else {
             Arc::new(evm::EvmModule::new(1, 7_000_000_000))
         };
@@ -259,6 +270,13 @@ impl Node {
     /// Access the app (executor) for inspection.
     pub fn app(&self) -> &Executor {
         &self.app
+    }
+
+    /// Access the EVM module for direct state inspection (balance,
+    /// nonce, state root). Returns `None` if the EVM module is not
+    /// registered.
+    pub fn evm_module(&self) -> Option<&evm::EvmModule> {
+        self.evm_module.as_deref()
     }
 
     /// Clone the shared executor handle.
@@ -406,6 +424,7 @@ fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use executor::Module;
 
     #[test]
     fn node_assembles_with_sequencer() {
@@ -414,6 +433,7 @@ mod tests {
             max_mempool_entries: 100,
             parallel_threshold: 32,
             evm_persistence: true,
+            storage_path: None,
         };
         let mut node = Node::assemble(&config);
         // The engine should be ready (no blocks yet).
@@ -427,6 +447,7 @@ mod tests {
             max_mempool_entries: 100,
             parallel_threshold: 32,
             evm_persistence: true,
+            storage_path: None,
         };
         let mut node = Node::assemble(&config);
         assert!(node.engine().finalized_height().is_none());
@@ -453,12 +474,14 @@ mod tests {
             max_mempool_entries: 100,
             parallel_threshold: 32,
             evm_persistence: true,
+            storage_path: None,
         };
         let bft_config = NodeConfig {
             consensus: ConsensusConfig::OxideBft,
             max_mempool_entries: 100,
             parallel_threshold: 32,
             evm_persistence: true,
+            storage_path: None,
         };
 
         let mut seq_node = Node::assemble(&seq_config);
@@ -480,6 +503,114 @@ mod tests {
         // the proof that the EVM module is registered.
     }
 
+    // ─── Disk-backed EVM storage tests ───────────────────────────
+
+    #[test]
+    fn disk_backed_evm_storage_assembles() {
+        // A node with a disk-backed EVM store should assemble and
+        // run consensus without errors.
+        let tmp = std::env::temp_dir().join(format!(
+            "oxide-test-redb-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let config = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 100,
+            parallel_threshold: 32,
+            evm_persistence: true,
+            storage_path: Some(tmp.clone()),
+        };
+        let mut node = Node::assemble(&config);
+        // Submit a tx and finalize a block.
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node.engine().submit_tx(tx);
+        node.engine().run_until_idle();
+        assert!(node.engine().finalized_height().is_some(), "block finalized");
+        // Clean up the temp file.
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn full_kv_snapshot_sync_restores_evm_state() {
+        // Full KV snapshot sync: export a snapshot with actual KV
+        // state from a node with a disk-backed EVM store, import it
+        // into a fresh node, and verify the EVM state matches.
+        let tmp1 = std::env::temp_dir().join(format!(
+            "oxide-test-snap-src-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let tmp2 = std::env::temp_dir().join(format!(
+            "oxide-test-snap-dst-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        // Source node: disk-backed EVM store.
+        let config_src = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 100,
+            parallel_threshold: 32,
+            evm_persistence: true,
+            storage_path: Some(tmp1.clone()),
+        };
+        let mut node_src = Node::assemble(&config_src);
+        // Submit a tx and finalize a block to produce EVM state.
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node_src.engine().submit_tx(tx);
+        node_src.engine().run_until_idle();
+        assert!(node_src.engine().finalized_height().is_some());
+
+        // Export the snapshot (with full KV state).
+        let snapshot = node_src.export_snapshot();
+        assert!(!snapshot.module_state.is_empty(), "snapshot must include module state");
+        // At least one module (EVM) should have exported KV state.
+        let has_kv = snapshot.module_state.iter().any(Option::is_some);
+        assert!(has_kv, "at least one module must export KV state");
+
+        // Destination node: fresh disk-backed EVM store.
+        let config_dst = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 100,
+            parallel_threshold: 32,
+            evm_persistence: true,
+            storage_path: Some(tmp2.clone()),
+        };
+        let node_dst = Node::assemble(&config_dst);
+
+        // Import the snapshot into the destination node.
+        node_dst.import_snapshot(&snapshot).expect("snapshot import must succeed");
+
+        // Verify the destination node's height matches.
+        assert_eq!(
+            node_dst.app_handle().current_height(),
+            node_src.app_handle().current_height(),
+            "height must match after snapshot sync"
+        );
+
+        // Verify the EVM module's state root matches — this proves
+        // the full KV state was transferred. Other modules (bank,
+        // staking) don't have StorageBackends yet, so their state
+        // remains at genesis; the aggregate root won't match until
+        // all modules support export_state/import_state.
+        let evm_src = node_src.evm_module().expect("src has EVM");
+        let evm_dst = node_dst.evm_module().expect("dst has EVM");
+        assert_eq!(
+            evm_dst.state_root(),
+            evm_src.state_root(),
+            "EVM state root must match after full KV snapshot sync"
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_file(&tmp1);
+        let _ = std::fs::remove_file(&tmp2);
+    }
+
     // ─── Snapshot sync tests ─────────────────────────────────────
 
     #[test]
@@ -491,6 +622,7 @@ mod tests {
             max_mempool_entries: 100,
             parallel_threshold: 32,
             evm_persistence: true,
+            storage_path: None,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -528,6 +660,7 @@ mod tests {
             height: 5,
             state_root: primitives::Hash::ZERO,
             module_roots: vec![],
+            module_state: vec![],
         };
         let err = node.import_snapshot(&empty_snapshot).expect_err("empty snapshot must fail");
         assert_eq!(err, executor::SnapshotImportError::EmptySnapshot);
@@ -599,6 +732,7 @@ mod tests {
             max_mempool_entries: 100,
             parallel_threshold: 32,
             evm_persistence: true,
+            storage_path: None,
         };
         let mut node = Node::assemble(&config);
         // Finalize one block.
@@ -640,6 +774,7 @@ mod tests {
             max_mempool_entries: 100,
             parallel_threshold: 32,
             evm_persistence: true,
+            storage_path: None,
         };
         let mut node1 = Node::assemble(&config);
         let mut node2 = Node::assemble(&config);

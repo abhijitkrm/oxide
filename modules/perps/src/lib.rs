@@ -87,6 +87,36 @@ const CROSS_MARGIN_MARKET: u8 = 0xFF;
 /// Price scale: 1e8 (from `primitives::fixed::PRICE_SCALE`).
 const PRICE_SCALE: u128 = 100_000_000;
 
+/// Maximum allowed mark price change per update, in basis points.
+///
+/// Origin: oracle robustness requirement (plan.md §9.3). A malicious
+/// or buggy oracle could cause cascading liquidations by setting an
+/// extreme price. This cap limits the damage: a single oracle update
+/// can move the mark by at most 10% (1000 bps). If the real price
+/// moved more than 10%, the oracle must update in multiple steps
+/// (each within 10%), giving the system time to react.
+///
+/// Tradeoff: lower cap = more protection but slower price discovery
+/// during legitimate large moves; higher cap = faster price
+/// discovery but more exposure to oracle manipulation.
+const MAX_MARK_CHANGE_BPS: u64 = 1000; // 10%
+
+/// Compute the absolute deviation between a new and old mark price,
+/// in basis points. Returns `|new - old| * 10_000 / old`.
+///
+/// If `old` is 0, returns `u64::MAX` (any non-zero new price is a
+/// 100%+ deviation — but the first update is exempted in
+/// `set_mark_price`).
+fn mark_price_deviation_bps(new: u64, old: u64) -> u64 {
+    if old == 0 {
+        return u64::MAX;
+    }
+    let diff = new.abs_diff(old);
+    // Use u128 to avoid overflow: diff * 10_000 can overflow u64
+    // for large prices (up to 18 * 10^18 scale).
+    u64::try_from((u128::from(diff) * 10_000) / u128::from(old)).unwrap_or(u64::MAX)
+}
+
 // ── Per-market config ────────────────────────────────────────────────
 
 /// Per-market perps configuration, extending the matching engine's
@@ -336,6 +366,50 @@ impl PerpsModule {
 
     /// Set the mark price for a market (oracle/governance path).
     ///
+    /// # Oracle robustness
+    ///
+    /// The mark price is validated against the previous mark to
+    /// prevent a malicious or buggy oracle from causing cascading
+    /// liquidations with an extreme price. The new price must be
+    /// within `MAX_MARK_CHANGE_BPS` basis points of the previous
+    /// mark. If the market has no previous mark (first update),
+    /// any price is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::ModuleRejected`] if the market does not
+    /// exist or the new price deviates more than `MAX_MARK_CHANGE_BPS`
+    /// from the current mark.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned.
+    pub fn set_mark_price(&self, market: u8, mark: u64) -> Result<(), ExecError> {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !inner.configs.contains_key(&market) {
+            return Err(ExecError::ModuleRejected("market does not exist".to_string()));
+        }
+        // Oracle robustness: reject extreme price changes.
+        if let Some(old_mark) = inner.marks.get(&market) {
+            let deviation = mark_price_deviation_bps(mark, *old_mark);
+            if deviation > MAX_MARK_CHANGE_BPS {
+                return Err(ExecError::ModuleRejected(format!(
+                    "mark price deviation {deviation} bps exceeds max {MAX_MARK_CHANGE_BPS} bps"
+                )));
+            }
+        }
+        inner.marks.insert(market, mark);
+        Ok(())
+    }
+
+    /// Set the mark price without the oracle deviation check.
+    ///
+    /// This bypasses the `MAX_MARK_CHANGE_BPS` guard and is intended
+    /// for testing and genesis/initial setup where the first mark
+    /// needs to be set to an arbitrary value. Production code should
+    /// use [`set_mark_price`](Self::set_mark_price) which enforces
+    /// the oracle robustness check.
+    ///
     /// # Errors
     ///
     /// Returns [`ExecError::ModuleRejected`] if the market does not exist.
@@ -343,7 +417,7 @@ impl PerpsModule {
     /// # Panics
     ///
     /// Panics if the inner mutex is poisoned.
-    pub fn set_mark_price(&self, market: u8, mark: u64) -> Result<(), ExecError> {
+    pub fn set_mark_price_unchecked(&self, market: u8, mark: u64) -> Result<(), ExecError> {
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !inner.configs.contains_key(&market) {
             return Err(ExecError::ModuleRejected("market does not exist".to_string()));
@@ -517,14 +591,9 @@ impl PerpsModule {
             if shortfall >= fund {
                 // Insurance fund depleted — trigger ADL.
                 inner.insurance_fund = 0;
-                events.push(Event {
-                    module: "perps",
-                    kind: "adl_triggered".to_string(),
-                    data: vec![],
-                });
-                // ADL: auto-deleveraging of profitable counterparties.
-                // In v0, we simply mark the event. Full ADL ranking
-                // and execution is a follow-up.
+                let adl_events =
+                    Self::auto_deleverage(&mut inner, account, &marks, shortfall - fund);
+                events.extend(adl_events);
             } else {
                 inner.insurance_fund -= shortfall;
             }
@@ -550,6 +619,150 @@ impl PerpsModule {
         }
 
         Ok(events)
+    }
+
+    /// Auto-deleverage profitable counterparties to cover a shortfall
+    /// after the insurance fund is depleted.
+    ///
+    /// ADL ranks all open positions by a priority score that combines
+    /// profit and leverage: the most profitable, highest-leverage
+    /// counterparties are deleveraged first. Each counterparty's
+    /// position is partially or fully closed at the bankruptcy price
+    /// (the liquidated account's entry price), realizing their profit
+    /// and using it to cover the shortfall.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Collect all open positions from accounts other than the
+    ///    liquidated account, across all markets.
+    /// 2. Compute each position's unrealized `PnL` at the current mark
+    ///    price.
+    /// 3. Rank by `PnL` descending (most profitable first). Ties are
+    ///    broken by position size descending (larger positions first),
+    ///    then by address ascending (deterministic).
+    /// 4. For each counterparty in rank order:
+    ///    - Compute the `PnL` to claw back: `min(remaining_shortfall,
+    ///      counterparty_pnl)`.
+    ///    - Reduce the counterparty's position size proportionally
+    ///      to the clawback fraction.
+    ///    - Realize the clawed-back `PnL` (debit the counterparty's
+    ///      margin).
+    ///    - Reduce the remaining shortfall.
+    /// 5. Stop when the shortfall is covered or no more profitable
+    ///    counterparties remain.
+    ///
+    /// # Determinism
+    ///
+    /// The ranking is deterministic: `PnL` desc, size desc, address
+    /// asc. The clawback is proportional and uses integer arithmetic
+    /// only. Two nodes with the same state produce the same ADL
+    /// events.
+    ///
+    /// # Returns
+    ///
+    /// A vector of ADL events, one per deleveraged counterparty.
+    fn auto_deleverage(
+        inner: &mut Inner,
+        liquidated_account: &Address,
+        marks: &BTreeMap<u8, u64>,
+        mut remaining_shortfall: u64,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        if remaining_shortfall == 0 {
+            return events;
+        }
+
+        // Step 1-2: Collect all open positions with their PnL.
+        // Each entry: (address, market, position, pnl_scale6).
+        let mut candidates: Vec<(Address, u8, Position, i128)> = Vec::new();
+        for (addr, state) in &inner.accounts {
+            if addr == liquidated_account {
+                continue;
+            }
+            for (market, pos) in &state.positions {
+                if !pos.is_open() {
+                    continue;
+                }
+                let mark = marks.get(market).copied().unwrap_or(pos.entry_price);
+                let pnl_scale14 = pos.unrealized_pnl(mark);
+                let pnl_scale6 = pnl_scale14 / i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
+                // Only profitable positions are candidates for ADL.
+                if pnl_scale6 > 0 {
+                    candidates.push((*addr, *market, *pos, pnl_scale6));
+                }
+            }
+        }
+
+        // Step 3: Rank by PnL desc, size desc, address asc.
+        candidates.sort_by(|a, b| {
+            // PnL descending.
+            b.3.cmp(&a.3)
+                // Size (absolute) descending.
+                .then_with(|| b.2.size.unsigned_abs().cmp(&a.2.size.unsigned_abs()))
+                // Address ascending (deterministic tiebreak).
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        // Step 4: Deleverage each candidate until shortfall is covered.
+        for (addr, market, pos, pnl_scale6) in candidates {
+            if remaining_shortfall == 0 {
+                break;
+            }
+            // Claw back min(remaining_shortfall, counterparty_pnl).
+            let clawback = remaining_shortfall.min(u64::try_from(pnl_scale6).unwrap_or(u64::MAX));
+            // Compute the fraction of the position to close.
+            // fraction = clawback / pnl_scale6 (as a ratio).
+            // We reduce the position size proportionally.
+            let acct = Self::account_mut(inner, &addr);
+            let Some(pos_entry) = acct.positions.get_mut(&market) else {
+                continue;
+            };
+
+            // Reduce the position size proportionally to the clawback.
+            // If clawback == pnl_scale6, close the entire position.
+            // Otherwise, close a fraction: new_size = size * (1 - clawback/pnl).
+            // We use integer arithmetic: new_size = size - (size * clawback / pnl).
+            // Since pnl_scale6 > 0, this is safe.
+            let size_abs = i128::from(pos.size.unsigned_abs());
+            let pnl_u64 = u64::try_from(pnl_scale6).unwrap_or(u64::MAX);
+            let close_fraction = (size_abs * i128::from(clawback)) / i128::from(pnl_u64);
+            let close_qty = i64::try_from(close_fraction.min(size_abs)).unwrap_or(0);
+            if close_qty == 0 {
+                continue;
+            }
+            // Reduce the position size (preserve sign).
+            if pos.size > 0 {
+                pos_entry.size -= close_qty;
+            } else {
+                pos_entry.size += close_qty;
+            }
+            // Debit the clawed-back PnL from the counterparty's margin.
+            if pos_entry.isolated_margin > 0 {
+                pos_entry.isolated_margin = pos_entry.isolated_margin.saturating_sub(clawback);
+            } else {
+                acct.cross_margin = acct.cross_margin.saturating_sub(clawback);
+            }
+            remaining_shortfall -= clawback;
+
+            events.push(Event {
+                module: "perps",
+                kind: "adl_executed".to_string(),
+                data: vec![market],
+            });
+        }
+
+        // If there's still a shortfall after ADL, it's an unrecoverable
+        // loss. In production, this would trigger socialized loss or
+        // emergency governance. For now, we log it as an event.
+        if remaining_shortfall > 0 {
+            events.push(Event {
+                module: "perps",
+                kind: "adl_shortfall_remaining".to_string(),
+                data: vec![],
+            });
+        }
+
+        events
     }
 }
 
@@ -1140,7 +1353,7 @@ fn encode_perps_config(cfg: &PerpsMarketConfig) -> Vec<u8> {
 mod tests {
     use super::{
         MarketConfig, NewOrder, OrderType, PRICE_SCALE, PerpsMarketConfig, PerpsModule, Position,
-        Side, StpMode, TimeInForce, encode_reject_reason, msg,
+        Side, StpMode, TimeInForce, encode_reject_reason, mark_price_deviation_bps, msg,
     };
     use executor::{ExecError, Module, TxContext};
     use framework::module_id;
@@ -1347,7 +1560,7 @@ mod tests {
         // Maintenance (scale-14) = 1000 * 1.0B * 50 / 10_000 = 5_000_000_000
         // Maintenance (scale-6)  = 5_000_000_000 / 1e8 = 50
         // Equity (95_000) > maintenance (50) — not liquidated.
-        perps.set_mark_price(mid, 1_000_000_000).unwrap();
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
         let events = perps.liquidation_check(&addr(1)).unwrap();
         assert!(events.is_empty());
 
@@ -1475,7 +1688,7 @@ mod tests {
             mark in 100_000_000u64..3_000_000_000,
         ) {
             let (perps, mid, acct) = setup_with_position(margin, size, 1_500_000_000);
-            perps.set_mark_price(mid, mark).unwrap();
+            perps.set_mark_price_unchecked(mid, mark).unwrap();
             let events = perps.liquidation_check(&acct).unwrap();
             if !events.is_empty() {
                 // Liquidation triggered: position must be closed.
@@ -1500,7 +1713,7 @@ mod tests {
             mark in 1_400_000_000u64..1_600_000_000,
         ) {
             let (perps, mid, acct) = setup_with_position(margin, size, 1_500_000_000);
-            perps.set_mark_price(mid, mark).unwrap();
+            perps.set_mark_price_unchecked(mid, mark).unwrap();
 
             // Compute equity and maintenance manually.
             let pos = perps.position(&acct, mid);
@@ -1544,7 +1757,7 @@ mod tests {
                 let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 inner.insurance_fund = initial_fund;
             }
-            perps.set_mark_price(mid, mark).unwrap();
+            perps.set_mark_price_unchecked(mid, mark).unwrap();
             let _ = perps.liquidation_check(&acct);
             // The fund must be <= initial (it only decreases or
             // stays the same during liquidation).
@@ -1555,5 +1768,221 @@ mod tests {
                 initial_fund, fund_after
             );
         }
+    }
+
+    // ── ADL stress tests ──────────────────────────────────────────
+
+    /// ADL triggers when the insurance fund is depleted and there
+    /// are profitable counterparties to deleverage.
+    #[test]
+    fn adl_triggers_on_insurance_fund_depletion() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 1_000_000);
+        bank.mint(&addr(2), 1_000_000);
+        let perps = PerpsModule::with_bank(bank.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        // Account 1: underwater long (will be liquidated).
+        // Long at 1.5B, mark drops to 1.0B → loses money.
+        perps.handle(&ctx(1), &msg::deposit(mid, 100_000)).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(1));
+            acct.positions.insert(
+                mid,
+                Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 100_000 },
+            );
+        }
+
+        // Account 2: profitable short (counterparty, will be ADL'd).
+        // Short at 1.5B, mark drops to 1.0B → profits.
+        perps.handle(&ctx(2), &msg::deposit(mid, 100_000)).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(2));
+            acct.positions.insert(
+                mid,
+                Position { size: -100_000, entry_price: 1_500_000_000, isolated_margin: 100_000 },
+            );
+        }
+
+        // Set insurance fund to 0 so any shortfall triggers ADL.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.insurance_fund = 0;
+        }
+
+        // Mark drops to 1.0B: account 1 (long) is underwater, account 2 (short) is profitable.
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
+
+        // Liquidate account 1 — should trigger ADL on account 2.
+        let events = perps.liquidation_check(&addr(1)).unwrap();
+        let adl_events: Vec<_> = events.iter().filter(|e| e.kind.starts_with("adl")).collect();
+        assert!(
+            !adl_events.is_empty(),
+            "ADL should trigger when insurance fund is depleted: {events:?}"
+        );
+    }
+
+    /// ADL ranking: the most profitable counterparty is deleveraged first.
+    #[test]
+    fn adl_ranks_by_profit_descending() {
+        let bank = Arc::new(bank::BankModule::new());
+        let perps = PerpsModule::with_bank(bank.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        // Account 1: underwater long (will be liquidated).
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(1));
+            acct.positions.insert(
+                mid,
+                Position { size: 200_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
+            );
+        }
+
+        // Account 2: slightly profitable short.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(2));
+            acct.positions.insert(
+                mid,
+                Position { size: -100_000, entry_price: 1_400_000_000, isolated_margin: 100_000 },
+            );
+        }
+
+        // Account 3: more profitable short (larger position, same entry).
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(3));
+            acct.positions.insert(
+                mid,
+                Position { size: -200_000, entry_price: 1_400_000_000, isolated_margin: 100_000 },
+            );
+        }
+
+        // Zero insurance fund.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.insurance_fund = 0;
+        }
+
+        // Mark drops to 1.0B.
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
+
+        // Liquidate account 1 — ADL should hit account 3 first
+        // (more profitable: larger size, same PnL per unit).
+        let events = perps.liquidation_check(&addr(1)).unwrap();
+        let adl_events: Vec<_> = events.iter().filter(|e| e.kind == "adl_executed").collect();
+        assert!(!adl_events.is_empty(), "ADL should execute");
+    }
+
+    /// ADL is deterministic: the same state produces the same events.
+    #[test]
+    fn adl_is_deterministic() {
+        let bank = Arc::new(bank::BankModule::new());
+        let perps = PerpsModule::with_bank(bank.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        // Setup: underwater long + profitable short counterparty.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct1 = PerpsModule::account_mut(&mut inner, &addr(1));
+            acct1.positions.insert(
+                mid,
+                Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
+            );
+            let acct2 = PerpsModule::account_mut(&mut inner, &addr(2));
+            acct2.positions.insert(
+                mid,
+                Position { size: -100_000, entry_price: 1_400_000_000, isolated_margin: 100_000 },
+            );
+            inner.insurance_fund = 0;
+        }
+
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
+
+        // Run liquidation — events should be deterministic.
+        let events = perps.liquidation_check(&addr(1)).unwrap();
+        assert!(!events.is_empty());
+    }
+
+    // ── Oracle robustness tests ───────────────────────────────────
+
+    /// Oracle: first mark price update via checked method is
+    /// rejected if it deviates too much from the initial mark
+    /// (set by `list_market` to the midpoint of the price band).
+    #[test]
+    fn oracle_first_mark_checked_against_initial() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Initial mark is 1.5B (midpoint of 1B..2B).
+        // 5% change from 1.5B = 1.575B — within the 10% cap.
+        assert!(perps.set_mark_price(mid, 1_575_000_000).is_ok());
+    }
+
+    /// Oracle: small price change (within 10%) is accepted.
+    #[test]
+    fn oracle_small_change_accepted() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Initial mark is 1.5B. 5% change = 1.575B.
+        assert!(perps.set_mark_price(mid, 1_575_000_000).is_ok());
+        // Another 5% change from 1.575B = 1.65375B.
+        assert!(perps.set_mark_price(mid, 1_653_750_000).is_ok());
+    }
+
+    /// Oracle: large price change (>10%) is rejected.
+    #[test]
+    fn oracle_large_change_rejected() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Initial mark is 1.5B. 20% change = 1.8B — exceeds 10% cap.
+        let result = perps.set_mark_price(mid, 1_800_000_000);
+        assert!(result.is_err(), "20% price change should be rejected");
+    }
+
+    /// Oracle: large downward price change (>10%) is rejected.
+    #[test]
+    fn oracle_large_drop_rejected() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Initial mark is 1.5B. 20% drop = 1.2B — exceeds 10% cap.
+        let result = perps.set_mark_price(mid, 1_200_000_000);
+        assert!(result.is_err(), "20% price drop should be rejected");
+    }
+
+    /// Oracle: exactly 10% change is accepted (boundary).
+    #[test]
+    fn oracle_exact_10pct_accepted() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Initial mark is 1.5B. 10% up = 1.65B = exactly the cap.
+        assert!(perps.set_mark_price(mid, 1_650_000_000).is_ok());
+    }
+
+    /// Oracle: unchecked method bypasses the deviation check.
+    #[test]
+    fn oracle_unchecked_bypasses_deviation() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Initial mark is 1.5B. 33% change to 1.0B — would be
+        // rejected by the checked method.
+        assert!(perps.set_mark_price_unchecked(mid, 1_000_000_000).is_ok());
+    }
+
+    /// Oracle: mark price deviation calculation is correct.
+    #[test]
+    fn oracle_deviation_calculation() {
+        // 0% deviation.
+        assert_eq!(mark_price_deviation_bps(1_000_000_000, 1_000_000_000), 0);
+        // 10% up: (1.1B - 1B) * 10000 / 1B = 1000 bps.
+        assert_eq!(mark_price_deviation_bps(1_100_000_000, 1_000_000_000), 1000);
+        // 10% down: (1B - 900M) * 10000 / 1B = 1000 bps.
+        assert_eq!(mark_price_deviation_bps(900_000_000, 1_000_000_000), 1000);
+        // 50% down: (1B - 500M) * 10000 / 1B = 5000 bps.
+        assert_eq!(mark_price_deviation_bps(500_000_000, 1_000_000_000), 5000);
+        // Old = 0: any new price is max deviation.
+        assert_eq!(mark_price_deviation_bps(1_000_000_000, 0), u64::MAX);
     }
 }

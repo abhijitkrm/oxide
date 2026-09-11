@@ -68,6 +68,7 @@ oxide-core = { workspace = true }
 bank = { workspace = true }
 staking = { workspace = true }
 ports = { workspace = true }
+tempfile = "3.27.0"
 
 [[bench]]
 name = "journal"

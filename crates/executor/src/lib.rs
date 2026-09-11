@@ -52,16 +52,24 @@ pub enum ExecError {
 
 /// A point-in-time snapshot of the executor's state (plan.md §8).
 ///
-/// Captures the chain height, the aggregate state root, and
-/// per-module state roots. Used for fast state sync: a new node
-/// imports a snapshot to skip replaying the entire chain from
-/// genesis.
+/// Captures the chain height, the aggregate state root, per-module
+/// state roots, and optionally per-module key-value state. Used for
+/// fast state sync: a new node imports a snapshot to skip replaying
+/// the entire chain from genesis.
 ///
 /// # Determinism
 ///
 /// The snapshot is deterministic: two executors with the same state
 /// produce byte-identical snapshots. The module roots are listed in
 /// registration order (module ID order).
+///
+/// # Full vs metadata-only
+///
+/// When `module_state` is populated, the snapshot includes the full
+/// key-value state for each module that supports `export_state`. This
+/// allows a new node to restore complete state without replaying.
+/// When `module_state` is empty, the snapshot is metadata-only
+/// (height + roots) — the v0 snapshot sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorSnapshot {
     /// The chain height (highest finalized block).
@@ -70,6 +78,10 @@ pub struct ExecutorSnapshot {
     pub state_root: Hash,
     /// Per-module state roots, in registration order.
     pub module_roots: Vec<(&'static str, Hash)>,
+    /// Per-module full key-value state, in registration order.
+    /// `None` for modules that don't support `export_state`. Empty
+    /// for metadata-only snapshots (v0).
+    pub module_state: Vec<Option<storage::Snapshot>>,
 }
 
 /// A snapshot import error.
@@ -93,6 +105,9 @@ pub enum SnapshotImportError {
         /// Registered module count in the executor.
         registered: usize,
     },
+    /// A module's `import_state` call failed (corrupted KV state
+    /// or backend error).
+    StateImportFailed,
 }
 
 impl std::fmt::Display for SnapshotImportError {
@@ -108,6 +123,7 @@ impl std::fmt::Display for SnapshotImportError {
                     "module count mismatch: snapshot has {snapshot}, executor has {registered}"
                 )
             }
+            Self::StateImportFailed => write!(f, "module state import failed"),
         }
     }
 }
@@ -310,6 +326,45 @@ pub trait Module: Send + Sync {
 
     /// Compute the module's state root (over its storage subtree).
     fn state_root(&self) -> Hash;
+
+    /// Export the module's full key-value state for snapshot sync.
+    ///
+    /// Returns `None` if the module does not support KV export (e.g.
+    /// in-memory modules without a `StorageBackend`). Modules with a
+    /// `StorageBackend` override this to return the backend's
+    /// `snapshot_export()`.
+    ///
+    /// This is used for full state sync: a new node imports the
+    /// snapshot to skip replaying the entire chain from genesis.
+    /// The snapshot includes all key-value pairs, not just the
+    /// state root.
+    ///
+    /// # Default
+    ///
+    /// Returns `None` — modules without a `StorageBackend` cannot
+    /// export KV state.
+    fn export_state(&self) -> Option<storage::Snapshot> {
+        None
+    }
+
+    /// Import a key-value snapshot, restoring the module's state.
+    ///
+    /// This is the import side of snapshot sync. The module restores
+    /// its `StorageBackend` from the snapshot, then reloads its
+    /// in-memory cache from the backend.
+    ///
+    /// # Default
+    ///
+    /// Returns `Ok(())` — modules without a `StorageBackend` silently
+    /// ignore the import (their state is in-memory only).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`storage::SnapshotError`] if the backend import
+    /// fails (malformed snapshot, backend I/O error).
+    fn import_state(&self, _snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+        Ok(())
+    }
 }
 
 /// An event emitted by a module during execution.
@@ -584,6 +639,9 @@ impl Executor {
         let state_root = self.state_root_at(height);
         let module_roots: Vec<(&'static str, Hash)> =
             self.modules.iter().flatten().map(|m| (m.name(), m.state_root())).collect();
+        // Export full KV state for each module that supports it.
+        let module_state: Vec<Option<storage::Snapshot>> =
+            self.modules.iter().flatten().map(|m| m.export_state()).collect();
         // Debug: verify the state root matches the recomputed aggregate.
         // This is a sanity check for the snapshot's internal consistency.
         let mut root_data = Vec::new();
@@ -599,7 +657,7 @@ impl Executor {
         } else {
             state_root
         };
-        ExecutorSnapshot { height, state_root, module_roots }
+        ExecutorSnapshot { height, state_root, module_roots, module_state }
     }
 
     /// Import a snapshot, restoring the executor to the snapshot's
@@ -627,10 +685,9 @@ impl Executor {
     /// This method does NOT restore individual module key-value
     /// state — it only restores the chain height and state root
     /// metadata. Full state restoration requires each module to
-    /// implement its own snapshot import. This is the v0 snapshot
-    /// sync: it verifies that the snapshot is consistent and sets
-    /// the chain height so consensus can resume from the correct
-    /// position. Full key-value state sync is Phase 3.
+    /// implement its own snapshot import. When `module_state` is
+    /// populated in the snapshot, this method calls each module's
+    /// `import_state` to restore the full key-value state.
     pub fn import_snapshot(&self, snapshot: &ExecutorSnapshot) -> Result<(), SnapshotImportError> {
         // A snapshot at height 0 is valid — it represents the genesis
         // state after the first (empty) block. We only reject if there
@@ -667,13 +724,24 @@ impl Executor {
             });
         }
 
+        // If the snapshot includes full KV state, import it into
+        // each module that supports `import_state`. This restores
+        // the complete key-value state, not just the roots.
+        if !snapshot.module_state.is_empty() {
+            for (module, state) in self.modules.iter().flatten().zip(&snapshot.module_state) {
+                if let Some(state) = state {
+                    module
+                        .import_state(state)
+                        .map_err(|_| SnapshotImportError::StateImportFailed)?;
+                }
+            }
+        }
+
         // Import: set the chain height and state root. The local
-        // modules' key-value state is NOT restored — this is the v0
-        // snapshot sync (metadata only). Full key-value state sync
-        // requires each module to implement its own snapshot import
-        // (Phase 3). For now, we set the chain height so consensus
-        // can resume from the correct position, and we store the
-        // trusted state root for attestation.
+        // modules' key-value state is restored above (if the snapshot
+        // included it). We set the chain height so consensus can
+        // resume from the correct position, and we store the trusted
+        // state root for attestation.
         self.state_roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

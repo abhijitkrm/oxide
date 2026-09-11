@@ -384,6 +384,31 @@ impl TcpMultiNodeDevnet {
         self.n
     }
 
+    /// Access the engines (mutable) — for Byzantine injection.
+    pub(crate) fn engines_mut(&mut self) -> &mut [OxideBft] {
+        &mut self.engines
+    }
+
+    /// Access the engines (immutable) — for Byzantine inspection.
+    pub(crate) fn engines(&self) -> &[OxideBft] {
+        &self.engines
+    }
+
+    /// Access the transports (mutable) — for Byzantine message injection.
+    pub(crate) fn transports_mut(&mut self) -> &mut [p2p::tcp::TcpTransport] {
+        &mut self.transports
+    }
+
+    /// Access the secret keys — for Byzantine vote signing.
+    pub(crate) fn secret_keys(&self) -> &[crypto::BlsSecretKey] {
+        &self.secret_keys
+    }
+
+    /// Access the apps (immutable) — for state root inspection.
+    pub(crate) fn apps(&self) -> &[Arc<Executor>] {
+        &self.apps
+    }
+
     /// Access the executor for validator `i`.
     ///
     /// # Panics
