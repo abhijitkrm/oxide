@@ -37,8 +37,35 @@ use std::thread;
 use std::time::Duration;
 
 use node::{ConsensusConfig, Node, NodeConfig};
+use ports::transport::Transport;
 use ports::{AppInterface, ConsensusEngine};
 use types::{MempoolAck, TxBytes};
+
+// Codec traits for encoding/decoding consensus messages.
+use codec::{Decode, Encode};
+
+// ── Devnet message tags ───────────────────────────────────────────
+// One-byte type tags for the devnet's TCP message framing. The
+// first byte of each message identifies the payload type.
+const MSG_PROPOSAL: u8 = 0x00;
+const MSG_VOTE: u8 = 0x01;
+const MSG_QC: u8 = 0x02;
+
+/// Build the BLS vote signing message: `view` || `phase` || `block_hash` || `epoch`.
+/// This must match the consensus engine's `vote_signing_message`.
+fn vote_signing_message(
+    view: primitives::View,
+    phase: types::VotePhase,
+    block_hash: &primitives::Hash,
+    epoch: primitives::Epoch,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(49);
+    msg.extend_from_slice(&view.value().to_le_bytes());
+    msg.push(phase as u8);
+    msg.extend_from_slice(block_hash.as_bytes());
+    msg.extend_from_slice(&epoch.value().to_le_bytes());
+    msg
+}
 
 mod driver;
 
@@ -250,16 +277,26 @@ fn run_single_node() {
 /// - `--devnet-node <i>`: this node's index (0-based).
 /// - `--num-nodes <N>`: total number of validator nodes.
 /// - `--base-port <port>`: base TCP port. Node `i` listens on
-///   `127.0.0.1:{base_port + i}`.
+///   `{bind_host}:{base_port + i}`.
+/// - `--bind-host <host>`: host to bind on (default `127.0.0.1`).
+/// - `--peer-host <host>`: host to connect to peers on (default
+///   `127.0.0.1`). For Docker, use the container service name or
+///   the peer's IP address.
+/// - `--peer-host-template <fmt>`: template for peer addresses,
+///   where `{i}` is replaced with the peer index (e.g.
+///   `validator-{i}`). Overrides `--peer-host`.
 fn run_devnet_node(node_index_str: &str) {
     let node_index: usize =
         node_index_str.parse().unwrap_or_else(|e| panic!("invalid --devnet-node index: {e}"));
     let num_nodes: usize = parse_cli_flag("--num-nodes").and_then(|s| s.parse().ok()).unwrap_or(4);
     let base_port: u16 =
         parse_cli_flag("--base-port").and_then(|s| s.parse().ok()).unwrap_or(22000);
+    let bind_host = parse_cli_flag("--bind-host").unwrap_or_else(|| "127.0.0.1".to_string());
+    let peer_host_template =
+        parse_cli_flag("--peer-host-template").or_else(|| parse_cli_flag("--peer-host"));
 
     println!(
-        "oxide-validator[{node_index}]: devnet node mode — index={node_index}, num_nodes={num_nodes}, base_port={base_port}"
+        "oxide-validator[{node_index}]: devnet node mode — index={node_index}, num_nodes={num_nodes}, base_port={base_port}, bind_host={bind_host}"
     );
 
     // Generate BLS keys for all nodes (deterministic, same as
@@ -274,14 +311,18 @@ fn run_devnet_node(node_index_str: &str) {
 
     let our_key = secret_keys[node_index].clone();
     let listen_port = base_port + u16::try_from(node_index).expect("port fits in u16");
-    let listen_addr = format!("127.0.0.1:{listen_port}");
+    let listen_addr = format!("{bind_host}:{listen_port}");
 
     // Build peer list: all other nodes.
     let peers: Vec<(Vec<u8>, String)> = (0..num_nodes)
         .filter(|&i| i != node_index)
         .map(|i| {
             let port = base_port + u16::try_from(i).expect("port fits in u16");
-            (vec![u8::try_from(i).expect("peer id fits in u8")], format!("127.0.0.1:{port}"))
+            let host = match &peer_host_template {
+                Some(tmpl) => tmpl.replace("{i}", &i.to_string()),
+                None => "127.0.0.1".to_string(),
+            };
+            (vec![u8::try_from(i).expect("peer id fits in u8")], format!("{host}:{port}"))
         })
         .collect();
 
@@ -301,7 +342,7 @@ fn run_devnet_node(node_index_str: &str) {
 
     // Create the TCP transport. Keep it alive for the lifetime of
     // the node — the transport runs background threads.
-    let _transport = p2p::tcp::TcpTransport::new(
+    let mut transport = p2p::tcp::TcpTransport::new(
         &listen_addr,
         vec![u8::try_from(node_index).expect("peer id fits in u8")],
         peers,
@@ -311,12 +352,13 @@ fn run_devnet_node(node_index_str: &str) {
     thread::sleep(Duration::from_millis(500));
 
     // Create the consensus engine.
+    let validator_set_clone = validator_set.clone();
     let mut engine = consensus::OxideBft::with_index(
         app_dyn,
         validator_set,
         u16::try_from(node_index).expect("index fits in u16"),
     )
-    .with_secret_key(our_key);
+    .with_secret_key(our_key.clone());
 
     println!("oxide-validator[{node_index}]: consensus engine started, waiting for blocks...");
 
@@ -326,20 +368,200 @@ fn run_devnet_node(node_index_str: &str) {
     let tx = build_tx(framework::module_id::BANK, &module_payload);
     engine.submit_tx(tx);
 
-    // Run the engine until idle, then report the finalized height.
-    engine.run_until_idle();
+    // Note: we do NOT call `run_until_idle()` here — that would
+    // consume the proposal before the consensus loop can broadcast
+    // it to peers. The loop handles proposal, voting, and QC
+    // formation with proper network I/O.
     let height = engine.finalized_height();
     println!("oxide-validator[{node_index}]: finalized height = {height:?}");
 
     // Keep running until killed (in a real node, this would be the
     // main event loop).
     println!("oxide-validator[{node_index}]: node running (press Ctrl+C to stop)");
+
+    // Run the consensus message pump loop.
+    run_consensus_loop(
+        &mut engine,
+        &mut transport,
+        &validator_set_clone,
+        &our_key,
+        node_index,
+        num_nodes,
+    );
+}
+
+/// The consensus message pump loop: proposes, votes, drains the
+/// transport, forms QCs, advances views, and syncs heights.
+///
+/// This is the distributed equivalent of the in-process devnet's
+/// `pipelined_tick`. Each iteration:
+/// 1. Leader proposes and broadcasts to followers.
+/// 2. Followers vote on pending proposals.
+/// 3. Drain inbound transport messages (proposals, votes, QCs).
+/// 4. Form QC if quorum reached, broadcast to peers.
+/// 5. Advance views and sync heights.
+#[allow(clippy::too_many_lines)]
+fn run_consensus_loop(
+    engine: &mut consensus::OxideBft,
+    transport: &mut p2p::tcp::TcpTransport,
+    validator_set: &consensus::ValidatorSet,
+    our_key: &crypto::BlsSecretKey,
+    node_index: usize,
+    num_nodes: usize,
+) {
+    // Track proposals received from the network. Followers vote on
+    // these proposals; the leader proposes locally.
+    let mut pending_proposals: Vec<(types::BlockHeader, types::Proposal)> = Vec::new();
+    let mut voted_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut proposed_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut last_reported_height: u64 = 0;
+    let mut iter_count: u64 = 0;
+
     loop {
-        thread::sleep(Duration::from_secs(1));
-        let height = engine.finalized_height();
-        if height.is_some() {
-            println!("oxide-validator[{node_index}]: height = {height:?}");
+        iter_count += 1;
+
+        // Phase 0: submit a keep-alive transaction every 50 iterations
+        // to ensure the mempool is never empty (the leader won't propose
+        // empty blocks without pending txs).
+        if iter_count % 50 == 1 {
+            let to = primitives::Address([2u8; 20]);
+            let module_payload = bank::msg::transfer(to, 100);
+            let tx = build_tx(framework::module_id::BANK, &module_payload);
+            engine.submit_tx(tx);
         }
+
+        // Phase 1: propose (if leader and haven't proposed this view).
+        let view = engine.current_view().value();
+        let leader_idx = usize::from(validator_set.leader(engine.current_view()));
+        if node_index == leader_idx && !proposed_views.contains(&view) {
+            if view > 0 && engine.high_qc().is_none() {
+                // Need the previous QC before proposing.
+            } else if let Some((header, proposal)) = engine.propose() {
+                let block_hash = consensus::OxideBft::block_hash(&header);
+                let proposal_view = header.view.value();
+                proposed_views.insert(proposal_view);
+                pending_proposals.push((header.clone(), proposal.clone()));
+                // Leader self-votes directly (no network).
+                let msg = vote_signing_message(
+                    header.view,
+                    types::VotePhase::Prepare,
+                    &block_hash,
+                    engine.epoch(),
+                );
+                let sig = our_key.sign(crypto::hash::Domain::Vote, &msg);
+                let leader_vote = types::Vote {
+                    view: header.view,
+                    phase: types::VotePhase::Prepare,
+                    block_hash,
+                    signature: sig,
+                };
+                let _ = engine.collect_vote(u16::try_from(node_index).unwrap(), leader_vote);
+                voted_views.insert(proposal_view);
+                // Broadcast proposal to followers.
+                let mut buf = Vec::with_capacity(1 + 512);
+                buf.push(MSG_PROPOSAL);
+                header.encode(&mut buf);
+                proposal.encode(&mut buf);
+                for i in 0..num_nodes {
+                    if i != node_index {
+                        let _ = transport.send(&vec![u8::try_from(i).unwrap()], &buf);
+                    }
+                }
+            }
+        }
+
+        // Phase 2: vote on pending proposals (followers).
+        for (header, proposal) in &pending_proposals {
+            let proposal_view = header.view.value();
+            if voted_views.contains(&proposal_view) {
+                continue;
+            }
+            let leader = usize::from(validator_set.leader(header.view));
+            if node_index == leader {
+                continue; // Leader already self-voted.
+            }
+            if let Some(vote) = engine.vote(header, proposal) {
+                let mut buf = Vec::with_capacity(1 + 137);
+                buf.push(MSG_VOTE);
+                vote.encode(&mut buf);
+                let _ = transport.send(&vec![u8::try_from(leader).unwrap()], &buf);
+                voted_views.insert(proposal_view);
+            }
+        }
+
+        // Phase 3: drain inbound transport messages.
+        while let Some(msg) = transport.recv() {
+            if msg.bytes.is_empty() {
+                continue;
+            }
+            let tag = msg.bytes[0];
+            let mut reader = codec::Reader::new(&msg.bytes[1..]);
+            match tag {
+                MSG_PROPOSAL => {
+                    if let (Ok(header), Ok(proposal)) = (
+                        types::BlockHeader::decode(&mut reader),
+                        types::Proposal::decode(&mut reader),
+                    ) {
+                        pending_proposals.push((header, proposal));
+                    }
+                }
+                MSG_VOTE => {
+                    if let Ok(vote) = types::Vote::decode(&mut reader) {
+                        let voter_idx = u16::from(msg.from[0]);
+                        let _ = engine.collect_vote(voter_idx, vote);
+                    }
+                }
+                MSG_QC => {
+                    if let Ok(qc) = types::QuorumCertificate::decode(&mut reader) {
+                        let _ = engine.deliver_qc(qc);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Phase 4: form QC (if quorum reached).
+        if let Some(qc) = engine.try_form_qc() {
+            let mut qc_buf = Vec::with_capacity(1 + 150);
+            qc_buf.push(MSG_QC);
+            qc.encode(&mut qc_buf);
+            for i in 0..num_nodes {
+                if i != node_index {
+                    let _ = transport.send(&vec![u8::try_from(i).unwrap()], &qc_buf);
+                }
+            }
+            let _ = engine.deliver_qc(qc);
+        }
+
+        // Phase 5: advance views.
+        if let Some(hqc) = engine.high_qc() {
+            if hqc.view == engine.current_view() {
+                engine.advance_view();
+            }
+        }
+
+        // Phase 6: sync heights.
+        let max_height = engine.next_height_value();
+        engine.sync_next_height(max_height);
+
+        // Report finalized height changes.
+        let height = engine.finalized_height();
+        if let Some(h) = height {
+            let h_val = h.value();
+            if h_val > last_reported_height {
+                println!("oxide-validator[{node_index}]: finalized height = {h_val}");
+                last_reported_height = h_val;
+            }
+        }
+
+        // Compact pending proposals (keep last 10 views).
+        let current_view = engine.current_view().value();
+        pending_proposals.retain(|(h, _)| h.view.value() >= current_view.saturating_sub(10));
+        voted_views.retain(|v| *v >= current_view.saturating_sub(10));
+        proposed_views.retain(|v| *v >= current_view.saturating_sub(10));
+
+        // Small sleep to avoid busy-looping.
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -460,6 +682,9 @@ fn print_help() {
     println!("    --devnet-node <i>         Devnet node index (multi-process mode)");
     println!("    --num-nodes <N>           Total devnet nodes");
     println!("    --base-port <port>        Base TCP port for devnet");
+    println!("    --bind-host <host>        Host to bind on (default 127.0.0.1)");
+    println!("    --peer-host <host>        Peer host (default 127.0.0.1)");
+    println!("    --peer-host-template <f>  Peer host template with {{i}} (e.g. validator-{{i}})");
     println!();
     println!("EXAMPLES:");
     println!("    oxide-validator init --chain-id 1");

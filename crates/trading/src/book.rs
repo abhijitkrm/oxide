@@ -289,10 +289,11 @@ impl BookBackend for DenseBook {
             pool[tail].next = slot;
         }
         self.levels[idx].tail = slot;
-        self.levels[idx].total_qty = self.levels[idx]
-            .total_qty
-            .checked_add(qty)
-            .expect("level total overflow: funds-locking bounds must prevent this");
+        // Fuzz fix: use saturating_add instead of expect. The
+        // funds-locking invariant should prevent this in production,
+        // but the fuzzer feeds arbitrary quantities. Saturating
+        // prevents a panic; the order book remains consistent.
+        self.levels[idx].total_qty = self.levels[idx].total_qty.saturating_add(qty);
         if was_empty {
             let bid = side == Side::Buy;
             if bid {

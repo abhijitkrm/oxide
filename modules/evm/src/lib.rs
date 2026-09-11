@@ -996,8 +996,12 @@ impl EvmModule {
         // - EIP-1559: `max_fee_per_gas` is the cap; `max_priority_fee_per_gas`
         //   is the tip. revm uses these with the block's base fee to
         //   compute the effective gas price.
-        let gas_price = signed.max_fee_per_gas().to::<u128>();
-        let priority_fee = signed.max_priority_fee_per_gas().to::<u128>();
+        // Fuzz fix: U256::to::<u128>() panics if the value doesn't fit
+        // in u128. Use try_into and reject oversized values.
+        let gas_price =
+            u128::try_from(signed.max_fee_per_gas()).map_err(|_| ExecError::Malformed)?;
+        let priority_fee =
+            u128::try_from(signed.max_priority_fee_per_gas()).map_err(|_| ExecError::Malformed)?;
         let tx = TxEnv::builder()
             .gas_limit(signed.gas_limit())
             .caller(caller)
@@ -2310,9 +2314,11 @@ impl Module for EvmModule {
         //    gas_cost = gas_limit * max_fee_per_gas (the worst-case
         //    fee the sender could pay). For legacy txs, gas_price is
         //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
-        let max_fee = signed.max_fee_per_gas().to::<u128>();
+        let max_fee = u128::try_from(signed.max_fee_per_gas())
+            .map_err(|_| ExecError::ModuleRejected("max_fee overflow u128".to_string()))?;
         let balance = self.balance(&sender_addr);
-        let value = signed.value().to::<u128>();
+        let value = u128::try_from(signed.value())
+            .map_err(|_| ExecError::ModuleRejected("value overflow u128".to_string()))?;
         // gas_cost = gas_limit * max_fee, checked for overflow.
         let gas_cost = u128::from(gas_limit)
             .checked_mul(max_fee)

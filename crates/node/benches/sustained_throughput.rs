@@ -85,5 +85,81 @@ fn bench_executor_bank_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_executor_bank_throughput);
+criterion_group!(benches, bench_executor_bank_throughput, bench_sustained_pipeline);
 criterion_main!(benches);
+
+/// Benchmark: sustained multi-block pipeline throughput.
+///
+/// Measures the full pipeline: mempool intake → block proposal →
+/// consensus finalize → executor apply, sustained across many
+/// blocks. This is the "real TPS" number — not the single-block
+/// executor ceiling.
+///
+/// ## What this tells us
+///
+/// The single-block bench (`executor_bank_throughput`) isolates the
+/// executor. This bench adds the consensus + finalization overhead
+/// per block. The gap between the two reveals how much overhead
+/// consensus adds per block.
+///
+/// ## Methodology
+///
+/// 1. Assemble a node with `SequencerEngine` (no voting overhead —
+///    we're measuring the pipeline, not BFT rounds).
+/// 2. Submit `txs_per_block` txs, run to idle (one block finalizes).
+/// 3. Repeat for `num_blocks` blocks.
+/// 4. Measure total wall time and compute sustained txs/s.
+///
+/// ## Gate
+///
+/// The sustained pipeline must achieve >= 5,000 txs/s across 100
+/// blocks of 100 txs each (release profile). This is lower than the
+/// single-block gate because per-block overhead (proposal, state
+/// root, finalization) is amortized over fewer txs.
+fn bench_sustained_pipeline(c: &mut Criterion) {
+    let configs: &[(usize, usize)] = &[
+        (100, 10),  // 100 txs/block, 10 blocks
+        (100, 100), // 100 txs/block, 100 blocks
+        (500, 20),  // 500 txs/block, 20 blocks
+        (1000, 10), // 1000 txs/block, 10 blocks
+    ];
+
+    let mut group = c.benchmark_group("sustained_pipeline");
+    group.sample_size(10); // fewer samples — each iteration is expensive
+
+    for &(txs_per_block, num_blocks) in configs {
+        let label = format!("{txs_per_block}tx_{num_blocks}blk");
+        let total_txs = txs_per_block * num_blocks;
+        group.throughput(Throughput::Elements(total_txs as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(&label),
+            &(txs_per_block, num_blocks),
+            |b, &(tpb, nb)| {
+                b.iter(|| {
+                    let config = NodeConfig {
+                        consensus: ConsensusConfig::Sequencer,
+                        max_mempool_entries: tpb + 100,
+                        parallel_threshold: 32,
+                        evm_persistence: false, // disable disk I/O for pure pipeline measurement
+                        storage_path: None,
+                    };
+                    let mut node = Node::assemble(&config);
+
+                    let mut nonce = 0u64;
+                    for _ in 0..nb {
+                        for _ in 0..tpb {
+                            node.engine().submit_tx(build_bank_tx(nonce));
+                            nonce += 1;
+                        }
+                        node.engine().run_until_idle();
+                    }
+
+                    // Verify all blocks were finalized.
+                    let height = node.engine().finalized_height();
+                    assert!(height.is_some(), "blocks should be finalized");
+                });
+            },
+        );
+    }
+    group.finish();
+}

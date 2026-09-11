@@ -537,7 +537,7 @@ impl SignedTx {
 
     /// The signing hash: keccak256 of the RLP-encoded unsigned tx
     /// (without the signature). This is what the signer signs.
-    fn signing_hash(&self) -> [u8; 32] {
+    pub fn signing_hash(&self) -> [u8; 32] {
         let encoded = self.encode_unsigned();
         crypto::secp::keccak256(&encoded)
     }
@@ -762,13 +762,20 @@ impl Decodable for SignedTx {
     }
 }
 
+/// Fuzz fix: safely convert U256 to u64, returning an RLP error on
+/// overflow instead of panicking. `U256::to::<u64>()` panics if the
+/// value doesn't fit in u64.
+fn u256_to_u64(v: U256) -> alloy_rlp::Result<u64> {
+    u64::try_from(v).map_err(|_| alloy_rlp::Error::Custom("u256 overflow u64"))
+}
+
 impl SignedTx {
     /// Decode a `y_parity` value (0 or 1) from RLP-encoded U256.
     fn decode_recid(buf: &mut &[u8]) -> alloy_rlp::Result<secp::RecoveryId> {
         let yp = decode_u256(buf)?;
+        let yp_u64 = u256_to_u64(yp)?;
         secp::RecoveryId::try_from_u8(
-            u8::try_from(yp.to::<u64>())
-                .map_err(|_| alloy_rlp::Error::Custom("invalid y_parity"))?,
+            u8::try_from(yp_u64).map_err(|_| alloy_rlp::Error::Custom("invalid y_parity"))?,
         )
         .map_err(|_| alloy_rlp::Error::Custom("invalid recovery id"))
     }
@@ -794,12 +801,12 @@ impl SignedTx {
         Ok(Self::Eip2930(
             TxEip2930 {
                 fields: TxFields {
-                    nonce: nonce.to(),
-                    gas_limit: gas_limit.to(),
+                    nonce: u256_to_u64(nonce)?,
+                    gas_limit: u256_to_u64(gas_limit)?,
                     to,
                     value,
                     data,
-                    chain_id: chain_id.to(),
+                    chain_id: u256_to_u64(chain_id)?,
                 },
                 gas_price,
                 access_list,
@@ -830,12 +837,12 @@ impl SignedTx {
         Ok(Self::Eip1559(
             TxEip1559 {
                 fields: TxFields {
-                    nonce: nonce.to(),
-                    gas_limit: gas_limit.to(),
+                    nonce: u256_to_u64(nonce)?,
+                    gas_limit: u256_to_u64(gas_limit)?,
                     to,
                     value,
                     data,
-                    chain_id: chain_id.to(),
+                    chain_id: u256_to_u64(chain_id)?,
                 },
                 max_priority_fee_per_gas: max_priority_fee,
                 max_fee_per_gas: max_fee,
@@ -861,7 +868,9 @@ impl SignedTx {
         let r = decode_u256(buf)?;
         let s = decode_u256(buf)?;
         // Decode v: pre-EIP-155 (27/28) or EIP-155 (35 + 2*chain_id + recid).
-        let v_u64: u64 = v.to();
+        // Fuzz fix: U256::to::<u64>() panics if the value doesn't fit
+        // in u64. Use the safe helper.
+        let v_u64: u64 = u256_to_u64(v)?;
         let (chain_id, recid) = if v_u64 == 27 || v_u64 == 28 {
             (0, v_u64 - 27)
         } else if v_u64 >= 35 {
@@ -878,8 +887,8 @@ impl SignedTx {
         Ok(Self::Legacy(
             TxLegacy {
                 fields: TxFields {
-                    nonce: nonce.to(),
-                    gas_limit: gas_limit.to(),
+                    nonce: u256_to_u64(nonce)?,
+                    gas_limit: u256_to_u64(gas_limit)?,
                     to,
                     value,
                     data,

@@ -60,6 +60,23 @@ const MSG_VOTE: u8 = 0x01;
 /// Message type tag: QC.
 const MSG_QC: u8 = 0x02;
 
+/// Build the BLS vote signing message: `(view, phase, block_hash,
+/// epoch)`. This must match the format used by
+/// `OxideBft::vote_signing_message` (C3 fix).
+fn vote_signing_message(
+    view: primitives::View,
+    phase: types::VotePhase,
+    block_hash: &primitives::Hash,
+    epoch: primitives::Epoch,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(49);
+    msg.extend_from_slice(&view.value().to_le_bytes());
+    msg.push(phase as u8);
+    msg.extend_from_slice(block_hash.as_bytes());
+    msg.extend_from_slice(&epoch.value().to_le_bytes());
+    msg
+}
+
 /// A TCP-based multi-node devnet: N validators running oxideBFT with
 /// real TCP transport.
 pub struct TcpMultiNodeDevnet {
@@ -762,8 +779,13 @@ impl TcpMultiNodeDevnet {
                 if i == leader_idx {
                     // Leader self-votes directly (no network).
                     let block_hash = OxideBft::block_hash(header);
-                    let sig =
-                        self.secret_keys[i].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+                    let msg = vote_signing_message(
+                        header.view,
+                        types::VotePhase::Prepare,
+                        &block_hash,
+                        engine.epoch(),
+                    );
+                    let sig = self.secret_keys[i].sign(crypto::hash::Domain::Vote, &msg);
                     let leader_vote = types::Vote {
                         view: header.view,
                         phase: types::VotePhase::Prepare,
@@ -852,6 +874,7 @@ impl TcpMultiNodeDevnet {
     }
 
     /// Run one consensus round with messages routed through TCP.
+    #[allow(clippy::too_many_lines)]
     fn run_round_tcp(&mut self) {
         let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
 
@@ -871,8 +894,13 @@ impl TcpMultiNodeDevnet {
         let block_hash = OxideBft::block_hash(&header);
 
         // Leader self-votes (direct — no network self-send).
-        let leader_sig =
-            self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        let leader_msg = vote_signing_message(
+            header.view,
+            types::VotePhase::Prepare,
+            &block_hash,
+            self.engines[leader_idx].epoch(),
+        );
+        let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
         let leader_vote = types::Vote {
             view: header.view,
             phase: types::VotePhase::Prepare,

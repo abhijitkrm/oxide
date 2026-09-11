@@ -1,0 +1,10 @@
+# Docker build context — exclude build artifacts and large
+# directories that aren't needed for the Docker image.
+target/
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/
+.git/
+docs/
+*.md
+plan.md

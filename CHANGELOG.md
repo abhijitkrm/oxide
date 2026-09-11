@@ -2287,3 +2287,49 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   poisoning recovery (§8), protocol stability rules (§9), and risk &
   rate limiting invariants (§10). `performance-first` skill now
   documents matcher hot-path and RPC cold-path invariants.
+
+### Added (2026-09-11)
+
+- **Docker multi-host testnet — 4-container oxideBFT consensus with
+  induced latency** (`Dockerfile`, `docker-compose.yml`,
+  `scripts/inject-latency.sh`, `bin/oxide-validator/src/main.rs`,
+  `crates/consensus/src/engine.rs`)
+  - 4 validator containers on a shared Docker bridge network
+    (`10.0.0.0/24`), each with a static IP and `tc netem` applied
+    for 20ms latency + 2ms jitter.
+  - Distributed consensus loop in the validator binary: proposes,
+    broadcasts proposals, votes, drains inbound transport, forms
+    QCs, broadcasts QCs, advances views, and reports finalized
+    heights — all over TCP between separate processes.
+  - All 4 validators finalized blocks 1–203+ with no stalls or
+    divergence. Sustained throughput ~2.25 blocks/sec under 20ms RTT.
+  - **In plain words:** the blockchain now runs across 4 separate
+    Docker containers that talk to each other over a network with
+    realistic latency. They agree on blocks, form quorum
+    certificates, and finalize blocks together — proving the
+    consensus engine works in a real distributed setting, not just
+    in a single process.
+
+### Fixed (2026-09-11)
+
+- **Stale vote pollution in oxideBFT consensus**: `collect_vote()`
+  accepted votes for any view, and `advance_view()` didn't clear
+  the vote buffer. Late-arriving votes from old views polluted the
+  new view's quorum accounting, causing `ConflictingVote` errors
+  and stalling consensus at view=5. Fixed by rejecting stale votes
+  (`vote.view < current_view`) in `collect_vote()` and clearing
+  the vote buffer in `advance_view()`.
+
+### Benchmark Results (2026-09-11, M2 MacBook Pro, release)
+
+- **Executor single-block throughput**: 662K tx/s at 1000 txs/block
+  (gate: ≥10K tx/s — PASS, 66× above).
+- **Sustained pipeline throughput**: 463K tx/s at 100tx×100blk
+  (gate: ≥5K tx/s — PASS, 93× above).
+- Executor is NOT the bottleneck: throughput is flat at ~660K tx/s
+  across block sizes 100–2000.
+- **In plain words:** the blockchain's transaction processor can
+  handle 660,000 simple transfers per second in a single block, and
+  sustains 463,000 per second across 100 consecutive blocks. Both
+  numbers are far above the targets, confirming the executor is not
+  the performance bottleneck.

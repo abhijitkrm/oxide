@@ -29,6 +29,7 @@ p2p = { workspace = true }
 oxide-core = { workspace = true }
 staking = { workspace = true }
 rpc = { workspace = true }
+codec = { workspace = true }
 tokio = { workspace = true }
 metrics = { workspace = true }
 toml = "0.8"

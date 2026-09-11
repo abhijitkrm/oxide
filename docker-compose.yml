@@ -1,0 +1,133 @@
+# Oxide 4-validator Docker testnet with induced latency.
+#
+# This compose file launches 4 validator containers, each running
+# oxide-validator in devnet-node mode. The containers are on a
+# shared Docker network and communicate over TCP. The
+# inject-latency.sh entrypoint applies `tc netem` to add 20ms RTT
+# between nodes, simulating WAN conditions.
+#
+# Usage:
+#   docker compose up --abort-on-container-exit
+#   docker compose logs -f
+#   docker compose down
+#
+# To run without latency:
+#   LATENCY_MS=0 docker compose up
+#
+# The testnet runs until interrupted (Ctrl+C) or a container exits.
+
+services:
+  validator-0:
+    build: .
+    container_name: oxide-validator-0
+    command:
+      - "--devnet-node"
+      - "0"
+      - "--num-nodes"
+      - "4"
+      - "--base-port"
+      - "22000"
+      - "--bind-host"
+      - "0.0.0.0"
+      - "--peer-host-template"
+      - "10.0.0.1{i}"
+    networks:
+      oxidetestnet:
+        ipv4_address: 10.0.0.10
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - RUST_LOG=info
+      - LATENCY_MS=20
+      - JITTER_MS=2
+    volumes:
+      - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+    entrypoint: ["/bin/bash", "/inject-latency.sh"]
+
+  validator-1:
+    build: .
+    container_name: oxide-validator-1
+    command:
+      - "--devnet-node"
+      - "1"
+      - "--num-nodes"
+      - "4"
+      - "--base-port"
+      - "22000"
+      - "--bind-host"
+      - "0.0.0.0"
+      - "--peer-host-template"
+      - "10.0.0.1{i}"
+    networks:
+      oxidetestnet:
+        ipv4_address: 10.0.0.11
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - RUST_LOG=info
+      - LATENCY_MS=20
+      - JITTER_MS=2
+    volumes:
+      - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+    entrypoint: ["/bin/bash", "/inject-latency.sh"]
+
+  validator-2:
+    build: .
+    container_name: oxide-validator-2
+    command:
+      - "--devnet-node"
+      - "2"
+      - "--num-nodes"
+      - "4"
+      - "--base-port"
+      - "22000"
+      - "--bind-host"
+      - "0.0.0.0"
+      - "--peer-host-template"
+      - "10.0.0.1{i}"
+    networks:
+      oxidetestnet:
+        ipv4_address: 10.0.0.12
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - RUST_LOG=info
+      - LATENCY_MS=20
+      - JITTER_MS=2
+    volumes:
+      - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+    entrypoint: ["/bin/bash", "/inject-latency.sh"]
+
+  validator-3:
+    build: .
+    container_name: oxide-validator-3
+    command:
+      - "--devnet-node"
+      - "3"
+      - "--num-nodes"
+      - "4"
+      - "--base-port"
+      - "22000"
+      - "--bind-host"
+      - "0.0.0.0"
+      - "--peer-host-template"
+      - "10.0.0.1{i}"
+    networks:
+      oxidetestnet:
+        ipv4_address: 10.0.0.13
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - RUST_LOG=info
+      - LATENCY_MS=20
+      - JITTER_MS=2
+    volumes:
+      - ./scripts/inject-latency.sh:/inject-latency.sh:ro
+    entrypoint: ["/bin/bash", "/inject-latency.sh"]
+
+networks:
+  oxidetestnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24

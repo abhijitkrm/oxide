@@ -351,8 +351,9 @@ impl Mempool {
                 if entry.nonce != *expected {
                     continue;
                 }
-                // Check byte budget.
-                if total_bytes + entry.size > max_bytes {
+                // Check byte budget. Use saturating_add to prevent
+                // overflow (M2 fix).
+                if total_bytes.saturating_add(entry.size) > max_bytes {
                     continue;
                 }
 
@@ -374,7 +375,7 @@ impl Mempool {
 
                     // Follow the chain: look up the next nonce for
                     // this sender in `by_sender`.
-                    let next_n = current_entry.nonce + 1;
+                    let next_n = current_entry.nonce.saturating_add(1); // M2 fix
                     let Some(queue) = self.by_sender.get(&current_entry.sender) else {
                         break;
                     };
@@ -384,7 +385,8 @@ impl Mempool {
                     let Some(next_entry) = self.by_hash.get(&next_hash) else {
                         break;
                     };
-                    if total_bytes + next_entry.size > max_bytes {
+                    if total_bytes.saturating_add(next_entry.size) > max_bytes {
+                        // M2 fix
                         break;
                     }
                     current_hash = next_hash;

@@ -30,6 +30,7 @@ storage = { workspace = true, features = ["redb"] }
 # tracing: structured diagnostic logging for node lifecycle events
 # (startup, shutdown, block finalization). Not on the hot path.
 tracing = { workspace = true }
+metrics.workspace = true
 
 [dev-dependencies]
 criterion = "0.7.0"

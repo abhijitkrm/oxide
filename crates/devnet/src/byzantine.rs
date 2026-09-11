@@ -187,9 +187,15 @@ impl ByzantineTcpDevnet {
     pub fn inject_invalid_vote(&mut self, byzantine_idx: usize, target_idx: usize) {
         use crypto::hash::Domain;
         let bad_block_hash = primitives::Hash([0xFF; 32]);
-        let sig =
-            self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, bad_block_hash.as_bytes());
         let view = self.inner.engines()[target_idx].current_view();
+        let epoch = self.inner.engines()[target_idx].epoch();
+        // C3 fix: sign with (view, phase, block_hash, epoch).
+        let mut msg = Vec::with_capacity(49);
+        msg.extend_from_slice(&view.value().to_le_bytes());
+        msg.push(VotePhase::Prepare as u8);
+        msg.extend_from_slice(bad_block_hash.as_bytes());
+        msg.extend_from_slice(&epoch.value().to_le_bytes());
+        let sig = self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, &msg);
         let vote =
             Vote { view, phase: VotePhase::Prepare, block_hash: bad_block_hash, signature: sig };
         let mut buf = Vec::with_capacity(1 + 137);
@@ -272,12 +278,22 @@ impl ByzantineTcpDevnet {
     pub fn inject_equivocation(&mut self, byzantine_idx: usize, target_idx: usize) {
         use crypto::hash::Domain;
         let view = self.inner.engines()[target_idx].current_view();
+        let epoch = self.inner.engines()[target_idx].epoch();
         let block_hash_1 = primitives::Hash([0x11; 32]);
         let block_hash_2 = primitives::Hash([0x22; 32]);
-        let sig_1 =
-            self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, block_hash_1.as_bytes());
-        let sig_2 =
-            self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, block_hash_2.as_bytes());
+        // C3 fix: sign with (view, phase, block_hash, epoch).
+        let mut msg1 = Vec::with_capacity(49);
+        msg1.extend_from_slice(&view.value().to_le_bytes());
+        msg1.push(VotePhase::Prepare as u8);
+        msg1.extend_from_slice(block_hash_1.as_bytes());
+        msg1.extend_from_slice(&epoch.value().to_le_bytes());
+        let mut msg2 = Vec::with_capacity(49);
+        msg2.extend_from_slice(&view.value().to_le_bytes());
+        msg2.push(VotePhase::Prepare as u8);
+        msg2.extend_from_slice(block_hash_2.as_bytes());
+        msg2.extend_from_slice(&epoch.value().to_le_bytes());
+        let sig_1 = self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, &msg1);
+        let sig_2 = self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, &msg2);
         let vote_1 =
             Vote { view, phase: VotePhase::Prepare, block_hash: block_hash_1, signature: sig_1 };
         let vote_2 =

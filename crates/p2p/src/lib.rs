@@ -53,6 +53,8 @@ pub mod tls;
 
 pub mod discovery;
 
+pub mod admission;
+
 pub mod rate_limit;
 
 pub mod sync;

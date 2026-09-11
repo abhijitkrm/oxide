@@ -23,6 +23,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Add swap space
+        # See ci.yml for rationale.
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
       - name: Run ignored throughput simulations
         # Feature-gated conformance tests (redb, RocksDB, MDBX) are
         # included so adapter regressions are caught nightly too
@@ -47,6 +54,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+      - name: Add swap space
+        # See ci.yml for rationale.
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Run fuzz targets (5 min each)

@@ -2577,6 +2577,7 @@ dependencies = [
  "exchange",
  "executor",
  "framework",
+ "metrics",
  "oxide-core",
  "perps",
  "ports",
@@ -2843,6 +2844,7 @@ name = "oxide-validator"
 version = "0.1.0"
 dependencies = [
  "bank",
+ "codec",
  "config",
  "consensus",
  "crypto",

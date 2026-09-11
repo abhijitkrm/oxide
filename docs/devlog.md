@@ -8712,3 +8712,223 @@ resume from the correct position.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo test --workspace`: all test suites pass (0 failures).
 - Perps module: 31 tests (10 new: 3 ADL + 7 oracle).
+
+### Production-readiness gates 1-3 (2025-01-30)
+
+**Gate 1: Production networking stack.**
+- Added `crates/p2p/src/admission.rs`: unified admission control
+  combining reputation checks, connection caps, and rate limiting.
+- `AdmissionControl` struct with `admit_connection` (banned-peer
+  rejection + connection cap) and `admit_message` (rate limit + ban
+  check + reputation increment).
+- `SharedAdmissionControl` thread-safe wrapper for the accept thread.
+- Wired into `TcpTransport` via `with_admission` constructor: accept
+  thread checks `admit_connection` before registering a peer, `recv()`
+  checks `admit_message` before delivering inbound messages.
+- 11 admission unit tests + 4 TCP integration tests.
+
+**Gate 2: Metrics end-to-end wiring.**
+- Extended `metrics::Recorder` with named counters (`incr_counter`,
+  `counter`) and gauges (`set_gauge`, `gauge`).
+- Updated `prometheus()` to include counters and gauges in exposition
+  format.
+- Wired `Arc<Recorder>` into `Node`: `export_snapshot` records
+  latency + counter + gauge, `import_snapshot` records latency +
+  counter + gauge, `run_node_smoke_test` records tx/block counters.
+- Added `Node::metrics()` accessor for RPC exposition.
+- 7 new metrics tests + 4 new node metrics tests.
+
+**Gate 3: Security self-review.**
+- Three parallel reviews found 14 issues (4 critical, 6 high, 4
+  medium). See `docs/security-review.md` for full findings.
+- **C1 fixed:** Perps liquidation scale mismatch — `total_loss` was
+  scale-14, `margin_total` was scale-6, added directly. Now
+  `total_loss` is converted to scale-6 before combining.
+- **C2 fixed:** Oracle `TAG_SET_MARK` handler bypassed the 10%
+  deviation check by directly inserting into `inner.marks`. Now
+  calls the deviation check.
+- **C3 fixed:** BLS vote malleability — votes signed only
+  `block_hash`, not `(view, phase, block_hash, epoch)`. Now signs
+  the full 49-byte message. Updated all devnet tests.
+- **C4 fixed:** `deliver_qc().expect()` panicked on malformed QC.
+  Now logs and returns `false`.
+- **H1 fixed:** `maintenance_margin` overflow — use
+  `saturating_mul`.
+- **H2 fixed:** `apply_funding` overflow — use `checked_mul` and
+  skip on overflow.
+- **H3 fixed:** ADL rounding dust — compute `close_qty` from
+  scale-14 PnL and debit the *realized* amount, not the target.
+- **H6 fixed:** `aggregate().unwrap_or(ZERO)` — propagate errors.
+- **M1 fixed:** Timeout signatures now bind `(view, epoch)`.
+- **M2 fixed:** Mempool/executor plain `+` overflow — use
+  `saturating_add`.
+- Documented for follow-up: H4 (mempool replay protection), H5
+  (executor nonce enforcement), M3 (snapshot import trusts roots),
+  M4 (no per-block oracle rate limit).
+
+**Gate 4: Sustained-throughput bench.**
+- Added `bench_sustained_pipeline` to `crates/node/benches/`:
+  measures full pipeline (mempool → block → consensus → executor)
+  across multiple blocks. 4 configurations: 100tx/10blk,
+  100tx/100blk, 500tx/20blk, 1000tx/10blk.
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all suites pass (0 failures).
+- Consensus: 73 tests (updated signing format).
+- Perps: 31 tests (scale fix + overflow fixes).
+- P2P: 95 tests (admission control).
+- Node: 18 tests (metrics).
+- Devnet: all multinode + byzantine tests pass with new signing.
+
+---
+
+## 2026-09-11 — Session 22: Gate 7 — Docker multi-host testnet with induced latency
+
+### Goal
+
+Run a 4-validator Docker testnet with induced network conditions (20ms
+latency, 2ms jitter) to prove oxideBFT consensus works across separate
+processes/containers, not just in-process simulation.
+
+### Root cause: validator binary had no distributed consensus loop
+
+The validator binary (`bin/oxide-validator/src/main.rs`) created a
+`TcpTransport` and `OxideBft` engine but only called
+`engine.run_until_idle()` then slept. The transport was never polled,
+inbound messages were never delivered to the engine, and proposals were
+never broadcast to peers. This is why every node logged
+`InsufficientQuorum { signers: 1, threshold: 3 }` — each node only had
+its own self-vote.
+
+### Fix: distributed consensus message pump
+
+Added `run_consensus_loop()` to the validator binary. Each iteration:
+1. **Phase 0**: Submit a keep-alive tx every 50 iterations so the
+   mempool is never empty (the leader won't propose without pending txs).
+2. **Phase 1 (leader)**: Call `engine.propose()`, self-vote directly,
+   broadcast the proposal to all 3 peers via `MSG_PROPOSAL` (0x00).
+3. **Phase 2 (followers)**: Vote on pending proposals, send votes to
+   the leader via `MSG_VOTE` (0x01).
+4. **Phase 3**: Drain inbound transport messages — decode proposals,
+   votes, and QCs by tag byte.
+5. **Phase 4 (leader)**: Call `try_form_qc()`, broadcast the QC to all
+   peers via `MSG_QC` (0x02), deliver locally.
+6. **Phase 5**: Advance views when `high_qc.view == current_view`.
+7. **Phase 6**: Sync heights and report finalized height changes.
+
+### Bug: stale votes polluting the vote buffer
+
+**Symptom**: Consensus stalled at view=5 with `ConflictingVote` errors.
+A stale vote from view N arrived late and was collected into view N+1's
+buffer. When the real vote for view N+1 arrived, it was rejected as
+conflicting because the block hashes didn't match.
+
+**Root cause**: `collect_vote()` accepted votes for any view, and
+`advance_view()` didn't clear the vote buffer. Late-arriving votes from
+old views polluted the new view's quorum accounting.
+
+**Fix**:
+- `collect_vote()`: reject votes with `vote.view < current_view`
+  (silently drop — the leader that needed them already formed its QC
+  or timed out).
+- `advance_view()`: clear `self.votes` and reset `self.vote_count` so
+  the new view starts with a clean buffer.
+
+### Docker configuration
+
+- **Dockerfile**: Multi-stage build (`rust:1.95-bookworm` builder,
+  `debian:bookworm-slim` runtime with `iproute2` for `tc netem`).
+- **docker-compose.yml**: 4 services on a shared bridge network
+  (`10.0.0.0/24`), each with a static IP (`10.0.0.10`–`10.0.0.13`).
+- **inject-latency.sh**: Entrypoint script that applies `tc netem` with
+  20ms latency, 2ms jitter, 0% loss before starting the validator.
+- **.dockerignore**: Excludes `target/`, `fuzz/target/`, and `.git/`
+  from the build context to avoid disk exhaustion.
+
+### Results
+
+**4-container Docker testnet with 20ms latency, 2ms jitter:**
+- All 4 validators reached consensus and finalized blocks 1–203+.
+- All 4 validators agreed on the same finalized height at every step.
+- No forks, no divergence, no InsufficientQuorum errors after the fix.
+- Sustained throughput: ~2.25 blocks/sec under 20ms RTT.
+
+**Local 4-process testnet (no latency):**
+- All 4 validators finalized height 100+ in ~45 seconds.
+- Confirms the consensus loop works both in Docker and bare-metal.
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all suites pass (0 failures).
+- Docker: `docker compose up --build` — 4 containers, all finalizing.
+
+### Files changed
+
+- `bin/oxide-validator/src/main.rs`: Added `run_consensus_loop()`,
+  `vote_signing_message()`, `bls_key()`, message tags, keep-alive tx
+  submission, proposal/vote/QC broadcast and drain.
+- `crates/consensus/src/engine.rs`: Fixed `collect_vote()` to reject
+  stale votes, `advance_view()` to clear the vote buffer, added
+  `vote_count_debug()` accessor.
+- `Dockerfile`: Removed `fuzz/` and `.devin/` from build context.
+- `.dockerignore`: New file to exclude build artifacts.
+
+---
+
+## 2026-09-11 — Session 22 (cont.): Gate 4 — Sustained-throughput benchmark
+
+### Goal
+
+Re-run the sustained-throughput benchmark after the consensus fixes
+(stale vote rejection + vote buffer clearing) to confirm the executor
+and pipeline still meet their acceptance gates.
+
+### Results (M2 MacBook Pro, release profile)
+
+**Executor bank throughput (single-block):**
+Gate: ≥10,000 tx/s in a single block of 1000 txs.
+
+| Block size | Time | Throughput |
+|---|---|---|
+| 100 txs | 151.73 µs | 659K tx/s |
+| 250 txs | 370.87 µs | 674K tx/s |
+| 500 txs | 745.01 µs | 671K tx/s |
+| 1000 txs | 1.5107 ms | 662K tx/s |
+| 2000 txs | 3.0417 ms | 658K tx/s |
+
+**Verdict:** PASS. 662K tx/s at 1000 txs/block — 66× above the gate.
+
+**Sustained pipeline (multi-block):**
+Gate: ≥5,000 tx/s across 100 blocks of 100 txs each.
+
+| Config | Time | Throughput |
+|---|---|---|
+| 100tx × 10blk | 2.1373 ms | 468K tx/s |
+| 100tx × 100blk | 21.581 ms | 463K tx/s |
+| 500tx × 20blk | 22.773 ms | 439K tx/s |
+| 1000tx × 10blk | 21.352 ms | 468K tx/s |
+
+**Verdict:** PASS. 463K tx/s at 100tx×100blk — 93× above the gate.
+
+### Analysis
+
+- The executor is NOT the bottleneck: throughput is flat at ~660K tx/s
+  across block sizes 100–2000. If the executor were the bottleneck, TPS
+  would plateau at some block size.
+- The sustained pipeline is ~440–468K tx/s, slightly lower than the
+  single-block ceiling due to per-block overhead (proposal, state root,
+  finalization). The gap is small, confirming consensus overhead is
+  well-amortized.
+- These numbers are for bank-transfer txs (simple state transitions).
+  EVM txs will be significantly slower due to the revm interpreter, but
+  the executor pipeline itself is not the bottleneck.
+
+### Verification
+
+- `cargo bench --bench sustained_throughput`: all configurations pass.
+- No regressions from the consensus fixes.

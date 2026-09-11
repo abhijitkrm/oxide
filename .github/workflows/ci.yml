@@ -23,6 +23,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Add swap space
+        # The ubuntu-latest runner has 7GB RAM but no swap. Linking
+        # heavy crates (revm, alloy, arkworks) can exhaust memory and
+        # cause `ld` to crash with SIGBUS. A 4GB swap file prevents
+        # this without slowing down the normal case.
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
       - name: Format
         run: cargo fmt --all --check
       - name: Lint

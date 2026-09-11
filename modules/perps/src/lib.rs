@@ -196,8 +196,11 @@ impl Position {
     /// Maintenance margin requirement at mark price:
     /// `notional * mmr / 10_000` (scale-14 → scale-14, since `mmr` is
     /// basis points over `10_000`).
+    ///
+    /// H1 fix: use `saturating_mul` to prevent `u128` overflow when
+    /// notional is near 2^127 and `mmr_rate` is up to 65535.
     fn maintenance_margin(&self, mark: u64, cfg: &PerpsMarketConfig) -> u128 {
-        (self.notional(mark) * mmr_rate(cfg)) / 10_000
+        self.notional(mark).saturating_mul(mmr_rate(cfg)) / 10_000
     }
 }
 
@@ -506,8 +509,19 @@ impl PerpsModule {
             // Funding amount = size * mark * rate / (PRICE_SCALE * 10_000).
             // If rate > 0, longs (size > 0) pay → funding > 0 → debit.
             // If rate > 0, shorts (size < 0) receive → funding < 0 → credit.
+            // H2 fix: use checked_mul to detect overflow in the triple
+            // product `size * mark * rate`. If it overflows i128,
+            // reject the funding application.
             let size = i128::from(pos.size);
-            let funding = size * i128::from(mark) * rate / scale;
+            let step1 = size.checked_mul(i128::from(mark));
+            let funding = match step1.and_then(|v| v.checked_mul(rate)) {
+                Some(v) => v / scale,
+                None => {
+                    // Overflow — skip this position rather than
+                    // producing a wrong funding amount.
+                    continue;
+                }
+            };
             let account = Self::account_mut(&mut inner, &addr);
             let pos_entry = account.positions.get_mut(&market).unwrap();
             if funding >= 0 {
@@ -562,7 +576,7 @@ impl PerpsModule {
 
         // Liquidate: close all positions at mark, realize losses.
         let mut events = Vec::new();
-        let mut total_loss: i128 = 0;
+        let mut total_loss_scale14: i128 = 0;
         let mut total_margin_recovered: u64 = 0;
 
         for (market, pos) in &acct.positions {
@@ -570,9 +584,9 @@ impl PerpsModule {
                 continue;
             }
             let mark = marks.get(market).copied().unwrap_or(pos.entry_price);
-            let pnl = pos.unrealized_pnl(mark);
-            total_loss += pnl;
-            total_margin_recovered += pos.isolated_margin;
+            let pnl = pos.unrealized_pnl(mark); // scale-14
+            total_loss_scale14 = total_loss_scale14.saturating_add(pnl);
+            total_margin_recovered = total_margin_recovered.saturating_add(pos.isolated_margin);
             events.push(Event {
                 module: "perps",
                 kind: "liquidated".to_string(),
@@ -580,12 +594,16 @@ impl PerpsModule {
             });
         }
 
-        // Realize: the account loses its margin, losses go to the
-        // insurance fund (or the fund covers the shortfall).
-        let margin_total = i128::from(acct.cross_margin + total_margin_recovered);
-        let net = margin_total + total_loss; // what the account walks away with (can be negative)
+        // Convert total_loss from scale-14 to scale-6 before combining
+        // with margin (which is scale-6). unrealized_pnl returns
+        // size_scale8 * price_scale6 = scale-14; dividing by PRICE_SCALE
+        // (1e8) brings it to scale-6, matching the margin units.
+        let price_scale_i128 = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
+        let total_loss_scale6 = total_loss_scale14 / price_scale_i128;
+        let margin_total = i128::from(acct.cross_margin.saturating_add(total_margin_recovered));
+        let net = margin_total + total_loss_scale6; // both scale-6
         if net < 0 {
-            // Insurance fund covers the shortfall.
+            // Insurance fund covers the shortfall (scale-6).
             let shortfall = u64::try_from(-net).unwrap_or(u64::MAX);
             let fund = inner.insurance_fund;
             if shortfall >= fund {
@@ -709,40 +727,61 @@ impl PerpsModule {
                 break;
             }
             // Claw back min(remaining_shortfall, counterparty_pnl).
-            let clawback = remaining_shortfall.min(u64::try_from(pnl_scale6).unwrap_or(u64::MAX));
-            // Compute the fraction of the position to close.
-            // fraction = clawback / pnl_scale6 (as a ratio).
-            // We reduce the position size proportionally.
+            let clawback_target =
+                remaining_shortfall.min(u64::try_from(pnl_scale6).unwrap_or(u64::MAX));
             let acct = Self::account_mut(inner, &addr);
             let Some(pos_entry) = acct.positions.get_mut(&market) else {
                 continue;
             };
 
-            // Reduce the position size proportionally to the clawback.
-            // If clawback == pnl_scale6, close the entire position.
-            // Otherwise, close a fraction: new_size = size * (1 - clawback/pnl).
-            // We use integer arithmetic: new_size = size - (size * clawback / pnl).
-            // Since pnl_scale6 > 0, this is safe.
+            // H3 fix: compute close_qty from scale-14 PnL to avoid
+            // double-flooring. The PnL per unit at scale-14 is
+            // |mark - entry|. To cover `clawback_target` (scale-6),
+            // we need to close:
+            //   close_qty = clawback_target * PRICE_SCALE / pnl_per_unit
+            // The realized PnL is then:
+            //   realized = close_qty * pnl_per_unit / PRICE_SCALE
+            // which may differ from clawback_target by at most 1
+            // scale-6 unit due to integer flooring. We debit the
+            // *realized* amount, not the target, to keep accounting
+            // exact.
+            let mark = marks.get(&market).copied().unwrap_or(pos.entry_price);
+            let pnl_per_unit = if pos.size > 0 {
+                i128::from(mark) - i128::from(pos.entry_price)
+            } else {
+                i128::from(pos.entry_price) - i128::from(mark)
+            };
+            if pnl_per_unit <= 0 {
+                continue; // not actually profitable at current mark
+            }
+            let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
+            let close_qty_i128 = (i128::from(clawback_target) * price_scale) / pnl_per_unit;
             let size_abs = i128::from(pos.size.unsigned_abs());
-            let pnl_u64 = u64::try_from(pnl_scale6).unwrap_or(u64::MAX);
-            let close_fraction = (size_abs * i128::from(clawback)) / i128::from(pnl_u64);
-            let close_qty = i64::try_from(close_fraction.min(size_abs)).unwrap_or(0);
+            let close_qty = i64::try_from(close_qty_i128.min(size_abs)).unwrap_or(0);
             if close_qty == 0 {
                 continue;
             }
+            // Compute the exact realized PnL (scale-6) from closing
+            // close_qty units. This is the amount we actually debit.
+            let realized_scale6 =
+                u64::try_from((i128::from(close_qty) * pnl_per_unit) / price_scale)
+                    .unwrap_or(u64::MAX);
+
             // Reduce the position size (preserve sign).
             if pos.size > 0 {
                 pos_entry.size -= close_qty;
             } else {
                 pos_entry.size += close_qty;
             }
-            // Debit the clawed-back PnL from the counterparty's margin.
+            // Debit the *realized* PnL (not the target) from the
+            // counterparty's margin. This keeps accounting exact.
             if pos_entry.isolated_margin > 0 {
-                pos_entry.isolated_margin = pos_entry.isolated_margin.saturating_sub(clawback);
+                pos_entry.isolated_margin =
+                    pos_entry.isolated_margin.saturating_sub(realized_scale6);
             } else {
-                acct.cross_margin = acct.cross_margin.saturating_sub(clawback);
+                acct.cross_margin = acct.cross_margin.saturating_sub(realized_scale6);
             }
-            remaining_shortfall -= clawback;
+            remaining_shortfall = remaining_shortfall.saturating_sub(realized_scale6);
 
             events.push(Event {
                 module: "perps",
@@ -909,6 +948,19 @@ impl Module for PerpsModule {
                 let (market, mark) = Self::parse_set_mark(body).ok_or(ExecError::Malformed)?;
                 if !inner.configs.contains_key(&market) {
                     return Err(ExecError::ModuleRejected("market does not exist".to_string()));
+                }
+                // Use the deviation-checked setter to enforce the
+                // MAX_MARK_CHANGE_BPS (10%) per-update cap. This
+                // prevents a malicious or buggy oracle from moving
+                // the mark price by more than 10% in a single
+                // transaction. The unchecked path is only for
+                // genesis setup and tests.
+                let current_mark = inner.marks.get(&market).copied().unwrap_or(mark);
+                let deviation = mark_price_deviation_bps(mark, current_mark);
+                if deviation > MAX_MARK_CHANGE_BPS {
+                    return Err(ExecError::ModuleRejected(format!(
+                        "mark price deviation {deviation} bps exceeds max {MAX_MARK_CHANGE_BPS} bps"
+                    )));
                 }
                 inner.marks.insert(market, mark);
                 Ok(vec![Event {

@@ -16,7 +16,8 @@ const MIN_PRICE: u64 = 1_000_000_000;
 const MAX_PRICE: u64 = 2_000_000_000;
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
-    if data.len() < 18 {
+    // Fuzz fix: need at least 19 bytes to safely slice data[11..19].
+    if data.len() < 19 {
         return;
     }
     let side = if data[0] & 1 == 0 { Side::Buy } else { Side::Sell };

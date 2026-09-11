@@ -471,6 +471,13 @@ impl OxideBft {
         self.next_height.value()
     }
 
+    /// Debug accessor for the current vote count (number of votes
+    /// collected for the current view). Used by the devnet node
+    /// loop for diagnostic logging.
+    pub fn vote_count_debug(&self) -> usize {
+        self.vote_count
+    }
+
     /// Sync this engine's `next_height` to `max_height`. In a real
     /// system, all validators see the same blocks via broadcast, so
     /// their `next_height` stays in lockstep. In the in-process
@@ -688,16 +695,47 @@ impl OxideBft {
         Some(Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature })
     }
 
+    /// Build the BLS signing message for a vote. Binds `(view,
+    /// phase, block_hash, epoch)` to prevent replay across phases
+    /// or epochs (C3 fix).
+    ///
+    /// Format: `view.to_le_bytes() (8) + phase_byte (1) +
+    /// block_hash (32) + epoch.to_le_bytes() (8)` = 49 bytes.
+    fn vote_signing_message(&self, view: View, phase_byte: u8, block_hash: &Hash) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(49);
+        msg.extend_from_slice(&view.value().to_le_bytes());
+        msg.push(phase_byte);
+        msg.extend_from_slice(block_hash.as_bytes());
+        msg.extend_from_slice(&self.epoch.value().to_le_bytes());
+        msg
+    }
+
+    /// Get the current pipeline phase as a byte. In the current
+    /// oxideBFT implementation, all votes are in the generic "vote"
+    /// phase (the engine doesn't distinguish prepare/pre-commit/
+    /// commit in the signing path yet — the phase is carried in the
+    /// `Vote` struct and will be bound to the signature in a future
+    /// hardening pass). For now, we use 0 as a placeholder.
+    fn current_phase_byte() -> u8 {
+        0
+    }
+
     /// Sign a vote with this engine's BLS secret key. If no key is set
-    /// (conformance mode), returns `Signature::ZERO`. The `view` is
-    /// reserved for future use (e.g. signing the view into the message).
-    fn sign_vote(&self, _view: View, block_hash: Hash) -> Signature {
+    /// (conformance mode), returns `Signature::ZERO`.
+    ///
+    /// # Signed message (C3 fix)
+    ///
+    /// The signed message binds `(view, phase, block_hash, epoch)` to
+    /// prevent vote replay across phases or epochs. A `Prepare` vote
+    /// signature cannot be reused as a `PreCommit` or `Commit` vote because
+    /// the phase byte differs. A vote from epoch 0 cannot be replayed
+    /// in epoch 1 because the epoch bytes differ.
+    fn sign_vote(&self, view: View, block_hash: Hash) -> Signature {
         match &self.secret_key {
             Some(sk) => {
-                // The signed message is the block hash (32 bytes).
-                // The domain is `Vote` for vote signatures.
-                let msg = block_hash.as_bytes();
-                sk.sign(crypto::hash::Domain::Vote, msg)
+                let phase_byte = Self::current_phase_byte();
+                let msg = self.vote_signing_message(view, phase_byte, &block_hash);
+                sk.sign(crypto::hash::Domain::Vote, &msg)
             }
             None => Signature::ZERO,
         }
@@ -741,26 +779,34 @@ impl OxideBft {
         if idx >= self.votes.len() {
             return Err(ConsensusError::InvalidVoteSignature { voter });
         }
+        // Reject stale votes: votes for views below the engine's
+        // current view are leftovers from a previous round that
+        // arrived late over the network. Collecting them would
+        // pollute the vote buffer and cause spurious ConflictingVote
+        // errors when the real votes for the current view arrive.
+        // Silently dropping them is safe — the leader that needed
+        // them already formed its QC or timed out.
+        if vote.view < self.current_view {
+            return Ok(());
+        }
         // Already collected — idempotent (not an error, just a no-op).
         if self.votes[idx].is_some() {
             return Ok(());
         }
 
         // C1 fix: verify the vote's BLS signature against the voter's
-        // public key. The signed message is the block hash (32 bytes)
-        // under Domain::Vote — the same domain used by `sign_vote`.
+        // public key. The signed message binds (view, phase,
+        // block_hash, epoch) to prevent replay across phases or
+        // epochs (C3 fix).
         if self.verify_signatures {
             let pk = self
                 .validator_set
                 .validator(voter)
                 .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
-            crypto::verify(
-                &vote.signature,
-                crypto::hash::Domain::Vote,
-                vote.block_hash.as_bytes(),
-                pk,
-            )
-            .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+            let phase_byte = vote.phase as u8;
+            let msg = self.vote_signing_message(vote.view, phase_byte, &vote.block_hash);
+            crypto::verify(&vote.signature, crypto::hash::Domain::Vote, &msg, pk)
+                .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
         }
 
         // Hardening: check that this vote agrees with the first vote
@@ -806,10 +852,15 @@ impl OxideBft {
 
         // Stage 5: aggregate the collected signatures via blst.
         // If no secret key is set (conformance mode), use ZERO.
+        // H6 fix: propagate aggregation errors instead of silently
+        // replacing with ZERO (which would produce an invalid QC).
         let aggregate_signature = if self.secret_key.is_some() {
             let sigs: Vec<Signature> =
                 self.votes.iter().filter_map(|v| v.as_ref().map(|v| v.signature)).collect();
-            crypto::aggregate(&sigs).unwrap_or(AggregateSignature::ZERO)
+            match crypto::aggregate(&sigs) {
+                Ok(agg) => agg,
+                Err(_) => return None, // aggregation failed — can't form QC
+            }
         } else {
             AggregateSignature::ZERO
         };
@@ -961,10 +1012,13 @@ impl OxideBft {
         if signer_pks.is_empty() {
             return Err(ConsensusError::InvalidQcSignature);
         }
+        // C3 fix: verify against the full (view, phase, block_hash,
+        // epoch) message, not just the block hash.
+        let msg = self.vote_signing_message(qc.view, qc.phase as u8, &qc.block_hash);
         crypto::aggregate_verify(
             &qc.aggregate_signature,
             crypto::hash::Domain::Vote,
-            qc.block_hash.as_bytes(),
+            &msg,
             &signer_pks,
         )
         .map_err(|_| ConsensusError::InvalidQcSignature)
@@ -994,6 +1048,14 @@ impl OxideBft {
         self.current_view = View::new(self.current_view.value() + 1);
         self.pacemaker.sync_to_view(self.current_view);
         self.pacemaker.on_progress();
+        // Clear the vote buffer on view advance. Stale votes from
+        // the previous view that arrive late over the network must
+        // not pollute the new view's quorum accounting. Without
+        // this, a late vote for view N could be collected into view
+        // N+1's buffer and cause a spurious ConflictingVote error
+        // when the real votes for view N+1 arrive.
+        self.votes.fill(None);
+        self.vote_count = 0;
     }
 
     /// Validator: local timer expired. Returns a timeout signature
@@ -1001,14 +1063,18 @@ impl OxideBft {
     /// (no one to timeout). In multi-validator mode, the simulation
     /// collects these and forms a TC.
     ///
-    /// The signed message is the view's little-endian bytes, signed
-    /// with `Domain::Timeout`. This proves the validator is timing
-    /// out on this specific view, preventing replay across views.
+    /// The signed message binds `(view, epoch)` to prevent replay
+    /// across epochs (M1 fix). The domain is `Timeout`.
     pub fn on_timeout(&mut self) -> Option<Signature> {
         let _ = self.pacemaker.on_local_timeout();
         match &self.secret_key {
             Some(sk) => {
-                let msg = self.current_view.value().to_le_bytes();
+                // M1 fix: bind epoch into the timeout message so a
+                // timeout signature from epoch 0 cannot be replayed
+                // in epoch 1 (views reset to 0 on epoch rotation).
+                let mut msg = Vec::with_capacity(16);
+                msg.extend_from_slice(&self.current_view.value().to_le_bytes());
+                msg.extend_from_slice(&self.epoch.value().to_le_bytes());
                 Some(sk.sign(crypto::hash::Domain::Timeout, &msg))
             }
             None => Some(Signature::ZERO),
@@ -1045,12 +1111,15 @@ impl OxideBft {
         signature: Signature,
     ) -> Result<Option<TimeoutCertificate>, ConsensusError> {
         // Verify the timeout signature before collecting (TC safety).
+        // M1 fix: verify against (view, epoch), not just view.
         if self.verify_signatures {
             let pk = self
                 .validator_set
                 .validator(voter)
                 .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-            let msg = self.current_view.value().to_le_bytes();
+            let mut msg = Vec::with_capacity(16);
+            msg.extend_from_slice(&self.current_view.value().to_le_bytes());
+            msg.extend_from_slice(&self.epoch.value().to_le_bytes());
             crypto::bls_signer::verify(&signature, crypto::hash::Domain::Timeout, &msg, pk)
                 .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
         }
@@ -1160,7 +1229,10 @@ impl OxideBft {
         if signer_pks.is_empty() {
             return Err(ConsensusError::InvalidTcSignature);
         }
-        let msg = tc.view.value().to_le_bytes();
+        // M1 fix: verify against (view, epoch), not just view.
+        let mut msg = Vec::with_capacity(16);
+        msg.extend_from_slice(&tc.view.value().to_le_bytes());
+        msg.extend_from_slice(&tc.epoch.value().to_le_bytes());
         crypto::aggregate_verify(
             &tc.aggregate_signature,
             crypto::hash::Domain::Timeout,
@@ -1193,7 +1265,11 @@ impl OxideBft {
         signer_bitmap[idx / 8] |= 1u8 << (idx % 8);
         let aggregate_signature = if self.secret_key.is_some() {
             // Real BLS: aggregate the single self-vote.
-            crypto::aggregate(&[vote.signature]).unwrap_or(AggregateSignature::ZERO)
+            // H6 fix: propagate aggregation errors.
+            match crypto::aggregate(&[vote.signature]) {
+                Ok(agg) => agg,
+                Err(_) => return false, // aggregation failed — can't form QC
+            }
         } else {
             AggregateSignature::ZERO
         };
@@ -1206,16 +1282,18 @@ impl OxideBft {
             aggregate_signature,
         };
 
-        // Deliver the QC (checks 2-chain commit). In single-validator
-        // mode the QC was self-formed: the aggregate signature is
-        // built from our own `sign_vote` output, and the signer
-        // bitmap contains only our own index. Verification cannot
-        // fail unless the BLS signing or verification logic is
-        // broken — a true invariant violation that must abort loud.
-        // Invariant: `sign_vote` and `verify` use the same domain
-        // (Domain::Vote) and the same message (block_hash); the
-        // secret key's public key is in the validator set.
-        self.deliver_qc(qc).expect("self-formed QC must verify (invariant: signing and verification use the same domain + message + key)");
+        // C4 fix: don't panic on deliver_qc failure. In single-
+        // validator mode the QC was self-formed and should always
+        // verify, but a panic here would be a DoS vector if the
+        // invariant is violated. Log and return instead.
+        if let Err(e) = self.deliver_qc(qc) {
+            // Self-formed QC verification failed — this indicates a
+            // bug in the signing/verification logic, not a byzantine
+            // attack. We log the error and continue rather than
+            // panicking.
+            eprintln!("WARN: self-formed QC verification failed: {e:?}");
+            return false;
+        }
 
         // Advance the view.
         self.advance_view();
@@ -1541,12 +1619,18 @@ mod tests {
         );
 
         // Verify the aggregate signature against the validator's PK.
-        // The signed message is the block hash.
+        // C3 fix: the signed message now binds (view, phase,
+        // block_hash, epoch).
         let block_hash = qc.block_hash;
+        let mut msg = Vec::with_capacity(49);
+        msg.extend_from_slice(&qc.view.value().to_le_bytes());
+        msg.push(qc.phase as u8);
+        msg.extend_from_slice(block_hash.as_bytes());
+        msg.extend_from_slice(&qc.epoch.value().to_le_bytes());
         let result = crypto::aggregate_verify(
             &qc.aggregate_signature,
             crypto::hash::Domain::Vote,
-            block_hash.as_bytes(),
+            &msg,
             &[pk],
         );
         assert!(result.is_ok(), "QC aggregate signature must verify");
@@ -1575,8 +1659,14 @@ mod tests {
         let (header, proposal) = leader.propose().expect("propose");
         let block_hash = OxideBft::block_hash(&header);
 
-        // Leader self-votes.
-        let leader_sig = keys[0].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        // Leader self-votes. C3 fix: sign with (view, phase,
+        // block_hash, epoch) message.
+        let mut vote_msg = Vec::with_capacity(49);
+        vote_msg.extend_from_slice(&header.view.value().to_le_bytes());
+        vote_msg.push(VotePhase::Prepare as u8);
+        vote_msg.extend_from_slice(block_hash.as_bytes());
+        vote_msg.extend_from_slice(&leader.epoch.value().to_le_bytes());
+        let leader_sig = keys[0].sign(crypto::hash::Domain::Vote, &vote_msg);
         leader
             .collect_vote(
                 0,
@@ -1607,10 +1697,16 @@ mod tests {
         );
 
         // Verify the aggregate signature against all 4 public keys.
+        // C3 fix: verify against (view, phase, block_hash, epoch).
+        let mut verify_msg = Vec::with_capacity(49);
+        verify_msg.extend_from_slice(&qc.view.value().to_le_bytes());
+        verify_msg.push(qc.phase as u8);
+        verify_msg.extend_from_slice(block_hash.as_bytes());
+        verify_msg.extend_from_slice(&qc.epoch.value().to_le_bytes());
         let result = crypto::aggregate_verify(
             &qc.aggregate_signature,
             crypto::hash::Domain::Vote,
-            block_hash.as_bytes(),
+            &verify_msg,
             &pks,
         );
         assert!(result.is_ok(), "QC aggregate signature must verify against all 4 keys");
@@ -1644,7 +1740,13 @@ mod tests {
 
         // Forge a vote: sign with key[2] but claim it's from validator 1.
         // The signature will verify against key[2]'s PK, not key[1]'s PK.
-        let forged_sig = keys[2].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        // C3 fix: use the full (view, phase, block_hash, epoch) message.
+        let mut vote_msg = Vec::with_capacity(49);
+        vote_msg.extend_from_slice(&header.view.value().to_le_bytes());
+        vote_msg.push(VotePhase::Prepare as u8);
+        vote_msg.extend_from_slice(block_hash.as_bytes());
+        vote_msg.extend_from_slice(&leader.epoch.value().to_le_bytes());
+        let forged_sig = keys[2].sign(crypto::hash::Domain::Vote, &vote_msg);
         let forged_vote = Vote {
             view: header.view,
             phase: VotePhase::Prepare,
@@ -1724,7 +1826,13 @@ mod tests {
         let block_hash = OxideBft::block_hash(&header);
 
         // Validator 1 signs its own vote with its own key.
-        let valid_sig = keys[1].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        // C3 fix: sign with (view, phase, block_hash, epoch) message.
+        let mut vote_msg = Vec::with_capacity(49);
+        vote_msg.extend_from_slice(&header.view.value().to_le_bytes());
+        vote_msg.push(VotePhase::Prepare as u8);
+        vote_msg.extend_from_slice(block_hash.as_bytes());
+        vote_msg.extend_from_slice(&leader.epoch.value().to_le_bytes());
+        let valid_sig = keys[1].sign(crypto::hash::Domain::Vote, &vote_msg);
         let valid_vote =
             Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature: valid_sig };
 
@@ -1773,8 +1881,11 @@ mod tests {
         let _ = engine.on_timeout();
 
         // Forge a timeout signature: sign with validator 2's key but
-        // claim it's from validator 1.
-        let forged_sig = keys[2].sign(crypto::hash::Domain::Timeout, &0u64.to_le_bytes());
+        // claim it's from validator 1. M1 fix: sign with (view, epoch).
+        let mut timeout_msg = Vec::with_capacity(16);
+        timeout_msg.extend_from_slice(&engine.current_view.value().to_le_bytes());
+        timeout_msg.extend_from_slice(&engine.epoch.value().to_le_bytes());
+        let forged_sig = keys[2].sign(crypto::hash::Domain::Timeout, &timeout_msg);
         let err = engine
             .collect_timeout_signature(1, forged_sig)
             .expect_err("forged timeout signature must be rejected");
@@ -1793,8 +1904,12 @@ mod tests {
         let mut engine =
             OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
 
-        // Validator 1 signs the timeout for view 0.
-        let valid_sig = keys[1].sign(crypto::hash::Domain::Timeout, &0u64.to_le_bytes());
+        // Validator 1 signs the timeout for view 0. M1 fix: sign
+        // with (view, epoch).
+        let mut timeout_msg = Vec::with_capacity(16);
+        timeout_msg.extend_from_slice(&engine.current_view.value().to_le_bytes());
+        timeout_msg.extend_from_slice(&engine.epoch.value().to_le_bytes());
+        let valid_sig = keys[1].sign(crypto::hash::Domain::Timeout, &timeout_msg);
         let result = engine.collect_timeout_signature(1, valid_sig);
         assert!(result.is_ok(), "valid timeout signature must be accepted");
     }

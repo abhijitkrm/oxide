@@ -59,23 +59,34 @@ const MAX_LATENCY: u64 = 60_000_000;
 /// its range — sufficient for p50/p99/p99.9 discrimination.
 const SIG_FIGS: u8 = 3;
 
-/// A thread-safe latency recorder that maintains per-operation HDR
-/// histograms.
+/// A thread-safe metrics recorder that maintains per-operation HDR
+/// histograms, named counters, and named gauges.
 ///
 /// Each operation name (e.g., `"block_pipeline"`, `"rpc_send_raw_tx"`)
 /// gets its own `Histogram<u64>` recording nanosecond-precision
-/// latencies. The recorder is `Send + Sync` and uses a `Mutex` —
-/// the lock is held only during `record` (amortized ~40ns) and
-/// `snapshot` (O(1) percentile lookup).
+/// latencies. Counters are monotonically increasing `u64` values
+/// (e.g., `"messages_received"`, `"peers_banned"`). Gauges are
+/// point-in-time `i64` values (e.g., `"mempool_size"`,
+/// `"active_connections"`).
+///
+/// The recorder is `Send + Sync` and uses a `Mutex` — the lock is
+/// held only during `record` (amortized ~40ns), `incr_counter`,
+/// `set_gauge`, and `snapshot` (O(1) percentile lookup).
 pub struct Recorder {
     histograms: Mutex<HashMap<String, Histogram<u64>>>,
+    counters: Mutex<HashMap<String, u64>>,
+    gauges: Mutex<HashMap<String, i64>>,
 }
 
 impl Recorder {
     /// Create a new empty recorder.
     #[must_use]
     pub fn new() -> Self {
-        Self { histograms: Mutex::new(HashMap::new()) }
+        Self {
+            histograms: Mutex::new(HashMap::new()),
+            counters: Mutex::new(HashMap::new()),
+            gauges: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Record a latency sample for the named operation.
@@ -160,6 +171,25 @@ impl Recorder {
             }
             let _ = writeln!(out, "oxide_latency_count{{op=\"{op}\"}} {}", h.len());
         }
+        drop(histograms);
+
+        // Counters.
+        let counters = self.counters.lock().expect("metrics mutex not poisoned");
+        out.push_str("# HELP oxide_counter Monotonically increasing counter\n");
+        out.push_str("# TYPE oxide_counter counter\n");
+        for (name, value) in &*counters {
+            let _ = writeln!(out, "oxide_counter{{name=\"{name}\"}} {value}");
+        }
+        drop(counters);
+
+        // Gauges.
+        let gauges = self.gauges.lock().expect("metrics mutex not poisoned");
+        out.push_str("# HELP oxide_gauge Point-in-time gauge value\n");
+        out.push_str("# TYPE oxide_gauge gauge\n");
+        for (name, value) in &*gauges {
+            let _ = writeln!(out, "oxide_gauge{{name=\"{name}\"}} {value}");
+        }
+
         out
     }
 
@@ -172,6 +202,75 @@ impl Recorder {
     pub fn operations(&self) -> Vec<String> {
         let histograms = self.histograms.lock().expect("metrics mutex not poisoned");
         histograms.keys().cloned().collect()
+    }
+
+    /// Increment a named counter by `delta`. Counters are
+    /// monotonically increasing values (e.g., messages received,
+    /// peers banned, blocks finalized).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn incr_counter(&self, name: &str, delta: u64) {
+        let mut counters = self.counters.lock().expect("metrics mutex not poisoned");
+        *counters.entry(name.to_string()).or_insert(0) += delta;
+    }
+
+    /// Get the current value of a named counter. Returns 0 if the
+    /// counter has never been incremented.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn counter(&self, name: &str) -> u64 {
+        let counters = self.counters.lock().expect("metrics mutex not poisoned");
+        counters.get(name).copied().unwrap_or(0)
+    }
+
+    /// Set a named gauge to `value`. Gauges are point-in-time values
+    /// (e.g., mempool size, active connections, current view).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_gauge(&self, name: &str, value: i64) {
+        let mut gauges = self.gauges.lock().expect("metrics mutex not poisoned");
+        gauges.insert(name.to_string(), value);
+    }
+
+    /// Get the current value of a named gauge. Returns 0 if the
+    /// gauge has never been set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn gauge(&self, name: &str) -> i64 {
+        let gauges = self.gauges.lock().expect("metrics mutex not poisoned");
+        gauges.get(name).copied().unwrap_or(0)
+    }
+
+    /// List all counter names.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn counter_names(&self) -> Vec<String> {
+        let counters = self.counters.lock().expect("metrics mutex not poisoned");
+        counters.keys().cloned().collect()
+    }
+
+    /// List all gauge names.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn gauge_names(&self) -> Vec<String> {
+        let gauges = self.gauges.lock().expect("metrics mutex not poisoned");
+        gauges.keys().cloned().collect()
     }
 }
 
@@ -251,5 +350,69 @@ mod tests {
         r.record("big_op", Duration::from_secs(120));
         let snap = r.snapshot("big_op").expect("snapshot exists");
         assert!(snap.max <= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn counter_increments() {
+        let r = Recorder::new();
+        r.incr_counter("messages_received", 1);
+        r.incr_counter("messages_received", 1);
+        r.incr_counter("messages_received", 5);
+        assert_eq!(r.counter("messages_received"), 7);
+    }
+
+    #[test]
+    fn counter_default_zero() {
+        let r = Recorder::new();
+        assert_eq!(r.counter("never_incremented"), 0);
+    }
+
+    #[test]
+    fn gauge_set_and_get() {
+        let r = Recorder::new();
+        r.set_gauge("mempool_size", 42);
+        assert_eq!(r.gauge("mempool_size"), 42);
+        r.set_gauge("mempool_size", 100);
+        assert_eq!(r.gauge("mempool_size"), 100);
+    }
+
+    #[test]
+    fn gauge_default_zero() {
+        let r = Recorder::new();
+        assert_eq!(r.gauge("never_set"), 0);
+    }
+
+    #[test]
+    fn gauge_negative_values() {
+        let r = Recorder::new();
+        r.set_gauge("balance", -100);
+        assert_eq!(r.gauge("balance"), -100);
+    }
+
+    #[test]
+    fn prometheus_includes_counters_and_gauges() {
+        let r = Recorder::new();
+        r.record("block_pipeline", Duration::from_micros(500));
+        r.incr_counter("messages_received", 42);
+        r.set_gauge("mempool_size", 100);
+        let prom = r.prometheus();
+        assert!(prom.contains("oxide_latency_ns{op=\"block_pipeline\""));
+        assert!(prom.contains("oxide_counter{name=\"messages_received\"} 42"));
+        assert!(prom.contains("oxide_gauge{name=\"mempool_size\"} 100"));
+    }
+
+    #[test]
+    fn counter_and_gauge_names() {
+        let r = Recorder::new();
+        r.incr_counter("counter_a", 1);
+        r.incr_counter("counter_b", 1);
+        r.set_gauge("gauge_x", 1);
+        r.set_gauge("gauge_y", 1);
+        let counters = r.counter_names();
+        assert!(counters.contains(&"counter_a".to_string()));
+        assert!(counters.contains(&"counter_b".to_string()));
+        let gauges = r.gauge_names();
+        assert!(gauges.contains(&"gauge_x".to_string()));
+        assert!(gauges.contains(&"gauge_y".to_string()));
     }
 }

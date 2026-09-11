@@ -747,7 +747,7 @@ impl Executor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(snapshot.height, snapshot.state_root);
         *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            snapshot.height + 1;
+            snapshot.height.saturating_add(1); // M2 fix
 
         Ok(())
     }
@@ -1120,7 +1120,7 @@ impl AppInterface for Executor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(block.height.value(), block.clone());
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                block.height.value() + 1;
+                block.height.value().saturating_add(1); // M2 fix
         } else {
             // Synchronous execution (default): execute the block
             // immediately and store the state root.
@@ -1134,7 +1134,7 @@ impl AppInterface for Executor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(block.height.value(), block.clone());
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                block.height.value() + 1;
+                block.height.value().saturating_add(1); // M2 fix
         }
         if let Some(recorder) = &self.recorder {
             recorder.record("finalize_block", start.elapsed());

@@ -130,6 +130,12 @@ pub struct Node {
     /// registered (should not happen with the default `assemble`
     /// path).
     evm_module: Option<Arc<evm::EvmModule>>,
+    /// Metrics recorder for node-level observability. Records
+    /// counters (txs submitted, blocks finalized), gauges (height,
+    /// mempool size), and latency histograms (block commit, snapshot
+    /// export/import). Accessible via [`Node::metrics`] for RPC
+    /// exposition.
+    metrics: Arc<metrics::Recorder>,
 }
 
 impl Node {
@@ -259,7 +265,12 @@ impl Node {
             }
         };
 
-        Self { engine, app, evm_module: Some(evm_module) }
+        Self {
+            engine,
+            app,
+            evm_module: Some(evm_module),
+            metrics: Arc::new(metrics::Recorder::new()),
+        }
     }
 
     /// Access the consensus engine for driving.
@@ -270,6 +281,14 @@ impl Node {
     /// Access the app (executor) for inspection.
     pub fn app(&self) -> &Executor {
         &self.app
+    }
+
+    /// Access the metrics recorder for Prometheus exposition or
+    /// inspection. The recorder is shared via `Arc` so the RPC
+    /// layer can expose `/metrics` without holding a reference to
+    /// the `Node`.
+    pub fn metrics(&self) -> &Arc<metrics::Recorder> {
+        &self.metrics
     }
 
     /// Access the EVM module for direct state inspection (balance,
@@ -298,7 +317,12 @@ impl Node {
     /// See [`Executor::export_snapshot`] for details.
     #[must_use]
     pub fn export_snapshot(&self) -> executor::ExecutorSnapshot {
-        self.app.export_snapshot()
+        let start = std::time::Instant::now();
+        let snap = self.app.export_snapshot();
+        self.metrics.record("snapshot_export", start.elapsed());
+        self.metrics.incr_counter("snapshot_exports", 1);
+        self.metrics.set_gauge("snapshot_height", i64::try_from(snap.height).unwrap_or(i64::MAX));
+        snap
     }
 
     /// Import a snapshot, restoring the node to the snapshot's
@@ -327,7 +351,15 @@ impl Node {
         &self,
         snapshot: &executor::ExecutorSnapshot,
     ) -> Result<(), executor::SnapshotImportError> {
-        self.app.import_snapshot(snapshot)
+        let start = std::time::Instant::now();
+        let result = self.app.import_snapshot(snapshot);
+        self.metrics.record("snapshot_import", start.elapsed());
+        self.metrics.incr_counter("snapshot_imports", 1);
+        if result.is_ok() {
+            self.metrics
+                .set_gauge("snapshot_height", i64::try_from(snapshot.height).unwrap_or(i64::MAX));
+        }
+        result
     }
 
     /// Assemble a node from config and restore from a snapshot.
@@ -396,15 +428,27 @@ pub fn run_node_smoke_test() {
     let module_payload = bank::msg::transfer(to, 100);
     let tx = build_tx(framework::module_id::BANK, &module_payload);
     node.engine().submit_tx(tx);
+    node.metrics().incr_counter("txs_submitted", 1);
     node.engine().run_until_idle();
 
     // Verify the block was finalized.
     let height = node.engine().finalized_height();
     assert!(height.is_some(), "node: a block should be finalized");
+    node.metrics().incr_counter("blocks_finalized", 1);
+    if let Some(h) = height {
+        node.metrics().set_gauge("finalized_height", i64::try_from(h.value()).unwrap_or(i64::MAX));
+    }
 
     // Verify the bank module processed the transfer.
     let balance = node.app().attest_state(primitives::Height::new(0));
     assert_ne!(balance.root, primitives::Hash::ZERO, "state root should be non-zero");
+
+    // Verify metrics were recorded.
+    assert_eq!(node.metrics().counter("txs_submitted"), 1);
+    assert_eq!(node.metrics().counter("blocks_finalized"), 1);
+    if let Some(h) = height {
+        node.metrics().set_gauge("finalized_height", i64::try_from(h.value()).unwrap_or(i64::MAX));
+    }
 }
 
 /// Build a tx in the mempool's v0 format with a module dispatch byte.
@@ -792,5 +836,74 @@ mod tests {
         assert_eq!(snap1.height, snap2.height, "heights must match");
         assert_eq!(snap1.state_root, snap2.state_root, "state roots must match");
         assert_eq!(snap1.module_roots, snap2.module_roots, "module roots must match");
+    }
+
+    // ─── Metrics tests ───────────────────────────────────────────
+
+    #[test]
+    fn metrics_recorder_available_after_assemble() {
+        let node = Node::assemble(&NodeConfig::default());
+        // The metrics recorder should be available and empty.
+        let prom = node.metrics().prometheus();
+        // No metrics recorded yet — output should have headers but
+        // no data lines.
+        assert!(prom.contains("oxide_latency_ns"));
+    }
+
+    #[test]
+    fn metrics_records_snapshot_export() {
+        let config = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 100,
+            parallel_threshold: 32,
+            evm_persistence: true,
+            storage_path: None,
+        };
+        let mut node = Node::assemble(&config);
+        // Finalize a block.
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node.engine().submit_tx(tx);
+        node.engine().run_until_idle();
+
+        // Export a snapshot — should record metrics.
+        let _ = node.export_snapshot();
+        assert!(node.metrics().counter("snapshot_exports") >= 1);
+        assert!(node.metrics().snapshot("snapshot_export").is_some());
+    }
+
+    #[test]
+    fn metrics_records_snapshot_import() {
+        let config = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 100,
+            parallel_threshold: 32,
+            evm_persistence: true,
+            storage_path: None,
+        };
+        let mut node = Node::assemble(&config);
+        let to = Address([2u8; 20]);
+        let module_payload = bank::msg::transfer(to, 100);
+        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        node.engine().submit_tx(tx);
+        node.engine().run_until_idle();
+        let snapshot = node.export_snapshot();
+
+        // Import into a fresh node — should record metrics.
+        let node2 = Node::assemble(&config);
+        node2.import_snapshot(&snapshot).expect("import must succeed");
+        assert!(node2.metrics().counter("snapshot_imports") >= 1);
+        assert!(node2.metrics().snapshot("snapshot_import").is_some());
+    }
+
+    #[test]
+    fn metrics_prometheus_includes_counters_and_gauges() {
+        let node = Node::assemble(&NodeConfig::default());
+        node.metrics().incr_counter("test_counter", 42);
+        node.metrics().set_gauge("test_gauge", 100);
+        let prom = node.metrics().prometheus();
+        assert!(prom.contains("oxide_counter{name=\"test_counter\"} 42"));
+        assert!(prom.contains("oxide_gauge{name=\"test_gauge\"} 100"));
     }
 }

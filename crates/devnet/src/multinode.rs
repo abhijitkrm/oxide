@@ -43,6 +43,22 @@ use types::{FinalizedBlock, TxBytes};
 /// Source: plan.md §13 (Phase 1 gate: 200k tx/s sim).
 const GENESIS_BALANCE: u64 = 1_000_000_000_000; // 10^12
 
+/// Build the BLS vote signing message: `(view, phase, block_hash,
+/// epoch)`. Must match `OxideBft::vote_signing_message` (C3 fix).
+fn vote_signing_message(
+    view: primitives::View,
+    phase: types::VotePhase,
+    block_hash: &primitives::Hash,
+    epoch: primitives::Epoch,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(49);
+    msg.extend_from_slice(&view.value().to_le_bytes());
+    msg.push(phase as u8);
+    msg.extend_from_slice(block_hash.as_bytes());
+    msg.extend_from_slice(&epoch.value().to_le_bytes());
+    msg
+}
+
 /// A multi-node devnet: N validators running oxideBFT with the real
 /// app stack.
 ///
@@ -450,8 +466,14 @@ impl MultiNodeDevnet {
 
         // Leader self-votes. The leader signs its own block with its
         // real BLS key (C1 fix: all votes carry real signatures).
-        let leader_sig =
-            self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        // C3 fix: sign with (view, phase, block_hash, epoch).
+        let leader_msg = vote_signing_message(
+            header.view,
+            types::VotePhase::Prepare,
+            &block_hash,
+            self.engines[leader_idx].epoch(),
+        );
+        let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
         let leader_vote = types::Vote {
             view: header.view,
             phase: types::VotePhase::Prepare,
@@ -545,8 +567,14 @@ impl MultiNodeDevnet {
         let block_hash = OxideBft::block_hash(&header);
 
         // Leader self-votes (direct — no network self-send).
-        let leader_sig =
-            self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, block_hash.as_bytes());
+        // C3 fix: sign with (view, phase, block_hash, epoch).
+        let leader_msg = vote_signing_message(
+            header.view,
+            types::VotePhase::Prepare,
+            &block_hash,
+            self.engines[leader_idx].epoch(),
+        );
+        let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
         let leader_vote = types::Vote {
             view: header.view,
             phase: types::VotePhase::Prepare,
