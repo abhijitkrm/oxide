@@ -47,6 +47,25 @@ fn addr_index(addr: &Address) -> usize {
     u32::from_le_bytes([addr.0[0], addr.0[1], addr.0[2], addr.0[3]]) as usize
 }
 
+/// Whether an address lives in the flat array (vs the sparse map).
+///
+/// Flat residency requires BOTH:
+/// - `idx < capacity` — the slot exists, and
+/// - `addr.0[4..]` is all zeros — the address is in canonical
+///   sequential form (`[u32 index LE][0; 16]`).
+///
+/// The second condition is the collision fix: previously residency
+/// depended only on the index, so two DIFFERENT addresses sharing
+/// their first 4 bytes silently aliased the same balance slot —
+/// `addr([i][0xAA; 16])` and `addr([i][0xBB; 16])` read and wrote
+/// each other's funds. Any non-canonical address goes to the
+/// sparse map, which is keyed by the FULL 20 bytes and cannot
+/// collide.
+#[inline]
+fn is_flat(addr: &Address, capacity: usize) -> bool {
+    addr_index(addr) < capacity && addr.0[4..].iter().all(|&b| b == 0)
+}
+
 /// A flat-array balance cache: `Vec<u64>` for sequential accounts,
 /// `HashMap` fallback for sparse addresses.
 ///
@@ -75,9 +94,8 @@ impl BalanceCache {
     /// `HashMap` lookup for sparse addresses.
     #[inline]
     pub fn get(&self, addr: &Address) -> u64 {
-        let idx = addr_index(addr);
-        if idx < self.balances.len() {
-            self.balances[idx]
+        if is_flat(addr, self.balances.len()) {
+            self.balances[addr_index(addr)]
         } else {
             self.sparse.get(&addr.0).copied().unwrap_or(0)
         }
@@ -86,9 +104,8 @@ impl BalanceCache {
     /// Set an account's balance (fund or overwrite).
     #[inline]
     pub fn set(&mut self, addr: &Address, amount: u64) {
-        let idx = addr_index(addr);
-        if idx < self.balances.len() {
-            self.balances[idx] = amount;
+        if is_flat(addr, self.balances.len()) {
+            self.balances[addr_index(addr)] = amount;
         } else {
             self.sparse.insert(addr.0, amount);
         }
@@ -98,8 +115,8 @@ impl BalanceCache {
     /// for underflow — the caller must pre-check with `get`.
     #[inline]
     pub fn debit(&mut self, addr: &Address, amount: u64) {
-        let idx = addr_index(addr);
-        if idx < self.balances.len() {
+        if is_flat(addr, self.balances.len()) {
+            let idx = addr_index(addr);
             self.balances[idx] = self.balances[idx].saturating_sub(amount);
         } else {
             let entry = self.sparse.entry(addr.0).or_insert(0);
@@ -110,8 +127,8 @@ impl BalanceCache {
     /// Credit an account (add to balance).
     #[inline]
     pub fn credit(&mut self, addr: &Address, amount: u64) {
-        let idx = addr_index(addr);
-        if idx < self.balances.len() {
+        if is_flat(addr, self.balances.len()) {
+            let idx = addr_index(addr);
             self.balances[idx] = self.balances[idx].saturating_add(amount);
         } else {
             let entry = self.sparse.entry(addr.0).or_insert(0);
@@ -119,10 +136,13 @@ impl BalanceCache {
         }
     }
 
-    /// Number of accounts with non-zero balance in the flat array
-    /// (not counting sparse).
+    /// Number of accounts with non-zero balance (flat + sparse).
+    /// Sparse entries can hold 0 (a debit that drained to zero
+    /// leaves the map entry behind), so count nonzero only —
+    /// consistent with `iter`.
     pub fn len(&self) -> usize {
-        self.balances.iter().filter(|&&b| b > 0).count() + self.sparse.len()
+        self.balances.iter().filter(|&&b| b > 0).count()
+            + self.sparse.values().filter(|&&b| b > 0).count()
     }
 
     /// Is the cache empty?
@@ -130,10 +150,12 @@ impl BalanceCache {
         self.len() == 0
     }
 
-    /// Iterate over all (address, balance) pairs in the flat array.
-    /// Sparse entries are not included in this iterator.
+    /// Iterate over all (address, balance) pairs — flat array AND
+    /// sparse map, nonzero balances only. Previously sparse entries
+    /// were silently excluded, so any full iteration (snapshot,
+    /// drain, reconciliation) lost those balances.
     pub fn iter(&self) -> impl Iterator<Item = ([u8; 20], u64)> + '_ {
-        self.balances.iter().enumerate().filter_map(|(i, &b)| {
+        let flat = self.balances.iter().enumerate().filter_map(|(i, &b)| {
             if b > 0 {
                 let mut addr = [0u8; 20];
                 addr[..4].copy_from_slice(&u32::try_from(i).unwrap_or(u32::MAX).to_le_bytes());
@@ -141,7 +163,9 @@ impl BalanceCache {
             } else {
                 None
             }
-        })
+        });
+        let sparse = self.sparse.iter().filter(|&(_, &b)| b > 0).map(|(&k, &b)| (k, b));
+        flat.chain(sparse)
     }
 }
 
@@ -305,10 +329,16 @@ impl ShardedBalanceCache {
     /// deadlock. If both accounts are in the same shard, locks only
     /// once.
     ///
+    /// Solvency is checked under the same locks: `false` if `from`
+    /// cannot cover `amount`, in which case NOTHING is debited or
+    /// credited. Previously the debit saturated to zero while the
+    /// full amount was credited — minting the difference out of
+    /// thin air (an underfunded `from` paid `to` in full).
+    ///
     /// # Panics
     ///
     /// Panics if either shard mutex is poisoned.
-    pub fn transfer(&self, from: &Address, to: &Address, amount: u64) {
+    pub fn transfer(&self, from: &Address, to: &Address, amount: u64) -> bool {
         let from_idx = self.shard_idx(from);
         let to_idx = self.shard_idx(to);
         if from_idx == to_idx {
@@ -316,9 +346,13 @@ impl ShardedBalanceCache {
             let mut shard =
                 self.shards[from_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let from_entry = shard.entry(from.0).or_insert(0);
-            *from_entry = from_entry.saturating_sub(amount);
+            if *from_entry < amount {
+                return false; // insolvent — nothing moved
+            }
+            *from_entry -= amount;
             let to_entry = shard.entry(to.0).or_insert(0);
             *to_entry = to_entry.saturating_add(amount);
+            true
         } else {
             // Different shards — lock in canonical order (lower
             // index first) to avoid deadlock. Both locks are held
@@ -345,9 +379,13 @@ impl ShardedBalanceCache {
                 (&mut second, &mut first)
             };
             let from_entry = from_shard.entry(from.0).or_insert(0);
-            *from_entry = from_entry.saturating_sub(amount);
+            if *from_entry < amount {
+                return false; // insolvent — nothing moved
+            }
+            *from_entry -= amount;
             let to_entry = to_shard.entry(to.0).or_insert(0);
             *to_entry = to_entry.saturating_add(amount);
+            true
         }
     }
 
@@ -488,7 +526,7 @@ mod tests {
         // addr_idx(0) and addr_idx(8) both map to shard 0 (0 % 8 = 0,
         // 8 % 8 = 0).
         cache.set(&addr_idx(0), 1_000_000);
-        cache.transfer(&addr_idx(0), &addr_idx(8), 300_000);
+        assert!(cache.transfer(&addr_idx(0), &addr_idx(8), 300_000));
         assert_eq!(cache.get(&addr_idx(0)), 700_000);
         assert_eq!(cache.get(&addr_idx(8)), 300_000);
     }
@@ -498,9 +536,74 @@ mod tests {
         let cache = ShardedBalanceCache::new(8);
         // addr_idx(0) → shard 0, addr_idx(1) → shard 1 — different.
         cache.set(&addr_idx(0), 1_000_000);
-        cache.transfer(&addr_idx(0), &addr_idx(1), 300_000);
+        assert!(cache.transfer(&addr_idx(0), &addr_idx(1), 300_000));
         assert_eq!(cache.get(&addr_idx(0)), 700_000);
         assert_eq!(cache.get(&addr_idx(1)), 300_000);
+    }
+
+    /// Regression test: an underfunded transfer must fail WITHOUT
+    /// moving anything. Before the fix the debit saturated to zero
+    /// while the full amount was credited — minting the difference.
+    #[test]
+    fn sharded_transfer_insolvent_moves_nothing() {
+        // Same shard.
+        let cache = ShardedBalanceCache::new(8);
+        cache.set(&addr_idx(0), 100);
+        assert!(!cache.transfer(&addr_idx(0), &addr_idx(8), 300));
+        assert_eq!(cache.get(&addr_idx(0)), 100, "debit must not happen");
+        assert_eq!(cache.get(&addr_idx(8)), 0, "credit must not happen");
+
+        // Cross shard.
+        let cache = ShardedBalanceCache::new(8);
+        cache.set(&addr_idx(0), 100);
+        assert!(!cache.transfer(&addr_idx(0), &addr_idx(1), 300));
+        assert_eq!(cache.get(&addr_idx(0)), 100);
+        assert_eq!(cache.get(&addr_idx(1)), 0);
+    }
+
+    /// Regression test: two different addresses that share their
+    /// first 4 bytes must NOT alias the same balance slot. Before
+    /// the fix both indexed `balances[idx]` — one account's funds
+    /// read and wrote the other's.
+    #[test]
+    fn same_index_prefix_addresses_do_not_collide() {
+        let mut cache = BalanceCache::with_capacity(100);
+        // Canonical sequential address for index 5.
+        let canonical = addr_idx(5);
+        // A different address sharing the first-4-bytes index 5.
+        let mut raw = [0xEE; 20];
+        raw[..4].copy_from_slice(&5u32.to_le_bytes());
+        let collider = Address(raw);
+
+        cache.set(&canonical, 1_000);
+        cache.set(&collider, 2_000);
+
+        assert_eq!(cache.get(&canonical), 1_000, "canonical slot untouched");
+        assert_eq!(cache.get(&collider), 2_000, "sparse entry independent");
+        // Mutations on one must not leak into the other.
+        cache.debit(&collider, 500);
+        cache.credit(&canonical, 250);
+        assert_eq!(cache.get(&canonical), 1_250);
+        assert_eq!(cache.get(&collider), 1_500);
+    }
+
+    /// Regression test: `iter` must include sparse entries —
+    /// previously a full iteration silently dropped every
+    /// non-canonical balance (lost in snapshots/reconciliation).
+    #[test]
+    fn iter_includes_sparse_entries() {
+        let mut cache = BalanceCache::with_capacity(10);
+        cache.set(&addr_idx(3), 700);
+        let mut raw = [0xEE; 20];
+        raw[..4].copy_from_slice(&42u32.to_le_bytes()); // idx 42 > cap → sparse
+        let sparse_addr = Address(raw);
+        cache.set(&sparse_addr, 900);
+
+        let entries: std::collections::HashMap<[u8; 20], u64> = cache.iter().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get(&addr_idx(3).0), Some(&700));
+        assert_eq!(entries.get(&sparse_addr.0), Some(&900));
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]

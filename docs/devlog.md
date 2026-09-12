@@ -10176,3 +10176,34 @@ contiguous.
 - `batch_settler_drops_after_max_retries_and_reuses_nonce` — the
   lane recovers after a permanently-dead envelope and reuses its
   nonce.
+
+## Security sweep round 2 — balance-cache collision, sparse iter, solvency
+
+Three correctness bugs in `crates/matcher/src/balance.rs`:
+
+1. **Address collision (fund aliasing).** Flat residency depended
+   only on `addr[..4]` — two DIFFERENT addresses sharing their
+   first 4 bytes silently aliased the same balance slot. Fix:
+   `is_flat` requires the canonical sequential form (`[u32 index
+   LE][0; 16]` tail) AND `idx < capacity`; every other address goes
+   to the sparse map keyed by the full 20 bytes. Same discriminant
+   on get/set/debit/credit.
+
+2. **`iter()` dropped sparse entries** — any full iteration
+   (snapshot/drain/reconciliation) lost non-canonical balances.
+   `iter` now chains nonzero flat + sparse entries; `len` counts
+   nonzero sparse only (drained entries stay in the map at 0).
+
+3. **`ShardedBalanceCache::transfer` minted money** — the debit
+   saturated to zero while the full amount was credited. Now a
+   solvency check under the same shard locks: `false` → nothing
+   moves (signature changed to `-> bool`; no production callers).
+
+### Tests
+
+- `same_index_prefix_addresses_do_not_collide` — canonical vs
+  colliding tail get independent balances.
+- `iter_includes_sparse_entries` — sparse balances appear in iter
+  and len.
+- `sharded_transfer_insolvent_moves_nothing` — same- and
+  cross-shard insolvency fails atomically.

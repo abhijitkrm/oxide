@@ -726,6 +726,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Matcher balance cache aliased colliding addresses and minted
+  money on insolvent transfers** (`crates/matcher/src/balance.rs`)
+  - `BalanceCache` keyed the flat array by the first 4 address
+    bytes only — two different addresses sharing those bytes
+    silently read and wrote each other's balance. Only canonical
+    sequential addresses (`[u32 index LE][0; 16]`) live in the flat
+    array now; everything else goes to the full-20-byte sparse map.
+  - `iter()` silently excluded every sparse balance.
+  - `ShardedBalanceCache::transfer` saturated the debit to zero
+    but credited the full amount — an insolvent sender paid the
+    recipient out of thin air. It now returns `false` and moves
+    nothing when the sender can't cover the amount.
+  - **In plain words:** accounts can no longer share balances by
+    accident, and insolvent transfers fail instead of creating
+    money.
+
 - **Failed settlement submissions lost matched trades and wedged
   the settlement lane** (`crates/matcher/src/server.rs`)
   - `BatchSettler::settle_now` drained the fill buffer and burned
