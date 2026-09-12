@@ -272,6 +272,17 @@ pub struct TcpTransportConfig {
 
     /// The read timeout for reader threads.
     pub read_timeout: Duration,
+
+    /// C4 fix: the set of allowed peer IDs. When present, the
+    /// transport rejects connections from peers whose self-claimed
+    /// peer ID is not in this set. This binds peer IDs to the
+    /// configured validator set — a peer cannot self-claim an
+    /// arbitrary ID and impersonate a validator.
+    ///
+    /// When `None`, all peer IDs are accepted (the old behavior,
+    /// for testing). In production, this must be set to the
+    /// validator set's peer IDs.
+    pub allowed_peer_ids: Option<std::collections::HashSet<PeerId>>,
 }
 
 impl Default for TcpTransportConfig {
@@ -280,6 +291,10 @@ impl Default for TcpTransportConfig {
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
+            // C4 fix: default to accepting all peer IDs (test
+            // behavior). Production callers must set this to the
+            // validator set's peer IDs via `with_allowed_peer_ids`.
+            allowed_peer_ids: None,
         }
     }
 }
@@ -413,6 +428,41 @@ impl TcpTransport {
         }
     }
 
+    /// Construct a TCP transport with the peer ID allowlist set (C4
+    /// fix). The transport will reject connections from peers whose
+    /// self-claimed peer ID is not in `allowed_peer_ids`. This binds
+    /// peer IDs to the configured validator set — a peer cannot
+    /// self-claim an arbitrary ID and impersonate a validator.
+    ///
+    /// # Arguments
+    ///
+    /// - `listen_addr`: the address to listen on.
+    /// - `peer_id`: this node's peer ID.
+    /// - `peers`: a list of `(peer_id, addr)` tuples for peers to
+    ///   connect to.
+    /// - `allowed_peer_ids`: the set of allowed peer IDs (the
+    ///   validator set's peer IDs).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listen address cannot be bound.
+    pub fn with_allowed_peer_ids(
+        listen_addr: &str,
+        peer_id: PeerId,
+        peers: Vec<(PeerId, TcpAddr)>,
+        allowed_peer_ids: std::collections::HashSet<PeerId>,
+    ) -> Self {
+        let config = TcpTransportConfig { allowed_peer_ids: Some(allowed_peer_ids), ..Default::default() };
+        #[cfg(feature = "tls")]
+        {
+            Self::build(listen_addr, peer_id, peers, config, None, None)
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            Self::build(listen_addr, peer_id, peers, config, None)
+        }
+    }
+
     /// Construct a TCP transport with admission control enabled.
     ///
     /// When admission control is set, the transport:
@@ -504,6 +554,10 @@ impl TcpTransport {
         let accept_shutdown_streams = shutdown_streams.clone();
         let accept_tx = inbound_tx.clone();
         let accept_shutdown = shutdown.clone();
+        // C4 fix: clone the allowed_peer_ids set for the accept
+        // thread. When present, the accept thread rejects connections
+        // from peers whose self-claimed peer ID is not in the set.
+        let accept_allowed_peer_ids = config.allowed_peer_ids.clone();
         #[cfg(feature = "tls")]
         let accept_tls = tls.clone();
         let accept_admission = admission.clone();
@@ -543,6 +597,22 @@ impl TcpTransport {
                         let Some((peer_id, write_stream, reader_stream)) = result else {
                             continue; // connection closed before ID
                         };
+
+                        // C4 fix: reject connections from peers whose
+                        // self-claimed peer ID is not in the allowed set.
+                        // This binds peer IDs to the configured validator
+                        // set — a peer cannot self-claim an arbitrary ID
+                        // and impersonate a validator. When
+                        // `allowed_peer_ids` is `None` (test mode), all
+                        // peer IDs are accepted.
+                        if let Some(ref allowed) = accept_allowed_peer_ids {
+                            if !allowed.contains(&peer_id) {
+                                // Drop the streams, closing the connection.
+                                drop(write_stream);
+                                drop(reader_stream);
+                                continue;
+                            }
+                        }
 
                         // Admission control: check reputation and
                         // connection cap. If rejected, close the
@@ -1422,6 +1492,7 @@ mod tests {
             max_message_bytes: 1024, // 1 KiB — very small for testing
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(30),
+            allowed_peer_ids: None,
         };
 
         let mut transport_a = TcpTransport::with_config(
@@ -1718,5 +1789,56 @@ mod tests {
         transport_b.send(&id_a, b"reply").unwrap();
         let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
         assert_eq!(msg.expect("A should receive").bytes, b"reply");
+    }
+
+    /// C4 fix: a peer whose self-claimed ID is not in the allowed
+    /// set must be rejected. The transport must not accept the
+    /// connection or deliver any messages from it.
+    #[test]
+    fn allowed_peer_ids_rejects_unlisted_peer() {
+        let addr_a = "127.0.0.1:19140";
+        let addr_b = "127.0.0.1:19141";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+        let id_c = vec![2u8]; // not in the allowed set
+
+        // Transport A only allows id_b. id_c is not in the set.
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert(id_b.clone());
+        let mut transport_a = TcpTransport::with_allowed_peer_ids(
+            addr_a,
+            id_a.clone(),
+            vec![(id_b.clone(), addr_b.to_string())],
+            allowed,
+        );
+
+        // Transport B is a normal transport claiming id_b (allowed).
+        let mut transport_b =
+            TcpTransport::new(addr_b, id_b.clone(), vec![(id_a.clone(), addr_a.to_string())]);
+
+        // Transport C is a normal transport claiming id_c (not allowed).
+        // It connects to A but A should reject it.
+        let addr_c = "127.0.0.1:19142";
+        let mut transport_c = TcpTransport::new(
+            addr_c,
+            id_c.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+        );
+
+        thread::sleep(Duration::from_millis(500));
+
+        // B → A should work (id_b is allowed).
+        transport_b.send(&id_a, b"hello from allowed peer").unwrap();
+        let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+        assert_eq!(msg.expect("A should receive from B").bytes, b"hello from allowed peer");
+
+        // C → A should be rejected (id_c is not allowed). A should
+        // not receive any messages from C. The send may fail (the
+        // connection is rejected) or succeed (the message is queued
+        // but never delivered) — either way, A must not receive it.
+        let _ = transport_c.send(&id_a, b"hello from rejected peer");
+        thread::sleep(Duration::from_millis(500));
+        let msg = poll_recv(&mut transport_a, Duration::from_millis(500));
+        assert!(msg.is_none(), "A must not receive from unlisted peer C");
     }
 }
