@@ -1323,7 +1323,7 @@ impl EvmModule {
                     local_touched.insert(revm::primitives::Address::from(addr.0));
                 }
                 local_touched.insert(coinbase);
-                results.push(Self::exec_result_to_events(Ok(result), self.base_fee));
+                results.push(Self::exec_result_to_events(Ok(result), self.base_fee, signed.tx_type()));
                 continue;
             }
 
@@ -1338,7 +1338,7 @@ impl EvmModule {
                     local_touched.insert(revm::primitives::Address::from(addr.0));
                 }
                 local_touched.insert(coinbase);
-                results.push(Self::exec_result_to_events(Ok(result), self.base_fee));
+                results.push(Self::exec_result_to_events(Ok(result), self.base_fee, signed.tx_type()));
                 continue;
             }
 
@@ -1379,7 +1379,7 @@ impl EvmModule {
                 result_and_state.result
             };
 
-            results.push(Self::exec_result_to_events(Ok(result), self.base_fee));
+            results.push(Self::exec_result_to_events(Ok(result), self.base_fee, signed.tx_type()));
         }
 
         // Merge local touched set into the global one (single lock).
@@ -1604,6 +1604,7 @@ impl EvmModule {
         ctx: &TxContext,
         decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>>,
     ) -> Vec<Result<Vec<Event>, ExecError>> {
+        use std::collections::hash_map::Entry;
         // Phase 2: group txs by sender, preserving original order
         // within each group. Txs from the same sender must execute
         // sequentially (nonce dependency). Txs from different senders
@@ -1618,11 +1619,15 @@ impl EvmModule {
         let mut group_order: Vec<revm::primitives::Address> = Vec::new();
         let mut errors: Vec<Option<ExecError>> = vec![None; decoded.len()];
         let n_txs = decoded.len();
+        // Collect tx types for receipt encoding (EIP-2718). Indexed
+        // by the original tx index so the results assembly phase can
+        // look up the type for each receipt.
+        let mut tx_types: Vec<u8> = vec![0; n_txs];
 
         for (idx, item) in decoded.into_iter().enumerate() {
             match item {
                 Ok((signed, caller)) => {
-                    use std::collections::hash_map::Entry;
+                    tx_types[idx] = signed.tx_type();
                     match groups.entry(caller) {
                         Entry::Occupied(_) => {
                             groups.get_mut(&caller).expect("group exists").push((idx, signed));
@@ -2093,13 +2098,13 @@ impl EvmModule {
             }
             // Check re-executed results first (conflict fallback).
             if let Some(r) = reexec_results.remove(&i) {
-                results.push(Self::exec_result_to_events(r, self.base_fee));
+                results.push(Self::exec_result_to_events(r, self.base_fee, tx_types[i]));
                 continue;
             }
             // Fall back to speculative results.
             match spec_index.get(&i) {
                 Some(result) => {
-                    results.push(Self::exec_result_to_events((*result).clone(), self.base_fee));
+                    results.push(Self::exec_result_to_events((*result).clone(), self.base_fee, tx_types[i]));
                 }
                 None => {
                     results.push(Err(ExecError::ModuleRejected(
@@ -2123,10 +2128,11 @@ impl EvmModule {
     fn exec_result_to_events(
         result: Result<revm::context::result::ExecutionResult, ExecError>,
         base_fee: u64,
+        tx_type: u8,
     ) -> Result<Vec<Event>, ExecError> {
         match result {
             Ok(r) => {
-                let receipt = receipts::Receipt::from_execution_result(&r);
+                let receipt = receipts::Receipt::from_execution_result(&r, tx_type);
                 let status_str = if receipt.status { "success" } else { "revert" };
                 let contract_info =
                     receipt.contract_address.map(|a| format!(" contract={a}")).unwrap_or_default();
@@ -2426,6 +2432,17 @@ impl Module for EvmModule {
     }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+        // Decode once to get the tx type for the receipt. The
+        // execute() call decodes again — this is a cold path (one
+        // decode per tx, not per opcode), and the decode is cheap
+        // (~1 µs) compared to EVM execution (~60–80 µs).
+        let tx_type = {
+            let mut buf = msg;
+            match <tx::SignedTx as alloy_rlp::Decodable>::decode(&mut buf) {
+                Ok(signed) => signed.tx_type(),
+                Err(_) => 0, // Malformed tx — execute() will reject it.
+            }
+        };
         let result = self.execute(ctx, msg)?;
 
         // Phase C: build a receipt from the execution result.
@@ -2433,7 +2450,7 @@ impl Module for EvmModule {
         // (for CREATE) the created address. This is the data that
         // `eth_getTransactionReceipt` returns and that goes into the
         // block's receipts trie.
-        let receipt = receipts::Receipt::from_execution_result(&result);
+        let receipt = receipts::Receipt::from_execution_result(&result, tx_type);
 
         let status_str = if receipt.status { "success" } else { "revert" };
         let contract_info =

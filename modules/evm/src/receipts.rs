@@ -41,6 +41,12 @@ pub type Bloom = [u8; 256];
 /// committed in the block's receipts trie.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
+    /// The EIP-2718 transaction type: `0` for legacy, `1` for
+    /// EIP-2930, `2` for EIP-1559. Used by `receipts_root` to
+    /// prefix typed receipts per EIP-2718 (a typed tx's receipt is
+    /// `type_byte || rlp(...)`, a legacy tx's receipt is just
+    /// `rlp(...)`).
+    pub tx_type: u8,
     /// The transaction's status: `true` = success, `false` = revert.
     /// EIP-658: replaces the pre-658 "post-transaction state root".
     pub status: bool,
@@ -56,7 +62,7 @@ pub struct Receipt {
 }
 
 impl Receipt {
-    /// Build a receipt from a revm `ExecutionResult`.
+    /// Build a receipt from a revm `ExecutionResult` and a tx type.
     ///
     /// This is the bridge between revm's execution outcome and
     /// Oxide's receipt type. It extracts:
@@ -65,12 +71,15 @@ impl Receipt {
     /// - Logs (copied from the execution result).
     /// - Contract address (for successful CREATE).
     /// - Bloom filter (computed from logs).
+    /// - Tx type (EIP-2718 type byte, for receipts root encoding).
     ///
     /// # Arguments
     ///
     /// - `result`: the revm execution result.
+    /// - `tx_type`: the EIP-2718 transaction type byte (0 for
+    ///   legacy, 1 for EIP-2930, 2 for EIP-1559).
     #[must_use]
-    pub fn from_execution_result(result: &ExecutionResult) -> Self {
+    pub fn from_execution_result(result: &ExecutionResult, tx_type: u8) -> Self {
         let status = result.is_success();
         let gas_used = result.tx_gas_used();
         let contract_address = result.created_address();
@@ -78,7 +87,7 @@ impl Receipt {
         let logs: Vec<Log> = result.logs().to_vec();
         let bloom = bloom_from_logs(&logs);
 
-        Self { status, gas_used, logs, bloom, contract_address }
+        Self { tx_type, status, gas_used, logs, bloom, contract_address }
     }
 
     /// The cumulative gas used across all receipts in a block.
@@ -201,6 +210,17 @@ fn bloom_check(bloom: &Bloom, data: &[u8]) -> bool {
 ///
 /// The 32-byte receipts root. For zero receipts, returns `EMPTY_ROOT`.
 ///
+/// # EIP-2718 encoding
+///
+/// Each receipt is encoded per EIP-2718:
+/// - Legacy (type 0): `rlp([status, cumulative_gas, bloom, logs])`.
+/// - Typed (type 1/2): `type_byte || rlp([status, cumulative_gas, bloom, logs])`.
+///
+/// This matches Ethereum mainnet's receipts root construction and
+/// reth's `ReceiptRoot` computation. The O(n) construction uses
+/// `ordered_trie_root_with_encoder` which builds a sorted trie over
+/// RLP-encoded transaction indices — O(n) in the number of receipts.
+///
 /// # Panics
 ///
 /// Panics if a receipt's RLP encoding exceeds 255 bytes for the list
@@ -217,17 +237,21 @@ pub fn receipts_root(receipts: &[Receipt]) -> B256 {
 
     // Each receipt is RLP-encoded as:
     // [status_byte, cumulative_gas_used, bloom, logs]
-    // For the trie, the key is the transaction index (RLP-encoded).
-    // We use alloy-trie's `ordered_trie_root_with_encoder` which
-    // handles the index keying.
+    // For typed transactions (EIP-2718), the receipt is prefixed
+    // with the tx type byte. For the trie, the key is the
+    // transaction index (RLP-encoded). We use alloy-trie's
+    // `ordered_trie_root_with_encoder` which handles the index
+    // keying — O(n) in the number of receipts.
     alloy_trie::root::ordered_trie_root_with_encoder(receipts, |receipt, buf| {
         use alloy_rlp::Encodable;
+        // EIP-2718: typed receipts are prefixed with the type byte.
+        // Legacy receipts (type 0) have no prefix.
+        if receipt.tx_type != 0 {
+            buf.push(receipt.tx_type);
+        }
+
         // RLP-encode the receipt as a list:
         // [status, cumulative_gas, bloom, logs]
-        // This matches Ethereum's pre-EIP-2718 receipt encoding.
-        // Typed transactions (EIP-2718) prefix the receipt with the
-        // tx type byte; we'll add that when we support typed tx
-        // receipts in a follow-up.
         let status_byte: u8 = u8::from(receipt.status);
 
         // Find this receipt's index to get its cumulative gas.
@@ -273,6 +297,7 @@ mod tests {
     #[test]
     fn empty_logs_produce_zero_bloom() {
         let receipt = Receipt {
+            tx_type: 0,
             status: true,
             gas_used: 21_000,
             logs: vec![],
@@ -328,6 +353,7 @@ mod tests {
     fn cumulative_gas_is_running_sum() {
         let receipts = vec![
             Receipt {
+                tx_type: 0,
                 status: true,
                 gas_used: 21_000,
                 logs: vec![],
@@ -335,6 +361,7 @@ mod tests {
                 contract_address: None,
             },
             Receipt {
+                tx_type: 0,
                 status: true,
                 gas_used: 30_000,
                 logs: vec![],
@@ -342,6 +369,7 @@ mod tests {
                 contract_address: None,
             },
             Receipt {
+                tx_type: 0,
                 status: false,
                 gas_used: 50_000,
                 logs: vec![],
@@ -378,6 +406,7 @@ mod tests {
     #[test]
     fn non_empty_receipts_produce_non_empty_root() {
         let receipts = vec![Receipt {
+            tx_type: 0,
             status: true,
             gas_used: 21_000,
             logs: vec![],

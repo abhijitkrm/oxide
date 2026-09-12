@@ -419,6 +419,19 @@ impl SignedTx {
         }
     }
 
+    /// The EIP-2718 transaction type byte: `0` for legacy (implicit,
+    /// not prefixed on the wire), `1` for EIP-2930, `2` for EIP-1559.
+    /// Used by the receipts root to prefix typed receipts per
+    /// EIP-2718 (a typed tx's receipt is `type_byte || rlp(...)`).
+    #[must_use]
+    pub const fn tx_type(&self) -> u8 {
+        match self {
+            Self::Legacy(_, _) => 0,
+            Self::Eip2930(_, _) => TX_TYPE_EIP2930,
+            Self::Eip1559(_, _) => TX_TYPE_EIP1559,
+        }
+    }
+
     /// The nonce of the transaction.
     #[must_use]
     pub fn nonce(&self) -> u64 {
