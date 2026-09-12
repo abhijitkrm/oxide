@@ -10632,3 +10632,19 @@ immediately: removed 4 validator images + pruned docker (4.2 GB
 reclaimed), killed a stray `oxide-validator --engine=sequencer`
 process, removed scratch files. `target/` (40 GB) left in place —
 active work session; `cargo clean` documented for disk pressure.
+
+## Disk hygiene — incremental cache removed + disabled
+
+The repo folder hit 40 GB+ (disk at 96%, 9 GB free). Breakdown:
+`target/debug/incremental` alone was ~22 GB of stale incremental
+artifacts; `target/debug/deps` ~13 GB; `target/release` ~4.4 GB;
+`fuzz/target` ~0.6 GB.
+
+Actions:
+- Deleted `target/debug/incremental` → ~17 GB freed (26 GB free).
+- Added `.cargo/config.toml` with `[build] incremental = false` —
+  the incremental cache pays off mostly for rapid local
+  edit-check cycles, not agent/CI-driven builds, and it was the
+  single largest regenerating consumer.
+- `target/` remains ~23 GB (debug deps + release + criterion);
+  `cargo clean` removes it fully if space gets tight again.

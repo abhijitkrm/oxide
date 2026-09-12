@@ -1,0 +1,9 @@
+# Workspace build configuration.
+#
+# Incremental compilation cache (`target/debug/incremental`) grew to
+# ~22 GB in this repo — it re-compiles whole crates' MIR objects per
+# change and pays off mostly for rapid local edit-check cycles. CI and
+# agent-driven builds compile fresh anyway, so disable it: builds stay
+# deterministic, disk stays bounded, and deps are still cached.
+[build]
+incremental = false
