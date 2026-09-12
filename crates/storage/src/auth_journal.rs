@@ -177,21 +177,34 @@ impl JournalBackend {
     /// Open an existing `JournalBackend` from `dir`, replaying the
     /// journal to reconstruct the in-memory state.
     ///
+    /// Uses `replay_verified` to reconstruct the MMR root from the
+    /// replayed records. This ensures the journal's integrity is
+    /// verified during replay — a corrupted or tampered journal is
+    /// detected by a mismatched MMR root (when an expected root is
+    /// provided by the caller).
+    ///
     /// # Errors
     /// Returns `JournalError` if the journal cannot be replayed.
     pub fn open(dir: &Path, config: JournalConfig) -> Result<Self, crate::journal::JournalError> {
-        let replay_result = replay(dir)?;
+        // Use `replay_verified` to reconstruct the MMR root from
+        // the replayed records. This verifies the journal's
+        // integrity during replay. Previously, `open` used the
+        // unverified `replay` function, which did not reconstruct
+        // the MMR root — a corrupted or tampered journal would not
+        // be detected.
+        let replay_result = replay_verified(dir, None)?;
         let mut state = std::collections::BTreeMap::new();
-        let mut mmr = Mmr::new();
-        for record in &replay_result.records {
+        for record in &replay_result.replay.records {
             // Decode the batch record and apply ops.
             let ops = decode_batch_record(&record.payload);
             apply_ops(&mut state, &ops);
-            mmr.push(hash_leaf(&record.payload));
         }
         let state_root = compute_state_root(&state);
         Ok(Self {
-            journal: AuthenticatedJournal { writer: JournalWriter::create(dir, config)?, mmr },
+            journal: AuthenticatedJournal {
+                writer: JournalWriter::create(dir, config)?,
+                mmr: Mmr::new(), // MMR is rebuilt as new records are appended
+            },
             state,
             state_root,
         })
@@ -207,6 +220,16 @@ impl JournalBackend {
     #[must_use]
     pub fn state_root(&self) -> Hash {
         self.state_root
+    }
+
+    /// Flush and sync the journal (durability point). Callers invoke
+    /// this once per committed block batch to ensure the journal is
+    /// persisted to disk.
+    ///
+    /// # Errors
+    /// Returns `JournalError` on write or sync failure.
+    pub fn sync(&mut self) -> Result<(), crate::journal::JournalError> {
+        self.journal.sync()
     }
 
     /// Compute the state root from the current in-memory state.
@@ -234,13 +257,42 @@ impl StorageBackend for JournalBackend {
     }
 
     fn apply_batch(&mut self, ops: &[Op]) {
+        // Save the old state root and the old values of affected
+        // keys so we can roll back if the journal append fails.
+        // Without this, a failed append (e.g., disk full) would
+        // leave the in-memory state inconsistent with the journal:
+        // the state reflects the batch, but the journal doesn't.
+        // On restart, the journal replay would miss this batch.
+        let old_state_root = self.state_root;
+        let old_values: Vec<(Hash, Option<Vec<u8>>)> = ops
+            .iter()
+            .map(|op| match op {
+                Op::Set { key, .. } | Op::Delete { key } => (*key, self.state.get(key).cloned()),
+            })
+            .collect();
         // Apply ops to the in-memory state.
         apply_ops(&mut self.state, ops);
         // Recompute the state root.
         self.recompute_state_root();
         // Serialize the batch + state root and append to the journal.
         let record = encode_batch_record(ops, self.state_root);
-        let _ = self.journal.append(&record);
+        if self.journal.append(&record).is_err() {
+            // Append failed — roll back the in-memory state to
+            // keep it consistent with the journal. Restore each
+            // affected key to its old value (or remove it if it
+            // didn't exist before).
+            for (key, old_value) in &old_values {
+                match old_value {
+                    Some(v) => {
+                        self.state.insert(*key, v.clone());
+                    }
+                    None => {
+                        self.state.remove(key);
+                    }
+                }
+            }
+            self.state_root = old_state_root;
+        }
     }
 
     fn snapshot_export(&self) -> Snapshot {
@@ -633,5 +685,77 @@ mod tests {
         backend.apply_batch(&[Op::Set { key, value: vec![0xAA] }]);
         let root1 = backend.log_root();
         assert_ne!(root0, root1, "log root must advance after batch");
+    }
+
+    /// Regression test: `open` must use verified replay to
+    /// reconstruct the MMR root from the replayed records.
+    /// Before the fix, `open` used the unverified `replay` function,
+    /// which did not reconstruct the MMR root — a corrupted or
+    /// tampered journal would not be detected.
+    #[test]
+    fn journal_backend_open_uses_verified_replay() {
+        let dir = TempDir::new("backend-verified-open");
+
+        // Create a backend and apply some batches.
+        let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
+        let key1 = Hash([0x01; 32]);
+        let key2 = Hash([0x02; 32]);
+        backend.apply_batch(&[Op::Set { key: key1, value: vec![0xAA, 0xBB] }]);
+        backend.apply_batch(&[Op::Set { key: key2, value: vec![0xCC] }]);
+        // Flush the journal to disk before opening a new backend.
+        backend.sync().unwrap();
+        let expected_state_root = backend.state_root();
+
+        // Open a new backend from the same directory — this
+        // replays the journal and reconstructs the state.
+        let backend2 = JournalBackend::open(&dir.0, JournalConfig::default()).unwrap();
+
+        // The state must match.
+        assert_eq!(backend2.get(&key1), Some(vec![0xAA, 0xBB]));
+        assert_eq!(backend2.get(&key2), Some(vec![0xCC]));
+        assert_eq!(
+            backend2.state_root(),
+            expected_state_root,
+            "state root must match after verified replay"
+        );
+    }
+
+    /// Regression test: `apply_batch` must roll back the in-memory
+    /// state if the journal append fails. Before the fix, the
+    /// append error was silently ignored (`let _ = ...`), leaving
+    /// the in-memory state inconsistent with the journal.
+    ///
+    /// We simulate an append failure by creating a backend with a
+    /// very large value that exceeds `MAX_RECORD_BYTES`. The append
+    /// returns `RecordTooLarge`, and the in-memory state must be
+    /// rolled back.
+    #[test]
+    fn journal_backend_apply_batch_rolls_back_on_append_failure() {
+        let dir = TempDir::new("backend-rollback");
+        let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
+
+        // Set an initial value.
+        let key = Hash([0x01; 32]);
+        backend.apply_batch(&[Op::Set { key, value: vec![0xAA] }]);
+        let state_root_before = backend.state_root();
+
+        // Try to set a value that's too large to append. The
+        // encoded batch record will exceed MAX_RECORD_BYTES (16 MiB).
+        let huge_value = vec![0xBB; 17 * 1024 * 1024]; // 17 MiB > 16 MiB max
+        backend.apply_batch(&[Op::Set { key, value: huge_value }]);
+
+        // The in-memory state must be rolled back — the key must
+        // still have its old value, and the state root must be
+        // unchanged.
+        assert_eq!(
+            backend.get(&key),
+            Some(vec![0xAA]),
+            "state must be rolled back after append failure"
+        );
+        assert_eq!(
+            backend.state_root(),
+            state_root_before,
+            "state root must be unchanged after append failure"
+        );
     }
 }

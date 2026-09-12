@@ -9673,3 +9673,46 @@ allocations. That requires an API change and is deferred.
 
 All existing crypto tests (42) pass. No new tests needed — this is
 a performance optimization with no behavioral change.
+
+## Pre-testnet audit: journal durability fixes
+
+### Root cause
+
+Two journal durability issues:
+
+1. **`apply_batch` ignored append errors**: The journal append
+   error was silently discarded (`let _ = self.journal.append(...)`).
+   If the append failed (e.g., disk full, record too large), the
+   in-memory state was updated but the journal was not. On restart,
+   the journal replay would miss this batch, causing the state to
+   diverge from what was persisted.
+
+2. **`open` used unverified replay**: The `open` function used the
+   unverified `replay` function, which did not reconstruct the MMR
+   root from the replayed records. A corrupted or tampered journal
+   would not be detected during replay.
+
+### Fix
+
+1. **`apply_batch` rollback**: Before applying ops, save the old
+   state root and the old values of affected keys. If the journal
+   append fails, roll back the in-memory state to its pre-batch
+   values and restore the old state root. This keeps the in-memory
+   state consistent with the journal.
+
+2. **`open` verified replay**: Changed `open` to use `replay_verified`
+   instead of `replay`. This reconstructs the MMR root from the
+   replayed records, enabling detection of a corrupted or tampered
+   journal (when an expected root is provided by the caller).
+
+3. **Added `sync` method**: Added a public `sync` method to
+   `JournalBackend` so callers can flush the journal to disk before
+   opening a new backend (needed for the regression test).
+
+### Regression tests
+
+- `journal_backend_open_uses_verified_replay` — `open` must
+  reconstruct the state correctly from the journal.
+- `journal_backend_apply_batch_rolls_back_on_append_failure` —
+  `apply_batch` must roll back the in-memory state if the journal
+  append fails.

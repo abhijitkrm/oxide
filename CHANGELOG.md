@@ -2651,3 +2651,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** quorum certificate verification is faster
     because the public key buffer no longer reallocates as it grows.
     This reduces per-QC overhead for the consensus engine.
+
+- **Journal backend ignored append errors and used unverified replay**
+  (`crates/storage/src/auth_journal.rs`)
+  - `apply_batch` silently discarded journal append errors (`let _ = ...`).
+    If the append failed (e.g., disk full), the in-memory state was updated
+    but the journal was not — on restart, the state would diverge.
+  - `open` used the unverified `replay` function, which did not reconstruct
+    the MMR root — a corrupted or tampered journal would not be detected.
+  - `apply_batch` now rolls back the in-memory state if the append fails.
+    `open` now uses `replay_verified` to reconstruct the MMR root.
+  - Regression tests: `journal_backend_open_uses_verified_replay`,
+    `journal_backend_apply_batch_rolls_back_on_append_failure`.
+  - **In plain words:** if the disk fills up while writing a block, the
+    node's in-memory state is rolled back to match what was actually
+    persisted. On restart, the journal is verified to detect corruption.

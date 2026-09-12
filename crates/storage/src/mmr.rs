@@ -364,7 +364,7 @@ mod tests {
     /// Regression test: MMR domain-separated hashes must not collide
     /// with transaction, vote, or block hashes for the same input.
     /// Before the fix, MMR used raw prefix 0x01 (colliding with
-    /// Domain::Transaction) and 0x02 (colliding with Domain::Vote).
+    /// `Domain::Transaction`) and 0x02 (colliding with `Domain::Vote`).
     #[test]
     fn mmr_domains_do_not_collide_with_consensus_domains() {
         let payload = b"test payload";
@@ -387,10 +387,7 @@ mod tests {
 
         // MMR node hash uses Domain::MmrNode (tag 5).
         let mmr_node = hash_node(&Hash::ZERO, &Hash::ZERO);
-        let tx_node = crypto::hash::Hasher::hash_one(
-            crypto::hash::Domain::Transaction,
-            &[0u8; 64],
-        );
+        let tx_node = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, &[0u8; 64]);
         assert_ne!(mmr_node, tx_node, "MMR node must not collide with transaction hash");
     }
 
