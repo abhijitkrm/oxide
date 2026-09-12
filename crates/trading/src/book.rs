@@ -173,6 +173,23 @@ pub trait BookBackend {
     /// O(active levels in range), no mutation.
     fn fillable_qty(&self, taker_side: Side, limit_raw: Option<u64>) -> u64;
 
+    /// Total quantity a `taker_side` order could fill given the
+    /// current book, bounded by `limit_raw`, excluding orders owned
+    /// by `exclude_owner`. Used by the FOK pre-scan when STP is
+    /// active — the taker's own resting orders will be skipped or
+    /// canceled during the sweep, so they must not count toward
+    /// the fillable quantity.
+    ///
+    /// Walks the opposite side best-first, visiting each resting
+    /// order at each level — O(orders in range), no mutation.
+    fn fillable_qty_excluding_owner(
+        &self,
+        taker_side: Side,
+        limit_raw: Option<u64>,
+        exclude_owner: primitives::Address,
+        pool: &crate::pool::OrderPool,
+    ) -> u64;
+
     /// Number of addressable levels (cold path: iteration, digests).
     fn level_count(&self) -> usize;
 
@@ -366,6 +383,63 @@ impl BookBackend for DenseBook {
                         break;
                     }
                     total = total.saturating_add(self.levels[idx as usize].total_qty);
+                    match self.bids.prev_before(idx) {
+                        Some(prev) => idx = prev,
+                        None => break,
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    fn fillable_qty_excluding_owner(
+        &self,
+        taker_side: Side,
+        limit_raw: Option<u64>,
+        exclude_owner: primitives::Address,
+        pool: &crate::pool::OrderPool,
+    ) -> u64 {
+        let mut total: u64 = 0;
+        match taker_side {
+            Side::Buy => {
+                let Some(mut idx) = self.asks.lowest() else { return 0 };
+                loop {
+                    let price = self.level_price(idx);
+                    if limit_raw.is_some_and(|lim| price > lim) {
+                        break;
+                    }
+                    // Walk the level's FIFO, summing quantities
+                    // excluding orders owned by `exclude_owner`.
+                    let mut slot = self.levels[idx as usize].head;
+                    while slot != crate::pool::NIL {
+                        let node = &pool[slot];
+                        if node.owner != exclude_owner {
+                            total = total.saturating_add(node.qty.0);
+                        }
+                        slot = node.next;
+                    }
+                    match self.asks.next_after(idx) {
+                        Some(next) => idx = next,
+                        None => break,
+                    }
+                }
+            }
+            Side::Sell => {
+                let Some(mut idx) = self.bids.highest() else { return 0 };
+                loop {
+                    let price = self.level_price(idx);
+                    if limit_raw.is_some_and(|lim| price < lim) {
+                        break;
+                    }
+                    let mut slot = self.levels[idx as usize].head;
+                    while slot != crate::pool::NIL {
+                        let node = &pool[slot];
+                        if node.owner != exclude_owner {
+                            total = total.saturating_add(node.qty.0);
+                        }
+                        slot = node.next;
+                    }
                     match self.bids.prev_before(idx) {
                         Some(prev) => idx = prev,
                         None => break,

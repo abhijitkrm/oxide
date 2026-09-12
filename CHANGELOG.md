@@ -2555,3 +2555,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     bounded by a gas limit. A sender with insufficient balance for
     the fee has their transaction skipped. A byzantine proposer
     cannot include unbounded computation in a single block.
+
+- **FOK pre-scan did not exclude self-trades under STP**
+  (`crates/trading/src/engine.rs`, `crates/trading/src/book.rs`)
+  - The FOK pre-scan used `fillable_qty` which summed all orders
+    including the taker's own. When STP was active, the sweep would
+    skip or cancel the taker's own orders, so the actual fillable
+    quantity was less. A FOK that should have been killed was
+    instead accepted and then canceled mid-sweep — violating the
+    FOK all-or-nothing guarantee.
+  - Added `fillable_qty_excluding_owner` to the `BookBackend` trait.
+    The FOK pre-scan now uses it when STP is active.
+  - Regression tests: `fok_pre_scan_excludes_self_trades_under_stp`,
+    `fok_pre_scan_counts_all_orders_without_stp`.
+  - **In plain words:** a fill-or-kill order now correctly accounts
+    for self-trade prevention when checking if enough liquidity
+    exists. If the only available liquidity is the trader's own
+    resting orders, the FOK is killed immediately rather than
+    executing partially and then being canceled.

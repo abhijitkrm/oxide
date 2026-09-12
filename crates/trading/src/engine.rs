@@ -240,11 +240,23 @@ impl<B: BookBackend> MatchingEngine<B> {
 
         // FOK: all-or-nothing. Pre-scan fillable quantity against the
         // current book; insufficient → kill without executing.
-        // (Self-trade prevention can still interrupt a FOK mid-sweep;
-        // that documented corner yields CanceledRemainder, never a
-        // silent partial fill of a "kill".)
+        //
+        // When STP is active, the taker's own resting orders on the
+        // opposite side will be skipped or canceled during the sweep,
+        // so they must not count toward the fillable quantity. Using
+        // the non-STP fillable_qty here would accept a FOK that STP
+        // then partially cancels — violating the FOK guarantee.
+        //
+        // (Self-trade prevention can still interrupt a FOK mid-sweep
+        // if a new self-match appears between the pre-scan and the
+        // sweep; that documented corner yields CanceledRemainder,
+        // never a silent partial fill of a "kill".)
         if req.tif == TimeInForce::Fok {
-            let fillable = self.book.fillable_qty(req.side, limit_raw);
+            let fillable = if matches!(req.stp, StpMode::None) {
+                self.book.fillable_qty(req.side, limit_raw)
+            } else {
+                self.book.fillable_qty_excluding_owner(req.side, limit_raw, req.owner, &self.pool)
+            };
             if fillable < req.qty.0 {
                 return Ok(OrderOutcome::Killed);
             }
@@ -971,5 +983,81 @@ mod tests {
         let result = e.cancel(order_id);
         assert!(result.is_err(), "double-cancel must error not panic");
         assert_eq!(e.resting_count(), 0, "resting must be 0 after cancel");
+    }
+
+    /// Regression test: FOK pre-scan must exclude the taker's own
+    /// resting orders when STP is active. Before the fix, the FOK
+    /// pre-scan counted the taker's own orders as fillable, so a
+    /// FOK that should have been killed (because STP would skip
+    /// the taker's own orders) was instead accepted and then
+    /// canceled mid-sweep — violating the FOK guarantee.
+    #[test]
+    fn fok_pre_scan_excludes_self_trades_under_stp() {
+        let mut e = engine();
+        let mut fills = Vec::new();
+
+        // Owner 1 rests a sell at 10.50 for 5,000 lots.
+        let out = e
+            .place(
+                order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 5_000, 1),
+                &mut fills,
+            )
+            .unwrap();
+        assert!(matches!(out, OrderOutcome::Resting { .. }));
+
+        // Owner 1 submits a FOK buy for 5,000 at 10.50 with STP
+        // CancelNewest. The only resting sell is owner 1's own
+        // order, so the STP-aware fillable quantity is 0 (the
+        // own order is excluded). The FOK must be killed.
+        let fok_req = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Fok,
+            price: Price(1_050_000_000),
+            qty: Qty(5_000),
+            owner: Address([1; 20]),
+            stp: StpMode::CancelNewest,
+        };
+        let out = e.place(fok_req, &mut fills).unwrap();
+        assert_eq!(out, OrderOutcome::Killed, "FOK with only self-trades must be killed under STP");
+        assert!(fills.is_empty(), "killed FOK must not produce fills");
+
+        // The resting order must still be in the book.
+        assert_eq!(e.resting_count(), 1, "resting order must not be removed by killed FOK");
+    }
+
+    /// Regression test: FOK pre-scan with STP None must count
+    /// all orders (including the taker's own). This verifies the
+    /// non-STP path is unchanged.
+    #[test]
+    fn fok_pre_scan_counts_all_orders_without_stp() {
+        let mut e = engine();
+        let mut fills = Vec::new();
+
+        // Owner 1 rests a sell at 10.50 for 5,000 lots.
+        let out = e
+            .place(
+                order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 5_000, 1),
+                &mut fills,
+            )
+            .unwrap();
+        assert!(matches!(out, OrderOutcome::Resting { .. }));
+
+        // Owner 1 submits a FOK buy for 5,000 at 10.50 with STP
+        // None. The own order counts as fillable, so the FOK
+        // passes the pre-scan and executes (self-trade happens).
+        let fok_req = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Fok,
+            price: Price(1_050_000_000),
+            qty: Qty(5_000),
+            owner: Address([1; 20]),
+            stp: StpMode::None,
+        };
+        let out = e.place(fok_req, &mut fills).unwrap();
+        // With STP None, the self-trade executes and the order fills.
+        assert_eq!(out, OrderOutcome::Filled, "FOK without STP must fill against own order");
+        assert!(!fills.is_empty(), "FOK without STP must produce fills");
     }
 }

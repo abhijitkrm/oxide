@@ -225,8 +225,10 @@ impl ModelBook {
             }
         }
 
-        // FOK pre-scan (STP-blind, matching the engine's documented
-        // behavior).
+        // FOK pre-scan (STP-aware, matching the engine's behavior).
+        // When STP is active, the taker's own resting orders on the
+        // opposite side will be skipped or canceled during the sweep,
+        // so they must not count toward the fillable quantity.
         if req.tif == TimeInForce::Fok {
             let mut fillable = 0u64;
             let prices: Vec<u64> = self.map(opposite).keys().copied().collect();
@@ -239,10 +241,16 @@ impl ModelBook {
                 if !Self::marketable(req.side, price, limit) {
                     break;
                 }
-                fillable += self
-                    .map(opposite)
-                    .get(&price)
-                    .map_or(0, |d| d.iter().map(|o| o.qty).sum::<u64>());
+                fillable += self.map(opposite).get(&price).map_or(0, |d| {
+                    d.iter()
+                        .filter(|o| {
+                            // STP-aware: exclude the taker's own
+                            // orders when STP is active.
+                            matches!(req.stp, StpMode::None) || o.owner != req.owner
+                        })
+                        .map(|o| o.qty)
+                        .sum::<u64>()
+                });
                 if fillable >= rem {
                     break;
                 }

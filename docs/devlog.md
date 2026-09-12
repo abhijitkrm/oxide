@@ -9463,3 +9463,32 @@ to prevent a panic on overflow.
 - `charge_fee_debits_sender_balance`
 - `charge_fee_rejects_insufficient_balance`
 - `charge_fee_zero_is_noop`
+
+## Pre-testnet audit: FOK pre-scan excludes self-trades under STP
+
+### Root cause
+
+The FOK pre-scan used `fillable_qty` which sums all orders at
+each level, including the taker's own resting orders. When STP
+was active, the sweep would skip or cancel the taker's own
+orders, reducing the actual fillable quantity. A FOK that
+should have been killed (because STP reduces fillable qty below
+the order qty) was instead accepted and then canceled
+mid-sweep — violating the FOK all-or-nothing guarantee.
+
+### Fix
+
+Added `fillable_qty_excluding_owner` method to the `BookBackend`
+trait. It walks the book levels and sums quantities excluding
+orders owned by the specified owner. The FOK pre-scan now uses
+this method when STP is active (`stp != StpMode::None`).
+
+Also updated the property test oracle's FOK pre-scan to be
+STP-aware, matching the engine's behavior.
+
+### Regression tests
+
+- `fok_pre_scan_excludes_self_trades_under_stp` — a FOK with only
+  self-trades available must be killed under STP.
+- `fok_pre_scan_counts_all_orders_without_stp` — a FOK without
+  STP must count all orders (including own) as fillable.
