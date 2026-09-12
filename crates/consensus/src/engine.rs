@@ -677,9 +677,9 @@ impl OxideBft {
             high_qc: self.high_qc.clone(),
             timeout_cert: None, // Stage 4: TC attached on view changes
             proposer: proposer_hash(self.validator_set.leader(self.current_view)),
-            timestamp: 0, // deterministic: no real clock in the test model
+            timestamp: 0,             // deterministic: no real clock in the test model
             proposer_signature: None, // set below after signing
-            exec_cert: None, // Wired after exec-cert aggregation
+            exec_cert: None,          // Wired after exec-cert aggregation
         };
         // C3 fix: sign the header with the leader's BLS secret key.
         // The signature authenticates that the claimed proposer
@@ -745,11 +745,7 @@ impl OxideBft {
             let Some(sig) = &header.proposer_signature else {
                 return None;
             };
-            let leader_pk = self
-                .validator_set
-                .validator(expected_leader)
-                .map_err(|_| ())
-                .ok()?;
+            let leader_pk = self.validator_set.validator(expected_leader).map_err(|_| ()).ok()?;
             let signing_hash = Self::proposal_signing_hash(header);
             crypto::verify(sig, crypto::hash::Domain::Proposal, signing_hash.as_bytes(), leader_pk)
                 .ok()?;
@@ -3206,9 +3202,7 @@ mod tests {
             signature: Signature::ZERO,
         };
         // C2: future-view vote is silently dropped, not an error.
-        leader
-            .collect_vote(2, vote_v1)
-            .expect("future-view vote silently dropped (C2)");
+        leader.collect_vote(2, vote_v1).expect("future-view vote silently dropped (C2)");
         // The vote buffer must not contain the future-view vote.
         assert!(leader.votes[2].is_none(), "future-view vote must not be stored");
     }
@@ -3229,9 +3223,7 @@ mod tests {
             block_hash: Hash::ZERO,
             signature: Signature::ZERO,
         };
-        leader
-            .collect_vote(1, future_vote)
-            .expect("future-view vote silently dropped");
+        leader.collect_vote(1, future_vote).expect("future-view vote silently dropped");
 
         // Real votes for view 0 (current) must still be accepted.
         let real_vote = Vote {
