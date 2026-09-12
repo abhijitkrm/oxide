@@ -589,7 +589,11 @@ impl OxideBft {
     /// bytes. A proper Merkle root (MMR or binary Merkle tree) lands
     /// when individual tx inclusion proofs are needed.
     fn tx_root(txs: &[TxBytes]) -> Hash {
-        let mut buf = Vec::new();
+        // Perf: pre-size the buffer to the total tx bytes to avoid
+        // reallocations. Each tx is ~120 B min, so a 10k-tx block
+        // is ~1.2 MB — one allocation instead of ~20 regrowths.
+        let total: usize = txs.iter().map(|t| t.as_bytes().len()).sum();
+        let mut buf = Vec::with_capacity(total);
         for tx in txs {
             buf.extend_from_slice(tx.as_bytes());
         }
@@ -605,7 +609,9 @@ impl OxideBft {
     /// Compute the block hash for a header. Public so the multi-node
     /// simulation can reference the same hash when constructing votes.
     pub fn block_hash(header: &BlockHeader) -> Hash {
-        let mut buf = Vec::new();
+        // Perf: pre-size to the header's encoded length. A BlockHeader
+        // is ~200 bytes, so this avoids one reallocation.
+        let mut buf = Vec::with_capacity(256);
         header.encode(&mut buf);
         Hasher::hash_one(Domain::Block, &buf)
     }
@@ -1254,7 +1260,11 @@ impl OxideBft {
     /// not verify.
     fn verify_qc_signature(&self, qc: &QuorumCertificate) -> Result<(), ConsensusError> {
         // Extract the signer public keys from the bitmap.
-        let mut signer_pks: Vec<crypto::bls::PublicKey> = Vec::new();
+        // Perf: pre-size to the quorum threshold — the number of
+        // signers is at most the validator set size, and typically
+        // close to the quorum threshold (2f+1).
+        let mut signer_pks: Vec<crypto::bls::PublicKey> =
+            Vec::with_capacity(self.validator_set.quorum());
         for (i, byte) in qc.signer_bitmap.iter().enumerate() {
             for bit in 0..8 {
                 if (byte >> bit) & 1 == 1 {
@@ -1550,7 +1560,9 @@ impl OxideBft {
     /// [`ConsensusError::InvalidTcSignature`] if the aggregate does
     /// not verify.
     fn verify_tc_signature(&self, tc: &TimeoutCertificate) -> Result<(), ConsensusError> {
-        let mut signer_pks: Vec<crypto::bls::PublicKey> = Vec::new();
+        // Perf: pre-size to the quorum threshold.
+        let mut signer_pks: Vec<crypto::bls::PublicKey> =
+            Vec::with_capacity(self.validator_set.quorum());
         for (i, byte) in tc.signer_bitmap.iter().enumerate() {
             for bit in 0..8 {
                 if (byte >> bit) & 1 == 1 {
