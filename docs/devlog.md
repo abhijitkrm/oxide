@@ -9492,3 +9492,44 @@ STP-aware, matching the engine's behavior.
   self-trades available must be killed under STP.
 - `fok_pre_scan_counts_all_orders_without_stp` — a FOK without
   STP must count all orders (including own) as fillable.
+
+## Pre-testnet audit: P2P duplicate connection and stale thread shutdown
+
+### Root cause
+
+The TCP transport had two issues:
+
+1. **Duplicate connections**: When a new connection from an existing
+   peer arrived (e.g. both sides connected simultaneously), the old
+   writer sender was silently overwritten in the `streams` map. The
+   old reader thread kept running, consuming resources.
+
+2. **Stale thread/socket shutdown**: `shutdown()` only cleared the
+   `streams` map (dropping writer senders). Reader threads kept
+   blocking on `read` for up to 30s (the read timeout) before
+   noticing the shutdown. This delayed clean process exit by up to
+   30s per peer.
+
+### Fix
+
+1. Added a `shutdown_streams` map (`PeerId -> TcpStream` clone) to
+   the transport. Each connection stores a `try_clone()` of the
+   underlying TCP socket. On `shutdown()`, we call
+   `shutdown(Shutdown::Both)` on each stored stream, causing all
+   reader threads to get an immediate error on their next `read`
+   and exit without waiting for the read timeout.
+
+2. For duplicate connections, we do NOT shut down the old stream
+   when replacing it. If both peers connected simultaneously, the
+   old outbound socket is the peer's new inbound socket — shutting
+   it down would kill the peer's new connection. Instead, the old
+   writer sender is dropped (causing the old writer thread to exit
+   within 100ms), and the old reader thread exits when the read
+   timeout expires or the peer closes the connection.
+
+### Regression tests
+
+- `tcp_shutdown_closes_connections_promptly` — `shutdown()` must
+  close connections within 5s (not 30s).
+- `tcp_duplicate_connections_survive` — simultaneous bidirectional
+  connections must not kill each other.

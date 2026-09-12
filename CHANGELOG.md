@@ -2573,3 +2573,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     exists. If the only available liquidity is the trader's own
     resting orders, the FOK is killed immediately rather than
     executing partially and then being canceled.
+
+- **P2P transport did not forcibly close connections on shutdown**
+  (`crates/p2p/src/tcp.rs`)
+  - `shutdown()` only cleared the `streams` map (dropping writer
+    senders). Reader threads kept blocking on `read` for up to 30s
+    before noticing the shutdown. This delayed clean process exit.
+  - Added a `shutdown_streams` map storing `TcpStream` clones. On
+    `shutdown()`, `shutdown(Shutdown::Both)` is called on each
+    stream, causing reader threads to exit immediately.
+  - Also fixed duplicate-connection handling: when both peers connect
+    simultaneously, the old connection is NOT shut down (that would
+    kill the peer's new inbound connection). The old writer sender
+    is dropped, and the old reader thread exits naturally.
+  - Regression tests: `tcp_shutdown_closes_connections_promptly`,
+    `tcp_duplicate_connections_survive`.
+  - **In plain words:** when a validator shuts down, all network
+    connections are closed immediately instead of lingering for up
+    to 30 seconds. Simultaneous connections between two peers no
+    longer kill each other.

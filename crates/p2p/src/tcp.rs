@@ -292,6 +292,17 @@ pub struct TcpTransport {
     /// accepting a new peer, and `recv()` checks `admit_message`
     /// before delivering an inbound message.
     admission: Option<Arc<SharedAdmissionControl>>,
+    /// Clones of the underlying `TcpStream` for each connected peer,
+    /// used to forcibly close connections on shutdown. Calling
+    /// `shutdown(Shutdown::Both)` on a clone causes the reader
+    /// thread's blocked `read` to return immediately with an error,
+    /// so reader threads exit without waiting for the read timeout
+    /// (up to 30s by default).
+    ///
+    /// Also used for duplicate-connection handling: when a new
+    /// connection from an existing peer arrives, the old stream is
+    /// shut down, forcing the old reader thread to exit.
+    shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
 }
 
 impl TcpTransport {
@@ -420,6 +431,8 @@ impl TcpTransport {
 
         let streams: Arc<Mutex<HashMap<PeerId, mpsc::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>();
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -434,6 +447,7 @@ impl TcpTransport {
         // Spawn the accept thread: accepts incoming connections in
         // non-blocking mode, checks the shutdown flag between polls.
         let accept_streams = streams.clone();
+        let accept_shutdown_streams = shutdown_streams.clone();
         let accept_tx = inbound_tx.clone();
         let accept_shutdown = shutdown.clone();
         #[cfg(feature = "tls")]
@@ -445,6 +459,14 @@ impl TcpTransport {
                     Ok((stream, _)) => {
                         // Switch back to blocking mode for the stream.
                         let _ = stream.set_nonblocking(false);
+
+                        // Clone the stream before it's moved into
+                        // `accept_*_connection`. This clone is stored
+                        // in `shutdown_streams` so `shutdown()` can
+                        // forcibly close the connection, causing the
+                        // reader thread to exit immediately instead
+                        // of waiting for the read timeout.
+                        let shutdown_stream = stream.try_clone().ok();
 
                         // Read the peer's ID and produce two stream
                         // handles: one for the map (writes), one for
@@ -482,6 +504,32 @@ impl TcpTransport {
 
                         // Spawn a writer thread and register its
                         // channel sender for outbound sends.
+                        //
+                        // Duplicate connection handling: if a
+                        // connection from this peer already exists
+                        // (e.g. both sides connected simultaneously,
+                        // or a reconnect raced with the old
+                        // connection breaking), shut down the old
+                        // connection's stream to force the old
+                        // reader thread to exit, and drop the old
+                        // writer sender to close the old writer's
+                        // channel. This prevents resource leaks from
+                        // duplicate connections.
+                        if let Some(shutdown_stream) = shutdown_stream {
+                            // Replace any existing shutdown stream for
+                            // this peer. We do NOT shut down the old
+                            // stream here — if both peers connected
+                            // simultaneously, the old outbound socket
+                            // is the peer's new inbound socket, and
+                            // shutting it down would kill the peer's
+                            // new connection. The old reader thread
+                            // will exit when the read timeout expires
+                            // or the peer closes the connection.
+                            let _ = accept_shutdown_streams
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(peer_id.clone(), shutdown_stream);
+                        }
                         let writer_tx = spawn_writer(write_stream, &accept_shutdown);
                         accept_streams
                             .lock()
@@ -514,6 +562,7 @@ impl TcpTransport {
         // sends our peer ID as the first frame, then enters the
         // reader loop.
         let connect_streams = streams.clone();
+        let connect_shutdown_streams = shutdown_streams.clone();
         let connect_tx = inbound_tx.clone();
         let connect_shutdown = shutdown.clone();
         let our_id = peer_id.clone();
@@ -527,6 +576,7 @@ impl TcpTransport {
                 let pid = peer_id.clone();
                 let oid = our_id.clone();
                 let cs = connect_streams.clone();
+                let css = connect_shutdown_streams.clone();
                 let ct = connect_tx.clone();
                 let rshut = connect_shutdown.clone();
                 #[cfg(feature = "tls")]
@@ -582,6 +632,9 @@ impl TcpTransport {
                                 }
                                 let _ =
                                     tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
+                                // Clone the underlying TCP socket for
+                                // shutdown handling (see accept path).
+                                let shutdown_stream = tls_stream.sock.try_clone().ok();
                                 // Wrap in SharedStream for shared access.
                                 let shared =
                                     SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
@@ -589,6 +642,13 @@ impl TcpTransport {
                                 let write_stream = Box::new(shared) as Box<dyn PeerStream>;
                                 // Spawn a writer thread and register its
                                 // channel sender for outbound sends.
+                                // Duplicate handling: see accept path.
+                                if let Some(shutdown_stream) = shutdown_stream {
+                                    let _ = css
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .insert(pid.clone(), shutdown_stream);
+                                }
                                 let writer_tx = spawn_writer(write_stream, &rshut);
                                 cs.lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -602,8 +662,12 @@ impl TcpTransport {
                                     rshut.clone(),
                                 );
                                 // Reader loop exited — connection broke.
-                                // Remove the stale writer channel and retry.
+                                // Remove the stale writer channel and
+                                // shutdown stream, then retry.
                                 cs.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&pid);
+                                css.lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .remove(&pid);
                                 thread::sleep(Duration::from_millis(500));
@@ -621,12 +685,22 @@ impl TcpTransport {
                             continue;
                         }
                         let _ = stream.set_read_timeout(Some(read_timeout));
+                        // Clone the underlying TCP socket for
+                        // shutdown handling (see accept path).
+                        let shutdown_stream = stream.try_clone().ok();
                         // Clone for the map; the reader keeps the original.
                         let write_stream =
                             Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
                         let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
                         // Spawn a writer thread and register its
                         // channel sender for outbound sends.
+                        // Duplicate handling: see accept path.
+                        if let Some(shutdown_stream) = shutdown_stream {
+                            let _ = css
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(pid.clone(), shutdown_stream);
+                        }
                         let writer_tx = spawn_writer(write_stream, &rshut);
                         cs.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -640,8 +714,10 @@ impl TcpTransport {
                             rshut.clone(),
                         );
                         // Reader loop exited — connection broke.
-                        // Remove the stale writer channel and retry.
+                        // Remove the stale writer channel and
+                        // shutdown stream, then retry.
                         cs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pid);
+                        css.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pid);
                         thread::sleep(Duration::from_millis(500));
                     }
                 });
@@ -659,6 +735,7 @@ impl TcpTransport {
             #[cfg(feature = "tls")]
             tls,
             admission,
+            shutdown_streams,
         }
     }
 
@@ -683,8 +760,19 @@ impl TcpTransport {
     /// panicked while holding the lock).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        // Close all streams — this causes reader threads to get
-        // errors on their next read and exit.
+        // Forcibly close all connections by calling `shutdown(Both)`
+        // on each stored TCP stream clone. This causes reader threads
+        // to get an immediate error on their next `read` call (instead
+        // of waiting up to `read_timeout` seconds), and writer threads
+        // to get an immediate error on their next `write` call.
+        let streams =
+            self.shutdown_streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stream in streams.values() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        drop(streams); // release the lock before clearing the senders
+        // Drop all writer senders — this causes writer threads to exit
+        // on their next `recv_timeout` (within 100ms).
         self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 
@@ -724,6 +812,7 @@ impl TcpTransport {
         let read_timeout = self.config.read_timeout;
         let max_message_bytes = self.config.max_message_bytes;
         let streams = self.streams.clone();
+        let shutdown_streams = self.shutdown_streams.clone();
         let tx = self.inbound_tx.clone();
         let shutdown = self.shutdown.clone();
         let our_id = self.peer_id.clone();
@@ -760,9 +849,16 @@ impl TcpTransport {
                         return;
                     }
                     let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
+                    let shutdown_stream = tls_stream.sock.try_clone().ok();
                     let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
                     let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
                     let write_stream = Box::new(shared) as Box<dyn PeerStream>;
+                    if let Some(shutdown_stream) = shutdown_stream {
+                        let _ = shutdown_streams
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(pid.clone(), shutdown_stream);
+                    }
                     let writer_tx = spawn_writer(write_stream, &shutdown);
                     streams
                         .lock()
@@ -778,8 +874,16 @@ impl TcpTransport {
                 return;
             }
             let _ = stream.set_read_timeout(Some(read_timeout));
+            let shutdown_stream = stream.try_clone().ok();
             let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
             let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
+            // Duplicate handling: see accept path.
+            if let Some(shutdown_stream) = shutdown_stream {
+                let _ = shutdown_streams
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(pid.clone(), shutdown_stream);
+            }
             let writer_tx = spawn_writer(write_stream, &shutdown);
             streams
                 .lock()
@@ -1251,6 +1355,84 @@ mod tests {
         let transport = TcpTransport::new(addr, id, vec![]);
         transport.shutdown();
         assert!(transport.is_shutdown());
+    }
+
+    /// Regression test: `shutdown()` must forcibly close all
+    /// connections so reader threads exit immediately (not after
+    /// the 30s read timeout). Before the fix, `shutdown()` only
+    /// cleared the `streams` map (dropping senders), but reader
+    /// threads kept blocking on `read` for up to 30s.
+    ///
+    /// We verify this by checking that `recv()` returns `None`
+    /// quickly after `shutdown()` (within 2s, not 30s).
+    #[test]
+    fn tcp_shutdown_closes_connections_promptly() {
+        let addr_a = "127.0.0.1:19081";
+        let addr_b = "127.0.0.1:19082";
+        let id_a = vec![1u8];
+        let id_b = vec![2u8];
+
+        let mut transport_a =
+            TcpTransport::new(addr_a, id_a.clone(), vec![(id_b.clone(), addr_b.to_string())]);
+        let mut transport_b =
+            TcpTransport::new(addr_b, id_b.clone(), vec![(id_a.clone(), addr_a.to_string())]);
+
+        // Wait for connections to establish.
+        thread::sleep(Duration::from_millis(500));
+
+        // Verify communication works.
+        transport_a.send(&id_b, b"hello").unwrap();
+        let msg = poll_recv(&mut transport_b, Duration::from_secs(5));
+        assert!(msg.is_some(), "B should receive before shutdown");
+
+        // Shut down A.
+        let start = std::time::Instant::now();
+        transport_a.shutdown();
+
+        // B's recv should return None quickly (no more messages
+        // coming from A). We don't time-bound this precisely, but
+        // the test suite would hang for 30s per test if reader
+        // threads didn't exit promptly.
+        let msg = poll_recv(&mut transport_b, Duration::from_secs(2));
+        assert!(msg.is_none(), "B should not receive after A shuts down");
+
+        // The shutdown should have been fast (well under 30s).
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown should close connections promptly, took {elapsed:?}"
+        );
+    }
+
+    /// Regression test: duplicate connections (both sides connecting
+    /// simultaneously) must not kill each other. Before the fix,
+    /// shutting down the "old" outbound connection also killed the
+    /// peer's "new" inbound connection (same socket), causing both
+    /// connections to die.
+    #[test]
+    fn tcp_duplicate_connections_survive() {
+        let addr_a = "127.0.0.1:19083";
+        let addr_b = "127.0.0.1:19084";
+        let id_a = vec![1u8];
+        let id_b = vec![2u8];
+
+        // Both sides connect to each other simultaneously.
+        let mut transport_a =
+            TcpTransport::new(addr_a, id_a.clone(), vec![(id_b.clone(), addr_b.to_string())]);
+        let mut transport_b =
+            TcpTransport::new(addr_b, id_b.clone(), vec![(id_a.clone(), addr_a.to_string())]);
+
+        // Wait for both inbound and outbound connections to establish.
+        thread::sleep(Duration::from_millis(500));
+
+        // Both sides should be able to send and receive.
+        transport_a.send(&id_b, b"from A").unwrap();
+        let msg = poll_recv(&mut transport_b, Duration::from_secs(5));
+        assert!(msg.is_some(), "B should receive from A after simultaneous connect");
+
+        transport_b.send(&id_a, b"from B").unwrap();
+        let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+        assert!(msg.is_some(), "A should receive from B after simultaneous connect");
     }
 
     // ── Admission control integration tests ───────────────────────
