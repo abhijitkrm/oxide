@@ -10543,3 +10543,50 @@ true O(touched·log n) needs a sparse retained trie
 
 New `#[doc(hidden)] mark_touched_for_test` hook lets benches mark
 accounts touched without executing txs.
+
+## TPS suite — mempool select redesign + harness fault tolerance
+
+The devnet TPS suite (`--ignored`, release, real TCP consensus)
+exposed three problems:
+
+1. **`evm_load` finalized 1 tx/block.** Root cause: the workload
+   generator declared `gas_limit = 30_000_000` (the whole block
+   limit) per tx, so the A10 proposal gas check
+   (`sum(tx.gas_limit) <= block.gas_limit`) correctly admitted
+   exactly one. Fix: per-type declared limits (transfer 25k,
+   deploy 100k, call 100k, read 50k) and the devnet executor's
+   block gas cap raised to the 1-gigagas consensus budget the
+   tests already assume.
+
+2. **`trading_tps_1m` panicked `TCP send vote to leader:
+   UnknownPeer`.** The p2p transport drops the peer's writer
+   channel when a connection breaks, then reconnects after ~500ms
+   backoff — so `send` returns `UnknownPeer` during the gap. The
+   harness `.expect()`ed every send. Now vote sends skip marking
+   the view voted on failure (retried next tick) and QC sends
+   tolerate per-peer failure. Also scaled the pipeline deadline
+   (60s + 250ms/round — the old formula gave the 2000-round test
+   160s when ~230s is needed at the healthy ~8.8 blk/s rate).
+
+3. **Mempool `select` was O(pool) per proposal** — scanning the
+   whole `by_fee` bucket plus a per-block `retain` pass over every
+   bucket. With a 2M-entry same-fee pool that's ~4G hash lookups
+   over the run. Rewrote selection as a sender-fair heap walk:
+   max-heap of (head-tx density, sender), pop the best sender and
+   take its contiguous nonce chain up to the per-sender cap —
+   O(senders + selected·log senders). `by_fee` survives only as
+   the pool-full eviction index, lazily pruned of stale hashes in
+   `evict_lowest_fee`; the per-block `retain` pass is gone.
+
+Results (release, TCP loopback):
+
+- `trading_tps_1m` — **2M txs, 2000 blocks, 8684 tx/s, 8.7
+  blocks/s, all validators agree on state root.** Previously
+  crashed at ~775 blocks.
+- `trading_tps_default` — 200k txs @ 8484 tx/s.
+- `evm_load` (all 4 variants) — full finalization + state-root
+  agreement: 4v @ 500/blk = 2753 tx/s (10k txs); EVM sweep
+  1000/blk = 3932 tx/s.
+- `block_sweep` — bank 8357 tx/s, EVM 3932 tx/s at 1000 txs/blk;
+  TPS scales with block size (consensus-bound, not executor-bound).
+- `tps` — 4v @ 1000/blk = 8787 tx/s; 1v = 31983 tx/s.

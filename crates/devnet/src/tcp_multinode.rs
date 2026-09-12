@@ -322,7 +322,12 @@ impl TcpMultiNodeDevnet {
         let mut exchange_modules = Vec::with_capacity(n);
 
         for (i, key) in secret_keys.iter().cloned().enumerate() {
-            let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold);
+            let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold)
+                // Devnet measures throughput, not gas policy — the
+                // block gas cap matches the consensus budget's
+                // `max_gas` (1 gigagas) so large test blocks fit
+                // under the declared-gas proposal check.
+                .with_gas_limit(1 << 30);
             executor.register_module(Arc::new(oxide_core::CoreModule::new()));
             // Create the bank as an `Arc` so the exchange module (if
             // registered) can share the same bank instance — the
@@ -673,11 +678,12 @@ impl TcpMultiNodeDevnet {
 
         // Pipelined loop (same as run_pipelined).
         let mut state = PipelineState::new();
-        // Scale the deadline with the workload: 60s base + 5s per 100
-        // rounds. This allows large trading TPS tests (2000+ rounds)
-        // to complete without timing out, while keeping small tests
-        // fast. At ~20 blocks/s, 2000 rounds need ~100s + flush.
-        let deadline_secs = 60 + 5 * u64::try_from(rounds / 100).unwrap_or(0);
+        // Scale the deadline with the workload: 60s base + 250ms per
+        // round (~4x the healthy ~10 blocks/s pipelined rate, so a
+        // genuinely stalled pipeline still trips the deadline while
+        // a slow-but-progressing one completes). 2000 rounds ≈ 230s
+        // at full rate, 560s deadline.
+        let deadline_secs = 60 + u64::try_from(rounds / 4).unwrap_or(0);
         let deadline = start + std::time::Duration::from_secs(deadline_secs);
         loop {
             if state.qcs_formed >= target_blocks {
@@ -801,10 +807,18 @@ impl TcpMultiNodeDevnet {
                     let mut buf = Vec::with_capacity(1 + 137);
                     buf.push(MSG_VOTE);
                     vote.encode(&mut buf);
-                    self.transports[i]
+                    // Tolerate transient send failure: the transport
+                    // reconnects a dropped peer connection after a
+                    // short backoff, so `UnknownPeer`/`ChannelClosed`
+                    // is expected during a reconnect window. Only
+                    // mark the view voted when the send succeeded —
+                    // otherwise the vote is retried next tick.
+                    if self.transports[i]
                         .send(&vec![u8::try_from(leader_idx).unwrap()], &buf)
-                        .expect("TCP send vote to leader");
-                    state.voted.insert((i, view));
+                        .is_ok()
+                    {
+                        state.voted.insert((i, view));
+                    }
                 }
             }
         }
@@ -851,9 +865,11 @@ impl TcpMultiNodeDevnet {
                 qc.encode(&mut qc_buf);
                 for j in 0..self.n {
                     if j != i {
-                        self.transports[i]
-                            .send(&vec![u8::try_from(j).unwrap()], &qc_buf)
-                            .expect("TCP send QC to follower");
+                        // Same transient-failure tolerance as the
+                        // vote path: a peer mid-reconnect gets the
+                        // QC dropped — it still finalizes via the
+                        // next QC or catches up on restart.
+                        let _ = self.transports[i].send(&vec![u8::try_from(j).unwrap()], &qc_buf);
                     }
                 }
                 engine.deliver_qc(qc).expect("leader self-deliver QC");
@@ -923,9 +939,10 @@ impl TcpMultiNodeDevnet {
             if let Some(vote) = engine.vote(&header, &proposal) {
                 let mut buf = Vec::new();
                 vote.encode(&mut buf);
-                self.transports[i]
-                    .send(&vec![u8::try_from(leader_idx).unwrap()], &buf)
-                    .expect("TCP send vote to leader");
+                // Tolerate transient send failure (peer mid-reconnect)
+                // — a dropped vote stalls this view into a timeout,
+                // which is the intended fault-injection behavior.
+                let _ = self.transports[i].send(&vec![u8::try_from(leader_idx).unwrap()], &buf);
             }
         }
 
@@ -966,9 +983,8 @@ impl TcpMultiNodeDevnet {
             if i == leader_idx {
                 continue;
             }
-            self.transports[leader_idx]
-                .send(&vec![u8::try_from(i).unwrap()], &qc_buf)
-                .expect("TCP send QC to follower");
+            // Tolerate transient send failure (peer mid-reconnect).
+            let _ = self.transports[leader_idx].send(&vec![u8::try_from(i).unwrap()], &qc_buf);
         }
 
         // Followers receive QC via TCP, decode, deliver.
