@@ -29,7 +29,7 @@
 //! time and can be tuned per-market or per-account in future
 //! versions.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use primitives::Address;
 
@@ -108,14 +108,14 @@ pub struct RateLimiter {
     /// "per second", but parameterized for flexibility).
     window_ms: u64,
     /// Per-account deque of order timestamps (ms).
-    recent: BTreeMap<[u8; 20], VecDeque<u64>>,
+    recent: HashMap<[u8; 20], VecDeque<u64>>,
 }
 
 impl RateLimiter {
     /// Create a rate limiter with the given max orders per second.
     #[must_use]
     pub fn new(max_per_second: u64) -> Self {
-        Self { max_per_window: max_per_second, window_ms: 1_000, recent: BTreeMap::new() }
+        Self { max_per_window: max_per_second, window_ms: 1_000, recent: HashMap::new() }
     }
 
     /// Check if an order from `addr` at timestamp `now_ms` is within
@@ -148,7 +148,7 @@ pub struct RiskEngine {
     rate_limiter: RateLimiter,
     /// Per-account resting-order counts (maintained by the matching
     /// server via `inc_resting` / `dec_resting`).
-    resting_counts: BTreeMap<[u8; 20], u32>,
+    resting_counts: HashMap<[u8; 20], u32>,
 }
 
 impl RiskEngine {
@@ -159,7 +159,7 @@ impl RiskEngine {
         Self {
             config,
             rate_limiter: RateLimiter::new(max_per_sec),
-            resting_counts: BTreeMap::new(),
+            resting_counts: HashMap::new(),
         }
     }
 
