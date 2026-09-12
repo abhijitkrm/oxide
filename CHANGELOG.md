@@ -726,6 +726,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **Mempool `select` cloned every chosen transaction and let one
+  sender monopolize a block** (`crates/mempool/src/lib.rs`)
+  - Selection now moves `TxBytes` out of `by_hash` in order
+    (zero clones), and index cleanup is a single
+    `BTreeMap::retain` pass per bucket.
+  - New `max_per_sender` cap (default 1000,
+    `with_max_per_sender`) bounds any account's block share —
+    a top-fee spammer can no longer starve other senders.
+  - **In plain words:** block proposals no longer copy every
+    transaction, and a single whale can't fill an entire block.
+
 - **EVM batch path cloned every transaction's bytes up to three
   times** (`crates/executor/src/lib.rs`, `modules/evm/src/lib.rs`)
   - `PreverifiedTx` now borrows `raw: &[u8]` instead of owning a

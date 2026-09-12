@@ -10233,3 +10233,28 @@ returned borrows must outlive the temporary slice.
 
 - All 128 executor + 126 EVM tests pass unchanged — the refactor
   is borrow-only, no semantics changed.
+
+## Perf + DoS sweep — mempool select zero-clone + per-sender cap
+
+`Mempool::select` cloned every selected `TxBytes`
+(`selected.push(entry.tx.clone())`) — a per-tx `Vec<u8>`
+allocation on the proposal path. It now records selection order
+by hash, then MOVES each entry out of `by_hash` in that order.
+Index cleanup simplified: `by_fee` buckets filtered once via
+`BTreeMap::retain` against the full selected set (the old
+`remove_batch` grouped by density, sorted, and built a HashSet
+per bucket).
+
+Also added `max_per_sender` (default `DEFAULT_MAX_PER_SENDER =
+1000`, `Mempool::with_max_per_sender` to override): without a
+cap, one sender with sequential nonces at top fee monopolized the
+whole block — a liveness DoS on every other account. The nonce
+chain now stops mid-chain at the cap; the rest stay pooled.
+
+### Tests
+
+- `per_sender_cap_bounds_block_share` — spammer capped at 2, the
+  low-fee victim still gets in.
+- `per_sender_cap_stops_nonce_chain` — chain halts at cap even
+  with more contiguous nonces.
+- All 19 mempool tests pass.

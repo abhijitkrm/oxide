@@ -83,7 +83,24 @@ pub struct Mempool {
     /// Maximum number of transactions in the pool. Beyond this, the
     /// lowest-fee entries are evicted.
     max_entries: usize,
+    /// Maximum txs a single sender can occupy in one `select` call.
+    /// Without a cap, one sender submitting N sequential nonces (at
+    /// top fee) monopolizes the whole block — a liveness `DoS` on
+    /// every other account. The cap bounds any sender's block
+    /// share regardless of fee.
+    max_per_sender: usize,
 }
+
+/// Default per-sender selection cap: 1000 txs per block.
+///
+/// Bounds any single account to at most 1000 txs in a proposed
+/// block — at the typical 1 MB block budget and ~120 B min-tx
+/// size that's ~1/8 of block capacity, so even a top-fee spammer
+/// cannot starve every other sender. Raise it via
+/// [`Mempool::with_max_per_sender`] if a single-account workload
+/// (e.g. a sequencer-owned settlement lane) legitimately needs
+/// more.
+pub const DEFAULT_MAX_PER_SENDER: usize = 1000;
 
 /// Fee density: fee per byte. Higher is better. We store `(fee, size)`
 /// and implement `Ord` by cross-multiplication (fee₁·size₂ vs
@@ -188,7 +205,15 @@ impl Mempool {
             by_sender: HashMap::new(),
             by_fee: BTreeMap::new(),
             max_entries,
+            max_per_sender: DEFAULT_MAX_PER_SENDER,
         }
+    }
+
+    /// Set the per-sender selection cap (txs per `select` call).
+    #[must_use]
+    pub fn with_max_per_sender(mut self, cap: usize) -> Self {
+        self.max_per_sender = cap;
+        self
     }
 
     /// Submit a transaction to the pool. Returns `Ok(())` if accepted,
@@ -313,17 +338,21 @@ impl Mempool {
     ///    and advance the sender's expected nonce.
     /// 5. Stop when the budget is full or no more txs are available.
     ///
+    /// # Per-sender cap
+    ///
+    /// At most `max_per_sender` txs from one account are selected
+    /// per call — the rest stay in the pool for the next block.
+    /// Without the cap a single high-fee sender with sequential
+    /// nonces monopolizes the whole block (liveness `DoS`).
+    ///
     /// # Removal complexity
     ///
-    /// Selected entries are removed in a single batch pass, not one
-    /// `remove()` call per tx. The prior implementation called
-    /// `remove()` for each selected hash, and `remove()` calls
-    /// `retain()` on the fee bucket — O(n) per call. Selecting N txs
-    /// from one fee bucket was therefore O(N²). The batch path
-    /// collects selected hashes into a `HashSet` and filters each fee
-    /// bucket at most once, making removal O(total pool size).
+    /// Selection records hashes in order, then MOVES each entry out
+    /// of `by_hash` in that order — no `TxBytes` clone (the previous
+    /// `selected.push(entry.tx.clone())` copied every selected tx).
+    /// `by_sender` queues drop the selected nonces in one pass each;
+    /// `by_fee` buckets are filtered once via `BTreeMap::retain`.
     pub fn select(&mut self, max_bytes: u64) -> Vec<TxBytes> {
-        let mut selected = Vec::new();
         let mut total_bytes = 0u64;
         // Track the next expected nonce per sender. Initialize from
         // the pool's per-sender minimum nonce — not 0 — so that
@@ -347,15 +376,23 @@ impl Mempool {
         // We collect selected hashes into a HashSet for O(1)
         // membership tests during the batch removal pass.
         let mut selected_hashes: HashSet<Hash> = HashSet::new();
+        let mut selected_order: Vec<Hash> = Vec::new();
+        let mut sender_counts: HashMap<Address, u64> = HashMap::new();
+        let per_sender_cap = u64::try_from(self.max_per_sender).unwrap_or(u64::MAX);
 
-        for (_density, hashes) in self.by_fee.iter().rev() {
+        'densities: for (_density, hashes) in self.by_fee.iter().rev() {
             for &hash in hashes {
                 if total_bytes >= max_bytes {
-                    break;
+                    break 'densities;
                 }
                 let Some(entry) = self.by_hash.get(&hash) else {
                     continue;
                 };
+                // Per-sender cap: a capped sender's txs are skipped —
+                // they stay in the pool for the next block.
+                if *sender_counts.get(&entry.sender).unwrap_or(&0) >= per_sender_cap {
+                    continue;
+                }
                 // Check nonce ordering: the tx's nonce must equal the
                 // sender's next expected nonce.
                 let expected = next_nonce.entry(entry.sender).or_insert(0);
@@ -380,9 +417,17 @@ impl Mempool {
                 let mut current_entry: &PoolEntry = entry;
                 loop {
                     total_bytes += current_entry.size;
-                    selected.push(current_entry.tx.clone());
-                    *expected += 1;
+                    selected_order.push(current_hash);
                     selected_hashes.insert(current_hash);
+                    *expected += 1;
+                    let count = sender_counts.entry(current_entry.sender).or_insert(0);
+                    *count += 1;
+                    // Stop chaining at the per-sender cap — the rest
+                    // of their contiguous nonces stay for the next
+                    // block.
+                    if *count >= per_sender_cap {
+                        break;
+                    }
 
                     // Follow the chain: look up the next nonce for
                     // this sender in `by_sender`.
@@ -413,70 +458,42 @@ impl Mempool {
         // index. This is O(total pool size) — each fee bucket is
         // filtered at most once, each sender queue is filtered at most
         // once, and `by_hash` is drained in one pass.
-        if !selected_hashes.is_empty() {
-            self.remove_batch(&selected_hashes);
+        // Move selected txs out of `by_hash` in selection order —
+        // no clone. Collect (sender, nonce) for index cleanup while
+        // already touching the entries.
+        let mut selected = Vec::with_capacity(selected_order.len());
+        let mut sender_cleanups: Vec<(Address, u64)> = Vec::with_capacity(selected_order.len());
+        for hash in selected_order {
+            if let Some(entry) = self.by_hash.remove(&hash) {
+                sender_cleanups.push((entry.sender, entry.nonce));
+                selected.push(entry.tx);
+            }
+        }
+
+        // Clean the secondary indices in one pass each. `by_fee`
+        // buckets are filtered once via `BTreeMap::retain` against
+        // the full selected set — no per-density grouping, sort, or
+        // extra HashSet (the old remove_batch did all three).
+        self.by_fee.retain(|_density, bucket| {
+            bucket.retain(|h| !selected_hashes.contains(h));
+            !bucket.is_empty()
+        });
+        for (sender, nonce) in sender_cleanups {
+            if let Some(queue) = self.by_sender.get_mut(&sender) {
+                queue.remove(&nonce);
+                if queue.is_empty() {
+                    self.by_sender.remove(&sender);
+                }
+            }
         }
 
         selected
     }
 
-    /// Remove a batch of transactions by hash from all indices in a
-    /// single pass. This is the batch equivalent of [`remove`](Self::remove),
-    /// used by [`select`](Self::select) to avoid the O(N²) cost of
-    /// calling `remove()` per selected tx.
-    ///
-    /// Each fee bucket is filtered at most once (vs `retain()` per tx
-    /// in the per-hash `remove`). Each sender queue is filtered at
-    /// most once. `by_hash` is drained in one pass.
-    fn remove_batch(&mut self, hashes: &HashSet<Hash>) {
-        // 1. Remove from by_hash and collect the entries we need to
-        //    clean up in by_sender and by_fee.
-        let mut sender_cleanups: Vec<(Address, u64)> = Vec::with_capacity(hashes.len());
-        let mut fee_cleanups: Vec<(FeeDensity, Hash)> = Vec::with_capacity(hashes.len());
-        for hash in hashes {
-            if let Some(entry) = self.by_hash.remove(hash) {
-                let density = FeeDensity { fee: entry.fee, size: entry.size };
-                fee_cleanups.push((density, *hash));
-                sender_cleanups.push((entry.sender, entry.nonce));
-            }
-        }
-
-        // 2. Filter each affected fee bucket in one pass. Group by
-        //    density so we touch each bucket at most once.
-        fee_cleanups.sort_by_key(|(d, _)| *d);
-        let mut i = 0;
-        while i < fee_cleanups.len() {
-            let density = fee_cleanups[i].0;
-            let mut to_drop = Vec::new();
-            while i < fee_cleanups.len() && fee_cleanups[i].0 == density {
-                to_drop.push(fee_cleanups[i].1);
-                i += 1;
-            }
-            if let Some(bucket) = self.by_fee.get_mut(&density) {
-                let to_drop_set: HashSet<Hash> = to_drop.into_iter().collect();
-                bucket.retain(|h| !to_drop_set.contains(h));
-                if bucket.is_empty() {
-                    self.by_fee.remove(&density);
-                }
-            }
-        }
-
-        // 3. Filter each affected sender queue in one pass.
-        for (sender, nonce) in &sender_cleanups {
-            if let Some(queue) = self.by_sender.get_mut(sender) {
-                queue.remove(nonce);
-                if queue.is_empty() {
-                    self.by_sender.remove(sender);
-                }
-            }
-        }
-    }
-
     /// Remove a single transaction by hash from all indices. This is
     /// the per-tx removal path — used when a specific tx needs to be
-    /// dropped (e.g. after a failed proposal or mempool eviction). The
-    /// batch path ([`remove_batch`](Self::remove_batch)) is preferred
-    /// when removing multiple txs at once.
+    /// dropped (e.g. after a failed proposal or mempool eviction).
+    /// [`select`](Self::select) removes in bulk for the block path.
     #[allow(dead_code)]
     fn remove(&mut self, hash: &Hash) {
         if let Some(entry) = self.by_hash.remove(hash) {
@@ -773,5 +790,50 @@ mod tests {
         // should be accepted (nonce 0 again, since the queue was
         // cleaned up and the pool starts fresh).
         assert!(pool.submit(build_tx(addr(1), 0, 100, &[0])).is_ok());
+    }
+
+    // ---- Per-sender cap tests ----
+
+    /// Prove that a single high-fee sender cannot monopolize a
+    /// block: with a cap of 2, only 2 of the spammer's 5 contiguous
+    /// nonces are selected — the rest stay in the pool for the next
+    /// block, leaving room for other senders.
+    #[test]
+    fn per_sender_cap_bounds_block_share() {
+        let mut pool = Mempool::new(100).with_max_per_sender(2);
+        // Spammer: 5 contiguous nonces at top fee.
+        for nonce in 0..5u64 {
+            pool.submit(build_tx(addr(1), nonce, 1_000_000, &[0])).unwrap();
+        }
+        // Victim: 1 tx at lower fee.
+        pool.submit(build_tx(addr(2), 0, 100, &[0])).unwrap();
+
+        let selected = pool.select(1 << 20);
+        let spammer_txs =
+            selected.iter().filter(|tx| parse_tx(tx.as_bytes()).unwrap().0 == addr(1)).count();
+        assert_eq!(spammer_txs, 2, "cap must bound the spammer to 2 txs");
+        assert_eq!(pool.len(), 3, "3 spammer txs remain after the capped selection");
+        // The victim's tx is selected too (room left after capping).
+        assert!(
+            selected.iter().any(|tx| parse_tx(tx.as_bytes()).unwrap().0 == addr(2)),
+            "the victim's tx must not be starved"
+        );
+        // Next select drains the spammer's remaining nonce chain.
+        let selected2 = pool.select(1 << 20);
+        assert_eq!(selected2.len(), 2, "next block takes the next 2 capped txs");
+    }
+
+    /// Prove the cap is enforced mid-chain: the nonce chain stops
+    /// at the cap even when more contiguous nonces exist.
+    #[test]
+    fn per_sender_cap_stops_nonce_chain() {
+        let mut pool = Mempool::new(100).with_max_per_sender(3);
+        for nonce in 0..6u64 {
+            pool.submit(build_tx(addr(1), nonce, 1_000, &[0])).unwrap();
+        }
+        let selected = pool.select(1 << 20);
+        assert_eq!(selected.len(), 3, "chain stops at cap even with more nonces");
+        // Nonces 0..2 selected, 3..5 remain.
+        assert_eq!(pool.len(), 3);
     }
 }
