@@ -156,11 +156,7 @@ impl RiskEngine {
     #[must_use]
     pub fn new(config: RiskConfig) -> Self {
         let max_per_sec = config.max_orders_per_second;
-        Self {
-            config,
-            rate_limiter: RateLimiter::new(max_per_sec),
-            resting_counts: HashMap::new(),
-        }
+        Self { config, rate_limiter: RateLimiter::new(max_per_sec), resting_counts: HashMap::new() }
     }
 
     /// Create a risk engine with default configuration.

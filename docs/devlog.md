@@ -11006,3 +11006,52 @@ crates pass.
 - Ceiling 4 (O(n) receipts root + free-gas stuffing gates)
 - Performance optimizations (consensus, p2p, executor/EVM, trading)
 - Final gate suite (fmt/clippy/test/bench + binary + dockernet TPS)
+
+## 2026-09-10 — Session: Performance optimizations
+
+### Completed performance optimizations
+
+- **Consensus: pre-size buffers** (`crates/consensus`):
+  Pre-sized the `tx_root` hash buffer to the total tx bytes (avoids
+  ~20 regrowths for a 10k-tx block), the `block_hash` buffer to 256
+  bytes (header is ~200 bytes), and the `signer_pks` vectors in
+  `verify_qc_signature` and `verify_tc_signature` to the quorum
+  threshold (avoids regrowths when collecting 2f+1 signer public
+  keys).
+
+- **P2P: byte-capped writer batches** (`crates/p2p`):
+  Added a 1 MiB byte cap to the writer batch in addition to the
+  64-message count cap. Before the fix, a batch with a few very
+  large messages (e.g. proposals) could exceed the TCP send buffer,
+  causing latency spikes from oversized writes.
+
+- **EVM: single RLP decode per tx** (`modules/evm`):
+  `handle()` now decodes the RLP once and reuses the decoded
+  `SignedTx` for both the tx type (receipt) and execution. Before
+  the fix, `handle()` decoded once for the tx type, then
+  `execute()` decoded again for execution — two decodes per tx.
+  Refactored `execute()` into `execute_signed(&SignedTx)` which
+  takes a pre-decoded signed transaction.
+
+- **Trading: flat risk structures** (`crates/matcher`):
+  Switched the risk engine's per-account rate limiter and
+  resting-order counter from `BTreeMap` to `HashMap`. `BTreeMap` is
+  O(log n) for lookups; `HashMap` is O(1) average. The risk engine
+  runs on every order submission (the hot path), so this saves
+  ~log2(n) comparisons per lookup. For a typical 10k-account
+  exchange, this is ~14 comparisons per lookup → 1 hash.
+
+### Test results
+
+Full workspace test suite: all green (0 failures). Consensus: 93
+tests. P2P: 97 tests. EVM: 128 + 31 + 18 tests. Matcher: 88 + 6
+tests. All other crates pass.
+
+### Remaining items
+
+- C4 (mutual TLS bound to validator keys)
+- C9 (consensus state persistence to journal/WAL)
+- Ceiling 2 (parallel executor with tx-granular conflict tracking)
+- Ceiling 3 (sparse retained trie for state root)
+- Trading: stack signing, RingMatcher default, Arc<str> market data
+- Final gate suite (fmt/clippy/test/bench + binary + dockernet TPS)
