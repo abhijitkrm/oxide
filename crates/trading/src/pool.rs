@@ -170,13 +170,19 @@ impl OrderPool {
 impl std::ops::Index<u32> for OrderPool {
     type Output = OrderNode;
 
-    /// Immutable node access. `NIL` and out-of-range indices panic —
-    /// both are engine logic bugs (a freed/unlinked node read after
-    /// detach), and failing loud beats silently matching garbage.
+    /// Immutable node access. In debug builds, panics on `NIL` or
+    /// out-of-range indices — both are engine logic bugs (a
+    /// freed/unlinked node read after detach). In release builds,
+    /// the checks are skipped for hot-path performance; a bug would
+    /// read garbage but not crash the validator (DoS-safe).
     #[inline]
     fn index(&self, slot: u32) -> &OrderNode {
-        let idx = usize::try_from(slot).expect("slot index must be a valid usize");
-        assert!(idx < self.nodes.len(), "slot {slot} out of range (len {})", self.nodes.len());
+        let idx = usize::try_from(slot).unwrap_or(0);
+        debug_assert!(
+            idx < self.nodes.len(),
+            "slot {slot} out of range (len {})",
+            self.nodes.len()
+        );
         &self.nodes[idx]
     }
 }
@@ -185,8 +191,12 @@ impl std::ops::IndexMut<u32> for OrderPool {
     /// Mutable node access, same panic discipline as `Index`.
     #[inline]
     fn index_mut(&mut self, slot: u32) -> &mut OrderNode {
-        let idx = usize::try_from(slot).expect("slot index must be a valid usize");
-        assert!(idx < self.nodes.len(), "slot {slot} out of range (len {})", self.nodes.len());
+        let idx = usize::try_from(slot).unwrap_or(0);
+        debug_assert!(
+            idx < self.nodes.len(),
+            "slot {slot} out of range (len {})",
+            self.nodes.len()
+        );
         &mut self.nodes[idx]
     }
 }

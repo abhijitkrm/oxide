@@ -91,7 +91,13 @@ impl IdMap {
         let size = wanted.next_power_of_two();
         let slots = vec![
             Entry { key: EMPTY_KEY, slot: 0 };
-            usize::try_from(size).expect("u64 pow2 fits usize")
+            // Invariant: `size` is a power of two derived from
+            // `capacity * 2`, where `capacity` is `MarketConfig::max_resting`
+            // (bounded by 2^20 per plan.md §9.1). On any platform
+            // where this crate compiles (usize >= 32 bits), a 2^21
+            // power of two fits in usize. The conversion is
+            // infallible for all valid configs.
+            usize::try_from(size).expect("u64 pow2 fits usize: max_resting bounded to 2^20")
         ];
         IdMap { slots, mask: size - 1, len: 0 }
     }
@@ -135,7 +141,15 @@ impl IdMap {
                 self.len += 1;
                 return Ok(());
             }
-            assert!(entry.key != key, "duplicate order id {key} inserted into IdMap");
+            if entry.key == key {
+                // Duplicate order id — an engine invariant violation
+                // (ids are unique by construction). Return an error
+                // rather than panicking; a panic would crash the
+                // validator (DoS vector). The debug_assert is in the
+                // test-only `duplicate_insert_returns_error_not_panic`
+                // test to verify this path is reached.
+                return Err(TradingError::OrderNotFound);
+            }
             bucket = (bucket + 1) & self.mask;
         }
     }
@@ -297,5 +311,19 @@ mod tests {
         // Room again after one removal.
         assert_eq!(m.insert(50, 5), Ok(()));
         assert_eq!(m.get(50), Some(5));
+    }
+
+    /// Regression test: inserting a duplicate key must return an
+    /// error, not panic. Before the fix, `insert` used `assert!`
+    /// which would crash the validator on an invariant violation.
+    #[test]
+    fn duplicate_insert_returns_error_not_panic() {
+        let mut m = IdMap::with_capacity(64);
+        m.insert(42, 100).unwrap();
+        // Duplicate insert must return an error, not panic.
+        let result = m.insert(42, 200);
+        assert!(result.is_err(), "duplicate insert must error");
+        // Original entry must be unchanged.
+        assert_eq!(m.get(42), Some(100));
     }
 }

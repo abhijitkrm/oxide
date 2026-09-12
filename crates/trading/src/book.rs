@@ -208,16 +208,21 @@ impl DenseBook {
         })
     }
 
-    /// Level index for a raw price. Panics on out-of-band/off-grid
-    /// prices — impossible after `NewOrder::validate` (documented
-    /// precondition of the trait).
+    /// Level index for a raw price. In debug builds, panics on
+    /// out-of-band/off-grid prices — impossible after
+    /// `NewOrder::validate` (documented precondition of the trait).
+    /// In release builds, the checks are skipped for hot-path
+    /// performance; a validation bug would produce a wrong index but
+    /// not crash the validator (DoS-safe).
     #[inline]
     fn level_index(&self, price_raw: u64) -> usize {
-        let offset = price_raw
-            .checked_sub(self.cfg.min_price)
-            .expect("price below band: validation precondition violated");
+        let offset = price_raw.saturating_sub(self.cfg.min_price);
+        debug_assert!(
+            price_raw >= self.cfg.min_price,
+            "price below band: validation precondition violated"
+        );
         let idx = offset / self.cfg.tick_size;
-        assert!(
+        debug_assert!(
             idx < self.levels.len() as u64,
             "price above band: validation precondition violated"
         );

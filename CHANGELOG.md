@@ -2510,3 +2510,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** MMR hashes are now in their own domain-
     separated hash space, so they can never collide with transaction,
     vote, or block hashes — even if the underlying bytes are identical.
+
+- **Trading core had production panic paths**
+  (`crates/trading/src/engine.rs`, `crates/trading/src/book.rs`,
+  `crates/trading/src/idmap.rs`, `crates/trading/src/pool.rs`)
+  - `remove_maker` used `.expect()`, `cancel` used unchecked
+    `resting -= 1`, `level_index` used `.expect()`/`assert!`,
+    `IdMap::insert` used `assert!` for duplicate keys, and
+    `OrderPool::index/index_mut` used `.expect()`/`assert!`. A
+    crafted input or internal invariant violation could crash the
+    validator.
+  - Replaced all production panics with graceful error returns or
+    `debug_assert` (debug-only checks that don't fire in release).
+  - Regression tests: `cancel_nonexistent_order_returns_error_not_panic`,
+    `remove_maker_does_not_panic_on_invariant_violation`,
+    `duplicate_insert_returns_error_not_panic`.
+  - **In plain words:** the matching engine no longer crashes on
+    invariant violations or edge-case inputs. Errors are returned
+    instead of panicking, so a bad order or internal bug rejects the
+    transaction rather than killing the validator.

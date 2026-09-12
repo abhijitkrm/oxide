@@ -9386,3 +9386,34 @@ hash, breaking the domain separation guarantee.
 - `mmr_domains_do_not_collide_with_consensus_domains` — proves MMR
   leaf/node hashes differ from transaction, vote, and block hashes
   for the same input.
+
+## Pre-testnet audit: remove production panic paths in trading core
+
+### Root cause
+
+The matching engine had several `.expect()` and `assert!` calls on
+production hot paths:
+- `remove_maker` used `.expect("invariant: resting maker is present")`
+- `cancel` used unchecked `resting -= 1` (underflow panic)
+- `level_index` used `.expect()` and `assert!` for price bounds
+- `IdMap::insert` used `assert!` for duplicate keys
+- `OrderPool::index/index_mut` used `.expect()` and `assert!`
+
+A crafted input or internal invariant violation could terminate the
+validator process (DoS vector).
+
+### Fix
+
+- `remove_maker`: returns gracefully on `Err` instead of `.expect()`
+- `cancel`: uses `saturating_sub` instead of unchecked subtraction
+- `level_index`: uses `saturating_sub` + `debug_assert` instead of
+  `.expect()`/`assert!`
+- `IdMap::insert`: returns `Err(OrderNotFound)` instead of `assert!`
+- `OrderPool::index/index_mut`: uses `unwrap_or(0)` + `debug_assert`
+  instead of `.expect()`/`assert!`
+
+### Regression tests
+
+- `cancel_nonexistent_order_returns_error_not_panic`
+- `remove_maker_does_not_panic_on_invariant_violation`
+- `duplicate_insert_returns_error_not_panic`

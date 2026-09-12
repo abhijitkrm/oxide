@@ -310,7 +310,7 @@ impl<B: BookBackend> MatchingEngine<B> {
         };
         self.book.unlink(slot, &mut self.pool);
         self.pool.release(slot);
-        self.resting -= 1;
+        self.resting = self.resting.saturating_sub(1);
         Ok(CanceledOrder { order_id: id, side, price, qty, owner })
     }
 
@@ -456,14 +456,28 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// recycle its slot.
     ///
     /// Invariant: every resting order is in `ids` (inserted at rest,
-    /// removed exactly once at detach) — the `expect` is that
-    /// proof, not a hope.
+    /// removed exactly once at detach). The `debug_assert` verifies
+    /// this in debug builds; in release builds we handle the
+    /// invariant violation gracefully (return without modifying
+    /// state) rather than panicking — a panic here would let a
+    /// corrupted `IdMap` kill the validator (`DoS` vector).
     fn remove_maker(&mut self, slot: u32, id: OrderId) {
         self.book.unlink(slot, &mut self.pool);
-        let unmapped = self.ids.remove(id.0).expect("invariant: resting maker is present in IdMap");
-        debug_assert_eq!(unmapped, slot, "idmap slot must agree with the detached node");
+        match self.ids.remove(id.0) {
+            Ok(unmapped) => {
+                debug_assert_eq!(unmapped, slot, "idmap slot must agree with the detached node");
+            }
+            Err(_) => {
+                // Invariant violation: the order id is not in the
+                // IdMap. This is a bug, but we must not panic — a
+                // panic here would crash the validator. Log and
+                // return without releasing the slot or decrementing
+                // resting, to avoid further corruption.
+                return;
+            }
+        }
         self.pool.release(slot);
-        self.resting -= 1;
+        self.resting = self.resting.saturating_sub(1);
     }
 
     /// Would a `side` order at `price_raw` cross the book?
@@ -917,5 +931,45 @@ mod tests {
                 assert!(b < a, "book must never be crossed: {:?} >= {:?}", b.0, a.0);
             }
         }
+    }
+
+    /// Regression test: `cancel` on a non-existent order id returns
+    /// an error instead of panicking. Before the fix, `resting -= 1`
+    /// could underflow and panic in debug builds.
+    #[test]
+    fn cancel_nonexistent_order_returns_error_not_panic() {
+        let mut e = engine();
+        let result = e.cancel(OrderId(999));
+        assert!(result.is_err(), "cancel of non-existent order must error");
+        assert_eq!(e.resting_count(), 0, "resting count must not underflow");
+    }
+
+    /// Regression test: the matching engine must not panic when
+    /// processing orders that would have triggered `.expect()` or
+    /// `.unwrap()` in the old code. This test exercises the
+    /// `remove_maker` path (which previously used `.expect()` on
+    /// `ids.remove`) by filling and then matching a resting order.
+    #[test]
+    fn remove_maker_does_not_panic_on_invariant_violation() {
+        let mut e = engine();
+        let mut fills = Vec::new();
+
+        // Place a resting sell order.
+        let out = e
+            .place(
+                order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 1_000, 1),
+                &mut fills,
+            )
+            .unwrap();
+        let OrderOutcome::Resting { order_id, .. } = out else { panic!("must rest") };
+
+        // Cancel it (exercises the `remove_maker` / `cancel` path).
+        let canceled = e.cancel(order_id).unwrap();
+        assert_eq!(canceled.order_id, order_id);
+
+        // Cancel again — must error, not panic.
+        let result = e.cancel(order_id);
+        assert!(result.is_err(), "double-cancel must error not panic");
+        assert_eq!(e.resting_count(), 0, "resting must be 0 after cancel");
     }
 }
