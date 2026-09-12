@@ -1118,6 +1118,14 @@ fn reader_loop(
 /// TCP burst, not a runaway.
 const WRITER_BATCH_MAX_MESSAGES: usize = 64;
 
+/// Maximum total bytes in one batched write (Perf fix). Bounds the
+/// per-batch buffer even when individual messages are large (e.g.
+/// a 1 MiB proposal). 1 MiB is a natural TCP send buffer size; beyond
+/// that, the kernel's TCP send buffer handles coalescing. Units:
+/// bytes. Origin: HFT performance discipline — one `write_all` per
+/// batch, capped to avoid latency spikes from oversized writes.
+const WRITER_BATCH_MAX_BYTES: usize = 1 << 20;
+
 fn writer_loop(
     mut stream: Box<dyn PeerStream>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -1134,10 +1142,20 @@ fn writer_loop(
                 // microseconds; batching turns N frames into one
                 // socket write instead of N syscalls + N flushes.
                 let mut batch: Vec<Vec<u8>> = Vec::with_capacity(8);
+                let mut total_bytes: usize = first.len();
                 batch.push(first);
                 while batch.len() < WRITER_BATCH_MAX_MESSAGES {
+                    // Perf: also cap by total bytes to avoid a single
+                    // batch with a few very large messages (e.g.
+                    // proposals) exceeding the TCP send buffer.
+                    if total_bytes >= WRITER_BATCH_MAX_BYTES {
+                        break;
+                    }
                     match rx.try_recv() {
-                        Ok(next) => batch.push(next),
+                        Ok(next) => {
+                            total_bytes += next.len();
+                            batch.push(next);
+                        }
                         Err(_) => break,
                     }
                 }
