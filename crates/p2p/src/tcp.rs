@@ -452,7 +452,8 @@ impl TcpTransport {
         peers: Vec<(PeerId, TcpAddr)>,
         allowed_peer_ids: std::collections::HashSet<PeerId>,
     ) -> Self {
-        let config = TcpTransportConfig { allowed_peer_ids: Some(allowed_peer_ids), ..Default::default() };
+        let config =
+            TcpTransportConfig { allowed_peer_ids: Some(allowed_peer_ids), ..Default::default() };
         #[cfg(feature = "tls")]
         {
             Self::build(listen_addr, peer_id, peers, config, None, None)
@@ -1819,11 +1820,8 @@ mod tests {
         // Transport C is a normal transport claiming id_c (not allowed).
         // It connects to A but A should reject it.
         let addr_c = "127.0.0.1:19142";
-        let mut transport_c = TcpTransport::new(
-            addr_c,
-            id_c.clone(),
-            vec![(id_a.clone(), addr_a.to_string())],
-        );
+        let mut transport_c =
+            TcpTransport::new(addr_c, id_c.clone(), vec![(id_a.clone(), addr_a.to_string())]);
 
         thread::sleep(Duration::from_millis(500));
 

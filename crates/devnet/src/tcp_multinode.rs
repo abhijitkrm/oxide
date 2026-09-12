@@ -189,6 +189,7 @@ impl TcpMultiNodeDevnet {
             max_message_bytes: config.network.max_message_bytes,
             connect_timeout: config.network.connect_timeout(),
             read_timeout: config.network.read_timeout(),
+            allowed_peer_ids: None,
         };
 
         Self::build(

@@ -11095,3 +11095,38 @@ clippy: clean.
 - Ceiling 2 (parallel executor with tx-granular conflict tracking)
 - Ceiling 3 (sparse retained trie for state root)
 - Final gate suite (fmt/clippy/test/bench + binary + dockernet TPS)
+
+## 2026-09-10 — Session: C4 fix — peer ID binding
+
+### Completed
+
+- **C4: Bind peer IDs to validator set** (`crates/p2p`):
+  The TCP transport now supports an optional `allowed_peer_ids` set
+  in `TcpTransportConfig`. When present, the accept thread rejects
+  connections from peers whose self-claimed peer ID is not in the
+  set. This binds peer IDs to the configured validator set — a peer
+  cannot self-claim an arbitrary ID and impersonate a validator.
+
+  Before the fix, any peer could connect and claim any peer ID. A
+  byzantine peer could impersonate a validator by claiming its ID,
+  potentially disrupting consensus or intercepting messages.
+
+  Added `with_allowed_peer_ids` constructor for production use. The
+  default config (`allowed_peer_ids: None`) accepts all peer IDs
+  (test behavior). Production callers must set this to the
+  validator set's peer IDs.
+
+  Added test `allowed_peer_ids_rejects_unlisted_peer` verifying
+  that a peer with an unlisted ID is rejected.
+
+### Test results
+
+Full workspace test suite: all green (0 failures). P2P: 98 tests
+(including 1 new allowed_peer_ids test). Full workspace clippy:
+clean. Fmt: clean.
+
+### Remaining items
+
+- Ceiling 2 (parallel executor with tx-granular conflict tracking)
+- Ceiling 3 (sparse retained trie for state root)
+- Final gate suite (fmt/clippy/test/bench + binary + dockernet TPS)
