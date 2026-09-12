@@ -384,6 +384,12 @@ pub const BATCH_FLAG: u8 = 0xFF;
 /// + nonce:8 + owner:20 + pubkey:32 + signature:64 = 144 bytes.
 pub const BATCH_ENTRY_SIZE: usize = 144;
 
+/// Maximum number of orders in a single batch request. Prevents a
+/// byzantine peer from sending a huge `count` field that causes the
+/// decoder to allocate a multi-GB buffer. `65_536` orders × 144 bytes
+/// = ~9 MiB — well within the matcher's memory budget.
+pub const MAX_BATCH_SIZE: usize = 65_536;
+
 /// Encode a batch of order requests into a single wire message.
 ///
 /// Format: `[magic:2][version:1][0xFF][count:4 LE][entry:104 × count]`
@@ -444,6 +450,11 @@ pub fn decode_batch_request(buf: &[u8]) -> Option<Vec<OrderRequest>> {
         return None;
     }
     let count = u32::from_le_bytes(buf[4..8].try_into().ok()?) as usize;
+    // HIGH fix: bound the batch size to prevent a byzantine peer
+    // from causing a huge allocation via a large `count` field.
+    if count > MAX_BATCH_SIZE {
+        return None;
+    }
     let needed = 8 + count * BATCH_ENTRY_SIZE;
     if buf.len() < needed {
         return None;

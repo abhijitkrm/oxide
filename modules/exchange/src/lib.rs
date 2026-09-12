@@ -99,6 +99,11 @@ const TAG_BATCH_SETTLE: u8 = 3;
 /// 2 + 8 + 8 + 20 + 20 = 58 bytes.
 const FILL_ENTRY_LEN: usize = 58;
 
+/// Maximum number of fills in a single batch-settle message. Prevents
+/// a byzantine settlement operator from submitting a huge batch that
+/// causes excessive processing. `65_536` fills × 58 bytes = ~3.8 MiB.
+const MAX_BATCH_FILLS: usize = 65_536;
+
 // ── Message sizes (body, excluding the 1-byte tag) ───────────────────
 
 /// `[market:1][side:1][type:1][tif:1][stp:1][price:8][qty:8]` = 21.
@@ -645,6 +650,12 @@ impl ExchangeModule {
             body[0..4].try_into().map_err(|_| ExecError::Malformed)?,
         ))
         .map_err(|_| ExecError::Malformed)?;
+        // HIGH fix: bound the batch size to prevent a byzantine
+        // settlement operator from submitting a huge batch that
+        // causes excessive processing.
+        if fill_count > MAX_BATCH_FILLS {
+            return Err(ExecError::Malformed);
+        }
         if body.len() != 4 + fill_count * FILL_ENTRY_LEN {
             return Err(ExecError::Malformed);
         }
