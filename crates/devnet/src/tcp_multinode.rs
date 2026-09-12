@@ -332,6 +332,9 @@ impl TcpMultiNodeDevnet {
                 bank.mint(&primitives::Address([sender_byte; 20]), genesis_balance);
             }
             executor.register_module(bank.clone());
+            // The bank collects fees for all native-module txs —
+            // without this only bank txs paid (other modules ran free).
+            executor.set_fee_module(framework::module_id::BANK);
             executor.register_module(Arc::new(staking::StakingModule::new()));
             // Optionally register the exchange module backed by this
             // validator's bank. Each validator gets its own exchange

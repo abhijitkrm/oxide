@@ -726,6 +726,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Most transaction types executed for free**
+  (`crates/executor/src/lib.rs`, `crates/node/src/lib.rs`,
+  `crates/devnet/`, `bin/oxide-validator/`)
+  - The fee charge was dispatched to `module.charge_fee` on the
+    *target* module — a no-op default meant only bank txs ever
+    paid; exchange, perps, core, and EVM txs ran free, and the
+    sender-controlled `ctx.fee` could be 0 anyway.
+  - The executor now charges every non-self-funded tx through a
+    designated fee collector (`set_fee_module`, wired to the bank
+    at node/devnet/validator assembly), plus a `min_fee` floor
+    (`NodeConfig.min_fee`) on the sender-declared fee.
+  - `Module::pays_own_fee()` exempts self-funded modules: the EVM
+    charges gas inside execution (bounded by base fee), so the
+    envelope fee would double-charge users.
+  - Fees are kept if execution later fails (the fee pays for
+    attempted work); a skipped tx doesn't advance its nonce and
+    can be resubmitted with adequate fee.
+  - **In plain words:** every transaction now pays its declared
+    fee through the bank — no more free execution on non-bank
+    modules, and a configurable floor stops zero-fee spam.
+
 - **Block gas limit was effectively unenforced**
   (`modules/evm/src/lib.rs`, `crates/executor/src/lib.rs`)
   - `EvmModule` used the default `estimate_gas` (`1000 + msg.len()`),

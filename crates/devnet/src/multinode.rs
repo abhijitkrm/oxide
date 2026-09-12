@@ -136,6 +136,9 @@ impl MultiNodeDevnet {
                 bank.mint(&primitives::Address([sender_byte; 20]), GENESIS_BALANCE);
             }
             executor.register_module(Arc::new(bank));
+            // The bank collects fees for all native-module txs —
+            // without this only bank txs paid (other modules ran free).
+            executor.set_fee_module(framework::module_id::BANK);
             executor.register_module(Arc::new(staking::StakingModule::new()));
             let app: Arc<Executor> = Arc::new(executor);
             let app_dyn: Arc<dyn AppInterface> = app.clone();

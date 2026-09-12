@@ -30,6 +30,8 @@
 //!     parallel_threshold: 32,
 //!     evm_persistence: true,
 //!     storage_path: None,
+//!     settlement_operator: None,
+//!     min_fee: 0,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.
@@ -103,6 +105,12 @@ pub struct NodeConfig {
     /// settlement entirely (fail-closed default — safe when no
     /// external matcher is attached to this node).
     pub settlement_operator: Option<primitives::Address>,
+    /// Minimum transaction fee (`ctx.fee`) for native-module txs.
+    /// Txs declaring less are skipped before execution — the fee
+    /// field is sender-controlled, so without a floor every tx could
+    /// declare 0 and execute for free. Self-funded modules (EVM: gas
+    /// is the fee) are exempt. `0` = no floor.
+    pub min_fee: u64,
 }
 
 impl Default for NodeConfig {
@@ -114,6 +122,7 @@ impl Default for NodeConfig {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         }
     }
 }
@@ -172,7 +181,8 @@ impl Node {
         // (default: 32 txs, lowered from 100 in the block-size sweep
         // session — rayon overhead amortizes at 32+).
         let mut executor =
-            Executor::with_config(config.max_mempool_entries, config.parallel_threshold);
+            Executor::with_config(config.max_mempool_entries, config.parallel_threshold)
+                .with_min_fee(config.min_fee);
         // Enable the async execution lane (plan.md §13 Phase D):
         // defer block execution to `attest_state`, overlapping
         // execution of block h-1 with consensus for block h.
@@ -185,6 +195,11 @@ impl Node {
         let bank = Arc::new(bank::BankModule::new());
         bank.mint(&primitives::Address([0u8; 20]), 1_000_000_000_000);
         executor.register_module(bank.clone());
+        // The bank is the fee collector: every native-module tx is
+        // charged `ctx.fee` through it before execution. Without
+        // this, only bank txs paid fees — exchange/perps/core txs
+        // ran free.
+        executor.set_fee_module(framework::module_id::BANK);
         executor.register_module(Arc::new(staking::StakingModule::new()));
         // Register the exchange module with a default spot market
         // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
@@ -490,6 +505,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node = Node::assemble(&config);
         // The engine should be ready (no blocks yet).
@@ -505,6 +521,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node = Node::assemble(&config);
         assert!(node.engine().finalized_height().is_none());
@@ -533,6 +550,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let bft_config = NodeConfig {
             consensus: ConsensusConfig::OxideBft,
@@ -541,6 +559,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
 
         let mut seq_node = Node::assemble(&seq_config);
@@ -580,6 +599,7 @@ mod tests {
             evm_persistence: true,
             storage_path: Some(tmp.clone()),
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -617,6 +637,7 @@ mod tests {
             evm_persistence: true,
             storage_path: Some(tmp1.clone()),
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node_src = Node::assemble(&config_src);
         // Submit a tx and finalize a block to produce EVM state.
@@ -642,6 +663,7 @@ mod tests {
             evm_persistence: true,
             storage_path: Some(tmp2.clone()),
             settlement_operator: None,
+            min_fee: 0,
         };
         let node_dst = Node::assemble(&config_dst);
 
@@ -686,6 +708,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -798,6 +821,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node = Node::assemble(&config);
         // Finalize one block.
@@ -841,6 +865,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node1 = Node::assemble(&config);
         let mut node2 = Node::assemble(&config);
@@ -881,6 +906,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node = Node::assemble(&config);
         // Finalize a block.
@@ -905,6 +931,7 @@ mod tests {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node = Node::assemble(&config);
         let to = Address([2u8; 20]);

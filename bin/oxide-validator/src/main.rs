@@ -338,6 +338,9 @@ fn run_devnet_node(node_index_str: &str) {
         bank_module.mint(&primitives::Address([sender_byte; 20]), 1_000_000_000_000);
     }
     executor.register_module(Arc::new(bank_module));
+    // The bank collects fees for all native-module txs — without
+    // this only bank txs paid (other modules ran free).
+    executor.set_fee_module(framework::module_id::BANK);
     executor.register_module(Arc::new(staking::StakingModule::new()));
     let app: Arc<executor::Executor> = Arc::new(executor);
     let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
@@ -797,6 +800,7 @@ fn load_config() -> (NodeConfig, config::RpcConfig) {
             evm_persistence: true,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         },
         rpc_config,
     )

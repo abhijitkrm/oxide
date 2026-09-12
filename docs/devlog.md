@@ -10069,3 +10069,40 @@ and `execute_block`, but two gaps made it toothless:
   under a 2500 cap → 2 selected, proposal validates.
 - `estimate_gas_returns_declared_limit` — declared limit returned;
   malformed payload → u64::MAX.
+
+## Security sweep round 2 — global fee model
+
+Fees were dispatched to `module.charge_fee` — the *target* module.
+Only `BankModule` implemented it (default: no-op), so exchange,
+perps, core, and EVM txs all executed for free, and the sender-
+controlled `ctx.fee` could be 0 anyway.
+
+### Design
+
+- `Executor.fee_module: Option<u8>` — a designated collector (the
+  bank) charged for every non-self-funded tx. Wired via
+  `set_fee_module(module_id::BANK)` in node assembly, both devnet
+  harnesses, and the validator binary.
+- `Executor.min_fee: u64` — a floor on the sender-declared
+  `ctx.fee`; below-floor txs are skipped before the charge and
+  before the nonce advances. `NodeConfig.min_fee` (default 0)
+  wires it.
+- `Module::pays_own_fee() -> bool` — self-funded modules are
+  exempt from the envelope fee. `EvmModule` returns `true`: revm
+  charges `gas_used × effective_gas_price` inside execution,
+  bounded below by the block base fee — charging the envelope fee
+  on top would double-charge EVM users.
+- Fee semantics on failure: the fee is kept if `handle` fails —
+  standard chain semantics (the fee pays for attempted work, like
+  gas on revert). A skipped tx does not advance its sender's
+  nonce, so it can be resubmitted with adequate fee.
+- `fee_module = None` preserves old behavior for test executors
+  that never wire a bank (dev-mode, not production).
+
+### Tests
+
+- `fee_module_charges_non_bank_txs` — a counter tx pays through
+  the collector and still executes.
+- `min_fee_floor_skips_underpaying_txs` — fee below floor skipped
+  (nonce not advanced); adequate fee charged + executed.
+- `evm_module_pays_own_fee` — EVM declares self-funded.

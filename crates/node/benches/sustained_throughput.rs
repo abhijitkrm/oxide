@@ -69,6 +69,7 @@ fn bench_executor_bank_throughput(c: &mut Criterion) {
                     evm_persistence: true,
                     storage_path: None,
                     settlement_operator: None,
+                    min_fee: 0,
                 };
                 let mut node = Node::assemble(&config);
 
@@ -144,6 +145,7 @@ fn bench_sustained_pipeline(c: &mut Criterion) {
                         evm_persistence: false, // disable disk I/O for pure pipeline measurement
                         storage_path: None,
                         settlement_operator: None,
+                        min_fee: 0,
                     };
                     let mut node = Node::assemble(&config);
 

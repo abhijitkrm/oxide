@@ -238,6 +238,7 @@ mod tests {
             evm_persistence: false,
             storage_path: None,
             settlement_operator: None,
+            min_fee: 0,
         };
         let mut node = Node::assemble(&config);
 

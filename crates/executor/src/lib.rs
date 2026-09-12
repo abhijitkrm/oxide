@@ -363,6 +363,19 @@ pub trait Module: Send + Sync {
         Ok(())
     }
 
+    /// Whether this module pays for its own execution internally,
+    /// exempting it from the envelope fee charged by the configured
+    /// fee module. `false` (default): the executor charges `ctx.fee`
+    /// through the fee module before execution. `true`: the module
+    /// meters and collects its own fee — the EVM is the canonical
+    /// case (revm charges `gas_used × effective_gas_price` from the
+    /// sender's account inside execution, bounded below by the block
+    /// base fee). Charging the envelope fee on top of that would
+    /// double-charge every EVM user.
+    fn pays_own_fee(&self) -> bool {
+        false
+    }
+
     /// Estimate the gas cost of a message for block gas limit
     /// enforcement.
     ///
@@ -605,6 +618,22 @@ pub struct Executor {
     /// Default: 30 million gas per block (comparable to Ethereum's
     /// 30M gas limit). Configurable via [`Executor::with_gas_limit`].
     block_gas_limit: u64,
+    /// The module that collects transaction fees (the bank). When
+    /// set, every non-self-funded module's txs are charged `ctx.fee`
+    /// through this module before execution — previously the charge
+    /// was dispatched to the *target* module, so any module that
+    /// didn't implement `charge_fee` executed for free.
+    ///
+    /// `None` = no fee collection (tests and dev-mode executors).
+    fee_module: Option<u8>,
+    /// Minimum acceptable `ctx.fee` per transaction. Txs declaring a
+    /// fee below this floor are skipped before the fee charge —
+    /// the envelope's fee field is sender-controlled, so without a
+    /// floor every tx could declare 0 and execute for free.
+    ///
+    /// `0` = no floor (the fee module's own rules apply — e.g.
+    /// zero-fee txs are free).
+    min_fee: u64,
 }
 
 impl Executor {
@@ -643,6 +672,8 @@ impl Executor {
             mempool_intake_rx: Mutex::new(intake_rx),
             executed_nonce: Mutex::new(HashMap::new()),
             block_gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
+            fee_module: None,
+            min_fee: 0,
         }
     }
 
@@ -654,6 +685,29 @@ impl Executor {
     #[must_use]
     pub fn with_gas_limit(mut self, limit: u64) -> Self {
         self.block_gas_limit = limit;
+        self
+    }
+
+    /// Designate a module as the fee collector (the bank).
+    ///
+    /// Once set, every tx routed to a non-self-funded module is
+    /// charged `ctx.fee` through this module before execution —
+    /// the charge is dispatched to the collector, not the target
+    /// module, so modules that never implemented `charge_fee` no
+    /// longer execute for free.
+    pub fn set_fee_module(&mut self, module_id: u8) {
+        self.fee_module = Some(module_id);
+    }
+
+    /// Set the minimum acceptable `ctx.fee` per transaction.
+    ///
+    /// The envelope's fee field is sender-declared; without a floor
+    /// every tx could declare 0 and execute for free. Txs below the
+    /// floor are skipped before the fee charge (and before the nonce
+    /// advances). `0` (default) = no floor.
+    #[must_use]
+    pub fn with_min_fee(mut self, min_fee: u64) -> Self {
+        self.min_fee = min_fee;
         self
     }
 
@@ -1026,13 +1080,32 @@ impl Executor {
             if cumulative_gas.saturating_add(gas) > self.block_gas_limit {
                 continue; // block gas limit exceeded — skip remaining txs
             }
-            // Charge the transaction fee. If the sender has
-            // insufficient balance, the tx is skipped (not executed)
-            // and its nonce is not advanced. This prevents free
-            // execution: every tx must pay its declared fee before
-            // it can execute.
-            if module.charge_fee(&ctx).is_err() {
-                continue; // insufficient balance for fee — skip
+            // Fee gate: every tx routed to a non-self-funded module
+            // pays `ctx.fee` through the configured fee collector
+            // (the bank) — not the target module. Previously the
+            // charge was dispatched to `module.charge_fee`, whose
+            // default no-op meant any module without an override
+            // (exchange, perps, EVM, ...) executed for free.
+            //
+            // `min_fee` is enforced first: the envelope's fee field
+            // is sender-declared, so without a floor every tx could
+            // declare 0. Self-funded modules (EVM: gas is the fee)
+            // are exempt — charging here would double-charge.
+            //
+            // The fee is kept even if `handle` later fails —
+            // standard chain semantics (work was attempted; the fee
+            // pays for the resources consumed, like gas on revert).
+            if !module.pays_own_fee() {
+                if ctx.fee < self.min_fee {
+                    continue; // below the fee floor — skip
+                }
+                if let Some(fee_module) =
+                    self.fee_module.and_then(|id| self.modules[usize::from(id)].as_ref())
+                {
+                    if fee_module.charge_fee(&ctx).is_err() {
+                        continue; // insufficient balance for fee — skip
+                    }
+                }
             }
             // Advance the local nonce counter for this sender.
             // (Only after fee charge succeeds — a tx that can't pay
@@ -1661,6 +1734,120 @@ mod tests {
         let root2 = executor.attest_state(Height::new(2)).root;
         assert_ne!(root0, root1, "state roots should differ across blocks");
         assert_ne!(root1, root2, "state roots should differ across blocks");
+    }
+
+    /// A minimal fee-collector module: records how much it charged.
+    struct FeeCollector {
+        charged: Mutex<u64>,
+    }
+
+    impl Module for FeeCollector {
+        fn id(&self) -> u8 {
+            9
+        }
+        fn name(&self) -> &'static str {
+            "feecollector"
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            Ok(vec![])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
+            *self.charged.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += ctx.fee;
+            Ok(())
+        }
+    }
+
+    /// Build a tx with an explicit fee (defaults differ from
+    /// `make_tx`'s fixed 100).
+    fn make_tx_with_fee_and_sender(
+        module_id: u8,
+        payload: &[u8],
+        nonce: u64,
+        fee: u64,
+        sender_byte: u8,
+    ) -> TxBytes {
+        let sender = Address([sender_byte; 20]);
+        let mut bytes = Vec::with_capacity(36 + 1 + payload.len());
+        bytes.extend_from_slice(&sender.0);
+        bytes.extend_from_slice(&nonce.to_le_bytes());
+        bytes.extend_from_slice(&fee.to_le_bytes());
+        bytes.push(module_id);
+        bytes.extend_from_slice(payload);
+        TxBytes::new(bytes)
+    }
+
+    fn make_tx_with_fee(module_id: u8, payload: &[u8], nonce: u64, fee: u64) -> TxBytes {
+        make_tx_with_fee_and_sender(module_id, payload, nonce, fee, 0)
+    }
+
+    /// Regression test: txs routed to a module that never implements
+    /// `charge_fee` must still pay — through the configured fee
+    /// collector. Before the fix, the charge was dispatched to the
+    /// *target* module, whose default no-op meant only bank txs ever
+    /// paid a fee.
+    #[test]
+    fn fee_module_charges_non_bank_txs() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        let collector = Arc::new(FeeCollector { charged: Mutex::new(0) });
+        executor.register_module(counter.clone());
+        executor.register_module(collector.clone());
+        executor.set_fee_module(9);
+
+        executor.ingest_tx(make_tx_with_fee(1, &[1], 0, 50));
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        executor.finalize_block(&FinalizedBlock { height: Height::new(0), txs: proposal.txs });
+
+        assert_eq!(
+            *collector.charged.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            50,
+            "the counter tx's fee must be charged through the collector"
+        );
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "the tx must still execute after paying"
+        );
+    }
+
+    /// Regression test: `min_fee` rejects txs whose declared fee is
+    /// below the floor — the envelope's fee field is
+    /// sender-controlled, so without a floor every tx could declare 0.
+    #[test]
+    fn min_fee_floor_skips_underpaying_txs() {
+        let mut executor = Executor::new(100).with_min_fee(50);
+        let counter = Arc::new(CounterModule::new());
+        let collector = Arc::new(FeeCollector { charged: Mutex::new(0) });
+        executor.register_module(counter.clone());
+        executor.register_module(collector.clone());
+        executor.set_fee_module(9);
+
+        // fee=10 < min_fee=50 → skipped (never executed, nonce not
+        // advanced). fee=100 ≥ 50 → charged and executed. Different
+        // senders: a skipped tx doesn't advance its sender's nonce,
+        // so a same-sender follow-up would also be nonce-skipped.
+        executor.ingest_tx(make_tx_with_fee_and_sender(1, &[1], 0, 10, 7));
+        executor.ingest_tx(make_tx_with_fee_and_sender(1, &[1], 0, 100, 8));
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        executor.finalize_block(&FinalizedBlock { height: Height::new(0), txs: proposal.txs });
+
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "only the adequately-paid tx executes"
+        );
+        assert_eq!(
+            *collector.charged.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            100,
+            "only the 100-fee tx is charged"
+        );
     }
 
     // ---- M2 fix: process_proposal validation tests ----

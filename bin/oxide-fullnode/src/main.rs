@@ -77,6 +77,7 @@ fn load_config() -> NodeConfig {
         evm_persistence: true,
         storage_path: None,
         settlement_operator: None,
+        min_fee: 0,
     }
 }
 

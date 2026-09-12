@@ -2339,6 +2339,15 @@ impl Module for EvmModule {
         Ok(())
     }
 
+    /// The EVM is self-funded: revm charges `gas_used × effective
+    /// gas price` from the sender's account inside execution,
+    /// bounded below by the block base fee (`GasPriceLessThanBasefee`
+    /// rejects under-priced txs). Charging the envelope fee on top
+    /// would double-charge every EVM user.
+    fn pays_own_fee(&self) -> bool {
+        true
+    }
+
     /// Gas estimate = the tx's declared `gas_limit`, decoded from
     /// the RLP payload. The default `1000 + len` proxy would let a
     /// tx with a 30M gas limit count as ~150 gas and blow through
@@ -4507,5 +4516,15 @@ mod tests {
         // Undecodable payload → u64::MAX (any block containing it is
         // over-limit → rejected, fail-safe direction).
         assert_eq!(m.estimate_gas(&[0xff, 0x00]), u64::MAX);
+    }
+
+    /// The EVM is self-funded: revm charges `gas_used × effective
+    /// gas price` from the sender inside execution (bounded below
+    /// by the block base fee). The envelope fee must not be charged
+    /// on top — that would double-charge every EVM user.
+    #[test]
+    fn evm_module_pays_own_fee() {
+        let m = make_module();
+        assert!(m.pays_own_fee());
     }
 }
