@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use codec::Encode;
+use codec::{Decode, Encode};
 use crypto::bls::{AggregateSignature, Signature};
 use crypto::hash::{Domain, Hasher};
 use ports::{AppInterface, ConsensusEngine};
@@ -182,6 +182,9 @@ pub enum ConsensusError {
         /// The state root the local validator computed.
         actual_root: Hash,
     },
+    /// The persisted consensus state could not be restored — the
+    /// byte buffer is malformed, truncated, or corrupted (C9 fix).
+    InvalidState,
 }
 
 impl std::fmt::Display for ConsensusError {
@@ -220,6 +223,7 @@ impl std::fmt::Display for ConsensusError {
                     height.value()
                 )
             }
+            Self::InvalidState => write!(f, "invalid persisted consensus state"),
         }
     }
 }
@@ -540,6 +544,127 @@ impl OxideBft {
     #[must_use]
     pub fn timeout_signer_count_debug(&self) -> usize {
         self.pacemaker.timeout_signer_count()
+    }
+
+    /// Serialize the engine's safety-critical state to a byte buffer
+    /// (C9 fix). The state includes:
+    /// - `high_qc` (the highest QC seen).
+    /// - `current_view` (the current view).
+    /// - `last_voted_view` (the highest view voted in).
+    /// - `next_height` (the next proposal height).
+    /// - `epoch` (the current epoch).
+    ///
+    /// This state must be persisted to a journal/WAL before the
+    /// engine shuts down. On restart, call [`restore_state`] with
+    /// the persisted bytes to restore the engine's safety state.
+    ///
+    /// The `voted_at_height` map is also included — it's the per-
+    /// height vote lock that prevents double-voting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state cannot be encoded (should never happen
+    /// for valid consensus state — all fields are plain integers
+    /// or encoded types).
+    #[must_use]
+    pub fn save_state(&self) -> Vec<u8> {
+        // Format:
+        // - 8 bytes: current_view
+        // - 8 bytes: last_voted_view (0 = None)
+        // - 8 bytes: next_height
+        // - 8 bytes: epoch
+        // - 1 byte: high_qc present (0 = None, 1 = Some)
+        // - if high_qc present: encoded QuorumCertificate
+        // - 8 bytes: voted_at_height.len()
+        // - for each entry: 8 bytes height + 32 bytes hash
+
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(&self.current_view.value().to_le_bytes());
+        buf.extend_from_slice(&self.last_voted_view.map_or(0u64, primitives::Id::value).to_le_bytes());
+        buf.extend_from_slice(&self.next_height.value().to_le_bytes());
+        buf.extend_from_slice(&self.epoch.value().to_le_bytes());
+
+        match &self.high_qc {
+            Some(qc) => {
+                buf.push(1);
+                qc.encode(&mut buf);
+            }
+            None => buf.push(0),
+        }
+
+        let voted_len = u64::try_from(self.voted_at_height.len()).unwrap_or(u64::MAX);
+        buf.extend_from_slice(&voted_len.to_le_bytes());
+        for (height, hash) in &self.voted_at_height {
+            buf.extend_from_slice(&height.to_le_bytes());
+            buf.extend_from_slice(hash.as_bytes());
+        }
+
+        buf
+    }
+
+    /// Restore the engine's safety-critical state from a byte buffer
+    /// (C9 fix). This is the inverse of [`save_state`]. Call this
+    /// on restart after constructing a fresh engine, before
+    /// processing any proposals or votes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsensusError::InvalidState`] if the buffer is
+    /// malformed (wrong length, bad encoding, etc.).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `try_into` slice conversion fails — this is
+    /// impossible because the slice lengths are checked before the
+    /// conversion.
+    pub fn restore_state(&mut self, bytes: &[u8]) -> Result<(), ConsensusError> {
+        if bytes.len() < 33 {
+            return Err(ConsensusError::InvalidState);
+        }
+
+        let mut offset = 0;
+        let current_view_val = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let last_voted_val = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let next_height_val = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let epoch_val = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        self.current_view = View::new(current_view_val);
+        self.last_voted_view = if last_voted_val == 0 { None } else { Some(View::new(last_voted_val)) };
+        self.next_height = Height::new(next_height_val);
+        self.epoch = Epoch::new(epoch_val);
+
+        let qc_present = bytes[offset];
+        offset += 1;
+
+        if qc_present == 1 {
+            let mut reader = codec::Reader::new(&bytes[offset..]);
+            self.high_qc = Some(QuorumCertificate::decode(&mut reader).map_err(|_| ConsensusError::InvalidState)?);
+            offset = bytes.len() - reader.remaining();
+        }
+
+        if offset + 8 > bytes.len() {
+            return Err(ConsensusError::InvalidState);
+        }
+        let voted_len = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        self.voted_at_height.clear();
+        for _ in 0..voted_len {
+            if offset + 40 > bytes.len() {
+                return Err(ConsensusError::InvalidState);
+            }
+            let height = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            let hash_bytes: [u8; 32] = bytes[offset..offset + 32].try_into().unwrap();
+            offset += 32;
+            self.voted_at_height.insert(height, Hash::from_slice(&hash_bytes).map_err(|_| ConsensusError::InvalidState)?);
+        }
+
+        Ok(())
     }
 
     /// Sync this engine's `next_height` to `max_height`. In a real
@@ -2286,6 +2411,67 @@ mod tests {
         // Voter index 99 is out of bounds (n=4).
         let err = leader.collect_vote(99, vote).expect_err("out-of-bounds voter must be rejected");
         assert_eq!(err, ConsensusError::InvalidVoteSignature { voter: 99 });
+    }
+
+    /// C9 fix: `save_state` / `restore_state` round-trip must preserve
+    /// the engine's safety-critical state.
+    #[test]
+    fn save_restore_state_round_trip() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut leader =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0).with_secret_key(keys[0].clone());
+
+        // Advance the engine: submit, propose, vote.
+        leader.submit_tx(TxBytes::new(vec![42]));
+        let (header, _proposal) = leader.propose().expect("propose");
+        let block_hash = OxideBft::block_hash(&header);
+
+        // Simulate a vote at height 0 for this block.
+        leader.voted_at_height.insert(0, block_hash);
+
+        // Save the state.
+        let state_bytes = leader.save_state();
+        assert!(!state_bytes.is_empty(), "save_state must produce non-empty bytes");
+
+        // Create a fresh engine and restore the state.
+        let mut restored =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        restored.restore_state(&state_bytes).expect("restore_state must succeed");
+
+        // Verify the state was restored.
+        assert_eq!(restored.current_view, leader.current_view, "current_view must match");
+        assert_eq!(restored.last_voted_view, leader.last_voted_view, "last_voted_view must match");
+        assert_eq!(restored.next_height, leader.next_height, "next_height must match");
+        assert_eq!(restored.epoch, leader.epoch, "epoch must match");
+        assert_eq!(restored.high_qc, leader.high_qc, "high_qc must match");
+        assert_eq!(restored.voted_at_height, leader.voted_at_height, "voted_at_height must match");
+    }
+
+    /// C9 fix: `restore_state` must reject malformed buffers.
+    #[test]
+    fn restore_state_rejects_malformed_buffer() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut leader =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        // Too short (less than 33 bytes).
+        let short = vec![0u8; 10];
+        let err = leader.restore_state(&short).expect_err("short buffer must be rejected");
+        assert_eq!(err, ConsensusError::InvalidState);
+
+        // Empty buffer.
+        let empty: Vec<u8> = vec![];
+        let err = leader.restore_state(&empty).expect_err("empty buffer must be rejected");
+        assert_eq!(err, ConsensusError::InvalidState);
     }
 
     #[test]
