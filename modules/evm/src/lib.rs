@@ -538,16 +538,14 @@ impl EvmModule {
     /// as a valid signed transaction (RLP decode failure, invalid
     /// signature, wrong chain ID).
     /// Returns [`ExecError::ModuleRejected`] if the EVM execution fails.
-    fn execute(
+    /// Execute a already-decoded signed transaction (Perf: single
+    /// RLP decode). Used by `handle()` to avoid decoding the same
+    /// RLP twice — `handle()` decodes once to get the tx type for
+    /// the receipt, then calls this method.
+    fn execute_signed(
         &self,
-        _ctx: &TxContext,
-        msg: &[u8],
+        signed: &tx::SignedTx,
     ) -> Result<revm::context::result::ExecutionResult, ExecError> {
-        // Decode the signed transaction from RLP.
-        let mut buf = msg;
-        let signed: tx::SignedTx =
-            alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
-
         // Enforce chain ID (EIP-155 replay protection).
         if signed.chain_id() != self.chain_id {
             return Err(ExecError::Malformed);
@@ -559,7 +557,7 @@ impl EvmModule {
         let caller = alloy_primitives_address(sender.0);
 
         // Build the transaction environment from the signed tx fields.
-        let tx = Self::build_tx_env(&signed, caller)?;
+        let tx = Self::build_tx_env(signed, caller)?;
 
         // Build and run the EVM. `transact_commit` executes the tx and
         // commits the state changes to the CacheDB in one step.
@@ -2449,19 +2447,17 @@ impl Module for EvmModule {
         }
     }
 
-    fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-        // Decode once to get the tx type for the receipt. The
-        // execute() call decodes again — this is a cold path (one
-        // decode per tx, not per opcode), and the decode is cheap
-        // (~1 µs) compared to EVM execution (~60–80 µs).
-        let tx_type = {
-            let mut buf = msg;
-            match <tx::SignedTx as alloy_rlp::Decodable>::decode(&mut buf) {
-                Ok(signed) => signed.tx_type(),
-                Err(_) => 0, // Malformed tx — execute() will reject it.
-            }
-        };
-        let result = self.execute(ctx, msg)?;
+    fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+        // Perf: single RLP decode. Decode once to get both the tx
+        // type (for the receipt) and the signed tx (for execution).
+        // The old code decoded twice — once in handle() for the tx
+        // type, once in execute() for execution. The decode is
+        // ~1 µs, so this saves ~1 µs per tx on the cold path.
+        let mut buf = msg;
+        let signed: tx::SignedTx =
+            alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+        let tx_type = signed.tx_type();
+        let result = self.execute_signed(&signed)?;
 
         // Phase C: build a receipt from the execution result.
         // The receipt captures status, gas used, logs, bloom, and
