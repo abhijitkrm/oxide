@@ -96,5 +96,61 @@ fn bench_storage_root(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_state_root_full_rebuild, bench_storage_root);
+/// Incremental `state_root` over a live `EvmModule`: N funded
+/// accounts, K touched (balance mutated) per call. Measures the
+/// end-to-end leaf-patch path — the old path re-hashed every
+/// address, re-encoded every account, and re-sorted N leaves each
+/// call; the incremental path patches K leaves and feeds a
+/// pre-sorted `BTreeMap` to `HashBuilder`.
+///
+/// The residual O(N) leaf-node hashing inside `HashBuilder::root()`
+/// is the floor for a non-sparse MPT — a sparse retained trie
+/// (reth's `reth-trie-sparse` approach) is the O(touched·log n)
+/// follow-up.
+fn bench_state_root_incremental(c: &mut Criterion) {
+    let mut group = c.benchmark_group("state_root_incremental");
+
+    for &(n_accounts, n_touched) in
+        &[(10_000usize, 10usize), (10_000, 100), (100_000, 10), (100_000, 100)]
+    {
+        group.bench_function(format!("{n_accounts}_accts_{n_touched}_touched"), |b| {
+            let module =
+                evm::EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+            let addrs: Vec<primitives::Address> = (0..n_accounts)
+                .map(|i| {
+                    let mut a = [0u8; 20];
+                    a[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    primitives::Address(a)
+                })
+                .collect();
+            for a in &addrs {
+                module.fund_account_for_test(a, 1_000_000);
+            }
+            // Warm the leaf map (first call is the full build).
+            black_box(executor::Module::state_root(&module));
+
+            let mut iter_n = 0u128;
+            b.iter(|| {
+                iter_n += 1;
+                for a in &addrs[..n_touched] {
+                    module.mark_touched_for_test(a);
+                    // Mutate the balance so the leaf actually
+                    // changes (re-encode + re-hash, not a no-op).
+                    module.fund_account_for_test(a, 1_000_000 + iter_n);
+                }
+                let root = executor::Module::state_root(&module);
+                black_box(root)
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_state_root_full_rebuild,
+    bench_storage_root,
+    bench_state_root_incremental
+);
 criterion_main!(benches);

@@ -10520,3 +10520,26 @@ Gate 5 (fuzz) + Gate 6 (expanded conformance, 29 vectors) +
 Gate 7 (multi-validator testnet under latency + kill/restart)
 all pass. Remaining gate work: sustained-throughput soak runs
 (gate 4 follow-up) and production hardening review items.
+
+## B1+B9 — incremental account-trie leaves for `state_root`
+
+`state_root` previously rebuilt every account leaf per call:
+`keccak256(addr)` + RLP-encode `TrieAccount` + sort, for all N
+accounts, before feeding `HashBuilder`. Now a `BTreeMap` of
+`keccak(addr) → RLP leaf` is kept in `trie_leaves` and patched for
+`touched` accounts only (storage-root recompute already cached
+per-account). The map is rebuilt once after construction /
+`import_state` (`trie_leaves_ready` flag).
+
+New vectors: `incremental_root_matches_fresh_replay_per_block`
+(patch path == fresh replay, per block) and
+`state_root_after_snapshot_import_rebuilds_leaves` (import
+invalidates the leaf map). New `state_root_incremental` bench:
+10k accts / 10 touched = 4.3 ms; 100k accts / 10 touched =
+45.1 ms — vs ~72 ms for the full rebuild at 100k (≈37% cut).
+The residual is `HashBuilder`'s intrinsic O(n) leaf hashing — a
+true O(touched·log n) needs a sparse retained trie
+(`reth-trie-sparse` approach), still deferred as consensus-critical.
+
+New `#[doc(hidden)] mark_touched_for_test` hook lets benches mark
+accounts touched without executing txs.

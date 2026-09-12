@@ -266,6 +266,20 @@ pub struct EvmModule {
     storage_root_cache:
         Mutex<std::collections::HashMap<revm::primitives::Address, alloy_primitives::B256>>,
     /// Cached state root from the last `state_root` call. If no
+    /// Phase B: incremental account-trie leaf cache — hashed
+    /// address (`keccak256` of the 20-byte EVM address) →
+    /// RLP-encoded `TrieAccount`. `state_root` patches this map
+    /// for `touched` accounts only instead of re-hashing every
+    /// address, re-encoding every account, and re-sorting every
+    /// call. The `BTreeMap` keeps leaves in sorted hashed-key
+    /// order — the exact order `HashBuilder::add_leaf` requires.
+    trie_leaves: Mutex<std::collections::BTreeMap<revm::primitives::B256, Vec<u8>>>,
+    /// Whether `trie_leaves` reflects the full account set. False
+    /// at construction and after `import_state` (state was
+    /// replaced wholesale); the next `state_root` rebuilds the
+    /// map in one pass — the same cost as the old non-incremental
+    /// path — then flips this true.
+    trie_leaves_ready: Mutex<bool>,
     /// accounts were touched since the last computation, the cached
     /// root is returned directly (O(1) fast path).
     cached_state_root: Mutex<Option<alloy_primitives::B256>>,
@@ -302,6 +316,8 @@ impl EvmModule {
             block_gas_limit: 30_000_000,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
+            trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
             perps: Mutex::new(None),
@@ -324,6 +340,8 @@ impl EvmModule {
             block_gas_limit: 30_000_000,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
+            trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
             perps: Mutex::new(None),
@@ -360,6 +378,8 @@ impl EvmModule {
             block_gas_limit: 30_000_000,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
+            trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
+            trie_leaves_ready: Mutex::new(false),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
             perps: Mutex::new(None),
@@ -2547,11 +2567,15 @@ impl Module for EvmModule {
         // Panics if the DB mutex is poisoned (a thread panicked while
         // holding the lock). This is unrecoverable and indicates a bug.
         let touched = self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut leaves = self.trie_leaves.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut leaves_ready =
+            self.trie_leaves_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Fast path: if nothing was touched since the last
-        // computation, return the cached root. This makes consecutive
-        // `state_root` calls with no intervening execution O(1).
-        if touched.is_empty() {
+        // Fast path: if the leaf map is built and nothing was
+        // touched since the last computation, return the cached
+        // root. This makes consecutive `state_root` calls with no
+        // intervening execution O(1).
+        if *leaves_ready && touched.is_empty() {
             if let Some(cached) =
                 *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             {
@@ -2563,50 +2587,81 @@ impl Module for EvmModule {
         let mut storage_root_cache =
             self.storage_root_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Build the account iterator: for each account, compute its
-        // storage root (incrementally) and build a TrieAccount.
-        let accounts = db.cache.accounts.iter().map(|(addr, account)| {
-            // Compute the storage root for this account.
-            //
-            // If the account was touched in this block, recompute
-            // its storage root from scratch and update the cache.
-            // Otherwise, reuse the cached storage root (O(1)).
-            let storage_root = if account.storage.is_empty() {
-                trie::EMPTY_ROOT
-            } else if touched.contains(addr) {
-                // Recompute for touched accounts.
-                let storage_iter = account.storage.iter().map(|(slot, value)| {
-                    (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
-                });
-                let root = trie::storage_root(storage_iter);
-                storage_root_cache.insert(*addr, root);
-                root
-            } else {
-                // Reuse cached storage root for untouched accounts.
-                storage_root_cache.get(addr).copied().unwrap_or_else(|| {
-                    // Cache miss (first computation or cache evicted).
+        if *leaves_ready {
+            // Incremental patch — only `touched` accounts are
+            // re-encoded. `touched` is the complete modified set
+            // (populated from `EvmState::keys()` post-commit), so
+            // every changed account is patched; accounts absent
+            // from the cache were removed from state.
+            for addr in touched.iter() {
+                let hashed = alloy_primitives::keccak256(addr);
+                match db.cache.accounts.get(addr) {
+                    Some(account) => {
+                        let storage_root = if account.storage.is_empty() {
+                            trie::EMPTY_ROOT
+                        } else {
+                            // Touched → always recompute the
+                            // storage root (its slots changed).
+                            let storage_iter = account.storage.iter().map(|(slot, value)| {
+                                (
+                                    alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()),
+                                    *value,
+                                )
+                            });
+                            let root = trie::storage_root(storage_iter);
+                            storage_root_cache.insert(*addr, root);
+                            root
+                        };
+                        leaves.insert(hashed, encode_trie_leaf(account, storage_root));
+                    }
+                    None => {
+                        leaves.remove(&hashed);
+                    }
+                }
+            }
+        } else {
+            // Full build — first call after construction or
+            // `import_state`. Hashes and encodes every account once
+            // (same cost as the old path); subsequent calls patch
+            // only `touched` accounts.
+            for (addr, account) in &db.cache.accounts {
+                let storage_root = if account.storage.is_empty() {
+                    trie::EMPTY_ROOT
+                } else if touched.contains(addr) {
+                    // Recompute for touched accounts.
                     let storage_iter = account.storage.iter().map(|(slot, value)| {
                         (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
                     });
                     let root = trie::storage_root(storage_iter);
                     storage_root_cache.insert(*addr, root);
                     root
-                })
-            };
+                } else {
+                    // Reuse cached storage root for untouched accounts.
+                    storage_root_cache.get(addr).copied().unwrap_or_else(|| {
+                        let storage_iter = account.storage.iter().map(|(slot, value)| {
+                            (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
+                        });
+                        let root = trie::storage_root(storage_iter);
+                        storage_root_cache.insert(*addr, root);
+                        root
+                    })
+                };
+                leaves.insert(
+                    alloy_primitives::keccak256(addr),
+                    encode_trie_leaf(account, storage_root),
+                );
+            }
+            *leaves_ready = true;
+        }
 
-            // Build the TrieAccount for the MPT.
-            let trie_account = trie::build_trie_account(
-                account.info.nonce,
-                account.info.balance,
-                storage_root,
-                account.info.code_hash,
-            );
-
-            (*addr, trie_account)
-        });
-
-        // Compute the state root via alloy-trie.
-        let root = trie::state_root(accounts);
+        // Feed the leaves into `HashBuilder` in sorted hashed-key
+        // order — the `BTreeMap` iteration order is exactly what
+        // `add_leaf` requires (it asserts sorted input).
+        let mut hb = alloy_trie::HashBuilder::default();
+        for (hashed_key, rlp) in leaves.iter() {
+            hb.add_leaf(alloy_trie::Nibbles::unpack(hashed_key), rlp);
+        }
+        let root = hb.root();
 
         // Cache the state root for the next call's fast path.
         *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -2658,6 +2713,11 @@ impl Module for EvmModule {
         if let Some(ref b) = *backend {
             self.load_from_storage(b.as_ref());
         }
+        // The account set was wholesale replaced — the incremental
+        // leaf map is stale. The next `state_root` rebuilds it in
+        // one pass.
+        *self.trie_leaves_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(())
     }
 }
@@ -2746,6 +2806,23 @@ impl EvmModule {
                 storage: revm::primitives::HashMap::default(),
             });
         account.info.balance = revm::primitives::U256::from(balance);
+    }
+
+    /// Mark an account as touched for the current block — the
+    /// incremental `state_root` then re-encodes its leaf. Test/bench
+    /// hook: real execution populates `touched` from
+    /// `EvmState::keys()` automatically; benches need a way to mark
+    /// accounts without executing txs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the touched mutex is poisoned.
+    #[doc(hidden)]
+    pub fn mark_touched_for_test(&self, addr: &Address) {
+        self.touched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(alloy_primitives_address(addr.0));
     }
 
     /// Flush the current `CacheDB` state to the `StorageBackend`.
@@ -2901,6 +2978,26 @@ impl EvmModule {
 /// Convert an Oxide `Address` (20 bytes) to a revm `Address`.
 fn alloy_primitives_address(bytes: [u8; 20]) -> revm::primitives::Address {
     revm::primitives::Address::from(bytes)
+}
+
+/// RLP-encode an account's `TrieAccount` leaf value for the account
+/// trie. Shared by the full-build and incremental-patch paths in
+/// `state_root` so both produce byte-identical leaves.
+fn encode_trie_leaf(
+    account: &revm::database::DbAccount,
+    storage_root: revm::primitives::B256,
+) -> Vec<u8> {
+    let trie_account = trie::build_trie_account(
+        account.info.nonce,
+        account.info.balance,
+        storage_root,
+        account.info.code_hash,
+    );
+    // TrieAccount RLP is ~70 bytes (nonce + 32B balance + two
+    // 32B hashes + RLP overhead); one allocation per leaf.
+    let mut buf = Vec::with_capacity(80);
+    alloy_rlp::Encodable::encode(&trie_account, &mut buf);
+    buf
 }
 
 #[cfg(test)]

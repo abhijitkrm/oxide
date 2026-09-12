@@ -943,3 +943,83 @@ fn selfdestruct_transfers_balance_and_keeps_code() {
         acct.code_len
     );
 }
+
+// ── Incremental state root (B1/B9) ─────────────────────────────────
+//
+// `state_root` now patches a hashed-leaf map instead of rebuilding
+// every account leaf per call. These vectors pin the leaf map's
+// correctness: incremental roots must equal a fresh module's root
+// after every block, and snapshot import must invalidate the map.
+
+/// After N blocks of mixed txs, the incremental root must equal the
+/// root a fresh module computes by replaying the same txs — catches
+/// stale/missing leaf patches.
+#[test]
+fn incremental_root_matches_fresh_replay_per_block() {
+    let key = TestKey::new();
+    let recipient = EvmAddress::from_slice(&[0x42; 20]);
+    let module_a = EvmModule::with_storage(1, 7_000_000_000, Box::new(storage::Volatile::new()));
+    let module_b = EvmModule::with_storage(1, 7_000_000_000, Box::new(storage::Volatile::new()));
+    fund(&module_a, &key.addr);
+    fund(&module_b, &key.addr);
+
+    // Deploy a contract (block 1), then transfer + call it (block 2).
+    let runtime = [0x60, 0x00, 0x35, 0x60, 0x00, 0x55, 0x00];
+    let deploy = signed_create(&key.privkey, 0, &deploy_init(&runtime));
+    let events = module_a.handle(&dummy_ctx(), &deploy).expect("deploy A");
+    let contract = event_field(&events, "contract")
+        .and_then(|h| h.parse::<EvmAddress>().ok())
+        .expect("contract address");
+    module_b.handle(&dummy_ctx(), &deploy).expect("deploy B");
+
+    module_a.end_block(Height::new(1));
+    module_b.end_block(Height::new(1));
+    assert_eq!(
+        module_a.state_root(),
+        module_b.state_root(),
+        "block 1: incremental root must match fresh replay"
+    );
+
+    // Block 2: one transfer + one contract call (touch new + existing accounts).
+    let transfer = signed_transfer(&key.privkey, 1, recipient, 7);
+    module_a.handle(&dummy_ctx(), &transfer).expect("transfer A");
+    module_b.handle(&dummy_ctx(), &transfer).expect("transfer B");
+    let mut data = vec![0u8; 32];
+    data[31] = 9;
+    let call = signed_call(&key.privkey, 2, contract, 0, &data);
+    module_a.handle(&dummy_ctx(), &call).expect("call A");
+    module_b.handle(&dummy_ctx(), &call).expect("call B");
+
+    module_a.end_block(Height::new(2));
+    module_b.end_block(Height::new(2));
+    assert_eq!(
+        module_a.state_root(),
+        module_b.state_root(),
+        "block 2: incremental root must match fresh replay"
+    );
+}
+
+/// Snapshot import replaces state wholesale — the incremental leaf
+/// map must be invalidated and rebuilt, not patched over stale leaves.
+#[test]
+fn state_root_after_snapshot_import_rebuilds_leaves() {
+    let key = TestKey::new();
+    let recipient = EvmAddress::from_slice(&[0x42; 20]);
+    let module_a = EvmModule::with_storage(1, 7_000_000_000, Box::new(storage::Volatile::new()));
+    fund(&module_a, &key.addr);
+    let raw = signed_transfer(&key.privkey, 0, recipient, 11);
+    module_a.handle(&dummy_ctx(), &raw).expect("transfer");
+    module_a.end_block(Height::new(1));
+    let root_a = module_a.state_root();
+
+    // Import A's snapshot into a fresh module — leaves_ready must be
+    // reset so the first state_root rebuilds from imported state.
+    let snapshot = module_a.export_state().expect("snapshot export");
+    let module_b = EvmModule::with_storage(1, 7_000_000_000, Box::new(storage::Volatile::new()));
+    module_b.import_state(&snapshot).expect("snapshot import");
+    assert_eq!(
+        module_b.state_root(),
+        root_a,
+        "post-import root must equal the source module's root"
+    );
+}
