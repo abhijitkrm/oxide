@@ -10039,3 +10039,33 @@ Three related fixes in the EVM module:
   and receive the balance.
 - `balance_saturates_above_u128` — U256::MAX balance reads as
   u128::MAX instead of panicking.
+
+## Security sweep round 2 — block gas enforcement end-to-end
+
+The block gas limit was nominally enforced at `process_proposal`
+and `execute_block`, but two gaps made it toothless:
+
+1. **`EvmModule` never overrode `estimate_gas`** — the default
+   `1000 + msg.len()` proxy counted a tx declaring `gas_limit =
+   30_000_000` as ~150 gas. An over-limit block passed validation
+   and only hit the real limit inside revm at execution.
+   Fix: `estimate_gas` decodes the RLP and returns the declared
+   `gas_limit`; undecodable payloads count as `u64::MAX` so a
+   proposal containing one is always over-limit (fail-safe).
+
+2. **`prepare_proposal` ignored gas entirely** — `BlockBudget.max_gas`
+   existed but selection used only `max_bytes`, so the proposer could
+   build a block every validator rejects at `process_proposal`
+   (a wasted round, and a griefing vector: a single oversized tx
+   could poison every proposal). Fix: selection now caps total
+   `estimate_gas` at `min(budget.max_gas, block_gas_limit)`, skips
+   oversized txs (leaving room for smaller later ones), and skips
+   un-executable txs (unparseable context, missing/unknown module)
+   that would make `process_proposal` reject the whole block.
+
+### Tests
+
+- `prepare_proposal_respects_block_gas_limit` — 4×~1001-gas txs
+  under a 2500 cap → 2 selected, proposal validates.
+- `estimate_gas_returns_declared_limit` — declared limit returned;
+  malformed payload → u64::MAX.

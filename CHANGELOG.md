@@ -726,6 +726,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Block gas limit was effectively unenforced**
+  (`modules/evm/src/lib.rs`, `crates/executor/src/lib.rs`)
+  - `EvmModule` used the default `estimate_gas` (`1000 + msg.len()`),
+    so a transaction declaring `gas_limit = 30_000_000` counted as
+    ~150 gas — an over-limit block passed proposal validation.
+    `estimate_gas` now returns the declared RLP `gas_limit`;
+    undecodable payloads count as `u64::MAX` (fail-safe).
+  - `prepare_proposal` selected transactions by bytes only and
+    ignored `BlockBudget.max_gas` — a proposer could build blocks
+    every validator rejects (a wasted round + griefing vector).
+    Selection now caps total gas at
+    `min(budget.max_gas, block_gas_limit)`, skips oversized txs, and
+    skips un-executable txs that would poison the whole proposal.
+  - Regression tests: gas-capped proposal builds + validates;
+    declared-limit estimation with fail-safe malformed handling.
+  - **In plain words:** block gas limits now mean what they say —
+    proposals can't exceed them and individual transactions are
+    charged their real declared gas.
+
 - **EVM execution under-tracked modified accounts**
   (`modules/evm/src/lib.rs`)
   - The sequential execution paths marked only `caller`, `to`,

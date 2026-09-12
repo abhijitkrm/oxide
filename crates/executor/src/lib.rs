@@ -1299,11 +1299,45 @@ impl AppInterface for Executor {
             }
         }
         // Select txs from the mempool by fee priority.
-        let txs = self
+        let candidates = self
             .mempool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .select(budget.max_bytes);
+        // Enforce the block gas limit at proposal time. The binding
+        // constraint is `min(budget.max_gas, block_gas_limit)` —
+        // `process_proposal` rejects blocks over `block_gas_limit`,
+        // and the consensus budget may ask for less. Without this
+        // the proposer could build a block the validators reject
+        // outright, wasting a round.
+        //
+        // Txs that would poison the proposal are skipped entirely:
+        // an unparseable context, missing module id, or unregistered
+        // module makes `process_proposal` reject the WHOLE block —
+        // a single malformed mempool entry could otherwise stall
+        // the chain by poisoning every proposal.
+        let gas_cap = budget.max_gas.min(self.block_gas_limit);
+        let mut total_gas: u64 = 0;
+        let mut txs = Vec::with_capacity(candidates.len());
+        for tx in candidates {
+            let bytes = tx.as_bytes();
+            let gas = match (parse_tx_context(bytes), parse_module_id(bytes)) {
+                (Some(_), Some(module_id)) => self.modules[usize::from(module_id)]
+                    .as_ref()
+                    .map(|m| m.estimate_gas(module_payload(bytes))),
+                _ => None,
+            };
+            let Some(gas) = gas else {
+                continue;
+            };
+            // Skip (not stop): a tx that doesn't fit leaves room for
+            // a smaller later tx.
+            if total_gas.saturating_add(gas) > gas_cap {
+                continue;
+            }
+            total_gas += gas;
+            txs.push(tx);
+        }
         let height = Height::new(
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         );
@@ -2057,6 +2091,34 @@ mod tests {
             count.0[0], 1,
             "only the first tx should execute (gas limit), got counter = {}",
             count.0[0]
+        );
+    }
+
+    /// Regression test: `prepare_proposal` must not build a block
+    /// the validators reject. Before the fix, proposal selection
+    /// used only the byte budget — a proposer could pack enough
+    /// gas into `max_bytes` to exceed the block gas limit, and
+    /// `process_proposal` would reject the whole proposal.
+    #[test]
+    fn prepare_proposal_respects_block_gas_limit() {
+        let mut executor =
+            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2500);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        // Submit 4 txs, each ~1001 gas (1000 base + 1 byte). Under
+        // a 2500 gas cap at most 2 fit (2×1001 = 2002; 3×1001 = 3003).
+        for n in 0..4u64 {
+            let tx = make_tx_with_nonce(1, &[u8::try_from(n).unwrap_or(0xff)], n);
+            assert!(matches!(executor.ingest_tx(tx), MempoolAck::Accepted));
+        }
+
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        assert_eq!(proposal.txs.len(), 2, "only two ~1001-gas txs fit under 2500");
+        // The built proposal must pass validation.
+        assert!(
+            matches!(executor.process_proposal(&proposal), Verdict::Accept),
+            "a gas-bounded proposal must be accepted"
         );
     }
 }

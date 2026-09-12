@@ -2339,6 +2339,25 @@ impl Module for EvmModule {
         Ok(())
     }
 
+    /// Gas estimate = the tx's declared `gas_limit`, decoded from
+    /// the RLP payload. The default `1000 + len` proxy would let a
+    /// tx with a 30M gas limit count as ~150 gas and blow through
+    /// the block limit at execution time — the block gas limit must
+    /// be enforced against *declared* limits (EIP-1559 semantics:
+    /// `sum(tx.gas_limit) <= block.gas_limit`).
+    ///
+    /// An undecodable tx counts as `u64::MAX`: it cannot carry a
+    /// valid gas limit, so any proposal containing it exceeds the
+    /// limit and is rejected at `process_proposal` — the safe
+    /// direction.
+    fn estimate_gas(&self, msg: &[u8]) -> u64 {
+        let mut buf = msg;
+        match <tx::SignedTx as alloy_rlp::Decodable>::decode(&mut buf) {
+            Ok(signed) => signed.gas_limit(),
+            Err(_) => u64::MAX,
+        }
+    }
+
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         let result = self.execute(ctx, msg)?;
 
@@ -4472,5 +4491,21 @@ mod tests {
 
         // Previously `to::<u128>()` panicked here.
         assert_eq!(m.balance(&oxide_addr), u128::MAX);
+    }
+
+    /// Regression test: `estimate_gas` must return the tx's declared
+    /// `gas_limit`, not the `1000 + len` size proxy — a 30M-gas tx
+    /// must count as 30M gas toward the block limit. Undecodable
+    /// payloads count as `u64::MAX` (un-includable, fail-safe).
+    #[test]
+    fn estimate_gas_returns_declared_limit() {
+        let m = make_module();
+        let (pk, _) = test_keypair();
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let raw = signed_tx(&pk, 0, tx::TxKind::Call(recipient), &[]);
+        assert_eq!(m.estimate_gas(&raw), DEFAULT_GAS_LIMIT);
+        // Undecodable payload → u64::MAX (any block containing it is
+        // over-limit → rejected, fail-safe direction).
+        assert_eq!(m.estimate_gas(&[0xff, 0x00]), u64::MAX);
     }
 }
