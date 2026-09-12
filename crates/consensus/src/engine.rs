@@ -66,6 +66,15 @@ fn proposer_hash(idx: ValidatorIndex) -> Hash {
     Hash(bytes)
 }
 
+/// Maximum finalized blocks retained in the engine's in-memory map.
+///
+/// The `finalized` map exists for the commit path and recent-height
+/// queries (`finalized_block`); full history is the journal's job.
+/// 4096 heights ≈ 7 minutes of blocks at a 100 ms cadence — far
+/// beyond any reorg-free query horizon, bounded so a long-lived
+/// validator doesn't grow memory without limit.
+const MAX_RETAINED_FINALIZED: usize = 4096;
+
 /// A block that has a QC but hasn't been committed yet — waiting for
 /// the 2-chain commit rule to fire.
 ///
@@ -1138,6 +1147,23 @@ impl OxideBft {
         // is no longer needed. Keeps the map bounded by the number
         // of in-flight (uncommitted) heights.
         self.voted_at_height.retain(|h, _| *h > header.height.value());
+        // Prune the block store of stale proposals: a block at or
+        // below the just-committed height can never be needed again
+        // (the 2-chain rule only walks ancestors of the pending
+        // block, which are strictly above). Without this, a
+        // byzantine leader could flood `blocks` with never-committed
+        // proposals and grow memory without bound — a memory DoS
+        // on every validator.
+        let committed = header.height.value();
+        self.blocks.retain(|_, (h, _)| h.height.value() > committed);
+        // Bound the in-memory finalized history. Full history lives
+        // in the journal/backend; the engine's map exists for the
+        // commit path and recent-height queries, so retaining the
+        // newest `MAX_RETAINED_FINALIZED` heights keeps memory
+        // bounded without changing consensus semantics.
+        while self.finalized.len() > MAX_RETAINED_FINALIZED {
+            self.finalized.pop_first();
+        }
     }
 
     /// Clear all per-view state: collected votes and timeout

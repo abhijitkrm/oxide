@@ -37,6 +37,31 @@ use types::{CommitAck, FinalizedBlock, MempoolAck, Proposal, StateAttestation, T
 
 use crypto::hash::{Domain, Hasher};
 
+/// Maximum finalized-block / state-root history retained in memory.
+///
+/// These maps exist for recent-height queries (`finalized_block`,
+/// `state_root_at`); full history is the journal's job. 4096
+/// heights ≈ 7 minutes at a 100 ms block cadence — bounded so a
+/// long-lived node doesn't grow memory without limit.
+const MAX_RETAINED_HISTORY: usize = 4096;
+
+/// Insert-then-prune for height-keyed history maps: keeps the
+/// newest [`MAX_RETAINED_HISTORY`] entries by dropping the oldest.
+trait InsertRetained<K: Ord, V> {
+    /// Insert `v` at `k`, then evict oldest entries until at most
+    /// [`MAX_RETAINED_HISTORY`] remain.
+    fn insert_retained(&mut self, k: K, v: V);
+}
+
+impl<K: Ord, V> InsertRetained<K, V> for BTreeMap<K, V> {
+    fn insert_retained(&mut self, k: K, v: V) {
+        self.insert(k, v);
+        while self.len() > MAX_RETAINED_HISTORY {
+            self.pop_first();
+        }
+    }
+}
+
 /// A module execution error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecError {
@@ -536,9 +561,11 @@ pub struct Executor {
     /// The mempool (owned, so the executor is the app's intake).
     /// Behind `Mutex` because `AppInterface` methods take `&self`.
     mempool: Mutex<mempool::Mempool>,
-    /// Finalized blocks, keyed by height.
+    /// Finalized blocks, keyed by height. Bounded to the newest
+    /// [`MAX_RETAINED_HISTORY`] heights — full history is the
+    /// journal's job; this map serves recent-height queries only.
     finalized: Mutex<BTreeMap<u64, FinalizedBlock>>,
-    /// State roots per finalized height.
+    /// State roots per finalized height. Same retention bound.
     state_roots: Mutex<BTreeMap<u64, Hash>>,
     /// The next proposal height.
     next_proposal_height: Mutex<u64>,
@@ -1544,7 +1571,7 @@ impl AppInterface for Executor {
             self.finalized
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(block.height.value(), block.clone());
+                .insert_retained(block.height.value(), block.clone());
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 block.height.value().saturating_add(1); // M2 fix
         } else {
@@ -1554,11 +1581,11 @@ impl AppInterface for Executor {
             self.state_roots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(block.height.value(), root);
+                .insert_retained(block.height.value(), root);
             self.finalized
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(block.height.value(), block.clone());
+                .insert_retained(block.height.value(), block.clone());
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 block.height.value().saturating_add(1); // M2 fix
         }

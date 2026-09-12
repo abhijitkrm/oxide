@@ -726,6 +726,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **Consensus and executor history maps grew without bound**
+  (`crates/consensus/src/engine.rs`, `crates/executor/src/lib.rs`)
+  - `OxideBft::blocks` now drops stale proposals at-or-below the
+    committed height — a byzantine leader can no longer flood the
+    block store for a memory DoS.
+  - `OxideBft::finalized`, `Executor::finalized`, and
+    `Executor::state_roots` are capped at the newest 4096 heights;
+    full history stays in the journal.
+  - **In plain words:** validators no longer leak memory every
+    block, and a hostile proposer can't bloat node RAM.
+
 - **Journal history grew forever with no integrity-safe pruning**
   (`crates/storage/src/journal.rs`, `auth_journal.rs`, `mmr.rs`)
   - `JournalBackend::checkpoint()` writes a marker committing the

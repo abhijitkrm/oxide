@@ -10302,3 +10302,30 @@ leaves (pruned = honestly unprovable).
 - `test_checkpoint_resume_produces_identical_roots`,
   `test_checkpointed_leaves_are_unprovable` (mmr).
 - 51 storage tests green.
+
+## Perf + DoS sweep — bounded consensus/executor history maps
+
+Three maps grew without bound per height:
+
+- `OxideBft::finalized` — every committed block kept in RAM
+  forever (~1 block per 50–100 ms).
+- `OxideBft::blocks` — committed blocks were removed but
+  never-committed proposals (a byzantine leader can flood them)
+  stayed forever — a memory DoS on every validator.
+- `Executor::finalized` + `Executor::state_roots` — same unbounded
+  growth on the app side.
+
+Fix: `commit_block` now drops `blocks` entries at-or-below the
+just-committed height (they can never commit — the 2-chain rule
+only walks ancestors of the pending block, which are strictly
+above) and bounds `finalized` to the newest
+`MAX_RETAINED_FINALIZED` (4096 ≈ 7 min at 100 ms). The executor's
+`finalized`/`state_roots` get the same `MAX_RETAINED_HISTORY`
+bound via an `insert_retained` helper. Full history remains in
+the journal/backend — the in-memory maps exist for the commit
+path and recent-height queries only.
+
+### Tests
+
+- 87 consensus + 45 executor tests green (existing commit-path
+  coverage exercises the new retains).
