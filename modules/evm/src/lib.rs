@@ -3002,6 +3002,21 @@ impl EvmModule {
                     storage: account.storage.into_iter().collect(),
                 },
             );
+            // HIGH fix: also populate `cache.contracts` (the code
+            // hash → Bytecode map). revm looks up contract code by
+            // hash via `cache.contracts`, not via the account's
+            // `info.code` field. Without this, after a storage
+            // reload, the EVM can't find contract code by hash —
+            // calling a reloaded contract would behave as if it
+            // has no code (a silent no-op call).
+            if !account.code.is_empty() {
+                db.cache.contracts.insert(
+                    account.code_hash,
+                    revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
+                        account.code.iter().copied(),
+                    )),
+                );
+            }
         }
     }
 }

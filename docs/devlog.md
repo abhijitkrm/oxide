@@ -10858,3 +10858,68 @@ tests. Broadcast: 21 tests. Primitives: 11 tests. Crypto: 42 tests.
 - C4 (mutual TLS bound to validator keys)
 - C9 (consensus state persistence to journal/WAL)
 - C10 (executed_nonce persistence on restart)
+
+## 2026-09-10 — Session: HIGH-severity remediation
+
+### Completed HIGH fixes
+
+- **EIP-2 low-s enforcement** (`crates/crypto/src/secp.rs`):
+  `recover_sender` now rejects signatures where `s` is in the
+  upper half of the secp256k1 curve order. High-s signatures are
+  malleable — `(r,s)` and `(r,n-s)` both verify against the same
+  message, producing two valid tx hashes from one signature.
+
+- **`without_signature_verification` gated** (`crates/consensus`):
+  The method is now `#[doc(hidden)]` with a strong warning that it
+  is test/conformance only. A production caller would allow forged
+  votes and QCs.
+
+- **Vote view + parent binding** (`crates/consensus`):
+  `vote()` now requires `header.view == current_view` (prevents
+  voting in a wrong view) and `header.prev_block == high_qc.block_hash`
+  (prevents a byzantine leader from creating a phantom chain).
+
+- **Batch decoding bounds** (`crates/matcher`, `modules/exchange`):
+  The matcher batch request decoder and the exchange batch-settle
+  handler now bound the batch size to 65_536 entries. Prevents a
+  byzantine peer from causing a multi-GB allocation via a large
+  `count` field.
+
+- **EVM admission gates** (`modules/evm`):
+  `validate()` now checks: `gas_limit <= block_gas_limit`,
+  `max_fee >= base_fee` (EIP-1559), and `priority_fee <= max_fee`
+  (EIP-1559). A tx that fails these gates can never be included —
+  rejecting at admission saves mempool and execution resources.
+
+- **Mempool nonce-gap anchoring** (`crates/mempool`):
+  The mempool now tracks per-sender executed nonces and anchors
+  selection to `executed_nonce + 1`. Prevents selecting mid-chain
+  nonces after earlier txs have executed (which would create a
+  nonce gap in the block).
+
+- **Bounded intake channels** (`crates/p2p`, `crates/executor`):
+  The p2p inbound message channel and the executor mempool intake
+  channel are now bounded (sync_channel, capacity 10_000). Prevents
+  a byzantine peer or a burst of submissions from exhausting memory.
+  The producer blocks when the queue is full, applying backpressure.
+
+### Test results
+
+Full workspace test suite: all green (0 failures). Consensus: 93
+tests. EVM: 128 + 31 + 18 tests. Matcher: 88 tests. Exchange: 25
+tests. P2P: 45 tests. Executor: 97 tests. Mempool: 19 tests.
+Crypto: 42 tests. Broadcast: 21 tests.
+
+### Remaining HIGH items
+
+- CacheDB.contracts repopulation after storage reload
+- receipts_root EIP-2718 encoding + O(n) construction
+- RPC auth + rate limit defaults + admission release
+- Trading money-math clamps (u64::MAX refund, i64::MAX fill)
+- Drop per-vote BLS verify (aggregate only) + snapshot auth
+
+### Remaining critical items
+
+- C4 (mutual TLS bound to validator keys)
+- C9 (consensus state persistence to journal/WAL)
+- C10 (executed_nonce persistence on restart)
