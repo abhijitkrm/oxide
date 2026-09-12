@@ -10443,3 +10443,32 @@ strictly faster while closing the financial-loss and DoS holes.
 - Gate 5/6/7 follow-ups: fuzz soak + coverage, expanded reth
   conformance vectors, 4-validator Docker testnet with induced
   faults, sustained-throughput runs — still outstanding.
+
+## Gate 6 — expanded EVM conformance vectors (reth-style)
+
+Five new vectors in `modules/evm/tests/conformance.rs` covering
+semantics the suite hadn't exercised (24 → 29 tests):
+
+- `plain_transfer_uses_exactly_21000_gas` — the Yellow Paper
+  Appendix G constant, asserted from the `evm_call` event's
+  `gas_used` field.
+- `revert_rolls_back_storage_but_charges_gas` — a contract whose
+  runtime SSTOREs then REVERTs: status=revert in the event, gas
+  still charged (balance − gas×price), nonce advances, and the
+  reverted SSTORE never reaches the persisted account.
+- `cold_sstore_costs_more_than_warm` — EIP-2929: first write to a
+  slot costs ≥2,100 gas more than a warm nonzero→nonzero rewrite;
+  the second write's value is verified in persisted storage.
+- `create_address_matches_keccak_rlp_sender_nonce` — the reported
+  `contract=` address equals `keccak256(rlp([sender, 0]))[12..]`.
+- `selfdestruct_transfers_balance_and_keeps_code` — EIP-6780
+  (PRAGUE): balance to beneficiary, code survives outside the
+  creation tx.
+
+Test plumbing: `deploy_init` builds CODECOPY/RETURN init code for
+arbitrary runtimes; `event_field`/`event_gas_used` parse the
+`evm_call` event data; `persisted_account` reads the serialized
+account from the flushed `Volatile` backend (documented
+`[0x01][addr][zeros]` key + persist.rs value format).
+
+All 29 conformance tests pass; clippy clean.

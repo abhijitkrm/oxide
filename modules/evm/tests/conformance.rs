@@ -661,3 +661,285 @@ fn insufficient_balance_rejected() {
     let result = module.handle(&dummy_ctx(), &raw);
     assert!(result.is_err(), "insufficient balance must be rejected");
 }
+
+// ── Reth-style vectors: revert semantics, gas schedule, CREATE ─────
+//
+// These vectors exercise EVM semantics the earlier tests did not:
+// revert rollback, EIP-2929 cold/warm SSTORE gas, CREATE address
+// derivation, and EIP-6780 selfdestruct (Prague spec). They mirror
+// the cases reth's `reth-evm` and the Ethereum test suite cover.
+
+/// Build init code that deploys `runtime` as the contract's code:
+/// `PUSH1 len; PUSH1 0x0c; PUSH1 0x00; CODECOPY; PUSH1 len; PUSH1
+/// 0x00; RETURN` — copies the runtime bytes appended after the
+/// 12-byte init prefix to memory and returns them.
+fn deploy_init(runtime: &[u8]) -> Vec<u8> {
+    let len = u8::try_from(runtime.len()).expect("test runtime < 256 bytes");
+    let mut init = vec![0x60, len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, len, 0x60, 0x00, 0xf3];
+    init.extend_from_slice(runtime);
+    init
+}
+
+/// Build a signed CALL transaction carrying calldata and value.
+fn signed_call(privkey: &[u8], nonce: u64, to: EvmAddress, value: u128, data: &[u8]) -> Vec<u8> {
+    let tx = TxLegacy {
+        fields: TxFields {
+            nonce,
+            gas_limit: GAS_LIMIT,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            data: Bytes::copy_from_slice(data),
+            chain_id: 1,
+        },
+        gas_price: U256::from(10_000_000_000u64),
+    };
+    SignedTx::sign_legacy(tx, privkey).expect("sign must succeed").encode_to_bytes()
+}
+
+/// Parse `key=value` from an `evm_call` event's data string
+/// (`"gas_used=21000 status=success base_fee=… logs=… [contract=0x…]"`).
+fn event_field<'a>(events: &'a [executor::Event], key: &str) -> Option<&'a str> {
+    let data = std::str::from_utf8(events.first()?.data.as_slice()).ok()?;
+    let prefix = format!("{key}=");
+    data.split_whitespace().find_map(|tok| tok.strip_prefix(&prefix))
+}
+
+/// The `gas_used` field of the first event, parsed.
+fn event_gas_used(events: &[executor::Event]) -> u64 {
+    event_field(events, "gas_used")
+        .and_then(|v| v.parse().ok())
+        .expect("evm_call event must carry gas_used")
+}
+
+/// The persisted fields of an EVM account, decoded from the
+/// backend's serialized value (see `persist.rs` for the layout).
+struct PersistedAccount {
+    /// Bytecode length in bytes.
+    code_len: usize,
+    /// Storage slots as `(slot, value)` pairs.
+    slots: Vec<(U256, U256)>,
+}
+
+/// Read the persisted account for `addr` after `end_block` has
+/// flushed the `CacheDB`. Consumes the module's backend (the test
+/// accessor is one-shot) — call only as the last step of a test.
+///
+/// Key: `[0x01][addr: 20B][zeros: 11B]`; value layout (persist.rs):
+/// `balance(32) nonce(8) code_hash(32) code_len(4) code n_slots(4)`
+/// then `(slot(32), value(32))` per entry.
+fn persisted_account(module: &EvmModule, addr: EvmAddress) -> Option<PersistedAccount> {
+    let backend = module.backend_for_test();
+    let mut key = [0u8; 32];
+    key[0] = 0x01;
+    key[1..21].copy_from_slice(addr.as_slice());
+    let data = backend.get(&Hash(key))?;
+    if data.len() < 76 {
+        return None;
+    }
+    let code_len = u32::from_be_bytes(data[72..76].try_into().ok()?) as usize;
+    let n_off = 76 + code_len;
+    let n = u32::from_be_bytes(data.get(n_off..n_off + 4)?.try_into().ok()?) as usize;
+    let mut slots = Vec::with_capacity(n);
+    let mut off = n_off + 4;
+    for _ in 0..n {
+        let s = U256::from_be_bytes::<32>(data.get(off..off + 32)?.try_into().ok()?);
+        let v = U256::from_be_bytes::<32>(data.get(off + 32..off + 64)?.try_into().ok()?);
+        slots.push((s, v));
+        off += 64;
+    }
+    Some(PersistedAccount { code_len, slots })
+}
+
+/// A plain value transfer must cost exactly 21,000 gas — the
+/// canonical Ethereum constant (Yellow Paper Appendix G).
+#[test]
+fn plain_transfer_uses_exactly_21000_gas() {
+    let key = TestKey::new();
+    let recipient = EvmAddress::from_slice(&[0x42; 20]);
+    let module = EvmModule::new(1, 7_000_000_000);
+    fund(&module, &key.addr);
+
+    let raw = signed_transfer(&key.privkey, 0, recipient, 1);
+    let events = module.handle(&dummy_ctx(), &raw).expect("transfer must succeed");
+    assert_eq!(event_gas_used(&events), 21_000, "plain transfer must use 21,000 gas");
+    assert_eq!(event_field(&events, "status"), Some("success"), "plain transfer must succeed");
+}
+
+/// A call whose runtime SSTOREs then REVERTs must report `revert`,
+/// charge gas, increment the sender nonce, and roll back the
+/// storage write — the Yellow Paper's exceptional-halt rollback.
+#[test]
+fn revert_rolls_back_storage_but_charges_gas() {
+    let key = TestKey::new();
+    // Runtime: SSTORE(0, 1); REVERT(0, 0).
+    // PUSH1 0x01 PUSH1 0x00 SSTORE PUSH1 0x00 PUSH1 0x00 REVERT
+    let runtime = [0x60, 0x01, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xfd];
+    let module = EvmModule::with_storage(1, 7_000_000_000, Box::new(storage::Volatile::new()));
+    fund(&module, &key.addr);
+
+    let deploy = signed_create(&key.privkey, 0, &deploy_init(&runtime));
+    let events = module.handle(&dummy_ctx(), &deploy).expect("deploy must succeed");
+    let contract_hex =
+        event_field(&events, "contract").expect("create must report the contract address");
+    let contract = contract_hex.parse::<EvmAddress>().expect("contract field must be hex");
+
+    let before = module.balance(&key.addr);
+    let call = signed_call(&key.privkey, 1, contract, 0, &[]);
+    let events = module.handle(&dummy_ctx(), &call).expect("reverting call still executes");
+    assert_eq!(event_field(&events, "status"), Some("revert"), "SSTORE+REVERT call must revert");
+
+    // Gas was charged despite the revert.
+    let gas = event_gas_used(&events);
+    assert!(gas > 0, "reverted call must still consume gas");
+    let after = module.balance(&key.addr);
+    assert_eq!(
+        before - after,
+        u128::from(gas) * 10_000_000_000,
+        "sender pays gas*gas_price even on revert"
+    );
+    // The sender nonce still consumed a sequence number.
+    assert_eq!(module.nonce(&key.addr), 2, "nonce advances on revert");
+
+    // The SSTORE inside the reverted frame must not persist.
+    module.end_block(Height::new(1));
+    let acct = persisted_account(&module, contract).expect("contract account must exist");
+    assert!(
+        !acct.slots.iter().any(|(s, _)| *s == U256::ZERO),
+        "reverted SSTORE must not leave slot 0 in storage"
+    );
+}
+
+/// EIP-2929: the first SSTORE to a slot is cold (≥ 2100-gas
+/// surcharge); a second write to the now-warm slot costs strictly
+/// less. The contract writes `CALLDATALOAD(0)` to slot 0.
+#[test]
+fn cold_sstore_costs_more_than_warm() {
+    let key = TestKey::new();
+    // Runtime: SSTORE(0, CALLDATALOAD(0)); STOP.
+    // PUSH1 0x00 CALLDATALOAD PUSH1 0x00 SSTORE STOP
+    let runtime = [0x60, 0x00, 0x35, 0x60, 0x00, 0x55, 0x00];
+    let module = EvmModule::with_storage(1, 7_000_000_000, Box::new(storage::Volatile::new()));
+    fund(&module, &key.addr);
+
+    let deploy = signed_create(&key.privkey, 0, &deploy_init(&runtime));
+    let events = module.handle(&dummy_ctx(), &deploy).expect("deploy must succeed");
+    let contract = event_field(&events, "contract")
+        .and_then(|h| h.parse::<EvmAddress>().ok())
+        .expect("create must report the contract address");
+
+    // First call: cold slot, zero → nonzero write.
+    let data1 = {
+        let mut d = vec![0u8; 32];
+        d[31] = 1;
+        d
+    };
+    let call1 = signed_call(&key.privkey, 1, contract, 0, &data1);
+    let gas1 = event_gas_used(&module.handle(&dummy_ctx(), &call1).expect("call 1 must succeed"));
+
+    // Second call: warm slot, nonzero → nonzero write.
+    let data2 = {
+        let mut d = vec![0u8; 32];
+        d[31] = 2;
+        d
+    };
+    let call2 = signed_call(&key.privkey, 2, contract, 0, &data2);
+    let gas2 = event_gas_used(&module.handle(&dummy_ctx(), &call2).expect("call 2 must succeed"));
+
+    assert!(
+        gas1 > gas2,
+        "cold zero→nonzero SSTORE ({gas1}) must cost more than warm nonzero→nonzero ({gas2})"
+    );
+    assert!(
+        gas1 - gas2 >= 2_100,
+        "the cold-access surcharge is at least EIP-2929's 2,100 gas (got {gas1} - {gas2})"
+    );
+
+    // And the second write actually landed: slot 0 == 2.
+    module.end_block(Height::new(1));
+    let acct = persisted_account(&module, contract).expect("contract account must exist");
+    assert_eq!(
+        acct.slots.iter().find(|(s, _)| *s == U256::ZERO).map(|(_, v)| *v),
+        Some(U256::from(2u64)),
+        "slot 0 must hold the second call's value"
+    );
+}
+
+/// CREATE must derive the contract address as
+/// `keccak256(rlp([sender, nonce]))[12..]` — the Ethereum formula
+/// (EIP-161 / Yellow Paper §7).
+#[test]
+fn create_address_matches_keccak_rlp_sender_nonce() {
+    let key = TestKey::new();
+    let module = EvmModule::new(1, 7_000_000_000);
+    fund(&module, &key.addr);
+
+    // Deploy a one-byte STOP runtime.
+    let deploy = signed_create(&key.privkey, 0, &deploy_init(&[0x00]));
+    let events = module.handle(&dummy_ctx(), &deploy).expect("deploy must succeed");
+    let reported = event_field(&events, "contract")
+        .and_then(|h| h.parse::<EvmAddress>().ok())
+        .expect("create must report the contract address");
+
+    // rlp([sender, 0]) for a 20-byte address and nonce 0:
+    // [0xd6, 0x94, <20-byte sender>, 0x80].
+    let sender = EvmAddress::from_slice(&key.addr.0);
+    let mut rlp = Vec::with_capacity(23);
+    rlp.push(0xd6);
+    rlp.push(0x94);
+    rlp.extend_from_slice(sender.as_slice());
+    rlp.push(0x80);
+    let expected_hash = revm::primitives::keccak256(&rlp);
+    let expected = EvmAddress::from_slice(&expected_hash[12..]);
+
+    assert_eq!(
+        reported, expected,
+        "contract address must be keccak256(rlp([sender, nonce]))[12..]"
+    );
+}
+
+/// EIP-6780 (active since Cancun, so in PRAGUE): SELFDESTRUCT in a
+/// non-creation transaction transfers the contract's balance to the
+/// beneficiary but leaves code and storage in place.
+#[test]
+fn selfdestruct_transfers_balance_and_keeps_code() {
+    let key = TestKey::new();
+    let beneficiary = EvmAddress::from_slice(&[0x77; 20]);
+    // Runtime: PUSH20 <beneficiary> SELFDESTRUCT.
+    let mut runtime = vec![0x73];
+    runtime.extend_from_slice(beneficiary.as_slice());
+    runtime.push(0xff);
+
+    let module = EvmModule::with_storage(1, 7_000_000_000, Box::new(storage::Volatile::new()));
+    fund(&module, &key.addr);
+    let code_len = runtime.len();
+
+    let deploy = signed_create(&key.privkey, 0, &deploy_init(&runtime));
+    let events = module.handle(&dummy_ctx(), &deploy).expect("deploy must succeed");
+    let contract = event_field(&events, "contract")
+        .and_then(|h| h.parse::<EvmAddress>().ok())
+        .expect("create must report the contract address");
+
+    // Call with value: the contract receives it, then SELFDESTRUCTs
+    // in the same call frame — balance goes to the beneficiary.
+    let value = 5_000_000_000u128;
+    let call = signed_call(&key.privkey, 1, contract, value, &[]);
+    module.handle(&dummy_ctx(), &call).expect("selfdestruct call must succeed");
+
+    assert_eq!(
+        module.balance(&Address(beneficiary.0.into())),
+        value,
+        "beneficiary must receive the contract balance"
+    );
+
+    // EIP-6780: code survives selfdestruct outside the creation tx.
+    // (revm may append a STOP terminator when storing the deployed
+    // code, so assert the code is still present rather than
+    // byte-length-identical.)
+    module.end_block(Height::new(1));
+    let acct = persisted_account(&module, contract).expect("contract account must still exist");
+    assert!(
+        acct.code_len >= code_len,
+        "EIP-6780: code must survive selfdestruct (persisted {} < deployed {code_len})",
+        acct.code_len
+    );
+}
