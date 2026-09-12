@@ -81,6 +81,7 @@ pub use ring::{SpscReceiver, SpscSender, Wakeup, spsc_ring, spsc_ring_with_wakeu
 pub use risk::{RiskConfig, RiskDecision, RiskEngine};
 
 use primitives::fixed::{Price, Qty};
+use std::collections::HashMap;
 use std::sync::Arc;
 use trading::{
     DenseBook, FillEvent, MarketConfig, MatchingEngine, NewOrder, OrderOutcome, OrderType, Side,
@@ -137,6 +138,11 @@ pub struct MatchingServer {
     risk_rejections: u64,
     /// The pending settlement batch.
     settlement_batch: Vec<SettledFill>,
+    /// Per-owner last-seen nonce (C7 fix). Each new order/action must
+    /// carry a nonce strictly greater than the last seen for that
+    /// owner. Prevents replay of signed orders — a captured order
+    /// cannot be resubmitted because its nonce is now stale.
+    last_seen_nonce: HashMap<primitives::Address, u64>,
 }
 
 impl MatchingServer {
@@ -156,6 +162,7 @@ impl MatchingServer {
             risk: RiskEngine::with_defaults(),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
+            last_seen_nonce: HashMap::new(),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
@@ -185,6 +192,7 @@ impl MatchingServer {
             risk: RiskEngine::new(risk_config),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
+            last_seen_nonce: HashMap::new(),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
@@ -213,6 +221,26 @@ impl MatchingServer {
     /// Returns the order response (filled, resting, or rejected).
     pub fn submit_order(&mut self, req: &OrderRequest) -> OrderResponse {
         self.orders_processed += 1;
+
+        // C7 fix: enforce per-owner nonce monotonicity. Each order
+        // must carry a nonce strictly greater than the last seen
+        // for this owner. A replayed order (same or lower nonce)
+        // is rejected with `StaleNonce` before any balance
+        // reservation or engine state change. This prevents a
+        // captured signed order from being resubmitted.
+        // The first order from a new owner is always accepted
+        // (no prior nonce to compare against).
+        if let Some(&last) = self.last_seen_nonce.get(&req.owner) {
+            if req.nonce <= last {
+                return OrderResponse::rejected(RejectReason::StaleNonce);
+            }
+        }
+        // Consume the nonce immediately — even if the order is later
+        // rejected by risk/balance/engine, the nonce is spent. This
+        // prevents an attacker from replaying a rejected order (the
+        // nonce is now stale). Same semantics as Ethereum account
+        // nonces: a transaction consumes its nonce even if it reverts.
+        self.last_seen_nonce.insert(req.owner, req.nonce);
 
         // ── Risk-engine checks ───────────────────────────────────
         // Run before the balance check so we reject spam and
@@ -1576,10 +1604,50 @@ mod tests {
         assert_eq!(server.balance(&addr(9)), 1_000_000_000 + 15_000);
     }
 
+    /// Regression test (C7): a replayed order (same nonce from the
+    /// same owner) must be rejected with `StaleNonce`. Before the
+    /// fix, the matcher ignored the protocol nonce field — signed
+    /// orders could be replayed indefinitely.
+    #[test]
+    fn replayed_order_rejected_with_stale_nonce() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        server.fund_account(&addr(1), 1_000_000_000);
+
+        let req = OrderRequest {
+            market: 0,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price(1_500_000_000),
+            qty: Qty(1_000),
+            owner: addr(1),
+            nonce: 42,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+
+        // First submission: accepted (nonce 42 is new).
+        let resp = server.submit_order(&req);
+        assert!(!resp.rejected, "first order with new nonce must be accepted");
+
+        // Replay: same nonce, same owner — must be rejected.
+        let replay = server.submit_order(&req);
+        assert!(replay.rejected, "replayed order must be rejected");
+        assert_eq!(
+            replay.reject_reason,
+            Some(RejectReason::StaleNonce),
+            "replay must be rejected with StaleNonce"
+        );
+
+        // Higher nonce: accepted.
+        let mut req2 = req;
+        req2.nonce = 43;
+        let resp2 = server.submit_order(&req2);
+        assert!(!resp2.rejected, "order with higher nonce must be accepted");
+    }
+
     #[test]
     fn spam_orders_rejected_without_balance() {
-        // Use unlimited rate limit — this test checks balance
-        // rejection, not rate limiting.
         let risk_cfg = RiskConfig {
             max_orders_per_second: 0,
             max_order_qty: 0,
@@ -1589,7 +1657,7 @@ mod tests {
         let mut server = MatchingServer::with_risk_config(cfg(), 100, risk_cfg);
 
         // Submit 1000 buy orders with zero balance — all should be rejected.
-        for _ in 0..1000 {
+        for i in 0..1000u64 {
             let req = OrderRequest {
                 market: 0,
                 side: Side::Buy,
@@ -1598,7 +1666,7 @@ mod tests {
                 price: Price(1_500_000_000),
                 qty: Qty(1_000),
                 owner: addr(1),
-                nonce: 0,
+                nonce: i,
                 pubkey: [0u8; 32],
                 signature: [0u8; 64],
             };
