@@ -807,12 +807,16 @@ impl EvmModule {
         //
         // Identical to what revm produces for a successful simple
         // transfer: Success with gas_used=21000, no logs, no output.
+        // EIP-7623 floor gas for empty calldata = 21000 + 0 = 21000,
+        // same as standard gas. Setting floor_gas correctly prevents
+        // free-gas stuffing: a tx with empty calldata pays at least
+        // 21000 gas (the floor), not less.
         let result = ExecutionResult::Success {
             reason: SuccessReason::Stop,
             gas: ResultGas::default()
                 .with_total_gas_spent(TX_GAS_TRANSFER)
                 .with_refunded(0)
-                .with_floor_gas(0),
+                .with_floor_gas(TX_GAS_TRANSFER),
             logs: Vec::new(),
             output: Output::Call(revm::primitives::Bytes::new()),
         };
@@ -995,13 +999,15 @@ impl EvmModule {
 
         // Build ExecutionResult — identical to what revm produces for
         // a successful call to empty code: Success with no logs, no
-        // output, gas_used = 21000 + calldata_gas.
+        // output, gas_used = max(21000 + calldata_gas, floor_gas).
+        // EIP-7623 floor gas prevents free-gas stuffing: a tx with
+        // cheap calldata still pays at least the floor gas.
         let result = ExecutionResult::Success {
             reason: SuccessReason::Stop,
             gas: ResultGas::default()
                 .with_total_gas_spent(gas_used)
                 .with_refunded(0)
-                .with_floor_gas(0),
+                .with_floor_gas(floor_gas),
             logs: Vec::new(),
             output: Output::Call(revm::primitives::Bytes::new()),
         };
