@@ -705,6 +705,7 @@ mod tests {
             state_root: primitives::Hash::ZERO,
             module_roots: vec![],
             module_state: vec![],
+            executed_nonces: vec![],
         };
         let err = node.import_snapshot(&empty_snapshot).expect_err("empty snapshot must fail");
         assert_eq!(err, executor::SnapshotImportError::EmptySnapshot);

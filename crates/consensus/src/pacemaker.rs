@@ -334,9 +334,27 @@ impl Pacemaker {
     /// past view) or we've already advanced.
     #[must_use]
     pub fn on_timeout_certificate(&mut self, tc: &TimeoutCertificate) -> Option<PacemakerEvent> {
-        if tc.view != self.current_view || tc.epoch != self.current_epoch {
-            // Stale TC (for a past view or epoch) — ignore.
+        // Reject TCs from a different epoch — they are not valid
+        // certificates for this epoch.
+        if tc.epoch != self.current_epoch {
             return None;
+        }
+        // Reject TCs for a past view — they are stale and must not
+        // regress the engine's view.
+        if tc.view.value() < self.current_view.value() {
+            return None;
+        }
+        // Accept TCs for the current view OR a higher view. A higher-
+        // view TC is the catch-up path: a validator that restarted (or
+        // was partitioned) at a lower view receives a TC from peers
+        // who have progressed further, and jumps forward to the TC's
+        // view + 1. Without this, a restarted validator is stuck at
+        // its old view forever because it cannot form or verify
+        // timeout signatures for the peers' current view.
+        if tc.view.value() > self.current_view.value() {
+            // Jump forward to the TC's view, then advance_view will
+            // increment to view + 1 and reset pacemaker state.
+            self.current_view = tc.view;
         }
         // The TC is valid for the current view; advance.
         let events = self.advance_view(Some(tc.clone()));

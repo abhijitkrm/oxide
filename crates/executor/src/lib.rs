@@ -82,6 +82,11 @@ pub struct ExecutorSnapshot {
     /// `None` for modules that don't support `export_state`. Empty
     /// for metadata-only snapshots (v0).
     pub module_state: Vec<Option<storage::Snapshot>>,
+    /// H4/H5 fix: per-account executed-nonce map, so replay
+    /// protection survives restarts/sync. Each entry is
+    /// `(address, next_expected_nonce)`. Empty for v0 snapshots
+    /// (treated as "all nonces start at 0" on import).
+    pub executed_nonces: Vec<(primitives::Address, u64)>,
 }
 
 /// A snapshot import error.
@@ -108,6 +113,18 @@ pub enum SnapshotImportError {
     /// A module's `import_state` call failed (corrupted KV state
     /// or backend error).
     StateImportFailed,
+    /// M3 fix: a module's recomputed state root (from the imported
+    /// KV data) does not match the snapshot's claimed module root.
+    /// This indicates a crafted or corrupted snapshot where the KV
+    /// data doesn't match the claimed roots.
+    ModuleRootMismatch {
+        /// The module's name.
+        module: &'static str,
+        /// The expected root from the snapshot.
+        expected: Hash,
+        /// The recomputed root from the imported KV data.
+        actual: Hash,
+    },
 }
 
 impl std::fmt::Display for SnapshotImportError {
@@ -124,6 +141,9 @@ impl std::fmt::Display for SnapshotImportError {
                 )
             }
             Self::StateImportFailed => write!(f, "module state import failed"),
+            Self::ModuleRootMismatch { module, expected, actual } => {
+                write!(f, "module {module} root mismatch: expected {expected}, got {actual}")
+            }
         }
     }
 }
@@ -513,6 +533,18 @@ pub struct Executor {
     /// The receiver side of the intake ring. Drained by
     /// `prepare_proposal` to flush buffered txs into the mempool.
     mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<TxBytes>>,
+    /// H4/H5 fix: per-account executed-nonce map. Tracks the next
+    /// expected nonce for each sender. Updated after `execute_block`
+    /// completes for each tx that was executed.
+    ///
+    /// This is the replay-protection gate: `ingest_tx` rejects any tx
+    /// whose `ctx.nonce < executed_nonce[sender]` (already executed),
+    /// and `process_proposal` / `execute_block` enforce strict
+    /// per-sender nonce ordering (H5: no gaps, no reorderings).
+    ///
+    /// The map is restored from snapshots via `import_snapshot` so
+    /// replay protection survives restarts.
+    executed_nonce: Mutex<HashMap<primitives::Address, u64>>,
 }
 
 impl Executor {
@@ -549,6 +581,7 @@ impl Executor {
             recorder: None,
             mempool_intake_tx: intake_tx,
             mempool_intake_rx: Mutex::new(intake_rx),
+            executed_nonce: Mutex::new(HashMap::new()),
         }
     }
 
@@ -657,7 +690,19 @@ impl Executor {
         } else {
             state_root
         };
-        ExecutorSnapshot { height, state_root, module_roots, module_state }
+        ExecutorSnapshot {
+            height,
+            state_root,
+            module_roots,
+            module_state,
+            executed_nonces: self
+                .executed_nonce
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(addr, nonce)| (*addr, *nonce))
+                .collect(),
+        }
     }
 
     /// Import a snapshot, restoring the executor to the snapshot's
@@ -727,12 +772,48 @@ impl Executor {
         // If the snapshot includes full KV state, import it into
         // each module that supports `import_state`. This restores
         // the complete key-value state, not just the roots.
+        //
+        // M3 fix: after importing KV state, recompute each module's
+        // state root from the imported data and verify it matches
+        // the snapshot's claimed module root. Without this, a
+        // crafted snapshot with arbitrary KV + matching aggregate
+        // root is accepted — the KV data doesn't actually produce
+        // the claimed per-module roots.
         if !snapshot.module_state.is_empty() {
             for (module, state) in self.modules.iter().flatten().zip(&snapshot.module_state) {
                 if let Some(state) = state {
                     module
                         .import_state(state)
                         .map_err(|_| SnapshotImportError::StateImportFailed)?;
+                }
+            }
+
+            // M3: recompute each module's state root from the
+            // imported KV data and verify it matches the snapshot's
+            // claimed root. This catches a crafted snapshot where
+            // the KV data doesn't match the claimed roots.
+            //
+            // Only verify modules that actually have KV state in
+            // the snapshot (`module_state[i].is_some()`). Modules
+            // without KV state (in-memory or no export support)
+            // cannot be verified from KV — we trust their claimed
+            // root.
+            for ((module, state), (name, claimed_root)) in self
+                .modules
+                .iter()
+                .flatten()
+                .zip(&snapshot.module_state)
+                .zip(&snapshot.module_roots)
+            {
+                if state.is_some() {
+                    let actual_root = module.state_root();
+                    if actual_root != *claimed_root {
+                        return Err(SnapshotImportError::ModuleRootMismatch {
+                            module: name,
+                            expected: *claimed_root,
+                            actual: actual_root,
+                        });
+                    }
                 }
             }
         }
@@ -748,6 +829,13 @@ impl Executor {
             .insert(snapshot.height, snapshot.state_root);
         *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             snapshot.height.saturating_add(1); // M2 fix
+
+        // H4/H5: restore the executed-nonce map so replay protection
+        // survives restarts and state sync. Without this, a node
+        // that restarts from a snapshot would accept already-executed
+        // txs (replay attack).
+        *self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            snapshot.executed_nonces.iter().copied().collect();
 
         Ok(())
     }
@@ -798,6 +886,21 @@ impl Executor {
         // block; the extend publishes this block's events.
         self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 
+        // H5 fix: cross-block nonce continuity. Verify that each
+        // sender's first tx in this block continues from the last
+        // executed nonce. This closes the replay window across blocks
+        // — a tx with a stale nonce from a previous block is rejected
+        // here, not just in the mempool.
+        //
+        // We snapshot the executed_nonce map into a local copy so we
+        // can update it as we process txs in this block without
+        // holding the lock for the entire block execution.
+        let mut local_nonce: HashMap<primitives::Address, u64> = {
+            let executed =
+                self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            executed.clone()
+        };
+
         // begin_block for all modules.
         for module in self.modules.iter().flatten() {
             module.begin_block(block.height);
@@ -814,12 +917,28 @@ impl Executor {
         //
         // We use a BTreeMap so module groups are processed in a
         // deterministic order (sorted by module ID).
+        //
+        // H5: we also validate per-sender nonce continuity against
+        // the executed_nonce map. Txs with stale or out-of-order
+        // nonces are skipped (not executed) — this is the defense
+        // against a byzantine proposer that bypassed
+        // `process_proposal` (e.g. via a direct finalize path).
         let mut groups: BTreeMap<u8, Vec<(TxContext, Vec<u8>, Hash)>> = BTreeMap::new();
         for tx in &block.txs {
             let bytes = tx.as_bytes();
             let Some(ctx) = parse_tx_context(bytes) else {
                 continue; // skip malformed txs
             };
+            // H5: check nonce continuity. Each tx's nonce must equal
+            // the next expected nonce for its sender. Txs that fail
+            // this check are skipped — they are not executed, and
+            // they do not advance the nonce counter.
+            let expected = local_nonce.get(&ctx.sender).copied().unwrap_or(0);
+            if ctx.nonce != expected {
+                continue; // stale or out-of-order nonce — skip
+            }
+            // Advance the local nonce counter for this sender.
+            local_nonce.insert(ctx.sender, expected + 1);
             let Some(module_id) = parse_module_id(bytes) else {
                 continue; // skip malformed txs
             };
@@ -912,6 +1031,15 @@ impl Executor {
             let mr = module.state_root();
             root_data.extend_from_slice(mr.as_bytes());
         }
+
+        // H4/H5: persist the updated nonce map. `local_nonce` was
+        // advanced as each tx passed the continuity check. We write
+        // it back in a single lock acquisition so the next block's
+        // `execute_block` and the mempool's `ingest_tx` see the
+        // updated state.
+        *self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            local_nonce;
+
         Hasher::hash_one(Domain::Block, &root_data)
     }
 }
@@ -928,6 +1056,20 @@ impl AppInterface for Executor {
         let Some(ctx) = parse_tx_context(bytes) else {
             return MempoolAck::Rejected { reason: "malformed: tx context".to_string() };
         };
+        // H4 fix: replay protection. Reject txs whose nonce has
+        // already been executed. Without this, a tx removed from the
+        // mempool after block selection can be re-submitted and
+        // re-executed — a replay attack.
+        {
+            let executed =
+                self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next_expected = executed.get(&ctx.sender).copied().unwrap_or(0);
+            if ctx.nonce < next_expected {
+                return MempoolAck::Rejected {
+                    reason: format!("replay: nonce {} < next expected {next_expected}", ctx.nonce),
+                };
+            }
+        }
         let Some(module_id) = parse_module_id(bytes) else {
             return MempoolAck::Rejected { reason: "malformed: no module ID".to_string() };
         };
@@ -1068,20 +1210,51 @@ impl AppInterface for Executor {
         //    fee, and module ID (≥ 37 bytes).
         // 2. Each tx's module ID must be a registered module.
         //
-        // Dynamic checks (nonce ordering, balance, signature) are
-        // not done here — they require state access and are checked
-        // during execution. Signature verification arrives when the
-        // tx envelope format includes signatures (Phase 2).
+        // H5 fix: per-sender nonce ordering. A byzantine leader can
+        // reorder same-account txs or insert gaps. We now enforce
+        // that within a proposal, each sender's nonces are strictly
+        // contiguous and increasing (no gaps, no reorderings). This
+        // is a static check — it doesn't need state access because
+        // the executor's `executed_nonce` map is only needed for
+        // cross-block continuity, not within-block ordering.
+        //
+        // Dynamic checks (balance, signature) are not done here —
+        // they require state access and are checked during execution.
+        // Signature verification arrives when the tx envelope format
+        // includes signatures (Phase 2).
+        let mut last_nonce: HashMap<primitives::Address, u64> = HashMap::new();
         for tx in &proposal.txs {
             let bytes = tx.as_bytes();
             // Check that the tx context is parseable (sender, nonce,
             // fee). This also implicitly checks the minimum size
             // (TX_MIN_SIZE = 36 bytes).
-            if parse_tx_context(bytes).is_none() {
+            let Some(ctx) = parse_tx_context(bytes) else {
                 return Verdict::Reject {
                     reason: "tx context (sender/nonce/fee) is malformed".to_string(),
                 };
+            };
+            // H5: enforce per-sender nonce ordering within the
+            // proposal. Each sender's nonces must be strictly
+            // contiguous (n, n+1, n+2, ...). A gap or reordering
+            // indicates a byzantine proposer.
+            match last_nonce.get(&ctx.sender) {
+                Some(&prev) if ctx.nonce != prev + 1 => {
+                    return Verdict::Reject {
+                        reason: format!(
+                            "nonce gap/reorder: sender {:?} expected {} got {}",
+                            ctx.sender,
+                            prev + 1,
+                            ctx.nonce
+                        ),
+                    };
+                }
+                // Either no previous nonce (first tx from this
+                // sender) or the nonce is contiguous (prev + 1) —
+                // accepted. The cross-block continuity check happens
+                // in `execute_block`.
+                _ => {}
             }
+            last_nonce.insert(ctx.sender, ctx.nonce);
             // Check that the tx has a module ID byte.
             if bytes.len() < MODULE_ID_OFFSET + 1 {
                 return Verdict::Reject { reason: "tx too short for module ID".to_string() };
@@ -1208,10 +1381,13 @@ mod tests {
     }
 
     fn make_tx(module_id: u8, payload: &[u8]) -> TxBytes {
+        make_tx_with_nonce(module_id, payload, 0)
+    }
+
+    fn make_tx_with_nonce(module_id: u8, payload: &[u8], nonce: u64) -> TxBytes {
         // Build a tx in the mempool's v0 format:
         // [sender: 20B][nonce: 8B LE][fee: 8B LE][module_id: 1B][payload].
         let sender = Address([0u8; 20]);
-        let nonce = 0u64;
         let fee = 100u64;
         let mut bytes = Vec::with_capacity(36 + 1 + payload.len());
         bytes.extend_from_slice(&sender.0);
@@ -1298,10 +1474,12 @@ mod tests {
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
-        // Execute 3 blocks, each with 1 tx.
+        // Execute 3 blocks, each with 1 tx. Each tx must use an
+        // incrementing nonce — the executor now enforces per-account
+        // nonce ordering (H4/H5 fix).
         for h in 0..3u64 {
             let h_byte = u8::try_from(h).unwrap_or(0xff);
-            let tx = make_tx(1, &[h_byte]);
+            let tx = make_tx_with_nonce(1, &[h_byte], h);
             executor.ingest_tx(tx);
             let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
             let proposal = executor.prepare_proposal(&budget);
@@ -1465,5 +1643,176 @@ mod tests {
             *tracker.fallback_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(preverified, 1, "preverified path should have been used (cache hit)");
         assert_eq!(fallback, 0, "fallback path should not have been used (no cache miss)");
+    }
+
+    // ---- H4 fix: mempool replay protection ----
+
+    /// H4: After a tx with nonce N is executed, re-submitting the
+    /// same tx (or any tx with nonce < N+1) must be rejected by
+    /// `ingest_tx`. Without this, a tx removed from the mempool
+    /// after block selection can be re-submitted and re-executed.
+    #[test]
+    fn h4_ingest_rejects_stale_nonce_after_execution() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        // Submit and execute nonce 0.
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        executor.ingest_tx(tx0);
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        let block = FinalizedBlock { height: Height::new(0), txs: proposal.txs };
+        executor.finalize_block(&block);
+
+        // Re-submit nonce 0 — must be rejected (replay).
+        let tx0_again = make_tx_with_nonce(1, &[0], 0);
+        match executor.ingest_tx(tx0_again) {
+            MempoolAck::Rejected { reason } => {
+                assert!(reason.contains("replay"), "expected replay rejection, got: {reason}");
+            }
+            MempoolAck::Accepted => panic!("stale nonce must be rejected (replay)"),
+        }
+
+        // Nonce 1 should still be accepted.
+        let tx1 = make_tx_with_nonce(1, &[1], 1);
+        assert!(matches!(executor.ingest_tx(tx1), MempoolAck::Accepted));
+    }
+
+    // ---- H5 fix: process_proposal nonce ordering ----
+
+    /// H5: `process_proposal` must reject a proposal where a
+    /// sender's nonces are not strictly contiguous. A byzantine
+    /// proposer cannot reorder same-account txs.
+    #[test]
+    fn h5_process_proposal_rejects_nonce_gap() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        // Two txs from the same sender: nonce 0 then nonce 2 (gap).
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        let tx2 = make_tx_with_nonce(1, &[2], 2);
+        let proposal = Proposal { height: Height::new(0), txs: vec![tx0, tx2], attestation: None };
+        match executor.process_proposal(&proposal) {
+            Verdict::Reject { reason } => {
+                assert!(
+                    reason.contains("nonce gap"),
+                    "expected nonce gap rejection, got: {reason}"
+                );
+            }
+            Verdict::Accept => panic!("nonce gap must be rejected"),
+        }
+    }
+
+    /// H5: `process_proposal` must reject a proposal where a
+    /// sender's nonces are out of order (e.g. nonce 1 before nonce 0).
+    #[test]
+    fn h5_process_proposal_rejects_nonce_reorder() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        // Nonce 1 before nonce 0 — reorder.
+        let tx1 = make_tx_with_nonce(1, &[1], 1);
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        let proposal = Proposal { height: Height::new(0), txs: vec![tx1, tx0], attestation: None };
+        match executor.process_proposal(&proposal) {
+            Verdict::Reject { reason } => {
+                assert!(
+                    reason.contains("nonce gap"),
+                    "expected nonce reorder rejection, got: {reason}"
+                );
+            }
+            Verdict::Accept => panic!("nonce reorder must be rejected"),
+        }
+    }
+
+    /// H5: `process_proposal` must accept a proposal with
+    /// contiguous, strictly increasing nonces.
+    #[test]
+    fn h5_process_proposal_accepts_contiguous_nonces() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        let tx1 = make_tx_with_nonce(1, &[1], 1);
+        let tx2 = make_tx_with_nonce(1, &[2], 2);
+        let proposal =
+            Proposal { height: Height::new(0), txs: vec![tx0, tx1, tx2], attestation: None };
+        assert!(matches!(executor.process_proposal(&proposal), Verdict::Accept));
+    }
+
+    /// H5: `execute_block` must skip txs with stale nonces (nonce
+    /// already executed). This is the cross-block continuity check.
+    #[test]
+    fn h5_execute_block_skips_stale_nonce() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        // Execute nonce 0 in block 0.
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        executor.ingest_tx(tx0);
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        let block0 = FinalizedBlock { height: Height::new(0), txs: proposal.txs };
+        executor.finalize_block(&block0);
+        assert_eq!(*counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
+
+        // Try to execute nonce 0 again in block 1 — must be skipped.
+        let tx0_again = make_tx_with_nonce(1, &[0], 0);
+        let block1 = FinalizedBlock { height: Height::new(1), txs: vec![tx0_again] };
+        executor.finalize_block(&block1);
+
+        // Counter should still be 1 — the stale tx was skipped.
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "stale nonce tx must be skipped during execution"
+        );
+    }
+
+    /// H4/H5: snapshot export/import must preserve the executed-nonce
+    /// map so replay protection survives restarts.
+    #[test]
+    fn h4h5_snapshot_preserves_executed_nonce() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        // Execute nonce 0 and nonce 1.
+        for n in 0..2u64 {
+            let tx = make_tx_with_nonce(1, &[u8::try_from(n).unwrap_or(0xff)], n);
+            executor.ingest_tx(tx);
+            let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+            let proposal = executor.prepare_proposal(&budget);
+            let block = FinalizedBlock { height: Height::new(n), txs: proposal.txs };
+            executor.finalize_block(&block);
+        }
+
+        // Export snapshot.
+        let snapshot = executor.export_snapshot();
+        assert_eq!(snapshot.executed_nonces.len(), 1, "one sender in the nonce map");
+        assert_eq!(snapshot.executed_nonces[0].1, 2, "next expected nonce is 2");
+
+        // Import into a fresh executor.
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(CounterModule::new()));
+        executor2.import_snapshot(&snapshot).expect("import must succeed");
+
+        // Re-submitting nonce 0 must be rejected (replay).
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        match executor2.ingest_tx(tx0) {
+            MempoolAck::Rejected { reason } => {
+                assert!(
+                    reason.contains("replay"),
+                    "expected replay rejection after snapshot import, got: {reason}"
+                );
+            }
+            MempoolAck::Accepted => panic!("stale nonce must be rejected after snapshot import"),
+        }
+
+        // Nonce 2 should be accepted (next expected).
+        let tx2 = make_tx_with_nonce(1, &[2], 2);
+        assert!(matches!(executor2.ingest_tx(tx2), MempoolAck::Accepted));
     }
 }

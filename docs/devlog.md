@@ -8932,3 +8932,351 @@ Gate: ≥5,000 tx/s across 100 blocks of 100 txs each.
 
 - `cargo bench --bench sustained_throughput`: all configurations pass.
 - No regressions from the consensus fixes.
+
+---
+
+## 2026-09-11 — Session 23: Security follow-ups H4, H5, M3, M4
+
+### Goal
+
+Close all remaining documented security findings from the security
+review. After this session, all 14 findings (4 critical, 6 high, 4
+medium) are fixed.
+
+### H4: Mempool replay protection
+
+**Root cause:** `Mempool::submit` deduplicates only by tx hash
+against `by_hash`. Once `select` removes a tx from the pool, the
+identical byte string can be re-submitted and will be accepted
+again. No per-account `executed_nonce` map was consulted during
+intake.
+
+**Fix:** Added `executed_nonce: Mutex<HashMap<Address, u64>>` to the
+executor. `ingest_tx` rejects any tx whose `ctx.nonce <
+executed_nonce[sender]`. The map is updated after `execute_block`
+completes and is preserved across restarts via snapshot
+export/import (new `executed_nonces` field on `ExecutorSnapshot`).
+
+### H5: Executor nonce ordering enforcement
+
+**Root cause:** `process_proposal` explicitly did not check nonce
+ordering, and `execute_block` dispatched txs grouped by module
+without any top-level per-account nonce-sequence check. A byzantine
+proposer could reorder same-account txs or insert gaps.
+
+**Fix:** Two-layer enforcement:
+1. `process_proposal`: per-sender nonce contiguity within a proposal
+   (n, n+1, n+2, ...). Gaps or reorderings are rejected.
+2. `execute_block`: cross-block nonce continuity using the
+   `executed_nonce` map. Txs with stale nonces are skipped (not
+   executed).
+
+### M3: Snapshot import trusts supplied module roots
+
+**Root cause:** `import_snapshot` verified the aggregate state root
+but did not recompute individual module roots from the imported KV
+data. A crafted snapshot with arbitrary KV + matching aggregate
+root was accepted.
+
+**Fix:** After importing KV state, each module's `state_root()` is
+recomputed from the imported data and verified against the
+snapshot's claimed module root. Mismatches are rejected with a new
+`ModuleRootMismatch` error variant. Only modules with KV state in
+the snapshot are verified (in-memory modules without export support
+are trusted).
+
+### M4: Per-block oracle rate limit
+
+**Root cause:** The perps module had a per-update deviation check
+(max 10% per update) but no per-block rate limit. Multiple 9.99%
+updates in the same block could compound to a large cumulative move
+(e.g. 7 updates × 9.99% ≈ 75%, enough for cascading liquidations).
+
+**Fix:** Added `MAX_ORACLE_UPDATES_PER_BLOCK` (1) — each market can
+have at most 1 oracle update per block. The counter is tracked in
+`Inner.oracle_updates_this_block` and reset in `begin_block`. The
+`TAG_SET_MARK` handle path now routes through `set_mark_price`
+which enforces both the per-update deviation check and the per-block
+rate limit.
+
+### Tests added
+
+- `h4_ingest_rejects_stale_nonce_after_execution` — replay rejection
+- `h5_process_proposal_rejects_nonce_gap` — gap detection
+- `h5_process_proposal_rejects_nonce_reorder` — reorder detection
+- `h5_process_proposal_accepts_contiguous_nonces` — valid ordering
+- `h5_execute_block_skips_stale_nonce` — cross-block continuity
+- `h4h5_snapshot_preserves_executed_nonce` — snapshot round-trip
+- `m4_oracle_rate_limit_rejects_second_update_same_block` — rate limit
+- `m4_oracle_rate_limit_resets_next_block` — reset on new block
+
+### Verification
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: all suites pass (0 failures).
+- Executor: 38 tests (6 new).
+- Perps: 33 tests (2 new).
+- Node: 18 tests (snapshot import with nonce map).
+
+### Operational runbooks
+
+Added `docs/runbooks.md` covering:
+- Startup, shutdown
+- Backup and snapshot export, restore from snapshot
+- Incident response: node stalled, consensus halt, state divergence
+- Monitoring and health checks (key metrics, Prometheus, alerting)
+- Key rotation, software upgrade (with rollback)
+
+These are the first operational runbooks for the project. They
+document the procedures that an operator would follow in
+production. The runbooks reference the security fixes from this
+session (H4/H5 replay protection, M3 snapshot verification) where
+relevant to incident response.
+
+### Gate 4: Overhead breakdown — matching engine vs executor vs EVM
+
+Ran the full benchmark suite to complete the remaining Gate 4
+acceptance criterion: compare the executor pipeline against the raw
+matching engine and EVM execution layer.
+
+**Matching engine (raw, single-core, M2 MacBook Pro, release):**
+- `rest_cancel_pair`: 31.19 ns median → 32.1M simple ops/s
+  (gate: ≥5M ops/s — PASS, 6.4× above).
+- `match_single_level`: 521.53 ns median → 1.92M match-ops/s.
+- `match_sweep_10_levels`: 1.85 µs median → 5.4M match-ops/s.
+- `mixed_workload`: 12.42 µs for 256 ops → 20.6M mixed ops/s
+  (gate: ≥1M ops/s — PASS, 20× above).
+
+**EVM execution (revm, single-threaded):**
+- Simple transfer: 34.9 µs/tx → 28.7K tx/s
+  (gate: ≥1K tx/s — PASS, 28× above).
+- Full block cycle (1000 txs): 35.46 ms → 28.2K tx/s.
+- Parallel batch (1000 txs, 100 senders): 7.99 ms → 125K tx/s.
+- Native vs EVM: native bank 9.45 ms/1000 tx vs EVM 35.41 ms/1000 tx
+  → EVM is 3.7× slower than native bank transfers.
+
+**Overhead breakdown:**
+- Raw matching engine: 20.6M ops/s.
+- Executor bank transfers: 662K tx/s.
+- EVM simple transfers: 28.7K tx/s.
+- The executor pipeline (662K tx/s) is 32× slower than the raw
+  matching engine (20.6M ops/s). Overhead: tx envelope parsing,
+  mempool admission, preverification caching, module dispatch, state
+  root computation, block finalization.
+- EVM execution (28.7K tx/s) is 23× slower than native bank
+  transfers (662K tx/s). Expected: EVM includes secp256k1 recovery,
+  bytecode interpretation, trie state management. Parallel sender
+  recovery recovers ~4.4× of this gap.
+- The bottleneck for EVM throughput is revm execution itself, not
+  the Oxide executor pipeline. Pipeline overhead adds ~10% on top of
+  raw EVM execution.
+
+**Limitations:**
+- Single-core, single-host measurements. Multi-host BFT consensus
+  adds network round-trip overhead (~20 ms per block with 20 ms
+  latency → ~50 blocks/s → 1.4M bank tx/s or 1.4K EVM tx/s across 4
+  validators at 1000 txs/block).
+- The 1M orders/sec trading target requires the matching engine
+  (20.6M ops/s single-core) integrated with the executor pipeline.
+  The matching engine is fast enough; the bottleneck is the
+  executor pipeline's tx dispatch overhead.
+- No p50/p99 latency measurements under BFT consensus (Gate 7
+  would provide these).
+
+## Session: Gate 7 Docker soak — devnet consensus fixes
+
+### H4 nonce fix broke the devnet keep-alive tx
+
+The H4 replay-protection fix (executor tracks executed nonces, mempool
+rejects stale nonces) exposed a latent bug in the devnet validator's
+keep-alive transaction generator. `build_tx()` always used nonce 0.
+After the first block finalized nonce 0, every subsequent keep-alive
+tx was rejected by `ingest_tx` as a replay. The mempool went empty,
+the leader had nothing to propose, and consensus stalled at the first
+block.
+
+**Fix:** `build_tx_with_nonce(module_id, payload, nonce)` takes an
+explicit nonce. The keep-alive loop increments `keepalive_nonce` on
+each submission. The initial smoke-test tx still uses nonce 0 via
+`build_tx()` (which delegates to `build_tx_with_nonce` with nonce 0).
+
+**Root cause:** The devnet validator was written before H4. The
+keep-alive tx assumed nonces were not enforced. H4 correctly broke
+this assumption; the fix is to use incrementing nonces.
+
+### Missing view-change timeout in the devnet consensus loop
+
+The Docker testnet started, connected, and finalized blocks in the
+happy path (all four validators up, 20 ms latency). But when validator-3
+was stopped (byzantine fault simulation), the remaining three validators
+stalled. The consensus loop only advanced views when `high_qc.view ==
+current_view` — it had no timeout-based view change. When the leader
+for the current view was the stopped validator, no one proposed, no
+QC formed, and the view never advanced.
+
+The oxideBFT engine already has the full pacemaker timeout machinery:
+`on_timeout()` produces a timeout signature, `collect_timeout_signature()`
+aggregates signatures and forms a TC at quorum, `on_timeout_certificate()`
+advances the view. But the devnet `run_consensus_loop` never called
+these methods.
+
+**Fix:** Added Phase 5b to the consensus loop:
+1. Track `view_start: Instant` — when the current view began.
+2. Track `timeout_sent_for_view: Option<u64>` — whether we already
+   fired `on_timeout()` for this view.
+3. If the view hasn't advanced within `pacemaker_timeout_ms()` (base
+   2 s, exponential backoff), call `engine.on_timeout()`, broadcast
+   the timeout signature to all peers (MSG_TIMEOUT), and self-collect.
+4. Added MSG_TIMEOUT (0x03) and MSG_TC (0x04) message types.
+5. The MSG_TIMEOUT handler calls `engine.collect_timeout_signature()`;
+   if a TC is formed, it broadcasts MSG_TC to all peers.
+6. The MSG_TC handler calls `engine.on_timeout_certificate()` to
+   advance the view.
+7. Added `engine.pacemaker_timeout_ms()` accessor to expose the
+   pacemaker's current timeout duration.
+
+**Result:** The three remaining validators continue finalizing after
+validator-3 is stopped. The byzantine recovery time is ~10 s (one
+timeout window). After restarting validator-3, it catches up via
+height sync.
+
+### Network partition via `tc netem loss 100%`
+
+The Docker container has `iproute2` but not `iptables`. The partition
+is simulated by replacing the `tc` qdisc on validator-2's `eth0` with
+`netem loss 100%` — all packets dropped. Healing restores the original
+`netem delay 20ms 2ms`. The three remaining validators continue
+finalizing; validator-2 catches up immediately after the partition heals
+(it was only 1 block behind because the 100% loss also blocks its
+own outbound proposals).
+
+### 10-minute validation soak results
+
+- Duration: 600 s (10 min).
+- Start height: 58. End height: 345.
+- 287 blocks finalized. Rate: 0.4783 blocks/sec (20 ms latency).
+- Byzantine fault: validator-3 stopped for 60 s. Three validators
+  continued. Recovery: 10 s after restart.
+- Network partition: validator-2 isolated for 90 s. Three validators
+  continued. Recovery: 0 s (1 block lag).
+- Final heights: [345, 345, 345, 345] — no state divergence.
+- No consensus stalls.
+
+## 2026-09-12 — Session: Gate 7 liveness fix — 1-hour soak passes
+
+### The post-restart liveness stall
+
+The 10-minute soak passed, but the first 1-hour soak stalled after
+the byzantine restart phase. Validator-3 restarted at view 0 with
+no high QC. The other validators were at view ~8603. The restarted
+validator's timeout signatures were for view 0; the other validators'
+timeout signatures were for view ~8603. Each side rejected the
+other's signatures as stale, so no TC could form and the cluster
+stalled at height ~2150.
+
+**Root causes (three bugs):**
+
+1. **Timeout signature framing:** The MSG_TIMEOUT wire format
+   carried only `voter_idx` + `signature`. The receiver verified
+   the signature against its own current view, but the sender had
+   signed a different view. This caused `InvalidVoteSignature`
+   rejections after any view divergence (partition, restart).
+
+2. **No view catch-up on timeout signatures:** Even after fixing
+   the framing (adding `view` + `epoch` to the wire format), the
+   MSG_TIMEOUT handler rejected any signature whose view differed
+   from the local view. Validators at adjacent views (e.g., 8603
+   and 8604) could never collect each other's signatures, so they
+   could never converge to form a TC.
+
+3. **No TCP reconnect after partition:** The TCP transport's
+   outbound connector ran once. When a partition broke the
+   connection, the reader thread exited but no reconnect loop
+   re-established the peer connection. (Fixed earlier in the
+   session.)
+
+**Fixes:**
+
+1. **Timeout message framing** (`bin/oxide-validator/src/main.rs`):
+   MSG_TIMEOUT now encodes `[voter_idx: 1B][view: 8B][epoch: 8B]
+   [signature: 96B]`. The receiver checks the signed view and
+   epoch before calling `collect_timeout_signature`. Mismatched
+   epochs are ignored. Stale (lower-view) signatures are ignored.
+   Higher-view signatures trigger a view sync (see fix 2).
+
+2. **`sync_to_view` engine method** (`crates/consensus/src/engine.rs`):
+   A new public method that monotonically advances the engine's
+   current view to a higher view. It syncs the pacemaker, clears
+   stale vote state, and resets the timeout window. The MSG_TIMEOUT
+   handler calls `sync_to_view` when it receives a timeout
+   signature for a higher view, then collects the signature. This
+   lets lagging validators converge to the highest view among the
+   cluster and form a TC.
+
+3. **`deliver_qc` view sync** (`crates/consensus/src/engine.rs`):
+   `deliver_qc` now synchronizes the current view when receiving a
+   valid higher-view QC. A restarted validator that receives a peer's
+   high QC catches up to `qc.view + 1`.
+
+4. **`on_timeout_certificate` higher-view TC** (`crates/consensus/
+   src/pacemaker.rs`): Accepts a valid TC for a higher view and
+   advances the local pacemaker to `tc.view + 1`. Past-view TCs
+   remain ignored.
+
+5. **TCP reconnect loop** (`crates/p2p/src/tcp.rs`): Outbound
+   connector threads retry connection establishment after the
+   reader loop exits. (Fixed earlier in the session.)
+
+**Safety properties preserved:**
+
+- Signature verification uses the encoded signed view and epoch —
+  never the receiver's local view.
+- Stale (lower-view) signatures and TCs are rejected.
+- View advancement is monotonic — `sync_to_view` is a no-op for
+  lower or equal views.
+- Quorum validation remains enforced independently of signature
+  verification mode.
+- Epoch binding remains — mismatched-epoch messages are ignored.
+
+### Regression tests
+
+Added three regression tests to `crates/consensus/src/engine.rs`:
+
+- `sync_to_view_advances_lagging_validator` — verifies that
+  `sync_to_view` advances the view forward.
+- `sync_to_view_rejects_lower_or_equal_view` — verifies that
+  `sync_to_view` does not regress the view (no-op for lower/equal).
+- `sync_to_view_clears_stale_votes` — verifies that `sync_to_view`
+  clears the vote buffer and vote count so late votes from the old
+  view don't pollute the new view's quorum accounting.
+
+Existing regression tests (already added earlier in the session):
+- `deliver_qc_advances_lagging_validator_view` — restarted
+  validator catches up via higher-view QC.
+- `on_timeout_certificate_advances_lagging_validator` — restarted
+  validator catches up via higher-view TC.
+- `on_timeout_certificate_rejects_past_view` — past-view TC does
+  not regress the view.
+
+### 1-hour Gate 7 soak results
+
+- Evidence: `docs/evidence/gate7-soak/soak-20260912T063417Z-*`
+- Duration: 3603 s (60 min).
+- Start height: 44. End height: 5329.
+- Total blocks: 5285. Rate: 1.4668 blocks/sec.
+- Final heights: [5329, 5329, 5329, 5329] — no state divergence.
+- Byzantine fault: validator-3 stopped for 60 s. Recovery: 10 s.
+- Network partition: validator-2 isolated for 90 s. Recovery: 10 s.
+- No consensus stalls. All fault phases passed. All validators
+  converged after recovery.
+
+### Debug logging cleanup
+
+Removed verbose per-message debug logging from the validator
+binary (`bin/oxide-validator/src/main.rs`):
+- Per-timeout-signature collection log (common case, too verbose).
+- Periodic status every 500 iterations (debug-only).
+
+Kept operational logs: TC formation, timeout sig rejection,
+view timeout broadcast, TC rejection, app rejection warning.

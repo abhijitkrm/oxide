@@ -50,6 +50,8 @@ use codec::{Decode, Encode};
 const MSG_PROPOSAL: u8 = 0x00;
 const MSG_VOTE: u8 = 0x01;
 const MSG_QC: u8 = 0x02;
+const MSG_TIMEOUT: u8 = 0x03; // timeout signature (view-change init)
+const MSG_TC: u8 = 0x04; // timeout certificate (view-change proof)
 
 /// Build the BLS vote signing message: `view` || `phase` || `block_hash` || `epoch`.
 /// This must match the consensus engine's `vote_signing_message`.
@@ -416,6 +418,19 @@ fn run_consensus_loop(
     let mut proposed_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut last_reported_height: u64 = 0;
     let mut iter_count: u64 = 0;
+    // H4 fix: the executor now rejects replayed nonces. The keep-alive
+    // tx must use an incrementing nonce so it's not rejected after
+    // the first block finalizes nonce 0.
+    let mut keepalive_nonce: u64 = 0;
+    // View-change timeout tracking. The pacemaker has an internal
+    // timeout duration (base 2s, exponential backoff). We track when
+    // the current view started; if it hasn't advanced within the
+    // timeout, we fire `on_timeout()` and broadcast the timeout
+    // signature to all peers. This is essential for recovering from
+    // a byzantine or crashed leader — without it, the consensus
+    // stalls forever when the leader stops proposing.
+    let mut view_start = std::time::Instant::now();
+    let mut timeout_sent_for_view: Option<u64> = None;
 
     loop {
         iter_count += 1;
@@ -426,8 +441,10 @@ fn run_consensus_loop(
         if iter_count % 50 == 1 {
             let to = primitives::Address([2u8; 20]);
             let module_payload = bank::msg::transfer(to, 100);
-            let tx = build_tx(framework::module_id::BANK, &module_payload);
+            let tx =
+                build_tx_with_nonce(framework::module_id::BANK, &module_payload, keepalive_nonce);
             engine.submit_tx(tx);
+            keepalive_nonce += 1;
         }
 
         // Phase 1: propose (if leader and haven't proposed this view).
@@ -516,6 +533,89 @@ fn run_consensus_loop(
                         let _ = engine.deliver_qc(qc);
                     }
                 }
+                MSG_TIMEOUT => {
+                    // View-change timeout signature from a peer.
+                    // Format: [voter_idx: 1B][view: 8B][epoch: 8B][signature: 96B]
+                    if let Ok(voter_idx_byte) = reader.read_u8() {
+                        if let Ok(sig_view) = reader.read_u64() {
+                            if let Ok(sig_epoch) = reader.read_u64() {
+                                if let Ok(sig) = crypto::Signature::decode(&mut reader) {
+                                    let voter_idx = u16::from(voter_idx_byte);
+                                    let my_epoch = engine.epoch().value();
+                                    // Ignore timeout sigs from a different
+                                    // epoch — they are not valid for this epoch.
+                                    if sig_epoch != my_epoch {
+                                        continue;
+                                    }
+                                    // If the sig is for a past view, ignore it
+                                    // (stale — the sender is behind us).
+                                    if sig_view < engine.current_view().value() {
+                                        continue;
+                                    }
+                                    // If the sig is for a higher view, catch up
+                                    // to that view. This lets validators that
+                                    // fell behind (e.g., after a partition)
+                                    // converge to the highest view among them,
+                                    // so they can all sign for the same view and
+                                    // form a TC. Without this, validators at
+                                    // adjacent views can never collect each
+                                    // other's sigs and the cluster stalls.
+                                    if sig_view > engine.current_view().value() {
+                                        engine.sync_to_view(primitives::View::new(sig_view));
+                                        view_start = std::time::Instant::now();
+                                        timeout_sent_for_view = None;
+                                    }
+                                    match engine.collect_timeout_signature(voter_idx, sig) {
+                                        Ok(Some(tc)) => {
+                                            // TC formed — broadcast to all peers.
+                                            eprintln!(
+                                                "oxide-validator[{node_index}]: TC formed after collecting timeout sig from voter={voter_idx} view={}",
+                                                engine.current_view().value()
+                                            );
+                                            let mut tc_buf = Vec::with_capacity(1 + 200);
+                                            tc_buf.push(MSG_TC);
+                                            tc.encode(&mut tc_buf);
+                                            for i in 0..num_nodes {
+                                                if i != node_index {
+                                                    let _ = transport.send(
+                                                        &vec![u8::try_from(i).unwrap()],
+                                                        &tc_buf,
+                                                    );
+                                                }
+                                            }
+                                            view_start = std::time::Instant::now();
+                                            timeout_sent_for_view = None;
+                                        }
+                                        Ok(None) => {
+                                            // Timeout sig collected but
+                                            // no TC yet — no log needed
+                                            // (this is the common case).
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "oxide-validator[{node_index}]: timeout sig from voter={voter_idx} rejected: {e:?}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                MSG_TC => {
+                    // Timeout certificate from a peer — advance the view.
+                    if let Ok(tc) = types::TimeoutCertificate::decode(&mut reader) {
+                        match engine.on_timeout_certificate(&tc) {
+                            Ok(()) => {
+                                view_start = std::time::Instant::now();
+                                timeout_sent_for_view = None;
+                            }
+                            Err(e) => {
+                                eprintln!("oxide-validator[{node_index}]: TC rejected: {e:?}");
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -534,9 +634,70 @@ fn run_consensus_loop(
         }
 
         // Phase 5: advance views.
+        let prev_view = engine.current_view().value();
         if let Some(hqc) = engine.high_qc() {
             if hqc.view == engine.current_view() {
                 engine.advance_view();
+            }
+        }
+
+        // Phase 5b: view-change timeout. If the current view hasn't
+        // advanced within the pacemaker's timeout duration, fire
+        // `on_timeout()`, broadcast the timeout signature to all
+        // peers, and let the pacemaker collect signatures to form a
+        // TC. This is the critical path for recovering from a
+        // byzantine or crashed leader.
+        let current_view_now = engine.current_view().value();
+        if current_view_now != prev_view {
+            // View advanced — reset the timer and clear the sent flag.
+            view_start = std::time::Instant::now();
+            timeout_sent_for_view = None;
+        }
+        let timeout_ms = engine.pacemaker_timeout_ms();
+        let elapsed_ms = u64::try_from(view_start.elapsed().as_millis()).unwrap_or(0);
+        if timeout_sent_for_view.is_none() && elapsed_ms >= timeout_ms {
+            timeout_sent_for_view = Some(current_view_now);
+            if let Some(sig) = engine.on_timeout() {
+                eprintln!(
+                    "oxide-validator[{node_index}]: view timeout view={current_view_now} elapsed={elapsed_ms}ms — broadcasting timeout sig"
+                );
+                let mut buf = Vec::with_capacity(1 + 1 + 8 + 8 + 96);
+                buf.push(MSG_TIMEOUT);
+                // Encode: voter_index (1 byte) + view (8 bytes) + epoch (8 bytes) + signature (96 bytes).
+                // The view and epoch are included so the receiver can
+                // verify the signature against the correct view and
+                // ignore stale sigs from a different view (e.g., after
+                // a partition when validators may be at different views).
+                buf.push(u8::try_from(node_index).unwrap());
+                buf.extend_from_slice(&current_view_now.to_le_bytes());
+                buf.extend_from_slice(&engine.epoch().value().to_le_bytes());
+                sig.encode(&mut buf);
+                for i in 0..num_nodes {
+                    if i != node_index {
+                        let _ = transport.send(&vec![u8::try_from(i).unwrap()], &buf);
+                    }
+                }
+                // Self-collect: feed our own timeout signature to the
+                // engine so it counts toward the quorum.
+                if let Ok(Some(tc)) =
+                    engine.collect_timeout_signature(u16::try_from(node_index).unwrap(), sig)
+                {
+                    // TC formed immediately (unlikely with 1/4, but
+                    // handle it). Broadcast the TC to all peers.
+                    eprintln!(
+                        "oxide-validator[{node_index}]: TC formed locally after self-timeout view={current_view_now}"
+                    );
+                    let mut tc_buf = Vec::with_capacity(1 + 200);
+                    tc_buf.push(MSG_TC);
+                    tc.encode(&mut tc_buf);
+                    for i in 0..num_nodes {
+                        if i != node_index {
+                            let _ = transport.send(&vec![u8::try_from(i).unwrap()], &tc_buf);
+                        }
+                    }
+                    view_start = std::time::Instant::now();
+                    timeout_sent_for_view = None;
+                }
             }
         }
 
@@ -640,8 +801,11 @@ fn parse_cli_flag(flag: &str) -> Option<String> {
 }
 
 fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
+    build_tx_with_nonce(module_id, module_payload, 0)
+}
+
+fn build_tx_with_nonce(module_id: u8, module_payload: &[u8], nonce: u64) -> types::TxBytes {
     let sender = primitives::Address([0u8; 20]);
-    let nonce = 0u64;
     let fee = 100u64;
     let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
     bytes.extend_from_slice(&sender.0);

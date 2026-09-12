@@ -2333,3 +2333,121 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   sustains 463,000 per second across 100 consecutive blocks. Both
   numbers are far above the targets, confirming the executor is not
   the performance bottleneck.
+
+### Fixed (2026-09-11)
+
+- **H4: Mempool replay protection** (`crates/executor/src/lib.rs`):
+  Added per-account `executed_nonce` map to the executor. `ingest_tx`
+  rejects any tx whose nonce has already been executed. The map is
+  preserved across restarts via snapshot export/import.
+  - **In plain words:** a transaction that has already been
+    executed cannot be re-submitted and re-executed. This prevents
+    replay attacks where a tx removed from the mempool after block
+    selection is re-submitted.
+
+- **H5: Executor nonce ordering enforcement**
+  (`crates/executor/src/lib.rs`):
+  `process_proposal` now enforces per-sender nonce contiguity (no
+  gaps, no reorderings). `execute_block` enforces cross-block nonce
+  continuity — txs with stale nonces are skipped.
+  - **In plain words:** a byzantine proposer cannot reorder
+    same-account transactions or insert gaps to bypass nonce
+    protection. Each sender's transactions must be in strict
+    nonce order.
+
+- **M3: Snapshot import verifies module roots from KV**
+  (`crates/executor/src/lib.rs`):
+  After importing KV state, each module's state root is recomputed
+  from the imported data and verified against the snapshot's claimed
+  root. Mismatches are rejected.
+  - **In plain words:** a crafted snapshot with arbitrary key-value
+    data that doesn't match its claimed state roots is now rejected.
+    Previously, the snapshot was trusted without verification.
+
+- **M4: Per-block oracle rate limit** (`modules/perps/src/lib.rs`):
+  Added `MAX_ORACLE_UPDATES_PER_BLOCK` (1) — each market can have at
+  most 1 mark price update per block. The `TAG_SET_MARK` handle path
+  now routes through `set_mark_price` which enforces both the
+  per-update deviation check and the per-block rate limit.
+  - **In plain words:** an oracle cannot make many small (just under
+    10%) price updates in a single block to achieve a large
+    cumulative price move. Each market gets only 1 oracle update per
+    block, forcing large price moves to happen across multiple
+    blocks and giving the system time to react.
+
+### Added (2026-09-11)
+
+- **Operational runbooks** (`docs/runbooks.md`):
+  Added operational procedures for running an Oxide validator or
+  full node in production: startup, shutdown, backup and snapshot
+  export, restore from snapshot, incident response (node stalled,
+  consensus halt, state divergence), monitoring and health checks,
+  key rotation, and software upgrade with rollback.
+  - **In plain words:** operators now have documented procedures
+    for running and maintaining an Oxide node, including what to do
+    when things go wrong.
+
+### Added (2026-09-11)
+
+- **Gate 4: Overhead breakdown** (`docs/production-readiness.md`):
+  Completed the sustained-throughput gate by comparing the executor
+  pipeline against the raw matching engine and EVM execution layer.
+  - **In plain words:** we now have a complete picture of where
+    throughput is spent. The matching engine runs at 20.6M ops/s
+    single-core, the executor pipeline processes bank transfers at
+    662K tx/s, and EVM transfers run at 28.7K tx/s single-threaded.
+    The matching engine is not the bottleneck — the executor
+    pipeline's tx dispatch overhead is. For EVM, revm execution
+    itself is the bottleneck, not the Oxide pipeline.
+
+### Fixed (2026-09-12)
+
+- **Consensus liveness after validator restart and partition**
+  (`crates/consensus/src/engine.rs`, `crates/consensus/src/pacemaker.rs`,
+  `crates/p2p/src/tcp.rs`, `bin/oxide-validator/src/main.rs`)
+  - Fixed a liveness stall where a restarted validator (at view 0)
+    could not catch up to the cluster (at view ~8600), causing the
+    entire cluster to stall after the byzantine restart phase.
+  - Fixed timeout signature framing: MSG_TIMEOUT now carries the
+    signed view and epoch so the receiver verifies against the
+    sender's view, not the receiver's local view.
+  - Added `OxideBft::sync_to_view()`: a monotonic view catch-up
+    method that advances the engine to a higher view, syncs the
+    pacemaker, and clears stale vote state.
+  - The MSG_TIMEOUT handler now syncs forward to a higher-view
+    timeout signature before collecting it, letting lagging
+    validators converge to the highest view in the cluster.
+  - `deliver_qc` now synchronizes the current view when receiving
+    a valid higher-view QC.
+  - `on_timeout_certificate` now accepts higher-view TCs (not just
+    the exact current view).
+  - TCP transport now reconnects after partition-induced connection
+    loss (outbound connector retries after reader exit).
+  - **In plain words:** if a validator crashes and restarts, or the
+    network partitions and heals, the cluster now recovers in ~10
+    seconds instead of stalling forever. The 1-hour Gate 7 soak
+    (5285 blocks, both fault phases, no state divergence) passes.
+
+### Added (2026-09-12)
+
+- **Gate 7: 1-hour Docker soak passes** (`docs/evidence/gate7-soak/`)
+  - Duration: 3603 s (60 min). 5285 blocks finalized.
+  - Finalization rate: 1.4668 blocks/sec.
+  - Byzantine fault (validator-3 stop/restart): recovery in 10 s.
+  - Network partition (validator-2 isolated 90 s): recovery in 10 s.
+  - Final heights: [5329, 5329, 5329, 5329] — no state divergence.
+  - **In plain words:** the four-validator Docker testnet now
+    survives both a crash and a network partition within the same
+    hour-long run, with all validators converging and no forks.
+
+- **Regression tests for view catch-up** (`crates/consensus/src/engine.rs`)
+  - `sync_to_view_advances_lagging_validator`
+  - `sync_to_view_rejects_lower_or_equal_view`
+  - `sync_to_view_clears_stale_votes`
+  - `deliver_qc_advances_lagging_validator_view`
+  - `on_timeout_certificate_advances_lagging_validator`
+  - `on_timeout_certificate_rejects_past_view`
+  - **In plain words:** we now have tests proving a lagging
+    validator catches up via higher-view QCs, TCs, and timeout
+    signatures, and that stale (lower-view) messages can never
+    regress the view.

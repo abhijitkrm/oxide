@@ -478,6 +478,14 @@ impl OxideBft {
         self.vote_count
     }
 
+    /// Returns the number of timeout signatures collected so far for
+    /// the current view. Used by the devnet consensus loop for debug
+    /// logging.
+    #[must_use]
+    pub fn timeout_signer_count_debug(&self) -> usize {
+        self.pacemaker.timeout_signer_count()
+    }
+
     /// Sync this engine's `next_height` to `max_height`. In a real
     /// system, all validators see the same blocks via broadcast, so
     /// their `next_height` stays in lockstep. In the in-process
@@ -951,6 +959,32 @@ impl OxideBft {
         // Update the highest QC.
         self.high_qc = Some(qc.clone());
 
+        // Catch-up: if the QC's view is higher than our current view,
+        // advance our view to qc.view + 1. This lets a restarted or
+        // partitioned validator that fell behind catch up to the
+        // network's current view when it receives a higher-view QC
+        // from peers. Without this, a lagging validator stays stuck
+        // at its old view and can never participate in consensus
+        // again (its timeout signatures are for the wrong view, its
+        // votes are for the wrong view, etc.).
+        //
+        // The QC is already verified (quorum + signature) at this
+        // point, so advancing to qc.view + 1 is safe — the QC proves
+        // that view qc.view has a notarized block, so view qc.view + 1
+        // is the next view that should propose.
+        //
+        // Only trigger catch-up when qc.view > current_view (strictly
+        // higher). When qc.view == current_view, the caller handles
+        // the normal view advancement via `advance_view()`.
+        if qc.view.value() > self.current_view.value() {
+            self.current_view = View::new(qc.view.value() + 1);
+            self.pacemaker.sync_to_view(self.current_view);
+            self.pacemaker.on_progress();
+            // Clear stale votes from the old view.
+            self.votes.fill(None);
+            self.vote_count = 0;
+        }
+
         // 2-chain commit check: if the QC's block extends the pending
         // block (i.e., the QC's block's high_qc matches the pending
         // block's hash), commit the pending block.
@@ -1056,6 +1090,35 @@ impl OxideBft {
         // when the real votes for view N+1 arrive.
         self.votes.fill(None);
         self.vote_count = 0;
+    }
+
+    /// Jump forward to `view` if it is higher than the current view.
+    /// This is the catch-up path for validators that fell behind
+    /// (e.g., after a restart or partition). It syncs the pacemaker
+    /// and clears stale votes, but does NOT trigger a view change
+    /// event — the caller is responsible for any subsequent actions
+    /// (e.g., collecting a timeout signature for the new view).
+    ///
+    /// Returns `true` if the view was advanced, `false` if `view` is
+    /// not higher than the current view (no-op).
+    pub fn sync_to_view(&mut self, view: View) -> bool {
+        if view.value() <= self.current_view.value() {
+            return false;
+        }
+        self.current_view = view;
+        self.pacemaker.sync_to_view(self.current_view);
+        self.pacemaker.on_progress();
+        self.votes.fill(None);
+        self.vote_count = 0;
+        true
+    }
+
+    /// Returns the pacemaker's current timeout duration in
+    /// milliseconds. The devnet consensus loop uses this to decide
+    /// when to fire `on_timeout()` and initiate a view change when
+    /// the leader doesn't propose.
+    pub fn pacemaker_timeout_ms(&self) -> u64 {
+        self.pacemaker.timeout_duration_ms()
     }
 
     /// Validator: local timer expired. Returns a timeout signature
@@ -2832,5 +2895,186 @@ mod tests {
             matches!(err, ConsensusError::InsufficientQuorum { signers, threshold } if signers == 2 && threshold == 3),
             "expected InsufficientQuorum (2 < 3), got {err:?}"
         );
+    }
+
+    /// Regression test: a validator that restarts at view 0 must
+    /// catch up when it receives a higher-view QC from peers. Before
+    /// the fix, `deliver_qc` only updated `high_qc` without advancing
+    /// `current_view`, so a restarted validator stayed stuck at view 0
+    /// forever and could never participate in consensus again.
+    #[test]
+    fn deliver_qc_advances_lagging_validator_view() {
+        // Run 5 rounds to advance the view.
+        let mut leader = make_multi_engine(0);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        for i in 0..5u8 {
+            drive_round(&mut leader, &mut [&mut f1, &mut f2, &mut f3], Some(TxBytes::new(vec![i])));
+        }
+        // All validators should have advanced beyond view 0.
+        let peer_view = leader.current_view().value();
+        assert!(peer_view > 0, "peers should have advanced beyond view 0");
+
+        // Simulate a restart: create a fresh engine for validator 3
+        // at view 0 (as if the process restarted from scratch).
+        let mut restarted = make_multi_engine(3);
+        assert_eq!(restarted.current_view().value(), 0);
+
+        // The restarted validator receives a QC from a peer for the
+        // peers' current high QC view.
+        let qc = leader.high_qc().expect("high_qc should be set").clone();
+        let qc_view = qc.view.value();
+        assert!(qc_view > 0, "QC should be for a view > 0");
+
+        // Deliver the QC to the restarted validator. Before the fix,
+        // this would update `high_qc` but NOT advance `current_view`,
+        // leaving the validator stuck at view 0.
+        restarted.deliver_qc(qc).expect("QC must verify");
+
+        // After the fix, the restarted validator's view should advance
+        // to qc.view + 1, allowing it to participate in consensus.
+        assert_eq!(
+            restarted.current_view().value(),
+            qc_view + 1,
+            "restarted validator must catch up to qc.view + 1"
+        );
+    }
+
+    /// Regression test: a validator that restarts at view 0 must
+    /// catch up when it receives a higher-view TC from peers. Before
+    /// the fix, the pacemaker rejected any TC whose view differed
+    /// from the current view, so a restarted validator could never
+    /// advance its view via TCs.
+    #[test]
+    fn on_timeout_certificate_advances_lagging_validator() {
+        // Run 5 rounds to advance the view.
+        let mut leader = make_multi_engine(0);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        for i in 0..5u8 {
+            drive_round(&mut leader, &mut [&mut f1, &mut f2, &mut f3], Some(TxBytes::new(vec![i])));
+        }
+        let peer_view = leader.current_view().value();
+        assert!(peer_view > 0, "peers should have advanced beyond view 0");
+
+        // Simulate a restart: create a fresh engine for validator 3
+        // at view 0.
+        let mut restarted = make_multi_engine(3);
+        assert_eq!(restarted.current_view().value(), 0);
+
+        // Construct a TC for the peers' current view with quorum.
+        let tc = TimeoutCertificate {
+            view: View::new(peer_view),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0111], // 3 signers (quorum)
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+
+        // Deliver the TC to the restarted validator. Before the fix,
+        // the pacemaker would reject this TC because tc.view != current_view.
+        restarted.on_timeout_certificate(&tc).expect("TC must be accepted");
+
+        // After the fix, the restarted validator's view should advance
+        // to tc.view + 1.
+        assert_eq!(
+            restarted.current_view().value(),
+            peer_view + 1,
+            "restarted validator must catch up to tc.view + 1"
+        );
+    }
+
+    /// Regression test: a TC for a past view must NOT regress the
+    /// engine's view. This ensures the catch-up logic doesn't
+    /// allow view regression (safety violation).
+    #[test]
+    fn on_timeout_certificate_rejects_past_view() {
+        let mut engine = make_multi_engine(0);
+        // Advance to view 5.
+        for _ in 0..5 {
+            engine.advance_view();
+        }
+        assert_eq!(engine.current_view().value(), 5);
+
+        // TC for view 3 (past view) — must be rejected.
+        let past_tc = TimeoutCertificate {
+            view: View::new(3),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        // The engine accepts the TC (quorum + signature pass) but
+        // the pacemaker ignores it (past view) — the view must not
+        // change.
+        engine.on_timeout_certificate(&past_tc).expect("TC with valid quorum should not error");
+
+        // View must not regress.
+        assert_eq!(engine.current_view().value(), 5);
+    }
+
+    /// Regression test: `sync_to_view` must advance a lagging
+    /// validator forward to a higher view. This is the catch-up path
+    /// used when a validator receives a timeout signature for a
+    /// higher view (e.g., after a restart or partition). Without
+    /// this, validators at adjacent views can never converge
+    /// because they reject each other's timeout signatures.
+    #[test]
+    fn sync_to_view_advances_lagging_validator() {
+        let mut engine = make_multi_engine(0);
+        assert_eq!(engine.current_view().value(), 0);
+
+        // Sync forward to view 10.
+        let advanced = engine.sync_to_view(View::new(10));
+        assert!(advanced, "sync_to_view should return true for a higher view");
+        assert_eq!(engine.current_view().value(), 10, "view should be 10");
+    }
+
+    /// Regression test: `sync_to_view` must NOT regress the view.
+    /// A lower or equal view is a no-op (returns false).
+    #[test]
+    fn sync_to_view_rejects_lower_or_equal_view() {
+        let mut engine = make_multi_engine(0);
+        // Advance to view 5.
+        for _ in 0..5 {
+            engine.advance_view();
+        }
+        assert_eq!(engine.current_view().value(), 5);
+
+        // Lower view — no-op.
+        let advanced = engine.sync_to_view(View::new(3));
+        assert!(!advanced, "sync_to_view should return false for a lower view");
+        assert_eq!(engine.current_view().value(), 5, "view must not regress");
+
+        // Equal view — no-op.
+        let advanced = engine.sync_to_view(View::new(5));
+        assert!(!advanced, "sync_to_view should return false for an equal view");
+        assert_eq!(engine.current_view().value(), 5, "view must not change");
+    }
+
+    /// Regression test: `sync_to_view` must clear stale vote state
+    /// so that late-arriving votes from the old view don't pollute
+    /// the new view's quorum accounting.
+    #[test]
+    fn sync_to_view_clears_stale_votes() {
+        let mut engine = make_multi_engine(0);
+
+        // Manually collect a vote to populate vote state.
+        let vote = Vote {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            signature: Signature::ZERO,
+        };
+        engine.collect_vote(1, vote).expect("conformance: no verification");
+        assert!(engine.vote_count > 0, "engine should have collected a vote");
+
+        // Sync forward to a higher view.
+        let advanced = engine.sync_to_view(View::new(100));
+        assert!(advanced, "sync should advance");
+
+        // Vote state must be cleared.
+        assert_eq!(engine.vote_count, 0, "vote_count must be cleared after sync");
+        assert!(engine.votes.iter().all(Option::is_none), "votes must be cleared after sync");
     }
 }

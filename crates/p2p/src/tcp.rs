@@ -532,73 +532,118 @@ impl TcpTransport {
                 #[cfg(feature = "tls")]
                 let ctls = connect_tls.clone();
                 thread::spawn(move || {
-                    // Retry connection — the peer may not be
-                    // listening yet (devnet startup race).
-                    let stream = loop {
+                    // Outer reconnect loop: if the connection breaks
+                    // (reader loop exits due to I/O error, EOF, or
+                    // peer shutdown), retry the connection after a
+                    // short backoff. This is essential for surviving
+                    // network partitions and transient failures —
+                    // without it, a broken connection is gone
+                    // forever and the peer becomes unreachable.
+                    loop {
                         if rshut.load(Ordering::Relaxed) {
                             return; // shutting down
                         }
-                        if let Ok(s) = TcpStream::connect_timeout(
-                            &addr.parse().unwrap_or_else(|_| panic!("invalid TCP address: {addr}")),
-                            connect_timeout,
-                        ) {
-                            break s;
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    };
-                    #[cfg(feature = "tls")]
-                    {
-                        if let Some(ref tls_config) = ctls {
-                            // Initiate TLS as client.
-                            let _ = stream.set_nodelay(true);
-                            let server_name = rustls::pki_types::ServerName::try_from("localhost")
-                                .expect("localhost is a valid server name");
-                            let client_conn = rustls::ClientConnection::new(
-                                tls_config.client_config.clone(),
-                                server_name,
-                            )
-                            .expect("client connection must be valid");
-                            let mut tls_stream = rustls::StreamOwned::new(client_conn, stream);
-                            // Send our peer ID as the first frame.
-                            if write_frame(&mut tls_stream, &oid).is_err() {
-                                return; // connection failed
+                        // Retry connection — the peer may not be
+                        // listening yet (devnet startup race) or may
+                        // have temporarily disconnected.
+                        let stream = loop {
+                            if rshut.load(Ordering::Relaxed) {
+                                return; // shutting down
                             }
-                            let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
-                            // Wrap in SharedStream for shared access.
-                            let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
-                            let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
-                            let write_stream = Box::new(shared) as Box<dyn PeerStream>;
-                            // Spawn a writer thread and register its
-                            // channel sender for outbound sends.
-                            let writer_tx = spawn_writer(write_stream, &rshut);
-                            cs.lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(pid.clone(), writer_tx);
-                            // Reader loop for this connection.
-                            reader_loop(reader_stream, pid, ct, max_message_bytes, rshut);
-                            return;
+                            if let Ok(s) = TcpStream::connect_timeout(
+                                &addr
+                                    .parse()
+                                    .unwrap_or_else(|_| panic!("invalid TCP address: {addr}")),
+                                connect_timeout,
+                            ) {
+                                break s;
+                            }
+                            thread::sleep(Duration::from_millis(100));
+                        };
+                        #[cfg(feature = "tls")]
+                        {
+                            if let Some(ref tls_config) = ctls {
+                                // Initiate TLS as client.
+                                let _ = stream.set_nodelay(true);
+                                let server_name =
+                                    rustls::pki_types::ServerName::try_from("localhost")
+                                        .expect("localhost is a valid server name");
+                                let client_conn = rustls::ClientConnection::new(
+                                    tls_config.client_config.clone(),
+                                    server_name,
+                                )
+                                .expect("client connection must be valid");
+                                let mut tls_stream = rustls::StreamOwned::new(client_conn, stream);
+                                // Send our peer ID as the first frame.
+                                if write_frame(&mut tls_stream, &oid).is_err() {
+                                    // Connection failed — retry after backoff.
+                                    thread::sleep(Duration::from_millis(500));
+                                    continue;
+                                }
+                                let _ =
+                                    tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
+                                // Wrap in SharedStream for shared access.
+                                let shared =
+                                    SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
+                                let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
+                                let write_stream = Box::new(shared) as Box<dyn PeerStream>;
+                                // Spawn a writer thread and register its
+                                // channel sender for outbound sends.
+                                let writer_tx = spawn_writer(write_stream, &rshut);
+                                cs.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(pid.clone(), writer_tx);
+                                // Reader loop for this connection.
+                                reader_loop(
+                                    reader_stream,
+                                    pid.clone(),
+                                    ct.clone(),
+                                    max_message_bytes,
+                                    rshut.clone(),
+                                );
+                                // Reader loop exited — connection broke.
+                                // Remove the stale writer channel and retry.
+                                cs.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&pid);
+                                thread::sleep(Duration::from_millis(500));
+                                continue;
+                            }
                         }
+                        // Plain TCP path.
+                        let mut stream = stream;
+                        // Disable Nagle (same rationale as accept path).
+                        let _ = stream.set_nodelay(true);
+                        // Send our peer ID as the first frame.
+                        if write_frame(&mut stream, &oid).is_err() {
+                            // Connection failed — retry after backoff.
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                        let _ = stream.set_read_timeout(Some(read_timeout));
+                        // Clone for the map; the reader keeps the original.
+                        let write_stream =
+                            Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
+                        let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
+                        // Spawn a writer thread and register its
+                        // channel sender for outbound sends.
+                        let writer_tx = spawn_writer(write_stream, &rshut);
+                        cs.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(pid.clone(), writer_tx);
+                        // Reader loop for this connection.
+                        reader_loop(
+                            reader_stream,
+                            pid.clone(),
+                            ct.clone(),
+                            max_message_bytes,
+                            rshut.clone(),
+                        );
+                        // Reader loop exited — connection broke.
+                        // Remove the stale writer channel and retry.
+                        cs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pid);
+                        thread::sleep(Duration::from_millis(500));
                     }
-                    // Plain TCP path.
-                    let mut stream = stream;
-                    // Disable Nagle (same rationale as accept path).
-                    let _ = stream.set_nodelay(true);
-                    // Send our peer ID as the first frame.
-                    if write_frame(&mut stream, &oid).is_err() {
-                        return; // connection failed
-                    }
-                    let _ = stream.set_read_timeout(Some(read_timeout));
-                    // Clone for the map; the reader keeps the original.
-                    let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
-                    let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
-                    // Spawn a writer thread and register its
-                    // channel sender for outbound sends.
-                    let writer_tx = spawn_writer(write_stream, &rshut);
-                    cs.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(pid.clone(), writer_tx);
-                    // Reader loop for this connection.
-                    reader_loop(reader_stream, pid, ct, max_message_bytes, rshut);
                 });
             }
         });

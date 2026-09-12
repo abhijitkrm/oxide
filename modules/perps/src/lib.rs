@@ -101,6 +101,27 @@ const PRICE_SCALE: u128 = 100_000_000;
 /// discovery but more exposure to oracle manipulation.
 const MAX_MARK_CHANGE_BPS: u64 = 1000; // 10%
 
+/// M4 fix: maximum number of oracle (mark price) updates per market
+/// per block. Without this, a malicious or buggy oracle can make
+/// many small (just under 10%) updates in a single block to achieve
+/// a large cumulative price move — e.g. 7 updates of 9.99% each
+/// compounds to ~75%, enough to trigger cascading liquidations.
+///
+/// Origin: security review M4 (docs/security-review.md). The
+/// per-update deviation check (`MAX_MARK_CHANGE_BPS`) limits each
+/// individual update to 10%, but without a per-block rate limit,
+/// the cumulative move is unbounded.
+///
+/// Setting this to 1 means each market can have at most 1 oracle
+/// update per block. If the real price moved more than 10%, the
+/// oracle must update across multiple blocks (each within 10%),
+/// giving the system time to react.
+///
+/// Tradeoff: lower cap = more protection but slower price discovery
+/// during legitimate large moves; higher cap = faster price
+/// discovery but more exposure to cumulative oracle manipulation.
+const MAX_ORACLE_UPDATES_PER_BLOCK: u8 = 1;
+
 /// Compute the absolute deviation between a new and old mark price,
 /// in basis points. Returns `|new - old| * 10_000 / old`.
 ///
@@ -288,6 +309,15 @@ struct Inner {
     insurance_fund: u64,
     /// Reusable fill buffer.
     fills: Vec<FillEvent>,
+    /// M4 fix: per-market oracle update count for the current
+    /// block. Each market can have at most
+    /// [`MAX_ORACLE_UPDATES_PER_BLOCK`] mark price updates per
+    /// block. This prevents a malicious or buggy oracle from
+    /// making many small (just under 10%) updates in a single
+    /// block to achieve a large cumulative price move.
+    ///
+    /// Reset to 0 in `begin_block`.
+    oracle_updates_this_block: BTreeMap<u8, u8>,
 }
 
 impl PerpsModule {
@@ -302,6 +332,7 @@ impl PerpsModule {
                 accounts: BTreeMap::new(),
                 insurance_fund: 0,
                 fills: Vec::with_capacity(64),
+                oracle_updates_this_block: BTreeMap::new(),
             }),
             store: Mutex::new(BTreeMap::new()),
             bank: None,
@@ -392,6 +423,17 @@ impl PerpsModule {
         if !inner.configs.contains_key(&market) {
             return Err(ExecError::ModuleRejected("market does not exist".to_string()));
         }
+        // M4 fix: per-block oracle rate limit. Each market can have
+        // at most `MAX_ORACLE_UPDATES_PER_BLOCK` oracle updates per
+        // block. Without this, many small (just under 10%) updates
+        // can compound to a large cumulative move within a single
+        // block.
+        let current_updates = inner.oracle_updates_this_block.get(&market).copied().unwrap_or(0);
+        if current_updates >= MAX_ORACLE_UPDATES_PER_BLOCK {
+            return Err(ExecError::ModuleRejected(format!(
+                "oracle update limit reached: {current_updates}/{MAX_ORACLE_UPDATES_PER_BLOCK} per block per market"
+            )));
+        }
         // Oracle robustness: reject extreme price changes.
         if let Some(old_mark) = inner.marks.get(&market) {
             let deviation = mark_price_deviation_bps(mark, *old_mark);
@@ -402,6 +444,7 @@ impl PerpsModule {
             }
         }
         inner.marks.insert(market, mark);
+        inner.oracle_updates_this_block.insert(market, current_updates + 1);
         Ok(())
     }
 
@@ -906,7 +949,13 @@ impl Module for PerpsModule {
         module_id::PERPS
     }
 
-    fn begin_block(&self, _height: Height) {}
+    fn begin_block(&self, _height: Height) {
+        // M4 fix: reset the per-block oracle update counter at the
+        // start of each block. Each market gets a fresh budget of
+        // [`MAX_ORACLE_UPDATES_PER_BLOCK`] updates per block.
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.oracle_updates_this_block.clear();
+    }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         if msg.is_empty() {
@@ -915,7 +964,7 @@ impl Module for PerpsModule {
         let tag = msg[0];
         let body = &msg[1..];
 
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         match tag {
             TAG_PLACE => {
@@ -946,23 +995,14 @@ impl Module for PerpsModule {
             }
             TAG_SET_MARK => {
                 let (market, mark) = Self::parse_set_mark(body).ok_or(ExecError::Malformed)?;
-                if !inner.configs.contains_key(&market) {
-                    return Err(ExecError::ModuleRejected("market does not exist".to_string()));
-                }
-                // Use the deviation-checked setter to enforce the
-                // MAX_MARK_CHANGE_BPS (10%) per-update cap. This
-                // prevents a malicious or buggy oracle from moving
-                // the mark price by more than 10% in a single
-                // transaction. The unchecked path is only for
-                // genesis setup and tests.
-                let current_mark = inner.marks.get(&market).copied().unwrap_or(mark);
-                let deviation = mark_price_deviation_bps(mark, current_mark);
-                if deviation > MAX_MARK_CHANGE_BPS {
-                    return Err(ExecError::ModuleRejected(format!(
-                        "mark price deviation {deviation} bps exceeds max {MAX_MARK_CHANGE_BPS} bps"
-                    )));
-                }
-                inner.marks.insert(market, mark);
+                drop(inner);
+                // M4 fix: use `set_mark_price` which enforces both
+                // the per-update deviation check (MAX_MARK_CHANGE_BPS)
+                // and the per-block rate limit
+                // (MAX_ORACLE_UPDATES_PER_BLOCK). The previous inline
+                // check bypassed the rate limit, allowing many small
+                // updates to compound within a single block.
+                self.set_mark_price(market, mark)?;
                 Ok(vec![Event {
                     module: "perps",
                     kind: "mark_updated".to_string(),
@@ -1410,6 +1450,7 @@ mod tests {
     use executor::{ExecError, Module, TxContext};
     use framework::module_id;
     use primitives::Address;
+    use primitives::Height;
     use primitives::fixed::{Price, Qty};
     use std::sync::Arc;
 
@@ -1980,6 +2021,9 @@ mod tests {
         let mid = perps.list_market(test_cfg()).unwrap();
         // Initial mark is 1.5B. 5% change = 1.575B.
         assert!(perps.set_mark_price(mid, 1_575_000_000).is_ok());
+        // M4 fix: each market can have only 1 oracle update per
+        // block. Advance to the next block before the second update.
+        perps.begin_block(Height::new(1));
         // Another 5% change from 1.575B = 1.65375B.
         assert!(perps.set_mark_price(mid, 1_653_750_000).is_ok());
     }
@@ -2021,6 +2065,46 @@ mod tests {
         // Initial mark is 1.5B. 33% change to 1.0B — would be
         // rejected by the checked method.
         assert!(perps.set_mark_price_unchecked(mid, 1_000_000_000).is_ok());
+    }
+
+    /// M4 fix: per-block oracle rate limit. A second oracle update
+    /// for the same market in the same block must be rejected.
+    /// Without this, many small (just under 10%) updates can
+    /// compound to a large cumulative move within a single block.
+    #[test]
+    fn m4_oracle_rate_limit_rejects_second_update_same_block() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // First update: 5% change — accepted.
+        assert!(perps.set_mark_price(mid, 1_575_000_000).is_ok());
+        // Second update in the same block — rejected by M4 rate limit.
+        let result = perps.set_mark_price(mid, 1_653_750_000);
+        assert!(result.is_err(), "second oracle update in same block must be rejected");
+        match result {
+            Err(ExecError::ModuleRejected(reason)) => {
+                assert!(
+                    reason.contains("oracle update limit"),
+                    "expected rate limit rejection, got: {reason}"
+                );
+            }
+            _ => panic!("expected ModuleRejected error"),
+        }
+    }
+
+    /// M4 fix: the rate limit resets at the next block. After
+    /// `begin_block`, a new oracle update is accepted.
+    #[test]
+    fn m4_oracle_rate_limit_resets_next_block() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // First update in block 0 — accepted.
+        assert!(perps.set_mark_price(mid, 1_575_000_000).is_ok());
+        // Second update in block 0 — rejected.
+        assert!(perps.set_mark_price(mid, 1_653_750_000).is_err());
+        // New block — rate limit resets.
+        perps.begin_block(Height::new(1));
+        // Update in block 1 — accepted.
+        assert!(perps.set_mark_price(mid, 1_653_750_000).is_ok());
     }
 
     /// Oracle: mark price deviation calculation is correct.
