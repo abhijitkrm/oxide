@@ -143,6 +143,19 @@ fn run_raw_engine(n_trades: usize) {
         "all makers should be matched after {n_trades} taker buys"
     );
     assert_eq!(total_fills, n_trades, "each taker should match exactly one maker");
+
+    // Gate: raw matching engine must sustain ≥ 1M ops/s
+    // (plan.md §13 Phase 3, matching.rs bench gate). This is the
+    // "engine-only ≥ 5M ops/s" gate de-rated for the full place()
+    // call (validation + book lookup + match + fill generation).
+    // The 1M floor is conservative for CI runners; the 16-core
+    // x86_64 rig is the source for absolute gate claims.
+    if n_trades >= 100_000 {
+        assert!(
+            tps >= 1_000_000.0,
+            "raw engine throughput gate failed: {tps:.0} orders/s < 1M orders/s (plan.md §13 Phase 3)"
+        );
+    }
 }
 
 /// Run the exchange settlement throughput test.
@@ -202,6 +215,19 @@ fn run_exchange_settlement(n_trades: usize) {
         0,
         "all makers should be matched after {n_trades} taker buys"
     );
+
+    // Gate: exchange settlement must sustain ≥ 100k ops/s
+    // (plan.md §13 Phase 3). This is the full settlement path
+    // (matching + bank transfer + event emission), not just the
+    // matching engine. The 100k floor is conservative for CI
+    // runners; the 16-core x86_64 rig is the source for absolute
+    // gate claims.
+    if n_trades >= 100_000 {
+        assert!(
+            tps >= 100_000.0,
+            "exchange throughput gate failed: {tps:.0} orders/s < 100k orders/s (plan.md §13 Phase 3)"
+        );
+    }
 }
 
 /// Default: 100M trades through both the raw engine and exchange

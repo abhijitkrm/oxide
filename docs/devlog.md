@@ -9786,3 +9786,34 @@ timeout) would starve the loop.
 All existing P2P tests (97) pass. The validator binary compiles
 cleanly. No new tests needed — this is a latency optimization with
 no behavioral change.
+
+## Pre-testnet audit: enforce benchmark gates with assertions and CI
+
+### Root cause
+
+The benchmark gates were documented in the bench file doc comments
+but not enforced with assertions. The nightly CI ran throughput
+simulations but did not run criterion benchmarks or enforce the
+throughput gates. A performance regression could land unnoticed.
+
+### Fix
+
+1. **Added throughput gate assertions** to
+   `trading_throughput.rs`:
+   - Raw matching engine: ≥ 1M orders/s (plan.md §13 Phase 3)
+   - Exchange settlement: ≥ 100k orders/s (plan.md §13 Phase 3)
+   The assertions only fire for runs with ≥ 100k trades (to avoid
+   noise on small runs).
+
+2. **Added a benchmark job to nightly CI** that:
+   - Runs all criterion benchmarks (`cargo bench --workspace`)
+   - Runs the throughput gate tests with assertions
+   - Uploads benchmark output as an artifact
+
+### Measured performance (M2 dev machine)
+
+- Raw matching engine: 37.8M orders/s (gate: 1M) — 37× headroom
+- Exchange settlement: 2.1M orders/s (gate: 100k) — 21× headroom
+
+Both gates pass with significant headroom on the dev machine. The
+16-core x86_64 rig is the source for absolute gate claims.

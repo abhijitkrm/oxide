@@ -2691,3 +2691,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     as they arrive, instead of waiting up to 10ms for the next poll.
     This reduces consensus round-trip latency by up to 10ms per
     message.
+
+- **Benchmark gates were not enforced with assertions or CI**
+  (`crates/devnet/tests/trading_throughput.rs`, `.github/workflows/nightly.yml`)
+  - The benchmark gates were documented in bench file doc comments but not
+    enforced. The nightly CI ran throughput simulations but did not run
+    criterion benchmarks or enforce the throughput gates.
+  - Added throughput gate assertions to `trading_throughput.rs`: raw matching
+    engine ≥ 1M orders/s, exchange settlement ≥ 100k orders/s. Added a
+    benchmark job to nightly CI that runs criterion benchmarks and the
+    throughput gate tests.
+  - **In plain words:** a performance regression will now fail CI instead of
+    landing unnoticed. The gates are conservative (1M raw, 100k exchange)
+    to avoid noise on CI runners; the dev machine measures 37M raw and 2M
+    exchange — 37× and 21× headroom respectively.

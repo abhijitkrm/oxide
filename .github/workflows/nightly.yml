@@ -89,3 +89,40 @@ jobs:
         run: cargo install cargo-audit
       - name: Run cargo audit
         run: cargo audit
+
+  benchmarks:
+    name: benchmark gates (criterion)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+      - name: Run criterion benchmarks
+        # Run the hot-path benchmarks to track performance
+        # regressions. Criterion reports regressions
+        # automatically on re-runs by comparing against
+        # target/criterion baselines. The throughput gate
+        # assertions in trading_throughput.rs enforce the
+        # plan.md §13 Phase 3 gates (≥1M ops/s raw engine,
+        # ≥100k ops/s exchange settlement).
+        run: |
+          cargo bench --workspace --features storage/redb,storage/rocksdb,storage/mdbx
+      - name: Run throughput gate tests
+        # Run the throughput gate tests with assertions that
+        # enforce the plan.md §13 Phase 3 gates.
+        run: |
+          THROUGHPUT_TRADES=1_000_000 cargo test --release --workspace \
+            --features storage/redb,storage/rocksdb,storage/mdbx -- \
+            --ignored --nocapture --test-threads=1 trading_throughput_smoke
+      - name: Upload benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-output
+          path: target/criterion/
