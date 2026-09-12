@@ -10472,3 +10472,51 @@ account from the flushed `Volatile` backend (documented
 `[0x01][addr][zeros]` key + persist.rs value format).
 
 All 29 conformance tests pass; clippy clean.
+
+## Gates 5 + 7 — fuzz soak + Docker 4-validator testnet
+
+### Gate 5: fuzz soak (committed corpus, 5-min budget per target)
+
+All 9 cargo-fuzz targets ran `-max_total_time=300 -timeout=10`
+over the committed corpus — ~620M total execs, **zero crashes**:
+
+| Target | Execs | Coverage |
+|---|---|---|
+| codec-decode | 153.3M | cov 83 |
+| types-decode | 24.2M | cov 291 |
+| consensus-msg | 42.4M | cov 286 |
+| sync-decode | 43.1M | — |
+| journal-replay | 0.87M | cov 63 |
+| mmr-proof-verify | 12.4M | cov 211 |
+| evm-execute | 4.5M | — |
+| trading-engine | 5.8M | — |
+| trading-order-validate | 401.0M | cov 14 |
+
+The only artifact on disk is a stale Sep-9 `oom-*` for
+types-decode (pre-dates the huge-count OOM fixes; gitignored).
+
+### Gate 7: Docker 4-validator testnet with induced faults
+
+`docker compose` built `oxide-validator` release images
+(debian:bookworm-slim + iproute2) and launched 4 validators on
+`10.0.0.1x` with `tc netem` injecting 20 ms latency + 2 ms jitter:
+
+- **Baseline:** ~7 blocks/s sustained finalization under WAN
+  latency (140+ heights in the first 20 s).
+- **Fault injection (f=1):** `docker stop oxide-validator-3` —
+  the remaining 3 validators kept finalizing via the timeout
+  path: views where the dead node was leader timed out (~2 s),
+  a TC formed from 3 timeout sigs, and the chain progressed.
+  Exactly the HotStuff liveness guarantee for n=4, f=1.
+- **Recovery:** `docker start` — validator-3 rejoined live
+  consensus and resumed finalizing current heights (stateless
+  devnet nodes rejoin the live view; no state sync needed).
+
+Teardown clean (`docker compose down`).
+
+### Verdict
+
+Gate 5 (fuzz) + Gate 6 (expanded conformance, 29 vectors) +
+Gate 7 (multi-validator testnet under latency + kill/restart)
+all pass. Remaining gate work: sustained-throughput soak runs
+(gate 4 follow-up) and production hardening review items.
