@@ -32,7 +32,7 @@
 //! per-account nonce tracking. No rate limiting, no eviction policy
 //! beyond size cap, no mempool gossip. Those arrive in Phase 2+.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use primitives::{Address, Hash};
 use types::TxBytes;
@@ -302,10 +302,21 @@ impl Mempool {
         let Some(hashes) = self.by_fee.get_mut(&lowest_density) else {
             return false;
         };
-        let Some(hash) = hashes.pop() else {
-            // Empty bucket — remove it and report no eviction.
-            self.by_fee.remove(&lowest_density);
-            return false;
+        // `by_fee` is lazily pruned — `select` no longer filters
+        // buckets per block, so a bucket may hold hashes already
+        // selected out of the pool. Skip stale entries and only
+        // evict a hash that still exists in `by_hash`.
+        let hash = loop {
+            match hashes.pop() {
+                Some(h) if self.by_hash.contains_key(&h) => break h,
+                Some(_) => {} // stale — already selected
+                None => {
+                    // Bucket drained (all stale) — remove it and
+                    // report no eviction; the caller can retry.
+                    self.by_fee.remove(&lowest_density);
+                    return false;
+                }
+            }
         };
         if hashes.is_empty() {
             self.by_fee.remove(&lowest_density);
@@ -354,103 +365,68 @@ impl Mempool {
     /// `by_fee` buckets are filtered once via `BTreeMap::retain`.
     pub fn select(&mut self, max_bytes: u64) -> Vec<TxBytes> {
         let mut total_bytes = 0u64;
-        // Track the next expected nonce per sender. Initialize from
-        // the pool's per-sender minimum nonce — not 0 — so that
-        // across multiple `select` calls, the expected nonce advances
-        // correctly. After the first `select` removes nonce 0, the
-        // pool's minimum nonce for that sender is 1, so the next
-        // `select` call starts expecting nonce 1.
-        let mut next_nonce: HashMap<Address, u64> = HashMap::new();
+        // Sender-fair fee-priority selection: a max-heap of
+        // (head fee density, sender) — the density of each sender's
+        // lowest pending nonce. Repeatedly pop the highest-density
+        // sender and take its contiguous nonce chain (bounded by the
+        // per-sender cap).
+        //
+        // Complexity: O(senders + selected·log senders). The old
+        // `by_fee` bucket scan was O(pool size) per call — at a
+        // multi-million-entry same-fee pool, every block proposal
+        // hashed the whole pool. Few senders with long nonce chains
+        // (the common trading workload) now cost ~O(selected).
+        let mut heap: std::collections::BinaryHeap<(FeeDensity, Address)> =
+            std::collections::BinaryHeap::with_capacity(self.by_sender.len());
         for (sender, queue) in &self.by_sender {
-            if let Some(&min_nonce) = queue.keys().next() {
-                next_nonce.insert(*sender, min_nonce);
+            if let Some(&hash) = queue.values().next() {
+                if let Some(entry) = self.by_hash.get(&hash) {
+                    heap.push((FeeDensity { fee: entry.fee, size: entry.size }, *sender));
+                }
             }
         }
 
-        // Iterate fee densities highest-first by walking the BTreeMap
-        // in reverse. The BTreeMap is already sorted by `FeeDensity`
-        // (ascending), so reverse iteration gives us highest-first
-        // without collecting into a Vec and sorting — O(n) iteration
-        // with zero allocation, vs the old O(n log n) sort.
-        //
-        // We collect selected hashes into a HashSet for O(1)
-        // membership tests during the batch removal pass.
-        let mut selected_hashes: HashSet<Hash> = HashSet::new();
         let mut selected_order: Vec<Hash> = Vec::new();
-        let mut sender_counts: HashMap<Address, u64> = HashMap::new();
         let per_sender_cap = u64::try_from(self.max_per_sender).unwrap_or(u64::MAX);
 
-        'densities: for (_density, hashes) in self.by_fee.iter().rev() {
-            for &hash in hashes {
-                if total_bytes >= max_bytes {
-                    break 'densities;
-                }
-                let Some(entry) = self.by_hash.get(&hash) else {
-                    continue;
-                };
-                // Per-sender cap: a capped sender's txs are skipped —
-                // they stay in the pool for the next block.
-                if *sender_counts.get(&entry.sender).unwrap_or(&0) >= per_sender_cap {
-                    continue;
-                }
-                // Check nonce ordering: the tx's nonce must equal the
-                // sender's next expected nonce.
-                let expected = next_nonce.entry(entry.sender).or_insert(0);
-                if entry.nonce != *expected {
-                    continue;
-                }
-                // Check byte budget. Use saturating_add to prevent
-                // overflow (M2 fix).
-                if total_bytes.saturating_add(entry.size) > max_bytes {
-                    continue;
-                }
-
-                // Select this tx, then follow the nonce chain: after
-                // selecting nonce N from sender S, immediately look up
-                // nonce N+1 from the same sender. This ensures all
-                // contiguous nonces are selected in one pass, even
-                // though the outer iteration visits txs in hash order
-                // (which is random w.r.t. nonce). Without this, txs
-                // with nonce N+1 would be skipped if their hash sorts
-                // before nonce N's hash in the BTreeSet.
-                let mut current_hash = hash;
-                let mut current_entry: &PoolEntry = entry;
-                loop {
-                    total_bytes += current_entry.size;
-                    selected_order.push(current_hash);
-                    selected_hashes.insert(current_hash);
-                    *expected += 1;
-                    let count = sender_counts.entry(current_entry.sender).or_insert(0);
-                    *count += 1;
-                    // Stop chaining at the per-sender cap — the rest
-                    // of their contiguous nonces stay for the next
-                    // block.
-                    if *count >= per_sender_cap {
-                        break;
-                    }
-
-                    // Follow the chain: look up the next nonce for
-                    // this sender in `by_sender`.
-                    let next_n = current_entry.nonce.saturating_add(1); // M2 fix
-                    let Some(queue) = self.by_sender.get(&current_entry.sender) else {
-                        break;
-                    };
-                    let Some(&next_hash) = queue.get(&next_n) else {
-                        break;
-                    };
-                    let Some(next_entry) = self.by_hash.get(&next_hash) else {
-                        break;
-                    };
-                    if total_bytes.saturating_add(next_entry.size) > max_bytes {
-                        // M2 fix
-                        break;
-                    }
-                    current_hash = next_hash;
-                    current_entry = next_entry;
-                }
-            }
+        'senders: while let Some((_density, sender)) = heap.pop() {
             if total_bytes >= max_bytes {
                 break;
+            }
+            let Some(queue) = self.by_sender.get(&sender) else {
+                continue;
+            };
+            // Start at the sender's minimum queued nonce — matching
+            // the previous semantics, which initialize the expected
+            // nonce from the pool's per-sender minimum (not 0) so
+            // senders whose earlier nonces already executed still
+            // select mid-chain.
+            let Some(&start_nonce) = queue.keys().next() else {
+                continue;
+            };
+            let mut nonce = start_nonce;
+            let mut count = 0u64;
+            // Follow the contiguous nonce chain up to the per-sender
+            // cap. Stop on a gap (later nonces aren't contiguous, so
+            // they can't be selected this block anyway), on the cap
+            // (rest stay for the next block), or on the byte budget
+            // (the chain is nonce-contiguous, so nothing further
+            // from this sender is selectable — other senders' txs
+            // may still fit, so keep popping the heap).
+            while count < per_sender_cap {
+                let Some(&hash) = queue.get(&nonce) else {
+                    break;
+                };
+                let Some(entry) = self.by_hash.get(&hash) else {
+                    break;
+                };
+                if total_bytes.saturating_add(entry.size) > max_bytes {
+                    continue 'senders;
+                }
+                total_bytes += entry.size;
+                selected_order.push(hash);
+                count += 1;
+                nonce = nonce.saturating_add(1);
             }
         }
 
@@ -470,14 +446,11 @@ impl Mempool {
             }
         }
 
-        // Clean the secondary indices in one pass each. `by_fee`
-        // buckets are filtered once via `BTreeMap::retain` against
-        // the full selected set — no per-density grouping, sort, or
-        // extra HashSet (the old remove_batch did all three).
-        self.by_fee.retain(|_density, bucket| {
-            bucket.retain(|h| !selected_hashes.contains(h));
-            !bucket.is_empty()
-        });
+        // Clean the per-sender queues for the selected txs. `by_fee`
+        // needs no per-block maintenance: it exists only for
+        // pool-full eviction (`evict_lowest_fee`), which lazily skips
+        // stale hashes — removing the per-block O(pool) retain pass
+        // was the point of the heap-walk select.
         for (sender, nonce) in sender_cleanups {
             if let Some(queue) = self.by_sender.get_mut(&sender) {
                 queue.remove(&nonce);
