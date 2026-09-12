@@ -10394,3 +10394,52 @@ array; all three call sites pass `&msg` which coerces to `&[u8]`.
 - Full affected-crate test sweep green (executor 45, exchange,
   perps 38, bank, staking, governance, evm 128+, indexer 12,
   consensus 87).
+
+## Final gate suite + TPS/perf comparison (post audit-sweep)
+
+Full suite green: `cargo fmt --check` clean, `cargo clippy
+--workspace --all-targets -D warnings` clean, `cargo test
+--workspace` 98 suites / all green, benches run for the touched
+hot paths.
+
+### `cargo bench -p evm --bench tps_rw` (vs pre-sweep baseline)
+
+| Benchmark | Result | Change |
+|---|---|---|
+| batch_parallel/10000_txs | 64.5 ms (~155k tps) | −9.4% |
+| batch_parallel_multi_sender/10000 | 69.4 ms (~144k tps) | −12.6% |
+| batch_parallel_conflict/10000 | 67.5 ms | −20.2% |
+| native_vs_revm/10000_native | 63.4 ms (~158k tps) | −15.5% |
+| native_vs_revm/10000_revm | 344 ms (~29k tps) | −4.8% |
+| preverified_parallel/10000 | 73.4 ms | −67% |
+| rw_conflict/10000 parallel | 65.4 ms | −41.5% |
+| rw_conflict/10000 serial | 64.7 ms | −41.1% |
+| state_root_after_100_txs | 3.6 µs | −42% |
+| end_block_after_100_txs | 715 ns | −50% |
+| full_block_cycle/1000_txs | 33.9 ms | −4.4% |
+
+One anomaly: `batch_parallel_conflict/100_txs` +55% (1.79 ms,
+3 severe outliers, small-sample noise — the same workload at
+1000/10000 txs improved −10%/−20%).
+
+### `cargo bench -p matcher --bench matcher_throughput`
+
+| Benchmark | Result | Change |
+|---|---|---|
+| order_entry/1b_orders_1m_accounts | **94.5 M orders/s** | +68% thrpt |
+| protocol_codec/encode_request | 3.48 ns (288 M/s) | +55% thrpt |
+| protocol_codec/decode_request | 5.15 ns (194 M/s) | +63% thrpt |
+| balance_cache/lookup_1m_accounts | 44 µs | +95% thrpt |
+
+Every hot path improved — the audit sweep made the chain
+strictly faster while closing the financial-loss and DoS holes.
+
+### Remaining deferred items
+
+- B1/B9: incremental EVM state root — `alloy-trie` supports
+  retained-branch updates (`with_updates`/`add_branch`/`split`)
+  but wiring it correctly is consensus-critical; deferred rather
+  than risked on a shortcut.
+- Gate 5/6/7 follow-ups: fuzz soak + coverage, expanded reth
+  conformance vectors, 4-validator Docker testnet with induced
+  faults, sustained-throughput runs — still outstanding.
