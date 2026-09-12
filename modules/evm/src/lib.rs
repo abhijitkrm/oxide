@@ -60,6 +60,9 @@ use std::sync::Mutex;
 use executor::{Event, ExecError, Module, TxContext};
 use framework::module_id;
 use primitives::{Address, Hash, Height};
+// Ceiling 1: the chain-configured block gas limit is the single
+// source of truth for the EVM's block gas limit too.
+use types::CHAIN_BLOCK_GAS_LIMIT;
 // rayon: parallel secp256k1 sender recovery in `handle_batch`.
 // 88% of per-tx cost is ECDSA recovery; parallelizing across cores
 // turns that into 88%/N_cores.
@@ -313,7 +316,7 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
-            block_gas_limit: 30_000_000,
+            block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -337,7 +340,7 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
-            block_gas_limit: 30_000_000,
+            block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -375,7 +378,7 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
-            block_gas_limit: 30_000_000,
+            block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -4174,7 +4177,7 @@ mod tests {
         }
 
         // Prepare a proposal — the mempool should select all 3 txs.
-        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let budget = types::CHAIN_BLOCK_BUDGET;
         let proposal = executor.prepare_proposal(&budget);
         assert_eq!(proposal.txs.len(), 3, "mempool must select all 3 EVM txs");
 
@@ -4263,7 +4266,7 @@ mod tests {
             let envelope = wrap_evm_tx_envelope(&oxide_addr, nonce, 1_000_000_000, &rlp);
             executor.ingest_tx(types::TxBytes::new(envelope));
         }
-        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let budget = types::CHAIN_BLOCK_BUDGET;
         let proposal = executor.prepare_proposal(&budget);
         assert_eq!(proposal.txs.len(), 5, "mempool must select all 5 EVM txs");
         let block = types::FinalizedBlock { height: Height::new(1), txs: proposal.txs };

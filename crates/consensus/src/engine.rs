@@ -390,13 +390,11 @@ impl OxideBft {
         self
     }
 
-    /// The budget the engine uses when assembling proposals. Phase 1
-    /// uses a generous fixed budget; Phase 2 tunes it from chain
-    /// config (plan.md §6: 1–2 GG/block).
-    const BUDGET: BlockBudget = BlockBudget {
-        max_bytes: 1 << 20, // 1 MiB
-        max_gas: 1 << 30,   // 1 gigagas
-    };
+    /// The budget the engine uses when assembling proposals. Ceiling 1:
+    /// reads the chain-configured limit from `types::CHAIN_BLOCK_BUDGET`
+    /// (10 GG/block, 16 MiB) so the engine, the EVM, and the tests all
+    /// agree on a single source of truth (plan.md §3).
+    const BUDGET: BlockBudget = types::CHAIN_BLOCK_BUDGET;
 
     /// Current view.
     #[must_use]

@@ -80,6 +80,44 @@ pub struct BlockBudget {
     pub max_gas: u64,
 }
 
+// ── Chain-configured block limits (Ceiling 1) ────────────────────────
+//
+// Oxide targets 10 gigagas per block (plan.md §3). These constants
+// are the single source of truth for the chain-configured block gas
+// limit and the matching block byte budget. Before Ceiling 1, the
+// consensus engine, the EVM module, and the test helpers each
+// hard-coded their own value (1 GG in consensus, 30M in the EVM,
+// 1 MiB in tests) — a tx that was legal under one limit was illegal
+// under another, and the 10 GG target was unreachable. Unifying
+// them here lets a future on-chain governance parameter flip the
+// limit in one place.
+//
+// Units: gas (max_gas) and bytes (max_bytes). Origin: plan.md §3
+// (10 GG/block target). Tradeoff: raising max_gas increases the
+// worst-case block execution time; raising max_bytes increases the
+// wire framing cost and the mempool memory footprint.
+
+/// The chain-configured block gas limit: 10 gigagas per block
+/// (plan.md §3 "gigagas capacity"). This is the single source of
+/// truth — the consensus engine, the EVM module, and the test
+/// helpers all read this constant instead of hard-coding their own.
+pub const CHAIN_BLOCK_GAS_LIMIT: u64 = 10_000_000_000;
+
+/// The chain-configured block byte budget: 16 MiB. At ~120 B per
+/// min-size tx, 10 GG of 21k-gas transfers is ~476k txs × ~120 B =
+/// ~57 MiB — too large for a single block. 16 MiB caps the wire
+/// framing cost while still allowing ~140k txs/block, well above
+/// the ~47k tx/block Ethereum mainnet throughput. Units: bytes.
+pub const CHAIN_BLOCK_MAX_BYTES: u64 = 16 << 20;
+
+/// The default block budget assembled from the chain-configured
+/// limits. Engines and tests use this instead of constructing a
+/// `BlockBudget` ad hoc.
+pub const CHAIN_BLOCK_BUDGET: BlockBudget = BlockBudget {
+    max_bytes: CHAIN_BLOCK_MAX_BYTES,
+    max_gas: CHAIN_BLOCK_GAS_LIMIT,
+};
+
 impl Encode for BlockBudget {
     fn encode(&self, buf: &mut Vec<u8>) {
         write::u64(buf, self.max_bytes);
