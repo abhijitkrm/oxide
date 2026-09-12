@@ -10258,3 +10258,47 @@ chain now stops mid-chain at the cap; the rest stay pooled.
 - `per_sender_cap_stops_nonce_chain` — chain halts at cap even
   with more contiguous nonces.
 - All 19 mempool tests pass.
+
+## Perf + DoS sweep — journal checkpoint + authenticated segment pruning
+
+The journal appended forever — ~1 TiB/day at full rate — and the
+only "pruning" was a blunt retention deleter (`prune.rs`) that
+would silently drop the prefix `open` needs to rebuild state.
+Real pruning needed integrity: what did the pruned prefix commit
+to, and how does a restarted node get the covered state back?
+
+Now: `JournalBackend::checkpoint()` rotates to a fresh segment
+(the marker MUST head a segment — mid-segment markers leave ops
+in front of it and break detection/resume) and writes a
+`CHECKPOINT_OP_COUNT` sentinel record carrying `{state_root,
+leaf_count, peaks}`. `prune_below(marker_segment)` deletes sealed
+segments (never the active one). `open_with_snapshot` detects the
+marker, rebuilds base state from the caller's snapshot, VERIFIES
+it against the marker's committed root, and resumes the MMR via
+the new `Mmr::from_checkpoint` — the resumed log root is
+identical to the unpruned root, so a pruned node and an archive
+node agree bit-for-bit.
+
+MMR internals changed to support resume: peaks now carry their
+hashes inline, `nodes` holds only post-checkpoint nodes behind a
+`node_base` offset, and `proof` returns `None` for checkpointed
+leaves (pruned = honestly unprovable).
+
+### Failure modes (all loud, never silent)
+
+- Pruned journal + no snapshot → `CheckpointWithoutSnapshot`.
+- Snapshot not covering the prefix → `SnapshotMismatch` (root
+  comparison against the marker).
+- Tampered/malformed marker → `MalformedCheckpoint`.
+- Wrong trusted root → `IntegrityMismatch` (unchanged).
+
+### Tests
+
+- `journal_backend_checkpoint_prune_reopen` — full lifecycle;
+  resumed log_root identical to pre-prune root.
+- `journal_backend_pruned_open_without_snapshot_fails`,
+  `journal_backend_checkpoint_wrong_snapshot_fails`,
+  `journal_prune_never_touches_active_segment`.
+- `test_checkpoint_resume_produces_identical_roots`,
+  `test_checkpointed_leaves_are_unprovable` (mmr).
+- 51 storage tests green.

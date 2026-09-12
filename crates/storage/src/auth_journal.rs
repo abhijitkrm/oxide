@@ -55,6 +55,24 @@ pub enum OpenError {
         /// The root reconstructed by replay.
         actual: Hash,
     },
+    /// The journal's first record is a checkpoint marker — segments
+    /// before it were pruned — but no base-state `Snapshot` was
+    /// supplied. Opening without the snapshot would silently
+    /// reconstruct a state missing everything the checkpoint
+    /// summarizes. Use [`JournalBackend::open_with_snapshot`].
+    CheckpointWithoutSnapshot,
+    /// The supplied snapshot's computed state root does not equal
+    /// the state root the checkpoint marker committed — the
+    /// snapshot does not cover this journal's pruned prefix.
+    SnapshotMismatch {
+        /// The state root committed by the checkpoint marker.
+        expected: Hash,
+        /// The state root computed from the supplied snapshot.
+        actual: Hash,
+    },
+    /// The checkpoint marker record was malformed — the journal
+    /// head was tampered with or corrupted past CRC detection.
+    MalformedCheckpoint,
 }
 
 impl std::fmt::Display for OpenError {
@@ -64,6 +82,13 @@ impl std::fmt::Display for OpenError {
             Self::IntegrityMismatch { expected, actual } => {
                 write!(f, "journal integrity mismatch: expected {expected:?}, replayed {actual:?}")
             }
+            Self::CheckpointWithoutSnapshot => {
+                write!(f, "journal is pruned at a checkpoint but no snapshot was supplied")
+            }
+            Self::SnapshotMismatch { expected, actual } => {
+                write!(f, "snapshot root mismatch: checkpoint expects {expected:?}, got {actual:?}")
+            }
+            Self::MalformedCheckpoint => write!(f, "malformed checkpoint marker record"),
         }
     }
 }
@@ -72,7 +97,10 @@ impl std::error::Error for OpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Journal(e) => Some(e),
-            Self::IntegrityMismatch { .. } => None,
+            Self::IntegrityMismatch { .. }
+            | Self::CheckpointWithoutSnapshot
+            | Self::SnapshotMismatch { .. }
+            | Self::MalformedCheckpoint => None,
         }
     }
 }
@@ -149,6 +177,21 @@ impl AuthenticatedJournal {
     /// The number of leaves (records) in the MMR.
     pub fn leaf_count(&self) -> u64 {
         self.mmr.leaf_count()
+    }
+
+    /// Delete sealed segment files with `seq < watermark`. See
+    /// [`JournalWriter::prune_below`] — the caller must have a
+    /// checkpoint covering the pruned records.
+    ///
+    /// # Errors
+    /// Returns `JournalError::Io` on flush or removal failure.
+    pub fn prune_below(&mut self, watermark: u32) -> Result<u32, JournalError> {
+        self.writer.prune_below(watermark)
+    }
+
+    /// The active segment's sequence number.
+    pub fn active_segment(&self) -> u32 {
+        self.writer.active_segment()
     }
 }
 
@@ -250,11 +293,91 @@ impl JournalBackend {
         config: JournalConfig,
         expected_root: Option<Hash>,
     ) -> Result<Self, OpenError> {
+        Self::open_with_snapshot(dir, config, None, expected_root)
+    }
+
+    /// Open with an optional base-state snapshot for a journal whose
+    /// prefix was pruned behind a checkpoint marker.
+    ///
+    /// If the first surviving record is a checkpoint marker, the
+    /// marker's committed state root is verified against the
+    /// supplied snapshot's recomputed root — a snapshot that does
+    /// not cover the pruned prefix is a fatal
+    /// [`OpenError::SnapshotMismatch`], never a silent wrong state.
+    /// The MMR resumes from the marker's `(leaf_count, peaks)` so
+    /// the log root continues the identical history (checkpointing
+    /// never forks the root). Records after the marker apply on top
+    /// of the snapshot.
+    ///
+    /// Supplying a snapshot for an *unpruned* journal is an error —
+    /// the snapshot would silently shadow real history.
+    ///
+    /// # Errors
+    /// As [`open`](Self::open), plus [`OpenError::CheckpointWithoutSnapshot`]
+    /// when the journal is pruned and no snapshot was supplied, and
+    /// [`OpenError::MalformedCheckpoint`] for a corrupt marker.
+    pub fn open_with_snapshot(
+        dir: &Path,
+        config: JournalConfig,
+        snapshot: Option<Snapshot>,
+        expected_root: Option<Hash>,
+    ) -> Result<Self, OpenError> {
         let replay_result = replay(dir)?;
         let mut mmr = Mmr::new();
         let mut state = std::collections::BTreeMap::new();
-        for record in &replay_result.records {
+        let mut first_is_checkpoint = false;
+
+        // Checkpoint detection: the first record carries the
+        // checkpoint sentinel. Everything it summarizes was pruned —
+        // base state must come from the caller's snapshot.
+        if let Some(first) = replay_result.records.first() {
+            if is_checkpoint_marker(&first.payload) {
+                let (marker_root, leaf_count, peaks) =
+                    decode_checkpoint(&first.payload).ok_or(OpenError::MalformedCheckpoint)?;
+                let Some(snapshot) = snapshot else {
+                    return Err(OpenError::CheckpointWithoutSnapshot);
+                };
+                // Rebuild the base state from the snapshot (sorted +
+                // unique keys, same rule as snapshot_import) and
+                // verify it against the marker's committed root.
+                let mut base = std::collections::BTreeMap::new();
+                let mut prev: Option<Hash> = None;
+                for (k, v) in &snapshot.entries {
+                    if let Some(p) = prev {
+                        if *k <= p {
+                            return Err(OpenError::MalformedCheckpoint);
+                        }
+                    }
+                    prev = Some(*k);
+                    base.insert(*k, v.clone());
+                }
+                let snap_root = compute_state_root(&base);
+                if snap_root != marker_root {
+                    return Err(OpenError::SnapshotMismatch {
+                        expected: marker_root,
+                        actual: snap_root,
+                    });
+                }
+                state = base;
+                mmr = Mmr::from_checkpoint(leaf_count, &peaks);
+                first_is_checkpoint = true;
+            } else if snapshot.is_some() {
+                return Err(OpenError::MalformedCheckpoint);
+            }
+        } else if snapshot.is_some() {
+            // An empty journal can't be "pruned at a checkpoint" —
+            // a snapshot here is a caller error, not a valid open.
+            return Err(OpenError::MalformedCheckpoint);
+        }
+
+        for (i, record) in replay_result.records.iter().enumerate() {
+            // Every record is a leaf — including the marker itself
+            // (it was appended as a normal record at checkpoint
+            // time, so the resumed MMR pushes it too).
             mmr.push(hash_leaf(&record.payload));
+            if i == 0 && first_is_checkpoint {
+                continue; // marker: no ops to apply
+            }
             apply_ops(&mut state, &decode_batch_record(&record.payload));
         }
         let actual_root = mmr.root();
@@ -269,6 +392,55 @@ impl JournalBackend {
             state,
             state_root,
         })
+    }
+
+    /// Write a checkpoint marker into the journal and return the
+    /// segment sequence it landed in. The marker commits the
+    /// current state root and the MMR checkpoint state
+    /// `(leaf_count, peaks)` — everything in segments strictly
+    /// below the returned seq may then be deleted via
+    /// [`prune_below`](Self::prune_below).
+    ///
+    /// The marker is synced to disk before returning — pruning must
+    /// never outrun durability.
+    ///
+    /// After pruning, [`open`](Self::open) must be replaced by
+    /// [`open_with_snapshot`](Self::open_with_snapshot) supplying a
+    /// [`Snapshot`] exported (and stored) *before* the checkpoint.
+    /// The checkpoint does not carry the state itself — a marker
+    /// big enough to hold every entry would exceed the record size
+    /// bound; the snapshot lives wherever the caller keeps cold
+    /// state (see `snapshot_export`).
+    ///
+    /// # Errors
+    /// Returns `JournalError` if the marker cannot be appended or
+    /// synced.
+    pub fn checkpoint(&mut self) -> Result<u32, crate::journal::JournalError> {
+        // Rotate FIRST: the marker must head a fresh segment so that
+        // `prune_below(marker_segment)` leaves it as the very first
+        // record replay sees. A marker sharing a segment with older
+        // records would sit behind them — replay would hit real ops
+        // before the marker, the checkpoint would be undetectable,
+        // and MMR resume would fork.
+        self.journal.writer.seal_and_rotate()?;
+        let marker = encode_checkpoint(
+            self.state_root,
+            self.journal.leaf_count(),
+            &self.journal.mmr.peak_hashes(),
+        );
+        let location = self.journal.append(&marker)?;
+        self.journal.sync()?;
+        Ok(location.segment)
+    }
+
+    /// Delete sealed journal segments with `seq < watermark`. The
+    /// typical call is `prune_below(backend.checkpoint())`, which
+    /// removes everything before the checkpoint marker.
+    ///
+    /// # Errors
+    /// Returns `JournalError::Io` on flush or removal failure.
+    pub fn prune_below(&mut self, watermark: u32) -> Result<u32, crate::journal::JournalError> {
+        self.journal.prune_below(watermark)
     }
 
     /// The current MMR root — commits the entire log of batch records.
@@ -509,6 +681,71 @@ fn decode_batch_record(payload: &[u8]) -> Vec<Op> {
         }
     }
     ops
+}
+
+/// The `op_count` sentinel marking a checkpoint record instead of a
+/// batch. `u64::MAX` can never be a real op count — a batch that
+/// large cannot be encoded (its ops alone would exceed the 16 MiB
+/// record bound by ~10¹⁵×), so the sentinel is collision-free by
+/// construction, not by convention.
+const CHECKPOINT_OP_COUNT: u64 = u64::MAX;
+
+/// Fixed checkpoint marker layout:
+/// `[state_root 32B][CHECKPOINT_OP_COUNT u64][leaf_count u64]
+///  [peaks_count u32][peaks 32B each]`.
+///
+/// `leaf_count`/`peaks` describe the MMR *before* the marker record
+/// itself was appended — on open, `Mmr::from_checkpoint` rebuilds
+/// that forest and the marker is then pushed as a normal leaf.
+const CHECKPOINT_FIXED_LEN: usize = 32 + 8 + 8 + 4;
+
+/// Whether `payload` is a checkpoint marker (vs a batch record).
+fn is_checkpoint_marker(payload: &[u8]) -> bool {
+    payload.len() >= CHECKPOINT_FIXED_LEN
+        && u64::from_le_bytes(payload[32..40].try_into().unwrap_or([0u8; 8])) == CHECKPOINT_OP_COUNT
+}
+
+/// Encode a checkpoint marker.
+fn encode_checkpoint(state_root: Hash, leaf_count: u64, peaks: &[Hash]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(CHECKPOINT_FIXED_LEN + peaks.len() * Hash::LEN);
+    buf.extend_from_slice(&state_root.0);
+    buf.extend_from_slice(&CHECKPOINT_OP_COUNT.to_le_bytes());
+    buf.extend_from_slice(&leaf_count.to_le_bytes());
+    buf.extend_from_slice(&u32::try_from(peaks.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for peak in peaks {
+        buf.extend_from_slice(&peak.0);
+    }
+    buf
+}
+
+/// Decode a checkpoint marker → `(state_root, leaf_count, peaks)`.
+/// `None` on any malformed field — the caller maps that to
+/// [`OpenError::MalformedCheckpoint`], never a partial state.
+fn decode_checkpoint(payload: &[u8]) -> Option<(Hash, u64, Vec<Hash>)> {
+    if payload.len() < CHECKPOINT_FIXED_LEN {
+        return None;
+    }
+    if u64::from_le_bytes(payload[32..40].try_into().ok()?) != CHECKPOINT_OP_COUNT {
+        return None;
+    }
+    let state_root = Hash(payload[..32].try_into().ok()?);
+    let leaf_count = u64::from_le_bytes(payload[40..48].try_into().ok()?);
+    let peaks_count = usize::try_from(u32::from_le_bytes(payload[48..52].try_into().ok()?)).ok()?;
+    // Exact-length check: a trailing garbage byte or a truncated
+    // peak table makes the marker untrustworthy.
+    if payload.len() != CHECKPOINT_FIXED_LEN + peaks_count * Hash::LEN {
+        return None;
+    }
+    // Sanity bound: an MMR with `leaf_count` leaves has
+    // popcount(leaf_count) ≤ 64 peaks. Anything more is corrupt.
+    if peaks_count > 64 {
+        return None;
+    }
+    let peaks = payload[CHECKPOINT_FIXED_LEN..]
+        .chunks_exact(Hash::LEN)
+        .map(|c| Hash(c.try_into().unwrap_or([0u8; 32])))
+        .collect();
+    Some((state_root, leaf_count, peaks))
 }
 
 /// Compute the (lo, hi) range bounds for a prefix scan over a
@@ -906,5 +1143,119 @@ mod tests {
             state_root_before,
             "state root must be unchanged after append failure"
         );
+    }
+
+    // ─── Checkpoint + pruning tests ────────────────────────────
+
+    /// Full checkpoint lifecycle: write batches across multiple
+    /// segments, export the snapshot, write the checkpoint marker,
+    /// prune all segments below it, then reopen with the snapshot.
+    /// The reopened backend must have identical state AND an
+    /// identical log root — checkpointing summarizes the prefix,
+    /// it never forks the MMR.
+    #[test]
+    fn journal_backend_checkpoint_prune_reopen() {
+        let dir = TempDir::new("backend-checkpoint");
+        // Small segments force rotation every couple of records.
+        let config = JournalConfig { max_segment_bytes: 128 };
+        let mut backend = JournalBackend::create(&dir.0, config).unwrap();
+        for i in 0..8u8 {
+            backend.apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i, i, i] }]);
+            backend.sync().unwrap();
+        }
+        // Snapshot BEFORE checkpointing — the caller's contract.
+        let snapshot = backend.snapshot_export();
+
+        // Checkpoint + prune everything below the marker's segment.
+        let ckpt_seg = backend.checkpoint().expect("checkpoint must succeed");
+        let deleted = backend.prune_below(ckpt_seg).expect("prune must succeed");
+        assert!(deleted > 0, "sealed segments below the checkpoint are deleted");
+
+        // A later batch lands in the surviving tail.
+        backend.apply_batch(&[Op::Set { key: Hash([0xF0; 32]), value: vec![9] }]);
+        backend.sync().unwrap();
+        let post_batch_log_root = backend.log_root();
+
+        // Reopen with the snapshot: base state from the snapshot,
+        // tail records applied on top, MMR resumed from the marker.
+        let reopened = JournalBackend::open_with_snapshot(
+            &dir.0,
+            config,
+            Some(snapshot),
+            Some(post_batch_log_root),
+        )
+        .expect("open with the covering snapshot must succeed");
+        assert_eq!(reopened.log_root(), post_batch_log_root, "resumed MMR is identical");
+        assert_eq!(reopened.get(&Hash([0xF0; 32])), Some(vec![9]), "tail ops apply on top");
+        assert_eq!(reopened.get(&Hash([0x00; 32])), Some(vec![0, 0, 0]), "snapshot state present");
+    }
+
+    /// Opening a pruned (checkpointed) journal WITHOUT a snapshot
+    /// must fail loudly — silently rebuilding only the suffix would
+    /// produce a wrong state and fork the chain.
+    #[test]
+    fn journal_backend_pruned_open_without_snapshot_fails() {
+        let dir = TempDir::new("backend-no-snapshot");
+        let config = JournalConfig { max_segment_bytes: 128 };
+        let mut backend = JournalBackend::create(&dir.0, config).unwrap();
+        for i in 0..6u8 {
+            backend.apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i] }]);
+            backend.sync().unwrap();
+        }
+        let ckpt_seg = backend.checkpoint().unwrap();
+        backend.prune_below(ckpt_seg).unwrap();
+
+        let result = JournalBackend::open(&dir.0, config, None);
+        assert!(
+            matches!(result.map(|_| ()), Err(OpenError::CheckpointWithoutSnapshot)),
+            "pruned journal without a snapshot must refuse to open"
+        );
+    }
+
+    /// A snapshot that does NOT cover the pruned prefix must be
+    /// rejected — its state root won't match the checkpoint's
+    /// committed root.
+    #[test]
+    fn journal_backend_checkpoint_wrong_snapshot_fails() {
+        let dir = TempDir::new("backend-wrong-snap");
+        let config = JournalConfig { max_segment_bytes: 128 };
+        let mut backend = JournalBackend::create(&dir.0, config).unwrap();
+        for i in 0..6u8 {
+            backend.apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i] }]);
+            backend.sync().unwrap();
+        }
+        let ckpt_seg = backend.checkpoint().unwrap();
+        backend.prune_below(ckpt_seg).unwrap();
+
+        // A bogus snapshot — different keys entirely.
+        let bogus = Snapshot { height: 0, entries: vec![(Hash([0xEE; 32]), vec![0xEE])] };
+        let result = JournalBackend::open_with_snapshot(&dir.0, config, Some(bogus), None);
+        assert!(
+            matches!(result.map(|_| ()), Err(OpenError::SnapshotMismatch { .. })),
+            "a snapshot that doesn't cover the pruned prefix must be rejected"
+        );
+    }
+
+    /// The active segment is never pruned, even if the watermark
+    /// exceeds it — deleting the segment being written would lose
+    /// unflushed records.
+    #[test]
+    fn journal_prune_never_touches_active_segment() {
+        let dir = TempDir::new("backend-active-safe");
+        let config = JournalConfig { max_segment_bytes: 128 };
+        let mut backend = JournalBackend::create(&dir.0, config).unwrap();
+        backend.apply_batch(&[Op::Set { key: Hash([0x01; 32]), value: vec![1] }]);
+        backend.sync().unwrap();
+
+        // Watermark beyond the active segment — only sealed
+        // segments may go; the active one survives.
+        let deleted = backend.prune_below(u32::MAX).unwrap();
+        let active = backend.journal.active_segment();
+        assert!(dir.0.join(format!("segment-{active}.log")).exists(), "active survives");
+        let _ = deleted;
+
+        // Everything still replays (the journal is intact).
+        let replayed = crate::journal::replay(&dir.0).unwrap();
+        assert!(replayed.truncated_at.is_none(), "journal must stay intact");
     }
 }

@@ -726,6 +726,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **Journal history grew forever with no integrity-safe pruning**
+  (`crates/storage/src/journal.rs`, `auth_journal.rs`, `mmr.rs`)
+  - `JournalBackend::checkpoint()` writes a marker committing the
+    state root and MMR checkpoint `(leaf_count, peaks)`;
+    `prune_below` deletes sealed segments under the marker
+    (never the active one).
+  - `open_with_snapshot` rebuilds base state from the caller's
+    snapshot, verifies it against the marker's committed root,
+    and resumes the MMR — the resumed log root is identical to
+    the unpruned root, so pruned and archive nodes agree.
+  - Every failure is loud: `CheckpointWithoutSnapshot`,
+    `SnapshotMismatch`, `MalformedCheckpoint`,
+    `IntegrityMismatch`.
+  - **In plain words:** a node can finally discard old journal
+    history without corrupting its state or silently diverging
+    from the rest of the chain.
+
 - **Mempool `select` cloned every chosen transaction and let one
   sender monopolize a block** (`crates/mempool/src/lib.rs`)
   - Selection now moves `TxBytes` out of `by_hash` in order

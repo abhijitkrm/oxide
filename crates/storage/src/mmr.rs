@@ -59,18 +59,29 @@ const ROOT_PREIMAGE_LEN: usize = 41;
 
 /// A Merkle Mountain Range over pre-hashed leaves.
 ///
-/// `peaks` is the incremental forest shape: `(node index, height)` for
-/// each mountain, left to right. It is redundant with `leaf_count` (and
-/// cross-checked against the pure [`peak_positions`] in tests) but kept
-/// so [`Mmr::push`] never pays a forest re-derivation.
+/// `peaks` is the incremental forest shape: `(absolute node index,
+/// height, hash)` for each mountain, left to right. The hash is
+/// carried inline so a checkpointed MMR — reconstructed from
+/// `(leaf_count, peak hashes)` alone — can keep pushing without
+/// the pruned node history. `nodes` holds only nodes appended
+/// *since* `node_base` (0 for a fresh MMR, the node count at
+/// checkpoint for a resumed one); proofs for leaves inside the
+/// checkpointed prefix return `None` — pruning forfeits per-leaf
+/// proofs for the dropped history.
 #[derive(Debug, Default, Clone)]
 pub struct Mmr {
-    /// Every node hash (leaves and internal) in append order.
+    /// Node hashes appended since `node_base`, in append order.
+    /// Index `i` maps to absolute index `node_base + i`.
     nodes: Vec<Hash>,
-    /// Mountain peaks (index, height), left to right.
-    peaks: Vec<(usize, u32)>,
-    /// Number of leaves committed.
+    /// Absolute index of `nodes[0]` — the node count at checkpoint
+    /// time (`2·leaf_count − popcount(leaf_count)`), 0 when fresh.
+    node_base: usize,
+    /// Mountain peaks (absolute index, height, hash), left to right.
+    peaks: Vec<(usize, u32, Hash)>,
+    /// Number of leaves committed (includes checkpointed prefix).
     leaf_count: u64,
+    /// Leaves covered by the checkpoint (proofs refuse these).
+    checkpointed_leaves: u64,
 }
 
 /// One step of an inclusion path: the sibling hash at this level and
@@ -175,7 +186,55 @@ pub fn peak_positions(n: u64) -> Vec<(usize, u32)> {
 impl Mmr {
     /// Empty forest.
     pub fn new() -> Self {
-        Mmr { nodes: Vec::new(), peaks: Vec::new(), leaf_count: 0 }
+        Mmr {
+            nodes: Vec::new(),
+            node_base: 0,
+            peaks: Vec::new(),
+            leaf_count: 0,
+            checkpointed_leaves: 0,
+        }
+    }
+
+    /// Resume an MMR from a checkpoint: `leaf_count` leaves already
+    /// committed (their node history pruned) and the `peak_hashes`
+    /// of the forest at that point. The result pushes and roots
+    /// identically to the unpruned MMR — peaks are the only state
+    /// appends ever consult.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `peak_hashes.len()` disagrees with the forest shape
+    /// implied by `leaf_count` — a malformed checkpoint is a caller
+    /// bug, not recoverable data.
+    #[must_use]
+    pub fn from_checkpoint(leaf_count: u64, peak_hashes: &[Hash]) -> Self {
+        let positions = peak_positions(leaf_count);
+        assert_eq!(
+            positions.len(),
+            peak_hashes.len(),
+            "checkpoint peaks must match the forest shape for leaf_count"
+        );
+        let node_base = usize::try_from(2 * leaf_count - u64::from(leaf_count.count_ones()))
+            .unwrap_or(usize::MAX);
+        Self {
+            nodes: Vec::new(),
+            node_base,
+            peaks: positions
+                .iter()
+                .zip(peak_hashes.iter())
+                .map(|(&(idx, h), &hash)| (idx, h, hash))
+                .collect(),
+            leaf_count,
+            checkpointed_leaves: leaf_count,
+        }
+    }
+
+    /// The current peak hashes, left to right — the serializable
+    /// state a journal checkpoint record carries so [`Mmr::from_checkpoint`]
+    /// can resume the log after segment pruning.
+    #[must_use]
+    pub fn peak_hashes(&self) -> Vec<Hash> {
+        self.peaks.iter().map(|&(_, _, h)| h).collect()
     }
 
     /// Number of leaves committed.
@@ -186,6 +245,7 @@ impl Mmr {
     /// Total node count (leaves + internal) — the structural law
     /// `2n − popcount(n)` from spec §3, exposed so tests and the
     /// conformance suite can assert it against any forest state.
+    /// For a checkpointed MMR this counts only post-checkpoint nodes.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -200,21 +260,21 @@ impl Mmr {
     /// vector push plus a couple of peak-stack pops.
     pub fn push(&mut self, leaf: Hash) {
         self.nodes.push(leaf);
-        self.peaks.push((self.nodes.len() - 1, 0));
+        self.peaks.push((self.node_base + self.nodes.len() - 1, 0, leaf));
         self.leaf_count += 1;
         // Merge cascade: while the two rightmost mountains are equal
         // height, their parent becomes the new rightmost mountain.
         while self.peaks.len() >= 2 {
-            let (right_index, right_height) = self.peaks[self.peaks.len() - 1];
-            let (left_index, left_height) = self.peaks[self.peaks.len() - 2];
+            let (_right_index, right_height, right_hash) = self.peaks[self.peaks.len() - 1];
+            let (_left_index, left_height, left_hash) = self.peaks[self.peaks.len() - 2];
             if right_height != left_height {
                 break;
             }
-            let parent = hash_node(&self.nodes[left_index], &self.nodes[right_index]);
+            let parent = hash_node(&left_hash, &right_hash);
             self.nodes.push(parent);
             self.peaks.pop();
             self.peaks.pop();
-            self.peaks.push((self.nodes.len() - 1, right_height + 1));
+            self.peaks.push((self.node_base + self.nodes.len() - 1, right_height + 1, parent));
         }
     }
 
@@ -223,7 +283,7 @@ impl Mmr {
     /// O(#peaks) hashes (~log n); maintained incrementally by [`push`],
     /// so calling this after every append costs the bagging only.
     pub fn root(&self) -> Hash {
-        let peak_hashes: Vec<Hash> = self.peaks.iter().map(|&(i, _)| self.nodes[i]).collect();
+        let peak_hashes: Vec<Hash> = self.peaks.iter().map(|&(_, _, h)| h).collect();
         bag_root(&peak_hashes, self.leaf_count)
     }
 
@@ -245,6 +305,12 @@ impl Mmr {
         if leaf_index >= self.leaf_count {
             return None;
         }
+        // Leaves covered by a checkpoint have no node history — the
+        // proof can't be built. `None` is honest: pruned means
+        // unprovable.
+        if leaf_index < self.checkpointed_leaves {
+            return None;
+        }
         let peaks = peak_positions(self.leaf_count);
         // Find the mountain whose leaf range contains leaf_index, and
         // the leaf's offset within that mountain. Mountain leaf ranges
@@ -264,7 +330,10 @@ impl Mmr {
         // (ranges partition [0, leaf_count)), but the operator keeps
         // that argument structural instead of a hand-rolled else.
         let (mut node, height, mut local) = found?;
-        // Descend peak → leaf, collecting siblings top-down.
+        // Descend peak → leaf, collecting siblings top-down. A sibling
+        // inside the checkpointed prefix is unprovable unless it is a
+        // still-current peak — `node_at` returns `None` for pruned
+        // nodes, and the whole proof returns `None` honestly.
         let mut path_down = Vec::with_capacity(height as usize);
         let mut h = height;
         while h > 0 {
@@ -273,11 +342,13 @@ impl Mmr {
             let left_leaves = 1u64 << (h - 1);
             if local < left_leaves {
                 // Target is in the LEFT child; sibling is the right child.
-                path_down.push(PathStep { sibling: self.nodes[right_child], target_is_left: true });
+                let sibling = self.node_at(right_child)?;
+                path_down.push(PathStep { sibling, target_is_left: true });
                 node = left_child;
             } else {
                 // Target is in the RIGHT child; sibling is the left child.
-                path_down.push(PathStep { sibling: self.nodes[left_child], target_is_left: false });
+                let sibling = self.node_at(left_child)?;
+                path_down.push(PathStep { sibling, target_is_left: false });
                 local -= left_leaves;
                 node = right_child;
             }
@@ -290,8 +361,20 @@ impl Mmr {
             leaf_index,
             leaf_count: self.leaf_count,
             path,
-            peaks: peaks.iter().map(|&(i, _)| self.nodes[i]).collect(),
+            peaks: self.peaks.iter().map(|&(_, _, hash)| hash).collect(),
         })
+    }
+
+    /// Resolve an absolute node index to its hash: post-checkpoint
+    /// nodes live in `nodes` (offset by `node_base`); a checkpointed
+    /// node is only known if it is still a current peak — anything
+    /// else was pruned and is honestly unprovable.
+    fn node_at(&self, index: usize) -> Option<Hash> {
+        if index >= self.node_base {
+            self.nodes.get(index - self.node_base).copied()
+        } else {
+            self.peaks.iter().find(|&&(i, _, _)| i == index).map(|&(_, _, h)| h)
+        }
     }
 
     /// Verify `leaf` is committed by `root` according to `proof`.
@@ -438,7 +521,7 @@ mod tests {
             let pure = peak_positions(n);
             assert_eq!(mmr.peaks.len(), pure.len(), "peak count at n={n}");
             for (a, b) in mmr.peaks.iter().zip(pure.iter()) {
-                assert_eq!(a, b, "peak positions agree at n={n}");
+                assert_eq!((a.0, a.1), *b, "peak positions agree at n={n}");
             }
         }
     }
@@ -527,5 +610,58 @@ mod tests {
                 assert!(Mmr::verify(&leaf(i), &proof, &root), "n={n}, i={i}");
             }
         }
+    }
+
+    /// Checkpoint resume: `from_checkpoint(leaf_count, peaks)` must
+    /// produce a byte-identical root and identical subsequent roots —
+    /// peaks are the only state appends ever consult.
+    #[test]
+    fn test_checkpoint_resume_produces_identical_roots() {
+        for checkpoint_at in [0u64, 1, 3, 4, 5, 7, 8, 15, 16] {
+            let mut full = Mmr::new();
+            for i in 0..checkpoint_at {
+                full.push(leaf(i));
+            }
+            let peaks = full.peak_hashes();
+
+            // Resume from the checkpoint and push the same suffix.
+            let mut resumed = Mmr::from_checkpoint(checkpoint_at, &peaks);
+            assert_eq!(resumed.root(), full.root(), "resumed root matches at n={checkpoint_at}");
+            for i in checkpoint_at..checkpoint_at + 10 {
+                full.push(leaf(i));
+                resumed.push(leaf(i));
+                assert_eq!(
+                    resumed.root(),
+                    full.root(),
+                    "root stays identical after resume (n={checkpoint_at}, +{i})"
+                );
+            }
+        }
+    }
+
+    /// Proofs for leaves inside the checkpointed prefix return `None`
+    /// (pruned = unprovable); leaves in post-checkpoint mountains
+    /// whose siblings are all known still prove.
+    #[test]
+    fn test_checkpointed_leaves_are_unprovable() {
+        let mut full = Mmr::new();
+        for i in 0..4u64 {
+            full.push(leaf(i));
+        }
+        let peaks = full.peak_hashes();
+        let mut resumed = Mmr::from_checkpoint(4, &peaks);
+
+        // Checkpointed leaves: no proof.
+        assert!(resumed.proof(0).is_none());
+        assert!(resumed.proof(3).is_none());
+
+        // A leaf whose proof needs only post-checkpoint nodes still
+        // proves (push 4,5 — mountain {4,5} is fully post-checkpoint).
+        for i in 4..6u64 {
+            resumed.push(leaf(i));
+        }
+        let root = resumed.root();
+        let p5 = resumed.proof(5).expect("leaf 5's siblings are all post-checkpoint");
+        assert!(Mmr::verify(&leaf(5), &p5, &root));
     }
 }

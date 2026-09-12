@@ -234,6 +234,57 @@ impl JournalWriter {
         self.next_offset = 0;
         Ok(())
     }
+
+    /// The sequence number of the currently-active segment.
+    ///
+    /// Callers pin a pruning watermark against this: everything
+    /// strictly below it is sealed and deletable; the active
+    /// segment is never prunable (it is still being written).
+    pub fn active_segment(&self) -> u32 {
+        self.segment
+    }
+
+    /// Flush, seal, and rotate to a fresh segment — even if the
+    /// current one hasn't hit the size bound.
+    ///
+    /// Used by checkpointing: a checkpoint marker must be the FIRST
+    /// record of its segment so that pruning below that segment
+    /// leaves the marker as the first record replay sees.
+    ///
+    /// # Errors
+    /// [`JournalError::Io`] on flush or segment-file failure.
+    pub fn seal_and_rotate(&mut self) -> Result<(), JournalError> {
+        self.rotate()
+    }
+
+    /// Delete sealed segment files with `seq < watermark`. Returns
+    /// the number of files removed.
+    ///
+    /// Pruning is a one-way door for replay: records in deleted
+    /// segments are gone forever — the caller MUST have a state
+    /// checkpoint covering them (see `JournalBackend::checkpoint`)
+    /// or accept that `replay` now yields only the suffix. The
+    /// active segment is never touched regardless of the watermark.
+    ///
+    /// # Errors
+    /// [`JournalError::Io`] on flush failure (sealed segments are
+    /// flushed before any deletion so no buffered bytes are lost)
+    /// or on a filesystem error removing a file.
+    pub fn prune_below(&mut self, watermark: u32) -> Result<u32, JournalError> {
+        // Flush the group buffer first — anything buffered for a
+        // sealed-but-unflushed tail must hit disk before we decide
+        // what is safe to delete.
+        self.flush()?;
+        let ceiling = watermark.min(self.segment);
+        let mut deleted = 0u32;
+        for (seq, path) in segment_files(&self.dir)? {
+            if seq < ceiling && seq != self.segment {
+                std::fs::remove_file(&path).map_err(JournalError::Io)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
 }
 
 /// One replayed record with its location.
