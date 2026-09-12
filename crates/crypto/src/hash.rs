@@ -55,6 +55,7 @@ use primitives::Hash;
 /// | `MmrNode` | 5 | MMR internal node (storage) |
 /// | `MmrLeaf` | 6 | MMR leaf (storage) |
 /// | `StateRoot` | 7 | execution state root (Phase 2) |
+/// | `MmrRoot` | 8 | MMR root finalization (storage) |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -74,6 +75,9 @@ pub enum Domain {
     MmrLeaf = 6,
     /// An execution state root.
     StateRoot = 7,
+    /// An MMR root finalization: `H(tag ‖ bagged_peaks ‖ leaf_count)`.
+    /// Appended after `StateRoot` — never renumber.
+    MmrRoot = 8,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

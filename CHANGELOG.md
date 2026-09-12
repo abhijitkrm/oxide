@@ -2495,3 +2495,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     view, it now clears all per-view state (votes and timeout
     signatures). This prevents stale data from the old view from
     blocking the new view.
+
+- **MMR used raw hash prefixes colliding with consensus domains**
+  (`crates/storage/src/mmr.rs`, `crates/crypto/src/hash.rs`)
+  - The MMR used raw prefixes `0x01` (internal node) and `0x02` (root),
+    colliding with `Domain::Transaction = 1` and `Domain::Vote = 2`.
+    `hash_leaf` had no domain tag at all. The crypto crate already
+    defined `Domain::MmrNode = 5` and `Domain::MmrLeaf = 6` but the
+    MMR never used them.
+  - Added `Domain::MmrRoot = 8` and updated `hash_node`, `bag_root`,
+    and `hash_leaf` to use the canonical `Domain` enum via the
+    `Hasher` API.
+  - Regression test: `mmr_domains_do_not_collide_with_consensus_domains`.
+  - **In plain words:** MMR hashes are now in their own domain-
+    separated hash space, so they can never collide with transaction,
+    vote, or block hashes — even if the underlying bytes are identical.

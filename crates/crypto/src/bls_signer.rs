@@ -54,6 +54,7 @@ fn dst(domain: Domain) -> &'static [u8] {
         Domain::MmrNode => b"oxide/mmr-node",
         Domain::MmrLeaf => b"oxide/mmr-leaf",
         Domain::StateRoot => b"oxide/state-root",
+        Domain::MmrRoot => b"oxide/mmr-root",
     }
 }
 

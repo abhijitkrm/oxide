@@ -9354,3 +9354,35 @@ and timeout_signatures. Called from every view-change path:
 - `sync_to_view_clears_timeout_signatures`
 - `deliver_qc_catchup_clears_timeout_signatures`
 - `advance_view_clears_timeout_signatures`
+
+## Pre-testnet audit: MMR domain separation
+
+### Root cause
+
+The MMR implementation used raw BLAKE3 prefixes:
+- `DOMAIN_NODE = 0x01` — colliding with `Domain::Transaction = 1`
+- `DOMAIN_ROOT = 0x02` — colliding with `Domain::Vote = 2`
+
+`hash_leaf` had no domain tag at all — raw `blake3::hash(preimage)`.
+
+The crypto crate already defined `Domain::MmrNode = 5` and
+`Domain::MmrLeaf = 6` but the MMR never wired them in. This is
+consensus-affecting: an MMR leaf hash could collide with a transaction
+hash, breaking the domain separation guarantee.
+
+### Fix
+
+- Added `Domain::MmrRoot = 8` for MMR root finalization (appended,
+  never renumbered).
+- Updated `hash_node` to use `Domain::MmrNode` (tag 5).
+- Updated `bag_root` to use `Domain::MmrRoot` (tag 8).
+- Updated `hash_leaf` to use `Domain::MmrLeaf` (tag 6) via
+  `Hasher::hash_one`.
+- Updated the `dst()` function in `bls_signer.rs` to handle the new
+  `MmrRoot` variant.
+
+### Regression test
+
+- `mmr_domains_do_not_collide_with_consensus_domains` — proves MMR
+  leaf/node hashes differ from transaction, vote, and block hashes
+  for the same input.

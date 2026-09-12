@@ -30,9 +30,13 @@
 //!
 //! | Input | Preimage |
 //! |---|---|
-//! | leaf | caller-supplied pre-hashed 32 bytes |
-//! | internal node | `0x01 ‖ left ‖ right` |
-//! | root | `0x02 ‖ bagged_peaks ‖ leaf_count (u64 LE)` |
+//! | leaf | `H(Domain::MmrLeaf ‖ preimage)` |
+//! | internal node | `H(Domain::MmrNode ‖ left ‖ right)` |
+//! | root | `H(Domain::MmrRoot ‖ bagged_peaks ‖ leaf_count (u64 LE))` |
+//!
+//! Domain tags come from `crypto::hash::Domain` — the canonical
+//! chain-wide domain separation enum. This ensures MMR hashes can
+//! never collide with transaction, vote, or block hashes.
 //!
 //! Peak bagging folds right-to-left (`acc = H(peak ‖ acc)` from the
 //! rightmost peak). Binding `leaf_count` into the root makes two
@@ -45,16 +49,12 @@
 //!    wrong leaf count, wrong peak.
 //! 3. Identical push sequences yield identical roots, forever.
 
+use crypto::hash::{Domain, Hasher};
 use primitives::Hash;
 
-/// Domain-separation prefix for internal nodes (spec §3 table).
-const DOMAIN_NODE: u8 = 0x01;
-/// Domain-separation prefix for the root finalization.
-const DOMAIN_ROOT: u8 = 0x02;
-
-/// Preimage width of an internal-node hash: prefix + two 32-byte digests.
+/// Preimage width of an internal-node hash: domain tag + two 32-byte digests.
 const NODE_PREIMAGE_LEN: usize = 65;
-/// Preimage width of the root finalization: prefix + digest + u64 count.
+/// Preimage width of the root finalization: domain tag + digest + u64 count.
 const ROOT_PREIMAGE_LEN: usize = 41;
 
 /// A Merkle Mountain Range over pre-hashed leaves.
@@ -97,7 +97,7 @@ pub struct MmrProof {
     pub peaks: Vec<Hash>,
 }
 
-/// Hash an internal node: `H(0x01 ‖ left ‖ right)`.
+/// Hash an internal node: `H(Domain::MmrNode ‖ left ‖ right)`.
 ///
 /// The preimage is assembled in a fixed stack buffer and hashed in one
 /// single-shot call — byte-identical to a chained-update formulation
@@ -107,14 +107,14 @@ pub struct MmrProof {
 /// gate decomposition in docs/storage-spec.md §3).
 pub fn hash_node(left: &Hash, right: &Hash) -> Hash {
     let mut preimage = [0u8; NODE_PREIMAGE_LEN];
-    preimage[0] = DOMAIN_NODE;
+    preimage[0] = Domain::MmrNode as u8;
     preimage[1..33].copy_from_slice(left.as_bytes());
     preimage[33..65].copy_from_slice(right.as_bytes());
     Hash(blake3::hash(&preimage).into())
 }
 
 /// Bag peaks right-to-left and finalize the root:
-/// `H(0x02 ‖ bag ‖ leaf_count LE)`.
+/// `H(Domain::MmrRoot ‖ bag ‖ leaf_count LE)`.
 fn bag_root(peaks: &[Hash], leaf_count: u64) -> Hash {
     // An empty forest commits to the zero hash with leaf_count 0 —
     // documented, deterministic, and only reachable pre-genesis.
@@ -127,7 +127,7 @@ fn bag_root(peaks: &[Hash], leaf_count: u64) -> Hash {
         acc = hash_node(peak, &acc);
     }
     let mut preimage = [0u8; ROOT_PREIMAGE_LEN];
-    preimage[0] = DOMAIN_ROOT;
+    preimage[0] = Domain::MmrRoot as u8;
     preimage[1..33].copy_from_slice(acc.as_bytes());
     preimage[33..41].copy_from_slice(&leaf_count.to_le_bytes());
     Hash(blake3::hash(&preimage).into())
@@ -344,10 +344,12 @@ impl Mmr {
     }
 }
 
-/// Hash a leaf preimage with BLAKE3-256 — the canonical way callers
-/// produce the pre-hashed leaves [`Mmr::push`] consumes.
+/// Hash a leaf preimage with BLAKE3-256 under `Domain::MmrLeaf` — the
+/// canonical way callers produce the pre-hashed leaves [`Mmr::push`]
+/// consumes. Domain separation ensures MMR leaf hashes can never
+/// collide with transaction, vote, or block hashes.
 pub fn hash_leaf(preimage: &[u8]) -> Hash {
-    Hash(blake3::hash(preimage).into())
+    Hasher::hash_one(Domain::MmrLeaf, preimage)
 }
 
 #[cfg(test)]
@@ -357,6 +359,39 @@ mod tests {
     /// Deterministic test leaves: blake3 of the index.
     fn leaf(i: u64) -> Hash {
         hash_leaf(&i.to_le_bytes())
+    }
+
+    /// Regression test: MMR domain-separated hashes must not collide
+    /// with transaction, vote, or block hashes for the same input.
+    /// Before the fix, MMR used raw prefix 0x01 (colliding with
+    /// Domain::Transaction) and 0x02 (colliding with Domain::Vote).
+    #[test]
+    fn mmr_domains_do_not_collide_with_consensus_domains() {
+        let payload = b"test payload";
+
+        // MMR leaf hash uses Domain::MmrLeaf (tag 6).
+        let mmr_leaf = hash_leaf(payload);
+
+        // Transaction hash uses Domain::Transaction (tag 1).
+        let tx_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, payload);
+
+        // Vote hash uses Domain::Vote (tag 2).
+        let vote_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Vote, payload);
+
+        // Block hash uses Domain::Block (tag 0).
+        let block_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Block, payload);
+
+        assert_ne!(mmr_leaf, tx_hash, "MMR leaf must not collide with transaction hash");
+        assert_ne!(mmr_leaf, vote_hash, "MMR leaf must not collide with vote hash");
+        assert_ne!(mmr_leaf, block_hash, "MMR leaf must not collide with block hash");
+
+        // MMR node hash uses Domain::MmrNode (tag 5).
+        let mmr_node = hash_node(&Hash::ZERO, &Hash::ZERO);
+        let tx_node = crypto::hash::Hasher::hash_one(
+            crypto::hash::Domain::Transaction,
+            &[0u8; 64],
+        );
+        assert_ne!(mmr_node, tx_node, "MMR node must not collide with transaction hash");
     }
 
     /// Regression (fuzz mmr-proof-verify, audit session 24):
