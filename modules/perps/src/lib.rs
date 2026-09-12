@@ -627,7 +627,7 @@ impl PerpsModule {
             let actual = (*bucket).min(*owed);
             *bucket -= actual;
             collected += u128::from(actual);
-            events.push(Event { module: "perps", kind: "funding".to_string(), data: vec![market] });
+            events.push(Event { module: "perps", kind: "funding", data: vec![market] });
         }
 
         // ── Pass 3: distribute to receivers, pro-rata ──
@@ -670,7 +670,7 @@ impl PerpsModule {
                 // below) rather than silently capping the receiver.
                 None => continue,
             }
-            events.push(Event { module: "perps", kind: "funding".to_string(), data: vec![market] });
+            events.push(Event { module: "perps", kind: "funding", data: vec![market] });
         }
 
         // Surplus (rounding dust, un-creditable receivers, and any
@@ -680,11 +680,7 @@ impl PerpsModule {
         inner.insurance_fund =
             inner.insurance_fund.saturating_add(u64::try_from(surplus).unwrap_or(u64::MAX));
         if collected < total_due {
-            events.push(Event {
-                module: "perps",
-                kind: "funding_shortfall".to_string(),
-                data: vec![market],
-            });
+            events.push(Event { module: "perps", kind: "funding_shortfall", data: vec![market] });
         }
         Ok(events)
     }
@@ -750,11 +746,7 @@ impl PerpsModule {
                 pos.size = 0;
                 pos.entry_price = 0;
                 pos.isolated_margin = 0;
-                events.push(Event {
-                    module: "perps",
-                    kind: "liquidated".to_string(),
-                    data: vec![*market],
-                });
+                events.push(Event { module: "perps", kind: "liquidated", data: vec![*market] });
             }
             acct_mut.cross_margin = 0;
         }
@@ -948,22 +940,14 @@ impl PerpsModule {
             }
             remaining_shortfall = remaining_shortfall.saturating_sub(realized_scale6);
 
-            events.push(Event {
-                module: "perps",
-                kind: "adl_executed".to_string(),
-                data: vec![market],
-            });
+            events.push(Event { module: "perps", kind: "adl_executed", data: vec![market] });
         }
 
         // If there's still a shortfall after ADL, it's an unrecoverable
         // loss. In production, this would trigger socialized loss or
         // emergency governance. For now, we log it as an event.
         if remaining_shortfall > 0 {
-            events.push(Event {
-                module: "perps",
-                kind: "adl_shortfall_remaining".to_string(),
-                data: vec![],
-            });
+            events.push(Event { module: "perps", kind: "adl_shortfall_remaining", data: vec![] });
         }
 
         events
@@ -1101,11 +1085,7 @@ impl Module for PerpsModule {
                 let cfg = Self::parse_list_market(body).ok_or(ExecError::Malformed)?;
                 drop(inner);
                 let id = self.list_market(cfg)?;
-                Ok(vec![Event {
-                    module: "perps",
-                    kind: "market_listed".to_string(),
-                    data: vec![id],
-                }])
+                Ok(vec![Event { module: "perps", kind: "market_listed", data: vec![id] }])
             }
             TAG_DEPOSIT => {
                 drop(inner);
@@ -1125,11 +1105,7 @@ impl Module for PerpsModule {
                 // check bypassed the rate limit, allowing many small
                 // updates to compound within a single block.
                 self.set_mark_price(market, mark)?;
-                Ok(vec![Event {
-                    module: "perps",
-                    kind: "mark_updated".to_string(),
-                    data: vec![market],
-                }])
+                Ok(vec![Event { module: "perps", kind: "mark_updated", data: vec![market] }])
             }
             TAG_APPLY_FUNDING => {
                 let (market, rate_bits) = Self::parse_funding(body).ok_or(ExecError::Malformed)?;
@@ -1296,7 +1272,7 @@ impl PerpsModule {
         }
         *balance = new_balance;
         drop(inner);
-        Ok(vec![Event { module: "perps", kind: "deposit".to_string(), data: vec![market] }])
+        Ok(vec![Event { module: "perps", kind: "deposit", data: vec![market] }])
     }
 
     /// Handle a withdraw-margin message (extracted from `handle`).
@@ -1329,7 +1305,7 @@ impl PerpsModule {
         }
         *balance -= amount;
         drop(inner);
-        Ok(vec![Event { module: "perps", kind: "withdraw".to_string(), data: vec![market] }])
+        Ok(vec![Event { module: "perps", kind: "withdraw", data: vec![market] }])
     }
 
     /// Post-trade margin check: if the account is under-margined,
@@ -1349,11 +1325,7 @@ impl PerpsModule {
         let equity = acct.equity(&inner.marks, &inner.configs);
         let maintenance = acct.total_maintenance(&inner.marks, &inner.configs);
         if equity < i128::try_from(maintenance).unwrap_or(i128::MAX) {
-            events.push(Event {
-                module: "perps",
-                kind: "margin_call".to_string(),
-                data: vec![market],
-            });
+            events.push(Event { module: "perps", kind: "margin_call", data: vec![market] });
         }
     }
 }
@@ -1516,7 +1488,7 @@ fn fill_event(fill: FillEvent) -> Event {
     data.extend_from_slice(&fill.maker_owner.0);
     data.extend_from_slice(&fill.taker_owner.0);
     data.push(encode_side(fill.taker_side));
-    Event { module: "perps", kind: "fill".to_string(), data }
+    Event { module: "perps", kind: "fill", data }
 }
 
 fn outcome_event(market: u8, outcome: OrderOutcome) -> Event {
@@ -1540,7 +1512,7 @@ fn outcome_event(market: u8, outcome: OrderOutcome) -> Event {
         OrderOutcome::Killed => ("killed", vec![]),
         OrderOutcome::Rejected(reason) => ("rejected", vec![encode_reject_reason(reason)]),
     };
-    Event { module: "perps", kind: kind.to_string(), data }
+    Event { module: "perps", kind, data }
 }
 
 fn cancel_event(market: u8, canceled: CanceledOrder) -> Event {
@@ -1551,7 +1523,7 @@ fn cancel_event(market: u8, canceled: CanceledOrder) -> Event {
     data.extend_from_slice(&canceled.price.0.to_le_bytes());
     data.extend_from_slice(&canceled.qty.0.to_le_bytes());
     data.extend_from_slice(&canceled.owner.0);
-    Event { module: "perps", kind: "canceled".to_string(), data }
+    Event { module: "perps", kind: "canceled", data }
 }
 
 // ── Codec helpers ────────────────────────────────────────────────────

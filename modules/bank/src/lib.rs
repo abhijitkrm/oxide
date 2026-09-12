@@ -236,7 +236,7 @@ impl Module for BankModule {
             .ok_or(ExecError::ModuleRejected("recipient balance overflow".to_string()))?;
         store.insert(to_key, new_to_bal.to_le_bytes().to_vec());
 
-        Ok(vec![Event { module: "bank", kind: "transfer".to_string(), data: msg.to_vec() }])
+        Ok(vec![Event { module: "bank", kind: "transfer", data: msg.to_vec() }])
     }
 
     fn end_block(&self, _height: Height) {}

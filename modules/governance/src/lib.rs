@@ -219,11 +219,7 @@ impl Module for GovernanceModule {
                     self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let vote_key = [id.to_le_bytes().as_slice(), ctx.sender.0.as_slice()].concat();
                 store.insert(vote_key, vec![vote as u8]);
-                return Ok(vec![Event {
-                    module: "governance",
-                    kind: "vote".to_string(),
-                    data: msg.to_vec(),
-                }]);
+                return Ok(vec![Event { module: "governance", kind: "vote", data: msg.to_vec() }]);
             }
         }
 
@@ -247,7 +243,7 @@ impl Module for GovernanceModule {
         proposals.insert(id, proposal);
         let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.insert(id.to_le_bytes().to_vec(), msg.to_vec());
-        Ok(vec![Event { module: "governance", kind: "propose".to_string(), data: msg.to_vec() }])
+        Ok(vec![Event { module: "governance", kind: "propose", data: msg.to_vec() }])
     }
 
     fn end_block(&self, _height: Height) {

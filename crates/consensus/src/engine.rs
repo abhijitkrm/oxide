@@ -780,12 +780,16 @@ impl OxideBft {
     ///
     /// Format: `view.to_le_bytes() (8) + phase_byte (1) +
     /// block_hash (32) + epoch.to_le_bytes() (8)` = 49 bytes.
-    fn vote_signing_message(&self, view: View, phase_byte: u8, block_hash: &Hash) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(49);
-        msg.extend_from_slice(&view.value().to_le_bytes());
-        msg.push(phase_byte);
-        msg.extend_from_slice(block_hash.as_bytes());
-        msg.extend_from_slice(&self.epoch.value().to_le_bytes());
+    ///
+    /// Returns a fixed stack array — this runs once per vote
+    /// (verify + sign) on the quorum hot path, and a heap `Vec`
+    /// allocated 49 bytes per call for no reason.
+    fn vote_signing_message(&self, view: View, phase_byte: u8, block_hash: &Hash) -> [u8; 49] {
+        let mut msg = [0u8; 49];
+        msg[..8].copy_from_slice(&view.value().to_le_bytes());
+        msg[8] = phase_byte;
+        msg[9..41].copy_from_slice(block_hash.as_bytes());
+        msg[41..49].copy_from_slice(&self.epoch.value().to_le_bytes());
         msg
     }
 

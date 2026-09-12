@@ -472,8 +472,10 @@ pub trait Module: Send + Sync {
 pub struct Event {
     /// The module that emitted this event.
     pub module: &'static str,
-    /// The event type (e.g. "transfer", "delegate").
-    pub kind: String,
+    /// The event type (e.g. "transfer", "delegate"). A static
+    /// string — every module emits a fixed set of kinds, so a
+    /// `String` here allocated once per event for no reason.
+    pub kind: &'static str,
     /// The event data (module-specific).
     pub data: Vec<u8>,
 }
@@ -1648,7 +1650,7 @@ mod tests {
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             let mut c = self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             *c += 1;
-            Ok(vec![Event { module: "counter", kind: "increment".to_string(), data: vec![] }])
+            Ok(vec![Event { module: "counter", kind: "increment", data: vec![] }])
         }
 
         fn end_block(&self, _height: Height) {}

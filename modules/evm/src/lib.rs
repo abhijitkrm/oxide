@@ -2110,7 +2110,7 @@ impl EvmModule {
                 let log_count = receipt.logs.len();
                 Ok(vec![Event {
                     module: "evm",
-                    kind: "evm_call".to_string(),
+                    kind: "evm_call",
                     data: format!(
                         "gas_used={} status={} base_fee={} logs={}{}",
                         receipt.gas_used, status_str, base_fee, log_count, contract_info
@@ -2388,7 +2388,7 @@ impl Module for EvmModule {
 
         Ok(vec![Event {
             module: "evm",
-            kind: "evm_call".to_string(),
+            kind: "evm_call",
             data: format!(
                 "gas_used={} status={} base_fee={} logs={}{}",
                 receipt.gas_used, status_str, self.base_fee, log_count, contract_info

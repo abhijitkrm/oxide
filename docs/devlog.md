@@ -10375,3 +10375,22 @@ Three perps paths cloned whole maps/accounts per call:
 
 - 38 perps tests green (liquidation, ADL ranking/determinism,
   funding zero-sum all exercised).
+
+## Perf + DoS sweep — event kind alloc + consensus signing-message alloc
+
+`Event.kind` was a `String` — every event (one per fill, per
+funding payment, per liquidation) heap-allocated a short literal.
+Every kind in the codebase is a static string, so the field is
+now `&'static str` and ~35 `kind: "...".to_string()` sites across
+exchange/perps/bank/staking/governance/evm allocate nothing. The
+indexer's `IndexedEvent` keeps `String` (a different, owned type).
+
+`OxideBft::vote_signing_message` allocated a 49-byte `Vec` per
+vote verify/sign on the quorum hot path — now a `[u8; 49]` stack
+array; all three call sites pass `&msg` which coerces to `&[u8]`.
+
+### Tests
+
+- Full affected-crate test sweep green (executor 45, exchange,
+  perps 38, bank, staking, governance, evm 128+, indexer 12,
+  consensus 87).

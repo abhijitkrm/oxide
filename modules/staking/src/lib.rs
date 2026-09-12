@@ -398,7 +398,7 @@ impl StakingModule {
         let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
 
-        Ok(vec![Event { module: "staking", kind: "delegate".to_string(), data: msg.to_vec() }])
+        Ok(vec![Event { module: "staking", kind: "delegate", data: msg.to_vec() }])
     }
 
     /// Handle an undelegate message: start unbonding `amount` from
@@ -440,7 +440,7 @@ impl StakingModule {
         };
         self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(entry);
 
-        Ok(vec![Event { module: "staking", kind: "undelegate".to_string(), data: msg.to_vec() }])
+        Ok(vec![Event { module: "staking", kind: "undelegate", data: msg.to_vec() }])
     }
 
     /// Handle a slash message: reduce `validator`'s stake by `amount`.
@@ -467,7 +467,7 @@ impl StakingModule {
         let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
 
-        Ok(vec![Event { module: "staking", kind: "slash".to_string(), data: msg.to_vec() }])
+        Ok(vec![Event { module: "staking", kind: "slash", data: msg.to_vec() }])
     }
 
     /// Handle a claim-reward message: withdraw accumulated rewards.
@@ -494,7 +494,7 @@ impl StakingModule {
         }
         *rewards.entry(validator).or_insert(0) -= claim_amount;
 
-        Ok(vec![Event { module: "staking", kind: "claim_reward".to_string(), data: msg.to_vec() }])
+        Ok(vec![Event { module: "staking", kind: "claim_reward", data: msg.to_vec() }])
     }
 
     /// Distribute block rewards to active validators proportional

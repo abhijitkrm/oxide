@@ -465,11 +465,7 @@ impl Module for ExchangeModule {
                 // double-locking (list_market locks inner again).
                 drop(inner);
                 let id = self.list_market(cfg)?;
-                Ok(vec![Event {
-                    module: "exchange",
-                    kind: "market_listed".to_string(),
-                    data: vec![id],
-                }])
+                Ok(vec![Event { module: "exchange", kind: "market_listed", data: vec![id] }])
             }
 
             TAG_BATCH_SETTLE => self.handle_batch_settle(ctx, body, &inner),
@@ -577,7 +573,7 @@ impl ExchangeModule {
                 let Ok(quote_amount) = u64::try_from(notional / PRICE_SCALE) else {
                     events.push(Event {
                         module: "exchange",
-                        kind: "settlement_failed".to_string(),
+                        kind: "settlement_failed",
                         data: vec![market],
                     });
                     continue;
@@ -590,7 +586,7 @@ impl ExchangeModule {
                 if bank.transfer(&buyer, &seller, quote_amount).is_err() {
                     events.push(Event {
                         module: "exchange",
-                        kind: "settlement_failed".to_string(),
+                        kind: "settlement_failed",
                         data: vec![market],
                     });
                 }
@@ -731,7 +727,7 @@ impl ExchangeModule {
             if bank.transfer(buyer, seller, *amount).is_err() {
                 events.push(Event {
                     module: "exchange",
-                    kind: "settlement_failed".to_string(),
+                    kind: "settlement_failed",
                     data: {
                         let mut d = Vec::with_capacity(20 + 20 + 8);
                         d.extend_from_slice(&buyer.0);
@@ -745,7 +741,7 @@ impl ExchangeModule {
 
             events.push(Event {
                 module: "exchange",
-                kind: "batch_fill".to_string(),
+                kind: "batch_fill",
                 data: {
                     let mut d = Vec::with_capacity(20 + 20 + 8);
                     d.extend_from_slice(&buyer.0);
@@ -768,7 +764,7 @@ fn rejected_leg_event(idx: usize, reason: &'static str) -> Event {
     #[allow(clippy::cast_possible_truncation)]
     data.extend_from_slice(&(idx as u32).to_le_bytes());
     data.extend_from_slice(reason.as_bytes());
-    Event { module: "exchange", kind: "fill_rejected".to_string(), data }
+    Event { module: "exchange", kind: "fill_rejected", data }
 }
 
 // ── Event helpers ────────────────────────────────────────────────────
@@ -787,7 +783,7 @@ fn fill_event(fill: FillEvent) -> Event {
     data.extend_from_slice(&fill.maker_owner.0);
     data.extend_from_slice(&fill.taker_owner.0);
     data.push(encode_side(fill.taker_side));
-    Event { module: "exchange", kind: "fill".to_string(), data }
+    Event { module: "exchange", kind: "fill", data }
 }
 
 /// Encode an [`OrderOutcome`] as an event.
@@ -812,7 +808,7 @@ fn outcome_event(market: u8, outcome: OrderOutcome) -> Event {
         OrderOutcome::Killed => ("killed", vec![]),
         OrderOutcome::Rejected(reason) => ("rejected", vec![encode_reject_reason(reason)]),
     };
-    Event { module: "exchange", kind: kind.to_string(), data }
+    Event { module: "exchange", kind, data }
 }
 
 /// Encode a [`CanceledOrder`] as an event.
@@ -824,7 +820,7 @@ fn cancel_event(market: u8, canceled: CanceledOrder) -> Event {
     data.extend_from_slice(&canceled.price.0.to_le_bytes());
     data.extend_from_slice(&canceled.qty.0.to_le_bytes());
     data.extend_from_slice(&canceled.owner.0);
-    Event { module: "exchange", kind: "canceled".to_string(), data }
+    Event { module: "exchange", kind: "canceled", data }
 }
 
 // ── Codec helpers ────────────────────────────────────────────────────

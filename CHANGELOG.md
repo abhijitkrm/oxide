@@ -726,6 +726,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **Every event and vote signature heap-allocated for no reason**
+  (`crates/executor/src/lib.rs`, `crates/consensus/src/engine.rs`,
+  all modules)
+  - `Event.kind` is now `&'static str` — all ~35 event sites
+    emitted static literals into a `String`, allocating once per
+    event (fill, funding, liquidation) for nothing.
+  - `vote_signing_message` is a `[u8; 49]` stack array instead of
+    a per-vote `Vec`.
+  - **In plain words:** the two most frequent allocations on the
+    trading and consensus hot paths are gone entirely.
+
 - **Perps cloned whole maps and positions on liquidation/funding
   paths** (`modules/perps/src/lib.rs`)
   - `margin_check` no longer clones configs, marks, and the whole
