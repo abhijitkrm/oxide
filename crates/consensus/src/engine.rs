@@ -372,13 +372,18 @@ impl OxideBft {
     ///
     /// By default, the engine verifies every vote signature in
     /// `collect_vote` and every QC aggregate in `deliver_qc`. This
-    /// is the production setting — a forged vote or QC is rejected
-    /// with [`ConsensusError`].
+    /// **TEST/CONFORMANCE ONLY — never call in production.**
     ///
-    /// Conformance tests that don't set BLS keys (votes carry
-    /// `Signature::ZERO`) call this to skip verification. The
-    /// multi-node simulation does NOT call this — it uses real keys
-    /// and real verification.
+    /// Disables BLS signature verification on votes, QCs, TCs, and
+    /// proposals. This is a release-build backdoor: if called in a
+    /// production validator, a byzantine peer could forge votes and
+    /// QCs with `Signature::ZERO`. The method is kept public only
+    /// for the conformance suite and benchmarks, which use fake
+    /// keys that can't produce real signatures.
+    ///
+    /// The multi-node simulation does NOT call this — it uses real
+    /// keys and real verification.
+    #[doc(hidden)]
     #[must_use]
     pub fn without_signature_verification(mut self) -> Self {
         self.verify_signatures = false;

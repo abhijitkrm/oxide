@@ -174,12 +174,36 @@ impl RecoverableSignature {
 /// Gate: p50 < 50µs (plan.md §13 Phase A gate).
 /// This is a hot path (per-tx in the mempool and per-tx in execution).
 pub fn recover_sender(msg_hash: &[u8], sig: &[u8], recid: u8) -> Result<Address, SecpError> {
+    // `n / 2` for secp256k1: 0x7FFF...B20A0 (computed from CURVE_ORDER).
+    // Used for EIP-2 low-s enforcement (reject malleable high-s sigs).
+    const HALF_ORDER: [u8; 32] = [
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
+        0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+    ];
+
     if msg_hash.len() != 32 {
         return Err(SecpError::InvalidMessageHashLen(msg_hash.len()));
     }
     let recid = RecoveryId::try_from_u8(recid)?;
     let recoverable = secp256k1::ecdsa::RecoverableSignature::from_compact(sig, recid.to_secp())
         .map_err(|_| SecpError::InvalidSignature)?;
+
+    // EIP-2 low-s enforcement: reject signatures where `s` is in
+    // the upper half of the curve order. High-s signatures are
+    // malleable — `(r, s)` and `(r, n-s)` both verify against the
+    // same message, producing two valid transaction hashes from
+    // one signature. We extract `s` from the compact serialization
+    // (bytes 32..64) and compare it to `n / 2` (half the secp256k1
+    // curve order). Rejecting rather than silently normalizing lets
+    // the caller see the original byzantine input.
+    let standard_sig = recoverable.to_standard();
+    let compact = standard_sig.serialize_compact();
+    let s_bytes = &compact[32..64];
+    if s_bytes > &HALF_ORDER[..] {
+        return Err(SecpError::InvalidSignature);
+    }
 
     let mut hash_arr = [0u8; 32];
     hash_arr.copy_from_slice(msg_hash);

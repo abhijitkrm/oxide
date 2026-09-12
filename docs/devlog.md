@@ -10799,3 +10799,62 @@ Four execution-path ceilings must fall:
 Each fix ships with: failing test first → fix → unit/property tests →
 benchmark (criterion) → binary TPS run → 4-validator Docker testnet run
 under latency + fault injection. Numbers land in devlog + changelog.
+
+## 2026-09-10 — Session: Critical remediation (C1–C8)
+
+### Completed critical fixes
+
+- **C1** (consensus overflow): All `value() + 1` paths in the
+  consensus engine and pacemaker now use `saturating_next()` or
+  `checked_next()`. A byzantine proposal with `height = u64::MAX`
+  can no longer wrap `next_height` to 0. Added `Id::MAX`,
+  `Id::checked_next()`, `Id::saturating_next()` to primitives.
+  `vote()` rejects proposals with height near `u64::MAX` before
+  learning it.
+
+- **C2** (future-view vote DoS): `collect_vote` now rejects votes
+  with `view > current_view` (silently dropped), not just
+  `view < current_view`. A single future-view vote can no longer
+  become the buffer's "first vote" and block all real current-view
+  votes via the `ConflictingVote` check.
+
+- **C3** (unsigned proposals): Proposals are now signed by the
+  leader's BLS secret key. `vote()` verifies the proposer identity
+  and signature when `verify_signatures` is true. Added
+  `Domain::Proposal` (discriminant 9) and `proposal_signing_hash()`.
+  Three regression tests: wrong proposer, missing signature, forged
+  signature.
+
+- **C5** (precompile no-ops + OOG): All precompile OOG paths now
+  charge `gas_limit` (not 0). `bank_transfer` and `staking_delegate`
+  return `revert` (not `success`) until executor-side settlement is
+  wired — prevents contracts from believing a no-op transfer
+  succeeded.
+
+- **C6** (RS reconstruct panic): `ReedSolomon::reconstruct` now
+  validates that all shards have at least `shard_size` bytes before
+  the matrix multiply. A truncated network shard returns `None`
+  instead of panicking.
+
+- **C7** (matcher nonce replay): `MatchingServer` now tracks
+  `last_seen_nonce` per owner and rejects orders with
+  `nonce <= last_seen`. The nonce is consumed immediately (even on
+  rejection), preventing replay of signed orders.
+
+- **C8** (exchange free fills): `handle_place` now returns `Err`
+  when any `bank.transfer` fails, instead of emitting an event and
+  letting the fill stand. The executor's state cache rolls back the
+  order-book mutation, preventing a "free fill" where the buyer gets
+  the fill but no funds move.
+
+### Test results
+
+Full workspace test suite: all green (0 failures). Consensus: 93
+tests. EVM: 128 + 31 + 18 tests. Matcher: 88 tests. Exchange: 25
+tests. Broadcast: 21 tests. Primitives: 11 tests. Crypto: 42 tests.
+
+### Remaining critical
+
+- C4 (mutual TLS bound to validator keys)
+- C9 (consensus state persistence to journal/WAL)
+- C10 (executed_nonce persistence on restart)
