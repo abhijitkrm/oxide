@@ -9927,3 +9927,45 @@ with no payment.
 - `market_buy_without_balance_rejected`
 - `market_buy_with_balance_settles_sweep`
 - `market_buy_insufficient_for_full_sweep_rejected`
+
+## Security sweep round 2 — perps margin accounting
+
+Three financial-conservation bugs in the perps module:
+
+1. **Withdraw was non-atomic**: margin debited, then `bank.credit`
+   — a failed credit (destination overflow) destroyed the margin.
+   Fix: credit the bank first (margin lock held), debit after;
+   the debit cannot fail once sufficiency is verified.
+
+2. **Deposit silently truncated**: bank debited, then margin
+   `saturating_add` — a deposit that overflowed u64 took the bank
+   funds while crediting less margin. Fix: `checked_add` before
+   the bank debit; reject while the bank is untouched.
+
+3. **Funding minted margin**: payers debited with `saturating_sub`
+   (floor 0) while receivers got the full computed credit — every
+   funding round with an insolvent payer created margin from
+   nothing. Fix: two-pass collect-then-distribute. Payers
+   contribute min(owed, bucket); receivers share the collected
+   pool pro-rata (`credit_i × pool / total_due`, last takes the
+   remainder — exactly zero-sum). Undistributed dust and
+   un-creditable surplus accrue to `insurance_fund` (tracked, not
+   vanished). A `funding_shortfall` event marks under-collection.
+
+4. **No initial-margin gate**: `handle_place` applied fills with no
+   leverage check — positions could be opened with zero margin.
+   Fix: orders that increase absolute exposure require
+   `equity >= existing IM + new notional / max_leverage`
+   (`AccountState::total_initial_margin` mirrors
+   `total_maintenance`). Reduce-only orders skip the check;
+   reduce-then-flip is charged the full new notional (conservative).
+   Market orders use the current mark as the reference price.
+
+### Tests
+
+- `deposit_overflow_rejected_bank_untouched`
+- `withdraw_bank_failure_preserves_margin`
+- `funding_zero_sum_when_payer_insolvent` (exact conservation:
+  user margin + insurance == deposits)
+- `place_rejected_without_initial_margin`
+- `place_allowed_with_sufficient_margin`

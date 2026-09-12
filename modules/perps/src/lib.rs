@@ -285,6 +285,30 @@ impl AccountState {
         }
         total
     }
+
+    /// Total initial margin across all positions, in scale-6:
+    /// `sum(notional(mark) / max_leverage)` per open position. Used
+    /// by the order-entry gate — the account's equity must cover
+    /// the initial margin of its whole book plus any new exposure.
+    fn total_initial_margin(
+        &self,
+        marks: &BTreeMap<u8, u64>,
+        configs: &BTreeMap<u8, PerpsMarketConfig>,
+    ) -> u128 {
+        let mut total: u128 = 0;
+        for (market, pos) in &self.positions {
+            if !pos.is_open() {
+                continue;
+            }
+            let mark = marks.get(market).copied().unwrap_or(pos.entry_price);
+            if let Some(cfg) = configs.get(market) {
+                let leverage = u128::from(cfg.max_leverage.max(1));
+                // notional is scale-14; convert to scale-6.
+                total += pos.notional(mark) / leverage / PRICE_SCALE;
+            }
+        }
+        total
+    }
 }
 
 // ── Module ───────────────────────────────────────────────────────────
@@ -536,25 +560,23 @@ impl PerpsModule {
         let rate = i128::from(rate_i64);
         let scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX) * 10_000; // scale-14 × bps denom
 
-        // Collect all (account, position) pairs for this market, then
-        // settle funding. We iterate in sorted address order for
-        // determinism.
+        // ── Pass 1: compute each open position's signed funding ──
+        // Funding amount = size * mark * rate / (PRICE_SCALE * 10_000).
+        // Positive = the account pays; negative = the account receives.
+        // Iterate in sorted address order for determinism.
         let accounts: Vec<(Address, Position)> = inner
             .accounts
             .iter()
             .filter_map(|(addr, state)| state.positions.get(&market).map(|p| (*addr, *p)))
             .collect();
 
-        for (addr, pos) in accounts {
+        let mut payers: Vec<(Address, u64)> = Vec::new();
+        let mut receivers: Vec<(Address, u64)> = Vec::new();
+        let mut total_due: u128 = 0;
+        for (addr, pos) in &accounts {
             if !pos.is_open() {
                 continue;
             }
-            // Funding amount = size * mark * rate / (PRICE_SCALE * 10_000).
-            // If rate > 0, longs (size > 0) pay → funding > 0 → debit.
-            // If rate > 0, shorts (size < 0) receive → funding < 0 → credit.
-            // H2 fix: use checked_mul to detect overflow in the triple
-            // product `size * mark * rate`. If it overflows i128,
-            // reject the funding application.
             let size = i128::from(pos.size);
             let step1 = size.checked_mul(i128::from(mark));
             let funding = match step1.and_then(|v| v.checked_mul(rate)) {
@@ -565,32 +587,103 @@ impl PerpsModule {
                     continue;
                 }
             };
-            let account = Self::account_mut(&mut inner, &addr);
-            let Some(pos_entry) = account.positions.get_mut(&market) else {
-                // No position for this market — skip (the account
-                // may have been closed since the funding loop
-                // started). Previously this used `unwrap()`, which
-                // would panic if the position was removed.
+            let Ok(amount) = u64::try_from(funding.unsigned_abs()) else {
+                // Over-u64 funding cannot be represented — skip the
+                // position rather than saturating the ledger.
                 continue;
             };
-            if funding >= 0 {
-                // Long pays (or short receives when rate < 0). Debit.
-                let debit = u64::try_from(funding).unwrap_or(u64::MAX);
-                if pos_entry.isolated_margin > 0 {
-                    pos_entry.isolated_margin = pos_entry.isolated_margin.saturating_sub(debit);
-                } else {
-                    account.cross_margin = account.cross_margin.saturating_sub(debit);
-                }
+            if amount == 0 {
+                continue;
+            }
+            if funding > 0 {
+                payers.push((*addr, amount));
             } else {
-                // Short pays (or long receives when rate < 0). Credit.
-                let credit = u64::try_from(-funding).unwrap_or(u64::MAX);
-                if pos_entry.isolated_margin > 0 {
-                    pos_entry.isolated_margin = pos_entry.isolated_margin.saturating_add(credit);
-                } else {
-                    account.cross_margin = account.cross_margin.saturating_add(credit);
-                }
+                receivers.push((*addr, amount));
+                total_due += u128::from(amount);
+            }
+        }
+
+        // ── Pass 2: collect from payers ──
+        // Each payer contributes min(computed, available margin) —
+        // a payer that cannot cover the full amount is drained to
+        // zero and becomes liquidation-eligible; the shortfall is
+        // NOT silently invented (the old code credited receivers the
+        // full computed amount while only collecting part of it,
+        // minting margin out of nothing).
+        let mut collected: u128 = 0;
+        for (addr, owed) in &payers {
+            let account = Self::account_mut(&mut inner, addr);
+            let Some(pos_entry) = account.positions.get_mut(&market) else {
+                continue;
+            };
+            // Debit the same bucket the old code used: isolated
+            // margin when present, else the cross pool.
+            let bucket = if pos_entry.isolated_margin > 0 {
+                &mut pos_entry.isolated_margin
+            } else {
+                &mut account.cross_margin
+            };
+            let actual = (*bucket).min(*owed);
+            *bucket -= actual;
+            collected += u128::from(actual);
+            events.push(Event { module: "perps", kind: "funding".to_string(), data: vec![market] });
+        }
+
+        // ── Pass 3: distribute to receivers, pro-rata ──
+        // Receivers share what was actually collected (capped at
+        // total_due): each gets `credit_i × pool / total_due`, with
+        // the last receiver taking the remainder so the distribution
+        // is exactly zero-sum. Undistributed dust accrues to the
+        // insurance fund (tracked, not vanished).
+        let pool = collected.min(total_due);
+        let mut distributed: u128 = 0;
+        let last_idx = receivers.len().saturating_sub(1);
+        for (i, (addr, due)) in receivers.iter().enumerate() {
+            let credit_u128 = if i == last_idx {
+                pool.saturating_sub(distributed)
+            } else {
+                // `total_due` is non-zero whenever `receivers` is
+                // non-empty (zero-amount entries are skipped), so
+                // the division cannot fail; `checked_div` keeps the
+                // arithmetic total regardless.
+                (pool * u128::from(*due)).checked_div(total_due).unwrap_or(0)
+            };
+            let credit = u64::try_from(credit_u128).unwrap_or(u64::MAX);
+            distributed += credit_u128;
+            if credit == 0 {
+                continue;
+            }
+            let account = Self::account_mut(&mut inner, addr);
+            let Some(pos_entry) = account.positions.get_mut(&market) else {
+                continue;
+            };
+            let bucket = if pos_entry.isolated_margin > 0 {
+                &mut pos_entry.isolated_margin
+            } else {
+                &mut account.cross_margin
+            };
+            match bucket.checked_add(credit) {
+                Some(v) => *bucket = v,
+                // A bucket at u64::MAX cannot grow — the excess
+                // remains in the funding pool (accrued to insurance
+                // below) rather than silently capping the receiver.
+                None => continue,
             }
             events.push(Event { module: "perps", kind: "funding".to_string(), data: vec![market] });
+        }
+
+        // Surplus (rounding dust, un-creditable receivers, and any
+        // collected > due) accrues to the insurance fund — the only
+        // place value may accumulate without a named owner.
+        let surplus = collected.saturating_sub(distributed);
+        inner.insurance_fund =
+            inner.insurance_fund.saturating_add(u64::try_from(surplus).unwrap_or(u64::MAX));
+        if collected < total_due {
+            events.push(Event {
+                module: "perps",
+                kind: "funding_shortfall".to_string(),
+                data: vec![market],
+            });
         }
         Ok(events)
     }
@@ -1042,6 +1135,56 @@ impl PerpsModule {
         order.owner = ctx.sender;
 
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // ── Initial-margin gate (plan.md §9.3) ──
+        // An order that increases the account's absolute exposure
+        // must leave `equity >= total initial margin` after the
+        // fill — otherwise anyone could open unbacked positions and
+        // socialize losses to the insurance fund / counterparties.
+        //
+        // `increases` is a conservative test: the order adds exposure
+        // when it is on the same side as the current position (or
+        // when there is no position). Reduce-only orders skip the
+        // check; a reduce-then-flip order is charged the full new
+        // notional (over-estimate is the safe direction).
+        let cfg =
+            inner.configs.get(&market).copied().ok_or_else(|| {
+                ExecError::ModuleRejected(format!("market {market} does not exist"))
+            })?;
+        {
+            let acct = inner.accounts.get(&ctx.sender);
+            let pos = acct.and_then(|a| a.positions.get(&market));
+            let increases = match pos {
+                Some(p) => {
+                    (p.size >= 0 && order.side == Side::Buy)
+                        || (p.size <= 0 && order.side == Side::Sell)
+                }
+                None => true,
+            };
+            if increases {
+                // Reference price for the notional: the limit price
+                // for priced orders, the current mark for market
+                // orders (no limit to bound the fill price).
+                let ref_price = match order.order_type {
+                    OrderType::Market => inner.marks.get(&market).copied().unwrap_or(order.price.0),
+                    _ => order.price.0,
+                };
+                // Scale-14 notional → scale-6 quote.
+                let notional = u128::from(order.qty.0) * u128::from(ref_price) / PRICE_SCALE;
+                let leverage = u128::from(cfg.max_leverage.max(1));
+                let new_im = notional / leverage;
+                let equity = acct.map_or(0i128, |a| a.equity(&inner.marks, &inner.configs));
+                let existing_im =
+                    acct.map_or(0u128, |a| a.total_initial_margin(&inner.marks, &inner.configs));
+                let required = existing_im.saturating_add(new_im);
+                if equity < i128::try_from(required).unwrap_or(i128::MAX) {
+                    return Err(ExecError::ModuleRejected(
+                        "insufficient initial margin".to_string(),
+                    ));
+                }
+            }
+        }
+
         let Inner { markets, fills, .. } = &mut *inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
             return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
@@ -1101,23 +1244,48 @@ impl PerpsModule {
     }
 
     /// Handle a deposit-margin message (extracted from `handle`).
+    /// Handle a deposit-margin message (extracted from `handle`).
+    ///
+    /// # Atomicity
+    ///
+    /// The margin credit is validated **before** the bank debit: a
+    /// deposit that would overflow the `u64` margin field is
+    /// rejected while the bank balance is still untouched. The
+    /// previous order — debit bank, then `saturating_add` the margin
+    /// — could take the user's bank funds while crediting less
+    /// margin than was deposited (silent value destruction).
     fn handle_deposit(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (market, amount) = Self::parse_margin(body).ok_or(ExecError::Malformed)?;
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let acct = Self::account_mut(&mut inner, &ctx.sender);
+        let balance = if market == CROSS_MARGIN_MARKET {
+            &mut acct.cross_margin
+        } else {
+            &mut acct.positions.entry(market).or_default().isolated_margin
+        };
+        // Overflow check first: never debit the bank for margin we
+        // cannot represent.
+        let new_balance = balance
+            .checked_add(amount)
+            .ok_or_else(|| ExecError::ModuleRejected("margin balance overflow".to_string()))?;
         if let Some(bank) = &self.bank {
             bank.debit(&ctx.sender, amount)?;
         }
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let acct = Self::account_mut(&mut inner, &ctx.sender);
-        if market == CROSS_MARGIN_MARKET {
-            acct.cross_margin = acct.cross_margin.saturating_add(amount);
-        } else {
-            let pos = acct.positions.entry(market).or_default();
-            pos.isolated_margin = pos.isolated_margin.saturating_add(amount);
-        }
+        *balance = new_balance;
+        drop(inner);
         Ok(vec![Event { module: "perps", kind: "deposit".to_string(), data: vec![market] }])
     }
 
     /// Handle a withdraw-margin message (extracted from `handle`).
+    ///
+    /// # Atomicity
+    ///
+    /// The bank credit is attempted **while the margin lock is held
+    /// and before the margin debit**: if `bank.credit` fails (e.g.
+    /// the destination balance would overflow `u64`), the margin is
+    /// untouched and the error propagates. The previous order —
+    /// debit margin, then credit bank — destroyed the user's margin
+    /// when the bank credit failed.
     fn handle_withdraw(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (market, amount) = Self::parse_margin(body).ok_or(ExecError::Malformed)?;
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1130,11 +1298,14 @@ impl PerpsModule {
         if *balance < amount {
             return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
         }
-        *balance -= amount;
-        drop(inner);
+        // Bank credit first (margin lock held): on failure the
+        // margin is untouched. The margin debit below cannot fail —
+        // sufficiency was just checked.
         if let Some(bank) = &self.bank {
             bank.credit(&ctx.sender, amount)?;
         }
+        *balance -= amount;
+        drop(inner);
         Ok(vec![Event { module: "perps", kind: "withdraw".to_string(), data: vec![market] }])
     }
 
@@ -2130,5 +2301,152 @@ mod tests {
         assert_eq!(mark_price_deviation_bps(500_000_000, 1_000_000_000), 5000);
         // Old = 0: any new price is max deviation.
         assert_eq!(mark_price_deviation_bps(1_000_000_000, 0), u64::MAX);
+    }
+
+    /// Regression test: a deposit that would overflow the `u64`
+    /// margin field must be rejected BEFORE the bank debit. Before
+    /// the fix, `handle_deposit` debited the bank then
+    /// `saturating_add`ed the margin — the user's bank funds were
+    /// taken while the margin was silently capped.
+    #[test]
+    fn deposit_overflow_rejected_bank_untouched() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_bank(bank.clone());
+        perps.list_market(test_cfg()).unwrap();
+
+        // Push cross margin near u64::MAX directly.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &addr(1)).cross_margin = u64::MAX - 100;
+        }
+
+        // Deposit 500 → margin would overflow → reject, bank intact.
+        let err =
+            perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        assert_eq!(bank.balance(&addr(1)), 1_000_000, "bank must not be debited");
+        assert_eq!(perps.cross_margin(&addr(1)), u64::MAX - 100);
+    }
+
+    /// Regression test: a failed bank credit must not destroy the
+    /// user's margin. Before the fix, `handle_withdraw` debited
+    /// margin first and returned `Err` when `bank.credit` failed —
+    /// the margin was gone.
+    #[test]
+    fn withdraw_bank_failure_preserves_margin() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), u64::MAX);
+        let perps = PerpsModule::with_bank(bank.clone());
+        perps.list_market(test_cfg()).unwrap();
+
+        // Deposit 500 (bank: MAX-500, margin: 500).
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500)).unwrap();
+        // Top the bank balance back up so a 500 credit overflows.
+        bank.mint(&addr(1), 400);
+        assert_eq!(bank.balance(&addr(1)), u64::MAX - 100);
+
+        // Withdraw 500 → bank credit overflows → error, margin intact.
+        let err =
+            perps.handle(&ctx(1), &msg::withdraw(super::CROSS_MARGIN_MARKET, 500)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        assert_eq!(
+            perps.cross_margin(&addr(1)),
+            500,
+            "margin must be preserved when the bank credit fails"
+        );
+    }
+
+    /// Regression test: funding must be zero-sum. A payer that
+    /// cannot cover its funding contributes only what it has, and
+    /// receivers share the collected pool pro-rata — the old code
+    /// credited receivers the full computed amount while only
+    /// partially debiting insolvent payers, minting margin from
+    /// nothing.
+    #[test]
+    fn funding_zero_sum_when_payer_insolvent() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 1_000_000_000);
+        bank.mint(&addr(2), 1_000_000_000);
+        let perps = PerpsModule::with_bank(bank.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        // Long deposits almost nothing (insolvent payer); short is
+        // well-funded.
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 100)).unwrap();
+        perps.handle(&ctx(2), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
+
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
+                mid,
+                Position { size: 1_000_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+            PerpsModule::account_mut(&mut inner, &addr(2)).positions.insert(
+                mid,
+                Position { size: -1_000_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+        }
+
+        // Funding owed by the long = 1_500 (same math as
+        // funding_long_pays_short), but it only has 100.
+        let events = perps.apply_funding(mid, 1).unwrap();
+        assert!(events.iter().any(|e| e.kind == "funding_shortfall"));
+
+        // Long drained to zero; short receives only what was
+        // collected (100), not the computed 1_500.
+        assert_eq!(perps.cross_margin(&addr(1)), 0);
+        assert_eq!(perps.cross_margin(&addr(2)), 500_000_000 + 100);
+
+        // Conservation: total user margin + insurance == deposits.
+        let insurance = {
+            let inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.insurance_fund
+        };
+        let total = perps.cross_margin(&addr(1)) + perps.cross_margin(&addr(2)) + insurance;
+        assert_eq!(total, 500_000_100, "margin must be conserved exactly");
+    }
+
+    /// Regression test: orders that increase exposure require
+    /// `equity >= existing IM + new notional / max_leverage`. Before
+    /// the fix, positions could be opened with zero margin.
+    #[test]
+    fn place_rejected_without_initial_margin() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 1_000_000);
+        bank.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_bank(bank.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        // addr(1) has NO margin — a 1-lot buy at tick 500 has
+        // notional 1_000 * 1.5e9 / 1e8 = 15_000; IM at 10x = 1_500.
+        let err = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+
+        // Deposit 1_000 cross margin — still below the 1_500 IM.
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 1_000)).unwrap();
+        let err = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// With sufficient margin the same order is accepted and the
+    /// position opens.
+    #[test]
+    fn place_allowed_with_sufficient_margin() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 1_000_000);
+        bank.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_bank(bank.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        // Seller needs margin too (its sell increases exposure).
+        perps.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+
+        // Rest a sell, then buy against it.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        let events = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        assert!(events.iter().any(|e| e.kind == "fill"));
+        assert_eq!(perps.position(&addr(1), mid).size, 1_000);
     }
 }

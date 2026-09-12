@@ -726,6 +726,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Perps margin accounting could destroy or create value**
+  (`modules/perps/src/lib.rs`)
+  - `withdraw` debited margin before crediting the bank — a failed
+    bank credit destroyed the user's margin. Now the bank credit is
+    attempted first while the margin lock is held.
+  - `deposit` debited the bank then `saturating_add`ed margin — a
+    deposit overflowing `u64` took bank funds while crediting less.
+    Now the margin add is `checked_add` validated before the debit.
+  - `apply_funding` debited insolvent payers with `saturating_sub`
+    but credited receivers the full computed amount — minting margin
+    every funding round. Now two-pass collect-then-distribute:
+    receivers share the actually-collected pool pro-rata (exactly
+    zero-sum); rounding dust accrues to the insurance fund and a
+    `funding_shortfall` event marks under-collection.
+  - `handle_place` had no initial-margin gate — positions could be
+    opened with zero margin. Orders that increase exposure now
+    require `equity >= existing IM + notional / max_leverage`.
+  - **In plain words:** deposits, withdrawals, and funding payments
+    can no longer silently lose or invent money, and leveraged
+    positions now require backing margin.
+
 - **Market buys bypassed the pre-trade balance check**
   (`modules/exchange/src/lib.rs`, `crates/trading/src/`)
   - The balance check was guarded by `order_type != Market`, so an
