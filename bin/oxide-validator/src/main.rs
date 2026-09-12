@@ -730,8 +730,13 @@ fn run_consensus_loop(
         voted_views.retain(|v| *v >= current_view.saturating_sub(10));
         proposed_views.retain(|v| *v >= current_view.saturating_sub(10));
 
-        // Small sleep to avoid busy-looping.
-        thread::sleep(Duration::from_millis(10));
+        // No sleep here — `transport.recv()` now blocks for up to
+        // 10ms (using `recv_timeout`), so the loop naturally yields
+        // when no messages are available. Previously, `recv()` was
+        // non-blocking (`try_recv`), forcing a 10ms sleep here to
+        // avoid busy-looping. The blocking `recv` returns messages
+        // immediately when they arrive, reducing latency from up
+        // to 10ms to near-zero.
     }
 }
 

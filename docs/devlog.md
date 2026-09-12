@@ -9751,3 +9751,38 @@ checks, not production panic paths.
 All existing mempool (17) and perps (33) tests pass. No new tests
 needed — these are defensive fixes for paths that should never be
 reached under normal operation.
+
+## Pre-testnet audit: replace validator loop 10ms sleep poll with blocking recv
+
+### Root cause
+
+The validator loop used a 10ms `thread::sleep` to avoid busy-looping
+when no messages were available. The transport's `recv` method used
+`try_recv()` (non-blocking), so the loop had to sleep between polls.
+This added up to 10ms latency to every message: if a message arrived
+just after the sleep started, it would wait up to 10ms before being
+processed.
+
+### Fix
+
+Changed the `TcpTransport::recv` method to use `recv_timeout(10ms)`
+instead of `try_recv()`. This blocks for up to 10ms, returning
+immediately when a message arrives. The validator loop's 10ms sleep
+was removed — the loop now naturally yields when `recv` blocks.
+
+The effect is that message latency is reduced from up to 10ms to
+near-zero: if a message arrives during the 10ms wait, it's returned
+immediately instead of waiting for the next loop iteration.
+
+### Note
+
+The `recv` method still returns `None` after 10ms if no message
+arrives, so the validator loop can continue to do other work
+(propose, vote, check timeouts). A fully blocking `recv` (no
+timeout) would starve the loop.
+
+### Tests
+
+All existing P2P tests (97) pass. The validator binary compiles
+cleanly. No new tests needed — this is a latency optimization with
+no behavioral change.

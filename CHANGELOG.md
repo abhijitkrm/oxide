@@ -2678,3 +2678,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** a corrupted internal state in the mempool
     or a removed position in the perps funding loop no longer
     crashes the node. The operations are skipped gracefully.
+
+- **Validator loop had 10ms message latency from sleep polling**
+  (`crates/p2p/src/tcp.rs`, `bin/oxide-validator/src/main.rs`)
+  - The transport's `recv` used `try_recv()` (non-blocking), forcing
+    the validator loop to sleep 10ms between polls. Messages arriving
+    during the sleep waited up to 10ms before processing.
+  - Changed `recv` to use `recv_timeout(10ms)`, which returns
+    immediately when a message arrives. Removed the 10ms sleep from
+    the validator loop.
+  - **In plain words:** consensus messages are now processed as soon
+    as they arrive, instead of waiting up to 10ms for the next poll.
+    This reduces consensus round-trip latency by up to 10ms per
+    message.

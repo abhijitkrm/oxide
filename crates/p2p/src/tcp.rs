@@ -912,13 +912,36 @@ impl Transport for TcpTransport {
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
+        // Semi-blocking receive: uses `recv_timeout` with a short
+        // timeout (10ms) instead of `try_recv()` (non-blocking).
+        // This reduces message latency from up to 10ms (the
+        // validator loop's sleep) to near-zero: if a message
+        // arrives during the 10ms wait, it's returned immediately
+        // instead of waiting for the next loop iteration.
+        //
+        // The Transport trait documents `recv` as "blocking until
+        // one arrives", but the validator loop needs to do other
+        // work (propose, vote, check timeouts) even when no
+        // messages arrive. A fully blocking `recv` would starve
+        // the loop. The 10ms timeout is the same as the previous
+        // sleep, but the message is returned as soon as it
+        // arrives, not after the full 10ms.
         loop {
-            let msg = self
+            if self.shutdown.load(Ordering::Relaxed) {
+                return None;
+            }
+            let msg = match self
                 .inbound_rx
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .try_recv()
-                .ok()?;
+                .recv_timeout(std::time::Duration::from_millis(10))
+            {
+                Ok(msg) => msg,
+                Err(
+                    std::sync::mpsc::RecvTimeoutError::Timeout
+                    | std::sync::mpsc::RecvTimeoutError::Disconnected,
+                ) => return None,
+            };
             // Admission control: check rate limit and reputation.
             // If rejected, drop the message and try the next one.
             if let Some(ref ac) = self.admission {
