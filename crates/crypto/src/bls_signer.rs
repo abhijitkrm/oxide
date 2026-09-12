@@ -147,6 +147,14 @@ pub fn aggregate(sigs: &[Signature]) -> Result<AggregateSignature, BlsError> {
 /// over the same message. This is the fast path for QC verification
 /// (one pairing check regardless of validator count).
 ///
+/// # Allocation
+///
+/// This function allocates one `Vec<BlstPk>` to deserialize the
+/// public keys and one `Vec<&BlstPk>` to pass references to blst.
+/// Both are pre-sized to `pks.len()` to avoid reallocation. For
+/// hot-path callers that verify many QCs, consider caching the
+/// deserialized PKs at the caller and using a lower-level API.
+///
 /// # Errors
 /// Returns `BlsError::InvalidSignature` if the aggregate signature is
 /// invalid, or `BlsError::EmptyAggregation` if `pks` is empty.
@@ -160,8 +168,12 @@ pub fn aggregate_verify(
         return Err(BlsError::EmptyAggregation);
     }
     let blst_agg = BlstSig::from_bytes(agg_sig.as_bytes())?;
-    let blst_pks: Vec<BlstPk> =
-        pks.iter().map(|pk| BlstPk::from_bytes(pk.as_bytes())).collect::<Result<_, _>>()?;
+    // Pre-size both Vecs to avoid reallocation. The deserialized
+    // PKs and the reference slice are exactly pks.len() long.
+    let mut blst_pks: Vec<BlstPk> = Vec::with_capacity(pks.len());
+    for pk in pks {
+        blst_pks.push(BlstPk::from_bytes(pk.as_bytes())?);
+    }
     let pk_refs: Vec<&BlstPk> = blst_pks.iter().collect();
     let result = blst_agg.fast_aggregate_verify(true, msg, dst(domain), &pk_refs);
     if result == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::InvalidSignature) }

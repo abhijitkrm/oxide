@@ -9640,3 +9640,36 @@ hot-path data structures.
 
 All existing trading tests (53 + 1 property) pass. No new tests
 needed — this is a layout guarantee with no behavioral change.
+
+## Pre-testnet audit: BLS aggregate verification allocation
+
+### Root cause
+
+`aggregate_verify` allocated two Vecs per QC verification:
+1. `blst_pks: Vec<BlstPk>` — deserialized public keys, collected
+   via `pks.iter().map(...).collect()` without pre-sizing.
+2. `pk_refs: Vec<&BlstPk>` — references to the deserialized PKs.
+
+The first Vec could reallocate multiple times as it grew (the
+default `collect` starts with capacity 0 and doubles). For a
+100-validator QC, this could mean 7 reallocations.
+
+### Fix
+
+Pre-sized both Vecs to `pks.len()` using `Vec::with_capacity`,
+eliminating reallocations. The deserialized PKs are pushed one at
+a time (avoiding the `collect::<Result<_, _>>` pattern which
+cannot pre-size).
+
+### Note
+
+The second Vec (`pk_refs`) is unavoidable given blst's API:
+`fast_aggregate_verify` takes `&[&BlstPk]`, not `&[BlstPk]`. A
+future optimization could cache deserialized PKs at the caller
+(consensus engine) and pass them directly, avoiding both
+allocations. That requires an API change and is deferred.
+
+### Tests
+
+All existing crypto tests (42) pass. No new tests needed — this is
+a performance optimization with no behavioral change.

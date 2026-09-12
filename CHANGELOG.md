@@ -2641,3 +2641,13 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** the matching engine's order data structures
     now have a guaranteed compact layout, improving cache
     performance and preventing future layout regressions.
+
+- **BLS aggregate verification had unnecessary reallocations**
+  (`crates/crypto/src/bls_signer.rs`)
+  - `aggregate_verify` allocated two Vecs per QC verification without
+    pre-sizing, causing multiple reallocations as the Vecs grew.
+  - Pre-sized both Vecs to `pks.len()` using `Vec::with_capacity`,
+    eliminating reallocations.
+  - **In plain words:** quorum certificate verification is faster
+    because the public key buffer no longer reallocates as it grows.
+    This reduces per-QC overhead for the consensus engine.
