@@ -327,14 +327,43 @@ impl<T: IdSpace> Id<T> {
     /// The first valid value of this space (all spaces start at 0).
     pub const ZERO: Id<T> = Id::new(0);
 
+    /// The maximum representable value. Used as a saturation target
+    /// by `checked_next` callers that prefer a stuck counter over a
+    /// silent wrap to 0 (a wrap would corrupt consensus state).
+    pub const MAX: Id<T> = Id::new(u64::MAX);
+
     /// Next value in the space; consensus uses this heavily
     /// (`view.next()` on timeout) and it must stay `const`-cheap.
+    ///
+    /// **Overflow semantics:** `next()` wraps on `u64::MAX` (matches
+    /// the `const fn` arithmetic contract). Consensus callers that
+    /// must never wrap use [`checked_next`](Self::checked_next) or
+    /// [`saturating_next`](Self::saturating_next) instead.
     ///
     /// `#[must_use]`: computing `next()` and discarding it is always a
     /// bug — the caller meant to advance something.
     #[must_use]
     pub const fn next(self) -> Self {
-        Id::new(self.0 + 1)
+        // Wrapping is intentional for the cheap path: callers that
+        // care use `checked_next`. Documented at the call sites.
+        Id::new(self.0.wrapping_add(1))
+    }
+
+    /// Checked successor: `None` if `self == MAX` (would overflow).
+    /// Use in consensus-critical paths where a wrap to 0 would
+    /// corrupt state (height/view advancement from untrusted input).
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        if self.0 == u64::MAX { None } else { Some(Id::new(self.0 + 1)) }
+    }
+
+    /// Saturating successor: `MAX` if `self == MAX`. Use when the
+    /// caller prefers a stuck counter (dead chain) over a silent
+    /// wrap to 0 (corrupted chain). The chain is already dead at
+    /// `u64::MAX` height/view — saturation just makes it explicit.
+    #[must_use]
+    pub const fn saturating_next(self) -> Self {
+        if self.0 == u64::MAX { self } else { Id::new(self.0 + 1) }
     }
 
     /// Previous value, if any (genesis has none).
@@ -587,6 +616,20 @@ mod tests {
         assert_eq!(Height::ZERO.next().value(), 1);
         assert!(Height::ZERO.prev().is_none(), "genesis has no parent");
         assert_eq!(Height::new(1).prev().unwrap(), Height::ZERO);
+    }
+
+    /// `checked_next` and `saturating_next` must not wrap at `u64::MAX`.
+    /// Consensus uses these to prevent a byzantine height/view from
+    /// corrupting state via integer overflow (C1 fix).
+    #[test]
+    fn test_id_checked_and_saturating_next_no_wrap() {
+        assert!(Height::MAX.checked_next().is_none());
+        assert_eq!(Height::MAX.saturating_next(), Height::MAX);
+        assert_eq!(Height::new(5).checked_next(), Some(Height::new(6)));
+        assert_eq!(Height::new(5).saturating_next(), Height::new(6));
+        // View space shares the impl.
+        assert!(View::MAX.checked_next().is_none());
+        assert_eq!(View::MAX.saturating_next(), View::MAX);
     }
 
     /// Fixed-point: notional and split-back are exact inverses where the

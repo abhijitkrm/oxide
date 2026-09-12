@@ -453,7 +453,10 @@ impl OxideBft {
             return Err(EpochRotationError::NoPendingRotation);
         };
         self.validator_set = new_set;
-        self.epoch = Epoch::new(self.epoch.value() + 1);
+        // Saturating: epoch = u64::MAX would wrap to 0, confusing
+        // the epoch boundary. Saturation is safe — the chain is
+        // already dead at epoch u64::MAX.
+        self.epoch = self.epoch.saturating_next();
         self.current_view = View::new(0);
         self.last_voted_view = None;
         self.high_qc = None;
@@ -539,7 +542,13 @@ impl OxideBft {
     /// current `next_height` is a no-op.
     pub fn observe_block_height(&mut self, height: Height) {
         if height.value() >= self.next_height.value() {
-            self.next_height = Height::new(height.value() + 1);
+            // Saturating, not wrapping: a byzantine proposal with
+            // height = u64::MAX must not wrap next_height to 0 (which
+            // would make the validator re-propose height 0, conflicting
+            // with the finalized genesis block). The vote() path
+            // additionally rejects absurd heights before this is
+            // called, but saturating here is defense in depth.
+            self.next_height = height.saturating_next();
         }
     }
 
@@ -653,7 +662,10 @@ impl OxideBft {
         // Advance the engine's height on proposal (not finalization).
         // The 2-chain pipeline proposes multiple blocks before
         // committing any; the engine's height leads the app's.
-        self.next_height = Height::new(self.next_height.value() + 1);
+        // Saturating: a legitimate chain never reaches u64::MAX height;
+        // if it somehow does, the chain is already dead and saturation
+        // makes that explicit instead of wrapping to 0.
+        self.next_height = self.next_height.saturating_next();
         Some((header, proposal))
     }
 
@@ -665,6 +677,16 @@ impl OxideBft {
     /// BLS secret key is set (stage 5), the vote is signed with real
     /// BLS; otherwise `Signature::ZERO` is used (conformance mode).
     pub fn vote(&mut self, header: &BlockHeader, proposal: &Proposal) -> Option<Vote> {
+        // Sanity bound (C1 fix): reject proposals with height near
+        // u64::MAX before learning it. Such a height is never
+        // legitimate (at 10 blk/s, u64::MAX is ~58 billion years),
+        // and observe_block_height would saturate next_height to MAX,
+        // permanently stalling this validator's proposer duty.
+        // Rejecting here prevents a byzantine leader from poisoning
+        // next_height via a crafted header.
+        if header.height.value() >= Height::MAX.prev().unwrap_or(Height::MAX).value() {
+            return None;
+        }
         // Height sync: learn the chain's progression from this
         // proposal. Even if we reject the proposal (tail-fork
         // resistance, already voted, etc.), the height is a fact
@@ -1052,7 +1074,10 @@ impl OxideBft {
         // higher). When qc.view == current_view, the caller handles
         // the normal view advancement via `advance_view()`.
         if qc.view.value() > self.current_view.value() {
-            self.current_view = View::new(qc.view.value() + 1);
+            // Saturating: a verified QC with view = u64::MAX would
+            // wrap current_view to 0 here; saturation keeps it at
+            // MAX (chain dead) instead of corrupting the view space.
+            self.current_view = qc.view.saturating_next();
             self.pacemaker.sync_to_view(self.current_view);
             self.pacemaker.on_progress();
             // Clear stale per-view state from the old view.
@@ -1192,7 +1217,11 @@ impl OxideBft {
     /// in lockstep across all validators. Syncs the pacemaker so that
     /// a later timeout fires for the correct view.
     pub fn advance_view(&mut self) {
-        self.current_view = View::new(self.current_view.value() + 1);
+        // Saturating: view = u64::MAX wraps to 0 without this guard,
+        // which would make the validator vote in view 0 again (double
+        // vote, safety violation). Saturation stalls the chain
+        // instead — the only recovery is epoch rotation.
+        self.current_view = self.current_view.saturating_next();
         self.pacemaker.sync_to_view(self.current_view);
         self.pacemaker.on_progress();
         // Clear per-view state. Stale votes from the previous view
@@ -3291,6 +3320,37 @@ mod tests {
         // Observe height 6 (equal) — should advance to 7.
         engine.observe_block_height(Height::new(6));
         assert_eq!(engine.next_height.value(), 7);
+    }
+
+    /// Regression test (C1): `observe_block_height` with
+    /// `height = u64::MAX` must saturate `next_height` at `MAX`
+    /// rather than wrapping to 0. Before the fix, the unchecked
+    /// `value() + 1` wrapped `next_height` to 0, which would make
+    /// the validator re-propose height 0 — conflicting with the
+    /// finalized genesis block and corrupting chain state.
+    #[test]
+    fn observe_block_height_saturates_at_max_not_wraps_to_zero() {
+        let mut engine = make_multi_engine(0);
+        assert_eq!(engine.next_height.value(), 0);
+
+        // A byzantine proposal with height = u64::MAX.
+        engine.observe_block_height(Height::MAX);
+        assert_eq!(
+            engine.next_height.value(),
+            u64::MAX,
+            "next_height must saturate at u64::MAX, not wrap to 0"
+        );
+    }
+
+    /// Regression test (C1): `Id::checked_next` and `saturating_next`
+    /// must not wrap at `u64::MAX`. This guards the primitive that all
+    /// consensus `+1` paths now use.
+    #[test]
+    fn id_checked_and_saturating_next_do_not_wrap() {
+        assert!(Height::MAX.checked_next().is_none());
+        assert_eq!(Height::MAX.saturating_next(), Height::MAX);
+        assert_eq!(Height::new(5).checked_next(), Some(Height::new(6)));
+        assert_eq!(Height::new(5).saturating_next(), Height::new(6));
     }
 
     /// Regression test: a follower that becomes the leader after a

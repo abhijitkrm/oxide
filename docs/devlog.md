@@ -10648,3 +10648,154 @@ Actions:
   single largest regenerating consumer.
 - `target/` remains ~23 GB (debug deps + release + criterion);
   `cargo clean` removes it fully if space gets tight again.
+
+## 2026-09-10 — Session: Production-testnet audit + remediation plan
+
+### Audit context
+
+Read-only audit of the entire codebase (EVM, trading/matcher/exchange/perps,
+consensus/broadcast, p2p/networking/storage/executor) against the
+production-testnet release bar and the 10-gigagas-per-block capacity target.
+No code changes were made during the audit itself. Findings are recorded
+here as the reference for the remediation work that follows.
+
+### Verdict
+
+The single-node performance core is strong. The consensus/protocol
+surface is **not testnet-safe**: peer identity is self-claimed, proposals
+are unsigned, one malformed message can stall every view, and one
+crafted header can wrap the height counter. The 10 GG/block goal is not
+a tuning problem — today the effective block gas is 30M (Ethereum
+parity), three config layers below the target, and the execution/
+serialization paths above ~1 GG/block don't exist yet.
+
+### CRITICAL — consensus safety / chain integrity
+
+| # | Finding | Location |
+|---|---|---|
+| C1 | `vote()` calls `observe_block_height(header.height)` before any validation — a proposal with `height = u64::MAX` makes `Height::new(value + 1)` wrap to 0, corrupting `next_height`; the validator later re-proposes height 0 | `engine.rs:673` + `primitives Id::next` |
+| C2 | `collect_vote` accepts votes for future views — `vote.view < current_view` is the only filter, so one vote for view V+1 becomes the buffer's "first vote"; all real current-view votes then fail the `ConflictingVote` check until a ~2s view timeout. One message per view = permanent liveness DoS | `engine.rs:872-910` |
+| C3 | Proposals are unsigned and `vote` never checks the proposer is the leader for the view — any validator can produce proposals for any view | `engine.rs:637-775`, `proposer_signature: None` |
+| C4 | p2p peer identity is self-claimed — plain TCP devnet path takes the peer ID from an unauthenticated first frame; even the TLS path uses `with_no_client_auth()` on both sides | `tcp.rs:1176-1191`, `tls.rs:88-110` |
+| C5 | `BANK_TRANSFER`/`STAKING_DELEGATE` precompiles are no-ops that return success — comment says "the actual transfer happens in the executor," but no executor-side settlement exists anywhere | `precompiles.rs:213-230` |
+| C6 | `ReedSolomon::reconstruct` panics on unequal shard lengths — network-received shard of the wrong size = validator crash | `rs.rs:203-209` |
+| C7 | Matcher ignores the protocol nonce — `protocol.rs:42-47` documents replay protection; `submit_order`/`submit_action` never read `req.nonce` or track `last_seen_nonce` | `matcher/lib.rs:214-381` |
+| C8 | `handle_place` mutates the book before bank settlement — fills stand even when `bank.transfer` fails (documented as a tradeoff, emitted as `settlement_failed`) | `exchange/lib.rs:548-592` |
+| C9 | No consensus WAL — `high_qc`, `current_view`, `voted_at_height`, `next_height`, vote locks are in-memory only; after restart a validator can re-propose finalized heights or double-vote | `engine.rs:236-301` |
+| C10 | `executed_nonce` is in-memory only — lost on restart unless a snapshot carrying it is imported; native-module tx replay protection dies with the process | `executor/lib.rs:649,710` |
+
+### HIGH — security
+
+- Underpriced/invalid EVM txs consume block gas for free — `validate` never
+  checks `max_fee ≥ base_fee`, `priority ≤ max_fee`, or
+  `gas_limit ≤ block_gas_limit`; combined with `estimate_gas = declared
+  gas_limit`, a tx can reserve 30M of block capacity and pay nothing when
+  revm rejects it (`evm/lib.rs:2297-2364`).
+- `load_from_storage` never repopulates `CacheDB.contracts` — after
+  restart/snapshot import, contract calls execute empty bytecode (STOP),
+  diverging from the state that produced the root (`evm/lib.rs:2929-2975`).
+- RLP decode accepts trailing bytes — tx malleability: same logical tx,
+  different hashes (`tx.rs:390-401`).
+- Signature malleability — recovery IDs 2/3 accepted, no low-s enforcement
+  (`tx.rs:775-786`, `crypto/secp.rs:88-91`).
+- `receipts_root` uses pre-EIP-2718 encoding for typed txs — wrong
+  `receiptsRoot` for any block with 2930/1559 txs; also O(n²) via
+  `position()` per receipt (`receipts.rs:210-265, 234`).
+- RPC: unauthenticated, plain HTTP, rate limit defaults to unlimited
+  (`rpc/lib.rs:362-377`).
+- Unbounded channels everywhere — p2p inbound/outbound, executor intake:
+  no backpressure, memory DoS under slow peer/consensus (`tcp.rs:482,1159`,
+  `executor/lib.rs:695`).
+- `admission.release_connection` is never called — connection counter leaks
+  up to 256 then rejects all peers until restart (`admission.rs:171-175`).
+- Mempool stuffing via nonce gaps — `process_proposal` checks within-block
+  contiguity but not anchoring to `executed_nonce`; proposer can fill blocks
+  with non-executable txs that still consume gas (`executor/lib.rs:1493-1552`).
+- Trading money-math clamps: `unwrap_or(u64::MAX)` refund paths can mint
+  quote (`matcher/lib.rs:241,270,409`); `unwrap_or(0)` partial-fill refund
+  destroys it (`lib.rs:309-311`); perps `i64::MAX` fill clamp decouples
+  position from notional (`perps/lib.rs:1344-1374`); funding skips amounts
+  > u64 breaking zero-sum (`perps/lib.rs:552-605`).
+- `BatchSettler` drops batches after 60 retries while the off-chain cache
+  already applied them — permanent cache/chain divergence
+  (`matcher/server.rs:230-248`).
+- TCP batch decoder unbounded `count` allocation —
+  `vec![0u8; count * BATCH_ENTRY_SIZE]` with attacker-controlled `count` =
+  OOM (`matcher/server.rs:446-449`).
+- `vote` doesn't require `header.view == current_view` and `header.prev_block`
+  isn't tied to `high_qc.block_hash` — tail-of-2-chain invariants not
+  enforced at vote time (`engine.rs:675-678, 1066`).
+- Double BLS verification per vote — per-vote `crypto::verify` +
+  `aggregate_verify` in `deliver_qc` = 2× pairing cost on the hot path
+  (`engine.rs:884-892, 1126-1132`).
+- Snapshot import is unauthenticated — crafted snapshots can zero
+  `executed_nonces` (enable replay) or corrupt state; only the state-root
+  hash is checked.
+- `without_signature_verification` is public API — not called by
+  `oxide-validator` today, but it's a release-build backdoor; gate it
+  behind `#[cfg(test)]`.
+
+### The 10-gigagas-per-block gap
+
+Measured and traced — current effective capacity is **30M gas/block**,
+~333× below target:
+
+| Layer | Location | Today | Needed for 10 GG |
+|---|---|---|---|
+| Executor block gas | `executor/lib.rs:544` `DEFAULT_BLOCK_GAS_LIMIT` | 30,000,000 | 10¹⁰ — this clamps everything |
+| Consensus budget | `engine.rs:391` `BUDGET.max_gas` | 1 GG (1<<30) | 10 GG |
+| Block bytes | `engine.rs:392` `BUDGET.max_bytes` | 1 MiB | ~64 MiB |
+| Broadcast caps | `broadcast/lib.rs:42-82` | 4/16 MiB | scale with `max_bytes` |
+| revm `BlockEnv` | `evm/lib.rs:481` | follows `block_gas_limit` | same 10¹⁰ |
+| `BaseFeeState` | `fee.rs` | 30M, not even wired in | plumb from chain config |
+
+Four execution-path ceilings must fall:
+
+1. **Execution throughput.** Single-thread revm ≈ 0.6 GG/s. 10 GG/block at
+   1s blocks needs ~10 GG/s sustained — only reachable via the parallel
+   executor at tx-granular conflict tracking.
+2. **`state_root` per block** — now 45ms @ 100k accounts (HashBuilder
+   floor); needs the sparse retained trie for O(touched·log n).
+3. **`receipts_root` O(n²)** — must become O(n) before big blocks.
+4. **Free-gas stuffing** — without fee/validity gates in `validate`, a
+   10 GG budget is trivially wasted, not filled.
+
+### Performance — "fastest in production"
+
+- **Consensus:** drop per-vote BLS verify (keep aggregate); `Arc<Proposal>`
+  instead of clone-on-store/deliver; pre-size `signer_pks`; tx_root buffer
+  pre-size.
+- **p2p:** `read_frame` allocates a fresh `Vec` per message → buffer pools;
+  writer batches cap 64 frames × 16MiB ≈ 1 GiB contiguous alloc →
+  byte-capped batches; rate limiter clones `PeerId` per message.
+- **Executor/EVM:** the same tx is RLP-decoded 4× (ingest preverify,
+  proposal estimate, process, execute) — extend `preverify_cache` to
+  carry `gas_limit` + decoded fields; unify lock order in `state_root` vs
+  `execute` (deadlock risk); journal replay slurps whole 256MiB segments
+  → stream.
+- **Trading (1M+ orders/s target):** `signing_message` heap-allocates per
+  order → fixed stack array; `SharedMatcher` global `Mutex` is still the
+  default server path → make `RingMatcher` the only path; risk engine
+  `BTreeMap` + `VecDeque` per order → flat/sharded; `Vec::insert(0,…)`
+  O(n²) bad-sig responses; `submit_one_ring` allocates `vec![req]` per
+  order; market-data JSON cloned per subscriber under a mutex → `Arc<str>`.
+
+### Remediation plan (order)
+
+1. C1, C2, C3, C6 — consensus input validation (height/view/leader
+   checks, checked arithmetic, shard length) — small diffs, removes
+   remote crash/corruption.
+2. C4 + RPC auth + `without_signature_verification` gating — network
+   identity (mutual TLS bound to validator keys).
+3. C9, C10 — persistence of consensus state + executed nonces on the
+   restart path.
+4. Free-gas/underpriced-tx gates + precompile no-op fix (C5) — before
+   any capacity raise.
+5. Gas/byte capacity plumbing to chain config → then parallel-execution
+   and state-root work for 10 GG.
+6. Trading money-math clamps (C7-C8 companions) and the matcher hot-path
+   allocation list.
+
+Each fix ships with: failing test first → fix → unit/property tests →
+benchmark (criterion) → binary TPS run → 4-validator Docker testnet run
+under latency + fault injection. Numbers land in devlog + changelog.

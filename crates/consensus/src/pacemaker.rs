@@ -385,7 +385,13 @@ impl Pacemaker {
     /// Returns the `AdvanceView` event.
     fn advance_view(&mut self, tc: Option<TimeoutCertificate>) -> Vec<PacemakerEvent> {
         let old_view = self.current_view;
-        self.current_view = View::new(self.current_view.value() + 1);
+        // Saturating: view = u64::MAX would wrap to 0, causing the
+        // pacemaker to schedule timeouts for view 0 and the engine
+        // to vote in view 0 again (double-vote safety violation).
+        // Saturation stalls the chain — the only recovery is epoch
+        // rotation, which resets the view to 0 under a new validator
+        // set, so saturation does not permanently block recovery.
+        self.current_view = self.current_view.saturating_next();
         self.state = PacemakerState::Active;
         self.reset_view_state();
         // Exponential backoff: double the timeout on each consecutive
