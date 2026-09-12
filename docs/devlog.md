@@ -9618,3 +9618,25 @@ discrepancy is visible.
 - `batch_settle_rolls_back_on_credit_overflow` — a batch settle
   where the seller's balance would overflow must not debit the
   buyer, and must emit a `settlement_failed` event.
+
+## Pre-testnet audit: stable enum layout for trading types
+
+### Root cause
+
+The trading enums (`Side`, `OrderType`, `TimeInForce`, `StpMode`)
+relied on the default Rust enum representation. While the compiler
+typically chooses 1 byte for enums with few variants, this is not
+guaranteed — adding variants or `#[non_exhaustive]` could silently
+bloat the slab node layout, reducing cache density.
+
+### Fix
+
+Added `#[repr(u8)]` to all four enums, guaranteeing a 1-byte
+representation regardless of variant count. This ensures stable
+slab node layout and cache-line alignment for the matching engine's
+hot-path data structures.
+
+### Tests
+
+All existing trading tests (53 + 1 property) pass. No new tests
+needed — this is a layout guarantee with no behavioral change.

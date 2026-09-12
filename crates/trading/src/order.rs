@@ -17,7 +17,13 @@ use crate::error::RejectReason;
 
 /// Trading side. One byte on the wire; ordering is irrelevant (sides
 /// are never compared, only matched).
+///
+/// `#[repr(u8)]` ensures the enum is exactly 1 byte, which is
+/// critical for slab node layout (cache-line alignment). Without it,
+/// the compiler could choose a larger representation, bloating the
+/// `OrderNode` struct and reducing cache density.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Side {
     /// Buying the base asset (taking from asks).
     Buy,
@@ -43,7 +49,10 @@ impl Side {
 /// `Market` and `PostOnly` are specializations of `Limit` for
 /// matching purposes: a market order is a limit sweep with no price
 /// bound; a post-only order is a limit order that must rest.
+///
+/// `#[repr(u8)]` ensures the enum is exactly 1 byte for slab layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum OrderType {
     /// Rests at `price` unless fully matched on entry; remainder
     /// rests (subject to [`TimeInForce`]).
@@ -62,7 +71,10 @@ pub enum OrderType {
 /// `Day`/`GTD` expiries are height-driven and arrive with the
 /// exchange module's order lifecycle; the engine core only needs to
 /// know whether a remainder may rest.
+///
+/// `#[repr(u8)]` ensures the enum is exactly 1 byte for slab layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum TimeInForce {
     /// Good-til-canceled: remainder rests until matched or canceled.
     Gtc,
@@ -77,7 +89,10 @@ pub enum TimeInForce {
 /// Self-trade-prevention mode applied when an incoming order would
 /// match against a resting order of the same owner (plan.md §9.1
 /// "STP modes").
+///
+/// `#[repr(u8)]` ensures the enum is exactly 1 byte for slab layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum StpMode {
     /// No prevention: self-trades execute like any other trade.
     /// Cheapest path (no owner compare skipped, but no special case).

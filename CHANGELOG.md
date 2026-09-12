@@ -2630,3 +2630,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** when the exchange settles a batch of trades,
     a failed credit no longer leaves the buyer debited without the
     seller being credited. The settlement is now all-or-nothing.
+
+- **Trading enums lacked stable layout representation**
+  (`crates/trading/src/order.rs`)
+  - The `Side`, `OrderType`, `TimeInForce`, and `StpMode` enums
+    relied on the default Rust representation, which is not
+    guaranteed to be 1 byte.
+  - Added `#[repr(u8)]` to all four enums, guaranteeing a 1-byte
+    representation for stable slab node layout and cache density.
+  - **In plain words:** the matching engine's order data structures
+    now have a guaranteed compact layout, improving cache
+    performance and preventing future layout regressions.
