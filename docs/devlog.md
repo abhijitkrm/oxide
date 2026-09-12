@@ -11181,3 +11181,30 @@ at the extreme 1M-account scale.
 - Ceiling 2 (parallel executor with tx-granular conflict tracking)
 - Ceiling 3 (sparse retained trie for state root)
 - Final gate suite (binary + dockernet TPS at 10GG)
+
+## 2026-09-10 — Session: Binary smoke tests
+
+### Binary smoke test results
+
+All binary smoke tests pass (release build):
+- `smoke_node_smoke_test`: ok
+- `smoke_fullnode_assembles`: ok
+- `smoke_spammer_batch_100_txs`: ok
+- `smoke_assemble_sequencer`: ok
+- `smoke_submit_finalize_state_root_oxidebft`: ok
+- `smoke_submit_finalize_state_root_sequencer`: ok
+
+All binaries build successfully (release):
+- `oxide-validator`
+- `oxide-fullnode`
+- `oxide-spammer`
+- `oxide-bench`
+- `oxide-deploy`
+- `oxide-loadgen`
+- `oxide-matcher`
+
+### Remaining items
+
+- Ceiling 2 (parallel executor with tx-granular conflict tracking)
+- Ceiling 3 (sparse retained trie for state root)
+- Docker testnet TPS at 10GG
