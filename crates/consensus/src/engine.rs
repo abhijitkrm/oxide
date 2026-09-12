@@ -439,6 +439,7 @@ impl OxideBft {
         self.pending = None;
         self.votes = vec![None; self.validator_set.n()];
         self.vote_count = 0;
+        self.timeout_signatures = vec![None; self.validator_set.n()];
         // Reset the pacemaker for the new epoch.
         self.pacemaker =
             crate::pacemaker::Pacemaker::new(self.validator_set.clone(), View::new(0), self.epoch);
@@ -1011,9 +1012,8 @@ impl OxideBft {
             self.current_view = View::new(qc.view.value() + 1);
             self.pacemaker.sync_to_view(self.current_view);
             self.pacemaker.on_progress();
-            // Clear stale votes from the old view.
-            self.votes.fill(None);
-            self.vote_count = 0;
+            // Clear stale per-view state from the old view.
+            self.clear_per_view_state();
         }
 
         // 2-chain commit check: if the QC's block extends the pending
@@ -1105,6 +1105,23 @@ impl OxideBft {
         self.finalized.insert(header.height.value(), block);
     }
 
+    /// Clear all per-view state: collected votes and timeout
+    /// signatures.
+    ///
+    /// This must be called on every view transition (advance,
+    /// sync, TC-driven jump, QC catch-up). Stale votes from a
+    /// previous view cause `ConflictingVote` errors when the new
+    /// view's votes arrive. Stale timeout signatures from a
+    /// previous view get aggregated into the new view's TC,
+    /// producing an aggregate that fails verification (the
+    /// signatures were for a different view) — peers reject the
+    /// TC and the view-change stalls.
+    fn clear_per_view_state(&mut self) {
+        self.votes.fill(None);
+        self.vote_count = 0;
+        self.timeout_signatures.fill(None);
+    }
+
     /// Advance to the next view (happy path: one view per block).
     /// Public so the multi-node simulation can drive view advancement
     /// in lockstep across all validators. Syncs the pacemaker so that
@@ -1113,14 +1130,11 @@ impl OxideBft {
         self.current_view = View::new(self.current_view.value() + 1);
         self.pacemaker.sync_to_view(self.current_view);
         self.pacemaker.on_progress();
-        // Clear the vote buffer on view advance. Stale votes from
-        // the previous view that arrive late over the network must
-        // not pollute the new view's quorum accounting. Without
-        // this, a late vote for view N could be collected into view
-        // N+1's buffer and cause a spurious ConflictingVote error
-        // when the real votes for view N+1 arrive.
-        self.votes.fill(None);
-        self.vote_count = 0;
+        // Clear per-view state. Stale votes from the previous view
+        // that arrive late over the network must not pollute the
+        // new view's quorum accounting. Stale timeout signatures
+        // must not leak into the new view's TC aggregation.
+        self.clear_per_view_state();
     }
 
     /// Jump forward to `view` if it is higher than the current view.
@@ -1139,8 +1153,7 @@ impl OxideBft {
         self.current_view = view;
         self.pacemaker.sync_to_view(self.current_view);
         self.pacemaker.on_progress();
-        self.votes.fill(None);
-        self.vote_count = 0;
+        self.clear_per_view_state();
         true
     }
 
@@ -1240,8 +1253,10 @@ impl OxideBft {
                     }
                 }
             }
-            // Clear stored timeout signatures for the next view.
-            self.timeout_signatures.fill(None);
+            // Clear per-view state for the new view. The TC
+            // formation advances the view; stale votes from the
+            // old view must not pollute the new view.
+            self.clear_per_view_state();
             self.current_view = self.pacemaker.current_view();
         }
         Ok(tc)
@@ -1285,6 +1300,15 @@ impl OxideBft {
             self.pacemaker.on_timeout_certificate(tc)
         {
             self.current_view = new_view;
+            // Clear stale per-view state. Votes collected for the
+            // old view must not pollute the new view's quorum
+            // accounting (they would cause ConflictingVote errors
+            // when the new view's real votes arrive). Timeout
+            // signatures collected for the old view must not leak
+            // into the new view's TC aggregation (they would
+            // produce an aggregate that fails verification because
+            // the signatures were for a different view).
+            self.clear_per_view_state();
         }
         Ok(())
     }
@@ -3203,6 +3227,129 @@ mod tests {
             header.height.value() > finalized_h,
             "new leader must propose at height > {finalized_h} (finalized), got {}",
             header.height.value()
+        );
+    }
+
+    /// Regression test: `on_timeout_certificate` must clear votes
+    /// and timeout signatures when the view advances. Before the
+    /// fix, `on_timeout_certificate` advanced the view but left
+    /// stale votes in the buffer, causing `ConflictingVote` errors
+    /// when the new view's real votes arrived.
+    #[test]
+    fn on_timeout_certificate_clears_per_view_state() {
+        let mut engine = make_multi_engine(0);
+
+        // Populate vote and timeout signature state for view 0.
+        let vote = Vote {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            signature: Signature::ZERO,
+        };
+        engine.collect_vote(1, vote).expect("conformance: no verification");
+        engine.timeout_signatures[2] = Some(Signature::ZERO);
+        assert!(engine.vote_count > 0, "should have collected a vote");
+        assert!(
+            engine.timeout_signatures.iter().any(Option::is_some),
+            "should have a timeout signature"
+        );
+
+        // Process a TC for view 0 with quorum (advances to view 1).
+        let tc = TimeoutCertificate {
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0111], // 3 signers (quorum)
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.on_timeout_certificate(&tc).expect("TC must be accepted");
+
+        // After the view advance, all per-view state must be cleared.
+        assert_eq!(engine.vote_count, 0, "vote_count must be cleared after TC");
+        assert!(engine.votes.iter().all(Option::is_none), "votes must be cleared after TC");
+        assert!(
+            engine.timeout_signatures.iter().all(Option::is_none),
+            "timeout_signatures must be cleared after TC"
+        );
+    }
+
+    /// Regression test: `sync_to_view` must clear timeout
+    /// signatures, not just votes. Before the fix, stale timeout
+    /// signatures from the old view leaked into the new view's TC
+    /// aggregation, producing an aggregate that failed verification.
+    #[test]
+    fn sync_to_view_clears_timeout_signatures() {
+        let mut engine = make_multi_engine(0);
+
+        // Populate timeout signature state for view 0.
+        engine.timeout_signatures[1] = Some(Signature::ZERO);
+        engine.timeout_signatures[2] = Some(Signature::ZERO);
+        assert!(
+            engine.timeout_signatures.iter().any(Option::is_some),
+            "should have timeout signatures"
+        );
+
+        // Sync forward to view 10.
+        let advanced = engine.sync_to_view(View::new(10));
+        assert!(advanced, "sync should advance");
+
+        // Timeout signatures must be cleared.
+        assert!(
+            engine.timeout_signatures.iter().all(Option::is_none),
+            "timeout_signatures must be cleared after sync_to_view"
+        );
+    }
+
+    /// Regression test: `deliver_qc` catch-up (when the QC's view
+    /// is higher than the local view) must clear timeout signatures,
+    /// not just votes. Before the fix, stale timeout signatures
+    /// from the old view leaked into the new view's TC aggregation.
+    #[test]
+    fn deliver_qc_catchup_clears_timeout_signatures() {
+        let mut engine = make_multi_engine(0);
+
+        // Populate timeout signature state for view 0.
+        engine.timeout_signatures[1] = Some(Signature::ZERO);
+        assert!(
+            engine.timeout_signatures.iter().any(Option::is_some),
+            "should have a timeout signature"
+        );
+
+        // Deliver a QC for a higher view (triggers catch-up).
+        let qc = QuorumCertificate {
+            view: View::new(5),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x11; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111], // 4 signers (quorum)
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.deliver_qc(qc).expect("QC must be accepted");
+
+        // After the catch-up, timeout signatures must be cleared.
+        assert!(
+            engine.timeout_signatures.iter().all(Option::is_none),
+            "timeout_signatures must be cleared after deliver_qc catch-up"
+        );
+    }
+
+    /// Regression test: `advance_view` must clear timeout
+    /// signatures, not just votes.
+    #[test]
+    fn advance_view_clears_timeout_signatures() {
+        let mut engine = make_multi_engine(0);
+
+        // Populate timeout signature state.
+        engine.timeout_signatures[1] = Some(Signature::ZERO);
+        assert!(
+            engine.timeout_signatures.iter().any(Option::is_some),
+            "should have a timeout signature"
+        );
+
+        engine.advance_view();
+
+        assert!(
+            engine.timeout_signatures.iter().all(Option::is_none),
+            "timeout_signatures must be cleared after advance_view"
         );
     }
 }

@@ -2473,3 +2473,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     height from proposals they receive. A validator that takes over
     as leader after a view change proposes at the correct height
     instead of re-proposing an already-finalized height.
+
+- **View-change paths did not clear timeout signatures**
+  (`crates/consensus/src/engine.rs`)
+  - `on_timeout_certificate`, `sync_to_view`, `deliver_qc` catch-up,
+    `advance_view`, and `collect_timeout_signature` cleared votes
+    but not `timeout_signatures`. Stale timeout signatures from the
+    old view leaked into the new view's TC aggregation, producing an
+    aggregate that failed verification and stalled view changes.
+    `on_timeout_certificate` was the worst: it cleared neither votes
+    nor timeout signatures, so stale votes caused ConflictingVote
+    errors that prevented the new leader from forming a QC.
+  - Added `clear_per_view_state()` helper that clears votes,
+    vote_count, and timeout_signatures. Called from every view-change
+    path.
+  - Regression tests: `on_timeout_certificate_clears_per_view_state`,
+    `sync_to_view_clears_timeout_signatures`,
+    `deliver_qc_catchup_clears_timeout_signatures`,
+    `advance_view_clears_timeout_signatures`.
+  - **In plain words:** when the consensus engine switches to a new
+    view, it now clears all per-view state (votes and timeout
+    signatures). This prevents stale data from the old view from
+    blocking the new view.

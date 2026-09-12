@@ -9320,3 +9320,37 @@ Removed the no-op Phase 6 self-sync from the validator loop.
 - `new_leader_proposes_at_correct_height_after_view_change` — a
   follower that becomes the leader after a view change proposes at the
   correct height, not height 0.
+
+## Pre-testnet audit: view-change state clearing
+
+### Root cause
+
+View-change paths (`on_timeout_certificate`, `sync_to_view`,
+`deliver_qc` catch-up, `advance_view`, `collect_timeout_signature`)
+cleared votes but not `timeout_signatures`. Stale timeout signatures
+from the old view leaked into the new view's TC aggregation, producing
+an aggregate that failed verification (the signatures were for a
+different view). Peers rejected the TC and the view-change stalled.
+
+`on_timeout_certificate` was the worst: it advanced the view but
+cleared neither votes nor timeout signatures. Stale votes caused
+`ConflictingVote` errors when the new view's real votes arrived,
+preventing the new leader from ever forming a QC.
+
+### Fix
+
+Added `clear_per_view_state()` helper that clears votes, vote_count,
+and timeout_signatures. Called from every view-change path:
+- `advance_view`
+- `sync_to_view`
+- `deliver_qc` catch-up
+- `on_timeout_certificate`
+- `collect_timeout_signature` (when TC is formed)
+- `complete_rotation` (epoch transition)
+
+### Regression tests
+
+- `on_timeout_certificate_clears_per_view_state`
+- `sync_to_view_clears_timeout_signatures`
+- `deliver_qc_catchup_clears_timeout_signatures`
+- `advance_view_clears_timeout_signatures`
