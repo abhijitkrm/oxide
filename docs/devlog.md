@@ -10923,3 +10923,50 @@ Crypto: 42 tests. Broadcast: 21 tests.
 - C4 (mutual TLS bound to validator keys)
 - C9 (consensus state persistence to journal/WAL)
 - C10 (executed_nonce persistence on restart)
+
+## 2026-09-10 — Session: HIGH-severity remediation (continued)
+
+### Completed HIGH fixes (continued)
+
+- **CacheDB.contracts repopulation** (`modules/evm`):
+  `load_from_storage` now populates `cache.contracts` (the code
+  hash → Bytecode map) in addition to `cache.accounts`. Before the
+  fix, after a storage reload, revm couldn't find contract code by
+  hash — calling a reloaded contract behaved as a silent no-op.
+
+- **C10: executed_nonce persistence** (`crates/executor`):
+  Added `save_executed_nonces` and `load_executed_nonces` methods
+  that persist the per-sender executed_nonce map to the storage
+  backend using a reserved key prefix. Before the fix, a restart
+  reset all nonces to zero, allowing replay of already-executed
+  native transactions.
+
+- **Ceiling 1: unified block gas limit at 10 GG** (`crates/types`,
+  `crates/consensus`, `modules/evm`):
+  Added `CHAIN_BLOCK_GAS_LIMIT` (10 GG), `CHAIN_BLOCK_MAX_BYTES`
+  (16 MiB), and `CHAIN_BLOCK_BUDGET` to the types crate as the
+  single source of truth. Before the fix, the consensus engine
+  (1 GG), the EVM module (30M), and the test helpers (1 GG) each
+  hard-coded their own value — a tx legal under one limit was
+  illegal under another, and the 10 GG target was unreachable.
+
+- **Trading money-math: perps funding** (`modules/perps`):
+  The funding distribution path used
+  `u64::try_from(credit_u128).unwrap_or(u64::MAX)` — if the
+  computed credit overflowed u64, the receiver was credited
+  u64::MAX (a free-money bug). Now the receiver is skipped and
+  the excess remains in the funding pool (accrued to insurance).
+
+- **EIP-2718 receipts root encoding** (`modules/evm`):
+  `receipts_root` now encodes typed receipts per EIP-2718 (type
+  byte prefix for EIP-2930/EIP-1559). Before the fix, all receipts
+  used the pre-EIP-2718 encoding, producing wrong receipts roots
+  for blocks with typed transactions. Added `tx_type` field to
+  `Receipt`, `tx_type()` method to `SignedTx`, and updated both
+  serial and parallel execution paths to pass the tx type through.
+
+### Test results
+
+Full workspace test suite: all green (0 failures). EVM: 128 + 31 +
+18 tests. Perps: 38 tests. Executor: 97 tests. Consensus: 93 tests.
+Types: 21 tests.
