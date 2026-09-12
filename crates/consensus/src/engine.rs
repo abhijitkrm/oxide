@@ -310,6 +310,18 @@ pub struct OxideBft {
     /// Used only by pure-logic tests that don't set BLS keys. The
     /// multi-node simulation uses real keys + verification.
     verify_signatures: bool,
+    /// Whether to verify each vote's BLS signature individually on
+    /// collection (HIGH perf fix). `true` = verify each vote as it
+    /// arrives (safe but ~1-2 ms per vote). `false` = skip per-vote
+    /// verification and rely on the aggregate verification in
+    /// `deliver_qc` (faster — one aggregate verify per QC instead
+    /// of N individual verifies per view). The aggregate verification
+    /// catches any forged votes, so this is safe: a forged vote
+    /// included in the QC causes the QC's aggregate to fail, rejecting
+    /// the QC. We still verify the voter is in the validator set
+    /// (structural check) and the vote is for the current view (C2
+    /// fix) regardless of this flag.
+    verify_per_vote: bool,
 }
 
 impl OxideBft {
@@ -356,6 +368,12 @@ impl OxideBft {
             vote_count: 0,
             timeout_signatures: vec![None; n],
             verify_signatures: true,
+            // HIGH perf fix: default to skipping per-vote BLS
+            // verification and relying on the aggregate verification
+            // in deliver_qc. This saves ~1-2 ms per vote (100-200 ms
+            // per view at 100 validators) while maintaining safety
+            // — the aggregate verification catches any forged votes.
+            verify_per_vote: false,
         }
     }
 
@@ -387,6 +405,16 @@ impl OxideBft {
     #[must_use]
     pub fn without_signature_verification(mut self) -> Self {
         self.verify_signatures = false;
+        self
+    }
+
+    /// Enable per-vote BLS verification (HIGH perf fix). By default,
+    /// per-vote verification is skipped and the engine relies on the
+    /// aggregate verification in `deliver_qc`. Enable this for tests
+    /// that specifically verify per-vote rejection behavior.
+    #[must_use]
+    pub fn with_per_vote_verification(mut self) -> Self {
+        self.verify_per_vote = true;
         self
     }
 
@@ -992,7 +1020,16 @@ impl OxideBft {
         // public key. The signed message binds (view, phase,
         // block_hash, epoch) to prevent replay across phases or
         // epochs (C3 fix).
-        if self.verify_signatures {
+        //
+        // HIGH perf fix: when `verify_per_vote` is `false` (the
+        // default), we skip per-vote verification and rely on the
+        // aggregate verification in `deliver_qc`. The aggregate
+        // verification catches any forged votes — a forged vote
+        // included in the QC causes the QC's aggregate to fail,
+        // rejecting the QC. We still verify the voter is in the
+        // validator set (structural check below) and the vote is for
+        // the current view (C2 fix above) regardless of this flag.
+        if self.verify_signatures && self.verify_per_vote {
             let pk = self
                 .validator_set
                 .validator(voter)
@@ -2187,7 +2224,8 @@ mod tests {
         let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
 
         let mut leader = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
-            .with_secret_key(keys[0].clone());
+            .with_secret_key(keys[0].clone())
+            .with_per_vote_verification();
 
         // Submit a tx and propose.
         leader.submit_tx(TxBytes::new(vec![42]));
