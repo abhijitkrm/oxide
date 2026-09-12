@@ -10590,3 +10590,33 @@ Results (release, TCP loopback):
 - `block_sweep` — bank 8357 tx/s, EVM 3932 tx/s at 1000 txs/blk;
   TPS scales with block size (consensus-bound, not executor-bound).
 - `tps` — 4v @ 1000/blk = 8787 tx/s; 1v = 31983 tx/s.
+
+## Production TPS run — matcher end-to-end (oxide-matcher + oxide-loadgen)
+
+`oxide-matcher` runs the full stack: executor + bank + exchange +
+matching engine over real TCP (binary protocol), with batch
+settlement into the consensus mempool. `oxide-loadgen` drove it:
+
+| Run | Orders | Throughput | Latency |
+|---|---|---|---|
+| batch, 8 conn, batch=500 | 2M | **6.97M orders/s** | 0.14 µs/order |
+| batch, 16 conn, batch=1000 | 10M | **4.98M orders/s** | 0.20 µs/order |
+| pipe (no batching), 8 conn | 1M | 83.0k orders/s | 12.0 µs/order |
+
+Batch mode sustains ~5–7M orders/s end-to-end through the wire
+protocol, matching engine, and settlement queue — 5–7× over the
+1M orders/s target. Pipelined (non-batch) mode is round-trip
+bound as expected.
+
+Chain-level TPS (consensus + execution, 4 validators, TCP):
+
+| Workload | tx/s | blocks/s |
+|---|---|---|
+| bank transfers, 1000/blk | 8,357 | 8.4 |
+| EVM mixed, 1000/blk | 3,932 | 3.9 |
+| trading (exchange), 1000/blk sustained 2M | 8,684 | 8.7 |
+| trading, 200k | 8,484 | 8.5 |
+
+Chain TPS is block-rate bound (~8–9 blk/s pipelined consensus on
+TCP loopback); it scales with txs/block. The EVM path carries the
+extra cost of secp256k1 recovery + revm execution per tx.

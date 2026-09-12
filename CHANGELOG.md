@@ -726,6 +726,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **Mempool selection walked the whole pool every block**
+  (`crates/mempool/src/lib.rs`)
+  - `select` scanned the entire fee bucket plus a per-block
+    `retain` over all buckets — O(pool) per proposal. At a
+    2M-entry pool the 2000-round trading test finalized ~0.4
+    blocks/s. Selection is now a sender-fair max-heap of
+    (head-tx fee density, sender) walked along each sender's
+    contiguous nonce chain: O(senders + selected·log senders).
+    `by_fee` survives only for pool-full eviction, lazily pruned.
+  - **In plain words:** proposing a block no longer re-reads
+    every pending transaction — the sustained 2M-tx trading run
+    now finalizes at 8.7 blocks/s (8,684 tx/s).
+
+- **Incremental EVM state root** (`modules/evm/src/lib.rs`)
+  - `state_root` no longer re-hashes every address, re-encodes
+    every account, and re-sorts all leaves per call. A
+    `BTreeMap<keccak(addr) → RLP leaf>` is patched for touched
+    accounts only; it rebuilds once after construction or
+    snapshot import.
+  - 100k accounts / 10 touched: 45.1 ms vs ~72 ms full rebuild
+    (~37%). The residual O(n) is `HashBuilder`'s intrinsic leaf
+    hashing — a sparse retained trie is the O(touched·log n)
+    follow-up.
+  - **In plain words:** each block re-derives the state root for
+    only the accounts that changed, not the whole state.
+
 - **Every event and vote signature heap-allocated for no reason**
   (`crates/executor/src/lib.rs`, `crates/consensus/src/engine.rs`,
   all modules)
@@ -818,6 +844,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     allocations per 10k-tx block.
 
 ### Fixed
+
+- **Devnet TPS harness crashed or starved under sustained load**
+  (`crates/devnet/src/tcp_multinode.rs`,
+  `crates/devnet/src/evm_workload.rs`)
+  - `TCP send … UnknownPeer` panic: the transport removes a dropped
+    peer's writer channel and reconnects after ~500ms, so `send`
+    fails transiently during the gap. Vote sends now retry next
+    tick; QC sends skip failed peers.
+  - The EVM workload declared `gas_limit = 30M` (the whole block)
+    per tx, so proposal gas accounting admitted exactly one tx per
+    block. Per-type declared limits (25k/100k/100k/50k) and a
+    devnet block cap matching the 1-gigagas consensus budget fix
+    it — `evm_load` now finalizes all txs with identical state
+    roots across validators.
+  - Pipeline deadline scales as 60s + 250ms/round; the old formula
+    made the 2000-round trading test impossible to finish.
+  - **In plain words:** the multi-validator load tests now survive
+    transient disconnects and run their full transaction count.
 
 - **Matcher balance cache aliased colliding addresses and minted
   money on insolvent transfers** (`crates/matcher/src/balance.rs`)
