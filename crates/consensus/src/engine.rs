@@ -249,6 +249,17 @@ pub struct OxideBft {
     /// The highest view the engine has voted in (prevents double-
     /// voting; a safety invariant). `None` = never voted.
     last_voted_view: Option<View>,
+    /// The block hash this validator voted for at each height — the
+    /// per-height vote lock (docs/oxidebft-spec.md §4). The view
+    /// check alone is insufficient: after a timeout the new leader
+    /// can propose a *different* block at the same height extending
+    /// the same parent QC; the tail-fork check passes (equal QC
+    /// view) and the validator would notarize two conflicting
+    /// blocks at one height — a safety violation that can fork the
+    /// committed chain. A validator may only re-vote a height for
+    /// the SAME block hash. Entries are pruned on commit (a
+    /// finalized prefix cannot conflict).
+    voted_at_height: BTreeMap<u64, Hash>,
     /// Block store: block hash → (header, proposal). Used to look up
     /// blocks at commit time.
     blocks: HashMap<Hash, (BlockHeader, Proposal)>,
@@ -325,6 +336,7 @@ impl OxideBft {
             pacemaker,
             high_qc: None,
             last_voted_view: None,
+            voted_at_height: BTreeMap::new(),
             blocks: HashMap::new(),
             pending: None,
             finalized: BTreeMap::new(),
@@ -655,6 +667,22 @@ impl OxideBft {
         if self.last_voted_view.is_some_and(|v| v >= header.view) {
             return None;
         }
+        // Per-height vote lock: never vote for a *different* block at
+        // a height we already voted. The view check alone does not
+        // cover this: after a timeout, a new leader can propose a
+        // conflicting block at the same height extending the same
+        // parent QC — the tail-fork check passes on equal QC view,
+        // and voting here would notarize two conflicting blocks at
+        // one height. Re-voting the same hash is safe and required
+        // for liveness (a leader re-proposing an uncommitted block).
+        let block_hash = Self::block_hash(header);
+        if self
+            .voted_at_height
+            .get(&header.height.value())
+            .is_some_and(|voted| *voted != block_hash)
+        {
+            return None;
+        }
         // Tail-fork resistance / extends-highest-QC rule
         // (docs/oxidebft-spec.md §4): reject proposals that don't
         // extend our highest QC. A leader that forks away a notarized
@@ -727,9 +755,11 @@ impl OxideBft {
             Verdict::Reject { .. } => return None,
         }
         // Store the block for later commit lookup.
-        let block_hash = Self::block_hash(header);
         self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
         self.last_voted_view = Some(header.view);
+        // Record the per-height lock: we may only ever vote this
+        // hash at this height from now on.
+        self.voted_at_height.insert(header.height.value(), block_hash);
         // Sign the vote (stage 5: real BLS if key is set).
         let signature = self.sign_vote(header.view, block_hash);
         Some(Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature })
@@ -1103,6 +1133,11 @@ impl OxideBft {
         let block = FinalizedBlock { height: header.height, txs: proposal.txs };
         self.app.finalize_block(&block);
         self.finalized.insert(header.height.value(), block);
+        // Prune per-height vote locks at-or-below the committed
+        // height: a finalized prefix cannot be forked, so the lock
+        // is no longer needed. Keeps the map bounded by the number
+        // of in-flight (uncommitted) heights.
+        self.voted_at_height.retain(|h, _| *h > header.height.value());
     }
 
     /// Clear all per-view state: collected votes and timeout
@@ -1374,6 +1409,8 @@ impl OxideBft {
         let vote =
             Vote { view: self.current_view, phase: VotePhase::Prepare, block_hash, signature };
         self.last_voted_view = Some(self.current_view);
+        // Record the per-height lock for the self-vote as well.
+        self.voted_at_height.insert(header.height.value(), block_hash);
 
         // Form QC (single validator: quorum = 1). Stage 5: aggregate
         // the real signature(s) if a key is set.
@@ -1656,6 +1693,46 @@ mod tests {
             assert_eq!(block.txs.len(), 1, "{name}: block 0 should have 1 tx");
             assert_eq!(block.txs[0].as_bytes(), [42], "{name}: block 0 tx mismatch");
         }
+    }
+
+    /// Regression test (safety): a validator that voted for block A
+    /// at height h must refuse a *different* block B at the same
+    /// height, even in a later view. Without the per-height lock,
+    /// the post-timeout flow — vote A at view v, time out, new
+    /// leader proposes conflicting B at height h extending the same
+    /// parent QC — passes the tail-fork check (equal QC view) and
+    /// the validator notarizes two conflicting blocks at one
+    /// height: both can form QCs and commit divergent state.
+    #[test]
+    fn vote_lock_rejects_conflicting_block_at_same_height() {
+        let mut leader = make_multi_engine(0);
+        let mut follower = make_multi_engine(1);
+
+        // Leader proposes block A at height 0, view 0.
+        let (header_a, prop_a) = leader.propose().expect("leader should propose");
+        assert!(follower.vote(&header_a, &prop_a).is_some(), "first vote at height 0 must succeed");
+
+        // Conflicting block B: same height, same parent QC, later
+        // view — different contents → different block hash.
+        let mut header_b = header_a.clone();
+        header_b.view = View::new(header_a.view.value() + 1);
+        header_b.tx_root = Hash([0xAB; 32]);
+        let prop_b = prop_a.clone();
+        assert!(
+            follower.vote(&header_b, &prop_b).is_none(),
+            "a conflicting block at an already-voted height must be refused"
+        );
+
+        // A block at the NEXT height is unaffected — normal
+        // progression continues.
+        let mut header_c = header_a.clone();
+        header_c.view = View::new(header_a.view.value() + 1);
+        header_c.height = Height::new(header_a.height.value() + 1);
+        header_c.prev_block = OxideBft::block_hash(&header_a);
+        assert!(
+            follower.vote(&header_c, &prop_a).is_some(),
+            "voting at the next height must still succeed"
+        );
     }
 
     #[test]

@@ -726,6 +726,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Consensus allowed voting for conflicting blocks at the same
+  height** (`crates/consensus/src/engine.rs`)
+  - After voting for block A at view v and timing out, a validator
+    would vote for a different block B at the same height in view
+    v+1 — the tail-fork check passes on equal parent-QC view and the
+    per-view check passes on the new view. Both blocks could form
+    QCs and commit divergent state (a committed-chain fork).
+  - Fix: `voted_at_height` records the block hash voted at each
+    height; a different hash at an already-voted height is refused.
+    Locks are pruned on commit so the map stays bounded by in-flight
+    heights.
+  - Regression test: same-height conflicting proposal refused while
+    next-height voting still succeeds.
+  - **In plain words:** validators can no longer accidentally help
+    notarize two competing versions of the same block — closing a
+    path that could split the finalized chain.
+
 - **Perps margin accounting could destroy or create value**
   (`modules/perps/src/lib.rs`)
   - `withdraw` debited margin before crediting the bank — a failed

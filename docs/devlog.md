@@ -9969,3 +9969,37 @@ Three financial-conservation bugs in the perps module:
   user margin + insurance == deposits)
 - `place_rejected_without_initial_margin`
 - `place_allowed_with_sufficient_margin`
+
+## Security sweep round 2 — consensus per-height vote lock
+
+A validator could vote for two *different* blocks at the same
+height: vote for block A at view v, time out, then a new leader
+proposes conflicting block B at the same height extending the same
+parent QC — the tail-fork check passes (equal QC view) and the
+`last_voted_view` check passes (new view). Both A and B could then
+form QCs and commit divergent state — a committed-chain fork.
+
+### Fix
+
+- `voted_at_height: BTreeMap<u64, Hash>` records the block hash
+  voted at each height. `vote()` refuses a different hash at an
+  already-voted height; re-voting the same hash is still allowed
+  (idempotent re-delivery).
+- The self-vote path (`step()`) records the lock too.
+- `commit_block` prunes locks at-or-below the committed height —
+  a finalized prefix cannot fork, so the map stays bounded by
+  in-flight heights.
+- `clear_per_view_state` deliberately does NOT clear the lock:
+  it must persist across views (that is the point).
+
+### Liveness
+
+Progress continues at new heights: once a QC for block A
+propagates, leaders extend A at h+1 — no lock conflict. The lock
+only closes the window where a validator saw A's votes but not
+yet A's QC.
+
+### Test
+
+- `vote_lock_rejects_conflicting_block_at_same_height` — same-height
+  conflicting proposal refused; next-height proposal still votes.
