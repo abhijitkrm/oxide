@@ -215,7 +215,7 @@ pub fn execute_precompile(
 fn execute_bank_transfer(input: &[u8], gas_limit: u64) -> PrecompileResult {
     const GAS_COST: u64 = 21_000;
     if gas_limit < GAS_COST {
-        return PrecompileResult::revert(0);
+        return PrecompileResult::revert(gas_limit);
     }
     // Input: 20-byte address + 32-byte amount = 52 bytes.
     if input.len() != 52 {
@@ -226,8 +226,16 @@ fn execute_bank_transfer(input: &[u8], gas_limit: u64) -> PrecompileResult {
     if to.iter().all(|&b| b == 0) {
         return PrecompileResult::revert(GAS_COST);
     }
-    // Success — the actual transfer happens in the executor.
-    PrecompileResult::success(Vec::new(), GAS_COST)
+    // C5 fix: the bank transfer side effect is NOT yet wired. The
+    // previous code returned `success` without performing any
+    // transfer — a contract calling this precompile would believe
+    // the transfer succeeded, but no funds moved. Returning
+    // `revert` here is safer: the caller sees a failed call and
+    // knows the transfer did not happen. When the executor-side
+    // settlement is wired (passing mutable bank access into the
+    // precompile context), this will return `success` after
+    // performing the actual transfer.
+    PrecompileResult::revert(GAS_COST)
 }
 
 /// Execute the bank balance precompile.
@@ -238,7 +246,7 @@ fn execute_bank_transfer(input: &[u8], gas_limit: u64) -> PrecompileResult {
 fn execute_bank_balance(input: &[u8], gas_limit: u64) -> PrecompileResult {
     const GAS_COST: u64 = 1_000;
     if gas_limit < GAS_COST {
-        return PrecompileResult::revert(0);
+        return PrecompileResult::revert(gas_limit);
     }
     if input.len() != 20 {
         return PrecompileResult::revert(GAS_COST);
@@ -257,7 +265,7 @@ fn execute_bank_balance(input: &[u8], gas_limit: u64) -> PrecompileResult {
 fn execute_staking_delegate(input: &[u8], gas_limit: u64) -> PrecompileResult {
     const GAS_COST: u64 = 50_000;
     if gas_limit < GAS_COST {
-        return PrecompileResult::revert(0);
+        return PrecompileResult::revert(gas_limit);
     }
     // Input: 20-byte validator + 32-byte amount = 52 bytes.
     if input.len() != 52 {
@@ -268,8 +276,15 @@ fn execute_staking_delegate(input: &[u8], gas_limit: u64) -> PrecompileResult {
     if validator.iter().all(|&b| b == 0) {
         return PrecompileResult::revert(GAS_COST);
     }
-    // Success — the actual delegation happens in the executor.
-    PrecompileResult::success(Vec::new(), GAS_COST)
+    // C5 fix: the staking delegation side effect is NOT yet wired.
+    // The previous code returned `success` without performing any
+    // delegation — a contract calling this precompile would believe
+    // the delegation succeeded, but no stake moved. Returning
+    // `revert` here is safer: the caller sees a failed call and
+    // knows the delegation did not happen. When the executor-side
+    // settlement is wired, this will return `success` after
+    // performing the actual delegation.
+    PrecompileResult::revert(GAS_COST)
 }
 
 // ── Native market reader ─────────────────────────────────────────────
@@ -380,7 +395,7 @@ fn execute_exchange_best_bid(
     reader: &native::NativeMarketReader,
 ) -> PrecompileResult {
     if gas_limit < GAS_EXCHANGE_L1 {
-        return PrecompileResult::revert(0);
+        return PrecompileResult::revert(gas_limit);
     }
     if input.len() != 1 {
         return PrecompileResult::revert(GAS_EXCHANGE_L1);
@@ -404,7 +419,7 @@ fn execute_exchange_best_ask(
     reader: &native::NativeMarketReader,
 ) -> PrecompileResult {
     if gas_limit < GAS_EXCHANGE_L1 {
-        return PrecompileResult::revert(0);
+        return PrecompileResult::revert(gas_limit);
     }
     if input.len() != 1 {
         return PrecompileResult::revert(GAS_EXCHANGE_L1);
@@ -431,7 +446,7 @@ fn execute_perps_position(
     reader: &native::NativeMarketReader,
 ) -> PrecompileResult {
     if gas_limit < GAS_PERPS_POSITION {
-        return PrecompileResult::revert(0);
+        return PrecompileResult::revert(gas_limit);
     }
     if input.len() != 21 {
         return PrecompileResult::revert(GAS_PERPS_POSITION);
@@ -453,7 +468,7 @@ fn execute_perps_mark_price(
     reader: &native::NativeMarketReader,
 ) -> PrecompileResult {
     if gas_limit < GAS_PERPS_MARK {
-        return PrecompileResult::revert(0);
+        return PrecompileResult::revert(gas_limit);
     }
     if input.len() != 1 {
         return PrecompileResult::revert(GAS_PERPS_MARK);
@@ -476,7 +491,7 @@ fn execute_perps_insurance_fund(
     reader: &native::NativeMarketReader,
 ) -> PrecompileResult {
     if gas_limit < GAS_PERPS_INSURANCE {
-        return PrecompileResult::revert(0);
+        return PrecompileResult::revert(gas_limit);
     }
     if !input.is_empty() {
         return PrecompileResult::revert(GAS_PERPS_INSURANCE);
@@ -654,11 +669,14 @@ mod tests {
 
     #[test]
     fn bank_transfer_success() {
+        // C5 fix: bank_transfer returns revert (not success) until
+        // the executor-side settlement is wired. The precompile
+        // validates input but does not perform the transfer.
         let addr = precompile_address(0x0B, 0x01);
         let mut input = vec![0u8; 52];
         input[0] = 0x42; // non-zero "to" address
         let result = execute_precompile(&addr, &input, 100_000, &empty_reader());
-        assert!(result.success);
+        assert!(!result.success, "bank_transfer must revert (side effect not wired)");
         assert_eq!(result.gas_used, 21_000);
         assert!(result.output.is_empty());
     }
@@ -687,7 +705,8 @@ mod tests {
         input[0] = 0x42;
         let result = execute_precompile(&addr, &input, 20_000, &empty_reader()); // < 21_000
         assert!(!result.success);
-        assert_eq!(result.gas_used, 0);
+        // C5 fix: OOG charges all available gas (gas_limit), not 0.
+        assert_eq!(result.gas_used, 20_000);
     }
 
     #[test]
@@ -702,11 +721,14 @@ mod tests {
 
     #[test]
     fn staking_delegate_success() {
+        // C5 fix: staking_delegate returns revert (not success) until
+        // the executor-side settlement is wired. The precompile
+        // validates input but does not perform the delegation.
         let addr = precompile_address(0x0C, 0x01);
         let mut input = vec![0u8; 52];
         input[0] = 0x42; // non-zero validator
         let result = execute_precompile(&addr, &input, 100_000, &empty_reader());
-        assert!(result.success);
+        assert!(!result.success, "staking_delegate must revert (side effect not wired)");
         assert_eq!(result.gas_used, 50_000);
     }
 
@@ -805,7 +827,8 @@ mod tests {
         let addr = precompile_address(EXCHANGE_BEST_BID.0, EXCHANGE_BEST_BID.1);
         let result = execute_precompile(&addr, &[0u8], 1_000, &empty_reader());
         assert!(!result.success);
-        assert_eq!(result.gas_used, 0);
+        // C5 fix: OOG charges all available gas (gas_limit), not 0.
+        assert_eq!(result.gas_used, 1_000);
     }
 
     #[test]
