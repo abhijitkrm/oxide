@@ -183,9 +183,11 @@ pub struct TxContext {
 /// root comparison across validators. For production multi-validator
 /// deployment, pair this with verification sampling.
 #[derive(Debug, Clone)]
-pub struct PreverifiedTx {
-    /// The raw module payload bytes (e.g. RLP-encoded signed EVM tx).
-    pub raw: Vec<u8>,
+pub struct PreverifiedTx<'a> {
+    /// The raw module payload bytes (e.g. RLP-encoded signed EVM tx),
+    /// borrowed from the caller's transaction buffer — the batch hot
+    /// path must not clone per-tx.
+    pub raw: &'a [u8],
     /// The sender recovered from the signature (20 bytes).
     pub sender: [u8; 20],
 }
@@ -285,8 +287,11 @@ pub trait Module: Send + Sync {
     ///
     /// Returns `Err(ExecError::Malformed)` for each transaction
     /// that cannot be parsed or whose signature is invalid.
-    fn preverify_batch(&self, msgs: &[&[u8]]) -> Vec<Result<PreverifiedTx, ExecError>> {
-        msgs.iter().map(|raw| Ok(PreverifiedTx { raw: raw.to_vec(), sender: [0u8; 20] })).collect()
+    fn preverify_batch<'a>(
+        &self,
+        msgs: &'a [&'a [u8]],
+    ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
+        msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0u8; 20] })).collect()
     }
 
     /// Execute a batch of transactions with pre-recovered senders.
@@ -309,10 +314,9 @@ pub trait Module: Send + Sync {
     fn handle_batch_preverified(
         &self,
         ctx: &TxContext,
-        txs: &[PreverifiedTx],
+        txs: &[PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
-        let batch: Vec<(TxContext, &[u8])> =
-            txs.iter().map(|pv| (*ctx, pv.raw.as_slice())).collect();
+        let batch: Vec<(TxContext, &[u8])> = txs.iter().map(|pv| (*ctx, pv.raw)).collect();
         self.handle_batch(&batch)
     }
 
@@ -336,7 +340,7 @@ pub trait Module: Send + Sync {
     fn handle_batch_parallel_preverified(
         &self,
         ctx: &TxContext,
-        txs: &[PreverifiedTx],
+        txs: &[PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
         self.handle_batch_preverified(ctx, txs)
     }
@@ -565,7 +569,11 @@ pub struct Executor {
     /// finalized (they are no longer needed — re-execution would
     /// re-preverify). This bounds the cache size to the mempool's
     /// capacity.
-    preverify_cache: Mutex<HashMap<Hash, PreverifiedTx>>,
+    ///
+    /// Only the recovered `sender` is stored — the payload bytes are
+    /// re-borrowed from the block's tx at execution time, so no
+    /// per-tx `Vec<u8>` is ever cloned into or out of this cache.
+    preverify_cache: Mutex<HashMap<Hash, [u8; 20]>>,
     /// Minimum batch size to use the parallel speculative execution
     /// path. Configurable via [`Executor::with_config`]. Default:
     /// [`DEFAULT_PARALLEL_THRESHOLD`] (32 txs). Lowered from 100
@@ -1153,15 +1161,13 @@ impl Executor {
                 group.iter().all(|(_ctx, _payload, tx_hash)| preverify_cache.contains_key(tx_hash));
 
             let results = if all_cached {
-                // All senders are pre-recovered — construct the
-                // preverified Vec from the cache (no payload clones).
-                let preverified: Vec<PreverifiedTx> = group
+                // All senders are pre-recovered — build borrowed
+                // `PreverifiedTx`s straight from the block bytes.
+                let preverified: Vec<PreverifiedTx<'_>> = group
                     .iter()
-                    .map(|(_ctx, payload, tx_hash)| {
-                        preverify_cache.remove(tx_hash).unwrap_or_else(|| PreverifiedTx {
-                            raw: payload.to_vec(),
-                            sender: [0u8; 20],
-                        })
+                    .map(|(_ctx, payload, tx_hash)| PreverifiedTx {
+                        raw: payload,
+                        sender: preverify_cache.remove(tx_hash).unwrap_or([0u8; 20]),
                     })
                     .collect();
 
@@ -1258,14 +1264,19 @@ impl AppInterface for Executor {
         // returns a zero sender), this is a no-op that stores a
         // placeholder. The execution path falls back to `handle_batch`
         // when the sender is zero.
-        let preverify_result = module.preverify_batch(&[payload]);
+        // `msgs` must outlive `preverify_result` — the returned
+        // `PreverifiedTx` borrows the payload slice.
+        let msgs = [payload];
+        let preverify_result = module.preverify_batch(&msgs);
         if let Ok(preverified) = &preverify_result[0] {
             let tx_hash =
                 crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, tx.as_bytes());
+            // Only the sender is cached — the payload is re-borrowed
+            // from the block's tx at execution time.
             self.preverify_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(tx_hash, preverified.clone());
+                .insert(tx_hash, preverified.sender);
         }
 
         // Push to the lock-free intake ring. The mempool submission
@@ -1327,17 +1338,22 @@ impl AppInterface for Executor {
                 results.push(MempoolAck::Rejected { reason: format!("validate: {e:?}") });
                 continue;
             }
-            // Pre-recover the sender at ingestion time.
-            let preverify_result = module.preverify_batch(&[payload]);
+            // Pre-recover the sender at ingestion time. `msgs` must
+            // outlive `preverify_result` — the returned
+            // `PreverifiedTx` borrows the payload slice.
+            let msgs = [payload];
+            let preverify_result = module.preverify_batch(&msgs);
             if let Ok(preverified) = &preverify_result[0] {
                 let tx_hash = crypto::hash::Hasher::hash_one(
                     crypto::hash::Domain::Transaction,
                     tx.as_bytes(),
                 );
+                // Only the sender is cached — the payload is
+                // re-borrowed from the block's tx at execution time.
                 self.preverify_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(tx_hash, preverified.clone());
+                    .insert(tx_hash, preverified.sender);
             }
             accepted_txs.push(tx);
             results.push(MempoolAck::Accepted);
@@ -1942,15 +1958,16 @@ mod tests {
         fn state_root(&self) -> Hash {
             Hash::ZERO
         }
-        fn preverify_batch(&self, msgs: &[&[u8]]) -> Vec<Result<PreverifiedTx, ExecError>> {
-            msgs.iter()
-                .map(|raw| Ok(PreverifiedTx { raw: raw.to_vec(), sender: [0u8; 20] }))
-                .collect()
+        fn preverify_batch<'a>(
+            &self,
+            msgs: &'a [&'a [u8]],
+        ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
+            msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0u8; 20] })).collect()
         }
         fn handle_batch_preverified(
             &self,
             _ctx: &TxContext,
-            txs: &[PreverifiedTx],
+            txs: &[PreverifiedTx<'_>],
         ) -> Vec<Result<Vec<Event>, ExecError>> {
             *self.preverified_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) +=
                 txs.len();

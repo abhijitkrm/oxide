@@ -594,15 +594,23 @@ fn bench_preverified_vs_recovery(c: &mut Criterion) {
                         .map(|i| signed_transfer(&key.privkey, i, recipient, 1_000_000_000))
                         .collect();
                     // Pre-recover senders (simulates mempool ingestion).
-                    let preverified: Vec<PreverifiedTx> = module
-                        .preverify_batch(&txs)
+                    // Keep the senders only — the borrowed
+                    // `PreverifiedTx`s are built inside the measured
+                    // routine because they borrow `txs`.
+                    let senders: Vec<revm::primitives::Address> = module
+                        .preverify_batch(&txs.iter().map(Vec::as_slice).collect::<Vec<_>>())
                         .into_iter()
-                        .map(|r| r.expect("preverify must succeed"))
+                        .map(|r| r.expect("preverify must succeed").sender)
                         .collect();
-                    (module, preverified)
+                    (module, txs, senders)
                 },
-                |(module, preverified)| {
+                |(module, txs, senders)| {
                     module.begin_block(Height::new(1));
+                    let preverified: Vec<PreverifiedTx<'_>> = txs
+                        .iter()
+                        .zip(&senders)
+                        .map(|(raw, &sender)| PreverifiedTx { raw: raw.as_slice(), sender })
+                        .collect();
                     let results = module.handle_batch_preverified(&dummy_ctx(), &preverified);
                     module.end_block(Height::new(1));
                     let root = module.state_root();
@@ -694,15 +702,23 @@ fn bench_preverified_parallel_vs_recovery(c: &mut Criterion) {
                             ));
                         }
                     }
-                    let preverified: Vec<PreverifiedTx> = module
-                        .preverify_batch(&txs)
+                    // Keep senders only — borrowed `PreverifiedTx`s
+                    // are built inside the measured routine (they
+                    // borrow `txs`).
+                    let senders: Vec<revm::primitives::Address> = module
+                        .preverify_batch(&txs.iter().map(Vec::as_slice).collect::<Vec<_>>())
                         .into_iter()
-                        .map(|r| r.expect("preverify must succeed"))
+                        .map(|r| r.expect("preverify must succeed").sender)
                         .collect();
-                    (module, preverified)
+                    (module, txs, senders)
                 },
-                |(module, preverified)| {
+                |(module, txs, senders)| {
                     module.begin_block(Height::new(1));
+                    let preverified: Vec<PreverifiedTx<'_>> = txs
+                        .iter()
+                        .zip(&senders)
+                        .map(|(raw, &sender)| PreverifiedTx { raw: raw.as_slice(), sender })
+                        .collect();
                     let results =
                         module.handle_batch_parallel_preverified(&dummy_ctx(), &preverified);
                     module.end_block(Height::new(1));

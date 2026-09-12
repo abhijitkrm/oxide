@@ -181,10 +181,11 @@ const TX_GAS_TRANSFER: u64 = 21_000;
 /// the result to [`EvmModule::handle_batch_preverified`] or
 /// [`EvmModule::handle_batch_parallel_preverified`].
 #[derive(Debug, Clone)]
-pub struct PreverifiedTx {
+pub struct PreverifiedTx<'a> {
     /// RLP-encoded signed transaction bytes (Legacy, EIP-2930, or
-    /// EIP-1559 per EIP-2718).
-    pub raw: Vec<u8>,
+    /// EIP-1559 per EIP-2718), borrowed from the caller's buffer —
+    /// the batch hot path must not clone per-tx.
+    pub raw: &'a [u8],
     /// The sender recovered from the transaction's secp256k1
     /// signature by the mempool. The execution layer trusts this
     /// address without re-verifying.
@@ -1065,7 +1066,7 @@ impl EvmModule {
     pub fn handle_batch(
         &self,
         ctx: &TxContext,
-        msgs: &[Vec<u8>],
+        msgs: &[impl AsRef<[u8]> + Sync],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
         // Phase 1: decode + recover all senders in parallel.
         // Each tx is independently decoded and its sender recovered.
@@ -1079,7 +1080,7 @@ impl EvmModule {
         let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = msgs
             .par_iter()
             .map(|raw| {
-                let mut buf = raw.as_slice();
+                let mut buf = raw.as_ref();
                 let signed: tx::SignedTx =
                     alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
@@ -1126,10 +1127,13 @@ impl EvmModule {
     /// # Panics
     ///
     /// This function does not panic.
-    pub fn preverify_batch(&self, msgs: &[Vec<u8>]) -> Vec<Result<PreverifiedTx, ExecError>> {
+    pub fn preverify_batch<'a, T: AsRef<[u8]> + Sync + 'a>(
+        &self,
+        msgs: &'a [T],
+    ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
         msgs.par_iter()
             .map(|raw| {
-                let mut buf = raw.as_slice();
+                let mut buf = raw.as_ref();
                 let signed: tx::SignedTx =
                     alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
@@ -1137,7 +1141,7 @@ impl EvmModule {
                 }
                 let sender = signed.recover_sender().map_err(|_| ExecError::Malformed)?;
                 let caller = alloy_primitives_address(sender.0);
-                Ok(PreverifiedTx { raw: raw.clone(), sender: caller })
+                Ok(PreverifiedTx { raw: raw.as_ref(), sender: caller })
             })
             .collect()
     }
@@ -1194,7 +1198,7 @@ impl EvmModule {
     pub fn handle_batch_preverified(
         &self,
         ctx: &TxContext,
-        txs: &[PreverifiedTx],
+        txs: &[PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
         // Phase 1: decode and re-recover the sender. RLP decode is
         // ~79 ns/tx; secp256k1 recovery is ~30 µs/tx. We re-recover
@@ -1204,7 +1208,7 @@ impl EvmModule {
         let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = txs
             .par_iter()
             .map(|pv| {
-                let mut buf = pv.raw.as_slice();
+                let mut buf = pv.raw;
                 let signed: tx::SignedTx =
                     alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
@@ -1448,7 +1452,7 @@ impl EvmModule {
     pub fn handle_batch_parallel(
         &self,
         ctx: &TxContext,
-        msgs: &[Vec<u8>],
+        msgs: &[impl AsRef<[u8]> + Sync],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
         // Fast path: empty batch.
         if msgs.is_empty() {
@@ -1464,7 +1468,7 @@ impl EvmModule {
         let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = msgs
             .par_iter()
             .map(|raw| {
-                let mut buf = raw.as_slice();
+                let mut buf = raw.as_ref();
                 let signed: tx::SignedTx =
                     alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
@@ -1526,7 +1530,7 @@ impl EvmModule {
     pub fn handle_batch_parallel_preverified(
         &self,
         ctx: &TxContext,
-        txs: &[PreverifiedTx],
+        txs: &[PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
         // Fast path: empty batch.
         if txs.is_empty() {
@@ -1538,7 +1542,7 @@ impl EvmModule {
         let decoded: Vec<Result<(tx::SignedTx, revm::primitives::Address), ExecError>> = txs
             .par_iter()
             .map(|pv| {
-                let mut buf = pv.raw.as_slice();
+                let mut buf = pv.raw;
                 let signed: tx::SignedTx =
                     alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
@@ -2407,9 +2411,10 @@ impl Module for EvmModule {
     /// Individual transactions may fail independently. A failed
     /// transaction does not abort the batch.
     fn handle_batch(&self, msgs: &[(TxContext, &[u8])]) -> Vec<Result<Vec<Event>, ExecError>> {
-        // Extract the raw RLP bytes from each (ctx, payload) pair.
-        // The payload IS the RLP-encoded signed transaction.
-        let raw_txs: Vec<Vec<u8>> = msgs.iter().map(|(_, payload)| payload.to_vec()).collect();
+        // Borrow the raw RLP bytes from each (ctx, payload) pair —
+        // no per-tx clone. The payload IS the RLP-encoded signed
+        // transaction.
+        let raw_txs: Vec<&[u8]> = msgs.iter().map(|(_, payload)| *payload).collect();
         let ctx = TxContext { sender: primitives::Address([0u8; 20]), nonce: 0, fee: 0 };
         // Call the inherent `handle_batch` (2 args: ctx, msgs) — Rust
         // resolves to the inherent method, not the trait method (1 arg)
@@ -2429,12 +2434,15 @@ impl Module for EvmModule {
     /// Returns `Err(ExecError::Malformed)` for each transaction
     /// that cannot be RLP-decoded, has a wrong chain ID, or whose
     /// signature is invalid.
-    fn preverify_batch(&self, msgs: &[&[u8]]) -> Vec<Result<executor::PreverifiedTx, ExecError>> {
+    fn preverify_batch<'a>(
+        &self,
+        msgs: &'a [&'a [u8]],
+    ) -> Vec<Result<executor::PreverifiedTx<'a>, ExecError>> {
         // Delegate to the inherent `preverify_batch` (which returns
-        // `evm::PreverifiedTx`) and convert to the executor's
-        // `PreverifiedTx` (which uses a generic `[u8; 20]` sender).
-        let raw_vec: Vec<Vec<u8>> = msgs.iter().map(|b| b.to_vec()).collect();
-        let results = EvmModule::preverify_batch(self, &raw_vec);
+        // `evm::PreverifiedTx` borrowing from `msgs`) and convert to
+        // the executor's `PreverifiedTx` (which uses a generic
+        // `[u8; 20]` sender). The borrow propagates — zero clones.
+        let results = EvmModule::preverify_batch(self, msgs);
         results
             .into_iter()
             .map(|r| {
@@ -2457,14 +2465,15 @@ impl Module for EvmModule {
     fn handle_batch_preverified(
         &self,
         ctx: &TxContext,
-        txs: &[executor::PreverifiedTx],
+        txs: &[executor::PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
         // Convert the executor's `PreverifiedTx` (generic [u8; 20]
         // sender) to the EVM's `PreverifiedTx` (revm Address sender).
-        let evm_txs: Vec<PreverifiedTx> = txs
+        // The raw bytes stay borrowed — no per-tx clone.
+        let evm_txs: Vec<PreverifiedTx<'_>> = txs
             .iter()
             .map(|pv| PreverifiedTx {
-                raw: pv.raw.clone(),
+                raw: pv.raw,
                 sender: revm::primitives::Address::from(pv.sender),
             })
             .collect();
@@ -2486,13 +2495,14 @@ impl Module for EvmModule {
     fn handle_batch_parallel_preverified(
         &self,
         ctx: &TxContext,
-        txs: &[executor::PreverifiedTx],
+        txs: &[executor::PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
         // Convert the executor's `PreverifiedTx` to the EVM's.
-        let evm_txs: Vec<PreverifiedTx> = txs
+        // The raw bytes stay borrowed — no per-tx clone.
+        let evm_txs: Vec<PreverifiedTx<'_>> = txs
             .iter()
             .map(|pv| PreverifiedTx {
-                raw: pv.raw.clone(),
+                raw: pv.raw,
                 sender: revm::primitives::Address::from(pv.sender),
             })
             .collect();
@@ -3719,7 +3729,7 @@ mod tests {
     #[test]
     fn handle_batch_parallel_empty_batch() {
         let m = make_module();
-        let results = m.handle_batch_parallel(&dummy_ctx(), &[]);
+        let results = m.handle_batch_parallel(&dummy_ctx(), &Vec::<&[u8]>::new());
         assert!(results.is_empty());
     }
 
@@ -3855,7 +3865,7 @@ mod tests {
         // Path 2: preverify + handle_batch_preverified.
         let m2 = make_module();
         fund(&m2, &addr);
-        let preverified: Vec<PreverifiedTx> = m2
+        let preverified: Vec<PreverifiedTx<'_>> = m2
             .preverify_batch(&txs)
             .into_iter()
             .map(|r| r.expect("preverify must succeed"))
@@ -3899,7 +3909,7 @@ mod tests {
         let m2 = make_module();
         fund(&m2, &addr_a);
         fund(&m2, &addr_b);
-        let preverified: Vec<PreverifiedTx> = m2
+        let preverified: Vec<PreverifiedTx<'_>> = m2
             .preverify_batch(&txs)
             .into_iter()
             .map(|r| r.expect("preverify must succeed"))
@@ -3948,7 +3958,7 @@ mod tests {
 
         // Pre-verify: the valid tx succeeds, the garbage fails.
         let raw_txs = vec![valid_tx.clone(), garbage];
-        let preverified: Vec<PreverifiedTx> =
+        let preverified: Vec<PreverifiedTx<'_>> =
             m.preverify_batch(&raw_txs).into_iter().filter_map(std::result::Result::ok).collect();
         assert_eq!(preverified.len(), 1, "only the valid tx should preverify");
 
@@ -4242,7 +4252,7 @@ mod tests {
 
         // Pre-verify to get the correct sender.
         let m = make_module();
-        let preverified: Vec<PreverifiedTx> = m
+        let preverified: Vec<PreverifiedTx<'_>> = m
             .preverify_batch(&txs)
             .into_iter()
             .map(|r| r.expect("preverify must succeed"))
@@ -4250,7 +4260,7 @@ mod tests {
 
         // Tamper: replace the sender with a wrong address.
         let wrong_addr = revm::primitives::Address::from_slice(&[0x99; 20]);
-        let tampered: Vec<PreverifiedTx> = preverified
+        let tampered: Vec<PreverifiedTx<'_>> = preverified
             .into_iter()
             .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr })
             .collect();
@@ -4279,14 +4289,14 @@ mod tests {
             (0..2).map(|i| signed_transfer_tx(&pk, i, recipient, 1_000_000_000)).collect();
 
         let m = make_module();
-        let preverified: Vec<PreverifiedTx> = m
+        let preverified: Vec<PreverifiedTx<'_>> = m
             .preverify_batch(&txs)
             .into_iter()
             .map(|r| r.expect("preverify must succeed"))
             .collect();
 
         let wrong_addr = revm::primitives::Address::from_slice(&[0x99; 20]);
-        let tampered: Vec<PreverifiedTx> = preverified
+        let tampered: Vec<PreverifiedTx<'_>> = preverified
             .into_iter()
             .map(|pv| PreverifiedTx { raw: pv.raw, sender: wrong_addr })
             .collect();

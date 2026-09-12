@@ -724,6 +724,19 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     case where there is no code to execute. True JIT compilation is
     not available in revm 42.
 
+### Performance
+
+- **EVM batch path cloned every transaction's bytes up to three
+  times** (`crates/executor/src/lib.rs`, `modules/evm/src/lib.rs`)
+  - `PreverifiedTx` now borrows `raw: &[u8]` instead of owning a
+    `Vec<u8>`; the preverify cache stores only the recovered sender
+    and re-borrows the payload from block bytes at execution time;
+    batch entry points take `impl AsRef<[u8]>` so no per-tx clone
+    happens at any layer.
+  - **In plain words:** the block-execution hot path no longer
+    allocates or copies transaction bytes — ~30k fewer `Vec<u8>`
+    allocations per 10k-tx block.
+
 ### Fixed
 
 - **Matcher balance cache aliased colliding addresses and minted

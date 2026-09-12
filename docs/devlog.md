@@ -10207,3 +10207,29 @@ Three correctness bugs in `crates/matcher/src/balance.rs`:
   and len.
 - `sharded_transfer_insolvent_moves_nothing` — same- and
   cross-shard insolvency fails atomically.
+
+## Perf sweep — zero-clone preverified batch path
+
+Every transaction on the EVM batch path was cloned at least once,
+sometimes three times: `handle_batch` copied each payload into a
+`Vec<Vec<u8>>`, `preverify_batch` cloned raw bytes into
+`evm::PreverifiedTx`, the trait boundary cloned again into
+`executor::PreverifiedTx`, and the executor's `preverify_cache`
+stored the whole `Vec<u8>` per tx (then cloned once more on the
+execute side). At 10k txs/block that's ~30k needless `Vec<u8>`
+allocations on the hot path.
+
+Fix: `PreverifiedTx` (both `evm` and `executor` versions) now
+borrows `raw: &'a [u8]` instead of owning `Vec<u8>`. The
+`preverify_cache` stores only the recovered `sender` — the payload
+is re-borrowed from the block's tx bytes at execution time, so
+zero bytes are cloned into or out of the cache. `handle_batch`/
+`handle_batch_parallel`/`preverify_batch` take `impl AsRef<[u8]>`
+so both `Vec<u8>` and `&[u8]` callers work with no copies. The
+`[payload]` literals at ingestion are bound to locals because the
+returned borrows must outlive the temporary slice.
+
+### Tests
+
+- All 128 executor + 126 EVM tests pass unchanged — the refactor
+  is borrow-only, no semantics changed.
