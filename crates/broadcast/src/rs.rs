@@ -185,6 +185,17 @@ impl ReedSolomon {
             shard_size
         };
 
+        // C6 fix: validate that all available shards have at least
+        // `shard_size` bytes. A malformed or truncated shard from
+        // the network would otherwise panic on `shard[col]` (index
+        // out of bounds) — a remote crash vector. Return `None`
+        // (reconstruction failed) instead of panicking.
+        for (_, shard) in available {
+            if shard.len() < shard_size {
+                return None;
+            }
+        }
+
         // Build the k×k submatrix from the encoding matrix rows
         // corresponding to the available shard indices.
         let mut submatrix = vec![0u8; self.k * self.k];
@@ -388,5 +399,47 @@ mod tests {
             [2, 3, 4, 5, 6].iter().map(|&i| (i, shards[i].clone())).collect();
         let recovered = rs.reconstruct(&available, shard_size).expect("reconstruct");
         assert_eq!(recovered, data);
+    }
+
+    /// Regression test (C6): `reconstruct` must not panic when a
+    /// shard is truncated (shorter than `shard_size`). Before the
+    /// fix, `shard[col]` panicked with an index-out-of-bounds — a
+    /// remote crash vector via a malformed network shard.
+    #[test]
+    fn reconstruct_unequal_shard_lengths_does_not_panic() {
+        let rs = ReedSolomon::new(3, 2);
+        let shard_size = 32;
+        let data: Vec<u8> = (0..3 * shard_size).map(|i| u8::try_from(i % 256).unwrap()).collect();
+        let shards = rs.encode(&data, shard_size);
+
+        // Truncate one shard to half its length.
+        let mut available: Vec<(usize, Vec<u8>)> =
+            [0, 1, 2].iter().map(|&i| (i, shards[i].clone())).collect();
+        available[2].1.truncate(shard_size / 2);
+
+        // Must return None, not panic.
+        let result = rs.reconstruct(&available, shard_size);
+        assert!(result.is_none(), "truncated shard must return None, not panic");
+    }
+
+    /// Regression test (C6): `reconstruct` must not panic when
+    /// `shard_size = 0` is auto-detected from a short first shard.
+    #[test]
+    fn reconstruct_auto_shard_size_with_short_shards_does_not_panic() {
+        let rs = ReedSolomon::new(3, 2);
+        let shard_size = 16;
+        let data: Vec<u8> = (0..3 * shard_size).map(|i| u8::try_from(i % 256).unwrap()).collect();
+        let shards = rs.encode(&data, shard_size);
+
+        // Pass shards with different lengths and shard_size=0 (auto).
+        let available: Vec<(usize, Vec<u8>)> = vec![
+            (0, shards[0].clone()),
+            (1, shards[1][..8].to_vec()), // shorter
+            (2, shards[2].clone()),
+        ];
+
+        // Must return None, not panic.
+        let result = rs.reconstruct(&available, 0);
+        assert!(result.is_none(), "unequal shards with auto size must return None");
     }
 }
