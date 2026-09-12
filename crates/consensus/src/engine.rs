@@ -497,6 +497,30 @@ impl OxideBft {
         }
     }
 
+    /// Observe a block height from a received proposal or QC.
+    ///
+    /// When a follower receives a proposal from the network, it
+    /// learns the height the leader assigned to that block. The
+    /// follower's `next_height` must advance to `height + 1` so that
+    /// if it later becomes the leader (after a view change), it
+    /// proposes at the correct height instead of re-proposing an
+    /// already-finalized height.
+    ///
+    /// Without this, a follower that never proposes (because it's
+    /// never the leader) keeps `next_height = 0`. When a view change
+    /// makes it the leader, it proposes a block at height 0 —
+    /// conflicting with the already-finalized block at height 0 and
+    /// corrupting the chain state (the app re-executes height 0 with
+    /// different transactions, overwriting finalized state).
+    ///
+    /// This method is idempotent: calling it with a height below the
+    /// current `next_height` is a no-op.
+    pub fn observe_block_height(&mut self, height: Height) {
+        if height.value() >= self.next_height.value() {
+            self.next_height = Height::new(height.value() + 1);
+        }
+    }
+
     /// Compute the Merkle root of a transaction list.
     ///
     /// Stage 4: a simple domain-separated hash of the concatenated tx
@@ -619,6 +643,13 @@ impl OxideBft {
     /// BLS secret key is set (stage 5), the vote is signed with real
     /// BLS; otherwise `Signature::ZERO` is used (conformance mode).
     pub fn vote(&mut self, header: &BlockHeader, proposal: &Proposal) -> Option<Vote> {
+        // Height sync: learn the chain's progression from this
+        // proposal. Even if we reject the proposal (tail-fork
+        // resistance, already voted, etc.), the height is a fact
+        // about the chain's progression. If we later become the
+        // leader, we must propose at a height above any we've seen.
+        self.observe_block_height(header.height);
+
         // Safety: never vote twice in the same view.
         if self.last_voted_view.is_some_and(|v| v >= header.view) {
             return None;
@@ -3076,5 +3107,102 @@ mod tests {
         // Vote state must be cleared.
         assert_eq!(engine.vote_count, 0, "vote_count must be cleared after sync");
         assert!(engine.votes.iter().all(Option::is_none), "votes must be cleared after sync");
+    }
+
+    /// Regression test: a follower that votes on proposals must
+    /// advance its `next_height` via `observe_block_height` (called
+    /// from `vote`). Without this, a follower that becomes the leader
+    /// after a view change would propose at a stale height,
+    /// re-executing an already-finalized height with different
+    /// transactions and corrupting chain state.
+    #[test]
+    fn vote_syncs_next_height_from_proposal() {
+        let mut leader = make_multi_engine(0);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        let mut followers = [&mut f1, &mut f2, &mut f3];
+
+        // Drive 3 rounds. The leader proposes at heights 0, 1, 2.
+        for i in 0..3u8 {
+            drive_round(&mut leader, &mut followers, Some(TxBytes::new(vec![i])));
+        }
+
+        // Followers should have advanced their next_height past 0
+        // because they voted on proposals at heights 0, 1, 2.
+        // After 3 rounds, next_height should be at least 3 (the
+        // leader proposed at heights 0, 1, 2, so next_height = 3).
+        for (name, follower) in [("f1", &f1), ("f2", &f2), ("f3", &f3)] {
+            assert!(
+                follower.next_height.value() >= 3,
+                "{name}: next_height should be >= 3 after 3 rounds, got {}",
+                follower.next_height.value()
+            );
+        }
+    }
+
+    /// Regression test: `observe_block_height` must be idempotent
+    /// and only advance forward. A stale height must not regress
+    /// `next_height`.
+    #[test]
+    fn observe_block_height_only_advances_forward() {
+        let mut engine = make_multi_engine(0);
+        assert_eq!(engine.next_height.value(), 0);
+
+        // Observe height 5 — should advance to 6.
+        engine.observe_block_height(Height::new(5));
+        assert_eq!(engine.next_height.value(), 6);
+
+        // Observe height 3 (stale) — should be a no-op.
+        engine.observe_block_height(Height::new(3));
+        assert_eq!(engine.next_height.value(), 6);
+
+        // Observe height 6 (equal) — should advance to 7.
+        engine.observe_block_height(Height::new(6));
+        assert_eq!(engine.next_height.value(), 7);
+    }
+
+    /// Regression test: a follower that becomes the leader after a
+    /// view change must propose at the correct height (not height 0).
+    /// Before the fix, followers never advanced `next_height` from
+    /// received proposals, so a new leader proposed at height 0,
+    /// conflicting with the already-finalized block at height 0.
+    #[test]
+    fn new_leader_proposes_at_correct_height_after_view_change() {
+        let mut leader = make_multi_engine(0);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        let mut followers = [&mut f1, &mut f2, &mut f3];
+
+        // Drive 3 rounds with leader 0 (heights 0, 1, 2).
+        for i in 0..3u8 {
+            drive_round(&mut leader, &mut followers, Some(TxBytes::new(vec![i])));
+        }
+
+        // All validators should have finalized blocks up to height 1
+        // (2-chain: 3 rounds → 2 committed blocks).
+        let finalized_h = leader.finalized_height().map_or(0, primitives::Id::value);
+        assert!(finalized_h >= 1, "should have finalized at least height 1");
+
+        // Now simulate a view change: advance views so that f1
+        // becomes the leader. With 4 validators and round-robin,
+        // view 4 % 4 = 0 (leader 0), view 5 % 4 = 1 (leader 1).
+        // Advance to view 5 so f1 is the leader.
+        for engine in [&mut leader, &mut f1, &mut f2, &mut f3] {
+            while engine.current_view().value() < 5 {
+                engine.advance_view();
+            }
+        }
+        assert!(f1.is_leader(), "f1 should be leader for view 5");
+
+        // f1 should propose at a height > finalized_h, not height 0.
+        f1.submit_tx(TxBytes::new(vec![42]));
+        let (header, _proposal) = f1.propose().expect("f1 should propose as new leader");
+        assert!(
+            header.height.value() > finalized_h,
+            "new leader must propose at height > {finalized_h} (finalized), got {}",
+            header.height.value()
+        );
     }
 }

@@ -9280,3 +9280,43 @@ binary (`bin/oxide-validator/src/main.rs`):
 
 Kept operational logs: TC formation, timeout sig rejection,
 view timeout broadcast, TC rejection, app rejection warning.
+
+## Pre-testnet audit: height sync fix
+
+### Root cause
+
+The validator binary's consensus loop synced `next_height` to its own
+value — a no-op (`engine.sync_next_height(engine.next_height_value())`).
+Followers never advanced `next_height` from received proposals. When a
+follower became the leader after a view change, it proposed at a stale
+height (often height 0), conflicting with already-finalized blocks. The
+app re-executed the height with different transactions, overwriting
+finalized state.
+
+The 1-hour Docker soak could not detect this: its divergence check only
+compared finalized *heights* (with 10-block lag tolerance), never state
+roots or block hashes. The soak's ~4:1 view-to-height ratio was the
+signature of 4 validators each re-proposing the same heights.
+
+### Fix
+
+Added `OxideBft::observe_block_height(height)` to the consensus engine.
+It advances `next_height` to `height + 1` whenever a higher height is
+observed. Called from:
+- `vote()` — when a follower votes on a proposal (syncs from the
+  proposal's header height, before any early returns so it syncs even
+  if the vote is later rejected).
+- The validator loop's `MSG_PROPOSAL` handler — when a proposal arrives
+  over the network.
+
+Removed the no-op Phase 6 self-sync from the validator loop.
+
+### Regression tests
+
+- `vote_syncs_next_height_from_proposal` — followers advance
+  `next_height` after voting on proposals.
+- `observe_block_height_only_advances_forward` — idempotent, never
+  regresses.
+- `new_leader_proposes_at_correct_height_after_view_change` — a
+  follower that becomes the leader after a view change proposes at the
+  correct height, not height 0.

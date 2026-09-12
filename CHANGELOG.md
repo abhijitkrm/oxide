@@ -2451,3 +2451,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     validator catches up via higher-view QCs, TCs, and timeout
     signatures, and that stale (lower-view) messages can never
     regress the view.
+
+### Fixed (2026-09-13)
+
+- **Followers never synced block heights from received proposals**
+  (`crates/consensus/src/engine.rs`, `bin/oxide-validator/src/main.rs`)
+  - The validator binary's consensus loop synced `next_height` to its
+    own value — a no-op. Followers never advanced `next_height` from
+    received proposals. When a follower became the leader after a
+    view change, it proposed at a stale height (often height 0),
+    conflicting with already-finalized blocks and corrupting chain
+    state.
+  - Added `OxideBft::observe_block_height(height)` to the consensus
+    engine, called from `vote()` and the validator loop's
+    `MSG_PROPOSAL` handler. It advances `next_height` to `height + 1`
+    whenever a higher height is observed.
+  - Regression tests: `vote_syncs_next_height_from_proposal`,
+    `observe_block_height_only_advances_forward`,
+    `new_leader_proposes_at_correct_height_after_view_change`.
+  - **In plain words:** validators now learn the chain's block
+    height from proposals they receive. A validator that takes over
+    as leader after a view change proposes at the correct height
+    instead of re-proposing an already-finalized height.
