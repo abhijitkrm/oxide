@@ -10329,3 +10329,22 @@ path and recent-height queries only.
 
 - 87 consensus + 45 executor tests green (existing commit-path
   coverage exercises the new retains).
+
+## Perf + DoS sweep — P2P writer batches queued frames
+
+The writer thread wrote each queued frame with its own
+`write_vectored` + `flush` — N queued consensus bursts (votes →
+QCs queue within microseconds) cost N syscalls + N flushes.
+
+`PeerStream::write_frames(&[Vec<u8>])` now batches: `TcpStream`
+builds one contiguous `[len][payload]…` buffer → one `write_all`
++ one `flush` per drain; `SharedStream` (TLS) takes the stream
+lock once and flushes once (also closing the mid-batch
+interleave window a competing writer had). `writer_loop` drains
+the outbound channel up to `WRITER_BATCH_MAX_MESSAGES = 64`
+(≈64 KiB of typical consensus frames — a natural TCP burst,
+bounded so the shutdown flag stays responsive).
+
+### Tests
+
+- 97 p2p tests green (transport e2e exercises the batch path).

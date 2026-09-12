@@ -726,6 +726,19 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **P2P writer flushed and syscalled per queued frame**
+  (`crates/p2p/src/tcp.rs`)
+  - `PeerStream::write_frames` batches a drained outbound queue:
+    `TcpStream` builds one contiguous frame buffer (one
+    `write_all` + one `flush` per drain); `SharedStream` (TLS)
+    takes the lock once and flushes once, also closing a
+    mid-batch interleave window.
+  - The writer loop drains up to 64 queued messages per batch —
+    consensus bursts (votes → QCs) now cost one syscall + one
+    flush instead of N of each.
+  - **In plain words:** vote and QC bursts go out in a single
+    socket write instead of a syscall per message.
+
 - **Consensus and executor history maps grew without bound**
   (`crates/consensus/src/engine.rs`, `crates/executor/src/lib.rs`)
   - `OxideBft::blocks` now drops stale proposals at-or-below the

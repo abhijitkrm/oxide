@@ -85,6 +85,24 @@ pub trait PeerStream: Send {
     ///
     /// Returns `Err` on I/O error.
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Write multiple length-prefixed frames, ideally in a single
+    /// flush. The writer loop calls this when several outbound
+    /// messages are queued at once — batching turns N frames into
+    /// one syscall + one flush instead of N of each.
+    ///
+    /// The default implementation writes frames sequentially;
+    /// transports override to batch properly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on I/O error.
+    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+        for f in frames {
+            self.write_frame(f)?;
+        }
+        Ok(())
+    }
 }
 
 impl PeerStream for TcpStream {
@@ -121,6 +139,25 @@ impl PeerStream for TcpStream {
         }
         self.flush()?;
         Ok(())
+    }
+
+    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+        if frames.len() == 1 {
+            // Single-frame fast path: keep the vectored write.
+            return self.write_frame(&frames[0]);
+        }
+        // Batched frames: one contiguous `[len][payload]…` buffer →
+        // one `write_all` + one `flush` for the whole batch. The
+        // single memcpy per batch is dwarfed by the syscall and
+        // flush savings (N frames would otherwise cost N of each).
+        let total: usize = frames.iter().map(|f| 4 + f.len()).sum();
+        let mut buf = Vec::with_capacity(total);
+        for f in frames {
+            buf.extend_from_slice(&u32::try_from(f.len()).unwrap_or(u32::MAX).to_be_bytes());
+            buf.extend_from_slice(f);
+        }
+        self.write_all(&buf)?;
+        self.flush()
     }
 }
 
@@ -176,6 +213,15 @@ impl<S: Read + Write + Send> PeerStream for SharedStream<S> {
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
         let mut stream = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         write_frame(&mut *stream, bytes)
+    }
+
+    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+        // One lock acquisition + one flush for the whole batch —
+        // the per-frame path took the lock and flushed per frame,
+        // which also let a competing writer interleave frames
+        // mid-batch.
+        let mut stream = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        write_frames(&mut *stream, frames)
     }
 }
 
@@ -1002,6 +1048,24 @@ fn write_frame<W: Write>(stream: &mut W, bytes: &[u8]) -> Result<(), std::io::Er
     Ok(())
 }
 
+/// Write multiple length-prefixed frames with a single flush —
+/// the batched counterpart of [`write_frame`]. The caller
+/// (writer loop) has already drained the outbound channel, so
+/// one flush covers the whole batch.
+///
+/// Only used by the TLS `SharedStream` path today — the plain
+/// `TcpStream` batch impl builds a contiguous buffer instead.
+#[cfg(feature = "tls")]
+fn write_frames<W: Write>(stream: &mut W, frames: &[Vec<u8>]) -> Result<(), std::io::Error> {
+    for f in frames {
+        let len = u32::try_from(f.len()).unwrap_or(u32::MAX);
+        stream.write_all(&len.to_be_bytes())?;
+        stream.write_all(f)?;
+    }
+    stream.flush()?;
+    Ok(())
+}
+
 /// The reader loop: reads frames from a peer's stream and sends
 /// them to the inbound channel. Exits when the stream is closed,
 /// an error occurs, or the shutdown flag is set.
@@ -1039,6 +1103,13 @@ fn reader_loop(
 /// This decouples `send()` from I/O — the global `streams` mutex is
 /// not held during writes. A slow peer only blocks its own writer
 /// thread, not sends to other peers.
+/// Maximum messages drained from the outbound channel into one
+/// batched write. Bounds the per-batch buffer and keeps the
+/// writer responsive to the shutdown flag; 64 msgs × typical
+/// consensus-frame size (~1 KiB) ≈ 64 KiB per batch — a natural
+/// TCP burst, not a runaway.
+const WRITER_BATCH_MAX_MESSAGES: usize = 64;
+
 fn writer_loop(
     mut stream: Box<dyn PeerStream>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -1048,8 +1119,21 @@ fn writer_loop(
         // Use recv_timeout to avoid blocking forever, so we can
         // check the shutdown flag periodically.
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(bytes) => {
-                if stream.write_frame(&bytes).is_err() {
+            Ok(first) => {
+                // Drain whatever else is already queued and write
+                // the batch in one syscall + one flush. Consensus
+                // bursts (votes → QCs) queue several frames within
+                // microseconds; batching turns N frames into one
+                // socket write instead of N syscalls + N flushes.
+                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(8);
+                batch.push(first);
+                while batch.len() < WRITER_BATCH_MAX_MESSAGES {
+                    match rx.try_recv() {
+                        Ok(next) => batch.push(next),
+                        Err(_) => break,
+                    }
+                }
+                if stream.write_frames(&batch).is_err() {
                     return; // connection closed or error
                 }
             }
