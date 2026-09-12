@@ -10620,3 +10620,15 @@ Chain-level TPS (consensus + execution, 4 validators, TCP):
 Chain TPS is block-rate bound (~8–9 blk/s pipelined consensus on
 TCP loopback); it scales with txs/block. The EVM path carries the
 extra cost of secp256k1 recovery + revm execution per tx.
+
+## Workspace hygiene — cleanup rules added to skills
+
+`git-conventions` gained a "Cleanup after each task" section
+(scratch files, fuzz artifacts, docker containers/images, devnet
+processes + node dirs, build artifacts, gate evidence, orphaned
+background work) and item 6 in the pre-commit checklist;
+`testing-standards` points fuzz artifact cleanup at it. Applied
+immediately: removed 4 validator images + pruned docker (4.2 GB
+reclaimed), killed a stray `oxide-validator --engine=sequencer`
+process, removed scratch files. `target/` (40 GB) left in place —
+active work session; `cargo clean` documented for disk pressure.

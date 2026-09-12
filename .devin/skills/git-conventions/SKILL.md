@@ -49,3 +49,33 @@ what they asked for — nothing more, and only for that commit.
    small — decisions, bug hunts with root cause, fixes) and
    `CHANGELOG.md` updated if anything user-visible shipped.
 5. Message follows the format above, with **no attribution trailers**.
+6. **Workspace cleanup done** (see below) — nothing generated is left
+   running or on disk to eat space.
+
+## Cleanup after each task
+
+Every commit/task ends with a cleanup pass. The rule: *if the task
+created it and it isn't source or committed evidence, it goes away.*
+
+- **Scratch files:** remove temp scripts, stray logs, `*.tmp`, core
+  dumps, downloaded fixtures, and ad-hoc binaries the task produced.
+  `git status` should show only intentional changes.
+- **Test/fuzz artifacts:** `fuzz/artifacts/` is gitignored — leave
+  crash inputs for triage until the fix lands, then delete them.
+  Committed `fuzz/corpus/` stays (it is the regression set); prune
+  obviously bloated corpus entries that add no coverage.
+- **Docker:** after any testnet run, `docker compose down` and remove
+  task-built images (`docker image rm oxide-validator-*`) plus
+  `docker system prune -f` for dangling layers if disk is tight.
+- **Devnet/node state:** kill any `oxide-*` processes the task started
+  (matcher, validator, loadgen); remove `local/`, `data/`, or other
+  node dirs the run created (gitignored anyway — don't leave them).
+- **Build artifacts:** leave `target/` alone during a work session
+  (rebuilds are expensive). Between heavy runs, or when disk pressure
+  shows, `cargo clean` is acceptable — `target/criterion` is never
+  committed regardless.
+- **Gate evidence:** `docs/evidence/` output that a gate requires IS
+  committed; everything else generated (coverage html, pprof dumps,
+  bench reports) is not.
+- **Background work:** no orphaned shell jobs, watch loops, or
+  port-bound processes survive the task.

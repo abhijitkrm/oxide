@@ -92,6 +92,10 @@ equivalent). CI runs these against **every** registered adapter in a matrix.
 - `fuzz/` holds cargo-fuzz targets (codec, consensus messages, matching
   engine vs. oracle, journal torn-write replay). Run locally with
   `cargo +nightly fuzz run <target>` — nightly CI job with 10-minute budget.
+- **Cleanup:** `fuzz/artifacts/` is gitignored — keep crash inputs until
+  the fix lands, then delete. Test-generated junk (node dirs, logs,
+  coverage output) is cleaned up after the task; see the cleanup rules
+  in `.devin/skills/git-conventions/SKILL.md`.
 
 ## Commands (source of truth)
 
