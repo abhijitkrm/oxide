@@ -579,6 +579,25 @@ impl OxideBft {
         Hasher::hash_one(Domain::Block, &buf)
     }
 
+    /// Compute the signing hash of a header — the block hash with
+    /// `proposer_signature` set to `None`. The leader signs this
+    /// hash; the signature is then stored in `proposer_signature`.
+    /// Verifiers recompute this hash (with the signature stripped)
+    /// and check the signature against it.
+    ///
+    /// This binds all header fields (`height`, `view`, `epoch`, `prev_block`,
+    /// `tx_root`, `high_qc`, `timeout_cert`, `proposer`, `timestamp`) into the
+    /// signed message, preventing a byzantine leader from swapping
+    /// any field after signing (C3 fix).
+    ///
+    /// The clone is acceptable: this runs once per block per
+    /// validator in `vote()`, not per-order or per-message.
+    fn proposal_signing_hash(header: &BlockHeader) -> Hash {
+        let mut unsigned = header.clone();
+        unsigned.proposer_signature = None;
+        Self::block_hash(&unsigned)
+    }
+
     /// Count the number of set bits in a signer bitmap. This is the
     /// number of validators who signed the certificate (QC or TC).
     /// Used for quorum enforcement — a structural property checked
@@ -644,7 +663,7 @@ impl OxideBft {
 
         let tx_root = Self::tx_root(&proposal.txs);
         let prev_block = self.high_qc.as_ref().map_or(Hash::ZERO, |qc| qc.block_hash);
-        let header = BlockHeader {
+        let mut header = BlockHeader {
             height: self.next_height,
             view: self.current_view,
             epoch: self.epoch,
@@ -653,10 +672,21 @@ impl OxideBft {
             high_qc: self.high_qc.clone(),
             timeout_cert: None, // Stage 4: TC attached on view changes
             proposer: proposer_hash(self.validator_set.leader(self.current_view)),
-            timestamp: 0,             // deterministic: no real clock in the test model
-            proposer_signature: None, // Stage 5: leader signs the header
-            exec_cert: None,          // Wired after exec-cert aggregation
+            timestamp: 0, // deterministic: no real clock in the test model
+            proposer_signature: None, // set below after signing
+            exec_cert: None, // Wired after exec-cert aggregation
         };
+        // C3 fix: sign the header with the leader's BLS secret key.
+        // The signature authenticates that the claimed proposer
+        // actually created this proposal — preventing a byzantine
+        // node from fabricating a proposal in another validator's
+        // name. In conformance mode (no secret key), the signature
+        // stays `None` and `vote()` skips verification.
+        if let Some(sk) = &self.secret_key {
+            let signing_hash = Self::proposal_signing_hash(&header);
+            let sig = sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes());
+            header.proposer_signature = Some(sig);
+        }
         let block_hash = Self::block_hash(&header);
         self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
         // Advance the engine's height on proposal (not finalization).
@@ -686,6 +716,38 @@ impl OxideBft {
         // next_height via a crafted header.
         if header.height.value() >= Height::MAX.prev().unwrap_or(Height::MAX).value() {
             return None;
+        }
+        // C3 fix: verify the proposer is the expected leader for
+        // this view and that the proposal is genuinely signed by
+        // that leader. Without this, any validator could fabricate
+        // a proposal in any view — the header's `proposer` field is
+        // self-claimed and `proposer_signature` was always `None`.
+        //
+        // In production mode (`verify_signatures`), we check:
+        //   1. `header.proposer` matches the expected leader for
+        //      `header.view` (prevents a non-leader from proposing).
+        //   2. `proposer_signature` is present and verifies against
+        //      the leader's public key over the proposal signing hash
+        //      (prevents a byzantine node from forging the leader's
+        //      proposal).
+        // In conformance mode, both checks are skipped.
+        if self.verify_signatures {
+            let expected_leader = self.validator_set.leader(header.view);
+            let expected_proposer = proposer_hash(expected_leader);
+            if header.proposer != expected_proposer {
+                return None;
+            }
+            let Some(sig) = &header.proposer_signature else {
+                return None;
+            };
+            let leader_pk = self
+                .validator_set
+                .validator(expected_leader)
+                .map_err(|_| ())
+                .ok()?;
+            let signing_hash = Self::proposal_signing_hash(header);
+            crypto::verify(sig, crypto::hash::Domain::Proposal, signing_hash.as_bytes(), leader_pk)
+                .ok()?;
         }
         // Height sync: learn the chain's progression from this
         // proposal. Even if we reject the proposal (tail-fork
@@ -1978,11 +2040,121 @@ mod tests {
     // public key. A forged QC has an aggregate signature that does
     // not verify against the signer bitmap's public keys.
 
+    /// Regression test (C3): `vote()` must reject a proposal whose
+    /// `proposer` field does not match the expected leader for the
+    /// view. Without this check, any validator could fabricate a
+    /// proposal in any view.
+    #[test]
+    fn vote_rejects_proposal_from_wrong_proposer() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut follower = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+            .with_secret_key(keys[1].clone());
+
+        // Leader for view 0 is index 0 (round-robin/stake-weighted).
+        // Construct a header claiming proposer = validator 2 (wrong).
+        let proposal = Proposal { height: Height::new(0), txs: vec![], attestation: None };
+        let mut header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: Hash::ZERO,
+            high_qc: None,
+            timeout_cert: None,
+            proposer: proposer_hash(2), // wrong proposer
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+        };
+        // Even with a valid signature from key 2, the proposer field
+        // doesn't match the expected leader (0), so vote() rejects.
+        let sk2 = bls_key(3);
+        let signing_hash = OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(sk2.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+        assert!(
+            follower.vote(&header, &proposal).is_none(),
+            "proposal from wrong proposer must be rejected"
+        );
+    }
+
+    /// Regression test (C3): `vote()` must reject a proposal with a
+    /// missing or invalid proposer signature. The signature proves
+    /// the claimed leader actually created the proposal.
+    #[test]
+    fn vote_rejects_proposal_with_missing_signature() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut follower = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+            .with_secret_key(keys[1].clone());
+
+        let proposal = Proposal { height: Height::new(0), txs: vec![], attestation: None };
+        // Correct proposer (leader 0 for view 0) but no signature.
+        let header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: Hash::ZERO,
+            high_qc: None,
+            timeout_cert: None,
+            proposer: proposer_hash(0),
+            timestamp: 0,
+            proposer_signature: None, // missing
+            exec_cert: None,
+        };
+        assert!(
+            follower.vote(&header, &proposal).is_none(),
+            "proposal with missing proposer signature must be rejected"
+        );
+    }
+
+    /// Regression test (C3): `vote()` must reject a proposal with a
+    /// forged proposer signature (signed by a different key).
+    #[test]
+    fn vote_rejects_proposal_with_forged_signature() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut follower = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+            .with_secret_key(keys[1].clone());
+
+        let proposal = Proposal { height: Height::new(0), txs: vec![], attestation: None };
+        // Correct proposer (leader 0 for view 0) but signed by key 3.
+        let mut header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: Hash::ZERO,
+            high_qc: None,
+            timeout_cert: None,
+            proposer: proposer_hash(0),
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+        };
+        let forged_sk = bls_key(3);
+        let signing_hash = OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(forged_sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+        assert!(
+            follower.vote(&header, &proposal).is_none(),
+            "proposal with forged proposer signature must be rejected"
+        );
+    }
+
     #[test]
     fn collect_vote_rejects_forged_signature() {
-        // 4 validators with real BLS keys. The leader has verification
-        // enabled (the default). A vote with a forged signature (signed
-        // by a different key) must be rejected.
         let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
         let pks: Vec<crypto::bls::PublicKey> =
             keys.iter().map(crypto::BlsSecretKey::public_key).collect();
@@ -2541,9 +2713,14 @@ mod tests {
         // must refuse to vote (divergence detected).
         //
         // We use an engine with signature verification enabled (the
-        // divergence check is gated on verify_signatures).
+        // divergence check is gated on verify_signatures). C3 fix:
+        // the validator set must use the real public key derived
+        // from the BLS secret key so proposer-signature verification
+        // passes (the fake `pk(1)` key doesn't match `bls_key(1)`).
         let app = Arc::new(MockApp::new());
-        let mut engine = OxideBft::new(app, single_validator_set()).with_secret_key(bls_key(1));
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
 
         // The MockApp's attest_state for height 0 returns
         // Hash([0x00; 32]) (height 0 → byte 0). We craft an
@@ -2565,7 +2742,9 @@ mod tests {
             txs: vec![TxBytes::new(vec![1])],
             attestation: None,
         };
-        let header = BlockHeader {
+        // C3: sign the header so the proposer-auth check passes;
+        // the divergence check is what we're testing here.
+        let mut header = BlockHeader {
             height: Height::new(0),
             view: View::new(0),
             epoch: Epoch::new(0),
@@ -2573,11 +2752,14 @@ mod tests {
             tx_root: OxideBft::tx_root(&proposal.txs),
             high_qc: None,
             timeout_cert: None,
-            proposer: Hash::ZERO,
+            proposer: proposer_hash(0),
             timestamp: 0,
             proposer_signature: None,
             exec_cert: Some(exec_cert),
         };
+        let signing_hash = OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
         let vote = engine.vote(&header, &proposal);
         assert!(
             vote.is_none(),
@@ -2595,7 +2777,9 @@ mod tests {
         // *matches* the locally computed state root, the engine
         // proceeds normally (no divergence).
         let app = Arc::new(MockApp::new());
-        let mut engine = OxideBft::new(app, single_validator_set()).with_secret_key(bls_key(1));
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
 
         // MockApp returns Hash([0x00; 32]) for height 0.
         let matching_root = Hash([0x00; 32]);
@@ -2613,7 +2797,8 @@ mod tests {
             txs: vec![TxBytes::new(vec![1])],
             attestation: None,
         };
-        let header = BlockHeader {
+        // C3: sign the header so the proposer-auth check passes.
+        let mut header = BlockHeader {
             height: Height::new(0),
             view: View::new(0),
             epoch: Epoch::new(0),
@@ -2621,11 +2806,14 @@ mod tests {
             tx_root: OxideBft::tx_root(&proposal.txs),
             high_qc: None,
             timeout_cert: None,
-            proposer: Hash::ZERO,
+            proposer: proposer_hash(0),
             timestamp: 0,
             proposer_signature: None,
             exec_cert: Some(exec_cert),
         };
+        let signing_hash = OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
         let vote = engine.vote(&header, &proposal);
         assert!(vote.is_some(), "proposal with matching exec_cert must be accepted");
     }

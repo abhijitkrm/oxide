@@ -56,6 +56,7 @@ use primitives::Hash;
 /// | `MmrLeaf` | 6 | MMR leaf (storage) |
 /// | `StateRoot` | 7 | execution state root (Phase 2) |
 /// | `MmrRoot` | 8 | MMR root finalization (storage) |
+/// | `Proposal` | 9 | block proposal signing (C3 fix) |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -78,6 +79,9 @@ pub enum Domain {
     /// An MMR root finalization: `H(tag ‖ bagged_peaks ‖ leaf_count)`.
     /// Appended after `StateRoot` — never renumber.
     MmrRoot = 8,
+    /// A block proposal (leader's signature over the header).
+    /// Appended after `MmrRoot` — never renumber.
+    Proposal = 9,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,
