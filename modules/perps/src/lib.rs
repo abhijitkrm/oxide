@@ -1046,16 +1046,20 @@ impl PerpsModule {
             .place(order, fills)
             .map_err(|e| ExecError::ModuleRejected(format!("engine: {e}")))?;
 
-        // Copy fills out so we can release the borrow on `inner` and
-        // then apply them to positions.
-        let fills_copy: Vec<FillEvent> = fills.clone();
-        let mut events = Vec::with_capacity(fills_copy.len() + 1);
-        for f in &fills_copy {
+        // Move fills out of the scratch buffer (no clone). The
+        // buffer is left empty for the next use. This avoids a
+        // per-fill clone: previously, `fills.clone()` copied every
+        // FillEvent so we could release the borrow on `inner` and
+        // then apply fills to positions. `mem::take` moves the Vec's
+        // contents out in O(1), leaving an empty Vec behind.
+        let fills_owned: Vec<FillEvent> = std::mem::take(fills);
+        let mut events = Vec::with_capacity(fills_owned.len() + 1);
+        for f in &fills_owned {
             events.push(fill_event(*f));
         }
 
         // Apply fills to positions (needs exclusive `&mut inner`).
-        for f in &fills_copy {
+        for f in &fills_owned {
             Self::apply_fill_to_position(&mut inner, market, f);
         }
 

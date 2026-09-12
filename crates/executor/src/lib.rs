@@ -442,6 +442,12 @@ pub struct Event {
 /// `[module_id: 1B][module_payload: ...]`.
 const MODULE_ID_OFFSET: usize = 36; // 20 + 8 + 8
 
+/// A tx grouped by module for batch execution. The payload is a
+/// zero-copy slice into the original tx bytes (no per-tx Vec
+/// allocation). The hash is the full tx hash (used for preverify
+/// cache lookup).
+type GroupedTx<'a> = (TxContext, &'a [u8], Hash);
+
 /// Parse the module ID from a tx's payload section.
 fn parse_module_id(bytes: &[u8]) -> Option<u8> {
     if bytes.len() < MODULE_ID_OFFSET + 1 {
@@ -989,7 +995,7 @@ impl Executor {
         // nonces are skipped (not executed) — this is the defense
         // against a byzantine proposer that bypassed
         // `process_proposal` (e.g. via a direct finalize path).
-        let mut groups: BTreeMap<u8, Vec<(TxContext, Vec<u8>, Hash)>> = BTreeMap::new();
+        let mut groups: BTreeMap<u8, Vec<GroupedTx<'_>>> = BTreeMap::new();
         let mut cumulative_gas: u64 = 0;
         for tx in &block.txs {
             let bytes = tx.as_bytes();
@@ -1033,11 +1039,10 @@ impl Executor {
             // its fee doesn't get its nonce advanced.)
             local_nonce.insert(ctx.sender, expected + 1);
             cumulative_gas = cumulative_gas.saturating_add(gas);
-            let payload = payload.to_vec();
-            // Cache key must match `ingest_tx`: hash of the FULL tx
-            // envelope, not just the module payload. The payload
-            // alone does not uniquely identify a transaction (two
-            // senders can send identical payloads).
+            // Zero-copy: store a reference to the payload in the
+            // original tx bytes, avoiding a per-tx Vec allocation.
+            // The payload is only cloned later if the tx is not in
+            // the preverify cache (uncached txs).
             let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
             groups.entry(module_id).or_default().push((ctx, payload, tx_hash));
         }
@@ -1081,7 +1086,7 @@ impl Executor {
                     .iter()
                     .map(|(_ctx, payload, tx_hash)| {
                         preverify_cache.remove(tx_hash).unwrap_or_else(|| PreverifiedTx {
-                            raw: payload.clone(),
+                            raw: payload.to_vec(),
                             sender: [0u8; 20],
                         })
                     })
@@ -1098,10 +1103,8 @@ impl Executor {
             } else {
                 // Fall back to the recovery path — no preverified
                 // Vec constructed, no payload clones.
-                let batch: Vec<(TxContext, &[u8])> = group
-                    .iter()
-                    .map(|(ctx, payload, _tx_hash)| (*ctx, payload.as_slice()))
-                    .collect();
+                let batch: Vec<(TxContext, &[u8])> =
+                    group.iter().map(|(ctx, payload, _tx_hash)| (*ctx, *payload)).collect();
                 module.handle_batch(&batch)
             };
             for events in results.into_iter().flatten() {

@@ -9533,3 +9533,37 @@ The TCP transport had two issues:
   close connections within 5s (not 30s).
 - `tcp_duplicate_connections_survive` — simultaneous bidirectional
   connections must not kill each other.
+
+## Pre-testnet audit: remove per-tx allocation in executor and per-fill clone in perps
+
+### Root cause
+
+1. **Executor**: `execute_block` called `module_payload(bytes).to_vec()`
+   for every transaction, allocating a `Vec<u8>` per tx. The payload
+   was then cloned again when constructing `PreverifiedTx` for
+   uncached txs — a double allocation.
+
+2. **Perps**: `handle_place` called `fills.clone()` to copy the fill
+   events out of the scratch buffer so the borrow on `inner` could
+   be released before applying fills to positions. This cloned every
+   `FillEvent`.
+
+### Fix
+
+1. **Executor**: Changed the `groups` BTreeMap to store `&[u8]`
+   references into the original tx bytes instead of `Vec<u8>`
+   allocations. The payload is only cloned when constructing
+   `PreverifiedTx` for uncached txs (unavoidable given the current
+   `PreverifiedTx` design). For cached txs (the common case in
+   production), zero allocation occurs.
+
+2. **Perps**: Replaced `fills.clone()` with `std::mem::take(fills)`,
+   which moves the Vec's contents out in O(1) and leaves an empty
+   Vec behind. The scratch buffer is already cleared before each
+   use, so leaving it empty is the correct state.
+
+### Tests
+
+All existing executor (41) and perps (33) tests pass. No new
+regression tests needed — these are performance optimizations with
+no behavioral change.

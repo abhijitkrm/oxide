@@ -2592,3 +2592,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     connections are closed immediately instead of lingering for up
     to 30 seconds. Simultaneous connections between two peers no
     longer kill each other.
+
+- **Executor and perps had unnecessary per-transaction allocations**
+  (`crates/executor/src/lib.rs`, `modules/perps/src/lib.rs`)
+  - The executor allocated a `Vec<u8>` per transaction for the
+    module payload, then cloned it again for uncached txs. The perps
+    module cloned every `FillEvent` to release a borrow.
+  - Executor: store `&[u8]` references into the original tx bytes
+    instead of `Vec<u8>` allocations. Perps: use `std::mem::take` to
+    move fills out of the scratch buffer in O(1) instead of cloning.
+  - **In plain words:** the execution hot path now avoids a memory
+    allocation per transaction, reducing GC pressure and improving
+    throughput. The perps module avoids cloning fill events, which
+    reduces per-trade overhead.
