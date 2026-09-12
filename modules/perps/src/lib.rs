@@ -566,7 +566,13 @@ impl PerpsModule {
                 }
             };
             let account = Self::account_mut(&mut inner, &addr);
-            let pos_entry = account.positions.get_mut(&market).unwrap();
+            let Some(pos_entry) = account.positions.get_mut(&market) else {
+                // No position for this market — skip (the account
+                // may have been closed since the funding loop
+                // started). Previously this used `unwrap()`, which
+                // would panic if the position was removed.
+                continue;
+            };
             if funding >= 0 {
                 // Long pays (or short receives when rate < 0). Debit.
                 let debit = u64::try_from(funding).unwrap_or(u64::MAX);

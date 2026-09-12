@@ -2666,3 +2666,15 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** if the disk fills up while writing a block, the
     node's in-memory state is rolled back to match what was actually
     persisted. On restart, the journal is verified to detect corruption.
+
+- **Mempool and perps had production panic paths**
+  (`crates/mempool/src/lib.rs`, `modules/perps/src/lib.rs`)
+  - The mempool's `evict_lowest_fee` used `expect` on internal state
+    that could be corrupted by a bug, crashing the node. The perps
+    module's `apply_funding` used `unwrap()` on a position lookup
+    that could fail if the position was removed mid-loop.
+  - Replaced with `let Some(...) else` guards that return/skip
+    gracefully instead of panicking.
+  - **In plain words:** a corrupted internal state in the mempool
+    or a removed position in the perps funding loop no longer
+    crashes the node. The operations are skipped gracefully.

@@ -269,8 +269,19 @@ impl Mempool {
         let Some(lowest_density) = self.by_fee.keys().next().copied() else {
             return false;
         };
-        let hashes = self.by_fee.get_mut(&lowest_density).expect("key exists");
-        let hash = hashes.pop().expect("non-empty fee bucket");
+        // Get the hash list for this fee density. The key exists
+        // (we just got it from `keys().next()`), but use `?`-style
+        // guards instead of `expect` to avoid panicking on a
+        // corrupted internal state — return `false` (no eviction)
+        // and let the caller retry.
+        let Some(hashes) = self.by_fee.get_mut(&lowest_density) else {
+            return false;
+        };
+        let Some(hash) = hashes.pop() else {
+            // Empty bucket — remove it and report no eviction.
+            self.by_fee.remove(&lowest_density);
+            return false;
+        };
         if hashes.is_empty() {
             self.by_fee.remove(&lowest_density);
         }

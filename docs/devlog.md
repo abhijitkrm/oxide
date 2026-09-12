@@ -9716,3 +9716,38 @@ Two journal durability issues:
 - `journal_backend_apply_batch_rolls_back_on_append_failure` —
   `apply_batch` must roll back the in-memory state if the journal
   append fails.
+
+## Pre-testnet audit: remove production panic paths in mempool and perps
+
+### Root cause
+
+1. **Mempool `evict_lowest_fee`**: Used `expect("key exists")` and
+   `expect("non-empty fee bucket")` on internal state that could be
+   corrupted by a bug. A panic here would crash the node.
+
+2. **Perps `apply_funding`**: Used `unwrap()` on
+   `account.positions.get_mut(&market)`, which would panic if the
+   position was removed between the start of the funding loop and
+   the application of funding to that position.
+
+### Fix
+
+1. **Mempool**: Replaced `expect` calls with `let Some(...) else`
+   guards that return `false` (no eviction) on corrupted state,
+   allowing the caller to retry instead of crashing.
+
+2. **Perps**: Replaced `unwrap()` with `let Some(...) else { continue }`
+   that skips the position if it was removed, instead of panicking.
+
+### Note
+
+The EVM receipts `expect` calls (lines 248, 255) were reviewed and
+are justified: they follow preceding checks that guarantee the
+conditions (`list_len < 56`, `len_bytes <= 8`). They are invariant
+checks, not production panic paths.
+
+### Tests
+
+All existing mempool (17) and perps (33) tests pass. No new tests
+needed — these are defensive fixes for paths that should never be
+reached under normal operation.
