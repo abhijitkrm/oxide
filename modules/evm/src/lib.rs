@@ -80,7 +80,7 @@ use revm::context::result::{ExecutionResult, Output, SuccessReason};
 use revm::context_interface::result::ResultGas;
 use revm::database::CacheDB;
 use revm::database_interface::{DatabaseRef, EmptyDB};
-use revm::handler::{ExecuteCommitEvm, MainContext};
+use revm::handler::{ExecuteCommitEvm, ExecuteEvm, MainContext};
 use revm::inspector::NoOpInspector;
 use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
@@ -245,7 +245,13 @@ pub struct EvmModule {
     /// Cleared at the start of each `begin_block` (after
     /// `state_root` has consumed the set for incremental updates).
     /// Behind a `Mutex` because `Module::handle` takes `&self`.
-    touched: Mutex<std::collections::HashSet<revm::primitives::Address>>,
+    ///
+    /// `BTreeSet` (sorted): `flush_to_storage` iterates this set to
+    /// build the backend op batch, and op order is part of the
+    /// journaled state transition. A `HashSet` would produce a
+    /// different op order on every validator — identical logical
+    /// state, divergent journal/MMR histories.
+    touched: Mutex<std::collections::BTreeSet<revm::primitives::Address>>,
     /// Per-account storage root cache. Updated incrementally in
     /// `state_root` — only touched accounts have their storage
     /// roots recomputed; the rest are reused from the cache.
@@ -293,7 +299,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
-            touched: Mutex::new(std::collections::HashSet::new()),
+            touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
@@ -315,7 +321,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
-            touched: Mutex::new(std::collections::HashSet::new()),
+            touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
@@ -351,7 +357,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: 30_000_000,
-            touched: Mutex::new(std::collections::HashSet::new()),
+            touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
@@ -549,32 +555,32 @@ impl EvmModule {
             *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut evm = self.build_evm(db, coinbase, block_number, block_timestamp);
 
-        let result = evm
-            .transact_commit(tx)
+        // `transact` (not `transact_commit`) so we get the complete
+        // `EvmState` — the exact set of accounts the tx modified.
+        // The previous top-level-only tracking (caller + to +
+        // created + coinbase) missed accounts changed by internal
+        // calls, SELFDESTRUCT beneficiaries, and SSTORE writes to
+        // third accounts — those accounts were updated in the
+        // CacheDB but never flushed or reflected in the incremental
+        // state root, diverging durable state from in-memory state.
+        let result_and_state = evm
+            .transact(tx)
             .map_err(|e| ExecError::ModuleRejected(format!("evm transact failed: {e:?}")))?;
 
         // Phase D: track touched accounts for incremental flush.
-        // After `transact_commit`, the CacheDB has the updated state.
-        // We mark the caller, the `to` address (if Call), and the
-        // created address (if Create succeeded) as touched. The
-        // coinbase is also touched (it receives the priority fee).
-        // This covers the accounts most likely modified by the tx.
-        // For deeper accuracy (e.g., SSTORE to a third account),
-        // a future optimization can diff the cache before/after.
+        // `state` contains EVERY account revm modified (including
+        // internal-call targets and selfdestruct beneficiaries);
+        // `commit` then applies it to the CacheDB — identical
+        // semantics to `transact_commit` but with the state
+        // available for tracking first.
         {
             let mut touched =
                 self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            touched.insert(caller);
-            if let tx::TxKind::Call(addr) = signed.to() {
-                touched.insert(revm::primitives::Address::from(addr.0));
-            }
-            if let Some(created) = result.created_address() {
-                touched.insert(created);
-            }
-            touched.insert(coinbase);
+            touched.extend(result_and_state.state.keys().copied());
         }
+        evm.commit(result_and_state.state);
 
-        Ok(result)
+        Ok(result_and_state.result)
     }
 
     /// Try to execute a simple ETH transfer natively, bypassing revm.
@@ -1324,26 +1330,27 @@ impl EvmModule {
 
             let result = {
                 let mut evm = self.build_evm(&mut *db, coinbase, block_number, block_timestamp);
-                match evm.transact_commit(tx) {
-                    Ok(r) => r,
+                // `transact` (not `transact_commit`) gives the
+                // complete `EvmState`: every account the tx
+                // modified, including internal-call targets and
+                // selfdestruct beneficiaries — not just the
+                // top-level caller/to/created/coinbase set that
+                // under-tracked durable state.
+                let result_and_state = match evm.transact(tx) {
+                    Ok(rs) => rs,
                     Err(e) => {
                         results.push(Err(ExecError::ModuleRejected(format!(
                             "evm transact failed: {e:?}"
                         ))));
                         continue;
                     }
-                }
+                };
+                // Track the exact modified-account set locally
+                // (no lock per tx), then commit.
+                local_touched.extend(result_and_state.state.keys().copied());
+                evm.commit(result_and_state.state);
+                result_and_state.result
             };
-
-            // Track touched accounts locally (no lock per tx).
-            local_touched.insert(caller);
-            if let tx::TxKind::Call(addr) = signed.to() {
-                local_touched.insert(revm::primitives::Address::from(addr.0));
-            }
-            if let Some(created) = result.created_address() {
-                local_touched.insert(created);
-            }
-            local_touched.insert(coinbase);
 
             results.push(Self::exec_result_to_events(Ok(result), self.base_fee));
         }
@@ -1939,36 +1946,33 @@ impl EvmModule {
                             continue;
                         }
                     };
-                    let result = {
+                    {
                         let mut evm =
                             self.build_evm(&mut *db, coinbase, block_number, block_timestamp);
-                        evm.transact_commit(tx_env)
-                    };
-                    match result {
-                        Ok(r) => {
-                            all_touched.insert(caller);
-                            if let tx::TxKind::Call(addr) = signed.to() {
-                                all_touched.insert(revm::primitives::Address::from(addr.0));
+                        // `transact` gives the complete `EvmState` —
+                        // every modified account (internal calls,
+                        // selfdestruct beneficiaries, third-party
+                        // SSTORE), not just caller/to/created.
+                        match evm.transact(tx_env) {
+                            Ok(rs) => {
+                                // Track the exact modified set before
+                                // committing it.
+                                let r = rs.result;
+                                for addr in rs.state.keys() {
+                                    all_touched.insert(*addr);
+                                    committed_touched.insert(*addr);
+                                }
+                                evm.commit(rs.state);
+                                reexec_results.insert(*idx, Ok(r));
                             }
-                            if let Some(created) = r.created_address() {
-                                all_touched.insert(created);
+                            Err(e) => {
+                                reexec_results.insert(
+                                    *idx,
+                                    Err(ExecError::ModuleRejected(format!(
+                                        "evm transact failed: {e:?}"
+                                    ))),
+                                );
                             }
-                            committed_touched.insert(caller);
-                            if let tx::TxKind::Call(addr) = signed.to() {
-                                committed_touched.insert(revm::primitives::Address::from(addr.0));
-                            }
-                            if let Some(created) = r.created_address() {
-                                committed_touched.insert(created);
-                            }
-                            reexec_results.insert(*idx, Ok(r));
-                        }
-                        Err(e) => {
-                            reexec_results.insert(
-                                *idx,
-                                Err(ExecError::ModuleRejected(format!(
-                                    "evm transact failed: {e:?}"
-                                ))),
-                            );
                         }
                     }
                 }
@@ -2635,7 +2639,14 @@ impl EvmModule {
     pub fn balance(&self, addr: &Address) -> u128 {
         let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let evm_addr = alloy_primitives_address(addr.0);
-        db.cache.accounts.get(&evm_addr).map_or(0, |a| a.info.balance.to::<u128>())
+        // `to::<u128>` panics on balances above u128::MAX — reachable
+        // via crafted state (e.g. snapshot import). Saturate instead:
+        // a balance that large cannot be spent anyway, and this is a
+        // query accessor, not a consensus path.
+        db.cache
+            .accounts
+            .get(&evm_addr)
+            .map_or(0, |a| u128::try_from(a.info.balance).unwrap_or(u128::MAX))
     }
 
     /// Get an account's nonce from the EVM state.
@@ -4364,5 +4375,102 @@ mod tests {
         };
 
         assert_eq!(value1, value2, "persisted value must be deterministic");
+    }
+
+    /// Regression test: the touched-account set must contain EVERY
+    /// account a tx modifies — not just `caller`/`to`/`created`/
+    /// `coinbase`.
+    /// A SELFDESTRUCT beneficiary is a third-party account: under the
+    /// old top-level-only tracking it was updated in the `CacheDB` but
+    /// never marked touched, so `flush_to_storage` skipped it and the
+    /// incremental state root reused its stale storage root —
+    /// diverging durable state from in-memory state.
+    #[test]
+    fn selfdestruct_beneficiary_is_tracked_as_touched() {
+        let (pk_caller, addr_caller) = test_keypair();
+        let (pk_deploy, addr_deploy) = test_keypair();
+        let beneficiary = revm::primitives::Address::from_slice(&[0xBB; 20]);
+        let oxide_beneficiary = primitives::Address(beneficiary.0.into());
+
+        // Runtime code: PUSH20 <beneficiary> ; SELFDESTRUCT — sends
+        // the contract's whole balance to `beneficiary` and removes
+        // the contract.
+        //   0x73 <20 bytes> = PUSH20, 0xff = SELFDESTRUCT (22 bytes)
+        // Init code: copy 22-byte runtime (at offset 12) and return it.
+        //   PUSH1 0x16 PUSH1 0x0c PUSH1 0x00 CODECOPY PUSH1 0x16
+        //   PUSH1 0x00 RETURN (12 bytes)
+        let mut deploy_data: Vec<u8> =
+            vec![0x60, 0x16, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x16, 0x60, 0x00, 0xf3, 0x73];
+        deploy_data.extend_from_slice(beneficiary.as_slice());
+        deploy_data.push(0xff);
+
+        let contract_addr = revm::primitives::Address::from_slice(&addr_deploy.0).create(0);
+        let oxide_contract = primitives::Address(contract_addr.0.into());
+
+        let m = make_module();
+        fund(&m, &addr_caller);
+        fund(&m, &addr_deploy);
+        m.begin_block(Height::new(1));
+        m.handle(&dummy_ctx(), &signed_tx(&pk_deploy, 0, tx::TxKind::Create, &deploy_data))
+            .expect("deploy must succeed");
+
+        // Give the contract a balance to selfdestruct away.
+        m.fund_account_for_test(&oxide_contract, 5_000_000_000);
+
+        // Call the contract — runs SELFDESTRUCT, paying the
+        // beneficiary (a third-party account absent from the old
+        // touched set).
+        let call = signed_tx(&pk_caller, 0, tx::TxKind::Call(contract_addr), &[]);
+        m.handle(&dummy_ctx(), &call).expect("call must succeed");
+        m.end_block(Height::new(1));
+
+        assert!(
+            m.touched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&beneficiary),
+            "selfdestruct beneficiary must be tracked as touched"
+        );
+        assert_eq!(
+            m.balance(&oxide_beneficiary),
+            5_000_000_000,
+            "beneficiary must receive the contract balance"
+        );
+    }
+
+    /// Regression test: `balance()` must not panic on a U256 balance
+    /// above `u128::MAX` (reachable via crafted snapshot import). The
+    /// accessor saturates rather than crashing the node.
+    #[test]
+    fn balance_saturates_above_u128() {
+        let m = make_module();
+        let evm_addr = revm::primitives::Address::from_slice(&[0xCC; 20]);
+        let oxide_addr = primitives::Address(evm_addr.0.into());
+
+        // Insert an account with a U256::MAX balance directly —
+        // beyond what `fund_account_for_test` (u128) can express.
+        {
+            let mut db_guard = m.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let db = Arc::make_mut(&mut *db_guard);
+            db.cache.accounts.insert(
+                evm_addr,
+                revm::database::DbAccount {
+                    info: revm::database::state::AccountInfo {
+                        balance: U256::MAX,
+                        nonce: 0,
+                        code_hash: revm::primitives::B256::ZERO,
+                        account_id: None,
+                        code: Some(revm::bytecode::Bytecode::new_raw(
+                            revm::primitives::Bytes::new(),
+                        )),
+                    },
+                    account_state: revm::database::AccountState::None,
+                    storage: revm::primitives::HashMap::default(),
+                },
+            );
+        }
+
+        // Previously `to::<u128>()` panicked here.
+        assert_eq!(m.balance(&oxide_addr), u128::MAX);
     }
 }

@@ -726,6 +726,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **EVM execution under-tracked modified accounts**
+  (`modules/evm/src/lib.rs`)
+  - The sequential execution paths marked only `caller`, `to`,
+    `created`, and `coinbase` as touched. Accounts changed by
+    internal calls, `SELFDESTRUCT` beneficiaries, and `SSTORE`
+    writes to third accounts were updated in memory but never
+    flushed to durable storage nor re-hashed by the incremental
+    state root — persistent state could silently diverge.
+  - Fix: `evm.transact()` now returns the complete `EvmState` and
+    its key set (the exact modified accounts) is recorded before
+    committing — applied to single-tx, batch, and parallel
+    re-execution paths.
+  - `touched` is now a `BTreeSet` — the flush op order is part of
+    the journaled state transition, so a `HashSet`'s nondeterministic
+    order would have produced divergent journal histories across
+    validators.
+  - `balance()` saturated instead of panicking on balances above
+    `u128::MAX` (reachable via crafted snapshot import).
+  - Regression tests: `SELFDESTRUCT` beneficiary tracked + paid;
+    `U256::MAX` balance reads as `u128::MAX`.
+  - **In plain words:** every account an EVM transaction changes is
+    now correctly persisted and hashed, and every validator writes
+    state changes in the same order.
+
 - **Consensus allowed voting for conflicting blocks at the same
   height** (`crates/consensus/src/engine.rs`)
   - After voting for block A at view v and timing out, a validator

@@ -10003,3 +10003,39 @@ yet A's QC.
 
 - `vote_lock_rejects_conflicting_block_at_same_height` — same-height
   conflicting proposal refused; next-height proposal still votes.
+
+## Security sweep round 2 — EVM touched tracking, balance panic, determinism
+
+Three related fixes in the EVM module:
+
+1. **Touched under-tracking (A8):** the sequential execution paths
+   recorded only caller/to/created/coinbase as touched. Accounts
+   modified by internal calls, SELFDESTRUCT beneficiaries, and
+   SSTORE writes to third accounts were updated in the CacheDB but
+   never flushed to the backend nor re-hashed by the incremental
+   state root — durable state and state roots diverged from
+   in-memory state. Fix: `evm.transact(tx)` returns the complete
+   `EvmState`; `state.keys()` is the exact modified set (tracked
+   before `evm.commit(state)`). Applied to `execute`,
+   `execute_decoded`'s revm fallthrough, and the parallel path's
+   sequential re-execution. (The parallel group's nested-cache diff
+   was already complete via `account_state != None`.)
+
+2. **`balance()` panic (A9):** `info.balance.to::<u128>()` panics
+   on balances above u128::MAX — reachable via crafted snapshot
+   import. Now saturates to u128::MAX (query accessor, not a
+   consensus path).
+
+3. **Nondeterministic journal order (B11):** `touched` was a
+   `HashSet` — `flush_to_storage` iterated it to build the backend
+   op batch, so op order varied across validators → identical
+   logical state, divergent journal/MMR histories. Now a `BTreeSet`
+   (sorted by address → deterministic op order).
+
+### Tests
+
+- `selfdestruct_beneficiary_is_tracked_as_touched` — SELFDESTRUCT
+  contract pays a third-party EOA; beneficiary must be in `touched`
+  and receive the balance.
+- `balance_saturates_above_u128` — U256::MAX balance reads as
+  u128::MAX instead of panicking.
