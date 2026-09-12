@@ -726,6 +726,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Failed settlement submissions lost matched trades and wedged
+  the settlement lane** (`crates/matcher/src/server.rs`)
+  - `BatchSettler::settle_now` drained the fill buffer and burned
+    a nonce before submitting — a failed `submit_tx` dropped real
+    fills, and the nonce gap made every later settlement get
+    nonce-skipped forever.
+  - Failed envelopes are now retried verbatim (the executor still
+    expects that nonce), sealing pauses while a batch is pending
+    (fills accumulate, nothing lost), the nonce advances only on
+    success, and a permanently-dead envelope is dropped loudly
+    after 60 retries with its nonce reused by the next batch.
+  - **In plain words:** a transient mempool rejection can no
+    longer erase matched trades or permanently stall settlement.
+
 - **Journal restart dropped integrity checks and snapshot imports
   lost their data** (`crates/storage/src/auth_journal.rs`)
   - `JournalBackend::open` never verified the journal against a

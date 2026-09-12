@@ -136,9 +136,41 @@ pub struct BatchSettler {
     interval: Duration,
     /// The sender address for settlement txs (the matcher operator).
     sender: primitives::Address,
-    /// Monotonic nonce for settlement txs.
+    /// Next settlement nonce — advanced ONLY on a successful submit,
+    /// never at encode time. A failed submission keeps its nonce so
+    /// the retried envelope (and the next batch) stay contiguous
+    /// with the executor's `executed_nonce` counter; a burned nonce
+    /// would gap the sequence and nonce-skip every later settlement
+    /// from this sender forever.
     nonce: std::sync::atomic::AtomicU64,
+    /// The encoded envelope whose last submit failed, awaiting
+    /// retry. Sealing pauses while a batch is pending — fills keep
+    /// accumulating in the sealer's buffer (nothing is lost), and
+    /// the same envelope is resubmitted verbatim because the
+    /// executor still expects exactly that nonce next.
+    pending: std::sync::Mutex<Option<PendingBatch>>,
 }
+
+/// A settlement envelope whose submission is being retried.
+struct PendingBatch {
+    /// The full encoded tx envelope (nonce baked in).
+    envelope: Vec<u8>,
+    /// Aggregated pair count (returned when the retry lands).
+    pair_count: usize,
+    /// Failed submission attempts so far.
+    attempts: u32,
+}
+
+/// Maximum retries before a pending batch is dropped: 60.
+///
+/// At the default 100 ms settle interval this is ~6 seconds of
+/// retry — long enough to ride out a transient mempool-full or a
+/// consensus reconnect, short enough that a permanently-rejected
+/// envelope doesn't wedge the settlement lane forever. The drop is
+/// a loud data-loss event (logged with the pair count); the lane
+/// then continues and the nonce is reused by the next batch because
+/// the dropped tx never executed.
+const MAX_PENDING_RETRIES: u32 = 60;
 
 impl BatchSettler {
     /// Create a new batch settler.
@@ -164,6 +196,7 @@ impl BatchSettler {
             interval: Duration::from_millis(interval_ms),
             sender,
             nonce: std::sync::atomic::AtomicU64::new(start_nonce),
+            pending: std::sync::Mutex::new(None),
         }
     }
 
@@ -184,6 +217,42 @@ impl BatchSettler {
     /// Panics if the underlying sealer's mutex/control channel is
     /// poisoned or disconnected.
     pub fn settle_now(&self) -> Result<usize, String> {
+        // Retry a pending envelope before sealing anything new.
+        // Previously a failed submit dropped the sealed fills AND
+        // burned the nonce — the next batch carried nonce N+1 while
+        // the executor still expected N, so every later settlement
+        // was nonce-skipped forever. Now the same envelope is
+        // resubmitted verbatim and the nonce advances only on
+        // success.
+        {
+            let mut pending =
+                self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(p) = pending.as_mut() {
+                return match self.submitter.submit_tx(TxBytes::new(p.envelope.clone())) {
+                    Ok(()) => {
+                        self.nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let settled = p.pair_count;
+                        *pending = None;
+                        Ok(settled)
+                    }
+                    Err(e) => {
+                        p.attempts += 1;
+                        if p.attempts >= MAX_PENDING_RETRIES {
+                            eprintln!(
+                                "batch settler: dropping batch of {} pairs after {} failed submissions: {e}",
+                                p.pair_count, p.attempts
+                            );
+                            // The nonce is deliberately NOT advanced:
+                            // the dropped tx never executed, so the
+                            // next batch reuses this nonce.
+                            *pending = None;
+                        }
+                        Err(e)
+                    }
+                };
+            }
+        }
+
         // Seal the batch from the single order book.
         let fills = self.sealer.seal_batch();
 
@@ -236,8 +305,12 @@ impl BatchSettler {
         // Encode as a batch-settle message.
         let module_payload = exchange::msg::batch_settle(&entries);
 
-        // Wrap in an Oxide transaction envelope.
-        let nonce = self.nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Wrap in an Oxide transaction envelope. The nonce is READ
+        // here, not consumed — it advances only when the submit
+        // succeeds, so a failed submission leaves the sequence
+        // contiguous for the retry (and for the next batch if this
+        // envelope is eventually dropped).
+        let nonce = self.nonce.load(std::sync::atomic::Ordering::Relaxed);
         let fee = 100u64;
         let mut envelope = Vec::with_capacity(36 + module_payload.len());
         envelope.extend_from_slice(&self.sender.0);
@@ -246,10 +319,20 @@ impl BatchSettler {
         envelope.push(framework::module_id::EXCHANGE);
         envelope.extend_from_slice(&module_payload);
 
-        // Submit to consensus.
-        self.submitter.submit_tx(TxBytes::new(envelope))?;
-
-        Ok(pair_count)
+        // Submit to consensus. On failure the envelope is kept for
+        // retry — the fills are NOT lost (they were drained from the
+        // sealer but live on in `pending`).
+        match self.submitter.submit_tx(TxBytes::new(envelope.clone())) {
+            Ok(()) => {
+                self.nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(pair_count)
+            }
+            Err(e) => {
+                *self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(PendingBatch { envelope, pair_count, attempts: 1 });
+                Err(e)
+            }
+        }
     }
 
     /// Run the batch settler loop. Seals and submits batches every
@@ -1594,5 +1677,164 @@ mod tests {
 
         let settled = settler.settle_now().expect("settle");
         assert_eq!(settled, 0, "empty batch should settle 0");
+    }
+
+    /// A submitter that fails the first `fail_count` submissions,
+    /// then accepts — and records every attempt.
+    struct FlakySubmitter {
+        fail_remaining: std::sync::Mutex<u32>,
+        submissions: std::sync::Mutex<Vec<TxBytes>>,
+    }
+
+    impl TxSubmitter for FlakySubmitter {
+        fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
+            self.submissions.lock().unwrap().push(tx);
+            let mut remaining = self.fail_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err("mempool full".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression test: a failed `submit_tx` must NOT lose the
+    /// sealed fills or burn the nonce. Before the fix the batch was
+    /// drained and the nonce already incremented, so the retry
+    /// carried nonce N+1 while the executor still expected N —
+    /// every subsequent settlement was nonce-skipped forever.
+    #[test]
+    fn batch_settler_retries_failed_batch_same_envelope() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        server.fund_account(&addr(9), 1_000_000_000_000);
+        server.fund_account(&addr(1), 1_000_000_000_000);
+        for (owner, side) in [(addr(9), Side::Sell), (addr(1), Side::Buy)] {
+            server.submit_order(&OrderRequest {
+                market: 0,
+                side,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price(1_500_000_000),
+                qty: Qty(1_000),
+                owner,
+                nonce: 0,
+                pubkey: [0u8; 32],
+                signature: [0u8; 64],
+            });
+        }
+        assert_eq!(server.pending_settlements(), 1);
+
+        let shared = Arc::new(SharedMatcher::new(server));
+        let flaky = Arc::new(FlakySubmitter {
+            fail_remaining: std::sync::Mutex::new(1),
+            submissions: std::sync::Mutex::new(Vec::new()),
+        });
+        let settler = BatchSettler::new(
+            Arc::clone(&shared) as Arc<dyn crate::BatchSealer>,
+            Arc::clone(&flaky) as Arc<dyn TxSubmitter>,
+            100,
+            addr(0),
+            0,
+        );
+
+        // First submission fails — the fills must be kept in
+        // `pending`, not dropped.
+        assert!(settler.settle_now().is_err());
+        assert_eq!(flaky.submissions.lock().unwrap().len(), 1);
+
+        // The retry resubmits the SAME envelope (same nonce — the
+        // executor still expects it) and succeeds.
+        let settled = settler.settle_now().expect("retry must succeed");
+        assert_eq!(settled, 1);
+        let subs = flaky.submissions.lock().unwrap();
+        assert_eq!(subs.len(), 2, "one original + one retry");
+        assert_eq!(
+            subs[0].as_bytes(),
+            subs[1].as_bytes(),
+            "the retry must resubmit the identical envelope (nonce baked in)"
+        );
+        drop(subs);
+
+        // The next batch gets the NEXT nonce — the sequence stayed
+        // contiguous because the failed submit never consumed one.
+        server_refill(&shared);
+        let settled = settler.settle_now().expect("second batch");
+        assert_eq!(settled, 1);
+        let subs = flaky.submissions.lock().unwrap();
+        assert_eq!(subs.len(), 3);
+        assert_ne!(subs[1].as_bytes(), subs[2].as_bytes(), "the next batch carries the next nonce");
+    }
+
+    /// Submit another matched pair so `seal_batch` returns a fill.
+    fn server_refill(shared: &SharedMatcher) {
+        for (owner, side) in [(addr(9), Side::Sell), (addr(1), Side::Buy)] {
+            shared.submit(&OrderRequest {
+                market: 0,
+                side,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price(1_500_000_000),
+                qty: Qty(1_000),
+                owner,
+                nonce: 1,
+                pubkey: [0u8; 32],
+                signature: [0u8; 64],
+            });
+        }
+    }
+
+    /// Regression test: a permanently-rejected envelope must not
+    /// wedge the settlement lane forever. After `MAX_PENDING_RETRIES`
+    /// the batch is dropped (loudly) and the nonce is reused by the
+    /// next batch — the dropped tx never executed, so the executor
+    /// still expects it.
+    #[test]
+    fn batch_settler_drops_after_max_retries_and_reuses_nonce() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        server.fund_account(&addr(9), 1_000_000_000_000);
+        server.fund_account(&addr(1), 1_000_000_000_000);
+        for (owner, side) in [(addr(9), Side::Sell), (addr(1), Side::Buy)] {
+            server.submit_order(&OrderRequest {
+                market: 0,
+                side,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price(1_500_000_000),
+                qty: Qty(1_000),
+                owner,
+                nonce: 0,
+                pubkey: [0u8; 32],
+                signature: [0u8; 64],
+            });
+        }
+
+        let shared = Arc::new(SharedMatcher::new(server));
+        // Fail forever — the batch is retried then dropped.
+        let flaky = Arc::new(FlakySubmitter {
+            fail_remaining: std::sync::Mutex::new(u32::MAX),
+            submissions: std::sync::Mutex::new(Vec::new()),
+        });
+        let settler = BatchSettler::new(
+            Arc::clone(&shared) as Arc<dyn crate::BatchSealer>,
+            Arc::clone(&flaky) as Arc<dyn TxSubmitter>,
+            100,
+            addr(0),
+            0,
+        );
+
+        // 1 initial failure + (MAX-1) retries → dropped.
+        for _ in 0..MAX_PENDING_RETRIES {
+            assert!(settler.settle_now().is_err());
+        }
+        // One more call: pending is now cleared, so a NEW batch is
+        // sealed — it must carry the SAME nonce (the dropped tx
+        // never executed). The envelope differs (different fills
+        // accumulated) but the nonce field (bytes 20..28) is reused.
+        server_refill(&shared);
+        assert!(settler.settle_now().is_err());
+        let subs = flaky.submissions.lock().unwrap();
+        let first_nonce = &subs[0].as_bytes()[20..28];
+        let last_nonce = &subs[subs.len() - 1].as_bytes()[20..28];
+        assert_eq!(first_nonce, last_nonce, "nonce must be reused after a drop");
     }
 }

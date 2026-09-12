@@ -10146,3 +10146,33 @@ because journal.rs documents a strict no-dependency invariant —
   across restart, post-reopen appends continue the same MMR.
 - `journal_backend_snapshot_import_survives_restart` — imported
   entries restored after reopen, replaced keys stay deleted.
+
+## Security sweep round 2 — batch settler fill loss + nonce burn
+
+`BatchSettler::settle_now` drained the fill buffer, burned a nonce
+(`fetch_add` at encode), then submitted — and on `submit_tx`
+failure returned `Err`, permanently dropping matched trades that
+were never settled on-chain. Worse, the burned nonce gapped the
+sender's sequence: the next batch carried N+1 while the executor's
+`executed_nonce` still expected N, so every subsequent settlement
+was nonce-skipped forever — one transient mempool rejection wedged
+the settlement lane permanently and silently.
+
+Fix: a `pending: Mutex<Option<PendingBatch>>` holds the encoded
+envelope (nonce baked in). `settle_now` retries it verbatim first
+— the executor still expects exactly that nonce — and pauses
+sealing while pending (fills accumulate safely in the sealer's
+buffer). The nonce advances only on a successful submit. After
+`MAX_PENDING_RETRIES` (60 ≈ 6 s at the default 100 ms interval)
+the batch is dropped loudly and the nonce is REUSED by the next
+batch — the dropped tx never executed, so the sequence stays
+contiguous.
+
+### Tests
+
+- `batch_settler_retries_failed_batch_same_envelope` — retry
+  resubmits the identical envelope, succeeds, next batch gets the
+  next nonce.
+- `batch_settler_drops_after_max_retries_and_reuses_nonce` — the
+  lane recovers after a permanently-dead envelope and reuses its
+  nonce.
