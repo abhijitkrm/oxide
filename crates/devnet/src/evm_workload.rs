@@ -42,8 +42,22 @@ use primitives::Address;
 use revm::primitives::{Bytes, U256};
 use types::TxBytes;
 
-/// The default gas limit for test transactions (30M, Ethereum mainnet standard).
-const GAS_LIMIT: u64 = 30_000_000;
+/// Declared gas limits per test-tx type.
+///
+/// These must be realistic: proposal assembly enforces the block gas
+/// limit against *declared* `gas_limit`s (EIP-1559 semantics:
+/// `sum(tx.gas_limit) <= block.gas_limit`). The previous flat 30M
+/// declaration made every tx reserve the whole block — exactly one
+/// tx fit per block, silently starving the load test.
+///
+/// - Transfer: 25k (a plain value transfer uses exactly 21k).
+/// - Deploy: 100k (53k create intrinsic + tiny init execution).
+/// - Call: 100k (cold SSTORE ~22k + intrinsic + calldata).
+/// - Read: 50k (SLOAD + intrinsic).
+const GAS_LIMIT_TRANSFER: u64 = 25_000;
+const GAS_LIMIT_DEPLOY: u64 = 100_000;
+const GAS_LIMIT_CALL: u64 = 100_000;
+const GAS_LIMIT_READ: u64 = 50_000;
 
 /// The gas price for test transactions (10 gwei). Must be >= the
 /// EVM module's base fee (7 gwei in the devnet) or transactions
@@ -106,8 +120,6 @@ pub struct WorkloadConfig {
     pub transfer_value: u128,
     /// Gas price (wei) for all txs.
     pub gas_price: u64,
-    /// Gas limit for all txs.
-    pub gas_limit: u64,
     /// Chain ID for signed txs.
     pub chain_id: u64,
 }
@@ -120,7 +132,6 @@ impl Default for WorkloadConfig {
             num_contracts: 10,
             transfer_value: 1_000_000_000,
             gas_price: GAS_PRICE,
-            gas_limit: GAS_LIMIT,
             chain_id: CHAIN_ID,
         }
     }
@@ -225,34 +236,55 @@ impl WorkloadGenerator {
         let rlp = match tx_type {
             TxType::Transfer => {
                 let recipient = self.recipients[nonce as usize % self.recipients.len()];
-                self.build_transfer(&privkey, nonce, recipient, self.config.transfer_value).0
+                self.build_transfer(
+                    &privkey,
+                    nonce,
+                    recipient,
+                    self.config.transfer_value,
+                    GAS_LIMIT_TRANSFER,
+                )
+                .0
             }
             TxType::Deploy => {
                 let bytecode =
                     &self.contract_bytecodes[self.next_contract % self.contract_bytecodes.len()];
                 self.next_contract = self.next_contract.wrapping_add(1);
-                self.build_deploy(&privkey, nonce, bytecode).0
+                self.build_deploy(&privkey, nonce, bytecode, GAS_LIMIT_DEPLOY).0
             }
             TxType::ContractCall => {
                 if self.deployed_contracts.is_empty() {
                     let recipient = self.recipients[nonce as usize % self.recipients.len()];
-                    self.build_transfer(&privkey, nonce, recipient, self.config.transfer_value).0
+                    self.build_transfer(
+                        &privkey,
+                        nonce,
+                        recipient,
+                        self.config.transfer_value,
+                        GAS_LIMIT_TRANSFER,
+                    )
+                    .0
                 } else {
                     let contract =
                         self.deployed_contracts[nonce as usize % self.deployed_contracts.len()];
                     let calldata = build_set_calldata(nonce.wrapping_add(1));
-                    self.build_call(&privkey, nonce, contract, &calldata).0
+                    self.build_call(&privkey, nonce, contract, &calldata, GAS_LIMIT_CALL).0
                 }
             }
             TxType::ContractRead => {
                 if self.deployed_contracts.is_empty() {
                     let recipient = self.recipients[nonce as usize % self.recipients.len()];
-                    self.build_transfer(&privkey, nonce, recipient, self.config.transfer_value).0
+                    self.build_transfer(
+                        &privkey,
+                        nonce,
+                        recipient,
+                        self.config.transfer_value,
+                        GAS_LIMIT_TRANSFER,
+                    )
+                    .0
                 } else {
                     let contract =
                         self.deployed_contracts[nonce as usize % self.deployed_contracts.len()];
                     let calldata = build_get_calldata();
-                    self.build_call(&privkey, nonce, contract, &calldata).0
+                    self.build_call(&privkey, nonce, contract, &calldata, GAS_LIMIT_READ).0
                 }
             }
         };
@@ -279,11 +311,12 @@ impl WorkloadGenerator {
         nonce: u64,
         to: Address,
         value: u128,
+        gas_limit: u64,
     ) -> (Vec<u8>, ()) {
         let tx = TxLegacy {
             fields: TxFields {
                 nonce,
-                gas_limit: self.config.gas_limit,
+                gas_limit,
                 to: TxKind::Call(revm::primitives::Address::from(to.0)),
                 value: U256::from(value),
                 data: Bytes::new(),
@@ -296,11 +329,17 @@ impl WorkloadGenerator {
     }
 
     /// Build a signed legacy contract deployment tx.
-    fn build_deploy(&self, privkey: &[u8], nonce: u64, bytecode: &[u8]) -> (Vec<u8>, ()) {
+    fn build_deploy(
+        &self,
+        privkey: &[u8],
+        nonce: u64,
+        bytecode: &[u8],
+        gas_limit: u64,
+    ) -> (Vec<u8>, ()) {
         let tx = TxLegacy {
             fields: TxFields {
                 nonce,
-                gas_limit: self.config.gas_limit,
+                gas_limit,
                 to: TxKind::Create,
                 value: U256::ZERO,
                 data: Bytes::copy_from_slice(bytecode),
@@ -319,11 +358,12 @@ impl WorkloadGenerator {
         nonce: u64,
         to: Address,
         calldata: &[u8],
+        gas_limit: u64,
     ) -> (Vec<u8>, ()) {
         let tx = TxLegacy {
             fields: TxFields {
                 nonce,
-                gas_limit: self.config.gas_limit,
+                gas_limit,
                 to: TxKind::Call(revm::primitives::Address::from(to.0)),
                 value: U256::ZERO,
                 data: Bytes::copy_from_slice(calldata),
