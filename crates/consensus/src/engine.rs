@@ -884,14 +884,18 @@ impl OxideBft {
         if idx >= self.votes.len() {
             return Err(ConsensusError::InvalidVoteSignature { voter });
         }
-        // Reject stale votes: votes for views below the engine's
-        // current view are leftovers from a previous round that
-        // arrived late over the network. Collecting them would
-        // pollute the vote buffer and cause spurious ConflictingVote
-        // errors when the real votes for the current view arrive.
-        // Silently dropping them is safe — the leader that needed
-        // them already formed its QC or timed out.
-        if vote.view < self.current_view {
+        // Reject votes not for the current view. Stale votes
+        // (view < current_view) are leftovers from a previous round.
+        // Future votes (view > current_view) are either premature
+        // (the voter advanced before us) or byzantine — in both
+        // cases, accepting them would poison the vote buffer: the
+        // future-view vote becomes the "first vote" and all real
+        // current-view votes then fail the ConflictingVote check,
+        // stalling the view until a ~2s timeout. One message per
+        // view = permanent liveness DoS (C2 fix). Silently dropping
+        // is safe — the voter will resend, or we'll catch up via QC
+        // delivery and then accept votes for the new current_view.
+        if vote.view != self.current_view {
             return Ok(());
         }
         // Already collected — idempotent (not an error, just a no-op).
@@ -2952,6 +2956,10 @@ mod tests {
     fn collect_vote_rejects_conflicting_vote_for_different_view() {
         // 4 validators, conformance mode. The leader collects a vote
         // for view 0, then receives a vote for view 1 (different view).
+        // C2 fix: future-view votes are silently dropped (not
+        // ConflictingVote errors) to prevent buffer poisoning — a
+        // single future-view vote must not become the "first vote"
+        // and block all real current-view votes.
         let mut leader = make_multi_engine(0);
 
         let vote_v0 = Vote {
@@ -2968,11 +2976,45 @@ mod tests {
             block_hash: Hash::ZERO,
             signature: Signature::ZERO,
         };
-        let err = leader.collect_vote(2, vote_v1).expect_err("conflicting vote must be rejected");
-        assert!(
-            matches!(err, ConsensusError::ConflictingVote { voter, view, .. } if voter == 2 && view == View::new(1)),
-            "expected ConflictingVote for view 1, got {err:?}"
-        );
+        // C2: future-view vote is silently dropped, not an error.
+        leader
+            .collect_vote(2, vote_v1)
+            .expect("future-view vote silently dropped (C2)");
+        // The vote buffer must not contain the future-view vote.
+        assert!(leader.votes[2].is_none(), "future-view vote must not be stored");
+    }
+
+    /// Regression test (C2): a single future-view vote must not
+    /// poison the vote buffer. Before the fix, the future-view vote
+    /// became the "first vote" and all real current-view votes then
+    /// failed the `ConflictingVote` check, stalling the view until
+    /// timeout — a permanent liveness `DoS` with one message per view.
+    #[test]
+    fn collect_vote_future_view_does_not_block_current_view_votes() {
+        let mut leader = make_multi_engine(0);
+
+        // Byzantine voter sends a vote for view 1 (future).
+        let future_vote = Vote {
+            view: View::new(1),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            signature: Signature::ZERO,
+        };
+        leader
+            .collect_vote(1, future_vote)
+            .expect("future-view vote silently dropped");
+
+        // Real votes for view 0 (current) must still be accepted.
+        let real_vote = Vote {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            signature: Signature::ZERO,
+        };
+        leader
+            .collect_vote(2, real_vote)
+            .expect("current-view vote accepted after future-view drop");
+        assert!(leader.votes[2].is_some(), "current-view vote must be stored");
     }
 
     #[test]
