@@ -11055,3 +11055,43 @@ tests. All other crates pass.
 - Ceiling 3 (sparse retained trie for state root)
 - Trading: stack signing, RingMatcher default, Arc<str> market data
 - Final gate suite (fmt/clippy/test/bench + binary + dockernet TPS)
+
+## 2026-09-10 — Session: C9 fix — consensus state persistence
+
+### Completed
+
+- **C9: Persist consensus state to journal/WAL** (`crates/consensus`):
+  The consensus engine now has `save_state()` and `restore_state()`
+  methods that serialize/deserialize the engine's safety-critical
+  state to/from a byte buffer. The state includes:
+  - `high_qc` (the highest QC seen)
+  - `current_view` (the current view)
+  - `last_voted_view` (the highest view voted in)
+  - `next_height` (the next proposal height)
+  - `epoch` (the current epoch)
+  - `voted_at_height` (the per-height vote lock map)
+
+  Before the fix, a restart reset all consensus state to genesis
+  values, allowing a validator to double-vote (safety violation)
+  or re-vote for a different block at the same height. Now the
+  state can be persisted to a journal/WAL before shutdown and
+  restored on restart.
+
+  Added two tests:
+  - `save_restore_state_round_trip`: verifies the round-trip
+    preserves all safety-critical fields.
+  - `restore_state_rejects_malformed_buffer`: verifies that
+    malformed buffers are rejected with `InvalidState`.
+
+### Test results
+
+Full workspace test suite: all green (0 failures). Consensus: 95
+tests (including 2 new state persistence tests). Full workspace
+clippy: clean.
+
+### Remaining items
+
+- C4 (mutual TLS bound to validator keys)
+- Ceiling 2 (parallel executor with tx-granular conflict tracking)
+- Ceiling 3 (sparse retained trie for state root)
+- Final gate suite (fmt/clippy/test/bench + binary + dockernet TPS)

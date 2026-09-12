@@ -580,7 +580,9 @@ impl OxideBft {
 
         let mut buf = Vec::with_capacity(256);
         buf.extend_from_slice(&self.current_view.value().to_le_bytes());
-        buf.extend_from_slice(&self.last_voted_view.map_or(0u64, primitives::Id::value).to_le_bytes());
+        buf.extend_from_slice(
+            &self.last_voted_view.map_or(0u64, primitives::Id::value).to_le_bytes(),
+        );
         buf.extend_from_slice(&self.next_height.value().to_le_bytes());
         buf.extend_from_slice(&self.epoch.value().to_le_bytes());
 
@@ -633,7 +635,8 @@ impl OxideBft {
         offset += 8;
 
         self.current_view = View::new(current_view_val);
-        self.last_voted_view = if last_voted_val == 0 { None } else { Some(View::new(last_voted_val)) };
+        self.last_voted_view =
+            if last_voted_val == 0 { None } else { Some(View::new(last_voted_val)) };
         self.next_height = Height::new(next_height_val);
         self.epoch = Epoch::new(epoch_val);
 
@@ -642,7 +645,9 @@ impl OxideBft {
 
         if qc_present == 1 {
             let mut reader = codec::Reader::new(&bytes[offset..]);
-            self.high_qc = Some(QuorumCertificate::decode(&mut reader).map_err(|_| ConsensusError::InvalidState)?);
+            self.high_qc = Some(
+                QuorumCertificate::decode(&mut reader).map_err(|_| ConsensusError::InvalidState)?,
+            );
             offset = bytes.len() - reader.remaining();
         }
 
@@ -661,7 +666,10 @@ impl OxideBft {
             offset += 8;
             let hash_bytes: [u8; 32] = bytes[offset..offset + 32].try_into().unwrap();
             offset += 32;
-            self.voted_at_height.insert(height, Hash::from_slice(&hash_bytes).map_err(|_| ConsensusError::InvalidState)?);
+            self.voted_at_height.insert(
+                height,
+                Hash::from_slice(&hash_bytes).map_err(|_| ConsensusError::InvalidState)?,
+            );
         }
 
         Ok(())
@@ -2422,8 +2430,8 @@ mod tests {
             keys.iter().map(crypto::BlsSecretKey::public_key).collect();
         let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
 
-        let mut leader =
-            OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0).with_secret_key(keys[0].clone());
+        let mut leader = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+            .with_secret_key(keys[0].clone());
 
         // Advance the engine: submit, propose, vote.
         leader.submit_tx(TxBytes::new(vec![42]));
