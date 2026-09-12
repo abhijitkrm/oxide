@@ -557,39 +557,37 @@ impl ExchangeModule {
 
         // Settlement (plan.md §9.2): for each fill, debit the
         // buyer and credit the seller. The quote amount is
-        // `notional / PRICE_SCALE` (scale-14 → scale-6). With the
-        // pre-trade check above, a failed transfer is only possible
-        // on seller-credit overflow (the seller's balance cannot
-        // grow); the fill stands and the discrepancy is reported as
-        // a `settlement_failed` event for venue reconciliation —
-        // the buyer is never debited for an unsettled fill
-        // (`bank.transfer` is atomic).
+        // `notional / PRICE_SCALE` (scale-14 → scale-6).
+        //
+        // C8 fix: if any settlement transfer fails, return `Err`
+        // immediately. The executor's per-transaction state cache
+        // will roll back the order-book mutation from `engine.place`,
+        // preventing a "free fill" where the buyer gets the fill
+        // but no funds move. Before the fix, a failed transfer
+        // emitted a `settlement_failed` event but the fill stood —
+        // the maker lost their resting order without receiving
+        // payment, and the buyer kept their balance.
         if let Some(bank) = &self.bank {
             for f in fills.iter() {
                 let notional = u128::from(f.price.0) * u128::from(f.qty.0);
-                // An over-u64 quote cannot transfer — emit
-                // settlement_failed rather than silently
-                // capping the amount moved.
+                // An over-u64 quote cannot transfer — reject the
+                // entire transaction rather than silently capping
+                // the amount moved.
                 let Ok(quote_amount) = u64::try_from(notional / PRICE_SCALE) else {
-                    events.push(Event {
-                        module: "exchange",
-                        kind: "settlement_failed",
-                        data: vec![market],
-                    });
-                    continue;
+                    return Err(ExecError::ModuleRejected(format!(
+                        "fill notional exceeds u64 quote range (market {market})"
+                    )));
                 };
                 let (buyer, seller) = if f.taker_side == Side::Buy {
                     (f.taker_owner, f.maker_owner)
                 } else {
                     (f.maker_owner, f.taker_owner)
                 };
-                if bank.transfer(&buyer, &seller, quote_amount).is_err() {
-                    events.push(Event {
-                        module: "exchange",
-                        kind: "settlement_failed",
-                        data: vec![market],
-                    });
-                }
+                bank.transfer(&buyer, &seller, quote_amount).map_err(|_| {
+                    ExecError::ModuleRejected(format!(
+                        "settlement transfer failed (market {market})"
+                    ))
+                })?;
             }
         }
 
