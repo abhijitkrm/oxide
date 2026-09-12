@@ -631,7 +631,7 @@ pub struct Executor {
     /// This eliminates the per-tx `mempool.lock()` on the ingestion
     /// hot path — the mempool lock is only acquired once per
     /// `prepare_proposal` call, not once per tx.
-    mempool_intake_tx: std::sync::mpsc::Sender<TxBytes>,
+    mempool_intake_tx: std::sync::mpsc::SyncSender<TxBytes>,
     /// The receiver side of the intake ring. Drained by
     /// `prepare_proposal` to flush buffered txs into the mempool.
     mempool_intake_rx: std::sync::Mutex<std::sync::mpsc::Receiver<TxBytes>>,
@@ -692,7 +692,7 @@ impl Executor {
     ///   parallel speculative execution path. Below this threshold,
     ///   serial execution is used.
     pub fn with_config(max_mempool_entries: usize, parallel_threshold: usize) -> Self {
-        let (intake_tx, intake_rx) = std::sync::mpsc::channel();
+        let (intake_tx, intake_rx) = std::sync::mpsc::sync_channel(10_000);
         Self {
             modules: std::array::from_fn(|_| None),
             mempool: Mutex::new(mempool::Mempool::new(max_mempool_entries)),

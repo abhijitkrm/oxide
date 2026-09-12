@@ -236,6 +236,14 @@ const TLS_READER_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 /// `ERASURE_MAX_BYTES`.
 const DEFAULT_MAX_MESSAGE_BYTES: u64 = 16 << 20;
 
+/// Bound on the inbound message channel (HIGH fix). Prevents a
+/// byzantine peer from flooding the inbound queue with messages
+/// faster than the consensus engine can consume them, exhausting
+/// memory. `10_000` messages is enough for a burst of consensus
+/// proposals/votes/QCs; beyond that, the TCP reader blocks,
+/// applying backpressure to the peer.
+const INBOUND_CHANNEL_BOUND: usize = 10_000;
+
 /// The default connect timeout for outbound TCP connections. Short
 /// enough that a dead peer is detected quickly during devnet startup.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -316,7 +324,7 @@ pub struct TcpTransport {
     inbound_rx: Mutex<mpsc::Receiver<InboundMessage>>,
     /// Inbound message channel sender. Stored so `add_peer` can
     /// spawn new reader threads that write to the same channel.
-    inbound_tx: mpsc::Sender<InboundMessage>,
+    inbound_tx: mpsc::SyncSender<InboundMessage>,
     /// This node's peer ID.
     peer_id: PeerId,
     /// The transport configuration (max message size, timeouts).
@@ -479,7 +487,7 @@ impl TcpTransport {
             Arc::new(Mutex::new(HashMap::new()));
         let shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>();
+        let (inbound_tx, inbound_rx) = mpsc::sync_channel::<InboundMessage>(INBOUND_CHANNEL_BOUND);
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let max_message_bytes = config.max_message_bytes;
@@ -1072,7 +1080,7 @@ fn write_frames<W: Write>(stream: &mut W, frames: &[Vec<u8>]) -> Result<(), std:
 fn reader_loop(
     mut stream: Box<dyn PeerStream>,
     peer_id: PeerId,
-    tx: mpsc::Sender<InboundMessage>,
+    tx: mpsc::SyncSender<InboundMessage>,
     max_message_bytes: u64,
     shutdown: Arc<AtomicBool>,
 ) {
