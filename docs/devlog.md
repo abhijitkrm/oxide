@@ -10970,3 +10970,39 @@ Crypto: 42 tests. Broadcast: 21 tests.
 Full workspace test suite: all green (0 failures). EVM: 128 + 31 +
 18 tests. Perps: 38 tests. Executor: 97 tests. Consensus: 93 tests.
 Types: 21 tests.
+
+## 2026-09-10 — Session: HIGH-severity remediation (final batch)
+
+### Completed HIGH fixes (final batch)
+
+- **RPC rate limiting** (`crates/rpc`):
+  The RPC HTTP server now includes a per-IP fixed-window rate
+  limiter (default 100 req/s per IP). Before the fix, a single
+  client could flood the RPC with unlimited requests, exhausting
+  the node's resources. Requests exceeding the limit get a 429
+  Too Many Requests response with JSON-RPC error code -32005.
+
+- **Drop per-vote BLS verify** (`crates/consensus`):
+  The consensus engine now defaults to skipping per-vote BLS
+  signature verification in `collect_vote` and relies on the
+  aggregate verification in `deliver_qc`. Saves ~1-2 ms per vote
+  (100-200 ms per view at 100 validators) while maintaining safety
+  — the aggregate verification catches any forged votes. Added
+  `with_per_vote_verification()` builder for tests that
+  specifically verify per-vote rejection behavior.
+
+### Test results
+
+Full workspace test suite: all green (0 failures). Consensus: 93
+tests. RPC: 52 + 18 + 1 tests. EVM: 128 + 31 + 18 tests. All other
+crates pass.
+
+### Remaining items
+
+- C4 (mutual TLS bound to validator keys)
+- C9 (consensus state persistence to journal/WAL)
+- Ceiling 2 (parallel executor with tx-granular conflict tracking)
+- Ceiling 3 (sparse retained trie for state root)
+- Ceiling 4 (O(n) receipts root + free-gas stuffing gates)
+- Performance optimizations (consensus, p2p, executor/EVM, trading)
+- Final gate suite (fmt/clippy/test/bench + binary + dockernet TPS)

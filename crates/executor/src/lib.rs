@@ -828,10 +828,7 @@ impl Executor {
         /// is keyed by `prefix || addr` and valued by the nonce as
         /// 8-byte LE.
         const PREFIX: &[u8] = b"exec_nonce";
-        let nonces = self
-            .executed_nonce
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonces = self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut ops: Vec<storage::Op> = Vec::with_capacity(nonces.len());
         for (addr, nonce) in nonces.iter() {
             let mut key_bytes = [0u8; 32];
@@ -853,10 +850,8 @@ impl Executor {
     pub fn load_executed_nonces(&self, backend: &(dyn storage::StorageBackend + Send)) {
         const PREFIX: &[u8] = b"exec_nonce";
         let entries = backend.range(PREFIX);
-        let mut nonces = self
-            .executed_nonce
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut nonces =
+            self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (key, value) in entries {
             let addr_bytes = &key.0[PREFIX.len()..PREFIX.len() + 20];
             let mut addr_arr = [0u8; 20];

@@ -1323,7 +1323,11 @@ impl EvmModule {
                     local_touched.insert(revm::primitives::Address::from(addr.0));
                 }
                 local_touched.insert(coinbase);
-                results.push(Self::exec_result_to_events(Ok(result), self.base_fee, signed.tx_type()));
+                results.push(Self::exec_result_to_events(
+                    Ok(result),
+                    self.base_fee,
+                    signed.tx_type(),
+                ));
                 continue;
             }
 
@@ -1338,7 +1342,11 @@ impl EvmModule {
                     local_touched.insert(revm::primitives::Address::from(addr.0));
                 }
                 local_touched.insert(coinbase);
-                results.push(Self::exec_result_to_events(Ok(result), self.base_fee, signed.tx_type()));
+                results.push(Self::exec_result_to_events(
+                    Ok(result),
+                    self.base_fee,
+                    signed.tx_type(),
+                ));
                 continue;
             }
 
@@ -2104,7 +2112,11 @@ impl EvmModule {
             // Fall back to speculative results.
             match spec_index.get(&i) {
                 Some(result) => {
-                    results.push(Self::exec_result_to_events((*result).clone(), self.base_fee, tx_types[i]));
+                    results.push(Self::exec_result_to_events(
+                        (*result).clone(),
+                        self.base_fee,
+                        tx_types[i],
+                    ));
                 }
                 None => {
                     results.push(Err(ExecError::ModuleRejected(

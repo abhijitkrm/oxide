@@ -113,10 +113,8 @@ pub const CHAIN_BLOCK_MAX_BYTES: u64 = 16 << 20;
 /// The default block budget assembled from the chain-configured
 /// limits. Engines and tests use this instead of constructing a
 /// `BlockBudget` ad hoc.
-pub const CHAIN_BLOCK_BUDGET: BlockBudget = BlockBudget {
-    max_bytes: CHAIN_BLOCK_MAX_BYTES,
-    max_gas: CHAIN_BLOCK_GAS_LIMIT,
-};
+pub const CHAIN_BLOCK_BUDGET: BlockBudget =
+    BlockBudget { max_bytes: CHAIN_BLOCK_MAX_BYTES, max_gas: CHAIN_BLOCK_GAS_LIMIT };
 
 impl Encode for BlockBudget {
     fn encode(&self, buf: &mut Vec<u8>) {
