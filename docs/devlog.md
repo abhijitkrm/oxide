@@ -10106,3 +10106,43 @@ controlled `ctx.fee` could be 0 anyway.
 - `min_fee_floor_skips_underpaying_txs` — fee below floor skipped
   (nonce not advanced); adequate fee charged + executed.
 - `evm_module_pays_own_fee` — EVM declares self-funded.
+
+## Security sweep round 2 — journal integrity at open + snapshot durability
+
+Three defects in `JournalBackend`:
+
+1. **`open` discarded all integrity information.** It called
+   `replay_verified(dir, None)` — the expected-root parameter was
+   never reachable, so no verification ever happened — and then
+   dropped the reconstructed MMR for `Mmr::new()`: `log_root()`
+   after restart reflected an empty log, and new appends forked
+   off history rather than continuing it.
+   Fix: `open(dir, config, expected_root: Option<Hash>)` replays,
+   rebuilds the MMR *and keeps it*, and fails with the new
+   `OpenError::IntegrityMismatch` (carrying expected + actual
+   roots) when a trusted root disagrees. `None` = unverified open
+   (dev/testing only). A truncated tail also surfaces here: fewer
+   records → different root → mismatch.
+
+2. **`snapshot_import` journaled no data.** The import record was
+   `[state_root][0 ops]` — replay restored nothing, so the entire
+   imported snapshot silently vanished on restart. Fix: the record
+   is a real batch — delete every live key, set every snapshot
+   entry — so replay rebuilds exactly the imported state.
+
+3. **`snapshot_import` swallowed durability failures** (`let _ =
+   append`). Now propagates as `SnapshotError::BackendError` and
+   leaves the old state untouched — the same all-or-nothing
+   contract `apply_batch`'s rollback enforces.
+
+`OpenError` is a dedicated type (not a new `JournalError` arm)
+because journal.rs documents a strict no-dependency invariant —
+`IntegrityMismatch` needs `primitives::Hash` fields.
+
+### Tests
+
+- `journal_backend_open_verifies_expected_root_and_continues_mmr`
+  — trusted root accepted, wrong root fatal, `log_root` identical
+  across restart, post-reopen appends continue the same MMR.
+- `journal_backend_snapshot_import_survives_restart` — imported
+  entries restored after reopen, replaced keys stay deleted.

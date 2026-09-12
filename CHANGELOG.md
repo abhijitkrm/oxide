@@ -726,6 +726,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Journal restart dropped integrity checks and snapshot imports
+  lost their data** (`crates/storage/src/auth_journal.rs`)
+  - `JournalBackend::open` never verified the journal against a
+    trusted root and discarded the reconstructed MMR — post-restart
+    `log_root()` reflected an empty log and new appends forked off
+    history. `open` now takes `expected_root: Option<Hash>` (the
+    caller's last `log_root()`), keeps the rebuilt MMR, and fails
+    fatally with `OpenError::IntegrityMismatch` on disagreement
+    (which also catches truncated tails).
+  - `snapshot_import` journaled only a state root with zero ops —
+    the imported entries vanished on restart. The record now
+    carries the full replacement (delete-all + set-all) and append
+    failures propagate instead of being silently ignored.
+  - **In plain words:** reopening a node now proves the journal is
+    exactly the history it shut down with, and state snapshots
+    actually survive a restart.
+
 - **Most transaction types executed for free**
   (`crates/executor/src/lib.rs`, `crates/node/src/lib.rs`,
   `crates/devnet/`, `bin/oxide-validator/`)

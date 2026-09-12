@@ -30,9 +30,58 @@
 use std::path::Path;
 
 use crate::backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend};
-use crate::journal::{JournalConfig, JournalWriter, Replay, replay};
+use crate::journal::{JournalConfig, JournalError, JournalWriter, Replay, replay};
 use crate::mmr::{Mmr, hash_leaf};
 use primitives::Hash;
+
+/// Why opening a [`JournalBackend`] can fail.
+///
+/// Distinct from [`JournalError`]: opening is replay *plus* an
+/// integrity decision, and the integrity arm carries the two roots
+/// that disagreed — information a bare IO error cannot express.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The journal itself failed (IO, unreadable directory).
+    Journal(JournalError),
+    /// The replayed MMR root does not match the trusted root the
+    /// caller persisted. The journal was truncated, corrupted past
+    /// CRC detection, or belongs to a different history. This is
+    /// fatal on purpose: opening anyway would silently continue a
+    /// divergent log — every subsequent MMR root (and thus every
+    /// state attestation) would commit a different history.
+    IntegrityMismatch {
+        /// The trusted root the caller expected.
+        expected: Hash,
+        /// The root reconstructed by replay.
+        actual: Hash,
+    },
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Journal(e) => write!(f, "journal error during open: {e}"),
+            Self::IntegrityMismatch { expected, actual } => {
+                write!(f, "journal integrity mismatch: expected {expected:?}, replayed {actual:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Journal(e) => Some(e),
+            Self::IntegrityMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<JournalError> for OpenError {
+    fn from(e: JournalError) -> Self {
+        Self::Journal(e)
+    }
+}
 
 /// An authenticated journal: the journal (durability) plus the MMR
 /// (authentication). Every `append` writes to both; the MMR root
@@ -177,34 +226,46 @@ impl JournalBackend {
     /// Open an existing `JournalBackend` from `dir`, replaying the
     /// journal to reconstruct the in-memory state.
     ///
-    /// Uses `replay_verified` to reconstruct the MMR root from the
-    /// replayed records. This ensures the journal's integrity is
-    /// verified during replay — a corrupted or tampered journal is
-    /// detected by a mismatched MMR root (when an expected root is
-    /// provided by the caller).
+    /// `expected_root` is the trusted MMR log root the caller
+    /// persisted before shutdown (what [`JournalBackend::log_root`]
+    /// returned). When `Some`, the reconstructed MMR root must match
+    /// exactly — a truncated, corrupted, or foreign journal is a
+    /// fatal [`OpenError::IntegrityMismatch`], not a silent
+    /// continue-from-prefix. `None` = unverified open (dev/testing;
+    /// production callers should always pass their last root).
+    ///
+    /// The reconstructed MMR is *kept* (previously it was rebuilt
+    /// and then discarded for `Mmr::new()`, so `log_root()` after
+    /// restart reflected an empty log and new appends forked off
+    /// history). The writer still starts a fresh segment — the on-
+    /// disk append order is unchanged; the MMR continues the same
+    /// leaf sequence.
     ///
     /// # Errors
-    /// Returns `JournalError` if the journal cannot be replayed.
-    pub fn open(dir: &Path, config: JournalConfig) -> Result<Self, crate::journal::JournalError> {
-        // Use `replay_verified` to reconstruct the MMR root from
-        // the replayed records. This verifies the journal's
-        // integrity during replay. Previously, `open` used the
-        // unverified `replay` function, which did not reconstruct
-        // the MMR root — a corrupted or tampered journal would not
-        // be detected.
-        let replay_result = replay_verified(dir, None)?;
+    /// Returns [`OpenError::Journal`] if the journal cannot be
+    /// replayed, and [`OpenError::IntegrityMismatch`] when a trusted
+    /// `expected_root` does not match the replayed log.
+    pub fn open(
+        dir: &Path,
+        config: JournalConfig,
+        expected_root: Option<Hash>,
+    ) -> Result<Self, OpenError> {
+        let replay_result = replay(dir)?;
+        let mut mmr = Mmr::new();
         let mut state = std::collections::BTreeMap::new();
-        for record in &replay_result.replay.records {
-            // Decode the batch record and apply ops.
-            let ops = decode_batch_record(&record.payload);
-            apply_ops(&mut state, &ops);
+        for record in &replay_result.records {
+            mmr.push(hash_leaf(&record.payload));
+            apply_ops(&mut state, &decode_batch_record(&record.payload));
+        }
+        let actual_root = mmr.root();
+        if let Some(expected) = expected_root {
+            if actual_root != expected {
+                return Err(OpenError::IntegrityMismatch { expected, actual: actual_root });
+            }
         }
         let state_root = compute_state_root(&state);
         Ok(Self {
-            journal: AuthenticatedJournal {
-                writer: JournalWriter::create(dir, config)?,
-                mmr: Mmr::new(), // MMR is rebuilt as new records are appended
-            },
+            journal: AuthenticatedJournal { writer: JournalWriter::create(dir, config)?, mmr },
             state,
             state_root,
         })
@@ -312,15 +373,31 @@ impl StorageBackend for JournalBackend {
             }
             prev = Some(k);
         }
-        // Replace all state.
-        self.state.clear();
-        for (k, v) in snapshot.entries {
-            self.state.insert(k, v);
+        // The journal record must carry the imported entries —
+        // previously it wrote only the state root with zero ops, so
+        // replay restored nothing and the entire snapshot silently
+        // vanished on restart. Encode the replacement as a real
+        // batch: delete every live key, then set every snapshot
+        // entry. Replay then rebuilds exactly the imported state.
+        let mut ops = Vec::with_capacity(self.state.len() + snapshot.entries.len());
+        ops.extend(self.state.keys().map(|key| Op::Delete { key: *key }));
+        let mut new_state = std::collections::BTreeMap::new();
+        for (k, v) in &snapshot.entries {
+            new_state.insert(*k, v.clone());
+            ops.push(Op::Set { key: *k, value: v.clone() });
         }
-        self.recompute_state_root();
-        // Append a snapshot-import record to the journal.
-        let record = encode_snapshot_record(&self.state_root);
-        let _ = self.journal.append(&record);
+        let new_root = compute_state_root(&new_state);
+        let record = encode_batch_record(&ops, new_root);
+        // Durability is not optional: previously the append result
+        // was discarded, so a failed write left in-memory state the
+        // journal could never restore. Propagate the failure and
+        // leave the old state untouched — all-or-nothing, the same
+        // contract `apply_batch`'s rollback enforces.
+        if self.journal.append(&record).is_err() {
+            return Err(SnapshotError::BackendError);
+        }
+        self.state = new_state;
+        self.state_root = new_root;
         Ok(())
     }
 }
@@ -432,14 +509,6 @@ fn decode_batch_record(payload: &[u8]) -> Vec<Op> {
         }
     }
     ops
-}
-
-/// Encode a snapshot-import record (just the state root).
-fn encode_snapshot_record(state_root: &Hash) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&state_root.0);
-    buf.extend_from_slice(&0u64.to_le_bytes()); // 0 ops
-    buf
 }
 
 /// Compute the (lo, hi) range bounds for a prefix scan over a
@@ -708,7 +777,7 @@ mod tests {
 
         // Open a new backend from the same directory — this
         // replays the journal and reconstructs the state.
-        let backend2 = JournalBackend::open(&dir.0, JournalConfig::default()).unwrap();
+        let backend2 = JournalBackend::open(&dir.0, JournalConfig::default(), None).unwrap();
 
         // The state must match.
         assert_eq!(backend2.get(&key1), Some(vec![0xAA, 0xBB]));
@@ -718,6 +787,86 @@ mod tests {
             expected_state_root,
             "state root must match after verified replay"
         );
+    }
+
+    /// Regression test: `open` must verify the trusted MMR root and
+    /// *keep* the reconstructed MMR. Before the fix the caller could
+    /// not pass an expected root (integrity info was computed then
+    /// discarded), and the rebuilt MMR was dropped for `Mmr::new()`
+    /// — `log_root()` after restart reflected an empty log and new
+    /// appends forked off history.
+    #[test]
+    fn journal_backend_open_verifies_expected_root_and_continues_mmr() {
+        let dir = TempDir::new("backend-trusted-open");
+        let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
+        backend.apply_batch(&[Op::Set { key: Hash([0x01; 32]), value: vec![0xAA] }]);
+        backend.apply_batch(&[Op::Set { key: Hash([0x02; 32]), value: vec![0xBB] }]);
+        backend.sync().unwrap();
+        let trusted_root = backend.log_root();
+
+        // Correct trusted root → opens, and the MMR continues the
+        // same leaf sequence (log_root unchanged across restart).
+        let mut reopened =
+            JournalBackend::open(&dir.0, JournalConfig::default(), Some(trusted_root))
+                .expect("open with the trusted root must succeed");
+        assert_eq!(reopened.log_root(), trusted_root, "MMR must continue across restart");
+
+        // A wrong trusted root → fatal IntegrityMismatch.
+        let wrong = JournalBackend::open(&dir.0, JournalConfig::default(), Some(Hash([0xFF; 32])));
+        assert!(
+            matches!(wrong.map(|_| ()), Err(OpenError::IntegrityMismatch { .. })),
+            "wrong trusted root must be a fatal IntegrityMismatch"
+        );
+
+        // New appends extend the *same* MMR — the root changes as a
+        // continuation, not a fork from empty.
+        reopened.apply_batch(&[Op::Set { key: Hash([0x03; 32]), value: vec![0xCC] }]);
+        reopened.sync().unwrap();
+        let continued_root = reopened.log_root();
+        assert_ne!(continued_root, trusted_root, "new appends must advance the root");
+
+        // Reopen again — the continued root is now the trusted one.
+        let reopened2 =
+            JournalBackend::open(&dir.0, JournalConfig::default(), Some(continued_root))
+                .expect("reopen with the continued root must succeed");
+        assert_eq!(reopened2.log_root(), continued_root);
+    }
+
+    /// Regression test: `snapshot_import` must journal the imported
+    /// entries — previously the record carried only the state root
+    /// with zero ops, so replay restored nothing and the snapshot
+    /// silently vanished on restart. It must also propagate append
+    /// failures (a durability failure used to be silently ignored).
+    #[test]
+    fn journal_backend_snapshot_import_survives_restart() {
+        let dir = TempDir::new("backend-snapshot-durability");
+        let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
+        // Pre-existing state that the import must replace.
+        backend.apply_batch(&[Op::Set { key: Hash([0xAA; 32]), value: vec![1] }]);
+        backend.sync().unwrap();
+
+        // Import a snapshot: two entries, sorted.
+        let snap = Snapshot {
+            height: 5,
+            entries: vec![(Hash([0x01; 32]), vec![0x11]), (Hash([0x02; 32]), vec![0x22])],
+        };
+        backend.snapshot_import(snap).expect("import must succeed");
+        backend.sync().unwrap();
+        let imported_root = backend.state_root();
+        let imported_log_root = backend.log_root();
+
+        // Reopen — replay must rebuild the snapshot's entries.
+        let reopened =
+            JournalBackend::open(&dir.0, JournalConfig::default(), Some(imported_log_root))
+                .expect("open after snapshot import must succeed");
+        assert_eq!(reopened.get(&Hash([0x01; 32])), Some(vec![0x11]));
+        assert_eq!(reopened.get(&Hash([0x02; 32])), Some(vec![0x22]));
+        assert_eq!(
+            reopened.get(&Hash([0xAA; 32])),
+            None,
+            "replaced keys must stay deleted after restart"
+        );
+        assert_eq!(reopened.state_root(), imported_root);
     }
 
     /// Regression test: `apply_batch` must roll back the in-memory
