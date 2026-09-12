@@ -726,6 +726,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Performance
 
+- **Perps cloned whole maps and positions on liquidation/funding
+  paths** (`modules/perps/src/lib.rs`)
+  - `margin_check` no longer clones configs, marks, and the whole
+    account per post-trade call — shared borrows of disjoint
+    fields suffice.
+  - `liquidation_check` splits into a read-only solvency phase and
+    a destructured mutation phase that closes positions in the
+    same pass it totals losses (was two passes + three clones).
+  - `auto_deleverage` reads `inner.marks` directly (its old
+    signature forced a marks clone) and collects scalar candidate
+    tuples instead of `Position` clones.
+  - `apply_funding` collects `(addr, amount)` instead of a
+    `Position` clone per holder.
+  - **In plain words:** liquidation and funding — the paths that
+    fire exactly when the market is busiest — no longer copy the
+    entire account book before doing math.
+
 - **P2P writer flushed and syscalled per queued frame**
   (`crates/p2p/src/tcp.rs`)
   - `PeerStream::write_frames` batches a drained outbound queue:

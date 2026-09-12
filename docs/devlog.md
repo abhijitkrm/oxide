@@ -10348,3 +10348,30 @@ bounded so the shutdown flag stays responsive).
 ### Tests
 
 - 97 p2p tests green (transport e2e exercises the batch path).
+
+## Perf + DoS sweep — perps map-clone removal on liquidation/funding paths
+
+Three perps paths cloned whole maps/accounts per call:
+
+- `margin_check` cloned `configs`, `marks`, AND the entire
+  account (every position) per post-trade check — pure reads.
+  Now uses shared borrows of disjoint fields; no account ⇒
+  solvent ⇒ early return.
+- `liquidation_check` cloned `marks`, `configs`, and the account
+  before even testing solvency. Now: a read-only equity phase,
+  then a destructured mutable phase (`marks`/`accounts` are
+  disjoint fields) that closes positions in the same pass that
+  totals losses — the old code walked positions twice.
+- `auto_deleverage` took `&mut Inner` AND a cloned `&BTreeMap`
+  for marks (the signature FORCED the caller to clone), and
+  collected a `Position` clone per candidate. It now reads
+  `inner.marks` directly and collects scalar tuples
+  `(addr, market, size, entry, pnl)`.
+- `apply_funding` materialized `Vec<(Address, Position)>` — a
+  position clone per holder — when only `size`/`is_open` are
+  read. Collects `(addr, amount)` directly.
+
+### Tests
+
+- 38 perps tests green (liquidation, ADL ranking/determinism,
+  funding zero-sum all exercised).

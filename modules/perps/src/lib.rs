@@ -564,16 +564,17 @@ impl PerpsModule {
         // Funding amount = size * mark * rate / (PRICE_SCALE * 10_000).
         // Positive = the account pays; negative = the account receives.
         // Iterate in sorted address order for determinism.
-        let accounts: Vec<(Address, Position)> = inner
-            .accounts
-            .iter()
-            .filter_map(|(addr, state)| state.positions.get(&market).map(|p| (*addr, *p)))
-            .collect();
-
+        //
+        // Collect only `(addr, amount)` — the old code materialized
+        // a `Vec<(Address, Position)>` (a full position clone per
+        // holder) when only `size`/`is_open` are read here.
         let mut payers: Vec<(Address, u64)> = Vec::new();
         let mut receivers: Vec<(Address, u64)> = Vec::new();
         let mut total_due: u128 = 0;
-        for (addr, pos) in &accounts {
+        for (addr, state) in &inner.accounts {
+            let Some(pos) = state.positions.get(&market) else {
+                continue;
+            };
             if !pos.is_open() {
                 continue;
             }
@@ -700,40 +701,62 @@ impl PerpsModule {
     /// Panics if the inner mutex is poisoned.
     pub fn liquidation_check(&self, account: &Address) -> Result<Vec<Event>, ExecError> {
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let marks = inner.marks.clone();
-        let configs = inner.configs.clone();
-        let acct = inner
-            .accounts
-            .get(account)
-            .cloned()
-            .ok_or_else(|| ExecError::ModuleRejected("account not found".to_string()))?;
 
-        let equity = acct.equity(&marks, &configs);
-        let maintenance = acct.total_maintenance(&marks, &configs);
+        // Phase 1 — read-only solvency check: the old code cloned
+        // `marks`, `configs`, and the whole account (every position)
+        // before even knowing whether liquidation was needed. The
+        // equity read only needs shared borrows of disjoint fields.
+        let (equity, maintenance) = {
+            let acct = inner
+                .accounts
+                .get(account)
+                .ok_or_else(|| ExecError::ModuleRejected("account not found".to_string()))?;
+            (
+                acct.equity(&inner.marks, &inner.configs),
+                acct.total_maintenance(&inner.marks, &inner.configs),
+            )
+        };
 
         // Liquidation condition: equity <= maintenance (as i128).
         if equity > i128::try_from(maintenance).unwrap_or(i128::MAX) {
             return Ok(vec![]); // not under-margined
         }
 
-        // Liquidate: close all positions at mark, realize losses.
+        // Phase 2 — liquidate: close all positions at mark and
+        // realize losses, mutating the real positions in place.
+        // `marks`/`accounts` are destructured so the mark lookup
+        // (shared) and the position mutation (mutable) borrow
+        // disjoint fields — no clone, no materialized positions.
         let mut events = Vec::new();
         let mut total_loss_scale14: i128 = 0;
         let mut total_margin_recovered: u64 = 0;
-
-        for (market, pos) in &acct.positions {
-            if !pos.is_open() {
-                continue;
+        let cross_margin;
+        {
+            let Inner { marks, accounts, .. } = &mut *inner;
+            let Some(acct_mut) = accounts.get_mut(account) else {
+                return Err(ExecError::ModuleRejected("account not found".to_string()));
+            };
+            cross_margin = acct_mut.cross_margin;
+            for (market, pos) in &mut acct_mut.positions {
+                if !pos.is_open() {
+                    continue;
+                }
+                let mark = marks.get(market).copied().unwrap_or(pos.entry_price);
+                let pnl = pos.unrealized_pnl(mark); // scale-14
+                total_loss_scale14 = total_loss_scale14.saturating_add(pnl);
+                total_margin_recovered = total_margin_recovered.saturating_add(pos.isolated_margin);
+                // Close the position in the same pass — the old code
+                // walked the map a second time to zero these fields.
+                pos.size = 0;
+                pos.entry_price = 0;
+                pos.isolated_margin = 0;
+                events.push(Event {
+                    module: "perps",
+                    kind: "liquidated".to_string(),
+                    data: vec![*market],
+                });
             }
-            let mark = marks.get(market).copied().unwrap_or(pos.entry_price);
-            let pnl = pos.unrealized_pnl(mark); // scale-14
-            total_loss_scale14 = total_loss_scale14.saturating_add(pnl);
-            total_margin_recovered = total_margin_recovered.saturating_add(pos.isolated_margin);
-            events.push(Event {
-                module: "perps",
-                kind: "liquidated".to_string(),
-                data: vec![*market],
-            });
+            acct_mut.cross_margin = 0;
         }
 
         // Convert total_loss from scale-14 to scale-6 before combining
@@ -742,7 +765,7 @@ impl PerpsModule {
         // (1e8) brings it to scale-6, matching the margin units.
         let price_scale_i128 = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
         let total_loss_scale6 = total_loss_scale14 / price_scale_i128;
-        let margin_total = i128::from(acct.cross_margin.saturating_add(total_margin_recovered));
+        let margin_total = i128::from(cross_margin.saturating_add(total_margin_recovered));
         let net = margin_total + total_loss_scale6; // both scale-6
         if net < 0 {
             // Insurance fund covers the shortfall (scale-6).
@@ -751,8 +774,7 @@ impl PerpsModule {
             if shortfall >= fund {
                 // Insurance fund depleted — trigger ADL.
                 inner.insurance_fund = 0;
-                let adl_events =
-                    Self::auto_deleverage(&mut inner, account, &marks, shortfall - fund);
+                let adl_events = Self::auto_deleverage(&mut inner, account, shortfall - fund);
                 events.extend(adl_events);
             } else {
                 inner.insurance_fund -= shortfall;
@@ -767,15 +789,6 @@ impl PerpsModule {
                     let _ = bank.credit(account, leftover);
                 }
             }
-        }
-
-        // Close all positions and zero out margins.
-        let acct_mut = Self::account_mut(&mut inner, account);
-        acct_mut.cross_margin = 0;
-        for pos in acct_mut.positions.values_mut() {
-            pos.size = 0;
-            pos.entry_price = 0;
-            pos.isolated_margin = 0;
         }
 
         Ok(events)
@@ -824,7 +837,6 @@ impl PerpsModule {
     fn auto_deleverage(
         inner: &mut Inner,
         liquidated_account: &Address,
-        marks: &BTreeMap<u8, u64>,
         mut remaining_shortfall: u64,
     ) -> Vec<Event> {
         let mut events = Vec::new();
@@ -833,8 +845,12 @@ impl PerpsModule {
         }
 
         // Step 1-2: Collect all open positions with their PnL.
-        // Each entry: (address, market, position, pnl_scale6).
-        let mut candidates: Vec<(Address, u8, Position, i128)> = Vec::new();
+        // Each entry: (address, market, size, entry_price, pnl_scale6).
+        // Scalars only — the old code cloned a whole `Position` per
+        // candidate and the caller cloned the entire `marks` map to
+        // pass it in alongside `&mut Inner`; `inner.marks` is read
+        // directly here via shared borrows.
+        let mut candidates: Vec<(Address, u8, i64, u64, i128)> = Vec::new();
         for (addr, state) in &inner.accounts {
             if addr == liquidated_account {
                 continue;
@@ -843,12 +859,12 @@ impl PerpsModule {
                 if !pos.is_open() {
                     continue;
                 }
-                let mark = marks.get(market).copied().unwrap_or(pos.entry_price);
+                let mark = inner.marks.get(market).copied().unwrap_or(pos.entry_price);
                 let pnl_scale14 = pos.unrealized_pnl(mark);
                 let pnl_scale6 = pnl_scale14 / i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
                 // Only profitable positions are candidates for ADL.
                 if pnl_scale6 > 0 {
-                    candidates.push((*addr, *market, *pos, pnl_scale6));
+                    candidates.push((*addr, *market, pos.size, pos.entry_price, pnl_scale6));
                 }
             }
         }
@@ -856,22 +872,29 @@ impl PerpsModule {
         // Step 3: Rank by PnL desc, size desc, address asc.
         candidates.sort_by(|a, b| {
             // PnL descending.
-            b.3.cmp(&a.3)
+            b.4.cmp(&a.4)
                 // Size (absolute) descending.
-                .then_with(|| b.2.size.unsigned_abs().cmp(&a.2.size.unsigned_abs()))
+                .then_with(|| b.2.unsigned_abs().cmp(&a.2.unsigned_abs()))
                 // Address ascending (deterministic tiebreak).
                 .then_with(|| a.0.cmp(&b.0))
         });
 
         // Step 4: Deleverage each candidate until shortfall is covered.
-        for (addr, market, pos, pnl_scale6) in candidates {
+        // `marks`/`accounts` are destructured so mark lookups (shared)
+        // and position mutations (mutable) borrow disjoint fields.
+        let Inner { marks, accounts, .. } = &mut *inner;
+        for (addr, market, pos_size, pos_entry_price, pnl_scale6) in candidates {
             if remaining_shortfall == 0 {
                 break;
             }
             // Claw back min(remaining_shortfall, counterparty_pnl).
             let clawback_target =
                 remaining_shortfall.min(u64::try_from(pnl_scale6).unwrap_or(u64::MAX));
-            let acct = Self::account_mut(inner, &addr);
+            // The candidate came from a live account — `get_mut`
+            // suffices (no account_mut side effects needed).
+            let Some(acct) = accounts.get_mut(&addr) else {
+                continue;
+            };
             let Some(pos_entry) = acct.positions.get_mut(&market) else {
                 continue;
             };
@@ -887,18 +910,18 @@ impl PerpsModule {
             // scale-6 unit due to integer flooring. We debit the
             // *realized* amount, not the target, to keep accounting
             // exact.
-            let mark = marks.get(&market).copied().unwrap_or(pos.entry_price);
-            let pnl_per_unit = if pos.size > 0 {
-                i128::from(mark) - i128::from(pos.entry_price)
+            let mark = marks.get(&market).copied().unwrap_or(pos_entry_price);
+            let pnl_per_unit = if pos_size > 0 {
+                i128::from(mark) - i128::from(pos_entry_price)
             } else {
-                i128::from(pos.entry_price) - i128::from(mark)
+                i128::from(pos_entry_price) - i128::from(mark)
             };
             if pnl_per_unit <= 0 {
                 continue; // not actually profitable at current mark
             }
             let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
             let close_qty_i128 = (i128::from(clawback_target) * price_scale) / pnl_per_unit;
-            let size_abs = i128::from(pos.size.unsigned_abs());
+            let size_abs = i128::from(pos_size.unsigned_abs());
             let close_qty = i64::try_from(close_qty_i128.min(size_abs)).unwrap_or(0);
             if close_qty == 0 {
                 continue;
@@ -910,7 +933,7 @@ impl PerpsModule {
                     .unwrap_or(u64::MAX);
 
             // Reduce the position size (preserve sign).
-            if pos.size > 0 {
+            if pos_size > 0 {
                 pos_entry.size -= close_qty;
             } else {
                 pos_entry.size += close_qty;
@@ -1311,12 +1334,20 @@ impl PerpsModule {
 
     /// Post-trade margin check: if the account is under-margined,
     /// emit a `margin_call` event.
+    ///
+    /// Read-only: the prior implementation cloned `configs`,
+    /// `marks`, AND the entire account (every position) per call —
+    /// three map clones on the post-trade hot path. `accounts`,
+    /// `marks`, and `configs` are disjoint fields, so shared
+    /// borrows suffice.
     fn margin_check(inner: &mut Inner, sender: &Address, market: u8, events: &mut Vec<Event>) {
-        let configs = inner.configs.clone();
-        let marks = inner.marks.clone();
-        let acct = Self::account_mut(inner, sender).clone();
-        let equity = acct.equity(&marks, &configs);
-        let maintenance = acct.total_maintenance(&marks, &configs);
+        // No account ⇒ no positions ⇒ equity 0 ⇒ solvent; the
+        // margin_call only matters for existing accounts.
+        let Some(acct) = inner.accounts.get(sender) else {
+            return;
+        };
+        let equity = acct.equity(&inner.marks, &inner.configs);
+        let maintenance = acct.total_maintenance(&inner.marks, &inner.configs);
         if equity < i128::try_from(maintenance).unwrap_or(i128::MAX) {
             events.push(Event {
                 module: "perps",
