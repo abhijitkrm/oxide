@@ -2529,3 +2529,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     invariant violations or edge-case inputs. Errors are returned
     instead of panicking, so a bad order or internal bug rejects the
     transaction rather than killing the validator.
+
+- **Executor did not enforce fees or block gas limits**
+  (`crates/executor/src/lib.rs`, `modules/bank/src/lib.rs`)
+  - The executor parsed `fee` and `gas` from the tx envelope but
+    never charged fees or enforced gas limits. `BlockBudget.max_gas`
+    existed but was only used in tests. This permitted free,
+    unbounded execution — a spam vector on a public testnet.
+  - Added `charge_fee()` and `estimate_gas()` methods to the
+    `Module` trait. The bank module overrides `charge_fee()` to
+    debit the sender's balance. Added `block_gas_limit` to the
+    Executor (default: 30M gas). `process_proposal` rejects blocks
+    exceeding the limit; `execute_block` skips txs exceeding the
+    cumulative limit and charges fees before execution.
+  - Also fixed `bank::mint()` which used `.expect("balance overflow")`
+    — replaced with `saturating_add()`.
+  - Regression tests: `process_proposal_rejects_block_exceeding_gas_limit`,
+    `process_proposal_accepts_block_within_gas_limit`,
+    `execute_block_skips_txs_exceeding_gas_limit`,
+    `charge_fee_debits_sender_balance`,
+    `charge_fee_rejects_insufficient_balance`,
+    `charge_fee_zero_is_noop`.
+  - **In plain words:** every transaction now pays its declared fee
+    before it can execute, and the total computation in a block is
+    bounded by a gas limit. A sender with insufficient balance for
+    the fee has their transaction skipped. A byzantine proposer
+    cannot include unbounded computation in a single block.

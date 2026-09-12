@@ -9417,3 +9417,49 @@ validator process (DoS vector).
 - `cancel_nonexistent_order_returns_error_not_panic`
 - `remove_maker_does_not_panic_on_invariant_violation`
 - `duplicate_insert_returns_error_not_panic`
+
+## Pre-testnet audit: fee deduction and gas enforcement
+
+### Root cause
+
+The executor parsed `fee` and `gas` from the tx envelope into
+`TxContext` but never charged fees or enforced gas limits. The
+`BlockBudget.max_gas` field existed but was only used in tests.
+This permitted free, effectively unbounded execution — a spam
+vector on a public testnet.
+
+### Fix
+
+Added fee deduction and block gas limit enforcement:
+
+1. Added `charge_fee()` method to the `Module` trait (default
+   no-op). The bank module overrides it to debit the sender's
+   balance by `ctx.fee` before execution.
+
+2. Added `estimate_gas()` method to the `Module` trait (default:
+   1000 gas base cost + 1 gas per byte of payload). Modules with
+   a more accurate gas model (e.g. EVM) can override this.
+
+3. Added `block_gas_limit` field to the Executor (default: 30M
+   gas, configurable via `with_gas_limit()`).
+
+4. `process_proposal` now sums the gas estimate of each tx and
+   rejects the block if the total exceeds the limit.
+
+5. `execute_block` now tracks cumulative gas and skips txs that
+   would exceed the limit. It also calls `charge_fee()` before
+   executing each tx — a tx whose sender has insufficient balance
+   for the fee is skipped (not executed, nonce not advanced).
+
+Also fixed the bank module's `mint()` method, which used
+`.expect("balance overflow")` — replaced with `saturating_add()`
+to prevent a panic on overflow.
+
+### Regression tests
+
+- `process_proposal_rejects_block_exceeding_gas_limit`
+- `process_proposal_accepts_block_within_gas_limit`
+- `execute_block_skips_txs_exceeding_gas_limit`
+- `charge_fee_debits_sender_balance`
+- `charge_fee_rejects_insufficient_balance`
+- `charge_fee_zero_is_noop`

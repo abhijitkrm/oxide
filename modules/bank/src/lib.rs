@@ -47,15 +47,21 @@ impl BankModule {
 
     /// Mint tokens to an account (for genesis / staking rewards).
     ///
+    /// Uses saturating arithmetic to prevent overflow panics. In
+    /// production, mint amounts are bounded by genesis config and
+    /// staking reward rates, so overflow should never occur — but
+    /// saturating is safer than panicking (a panic would crash the
+    /// validator).
+    ///
     /// # Panics
     ///
-    /// Panics if the store mutex is poisoned or the balance overflows.
+    /// Panics if the store mutex is poisoned (cold path, unrecoverable).
     pub fn mint(&self, addr: &Address, amount: u64) {
         let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bal = store
             .get(&addr.0[..])
             .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
-        let new_bal = bal.checked_add(amount).expect("balance overflow");
+        let new_bal = bal.saturating_add(amount);
         store.insert(addr.0.to_vec(), new_bal.to_le_bytes().to_vec());
     }
 
@@ -179,6 +185,27 @@ impl Module for BankModule {
     }
 
     fn begin_block(&self, _height: Height) {}
+
+    /// Charge the transaction fee from the sender's balance.
+    ///
+    /// This is called by the executor before `handle` to enforce
+    /// that every transaction pays its declared fee. A tx whose
+    /// sender has insufficient balance is rejected.
+    fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
+        if ctx.fee == 0 {
+            return Ok(()); // zero-fee tx — no charge
+        }
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sender_key = Self::balance_key(&ctx.sender);
+        let sender_bal = store
+            .get(&sender_key[..])
+            .map_or(0, |v| u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0u8; 8])));
+        let new_bal = sender_bal
+            .checked_sub(ctx.fee)
+            .ok_or_else(|| ExecError::ModuleRejected("insufficient balance for fee".to_string()))?;
+        store.insert(sender_key, new_bal.to_le_bytes().to_vec());
+        Ok(())
+    }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (to, amount) = Self::parse_transfer(msg).ok_or(ExecError::Malformed)?;
@@ -352,5 +379,43 @@ mod tests {
         // Neither balance changed.
         assert_eq!(bank.balance(&from), 50);
         assert_eq!(bank.balance(&to), 0);
+    }
+
+    /// Regression test: `charge_fee` must debit the sender's balance
+    /// by the fee amount. Before the fix, fees were parsed but never
+    /// charged — allowing free execution on the network.
+    #[test]
+    fn charge_fee_debits_sender_balance() {
+        let bank = BankModule::new();
+        let sender = addr(1);
+        bank.mint(&sender, 1000);
+        let ctx = TxContext { sender, nonce: 0, fee: 100 };
+        bank.charge_fee(&ctx).unwrap();
+        assert_eq!(bank.balance(&sender), 900, "fee must be deducted from sender balance");
+    }
+
+    /// Regression test: `charge_fee` must reject if the sender has
+    /// insufficient balance to cover the fee.
+    #[test]
+    fn charge_fee_rejects_insufficient_balance() {
+        let bank = BankModule::new();
+        let sender = addr(1);
+        bank.mint(&sender, 50);
+        let ctx = TxContext { sender, nonce: 0, fee: 100 };
+        let err = bank.charge_fee(&ctx).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "insufficient fee must be rejected");
+        // Balance must be unchanged.
+        assert_eq!(bank.balance(&sender), 50, "balance must not change on rejected fee");
+    }
+
+    /// Regression test: `charge_fee` with a zero fee is a no-op.
+    #[test]
+    fn charge_fee_zero_is_noop() {
+        let bank = BankModule::new();
+        let sender = addr(1);
+        bank.mint(&sender, 1000);
+        let ctx = TxContext { sender, nonce: 0, fee: 0 };
+        bank.charge_fee(&ctx).unwrap();
+        assert_eq!(bank.balance(&sender), 1000, "zero fee must not change balance");
     }
 }

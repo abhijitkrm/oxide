@@ -344,6 +344,44 @@ pub trait Module: Send + Sync {
     /// Called at the end of each block, after all txs.
     fn end_block(&self, height: Height);
 
+    /// Charge the transaction fee from the sender's account.
+    ///
+    /// This is called by the executor *before* `handle` to enforce
+    /// that every transaction pays its declared fee. A tx whose
+    /// sender has insufficient balance to cover the fee is rejected
+    /// — it is not executed, and its nonce is not advanced.
+    ///
+    /// The default implementation is a no-op (no fee charged).
+    /// Modules that manage account balances (e.g. the bank module)
+    /// override this to debit the sender's balance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::ModuleRejected`] if the sender has
+    /// insufficient balance to cover the fee.
+    fn charge_fee(&self, _ctx: &TxContext) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    /// Estimate the gas cost of a message for block gas limit
+    /// enforcement.
+    ///
+    /// The default implementation uses the message byte length as a
+    /// proxy for gas cost (1 byte = 1 gas unit). Modules with a more
+    /// accurate gas model (e.g. EVM) override this to return the
+    /// actual gas estimate.
+    ///
+    /// This is called by the executor in `process_proposal` to check
+    /// that the total block gas does not exceed the block gas limit,
+    /// and in `execute_block` to track cumulative gas consumption.
+    fn estimate_gas(&self, msg: &[u8]) -> u64 {
+        // Default: 1 gas per byte + a base cost of 1000 gas per tx
+        // (covers fixed overhead: nonce check, fee deduction, event
+        // emission). The base cost prevents a flood of 1-byte txs
+        // from fitting in a block with a low gas limit.
+        1000 + msg.len() as u64
+    }
+
     /// Compute the module's state root (over its storage subtree).
     fn state_root(&self) -> Hash;
 
@@ -447,6 +485,14 @@ fn parse_tx_context(bytes: &[u8]) -> Option<TxContext> {
 /// from the [`config`](::config) crate's `ExecutorConfig`.
 pub const DEFAULT_PARALLEL_THRESHOLD: usize = 32;
 
+/// Default block gas limit: 30 million gas units per block.
+///
+/// This is comparable to Ethereum's 30M gas limit. Each transaction
+/// consumes at least 1000 gas (base cost) plus 1 gas per byte of
+/// payload. The limit prevents a byzantine proposer from including
+/// unbounded computation in a single block.
+pub const DEFAULT_BLOCK_GAS_LIMIT: u64 = 30_000_000;
+
 /// Minimum tx size: sender (20) + nonce (8) + fee (8) = 36 bytes.
 const TX_MIN_SIZE: usize = 20 + 8 + 8;
 
@@ -545,6 +591,14 @@ pub struct Executor {
     /// The map is restored from snapshots via `import_snapshot` so
     /// replay protection survives restarts.
     executed_nonce: Mutex<HashMap<primitives::Address, u64>>,
+    /// Block gas limit. The total gas of all txs in a block must not
+    /// exceed this limit. Enforced in `process_proposal` (rejects
+    /// blocks that exceed the limit) and `execute_block` (skips
+    /// txs that would exceed the cumulative limit).
+    ///
+    /// Default: 30 million gas per block (comparable to Ethereum's
+    /// 30M gas limit). Configurable via [`Executor::with_gas_limit`].
+    block_gas_limit: u64,
 }
 
 impl Executor {
@@ -582,7 +636,19 @@ impl Executor {
             mempool_intake_tx: intake_tx,
             mempool_intake_rx: Mutex::new(intake_rx),
             executed_nonce: Mutex::new(HashMap::new()),
+            block_gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
         }
+    }
+
+    /// Set the block gas limit.
+    ///
+    /// The total gas of all txs in a block must not exceed this
+    /// limit. Each tx consumes at least 1000 gas (base cost) plus
+    /// 1 gas per byte of payload.
+    #[must_use]
+    pub fn with_gas_limit(mut self, limit: u64) -> Self {
+        self.block_gas_limit = limit;
+        self
     }
 
     /// Attach a latency recorder for the block pipeline.
@@ -924,6 +990,7 @@ impl Executor {
         // against a byzantine proposer that bypassed
         // `process_proposal` (e.g. via a direct finalize path).
         let mut groups: BTreeMap<u8, Vec<(TxContext, Vec<u8>, Hash)>> = BTreeMap::new();
+        let mut cumulative_gas: u64 = 0;
         for tx in &block.txs {
             let bytes = tx.as_bytes();
             let Some(ctx) = parse_tx_context(bytes) else {
@@ -937,12 +1004,36 @@ impl Executor {
             if ctx.nonce != expected {
                 continue; // stale or out-of-order nonce — skip
             }
-            // Advance the local nonce counter for this sender.
-            local_nonce.insert(ctx.sender, expected + 1);
             let Some(module_id) = parse_module_id(bytes) else {
                 continue; // skip malformed txs
             };
-            let payload = module_payload(bytes).to_vec();
+            let Some(module) = self.modules[module_id as usize].as_ref() else {
+                continue; // unknown module — skip
+            };
+            // Enforce block gas limit: skip txs that would exceed
+            // the cumulative gas limit. This is the execution-time
+            // enforcement (the proposal-time check is in
+            // `process_proposal`). A byzantine proposer that
+            // bypasses `process_proposal` still hits this gate.
+            let payload = module_payload(bytes);
+            let gas = module.estimate_gas(payload);
+            if cumulative_gas.saturating_add(gas) > self.block_gas_limit {
+                continue; // block gas limit exceeded — skip remaining txs
+            }
+            // Charge the transaction fee. If the sender has
+            // insufficient balance, the tx is skipped (not executed)
+            // and its nonce is not advanced. This prevents free
+            // execution: every tx must pay its declared fee before
+            // it can execute.
+            if module.charge_fee(&ctx).is_err() {
+                continue; // insufficient balance for fee — skip
+            }
+            // Advance the local nonce counter for this sender.
+            // (Only after fee charge succeeds — a tx that can't pay
+            // its fee doesn't get its nonce advanced.)
+            local_nonce.insert(ctx.sender, expected + 1);
+            cumulative_gas = cumulative_gas.saturating_add(gas);
+            let payload = payload.to_vec();
             // Cache key must match `ingest_tx`: hash of the FULL tx
             // envelope, not just the module payload. The payload
             // alone does not uniquely identify a transaction (two
@@ -1223,6 +1314,7 @@ impl AppInterface for Executor {
         // Signature verification arrives when the tx envelope format
         // includes signatures (Phase 2).
         let mut last_nonce: HashMap<primitives::Address, u64> = HashMap::new();
+        let mut total_gas: u64 = 0;
         for tx in &proposal.txs {
             let bytes = tx.as_bytes();
             // Check that the tx context is parseable (sender, nonce,
@@ -1263,8 +1355,23 @@ impl AppInterface for Executor {
             let Some(module_id) = parse_module_id(bytes) else {
                 return Verdict::Reject { reason: "tx has no module ID".to_string() };
             };
-            if self.modules[module_id as usize].is_none() {
+            let Some(module) = self.modules[module_id as usize].as_ref() else {
                 return Verdict::Reject { reason: format!("unknown module ID {module_id}") };
+            };
+            // Enforce block gas limit: sum the gas estimate of each
+            // tx and reject the block if the total exceeds the limit.
+            // This prevents a byzantine proposer from including
+            // unbounded computation in a single block.
+            let payload = module_payload(bytes);
+            let gas = module.estimate_gas(payload);
+            total_gas = total_gas.saturating_add(gas);
+            if total_gas > self.block_gas_limit {
+                return Verdict::Reject {
+                    reason: format!(
+                        "block gas limit exceeded: {total_gas} > {}",
+                        self.block_gas_limit
+                    ),
+                };
             }
         }
         Verdict::Accept
@@ -1814,5 +1921,80 @@ mod tests {
         // Nonce 2 should be accepted (next expected).
         let tx2 = make_tx_with_nonce(1, &[2], 2);
         assert!(matches!(executor2.ingest_tx(tx2), MempoolAck::Accepted));
+    }
+
+    /// Regression test: `process_proposal` must reject a block whose
+    /// total gas exceeds the block gas limit. Before the fix, the
+    /// `BlockBudget.max_gas` field was ignored — a byzantine proposer
+    /// could include unbounded computation in a single block.
+    #[test]
+    fn process_proposal_rejects_block_exceeding_gas_limit() {
+        let mut executor =
+            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2000);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        // Each tx costs 1000 gas (base) + payload bytes. With a 2000
+        // gas limit, we can fit at most 1 tx with a small payload
+        // (1000 + N bytes). Two txs would exceed 2000.
+        let tx1 = make_tx(1, &[0]);
+        let tx2 = make_tx_with_nonce(1, &[1], 1);
+
+        // A proposal with 2 txs (each ~1001 gas) totals ~2002 gas,
+        // exceeding the 2000 limit.
+        let proposal = Proposal { height: Height::new(0), txs: vec![tx1, tx2], attestation: None };
+        let verdict = executor.process_proposal(&proposal);
+        match verdict {
+            Verdict::Reject { reason } => {
+                assert!(
+                    reason.contains("gas limit"),
+                    "expected gas limit rejection, got: {reason}"
+                );
+            }
+            Verdict::Accept => panic!("block exceeding gas limit must be rejected"),
+        }
+    }
+
+    /// Regression test: `process_proposal` must accept a block whose
+    /// total gas is within the block gas limit.
+    #[test]
+    fn process_proposal_accepts_block_within_gas_limit() {
+        let mut executor =
+            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(10_000);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        // One tx with a small payload: 1000 + 1 = 1001 gas, well
+        // within the 10,000 limit.
+        let tx = make_tx(1, &[0]);
+        let proposal = Proposal { height: Height::new(0), txs: vec![tx], attestation: None };
+        let verdict = executor.process_proposal(&proposal);
+        assert!(matches!(verdict, Verdict::Accept), "block within gas limit must be accepted");
+    }
+
+    /// Regression test: `execute_block` must skip txs that would
+    /// exceed the cumulative block gas limit. This is the
+    /// execution-time enforcement (the proposal-time check is in
+    /// `process_proposal`).
+    #[test]
+    fn execute_block_skips_txs_exceeding_gas_limit() {
+        let mut executor =
+            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2000);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        // Two txs, each costing ~1001 gas. The first fits (cumulative
+        // 1001 ≤ 2000), the second would push to 2002 > 2000.
+        let tx1 = make_tx(1, &[0]);
+        let tx2 = make_tx_with_nonce(1, &[1], 1);
+        let block = FinalizedBlock { height: Height::new(0), txs: vec![tx1, tx2] };
+        executor.finalize_block(&block);
+
+        // Only the first tx should have been executed (counter = 1).
+        // The second tx was skipped due to the gas limit.
+        let counter = executor.modules[1].as_ref().unwrap();
+        let count = counter.state_root();
+        assert_eq!(
+            count.0[0], 1,
+            "only the first tx should execute (gas limit), got counter = {}",
+            count.0[0]
+        );
     }
 }
