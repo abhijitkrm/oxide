@@ -816,6 +816,59 @@ impl Executor {
         self.state_root_at(self.current_height())
     }
 
+    /// Save executed nonces to a storage backend (C10 fix).
+    ///
+    /// Persists the per-sender `executed_nonce` map to the storage
+    /// backend using a reserved key prefix. Call this on shutdown
+    /// or after each block commit to ensure nonces survive restart.
+    /// Without this, a restart resets all executed nonces to zero,
+    /// allowing replay of already-executed native transactions.
+    pub fn save_executed_nonces(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
+        /// Key prefix: `exec_nonce` padded to 32 bytes. Each entry
+        /// is keyed by `prefix || addr` and valued by the nonce as
+        /// 8-byte LE.
+        const PREFIX: &[u8] = b"exec_nonce";
+        let nonces = self
+            .executed_nonce
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ops: Vec<storage::Op> = Vec::with_capacity(nonces.len());
+        for (addr, nonce) in nonces.iter() {
+            let mut key_bytes = [0u8; 32];
+            key_bytes[..PREFIX.len()].copy_from_slice(PREFIX);
+            key_bytes[PREFIX.len()..PREFIX.len() + 20].copy_from_slice(&addr.0);
+            ops.push(storage::Op::Set {
+                key: primitives::Hash(key_bytes),
+                value: nonce.to_le_bytes().to_vec(),
+            });
+        }
+        backend.apply_batch(&ops);
+    }
+
+    /// Load executed nonces from a storage backend (C10 fix).
+    ///
+    /// Restores the per-sender `executed_nonce` map from the storage
+    /// backend. Call this on startup before processing any
+    /// transactions.
+    pub fn load_executed_nonces(&self, backend: &(dyn storage::StorageBackend + Send)) {
+        const PREFIX: &[u8] = b"exec_nonce";
+        let entries = backend.range(PREFIX);
+        let mut nonces = self
+            .executed_nonce
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (key, value) in entries {
+            let addr_bytes = &key.0[PREFIX.len()..PREFIX.len() + 20];
+            let mut addr_arr = [0u8; 20];
+            addr_arr.copy_from_slice(addr_bytes);
+            let addr = primitives::Address(addr_arr);
+            if value.len() >= 8 {
+                let nonce = u64::from_le_bytes(value[..8].try_into().unwrap_or([0u8; 8]));
+                nonces.insert(addr, nonce);
+            }
+        }
+    }
+
     /// Export a snapshot of the executor's state at the current
     /// chain height.
     ///
