@@ -426,93 +426,7 @@ impl Module for ExchangeModule {
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         match tag {
-            TAG_PLACE => {
-                let (market, mut order, _owner_placeholder) =
-                    Self::parse_place(body).ok_or(ExecError::Malformed)?;
-                // The tx sender is the order owner (self-trade checks
-                // and settlement attribution use this).
-                order.owner = ctx.sender;
-
-                // Split the borrow: the MutexGuard derefs to `Inner`,
-                // and we need `&mut markets` and `&mut fills` at once.
-                let Inner { markets, fills } = &mut *inner;
-                let Some(engine) = markets[usize::from(market)].as_mut() else {
-                    return Err(ExecError::ModuleRejected(format!(
-                        "market {market} does not exist"
-                    )));
-                };
-
-                // Pre-trade risk check (plan.md §9.2): if the bank is
-                // wired, verify the buyer has enough quote balance for
-                // the worst-case fill. Buy orders pay `price * qty`;
-                // sell orders receive quote (no pre-check needed for v0
-                // — base-asset tracking is deferred).
-                if let Some(bank) = &self.bank {
-                    if order.side == Side::Buy && order.order_type != OrderType::Market {
-                        let notional = u128::from(order.price.0) * u128::from(order.qty.0);
-                        // Scale-14 notional → scale-6 quote. Saturating
-                        // is safe: a notional exceeding u64::MAX in
-                        // scale-6 would require >1.8e19 quote units
-                        // (~18 trillion units), far beyond any
-                        // realistic balance.
-                        let quote_needed =
-                            u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
-                        if bank.balance(&ctx.sender) < quote_needed {
-                            return Err(ExecError::ModuleRejected(
-                                "insufficient balance for buy order".to_string(),
-                            ));
-                        }
-                    }
-                }
-
-                // Reuse the fill buffer across calls — zero alloc.
-                fills.clear();
-                let outcome = engine
-                    .place(order, fills)
-                    .map_err(|e| ExecError::ModuleRejected(format!("engine: {e}")))?;
-
-                // Emit one event per fill + one for the outcome.
-                let mut events = Vec::with_capacity(fills.len() + 1);
-                for f in fills.iter() {
-                    events.push(fill_event(*f));
-                }
-
-                // Settlement (plan.md §9.2): for each fill, debit the
-                // buyer and credit the seller. The quote amount is
-                // `notional / PRICE_SCALE` (scale-14 → scale-6). If
-                // settlement fails on any fill (should not happen after
-                // the pre-check, but a maker's resting order could have
-                // been placed before the buyer's balance changed), the
-                // fill events still stand — settlement is best-effort
-                // in v0 and will be made atomic with the cross-module
-                // coordinator.
-                if let Some(bank) = &self.bank {
-                    for f in fills.iter() {
-                        let notional = u128::from(f.price.0) * u128::from(f.qty.0);
-                        let quote_amount =
-                            u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
-                        let (buyer, seller) = if f.taker_side == Side::Buy {
-                            (f.taker_owner, f.maker_owner)
-                        } else {
-                            (f.maker_owner, f.taker_owner)
-                        };
-                        // Best-effort: if debit fails, emit a
-                        // settlement-failed event so the discrepancy
-                        // is visible. Full atomicity arrives with the
-                        // coordinator.
-                        if bank.transfer(&buyer, &seller, quote_amount).is_err() {
-                            events.push(Event {
-                                module: "exchange",
-                                kind: "settlement_failed".to_string(),
-                                data: vec![market],
-                            });
-                        }
-                    }
-                }
-
-                events.push(outcome_event(market, outcome));
-                Ok(events)
-            }
+            TAG_PLACE => self.handle_place(ctx, body, &mut inner),
 
             TAG_CANCEL => {
                 let (market, order_id) = Self::parse_cancel(body).ok_or(ExecError::Malformed)?;
@@ -572,6 +486,121 @@ impl Module for ExchangeModule {
 }
 
 impl ExchangeModule {
+    /// Handle a place-order message (extracted from `handle`).
+    ///
+    /// Runs the full order lifecycle: parse → pre-trade balance check
+    /// → match → fill events → settlement. `inner` is the
+    /// already-held module lock; the order book and reusable fill
+    /// buffer are borrowed from it.
+    fn handle_place(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        let (market, mut order, _owner_placeholder) =
+            Self::parse_place(body).ok_or(ExecError::Malformed)?;
+        // The tx sender is the order owner (self-trade checks
+        // and settlement attribution use this).
+        order.owner = ctx.sender;
+
+        // Split the borrow: `inner` derefs to `Inner`, and we need
+        // `&mut markets` and `&mut fills` at once.
+        let Inner { markets, fills } = inner;
+        let Some(engine) = markets[usize::from(market)].as_mut() else {
+            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+        };
+
+        // Pre-trade risk check (plan.md §9.2): if the bank is
+        // wired, verify the buyer has enough quote balance for
+        // the worst-case fill. Buy orders pay `price * qty`;
+        // sell orders receive quote (no pre-check needed for v0
+        // — base-asset tracking is deferred).
+        //
+        // Market buys have no limit price, so `price * qty` is
+        // meaningless — the worst case is the actual sweep
+        // cost of `qty` through the ask ladder, computed by
+        // `engine.sweep_cost`. Without this check an unfunded
+        // taker could sweep the book and leave every fill
+        // unsettled (makers' orders consumed, no payment).
+        if let Some(bank) = &self.bank {
+            if order.side == Side::Buy {
+                // Scale-14 notional: limit buys use the
+                // worst-case `price × qty` bound (fills can
+                // only cost less); market buys use the real
+                // sweep cost.
+                let notional = match order.order_type {
+                    OrderType::Market => engine.sweep_cost(Side::Buy, order.qty.0, None),
+                    _ => u128::from(order.price.0) * u128::from(order.qty.0),
+                };
+                // Reject rather than cap when the quote amount
+                // exceeds u64 — a saturating conversion would
+                // silently change what the buyer pays.
+                let quote_needed = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
+                    ExecError::ModuleRejected("buy notional exceeds u64 quote range".to_string())
+                })?;
+                if bank.balance(&ctx.sender) < quote_needed {
+                    return Err(ExecError::ModuleRejected(
+                        "insufficient balance for buy order".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Reuse the fill buffer across calls — zero alloc.
+        fills.clear();
+        let outcome = engine
+            .place(order, fills)
+            .map_err(|e| ExecError::ModuleRejected(format!("engine: {e}")))?;
+
+        // Emit one event per fill + one for the outcome.
+        let mut events = Vec::with_capacity(fills.len() + 1);
+        for f in fills.iter() {
+            events.push(fill_event(*f));
+        }
+
+        // Settlement (plan.md §9.2): for each fill, debit the
+        // buyer and credit the seller. The quote amount is
+        // `notional / PRICE_SCALE` (scale-14 → scale-6). With the
+        // pre-trade check above, a failed transfer is only possible
+        // on seller-credit overflow (the seller's balance cannot
+        // grow); the fill stands and the discrepancy is reported as
+        // a `settlement_failed` event for venue reconciliation —
+        // the buyer is never debited for an unsettled fill
+        // (`bank.transfer` is atomic).
+        if let Some(bank) = &self.bank {
+            for f in fills.iter() {
+                let notional = u128::from(f.price.0) * u128::from(f.qty.0);
+                // An over-u64 quote cannot transfer — emit
+                // settlement_failed rather than silently
+                // capping the amount moved.
+                let Ok(quote_amount) = u64::try_from(notional / PRICE_SCALE) else {
+                    events.push(Event {
+                        module: "exchange",
+                        kind: "settlement_failed".to_string(),
+                        data: vec![market],
+                    });
+                    continue;
+                };
+                let (buyer, seller) = if f.taker_side == Side::Buy {
+                    (f.taker_owner, f.maker_owner)
+                } else {
+                    (f.maker_owner, f.taker_owner)
+                };
+                if bank.transfer(&buyer, &seller, quote_amount).is_err() {
+                    events.push(Event {
+                        module: "exchange",
+                        kind: "settlement_failed".to_string(),
+                        data: vec![market],
+                    });
+                }
+            }
+        }
+
+        events.push(outcome_event(market, outcome));
+        Ok(events)
+    }
+
     /// Handle a batch-settle message: apply pre-matched fills from
     /// the off-chain matching server. Each valid fill leg debits the
     /// buyer and credits the seller by a **chain-computed** amount —
@@ -1464,5 +1493,100 @@ mod tests {
         assert_eq!(bank.balance(&addr(9)), 10_000_000 + 40_000);
         // Exactly one pair transfer → one batch_fill event.
         assert_eq!(events.iter().filter(|e| e.kind == "batch_fill").count(), 1);
+    }
+
+    /// Regression test: market buys must pass the pre-trade balance
+    /// check against the real sweep cost. Before the fix, market
+    /// buys skipped the check entirely (`order_type != Market`), so
+    /// an unfunded taker could sweep the book and leave every fill
+    /// unsettled — makers' orders consumed with no payment.
+    #[test]
+    fn market_buy_without_balance_rejected() {
+        let (bank, ex) = bank_and_exchange();
+        let mid = 0;
+
+        // Rest a maker sell at tick 500 ($15.00), 1 lot.
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+
+        // ctx(2) has no bank balance at all.
+        let mkt = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            tif: TimeInForce::Ioc,
+            price: Price(0), // ignored for market orders
+            qty: Qty(1_000),
+            owner: addr(2),
+            stp: StpMode::None,
+        };
+        let err = ex.handle(&ctx(2), &msg::place(mid, mkt)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        // The maker's order must still be resting — nothing matched.
+        assert_eq!(ex.resting_count(mid), 1);
+        assert_eq!(bank.balance(&addr(9)), 1_000_000_000_000);
+    }
+
+    /// A funded market buy sweeps and pays exactly the chain-computed
+    /// fill cost (sweep price × qty), not a wire-supplied amount.
+    #[test]
+    fn market_buy_with_balance_settles_sweep() {
+        let (bank, ex) = bank_and_exchange();
+        let mid = 0;
+
+        // Rest 2 maker sells: 1 lot @ tick 500 ($15.00), 1 lot @ tick
+        // 501 ($15.01).
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 501, 1, 9))).unwrap();
+
+        let buyer_before = bank.balance(&addr(1));
+        let seller_before = bank.balance(&addr(9));
+
+        // Market buy 2 lots — sweeps both levels.
+        let mkt = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            tif: TimeInForce::Ioc,
+            price: Price(0),
+            qty: Qty(2_000),
+            owner: addr(1),
+            stp: StpMode::None,
+        };
+        ex.handle(&ctx(1), &msg::place(mid, mkt)).unwrap();
+
+        // Cost = 15_000 + 15_010 = 30_010 quote units.
+        assert_eq!(bank.balance(&addr(1)), buyer_before - 30_010);
+        assert_eq!(bank.balance(&addr(9)), seller_before + 30_010);
+        assert_eq!(ex.resting_count(mid), 0);
+    }
+
+    /// A market buy whose sweep cost exceeds the available balance is
+    /// rejected entirely — the engine must not partially settle.
+    #[test]
+    fn market_buy_insufficient_for_full_sweep_rejected() {
+        let bank = Arc::new(bank::BankModule::new());
+        // Buyer has only 20_000 quote — enough for the cheap level
+        // (15_000) but not the whole sweep (30_010).
+        bank.mint(&addr(1), 20_000);
+        bank.mint(&addr(9), 1_000_000_000_000);
+        let ex = ExchangeModule::with_bank(bank.clone());
+        ex.list_market(test_cfg()).unwrap();
+        let mid = 0;
+
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 501, 1, 9))).unwrap();
+
+        let mkt = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            tif: TimeInForce::Ioc,
+            price: Price(0),
+            qty: Qty(2_000),
+            owner: addr(1),
+            stp: StpMode::None,
+        };
+        let err = ex.handle(&ctx(1), &msg::place(mid, mkt)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        // Nothing matched — both makers still rest, no funds moved.
+        assert_eq!(ex.resting_count(mid), 2);
+        assert_eq!(bank.balance(&addr(1)), 20_000);
     }
 }

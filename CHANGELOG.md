@@ -726,6 +726,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Market buys bypassed the pre-trade balance check**
+  (`modules/exchange/src/lib.rs`, `crates/trading/src/`)
+  - The balance check was guarded by `order_type != Market`, so an
+    unfunded taker could submit a market buy that swept resting
+    makers and left every fill unsettled — orders consumed with no
+    payment.
+  - Fix: new `BookBackend::sweep_cost` walks the opposite side
+    best-first accumulating `price × qty` (u128), giving the
+    exchange the real cost of a market sweep. All buy orders are now
+    checked: limit buys keep the worst-case `price × qty` bound,
+    market buys check the actual sweep cost. Over-`u64` amounts
+    reject rather than saturating to `u64::MAX`.
+  - Regression tests: unfunded market buy rejected (book untouched),
+    funded market buy settles the exact sweep cost, partially-
+    affordable sweep rejected entirely.
+  - **In plain words:** you can no longer place a market buy order
+    with an empty wallet and consume other people's resting orders
+    for free.
+
 - **Batch settlement was unauthenticated and trusted operator-supplied
   amounts** (`modules/exchange/src/lib.rs`, `crates/matcher/src/`)
   - `handle_batch_settle` ignored `ctx.sender` entirely — any account

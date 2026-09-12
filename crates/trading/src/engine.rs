@@ -203,6 +203,16 @@ impl<B: BookBackend> MatchingEngine<B> {
         Some(self.pool[slot].owner)
     }
 
+    /// Total notional (scale-14: `price * qty`) a `taker_side` sweep
+    /// of up to `qty` base units would consume against the current
+    /// book, bounded by `limit_raw` (`None` = unbounded market
+    /// sweep). Delegates to [`BookBackend::sweep_cost`]; used by the
+    /// exchange module's market-buy pre-trade balance check.
+    #[must_use]
+    pub fn sweep_cost(&self, taker_side: Side, qty: u64, limit_raw: Option<u64>) -> u128 {
+        self.book.sweep_cost(taker_side, qty, limit_raw)
+    }
+
     /// Submit an order. Fills are appended to the caller-owned
     /// `fills` buffer (preallocate and reuse; the engine never
     /// allocates here).

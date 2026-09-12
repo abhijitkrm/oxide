@@ -190,6 +190,21 @@ pub trait BookBackend {
         pool: &crate::pool::OrderPool,
     ) -> u64;
 
+    /// Total notional (scale-14: `price * qty`) a `taker_side` sweep
+    /// of up to `qty` base units would consume given the current
+    /// book, bounded by `limit_raw`. Walks the opposite side
+    /// best-first accumulating `price × min(remaining, level_total)`
+    /// until `qty` is covered or the side is exhausted —
+    /// O(active levels in range), no mutation.
+    ///
+    /// Returns the cost of the liquidity actually consumable
+    /// (`min(qty, fillable)`): an unfillable remainder contributes
+    /// nothing. Self-trade orders are included — an over-estimate is
+    /// the safe direction for a pre-trade balance check. Used by the
+    /// exchange module to reject market buys the taker cannot pay
+    /// for before they sweep resting makers without settling.
+    fn sweep_cost(&self, taker_side: Side, qty: u64, limit_raw: Option<u64>) -> u128;
+
     /// Number of addressable levels (cold path: iteration, digests).
     fn level_count(&self) -> usize;
 
@@ -450,6 +465,57 @@ impl BookBackend for DenseBook {
         total
     }
 
+    fn sweep_cost(&self, taker_side: Side, qty: u64, limit_raw: Option<u64>) -> u128 {
+        let mut remaining = qty;
+        // u128 notional cannot overflow: a single level contributes at
+        // most u64×u64 < 2^128, and the number of levels is bounded by
+        // the addressable band (memory-bound, ≪2^64).
+        let mut cost: u128 = 0;
+        match taker_side {
+            // A buy sweeps asks ascending from the best (lowest) ask.
+            Side::Buy => {
+                let Some(mut idx) = self.asks.lowest() else { return 0 };
+                loop {
+                    let price = self.level_price(idx);
+                    if limit_raw.is_some_and(|lim| price > lim) {
+                        break;
+                    }
+                    let fill = remaining.min(self.levels[idx as usize].total_qty);
+                    cost += u128::from(price) * u128::from(fill);
+                    remaining -= fill;
+                    if remaining == 0 {
+                        break;
+                    }
+                    match self.asks.next_after(idx) {
+                        Some(next) => idx = next,
+                        None => break,
+                    }
+                }
+            }
+            // A sell sweeps bids descending from the best (highest) bid.
+            Side::Sell => {
+                let Some(mut idx) = self.bids.highest() else { return 0 };
+                loop {
+                    let price = self.level_price(idx);
+                    if limit_raw.is_some_and(|lim| price < lim) {
+                        break;
+                    }
+                    let fill = remaining.min(self.levels[idx as usize].total_qty);
+                    cost += u128::from(price) * u128::from(fill);
+                    remaining -= fill;
+                    if remaining == 0 {
+                        break;
+                    }
+                    match self.bids.prev_before(idx) {
+                        Some(prev) => idx = prev,
+                        None => break,
+                    }
+                }
+            }
+        }
+        cost
+    }
+
     #[inline]
     fn level_count(&self) -> usize {
         self.levels.len()
@@ -655,5 +721,48 @@ mod tests {
         assert_eq!(book.fillable_qty(Side::Sell, Some(1_006_000_000)), 4_000);
         // Limit above every bid: nothing.
         assert_eq!(book.fillable_qty(Side::Sell, Some(1_011_000_000)), 0);
+    }
+
+    /// `sweep_cost` accumulates `price × qty` best-first and stops
+    /// early once the requested quantity is covered — the residual
+    /// (deeper levels, unfillable remainder) must not contribute.
+    /// This is the cost bound the exchange's market-buy balance
+    /// check relies on.
+    #[test]
+    fn sweep_cost_walks_best_first_and_caps_at_qty() {
+        let mut book = DenseBook::new(cfg()).unwrap();
+        let mut pool = OrderPool::with_capacity(16);
+
+        // Ask ladder: 10.20 (3k), 10.21 (2k), 10.30 (5k).
+        place_at(&mut book, &mut pool, 1, Side::Sell, 1_020_000_000, 3_000);
+        place_at(&mut book, &mut pool, 2, Side::Sell, 1_021_000_000, 2_000);
+        place_at(&mut book, &mut pool, 3, Side::Sell, 1_030_000_000, 5_000);
+
+        // Buy 4k: fills 3k @10.20 + 1k @10.21.
+        // 1_020_000_000×3_000 + 1_021_000_000×1_000 = 4_081_000_000_000.
+        let cost = book.sweep_cost(Side::Buy, 4_000, None);
+        assert_eq!(cost, 4_081_000_000_000u128);
+
+        // Buy more than the book holds (10k available): cost is the
+        // whole ask side — the unfillable remainder adds nothing.
+        // 3_060e9 + 1_021e9×2 + 1_030e9×5 = 10_252_000_000_000.
+        let cost = book.sweep_cost(Side::Buy, 20_000, None);
+        assert_eq!(cost, 10_252_000_000_000u128);
+
+        // Bounded at 10.20: only the first level counts.
+        let cost = book.sweep_cost(Side::Buy, 10_000, Some(1_020_000_000));
+        assert_eq!(cost, 3_060_000_000_000u128);
+
+        // Sell side: bids 10.10 (4k), 10.05 (6k).
+        place_at(&mut book, &mut pool, 4, Side::Buy, 1_010_000_000, 4_000);
+        place_at(&mut book, &mut pool, 5, Side::Buy, 1_005_000_000, 6_000);
+        // Sell 5k: fills 4k @10.10 + 1k @10.05.
+        // 1_010_000_000×4_000 + 1_005_000_000×1_000 = 5_045_000_000_000.
+        let cost = book.sweep_cost(Side::Sell, 5_000, None);
+        assert_eq!(cost, 5_045_000_000_000u128);
+
+        // Empty-side sweep costs nothing.
+        let empty = DenseBook::new(cfg()).unwrap();
+        assert_eq!(empty.sweep_cost(Side::Buy, 1_000, None), 0);
     }
 }

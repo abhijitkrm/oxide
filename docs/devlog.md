@@ -9895,3 +9895,35 @@ wire-supplied `quote_amount` without verifying `price × qty`.
 - `batch_settle_rolls_back_on_credit_overflow` (updated)
 
 `cargo test -p exchange -p matcher`: 22 + 82 tests pass. fmt+clippy clean.
+
+## Security sweep round 2 — market-buy balance check + sweep cost
+
+Market buys skipped the pre-trade balance check entirely
+(`order_type != OrderType::Market`), so an unfunded taker could sweep
+the book and leave every fill unsettled — makers' orders consumed
+with no payment.
+
+### Fix
+
+- `BookBackend::sweep_cost(side, qty, limit)` — walks the opposite
+  side best-first accumulating `price × min(remaining, level_total)`
+  in u128; caps at the requested qty (unfillable remainder adds
+  nothing). O(active levels), no mutation.
+- `MatchingEngine::sweep_cost` delegate.
+- Exchange `handle_place` now checks ALL buy orders: limit buys keep
+  the worst-case `price × qty` bound; market buys use the real sweep
+  cost. Both reject on `u64` overflow instead of saturating to
+  `u64::MAX` (a cap would silently change what the buyer pays).
+- Settlement loop: over-u64 quote emits `settlement_failed` instead
+  of capping the transfer.
+- Residual semantics documented: with the pre-check, a mid-sweep
+  transfer can only fail on seller-credit overflow; `bank.transfer`
+  is atomic so the buyer is never debited for an unsettled fill.
+- Extracted `handle_place` from `handle` (clippy 100-line limit).
+
+### Tests
+
+- `sweep_cost_walks_best_first_and_caps_at_qty` (book level)
+- `market_buy_without_balance_rejected`
+- `market_buy_with_balance_settles_sweep`
+- `market_buy_insufficient_for_full_sweep_rejected`
