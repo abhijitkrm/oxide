@@ -9567,3 +9567,28 @@ The TCP transport had two issues:
 All existing executor (41) and perps (33) tests pass. No new
 regression tests needed — these are performance optimizations with
 no behavioral change.
+
+## Pre-testnet audit: batch intake missing nonce replay check
+
+### Root cause
+
+`ingest_tx_batch` (the batch mempool intake path) did not enforce
+the executed-nonce replay check that `ingest_tx` (the single-tx path)
+enforced. A tx with a stale nonce could be accepted via the batch
+path even though it would be rejected via the single-tx path. This
+was a replay attack vector: a tx removed from the mempool after
+block selection could be re-submitted via the batch path and
+re-executed.
+
+### Fix
+
+Added the same executed-nonce replay check to `ingest_tx_batch` that
+exists in `ingest_tx`: before accepting a tx, check if its nonce is
+less than the next expected nonce for its sender. If so, reject it
+with a "replay" reason.
+
+### Regression test
+
+- `h4_ingest_batch_rejects_stale_nonce_after_execution` — a stale
+  nonce submitted via the batch path must be rejected, while a valid
+  nonce in the same batch must be accepted.

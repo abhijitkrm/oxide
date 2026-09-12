@@ -1219,6 +1219,26 @@ impl AppInterface for Executor {
                 results.push(MempoolAck::Rejected { reason: "malformed: tx context".to_string() });
                 continue;
             };
+            // H4 fix: replay protection. Reject txs whose nonce has
+            // already been executed. This check exists in `ingest_tx`
+            // but was missing from the batch path — a replay attack
+            // vector. A tx removed from the mempool after block
+            // selection could be re-submitted via the batch path and
+            // re-executed.
+            {
+                let executed =
+                    self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let next_expected = executed.get(&ctx.sender).copied().unwrap_or(0);
+                if ctx.nonce < next_expected {
+                    results.push(MempoolAck::Rejected {
+                        reason: format!(
+                            "replay: nonce {} < next expected {next_expected}",
+                            ctx.nonce
+                        ),
+                    });
+                    continue;
+                }
+            }
             let Some(module_id) = parse_module_id(bytes) else {
                 results
                     .push(MempoolAck::Rejected { reason: "malformed: no module ID".to_string() });
@@ -1787,6 +1807,45 @@ mod tests {
         // Nonce 1 should still be accepted.
         let tx1 = make_tx_with_nonce(1, &[1], 1);
         assert!(matches!(executor.ingest_tx(tx1), MempoolAck::Accepted));
+    }
+
+    /// Regression test: `ingest_tx_batch` must reject txs with stale
+    /// nonces (replay protection). Before the fix, the batch path
+    /// skipped the executed-nonce check that `ingest_tx` enforced,
+    /// allowing replayed txs to enter the mempool via the batch path.
+    #[test]
+    fn h4_ingest_batch_rejects_stale_nonce_after_execution() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        // Submit and execute nonce 0.
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        executor.ingest_tx(tx0);
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        let block = FinalizedBlock { height: Height::new(0), txs: proposal.txs };
+        executor.finalize_block(&block);
+
+        // Re-submit nonce 0 via the batch path — must be rejected.
+        let tx0_again = make_tx_with_nonce(1, &[0], 0);
+        let tx1 = make_tx_with_nonce(1, &[1], 1);
+        let results = executor.ingest_tx_batch(vec![tx0_again, tx1]);
+        assert_eq!(results.len(), 2);
+        match &results[0] {
+            MempoolAck::Rejected { reason } => {
+                assert!(
+                    reason.contains("replay"),
+                    "expected replay rejection for stale nonce in batch, got: {reason}"
+                );
+            }
+            MempoolAck::Accepted => panic!("stale nonce must be rejected in batch path (replay)"),
+        }
+        // Nonce 1 should still be accepted.
+        assert!(
+            matches!(results[1], MempoolAck::Accepted),
+            "valid nonce must be accepted in batch path"
+        );
     }
 
     // ---- H5 fix: process_proposal nonce ordering ----

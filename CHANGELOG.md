@@ -2605,3 +2605,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     allocation per transaction, reducing GC pressure and improving
     throughput. The perps module avoids cloning fill events, which
     reduces per-trade overhead.
+
+- **Batch mempool intake missing nonce replay check**
+  (`crates/executor/src/lib.rs`)
+  - `ingest_tx_batch` (the batch intake path) did not enforce the
+    executed-nonce replay check that `ingest_tx` (the single-tx path)
+    enforced. A tx with a stale nonce could be accepted via the batch
+    path — a replay attack vector.
+  - Added the same executed-nonce replay check to `ingest_tx_batch`.
+  - Regression test: `h4_ingest_batch_rejects_stale_nonce_after_execution`.
+  - **In plain words:** a transaction that has already been executed
+    can no longer be re-submitted via the batch intake path. Previously,
+    only the single-tx path checked for replays, leaving the batch
+    path as a bypass.
