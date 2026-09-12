@@ -25,7 +25,7 @@ use crate::protocol::{
 use crate::{MatchingServer, OrderAction, SharedMatcher};
 use exchange::BatchFillEntry;
 use futures_util::{SinkExt, StreamExt};
-use primitives::fixed::Qty;
+use primitives::fixed::{Price, Qty};
 use std::sync::Arc;
 use std::time::Duration;
 use trading::MarketConfig;
@@ -191,30 +191,46 @@ impl BatchSettler {
             return Ok(0);
         }
 
-        // Aggregate fills by (buyer, seller) pair: compute the net
-        // quote amount for each unique pair. Multiple fills between
-        // the same buyer and seller are combined into one transfer.
-        let mut aggregated: std::collections::HashMap<
-            (primitives::Address, primitives::Address),
-            BatchFillEntry,
-        > = std::collections::HashMap::new();
+        // Aggregate fills by (market, price, buyer, seller): legs at
+        // the same price between the same pair merge into one entry.
+        // The wire carries no claimed settlement amount — the chain
+        // recomputes `price * qty / PRICE_SCALE` per leg — so
+        // aggregation must not sum the off-chain `quote_amount`
+        // (floor-division dust would make the sums diverge).
+        //
+        // BTreeMap keeps the encoded entry order deterministic and
+        // reproducible for a given fill sequence.
+        let mut aggregated: std::collections::BTreeMap<
+            (u16, Price, primitives::Address, primitives::Address),
+            Qty,
+        > = std::collections::BTreeMap::new();
         for f in &fills {
-            let key = (f.buyer, f.seller);
-            aggregated
-                .entry(key)
-                .and_modify(|e| {
-                    e.qty = Qty(e.qty.0.saturating_add(f.qty.0));
-                    e.quote_amount = e.quote_amount.saturating_add(f.quote_amount);
-                })
-                .or_insert(BatchFillEntry {
-                    price: f.price,
-                    qty: f.qty,
-                    buyer: f.buyer,
-                    seller: f.seller,
-                    quote_amount: f.quote_amount,
-                });
+            let key = (f.market, f.price, f.buyer, f.seller);
+            match aggregated.get_mut(&key) {
+                Some(q) => {
+                    // A qty sum above u64::MAX is unreachable in
+                    // practice (would require ~1.8e13 lots traded in
+                    // one batch); fail loudly rather than saturate.
+                    *q = Qty(q
+                        .0
+                        .checked_add(f.qty.0)
+                        .ok_or_else(|| "fill qty aggregation overflow".to_string())?);
+                }
+                None => {
+                    aggregated.insert(key, f.qty);
+                }
+            }
         }
-        let entries: Vec<BatchFillEntry> = aggregated.into_values().collect();
+        let entries: Vec<BatchFillEntry> = aggregated
+            .into_iter()
+            .map(|((market, price, buyer, seller), qty)| BatchFillEntry {
+                market,
+                price,
+                qty,
+                buyer,
+                seller,
+            })
+            .collect();
         let pair_count = entries.len();
 
         // Encode as a batch-settle message.

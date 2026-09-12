@@ -9861,3 +9861,37 @@ All 17 critical and high-priority issues fixed. Final gate suite:
 - trading_tps_1m (2M txs): fails with "TCP send QC to follower:
   UnknownPeer" — a pre-existing TCP connection issue in the devnet
   harness during long-running tests. The 200k tx test passes.
+
+## Security sweep round 2 — batch_settle authorization + validation
+
+Second comprehensive audit (financial loss + performance) found that
+`handle_batch_settle` ignored `ctx.sender` — any account could submit
+forged fills and drain arbitrary bank balances — and trusted a
+wire-supplied `quote_amount` without verifying `price × qty`.
+
+### Fix
+
+- `ExchangeModule.settlement_operator: Option<Address>` — only this
+  address may submit `batch_settle` txs; `None` fails closed.
+  `NodeConfig.settlement_operator` wires it at node assembly.
+- Every leg validated against the market config (listed market,
+  positive lot-aligned qty, on-tick in-band price, buyer != seller).
+- Settlement amount recomputed on-chain (`price*qty/PRICE_SCALE`,
+  checked u128→u64); `quote_amount` removed from the wire entirely.
+- Legs aggregated per (buyer,seller) into a BTreeMap — deterministic
+  transfer order, one atomic transfer per pair.
+- Wire: `[market:2][price:8][qty:8][buyer:20][seller:20]` = 58B/leg.
+- Matcher aggregates same-price legs per pair (checked qty sum).
+- Gotcha found during testing: `handle` holds the `inner` lock when
+  dispatching — `handle_batch_settle` must take `&Inner`, not re-lock
+  (deadlock).
+
+### Tests
+
+- `batch_settle_rejects_unauthorized_sender`
+- `batch_settle_disabled_without_operator`
+- `batch_settle_rejects_invalid_legs` (6 invalid-leg classes)
+- `batch_settle_computes_quote_onchain` (pair aggregation)
+- `batch_settle_rolls_back_on_credit_overflow` (updated)
+
+`cargo test -p exchange -p matcher`: 22 + 82 tests pass. fmt+clippy clean.

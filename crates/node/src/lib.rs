@@ -97,6 +97,12 @@ pub struct NodeConfig {
     /// `Volatile` (in-memory) backend. Default: `None` —
     /// in-memory for devnet; set to a path for production.
     pub storage_path: Option<std::path::PathBuf>,
+    /// The settlement operator address — the only account allowed to
+    /// submit exchange `batch_settle` transactions (the off-chain
+    /// matching service's tx sender). `None` disables batch
+    /// settlement entirely (fail-closed default — safe when no
+    /// external matcher is attached to this node).
+    pub settlement_operator: Option<primitives::Address>,
 }
 
 impl Default for NodeConfig {
@@ -107,6 +113,7 @@ impl Default for NodeConfig {
             parallel_threshold: executor::DEFAULT_PARALLEL_THRESHOLD,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         }
     }
 }
@@ -182,7 +189,11 @@ impl Node {
         // Register the exchange module with a default spot market
         // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
         // exchange is wired to the bank for quote-currency settlement.
-        let exchange = Arc::new(exchange::ExchangeModule::with_bank(bank.clone()));
+        let mut exchange_mod = exchange::ExchangeModule::with_bank(bank.clone());
+        if let Some(operator) = config.settlement_operator {
+            exchange_mod.set_settlement_operator(operator);
+        }
+        let exchange = Arc::new(exchange_mod);
         exchange
             .list_market(trading::MarketConfig {
                 market_id: 0,
@@ -478,6 +489,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
         let mut node = Node::assemble(&config);
         // The engine should be ready (no blocks yet).
@@ -492,6 +504,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
         let mut node = Node::assemble(&config);
         assert!(node.engine().finalized_height().is_none());
@@ -519,6 +532,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
         let bft_config = NodeConfig {
             consensus: ConsensusConfig::OxideBft,
@@ -526,6 +540,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
 
         let mut seq_node = Node::assemble(&seq_config);
@@ -564,6 +579,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: Some(tmp.clone()),
+            settlement_operator: None,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -600,6 +616,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: Some(tmp1.clone()),
+            settlement_operator: None,
         };
         let mut node_src = Node::assemble(&config_src);
         // Submit a tx and finalize a block to produce EVM state.
@@ -624,6 +641,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: Some(tmp2.clone()),
+            settlement_operator: None,
         };
         let node_dst = Node::assemble(&config_dst);
 
@@ -667,6 +685,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -778,6 +797,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
         let mut node = Node::assemble(&config);
         // Finalize one block.
@@ -820,6 +840,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
         let mut node1 = Node::assemble(&config);
         let mut node2 = Node::assemble(&config);
@@ -859,6 +880,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
         let mut node = Node::assemble(&config);
         // Finalize a block.
@@ -882,6 +904,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         };
         let mut node = Node::assemble(&config);
         let to = Address([2u8; 20]);

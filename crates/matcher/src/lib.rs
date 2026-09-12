@@ -94,6 +94,10 @@ const PRICE_SCALE: u128 = 100_000_000;
 /// A matched fill with settlement attribution.
 #[derive(Debug, Clone, Copy)]
 pub struct SettledFill {
+    /// Market the fill executed on — included in the on-chain
+    /// batch-settle leg so the chain can validate against the
+    /// market's config.
+    pub market: u16,
     /// Execution price (scale-8).
     pub price: Price,
     /// Traded quantity (scale-6).
@@ -102,7 +106,9 @@ pub struct SettledFill {
     pub buyer: primitives::Address,
     /// Seller address.
     pub seller: primitives::Address,
-    /// Quote amount debited from buyer / credited to seller (scale-6).
+    /// Quote amount debited from buyer / credited to seller (scale-6)
+    /// in the off-chain cache — recorded for reconciliation; the
+    /// on-chain batch settles a recomputed amount, not this value.
     pub quote_amount: u64,
 }
 
@@ -285,6 +291,7 @@ impl MatchingServer {
             self.balances.credit(&seller, quote_amount);
             // Accumulate for batch settlement.
             self.settlement_batch.push(SettledFill {
+                market: self.engine.config().market_id,
                 price: f.price,
                 qty: f.qty,
                 buyer,
@@ -1340,6 +1347,7 @@ impl MarketWorker {
             self.balances.credit(&seller, quote_amount);
             // Accumulate for batch settlement.
             self.settlement_batch.push(SettledFill {
+                market: self.engine.config().market_id,
                 price: f.price,
                 qty: f.qty,
                 buyer,

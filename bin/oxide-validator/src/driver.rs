@@ -237,6 +237,7 @@ mod tests {
             parallel_threshold: 32,
             evm_persistence: false,
             storage_path: None,
+            settlement_operator: None,
         };
         let mut node = Node::assemble(&config);
 

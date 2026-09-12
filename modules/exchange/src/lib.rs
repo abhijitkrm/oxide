@@ -59,9 +59,18 @@ use trading::{
 
 /// A pre-matched fill entry for batch settlement from the off-chain
 /// matching server. Encoded as
-/// `[price:8][qty:8][buyer:20][seller:20][quote_amount:8]` = 64 bytes.
+/// `[market:2][price:8][qty:8][buyer:20][seller:20]` = 58 bytes.
+///
+/// The wire carries no claimed settlement amount: the chain computes
+/// `price * qty / PRICE_SCALE` itself after validating the leg against
+/// the market's tick/lot/price-band config, so a malformed or forged
+/// entry cannot move funds it should not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchFillEntry {
+    /// Market the fill executed on — selects the config used for
+    /// tick/lot/price-band validation. Legs for markets that are not
+    /// listed on-chain are rejected.
+    pub market: u16,
     /// Execution price (scale-8).
     pub price: Price,
     /// Traded quantity (scale-6).
@@ -70,8 +79,6 @@ pub struct BatchFillEntry {
     pub buyer: primitives::Address,
     /// Seller address.
     pub seller: primitives::Address,
-    /// Quote amount debited from buyer / credited to seller (scale-6).
-    pub quote_amount: u64,
 }
 
 // ── Wire tags ────────────────────────────────────────────────────────
@@ -84,12 +91,13 @@ const TAG_CANCEL: u8 = 1;
 const TAG_LIST_MARKET: u8 = 2;
 /// Batch-settle message tag: applies pre-matched fills from the
 /// off-chain matching server without re-matching. Each fill entry
-/// is `[price:8][qty:8][buyer:20][seller:20][quote_amount:8]` = 64
-/// bytes. The body is `[fill_count:4][fill entries...]`.
+/// is `[market:2][price:8][qty:8][buyer:20][seller:20]` = 58 bytes.
+/// The body is `[fill_count:4][fill entries...]`.
 const TAG_BATCH_SETTLE: u8 = 3;
 
-/// Size of a single fill entry in a batch-settle message: 64 bytes.
-const FILL_ENTRY_LEN: usize = 64;
+/// Size of a single fill entry in a batch-settle message:
+/// 2 + 8 + 8 + 20 + 20 = 58 bytes.
+const FILL_ENTRY_LEN: usize = 58;
 
 // ── Message sizes (body, excluding the 1-byte tag) ───────────────────
 
@@ -133,6 +141,11 @@ pub struct ExchangeModule {
     /// no-settlement mode, useful for testing the matching path in
     /// isolation).
     bank: Option<Arc<bank::BankModule>>,
+    /// The address authorized to submit `batch_settle` transactions:
+    /// the off-chain matching service's tx sender. `None` disables
+    /// batch settlement entirely (fail-closed) — an unconfigured
+    /// operator must never be able to move bank balances.
+    settlement_operator: Option<Address>,
 }
 
 struct Inner {
@@ -157,16 +170,33 @@ impl ExchangeModule {
             }),
             store: Mutex::new(BTreeMap::new()),
             bank: None,
+            settlement_operator: None,
         }
     }
 
     /// Construct an exchange module wired to a bank for settlement.
     /// Fills debit the buyer and credit the seller (quote currency).
     /// Pre-trade balance checks reject buy orders that would overdraw.
+    ///
+    /// Note: `batch_settle` stays disabled until
+    /// [`Self::set_settlement_operator`] configures the authorized
+    /// operator address — wiring a bank alone does not open the
+    /// privileged settlement path.
     pub fn with_bank(bank: Arc<bank::BankModule>) -> Self {
         let mut ex = Self::new();
         ex.bank = Some(bank);
         ex
+    }
+
+    /// Configure the settlement operator address — the off-chain
+    /// matching service's tx sender, and the only account allowed to
+    /// submit `batch_settle` transactions.
+    ///
+    /// Must be called before the module is shared (e.g. wrapped in
+    /// `Arc` and registered on the executor). While unset, every
+    /// `batch_settle` message is rejected.
+    pub fn set_settlement_operator(&mut self, operator: Address) {
+        self.settlement_operator = Some(operator);
     }
 
     /// List a new market with the given configuration. Returns the
@@ -345,10 +375,13 @@ pub mod msg {
 
     /// Build a batch-settle message for pre-matched fills from the
     /// off-chain matching server. Each fill is encoded as
-    /// `[price:8][qty:8][buyer:20][seller:20][quote_amount:8]`.
+    /// `[market:2][price:8][qty:8][buyer:20][seller:20]` (58 bytes).
+    /// The wire carries no claimed settlement amount — the chain
+    /// recomputes `price * qty / PRICE_SCALE` per leg.
     ///
     /// The resulting message is submitted as the module payload of
     /// an Oxide transaction envelope with `module_id = EXCHANGE (5)`.
+    /// The tx's `sender` must be the configured settlement operator.
     ///
     /// # Panics
     ///
@@ -360,11 +393,11 @@ pub mod msg {
         msg.push(super::TAG_BATCH_SETTLE);
         msg.extend_from_slice(&u32::try_from(fills.len()).unwrap_or(u32::MAX).to_le_bytes());
         for f in fills {
+            msg.extend_from_slice(&f.market.to_le_bytes());
             msg.extend_from_slice(&f.price.0.to_le_bytes());
             msg.extend_from_slice(&f.qty.0.to_le_bytes());
             msg.extend_from_slice(&f.buyer.0);
             msg.extend_from_slice(&f.seller.0);
-            msg.extend_from_slice(&f.quote_amount.to_le_bytes());
         }
         msg
     }
@@ -525,7 +558,7 @@ impl Module for ExchangeModule {
                 }])
             }
 
-            TAG_BATCH_SETTLE => self.handle_batch_settle(body),
+            TAG_BATCH_SETTLE => self.handle_batch_settle(ctx, body, &inner),
 
             _ => Err(ExecError::Malformed),
         }
@@ -540,59 +573,141 @@ impl Module for ExchangeModule {
 
 impl ExchangeModule {
     /// Handle a batch-settle message: apply pre-matched fills from
-    /// the off-chain matching server. Each fill debits the buyer and
-    /// credits the seller. No re-matching — the fills are already
-    /// determined by the off-chain matcher.
+    /// the off-chain matching server. Each valid fill leg debits the
+    /// buyer and credits the seller by a **chain-computed** amount —
+    /// no re-matching, and no trust in operator-supplied amounts.
     ///
     /// Body format: `[fill_count:4 LE][fill entries...]`
-    /// Each fill entry: `[price:8][qty:8][buyer:20][seller:20][quote_amount:8]`.
-    fn handle_batch_settle(&self, body: &[u8]) -> Result<Vec<Event>, ExecError> {
+    /// Each fill entry: `[market:2][price:8][qty:8][buyer:20][seller:20]`.
+    ///
+    /// # Security
+    ///
+    /// - **Authorization:** only `ctx.sender == settlement_operator`
+    ///   (the genesis-configured matcher identity) may submit batch
+    ///   settlements. Without this check any account could forge
+    ///   fills and drain arbitrary bank balances.
+    /// - **Validation:** every leg is checked against the market's
+    ///   config (listed market, positive lot-aligned qty, on-tick
+    ///   price inside the configured band, distinct buyer/seller).
+    /// - **Amounts:** the settlement amount is recomputed on-chain as
+    ///   `price * qty / PRICE_SCALE` with checked `u128`/`u64` math.
+    ///   A leg that fails validation or overflows is skipped with a
+    ///   `fill_rejected` event — invalid legs cannot move funds.
+    /// - **Aggregation:** amounts are accumulated per (buyer, seller)
+    ///   pair in a `BTreeMap` so transfer order is deterministic and
+    ///   each pair settles in one atomic `bank.transfer`.
+    ///
+    /// A leg whose buyer is insolvent is skipped with a
+    /// `settlement_failed` event (the venue reconciles off-chain);
+    /// other legs in the batch still settle — one insolvent account
+    /// cannot halt settlement for the whole batch.
+    ///
+    /// `inner` is the already-held module lock (batch settle only
+    /// reads market configs — it never mutates the books).
+    fn handle_batch_settle(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        // Authorization gate: the settlement operator is the only
+        // account allowed to move balances via this path.
+        if self.settlement_operator != Some(ctx.sender) {
+            return Err(ExecError::ModuleRejected("unauthorized settlement operator".to_string()));
+        }
         if body.len() < 4 {
             return Err(ExecError::Malformed);
         }
-        let fill_count =
-            u32::from_le_bytes(body[0..4].try_into().map_err(|_| ExecError::Malformed)?) as usize;
-        if body.len() < 4 + fill_count * FILL_ENTRY_LEN {
+        let fill_count = usize::try_from(u32::from_le_bytes(
+            body[0..4].try_into().map_err(|_| ExecError::Malformed)?,
+        ))
+        .map_err(|_| ExecError::Malformed)?;
+        if body.len() != 4 + fill_count * FILL_ENTRY_LEN {
             return Err(ExecError::Malformed);
         }
 
-        let mut events = Vec::with_capacity(fill_count);
         let bank = self.bank.as_ref().ok_or_else(|| {
             ExecError::ModuleRejected("batch settle requires bank wiring".to_string())
         })?;
 
+        // Snapshot the market configs once — batch settle never
+        // mutates the books, so one pass over `inner.markets` serves
+        // every leg.
+        let configs: Vec<Option<MarketConfig>> =
+            inner.markets.iter().map(|m| m.as_ref().map(|e| *e.config())).collect();
+
+        // Validate every leg and accumulate the settlement total per
+        // (buyer, seller) pair in a BTreeMap: deterministic transfer
+        // order, one atomic transfer per pair.
+        let mut totals: BTreeMap<(Address, Address), u64> = BTreeMap::new();
+        let mut events = Vec::with_capacity(fill_count);
         for i in 0..fill_count {
             let off = 4 + i * FILL_ENTRY_LEN;
-            let entry = &body[off..off + FILL_ENTRY_LEN];
+            let market = u16::from_le_bytes(
+                body[off..off + 2].try_into().map_err(|_| ExecError::Malformed)?,
+            );
             let price = Price(u64::from_le_bytes(
-                entry[0..8].try_into().map_err(|_| ExecError::Malformed)?,
+                body[off + 2..off + 10].try_into().map_err(|_| ExecError::Malformed)?,
             ));
-            let qty =
-                Qty(u64::from_le_bytes(entry[8..16].try_into().map_err(|_| ExecError::Malformed)?));
+            let qty = Qty(u64::from_le_bytes(
+                body[off + 10..off + 18].try_into().map_err(|_| ExecError::Malformed)?,
+            ));
             let buyer =
-                primitives::Address(entry[16..36].try_into().map_err(|_| ExecError::Malformed)?);
+                Address(body[off + 18..off + 38].try_into().map_err(|_| ExecError::Malformed)?);
             let seller =
-                primitives::Address(entry[36..56].try_into().map_err(|_| ExecError::Malformed)?);
-            let quote_amount =
-                u64::from_le_bytes(entry[56..64].try_into().map_err(|_| ExecError::Malformed)?);
+                Address(body[off + 38..off + 58].try_into().map_err(|_| ExecError::Malformed)?);
 
+            // A leg is valid iff its market is listed, the qty is
+            // positive and lot-aligned, the price is on-tick inside
+            // the configured band, and buyer != seller. The quote
+            // amount is recomputed with checked fixed-point math —
+            // an over-u64 notional rejects the leg rather than
+            // silently capping the transfer.
+            let quote = configs
+                .get(usize::from(market))
+                .copied()
+                .flatten()
+                .filter(|c| {
+                    qty.0 > 0
+                        && qty.0 % c.lot_size == 0
+                        && price.0 >= c.min_price
+                        && price.0 <= c.max_price
+                        && price.0 % c.tick_size == 0
+                        && buyer != seller
+                })
+                .and_then(|_| {
+                    u64::try_from(u128::from(price.0) * u128::from(qty.0) / PRICE_SCALE).ok()
+                });
+
+            match quote {
+                Some(amount) => {
+                    let entry = totals.entry((buyer, seller)).or_insert(0);
+                    match entry.checked_add(amount) {
+                        Some(sum) => *entry = sum,
+                        // Practically unreachable (needs > u64::MAX
+                        // quote for one pair) — skip rather than
+                        // silently saturating the settlement.
+                        None => events.push(rejected_leg_event(i, "pair total overflow")),
+                    }
+                }
+                None => events.push(rejected_leg_event(i, "invalid fill leg")),
+            }
+        }
+
+        for ((buyer, seller), amount) in &totals {
             // Atomic settlement: debit buyer, credit seller. Using
             // `transfer` instead of separate `debit` + `credit`
             // ensures atomicity — if the credit fails (e.g.
-            // overflow), the debit is rolled back. Previously, a
-            // failed credit after a successful debit would lose
-            // funds: the buyer was debited but the seller was never
-            // credited.
-            if let Err(_e) = bank.transfer(&buyer, &seller, quote_amount) {
+            // overflow), the debit is rolled back.
+            if bank.transfer(buyer, seller, *amount).is_err() {
                 events.push(Event {
                     module: "exchange",
                     kind: "settlement_failed".to_string(),
                     data: {
-                        let mut d = Vec::with_capacity(8 + 20 + 20 + 8);
-                        d.extend_from_slice(&price.0.to_le_bytes());
+                        let mut d = Vec::with_capacity(20 + 20 + 8);
                         d.extend_from_slice(&buyer.0);
                         d.extend_from_slice(&seller.0);
-                        d.extend_from_slice(&quote_amount.to_le_bytes());
+                        d.extend_from_slice(&amount.to_le_bytes());
                         d
                     },
                 });
@@ -603,12 +718,10 @@ impl ExchangeModule {
                 module: "exchange",
                 kind: "batch_fill".to_string(),
                 data: {
-                    let mut d = Vec::with_capacity(8 + 8 + 20 + 20 + 8);
-                    d.extend_from_slice(&price.0.to_le_bytes());
-                    d.extend_from_slice(&qty.0.to_le_bytes());
+                    let mut d = Vec::with_capacity(20 + 20 + 8);
                     d.extend_from_slice(&buyer.0);
                     d.extend_from_slice(&seller.0);
-                    d.extend_from_slice(&quote_amount.to_le_bytes());
+                    d.extend_from_slice(&amount.to_le_bytes());
                     d
                 },
             });
@@ -616,6 +729,17 @@ impl ExchangeModule {
 
         Ok(events)
     }
+}
+
+/// Build a `fill_rejected` event for a malformed batch-settle leg.
+/// `idx` is the leg's position in the batch (u32 LE) and `reason` is
+/// a short static tag for diagnostics.
+fn rejected_leg_event(idx: usize, reason: &'static str) -> Event {
+    let mut data = Vec::with_capacity(4 + reason.len());
+    #[allow(clippy::cast_possible_truncation)]
+    data.extend_from_slice(&(idx as u32).to_le_bytes());
+    data.extend_from_slice(reason.as_bytes());
+    Event { module: "exchange", kind: "fill_rejected".to_string(), data }
 }
 
 // ── Event helpers ────────────────────────────────────────────────────
@@ -1122,19 +1246,21 @@ mod tests {
         bank.mint(&addr(1), 1_000_000);
         // Fund seller near u64::MAX so the credit overflows.
         bank.mint(&addr(9), u64::MAX - 500_000);
-        let ex = ExchangeModule::with_bank(bank.clone());
+        let mut ex = ExchangeModule::with_bank(bank.clone());
+        ex.set_settlement_operator(addr(1));
+        ex.list_market(test_cfg()).unwrap();
 
         let buyer_before = bank.balance(&addr(1));
         let seller_before = bank.balance(&addr(9));
 
-        // Construct a batch settle with a fill that would overflow
-        // the seller's balance.
+        // Chain-computed quote = 1e9 * 100_000 / 1e8 = 1_000_000,
+        // which overflows the seller's u64::MAX - 500_000 balance.
         let fill = BatchFillEntry {
+            market: 0,
             price: Price(1_000_000_000),
-            qty: Qty(1_000),
+            qty: Qty(100_000),
             buyer: addr(1),
             seller: addr(9),
-            quote_amount: 1_000_000, // would overflow seller
         };
         let msg = msg::batch_settle(&[fill]);
         let events = ex.handle(&ctx(1), &msg).unwrap();
@@ -1156,5 +1282,187 @@ mod tests {
             events.iter().any(|e| e.kind == "settlement_failed"),
             "expected settlement_failed event on credit overflow"
         );
+    }
+
+    /// Regression test: `batch_settle` must reject any sender that is
+    /// not the configured settlement operator. Before the fix the
+    /// handler ignored `ctx.sender` entirely — any account could
+    /// submit forged fills and drain arbitrary bank balances.
+    #[test]
+    fn batch_settle_rejects_unauthorized_sender() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 1_000_000);
+        bank.mint(&addr(9), 1_000_000);
+        let mut ex = ExchangeModule::with_bank(bank.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+
+        let fill = BatchFillEntry {
+            market: 0,
+            price: Price(1_000_000_000),
+            qty: Qty(1_000),
+            buyer: addr(1),
+            seller: addr(9),
+        };
+        let msg = msg::batch_settle(&[fill]);
+
+        // ctx(1) is not the operator — must be rejected, no funds move.
+        let err = ex.handle(&ctx(1), &msg).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        assert_eq!(bank.balance(&addr(1)), 1_000_000);
+        assert_eq!(bank.balance(&addr(9)), 1_000_000);
+
+        // The configured operator is accepted.
+        let events = ex.handle(&ctx(0xAA), &msg).unwrap();
+        assert!(events.iter().any(|e| e.kind == "batch_fill"));
+        // quote = 1e9 * 1_000 / 1e8 = 10_000
+        assert_eq!(bank.balance(&addr(1)), 1_000_000 - 10_000);
+        assert_eq!(bank.balance(&addr(9)), 1_000_000 + 10_000);
+    }
+
+    /// Regression test: `batch_settle` must be fail-closed when no
+    /// settlement operator is configured.
+    #[test]
+    fn batch_settle_disabled_without_operator() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 1_000_000);
+        bank.mint(&addr(9), 1_000_000);
+        let ex = ExchangeModule::with_bank(bank.clone());
+        ex.list_market(test_cfg()).unwrap();
+
+        let fill = BatchFillEntry {
+            market: 0,
+            price: Price(1_000_000_000),
+            qty: Qty(1_000),
+            buyer: addr(1),
+            seller: addr(9),
+        };
+        let msg = msg::batch_settle(&[fill]);
+        let err = ex.handle(&ctx(1), &msg).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        assert_eq!(bank.balance(&addr(1)), 1_000_000);
+    }
+
+    /// Regression test: every batch-settle leg is validated against
+    /// the market config. Invalid legs (unlisted market, off-tick
+    /// price, out-of-band price, non-lot-aligned or zero qty,
+    /// self-trade) must be skipped with `fill_rejected` events and
+    /// must not move funds. Before the fix there was no validation
+    /// at all — the wire's `quote_amount` was trusted blindly.
+    #[test]
+    fn batch_settle_rejects_invalid_legs() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 10_000_000);
+        bank.mint(&addr(9), 10_000_000);
+        let mut ex = ExchangeModule::with_bank(bank.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+
+        let legs = [
+            // Unlisted market.
+            BatchFillEntry {
+                market: 7,
+                price: Price(1_000_000_000),
+                qty: Qty(1_000),
+                buyer: addr(1),
+                seller: addr(9),
+            },
+            // Off-tick price (1_000_000_500 % 1_000_000 != 0).
+            BatchFillEntry {
+                market: 0,
+                price: Price(1_000_000_500),
+                qty: Qty(1_000),
+                buyer: addr(1),
+                seller: addr(9),
+            },
+            // Price out of band (> 2_000_000_000 max).
+            BatchFillEntry {
+                market: 0,
+                price: Price(3_000_000_000),
+                qty: Qty(1_000),
+                buyer: addr(1),
+                seller: addr(9),
+            },
+            // Zero qty.
+            BatchFillEntry {
+                market: 0,
+                price: Price(1_000_000_000),
+                qty: Qty(0),
+                buyer: addr(1),
+                seller: addr(9),
+            },
+            // Qty not lot-aligned (lot = 1_000).
+            BatchFillEntry {
+                market: 0,
+                price: Price(1_000_000_000),
+                qty: Qty(1_500),
+                buyer: addr(1),
+                seller: addr(9),
+            },
+            // Self-trade.
+            BatchFillEntry {
+                market: 0,
+                price: Price(1_000_000_000),
+                qty: Qty(1_000),
+                buyer: addr(1),
+                seller: addr(1),
+            },
+            // One valid leg for contrast: quote = 10_000.
+            BatchFillEntry {
+                market: 0,
+                price: Price(1_000_000_000),
+                qty: Qty(1_000),
+                buyer: addr(1),
+                seller: addr(9),
+            },
+        ];
+        let msg = msg::batch_settle(&legs);
+        let events = ex.handle(&ctx(0xAA), &msg).unwrap();
+
+        let rejected = events.iter().filter(|e| e.kind == "fill_rejected").count();
+        assert_eq!(rejected, 6, "all six invalid legs must be rejected");
+        // Only the valid leg settled: quote = 1e9 * 1_000 / 1e8 = 10_000.
+        assert_eq!(bank.balance(&addr(1)), 10_000_000 - 10_000);
+        assert_eq!(bank.balance(&addr(9)), 10_000_000 + 10_000);
+    }
+
+    /// Regression test: the chain computes settlement amounts itself.
+    /// Two legs between the same pair at different prices aggregate
+    /// into one transfer of `sum(price_i * qty_i / PRICE_SCALE)` —
+    /// the operator cannot inflate or deflate the amount.
+    #[test]
+    fn batch_settle_computes_quote_onchain() {
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&addr(1), 10_000_000);
+        bank.mint(&addr(9), 10_000_000);
+        let mut ex = ExchangeModule::with_bank(bank.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+
+        // Leg 1: 1e9 * 1_000 / 1e8 = 10_000.
+        // Leg 2: 1.5e9 * 2_000 / 1e8 = 30_000. Pair total = 40_000.
+        let legs = [
+            BatchFillEntry {
+                market: 0,
+                price: Price(1_000_000_000),
+                qty: Qty(1_000),
+                buyer: addr(1),
+                seller: addr(9),
+            },
+            BatchFillEntry {
+                market: 0,
+                price: Price(1_500_000_000),
+                qty: Qty(2_000),
+                buyer: addr(1),
+                seller: addr(9),
+            },
+        ];
+        let msg = msg::batch_settle(&legs);
+        let events = ex.handle(&ctx(0xAA), &msg).unwrap();
+
+        assert_eq!(bank.balance(&addr(1)), 10_000_000 - 40_000);
+        assert_eq!(bank.balance(&addr(9)), 10_000_000 + 40_000);
+        // Exactly one pair transfer → one batch_fill event.
+        assert_eq!(events.iter().filter(|e| e.kind == "batch_fill").count(), 1);
     }
 }

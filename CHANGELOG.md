@@ -726,6 +726,36 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Batch settlement was unauthenticated and trusted operator-supplied
+  amounts** (`modules/exchange/src/lib.rs`, `crates/matcher/src/`)
+  - `handle_batch_settle` ignored `ctx.sender` entirely — any account
+    could submit forged fills and drain arbitrary bank balances via
+    `bank.transfer`. The wire format also carried a claimed
+    `quote_amount` that was never verified against `price × qty`.
+  - Fix: batch settle now requires `ctx.sender` to equal the
+    genesis-configured `settlement_operator` (fail-closed while
+    unset — `NodeConfig.settlement_operator` configures it). Every
+    leg is validated against the market's config (listed market,
+    positive lot-aligned qty, on-tick price inside the band,
+    distinct buyer/seller), the settlement amount is recomputed
+    on-chain as `price * qty / PRICE_SCALE` with checked
+    `u128`/`u64` math, and legs are aggregated per (buyer, seller)
+    pair for one atomic transfer each. Invalid or insolvent legs
+    are skipped with `fill_rejected` / `settlement_failed` events.
+  - Wire format changed: fill entries are now
+    `[market:2][price:8][qty:8][buyer:20][seller:20]` = 58 bytes
+    (no claimed amount, market included for config validation).
+    The matcher aggregates same-price legs per pair with checked
+    qty accumulation.
+  - Regression tests: unauthorized sender rejection, disabled
+    without operator, six classes of invalid legs, chain-computed
+    pair aggregation, credit-overflow rollback.
+  - **In plain words:** only the configured matching service can
+    settle trades on-chain, and the chain — not the matcher —
+    decides how much money moves for each trade. Previously anyone
+    could submit a "settlement" transaction that transferred funds
+    out of any account.
+
 - **Storage backend benchmark had broken closure syntax** (pre-existing,
   exposed by enabling the `redb` feature)
   - The `crates/storage/benches/backend.rs` file had mangled closure

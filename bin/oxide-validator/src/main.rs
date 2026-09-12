@@ -796,6 +796,7 @@ fn load_config() -> (NodeConfig, config::RpcConfig) {
             parallel_threshold: config.executor.parallel_threshold,
             evm_persistence: true,
             storage_path: None,
+            settlement_operator: None,
         },
         rpc_config,
     )
