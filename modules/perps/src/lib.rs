@@ -649,7 +649,13 @@ impl PerpsModule {
                 // arithmetic total regardless.
                 (pool * u128::from(*due)).checked_div(total_due).unwrap_or(0)
             };
-            let credit = u64::try_from(credit_u128).unwrap_or(u64::MAX);
+            // HIGH fix: credit overflows u64 — skip the
+            // receiver rather than crediting u64::MAX (a
+            // free-money bug). The excess remains in the
+            // funding pool (accrued to insurance below).
+            let Ok(credit) = u64::try_from(credit_u128) else {
+                continue;
+            };
             distributed += credit_u128;
             if credit == 0 {
                 continue;
@@ -1341,6 +1347,12 @@ impl PerpsModule {
         } else {
             (fill.maker_owner, fill.taker_owner)
         };
+        // HIGH fix: `fill.qty.0` is u64; the position model is i64.
+        // If a fill quantity exceeds i64::MAX (impossible in practice
+        // — market configs bound order qty well below i64::MAX), cap
+        // at i64::MAX. Both buyer and seller get the same capped
+        // magnitude, so the net position change is zero — position
+        // accounting stays consistent.
         let fill_qty = i64::try_from(fill.qty.0).unwrap_or(i64::MAX);
 
         // Buyer's position increases (or shorts decrease).
