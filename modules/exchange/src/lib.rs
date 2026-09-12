@@ -576,12 +576,27 @@ impl ExchangeModule {
             let quote_amount =
                 u64::from_le_bytes(entry[56..64].try_into().map_err(|_| ExecError::Malformed)?);
 
-            // Debit buyer, credit seller. If the debit fails
-            // (insufficient balance), skip this fill — the
-            // off-chain matcher should have pre-checked, but
-            // on-chain settlement is authoritative.
-            if bank.debit(&buyer, quote_amount).is_ok() {
-                let _ = bank.credit(&seller, quote_amount);
+            // Atomic settlement: debit buyer, credit seller. Using
+            // `transfer` instead of separate `debit` + `credit`
+            // ensures atomicity — if the credit fails (e.g.
+            // overflow), the debit is rolled back. Previously, a
+            // failed credit after a successful debit would lose
+            // funds: the buyer was debited but the seller was never
+            // credited.
+            if let Err(_e) = bank.transfer(&buyer, &seller, quote_amount) {
+                events.push(Event {
+                    module: "exchange",
+                    kind: "settlement_failed".to_string(),
+                    data: {
+                        let mut d = Vec::with_capacity(8 + 20 + 20 + 8);
+                        d.extend_from_slice(&price.0.to_le_bytes());
+                        d.extend_from_slice(&buyer.0);
+                        d.extend_from_slice(&seller.0);
+                        d.extend_from_slice(&quote_amount.to_le_bytes());
+                        d
+                    },
+                });
+                continue;
             }
 
             events.push(Event {
@@ -773,8 +788,8 @@ fn encode_market_config(cfg: &MarketConfig) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExchangeModule, MarketConfig, NewOrder, OrderId, OrderType, Side, StpMode, TAG_PLACE,
-        TimeInForce, encode_reject_reason, msg,
+        BatchFillEntry, ExchangeModule, MarketConfig, NewOrder, OrderId, OrderType, Side, StpMode,
+        TAG_PLACE, TimeInForce, encode_reject_reason, msg,
     };
     use executor::{ExecError, Module, TxContext};
     use framework::module_id;
@@ -1093,5 +1108,53 @@ mod tests {
         let total_quote = 45_030u64;
         assert_eq!(bank.balance(&addr(1)), buyer_before - total_quote);
         assert_eq!(bank.balance(&addr(9)), seller_before + total_quote);
+    }
+
+    /// Regression test: batch settlement must be atomic. If the
+    /// credit fails (e.g., overflow), the debit must be rolled
+    /// back. Before the fix, `handle_batch_settle` used separate
+    /// `debit` + `credit` calls — a failed credit after a successful
+    /// debit would lose funds.
+    #[test]
+    fn batch_settle_rolls_back_on_credit_overflow() {
+        let bank = Arc::new(bank::BankModule::new());
+        // Fund buyer with enough for the transfer.
+        bank.mint(&addr(1), 1_000_000);
+        // Fund seller near u64::MAX so the credit overflows.
+        bank.mint(&addr(9), u64::MAX - 500_000);
+        let ex = ExchangeModule::with_bank(bank.clone());
+
+        let buyer_before = bank.balance(&addr(1));
+        let seller_before = bank.balance(&addr(9));
+
+        // Construct a batch settle with a fill that would overflow
+        // the seller's balance.
+        let fill = BatchFillEntry {
+            price: Price(1_000_000_000),
+            qty: Qty(1_000),
+            buyer: addr(1),
+            seller: addr(9),
+            quote_amount: 1_000_000, // would overflow seller
+        };
+        let msg = msg::batch_settle(&[fill]);
+        let events = ex.handle(&ctx(1), &msg).unwrap();
+
+        // The settlement should fail atomically — buyer is NOT debited.
+        assert_eq!(
+            bank.balance(&addr(1)),
+            buyer_before,
+            "buyer must not be debited on failed settlement"
+        );
+        assert_eq!(
+            bank.balance(&addr(9)),
+            seller_before,
+            "seller balance must not change on failed settlement"
+        );
+
+        // A settlement_failed event should be emitted.
+        assert!(
+            events.iter().any(|e| e.kind == "settlement_failed"),
+            "expected settlement_failed event on credit overflow"
+        );
     }
 }

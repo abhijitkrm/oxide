@@ -9592,3 +9592,29 @@ with a "replay" reason.
 - `h4_ingest_batch_rejects_stale_nonce_after_execution` — a stale
   nonce submitted via the batch path must be rejected, while a valid
   nonce in the same batch must be accepted.
+
+## Pre-testnet audit: exchange batch settlement atomicity
+
+### Root cause
+
+`handle_batch_settle` used separate `bank.debit(&buyer, amount)`
+and `bank.credit(&seller, amount)` calls. If the debit succeeded but
+the credit failed (e.g., recipient balance overflow), the buyer was
+debited but the seller was never credited — funds were lost.
+
+### Fix
+
+Replaced the separate `debit` + `credit` calls with a single
+`bank.transfer(&buyer, &seller, amount)` call. The bank's `transfer`
+method is atomic: it checks both the debit and credit before
+committing either. If the credit would fail, the debit is not
+applied.
+
+On failure, a `settlement_failed` event is emitted so the
+discrepancy is visible.
+
+### Regression test
+
+- `batch_settle_rolls_back_on_credit_overflow` — a batch settle
+  where the seller's balance would overflow must not debit the
+  buyer, and must emit a `settlement_failed` event.

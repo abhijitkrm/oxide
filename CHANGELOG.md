@@ -2618,3 +2618,15 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     can no longer be re-submitted via the batch intake path. Previously,
     only the single-tx path checked for replays, leaving the batch
     path as a bypass.
+
+- **Exchange batch settlement was not atomic**
+  (`modules/exchange/src/lib.rs`)
+  - `handle_batch_settle` used separate `debit` + `credit` calls. If
+    the credit failed (e.g., overflow), the debit was not rolled
+    back — funds were lost.
+  - Replaced with a single `bank.transfer` call, which is atomic:
+    both debit and credit are checked before either is committed.
+  - Regression test: `batch_settle_rolls_back_on_credit_overflow`.
+  - **In plain words:** when the exchange settles a batch of trades,
+    a failed credit no longer leaves the buyer debited without the
+    seller being credited. The settlement is now all-or-nothing.
