@@ -761,6 +761,18 @@ impl OxideBft {
         // leader, we must propose at a height above any we've seen.
         self.observe_block_height(header.height);
 
+        // HIGH fix: require the proposal's view to match our current
+        // view. A proposal for a different view is either stale
+        // (already finalized) or premature (future round). Voting
+        // for a stale view re-opens a committed height; voting for
+        // a future view breaks the one-view-one-vote invariant.
+        // The `last_voted_view` check below prevents re-voting in
+        // the same view, but does not prevent voting in a *wrong*
+        // view.
+        if header.view != self.current_view {
+            return None;
+        }
+
         // Safety: never vote twice in the same view.
         if self.last_voted_view.is_some_and(|v| v >= header.view) {
             return None;
@@ -824,6 +836,18 @@ impl OxideBft {
                 // prop_qc.view >= our_high_qc.view: the proposal
                 // extends or advances our highest QC — accept.
                 _ => {}
+            }
+            // HIGH fix: bind the proposal's parent to our high QC.
+            // The proposal's `prev_block` must equal the block hash
+            // in our `high_qc` — the leader must build on the same
+            // notarized block we hold. Without this, a byzantine
+            // leader could propose a block with a valid high_qc view
+            // but a `prev_block` that doesn't match, creating a
+            // phantom chain that doesn't extend any real block.
+            // Exception: at genesis (prev_block = ZERO, no high_qc
+            // yet), this is the expected case.
+            if header.prev_block != our_high_qc.block_hash {
+                return None;
             }
         }
         // Divergence detection (docs/oxidebft-spec.md §6): if the
@@ -1848,6 +1872,8 @@ mod tests {
         header_b.view = View::new(header_a.view.value() + 1);
         header_b.tx_root = Hash([0xAB; 32]);
         let prop_b = prop_a.clone();
+        // HIGH fix: vote() requires header.view == current_view.
+        follower.current_view = header_b.view;
         assert!(
             follower.vote(&header_b, &prop_b).is_none(),
             "a conflicting block at an already-voted height must be refused"
@@ -1859,6 +1885,7 @@ mod tests {
         header_c.view = View::new(header_a.view.value() + 1);
         header_c.height = Height::new(header_a.height.value() + 1);
         header_c.prev_block = OxideBft::block_hash(&header_a);
+        // current_view already set to header_c.view above.
         assert!(
             follower.vote(&header_c, &prop_a).is_some(),
             "voting at the next height must still succeed"
@@ -2570,6 +2597,9 @@ mod tests {
             txs: vec![TxBytes::new(vec![2])],
             attestation: None,
         };
+        // HIGH fix: vote() now requires header.view == current_view.
+        // Set current_view to match the test proposal's view.
+        engine.current_view = View::new(99);
         let header = BlockHeader {
             height: Height::new(99),
             view: View::new(99),
@@ -2618,9 +2648,15 @@ mod tests {
             txs: vec![TxBytes::new(vec![2])],
             attestation: None,
         };
+        // HIGH fix: vote() now requires header.view == current_view
+        // and prev_block == high_qc.block_hash. Set current_view to
+        // match, and update high_qc so prev_block matches.
+        let proposal_view = View::new(our_high_qc.view.value() + 2);
+        engine.current_view = proposal_view;
+        engine.high_qc = Some(newer_qc.clone());
         let header = BlockHeader {
             height: Height::new(99),
-            view: View::new(our_high_qc.view.value() + 2),
+            view: proposal_view,
             epoch: Epoch::new(0),
             prev_block: newer_qc.block_hash,
             tx_root: OxideBft::tx_root(&proposal.txs),
