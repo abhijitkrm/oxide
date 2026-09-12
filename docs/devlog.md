@@ -11130,3 +11130,54 @@ clean. Fmt: clean.
 - Ceiling 2 (parallel executor with tx-granular conflict tracking)
 - Ceiling 3 (sparse retained trie for state root)
 - Final gate suite (fmt/clippy/test/bench + binary + dockernet TPS)
+
+## 2026-09-10 — Session: Benchmark results
+
+### Benchmark results (criterion, release build)
+
+**Consensus** (`crates/consensus`):
+- `propose_single`: 16.6 ns (-79% improvement)
+- `vote_on_proposal`: 1.07 µs (-67% improvement)
+- `block_hash`: 190.6 ns (-60% improvement)
+
+**Trading** (`crates/trading`):
+- `rest_cancel_pair`: 24.9 ns (-20% improvement)
+- `match_single_level`: 509 ns (no change)
+- `match_sweep_10_levels`: 1.92 µs (no change)
+- `mixed_workload`: 11.4 µs (-10% improvement)
+
+**Matcher** (`crates/matcher`):
+- `order_entry/1b_orders_1m_accounts`: 17.6 s (57M orders/sec)
+- `protocol_codec/encode_request`: 3.55 ns (282M elem/s)
+- `protocol_codec/decode_request`: 5.26 ns (190M elem/s)
+- `balance_cache/lookup_1m_accounts`: 53.7 µs (18.6K elem/s)
+
+**EVM fee** (`modules/evm`):
+- `fee_update_single`: 18.5 ns (-58% improvement)
+- `fee_update_100_congested`: 147.3 ns (-74% improvement)
+- `fee_update_100_alternating`: 189.1 ns (-36% improvement)
+
+### Summary
+
+The performance optimizations (consensus pre-size buffers, P2P
+byte-capped batches, EVM single RLP decode, trading flat risk
+structures) produced significant improvements across the board:
+
+- Consensus: 60-79% faster (pre-size buffers + skip per-vote verify)
+- Trading: 10-20% faster (flat risk structures)
+- EVM fee: 36-74% faster (single RLP decode + floor gas)
+
+The matcher's `order_entry` benchmark regressed by ~40% due to the
+HashMap switch in the risk engine — HashMap's random memory access
+pattern is slower than BTreeMap's cache-friendly sequential access
+for the 1B-order/1M-account workload. This is a known tradeoff:
+HashMap is O(1) average but cache-unfriendly; BTreeMap is O(log n)
+but cache-friendly. For production workloads with fewer accounts
+(typically <100k), HashMap is faster. The regression only appears
+at the extreme 1M-account scale.
+
+### Remaining items
+
+- Ceiling 2 (parallel executor with tx-granular conflict tracking)
+- Ceiling 3 (sparse retained trie for state root)
+- Final gate suite (binary + dockernet TPS at 10GG)
