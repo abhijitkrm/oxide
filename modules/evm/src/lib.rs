@@ -2326,6 +2326,16 @@ impl Module for EvmModule {
             return Err(ExecError::ModuleRejected("gas_limit is zero".to_string()));
         }
 
+        // HIGH fix: gas_limit must fit within the block gas limit.
+        // A tx with gas_limit > block_gas_limit can never be included
+        // and should be rejected at admission to save mempool space.
+        if gas_limit > self.block_gas_limit {
+            return Err(ExecError::ModuleRejected(format!(
+                "gas_limit {gas_limit} > block_gas_limit {}",
+                self.block_gas_limit
+            )));
+        }
+
         // 6. Intrinsic gas: gas_limit must cover the intrinsic cost.
         //    The intrinsic cost is 21_000 (base) + calldata cost
         //    (16/byte for non-zero, 4/byte for zero) + access list
@@ -2338,12 +2348,33 @@ impl Module for EvmModule {
             )));
         }
 
+        // HIGH fix: EIP-1559 fee gates.
+        //   a. max_fee >= base_fee: a tx with max_fee < base_fee
+        //      can never be included (revm rejects it during
+        //      execution). Reject at admission to save resources.
+        //   b. priority_fee <= max_fee: EIP-1559 requires
+        //      max_priority_fee_per_gas <= max_fee_per_gas. A tx
+        //      with priority_fee > max_fee is invalid.
+        let max_fee = u128::try_from(signed.max_fee_per_gas())
+            .map_err(|_| ExecError::ModuleRejected("max_fee overflow u128".to_string()))?;
+        let priority_fee = u128::try_from(signed.max_priority_fee_per_gas())
+            .map_err(|_| ExecError::ModuleRejected("priority_fee overflow u128".to_string()))?;
+        if max_fee < u128::from(self.base_fee) {
+            return Err(ExecError::ModuleRejected(format!(
+                "max_fee {max_fee} < base_fee {}",
+                self.base_fee
+            )));
+        }
+        if priority_fee > max_fee {
+            return Err(ExecError::ModuleRejected(format!(
+                "priority_fee {priority_fee} > max_fee {max_fee}"
+            )));
+        }
+
         // 7. Balance: sender must cover gas_cost + value.
         //    gas_cost = gas_limit * max_fee_per_gas (the worst-case
         //    fee the sender could pay). For legacy txs, gas_price is
         //    the max fee. For EIP-1559, max_fee_per_gas is the cap.
-        let max_fee = u128::try_from(signed.max_fee_per_gas())
-            .map_err(|_| ExecError::ModuleRejected("max_fee overflow u128".to_string()))?;
         let balance = self.balance(&sender_addr);
         let value = u128::try_from(signed.value())
             .map_err(|_| ExecError::ModuleRejected("value overflow u128".to_string()))?;
