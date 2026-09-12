@@ -89,6 +89,14 @@ pub struct Mempool {
     /// every other account. The cap bounds any sender's block
     /// share regardless of fee.
     max_per_sender: usize,
+    /// Per-sender last executed nonce (HIGH fix). The mempool
+    /// anchors selection to `executed_nonce + 1` — a tx with a
+    /// lower nonce is stale (already executed) and a tx with a
+    /// higher nonce can't be selected until the gap is filled.
+    /// Without this, `select` started at the minimum queued nonce,
+    /// which could be a mid-chain nonce after earlier txs executed,
+    /// creating a nonce gap in the block.
+    executed_nonces: HashMap<Address, u64>,
 }
 
 /// Default per-sender selection cap: 1000 txs per block.
@@ -206,6 +214,7 @@ impl Mempool {
             by_fee: BTreeMap::new(),
             max_entries,
             max_per_sender: DEFAULT_MAX_PER_SENDER,
+            executed_nonces: HashMap::new(),
         }
     }
 
@@ -214,6 +223,16 @@ impl Mempool {
     pub fn with_max_per_sender(mut self, cap: usize) -> Self {
         self.max_per_sender = cap;
         self
+    }
+
+    /// Record the last executed nonce for a sender (HIGH fix).
+    /// The mempool anchors selection to `executed_nonce + 1` —
+    /// transactions with a lower nonce are stale and transactions
+    /// with a higher nonce can't be selected until the gap is
+    /// filled. Call this after each block commits to keep the
+    /// mempool's nonce anchoring fresh.
+    pub fn set_executed_nonce(&mut self, sender: Address, nonce: u64) {
+        self.executed_nonces.insert(sender, nonce);
     }
 
     /// Submit a transaction to the pool. Returns `Ok(())` if accepted,
@@ -396,13 +415,18 @@ impl Mempool {
             let Some(queue) = self.by_sender.get(&sender) else {
                 continue;
             };
-            // Start at the sender's minimum queued nonce — matching
-            // the previous semantics, which initialize the expected
-            // nonce from the pool's per-sender minimum (not 0) so
-            // senders whose earlier nonces already executed still
-            // select mid-chain.
-            let Some(&start_nonce) = queue.keys().next() else {
-                continue;
+            // HIGH fix: anchor the start nonce to `executed_nonce + 1`
+            // if we know the executed nonce for this sender. This
+            // prevents selecting mid-chain nonces after earlier txs
+            // have executed (which would create a nonce gap in the
+            // block). If we don't know the executed nonce, start at
+            // the minimum queued nonce (the old behavior).
+            let start_nonce = match self.executed_nonces.get(&sender) {
+                Some(&executed) => executed + 1,
+                None => match queue.keys().next() {
+                    Some(&min) => min,
+                    None => continue,
+                },
             };
             let mut nonce = start_nonce;
             let mut count = 0u64;
