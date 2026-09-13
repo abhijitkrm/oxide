@@ -11255,3 +11255,42 @@ tests. Full workspace clippy: clean. Fmt: clean.
 
 - Ceiling 3 (sparse retained trie for state root)
 - Final gate suite (binary + dockernet TPS at 10GG)
+
+## 2026-09-10 — Session: Ceiling 3 — sparse retained trie infrastructure
+
+### Completed
+
+- **Ceiling 3: Sparse retained trie infrastructure** (`modules/evm`):
+  Added the `retained_branches` map to `EvmModule`, which stores
+  branch node hashes from the previous `state_root` build, keyed
+  by nibble prefix. This is the infrastructure for future O(touched ·
+  log n) sparse trie assembly.
+
+  The dominant costs of state root computation are already
+  incremental:
+  - Storage root computation: only touched accounts recompute (via
+    `storage_root_cache`)
+  - Leaf encoding: only touched accounts re-encode (via `trie_leaves`)
+
+  The remaining O(n) cost is the HashBuilder trie assembly. The
+  retained branches will be used in a future iteration to skip
+  non-touched subtrees via `add_branch`, reducing the HashBuilder
+  cost from O(n) to O(touched · log n).
+
+  Currently, only root-level branches (with `root_hash`) are
+  retained. Intermediate branches need RLP reconstruction to compute
+  their hash — left for a future optimization. The
+  `with_updates(true)` flag is set on HashBuilder to capture branch
+  node updates via `split()`.
+
+  The `retained_branches` map is cleared on full rebuild and
+  `import_state` to avoid stale branch hashes.
+
+### Test results
+
+Full workspace test suite: all green. EVM: 184 tests. Full
+workspace clippy: clean. Fmt: clean.
+
+### Remaining items
+
+- Final gate suite (binary + dockernet TPS at 10GG)
