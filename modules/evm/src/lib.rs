@@ -1736,9 +1736,30 @@ impl EvmModule {
                     usize,
                     Result<revm::context::result::ExecutionResult, ExecError>,
                 )> = Vec::with_capacity(txs.len());
+                // Ceiling 2: per-tx accessed account sets. For each
+                // tx, we record the set of accounts it accessed
+                // (read OR written). This enables tx-granular
+                // conflict detection: when a group conflicts, only
+                // the specific txs that accessed conflicting accounts
+                // are re-executed, not the entire group.
+                let mut per_tx_accessed: Vec<(
+                    usize,
+                    std::collections::HashSet<revm::primitives::Address>,
+                )> = Vec::with_capacity(txs.len());
 
                 for (idx, signed) in txs {
                     let caller = *sender;
+
+                    // Snapshot the cache's account keys before this
+                    // tx. After the tx, the union of before-keys and
+                    // after-keys is the set of accounts this tx
+                    // accessed (read accounts are loaded into the
+                    // cache; written accounts are modified in the
+                    // cache). This is O(n_cache) per tx, but n_cache
+                    // is typically small (10-50 accounts for a
+                    // contract call).
+                    let cache_keys_before: std::collections::HashSet<revm::primitives::Address> =
+                        db.cache.accounts.keys().copied().collect();
 
                     // Try the native transfer fast path first. For
                     // simple ETH transfers (empty calldata, EOA
@@ -1746,6 +1767,14 @@ impl EvmModule {
                     if let Some(result) =
                         Self::try_native_transfer(signed, caller, &mut db, coinbase, self.base_fee)
                     {
+                        // Native transfer accesses: caller, recipient, coinbase.
+                        let mut accessed = std::collections::HashSet::new();
+                        accessed.insert(caller);
+                        if let tx::TxKind::Call(addr) = signed.to() {
+                            accessed.insert(revm::primitives::Address::from(addr.0));
+                        }
+                        accessed.insert(coinbase);
+                        per_tx_accessed.push((*idx, accessed));
                         tx_results.push((*idx, Ok(result)));
                         continue;
                     }
@@ -1757,6 +1786,14 @@ impl EvmModule {
                     if let Some(result) =
                         Self::try_empty_code_call(signed, caller, &mut db, coinbase, self.base_fee)
                     {
+                        // Empty-code call accesses: caller, recipient, coinbase.
+                        let mut accessed = std::collections::HashSet::new();
+                        accessed.insert(caller);
+                        if let tx::TxKind::Call(addr) = signed.to() {
+                            accessed.insert(revm::primitives::Address::from(addr.0));
+                        }
+                        accessed.insert(coinbase);
+                        per_tx_accessed.push((*idx, accessed));
                         tx_results.push((*idx, Ok(result)));
                         continue;
                     }
@@ -1765,22 +1802,41 @@ impl EvmModule {
                     let tx_env = match Self::build_tx_env(signed, caller) {
                         Ok(t) => t,
                         Err(e) => {
+                            per_tx_accessed.push((*idx, std::collections::HashSet::new()));
                             tx_results.push((*idx, Err(e)));
                             continue;
                         }
                     };
 
+                    // Ceiling 2: use `transact` (not `transact_commit`)
+                    // to get the per-tx `EvmState`, which contains
+                    // the exact set of modified accounts. This lets
+                    // us track per-tx write sets for tx-granular
+                    // conflict detection.
                     let result = {
                         let mut evm =
                             self.build_evm(&mut db, coinbase, block_number, block_timestamp);
-                        evm.transact_commit(tx_env)
+                        let rs = evm.transact(tx_env);
+                        if let Ok(ref rs) = rs {
+                            evm.commit(rs.state.clone());
+                        }
+                        rs
                     };
 
                     match result {
-                        Ok(r) => {
-                            tx_results.push((*idx, Ok(r)));
+                        Ok(rs) => {
+                            // Per-tx accessed accounts: the union of
+                            // cache keys before and after the tx, plus
+                            // the accounts in the EvmState (which may
+                            // include accounts not yet in the cache).
+                            let mut accessed = cache_keys_before;
+                            accessed.extend(rs.state.keys().copied());
+                            accessed.extend(db.cache.accounts.keys().copied());
+                            per_tx_accessed.push((*idx, accessed));
+                            tx_results.push((*idx, Ok(rs.result)));
                         }
                         Err(e) => {
+                            per_tx_accessed.push((*idx, cache_keys_before));
                             tx_results.push((
                                 *idx,
                                 Err(ExecError::ModuleRejected(format!(
@@ -1850,6 +1906,7 @@ impl EvmModule {
                     tx_results,
                     touched_accounts,
                     accessed_accounts,
+                    per_tx_accessed,
                     new_contracts,
                     coinbase_delta,
                 }
@@ -1933,16 +1990,54 @@ impl EvmModule {
             };
 
             if has_conflict {
-                // Conflict: re-execute this group's txs sequentially
-                // against the main DB. The speculative execution
-                // assumed stale state for the conflicting account.
+                // Ceiling 2: tx-granular conflict re-execution.
+                // Instead of re-executing the entire group, only
+                // re-execute the specific txs that accessed accounts
+                // written by previously committed groups. Txs that
+                // only accessed non-conflicting accounts keep their
+                // speculative results.
                 //
-                // Try the native fast path first for each tx; fall
-                // through to revm only for non-native txs. Build the
-                // EVM context lazily — only if a non-native tx is
-                // encountered.
-                for (idx, signed) in groups.get(&gr.sender).expect("group exists") {
+                // This is a major improvement for workloads where
+                // only a few txs in a group conflict — e.g. a group
+                // of 100 txs where only 2 read a hot contract: only
+                // those 2 are re-executed, not all 100.
+                let group_txs = groups.get(&gr.sender).expect("group exists");
+                for (tx_pos, (idx, signed)) in group_txs.iter().enumerate() {
                     let caller = gr.sender;
+
+                    // Check if this specific tx accessed any
+                    // conflicting account. If not, keep its
+                    // speculative result.
+                    let empty_set = std::collections::HashSet::new();
+                    let tx_accessed = match gr.per_tx_accessed.get(tx_pos) {
+                        Some((_, s)) => s,
+                        None => &empty_set,
+                    };
+                    let tx_conflicts = tx_accessed
+                        .iter()
+                        .filter(|addr| **addr != coinbase)
+                        .any(|addr| committed_touched.contains(addr));
+
+                    if !tx_conflicts {
+                        // This tx doesn't conflict — keep its
+                        // speculative result. Still need to track
+                        // its touched accounts for future conflict
+                        // detection.
+                        let tx_touched: std::collections::HashSet<revm::primitives::Address> =
+                            tx_accessed.iter().filter(|addr| **addr != coinbase).copied().collect();
+                        committed_touched.extend(tx_touched.iter().copied());
+                        all_touched.extend(tx_touched.iter().copied());
+                        continue;
+                    }
+
+                    // This tx conflicts — re-execute it sequentially
+                    // against the main DB.
+                    //
+                    // Try the native fast path first for each tx; fall
+                    // through to revm only for non-native txs. Build the
+                    // EVM context lazily — only if a non-native tx is
+                    // encountered.
+                    let idx = *idx;
 
                     // Try native fast path first.
                     if let Some(result) =
@@ -1958,7 +2053,7 @@ impl EvmModule {
                             committed_touched.insert(revm::primitives::Address::from(addr.0));
                         }
                         committed_touched.insert(coinbase);
-                        reexec_results.insert(*idx, Ok(result));
+                        reexec_results.insert(idx, Ok(result));
                         continue;
                     }
 
@@ -1978,7 +2073,7 @@ impl EvmModule {
                             committed_touched.insert(revm::primitives::Address::from(addr.0));
                         }
                         committed_touched.insert(coinbase);
-                        reexec_results.insert(*idx, Ok(result));
+                        reexec_results.insert(idx, Ok(result));
                         continue;
                     }
 
@@ -1986,7 +2081,7 @@ impl EvmModule {
                     let tx_env = match Self::build_tx_env(signed, caller) {
                         Ok(t) => t,
                         Err(e) => {
-                            reexec_results.insert(*idx, Err(e));
+                            reexec_results.insert(idx, Err(e));
                             continue;
                         }
                     };
@@ -2007,11 +2102,11 @@ impl EvmModule {
                                     committed_touched.insert(*addr);
                                 }
                                 evm.commit(rs.state);
-                                reexec_results.insert(*idx, Ok(r));
+                                reexec_results.insert(idx, Ok(r));
                             }
                             Err(e) => {
                                 reexec_results.insert(
-                                    *idx,
+                                    idx,
                                     Err(ExecError::ModuleRejected(format!(
                                         "evm transact failed: {e:?}"
                                     ))),
@@ -2253,6 +2348,15 @@ struct GroupExecResult {
     /// conflict detection: a group conflicts if its accessed set
     /// overlaps with any previously committed group's write set.
     accessed_accounts: std::collections::HashSet<revm::primitives::Address>,
+    /// Ceiling 2: per-tx accessed account sets. Each entry is
+    /// the set of accounts accessed (read OR written) by the tx
+    /// at the corresponding position in `tx_results`. Used for
+    /// tx-granular conflict detection: when a group conflicts, only
+    /// the specific txs that accessed conflicting accounts are
+    /// re-executed, not the entire group. This is a major
+    /// improvement over group-level conflict tracking for
+    /// workloads where only a few txs in a group conflict.
+    per_tx_accessed: Vec<(usize, std::collections::HashSet<revm::primitives::Address>)>,
     /// New contracts created by this group, extracted from
     /// `CacheDB::cache::contracts`.
     new_contracts: revm::primitives::B256Map<revm::bytecode::Bytecode>,
