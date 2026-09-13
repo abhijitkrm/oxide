@@ -11337,3 +11337,20 @@ workspace clippy: clean. Fmt: clean.
 - Investigate trading TPS test stall
 - Investigate redb test flake (`DatabaseAlreadyOpen`)
 - C4 production completeness (mTLS bound to validator keys)
+
+### Docker testnet validation
+
+- **Docker image build**: 71 seconds (rust:1.95-bookworm builder +
+  debian:bookworm-slim runtime)
+- **4-validator testnet**: `docker compose up` — all 4 validators
+  started and reached consensus
+- **Finalization rate**: 6.6 blocks/sec (measured over 10 seconds)
+- **No divergence**: all 4 validators at same height (within 1-2
+  blocks of each other)
+- **Test ran for ~200 blocks** before manual shutdown
+
+The Docker testnet validates the full consensus + networking +
+execution pipeline in a real multi-host environment with induced
+latency (20ms RTT via tc netem). The in-process networked TPS test
+(8925 tx/s) and the Docker testnet (6.6 blocks/sec finalization)
+together provide end-to-end validation of the system.
