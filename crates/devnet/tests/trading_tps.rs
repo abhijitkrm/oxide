@@ -322,3 +322,59 @@ fn trading_tps_1m() {
     let txs_per_round = env_usize("TRADING_TXS_PER_ROUND", 1000);
     run_trading_tps(n, rounds, txs_per_round, 35000, 1000.0);
 }
+
+/// 7-validator trading TPS test: tests scaling with more validators.
+/// Default: 7 validators, 200 rounds, 1000 txs/round = 200k txs.
+///
+/// Run with:
+/// `cargo test -p devnet --test trading_tps --release -- --ignored trading_tps_7_validators --nocapture`
+#[test]
+#[ignore = "trading TPS test binds TCP ports; run with --release --ignored --nocapture"]
+fn trading_tps_7_validators() {
+    let n = env_usize("TRADING_VALIDATORS", 7);
+    let rounds = env_usize("TRADING_ROUNDS", 200);
+    let txs_per_round = env_usize("TRADING_TXS_PER_ROUND", 1000);
+    run_trading_tps(n, rounds, txs_per_round, 36000, 500.0);
+}
+
+/// 10-validator trading TPS test: tests scaling to 10 validators
+/// (max for f=3 byzantine tolerance with n=3f+1).
+/// Default: 10 validators, 200 rounds, 1000 txs/round = 200k txs.
+///
+/// Run with:
+/// `cargo test -p devnet --test trading_tps --release -- --ignored trading_tps_10_validators --nocapture`
+#[test]
+#[ignore = "trading TPS test binds TCP ports; run with --release --ignored --nocapture"]
+fn trading_tps_10_validators() {
+    let n = env_usize("TRADING_VALIDATORS", 10);
+    let rounds = env_usize("TRADING_ROUNDS", 200);
+    let txs_per_round = env_usize("TRADING_TXS_PER_ROUND", 1000);
+    run_trading_tps(n, rounds, txs_per_round, 37000, 500.0);
+}
+
+/// Large-scale trading TPS test: configurable up to 10B orders.
+/// Default: 4 validators, 10000 rounds, 1000 txs/round = 10M txs
+/// (5M maker+taker pairs = 5M fills).
+///
+/// Scale up with env vars:
+/// ```sh
+/// # 100M txs (50M fills):
+/// TRADING_ROUNDS=100000 cargo test -p devnet --test trading_tps --release -- \
+///   --ignored trading_tps_large --nocapture
+///
+/// # 1B txs (500M fills):
+/// TRADING_ROUNDS=1000000 cargo test -p devnet --test trading_tps --release -- \
+///   --ignored trading_tps_large --nocapture
+///
+/// # 10B txs (5B fills):
+/// TRADING_ROUNDS=10000000 TRADING_TXS_PER_ROUND=1000 cargo test -p devnet --test trading_tps --release -- \
+///   --ignored trading_tps_large --nocapture
+/// ```
+#[test]
+#[ignore = "large trading TPS test; run with --release --ignored"]
+fn trading_tps_large() {
+    let n = env_usize("TRADING_VALIDATORS", 4);
+    let rounds = env_usize("TRADING_ROUNDS", 10_000);
+    let txs_per_round = env_usize("TRADING_TXS_PER_ROUND", 1000);
+    run_trading_tps(n, rounds, txs_per_round, 38000, 1000.0);
+}

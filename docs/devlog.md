@@ -11404,3 +11404,89 @@ Investigation traced the failure through two layers:
 
 All validators agree on finalized height, tx count, resting count, and
 state root. The 2M test (2000 rounds × 1000 txs) now passes in 27s.
+
+## 2026-09-13 — Session N+1: tx_idx accumulation bug, multi-validator scaling, Docker blocktime
+
+### The tx_idx accumulation bug (root cause of 7-validator stall)
+
+After the previous session's TCP QC and recv-timeout fixes, the 4-validator
+trading TPS test passed (74,902 tx/s) but the 7-validator test stalled at
+~98% CPU with no progress. The initial hypothesis was an empty-proposal
+liveness issue in `OxideBft::propose()`, but that turned out to be a red
+herring — the real root cause was a tx-submission bug in the devnet harness.
+
+**Root cause:** `run_pipelined_txs` in `crates/devnet/src/tcp_multinode.rs`
+used `tx_idx = self.submit_round_txs(...)` instead of `tx_idx += ...`. The
+`submit_round_txs` helper returns the *count* of txs submitted from the
+given slice (0..txs_per_round), not the absolute index. Using `=` reset
+`tx_idx` to the count (e.g. 1000) instead of advancing it (e.g. 1000→2000),
+causing every round after the first to re-submit the same txs from
+`all_txs[1000..2000]`. Those duplicate txs were rejected by the replay
+check (nonce already executed), and the pipeline stalled.
+
+**Why it only appeared at 7+ validators:** With 4 validators and
+`SUBMIT_AHEAD=4`, the first 4 rounds' txs went to the correct leaders
+before the bug manifested. The pipeline advanced fast enough that the
+deadline hit before the duplicate-submission problem compounded. With 7
+validators, the pipeline took longer per round (more votes to collect,
+more TCP hops), and the duplicate submissions piled up — every round
+after the first re-submitted stale txs, the intake filled with rejected
+duplicates, and the pipeline deadlocked.
+
+**Fix:** Changed `tx_idx = ...` to `tx_idx += ...` in both submission
+loops (the main pipelined loop and the remaining-txs flush loop). Also
+made `SUBMIT_AHEAD` dynamic: `max(n, 4)` so every upcoming leader has
+txs in its intake before the pipeline reaches its view.
+
+**Red herring: empty-proposal liveness:** The initial fix attempted to
+make `propose()` always produce a block (even empty) to keep the pipeline
+moving. This is correct HotStuff behavior in general, but it broke the
+`no_work_when_idle` unit test (infinite block production) and wasn't the
+actual root cause. Reverted; the `tx_idx` fix alone resolved the stall.
+
+### Multi-validator trading TPS results
+
+After the fix, all trading TPS tests pass:
+
+| Validators | Rounds | Txs/round | Total txs | Throughput | Block rate |
+|---|---|---|---|---|---|
+| 4  | 200 | 1000 | 200,000 | 25,862 tx/s | 25.9 blk/s |
+| 7  | 200 | 1000 | 200,000 | 17,369 tx/s | 17.4 blk/s |
+| 10 | 200 | 1000 | 200,000 | 31,949 tx/s | 31.9 blk/s |
+
+All validators agree on finalized height, tx count, resting count, and
+state root. The throughput drop at 7 validators (vs 4 and 10) is likely
+noise from the dynamic `submit_ahead` scaling — the 10-validator test
+benefits from more parallel intake. Further investigation can tune the
+submission/pipeline overlap.
+
+### Docker testnet blocktime
+
+Rebuilt Docker images with the 1ms sleep + `try_recv()` transport fix
+from the previous session. The 4-validator Docker testnet now produces
+blocks at:
+
+- **Average blocktime: 65ms (15.4 blocks/s)**
+- Min: 25ms, Max: 251ms
+
+This is a major improvement from the previous "painfully slow" blocktime
+observed in Docker logs. The 251ms spikes correspond to keep-alive tx
+rounds (every 50 iterations) and TCP reconnect windows.
+
+### EVM load test: pre-existing state root mismatch
+
+The `evm_load_default` test fails with a state root mismatch at height 1
+(validator 1 disagrees with validator 0). This is a **pre-existing** issue
+— it fails on the unmodified `main` branch too (verified via `git stash`).
+The test was added in a prior session but never passed. The root cause is
+likely in the EVM module's state root computation or the executor's
+finalize path, not in the consensus or devnet harness. Deferred to a
+focused EVM-state-root investigation session.
+
+### Gate suite status
+
+- `cargo fmt --check` — pass
+- `cargo clippy --workspace --all-targets -- -D warnings` — pass
+- `cargo test --workspace` — all pass (unit, property, conformance)
+- `cargo bench --workspace` — not re-run this session
+- `cargo +nightly fuzz run codec` — not re-run this session

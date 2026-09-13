@@ -271,3 +271,40 @@ fn evm_load_single_validator() {
     let total_txs = env_usize("EVM_LOAD_TXS", 1000);
     run_evm_load_test(n, total_txs, 37000);
 }
+
+/// Large-scale EVM load test: configurable up to 1B EVM transactions.
+/// Default: 4 validators, 1,000,000 EVM txs (mix of transfers, deploys,
+/// contract calls, and reads).
+///
+/// Scale up with env vars:
+/// ```sh
+/// # 10M EVM txs:
+/// EVM_LOAD_TXS=10000000 cargo test -p devnet --test evm_load --release -- \
+///   --ignored evm_load_large --nocapture
+///
+/// # 100M EVM txs:
+/// EVM_LOAD_TXS=100000000 cargo test -p devnet --test evm_load --release -- \
+///   --ignored evm_load_large --nocapture
+///
+/// # 1B EVM txs:
+/// EVM_LOAD_TXS=1000000000 cargo test -p devnet --test evm_load --release -- \
+///   --ignored evm_load_large --nocapture
+/// ```
+#[test]
+#[ignore = "large EVM load test; run with --release --ignored"]
+fn evm_load_large() {
+    let n = env_usize("EVM_LOAD_VALIDATORS", 4);
+    let total_txs = env_usize("EVM_LOAD_TXS", 1_000_000);
+    run_evm_load_test(n, total_txs, 38000);
+}
+
+/// 7-validator large EVM load test: tests EVM scaling with more
+/// validators at a larger tx count.
+/// Default: 7 validators, 100,000 EVM txs.
+#[test]
+#[ignore = "large EVM load test; run with --release --ignored"]
+fn evm_load_7_validators_large() {
+    let n = 7;
+    let total_txs = env_usize("EVM_LOAD_TXS", 100_000);
+    run_evm_load_test(n, total_txs, 39000);
+}

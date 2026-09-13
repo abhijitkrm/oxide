@@ -445,6 +445,24 @@ impl OxideBft {
         self.high_qc.as_ref()
     }
 
+    /// Current vote count collected for the current view (diagnostic).
+    #[must_use]
+    pub fn vote_count(&self) -> usize {
+        self.vote_count
+    }
+
+    /// Quorum size for the current validator set (diagnostic).
+    #[must_use]
+    pub fn quorum(&self) -> usize {
+        self.validator_set.quorum()
+    }
+
+    /// Last voted view (diagnostic).
+    #[must_use]
+    pub fn last_voted_view(&self) -> Option<View> {
+        self.last_voted_view
+    }
+
     /// Current epoch.
     #[must_use]
     pub fn epoch(&self) -> Epoch {
@@ -808,6 +826,16 @@ impl OxideBft {
         let pending_has_txs = self.pending.as_ref().is_some_and(|p| !p.proposal.txs.is_empty());
 
         // No work: no pending txs and no pending block to flush.
+        // The leader returns None and waits for the next view. This
+        // is correct HotStuff behavior — an idle leader doesn't
+        // produce empty blocks. The 2-chain commit rule only needs
+        // a second block when there's actual work to commit.
+        //
+        // Note: the pipelined devnet harness (`pipelined_tick`) calls
+        // `propose()` once per tick per leader, so this doesn't cause
+        // a busy-loop. The `tx_idx` accumulation fix in the submission
+        // loop ensures txs reach the correct leader's intake before
+        // the pipeline reaches that leader's view.
         if !has_pending_txs && !pending_has_txs && self.next_height != Height::new(0) {
             return None;
         }

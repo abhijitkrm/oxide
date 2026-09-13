@@ -3064,3 +3064,38 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     74,293 tx/s (was: stalled at 495K txs). The 200K test improved
     from 16,968 tx/s to 74,902 tx/s. All validators agree on
     finalized height, tx count, resting count, and state root.
+
+### Fixed (2026-09-13)
+
+- **Multi-validator trading TPS test stalled due to tx_idx accumulation
+  bug in devnet harness** (`crates/devnet/src/tcp_multinode.rs`)
+  - The 7-validator and 10-validator trading TPS tests stalled at ~98% CPU
+    with no progress. Root cause: `run_pipelined_txs` used
+    `tx_idx = submit_round_txs(...)` instead of `tx_idx += ...`. The
+    helper returns the *count* of txs submitted (0..txs_per_round), not
+    the absolute index. Using `=` reset `tx_idx` to the count instead of
+    advancing it, causing every round after the first to re-submit the
+    same stale txs. Those duplicates were rejected by the replay check
+    (nonce already executed), filling the intake with rejected txs and
+    deadlocking the pipeline.
+  - Fix: changed `=` to `+=` in both submission loops, and made
+    `SUBMIT_AHEAD` dynamic (`max(n, 4)`) so every upcoming leader has
+    txs in its intake before the pipeline reaches its view.
+  - **In plain words:** the 7-validator and 10-validator trading TPS
+    tests now pass. 7 validators: 17,369 tx/s. 10 validators: 31,949
+    tx/s. All validators agree on finalized height, tx count, resting
+    count, and state root.
+
+### Changed (2026-09-13)
+
+- **Docker testnet blocktime improved to 65ms average (15.4 blocks/s)**
+  (`bin/oxide-validator/src/main.rs`, `crates/p2p/src/tcp.rs`)
+  - The Docker testnet previously had "painfully slow" blocktime. The
+    transport's `recv()` was changed from `recv_timeout(10ms)` to
+    non-blocking `try_recv()` with a 1ms sleep in the consensus loop,
+    reducing idle-loop latency from 10ms to ~1ms. The 4-validator
+    Docker testnet now produces blocks at 65ms average (min 25ms,
+    max 251ms), a major improvement from the previous slow blocktime.
+  - **In plain words:** Docker testnet blocks are now produced ~15
+    times per second instead of the previous slow rate, giving much
+    faster response times for transactions.

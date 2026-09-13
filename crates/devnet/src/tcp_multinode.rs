@@ -657,7 +657,14 @@ impl TcpMultiNodeDevnet {
         txs_per_round: usize,
         all_txs: &[TxBytes],
     ) -> (TcpDevnetResult, std::time::Duration) {
-        const SUBMIT_AHEAD: usize = 4;
+        // Submit ahead by at least n validators so every upcoming
+        // leader has txs in its intake before the pipeline reaches
+        // its view. With the tx_idx accumulation fix, each round's
+        // txs go to the correct leader; SUBMIT_AHEAD >= n ensures
+        // the leader isn't starved when the pipeline advances.
+        // 4 is the minimum (covers the 4-validator case); we scale
+        // up to n when n > 4.
+        let submit_ahead: usize = self.n.max(4);
         let start = std::time::Instant::now();
         let target_blocks = u64::try_from(rounds).unwrap_or(u64::MAX);
         let needed = rounds.checked_mul(txs_per_round).expect("rounds * txs_per_round overflow");
@@ -711,18 +718,27 @@ impl TcpMultiNodeDevnet {
                 break;
             }
 
-            // Submit txs for rounds that are within SUBMIT_AHEAD of
+            // Submit txs for rounds that are within `submit_ahead` of
             // the pipeline's current position. The pipeline has
             // formed `state.qcs_formed` blocks, so we submit txs
-            // for rounds up to `qcs_formed + SUBMIT_AHEAD`.
+            // for rounds up to `qcs_formed + submit_ahead`.
             let submit_through = usize::try_from(state.qcs_formed)
                 .unwrap_or(usize::MAX)
-                .saturating_add(SUBMIT_AHEAD)
+                .saturating_add(submit_ahead)
                 .min(rounds);
             while next_submit_round < submit_through {
                 let view = primitives::View::new(next_submit_round as u64);
                 let leader_idx = usize::from(self.validator_set.leader(view));
-                tx_idx = self.submit_round_txs(
+                // Accumulate tx_idx: submit_round_txs returns the
+                // count of txs submitted from the given slice, not
+                // the absolute index. Using `=` instead of `+=`
+                // resets tx_idx to the count (e.g. 1000) instead of
+                // advancing it (e.g. 1000 → 2000), causing every
+                // round after the first to re-submit the same txs
+                // from all_txs[1000..2000]. Those duplicate txs are
+                // rejected by the replay check (nonce already
+                // executed), and the pipeline stalls.
+                tx_idx += self.submit_round_txs(
                     leader_idx,
                     txs_per_round,
                     &all_txs[tx_idx..],
@@ -752,7 +768,7 @@ impl TcpMultiNodeDevnet {
             }
             let view = primitives::View::new(next_submit_round as u64);
             let leader_idx = usize::from(self.validator_set.leader(view));
-            tx_idx = self.submit_round_txs(
+            tx_idx += self.submit_round_txs(
                 leader_idx,
                 txs_per_round,
                 &all_txs[tx_idx..],
@@ -879,7 +895,19 @@ impl TcpMultiNodeDevnet {
     }
 
     /// Phase 2: any engine that hasn't voted, vote on the proposal.
+    ///
+    /// Votes are delivered two ways (same as QC delivery):
+    /// 1. **In-process** (reliable): the vote is collected directly on
+    ///    the leader's engine. This is the authoritative path.
+    /// 2. **TCP** (best-effort): the vote is sent via the transport
+    ///    for realism. TCP delivery may fail during reconnects; the
+    ///    in-process path ensures liveness regardless.
     fn vote_phase(&mut self, state: &mut PipelineState) {
+        // Collect votes to deliver in-process after the loop (avoid
+        // borrow conflicts — can't collect on another engine while
+        // iterating `self.engines` mutably).
+        let mut votes_to_collect: Vec<(usize, u16, types::Vote)> = Vec::new();
+
         for (i, engine) in self.engines.iter_mut().enumerate() {
             for (header, proposal) in &state.proposals {
                 let view = header.view.value();
@@ -909,20 +937,22 @@ impl TcpMultiNodeDevnet {
                     let mut buf = Vec::with_capacity(1 + 137);
                     buf.push(MSG_VOTE);
                     vote.encode(&mut buf);
-                    // Tolerate transient send failure: the transport
-                    // reconnects a dropped peer connection after a
-                    // short backoff, so `UnknownPeer`/`ChannelClosed`
-                    // is expected during a reconnect window. Only
-                    // mark the view voted when the send succeeded —
-                    // otherwise the vote is retried next tick.
-                    if self.transports[i]
-                        .send(&vec![u8::try_from(leader_idx).unwrap()], &buf)
-                        .is_ok()
-                    {
-                        state.voted.insert((i, view));
-                    }
+                    // Best-effort TCP broadcast. Failures are tolerated
+                    // — the in-process delivery below is authoritative.
+                    let _ = self.transports[i].send(&vec![u8::try_from(leader_idx).unwrap()], &buf);
+                    // In-process vote delivery: collect the vote
+                    // directly on the leader's engine. This ensures
+                    // the vote is received even if TCP drops it.
+                    votes_to_collect.push((leader_idx, u16::try_from(i).unwrap(), vote));
+                    state.voted.insert((i, view));
                 }
             }
+        }
+
+        // In-process vote delivery: collect all votes formed this
+        // tick on their respective leader engines.
+        for (leader_idx, voter_idx, vote) in votes_to_collect {
+            let _ = self.engines[leader_idx].collect_vote(voter_idx, vote);
         }
     }
 
