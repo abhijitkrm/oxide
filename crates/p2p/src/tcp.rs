@@ -1037,34 +1037,32 @@ impl Transport for TcpTransport {
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
-        // Semi-blocking receive: uses `recv_timeout` with a short
-        // timeout (10ms) instead of `try_recv()` (non-blocking).
-        // This reduces message latency from up to 10ms (the
-        // validator loop's sleep) to near-zero: if a message
-        // arrives during the 10ms wait, it's returned immediately
-        // instead of waiting for the next loop iteration.
+        // Non-blocking receive: uses `try_recv()` instead of
+        // `recv_timeout(10ms)`. The previous 10ms timeout caused a
+        // 40ms/tick stall in the devnet's pipelined loop (4 transports
+        // × 10ms each when all channels were empty), which dominated
+        // the consensus tick cost and throttled throughput from ~17
+        // blk/s to ~1.5 blk/s after ~500 blocks.
         //
-        // The Transport trait documents `recv` as "blocking until
-        // one arrives", but the validator loop needs to do other
-        // work (propose, vote, check timeouts) even when no
-        // messages arrive. A fully blocking `recv` would starve
-        // the loop. The 10ms timeout is the same as the previous
-        // sleep, but the message is returned as soon as it
-        // arrives, not after the full 10ms.
+        // The tight pipelined loop (and the production validator loop)
+        // calls `recv()` repeatedly — `try_recv()` returns `None`
+        // immediately when the channel is empty, and the next tick
+        // (microseconds later) picks up any messages that arrived.
+        // This eliminates the 10ms-per-empty-channel tax.
+        if self.shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
         loop {
-            if self.shutdown.load(Ordering::Relaxed) {
-                return None;
-            }
             let msg = match self
                 .inbound_rx
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .recv_timeout(std::time::Duration::from_millis(10))
+                .try_recv()
             {
                 Ok(msg) => msg,
                 Err(
-                    std::sync::mpsc::RecvTimeoutError::Timeout
-                    | std::sync::mpsc::RecvTimeoutError::Disconnected,
+                    std::sync::mpsc::TryRecvError::Empty
+                    | std::sync::mpsc::TryRecvError::Disconnected,
                 ) => return None,
             };
             // Admission control: check rate limit and reputation.

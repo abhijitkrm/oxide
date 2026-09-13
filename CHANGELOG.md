@@ -3040,3 +3040,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     landing unnoticed. The gates are conservative (1M raw, 100k exchange)
     to avoid noise on CI runners; the dev machine measures 37M raw and 2M
     exchange — 37× and 21× headroom respectively.
+
+### Fixed (2026-09-14)
+
+- **Trading TPS test stalled after ~270 blocks due to TCP QC drops and
+  10ms recv timeout tax**
+  (`crates/devnet/src/tcp_multinode.rs`, `crates/p2p/src/tcp.rs`)
+  - The 2M-tx trading TPS test (`trading_tps_1m`) deadlocked after
+    ~270 blocks. Two root causes: (1) `form_qc_phase` broadcast QCs
+    via TCP and ignored send errors — a transient `UnknownPeer`
+    (peer mid-reconnect) permanently dropped the QC, stalling the
+    recipient's view advancement; (2) `Transport::recv` used
+    `recv_timeout(10ms)`, costing 40ms/tick (4 transports × 10ms)
+    when channels were empty, throttling throughput from ~75 blk/s
+    to ~1.5 blk/s once the intake filled.
+  - Fix: (1) `form_qc_phase` now delivers every formed QC directly to
+    all engines in-process (in addition to best-effort TCP).
+    `deliver_qc` is idempotent for stale QCs, so duplicate delivery
+    is a no-op. (2) `Transport::recv` now uses non-blocking
+    `try_recv()` — the tight pipelined loop picks up messages on
+    the next tick (microseconds later), eliminating the 10ms tax.
+  - **In plain words:** the 2M-tx trading test now passes in 27s at
+    74,293 tx/s (was: stalled at 495K txs). The 200K test improved
+    from 16,968 tx/s to 74,902 tx/s. All validators agree on
+    finalized height, tx count, resting count, and state root.

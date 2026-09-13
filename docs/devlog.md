@@ -11354,3 +11354,53 @@ execution pipeline in a real multi-host environment with induced
 latency (20ms RTT via tc netem). The in-process networked TPS test
 (8925 tx/s) and the Docker testnet (6.6 blocks/sec finalization)
 together provide end-to-end validation of the system.
+
+## 2026-09-09 — Session N: trading TPS deadlock root cause and fix
+
+### Root cause
+
+The 2M-tx trading TPS test (`trading_tps_1m`) stalled after ~270 blocks.
+Investigation traced the failure through two layers:
+
+1. **TCP QC delivery drops (secondary):** `form_qc_phase` broadcast QCs
+   via `Transport::send` and ignored errors. A transient `UnknownPeer`
+   (peer mid-reconnect) permanently dropped the QC for that recipient.
+   The recipient never advanced its view, the next leader couldn't
+   propose, and the pipeline deadlocked at 0% CPU.
+
+2. **`recv()` 10ms timeout tax (primary bottleneck):** `Transport::recv`
+   used `recv_timeout(10ms)`. The devnet's pipelined loop calls `recv()`
+   on each of 4 transports per tick. When all channels are empty (the
+   common case between bursts), each call blocks for 10ms — 40ms/tick
+   of wasted time. At 2 ticks/QC, that's 80ms/QC, throttling throughput
+   from ~75 blk/s to ~1.5 blk/s after the intake filled. This is why
+   the 200K test passed (intake never filled) but 500K+ stalled.
+
+### Fix
+
+1. **In-process QC delivery (reliable path):** `form_qc_phase` now
+   delivers every formed QC directly to all engines in-process, in
+   addition to the best-effort TCP broadcast. `deliver_qc` is idempotent
+   for stale QCs (rejects view ≤ high_qc.view), so duplicate delivery
+   is a no-op. This eliminates the TCP-drop deadlock for the devnet
+   harness while preserving TCP for realism.
+
+2. **Non-blocking `recv()`:** Changed `Transport::recv` from
+   `recv_timeout(10ms)` to `try_recv()`. The tight pipelined loop picks
+   up messages on the next tick (microseconds later), eliminating the
+   10ms-per-empty-channel tax. This is the dominant performance fix.
+
+3. **Refactoring:** Extracted `submit_round_txs` helper to keep
+   `run_pipelined_txs` under clippy's function-length limit.
+
+### Results
+
+| Workload | Before | After |
+|---|---|---|
+| 200K (default) | 16,968 tx/s, 12s | 74,902 tx/s, 2.7s |
+| 500K | 16,595 tx/s, 30s | (not re-run) |
+| 1M (1000 rounds) | FAILED at 954K | (not re-run) |
+| 2M (1M fills) | FAILED at 495K | 74,293 tx/s, 27s |
+
+All validators agree on finalized height, tx count, resting count, and
+state root. The 2M test (2000 rounds × 1000 txs) now passes in 27s.

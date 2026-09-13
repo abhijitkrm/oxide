@@ -1356,12 +1356,27 @@ impl AppInterface for Executor {
                 .insert(tx_hash, preverified.sender);
         }
 
-        // Push to the lock-free intake ring. The mempool submission
+        // Push to the bounded intake ring. The mempool submission
         // is deferred to `prepare_proposal` — this eliminates the
         // per-tx mempool lock on the ingestion hot path.
-        match self.mempool_intake_tx.send(tx) {
+        //
+        // We use `try_send` (non-blocking) instead of `send` (blocking)
+        // because a blocking send would deadlock if the intake channel
+        // is full and no consumer is draining it. This happens when the
+        // consensus pipeline stalls (e.g., during view changes) — the
+        // intake fills up, `send` blocks waiting for a consumer, but the
+        // consumer (the propose phase) can't run because the submission
+        // thread holds the test's main loop. `try_send` breaks the
+        // deadlock: a full intake returns `Rejected` (backpressure)
+        // instead of blocking forever. The caller can retry later.
+        match self.mempool_intake_tx.try_send(tx) {
             Ok(()) => MempoolAck::Accepted,
-            Err(_) => MempoolAck::Rejected { reason: "intake ring closed".to_string() },
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                MempoolAck::Rejected { reason: "intake ring full".to_string() }
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                MempoolAck::Rejected { reason: "intake ring closed".to_string() }
+            }
         }
     }
 

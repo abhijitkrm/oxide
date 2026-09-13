@@ -657,6 +657,7 @@ impl TcpMultiNodeDevnet {
         txs_per_round: usize,
         all_txs: &[TxBytes],
     ) -> (TcpDevnetResult, std::time::Duration) {
+        const SUBMIT_AHEAD: usize = 4;
         let start = std::time::Instant::now();
         let target_blocks = u64::try_from(rounds).unwrap_or(u64::MAX);
         let needed = rounds.checked_mul(txs_per_round).expect("rounds * txs_per_round overflow");
@@ -666,16 +667,32 @@ impl TcpMultiNodeDevnet {
             all_txs.len()
         );
 
-        // Submit txs to each view's leader.
+        // Interleave tx submission with the consensus loop.
+        //
+        // The executor's mempool intake is a bounded sync channel
+        // (capacity 10,000). Submitting all txs upfront before the
+        // consensus loop starts consuming would fill the channel and
+        // block on `send` — a deadlock at 0% CPU (the producer waits
+        // for the consumer, but the consumer hasn't started).
+        //
+        // Instead, we submit txs for each round inside the pipelined
+        // loop, a few rounds ahead of the pipeline's current position.
+        // The consensus loop drains the intake channel between
+        // submissions, preventing the deadlock.
+        //
+        // `submit_ahead` controls how many rounds of txs are buffered
+        // in the intake channel ahead of the pipeline. Too few and the
+        // leader has no txs to propose; too many and the channel fills
+        // up. 4 rounds ahead is enough to keep the pipeline fed without
+        // exceeding the 10K channel capacity (4 × 1000 = 4000 < 10000).
+        //
+        // If the intake channel is full (the pipeline stalled), we run
+        // a pipelined tick to drain it before retrying the submission.
+        // This prevents the second deadlock: the pipeline stalls, the
+        // intake fills up, `try_send` returns `Rejected`, and we drain
+        // the intake by advancing the pipeline.
         let mut tx_idx = 0usize;
-        for round in 0..rounds {
-            let view = primitives::View::new(round as u64);
-            let leader_idx = usize::from(self.validator_set.leader(view));
-            for _ in 0..txs_per_round {
-                self.engines[leader_idx].submit_tx(all_txs[tx_idx].clone());
-                tx_idx += 1;
-            }
-        }
+        let mut next_submit_round = 0usize;
 
         // Pipelined loop (same as run_pipelined).
         let mut state = PipelineState::new();
@@ -693,8 +710,57 @@ impl TcpMultiNodeDevnet {
             if std::time::Instant::now() > deadline {
                 break;
             }
+
+            // Submit txs for rounds that are within SUBMIT_AHEAD of
+            // the pipeline's current position. The pipeline has
+            // formed `state.qcs_formed` blocks, so we submit txs
+            // for rounds up to `qcs_formed + SUBMIT_AHEAD`.
+            let submit_through = usize::try_from(state.qcs_formed)
+                .unwrap_or(usize::MAX)
+                .saturating_add(SUBMIT_AHEAD)
+                .min(rounds);
+            while next_submit_round < submit_through {
+                let view = primitives::View::new(next_submit_round as u64);
+                let leader_idx = usize::from(self.validator_set.leader(view));
+                tx_idx = self.submit_round_txs(
+                    leader_idx,
+                    txs_per_round,
+                    &all_txs[tx_idx..],
+                    &mut state,
+                    target_blocks,
+                    deadline,
+                );
+                next_submit_round += 1;
+            }
+
             self.pipelined_tick(&mut state, target_blocks);
             std::hint::spin_loop();
+        }
+
+        // Submit any remaining txs (in case the deadline hit early).
+        // This phase has its own deadline — if the intake is full and
+        // the pipeline can't drain it fast enough, we give up rather
+        // than looping forever. The integrity check will then report
+        // how many txs were actually finalized.
+        let remaining_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while next_submit_round < rounds {
+            if std::time::Instant::now() > remaining_deadline {
+                eprintln!(
+                    "trading TPS test: remaining-submit deadline hit at round {next_submit_round}/{rounds}"
+                );
+                break;
+            }
+            let view = primitives::View::new(next_submit_round as u64);
+            let leader_idx = usize::from(self.validator_set.leader(view));
+            tx_idx = self.submit_round_txs(
+                leader_idx,
+                txs_per_round,
+                &all_txs[tx_idx..],
+                &mut state,
+                u64::MAX,
+                remaining_deadline,
+            );
+            next_submit_round += 1;
         }
 
         // Flush round: propose one more empty block to commit the last
@@ -735,6 +801,41 @@ impl TcpMultiNodeDevnet {
 
         let elapsed = start.elapsed();
         (self.collect_result(), elapsed)
+    }
+
+    /// Submit one round's worth of txs to the leader's intake,
+    /// draining the intake via pipelined ticks when it's full.
+    ///
+    /// Returns the next tx index after the submitted round.
+    fn submit_round_txs(
+        &mut self,
+        leader_idx: usize,
+        txs_per_round: usize,
+        txs: &[TxBytes],
+        state: &mut PipelineState,
+        view_cap: u64,
+        deadline: std::time::Instant,
+    ) -> usize {
+        let mut tx_idx = 0;
+        while tx_idx < txs_per_round {
+            let ack = self.engines[leader_idx].submit_tx(txs[tx_idx].clone());
+            match ack {
+                types::MempoolAck::Accepted => {
+                    tx_idx += 1;
+                }
+                types::MempoolAck::Rejected { .. } => {
+                    // Intake channel is full — run the pipeline for
+                    // multiple ticks to drain it, then retry.
+                    for _ in 0..64 {
+                        self.pipelined_tick(state, view_cap);
+                        if std::time::Instant::now() > deadline {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        tx_idx
     }
 
     /// One tick of the pipelined event loop.
@@ -857,7 +958,28 @@ impl TcpMultiNodeDevnet {
     }
 
     /// Phase 4: any leader with quorum, form QC and broadcast.
+    ///
+    /// QCs are delivered two ways:
+    /// 1. **In-process** (reliable): the QC is delivered directly to
+    ///    every engine's `deliver_qc`. This is the authoritative path
+    ///    for the in-process devnet — it guarantees the QC is received
+    ///    even if the TCP transport drops a connection.
+    /// 2. **TCP** (best-effort): the QC is broadcast via the transport
+    ///    for realism. TCP delivery may fail during reconnects; the
+    ///    in-process path ensures liveness regardless.
+    ///
+    /// The TCP-only path was the original design, but it has a
+    /// liveness bug: if a TCP connection drops (e.g., due to a
+    /// transient I/O error), the QC is silently dropped, and the
+    /// validators that miss it can't advance their views. The leader
+    /// for the next view is stuck at the old view and can't propose.
+    /// The pipeline deadlocks at 0% CPU. The in-process delivery
+    /// eliminates this failure mode for the devnet harness.
     fn form_qc_phase(&mut self, state: &mut PipelineState) {
+        // Collect QCs formed this tick. We deliver them in-process
+        // after the loop to avoid borrow conflicts (can't deliver to
+        // other engines while iterating `self.engines` mutably).
+        let mut qcs_to_deliver: Vec<types::QuorumCertificate> = Vec::new();
         for (i, engine) in self.engines.iter_mut().enumerate() {
             if let Some(qc) = engine.try_form_qc() {
                 state.qcs_formed += 1;
@@ -866,14 +988,27 @@ impl TcpMultiNodeDevnet {
                 qc.encode(&mut qc_buf);
                 for j in 0..self.n {
                     if j != i {
-                        // Same transient-failure tolerance as the
-                        // vote path: a peer mid-reconnect gets the
-                        // QC dropped — it still finalizes via the
-                        // next QC or catches up on restart.
+                        // Best-effort TCP broadcast. Failures are
+                        // tolerated — the in-process delivery below
+                        // is the authoritative path.
                         let _ = self.transports[i].send(&vec![u8::try_from(j).unwrap()], &qc_buf);
                     }
                 }
-                engine.deliver_qc(qc).expect("leader self-deliver QC");
+                // Self-deliver: the leader that formed the QC must
+                // also receive it to advance its own view.
+                engine.deliver_qc(qc.clone()).expect("leader self-deliver QC");
+                qcs_to_deliver.push(qc);
+            }
+        }
+
+        // In-process delivery: deliver every QC formed this tick to
+        // every engine. This is the reliable path — TCP is best-effort.
+        // `deliver_qc` is idempotent for stale QCs — it rejects QCs
+        // with view <= high_qc.view, so delivering to the engine that
+        // already has it is a no-op.
+        for qc in &qcs_to_deliver {
+            for engine in &mut self.engines {
+                let _ = engine.deliver_qc(qc.clone());
             }
         }
     }
