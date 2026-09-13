@@ -2868,25 +2868,18 @@ impl Module for EvmModule {
         // Feed the leaves into `HashBuilder` in sorted hashed-key
         // order — the `BTreeMap` iteration order is exactly what
         // `add_leaf` requires (it asserts sorted input).
-        let mut hb = alloy_trie::HashBuilder::default().with_updates(true);
+        //
+        // Note: `with_updates(true)` is NOT enabled here because it
+        // adds overhead to track branch node updates. The
+        // `retained_branches` map is infrastructure for a future
+        // sparse trie optimization that will use `add_branch` to
+        // skip non-touched subtrees. Enabling `with_updates` only
+        // makes sense when the sparse walk is actually implemented.
+        let mut hb = alloy_trie::HashBuilder::default();
         for (hashed_key, rlp) in leaves.iter() {
             hb.add_leaf(alloy_trie::Nibbles::unpack(hashed_key), rlp);
         }
         let root = hb.root();
-
-        // Retain the branch node updates for future sparse builds.
-        // `split()` returns the branch node hashes keyed by their
-        // nibble prefix. `BranchNodeCompact.root_hash` is only set
-        // for the root (len == 0). Intermediate branches would need
-        // RLP reconstruction to compute their hash — left for a
-        // future optimization.
-        let (_, updates) = hb.split();
-        retained.clear();
-        for (prefix, branch) in updates {
-            if let Some(hash) = branch.root_hash {
-                retained.insert(prefix, hash);
-            }
-        }
 
         // Cache the state root for the next call's fast path.
         *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
