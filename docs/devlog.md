@@ -11208,3 +11208,50 @@ All binaries build successfully (release):
 - Ceiling 2 (parallel executor with tx-granular conflict tracking)
 - Ceiling 3 (sparse retained trie for state root)
 - Docker testnet TPS at 10GG
+
+## 2026-09-10 — Session: Ceiling 2 — tx-granular conflict tracking
+
+### Completed
+
+- **Ceiling 2: Parallel executor with tx-granular conflict tracking**
+  (`modules/evm`):
+  The parallel executor now tracks per-tx accessed account sets,
+  enabling tx-granular conflict detection. When a group conflicts,
+  only the specific txs that accessed conflicting accounts are
+  re-executed, not the entire group.
+
+  Before the fix, a group of 100 txs where only 2 read a hot
+  contract would re-execute all 100 txs sequentially. Now only the
+  2 conflicting txs are re-executed; the other 98 keep their
+  speculative results.
+
+  Implementation:
+  - Added `per_tx_accessed` field to `GroupExecResult` — per-tx
+    accessed account sets.
+  - Changed `transact_commit` to `transact` + explicit `commit` to
+    capture the per-tx `EvmState` (modified accounts).
+  - Per-tx accessed set = union of cache keys before/after the tx +
+    accounts in the EvmState.
+  - Conflict re-execution now iterates per-tx, checking each tx's
+    accessed set against `committed_touched`. Non-conflicting txs
+    keep their speculative results; only conflicting txs are
+    re-executed.
+
+### Benchmark results (criterion, release build)
+
+- `block_pipeline/100`: -43% faster (609K → 1.05M tx/s)
+- `block_pipeline/1000`: -46% faster (642K → 1.56M tx/s)
+- `propose_only/100`: -46% faster (1.54M tx/s)
+- `propose_only/1000`: -62% faster (1.59M tx/s)
+- `execute_only/100`: -24% faster (917K tx/s)
+- `execute_only/1000`: -37% faster (971K tx/s)
+
+### Test results
+
+Full workspace test suite: all green. EVM: 184 tests. Executor: 45
+tests. Full workspace clippy: clean. Fmt: clean.
+
+### Remaining items
+
+- Ceiling 3 (sparse retained trie for state root)
+- Final gate suite (binary + dockernet TPS at 10GG)
