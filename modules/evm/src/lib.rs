@@ -2006,53 +2006,29 @@ impl EvmModule {
             };
 
             if has_conflict {
-                // Ceiling 2: tx-granular conflict re-execution.
-                // Instead of re-executing the entire group, only
-                // re-execute the specific txs that accessed accounts
-                // written by previously committed groups. Txs that
-                // only accessed non-conflicting accounts keep their
-                // speculative results.
+                // Conflict resolution: re-execute the ENTIRE group
+                // sequentially against the main DB.
                 //
-                // This is a major improvement for workloads where
-                // only a few txs in a group conflict — e.g. a group
-                // of 100 txs where only 2 read a hot contract: only
-                // those 2 are re-executed, not all 100.
+                // We previously tried tx-granular re-execution (only
+                // re-executing the specific txs that accessed
+                // conflicting accounts, keeping speculative results
+                // for non-conflicting txs). This was incorrect:
+                // non-conflicting txs' state changes (nonce increments,
+                // balance deductions) were never applied to the main
+                // DB, so when a later tx in the same group was
+                // re-executed, the main DB had a stale nonce — causing
+                // `NonceTooHigh` failures.
+                //
+                // All txs from the same sender have a strict nonce
+                // dependency: tx N+1 cannot execute until tx N's
+                // nonce increment is committed. Partial re-execution
+                // breaks this dependency. Full-group re-execution
+                // preserves it: the entire group runs sequentially
+                // against the main DB, which sees each tx's nonce
+                // increment before the next tx executes.
                 let group_txs = groups.get(&gr.sender).expect("group exists");
-                for (tx_pos, (idx, signed)) in group_txs.iter().enumerate() {
+                for (idx, signed) in group_txs {
                     let caller = gr.sender;
-
-                    // Check if this specific tx accessed any
-                    // conflicting account. If not, keep its
-                    // speculative result.
-                    let empty_set = std::collections::HashSet::new();
-                    let tx_accessed = match gr.per_tx_accessed.get(tx_pos) {
-                        Some((_, s)) => s,
-                        None => &empty_set,
-                    };
-                    let tx_conflicts = tx_accessed
-                        .iter()
-                        .filter(|addr| **addr != coinbase)
-                        .any(|addr| committed_touched.contains(addr));
-
-                    if !tx_conflicts {
-                        // This tx doesn't conflict — keep its
-                        // speculative result. Still need to track
-                        // its touched accounts for future conflict
-                        // detection.
-                        let tx_touched: std::collections::HashSet<revm::primitives::Address> =
-                            tx_accessed.iter().filter(|addr| **addr != coinbase).copied().collect();
-                        committed_touched.extend(tx_touched.iter().copied());
-                        all_touched.extend(tx_touched.iter().copied());
-                        continue;
-                    }
-
-                    // This tx conflicts — re-execute it sequentially
-                    // against the main DB.
-                    //
-                    // Try the native fast path first for each tx; fall
-                    // through to revm only for non-native txs. Build the
-                    // EVM context lazily — only if a non-native tx is
-                    // encountered.
                     let idx = *idx;
 
                     // Try native fast path first.
@@ -2104,14 +2080,8 @@ impl EvmModule {
                     {
                         let mut evm =
                             self.build_evm(&mut *db, coinbase, block_number, block_timestamp);
-                        // `transact` gives the complete `EvmState` —
-                        // every modified account (internal calls,
-                        // selfdestruct beneficiaries, third-party
-                        // SSTORE), not just caller/to/created.
                         match evm.transact(tx_env) {
                             Ok(rs) => {
-                                // Track the exact modified set before
-                                // committing it.
                                 let r = rs.result;
                                 for addr in rs.state.keys() {
                                     all_touched.insert(*addr);
@@ -2364,14 +2334,19 @@ struct GroupExecResult {
     /// conflict detection: a group conflicts if its accessed set
     /// overlaps with any previously committed group's write set.
     accessed_accounts: std::collections::HashSet<revm::primitives::Address>,
-    /// Ceiling 2: per-tx accessed account sets. Each entry is
-    /// the set of accounts accessed (read OR written) by the tx
-    /// at the corresponding position in `tx_results`. Used for
-    /// tx-granular conflict detection: when a group conflicts, only
-    /// the specific txs that accessed conflicting accounts are
-    /// re-executed, not the entire group. This is a major
-    /// improvement over group-level conflict tracking for
-    /// workloads where only a few txs in a group conflict.
+    /// Per-tx accessed account sets. Each entry is the set of
+    /// accounts accessed (read OR written) by the tx at the
+    /// corresponding position in `tx_results`.
+    ///
+    /// Currently unused: tx-granular conflict re-execution was
+    /// removed because it broke nonce continuity within a group
+    /// (non-conflicting txs' nonce increments were not applied to
+    /// the main DB before conflicting txs were re-executed).
+    /// Retained as infrastructure for a future tx-granular
+    /// optimization that properly handles nonce dependencies by
+    /// committing non-conflicting txs' state before re-executing
+    /// conflicting txs.
+    #[allow(dead_code)]
     per_tx_accessed: Vec<(usize, std::collections::HashSet<revm::primitives::Address>)>,
     /// New contracts created by this group, extracted from
     /// `CacheDB::cache::contracts`.
@@ -3741,6 +3716,108 @@ mod tests {
         let oxide_recipient_b = primitives::Address(recipient_b.0.into());
         assert_eq!(m.balance(&oxide_recipient_a), 1_000_000_000, "recipient A balance");
         assert_eq!(m.balance(&oxide_recipient_b), 1_000_000_000, "recipient B balance");
+    }
+
+    /// Parallel execution with mixed tx types (transfers + deployments)
+    /// must produce correct nonces. This reproduces the devnet load-test
+    /// scenario: multiple senders, each with a mix of transfers and
+    /// CREATE txs, executed through the parallel speculative path.
+    #[test]
+    fn handle_batch_parallel_mixed_tx_types_nonces() {
+        let n_senders = 10;
+        let txs_per_sender = 10;
+        let mut keys = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..n_senders {
+            let (pk, addr) = test_keypair();
+            keys.push(pk);
+            addrs.push(addr);
+        }
+        let recipient = revm::primitives::Address::from_slice(&[0x99; 20]);
+        let deploy_bytecode =
+            revm::primitives::Bytes::copy_from_slice(&[0x60, 0x80, 0x60, 0x40, 0x52]);
+
+        // Build txs: each sender has a mix of transfers and deployments.
+        // Nonces are sequential per sender.
+        let mut txs = Vec::new();
+        for (pk, _) in keys.iter().zip(addrs.iter()) {
+            for nonce in 0..txs_per_sender {
+                if nonce % 2 == 0 {
+                    // Transfer
+                    txs.push(signed_transfer_tx(pk, nonce, recipient, 1_000_000_000));
+                } else {
+                    // Deploy
+                    txs.push(signed_tx(pk, nonce, tx::TxKind::Create, deploy_bytecode.as_ref()));
+                }
+            }
+        }
+
+        let m = make_module();
+        for addr in &addrs {
+            fund(&m, addr);
+        }
+        let results = m.handle_batch_parallel(&dummy_ctx(), &txs);
+        assert_eq!(results.len(), n_senders * usize::try_from(txs_per_sender).unwrap());
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "tx {i} must succeed");
+        }
+        // Each sender's nonce must be txs_per_sender.
+        for (i, addr) in addrs.iter().enumerate() {
+            let actual = m.nonce(addr);
+            assert_eq!(
+                actual, txs_per_sender,
+                "sender {i} nonce must be {txs_per_sender}, got {actual}"
+            );
+        }
+    }
+
+    /// Regression test: parallel execution with conflicting groups
+    /// (multiple senders transferring to the same recipient) must
+    /// preserve nonce continuity. The tx-granular conflict
+    /// re-execution path previously broke nonce continuity by not
+    /// applying non-conflicting txs' state changes to the main DB
+    /// before re-executing conflicting txs, causing `NonceTooHigh`
+    /// failures.
+    #[test]
+    fn handle_batch_parallel_conflict_nonce_continuity() {
+        let n_senders = 10;
+        let txs_per_sender = 5;
+        let mut keys = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..n_senders {
+            let (pk, addr) = test_keypair();
+            keys.push(pk);
+            addrs.push(addr);
+        }
+        // All senders transfer to the SAME recipient — this creates
+        // a write-write conflict on the recipient account, forcing
+        // the conflict re-execution path.
+        let shared_recipient = revm::primitives::Address::from_slice(&[0x99; 20]);
+
+        let mut txs = Vec::new();
+        for (pk, _) in keys.iter().zip(addrs.iter()) {
+            for nonce in 0..txs_per_sender {
+                txs.push(signed_transfer_tx(pk, nonce, shared_recipient, 1_000_000_000));
+            }
+        }
+
+        let m = make_module();
+        for addr in &addrs {
+            fund(&m, addr);
+        }
+        let results = m.handle_batch_parallel(&dummy_ctx(), &txs);
+        assert_eq!(results.len(), n_senders * usize::try_from(txs_per_sender).unwrap());
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "tx {i} must succeed");
+        }
+        // Each sender's nonce must be txs_per_sender.
+        for (i, addr) in addrs.iter().enumerate() {
+            let actual = m.nonce(addr);
+            assert_eq!(
+                actual, txs_per_sender,
+                "sender {i} nonce must be {txs_per_sender}, got {actual}"
+            );
+        }
     }
 
     /// Parallel execution must produce the same state root as serial

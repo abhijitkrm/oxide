@@ -11490,3 +11490,72 @@ focused EVM-state-root investigation session.
 - `cargo test --workspace` — all pass (unit, property, conformance)
 - `cargo bench --workspace` — not re-run this session
 - `cargo +nightly fuzz run codec` — not re-run this session
+
+### EVM parallel execution: tx-granular conflict re-execution nonce bug
+
+**Root cause found and fixed.** The `evm_load_default` and
+`evm_load_single_validator` tests were failing because the EVM parallel
+speculative execution path had a bug in its tx-granular conflict
+re-execution logic.
+
+**The bug:** When a group of transactions from one sender conflicted
+with a previously committed group (e.g., multiple senders transferring
+to the same recipient), the conflict resolver only re-executed the
+*specific* txs that accessed conflicting accounts. Non-conflicting txs
+kept their speculative results — but their state changes (nonce
+increments, balance deductions) were **never applied to the main DB**.
+When a later tx in the same group was re-executed against the main DB,
+the DB had a stale nonce, causing `NonceTooHigh` failures.
+
+In the devnet workload (100 senders, 10 txs each, mixed transfers +
+deploys + contract calls), this caused 441 out of 1000 transactions to
+fail with `NonceTooHigh { tx: N, state: 0 }`. The state root agreement
+check passed because all validators produced the same (incorrect) state
+— the failed txs were identical on every validator.
+
+**The fix:** When any tx in a group conflicts, re-execute the **entire**
+group sequentially against the main DB. This preserves nonce continuity
+within the group: the main DB sees each tx's nonce increment before the
+next tx executes. The tx-granular re-execution optimization was removed
+because it is fundamentally incompatible with per-sender nonce
+dependencies — partial re-execution breaks the nonce chain.
+
+**Why the unit tests didn't catch it:** The existing parallel execution
+tests used either:
+- Distinct recipients per sender (no conflicts → no re-execution path
+  triggered), or
+- Only transfers (the native fast path handles nonce increments
+  correctly even in the old tx-granular path, because native transfers
+  modify the DB directly).
+
+The bug only manifested with:
+1. Multiple senders writing to the **same** account (triggering
+   conflict detection), AND
+2. Contract calls/deploys that go through the revm path (where the
+   tx-granular path's failure to commit non-conflicting txs' state
+   caused stale nonces).
+
+**Regression test added:** `handle_batch_parallel_conflict_nonce_continuity`
+— 10 senders, 5 txs each, all transferring to the **same** recipient.
+This forces the conflict re-execution path and verifies that all
+senders' nonces are correct after execution.
+
+**Validation:**
+- `evm_load_single_validator`: 1 validator, 1000 txs — PASS (was FAIL)
+- `evm_load_default`: 4 validators, 1000 txs — PASS (was FAIL)
+- All 130 EVM unit tests — PASS
+- All 31 EVM conformance tests — PASS
+- All 18 EVM exploit tests — PASS
+- All 5 EVM multiblock tests — PASS
+- `cargo clippy -p evm -p executor --all-targets -- -D warnings` — PASS
+- `cargo fmt --check` — PASS
+
+**Performance note:** The fix may slightly reduce throughput for
+workloads with frequent conflicts, since conflicting groups are now
+fully re-executed instead of partially. However, the previous behavior
+was **incorrect** — it silently dropped nonce increments and produced
+wrong state. Correctness takes priority over speculative throughput.
+The `per_tx_accessed` field is retained in `GroupExecResult` as
+infrastructure for a future tx-granular optimization that properly
+handles nonce dependencies by committing non-conflicting txs' state
+before re-executing conflicting txs.

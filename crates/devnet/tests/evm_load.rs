@@ -308,3 +308,60 @@ fn evm_load_7_validators_large() {
     let total_txs = env_usize("EVM_LOAD_TXS", 100_000);
     run_evm_load_test(n, total_txs, 39000);
 }
+
+/// Diagnostic: serial path only (parallel_threshold = usize::MAX).
+/// If this passes and the parallel version fails, the bug is in the
+/// parallel speculative execution path.
+#[test]
+#[ignore = "diagnostic test; run with --ignored --nocapture"]
+fn evm_load_diagnostic_serial() {
+    let n = 1;
+    let total_txs = env_usize("EVM_LOAD_TXS", 1000);
+    eprintln!("diagnostic-serial: {n} validator, {total_txs} EVM txs (serial path)");
+
+    let num_senders = total_txs.clamp(10, 100);
+    let config = WorkloadConfig {
+        num_senders,
+        num_recipients: 50,
+        num_contracts: 10,
+        ..WorkloadConfig::default()
+    };
+    let mut workload = WorkloadGenerator::new(config);
+    let generated = workload.generate_batch(total_txs);
+
+    let mut devnet =
+        TcpMultiNodeDevnet::with_base_port_and_threshold(n, total_txs + 100, 43000, usize::MAX);
+
+    for sender in workload.senders() {
+        devnet.fund_evm_account(&sender.addr, u128::MAX);
+    }
+
+    let all_txs: Vec<types::TxBytes> = generated.iter().map(|g| g.envelope.clone()).collect();
+    let txs_per_round = env_usize("EVM_TXS_PER_ROUND", 500);
+    let rounds = total_txs.div_ceil(txs_per_round).max(2);
+    let (result, elapsed) = devnet.run_pipelined_txs(rounds, txs_per_round, &all_txs);
+    eprintln!("diagnostic-serial: consensus completed in {:.3}s", elapsed.as_secs_f64());
+
+    let n_blocks = result.finalized[0].len();
+    eprintln!("diagnostic-serial: {n_blocks} blocks finalized");
+
+    // Check nonce continuity.
+    let senders_to_check = workload.senders().len().min(20);
+    let mut nonce_ok = 0;
+    for (i, sender) in workload.senders().iter().enumerate().take(senders_to_check) {
+        let expected = sender.expected_nonce;
+        let actual = devnet.evm_module(0).nonce(&sender.addr);
+        if actual != expected {
+            eprintln!(
+                "diagnostic-serial: sender {i} nonce mismatch: expected {expected}, got {actual}"
+            );
+        } else {
+            nonce_ok += 1;
+        }
+    }
+    eprintln!("diagnostic-serial: {nonce_ok}/{senders_to_check} senders have correct nonce");
+
+    // Check EVM state root.
+    let evm_root = devnet.evm_module(0).state_root();
+    eprintln!("diagnostic-serial: EVM state root = {evm_root}");
+}

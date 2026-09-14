@@ -226,6 +226,29 @@ impl TcpMultiNodeDevnet {
     }
 
     /// Assemble a TCP-based multi-node devnet with `n` validators,
+    /// using a custom base port and parallel execution threshold.
+    ///
+    /// Use this in tests to control whether the EVM parallel
+    /// speculative execution path is used. Setting
+    /// `parallel_threshold` to `usize::MAX` forces the serial path.
+    pub fn with_base_port_and_threshold(
+        n: usize,
+        max_mempool_entries: usize,
+        base_port: u16,
+        parallel_threshold: usize,
+    ) -> Self {
+        Self::build(
+            n,
+            base_port,
+            GENESIS_BALANCE,
+            32,
+            max_mempool_entries,
+            parallel_threshold,
+            p2p::tcp::TcpTransportConfig::default(),
+        )
+    }
+
+    /// Assemble a TCP-based multi-node devnet with `n` validators,
     /// registering the exchange module (backed by each validator's
     /// bank module) on every validator. Use this for trading TPS
     /// tests that need the exchange module's `handle()` path through
