@@ -326,6 +326,13 @@ pub struct OxideBft {
     /// (structural check) and the vote is for the current view (C2
     /// fix) regardless of this flag.
     verify_per_vote: bool,
+    /// C9 fix: optional consensus WAL for restart safety. When
+    /// set, the engine appends a `WalEntry` after every vote and
+    /// QC delivery, ensuring `last_voted_view`, `voted_at_height`,
+    /// and `high_qc` are durable before the vote/QC message hits
+    /// the network. On restart, call [`OxideBft::recover_from_wal`]
+    /// to restore safety-critical state.
+    wal: Option<crate::wal::Wal>,
 }
 
 impl OxideBft {
@@ -378,6 +385,7 @@ impl OxideBft {
             // per view at 100 validators) while maintaining safety
             // — the aggregate verification catches any forged votes.
             verify_per_vote: false,
+            wal: None,
         }
     }
 
@@ -399,12 +407,14 @@ impl OxideBft {
     /// Disables BLS signature verification on votes, QCs, TCs, and
     /// proposals. This is a release-build backdoor: if called in a
     /// production validator, a byzantine peer could forge votes and
-    /// QCs with `Signature::ZERO`. The method is kept public only
-    /// for the conformance suite and benchmarks, which use fake
-    /// keys that can't produce real signatures.
+    /// QCs with `Signature::ZERO`. The method is gated behind
+    /// `#[cfg(any(test, feature = "conformance"))]` so it cannot be
+    /// called from a production build without explicitly enabling the
+    /// `conformance` feature.
     ///
     /// The multi-node simulation does NOT call this — it uses real
     /// keys and real verification.
+    #[cfg(any(test, feature = "conformance"))]
     #[doc(hidden)]
     #[must_use]
     pub fn without_signature_verification(mut self) -> Self {
@@ -420,6 +430,88 @@ impl OxideBft {
     pub fn with_per_vote_verification(mut self) -> Self {
         self.verify_per_vote = true;
         self
+    }
+
+    /// Attach a consensus WAL for restart safety (C9 fix).
+    ///
+    /// When set, the engine appends a [`WalEntry`] to the WAL
+    /// after every vote and QC delivery, ensuring the
+    /// safety-critical state (`last_voted_view`,
+    /// `voted_at_height`, `high_qc`, `current_view`,
+    /// `next_height`, `epoch`) is durable before the vote/QC
+    /// message hits the network.
+    ///
+    /// On restart, call [`OxideBft::recover_from_wal`] to
+    /// restore the engine's state from the WAL.
+    #[must_use]
+    pub fn with_wal(mut self, wal: crate::wal::Wal) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    /// Recover safety-critical state from the WAL.
+    ///
+    /// Reads the latest valid `WalEntry` from the WAL and
+    /// restores `last_voted_view`, `voted_at_height`, `high_qc`,
+    /// `current_view`, `next_height`, and `epoch`. This must be
+    /// called before the engine participates in consensus after a
+    /// restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError`] if the WAL cannot be read.
+    pub fn recover_from_wal(&mut self) -> Result<(), crate::wal::WalError> {
+        let Some(ref wal) = self.wal else {
+            return Ok(()); // no WAL — nothing to recover
+        };
+        if let Some(entry) = wal.recover()? {
+            self.last_voted_view = entry.last_voted_view;
+            self.voted_at_height = entry.voted_at_height;
+            self.high_qc = entry.high_qc;
+            self.current_view = entry.current_view;
+            self.next_height = entry.next_height;
+            self.epoch = entry.epoch;
+            // Sync the pacemaker to the recovered view.
+            self.pacemaker.sync_to_view(self.current_view);
+        }
+        Ok(())
+    }
+
+    /// Build a `WalEntry` snapshot of the engine's current
+    /// safety-critical state.
+    #[allow(dead_code)]
+    fn wal_entry(&self) -> crate::wal::WalEntry {
+        crate::wal::WalEntry {
+            last_voted_view: self.last_voted_view,
+            voted_at_height: self.voted_at_height.clone(),
+            high_qc: self.high_qc.clone(),
+            current_view: self.current_view,
+            next_height: self.next_height,
+            epoch: self.epoch,
+        }
+    }
+
+    /// Append the current state to the WAL (if attached).
+    /// Called after every vote and QC delivery.
+    fn append_wal(&mut self) {
+        if let Some(ref mut wal) = self.wal {
+            // Build the entry first to avoid borrowing self while
+            // the WAL is mutably borrowed.
+            let entry = crate::wal::WalEntry {
+                last_voted_view: self.last_voted_view,
+                voted_at_height: self.voted_at_height.clone(),
+                high_qc: self.high_qc.clone(),
+                current_view: self.current_view,
+                next_height: self.next_height,
+                epoch: self.epoch,
+            };
+            // If the WAL append fails, the engine continues —
+            // the vote is already in memory. A WAL failure means
+            // restart safety is compromised, but the current
+            // round should not stall. The operator should monitor
+            // WAL errors and restart the node if they persist.
+            let _ = wal.append(&entry);
+        }
     }
 
     /// The budget the engine uses when assembling proposals. Ceiling 1:
@@ -1071,6 +1163,12 @@ impl OxideBft {
         // Record the per-height lock: we may only ever vote this
         // hash at this height from now on.
         self.voted_at_height.insert(header.height.value(), block_hash);
+        // C9 fix: persist safety-critical state to the WAL before
+        // sending the vote. If the node crashes after the vote is
+        // sent but before the WAL is written, a restart could
+        // double-vote or vote for a conflicting block. The WAL
+        // append fsyncs before returning, ensuring durability.
+        self.append_wal();
         // Sign the vote (stage 5: real BLS if key is set).
         let signature = self.sign_vote(header.view, block_hash);
         Some(Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature })
@@ -1348,6 +1446,11 @@ impl OxideBft {
 
         // Update the highest QC.
         self.high_qc = Some(qc.clone());
+        // C9 fix: persist the updated high_qc to the WAL. A
+        // restarted validator must propose from the correct
+        // high_qc; without persistence, it could propose a stale
+        // fork.
+        self.append_wal();
 
         // Catch-up: if the QC's view is higher than our current view,
         // advance our view to qc.view + 1. This lets a restarted or
@@ -4051,5 +4154,71 @@ mod tests {
             engine.timeout_signatures.iter().all(Option::is_none),
             "timeout_signatures must be cleared after advance_view"
         );
+    }
+
+    /// C9 test: a restarted engine recovers `last_voted_view` and
+    /// `voted_at_height` from the WAL, preventing double-voting
+    /// and conflicting votes after a crash.
+    #[test]
+    fn c9_wal_restart_recovery() {
+        use crate::wal::Wal;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("consensus.wal");
+
+        // Phase 1: create an engine with a WAL, vote on a proposal,
+        // and verify the WAL was written.
+        {
+            let app = Arc::new(MockApp::new());
+            let wal = Wal::open(&wal_path).expect("open WAL");
+            let mut engine = OxideBft::new(app, single_validator_set())
+                .without_signature_verification()
+                .with_wal(wal);
+
+            // Manually set safety-critical state to simulate a vote.
+            engine.last_voted_view = Some(View::new(5));
+            engine.voted_at_height.insert(3, Hash([0xAA; 32]));
+            engine.current_view = View::new(6);
+            engine.next_height = Height::new(4);
+            engine.append_wal();
+        }
+
+        // Phase 2: simulate a restart — create a new engine with
+        // the same WAL and recover.
+        {
+            let app = Arc::new(MockApp::new());
+            let wal = Wal::open(&wal_path).expect("open WAL");
+            let mut engine = OxideBft::new(app, single_validator_set())
+                .without_signature_verification()
+                .with_wal(wal);
+
+            engine.recover_from_wal().expect("recover from WAL");
+
+            // The recovered state must prevent double-voting.
+            assert_eq!(engine.last_voted_view, Some(View::new(5)));
+            // The recovered state must prevent conflicting votes.
+            assert_eq!(
+                engine.voted_at_height.get(&3),
+                Some(&Hash([0xAA; 32])),
+                "voted_at_height must be recovered from WAL"
+            );
+            // The recovered state must have the correct view and height.
+            assert_eq!(engine.current_view, View::new(6));
+            assert_eq!(engine.next_height, Height::new(4));
+        }
+    }
+
+    /// C9 test: an engine without a WAL does not crash when
+    /// `append_wal` or `recover_from_wal` is called.
+    #[test]
+    fn c9_no_wal_no_crash() {
+        let mut engine = make_engine();
+
+        // append_wal with no WAL should be a no-op.
+        engine.append_wal();
+
+        // recover_from_wal with no WAL should return Ok(()).
+        engine.recover_from_wal().expect("recover with no WAL should be Ok");
     }
 }

@@ -166,10 +166,13 @@ struct PendingBatch {
 /// At the default 100 ms settle interval this is ~6 seconds of
 /// retry — long enough to ride out a transient mempool-full or a
 /// consensus reconnect, short enough that a permanently-rejected
-/// envelope doesn't wedge the settlement lane forever. The drop is
-/// a loud data-loss event (logged with the pair count); the lane
-/// then continues and the nonce is reused by the next batch because
-/// the dropped tx never executed.
+/// envelope doesn't wedge the settlement lane forever. After this
+/// many retries, the settler logs a critical alert but does NOT
+/// drop the pending envelope — dropping would cause cache/chain
+/// divergence (the off-chain cache already reflects the fills from
+/// `seal_batch`, but the on-chain settlement never landed). Instead,
+/// the envelope stays pending so the operator can intervene and the
+/// settlement can eventually land when the chain recovers.
 const MAX_PENDING_RETRIES: u32 = 60;
 
 impl BatchSettler {
@@ -238,14 +241,21 @@ impl BatchSettler {
                     Err(e) => {
                         p.attempts += 1;
                         if p.attempts >= MAX_PENDING_RETRIES {
+                            // HIGH fix: do NOT drop the pending
+                            // envelope. The fills were already removed
+                            // from the order book by `seal_batch` and
+                            // the off-chain cache reflects the trades.
+                            // Dropping the envelope would leave the
+                            // cache applied without on-chain settlement,
+                            // causing cache/chain divergence. Instead,
+                            // log a critical alert and keep the
+                            // envelope pending so the operator can
+                            // intervene and the settlement can land
+                            // when the chain recovers.
                             eprintln!(
-                                "batch settler: dropping batch of {} pairs after {} failed submissions: {e}",
+                                "batch settler: CRITICAL — batch of {} pairs failed {} submissions, keeping pending: {e}",
                                 p.pair_count, p.attempts
                             );
-                            // The nonce is deliberately NOT advanced:
-                            // the dropped tx never executed, so the
-                            // next batch reuses this nonce.
-                            *pending = None;
                         }
                         Err(e)
                     }
@@ -444,6 +454,14 @@ async fn handle_connection(
                 break;
             }
             let count = u32::from_le_bytes(count_buf) as usize;
+            // HIGH fix: bound-check `count` BEFORE allocating. A
+            // byzantine peer can send `u32::MAX` as the count, which
+            // would cause a multi-GB allocation (OOM). The MAX_BATCH_SIZE
+            // check in the protocol decoder runs after allocation;
+            // we must check here first.
+            if count > crate::protocol::MAX_BATCH_SIZE {
+                break; // reject oversized batch
+            }
             let entries_len = count * crate::protocol::BATCH_ENTRY_SIZE;
             let mut entries = vec![0u8; entries_len];
             if socket.read_exact(&mut entries).await.is_err() {
@@ -1250,6 +1268,11 @@ async fn handle_connection_multi(
                 break;
             }
             let count = u32::from_le_bytes(count_buf) as usize;
+            // HIGH fix: bound-check `count` BEFORE allocating (OOM
+            // prevention — same as the async path above).
+            if count > crate::protocol::MAX_BATCH_SIZE {
+                break; // reject oversized batch
+            }
             let entries_len = count * crate::protocol::BATCH_ENTRY_SIZE;
             let mut entries = vec![0u8; entries_len];
             if socket.read_exact(&mut entries).await.is_err() {
@@ -1783,13 +1806,15 @@ mod tests {
         }
     }
 
-    /// Regression test: a permanently-rejected envelope must not
-    /// wedge the settlement lane forever. After `MAX_PENDING_RETRIES`
-    /// the batch is dropped (loudly) and the nonce is reused by the
-    /// next batch — the dropped tx never executed, so the executor
-    /// still expects it.
+    /// Regression test: a permanently-rejected envelope must NOT be
+    /// dropped after `MAX_PENDING_RETRIES`. Dropping would cause
+    /// cache/chain divergence (the off-chain cache already reflects
+    /// the fills from `seal_batch`, but the on-chain settlement never
+    /// landed). Instead, the envelope stays pending so the operator
+    /// can intervene and the settlement can land when the chain
+    /// recovers. The nonce is NOT advanced (the tx never executed).
     #[test]
-    fn batch_settler_drops_after_max_retries_and_reuses_nonce() {
+    fn batch_settler_keeps_pending_after_max_retries() {
         let mut server = MatchingServer::new(cfg(), 100);
         server.fund_account(&addr(9), 1_000_000_000_000);
         server.fund_account(&addr(1), 1_000_000_000_000);
@@ -1809,7 +1834,7 @@ mod tests {
         }
 
         let shared = Arc::new(SharedMatcher::new(server));
-        // Fail forever — the batch is retried then dropped.
+        // Fail forever — the batch is retried but NOT dropped.
         let flaky = Arc::new(FlakySubmitter {
             fail_remaining: std::sync::Mutex::new(u32::MAX),
             submissions: std::sync::Mutex::new(Vec::new()),
@@ -1822,19 +1847,19 @@ mod tests {
             0,
         );
 
-        // 1 initial failure + (MAX-1) retries → dropped.
+        // 1 initial failure + (MAX-1) retries — all fail, but the
+        // pending envelope is NOT dropped.
         for _ in 0..MAX_PENDING_RETRIES {
             assert!(settler.settle_now().is_err());
         }
-        // One more call: pending is now cleared, so a NEW batch is
-        // sealed — it must carry the SAME nonce (the dropped tx
-        // never executed). The envelope differs (different fills
-        // accumulated) but the nonce field (bytes 20..28) is reused.
-        server_refill(&shared);
+        // One more call: pending is still there, so the SAME envelope
+        // is retried (not a new batch). The nonce is NOT advanced.
         assert!(settler.settle_now().is_err());
         let subs = flaky.submissions.lock().unwrap();
+        // All submissions carry the same nonce (the same envelope
+        // is retried, never dropped).
         let first_nonce = &subs[0].as_bytes()[20..28];
         let last_nonce = &subs[subs.len() - 1].as_bytes()[20..28];
-        assert_eq!(first_nonce, last_nonce, "nonce must be reused after a drop");
+        assert_eq!(first_nonce, last_nonce, "nonce must not advance while pending");
     }
 }

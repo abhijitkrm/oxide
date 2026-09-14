@@ -748,6 +748,7 @@ mod tests {
             module_roots: vec![],
             module_state: vec![],
             executed_nonces: vec![],
+            nonce_root: primitives::Hash::ZERO,
         };
         let err = node.import_snapshot(&empty_snapshot).expect_err("empty snapshot must fail");
         assert_eq!(err, executor::SnapshotImportError::EmptySnapshot);
@@ -798,6 +799,9 @@ mod tests {
         for (_, root) in &snapshot.module_roots {
             root_data.extend_from_slice(root.as_bytes());
         }
+        // HIGH fix: include the nonce root in the state root
+        // recomputation (it's now part of the authenticated root).
+        root_data.extend_from_slice(snapshot.nonce_root.as_bytes());
         snapshot.state_root = Hasher::hash_one(Domain::Block, &root_data);
 
         let node2 = Node::assemble(&config);

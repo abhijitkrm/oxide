@@ -508,7 +508,7 @@ impl<T: Transport> BroadcastEngine for NetworkedBroadcast<T> {
                 Err(TransportError::MessageTooLarge) => {
                     return Err(BroadcastError::PayloadTooLarge);
                 }
-                Err(TransportError::ChannelClosed) => {
+                Err(TransportError::ChannelClosed | TransportError::ChannelFull) => {
                     return Err(BroadcastError::DisseminationFailed);
                 }
             }

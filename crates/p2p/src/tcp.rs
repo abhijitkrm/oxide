@@ -244,6 +244,14 @@ const DEFAULT_MAX_MESSAGE_BYTES: u64 = 16 << 20;
 /// applying backpressure to the peer.
 const INBOUND_CHANNEL_BOUND: usize = 10_000;
 
+/// Bound on the outbound message channel (HIGH fix). Prevents a
+/// slow or stalled peer from causing unbounded outbound queue growth
+/// (OOM) — if the writer thread can't drain fast enough, `send()`
+/// returns `ChannelFull` and the caller applies backpressure or sheds
+/// load. `10_000` matches the inbound bound; consensus bursts rarely
+/// exceed a few hundred queued frames per peer.
+const OUTBOUND_CHANNEL_BOUND: usize = 10_000;
+
 /// The default connect timeout for outbound TCP connections. Short
 /// enough that a dead peer is detected quickly during devnet startup.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -333,7 +341,7 @@ pub struct TcpTransport {
     /// accept thread may insert new connections concurrently. The
     /// lock is held only to look up the channel sender, not during
     /// I/O.
-    streams: Arc<Mutex<HashMap<PeerId, mpsc::Sender<Vec<u8>>>>>,
+    streams: Arc<Mutex<HashMap<PeerId, mpsc::SyncSender<Vec<u8>>>>>,
     /// Inbound message channel. Reader threads write; `recv()`
     /// reads.
     inbound_rx: Mutex<mpsc::Receiver<InboundMessage>>,
@@ -534,7 +542,7 @@ impl TcpTransport {
         let listener = TcpListener::bind(listen_addr)
             .unwrap_or_else(|e| panic!("failed to bind TCP transport to {listen_addr}: {e}"));
 
-        let streams: Arc<Mutex<HashMap<PeerId, mpsc::Sender<Vec<u8>>>>> =
+        let streams: Arc<Mutex<HashMap<PeerId, mpsc::SyncSender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -691,6 +699,7 @@ impl TcpTransport {
         let connect_tx = inbound_tx.clone();
         let connect_shutdown = shutdown.clone();
         let our_id = peer_id.clone();
+        let connect_admission = admission.clone();
         #[cfg(feature = "tls")]
         let connect_tls = tls.clone();
         thread::spawn(move || {
@@ -704,6 +713,7 @@ impl TcpTransport {
                 let css = connect_shutdown_streams.clone();
                 let ct = connect_tx.clone();
                 let rshut = connect_shutdown.clone();
+                let cac = connect_admission.clone();
                 #[cfg(feature = "tls")]
                 let ctls = connect_tls.clone();
                 thread::spawn(move || {
@@ -740,6 +750,10 @@ impl TcpTransport {
                             if let Some(ref tls_config) = ctls {
                                 // Initiate TLS as client.
                                 let _ = stream.set_nodelay(true);
+                                // Ensure blocking mode (TcpStream::connect
+                                // should already be blocking, but be
+                                // explicit — rustls requires blocking I/O).
+                                let _ = stream.set_nonblocking(false);
                                 let server_name =
                                     rustls::pki_types::ServerName::try_from("localhost")
                                         .expect("localhost is a valid server name");
@@ -789,6 +803,12 @@ impl TcpTransport {
                                 // Reader loop exited — connection broke.
                                 // Remove the stale writer channel and
                                 // shutdown stream, then retry.
+                                // Release the admission connection slot
+                                // (HIGH fix: prevents connection counter
+                                // leak on disconnect).
+                                if let Some(ref ac) = cac {
+                                    ac.release_connection();
+                                }
                                 cs.lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .remove(&pid);
@@ -841,6 +861,12 @@ impl TcpTransport {
                         // Reader loop exited — connection broke.
                         // Remove the stale writer channel and
                         // shutdown stream, then retry.
+                        // Release the admission connection slot
+                        // (HIGH fix: prevents connection counter
+                        // leak on disconnect).
+                        if let Some(ref ac) = cac {
+                            ac.release_connection();
+                        }
                         cs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pid);
                         css.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pid);
                         thread::sleep(Duration::from_millis(500));
@@ -895,7 +921,15 @@ impl TcpTransport {
         for stream in streams.values() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
+        let connection_count = streams.len();
         drop(streams); // release the lock before clearing the senders
+        // Release all admission connection slots (HIGH fix: prevents
+        // connection counter leak on shutdown).
+        if let Some(ref ac) = self.admission {
+            for _ in 0..connection_count {
+                ac.release_connection();
+            }
+        }
         // Drop all writer senders — this causes writer threads to exit
         // on their next `recv_timeout` (within 100ms).
         self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
@@ -1032,8 +1066,14 @@ impl Transport for TcpTransport {
             return Err(TransportError::UnknownPeer);
         };
         // Clone the bytes into a Vec for the channel. The writer
-        // thread owns the stream and writes the frame.
-        sender.send(bytes.to_vec()).map_err(|_| TransportError::ChannelClosed)
+        // thread owns the stream and writes the frame. Use
+        // `try_send` (non-blocking) so a full outbound channel
+        // returns `ChannelFull` instead of blocking the caller or
+        // growing the queue without bound.
+        sender.try_send(bytes.to_vec()).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
+            mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
+        })
     }
 
     fn recv(&mut self) -> Option<InboundMessage> {
@@ -1164,9 +1204,21 @@ fn reader_loop(
                     return; // channel closed — transport shut down
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // Read timeout (TLS poll timeout) — loop will check
-                // the shutdown flag and retry.
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // Read timeout or would block (TLS poll timeout) —
+                // loop will check the shutdown flag and retry.
+                // C4 fix: SharedStream uses a single Mutex for both
+                // read and write. The reader holds the Mutex during
+                // read_frame (up to read_timeout). Without a yield,
+                // the reader starves the writer — it re-acquires the
+                // Mutex before the writer can. A short sleep gives
+                // the writer a window to acquire the Mutex and flush
+                // pending outbound frames.
+                #[cfg(feature = "tls")]
+                thread::sleep(Duration::from_millis(1));
             }
             Err(_) => return, // connection closed or error
         }
@@ -1250,8 +1302,8 @@ fn writer_loop(
 fn spawn_writer(
     write_stream: Box<dyn PeerStream>,
     shutdown: &Arc<AtomicBool>,
-) -> mpsc::Sender<Vec<u8>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+) -> mpsc::SyncSender<Vec<u8>> {
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_CHANNEL_BOUND);
     let shutdown = Arc::clone(shutdown);
     thread::spawn(move || {
         writer_loop(write_stream, rx, shutdown);
@@ -1297,18 +1349,58 @@ fn accept_tls_connection(
     stream: TcpStream,
     tls_config: &TlsConfig,
     max_message_bytes: u64,
-    read_timeout: Duration,
+    _read_timeout: Duration,
 ) -> AcceptResult {
     // Disable Nagle (same rationale as plain accept).
     let _ = stream.set_nodelay(true);
+    // The listener is in non-blocking mode, and accepted streams
+    // inherit that mode. rustls's `StreamOwned` requires blocking
+    // I/O (with a read timeout) — non-blocking mode causes
+    // `EAGAIN` (WouldBlock) errors that the reader loop treats as
+    // fatal. Switch back to blocking mode with a read timeout.
+    let _ = stream.set_nonblocking(false);
     let server_conn = rustls::ServerConnection::new(tls_config.server_config.clone()).ok()?;
     let mut tls_stream = rustls::StreamOwned::new(server_conn, stream);
-    let _ = tls_stream.sock.set_read_timeout(Some(read_timeout));
-    let peer_id = read_frame(&mut tls_stream, max_message_bytes).ok()?;
-    let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
-    let write_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
-    let reader_stream = Box::new(shared) as Box<dyn PeerStream>;
-    Some((peer_id, write_stream, reader_stream))
+    // C4 fix: use TLS_READER_POLL_TIMEOUT (500ms), not the
+    // configured read_timeout (30s). SharedStream uses a single
+    // Mutex for both read and write; a long read timeout would
+    // hold the Mutex for 30s, starving the writer. The short poll
+    // timeout lets the reader release the Mutex frequently so the
+    // writer can acquire it. The reader loop handles TimedOut by
+    // retrying.
+    let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
+    // Read the first frame (self-claimed peer ID). This also
+    // completes the TLS handshake, during which the client
+    // certificate is verified against the trust store.
+    let claimed_peer_id = read_frame(&mut tls_stream, max_message_bytes).ok()?;
+
+    // C4 fix: extract the authenticated peer ID from the verified
+    // client certificate. The first-frame peer ID is self-claimed;
+    // the certificate is cryptographically verified. If they don't
+    // match, reject the connection.
+    let cert_peer_id = tls_config.extract_peer_id(tls_stream.conn.peer_certificates());
+    match cert_peer_id {
+        Some(authenticated_id) => {
+            // Defense in depth: verify the self-claimed peer ID
+            // matches the certificate peer ID.
+            if authenticated_id != claimed_peer_id {
+                // Certificate peer ID doesn't match the claimed peer
+                // ID — reject (possible impersonation attempt).
+                return None;
+            }
+            // Use the authenticated peer ID from the certificate.
+            let peer_id = authenticated_id;
+            let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
+            let write_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
+            let reader_stream = Box::new(shared) as Box<dyn PeerStream>;
+            Some((peer_id, write_stream, reader_stream))
+        }
+        None => {
+            // No client certificate or cert not in the peer_id_map.
+            // mTLS requires a valid client cert — reject.
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1836,5 +1928,179 @@ mod tests {
         thread::sleep(Duration::from_millis(500));
         let msg = poll_recv(&mut transport_a, Duration::from_millis(500));
         assert!(msg.is_none(), "A must not receive from unlisted peer C");
+    }
+
+    /// C4 fix: mutual TLS — two nodes connect with mTLS and exchange
+    /// messages. The server verifies the client certificate, and the
+    /// peer ID is extracted from the verified certificate (not the
+    /// self-claimed first-frame ID).
+    #[cfg(feature = "tls")]
+    #[test]
+    fn c4_mutual_tls_two_nodes_exchange() {
+        use crate::tls::{TlsConfig, generate_ca_cert_pem};
+
+        // Install the aws_lc_rs crypto provider as the process default.
+        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+
+        let addr_a = "127.0.0.1:19200";
+        let addr_b = "127.0.0.1:19201";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        // Generate certs and keys ONCE, then share between configs.
+        // This ensures A trusts B's actual cert (not a separately
+        // generated one) and vice versa.
+        let (cert_pem_a, key_pem_a) = generate_ca_cert_pem(&id_a);
+        let (cert_pem_b, key_pem_b) = generate_ca_cert_pem(&id_b);
+        let cert_der_a = rustls_pemfile::certs(&mut cert_pem_a.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
+            .as_ref()
+            .to_vec();
+        let cert_der_b = rustls_pemfile::certs(&mut cert_pem_b.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
+            .as_ref()
+            .to_vec();
+
+        // Build mTLS configs: each node trusts the other's actual cert.
+        let tls_a = TlsConfig::with_cert_pem(
+            &id_a,
+            &cert_pem_a,
+            &key_pem_a,
+            vec![(id_b.clone(), cert_der_b.clone())],
+        );
+        let tls_b = TlsConfig::with_cert_pem(
+            &id_b,
+            &cert_pem_b,
+            &key_pem_b,
+            vec![(id_a.clone(), cert_der_a.clone())],
+        );
+
+        let mut transport_a = TcpTransport::with_tls(
+            addr_a,
+            id_a.clone(),
+            vec![(id_b.clone(), addr_b.to_string())],
+            TcpTransportConfig::default(),
+            tls_a,
+        );
+        let mut transport_b = TcpTransport::with_tls(
+            addr_b,
+            id_b.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+            TcpTransportConfig::default(),
+            tls_b,
+        );
+
+        thread::sleep(Duration::from_millis(500));
+
+        // A → B: normal communication should work over mTLS.
+        transport_a.send(&id_b, b"hello over mTLS").unwrap();
+        let msg = poll_recv(&mut transport_b, Duration::from_secs(5));
+        assert_eq!(msg.expect("B should receive over mTLS").bytes, b"hello over mTLS");
+
+        // B → A: reply should also work.
+        transport_b.send(&id_a, b"reply over mTLS").unwrap();
+        let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+        assert_eq!(msg.expect("A should receive reply over mTLS").bytes, b"reply over mTLS");
+    }
+
+    /// C4 fix: mutual TLS — a peer with an untrusted certificate must
+    /// be rejected. Node A trusts only B's cert; node C has a cert
+    /// that A does not trust. C's connection must be rejected by the
+    /// TLS handshake (no valid client cert).
+    #[cfg(feature = "tls")]
+    #[test]
+    fn c4_mutual_tls_rejects_untrusted_cert() {
+        use crate::tls::{TlsConfig, generate_ca_cert_pem};
+
+        // Install the aws_lc_rs crypto provider as the process default.
+        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+
+        let addr_a = "127.0.0.1:19210";
+        let addr_b = "127.0.0.1:19211";
+        let addr_c = "127.0.0.1:19212";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+        let id_c = vec![2u8];
+
+        // Generate certs and keys ONCE for all three nodes.
+        let (cert_pem_a, key_pem_a) = generate_ca_cert_pem(&id_a);
+        let (cert_pem_b, key_pem_b) = generate_ca_cert_pem(&id_b);
+        let (cert_pem_c, key_pem_c) = generate_ca_cert_pem(&id_c);
+        let cert_der_a = rustls_pemfile::certs(&mut cert_pem_a.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
+            .as_ref()
+            .to_vec();
+        let cert_der_b = rustls_pemfile::certs(&mut cert_pem_b.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
+            .as_ref()
+            .to_vec();
+
+        // A trusts only B (not C).
+        let tls_a = TlsConfig::with_cert_pem(
+            &id_a,
+            &cert_pem_a,
+            &key_pem_a,
+            vec![(id_b.clone(), cert_der_b.clone())],
+        );
+        // B trusts only A.
+        let tls_b = TlsConfig::with_cert_pem(
+            &id_b,
+            &cert_pem_b,
+            &key_pem_b,
+            vec![(id_a.clone(), cert_der_a.clone())],
+        );
+        // C trusts A (but A does not trust C).
+        let tls_c = TlsConfig::with_cert_pem(
+            &id_c,
+            &cert_pem_c,
+            &key_pem_c,
+            vec![(id_a.clone(), cert_der_a.clone())],
+        );
+
+        let mut transport_a = TcpTransport::with_tls(
+            addr_a,
+            id_a.clone(),
+            vec![(id_b.clone(), addr_b.to_string())],
+            TcpTransportConfig::default(),
+            tls_a,
+        );
+        let mut transport_b = TcpTransport::with_tls(
+            addr_b,
+            id_b.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+            TcpTransportConfig::default(),
+            tls_b,
+        );
+        // C connects to A, but A does not trust C's cert.
+        let mut transport_c = TcpTransport::with_tls(
+            addr_c,
+            id_c.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+            TcpTransportConfig::default(),
+            tls_c,
+        );
+
+        thread::sleep(Duration::from_millis(500));
+
+        // B → A should work (A trusts B).
+        transport_b.send(&id_a, b"hello from trusted B").unwrap();
+        let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+        assert_eq!(msg.expect("A should receive from B").bytes, b"hello from trusted B");
+
+        // C → A should be rejected (A does not trust C's cert).
+        // The TLS handshake fails, so the send may error or the
+        // message is never delivered.
+        let _ = transport_c.send(&id_a, b"hello from untrusted C");
+        thread::sleep(Duration::from_millis(500));
+        let msg = poll_recv(&mut transport_a, Duration::from_millis(500));
+        assert!(msg.is_none(), "A must not receive from untrusted C");
     }
 }

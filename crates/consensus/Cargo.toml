@@ -18,12 +18,22 @@ crypto = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
 
+[features]
+# Conformance mode: disables BLS signature verification for
+# conformance suites and benchmarks that use fake keys. This feature
+# must NEVER be enabled in production builds — it allows forged votes
+# and QCs. The `without_signature_verification` method is gated
+# behind `#[cfg(any(test, feature = "conformance"))]`.
+conformance = []
+
 [dev-dependencies]
 criterion = "0.7.0"
+tempfile = "3"
 
 [[bench]]
 name = "engine"
 harness = false
+required-features = ["conformance"]
 
 [lints]
 workspace = true

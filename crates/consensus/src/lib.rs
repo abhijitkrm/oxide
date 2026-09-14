@@ -23,8 +23,10 @@ pub mod engine;
 pub mod pacemaker;
 pub mod sequencer;
 pub mod validator;
+pub mod wal;
 
 pub use engine::{EpochRotationError, OxideBft};
 pub use pacemaker::{Pacemaker, PacemakerEvent, PacemakerState};
 pub use sequencer::SequencerEngine;
 pub use validator::{ValidatorIndex, ValidatorSet};
+pub use wal::{Wal, WalEntry, WalError};

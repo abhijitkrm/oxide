@@ -12,6 +12,131 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Mutual TLS bound to validator/peer identities (C4)**
+  (`crates/p2p/src/tls.rs`, `crates/p2p/src/tcp.rs`)
+  - The p2p transport now requires mutual TLS: the server verifies
+    the client's certificate, and the client presents its
+    certificate. The verified certificate's DER is bound to a
+    configured peer ID via a `peer_id_map`.
+  - `accept_tls_connection` extracts the authenticated peer ID
+    from the verified certificate and verifies it matches the
+    self-claimed first-frame peer ID. Unknown or untrusted
+    certificates are rejected.
+  - Added `TlsConfig::with_cert_pem()` for pre-generated
+    certificates (production file-based config and test sharing).
+  - **In plain words:** A peer can no longer impersonate a
+    validator by claiming its peer ID. The TLS handshake
+    cryptographically verifies the peer's identity, and the
+    first-frame peer ID must match the certificate.
+
+- **Consensus write-ahead log for restart safety (C9)**
+  (`crates/consensus/src/wal.rs`, `crates/consensus/src/engine.rs`)
+  - Added a `Wal` that persists safety-critical consensus state
+    (`last_voted_view`, `voted_at_height`, `high_qc`,
+    `current_view`, `next_height`, `epoch`) to a durable file
+    before the engine sends any vote or QC.
+  - On restart, `OxideBft::recover_from_wal()` restores the
+    state, preventing double-voting and conflicting votes after
+    a crash.
+  - Entries are CRC32-protected and length-prefixed; truncated
+    or corrupted tail entries are discarded on recovery.
+  - **In plain words:** A validator that crashes and restarts
+    can no longer double-vote or vote for a conflicting block.
+    The WAL ensures the safety-critical state is durable before
+    the vote hits the network.
+
+- **O(n) receipts root for the EVM module**
+  (`modules/evm/src/receipts.rs`)
+  - Replaced the O(n²) `position()` lookup in `receipts_root` with an
+    O(n) indexed iteration. The encoder now receives the receipt and
+    its index directly, eliminating the per-receipt scan.
+  - **In plain words:** Computing the receipts root for a block with
+    millions of transactions no longer takes quadratic time. Each
+    receipt is processed exactly once instead of scanning the entire
+    receipt list to find each one's position.
+
+- **Authenticated replay-protection nonces in snapshots**
+  (`crates/executor/src/lib.rs`)
+  - Added `nonce_root` to `ExecutorSnapshot` that binds
+    `executed_nonces` into the authenticated `state_root`. A crafted
+    snapshot can no longer zero or corrupt replay-protection nonces
+    without detection.
+  - **In plain words:** When a new node syncs state from a snapshot,
+    the replay-protection nonce map is now cryptographically
+    authenticated. A malicious peer cannot tamper with nonces to
+    enable replay attacks.
+
+- **`conformance` feature for the consensus crate**
+  (`crates/consensus/Cargo.toml`, `crates/consensus/src/engine.rs`)
+  - Added a `conformance` feature that gates the
+    `without_signature_verification` method. The method can no longer
+    be called from production builds without explicitly enabling the
+    feature.
+  - **In plain words:** The BLS signature verification bypass, used
+    only by conformance tests and benchmarks with fake keys, is now
+    locked behind a feature flag. It cannot accidentally ship in a
+    production validator.
+
+### Fixed
+
+- **Signature malleability: reject recovery IDs 2 and 3**
+  (`crates/crypto/src/secp.rs`)
+  - `RecoveryId::try_from_u8` now rejects values 2 and 3 (only 0 and
+    1 are valid for Ethereum signatures). Previously, 2/3 were
+    accepted, enabling signature malleability and DoS vectors.
+  - **In plain words:** Only recovery IDs 0 and 1 are now accepted in
+    transaction signatures. Values 2 and 3 correspond to
+    provably-unused keys and never appear in real Ethereum signatures.
+
+- **Unbounded outbound p2p channel**
+  (`crates/p2p/src/tcp.rs`, `crates/ports/src/transport.rs`)
+  - Replaced the unbounded `mpsc::channel()` with a bounded
+    `mpsc::sync_channel(10_000)`. `send()` now returns
+    `TransportError::ChannelFull` when the outbound queue is full,
+    applying backpressure instead of growing without bound.
+  - **In plain words:** A slow peer can no longer cause the node to
+    run out of memory by buffering unlimited outbound messages. When
+    the queue is full, the sender is told to back off.
+
+- **Admission control connection leak**
+  (`crates/p2p/src/tcp.rs`)
+  - `release_connection` is now called when connections break and on
+    shutdown. Previously, the connection counter leaked, eventually
+    reaching the cap and rejecting all new connections.
+  - **In plain words:** The node no longer slowly loses the ability
+    to accept new peer connections over time. Disconnected peers
+    properly free their connection slots.
+
+- **BatchSettler cache/chain divergence**
+  (`crates/matcher/src/server.rs`)
+  - The pending settlement envelope is no longer dropped after max
+    retries. Dropping would leave the off-chain cache applied
+    without on-chain settlement. The envelope stays pending so the
+    operator can intervene.
+  - **In plain words:** When a settlement transaction repeatedly
+    fails to submit, the system no longer silently drops it and
+    diverges from the chain. The pending settlement is kept for
+    operator intervention.
+
+- **TCP batch decoder OOM**
+  (`crates/matcher/src/server.rs`)
+  - The batch `count` field is now bound-checked against
+    `MAX_BATCH_SIZE` before allocating the buffer. A byzantine peer
+    sending `u32::MAX` could previously trigger a multi-GB allocation.
+  - **In plain words:** A malicious peer can no longer crash the
+    matching engine by sending a huge batch count in a single
+    request.
+
+- **`without_signature_verification` release-build backdoor**
+  (`crates/consensus/src/engine.rs`)
+  - The method is now gated behind `#[cfg(any(test, feature =
+    "conformance"))]`. Previously, it was callable from release
+    builds, allowing a production validator to disable BLS
+    verification.
+  - **In plain words:** The signature verification bypass can no
+    longer be called from a production build. It is only available
+    in tests and when the `conformance` feature is explicitly enabled.
+
 - **Sparse incremental state-root computation for the EVM module**
   (`modules/evm/src/lib.rs`, `modules/evm/benches/trie_root.rs`)
   - Replaced the O(N) `HashBuilder` trie-assembly pass with a

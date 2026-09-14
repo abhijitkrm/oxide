@@ -99,7 +99,8 @@ pub enum ExecError {
 pub struct ExecutorSnapshot {
     /// The chain height (highest finalized block).
     pub height: u64,
-    /// The aggregate state root (hash of all module state roots).
+    /// The aggregate state root (hash of all module state roots AND
+    /// the executed-nonce root).
     pub state_root: Hash,
     /// Per-module state roots, in registration order.
     pub module_roots: Vec<(&'static str, Hash)>,
@@ -112,6 +113,14 @@ pub struct ExecutorSnapshot {
     /// `(address, next_expected_nonce)`. Empty for v0 snapshots
     /// (treated as "all nonces start at 0" on import).
     pub executed_nonces: Vec<(primitives::Address, u64)>,
+    /// HIGH fix: hash of the executed-nonce map, binding it into the
+    /// authenticated `state_root`. Without this, a crafted snapshot
+    /// could zero or corrupt `executed_nonces` (replay protection)
+    /// without detection — `executed_nonces` are not part of any
+    /// module's state root. The nonce root is computed as
+    /// `keccak256(concat(address || nonce_le))` over all entries,
+    /// sorted by address for determinism.
+    pub nonce_root: Hash,
 }
 
 /// A snapshot import error.
@@ -150,6 +159,16 @@ pub enum SnapshotImportError {
         /// The recomputed root from the imported KV data.
         actual: Hash,
     },
+    /// HIGH fix: the snapshot's `nonce_root` does not match the
+    /// recomputed hash of the `executed_nonces` field. This catches
+    /// a crafted snapshot that tampers with replay-protection
+    /// nonces without updating the authenticated root.
+    NonceRootMismatch {
+        /// The expected root from the snapshot.
+        expected: Hash,
+        /// The recomputed root from the `executed_nonces`.
+        actual: Hash,
+    },
 }
 
 impl std::fmt::Display for SnapshotImportError {
@@ -169,11 +188,33 @@ impl std::fmt::Display for SnapshotImportError {
             Self::ModuleRootMismatch { module, expected, actual } => {
                 write!(f, "module {module} root mismatch: expected {expected}, got {actual}")
             }
+            Self::NonceRootMismatch { expected, actual } => {
+                write!(f, "nonce root mismatch: expected {expected}, got {actual}")
+            }
         }
     }
 }
 
 impl std::error::Error for SnapshotImportError {}
+
+/// HIGH fix: compute the authenticated root of the executed-nonce
+/// map. This binds `executed_nonces` into the snapshot's
+/// `state_root` so a crafted snapshot cannot tamper with
+/// replay-protection nonces without detection.
+///
+/// The root is `keccak256(concat(address || nonce_le))` over all
+/// entries sorted by address. Sorting ensures determinism regardless
+/// of `HashMap` iteration order.
+fn compute_nonce_root(nonces: &[(primitives::Address, u64)]) -> Hash {
+    let mut sorted = nonces.to_vec();
+    sorted.sort_by_key(|a| a.0);
+    let mut data = Vec::with_capacity(sorted.len() * 28);
+    for (addr, nonce) in &sorted {
+        data.extend_from_slice(&addr.0);
+        data.extend_from_slice(&nonce.to_le_bytes());
+    }
+    Hasher::hash_one(Domain::Block, &data)
+}
 
 /// Transaction context passed to modules during `handle`.
 ///
@@ -892,27 +933,31 @@ impl Executor {
         for (_, root) in &module_roots {
             root_data.extend_from_slice(root.as_bytes());
         }
-        let recomputed = Hasher::hash_one(Domain::Block, &root_data);
-        // If the stored state root doesn't match the recomputed one,
-        // use the recomputed one (the stored root may be stale if
-        // the block hasn't been executed yet, e.g., async execution).
-        let state_root = if state_root == Hash::ZERO && !module_roots.is_empty() {
-            recomputed
-        } else {
-            state_root
-        };
+        // Recompute the state root from the module roots and the
+        // nonce root. We always recompute (rather than using the
+        // stored root) because the stored root may be stale if the
+        // block hasn't been executed yet (async execution), and
+        // the HIGH fix binds the nonce root into the state root.
+        let _ = state_root; // stored root may be stale; we recompute below
+        let executed_nonces: Vec<(primitives::Address, u64)> = self
+            .executed_nonce
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(addr, nonce)| (*addr, *nonce))
+            .collect();
+        // HIGH fix: compute the nonce root and bind it into the
+        // state root so `executed_nonces` are authenticated.
+        let nonce_root = compute_nonce_root(&executed_nonces);
+        root_data.extend_from_slice(nonce_root.as_bytes());
+        let state_root = Hasher::hash_one(Domain::Block, &root_data);
         ExecutorSnapshot {
             height,
             state_root,
             module_roots,
             module_state,
-            executed_nonces: self
-                .executed_nonce
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .map(|(addr, nonce)| (*addr, *nonce))
-                .collect(),
+            executed_nonces,
+            nonce_root,
         }
     }
 
@@ -954,13 +999,26 @@ impl Executor {
 
         // Verify the snapshot's internal consistency: the state root
         // must match the recomputed aggregate of the snapshot's own
-        // per-module state roots. This catches corrupted or tampered
-        // snapshots without requiring the local modules to have the
-        // same state (the snapshot is from a peer, not local).
+        // per-module state roots AND the nonce root. This catches
+        // corrupted or tampered snapshots without requiring the local
+        // modules to have the same state (the snapshot is from a
+        // peer, not local).
         let mut root_data = Vec::new();
         for (_, root) in &snapshot.module_roots {
             root_data.extend_from_slice(root.as_bytes());
         }
+        // HIGH fix: bind the nonce root into the state root so
+        // `executed_nonces` are authenticated. Without this, a
+        // crafted snapshot could zero or corrupt replay-protection
+        // nonces without detection.
+        let recomputed_nonce_root = compute_nonce_root(&snapshot.executed_nonces);
+        if recomputed_nonce_root != snapshot.nonce_root {
+            return Err(SnapshotImportError::NonceRootMismatch {
+                expected: snapshot.nonce_root,
+                actual: recomputed_nonce_root,
+            });
+        }
+        root_data.extend_from_slice(recomputed_nonce_root.as_bytes());
         let recomputed = Hasher::hash_one(Domain::Block, &root_data);
         if recomputed != snapshot.state_root {
             return Err(SnapshotImportError::StateRootMismatch {
@@ -1542,10 +1600,18 @@ impl AppInterface for Executor {
         // H5 fix: per-sender nonce ordering. A byzantine leader can
         // reorder same-account txs or insert gaps. We now enforce
         // that within a proposal, each sender's nonces are strictly
-        // contiguous and increasing (no gaps, no reorderings). This
-        // is a static check — it doesn't need state access because
-        // the executor's `executed_nonce` map is only needed for
-        // cross-block continuity, not within-block ordering.
+        // contiguous and increasing (no gaps, no reorderings).
+        //
+        // Cross-block nonce anchoring is NOT checked here because the
+        // pipelined two-chain HotStuff consensus proposes a new block
+        // before the previous block's execution completes. The
+        // `executed_nonce` map may lag behind the proposal height, so
+        // anchoring here would reject valid proposals. Instead, cross-
+        // block anchoring is enforced at two other points:
+        // 1. `ingest_tx` (mempool admission): rejects txs with
+        //    `nonce < executed_nonce[sender]` (replay protection).
+        // 2. `execute_block` (execution): skips txs with stale or
+        //    out-of-order nonces (silent skip, not block rejection).
         //
         // Dynamic checks (balance, signature) are not done here —
         // they require state access and are checked during execution.
@@ -1567,6 +1633,8 @@ impl AppInterface for Executor {
             // proposal. Each sender's nonces must be strictly
             // contiguous (n, n+1, n+2, ...). A gap or reordering
             // indicates a byzantine proposer.
+            // Cross-block anchoring is NOT checked here (see comment
+            // above — pipelined consensus means execution may lag).
             match last_nonce.get(&ctx.sender) {
                 Some(&prev) if ctx.nonce != prev + 1 => {
                     return Verdict::Reject {
@@ -1580,8 +1648,8 @@ impl AppInterface for Executor {
                 }
                 // Either no previous nonce (first tx from this
                 // sender) or the nonce is contiguous (prev + 1) —
-                // accepted. The cross-block continuity check happens
-                // in `execute_block`.
+                // accepted. Cross-block continuity is enforced in
+                // `ingest_tx` (mempool) and `execute_block`.
                 _ => {}
             }
             last_nonce.insert(ctx.sender, ctx.nonce);
@@ -2218,7 +2286,7 @@ mod tests {
             Verdict::Reject { reason } => {
                 assert!(
                     reason.contains("nonce gap"),
-                    "expected nonce reorder rejection, got: {reason}"
+                    "expected nonce gap rejection, got: {reason}"
                 );
             }
             Verdict::Accept => panic!("nonce reorder must be rejected"),
@@ -2268,6 +2336,42 @@ mod tests {
             1,
             "stale nonce tx must be skipped during execution"
         );
+    }
+
+    /// H5+: `ingest_tx` (mempool admission) must reject txs with
+    /// stale nonces (nonce < `executed_nonce`). This is the cross-block
+    /// nonce anchoring gate — it prevents replay attacks where a tx
+    /// removed from the mempool after block selection is re-submitted.
+    /// `process_proposal` does NOT check cross-block anchoring because
+    /// the pipelined consensus may propose before the previous block's
+    /// execution completes.
+    #[test]
+    fn h5_ingest_tx_rejects_stale_nonce_after_execution() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        // Execute nonce 0 in block 0.
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        executor.ingest_tx(tx0);
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        let block0 = FinalizedBlock { height: Height::new(0), txs: proposal.txs };
+        executor.finalize_block(&block0);
+        assert_eq!(*counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
+
+        // Try to ingest nonce 0 again (stale) — must be rejected.
+        let tx0_stale = make_tx_with_nonce(1, &[0], 0);
+        let ack = executor.ingest_tx(tx0_stale);
+        assert!(
+            matches!(ack, MempoolAck::Rejected { .. }),
+            "stale nonce must be rejected by mempool"
+        );
+
+        // Ingest nonce 1 (correct) — must be accepted.
+        let tx1 = make_tx_with_nonce(1, &[1], 1);
+        let ack = executor.ingest_tx(tx1);
+        assert!(matches!(ack, MempoolAck::Accepted), "correct nonce must be accepted by mempool");
     }
 
     /// H4/H5: snapshot export/import must preserve the executed-nonce

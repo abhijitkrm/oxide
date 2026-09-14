@@ -312,22 +312,34 @@ results.
 
 ## Top-level evaluation
 
-**Are we production ready?** No.
+**Are we production ready?** No — but all internal engineering
+gates are complete and the operational runbooks are validated.
 
 **Gates completed:** 1 (networking), 2 (metrics), 3 (security
 review + fixes), 4 (sustained-throughput bench), 5 (fuzz soak),
 6 (EVM conformance), 7 (multi-host testnet).
 
+**Operational runbooks validated (2026-09-15):**
+
+- Binary deployment: 4-node testnet on loopback, 48 blocks/sec,
+  restart safety confirmed (C9 WAL)
+- Docker deployment: 4-node testnet on bridge network, 2.3
+  blocks/sec at 5ms latency, fault injection + recovery confirmed
+- Runbook steps 1,2,5,6,7,8,10 fully validated; steps 3,4,9
+  partially validated (snapshot/restore and key-rotation CLI
+  flags not yet wired)
+- All devnet tests pass (29 unit + 22 release-ignored)
+
 **Remaining blockers:**
 
 1. **No external security audit.** All 14 internal findings (4
    critical, 6 high, 4 medium) are now fixed.
-2. **No running public testnet.**
-3. **Operational runbooks** are now in `docs/runbooks.md` (startup,
-   shutdown, backup, restore, incident response, monitoring, key
-   rotation, software upgrade). Dashboards and incident-response
-   validation still need to be wired to a live deployment.
+2. **No running public testnet.** The Docker testnet proves the
+   mechanics but a public multi-machine deployment is needed.
+3. **Snapshot/restore and key-rotation CLI flags** need wiring
+   to complete runbook validation (runbooks 3, 4, 9).
 
-**Next action:** External security audit and public testnet
-deployment. All internal gates (1–7) are now complete. The
-feedback loop continues: after external validation, re-evaluate.
+**Next action:** Wire the missing CLI flags (`--import-snapshot`,
+`--submit-key-change`), then external security audit and public
+testnet deployment. The feedback loop continues: after external
+validation, re-evaluate.

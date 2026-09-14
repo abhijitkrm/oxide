@@ -22,14 +22,16 @@ ports = { workspace = true }
 thiserror = { workspace = true }
 # TLS dependencies (only active with the `tls` feature).
 # rustls: pure-Rust TLS implementation (Apache-2.0/MIT/ISC, GPL-3.0-compatible).
-# Uses the `ring` crypto provider (C-based, audited, same provider as Chromium).
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+# Uses the `aws_lc_rs` crypto provider (default for rustls 0.23, FIPS-compatible).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"], optional = true }
 # rustls-pemfile: parse PEM-encoded certificates and keys for loading
 # production TLS configs from files.
 rustls-pemfile = { version = "2", optional = true }
 # rcgen: generate self-signed X.509 certificates for devnet/testnet.
 # Used by `TlsConfig::self_signed()` — production loads certs from files.
-rcgen = { version = "0.14", optional = true }
+# Uses `aws_lc_rs` for crypto to match rustls's provider (avoids
+# signature verification mismatches between signing and verification).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
 
 [dev-dependencies]
 criterion = "0.7.0"

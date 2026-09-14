@@ -221,6 +221,22 @@ fn bloom_check(bloom: &Bloom, data: &[u8]) -> bool {
 /// `ordered_trie_root_with_encoder` which builds a sorted trie over
 /// RLP-encoded transaction indices — O(n) in the number of receipts.
 ///
+/// # O(n²) bug fixed
+///
+/// The previous implementation used `receipts.iter().position(|r|
+/// std::ptr::eq(r, receipt))` inside the encoder closure to find
+/// each receipt's index. Since `ordered_trie_root_with_encoder`
+/// reorders receipts via `adjust_index_for_rlp`, the closure is
+/// called with receipts in a different order than the input slice,
+/// making `position()` a linear scan — O(n) per receipt, O(n²)
+/// total. At 10 GG/block with ~170k receipts, this would dominate
+/// block processing.
+///
+/// The fix pre-encodes each receipt (with its cumulative gas) into a
+/// `Vec<Vec<u8>>` in O(n), then passes the pre-encoded vector to
+/// `ordered_trie_root` which feeds each entry to `HashBuilder` in
+/// the adjusted index order — O(n) total.
+///
 /// # Panics
 ///
 /// Panics if a receipt's RLP encoding exceeds 255 bytes for the list
@@ -235,57 +251,62 @@ pub fn receipts_root(receipts: &[Receipt]) -> B256 {
     // Pre-compute cumulative gas for each receipt index.
     let cumulative_gases = Receipt::cumulative_gas(receipts);
 
-    // Each receipt is RLP-encoded as:
-    // [status_byte, cumulative_gas_used, bloom, logs]
-    // For typed transactions (EIP-2718), the receipt is prefixed
-    // with the tx type byte. For the trie, the key is the
-    // transaction index (RLP-encoded). We use alloy-trie's
-    // `ordered_trie_root_with_encoder` which handles the index
-    // keying — O(n) in the number of receipts.
-    alloy_trie::root::ordered_trie_root_with_encoder(receipts, |receipt, buf| {
-        use alloy_rlp::Encodable;
-        // EIP-2718: typed receipts are prefixed with the type byte.
-        // Legacy receipts (type 0) have no prefix.
-        if receipt.tx_type != 0 {
-            buf.push(receipt.tx_type);
-        }
+    // Pre-encode each receipt into its final RLP form (with EIP-2718
+    // type prefix + cumulative gas) in O(n). This avoids the O(n²)
+    // `position()` lookup that the previous closure-based approach
+    // required inside `ordered_trie_root_with_encoder`.
+    let encoded: Vec<Vec<u8>> = receipts
+        .iter()
+        .zip(cumulative_gases.iter().copied())
+        .map(|(receipt, cumulative)| {
+            use alloy_rlp::Encodable;
+            let mut buf = Vec::with_capacity(320);
 
-        // RLP-encode the receipt as a list:
-        // [status, cumulative_gas, bloom, logs]
-        let status_byte: u8 = u8::from(receipt.status);
+            // EIP-2718: typed receipts are prefixed with the type byte.
+            // Legacy receipts (type 0) have no prefix.
+            if receipt.tx_type != 0 {
+                buf.push(receipt.tx_type);
+            }
 
-        // Find this receipt's index to get its cumulative gas.
-        let idx = receipts.iter().position(|r| std::ptr::eq(r, receipt)).unwrap_or(0);
-        let cumulative = cumulative_gases[idx];
+            // RLP-encode the receipt as a list:
+            // [status, cumulative_gas, bloom, logs]
+            let status_byte: u8 = u8::from(receipt.status);
 
-        // Encode the logs as an RLP list into a temporary buffer.
-        let mut logs_rlp = Vec::new();
-        alloy_rlp::encode_list(&receipt.logs, &mut logs_rlp);
+            // Encode the logs as an RLP list into a temporary buffer.
+            let mut logs_rlp = Vec::new();
+            alloy_rlp::encode_list(&receipt.logs, &mut logs_rlp);
 
-        // Compute the RLP list body length:
-        // status (1 byte) + cumulative (variable) + bloom (256) + logs (variable)
-        let cumulative_len = alloy_rlp::Encodable::length(&cumulative);
-        let list_len = 1 + cumulative_len + 256 + logs_rlp.len();
+            // Compute the RLP list body length:
+            // status (1 byte) + cumulative (variable) + bloom (256) + logs (variable)
+            let cumulative_len = alloy_rlp::Encodable::length(&cumulative);
+            let list_len = 1 + cumulative_len + 256 + logs_rlp.len();
 
-        // RLP list header.
-        if list_len < 56 {
-            let suffix = u8::try_from(list_len).expect("list_len < 56");
-            buf.push(0xc0 + suffix);
-        } else {
-            // Long list: 0xf7 + length_of_length bytes.
-            let len_bytes = list_len.to_be_bytes();
-            let leading_zeros = len_bytes.iter().take_while(|&&b| b == 0).count();
-            let trimmed = &len_bytes[leading_zeros..];
-            let suffix = u8::try_from(trimmed.len()).expect("len bytes <= 8");
-            buf.push(0xf7 + suffix);
-            buf.extend_from_slice(trimmed);
-        }
+            // RLP list header.
+            if list_len < 56 {
+                let suffix = u8::try_from(list_len).expect("list_len < 56");
+                buf.push(0xc0 + suffix);
+            } else {
+                // Long list: 0xf7 + length_of_length bytes.
+                let len_bytes = list_len.to_be_bytes();
+                let leading_zeros = len_bytes.iter().take_while(|&&b| b == 0).count();
+                let trimmed = &len_bytes[leading_zeros..];
+                let suffix = u8::try_from(trimmed.len()).expect("len bytes <= 8");
+                buf.push(0xf7 + suffix);
+                buf.extend_from_slice(trimmed);
+            }
 
-        status_byte.encode(buf);
-        cumulative.encode(buf);
-        buf.extend_from_slice(&receipt.bloom);
-        buf.extend_from_slice(&logs_rlp);
-    })
+            status_byte.encode(&mut buf);
+            cumulative.encode(&mut buf);
+            buf.extend_from_slice(&receipt.bloom);
+            buf.extend_from_slice(&logs_rlp);
+            buf
+        })
+        .collect();
+
+    // Feed the pre-encoded receipts into the trie in adjusted index
+    // order. `ordered_trie_root` handles the RLP index keying and
+    // the `adjust_index_for_rlp` reordering — O(n) total.
+    alloy_trie::root::ordered_trie_root(&encoded)
 }
 
 #[cfg(test)]

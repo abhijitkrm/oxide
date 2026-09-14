@@ -63,19 +63,26 @@ impl std::error::Error for SecpError {}
 ///
 /// Only values 0 and 1 are valid for standard ECDSA recovery. Values
 /// 2 and 3 exist in the secp256k1 library for completeness (provably
-/// unused keys) but never appear in Ethereum signatures.
+/// unused keys) but never appear in Ethereum signatures. Accepting
+/// them would allow a malicious peer to submit signatures that
+/// recover to arbitrary/unused pubkeys, enabling signature
+/// malleability and `DoS` vectors. We reject them at the parse boundary
+/// so they never reach `recover_ecdsa`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryId(u8);
 
 impl RecoveryId {
     /// Create a recovery ID from a raw byte. Returns `Err` if the
-    /// value is not 0, 1, 2, or 3.
+    /// value is not 0 or 1 — the only valid Ethereum recovery IDs.
     ///
     /// # Errors
     ///
-    /// Returns [`SecpError::InvalidRecoveryId`] if `v > 3`.
+    /// Returns [`SecpError::InvalidRecoveryId`] if `v > 1`. Values 2
+    /// and 3 are rejected to prevent signature malleability (they
+    /// correspond to provably-unused keys and never appear in real
+    /// Ethereum signatures).
     pub const fn try_from_u8(v: u8) -> Result<Self, SecpError> {
-        if v <= 3 { Ok(Self(v)) } else { Err(SecpError::InvalidRecoveryId(v)) }
+        if v <= 1 { Ok(Self(v)) } else { Err(SecpError::InvalidRecoveryId(v)) }
     }
 
     /// Create a recovery ID, panicking on invalid input. For tests
@@ -83,10 +90,10 @@ impl RecoveryId {
     ///
     /// # Panics
     ///
-    /// Panics if `v > 3`.
+    /// Panics if `v > 1`.
     #[must_use]
     pub const fn new(v: u8) -> Self {
-        assert!(v <= 3, "recovery id must be 0-3");
+        assert!(v <= 1, "recovery id must be 0 or 1");
         Self(v)
     }
 
@@ -97,22 +104,39 @@ impl RecoveryId {
     }
 
     /// Convert to the secp256k1 library's `RecoveryId` enum.
+    ///
+    /// `self.0` is guaranteed to be 0 or 1 by the constructors, so
+    /// the 2/3 arms are unreachable.
     fn to_secp(self) -> secp256k1::ecdsa::RecoveryId {
         match self.0 {
             0 => secp256k1::ecdsa::RecoveryId::Zero,
             1 => secp256k1::ecdsa::RecoveryId::One,
-            2 => secp256k1::ecdsa::RecoveryId::Two,
-            _ => secp256k1::ecdsa::RecoveryId::Three,
+            // Unreachable: `try_from_u8` and `new` reject 2/3.
+            _ => unreachable!("recovery id 2/3 rejected at construction"),
         }
     }
 
     /// Convert from the secp256k1 library's `RecoveryId` enum.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `RecoveryId::Two`/`Three`. These never occur in
+    /// practice for valid secp256k1 keys (they correspond to
+    /// provably-unused keys) and are rejected at the parse boundary
+    /// by [`RecoveryId::try_from_u8`]. This is a defense-in-depth
+    /// assertion: if the signing library ever yields 2/3, that is a
+    /// bug worth surfacing loudly rather than silently producing a
+    /// malleable signature.
     fn from_secp(recid: secp256k1::ecdsa::RecoveryId) -> Self {
         match recid {
             secp256k1::ecdsa::RecoveryId::Zero => Self(0),
             secp256k1::ecdsa::RecoveryId::One => Self(1),
-            secp256k1::ecdsa::RecoveryId::Two => Self(2),
-            secp256k1::ecdsa::RecoveryId::Three => Self(3),
+            secp256k1::ecdsa::RecoveryId::Two => {
+                panic!("secp256k1 yielded recovery id 2 (provably-unused key)")
+            }
+            secp256k1::ecdsa::RecoveryId::Three => {
+                panic!("secp256k1 yielded recovery id 3 (provably-unused key)")
+            }
         }
     }
 }
@@ -395,10 +419,25 @@ mod tests {
     fn recovery_id_try_from_u8_bounds() {
         assert!(RecoveryId::try_from_u8(0).is_ok());
         assert!(RecoveryId::try_from_u8(1).is_ok());
-        assert!(RecoveryId::try_from_u8(2).is_ok());
-        assert!(RecoveryId::try_from_u8(3).is_ok());
+        // Recovery IDs 2 and 3 are rejected to prevent signature
+        // malleability (they correspond to provably-unused keys and
+        // never appear in valid Ethereum signatures).
+        assert!(RecoveryId::try_from_u8(2).is_err());
+        assert!(RecoveryId::try_from_u8(3).is_err());
         assert!(RecoveryId::try_from_u8(4).is_err());
         assert!(RecoveryId::try_from_u8(255).is_err());
+    }
+
+    #[test]
+    fn recovery_id_new_rejects_2_and_3() {
+        // `new` is const and panics on invalid input; verify the
+        // panic message for 2/3 (defense-in-depth against malleability).
+        assert!(std::panic::catch_unwind(|| RecoveryId::new(2)).is_err());
+        assert!(std::panic::catch_unwind(|| RecoveryId::new(3)).is_err());
+        assert!(std::panic::catch_unwind(|| RecoveryId::new(4)).is_err());
+        // 0 and 1 must not panic.
+        let _ = RecoveryId::new(0);
+        let _ = RecoveryId::new(1);
     }
 
     #[test]

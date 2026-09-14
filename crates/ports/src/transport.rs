@@ -101,4 +101,8 @@ pub enum TransportError {
     /// The transport channel is closed (shut down, irrecoverable
     /// error). Phase 1 splits this into per-cause variants.
     ChannelClosed,
+    /// The outbound channel is full (backpressure). The caller
+    /// should retry or shed load. This protects against a slow
+    /// peer causing unbounded outbound queue growth (OOM).
+    ChannelFull,
 }
