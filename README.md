@@ -232,7 +232,7 @@ cargo run --bin oxide-deploy -- generate --validators 4 local
 | **0 — Foundation** | workspace, primitives, codec, runtime, ports/OAI, storage journal + MMR | journal ≥1M appends/s single-thread; MMR over 1M leaves <20ms; deterministic 4-node echo sim; mock engine drives app via OAI | ✅ Complete |
 | **1 — Consensus + chain skeleton** | oxideBFT, broadcast, mempool, executor v0, core/bank/staking, devnet tooling | 50–100ms blocks; 200k tx/s sim (n=32); devnet runs on SequencerEngine via config swap with **zero app-code changes**; bit-exact journal replay | ✅ Complete |
 | **2 — EVM + storage** | revm module, parallel OCC scheduler, JSON-RPC, adapters, snapshots | ≥1 GG/s on 16-core rig; MetaMask/Foundry/Blockscout green; storage conformance for every adapter | ✅ Complete |
-| **3 — Trading core** (next) | matching engine, risk, spot + perps, oracle, market data | ≥5M ops/s single-core; ≥1M orders/s chain-wide sim; p50 <200ns order ops; perps property tests (no negative equity, ADL correctness) | 🚧 Next |
+| **3 — Trading core** | matching engine, risk, spot + perps, oracle, market data | ≥5M ops/s single-core; ≥1M orders/s chain-wide sim; p50 <200ns order ops; perps property tests (no negative equity, ADL correctness) | 🚧 In progress |
 | **4 — Hardening & testnet** | fuzz, chaos sims, TLA+ model, external review, 20–50 validator testnet | 7-day soak ≥50% load; zero safety violations in 10k randomized sims | 📋 Planned |
 
 Post-testnet: mainnet + tokenomics, slashing, encrypted mempool, BAL access
@@ -242,7 +242,7 @@ lists, revmc JIT, DPDK/AF_XDP gateway lane, bridges, SVM/MoveVM modules.
 
 ## What's built so far
 
-Phases 0–2 are complete. Here's what's in the repo today:
+Phases 0–2 are complete, Phase 3 (trading core) is in progress. Here's what's in the repo today:
 
 ### Phase 0 — Foundation ✅
 
@@ -296,6 +296,50 @@ Phases 0–2 are complete. Here's what's in the repo today:
 - **Indexer/explorer v0**: in-memory block/tx index.
 - **Uniswap-transfer benchmark**: ≥1 GG/s gate met (see below).
 
+### Audit-driven hardening (post-Phase 2)
+
+A full codebase audit against the production-testnet release bar
+identified critical consensus-safety findings, HIGH-severity
+security issues, and four execution-path ceilings for the 10 GG/block
+target. Remediation is in progress:
+
+**Critical fixes (C1–C10):**
+- C1: consensus height overflow (`u64::MAX` wrap) — saturating arithmetic
+- C2: future-view vote acceptance — view-range filtering
+- C3: unsigned proposals — leader signature verification
+- C5: precompile no-ops — executor-side settlement
+- C6: Reed-Solomon reconstruct panic on unequal shards — checked lengths
+- C7: matcher ignores protocol nonce — replay protection
+- C8: fills before bank settlement — settlement ordering
+- C10: `executed_nonce` in-memory only — persisted to storage backend
+- **Remaining:** C4 (mutual TLS bound to validator keys), C9 (consensus WAL)
+
+**Execution-path ceilings (10 GG/block):**
+- Ceiling 1: unified block gas limit at 10 GG ✅
+- Ceiling 2: parallel executor with tx-granular conflict tracking ✅
+- Ceiling 3: sparse retained-trie for O(touched·log N) state root ✅
+- Ceiling 4: O(n) receipts root + free-gas stuffing gates — remaining
+
+**HIGH-severity fixes (partial):**
+- RPC rate limiting, per-vote BLS verify drop, EIP-2718 receipts
+  encoding, perps funding clamp, trading money-math clamps — done.
+- RLP trailing bytes, signature malleability, unbounded channels,
+  admission leak, mempool nonce anchoring, snapshot auth — in progress.
+
+### Phase 3 — Trading core (in progress)
+
+- **Matching engine** (`crates/trading`): multi-market parallel
+  matcher (one worker per market), shared `ShardedBalanceCache`
+  (64 shards), 4 protocols (TCP, JSON-RPC, FIX, WebSocket).
+  15.15M orders/s single-market, 11.68M orders/s across 128 markets.
+- **Exchange module** (`modules/exchange`): spot CLOB with
+  limit/market orders, settlement via bank module.
+- **Perps module** (`modules/perps`): perpetuals with margin,
+  funding, liquidations, insurance fund, ADL.
+- **EVM load test**: 100K EVM txs at 6,410 tx/s (4 validators),
+  throughput stable as state grows (sparse state root).
+- **Trading load test**: 2M trading txs at 72,556 tx/s (4 validators).
+
 ### Benchmark results (8-core Apple M1)
 
 | Benchmark | Result | Gate |
@@ -306,8 +350,15 @@ Phases 0–2 are complete. Here's what's in the repo today:
 | Storage `get` (1 key) | Volatile 32.7M elem/s, MDBX 3M, RocksDB 2.1M, redb 825K | runs + reports ✅ |
 | Uniswap-transfer (sequential) | 4.83 GG/s (single core) | ≥1 GG/s ✅ |
 | Uniswap-transfer (parallel, 8 threads) | 12.96 GG/s (2.7x speedup) | ≥1 GG/s ✅ |
+| State root incremental (100k accts, 10 touched) | 110 µs | <10ms ✅ |
+| State root incremental (100k accts, 100 touched) | 1.0 ms | <10ms ✅ |
+| State root incremental (1M accts, 100 touched) | 1.27 ms | <10ms ✅ |
+| Matching engine (1 market, ring) | 15.15M orders/s | ≥5M ops/s ✅ |
+| Matching engine (128 markets, multi) | 11.68M orders/s | ≥1M orders/s ✅ |
+| EVM load test (4 validators, 100k txs) | 6,410 tx/s | — |
+| Trading load test (4 validators, 2M txs) | 72,556 tx/s | — |
 
-**374 tests pass.** `cargo fmt --check`, `cargo clippy -D warnings`,
+**1,138 tests pass.** `cargo fmt --check`, `cargo clippy -D warnings`,
 `cargo deny check` all clean.
 
 ---
