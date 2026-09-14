@@ -11559,3 +11559,85 @@ The `per_tx_accessed` field is retained in `GroupExecResult` as
 infrastructure for a future tx-granular optimization that properly
 handles nonce dependencies by committing non-conflicting txs' state
 before re-executing conflicting txs.
+
+### Scale test results after EVM parallel execution fix
+
+All tests run on the local dev machine (Apple Silicon). Throughput
+numbers are end-to-end (consensus pipeline, including 4 validators,
+TCP transport, signature verification, state root computation).
+
+#### Trading TPS (exchange module, native order matching)
+
+| Workload | Validators | Txs | Throughput | Block rate |
+|----------|-----------|-----|------------|------------|
+| `trading_tps_default` | 4 | 200k | 76,517 tx/s | 76.5 blocks/s |
+| `trading_tps_1m` | 4 | 2M | 72,556 tx/s | 72.6 blocks/s |
+
+Trading throughput is stable at ~72k tx/s across 2M txs. No ceiling
+hit yet — the matching engine is not the bottleneck.
+
+#### EVM load (mixed transfers + deploys + contract calls + reads)
+
+| Workload | Validators | Txs | Throughput | Block rate |
+|----------|-----------|-----|------------|------------|
+| `evm_load_default` | 4 | 1k | 1,310 tx/s | 2.6 blocks/s |
+| `evm_load_10k` | 4 | 10k | 6,274 tx/s | 12.5 blocks/s |
+| `evm_load_large` | 4 | 1M | 1,899 tx/s | 3.8 blocks/s |
+
+EVM throughput degrades from ~2,500 tx/s (early) to ~1,900 tx/s (late)
+during the 1M-tx run. The degradation correlates with state growth:
+200k contracts deployed, growing state trie. The incremental state
+root computation (`state_root_incremental/100000_accts_100_touched`)
+takes ~43ms per block at 100k accounts, which dominates block time at
+this scale. This is the next execution-path ceiling to address.
+
+All integrity checks pass at 1M txs:
+- 4 validators agree on 2000 finalized blocks
+- All validators agree on tx contents
+- All validators agree on state root
+- Nonce continuity verified for 20 senders
+- Balance conservation verified for 20 senders
+- All validators agree on EVM state root
+
+#### Fuzz targets (cargo +nightly fuzz, 15-30s each)
+
+All 9 fuzz targets pass with no crashes:
+- `evm-execute`: 508k runs, cov 2541
+- `codec-decode`: 9.3M runs, cov 83
+- `consensus-msg`: 2.8M runs, cov 286
+- `journal-replay`: 66k runs, cov 63
+- `mmr-proof-verify`: 1.0M runs, cov 211
+- `sync-decode`: 2.7M runs, cov 115
+- `trading-engine`: 421k runs
+- `trading-order-validate`: 22M runs, cov 14
+- `types-decode`: 1.9M runs, cov 291
+
+#### Benchmark suite (cargo bench --workspace --exclude perps)
+
+All benchmarks pass. The `perps_settlement` bench has a pre-existing
+failure (insufficient initial margin — unrelated to this fix, fails
+on `main` too). Key EVM numbers:
+
+- `batch_parallel/100_txs`: 983 µs (improved 7.4%)
+- `batch_parallel_conflict/1000_txs_100_senders`: 9.1 ms (within noise)
+- `read_write_conflict_parallel_vs_serial/1000_txs_parallel`: 8.8 ms
+- `state_root_incremental/100000_accts_10_touched`: 41 ms
+- `state_root_incremental/100000_accts_100_touched`: 44 ms
+- `native_vs_revm/1000_txs_native`: 9.8 ms
+- `native_vs_revm/1000_txs_revm`: 38.8 ms
+
+The native EVM fast path is ~4x faster than the revm path for simple
+transfers, confirming the fast-path optimization is working.
+
+#### Next ceiling: incremental state root at scale
+
+The EVM load test's throughput degradation at 1M txs is caused by
+the incremental state root computation, which takes ~43ms per block
+at 100k accounts. This is the dominant cost in each block at scale.
+Options to investigate:
+1. Cache the trie structure more aggressively (avoid rebuilding
+   intermediate nodes on every block).
+2. Parallelize the trie rebuild across touched accounts.
+3. Snapshot the trie and apply deltas instead of rebuilding.
+4. Move state root computation off the critical path (compute
+   asynchronously, verify on commit).
