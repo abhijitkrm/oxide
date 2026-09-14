@@ -863,6 +863,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** the multi-validator load tests now survive
     transient disconnects and run their full transaction count.
 
+- **EVM parallel execution dropped nonces on conflict re-execution**
+  (`modules/evm/src/lib.rs`)
+  - The tx-granular conflict re-execution path kept speculative
+    results for non-conflicting txs but never applied their state
+    changes (nonce increments, balance deductions) to the main DB.
+    When a later tx in the same sender group was re-executed, the
+    main DB had a stale nonce, causing `NonceTooHigh` failures.
+  - In the devnet workload (100 senders, 10 txs each, mixed tx
+    types), this caused 441 out of 1000 transactions to fail.
+  - Replaced tx-granular re-execution with full-group re-execution:
+    when any tx in a group conflicts, the entire group is
+    re-executed sequentially against the main DB, preserving nonce
+    continuity.
+  - Added regression test `handle_batch_parallel_conflict_nonce_continuity`.
+  - **In plain words:** EVM load tests at scale now pass with all
+    transactions succeeding and correct state roots across validators.
+
+- **Real-time progress reporting in pipelined tx runner**
+  (`crates/devnet/src/tcp_multinode.rs`)
+  - The pipelined tx runner (used by trading TPS and EVM load
+    tests) previously ran silently for minutes on large workloads.
+    Now prints finalized txs / total, block count, throughput, and
+    elapsed time every 5% of blocks or every 5 seconds.
+  - **In plain words:** long-running load tests now show live
+    progress instead of a multi-minute silence.
+
 - **Matcher balance cache aliased colliding addresses and minted
   money on insolvent transfers** (`crates/matcher/src/balance.rs`)
   - `BalanceCache` keyed the flat array by the first 4 address
