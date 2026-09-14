@@ -697,6 +697,15 @@ impl TcpMultiNodeDevnet {
             all_txs.len()
         );
 
+        // Progress reporting: print a line every `progress_interval`
+        // blocks or every 5 seconds, whichever comes first. This gives
+        // real-time visibility into long-running tests (1M+ txs) instead
+        // of a multi-minute silence.
+        let progress_interval = (rounds / 20).max(1); // ~5% steps
+        let mut last_progress_block = 0u64;
+        let mut last_progress_time = std::time::Instant::now();
+        let progress_secs = std::time::Duration::from_secs(5);
+
         // Interleave tx submission with the consensus loop.
         //
         // The executor's mempool intake is a bounded sync channel
@@ -773,6 +782,29 @@ impl TcpMultiNodeDevnet {
             }
 
             self.pipelined_tick(&mut state, target_blocks);
+
+            // Progress report: print finalized txs / total and current
+            // throughput every `progress_interval` blocks or every 5s.
+            let blocks_done = state.qcs_formed;
+            let time_since = last_progress_time.elapsed();
+            if blocks_done >= last_progress_block + progress_interval as u64
+                || (time_since >= progress_secs && blocks_done > last_progress_block)
+            {
+                let txs_done = blocks_done * txs_per_round as u64;
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 { txs_done as f64 / elapsed } else { 0.0 };
+                let pct = if target_blocks > 0 {
+                    blocks_done as f64 / target_blocks as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "  progress: {txs_done}/{needed} txs ({pct:.1}%) — {blocks_done}/{target_blocks} blocks — {rate:.0} tx/s — {elapsed:.1}s elapsed"
+                );
+                last_progress_block = blocks_done;
+                last_progress_time = std::time::Instant::now();
+            }
+
             std::hint::spin_loop();
         }
 
