@@ -11641,3 +11641,140 @@ Options to investigate:
 3. Snapshot the trie and apply deltas instead of rebuilding.
 4. Move state root computation off the critical path (compute
    asynchronously, verify on commit).
+
+### Session: Sparse state-root optimization (Ceiling 3)
+
+**Date:** 2025-01-28
+
+**Problem:** The incremental `state_root` path patched only touched
+account leaves in the `trie_leaves` `BTreeMap` but still fed every
+leaf into `alloy_trie::HashBuilder` on each call. This made trie
+assembly O(total_accounts) even when only a few accounts changed.
+At 100k accounts, 100 touched accounts cost ~43ms — the dominant
+per-block cost at scale. EVM load throughput degraded from ~2,500
+tx/s early in a 1M-tx run to ~1,900 tx/s late, directly caused by
+this O(N) state-root ceiling.
+
+**Root cause:** `HashBuilder::add_leaf` processes every leaf in
+sorted order to build the Merkle-Patricia Trie. Even with the
+storage-root and leaf-encoding already incremental, the final
+`HashBuilder` pass walked all N leaves — O(N) hashing per block.
+
+**Solution: Sparse retained-trie walk**
+
+After the first full build, `HashBuilder::split()` (with
+`with_updates(true)`) captures every branch node's
+`BranchNodeCompact` — masks + child hashes — keyed by nibble
+prefix. This metadata is stored in `retained_branches`.
+
+On subsequent calls, instead of feeding all N leaves, we walk the
+retained branch tree depth-first (`sparse_walk`):
+
+1. At each branch node, iterate its children (set bits in
+   `state_mask`).
+2. For a child containing NO touched account:
+   - If the child is hashed (in `hash_mask`), call
+     `add_branch(child_prefix, child_hash, true)` — the entire
+     subtree is skipped in O(1).
+   - If the child is inline (leaf/extension), feed its leaves from
+     `trie_leaves` (O(1) for a leaf, O(16) for a shallow branch).
+3. For a child containing touched accounts:
+   - If the child is a stored branch (in `tree_mask` and present in
+     `retained_branches`), recurse.
+   - Otherwise, feed all leaves under it from `trie_leaves`.
+
+**Handling account insertions:** The stale `state_mask` may not
+include new children created by account insertions. Before
+iterating, we scan `touched_hashes` under the current prefix and
+add any child nibble not already in `state_mask`. This ensures new
+accounts' leaves are always fed.
+
+**Handling stale branches:** After the sparse walk, we remove
+stale `retained_branches` entries on the touched path (all nibble
+prefixes of touched hashed keys) and merge the rebuilt branches
+from `split()`. This correctly handles:
+- Account deletion (branches that become leaves/extensions —
+  removed from `retained`, not re-added by `split()`).
+- Account insertion (new branches — added by `split()`).
+- Structure changes (branches that change mask/hash — replaced by
+  `split()` output).
+
+**`prefix_range` helper:** Computes inclusive B256 bounds for all
+keys sharing a nibble prefix. Uses inclusive end (not `end + 1`) to
+avoid wrap-around panics for prefixes at the end of the key space
+(e.g., nibble 0xF).
+
+**Complexity:** O(touched · depth · 16) = O(touched · log N) per
+call. For 100 touched in 1M accounts (depth ~5), this is ~8,000
+operations vs ~1,000,000 for the old O(N) path.
+
+**Bugs found and fixed during implementation:**
+
+1. **`prefix_range` end computation for odd-length prefixes:** The
+   even pass set `end[byte] = nibble << 4 | 0x0F`, and the odd pass
+   did `end[byte] |= nibble`. But `0x0F | nibble == 0x0F` for any
+   nibble ≤ 0xF, so the low nibble was always 0xF instead of the
+   actual prefix nibble. Fixed by setting only the high nibble in
+   the even pass and ORing the low nibble in the odd pass.
+
+2. **`prefix_range` wrap-around for end-of-keyspace prefixes:** For
+   a prefix like nibble 0xF, the exclusive end (max_key + 1) wraps
+   to 0, which is less than the start — causing
+   `BTreeSet::range` to panic. Fixed by using inclusive bounds
+   (`start..=end`) instead of exclusive (`start..end`).
+
+3. **New children from account insertions:** The stale
+   `state_mask` doesn't include children created by new account
+   insertions. The sparse walk would skip these children, missing
+   their leaves. Fixed by scanning `touched_hashes` and adding
+   missing child nibbles to the iteration.
+
+**Benchmark results (criterion, release):**
+
+| Benchmark | Before | After | Improvement |
+|-----------|--------|-------|-------------|
+| 10k/10 touched | ~3.7 ms | 88 µs | 42x |
+| 10k/100 touched | ~4.3 ms | 717 µs | 6x |
+| 100k/10 touched | ~40 ms | 110 µs | 364x |
+| 100k/100 touched | ~43 ms | 1.0 ms | 43x |
+| 1M/10 touched | N/A | 128 µs | new |
+| 1M/100 touched | N/A | 1.27 ms | new |
+
+**Acceptance gate:** 1M accounts / 100 touched < 10ms.
+**Result: 1.27 ms — passed with 7.9x margin.**
+
+The O(touched · log N) scaling is confirmed: 1M/100 is only ~10x
+slower than 10k/100, not 100x.
+
+**EVM load test (4 validators, 100K EVM txs, release):**
+
+- Throughput: 6,410 tx/s (up from ~1,900 tx/s at 1M txs before)
+- Throughput *increases* over time (3,384 → 6,425 tx/s) — no
+  degradation as state grows, confirming the sparse walk eliminates
+  the O(N) state-root ceiling.
+- All 4 validators agree on 200 finalized blocks, state root, tx
+  contents, nonce continuity, balance conservation, and EVM state
+  root.
+- 20,000 contracts deployed across 100K transactions.
+
+**Tests added:**
+- `sparse_root_matches_full_after_single_mutation`
+- `sparse_root_matches_full_10k_100_touched`
+- `sparse_root_matches_full_100k_100_touched`
+- `sparse_root_matches_full_multiple_rounds` (10 incremental rounds)
+- `sparse_root_matches_full_after_insertion` (new account)
+- `sparse_root_matches_full_retouch` (same account twice)
+- `sparse_root_matches_full_same_subtree` (consecutive accounts)
+- `sparse_root_matches_full_spread_subtrees` (every 100th account)
+- `prefix_range_correct_bounds` (unit test for the helper)
+
+All tests verify that the sparse incremental root matches a full
+rebuild (via `reset_leaf_cache_for_test`).
+
+**Validation gates passed:**
+- `cargo fmt --check` ✓
+- `cargo clippy -p evm --all-targets -- -D warnings` ✓
+- `cargo test -p evm` (195 tests) ✓
+- `cargo test --workspace` (all crates) ✓
+- `cargo bench -p evm --bench trie_root` ✓
+- EVM load test (100K txs, 4 validators) ✓

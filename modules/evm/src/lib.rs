@@ -283,19 +283,30 @@ pub struct EvmModule {
     /// map in one pass — the same cost as the old non-incremental
     /// path — then flips this true.
     trie_leaves_ready: Mutex<bool>,
-    /// Ceiling 3: retained branch node hashes from the previous
+    /// Ceiling 3: retained branch node metadata from the previous
     /// `state_root` build. Keyed by the nibble prefix of the branch
-    /// node. Used to skip non-touched subtrees: instead of feeding
-    /// every leaf into `HashBuilder`, we feed the retained branch
-    /// hash via `add_branch` for subtrees that contain no touched
-    /// accounts. This turns the trie assembly from `O(total_accounts)`
-    /// to `O(touched · log(total_accounts))`.
+    /// node. Each entry stores the `BranchNodeCompact` (state/tree/hash
+    /// masks + child hashes) returned by `HashBuilder::split()`.
+    ///
+    /// Used to skip non-touched subtrees: instead of feeding every
+    /// leaf into `HashBuilder`, we call `add_branch` with the
+    /// retained child hash for subtrees that contain no touched
+    /// accounts. Only the branch nodes on the path from touched
+    /// leaves to the root are rebuilt. This turns trie assembly
+    /// from `O(total_accounts)` to `O(touched · log(total_accounts))`.
+    ///
+    /// A branch's own hash (needed for `add_branch`) is obtained
+    /// from its parent's `BranchNodeCompact::hash_for_nibble`, or
+    /// from `root_hash` for the root branch (prefix = empty).
     ///
     /// The map is cleared on full rebuild (when `trie_leaves_ready`
     /// is false) and after `import_state`. It is repopulated after
-    /// each incremental `state_root` call via `HashBuilder::split()`.
+    /// each `state_root` call via `HashBuilder::split()`: the full
+    /// build replaces the map entirely; the incremental build merges
+    /// the rebuilt branches (removing stale entries on the touched
+    /// path first, then inserting the new `BranchNodeCompact`s).
     retained_branches:
-        Mutex<std::collections::HashMap<alloy_trie::Nibbles, alloy_primitives::B256>>,
+        Mutex<std::collections::HashMap<alloy_trie::Nibbles, alloy_trie::BranchNodeCompact>>,
     /// accounts were touched since the last computation, the cached
     /// root is returned directly (O(1) fast path).
     cached_state_root: Mutex<Option<alloy_primitives::B256>>,
@@ -2701,6 +2712,7 @@ impl Module for EvmModule {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn state_root(&self) -> Hash {
         // Phase B: compute the Ethereum-compatible Merkle-Patricia
         // Trie state root over all accounts in the CacheDB.
@@ -2824,37 +2836,121 @@ impl Module for EvmModule {
         //
         // The state root computation has three costs:
         // 1. Per-account storage root computation — O(storage_size)
-        //    per account. This is already incremental: only touched
-        //    accounts recompute their storage roots (via
-        //    `storage_root_cache`).
+        //    per account. Already incremental: only touched accounts
+        //    recompute their storage roots (via `storage_root_cache`).
         // 2. Per-account leaf encoding — O(1) per account. Already
         //    incremental: only touched accounts are re-encoded in
         //    the `trie_leaves` BTreeMap.
-        // 3. HashBuilder trie assembly — O(n) over all leaves.
+        // 3. HashBuilder trie assembly — was O(n) over all leaves.
+        //    Now O(touched · log n) via the sparse walk below.
         //
-        // The dominant costs (storage root + leaf encoding) are
-        // already incremental. The HashBuilder O(n) pass is fast
-        // (just hashing) and will be optimized to O(touched · log n)
-        // in a future iteration using retained branch node hashes.
-        // The `retained_branches` map is populated but not yet used
-        // for sparse builds — it is infrastructure for the future
-        // optimization.
+        // # Sparse walk algorithm
         //
-        // Feed the leaves into `HashBuilder` in sorted hashed-key
-        // order — the `BTreeMap` iteration order is exactly what
-        // `add_leaf` requires (it asserts sorted input).
+        // After the first full build, `retained_branches` holds every
+        // branch node's `BranchNodeCompact` (masks + child hashes),
+        // keyed by nibble prefix. On subsequent calls, instead of
+        // feeding all N leaves into `HashBuilder`, we walk the
+        // retained branch tree depth-first:
         //
-        // Note: `with_updates(true)` is NOT enabled here because it
-        // adds overhead to track branch node updates. The
-        // `retained_branches` map is infrastructure for a future
-        // sparse trie optimization that will use `add_branch` to
-        // skip non-touched subtrees. Enabling `with_updates` only
-        // makes sense when the sparse walk is actually implemented.
-        let mut hb = alloy_trie::HashBuilder::default();
-        for (hashed_key, rlp) in leaves.iter() {
-            hb.add_leaf(alloy_trie::Nibbles::unpack(hashed_key), rlp);
+        // - For each branch node at prefix P, iterate its children
+        //   (the set bits in `state_mask`).
+        // - For a child at P+n that contains NO touched account:
+        //   call `add_branch(P+n, child_hash, true)` — the entire
+        //   subtree is skipped (O(1)).
+        // - For a child that DOES contain touched accounts:
+        //   - If the child is a stored branch (in `tree_mask` and
+        //     present in `retained_branches`), recurse.
+        //   - Otherwise (inline leaf/extension, or a shallow branch
+        //     not in `retained_branches`), feed all leaves under
+        //     that child prefix from `trie_leaves` (at most 16 for
+        //     a shallow branch; O(1) for a leaf).
+        //
+        // The total work is O(touched · depth · 16) = O(touched ·
+        // log n): at each of the ~log n levels, we visit at most 16
+        // children per touched path, and each untouched child is
+        // skipped in O(1) via `add_branch`.
+        //
+        // After the build, `HashBuilder::split()` returns the
+        // rebuilt branch nodes. For the full build, these replace
+        // `retained_branches` entirely. For the incremental build,
+        // we first remove stale entries on the touched path (prefixes
+        // of touched hashed keys that were in `retained_branches`),
+        // then merge the new `BranchNodeCompact`s — this correctly
+        // handles account insertions (new branches) and deletions
+        // (branches that become leaves/extensions and are no longer
+        // in the `split()` output).
+        //
+        // # `with_updates(true)` overhead
+        //
+        // Enabling update tracking adds a constant factor to each
+        // branch node construction. For the full build this is a
+        // one-time O(n) cost. For the incremental build the overhead
+        // is O(touched · log n) — negligible compared to the savings.
+        //
+        // # Edge cases
+        //
+        // - Empty state (zero accounts): `retained_branches` is
+        //   empty; the full-build path feeds zero leaves and returns
+        //   `EMPTY_ROOT`.
+        // - Single account: no branch nodes, `retained_branches` is
+        //   empty; the sparse walk falls back to feeding all leaves
+        //   (O(1)).
+        // - Root is an extension (rare with keccak256 keys):
+        //   `retained_branches[empty]` doesn't exist; we fall back to
+        //   feeding all leaves for that call, and `split()` repopulates
+        //   `retained_branches` for the next call.
+        let mut hb = alloy_trie::HashBuilder::default().with_updates(true);
+
+        let is_full_build = !*leaves_ready;
+        let can_sparse = !is_full_build && !retained.is_empty();
+
+        if can_sparse {
+            // Sparse incremental walk — O(touched · log n).
+            let touched_hashes: std::collections::BTreeSet<alloy_primitives::B256> =
+                touched.iter().map(alloy_primitives::keccak256).collect();
+            sparse_walk(
+                alloy_trie::Nibbles::default(),
+                &retained,
+                &leaves,
+                &touched_hashes,
+                &mut hb,
+            );
+        } else {
+            // Full build (or fallback when no retained branches):
+            // feed every leaf in sorted hashed-key order.
+            for (hashed_key, rlp) in leaves.iter() {
+                hb.add_leaf(alloy_trie::Nibbles::unpack(hashed_key), rlp);
+            }
         }
+
         let root = hb.root();
+        let (_, branch_updates) = hb.split();
+
+        if is_full_build {
+            // Full build: replace the entire retained map.
+            // `split()` returns `alloy_primitives::map::HashMap`
+            // (hashbrown, DefaultHashBuilder); convert to the std
+            // HashMap used by `retained_branches`.
+            *retained = branch_updates.into_iter().collect();
+        } else {
+            // Incremental build: remove stale branches on the
+            // touched path, then merge the rebuilt branches.
+            // A branch is "on the touched path" if its nibble
+            // prefix is a prefix of any touched hashed key. We
+            // check all 64 prefix lengths per touched key; only
+            // prefixes that exist in `retained` are removed.
+            for addr in touched.iter() {
+                let hashed = alloy_primitives::keccak256(addr);
+                let nibbles = alloy_trie::Nibbles::unpack(hashed);
+                for len in 0..nibbles.len() {
+                    let prefix = nibbles.slice(..len);
+                    retained.remove(&prefix);
+                }
+            }
+            for (prefix, node) in branch_updates {
+                retained.insert(prefix, node);
+            }
+        }
 
         // Cache the state root for the next call's fast path.
         *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -3017,6 +3113,22 @@ impl EvmModule {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(alloy_primitives_address(addr.0));
+    }
+
+    /// Reset the leaf cache so the next `state_root` call performs
+    /// a full rebuild instead of an incremental sparse walk. Test
+    /// hook: used to compute the "ground truth" root and verify
+    /// that the sparse incremental path produces the same result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any mutex is poisoned.
+    #[doc(hidden)]
+    pub fn reset_leaf_cache_for_test(&self) {
+        *self.trie_leaves_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.trie_leaves.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.retained_branches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Flush the current `CacheDB` state to the `StorageBackend`.
@@ -3207,6 +3319,189 @@ fn encode_trie_leaf(
     let mut buf = Vec::with_capacity(80);
     alloy_rlp::Encodable::encode(&trie_account, &mut buf);
     buf
+}
+
+/// Compute the inclusive-start and inclusive-end `B256` bounds for
+/// all keys that share the given nibble `prefix`.
+///
+/// The state trie is keyed by `keccak256(address)` — a 32-byte value,
+/// i.e. 64 nibbles. A prefix of length L fixes the first L nibbles;
+/// the remaining 64−L nibbles range freely. This function returns the
+/// `(start, end)` pair for a `BTreeMap<B256, _>::range(start..=end)`
+/// query covering exactly those keys (inclusive on both ends).
+///
+/// Using an inclusive end avoids the `end + 1` wrap-around that
+/// would occur for prefixes at the very end of the key space (e.g.
+/// a single-nibble prefix of 0xF), which would produce `end < start`
+/// and panic in `BTreeMap::range`.
+///
+/// For even L the boundary is byte-aligned. For odd L the last
+/// boundary byte carries the prefix nibble in its high half and 0
+/// (start) or 0xF (end) in its low half.
+fn prefix_range(prefix: &alloy_trie::Nibbles) -> (alloy_primitives::B256, alloy_primitives::B256) {
+    let len = prefix.len();
+    let mut start = [0u8; 32];
+    let mut end = [0u8; 32];
+    // Pack the prefix nibbles into both arrays. For even `i` we
+    // set the high nibble; for odd `i` we OR in the low nibble.
+    // We do NOT pre-fill the low nibble with 0xF on the even
+    // pass — that would corrupt the odd pass (0xF | x == 0xF).
+    for i in 0..len {
+        let nibble = prefix.get_unchecked(i);
+        let byte_idx = i / 2;
+        if i % 2 == 0 {
+            start[byte_idx] = nibble << 4;
+            end[byte_idx] = nibble << 4;
+        } else {
+            start[byte_idx] |= nibble;
+            end[byte_idx] |= nibble;
+        }
+    }
+    // If the prefix length is odd, the last packed byte has a free
+    // low nibble. Set it to 0x0F for the end bound (start already 0).
+    if len % 2 == 1 {
+        let last_byte_idx = len / 2;
+        end[last_byte_idx] |= 0x0F;
+    }
+    // Bytes after the prefix: start stays 0x00, end becomes 0xFF.
+    let last_packed_byte = len.div_ceil(2);
+    for b in &mut end[last_packed_byte..] {
+        *b = 0xFF;
+    }
+    (alloy_primitives::B256::from(start), alloy_primitives::B256::from(end))
+}
+
+/// Recursively walk the retained branch trie, feeding `HashBuilder`
+/// only the leaves and branch hashes that need recomputation.
+///
+/// Starting from the branch node at `prefix` (looked up in
+/// `retained`), iterate each child nibble. For children whose subtree
+/// contains no touched account, inject the precomputed child hash
+/// via `add_branch` (O(1) skip). For children containing touched
+/// accounts, either recurse (if the child is a stored branch) or
+/// feed the actual leaves from `trie_leaves` (for inline
+/// leaves/extensions or shallow branches not in `retained`).
+///
+/// # Arguments
+///
+/// - `prefix`: the nibble prefix of the current branch node.
+/// - `retained`: the full retained branch map from the previous
+///   `state_root` build.
+/// - `leaves`: the `trie_leaves` `BTreeMap` (all account leaves, keyed
+///   by `keccak256` of the address).
+/// - `touched_hashes`: sorted set of touched hashed addresses, used
+///   to determine which subtrees need recomputation.
+/// - `hb`: the `HashBuilder` to feed.
+///
+/// # Complexity
+///
+/// O(touched · depth · 16) = O(touched · log n) per call.
+fn sparse_walk(
+    prefix: alloy_trie::Nibbles,
+    retained: &std::collections::HashMap<alloy_trie::Nibbles, alloy_trie::BranchNodeCompact>,
+    leaves: &std::collections::BTreeMap<alloy_primitives::B256, Vec<u8>>,
+    touched_hashes: &std::collections::BTreeSet<alloy_primitives::B256>,
+    hb: &mut alloy_trie::HashBuilder,
+) {
+    let Some(branch) = retained.get(&prefix) else {
+        // No retained branch at this prefix — feed all leaves
+        // under it. This handles the root-extension case and
+        // any shallow branch not stored in `retained`.
+        feed_leaves_under(&prefix, leaves, hb);
+        return;
+    };
+
+    // Collect all child nibbles to process. The stale `state_mask`
+    // reflects the branch structure at the time of the previous
+    // build. Account insertions may have created new children that
+    // are NOT in the stale `state_mask` — we must include them so
+    // their leaves are fed. We scan `touched_hashes` under the
+    // current prefix and add any child nibble not already in
+    // `state_mask`. This is O(touched) per branch, O(touched · depth)
+    // total — dominated by the O(touched · depth · 16) walk.
+    let mut children: [u8; 16] = [0; 16];
+    let mut children_len = 0usize;
+    for n in branch.state_mask.iter() {
+        children[children_len] = n;
+        children_len += 1;
+    }
+    {
+        let (p_start, p_end) = prefix_range(&prefix);
+        let mut last_child: Option<u8> = None;
+        for th in touched_hashes.range(p_start..=p_end) {
+            let nibs = alloy_trie::Nibbles::unpack(th);
+            if nibs.len() <= prefix.len() {
+                continue;
+            }
+            let child_n = nibs.get_unchecked(prefix.len());
+            if Some(child_n) != last_child && !branch.state_mask.is_bit_set(child_n) {
+                children[children_len] = child_n;
+                children_len += 1;
+                last_child = Some(child_n);
+            } else {
+                last_child = Some(child_n);
+            }
+        }
+    }
+    // `state_mask.iter()` yields ascending nibbles; we appended new
+    // children in ascending order (BTreeSet range). Sort to be safe.
+    children[..children_len].sort_unstable();
+
+    for &n in &children[..children_len] {
+        // Build the child prefix = prefix + n.
+        let mut child_prefix = prefix;
+        child_prefix.push(n);
+
+        let has_touched = {
+            let (start, end) = prefix_range(&child_prefix);
+            touched_hashes.range(start..=end).next().is_some()
+        };
+
+        // A child not in the stale `state_mask` is new (from an
+        // account insertion). It has no retained hash and no stored
+        // branch — we must feed its leaves.
+        let in_state_mask = branch.state_mask.is_bit_set(n);
+        let is_hashed_child = in_state_mask && branch.hash_mask.is_bit_set(n);
+        let is_stored_branch = in_state_mask && branch.tree_mask.is_bit_set(n);
+
+        if !has_touched {
+            if is_hashed_child {
+                // Untouched hashed subtree — skip with precomputed
+                // hash. The child hash comes from the parent's
+                // `hashes` array (indexed by the hash_mask).
+                let child_hash = branch.hash_for_nibble(n);
+                hb.add_branch(child_prefix, child_hash, true);
+            } else {
+                // Untouched inline child (leaf or short extension).
+                // We must feed it — its value is embedded in the
+                // parent branch's RLP, not stored as a hash.
+                feed_leaves_under(&child_prefix, leaves, hb);
+            }
+        } else if is_stored_branch && retained.contains_key(&child_prefix) {
+            // Touched subtree that is a stored branch — recurse.
+            sparse_walk(child_prefix, retained, leaves, touched_hashes, hb);
+        } else {
+            // Touched subtree that is not a stored branch (inline
+            // leaf/extension, or a shallow branch not in `retained`,
+            // or a new child from account insertion).
+            // Feed all leaves under it. For a shallow branch this is
+            // at most 16 leaves; for a leaf it is 1.
+            feed_leaves_under(&child_prefix, leaves, hb);
+        }
+    }
+}
+
+/// Feed all leaves whose hashed key falls under `prefix` into
+/// `HashBuilder`, in sorted order (required by `add_leaf`).
+fn feed_leaves_under(
+    prefix: &alloy_trie::Nibbles,
+    leaves: &std::collections::BTreeMap<alloy_primitives::B256, Vec<u8>>,
+    hb: &mut alloy_trie::HashBuilder,
+) {
+    let (start, end) = prefix_range(prefix);
+    for (hashed_key, rlp) in leaves.range(start..=end) {
+        hb.add_leaf(alloy_trie::Nibbles::unpack(hashed_key), rlp);
+    }
 }
 
 #[cfg(test)]
@@ -4944,5 +5239,253 @@ mod tests {
     fn evm_module_pays_own_fee() {
         let m = make_module();
         assert!(m.pays_own_fee());
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Ceiling 3: sparse state-root regression tests.
+    //
+    // These tests verify that the sparse incremental walk produces
+    // the same state root as a full rebuild, across insertions,
+    // deletions, mutations, and at scale (1k–100k accounts). The
+    // 1M-account case is covered by the benchmark gate
+    // (`state_root_incremental/1M_accts_*_touched`).
+    // ───────────────────────────────────────────────────────────
+
+    /// Build N deterministic test addresses.
+    fn make_addrs(n: usize) -> Vec<primitives::Address> {
+        (0..n)
+            .map(|i| {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                primitives::Address(a)
+            })
+            .collect()
+    }
+
+    /// Compute the "ground truth" state root by forcing a full
+    /// rebuild (resets the leaf cache + retained branches so the
+    /// next `state_root` call walks every leaf from scratch).
+    fn full_rebuild_root(m: &EvmModule) -> Hash {
+        m.reset_leaf_cache_for_test();
+        executor::Module::state_root(m)
+    }
+
+    /// Sparse root must match full rebuild after a single mutation.
+    #[test]
+    fn sparse_root_matches_full_after_single_mutation() {
+        let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+        let addrs = make_addrs(1_000);
+        for a in &addrs {
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        // First call = full build (warms the leaf map + retained branches).
+        let root0 = executor::Module::state_root(&m);
+
+        // Touch one account and recompute.
+        m.mark_touched_for_test(&addrs[0]);
+        m.fund_account_for_test(&addrs[0], 2_000_000);
+        let root1 = executor::Module::state_root(&m);
+
+        // Must differ (balance changed).
+        assert_ne!(root1, root0, "root must change after mutation");
+
+        // Must match a full rebuild.
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root1, truth, "sparse root must match full rebuild");
+    }
+
+    /// Sparse root must match full rebuild after touching 100
+    /// accounts in a 10k-account state.
+    #[test]
+    fn sparse_root_matches_full_10k_100_touched() {
+        let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+        let addrs = make_addrs(10_000);
+        for a in &addrs {
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        executor::Module::state_root(&m); // full build
+
+        for (i, a) in addrs[..100].iter().enumerate() {
+            m.mark_touched_for_test(a);
+            m.fund_account_for_test(a, 1_000_000 + i as u128);
+        }
+        let root = executor::Module::state_root(&m);
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root, truth, "sparse root must match full rebuild at 10k/100");
+    }
+
+    /// Sparse root must match full rebuild after touching 100
+    /// accounts in a 100k-account state.
+    #[test]
+    fn sparse_root_matches_full_100k_100_touched() {
+        let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+        let addrs = make_addrs(100_000);
+        for a in &addrs {
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        executor::Module::state_root(&m); // full build
+
+        for (i, a) in addrs[..100].iter().enumerate() {
+            m.mark_touched_for_test(a);
+            m.fund_account_for_test(a, 1_000_000 + i as u128);
+        }
+        let root = executor::Module::state_root(&m);
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root, truth, "sparse root must match full rebuild at 100k/100");
+    }
+
+    /// Sparse root must match full rebuild after multiple
+    /// incremental rounds (each round touches a different set).
+    #[test]
+    fn sparse_root_matches_full_multiple_rounds() {
+        let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+        let addrs = make_addrs(5_000);
+        for a in &addrs {
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        executor::Module::state_root(&m); // full build
+
+        // 10 rounds, each touching 50 accounts.
+        for round in 0..10u128 {
+            let offset = (round as usize) * 50;
+            for (i, a) in addrs[offset..offset + 50].iter().enumerate() {
+                m.mark_touched_for_test(a);
+                m.fund_account_for_test(a, 1_000_000 + round * 100 + i as u128);
+            }
+            let root = executor::Module::state_root(&m);
+            let truth = full_rebuild_root(&m);
+            assert_eq!(root, truth, "sparse root must match full rebuild at round {round}");
+        }
+    }
+
+    /// Sparse root must match full rebuild after account insertion
+    /// (new account not in the previous build).
+    #[test]
+    fn sparse_root_matches_full_after_insertion() {
+        let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+        let addrs = make_addrs(1_000);
+        for a in &addrs {
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        executor::Module::state_root(&m); // full build
+
+        // Insert a new account whose hashed key may create a new
+        // branch child (the address is outside the original range).
+        let new_addr = {
+            let mut a = [0u8; 20];
+            a[..8].copy_from_slice(&(0xDEAD_BEEFu64).to_be_bytes());
+            primitives::Address(a)
+        };
+        m.fund_account_for_test(&new_addr, 1_000_000);
+        m.mark_touched_for_test(&new_addr);
+        let root = executor::Module::state_root(&m);
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root, truth, "sparse root must match full rebuild after insertion");
+    }
+
+    /// Sparse root must match full rebuild after touching the same
+    /// account twice (idempotent re-touch).
+    #[test]
+    fn sparse_root_matches_full_retouch() {
+        let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+        let addrs = make_addrs(500);
+        for a in &addrs {
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        executor::Module::state_root(&m);
+
+        m.mark_touched_for_test(&addrs[0]);
+        m.fund_account_for_test(&addrs[0], 2_000_000);
+        executor::Module::state_root(&m);
+
+        // Touch the same account again.
+        m.mark_touched_for_test(&addrs[0]);
+        m.fund_account_for_test(&addrs[0], 3_000_000);
+        let root = executor::Module::state_root(&m);
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root, truth, "sparse root must match full rebuild after retouch");
+    }
+
+    /// Sparse root must match full rebuild when touching accounts
+    /// that share a long key prefix (same branch subtree).
+    #[test]
+    fn sparse_root_matches_full_same_subtree() {
+        let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+        let addrs = make_addrs(2_000);
+        for a in &addrs {
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        executor::Module::state_root(&m);
+
+        // Touch 10 consecutive accounts (likely in the same subtree).
+        for (i, a) in addrs[..10].iter().enumerate() {
+            m.mark_touched_for_test(a);
+            m.fund_account_for_test(a, 1_000_000 + i as u128);
+        }
+        let root = executor::Module::state_root(&m);
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root, truth, "sparse root must match full rebuild in same subtree");
+    }
+
+    /// Sparse root must match full rebuild when touching accounts
+    /// spread across the entire key space (different subtrees).
+    #[test]
+    fn sparse_root_matches_full_spread_subtrees() {
+        let m = EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
+        let addrs = make_addrs(10_000);
+        for a in &addrs {
+            m.fund_account_for_test(a, 1_000_000);
+        }
+        executor::Module::state_root(&m);
+
+        // Touch every 100th account — spread across the key space.
+        for (i, a) in addrs.iter().step_by(100).enumerate() {
+            m.mark_touched_for_test(a);
+            m.fund_account_for_test(a, 1_000_000 + i as u128);
+        }
+        let root = executor::Module::state_root(&m);
+        let truth = full_rebuild_root(&m);
+        assert_eq!(root, truth, "sparse root must match full rebuild across subtrees");
+    }
+
+    /// `prefix_range` must produce correct inclusive bounds.
+    #[test]
+    fn prefix_range_correct_bounds() {
+        use alloy_primitives::B256;
+
+        // Empty prefix: start=0, end=MAX.
+        let (s, e) = prefix_range(&alloy_trie::Nibbles::default());
+        assert_eq!(s, B256::ZERO);
+        assert_eq!(e, B256::repeat_byte(0xFF));
+
+        // Single nibble 0: start=00..00, end=0F..FF.
+        let mut p = alloy_trie::Nibbles::default();
+        p.push(0x0);
+        let (s, e) = prefix_range(&p);
+        assert_eq!(s, B256::ZERO);
+        let mut expected_end = [0xFFu8; 32];
+        expected_end[0] = 0x0F;
+        assert_eq!(e, B256::from_slice(&expected_end));
+
+        // Single nibble F: start=F0..00, end=FF..FF.
+        let mut p = alloy_trie::Nibbles::default();
+        p.push(0xF);
+        let (s, e) = prefix_range(&p);
+        let mut expected_start = [0u8; 32];
+        expected_start[0] = 0xF0;
+        assert_eq!(s, B256::from_slice(&expected_start));
+        assert_eq!(e, B256::repeat_byte(0xFF));
+
+        // Two nibbles C, 9: start=C9..00, end=C9..FF.
+        let mut p = alloy_trie::Nibbles::default();
+        p.push(0xC);
+        p.push(0x9);
+        let (s, e) = prefix_range(&p);
+        let mut expected_start = [0u8; 32];
+        expected_start[0] = 0xC9;
+        assert_eq!(s, B256::from_slice(&expected_start));
+        let mut expected_end = [0xFFu8; 32];
+        expected_end[0] = 0xC9;
+        assert_eq!(e, B256::from_slice(&expected_end));
     }
 }

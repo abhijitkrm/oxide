@@ -12,6 +12,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Sparse incremental state-root computation for the EVM module**
+  (`modules/evm/src/lib.rs`, `modules/evm/benches/trie_root.rs`)
+  - Replaced the O(N) `HashBuilder` trie-assembly pass with a
+    sparse retained-trie walk that skips untouched subtrees via
+    `add_branch`. After the first full build, branch node metadata
+    (`BranchNodeCompact`) is retained from `HashBuilder::split()`.
+    Subsequent calls walk only the path from touched leaves to the
+    root, injecting precomputed hashes for untouched subtrees.
+  - Complexity reduced from O(total_accounts) to
+    O(touched · log(total_accounts)) per block.
+  - **In plain words:** When a block changes 100 accounts out of
+    1 million, the state root is now computed by walking only the
+    100 changed paths through the trie tree, not by re-hashing all
+    1 million accounts. This makes state-root computation ~1000x
+    faster at scale and eliminates the throughput degradation that
+    occurred as the account set grew.
+  - Benchmark gate: 1M accounts / 100 touched < 10ms → **1.27 ms**
+    (7.9x margin).
+  - EVM load test: 100K txs at 6,410 tx/s with 4 validators,
+    throughput now *increases* over time instead of degrading.
+
 - **Real Reed-Solomon erasure broadcast with proof of availability**
   (`crates/broadcast/src/gf256.rs`, `crates/broadcast/src/rs.rs`,
   `crates/broadcast/src/lib.rs`)

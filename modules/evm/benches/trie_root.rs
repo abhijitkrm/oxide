@@ -98,21 +98,21 @@ fn bench_storage_root(c: &mut Criterion) {
 
 /// Incremental `state_root` over a live `EvmModule`: N funded
 /// accounts, K touched (balance mutated) per call. Measures the
-/// end-to-end leaf-patch path — the old path re-hashed every
-/// address, re-encoded every account, and re-sorted N leaves each
-/// call; the incremental path patches K leaves and feeds a
-/// pre-sorted `BTreeMap` to `HashBuilder`.
-///
-/// The residual O(N) leaf-node hashing inside `HashBuilder::root()`
-/// is the floor for a non-sparse MPT — a sparse retained trie
-/// (reth's `reth-trie-sparse` approach) is the O(touched·log n)
-/// follow-up.
+/// end-to-end sparse-walk path — the first call is a full build
+/// (O(N)); subsequent calls walk only the touched path through
+/// the retained branch trie, skipping untouched subtrees via
+/// `add_branch`. The gate: 100 touched in 1M accounts < 10ms.
 fn bench_state_root_incremental(c: &mut Criterion) {
     let mut group = c.benchmark_group("state_root_incremental");
 
-    for &(n_accounts, n_touched) in
-        &[(10_000usize, 10usize), (10_000, 100), (100_000, 10), (100_000, 100)]
-    {
+    for &(n_accounts, n_touched) in &[
+        (10_000usize, 10usize),
+        (10_000, 100),
+        (100_000, 10),
+        (100_000, 100),
+        (1_000_000, 10),
+        (1_000_000, 100),
+    ] {
         group.bench_function(format!("{n_accounts}_accts_{n_touched}_touched"), |b| {
             let module =
                 evm::EvmModule::with_storage(1, 1_000_000_000, Box::new(storage::Volatile::new()));
