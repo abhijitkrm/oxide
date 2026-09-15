@@ -72,6 +72,23 @@ pub trait TxSubmitter: Send + Sync {
     fn submit_tx(&self, tx: TxBytes) -> Result<(), String>;
 }
 
+/// Trait for providing a state snapshot via the `/snapshot` endpoint.
+///
+/// Implemented by the node's executor handle. The snapshot is returned
+/// as codec-encoded bytes, hex-encoded for the HTTP response.
+///
+/// The trait is `Send + Sync` so an `Arc<dyn SnapshotProvider>` can be
+/// shared across the HTTP handler's async tasks.
+pub trait SnapshotProvider: Send + Sync {
+    /// Export the current state snapshot, codec-encoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(reason)` if the snapshot cannot be produced (e.g.
+    /// the node is not yet initialized, or state is being written).
+    fn export_snapshot(&self) -> Result<Vec<u8>, String>;
+}
+
 /// The JSON-RPC 2.0 request envelope.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RpcRequest {
@@ -354,6 +371,10 @@ pub struct RpcServer {
     rate_window_start_ms: AtomicU64,
     /// Rate limiter state: request count within the current window.
     rate_window_count: AtomicU64,
+    /// Optional snapshot provider for the `GET /snapshot` endpoint.
+    /// When set, the endpoint returns the codec-encoded snapshot as
+    /// hex. When `None`, the endpoint returns 404.
+    snapshot_provider: Option<Arc<dyn SnapshotProvider>>,
 }
 
 impl RpcServer {
@@ -373,6 +394,7 @@ impl RpcServer {
             max_requests_per_second: 0, // unlimited by default
             rate_window_start_ms: AtomicU64::new(0),
             rate_window_count: AtomicU64::new(0),
+            snapshot_provider: None,
         }
     }
 
@@ -384,6 +406,22 @@ impl RpcServer {
     /// Phase 2 v0 behaviour, retained for stateless unit tests.
     pub fn set_tx_submitter(&mut self, submitter: Arc<dyn TxSubmitter>) {
         self.tx_submitter = Some(submitter);
+    }
+
+    /// Attach a snapshot provider so `GET /snapshot` returns the
+    /// current executor state as codec-encoded bytes (hex-encoded in
+    /// the HTTP response).
+    ///
+    /// Without this call, `/snapshot` returns 404 — the endpoint is
+    /// disabled for stateless test configurations.
+    pub fn set_snapshot_provider(&mut self, provider: Arc<dyn SnapshotProvider>) {
+        self.snapshot_provider = Some(provider);
+    }
+
+    /// Get the snapshot provider, if attached.
+    #[must_use]
+    pub fn snapshot_provider(&self) -> Option<&Arc<dyn SnapshotProvider>> {
+        self.snapshot_provider.as_ref()
     }
 
     /// Attach a latency recorder for RPC handler metrics.

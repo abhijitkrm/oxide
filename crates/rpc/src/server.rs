@@ -18,6 +18,7 @@
 //! - `POST /` — JSON-RPC 2.0 request/response (Ethereum-compatible)
 //! - `GET /health` — simple health check (returns 200 OK)
 //! - `GET /metrics` — Prometheus-format node metrics
+//! - `GET /snapshot` — codec-encoded state snapshot (hex)
 //!
 //! # Usage
 //!
@@ -165,6 +166,7 @@ impl HttpServer {
             .route("/", post(handle_rpc))
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))
+            .route("/snapshot", get(snapshot_handler))
             .with_state((rpc, rate_limiter))
     }
 }
@@ -206,6 +208,65 @@ async fn handle_rpc(
                 .body("{}".to_string())
                 .unwrap()
         })
+}
+
+/// State snapshot endpoint (`GET /snapshot`).
+///
+/// Returns the codec-encoded `ExecutorSnapshot` as a hex string
+/// (`0x`-prefixed). The caller can save the hex to a file and later
+/// import it via `--import-snapshot` on a new node.
+///
+/// Returns 404 if no snapshot provider is attached (stateless config).
+async fn snapshot_handler(
+    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+) -> Response<String> {
+    match rpc.snapshot_provider() {
+        Some(provider) => match provider.export_snapshot() {
+            Ok(bytes) => {
+                let hex = format!("0x{}", hex_encode(&bytes));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .body(hex)
+                    .unwrap_or_else(|_| {
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(String::new())
+                            .unwrap()
+                    })
+            }
+            Err(e) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/json")
+                .body(format!(r#"{{"error":"{e}"}}"#))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body("{}".to_string())
+                        .unwrap()
+                }),
+        },
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .body(r#"{"error":"snapshot provider not configured"}"#.to_string())
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body("{}".to_string())
+                    .unwrap()
+            }),
+    }
+}
+
+/// Hex-encode a byte slice (lowercase, no separators).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{b:02x}").expect("writing to String cannot fail");
+    }
+    s
 }
 
 /// Health check endpoint. Returns 200 OK with "ok".

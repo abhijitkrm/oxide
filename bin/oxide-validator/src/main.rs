@@ -92,6 +92,26 @@ impl rpc::TxSubmitter for ExecutorTxSubmitter {
     }
 }
 
+/// Adapter that lets the RPC server export the executor's state
+/// snapshot via the `rpc::SnapshotProvider` trait.
+///
+/// The executor's `export_snapshot` returns an `ExecutorSnapshot`;
+/// this adapter codec-encodes it so the RPC layer can serve it as
+/// hex bytes without a direct dependency on the executor crate's
+/// internal types.
+struct ExecutorSnapshotProvider {
+    executor: Arc<executor::Executor>,
+}
+
+impl rpc::SnapshotProvider for ExecutorSnapshotProvider {
+    fn export_snapshot(&self) -> Result<Vec<u8>, String> {
+        let snap = self.executor.export_snapshot();
+        let mut buf = Vec::new();
+        snap.encode(&mut buf);
+        Ok(buf)
+    }
+}
+
 fn main() {
     // Initialize the tracing subscriber with `EnvFilter` so log levels
     // can be controlled via the `RUST_LOG` environment variable (e.g.
@@ -153,6 +173,8 @@ fn run_single_node() {
     let mut node = Node::assemble(&node_config);
     tracing::info!("oxide-validator: assembled stack (executor + core/bank/staking modules)");
 
+    handle_import_snapshot(&mut node);
+
     // Submit a smoke-test bank transfer.
     let to = primitives::Address([2u8; 20]);
     let module_payload = bank::msg::transfer(to, 100);
@@ -175,6 +197,11 @@ fn run_single_node() {
 
     tracing::info!("oxide-validator: smoke test complete");
 
+    if handle_export_snapshot(&mut node) {
+        return;
+    }
+    handle_key_change(&mut node);
+
     // Start the JSON-RPC HTTP server.
     tracing::info!(
         listen_addr = %rpc_config.listen_addr,
@@ -188,6 +215,10 @@ fn run_single_node() {
     // Wire the executor into the RPC so `eth_sendRawTransaction`
     // decodes, wraps, and submits EVM transactions into the mempool.
     rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: node.app_handle() }));
+    // Wire the executor into the RPC so `GET /snapshot` returns the
+    // codec-encoded state snapshot.
+    rpc_server
+        .set_snapshot_provider(Arc::new(ExecutorSnapshotProvider { executor: node.app_handle() }));
     // Attach the latency recorder for RPC handler metrics.
     rpc_server.set_recorder(recorder.clone());
     // Seed the metrics with the current block height and mempool size.
@@ -266,6 +297,74 @@ fn run_single_node() {
     });
 
     tracing::info!("oxide-validator: node stopped");
+}
+
+/// Handle `--import-snapshot <path>`: restore state from a snapshot
+/// file before starting consensus. The file is codec-encoded
+/// `ExecutorSnapshot` (written by `--export-snapshot` or `GET /snapshot`).
+fn handle_import_snapshot(node: &mut Node) {
+    if let Some(snapshot_path) = parse_cli_flag("--import-snapshot") {
+        let data = std::fs::read(&snapshot_path)
+            .unwrap_or_else(|e| panic!("cannot read snapshot file {snapshot_path}: {e}"));
+        let mut reader = codec::Reader::new(&data);
+        let snapshot = executor::ExecutorSnapshot::decode(&mut reader)
+            .unwrap_or_else(|e| panic!("cannot decode snapshot {snapshot_path}: {e}"));
+        node.import_snapshot(&snapshot).unwrap_or_else(|e| panic!("snapshot import failed: {e}"));
+        tracing::info!(
+            height = snapshot.height,
+            path = snapshot_path,
+            "oxide-validator: imported snapshot"
+        );
+    }
+}
+
+/// Handle `--export-snapshot <path>`: write the current state
+/// snapshot to a file and return `true` (the caller exits).
+fn handle_export_snapshot(node: &mut Node) -> bool {
+    if let Some(snapshot_path) = parse_cli_flag("--export-snapshot") {
+        let snap = node.export_snapshot();
+        let mut buf = Vec::new();
+        snap.encode(&mut buf);
+        std::fs::write(&snapshot_path, &buf)
+            .unwrap_or_else(|e| panic!("cannot write snapshot {snapshot_path}: {e}"));
+        tracing::info!(
+            height = snap.height,
+            path = snapshot_path,
+            bytes = buf.len(),
+            "oxide-validator: exported snapshot"
+        );
+        return true;
+    }
+    false
+}
+
+/// Handle `--submit-key-change <new_bls_pubkey_hex>`: submit a
+/// staking key-change transaction for this validator. The transaction
+/// is included in the next block; the new key takes effect at the
+/// next epoch rotation.
+fn handle_key_change(node: &mut Node) {
+    if let Some(hex_key) = parse_cli_flag("--submit-key-change") {
+        let new_key_bytes =
+            hex_decode(&hex_key).unwrap_or_else(|e| panic!("invalid BLS key hex: {e}"));
+        // The validator address is the tx sender (Address([0u8; 20])
+        // in devnet mode). In production this would be the node's
+        // configured validator address.
+        let validator_addr = primitives::Address([0u8; 20]);
+        // Ensure the validator has stake (delegate 1 unit if needed)
+        // so the key-change handler accepts the tx.
+        let delegate_msg = staking::msg::delegate(validator_addr, 1);
+        let delegate_tx = build_tx(framework::module_id::STAKING, &delegate_msg);
+        node.engine().submit_tx(delegate_tx);
+        node.engine().run_until_idle();
+        let msg_payload = staking::msg::key_change(validator_addr, &new_key_bytes);
+        let tx = build_tx(framework::module_id::STAKING, &msg_payload);
+        node.engine().submit_tx(tx);
+        tracing::info!("oxide-validator: submitted key-change transaction");
+        // Drive consensus once more to include the key-change tx.
+        node.engine().run_until_idle();
+        let h = node.engine().finalized_height();
+        tracing::info!(?h, "oxide-validator: key-change block finalized");
+    }
 }
 
 /// Run a single validator node in multi-process devnet mode.
@@ -826,6 +925,25 @@ fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
     build_tx_with_nonce(module_id, module_payload, 0)
 }
 
+/// Decode a hex string (with or without `0x` prefix) into bytes.
+///
+/// # Errors
+///
+/// Returns `Err` if the string is not valid hex or has an odd length.
+fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    if hex.len() % 2 != 0 {
+        return Err("hex string has odd length".to_string());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| format!("invalid hex at byte {}: {e}", i / 2))
+        })
+        .collect()
+}
+
 fn build_tx_with_nonce(module_id: u8, module_payload: &[u8], nonce: u64) -> types::TxBytes {
     let sender = primitives::Address([0u8; 20]);
     let fee = 100u64;
@@ -871,12 +989,18 @@ fn print_help() {
     println!("    --bind-host <host>        Host to bind on (default 127.0.0.1)");
     println!("    --peer-host <host>        Peer host (default 127.0.0.1)");
     println!("    --peer-host-template <f>  Peer host template with {{i}} (e.g. validator-{{i}})");
+    println!("    --export-snapshot <path>  Export state snapshot to file and exit");
+    println!("    --import-snapshot <path>  Import state snapshot before starting");
+    println!("    --submit-key-change <hex> Submit a BLS key-change transaction");
     println!();
     println!("EXAMPLES:");
     println!("    oxide-validator init --chain-id 1");
     println!("    oxide-validator genesis --chain-id 1 --validators 4");
     println!("    oxide-validator --config config/devnet.toml");
     println!("    oxide-validator --engine oxidebft");
+    println!("    oxide-validator --export-snapshot snapshot.bin");
+    println!("    oxide-validator --import-snapshot snapshot.bin");
+    println!("    oxide-validator --submit-key-change 0xabcdef...");
 }
 
 /// `oxide-validator init` — initialize a new node directory.

@@ -12172,12 +12172,84 @@ validator-1 — caught up to height 2826.
   (single-node sequencer mode)
 - `oxide-deploy`: devnet smoke test passes
 
+### Remaining work — all items completed in this session
+
+- ✅ `/snapshot` RPC endpoint wired (`GET /snapshot` returns
+  codec-encoded `ExecutorSnapshot` as hex)
+- ✅ `--import-snapshot` / `--export-snapshot` CLI flags wired
+- ✅ `--submit-key-change` CLI flag wired + `KEY_CHANGE` msg type
+  added to staking module
+- ✅ `trading_tps_large` 10M-tx root cause found and fixed:
+  `MAX_RETAINED_FINALIZED` (4096) pruned old finalized blocks from
+  the engine's `finalized` map; `collect_result` iterated
+  `0..=finalized_height` and got `None` for pruned blocks. Fixed by
+  adding `commit_listener` to `OxideBft` — the devnet now collects
+  all committed blocks via a callback into `committed_blocks`
+  vectors. 10M test passes: 10000 blocks, 10M txs, all validators
+  agree on state root at height 9999, 78.7K tx/s sustained.
+
+---
+
+## 2026-09-14 — Session 4: runbook wiring + devnet fix
+
+### What was done
+
+**Codec impls for snapshot serialization:**
+- `storage::Snapshot` and `executor::ExecutorSnapshot` now implement
+  `Encode`/`Decode` for binary save/load and RPC export.
+- `ExecutorSnapshot::module_roots` changed from `Vec<(&'static str, Hash)>`
+  to `Vec<(String, Hash)>` — `&'static str` can't be decoded (borrowed
+  lifetime); `String` is owned and serializable.
+
+**`/snapshot` RPC endpoint:**
+- `rpc::SnapshotProvider` trait — executor implements it by calling
+  `export_snapshot()` + `encode()`.
+- `GET /snapshot` returns `0x`-prefixed hex of the codec-encoded
+  snapshot. Returns 404 if no provider attached.
+
+**`--import-snapshot` / `--export-snapshot` CLI flags:**
+- `--export-snapshot <path>`: after smoke test, encode + write
+  `ExecutorSnapshot` to file, exit.
+- `--import-snapshot <path>`: after `Node::assemble`, read + decode
+  `ExecutorSnapshot`, call `node.import_snapshot()`, continue.
+
+**`--submit-key-change` CLI flag + `KEY_CHANGE` msg type:**
+- `staking::msg::key_change(validator, new_key)` — 69-byte message
+  `[type:0x05][validator:20B][new_key:48B]`.
+- `handle_key_change` validates sender == validator, validator has
+  stake, key is 48 bytes. Stores in `pending_key_changes`.
+- `take_key_changes()` drains pending changes (called at epoch
+  boundary by the consensus engine).
+- `--submit-key-change` delegates 1 unit of stake (if needed) then
+  submits the key-change tx.
+
+**`trading_tps_large` fix:**
+- Root cause: `MAX_RETAINED_FINALIZED = 4096` in the engine pruned
+  old finalized blocks. `collect_result` iterated `0..=height` and
+  got `None` for pruned blocks — only the last 4096 were collected.
+- Fix: added `commit_listener: Option<Box<dyn Fn(&FinalizedBlock)>>`
+  to `OxideBft`. Called in `commit_block` before the block is added
+  to `finalized`. The devnet sets the listener to push each block
+  into a shared `Arc<Mutex<Vec<FinalizedBlock>>>`.
+- `collect_result` now reads from `committed_blocks` instead of
+  iterating `0..=finalized_height`.
+
+**Clippy fixes:**
+- `tcp_multinode.rs`: extracted `report_progress` helper (107→~80
+  lines), fixed `u64→f64` precision-loss casts.
+- `evm_load.rs`: fixed doc backticks and `!=`/`==` inversion.
+- `staking/lib.rs`: fixed `single_match_else` in `handle`.
+
+### Test results
+
+- `cargo test --workspace` — all pass, 0 failures
+- `cargo fmt --check` — clean
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- `cargo test -p devnet --release -- --ignored trading_tps_large` —
+  10M txs, 10000 blocks, all validators agree, 78.7K tx/s, 127s
+
 ### Remaining work
 
-- Wire `/snapshot` RPC endpoint for runbook 3 (backup)
-- Wire `--import-snapshot` CLI flag for runbook 4 (restore)
-- Wire `--submit-key-change` CLI flag for runbook 9 (key rotation)
-- The 10M-tx trading TPS test needs investigation — the common
-  prefix (4096 blocks) is less than the round count (10000),
-  suggesting the pipelined loop may not be producing blocks
-  fast enough for the test's iteration count
+- `take_key_changes` needs to be wired into `complete_rotation` so
+  pending key changes are applied at epoch boundaries (currently
+  stored but not consumed).

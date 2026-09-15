@@ -282,7 +282,14 @@ pub struct OxideBft {
     pending: Option<PendingBlock>,
     /// Finalized blocks keyed by height. `BTreeMap` for ordered
     /// iteration (the conformance suite checks the height sequence).
+    /// Bounded to `MAX_RETAINED_FINALIZED` — old blocks are pruned.
     finalized: BTreeMap<u64, FinalizedBlock>,
+    /// Optional commit listener. Called with each committed block
+    /// before it's added to `finalized`. Used by devnet harnesses to
+    /// observe all commits (the `finalized` map prunes old entries,
+    /// so external consumers can't rely on it for full history).
+    #[allow(clippy::type_complexity)]
+    commit_listener: Option<Box<dyn Fn(&FinalizedBlock) + Send + Sync>>,
     /// The next height at which a block will be proposed. Advances in
     /// lockstep with the app's `next_proposal_height`.
     next_height: Height,
@@ -372,6 +379,7 @@ impl OxideBft {
             blocks: HashMap::new(),
             pending: None,
             finalized: BTreeMap::new(),
+            commit_listener: None,
             next_height: Height::new(0),
             current_view: initial_view,
             epoch,
@@ -387,6 +395,17 @@ impl OxideBft {
             verify_per_vote: false,
             wal: None,
         }
+    }
+
+    /// Set a commit listener that fires on each committed block.
+    ///
+    /// The listener is called with the committed block before it's
+    /// added to `finalized`. Used by devnet harnesses to observe all
+    /// commits (the `finalized` map prunes old entries at
+    /// `MAX_RETAINED_FINALIZED`, so external consumers can't rely on
+    /// it for full history).
+    pub fn set_commit_listener(&mut self, listener: Box<dyn Fn(&FinalizedBlock) + Send + Sync>) {
+        self.commit_listener = Some(listener);
     }
 
     /// Set the BLS secret key for this engine (stage 5). When set,
@@ -1569,6 +1588,12 @@ impl OxideBft {
             return; // already committed or unknown
         };
         let block = FinalizedBlock { height: header.height, txs: proposal.txs };
+        // Notify the commit listener before inserting into `finalized`
+        // — the map prunes at `MAX_RETAINED_FINALIZED`, so external
+        // consumers that need full history must observe commits here.
+        if let Some(listener) = &self.commit_listener {
+            listener(&block);
+        }
         self.app.finalize_block(&block);
         self.finalized.insert(header.height.value(), block);
         // Prune per-height vote locks at-or-below the committed

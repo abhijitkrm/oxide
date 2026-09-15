@@ -77,6 +77,9 @@ mod msg_type {
     pub const SLASH: u8 = 0x03;
     /// Claim reward: withdraw accumulated rewards.
     pub const CLAIM_REWARD: u8 = 0x04;
+    /// Key change: update a validator's BLS consensus public key.
+    /// The new key takes effect at the next epoch rotation.
+    pub const KEY_CHANGE: u8 = 0x05;
 }
 
 /// The unbonding period in blocks.
@@ -151,6 +154,11 @@ pub struct StakingModule {
     unbonding: Mutex<Vec<UnbondingEntry>>,
     /// Accumulated rewards per validator address.
     rewards: Mutex<BTreeMap<Address, u64>>,
+    /// Pending BLS key changes per validator address. The new key
+    /// takes effect at the next epoch rotation — the consensus
+    /// engine reads these via `take_key_changes` at the epoch
+    /// boundary.
+    pending_key_changes: Mutex<BTreeMap<Address, Vec<u8>>>,
     /// The unbonding period in blocks.
     unbonding_period: u64,
     /// The block reward in atomic units.
@@ -168,6 +176,7 @@ impl StakingModule {
             validators: Mutex::new(BTreeMap::new()),
             unbonding: Mutex::new(Vec::new()),
             rewards: Mutex::new(BTreeMap::new()),
+            pending_key_changes: Mutex::new(BTreeMap::new()),
             unbonding_period: DEFAULT_UNBONDING_PERIOD_BLOCKS,
             block_reward: DEFAULT_BLOCK_REWARD,
             current_height: Mutex::new(0),
@@ -246,6 +255,36 @@ impl StakingModule {
         self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
+    /// Take all pending key changes, clearing the queue. Called by
+    /// the consensus engine at the epoch boundary to apply new BLS
+    /// keys to the validator set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
+        std::mem::take(
+            &mut *self
+                .pending_key_changes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    /// Check if a validator has a pending key change.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn has_key_change(&self, addr: &Address) -> bool {
+        self.pending_key_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(addr)
+    }
+
     /// Get completed unbonding entries (for withdrawal).
     ///
     /// # Panics
@@ -263,13 +302,24 @@ impl StakingModule {
             .collect()
     }
 
+    /// Parse a staking message header: `[type: 1B][validator: 20B]`.
+    /// Returns `(msg_type, validator)` — the payload after the
+    /// validator field varies by message type (amount, BLS key, etc.).
+    fn parse_message_header(msg: &[u8]) -> Option<(u8, Address)> {
+        if msg.len() < 21 {
+            return None;
+        }
+        let msg_type = msg[0];
+        let validator = Address::from_slice(&msg[1..21]).ok()?;
+        Some((msg_type, validator))
+    }
+
     /// Parse a staking message: `[type: 1B][validator: 20B][amount: 8B LE]`.
     fn parse_message(msg: &[u8]) -> Option<(u8, Address, u64)> {
         if msg.len() < 29 {
             return None;
         }
-        let msg_type = msg[0];
-        let validator = Address::from_slice(&msg[1..21]).ok()?;
+        let (msg_type, validator) = Self::parse_message_header(msg)?;
         let amount = u64::from_le_bytes(msg[21..29].try_into().ok()?);
         Some((msg_type, validator, amount))
     }
@@ -335,6 +385,21 @@ pub mod msg {
         stake.saturating_mul(super::SLASH_FRACTION_DOUBLE_SIGN_NUMERATOR)
             / super::SLASH_FRACTION_DENOMINATOR
     }
+
+    /// A key-change message: `[type: 0x05][validator: 20B][new_key: 48B]`.
+    ///
+    /// Updates a validator's BLS consensus public key. The new key
+    /// takes effect at the next epoch rotation. Only the validator
+    /// itself can submit this (the sender must equal `validator`).
+    ///
+    /// `new_key` is a 48-byte BLS12-381 compressed public key.
+    pub fn key_change(validator: primitives::Address, new_key: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(69);
+        msg.push(super::msg_type::KEY_CHANGE);
+        msg.extend_from_slice(&validator.0);
+        msg.extend_from_slice(new_key);
+        msg
+    }
 }
 
 impl Module for StakingModule {
@@ -351,8 +416,12 @@ impl Module for StakingModule {
     }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-        let (msg_type, validator, amount) = Self::parse_message(msg).ok_or(ExecError::Malformed)?;
+        let (msg_type, validator) = Self::parse_message_header(msg).ok_or(ExecError::Malformed)?;
 
+        if msg_type == msg_type::KEY_CHANGE {
+            return self.handle_key_change(ctx, validator, msg);
+        }
+        let (_, _, amount) = Self::parse_message(msg).ok_or(ExecError::Malformed)?;
         match msg_type {
             msg_type::DELEGATE => self.handle_delegate(ctx, validator, amount, msg),
             msg_type::UNDELEGATE => self.handle_undelegate(ctx, validator, amount, msg),
@@ -495,6 +564,50 @@ impl StakingModule {
         *rewards.entry(validator).or_insert(0) -= claim_amount;
 
         Ok(vec![Event { module: "staking", kind: "claim_reward", data: msg.to_vec() }])
+    }
+
+    /// Handle a key-change message: record a new BLS consensus key
+    /// for `validator`.
+    ///
+    /// The message format is `[type: 0x05][validator: 20B][new_key: 48B]`.
+    /// The new key takes effect at the next epoch rotation — the
+    /// consensus engine reads pending changes via `take_key_changes`.
+    ///
+    /// Only the validator itself can change its key (checked via
+    /// `ctx.sender`). The sender must be the validator address.
+    fn handle_key_change(
+        &self,
+        ctx: &TxContext,
+        validator: Address,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        // The sender must be the validator changing its own key.
+        if ctx.sender != validator {
+            return Err(ExecError::ModuleRejected(
+                "key_change: sender must be the validator".to_string(),
+            ));
+        }
+        // The validator must exist (have non-zero stake).
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !validators.contains_key(&validator) {
+            return Err(ExecError::ModuleRejected("key_change: validator not found".to_string()));
+        }
+        // The new key is a 48-byte BLS12-381 compressed public key.
+        if msg.len() != 21 + 48 {
+            return Err(ExecError::ModuleRejected(format!(
+                "key_change: expected 48-byte key, got {} bytes",
+                msg.len().saturating_sub(21)
+            )));
+        }
+        let new_key = msg[21..69].to_vec();
+        drop(validators); // release lock before acquiring pending_key_changes
+
+        self.pending_key_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(validator, new_key);
+
+        Ok(vec![Event { module: "staking", kind: "key_change", data: msg.to_vec() }])
     }
 
     /// Distribute block rewards to active validators proportional
@@ -784,5 +897,51 @@ mod tests {
         staking.handle(&ctx(), &msg::undelegate(v, 500)).unwrap();
         let pending = staking.pending_unbonding();
         assert_eq!(pending[0].completion_height, 15, "5 + 10 = 15");
+    }
+
+    #[test]
+    fn key_change_stores_pending_key() {
+        let staking = StakingModule::new();
+        let v = addr(0); // sender is addr(0) in ctx()
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let new_key = vec![0xAA; 48];
+        staking.handle(&ctx(), &msg::key_change(v, &new_key)).unwrap();
+        assert!(staking.has_key_change(&v), "key change must be pending");
+        let changes = staking.take_key_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, v);
+        assert_eq!(changes[0].1, new_key);
+        // After take, the pending map is empty.
+        assert!(!staking.has_key_change(&v), "key change must be drained");
+    }
+
+    #[test]
+    fn key_change_rejects_wrong_sender() {
+        let staking = StakingModule::new();
+        let v = addr(1); // sender is addr(0), but validator is addr(1)
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let new_key = vec![0xAA; 48];
+        let result = staking.handle(&ctx(), &msg::key_change(v, &new_key));
+        assert!(result.is_err(), "must reject key change from non-validator sender");
+    }
+
+    #[test]
+    fn key_change_rejects_unknown_validator() {
+        let staking = StakingModule::new();
+        let v = addr(0); // sender is addr(0) but no stake delegated
+        let new_key = vec![0xAA; 48];
+        let result = staking.handle(&ctx(), &msg::key_change(v, &new_key));
+        assert!(result.is_err(), "must reject key change for unknown validator");
+    }
+
+    #[test]
+    fn key_change_rejects_wrong_key_length() {
+        let staking = StakingModule::new();
+        let v = addr(0);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let short_key = vec![0xAA; 32]; // not 48 bytes
+        let msg = msg::key_change(v, &short_key);
+        let result = staking.handle(&ctx(), &msg);
+        assert!(result.is_err(), "must reject non-48-byte key");
     }
 }

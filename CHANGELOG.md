@@ -38,6 +38,45 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - On restart, `OxideBft::recover_from_wal()` restores the
     state, preventing double-voting and conflicting votes after
     a crash.
+
+- **State snapshot export/import via CLI and RPC**
+  (`bin/oxide-validator/src/main.rs`, `crates/rpc/src/server.rs`)
+  - `oxide-validator --export-snapshot <path>` writes the
+    codec-encoded `ExecutorSnapshot` to a file and exits.
+  - `oxide-validator --import-snapshot <path>` restores state from
+    a snapshot file before starting consensus.
+  - `GET /snapshot` on the RPC endpoint returns the snapshot as
+    hex (for download/transfer to a new node).
+  - `rpc::SnapshotProvider` trait lets the RPC layer export state
+    without a direct dependency on the executor.
+  - **In plain words:** A validator can now save its entire state
+    to a file (backup), transfer it to a new node (migration), or
+    restore it after data loss (disaster recovery) — without
+    replaying from genesis.
+
+- **Validator BLS key rotation via `--submit-key-change`**
+  (`modules/staking/src/lib.rs`, `bin/oxide-validator/src/main.rs`)
+  - New `KEY_CHANGE` (0x05) staking message type: `[type][validator:20B][new_key:48B]`.
+  - `staking::msg::key_change(validator, key)` constructs the message.
+  - `handle_key_change` validates sender == validator, validator
+    has stake, key is 48 bytes. Stores in `pending_key_changes`.
+  - `staking.take_key_changes()` drains pending changes (for epoch
+    boundary application by the consensus engine — wiring pending).
+  - `oxide-validator --submit-key-change <hex>` submits the tx.
+  - **In plain words:** A validator can rotate its BLS consensus
+    key (e.g., after a suspected key compromise) by submitting a
+    transaction — no restart or re-registration needed.
+
+- **Full commit history in devnet via `commit_listener`**
+  (`crates/consensus/src/engine.rs`, `crates/devnet/src/tcp_multinode.rs`)
+  - `OxideBft::set_commit_listener` registers a callback that fires
+    on each committed block — before the `finalized` map prunes
+    entries at `MAX_RETAINED_FINALIZED` (4096).
+  - `TcpMultiNodeDevnet` wires the listener to collect all commits
+    into `committed_blocks` vectors for the integrity check.
+  - **In plain words:** Long-running tests (>4096 blocks) now
+    correctly verify that all validators committed the same blocks —
+    previously only the last 4096 were visible due to pruning.
   - Entries are CRC32-protected and length-prefixed; truncated
     or corrupted tail entries are discarded on recovery.
   - **In plain words:** A validator that crashes and restarts

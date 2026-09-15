@@ -330,16 +330,39 @@ review + fixes), 4 (sustained-throughput bench), 5 (fuzz soak),
   flags not yet wired)
 - All devnet tests pass (29 unit + 22 release-ignored)
 
+### Session 4 follow-up (2026-09-14)
+
+All partial runbook items completed:
+
+- **Runbook 3 (backup/snapshot):** ✅ `GET /snapshot` RPC endpoint
+  wired; returns codec-encoded `ExecutorSnapshot` as hex.
+  `--export-snapshot <path>` CLI flag writes snapshot to file.
+- **Runbook 4 (restore):** ✅ `--import-snapshot <path>` CLI flag
+  reads + decodes snapshot, calls `node.import_snapshot()` before
+  consensus starts.
+- **Runbook 9 (key rotation):** ✅ `--submit-key-change <hex>` CLI
+  flag + `KEY_CHANGE` (0x05) staking message type. Pending key
+  changes stored for epoch-boundary application.
+- **`trading_tps_large` (10M txs):** ✅ Fixed. Root cause was
+  `MAX_RETAINED_FINALIZED` (4096) pruning old finalized blocks —
+  `collect_result` only saw the last 4096. Added `commit_listener`
+  callback to `OxideBft`; devnet collects all commits into
+  `committed_blocks`. 10M test passes: 10000 blocks, 10M txs,
+  all validators agree, 78.7K tx/s sustained.
+- **Clippy:** All workspace crates pass `--all-targets -D warnings`
+  including devnet (previously failing on `tcp_multinode.rs` and
+  `evm_load.rs`).
+
 **Remaining blockers:**
 
 1. **No external security audit.** All 14 internal findings (4
    critical, 6 high, 4 medium) are now fixed.
 2. **No running public testnet.** The Docker testnet proves the
    mechanics but a public multi-machine deployment is needed.
-3. **Snapshot/restore and key-rotation CLI flags** need wiring
-   to complete runbook validation (runbooks 3, 4, 9).
+3. **Epoch-boundary key-change application:** `take_key_changes`
+   is stored but not yet consumed by `complete_rotation` — the
+   mapping from `Address` to validator index needs design.
 
-**Next action:** Wire the missing CLI flags (`--import-snapshot`,
-`--submit-key-change`), then external security audit and public
-testnet deployment. The feedback loop continues: after external
+**Next action:** External security audit and public testnet
+deployment. The feedback loop continues: after external
 validation, re-evaluate.

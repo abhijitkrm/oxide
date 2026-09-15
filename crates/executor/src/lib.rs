@@ -103,7 +103,7 @@ pub struct ExecutorSnapshot {
     /// the executed-nonce root).
     pub state_root: Hash,
     /// Per-module state roots, in registration order.
-    pub module_roots: Vec<(&'static str, Hash)>,
+    pub module_roots: Vec<(String, Hash)>,
     /// Per-module full key-value state, in registration order.
     /// `None` for modules that don't support `export_state`. Empty
     /// for metadata-only snapshots (v0).
@@ -153,7 +153,7 @@ pub enum SnapshotImportError {
     /// data doesn't match the claimed roots.
     ModuleRootMismatch {
         /// The module's name.
-        module: &'static str,
+        module: String,
         /// The expected root from the snapshot.
         expected: Hash,
         /// The recomputed root from the imported KV data.
@@ -196,6 +196,70 @@ impl std::fmt::Display for SnapshotImportError {
 }
 
 impl std::error::Error for SnapshotImportError {}
+
+// ---------------------------------------------------------------------------
+// Codec impls — binary serialization for snapshot save/load and RPC export.
+// ---------------------------------------------------------------------------
+
+impl codec::Encode for ExecutorSnapshot {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        codec::write::u64(buf, self.height);
+        self.state_root.encode(buf);
+        codec::write::u32(buf, u32::try_from(self.module_roots.len()).unwrap_or(u32::MAX));
+        for (name, root) in &self.module_roots {
+            codec::write::bytes(buf, name.as_bytes());
+            root.encode(buf);
+        }
+        codec::write::u32(buf, u32::try_from(self.module_state.len()).unwrap_or(u32::MAX));
+        for state in &self.module_state {
+            codec::write::bool(buf, state.is_some());
+            if let Some(snap) = state {
+                snap.encode(buf);
+            }
+        }
+        codec::write::u32(buf, u32::try_from(self.executed_nonces.len()).unwrap_or(u32::MAX));
+        for (addr, nonce) in &self.executed_nonces {
+            addr.encode(buf);
+            codec::write::u64(buf, *nonce);
+        }
+        self.nonce_root.encode(buf);
+    }
+}
+
+impl<'a> codec::Decode<'a> for ExecutorSnapshot {
+    fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
+        let height = reader.read_u64()?;
+        let state_root = Hash::decode(reader)?;
+        let roots_count = reader.read_u32()?;
+        let mut module_roots = Vec::with_capacity(roots_count as usize);
+        for _ in 0..roots_count {
+            let name_bytes = reader.read_bytes()?;
+            let name = String::from_utf8(name_bytes.to_vec())
+                .map_err(|_| codec::DecodeError::InvalidUtf8)?;
+            let root = Hash::decode(reader)?;
+            module_roots.push((name, root));
+        }
+        let state_count = reader.read_u32()?;
+        let mut module_state = Vec::with_capacity(state_count as usize);
+        for _ in 0..state_count {
+            let present = reader.read_bool()?;
+            if present {
+                module_state.push(Some(storage::Snapshot::decode(reader)?));
+            } else {
+                module_state.push(None);
+            }
+        }
+        let nonces_count = reader.read_u32()?;
+        let mut executed_nonces = Vec::with_capacity(nonces_count as usize);
+        for _ in 0..nonces_count {
+            let addr = primitives::Address::decode(reader)?;
+            let nonce = reader.read_u64()?;
+            executed_nonces.push((addr, nonce));
+        }
+        let nonce_root = Hash::decode(reader)?;
+        Ok(Self { height, state_root, module_roots, module_state, executed_nonces, nonce_root })
+    }
+}
 
 /// HIGH fix: compute the authenticated root of the executed-nonce
 /// map. This binds `executed_nonces` into the snapshot's
@@ -922,8 +986,8 @@ impl Executor {
         use crypto::hash::{Domain, Hasher};
         let height = self.current_height();
         let state_root = self.state_root_at(height);
-        let module_roots: Vec<(&'static str, Hash)> =
-            self.modules.iter().flatten().map(|m| (m.name(), m.state_root())).collect();
+        let module_roots: Vec<(String, Hash)> =
+            self.modules.iter().flatten().map(|m| (m.name().to_string(), m.state_root())).collect();
         // Export full KV state for each module that supports it.
         let module_state: Vec<Option<storage::Snapshot>> =
             self.modules.iter().flatten().map(|m| m.export_state()).collect();
@@ -1078,7 +1142,7 @@ impl Executor {
                     let actual_root = module.state_root();
                     if actual_root != *claimed_root {
                         return Err(SnapshotImportError::ModuleRootMismatch {
-                            module: name,
+                            module: name.clone(),
                             expected: *claimed_root,
                             actual: actual_root,
                         });

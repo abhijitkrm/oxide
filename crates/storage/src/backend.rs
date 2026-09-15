@@ -28,6 +28,7 @@
 //!   storage-conformance suite (Phase 2) before node wiring lets a
 //!   validator run it.
 
+use codec::{Decode, DecodeError, Encode, Reader};
 use primitives::Hash;
 
 /// One state operation inside a block batch.
@@ -167,6 +168,35 @@ impl std::fmt::Display for SnapshotError {
 }
 
 impl std::error::Error for SnapshotError {}
+
+// ---------------------------------------------------------------------------
+// Codec impls — binary serialization for snapshot save/load and RPC export.
+// ---------------------------------------------------------------------------
+
+impl Encode for Snapshot {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        codec::write::u64(buf, self.height);
+        codec::write::u32(buf, u32::try_from(self.entries.len()).unwrap_or(u32::MAX));
+        for (key, value) in &self.entries {
+            key.encode(buf);
+            codec::write::bytes(buf, value);
+        }
+    }
+}
+
+impl<'a> Decode<'a> for Snapshot {
+    fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        let height = reader.read_u64()?;
+        let count = reader.read_u32()?;
+        let mut entries = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let key = Hash::decode(reader)?;
+            let value = reader.read_bytes()?.to_vec();
+            entries.push((key, value));
+        }
+        Ok(Self { height, entries })
+    }
+}
 
 /// In-memory reference backend: a `BTreeMap` keyed by the full 32-byte
 /// key. O(log n) ops, deterministic ordered iteration, no

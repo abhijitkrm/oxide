@@ -105,6 +105,11 @@ pub struct TcpMultiNodeDevnet {
     /// execute the same blocks, so their exchange state converges
     /// after finality.
     exchange_modules: Vec<Arc<exchange::ExchangeModule>>,
+    /// Full commit history per validator. The engine's `finalized`
+    /// map prunes at `MAX_RETAINED_FINALIZED` (4096), so the devnet
+    /// collects commits via `commit_listener` into these unbounded
+    /// vectors for the integrity check.
+    committed_blocks: Vec<Arc<std::sync::Mutex<Vec<FinalizedBlock>>>>,
 }
 
 /// The result of running a TCP devnet: finalized blocks from each
@@ -344,6 +349,8 @@ impl TcpMultiNodeDevnet {
         let mut transports = Vec::with_capacity(n);
         let mut evm_modules = Vec::with_capacity(n);
         let mut exchange_modules = Vec::with_capacity(n);
+        let committed_blocks: Vec<Arc<std::sync::Mutex<Vec<FinalizedBlock>>>> =
+            (0..n).map(|_| Arc::new(std::sync::Mutex::new(Vec::new()))).collect();
 
         for (i, key) in secret_keys.iter().cloned().enumerate() {
             let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold)
@@ -408,6 +415,20 @@ impl TcpMultiNodeDevnet {
             let engine = OxideBft::with_index(app_dyn, vs.clone(), u16::try_from(i).unwrap())
                 .with_secret_key(key);
 
+            // Wire a commit listener that pushes each committed block
+            // into the shared `committed_blocks` vector. The engine's
+            // `finalized` map prunes at `MAX_RETAINED_FINALIZED` (4096),
+            // so the devnet needs an external copy for the integrity
+            // check on tests > 4096 blocks.
+            let committed = committed_blocks[i].clone();
+            let mut engine = engine;
+            engine.set_commit_listener(Box::new(move |block| {
+                committed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(block.clone());
+            }));
+
             engines.push(engine);
             apps.push(app);
             transports.push(transport);
@@ -425,6 +446,7 @@ impl TcpMultiNodeDevnet {
             n,
             evm_modules,
             exchange_modules,
+            committed_blocks,
         }
     }
 
@@ -790,17 +812,7 @@ impl TcpMultiNodeDevnet {
             if blocks_done >= last_progress_block + progress_interval as u64
                 || (time_since >= progress_secs && blocks_done > last_progress_block)
             {
-                let txs_done = blocks_done * txs_per_round as u64;
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 { txs_done as f64 / elapsed } else { 0.0 };
-                let pct = if target_blocks > 0 {
-                    blocks_done as f64 / target_blocks as f64 * 100.0
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "  progress: {txs_done}/{needed} txs ({pct:.1}%) — {blocks_done}/{target_blocks} blocks — {rate:.0} tx/s — {elapsed:.1}s elapsed"
-                );
+                Self::report_progress(blocks_done, txs_per_round, needed, target_blocks, &start);
                 last_progress_block = blocks_done;
                 last_progress_time = std::time::Instant::now();
             }
@@ -872,6 +884,29 @@ impl TcpMultiNodeDevnet {
 
         let elapsed = start.elapsed();
         (self.collect_result(), elapsed)
+    }
+
+    /// Print a progress report for the pipelined TPS run.
+    ///
+    /// Extracted from `run_pipelined_txs` to keep that function under
+    /// the 100-line clippy limit. All `u64 → f64` casts are in this
+    /// cold-path diagnostic only — they are not on any hot path.
+    #[allow(clippy::cast_precision_loss)]
+    fn report_progress(
+        blocks_done: u64,
+        txs_per_round: usize,
+        needed: usize,
+        target_blocks: u64,
+        start: &std::time::Instant,
+    ) {
+        let txs_done = blocks_done * txs_per_round as u64;
+        let elapsed = start.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { txs_done as f64 / elapsed } else { 0.0 };
+        let pct =
+            if target_blocks > 0 { blocks_done as f64 / target_blocks as f64 * 100.0 } else { 0.0 };
+        eprintln!(
+            "  progress: {txs_done}/{needed} txs ({pct:.1}%) — {blocks_done}/{target_blocks} blocks — {rate:.0} tx/s — {elapsed:.1}s elapsed"
+        );
     }
 
     /// Submit one round's worth of txs to the leader's intake,
@@ -1243,16 +1278,16 @@ impl TcpMultiNodeDevnet {
     }
 
     /// Collect finalized blocks from each validator.
+    ///
+    /// Uses the `committed_blocks` vectors populated by the commit
+    /// listeners — the engine's `finalized` map prunes at
+    /// `MAX_RETAINED_FINALIZED` (4096), so iterating `0..=height`
+    /// misses pruned blocks on long-running tests.
     fn collect_result(&self) -> TcpDevnetResult {
         let finalized = self
-            .engines
+            .committed_blocks
             .iter()
-            .map(|e| {
-                let h = e.finalized_height().map_or(0, primitives::Id::value);
-                (0..=h)
-                    .filter_map(|i| e.finalized_block(primitives::Height::new(i)))
-                    .collect::<Vec<_>>()
-            })
+            .map(|v| v.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
             .collect();
         TcpDevnetResult { finalized }
     }

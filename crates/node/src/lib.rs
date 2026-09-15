@@ -794,7 +794,7 @@ mod tests {
         // Add a fake module root to create a count mismatch.
         // Also recompute the state root to match so we test the
         // module count check, not the state root check.
-        snapshot.module_roots.push(("fake", primitives::Hash::ZERO));
+        snapshot.module_roots.push(("fake".to_string(), primitives::Hash::ZERO));
         let mut root_data = Vec::new();
         for (_, root) in &snapshot.module_roots {
             root_data.extend_from_slice(root.as_bytes());

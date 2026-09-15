@@ -309,7 +309,7 @@ fn evm_load_7_validators_large() {
     run_evm_load_test(n, total_txs, 39000);
 }
 
-/// Diagnostic: serial path only (parallel_threshold = usize::MAX).
+/// Diagnostic: serial path only (`parallel_threshold = usize::MAX`).
 /// If this passes and the parallel version fails, the bug is in the
 /// parallel speculative execution path.
 #[test]
@@ -351,12 +351,12 @@ fn evm_load_diagnostic_serial() {
     for (i, sender) in workload.senders().iter().enumerate().take(senders_to_check) {
         let expected = sender.expected_nonce;
         let actual = devnet.evm_module(0).nonce(&sender.addr);
-        if actual != expected {
+        if actual == expected {
+            nonce_ok += 1;
+        } else {
             eprintln!(
                 "diagnostic-serial: sender {i} nonce mismatch: expected {expected}, got {actual}"
             );
-        } else {
-            nonce_ok += 1;
         }
     }
     eprintln!("diagnostic-serial: {nonce_ok}/{senders_to_check} senders have correct nonce");
