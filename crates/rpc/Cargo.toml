@@ -23,6 +23,10 @@ hex = "0.4"
 # sha3: keccak-256 for `web3_sha3` and tx hash computation.
 # MIT/Apache-2.0 licensed. Already a transitive dep via revm.
 sha3 = { workspace = true }
+# alloy-primitives: B256/Address/U256 for block-tag, hash, and storage
+# params. MIT/Apache-2.0 licensed. Same workspace pin the evm crate
+# uses, so the types line up.
+alloy-primitives = { workspace = true }
 # tokio: async runtime for the HTTP server.
 # MIT-licensed (GPL-3.0-compatible). Not on the hot path.
 tokio = { workspace = true }
@@ -42,6 +46,9 @@ hyper = { workspace = true }
 # Already a transitive dep via evm; declared explicitly for direct use
 # in test helpers. MIT/Apache-2.0 licensed.
 revm = { workspace = true }
+# executor: the `Module` trait lives here — needed by tests that drive
+# `EvmModule::begin_block`/`end_block` to seal history entries.
+executor = { workspace = true }
 
 [lints]
 workspace = true

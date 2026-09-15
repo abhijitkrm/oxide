@@ -2889,11 +2889,13 @@ dependencies = [
 name = "oxide-validator"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "bank",
  "codec",
  "config",
  "consensus",
  "crypto",
+ "evm",
  "executor",
  "framework",
  "metrics",
@@ -3686,8 +3688,10 @@ dependencies = [
 name = "rpc"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "axum",
  "evm",
+ "executor",
  "hex",
  "hyper",
  "metrics",

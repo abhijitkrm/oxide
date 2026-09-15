@@ -80,7 +80,16 @@ matcher = { path = "crates/matcher", version = "0.1.0" }
 # External EVM stack (plan.md §2: revm is the approved EVM engine).
 # revm is MIT-licensed (GPL-3.0-compatible). Pinned exact version
 # per AGENTS.md dependency policy.
-revm = "42.0.1"
+# The `optional_*` features expose CfgEnv flags used by the read-only
+# call path (`eth_call`/`eth_estimateGas`): block-gas-limit, base-fee,
+# priority-fee, and EIP-3607 checks are disabled in the sim env while
+# balance and fee checks stay enabled (geth `DoCall` semantics).
+revm = { version = "42.0.1", features = [
+    "optional_block_gas_limit",
+    "optional_eip3607",
+    "optional_no_base_fee",
+    "optional_priority_fee_check",
+] }
 
 # thiserror: ergonomic error enums (used across infrastructure crates).
 # MIT-OR-APACHE-2.0 licensed (GPL-3.0-compatible).

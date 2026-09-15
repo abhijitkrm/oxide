@@ -61,6 +61,9 @@ pub struct Genesis {
     /// Staking module: initial validator set and parameters.
     #[serde(default)]
     pub staking: GenesisStaking,
+    /// EVM module: `alloc` state (Ethereum `genesis.json` convention).
+    #[serde(default)]
+    pub evm: GenesisEvm,
 }
 
 /// Consensus parameters in the genesis file.
@@ -129,6 +132,37 @@ impl Default for GenesisStaking {
     }
 }
 
+/// EVM module genesis state: the Ethereum `alloc` map.
+///
+/// Follows the `genesis.json` convention used by geth/reth/Foundry:
+/// each key is a hex address, each value carries `balance`, `nonce`,
+/// `code`, and `storage` so a genesis can declare contracts and
+/// preinstalls (e.g. the Create2 factory, Multicall3) at canonical
+/// addresses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenesisEvm {
+    /// Account allocations, keyed by hex address (`0x` + 40 chars).
+    #[serde(default)]
+    pub alloc: std::collections::BTreeMap<String, GenesisEvmAccount>,
+}
+
+/// One `alloc` entry: the account's initial state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenesisEvmAccount {
+    /// Wei balance — hex quantity (`"0x…"`) or decimal string.
+    #[serde(default)]
+    pub balance: String,
+    /// Account nonce.
+    #[serde(default)]
+    pub nonce: u64,
+    /// Runtime bytecode as a hex string (preinstalled contracts).
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Initial storage slots, `hex slot → hex value` (32-byte each).
+    #[serde(default)]
+    pub storage: std::collections::BTreeMap<String, String>,
+}
+
 fn default_unbonding_period() -> u64 {
     100
 }
@@ -162,6 +196,7 @@ impl Genesis {
             consensus: GenesisConsensus::default(),
             bank: GenesisBank::default(),
             staking: GenesisStaking::default(),
+            evm: GenesisEvm::default(),
         }
     }
 

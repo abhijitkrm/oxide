@@ -44,6 +44,8 @@ pub mod server;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use alloy_primitives::{B256, U256};
+use evm::history::{ExecutedBlock, LogFilter, StoredTx, TopicMatcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use types::TxBytes;
@@ -414,6 +416,18 @@ pub struct RpcServer {
     /// set as JSON (addresses, public keys, stakes). When `None`,
     /// the endpoint returns 404.
     validator_set_provider: Option<Arc<dyn ValidatorSetProvider>>,
+    /// Optional EVM module handle — the same `Arc` the executor
+    /// executes against. When set, the read paths (`eth_call`,
+    /// `eth_estimateGas`, account queries) serve real state and the
+    /// lookup paths (`eth_getTransactionReceipt`, `eth_getBlock*`,
+    /// `eth_getLogs`) serve the module's sealed-block history.
+    /// When `None`, those endpoints return the stateless-test
+    /// placeholders documented per-handler.
+    ///
+    /// Concurrency: all module methods take `&self` (interior
+    /// `Mutex`es serialize against block execution), so sharing the
+    /// `Arc` with the HTTP handler tasks is safe.
+    evm: Option<Arc<evm::EvmModule>>,
 }
 
 impl RpcServer {
@@ -435,6 +449,7 @@ impl RpcServer {
             rate_window_count: AtomicU64::new(0),
             snapshot_provider: None,
             validator_set_provider: None,
+            evm: None,
         }
     }
 
@@ -477,6 +492,17 @@ impl RpcServer {
     #[must_use]
     pub fn validator_set_provider(&self) -> Option<&Arc<dyn ValidatorSetProvider>> {
         self.validator_set_provider.as_ref()
+    }
+
+    /// Attach the EVM module the executor runs, so the `eth_*` read
+    /// and lookup endpoints serve real state and sealed-block history.
+    ///
+    /// The `Arc` must be the same instance registered with the
+    /// executor — reads then observe exactly what blocks commit.
+    /// Without this call the account/history endpoints return the
+    /// stateless-test placeholders (`0x0`, `null`, `[]`).
+    pub fn set_evm(&mut self, module: Arc<evm::EvmModule>) {
+        self.evm = Some(module);
     }
 
     /// Attach a latency recorder for RPC handler metrics.
@@ -664,6 +690,9 @@ impl RpcServer {
             "eth_getTransactionByBlockNumberAndIndex" => {
                 self.eth_get_transaction_by_block_and_index(&request.params)
             }
+            "eth_getTransactionByBlockHashAndIndex" => {
+                self.eth_get_transaction_by_block_hash_and_index(&request.params)
+            }
             "eth_getTransactionReceipt" => self.eth_get_transaction_receipt(&request.params),
             "eth_sendRawTransaction" => self.eth_send_raw_transaction(&request.params),
             // ---- Call / estimate ----
@@ -757,14 +786,15 @@ impl RpcServer {
     /// string in wei.
     ///
     /// Params: `[address: String, block: String?]`
+    ///
+    /// Only the latest state is servable (no historical trie window
+    /// yet); a tag resolving to an older sealed block returns the
+    /// geth-style "missing trie node" error.
     fn eth_get_balance(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing address"));
-        }
-        // Phase 2 v0: always return 0 (no account state wired yet).
-        // Full implementation reads from the EVM module's CacheDB.
-        Ok(json!("0x0"))
+        let addr = parse_address(params.first())?;
+        let evm = self.require_evm()?;
+        self.require_latest(params.get(1))?;
+        Ok(hex_quantity_u128(evm.balance(&addr)))
     }
 
     /// `eth_getTransactionCount` — returns an account's nonce as a
@@ -772,12 +802,10 @@ impl RpcServer {
     ///
     /// Params: `[address: String, block: String?]`
     fn eth_get_transaction_count(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing address"));
-        }
-        // Phase 2 v0: always return 0 (no account state wired yet).
-        Ok(json!("0x0"))
+        let addr = parse_address(params.first())?;
+        let evm = self.require_evm()?;
+        self.require_latest(params.get(1))?;
+        Ok(json!(format!("0x{:x}", evm.nonce(&addr))))
     }
 
     /// `eth_subscribe` — creates a WebSocket subscription.
@@ -843,13 +871,10 @@ impl RpcServer {
     ///
     /// Params: `[address: String, block: String?]`
     fn eth_get_code(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing address"));
-        }
-        // Phase E v0: return "0x" (empty code) — no account state
-        // wired to the RPC server yet.
-        Ok(json!("0x"))
+        let addr = parse_address(params.first())?;
+        let evm = self.require_evm()?;
+        self.require_latest(params.get(1))?;
+        Ok(json!(format!("0x{}", hex::encode(evm.code(&addr)))))
     }
 
     /// `eth_getStorageAt` — returns the storage value at a given
@@ -857,35 +882,47 @@ impl RpcServer {
     ///
     /// Params: `[address: String, slot: String, block: String?]`
     fn eth_get_storage_at(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.len() < 2 {
-            return Err(RpcError::invalid_params("missing address or slot"));
-        }
-        // Phase E v0: return 32-byte zero — no storage wired.
-        Ok(json!("0x0000000000000000000000000000000000000000000000000000000000000000"))
+        let addr = parse_address(params.first())?;
+        let slot = parse_u256(
+            params.get(1).ok_or_else(|| RpcError::invalid_params("missing storage slot"))?,
+        )?;
+        let evm = self.require_evm()?;
+        self.require_latest(params.get(2))?;
+        let value = evm.storage_at(&addr, &slot);
+        Ok(json!(format!("0x{value:064x}")))
     }
 
     /// `eth_getBlockByNumber` — returns a block by number.
     ///
-    /// Params: `[blockNumber: String, fullTransactions: bool]`
+    /// Params: `[blockNumber: String|Object, fullTransactions: bool]`
+    ///
+    /// Serves the module's sealed-block history window; heights
+    /// outside the window (evicted or future) return `null`.
     fn eth_get_block_by_number(&self, params: &[Value]) -> Result<Value, RpcError> {
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing block number"));
-        }
-        let block_num = parse_block_tag(&params[0])?;
-        Ok(self.block_json(block_num))
+        let evm = self.require_evm()?;
+        let full = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+        let number = self.resolve_block_ref(params.first())?;
+        let history = evm.history();
+        Ok(match history.block(number) {
+            Some(block) => block_json(block, full),
+            None => Value::Null,
+        })
     }
 
     /// `eth_getBlockByHash` — returns a block by hash.
     ///
     /// Params: `[blockHash: String, fullTransactions: bool]`
     fn eth_get_block_by_hash(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing block hash"));
-        }
-        // Phase E v0: return null (no block store wired).
-        Ok(Value::Null)
+        let hash = parse_b256(
+            params.first().ok_or_else(|| RpcError::invalid_params("missing block hash"))?,
+        )?;
+        let evm = self.require_evm()?;
+        let full = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+        let history = evm.history();
+        Ok(match history.block_by_hash(&hash) {
+            Some(block) => block_json(block, full),
+            None => Value::Null,
+        })
     }
 
     /// `eth_getBlockTransactionCountByNumber` — returns the number of
@@ -893,12 +930,13 @@ impl RpcServer {
     ///
     /// Params: `[blockNumber: String]`
     fn eth_get_block_tx_count_by_number(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing block number"));
-        }
-        // Phase E v0: return 0.
-        Ok(json!("0x0"))
+        let evm = self.require_evm()?;
+        let number = self.resolve_block_ref(params.first())?;
+        let history = evm.history();
+        Ok(match history.block(number) {
+            Some(block) => json!(format!("0x{:x}", block.txs.len())),
+            None => Value::Null,
+        })
     }
 
     /// `eth_getBlockTransactionCountByHash` — returns the number of
@@ -906,23 +944,32 @@ impl RpcServer {
     ///
     /// Params: `[blockHash: String]`
     fn eth_get_block_tx_count_by_hash(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing block hash"));
-        }
-        Ok(json!("0x0"))
+        let hash = parse_b256(
+            params.first().ok_or_else(|| RpcError::invalid_params("missing block hash"))?,
+        )?;
+        let evm = self.require_evm()?;
+        let history = evm.history();
+        Ok(match history.block_by_hash(&hash) {
+            Some(block) => json!(format!("0x{:x}", block.txs.len())),
+            None => Value::Null,
+        })
     }
 
     /// `eth_getTransactionByHash` — returns a transaction by hash.
     ///
     /// Params: `[txHash: String]`
     fn eth_get_transaction_by_hash(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing tx hash"));
-        }
-        // Phase E v0: return null (no tx store wired).
-        Ok(Value::Null)
+        let hash =
+            parse_b256(params.first().ok_or_else(|| RpcError::invalid_params("missing tx hash"))?)?;
+        let evm = self.require_evm()?;
+        let history = evm.history();
+        Ok(match history.tx_location(&hash) {
+            Some((height, index)) => history
+                .block(height)
+                .and_then(|b| b.txs.get(index as usize).map(|t| tx_json(t, b)))
+                .unwrap_or(Value::Null),
+            None => Value::Null,
+        })
     }
 
     /// `eth_getTransactionByBlockNumberAndIndex` — returns a tx by
@@ -930,23 +977,65 @@ impl RpcServer {
     ///
     /// Params: `[blockNumber: String, index: String]`
     fn eth_get_transaction_by_block_and_index(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.len() < 2 {
-            return Err(RpcError::invalid_params("missing block number or index"));
-        }
-        Ok(Value::Null)
+        let evm = self.require_evm()?;
+        let number = self.resolve_block_ref(params.first())?;
+        let index =
+            parse_u64(params.get(1).ok_or_else(|| RpcError::invalid_params("missing tx index"))?)?;
+        let history = evm.history();
+        let i = usize::try_from(index).unwrap_or(usize::MAX);
+        Ok(match history.block(number) {
+            Some(block) => block.txs.get(i).map_or(Value::Null, |t| tx_json(t, block)),
+            None => Value::Null,
+        })
+    }
+
+    /// `eth_getTransactionByBlockHashAndIndex` — returns a tx by
+    /// block hash and index.
+    ///
+    /// Params: `[blockHash: String, index: String]`
+    fn eth_get_transaction_by_block_hash_and_index(
+        &self,
+        params: &[Value],
+    ) -> Result<Value, RpcError> {
+        let hash = parse_b256(
+            params.first().ok_or_else(|| RpcError::invalid_params("missing block hash"))?,
+        )?;
+        let evm = self.require_evm()?;
+        let index =
+            parse_u64(params.get(1).ok_or_else(|| RpcError::invalid_params("missing tx index"))?)?;
+        let history = evm.history();
+        let i = usize::try_from(index).unwrap_or(usize::MAX);
+        Ok(match history.block_by_hash(&hash) {
+            Some(block) => block.txs.get(i).map_or(Value::Null, |t| tx_json(t, block)),
+            None => Value::Null,
+        })
     }
 
     /// `eth_getTransactionReceipt` — returns a transaction receipt.
     ///
     /// Params: `[txHash: String]`
     fn eth_get_transaction_receipt(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing tx hash"));
-        }
-        // Phase E v0: return null (no receipt store wired).
-        Ok(Value::Null)
+        let hash =
+            parse_b256(params.first().ok_or_else(|| RpcError::invalid_params("missing tx hash"))?)?;
+        let evm = self.require_evm()?;
+        let history = evm.history();
+        Ok(match history.tx_location(&hash) {
+            Some((height, index)) => history.block(height).map_or(Value::Null, |block| {
+                let i = index as usize;
+                match (block.txs.get(i), block.receipts.get(i)) {
+                    (Some(tx), Some(receipt)) => {
+                        let cumulative = evm::receipts::Receipt::cumulative_gas(&block.receipts);
+                        let log_base: u32 = block.receipts[..i]
+                            .iter()
+                            .map(|r| u32::try_from(r.logs.len()).unwrap_or(u32::MAX))
+                            .sum();
+                        receipt_json(tx, receipt, block, cumulative[i], log_base)
+                    }
+                    _ => Value::Null,
+                }
+            }),
+            None => Value::Null,
+        })
     }
 
     /// `eth_sendRawTransaction` — submits a raw EVM transaction.
@@ -1017,26 +1106,39 @@ impl RpcServer {
     /// `eth_call` — executes a call without persisting state.
     ///
     /// Params: `[call: Object, block: String?]`
+    ///
+    /// Runs on the module's simulation env (nonce/block-gas-limit/
+    /// base-fee checks disabled; balance and fee checks kept, as in
+    /// geth's `DoCall`). Reverts surface as JSON-RPC error code 3
+    /// with the revert data attached — the shape web3 libraries
+    /// decode into `Error(string)` reasons.
     fn eth_call(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing call object"));
+        let call = params.first().ok_or_else(|| RpcError::invalid_params("missing call object"))?;
+        let req = parse_call_object(call)?;
+        let evm = self.require_evm()?;
+        self.require_latest(params.get(1))?;
+        match evm.call_read(&req) {
+            Ok(outcome) => Ok(json!(format!("0x{}", hex::encode(outcome.output)))),
+            Err(e) => Err(call_error(e)),
         }
-        // Phase E v0: return "0x" (empty return data).
-        Ok(json!("0x"))
     }
 
     /// `eth_estimateGas` — estimates gas for a call.
     ///
     /// Params: `[call: Object, block: String?]`
+    ///
+    /// Binary-searches the simulation env for the smallest succeeding
+    /// gas limit (geth/reth semantics). A call that cannot succeed at
+    /// the block gas limit surfaces the underlying revert/halt error.
     fn eth_estimate_gas(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing call object"));
+        let call = params.first().ok_or_else(|| RpcError::invalid_params("missing call object"))?;
+        let req = parse_call_object(call)?;
+        let evm = self.require_evm()?;
+        self.require_latest(params.get(1))?;
+        match evm.estimate_call_gas(&req) {
+            Ok(gas) => Ok(json!(format!("0x{gas:x}"))),
+            Err(e) => Err(call_error(e)),
         }
-        // Phase E v0: return 21,000 (intrinsic gas for a simple
-        // transfer).
-        Ok(json!("0x5208"))
     }
 
     /// `eth_maxPriorityFeePerGas` — returns the current priority fee.
@@ -1050,40 +1152,131 @@ impl RpcServer {
     ///
     /// Params: `[block: String]`
     fn eth_get_block_receipts(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing block"));
-        }
-        // Phase E v0: return null (no receipt store wired).
-        Ok(Value::Null)
+        let evm = self.require_evm()?;
+        let number = self.resolve_block_ref(params.first())?;
+        let history = evm.history();
+        Ok(match history.block(number) {
+            Some(block) => {
+                let cumulative = evm::receipts::Receipt::cumulative_gas(&block.receipts);
+                let mut log_base = 0u32;
+                Value::Array(
+                    block
+                        .txs
+                        .iter()
+                        .zip(block.receipts.iter())
+                        .zip(cumulative.iter())
+                        .map(|((tx, receipt), &cum)| {
+                            let json = receipt_json(tx, receipt, block, cum, log_base);
+                            log_base = log_base.saturating_add(
+                                u32::try_from(receipt.logs.len()).unwrap_or(u32::MAX),
+                            );
+                            json
+                        })
+                        .collect(),
+                )
+            }
+            None => Value::Null,
+        })
     }
 
     /// `eth_getLogs` — returns logs matching a filter.
     ///
-    /// Params: `[filter: Object]`
+    /// Params: `[filter: Object]` with `fromBlock`, `toBlock`,
+    /// `address` (string or array), `topics` (positional array of
+    /// hash / hash-array / null), or `blockHash` (EIP-234
+    /// single-block form).
+    ///
+    /// Bounds: the scan is limited to the retained history window
+    /// and `MAX_LOG_RESULTS` entries — an unbounded request returns
+    /// `-32005` rather than OOM-ing the node (geth applies the same
+    /// resource-limit principle via `FilterQuery` caps).
     fn eth_get_logs(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing filter"));
+        let filter_obj =
+            params.first().ok_or_else(|| RpcError::invalid_params("missing filter"))?;
+        if !filter_obj.is_object() {
+            return Err(RpcError::invalid_params("filter must be an object"));
         }
-        // Phase E v0: return empty array (no log store wired).
-        Ok(json!([]))
+        let evm = self.require_evm()?;
+        let filter = self.parse_log_filter(filter_obj)?;
+        let history = evm.history();
+        let matches = history.logs(&filter);
+        if matches.len() > MAX_LOG_RESULTS {
+            return Err(RpcError {
+                code: -32_005,
+                message: format!(
+                    "query returned more than {MAX_LOG_RESULTS} results; narrow the filter"
+                ),
+                data: None,
+            });
+        }
+        Ok(Value::Array(matches.iter().map(log_json).collect()))
     }
 
     /// `eth_feeHistory` — returns fee history.
     ///
     /// Params: `[blockCount: String, newestBlock: String, rewardPercentiles: Array?]`
+    ///
+    /// Serves per-block `baseFeePerGas`, `gasUsedRatio`, and (when
+    /// percentiles are requested) per-block priority-fee percentiles
+    /// over executed transactions — the same shape geth returns.
     fn eth_fee_history(&self, params: &[Value]) -> Result<Value, RpcError> {
-        if params.len() < 2 {
-            return Err(RpcError::invalid_params("missing blockCount or newestBlock"));
+        let count = parse_u64(
+            params.first().ok_or_else(|| RpcError::invalid_params("missing blockCount"))?,
+        )?;
+        if count == 0 {
+            return Err(RpcError::invalid_params("blockCount must be > 0"));
         }
-        // Phase E v0: return a minimal fee history with the
-        // current base fee.
-        Ok(json!({
-            "oldestBlock": "0x0",
-            "baseFeePerGas": [format!("0x{:x}", self.base_fee)],
-            "gasUsedRatio": [0.0],
-        }))
+        if count > MAX_FEE_HISTORY_BLOCKS {
+            return Err(RpcError::invalid_params(&format!(
+                "blockCount exceeds maximum {MAX_FEE_HISTORY_BLOCKS}"
+            )));
+        }
+        let evm = self.require_evm()?;
+        let newest = self.resolve_block_ref(params.get(1))?;
+        let percentiles: Vec<f64> = params
+            .get(2)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_f64).collect())
+            .unwrap_or_default();
+        let history = evm.history();
+        let latest = history.latest().unwrap_or(0);
+        let newest = newest.min(latest);
+        // `+1` for the EIP-1559 next-block base fee geth appends.
+        let oldest = newest.saturating_sub(count).saturating_add(1);
+        // `count` ≤ MAX_FEE_HISTORY_BLOCKS (checked above) — always
+        // fits usize even on 32-bit targets.
+        let cap = usize::try_from(count).unwrap_or(0);
+        let mut base_fees = Vec::with_capacity(cap + 1);
+        let mut ratios = Vec::with_capacity(cap);
+        let mut rewards: Vec<Vec<String>> = Vec::with_capacity(cap);
+        for h in oldest..=newest {
+            if let Some(block) = history.block(h) {
+                base_fees.push(format!("0x{:x}", block.base_fee));
+                #[allow(clippy::cast_precision_loss)]
+                ratios.push(block.gas_used as f64 / block.gas_limit.max(1) as f64);
+                if !percentiles.is_empty() {
+                    rewards.push(block_reward_percentiles(block, &percentiles));
+                }
+            } else {
+                base_fees.push("0x0".to_string());
+                ratios.push(0.0);
+                if !percentiles.is_empty() {
+                    rewards.push(Vec::new());
+                }
+            }
+        }
+        // The next block's base fee: our base fee is configured
+        // statically (no EIP-1559 adjustment), so it repeats.
+        base_fees.push(format!("0x{:x}", self.base_fee));
+        let mut out = json!({
+            "oldestBlock": format!("0x{oldest:x}"),
+            "baseFeePerGas": base_fees,
+            "gasUsedRatio": ratios,
+        });
+        if !percentiles.is_empty() {
+            out["reward"] = json!(rewards);
+        }
+        Ok(out)
     }
 
     /// `eth_mining` — returns whether the node is mining.
@@ -1124,35 +1317,498 @@ impl RpcServer {
 
     // ---- Helpers ----
 
-    /// Build a minimal block JSON object for `eth_getBlockByNumber`.
-    ///
-    /// Phase E v0: returns a stub block with the correct number but
-    /// zeroed hashes/txs. Full implementation reads from the block
-    /// store.
-    fn block_json(&self, block_num: u64) -> Value {
-        let _ = self;
-        json!({
-            "number": format!("0x{block_num:x}"),
-            "hash": format!("0x{block_num:064x}"),
-            "parentHash": format!("0x{:064x}", block_num.saturating_sub(1)),
-            "nonce": "0x0000000000000000",
-            "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "transactionsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
-            "stateRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
-            "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
-            "miner": "0x0000000000000000000000000000000000000000",
-            "difficulty": "0x0",
-            "totalDifficulty": "0x0",
-            "extraData": "0x",
-            "size": "0x0",
-            "gasLimit": format!("0x{:x}", 30_000_000),
-            "gasUsed": "0x0",
-            "timestamp": "0x0",
-            "transactions": [],
-            "uncles": [],
-        })
+    /// The attached EVM module, or an internal error when the node
+    /// was built without one (stateless test harnesses).
+    fn require_evm(&self) -> Result<&evm::EvmModule, RpcError> {
+        self.evm.as_deref().ok_or_else(|| RpcError::internal_error("evm module unavailable"))
     }
+
+    /// Resolve a block tag / number / EIP-1898 object to a concrete
+    /// block height in the sealed history window.
+    ///
+    /// Tag semantics under instant-finality consensus:
+    ///
+    /// - `latest` — the most recently *sealed* block
+    ///   (`history.latest()`; falls back to the executor-reported
+    ///   height when no block has sealed yet).
+    /// - `safe` / `finalized` — identical to `latest`: a committed
+    ///   block is final, there is no unfinalized "latest".
+    /// - `pending` — `latest` for lookups (no pending-block
+    ///   simulation is implemented yet).
+    /// - `earliest` — height 0.
+    /// - `"0x…"` — a literal height; may resolve outside the
+    ///   retained window (history queries then return `null`).
+    /// - `{blockHash: "0x…"}` / `{blockNumber: "0x…"}` — EIP-1898
+    ///   object form; an unknown hash is an error.
+    fn resolve_block_ref(&self, tag: Option<&Value>) -> Result<u64, RpcError> {
+        let latest = self.latest_sealed_height();
+        match tag {
+            None => Ok(latest),
+            Some(Value::String(s)) => match s.as_str() {
+                "latest" | "safe" | "finalized" | "pending" => Ok(latest),
+                "earliest" => Ok(0),
+                _ => {
+                    let s = s.strip_prefix("0x").unwrap_or(s);
+                    u64::from_str_radix(s, 16).map_err(|e| {
+                        RpcError::invalid_params(&format!("invalid block number: {e}"))
+                    })
+                }
+            },
+            Some(Value::Object(obj)) => {
+                if let Some(hash) = obj.get("blockHash") {
+                    let hash = parse_b256(hash)?;
+                    let evm = self.require_evm()?;
+                    let history = evm.history();
+                    return history
+                        .block_by_hash(&hash)
+                        .map(|b| b.number)
+                        .ok_or_else(|| RpcError::invalid_params("unknown block hash"));
+                }
+                if let Some(number) = obj.get("blockNumber") {
+                    return self.resolve_block_ref(Some(number));
+                }
+                Err(RpcError::invalid_params("invalid block object"))
+            }
+            Some(_) => Err(RpcError::invalid_params("block must be a tag, number, or object")),
+        }
+    }
+
+    /// The height of the most recent sealed block — the height
+    /// `"latest"` resolves to. Falls back to the executor-reported
+    /// height before the first block seals.
+    fn latest_sealed_height(&self) -> u64 {
+        self.evm
+            .as_deref()
+            .and_then(|evm| evm.history().latest())
+            .unwrap_or_else(|| self.block_height())
+    }
+
+    /// Gate for *state* queries (`eth_call`, `eth_getBalance`, …):
+    /// only the latest state is servable (no historical trie window
+    /// yet). A tag resolving below the latest sealed height returns
+    /// the geth-style "missing trie node" error; above it, "header
+    /// not found".
+    fn require_latest(&self, tag: Option<&Value>) -> Result<(), RpcError> {
+        let h = self.resolve_block_ref(tag)?;
+        let latest = self.latest_sealed_height();
+        if h > latest {
+            return Err(RpcError::internal_error("header not found"));
+        }
+        if h < latest {
+            return Err(RpcError::internal_error(&format!(
+                "missing trie node: state for block {h} unavailable (latest is {latest})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Parse an `eth_getLogs`/`eth_newFilter` filter object into the
+    /// module's [`LogFilter`].
+    ///
+    /// `fromBlock`/`toBlock` accept tags and hex numbers (default
+    /// `latest`); `blockHash` (EIP-234) makes the range fields
+    /// irrelevant. `address` accepts a string or array of strings;
+    /// `topics` accepts `null`, a hash, or an array of hashes per
+    /// position.
+    fn parse_log_filter(&self, obj: &Value) -> Result<LogFilter, RpcError> {
+        let mut filter = LogFilter {
+            from_block: self.latest_sealed_height(),
+            to_block: self.latest_sealed_height(),
+            ..LogFilter::default()
+        };
+        let Some(map) = obj.as_object() else {
+            return Err(RpcError::invalid_params("filter must be an object"));
+        };
+        if let Some(v) = map.get("blockHash") {
+            filter.block_hash = Some(parse_b256(v)?);
+        }
+        if let Some(v) = map.get("fromBlock") {
+            filter.from_block = self.resolve_block_ref(Some(v))?;
+        }
+        if let Some(v) = map.get("toBlock") {
+            filter.to_block = self.resolve_block_ref(Some(v))?;
+        }
+        if filter.from_block > filter.to_block && filter.block_hash.is_none() {
+            return Err(RpcError::invalid_params("fromBlock exceeds toBlock"));
+        }
+        match map.get("address") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(_)) => {
+                filter.addresses.push(parse_eth_address(map.get("address"))?);
+            }
+            Some(Value::Array(addrs)) => {
+                for a in addrs {
+                    filter.addresses.push(parse_eth_address(Some(a))?);
+                }
+            }
+            Some(_) => {
+                return Err(RpcError::invalid_params("address must be string or array"));
+            }
+        }
+        if let Some(Value::Array(topics)) = map.get("topics") {
+            for entry in topics {
+                let matcher = match entry {
+                    Value::Null => TopicMatcher::Any,
+                    Value::String(_) => TopicMatcher::One(parse_b256(entry)?),
+                    Value::Array(set) => TopicMatcher::AnyOf(
+                        set.iter().map(parse_b256).collect::<Result<Vec<B256>, _>>()?,
+                    ),
+                    _ => {
+                        return Err(RpcError::invalid_params(
+                            "topics entries must be null, a hash, or an array",
+                        ));
+                    }
+                };
+                filter.topics.push(matcher);
+            }
+        }
+        Ok(filter)
+    }
+}
+
+/// Maximum `eth_getLogs` results per request. geth does not cap
+/// `eth_getLogs` server-side (only via timeouts); we cap because a
+/// full-window scan over a 500k-tx block can produce hundreds of
+/// thousands of entries in one response body.
+const MAX_LOG_RESULTS: usize = 10_000;
+
+/// Maximum `eth_feeHistory` block count per request — mirrors
+/// geth's `maxFeeHistory` (1024) headroom while staying comfortably
+/// inside the 8192-block retained window.
+const MAX_FEE_HISTORY_BLOCKS: u64 = 1024;
+
+/// Map a [`evm::CallError`] onto the Ethereum JSON-RPC error
+/// surface: reverts use code `3` ("execution reverted") with the
+/// revert data attached for ABI decoding; halts and validation
+/// rejections use `-32000` with a human-readable reason.
+fn call_error(e: evm::CallError) -> RpcError {
+    match e {
+        evm::CallError::Revert { output, .. } => RpcError {
+            code: 3,
+            message: revert_message(&output),
+            data: Some(json!(format!("0x{}", hex::encode(output)))),
+        },
+        evm::CallError::Halt { reason, .. } => {
+            RpcError::internal_error(&format!("execution halted: {reason}"))
+        }
+        evm::CallError::Rejected(err) => {
+            RpcError::internal_error(&format!("execution rejected: {err:?}"))
+        }
+    }
+}
+
+/// Extract the `Error(string)` reason from ABI revert data, falling
+/// back to geth's generic message when the payload is not an
+/// `Error(string)` selector.
+fn revert_message(output: &[u8]) -> String {
+    // ABI Error(string): selector 0x08c379a0, offset, length, utf8.
+    const ERROR_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+    if output.len() >= 4 + 64 && output[..4] == ERROR_SELECTOR {
+        let len_bytes: [u8; 32] = output[4 + 32..4 + 64].try_into().unwrap_or([0; 32]);
+        let len = U256::from_be_bytes(len_bytes).to::<usize>();
+        if output.len() >= 4 + 64 + len
+            && let Ok(reason) = std::str::from_utf8(&output[4 + 64..4 + 64 + len])
+        {
+            return format!("execution reverted: {reason}");
+        }
+    }
+    "execution reverted".to_string()
+}
+
+/// Per-block priority-fee percentiles for `eth_feeHistory`.
+///
+/// The tip each transaction paid is `effective_gas_price −
+/// base_fee`; percentiles are taken over the block's txs (empty
+/// blocks yield zeroes, matching geth).
+fn block_reward_percentiles(block: &ExecutedBlock, percentiles: &[f64]) -> Vec<String> {
+    if block.txs.is_empty() {
+        return vec!["0x0".to_string(); percentiles.len()];
+    }
+    let mut tips: Vec<u128> = block
+        .txs
+        .iter()
+        .map(|tx| {
+            evm::history::effective_gas_price(tx, block.base_fee)
+                .saturating_sub(u128::from(block.base_fee))
+        })
+        .collect();
+    tips.sort_unstable();
+    percentiles
+        .iter()
+        .map(|p| {
+            let p = p.clamp(0.0, 100.0);
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation
+            )]
+            let idx = ((tips.len() - 1) as f64 * p / 100.0) as usize;
+            format!("0x{:x}", tips[idx])
+        })
+        .collect()
+}
+
+/// Serialize a stored transaction to the `eth_getTransactionByHash`
+/// object shape. `block` supplies the positional metadata.
+fn tx_json(tx: &StoredTx, block: &ExecutedBlock) -> Value {
+    json!({
+        "hash": format!("0x{:x}", tx.hash),
+        "nonce": format!("0x{:x}", tx.nonce),
+        "blockHash": format!("0x{:x}", block.hash),
+        "blockNumber": format!("0x{:x}", block.number),
+        "transactionIndex": format!("0x{:x}", tx.tx_index),
+        "from": format!("0x{:x}", tx.from),
+        "to": tx.to.map_or(Value::Null, |a| json!(format!("0x{a:x}"))),
+        "value": format!("0x{:x}", tx.value),
+        "gas": format!("0x{:x}", tx.gas_limit),
+        "gasPrice": format!("0x{:x}", evm::history::effective_gas_price(tx, block.base_fee)),
+        "maxFeePerGas": format!("0x{:x}", tx.gas_price),
+        "maxPriorityFeePerGas": format!("0x{:x}", tx.max_priority_fee_per_gas),
+        "input": format!("0x{}", hex::encode(&tx.input)),
+        "type": format!("0x{:x}", tx.tx_type),
+        "chainId": "0x1",
+        "v": format!("0x{:x}", tx.v),
+        "r": format!("0x{:x}", tx.r),
+        "s": format!("0x{:x}", tx.s),
+    })
+}
+
+/// Serialize a receipt to the `eth_getTransactionReceipt` object
+/// shape. `cumulative` is the block-cumulative gas up to and
+/// including this tx; `log_base` is the block-wide index of this
+/// receipt's first log.
+fn receipt_json(
+    tx: &StoredTx,
+    receipt: &evm::receipts::Receipt,
+    block: &ExecutedBlock,
+    cumulative: u64,
+    log_base: u32,
+) -> Value {
+    let logs: Vec<Value> = receipt
+        .logs
+        .iter()
+        .enumerate()
+        .map(|(i, log)| {
+            json!({
+                "address": format!("0x{:x}", log.address),
+                "topics": log.topics().iter().map(|t| format!("0x{t:x}")).collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data.data)),
+                "blockNumber": format!("0x{:x}", block.number),
+                "blockHash": format!("0x{:x}", block.hash),
+                "transactionHash": format!("0x{:x}", tx.hash),
+                "transactionIndex": format!("0x{:x}", tx.tx_index),
+                "logIndex": format!("0x{:x}", log_base.saturating_add(u32::try_from(i).unwrap_or(u32::MAX))),
+                "removed": false,
+            })
+        })
+        .collect();
+    json!({
+        "transactionHash": format!("0x{:x}", tx.hash),
+        "transactionIndex": format!("0x{:x}", tx.tx_index),
+        "blockHash": format!("0x{:x}", block.hash),
+        "blockNumber": format!("0x{:x}", block.number),
+        "from": format!("0x{:x}", tx.from),
+        "to": tx.to.map_or(Value::Null, |a| json!(format!("0x{a:x}"))),
+        "cumulativeGasUsed": format!("0x{cumulative:x}"),
+        "gasUsed": format!("0x{:x}", receipt.gas_used),
+        "contractAddress": receipt
+            .contract_address
+            .map_or(Value::Null, |a| json!(format!("0x{a:x}"))),
+        "logs": logs,
+        "logsBloom": format!("0x{}", hex::encode(receipt.bloom.as_slice())),
+        "status": if receipt.status { "0x1" } else { "0x0" },
+        "type": format!("0x{:x}", tx.tx_type),
+        "effectiveGasPrice": format!("0x{:x}", evm::history::effective_gas_price(tx, block.base_fee)),
+    })
+}
+
+/// Serialize a [`evm::history::LogMatch`] to the `eth_getLogs`
+/// entry shape.
+fn log_json(m: &evm::history::LogMatch) -> Value {
+    json!({
+        "address": format!("0x{:x}", m.address),
+        "topics": m.topics.iter().map(|t| format!("0x{t:x}")).collect::<Vec<_>>(),
+        "data": format!("0x{}", hex::encode(&m.data)),
+        "blockNumber": format!("0x{:x}", m.block_number),
+        "blockHash": format!("0x{:x}", m.block_hash),
+        "transactionHash": format!("0x{:x}", m.tx_hash),
+        "transactionIndex": format!("0x{:x}", m.tx_index),
+        "logIndex": format!("0x{:x}", m.log_index),
+        "removed": false,
+    })
+}
+
+/// Serialize a sealed block to the `eth_getBlockBy*` object shape.
+/// `full` selects full transaction objects over bare hashes.
+///
+/// Post-merge fields carry their canonical empties: `sha3Uncles`
+/// is the empty-list hash, `nonce`/`difficulty`/`mixHash` are zero,
+/// `withdrawals`/`withdrawalsRoot` are the empty Prague values.
+fn block_json(block: &ExecutedBlock, full: bool) -> Value {
+    let txs: Vec<Value> = if full {
+        block.txs.iter().map(|t| tx_json(t, block)).collect()
+    } else {
+        block.txs.iter().map(|t| json!(format!("0x{:x}", t.hash))).collect()
+    };
+    json!({
+        "number": format!("0x{:x}", block.number),
+        "hash": format!("0x{:x}", block.hash),
+        "parentHash": format!("0x{:x}", block.parent_hash),
+        "nonce": "0x0000000000000000",
+        "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+        "logsBloom": format!("0x{}", hex::encode(block.bloom)),
+        "transactionsRoot": format!("0x{:x}", block.tx_root),
+        "stateRoot": format!("0x{:x}", block.state_root),
+        "receiptsRoot": format!("0x{:x}", block.receipts_root),
+        "miner": format!("0x{:x}", block.coinbase),
+        "difficulty": "0x0",
+        "totalDifficulty": "0x0",
+        "extraData": "0x",
+        "size": "0x0",
+        "gasLimit": format!("0x{:x}", block.gas_limit),
+        "gasUsed": format!("0x{:x}", block.gas_used),
+        "timestamp": format!("0x{:x}", block.timestamp),
+        "baseFeePerGas": format!("0x{:x}", block.base_fee),
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "transactions": txs,
+        "uncles": [],
+        "withdrawals": [],
+        "withdrawalsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+    })
+}
+
+/// Parse a 20-byte hex address param into `primitives::Address`.
+fn parse_address(v: Option<&Value>) -> Result<primitives::Address, RpcError> {
+    let v = v.ok_or_else(|| RpcError::invalid_params("missing address"))?;
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("address must be a hex string"))?;
+    let bytes = hex_decode(s)?;
+    let arr: [u8; 20] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| RpcError::invalid_params("address must be 20 bytes"))?;
+    Ok(primitives::Address(arr))
+}
+
+/// Parse a 20-byte hex address param into the `alloy`/`revm`
+/// address type used inside `LogFilter`, `AccessListItem`, and
+/// `StoredTx` (distinct from the envelope's `primitives::Address`).
+fn parse_eth_address(v: Option<&Value>) -> Result<alloy_primitives::Address, RpcError> {
+    let v = v.ok_or_else(|| RpcError::invalid_params("missing address"))?;
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("address must be a hex string"))?;
+    let bytes = hex_decode(s)?;
+    let arr: [u8; 20] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| RpcError::invalid_params("address must be 20 bytes"))?;
+    Ok(alloy_primitives::Address::from(arr))
+}
+
+/// Parse a 32-byte hex hash param into [`B256`].
+fn parse_b256(v: &Value) -> Result<B256, RpcError> {
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("hash must be a hex string"))?;
+    let bytes = hex_decode(s)?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| RpcError::invalid_params("hash must be 32 bytes"))?;
+    Ok(B256::from(arr))
+}
+
+/// Parse a hex-quantity (`"0x…"`) or decimal param into `u64`.
+fn parse_u64(v: &Value) -> Result<u64, RpcError> {
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("expected hex quantity"))?;
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16)
+            .map_err(|e| RpcError::invalid_params(&format!("invalid quantity: {e}")))
+    } else {
+        s.parse::<u64>().map_err(|e| RpcError::invalid_params(&format!("invalid quantity: {e}")))
+    }
+}
+
+/// Parse a hex-quantity param into `u128` (gas-price fields can
+/// exceed u64 on paper).
+fn parse_u128(v: &Value) -> Result<u128, RpcError> {
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("expected hex quantity"))?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u128::from_str_radix(s, 16)
+        .map_err(|e| RpcError::invalid_params(&format!("invalid quantity: {e}")))
+}
+
+/// Parse a hex-quantity/storage-slot param into [`U256`].
+fn parse_u256(v: &Value) -> Result<U256, RpcError> {
+    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("expected hex quantity"))?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    U256::from_str_radix(s, 16)
+        .map_err(|e| RpcError::invalid_params(&format!("invalid quantity: {e}")))
+}
+
+/// Format a `u128` as an Ethereum hex quantity (`0x0` for zero).
+fn hex_quantity_u128(v: u128) -> Value {
+    json!(format!("0x{v:x}"))
+}
+
+/// Parse the `eth_call`/`eth_estimateGas` call object into
+/// [`evm::CallRequest`]. `data` and `input` are interchangeable
+/// (geth merges them; `input` wins when both are present).
+fn parse_call_object(v: &Value) -> Result<evm::CallRequest, RpcError> {
+    let Some(map) = v.as_object() else {
+        return Err(RpcError::invalid_params("call object must be an object"));
+    };
+    let opt = |key: &str| map.get(key).filter(|v| !v.is_null());
+    let mut req = evm::CallRequest {
+        from: None,
+        to: None,
+        gas: None,
+        gas_price: None,
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
+        value: U256::ZERO,
+        data: Vec::new(),
+        nonce: None,
+        access_list: Vec::new(),
+    };
+    if let Some(v) = opt("from") {
+        req.from = Some(parse_address(Some(v))?);
+    }
+    if let Some(v) = opt("to") {
+        req.to = Some(parse_address(Some(v))?);
+    }
+    if let Some(v) = opt("gas") {
+        req.gas = Some(parse_u64(v)?);
+    }
+    if let Some(v) = opt("gasPrice") {
+        req.gas_price = Some(parse_u128(v)?);
+    }
+    if let Some(v) = opt("maxFeePerGas") {
+        req.max_fee_per_gas = Some(parse_u128(v)?);
+    }
+    if let Some(v) = opt("maxPriorityFeePerGas") {
+        req.max_priority_fee_per_gas = Some(parse_u128(v)?);
+    }
+    if let Some(v) = opt("value") {
+        req.value = parse_u256(v)?;
+    }
+    if let Some(v) = opt("data").or_else(|| opt("input")) {
+        req.data = hex_decode(
+            v.as_str().ok_or_else(|| RpcError::invalid_params("data must be a hex string"))?,
+        )?;
+    }
+    if let Some(v) = opt("nonce") {
+        req.nonce = Some(parse_u64(v)?);
+    }
+    if let Some(Value::Array(items)) = opt("accessList") {
+        for item in items {
+            let address = parse_eth_address(item.get("address"))?;
+            let storage_keys = item
+                .get("storageKeys")
+                .and_then(Value::as_array)
+                .map(|keys| keys.iter().map(parse_b256).collect::<Result<Vec<B256>, _>>())
+                .transpose()?
+                .unwrap_or_default();
+            req.access_list.push(evm::tx::AccessListItem { address, storage_keys });
+        }
+    }
+    Ok(req)
 }
 
 /// Decode a hex string (with or without `0x` prefix) to bytes.
@@ -1169,26 +1825,23 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Parse a block tag (`"latest"`, `"earliest"`, `"pending"`, or a
-/// hex block number) to a `u64`.
-fn parse_block_tag(v: &Value) -> Result<u64, RpcError> {
-    let s = v.as_str().ok_or_else(|| RpcError::invalid_params("block must be a string"))?;
-    match s {
-        "latest" | "pending" | "earliest" => Ok(0), // Phase E v0: no block store
-        _ => {
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            u64::from_str_radix(s, 16)
-                .map_err(|e| RpcError::invalid_params(&format!("invalid block number: {e}")))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_server() -> RpcServer {
         RpcServer::new(1, 7_000_000_000)
+    }
+
+    /// Server with a live `EvmModule` attached — the same `Arc` an
+    /// executor would run against. `seal` lets a test run a
+    /// `begin_block`/`end_block` pair so history queries see a real
+    /// sealed block.
+    fn make_evm_server() -> (RpcServer, Arc<evm::EvmModule>) {
+        let mut s = RpcServer::new(1, 7);
+        let module = Arc::new(evm::EvmModule::new(1, 7));
+        s.set_evm(module.clone());
+        (s, module)
     }
 
     fn make_request(method: &str, params: Vec<Value>, id: Value) -> RpcRequest {
@@ -1261,7 +1914,7 @@ mod tests {
 
     #[test]
     fn eth_get_balance_returns_zero() {
-        let s = make_server();
+        let (s, _evm) = make_evm_server();
         let req = make_request(
             "eth_getBalance",
             vec![json!("0x0000000000000000000000000000000000000000")],
@@ -1282,7 +1935,7 @@ mod tests {
 
     #[test]
     fn eth_get_transaction_count_returns_zero() {
-        let s = make_server();
+        let (s, _evm) = make_evm_server();
         let req = make_request(
             "eth_getTransactionCount",
             vec![json!("0x0000000000000000000000000000000000000000")],
@@ -1485,7 +2138,7 @@ mod tests {
 
     #[test]
     fn eth_get_code_returns_empty() {
-        let s = make_server();
+        let (s, _evm) = make_evm_server();
         let req = make_request(
             "eth_getCode",
             vec![json!("0x0000000000000000000000000000000000000000")],
@@ -1497,7 +2150,7 @@ mod tests {
 
     #[test]
     fn eth_get_storage_at_returns_zero() {
-        let s = make_server();
+        let (s, _evm) = make_evm_server();
         let req = make_request(
             "eth_getStorageAt",
             vec![json!("0x0000000000000000000000000000000000000000"), json!("0x0")],
@@ -1512,20 +2165,31 @@ mod tests {
 
     #[test]
     fn eth_get_block_by_number_returns_block() {
-        let s = make_server();
+        use executor::Module;
+        use primitives::Height;
+        let (s, evm) = make_evm_server();
+        // Seal an empty block 0 — the module seals every block it
+        // executes, including empty ones.
+        evm.begin_block(Height::new(0));
+        evm.end_block(Height::new(0));
         let req = make_request("eth_getBlockByNumber", vec![json!("0x0"), json!(false)], json!(1));
         let resp = s.handle(&req);
         let block = resp.result.unwrap();
         assert_eq!(block["number"], json!("0x0"));
         assert!(block["transactions"].is_array());
+        // A real header hash — not the zeroed stub.
+        assert_ne!(
+            block["hash"],
+            json!("0x0000000000000000000000000000000000000000000000000000000000000000")
+        );
     }
 
     #[test]
     fn eth_estimate_gas_returns_intrinsic() {
-        let s = make_server();
+        let (s, _evm) = make_evm_server();
         let req = make_request(
             "eth_estimateGas",
-            vec![json!({"to": "0x0000000000000000000000000000000000000000", "value": "0x1"})],
+            vec![json!({"to": "0x0000000000000000000000000000000000000000", "value": "0x0"})],
             json!(1),
         );
         let resp = s.handle(&req);
@@ -1553,7 +2217,7 @@ mod tests {
 
     #[test]
     fn eth_fee_history_returns_minimal() {
-        let s = make_server();
+        let (s, _evm) = make_evm_server();
         let req = make_request("eth_feeHistory", vec![json!("0x1"), json!("latest")], json!(1));
         let resp = s.handle(&req);
         let result = resp.result.unwrap();
@@ -1586,7 +2250,7 @@ mod tests {
 
     #[test]
     fn eth_get_logs_returns_empty() {
-        let s = make_server();
+        let (s, _evm) = make_evm_server();
         let req = make_request(
             "eth_getLogs",
             vec![json!({"fromBlock": "0x0", "toBlock": "latest"})],

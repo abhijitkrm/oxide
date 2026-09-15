@@ -31,6 +31,11 @@ executor = { workspace = true }
 p2p = { workspace = true, features = ["tls"] }
 oxide-core = { workspace = true }
 staking = { workspace = true }
+# evm: registered into the devnet executor so `eth_*` RPCs serve real
+# state/history in multi-node mode.
+evm = { workspace = true }
+# alloy-primitives: U256 for parsing genesis `evm.alloc` storage slots.
+alloy-primitives = { workspace = true }
 rpc = { workspace = true }
 codec = { workspace = true }
 tokio = { workspace = true }

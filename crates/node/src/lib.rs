@@ -324,6 +324,13 @@ impl Node {
         self.evm_module.as_deref()
     }
 
+    /// Clone the shared EVM-module handle so another owner (the RPC
+    /// server) can read state and sealed-block history while the
+    /// executor keeps executing against the same instance.
+    pub fn evm_module_handle(&self) -> Option<Arc<evm::EvmModule>> {
+        self.evm_module.clone()
+    }
+
     /// Clone the shared executor handle.
     ///
     /// The executor is wrapped in an `Arc` so the RPC server can submit

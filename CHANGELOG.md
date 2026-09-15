@@ -12,6 +12,36 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **EVM execution history + real `eth_*` RPC surface (P0 parity)**
+  (`modules/evm/src/history.rs`, `crates/rpc`, `bin/oxide-validator`)
+  - `History` retains a bounded window (8192 blocks) of executed
+    blocks: real block hash (Prague-style header), transaction and
+    receipt trie roots, block bloom, receipts, logs with block-wide
+    indices, gas totals, and per-hash/height indexes.
+  - `eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`,
+    `eth_getTransactionByBlockNumberAndIndex`, block transaction
+    counts, `eth_getTransactionReceipt`, `eth_getBlockReceipts`,
+    `eth_getLogs` (range + address + topics + `blockHash`), and
+    `eth_feeHistory` now serve real executed data instead of stubs.
+  - `eth_call` executes a real read-only call against current EVM
+    state; reverts surface as JSON-RPC code 3 with revert data.
+    `eth_estimateGas` runs a bounded binary search and propagates
+    reverts/halts instead of returning a constant.
+  - Genesis supports an Ethereum-style `evm.alloc` section
+    (balance/nonce/code/storage) applied in single-node and devnet
+    assembly.
+  - `eth_sendRawTransaction` now gossips the wrapped transaction to
+    peers (deduplicated, no rebroadcast loops) so submissions to a
+    non-leader node still reach the mempool.
+  - Multi-node devnet mode now registers an `EvmModule` — `eth_*`
+    endpoints were previously unbacked there.
+  - **In plain words:** MetaMask, Foundry, and other Ethereum tooling
+    can now query blocks, transactions, receipts, and logs, simulate
+    calls, and estimate gas against Oxide the same way they do
+    against Ethereum — and transactions submitted to any validator
+    reach the whole network.
+
+
 - **Mutual TLS bound to validator/peer identities (C4)**
   (`crates/p2p/src/tls.rs`, `crates/p2p/src/tcp.rs`)
   - The p2p transport now requires mutual TLS: the server verifies

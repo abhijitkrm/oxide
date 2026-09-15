@@ -12576,3 +12576,113 @@ P2: historical state window; `eth_getProof`; `debug_trace*`;
 P3: distribution, slashing, upgrades/migrations, state sync, pruning.
 
 No code changed in this session — analysis only.
+
+## Session — P0 EVM/RPC parity: history store, `eth_call`, `eth_estimateGas`, tx gossip, genesis alloc
+
+Implemented the P0 tier of `docs/evm-parity-gap-analysis.md`. The
+`eth_*` surface now serves real executed data end-to-end instead of
+stubs.
+
+### History store (`modules/evm/src/history.rs`)
+
+- `History` retains a bounded window (8192 blocks) of `ExecutedBlock`s:
+  sealed header hash, `StoredTx` list (hash → tx index), receipts,
+  logs with block-wide `logIndex`, bloom, gas totals, state root.
+- `record` assigns `tx_index` at record time so parallel-execution
+  completion order can't scramble block order; pending raw RLP is
+  kept only until seal (needed once for `transactionsRoot`, then
+  dropped — zero persistent raw-bytes cost).
+- `end_block` seals: computes the post-execution state root over the
+  touched set, builds the Prague-style 21-field header (parent hash,
+  ommers, beneficiary, state/tx/receipt roots, bloom, gas, base fee,
+  withdrawals root, blob fields, parent-beacon root,
+  `EMPTY_REQUESTS_HASH = sha256("")` per EIP-7685), keccak-hashes it,
+  indexes by hash, evicts beyond the window, then **clears `touched`**
+  so the executor's post-block `state_root` hits the O(1) cached path.
+- Transaction trie root uses raw signed RLP; receipts root uses
+  revm's `Receipt` envelope encoding — both geth-compatible.
+
+### Read-only execution (`call_read` / `estimate_call_gas`)
+
+- `call_read` builds a separate revm env (sim flags: nonce, base-fee,
+  block-gas-limit, priority-fee, EIP-3607 checks disabled — balance
+  and fee-charge validation retained, matching geth `eth_call`) and
+  **discards** the returned state — nothing persists.
+- `CallRequest`/`CallOutcome`/`CallError` types; `Revert` and `Halt`
+  propagate distinctly (`eth_call` → JSON-RPC code 3 with revert data,
+  `eth_estimateGas` → error).
+- `estimate_call_gas`: bounded binary search over `call_read`;
+  treats `Ok(Revert)`/`Ok(Halt)` at the cap as failure (was a bug in
+  the first cut — only `Err` was checked).
+- `code`, `storage_at`, `history`, `current_height` accessors added.
+- `build_tx_env` now wires the EIP-2930 access list (was silently
+  dropped — wrong warm-access semantics).
+
+### RPC wiring (`crates/rpc`)
+
+- `RpcServer::set_evm(Arc<EvmModule>)`; all account/block/tx/receipt/
+  log/call/estimate/feeHistory handlers serve the live module.
+  Param validation precedes the backend check so `-32602` semantics
+  hold regardless of wiring. Historic state tags on account queries
+  return an explicit error (no trie window yet).
+- `block_json` emits full geth-shaped fields incl. real `hash`,
+  `transactionsRoot`, `receiptsRoot`, `logsBloom`, `baseFeePerGas`;
+  `full=false` → tx hashes, `full=true` → full tx objects.
+- `eth_getLogs` supports `fromBlock`/`toBlock`, address list, topics,
+  and EIP-234 `blockHash`.
+- 12-test `tests/evm_parity.rs` drives a real module through a block
+  (genesis-alloc'd sender + LOG0/RETURN/REVERT contracts) and asserts
+  every wired endpoint.
+
+### Tx gossip (`bin/oxide-validator`)
+
+- `MSG_TX` tag + `GossipSubmitter` (implements `TxSubmitter`):
+  `eth_sendRawTransaction` → decode → recover → wrap in Oxide
+  envelope → submit locally → queue to peers. Inbound gossip goes to
+  `ingest_tx` and is **not** rebroadcast (loop prevention); a bounded
+  100k-hash FIFO dedups.
+
+### Genesis alloc (`crates/config`, `evm`)
+
+- `Genesis.evm.alloc`: `[{address, balance, nonce?, code?, storage?}]`
+  — Ethereum-style. Applied in both `Node::assemble` (single-node)
+  and `build_devnet_executor` (multi-node).
+- `EvmModule::genesis_insert_account` sets balance/nonce/code/storage
+  with correct `keccak256("")` empty-code hash; also fixed the same
+  `B256::ZERO` bug in `fund_account_for_test`.
+
+### Also wired
+
+- `build_devnet_executor` now constructs + registers an `EvmModule`
+  (multi-node mode previously had no EVM behind `eth_*` at all) and
+  returns it so `start_devnet_rpc` attaches the live instance;
+  `Node::evm_arc()` exposes the same `Arc` for the single-node path.
+
+### Benchmarks (`cargo bench -p evm --bench tps_rw`, Apple M-series laptop)
+
+- `tps_simple_transfer`: ~35 µs/tx — **no change** (history record is
+  a mutex push + small struct per tx).
+- `end_block` seal: 11.7 µs @1 tx → 225 µs @100 txs (~2.2 µs/tx
+  amortized) — new work where `end_block` was previously a no-op;
+  this is the block-hash/roots cost, off the per-tx path.
+- `batch_parallel` 10k: ~97 ms (improved/no-change vs baseline).
+- Contended and recovery paths (`batch_parallel_conflict`,
+  `preverified_*`, `read_write_conflict_*`) regressed +15–80%
+  depending on size — this is the honest cost of recording history:
+  one mutex acquisition + `StoredTx` + raw-RLP copy per tx (~2–4 µs
+  on top of ~11–15 µs/tx execution). Before this change **nothing**
+  was retained at all, so the delta is the price of the feature, not
+  degradation of prior work. Still ~70–90k tx/s parallel.
+- Some sub-benchmarks show noise-level deltas in both directions
+  (shared machine, high outlier counts).
+- Acceptance: per-tx serial execution unchanged (35 µs/tx); seal
+  cost ≪ block execution cost (225 µs vs ~4 ms for a 100-tx block).
+- Follow-up idea: batch `History::record` under one lock per
+  block-chunk, or keep pending entries per-path and merge at seal —
+  would cut most of the contended-path delta.
+
+### Tests
+
+`cargo test --workspace`: **1194 passed, 0 failed**. New coverage:
+evm history/call/estimate unit + integration tests; rpc parity
+suite (12); gossip dedup exercised via devnet path.

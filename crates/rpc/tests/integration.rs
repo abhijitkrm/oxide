@@ -36,8 +36,12 @@ use rpc::{RpcRequest, RpcServer};
 use serde_json::{Value, json};
 
 fn make_server() -> RpcServer {
-    let s = RpcServer::new(1337, 1_000_000_000);
+    let mut s = RpcServer::new(1337, 1_000_000_000);
     s.set_block_height(42);
+    // Attach a real EVM module so state/history reads return actual
+    // values (empty state → zero balances/nonces) instead of the
+    // "evm module unavailable" error.
+    s.set_evm(std::sync::Arc::new(evm::EvmModule::new(1337, 1_000_000_000)));
     s
 }
 

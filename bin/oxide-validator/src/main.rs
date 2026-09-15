@@ -53,6 +53,7 @@ const MSG_VOTE: u8 = 0x01;
 const MSG_QC: u8 = 0x02;
 const MSG_TIMEOUT: u8 = 0x03; // timeout signature (view-change init)
 const MSG_TC: u8 = 0x04; // timeout certificate (view-change proof)
+const MSG_TX: u8 = 0x05; // raw tx envelope gossip (mempool propagation)
 
 /// Build the BLS vote signing message: `view` || `phase` || `block_hash` || `epoch`.
 /// This must match the consensus engine's `vote_signing_message`.
@@ -87,6 +88,43 @@ struct ExecutorTxSubmitter {
 impl rpc::TxSubmitter for ExecutorTxSubmitter {
     fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
         match self.executor.ingest_tx(tx) {
+            MempoolAck::Accepted => Ok(()),
+            MempoolAck::Rejected { reason } => Err(reason),
+        }
+    }
+}
+
+/// `TxSubmitter` that additionally gossips accepted transactions to
+/// all peers.
+///
+/// After the local mempool accepts a tx, the *envelope bytes* are
+/// pushed onto a channel the consensus loop drains and broadcasts
+/// as `MSG_TX` frames. Only locally submitted txs are gossiped —
+/// received gossip is ingested but never re-broadcast, so in the
+/// full-mesh validator topology each tx traverses exactly one hop
+/// and no flood loop forms. The channel is bounded; a full channel
+/// drops the gossip copy but never fails the local submission (the
+/// originator's mempool still holds the tx, and the keep-alive path
+/// ensures liveness for non-gossipped txs is unaffected — peers may
+/// simply not see it until resubmission).
+struct GossipingTxSubmitter {
+    inner: ExecutorTxSubmitter,
+    gossip: std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
+impl rpc::TxSubmitter for GossipingTxSubmitter {
+    fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
+        self.inner.submit_tx_ref(&tx)?;
+        let _ = self.gossip.try_send(tx.as_bytes().to_vec());
+        Ok(())
+    }
+}
+
+impl ExecutorTxSubmitter {
+    /// Submit without consuming `tx` — used by [`GossipingTxSubmitter`]
+    /// to keep the bytes for the gossip frame.
+    fn submit_tx_ref(&self, tx: &TxBytes) -> Result<(), String> {
+        match self.executor.ingest_tx(TxBytes::new(tx.as_bytes().to_vec())) {
             MempoolAck::Accepted => Ok(()),
             MempoolAck::Rejected { reason } => Err(reason),
         }
@@ -220,6 +258,12 @@ fn run_single_node() {
     // Wire the executor into the RPC so `eth_sendRawTransaction`
     // decodes, wraps, and submits EVM transactions into the mempool.
     rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: node.app_handle() }));
+    // Share the executor's EVM module with the RPC so `eth_call`,
+    // `eth_getBalance`, and the block/tx/receipt/log lookups serve
+    // the same state the executor is committing.
+    if let Some(evm_module) = node.evm_module_handle() {
+        rpc_server.set_evm(evm_module);
+    }
     // Wire the executor into the RPC so `GET /snapshot` returns the
     // codec-encoded state snapshot.
     rpc_server
@@ -489,7 +533,8 @@ fn run_devnet_node(node_index_str: &str) {
         config::genesis::Genesis::from_json_file(&PathBuf::from(&p))
             .unwrap_or_else(|e| panic!("failed to load genesis file {p}: {e}"))
     });
-    let executor = build_devnet_executor(&genesis_config, &node_config, genesis.as_ref());
+    let (executor, evm_module) =
+        build_devnet_executor(&genesis_config, &node_config, &rpc_config, genesis.as_ref());
     let app: Arc<executor::Executor> = Arc::new(executor);
     let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
 
@@ -553,8 +598,22 @@ fn run_devnet_node(node_index_str: &str) {
     // `GET /validator-set`.
     let shared_validator_set = Arc::new(std::sync::RwLock::new(validator_set_clone.clone()));
 
+    // Tx-gossip channel: the RPC submitter pushes accepted txs here;
+    // the consensus loop drains it and broadcasts `MSG_TX` frames to
+    // all peers. Bounded at 10k — a full channel drops the gossip
+    // copy (local submission already succeeded) instead of blocking
+    // the RPC thread.
+    let (gossip_tx, gossip_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(10_000);
+
     // Start the RPC server if --rpc-listen or rpc.listen_addr is set.
-    let rpc_handle = start_devnet_rpc(&rpc_config, &app, node_index, shared_validator_set.clone());
+    let rpc_handle = start_devnet_rpc(
+        &rpc_config,
+        &app,
+        node_index,
+        shared_validator_set.clone(),
+        &evm_module,
+        gossip_tx,
+    );
 
     println!("oxide-validator[{node_index}]: consensus engine started, waiting for blocks...");
 
@@ -609,6 +668,7 @@ fn run_devnet_node(node_index_str: &str) {
         shutdown.as_ref(),
         rpc_handle.as_deref(),
         &shared_validator_set,
+        &gossip_rx,
     );
 
     // Graceful shutdown: if --data-dir is set, export the current
@@ -718,16 +778,23 @@ fn load_validator_set(num_nodes: usize, _node_index: usize) -> consensus::Valida
     }
 }
 
-/// Build the devnet executor with core, bank, and staking modules.
+/// Build the devnet executor with core, bank, staking, and EVM
+/// modules.
 ///
 /// Uses `genesis_config` for the number of pre-funded senders and
-/// genesis balance, and `node_config` for executor params
-/// (mempool size, parallel threshold).
+/// genesis balance, `node_config` for executor params (mempool size,
+/// parallel threshold), and `rpc_config` for the EVM chain ID and
+/// base fee so `eth_chainId`/`eth_gasPrice` agree with execution.
+///
+/// Returns the executor and the shared `Arc<EvmModule>` so the RPC
+/// server can serve `eth_*` reads against the same instance the
+/// executor commits.
 fn build_devnet_executor(
     genesis_config: &config::GenesisConfig,
     node_config: &NodeConfig,
+    rpc_config: &config::RpcConfig,
     genesis: Option<&config::genesis::Genesis>,
-) -> executor::Executor {
+) -> (executor::Executor, Arc<evm::EvmModule>) {
     let mut executor = executor::Executor::with_config(
         node_config.max_mempool_entries,
         node_config.parallel_threshold,
@@ -778,7 +845,61 @@ fn build_devnet_executor(
         }
     }
     executor.register_module(Arc::new(staking_module));
-    executor
+
+    // EVM module: registered in devnet mode too so `eth_*` RPCs serve
+    // real state/history and `eth_sendRawTransaction` actually
+    // executes. Uses the RPC-config chain ID/base fee so the
+    // advertised and enforced parameters agree.
+    let evm_module = Arc::new(evm::EvmModule::new(rpc_config.chain_id, rpc_config.base_fee));
+    // Apply the genesis `alloc` map (Ethereum `genesis.json`
+    // convention): balances, nonces, code, and storage for
+    // pre-funded accounts and preinstalled contracts.
+    if let Some(genesis) = genesis {
+        for (addr_hex, account) in &genesis.evm.alloc {
+            let addr_bytes = hex_decode(addr_hex)
+                .unwrap_or_else(|e| panic!("genesis evm.alloc invalid address: {e}"));
+            let addr: [u8; 20] = addr_bytes
+                .try_into()
+                .unwrap_or_else(|_| panic!("genesis evm.alloc address must be 20 bytes"));
+            let balance = if let Some(hex) = account.balance.strip_prefix("0x") {
+                u128::from_str_radix(hex, 16)
+            } else {
+                account.balance.parse::<u128>()
+            }
+            .unwrap_or_else(|e| panic!("genesis evm.alloc invalid balance: {e}"));
+            let code = account
+                .code
+                .as_deref()
+                .map(|c| hex_decode(c).unwrap_or_else(|e| panic!("evm.alloc code: {e}")))
+                .unwrap_or_default();
+            let storage = account
+                .storage
+                .iter()
+                .map(|(slot, value)| {
+                    let slot = alloy_primitives::U256::from_str_radix(
+                        slot.strip_prefix("0x").unwrap_or(slot),
+                        16,
+                    )
+                    .unwrap_or_else(|e| panic!("evm.alloc slot: {e}"));
+                    let value = alloy_primitives::U256::from_str_radix(
+                        value.strip_prefix("0x").unwrap_or(value),
+                        16,
+                    )
+                    .unwrap_or_else(|e| panic!("evm.alloc storage value: {e}"));
+                    (slot, value)
+                })
+                .collect();
+            evm_module.genesis_insert_account(
+                &primitives::Address(addr),
+                balance,
+                account.nonce,
+                code,
+                storage,
+            );
+        }
+    }
+    executor.register_module(evm_module.clone());
+    (executor, evm_module)
 }
 
 /// Build the TCP transport: `--tls-dir` for mTLS, plain TCP otherwise.
@@ -859,18 +980,27 @@ impl rpc::ValidatorSetProvider for SharedValidatorSetProvider {
 ///
 /// The HTTP server is spawned on a dedicated tokio runtime thread so
 /// the consensus loop can run on the main thread.
+#[allow(clippy::too_many_arguments)]
 fn start_devnet_rpc(
     rpc_config: &config::RpcConfig,
     app: &Arc<executor::Executor>,
     node_index: usize,
     shared_validator_set: Arc<std::sync::RwLock<consensus::ValidatorSet>>,
+    evm_module: &Arc<evm::EvmModule>,
+    gossip_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) -> Option<Arc<rpc::RpcServer>> {
     let listen = parse_cli_flag("--rpc-listen").or_else(|| {
         if rpc_config.listen_addr.is_empty() { None } else { Some(rpc_config.listen_addr.clone()) }
     })?;
 
     let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
-    rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: app.clone() }));
+    // Gossip-aware submitter: accepted txs are broadcast to all peers
+    // so a tx sent to a non-leader still reaches the current leader.
+    rpc_server.set_tx_submitter(Arc::new(GossipingTxSubmitter {
+        inner: ExecutorTxSubmitter { executor: app.clone() },
+        gossip: gossip_tx,
+    }));
+    rpc_server.set_evm(evm_module.clone());
     rpc_server.set_snapshot_provider(Arc::new(ExecutorSnapshotProvider { executor: app.clone() }));
     rpc_server.set_validator_set_provider(Arc::new(SharedValidatorSetProvider {
         set: shared_validator_set,
@@ -916,7 +1046,13 @@ fn run_consensus_loop(
     shutdown: &AtomicBool,
     rpc: Option<&rpc::RpcServer>,
     shared_validator_set: &std::sync::RwLock<consensus::ValidatorSet>,
+    gossip_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
 ) {
+    // Gossip dedup cap: tx hashes we've already ingested (ours +
+    // peers'). 100k entries covers several blocks' worth of txs; a
+    // duplicate arriving after eviction is re-ingested harmlessly
+    // (the executor's nonce-replay check still applies).
+    const GOSSIP_SEEN_CAP: usize = 100_000;
     // Track proposals received from the network. Followers vote on
     // these proposals; the leader proposes locally.
     let mut pending_proposals: Vec<(types::BlockHeader, types::Proposal)> = Vec::new();
@@ -941,6 +1077,10 @@ fn run_consensus_loop(
     // validator set was rotated by `complete_rotation`. Update the
     // shared set so `GET /validator-set` reflects the new set.
     let mut last_epoch = engine.epoch().value();
+    let mut seen_txs: std::collections::HashSet<primitives::Hash> =
+        std::collections::HashSet::with_capacity(GOSSIP_SEEN_CAP.min(4096));
+    let mut seen_txs_fifo: std::collections::VecDeque<primitives::Hash> =
+        std::collections::VecDeque::new();
 
     loop {
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
@@ -1059,6 +1199,29 @@ fn run_consensus_loop(
                         let _ = engine.deliver_qc(qc);
                     }
                 }
+                MSG_TX => {
+                    // Raw tx envelope gossiped by a peer's RPC
+                    // (`eth_sendRawTransaction`). Ingest into our
+                    // mempool — the leader may be a different node,
+                    // so without gossip a tx submitted to a non-leader
+                    // would sit until that node's leader turn.
+                    //
+                    // Never re-broadcast: in the full-mesh validator
+                    // topology a single hop reaches every peer, and
+                    // re-gossip would loop indefinitely.
+                    let payload = &msg.bytes[1..];
+                    let tx_hash =
+                        crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, payload);
+                    if seen_txs.insert(tx_hash) {
+                        seen_txs_fifo.push_back(tx_hash);
+                        if seen_txs_fifo.len() > GOSSIP_SEEN_CAP
+                            && let Some(old) = seen_txs_fifo.pop_front()
+                        {
+                            seen_txs.remove(&old);
+                        }
+                        let _ = engine.submit_tx(TxBytes::new(payload.to_vec()));
+                    }
+                }
                 MSG_TIMEOUT => {
                     // View-change timeout signature from a peer.
                     // Format: [voter_idx: 1B][view: 8B][epoch: 8B][signature: 96B]
@@ -1143,6 +1306,35 @@ fn run_consensus_loop(
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Phase 3b: drain the tx-gossip channel — the RPC submitter
+        // pushes locally-accepted txs here; broadcast each as a
+        // `MSG_TX` frame to every peer. Bounded by the channel cap
+        // (10k), so worst case this drains 10k frames in one
+        // iteration — each send is a channel push to the peer's
+        // writer task, non-blocking.
+        while let Ok(tx_bytes) = gossip_rx.try_recv() {
+            // Record locally-originated txs in the dedup set too, so a
+            // peer that somehow reflects our frame back is dropped.
+            let tx_hash =
+                crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, &tx_bytes);
+            if seen_txs.insert(tx_hash) {
+                seen_txs_fifo.push_back(tx_hash);
+                if seen_txs_fifo.len() > GOSSIP_SEEN_CAP
+                    && let Some(old) = seen_txs_fifo.pop_front()
+                {
+                    seen_txs.remove(&old);
+                }
+            }
+            let mut buf = Vec::with_capacity(1 + tx_bytes.len());
+            buf.push(MSG_TX);
+            buf.extend_from_slice(&tx_bytes);
+            for i in 0..num_nodes {
+                if i != node_index {
+                    let _ = transport.send(&vec![u8::try_from(i).unwrap()], &buf);
+                }
             }
         }
 

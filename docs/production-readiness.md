@@ -411,19 +411,26 @@ imported → catches up. `/validator-set` returns current set.
    validation and epoch-boundary application.
 7. ~~TLS cert generation tooling~~ — **resolved.** `tls-gen` subcommand.
 8. **EVM parity gaps vs. cosmos-evm.** See
-   `docs/evm-parity-gap-analysis.md` for the full inventory. Headline:
-   ~17 of ~35 `eth_*` RPC methods return real data; there is no
-   retained block/tx/receipt/log store, no read-only EVM call path
-   (`eth_call`/`eth_estimateGas` are stubs), no WebSocket transport for
-   `eth_subscribe`, and no transaction gossip — a tx submitted to a
-   non-leader node waits in its local mempool. The P0 items there
-   are prerequisites for external-developer EVM compatibility, though
-   not for a validator-only testnet.
+   `docs/evm-parity-gap-analysis.md` for the full inventory.
+   **P0 resolved:** the executed-history store now retains blocks,
+   transactions, receipts, and logs (real block hash, tx/receipt
+   roots, bloom, block-wide log indices); `eth_call` executes a real
+   read-only simulation and `eth_estimateGas` binary-searches gas;
+   block tags resolve correctly; `eth_sendRawTransaction` gossips
+   wrapped transactions to peers; genesis supports `evm.alloc`;
+   and the devnet path registers an EVM module so `eth_*` is backed
+   in multi-node mode. **Remaining (P1+):** legacypool-style mempool
+   ordering, WebSocket transport for `eth_subscribe`, filter APIs,
+   staking-precompile side effects, genesis preinstalls, historical
+   state window, `eth_getProof`, `debug_trace*`, `txpool_*`,
+   EIP-7702, and persistent history across restart.
 
 **Next action:** External security audit and public multi-machine
 testnet deployment. The codebase now has all the infrastructure a
 testnet needs: mTLS, WAL persistence, snapshot persistence, genesis
-loading, key rotation, validator add/remove, RPC endpoints, and
-graceful shutdown. For external-developer-facing EVM compatibility,
-the P0 items in `docs/evm-parity-gap-analysis.md` (history store,
-read-only calls, block tags, tx gossip) come first.
+loading (incl. EVM alloc), key rotation, validator add/remove, a
+real `eth_*` RPC surface (blocks/txs/receipts/logs/call/estimate/
+feeHistory), tx gossip, and graceful shutdown. The P1 tier in
+`docs/evm-parity-gap-analysis.md` (mempool ordering, WS transport,
+filters, precompile side effects, preinstalls, RPC limits) is next
+for external-developer-facing completeness.
