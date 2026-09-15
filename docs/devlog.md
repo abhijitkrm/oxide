@@ -12518,3 +12518,61 @@ entries, and connects via `--devnet-node` — no genesis file needed.
 
 - External security audit
 - Public multi-machine testnet deployment
+
+## Session — cosmos-evm parity gap analysis
+
+Compared Oxide against `github.com/cosmos/evm` v0.7.2 (geth-fork EVM over
+SDK KVStore; the release-grade reference for Cosmos-style EVM chains).
+Full inventory + per-feature status lives in
+`docs/evm-parity-gap-analysis.md`.
+
+### Headline findings
+
+- **RPC surface is ~half stubbed.** Of ~35 advertised `eth_*` methods,
+  ~17 return correct data. `eth_call`, `eth_estimateGas`,
+  `eth_getTransactionReceipt`, `eth_getTransactionByHash`,
+  `eth_getBlockByHash`, `eth_getLogs`, `eth_getBlockReceipts`, all
+  filter APIs, and the `txpool_*`/`debug_*` namespaces are missing or
+  return placeholders. Block tags map every tag to height 0.
+- **Nothing retains finalized EVM history.** Receipts are built for
+  event emission then dropped; no block store, tx index, or log index
+  is wired to RPC. The `indexer` crate exists but only indexes generic
+  `FinalizedBlock` events and is not connected to the validator.
+- **No read-only EVM entry point.** `execute_signed` requires signature
+  recovery, so `eth_call`/`eth_estimateGas`/`eth_createAccessList`/
+  `debug_traceCall` are all blocked on a new `call_read` path.
+- **No tx gossip.** `eth_sendRawTransaction` lands in the local node's
+  mempool only — broken in multi-validator deployments when the
+  submission node isn't the current leader.
+- **No WebSocket transport.** `eth_subscribe` manages subscription
+  objects but there is no WS listener — MetaMask/hardhat `newHeads`
+  cannot work.
+- **Staking delegate precompile reverts** — the native side effect is
+  not wired (existing known gap; cosmos-evm's `0x0800` actually
+  delegates).
+- **Missing modules vs. the SDK surface:** distribution (fee/reward
+  payout), slashing+evidence, upgrade/migrations, ERC20 facade over
+  bank denoms. Base fee is **burned** (Ethereum-faithful) where
+  cosmos-evm **distributes to validators** — needs an explicit decision.
+- **Cheap high-value wins:** genesis preinstalls (Create2 factory,
+  Multicall3, Permit2, Safe singleton) and EVM `alloc` in
+  `GenesisConfig`.
+- **Security lesson imported:** the Aug-2026 cosmos-evm exploit minted
+  ~2.99B tokens via a precompile→module `SubBalance` underflow. Oxide's
+  precompile side-effect wiring must reuse the native module's
+  invariant checks, never a parallel balance path.
+- **Deliberately out of scope:** IBC, `personal_*` key custody,
+  `eth_sendTransaction`, miner/engine/clique/trace namespaces, bech32,
+  CometBFT RPC, runtime EIP mutation, permissioned EVM.
+
+### Roadmap (proposed, in `evm-parity-gap-analysis.md`)
+
+P0: block/tx/receipt/log store + RPC wiring; read-only call path;
+correct block tags; tx gossip.
+P1: legacypool-style mempool ordering; WS transport; filter APIs;
+staking precompile side effects; preinstalls; RPC resource limits.
+P2: historical state window; `eth_getProof`; `debug_trace*`;
+`txpool_*`; EIP-7702; EIP-712 for native msgs; ERC20 facade.
+P3: distribution, slashing, upgrades/migrations, state sync, pruning.
+
+No code changed in this session — analysis only.
