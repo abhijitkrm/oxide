@@ -12248,8 +12248,80 @@ validator-1 — caught up to height 2826.
 - `cargo test -p devnet --release -- --ignored trading_tps_large` —
   10M txs, 10000 blocks, all validators agree, 78.7K tx/s, 127s
 
-### Remaining work
+### Remaining work — resolved in Session 5
 
-- `take_key_changes` needs to be wired into `complete_rotation` so
-  pending key changes are applied at epoch boundaries (currently
-  stored but not consumed).
+- ✅ `take_key_changes` → `complete_rotation` wired end-to-end.
+
+---
+
+## 2026-09-14 — Session 5: key-change → epoch rotation wiring
+
+### What was done
+
+**`Address` ↔ `ValidatorIndex` mapping (`ValidatorSet`):**
+- `ValidatorSet` gained `validator_addresses: Vec<Address>` —
+  parallel to `validators` and `stakes`. The address is the
+  validator's staking identity; it survives key rotation.
+- `ValidatorSet::new(keys, stakes)` derives addresses from BLS keys
+  via `validator_address(pk)` — `hash(ValidatorAddress ‖ pk)[..20]`.
+- `ValidatorSet::with_addresses(keys, stakes, addresses)` accepts
+  explicit addresses for setups where the staking identity is
+  independent of the consensus key (devnet uses `Address([i; 20])`).
+- `index_of(addr)` — linear scan of `validator_addresses`.
+- `apply_key_change(index, new_key)` — returns a new `ValidatorSet`
+  with the updated key; the address is preserved.
+
+**`Domain::ValidatorAddress = 10`** in `crypto::hash` — appended
+after `Proposal` (never renumber). `bls_signer::dst` maps it to
+`b"oxide/validator-address"`.
+
+**`validator_address(pk: &PublicKey) -> Address`** in `crypto::bls` —
+`hash(Domain::ValidatorAddress ‖ pk)[..20]`. Standard pattern
+(Ethereum derives addresses from secp256k1 public keys).
+
+**`Module::take_key_changes()`** — new trait method on `Module`,
+default returns empty. `StakingModule` overrides it to drain
+`pending_key_changes`. This avoids `as_any`/downcasting — the
+`Executor` doesn't need to know about `StakingModule` (no circular
+dep: `staking` depends on `executor`, not vice versa).
+
+**`Executor::take_pending_key_changes()`** — iterates all registered
+modules, collects their `take_key_changes()` results. Only the
+staking module produces non-empty results.
+
+**`OxideBft::apply_key_changes(changes)`** — for each `(address,
+new_key)`, finds the index via `index_of`, replaces the BLS key,
+builds an updated `ValidatorSet` preserving stakes and addresses,
+calls `schedule_rotation`. Returns `Ok(applied_count)`.
+
+**`OxideBft::validator_set()`** — accessor for the active set (used
+by key-rotation tests to verify the new key is active).
+
+**`KeyChangeError`** — `InvalidKeyLength`, `InvalidSet`,
+`RotationAlreadyPending`.
+
+**Devnet wiring:**
+- `TcpMultiNodeDevnet` and `MultiNodeDevnet` use
+  `ValidatorSet::with_addresses` with `Address([i; 20])` — the
+  devnet convention for validator `i`.
+- `TcpMultiNodeDevnet::rotate_epoch_with_key_changes()` — drains
+  pending changes from `app[0]` (all apps see the same blocks),
+  calls `apply_key_changes` on all engines, then `rotate_epoch` on
+  all engines, then updates `self.validator_set`.
+- `run_devnet_node` in `main.rs` uses `with_addresses` with
+  `Address([i; 20])`.
+
+### Test results
+
+- `key_change_rotates_validator_key` — full flow: `apply_key_changes`
+  → `schedule_rotation` → `rotate_epoch` → new key active.
+- `key_change_unknown_address_skipped` — unknown address returns 0.
+- `key_change_invalid_key_length` — 47-byte key rejected.
+- `validator_set_index_of_and_apply_key_change` — `index_of` finds
+  each derived address; `apply_key_change` preserves address.
+- `tcp_multinode_key_rotation` — end-to-end devnet test: delegate +
+  key_change tx finalized → `rotate_epoch_with_key_changes` →
+  validator 0's key rotated, address preserved.
+- `cargo test --workspace` — all pass, 0 failures
+- `cargo fmt --check` — clean
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean

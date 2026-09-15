@@ -408,7 +408,15 @@ fn run_devnet_node(node_index_str: &str) {
     let pks: Vec<crypto::bls::PublicKey> =
         secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
     let stakes = vec![1u64; num_nodes];
-    let validator_set = consensus::ValidatorSet::new(pks, stakes).expect("validator set");
+    // Devnet convention: validator `i` has staking address
+    // `Address([i as u8; 20])` — `Address::ZERO` for validator 0.
+    // `with_addresses` preserves these explicit identities so
+    // `handle_key_change`'s `ctx.sender == validator` check works
+    // with the devnet's `Address([i; 20])` sender convention.
+    let addresses: Vec<primitives::Address> =
+        (0..num_nodes).map(|i| primitives::Address([u8::try_from(i).unwrap_or(0); 20])).collect();
+    let validator_set =
+        consensus::ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set");
 
     let our_key = secret_keys[node_index].clone();
     let listen_port = base_port + u16::try_from(node_index).expect("port fits in u16");

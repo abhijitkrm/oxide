@@ -359,9 +359,12 @@ All partial runbook items completed:
    critical, 6 high, 4 medium) are now fixed.
 2. **No running public testnet.** The Docker testnet proves the
    mechanics but a public multi-machine deployment is needed.
-3. **Epoch-boundary key-change application:** `take_key_changes`
-   is stored but not yet consumed by `complete_rotation` — the
-   mapping from `Address` to validator index needs design.
+3. ~~Epoch-boundary key-change application~~ — **resolved.** The
+   `Address` → `ValidatorIndex` mapping is now stored in
+   `ValidatorSet::validator_addresses` (derived from BLS key via
+   `validator_address(pk)` by default, or explicit via
+   `with_addresses`). `OxideBft::apply_key_changes` bridges
+   `take_key_changes` → `schedule_rotation` → `complete_rotation`.
 
 **Next action:** External security audit and public testnet
 deployment. The feedback loop continues: after external

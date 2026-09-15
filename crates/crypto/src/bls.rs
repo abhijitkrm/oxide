@@ -59,6 +59,30 @@ impl PublicKey {
     }
 }
 
+/// Derive a validator's staking [`Address`](primitives::Address) from
+/// their BLS public key.
+///
+/// The address is the first 20 bytes of
+/// `hash(ValidatorAddress ‖ pk)`. This is the standard pattern
+/// (Ethereum derives externally-owned addresses from secp256k1 public
+/// keys); it gives every validator a unique, deterministic identity in
+/// the staking module without a separate registration step.
+///
+/// The `Domain::ValidatorAddress` tag ensures this hash can never
+/// collide with a block hash, vote hash, or any other domain-separated
+/// digest.
+///
+/// The staking address is the validator's *identity* — it survives
+/// key rotation (the consensus key changes, the address does not).
+#[must_use]
+pub fn validator_address(pk: &PublicKey) -> primitives::Address {
+    let hash = crate::hash::Hasher::hash_one(crate::hash::Domain::ValidatorAddress, pk.as_bytes());
+    // `Hash` is always 32 bytes; the first 20 always fit an `Address`.
+    let mut bytes = [0u8; 20];
+    bytes.copy_from_slice(&hash.0[..20]);
+    primitives::Address(bytes)
+}
+
 impl Encode for PublicKey {
     fn encode(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.0);

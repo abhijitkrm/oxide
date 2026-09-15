@@ -60,12 +60,38 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - `staking::msg::key_change(validator, key)` constructs the message.
   - `handle_key_change` validates sender == validator, validator
     has stake, key is 48 bytes. Stores in `pending_key_changes`.
-  - `staking.take_key_changes()` drains pending changes (for epoch
-    boundary application by the consensus engine — wiring pending).
+  - `staking.take_key_changes()` drains pending changes.
   - `oxide-validator --submit-key-change <hex>` submits the tx.
   - **In plain words:** A validator can rotate its BLS consensus
     key (e.g., after a suspected key compromise) by submitting a
     transaction — no restart or re-registration needed.
+
+- **Key-change → epoch rotation wiring**
+  (`crates/consensus/src/validator.rs`, `crates/consensus/src/engine.rs`,
+  `crates/executor/src/lib.rs`, `crates/devnet/src/tcp_multinode.rs`)
+  - `ValidatorSet` now carries `validator_addresses: Vec<Address>` —
+    each validator's staking identity, parallel to their consensus
+    key. The address survives key rotation.
+  - `validator_address(pk)` derives the staking address from a BLS
+    key: `hash(ValidatorAddress ‖ pk)[..20]` — the standard pattern
+    (Ethereum derives addresses from public keys).
+  - `ValidatorSet::index_of(address)` maps a staking address to its
+    validator index. `ValidatorSet::apply_key_change(index, key)`
+    returns an updated set preserving the address.
+  - `Module::take_key_changes()` is a new trait method (default
+    empty); `StakingModule` overrides it to drain pending changes.
+    `Executor::take_pending_key_changes()` collects them across all
+    modules.
+  - `OxideBft::apply_key_changes(changes)` builds an updated
+    `ValidatorSet` and calls `schedule_rotation` — the two-phase
+    handoff completes at the epoch boundary via `complete_rotation`.
+  - `TcpMultiNodeDevnet::rotate_epoch_with_key_changes()` bridges
+    the full flow: drain → apply → schedule → rotate.
+  - **In plain words:** When a validator submits a `KEY_CHANGE`
+    transaction, the new key is stored pending. At epoch boundary,
+    the consensus engine reads the pending changes, swaps in the
+    new BLS keys, and rotates — the validator's identity (staking
+    address) stays the same, only the signing key changes.
 
 - **Full commit history in devnet via `commit_listener`**
   (`crates/consensus/src/engine.rs`, `crates/devnet/src/tcp_multinode.rs`)

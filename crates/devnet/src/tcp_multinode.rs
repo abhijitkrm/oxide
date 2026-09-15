@@ -334,7 +334,15 @@ impl TcpMultiNodeDevnet {
         let pks: Vec<crypto::bls::PublicKey> =
             secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
         let stakes = vec![1u64; n];
-        let vs = ValidatorSet::new(pks, stakes).expect("validator set");
+        // Devnet convention: validator `i` has staking address
+        // `Address([i as u8; 20])` — `Address::ZERO` for validator 0.
+        // `with_addresses` preserves these explicit identities (the
+        // derived `validator_address(pk)` would produce hash-based
+        // addresses that don't match the devnet's `Address([i; 20])`
+        // convention used by `build_tx` and `handle_key_change`).
+        let addresses: Vec<primitives::Address> =
+            (0..n).map(|i| primitives::Address([u8::try_from(i).unwrap_or(0); 20])).collect();
+        let vs = ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set");
 
         // Build peer addresses for full mesh.
         let peer_addrs: Vec<(Vec<u8>, String)> = (0..n)
@@ -494,6 +502,12 @@ impl TcpMultiNodeDevnet {
     /// Empty if the devnet was built without `with_exchange_and_base_port`.
     pub fn exchange_modules(&self) -> &[Arc<exchange::ExchangeModule>] {
         &self.exchange_modules
+    }
+
+    /// The shared validator set. Used by key-rotation tests to
+    /// inspect validator keys and staking addresses.
+    pub fn validator_set(&self) -> &ValidatorSet {
+        &self.validator_set
     }
 
     /// Fund an EVM account on all validators.
@@ -1291,6 +1305,49 @@ impl TcpMultiNodeDevnet {
             .collect();
         TcpDevnetResult { finalized }
     }
+
+    /// Drain pending validator key changes from the staking module
+    /// and schedule an epoch rotation. Returns the number of key
+    /// changes applied.
+    ///
+    /// The key-change flow:
+    /// 1. A `KEY_CHANGE` tx is finalized → the staking module
+    ///    records it in `pending_key_changes`.
+    /// 2. `take_pending_key_changes` drains the map from the first
+    ///    app's executor (all apps execute the same blocks, so they
+    ///    all see the same changes).
+    /// 3. `apply_key_changes` builds an updated `ValidatorSet` and
+    ///    calls `schedule_rotation` on each engine.
+    /// 4. `rotate_epoch` completes the handoff — the new keys take
+    ///    effect for the next epoch.
+    ///
+    /// Called after `run_pipelined` or `run_pipelined_txs` — reads
+    /// the first app's pending changes.
+    pub fn rotate_epoch_with_key_changes(&mut self) -> usize {
+        let changes = self.apps[0].take_pending_key_changes();
+        if changes.is_empty() {
+            return 0;
+        }
+        let mut applied = 0;
+        for engine in &mut self.engines {
+            match engine.apply_key_changes(&changes) {
+                Ok(n) => applied = n,
+                Err(e) => {
+                    eprintln!("key-change apply failed: {e}");
+                }
+            }
+        }
+        if applied > 0 {
+            for engine in &mut self.engines {
+                let _ = engine.rotate_epoch();
+            }
+            // Update the devnet's copy of the validator set — the
+            // engines' sets were rotated, and `self.validator_set`
+            // must match for `leader()` lookups to stay correct.
+            self.validator_set = self.engines[0].validator_set().clone();
+        }
+        applied
+    }
 }
 
 /// Construct a deterministic BLS secret key from a single byte.
@@ -1315,9 +1372,72 @@ fn make_batch_tx(round: usize, tx_i: usize) -> TxBytes {
     TxBytes::new(bytes)
 }
 
+/// Build a staking-module tx with the given nonce. The sender is
+/// `Address::ZERO` (the devnet's default sender — it has a genesis
+/// balance for fee payment).
+#[cfg(test)]
+fn make_staking_tx(module_payload: &[u8], nonce: u64) -> TxBytes {
+    let sender = primitives::Address([0u8; 20]);
+    let fee = 100u64;
+    let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
+    bytes.extend_from_slice(&sender.0);
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&fee.to_le_bytes());
+    bytes.push(framework::module_id::STAKING);
+    bytes.extend_from_slice(module_payload);
+    TxBytes::new(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end validator key rotation: submit a `KEY_CHANGE` tx,
+    /// finalize it, apply the rotation, verify the new key is active.
+    ///
+    /// Exercises the full flow: `staking::msg::key_change` →
+    /// `handle_key_change` → `pending_key_changes` →
+    /// `take_pending_key_changes` → `apply_key_changes` →
+    /// `schedule_rotation` → `rotate_epoch`.
+    #[test]
+    fn tcp_multinode_key_rotation() {
+        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21500);
+
+        // Record the original key for validator 0.
+        let original_key = *devnet.validator_set().validator(0).expect("validator 0");
+
+        // Build a key-change tx for validator 0 (Address::ZERO in
+        // the devnet's `Address([i; 20])` convention). The delegate
+        // must come first so `handle_key_change` accepts the tx.
+        let new_key_bytes = [0xFF; 48];
+        let delegate_msg = staking::msg::delegate(primitives::Address::ZERO, 1);
+        let key_change_msg = staking::msg::key_change(primitives::Address::ZERO, &new_key_bytes);
+
+        // Submit both txs to the first app's mempool — they'll be
+        // included in the next block.
+        devnet.apps[0].ingest_tx(make_staking_tx(&delegate_msg, 0));
+        devnet.apps[0].ingest_tx(make_staking_tx(&key_change_msg, 1));
+
+        // Run a few rounds to finalize both txs.
+        devnet.run_batch(3, 0);
+
+        // Apply the pending key change — should find 1 change for
+        // validator 0 (Address::ZERO → index 0).
+        let applied = devnet.rotate_epoch_with_key_changes();
+        assert_eq!(applied, 1, "one key change should be applied");
+
+        // The new key is active for validator 0.
+        let new_key = *devnet.validator_set().validator(0).expect("validator 0");
+        assert_eq!(new_key.as_bytes(), &new_key_bytes, "validator 0 key must be rotated");
+        assert_ne!(new_key, original_key, "key must have changed");
+
+        // The staking address is preserved (identity survives rotation).
+        assert_eq!(
+            devnet.validator_set().validator_addresses()[0],
+            primitives::Address::ZERO,
+            "staking address must be preserved across key rotation",
+        );
+    }
 
     /// 4 validators, 3 rounds, 10 txs/round over TCP.
     #[test]

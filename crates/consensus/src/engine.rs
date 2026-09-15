@@ -109,6 +109,39 @@ impl std::fmt::Display for EpochRotationError {
 
 impl std::error::Error for EpochRotationError {}
 
+/// Errors from applying validator key changes (staking `KEY_CHANGE`).
+///
+/// Key changes are submitted as transactions and stored in the
+/// staking module's `pending_key_changes`. At epoch boundary, the
+/// caller drains them and passes them to `apply_key_changes`, which
+/// builds an updated `ValidatorSet` and schedules a rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyChangeError {
+    /// A key in the change list is not exactly 48 bytes (BLS12-381
+    /// compressed public key length).
+    InvalidKeyLength,
+    /// The updated `ValidatorSet` failed construction (e.g. a key
+    /// change produced an invalid set — should not happen in
+    /// practice since `apply_key_change` preserves stakes and
+    /// addresses).
+    InvalidSet,
+    /// A rotation is already scheduled — the caller must wait for
+    /// it to complete before applying more key changes.
+    RotationAlreadyPending,
+}
+
+impl std::fmt::Display for KeyChangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidKeyLength => write!(f, "key change key is not 48 bytes"),
+            Self::InvalidSet => write!(f, "updated validator set failed construction"),
+            Self::RotationAlreadyPending => write!(f, "epoch rotation already pending"),
+        }
+    }
+}
+
+impl std::error::Error for KeyChangeError {}
+
 /// Errors from consensus message verification (C1 fix + hardening).
 ///
 /// These are distinct from operational errors (io, codec): they
@@ -568,6 +601,16 @@ impl OxideBft {
         self.validator_set.quorum()
     }
 
+    /// The active validator set for the current epoch.
+    ///
+    /// Exposed for key-rotation tests and epoch-boundary inspection.
+    /// The set is swapped by `complete_rotation` when a pending
+    /// rotation finishes.
+    #[must_use]
+    pub fn validator_set(&self) -> &ValidatorSet {
+        &self.validator_set
+    }
+
     /// Last voted view (diagnostic).
     #[must_use]
     pub fn last_voted_view(&self) -> Option<View> {
@@ -644,6 +687,54 @@ impl OxideBft {
     /// is pending.
     pub fn rotate_epoch(&mut self) -> Result<(), EpochRotationError> {
         self.complete_rotation()
+    }
+
+    /// Apply pending validator key changes and schedule an epoch
+    /// rotation (staking `KEY_CHANGE` → `schedule_rotation` bridge).
+    ///
+    /// For each `(address, new_key_bytes)` in `changes`, finds the
+    /// validator index via `validator_set.index_of(address)`,
+    /// replaces the BLS key, and builds an updated `ValidatorSet`
+    /// preserving stakes and addresses. The updated set is scheduled
+    /// via `schedule_rotation` — the two-phase handoff completes at
+    /// the epoch boundary when `complete_rotation` swaps it in.
+    ///
+    /// Returns the number of key changes applied. Returns `Ok(0)` if
+    /// `changes` is empty.
+    ///
+    /// # Errors
+    /// - `KeyChangeError::InvalidKeyLength` — a key is not 48 bytes.
+    /// - `KeyChangeError::InvalidSet` — the updated set failed
+    ///   construction.
+    /// - `KeyChangeError::RotationAlreadyPending` — a rotation is
+    ///   already scheduled.
+    pub fn apply_key_changes(
+        &mut self,
+        changes: &[(primitives::Address, Vec<u8>)],
+    ) -> Result<usize, KeyChangeError> {
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let mut keys = self.validator_set.public_keys().to_vec();
+        let mut applied = 0usize;
+        for (addr, key_bytes) in changes {
+            let new_key = crypto::bls::PublicKey::from_slice(key_bytes)
+                .map_err(|_| KeyChangeError::InvalidKeyLength)?;
+            if let Some(idx) = self.validator_set.index_of(addr) {
+                keys[usize::from(idx)] = new_key;
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            let new_set = ValidatorSet::with_addresses(
+                keys,
+                self.validator_set.stakes().to_vec(),
+                self.validator_set.validator_addresses().to_vec(),
+            )
+            .map_err(|_| KeyChangeError::InvalidSet)?;
+            self.schedule_rotation(new_set).map_err(|_| KeyChangeError::RotationAlreadyPending)?;
+        }
+        Ok(applied)
     }
 
     /// Whether this engine is the leader for the current view.
@@ -4245,5 +4336,103 @@ mod tests {
 
         // recover_from_wal with no WAL should return Ok(()).
         engine.recover_from_wal().expect("recover with no WAL should be Ok");
+    }
+
+    // ---- Validator key rotation (staking KEY_CHANGE) ----
+
+    /// `apply_key_changes` reads pending key changes, builds an
+    /// updated `ValidatorSet`, and schedules a rotation. After
+    /// `rotate_epoch`, the new key is active.
+    #[test]
+    fn key_change_rotates_validator_key() {
+        // 4 validators with derived addresses (production convention:
+        // address = validator_address(pk)).
+        let pks: Vec<crypto::bls::PublicKey> = (1..=4u8).map(pk).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+            .without_signature_verification();
+
+        // The staking address of validator 0 is derived from pk(1).
+        let addr = vs.validator_addresses()[0];
+
+        // Submit a key change: validator 0 rotates to pk(0xFF).
+        let new_key = crypto::bls::PublicKey([0xFF; crypto::bls::PublicKey::LEN]);
+        let changes = vec![(addr, new_key.0.to_vec())];
+        let applied = engine.apply_key_changes(&changes).expect("apply key changes");
+        assert_eq!(applied, 1, "one key change applied");
+
+        // The rotation is pending.
+        assert!(engine.rotation_pending(), "rotation should be pending");
+
+        // Complete the rotation — the new key takes effect.
+        engine.rotate_epoch().expect("complete rotation");
+
+        // The new set has the updated key for validator 0.
+        let new_set = engine.validator_set();
+        assert_eq!(
+            new_set.validator(0).expect("validator 0").as_bytes(),
+            new_key.as_bytes(),
+            "validator 0's key must be rotated",
+        );
+
+        // The staking address is preserved (identity survives key rotation).
+        assert_eq!(new_set.validator_addresses()[0], addr);
+    }
+
+    /// `apply_key_changes` with an unknown address skips it (no-op).
+    #[test]
+    fn key_change_unknown_address_skipped() {
+        let pks: Vec<crypto::bls::PublicKey> = (1..=4u8).map(pk).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut engine =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).without_signature_verification();
+
+        // An address not in the validator set — no index_of match.
+        let unknown = primitives::Address([0xAA; 20]);
+        let changes = vec![(unknown, vec![0xBB; 48])];
+        let applied = engine.apply_key_changes(&changes).expect("apply key changes");
+        assert_eq!(applied, 0, "unknown address produces no change");
+        assert!(!engine.rotation_pending(), "no rotation scheduled");
+    }
+
+    /// `apply_key_changes` with an invalid key length returns an error.
+    #[test]
+    fn key_change_invalid_key_length() {
+        let pks: Vec<crypto::bls::PublicKey> = (1..=4u8).map(pk).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+            .without_signature_verification();
+
+        let addr = vs.validator_addresses()[0];
+        let changes = vec![(addr, vec![0xBB; 47])]; // 47 bytes — not 48
+        let result = engine.apply_key_changes(&changes);
+        assert!(result.is_err(), "invalid key length must be rejected");
+    }
+
+    /// `ValidatorSet::index_of` finds the right index for a derived
+    /// address, and `apply_key_change` preserves the address.
+    #[test]
+    fn validator_set_index_of_and_apply_key_change() {
+        let pks: Vec<crypto::bls::PublicKey> = (1..=4u8).map(pk).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        // Derived addresses: index_of finds each validator.
+        for i in 0..4u16 {
+            let addr = vs.validator_addresses()[usize::from(i)];
+            assert_eq!(vs.index_of(&addr), Some(i));
+        }
+
+        // Unknown address returns None.
+        let unknown = primitives::Address([0xAA; 20]);
+        assert_eq!(vs.index_of(&unknown), None);
+
+        // apply_key_change replaces the key, preserves the address.
+        let new_key = crypto::bls::PublicKey([0xFF; 48]);
+        let updated = vs.apply_key_change(0, new_key).expect("apply key change");
+        assert_eq!(updated.validator(0).expect("v0").as_bytes(), new_key.as_bytes());
+        assert_eq!(updated.validator_addresses()[0], vs.validator_addresses()[0]);
     }
 }

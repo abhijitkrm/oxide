@@ -445,6 +445,10 @@ impl Module for StakingModule {
     fn state_root(&self) -> Hash {
         subtree_root(&self.store)
     }
+
+    fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
+        StakingModule::take_key_changes(self)
+    }
 }
 
 impl StakingModule {

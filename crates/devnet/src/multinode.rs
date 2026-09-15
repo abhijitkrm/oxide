@@ -116,7 +116,11 @@ impl MultiNodeDevnet {
         let pks: Vec<crypto::bls::PublicKey> =
             secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
         let stakes = vec![1u64; n];
-        let vs = ValidatorSet::new(pks, stakes).expect("validator set");
+        // Devnet convention: validator `i` has staking address
+        // `Address([i as u8; 20])` — `Address::ZERO` for validator 0.
+        let addresses: Vec<primitives::Address> =
+            (0..n).map(|i| primitives::Address([u8::try_from(i).unwrap_or(0); 20])).collect();
+        let vs = ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set");
 
         let mut engines = Vec::with_capacity(n);
         let mut apps = Vec::with_capacity(n);

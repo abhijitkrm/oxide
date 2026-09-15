@@ -82,6 +82,10 @@ pub enum Domain {
     /// A block proposal (leader's signature over the header).
     /// Appended after `MmrRoot` — never renumber.
     Proposal = 9,
+    /// A validator's staking address, derived from their BLS public
+    /// key (`validator_address(pk)`). Appended after `Proposal` —
+    /// never renumber.
+    ValidatorAddress = 10,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

@@ -12,8 +12,8 @@
 //! faults. A quorum is `2f + 1` (supermajority). These two constants
 //! are derived from the validator set size, never stored separately.
 
-use crypto::bls::PublicKey;
-use primitives::View;
+use crypto::bls::{PublicKey, validator_address};
+use primitives::{Address, View};
 
 /// An index into the epoch's validator set. Used in the quorum
 /// certificate's signer bitmap to identify which validators signed.
@@ -22,9 +22,18 @@ pub type ValidatorIndex = crypto::bls::ValidatorIndex;
 
 /// The active validator set for an epoch.
 ///
-/// Invariant: `validators.len() == stakes.len()` and the set is
-/// non-empty. The constructor enforces this; the fields are private
-/// so callers cannot break the invariant.
+/// Invariant: `validators.len() == stakes.len() ==
+/// validator_addresses.len()` and the set is non-empty. The
+/// constructor enforces this; the fields are private so callers
+/// cannot break the invariant.
+///
+/// `validator_addresses[i]` is the staking identity of the validator
+/// whose consensus key is `validators[i]`. The address is derived
+/// from the key by default (`validator_address(pk)`); `with_addresses`
+/// accepts explicit addresses for setups where the staking identity
+/// is independent of the consensus key (e.g. a cold wallet). The
+/// address survives key rotation — `apply_key_change` replaces the
+/// key but preserves the address.
 #[derive(Debug, Clone)]
 pub struct ValidatorSet {
     /// Public keys, indexed by `ValidatorIndex`.
@@ -32,6 +41,10 @@ pub struct ValidatorSet {
     /// Stake for each validator, in the smallest unit (plan.md §9:
     /// fixed-point u64). Used for stake-weighted leader election.
     stakes: Vec<u64>,
+    /// Staking address for each validator, indexed by
+    /// `ValidatorIndex`. Derived from `validators` by default;
+    /// `with_addresses` accepts explicit values.
+    validator_addresses: Vec<Address>,
     /// Cumulative stake for binary-search leader election. Computed
     /// once at construction; `leader(v)` is O(log n) thereafter.
     cumulative_stakes: Vec<u64>,
@@ -42,10 +55,34 @@ pub struct ValidatorSet {
 impl ValidatorSet {
     /// Construct a validator set from public keys and stakes.
     ///
+    /// The staking address for each validator is derived from their
+    /// BLS public key via [`validator_address`] — the standard
+    /// pattern (Ethereum derives addresses from public keys). Use
+    /// [`with_addresses`] for setups where the staking identity is
+    /// independent of the consensus key.
+    ///
     /// # Errors
     /// Returns a typed error if the set is empty or the lengths
     /// mismatch — both are caller bugs, not environment faults.
     pub fn new(validators: Vec<PublicKey>, stakes: Vec<u64>) -> Result<Self, ValidatorSetError> {
+        let addresses = validators.iter().map(validator_address).collect();
+        Self::with_addresses(validators, stakes, addresses)
+    }
+
+    /// Construct a validator set with explicit staking addresses.
+    ///
+    /// `validator_addresses[i]` is the staking identity of the
+    /// validator whose consensus key is `validators[i]`. The address
+    /// is independent of the key — it survives key rotation.
+    ///
+    /// # Errors
+    /// Same as [`ValidatorSet::new`], plus `AddressMismatch` if
+    /// `validator_addresses.len() != validators.len()`.
+    pub fn with_addresses(
+        validators: Vec<PublicKey>,
+        stakes: Vec<u64>,
+        validator_addresses: Vec<Address>,
+    ) -> Result<Self, ValidatorSetError> {
         if validators.is_empty() {
             return Err(ValidatorSetError::Empty);
         }
@@ -53,6 +90,12 @@ impl ValidatorSet {
             return Err(ValidatorSetError::LengthMismatch {
                 validators: validators.len(),
                 stakes: stakes.len(),
+            });
+        }
+        if validators.len() != validator_addresses.len() {
+            return Err(ValidatorSetError::AddressMismatch {
+                validators: validators.len(),
+                addresses: validator_addresses.len(),
             });
         }
         if stakes.contains(&0) {
@@ -65,7 +108,57 @@ impl ValidatorSet {
             cumulative_stakes.push(acc);
         }
         let total_stake = acc;
-        Ok(Self { validators, stakes, cumulative_stakes, total_stake })
+        Ok(Self { validators, stakes, validator_addresses, cumulative_stakes, total_stake })
+    }
+
+    /// The public keys in this set, indexed by `ValidatorIndex`.
+    #[must_use]
+    pub fn public_keys(&self) -> &[PublicKey] {
+        &self.validators
+    }
+
+    /// The stakes in this set, indexed by `ValidatorIndex`.
+    #[must_use]
+    pub fn stakes(&self) -> &[u64] {
+        &self.stakes
+    }
+
+    /// The staking addresses in this set, indexed by
+    /// `ValidatorIndex`. Parallel to `public_keys` —
+    /// `validator_addresses[i]` is the identity of the validator
+    /// whose consensus key is `public_keys[i]`.
+    #[must_use]
+    pub fn validator_addresses(&self) -> &[Address] {
+        &self.validator_addresses
+    }
+
+    /// Find the validator index for a staking address.
+    ///
+    /// Linear scan — validator sets are small (typically <100) and
+    /// this is called at epoch boundary, not on the hot path.
+    #[must_use]
+    pub fn index_of(&self, addr: &Address) -> Option<ValidatorIndex> {
+        self.validator_addresses.iter().position(|a| a == addr).and_then(|i| u16::try_from(i).ok())
+    }
+
+    /// Apply a key change: return a new `ValidatorSet` with the
+    /// consensus key at `index` replaced by `new_key`.
+    ///
+    /// The validator's staking address is preserved — the key
+    /// rotates, not the identity.
+    ///
+    /// # Errors
+    /// Returns `OutOfBounds` if `index` is past the end.
+    pub fn apply_key_change(
+        &self,
+        index: ValidatorIndex,
+        new_key: PublicKey,
+    ) -> Result<Self, ValidatorSetError> {
+        let mut validators = self.validators.clone();
+        *validators
+            .get_mut(usize::from(index))
+            .ok_or(ValidatorSetError::OutOfBounds { index, n: self.n() })? = new_key;
+        Self::with_addresses(validators, self.stakes.clone(), self.validator_addresses.clone())
     }
 
     /// Number of validators (`n`).
@@ -162,6 +255,13 @@ pub enum ValidatorSetError {
         /// Number of stake values.
         stakes: usize,
     },
+    /// The validators and addresses vectors have different lengths.
+    AddressMismatch {
+        /// Number of public keys.
+        validators: usize,
+        /// Number of addresses.
+        addresses: usize,
+    },
     /// A validator with zero stake cannot lead or vote.
     ZeroStake,
     /// Total stake exceeds `u64` — the set is too large.
@@ -181,6 +281,9 @@ impl std::fmt::Display for ValidatorSetError {
             Self::Empty => write!(f, "validator set is empty"),
             Self::LengthMismatch { validators, stakes } => {
                 write!(f, "validators len {validators} != stakes len {stakes}")
+            }
+            Self::AddressMismatch { validators, addresses } => {
+                write!(f, "validators len {validators} != addresses len {addresses}")
             }
             Self::ZeroStake => write!(f, "a validator has zero stake"),
             Self::StakeOverflow => write!(f, "total stake overflows u64"),

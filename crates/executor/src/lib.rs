@@ -32,7 +32,7 @@ pub mod divergence;
 pub mod occ;
 
 use ports::AppInterface;
-use primitives::{Hash, Height};
+use primitives::{Address, Hash, Height};
 use types::{CommitAck, FinalizedBlock, MempoolAck, Proposal, StateAttestation, TxBytes, Verdict};
 
 use crypto::hash::{Domain, Hasher};
@@ -570,6 +570,22 @@ pub trait Module: Send + Sync {
     fn import_state(&self, _snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         Ok(())
     }
+
+    /// Drain pending validator key changes.
+    ///
+    /// Called by the consensus layer at epoch boundary to collect
+    /// key rotations submitted via `KEY_CHANGE` transactions. Each
+    /// entry is `(staking_address, new_bls_key_bytes)` — the staking
+    /// module records them; the consensus engine applies them to
+    /// the validator set.
+    ///
+    /// # Default
+    ///
+    /// Returns empty — most modules don't track key changes. Only
+    /// the staking module overrides this.
+    fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
+        Vec::new()
+    }
 }
 
 /// An event emitted by a module during execution.
@@ -919,6 +935,21 @@ impl Executor {
     #[must_use]
     pub fn current_state_root(&self) -> Hash {
         self.state_root_at(self.current_height())
+    }
+
+    /// Drain pending validator key changes from all modules.
+    ///
+    /// Called by the consensus layer at epoch boundary. Iterates all
+    /// registered modules and collects their pending key changes —
+    /// only the staking module produces non-empty results.
+    ///
+    /// Returns `Vec<(staking_address, new_bls_key_bytes)>`. The
+    /// caller passes these to `OxideBft::apply_key_changes` which
+    /// builds the updated `ValidatorSet` and schedules an epoch
+    /// rotation.
+    #[must_use]
+    pub fn take_pending_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
+        self.modules.iter().flatten().flat_map(|m| m.take_key_changes()).collect()
     }
 
     /// Save executed nonces to a storage backend (C10 fix).
