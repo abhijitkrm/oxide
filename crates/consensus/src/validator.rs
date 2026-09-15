@@ -161,6 +161,59 @@ impl ValidatorSet {
         Self::with_addresses(validators, self.stakes.clone(), self.validator_addresses.clone())
     }
 
+    /// Add a validator: return a new `ValidatorSet` with `pk`,
+    /// `stake`, and `address` appended.
+    ///
+    /// The new validator is added at the end of the set (index `n`).
+    /// The validator set size grows by 1 — the quorum threshold and
+    /// leader-election weights are recomputed.
+    ///
+    /// # Errors
+    /// Returns `ZeroStake` if `stake == 0`, or any construction error
+    /// from [`with_addresses`](Self::with_addresses).
+    pub fn add_validator(
+        &self,
+        pk: PublicKey,
+        stake: u64,
+        address: Address,
+    ) -> Result<Self, ValidatorSetError> {
+        let mut validators = self.validators.clone();
+        let mut stakes = self.stakes.clone();
+        let mut addresses = self.validator_addresses.clone();
+        validators.push(pk);
+        stakes.push(stake);
+        addresses.push(address);
+        Self::with_addresses(validators, stakes, addresses)
+    }
+
+    /// Remove a validator: return a new `ValidatorSet` with the
+    /// validator at `index` removed.
+    ///
+    /// The validator set size shrinks by 1 — the quorum threshold and
+    /// leader-election weights are recomputed. All validators after
+    /// `index` shift down by one index.
+    ///
+    /// # Errors
+    /// Returns `OutOfBounds` if `index` is past the end, or `Empty`
+    /// if this would remove the last validator (a chain must have
+    /// at least one validator).
+    pub fn remove_validator(&self, index: ValidatorIndex) -> Result<Self, ValidatorSetError> {
+        let idx = usize::from(index);
+        if idx >= self.n() {
+            return Err(ValidatorSetError::OutOfBounds { index, n: self.n() });
+        }
+        if self.n() == 1 {
+            return Err(ValidatorSetError::Empty);
+        }
+        let mut validators = self.validators.clone();
+        let mut stakes = self.stakes.clone();
+        let mut addresses = self.validator_addresses.clone();
+        validators.remove(idx);
+        stakes.remove(idx);
+        addresses.remove(idx);
+        Self::with_addresses(validators, stakes, addresses)
+    }
+
     /// Number of validators (`n`).
     #[must_use]
     pub fn n(&self) -> usize {

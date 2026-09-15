@@ -167,6 +167,7 @@ impl HttpServer {
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))
             .route("/snapshot", get(snapshot_handler))
+            .route("/validator-set", get(validator_set_handler))
             .with_state((rpc, rate_limiter))
     }
 }
@@ -250,6 +251,57 @@ async fn snapshot_handler(
             .status(StatusCode::NOT_FOUND)
             .header("content-type", "application/json")
             .body(r#"{"error":"snapshot provider not configured"}"#.to_string())
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body("{}".to_string())
+                    .unwrap()
+            }),
+    }
+}
+
+/// Validator set endpoint (`GET /validator-set`).
+///
+/// Returns the current validator set as JSON — a list of
+/// `{address, public_key, stake}` objects. A new validator joining
+/// mid-epoch queries this endpoint on an existing validator to
+/// discover the current set + peer addresses, then connects via
+/// `--devnet-node` with the updated `ValidatorSet`.
+///
+/// Returns 404 if no validator-set provider is attached.
+async fn validator_set_handler(
+    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+) -> Response<String> {
+    match rpc.validator_set_provider() {
+        Some(provider) => match provider.validator_set() {
+            Ok(entries) => {
+                let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(json)
+                    .unwrap_or_else(|_| {
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(String::new())
+                            .unwrap()
+                    })
+            }
+            Err(e) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/json")
+                .body(format!(r#"{{"error":"{e}"}}"#))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body("{}".to_string())
+                        .unwrap()
+                }),
+        },
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .body(r#"{"error":"validator-set provider not configured"}"#.to_string())
             .unwrap_or_else(|_| {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)

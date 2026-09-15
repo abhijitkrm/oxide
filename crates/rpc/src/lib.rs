@@ -89,6 +89,40 @@ pub trait SnapshotProvider: Send + Sync {
     fn export_snapshot(&self) -> Result<Vec<u8>, String>;
 }
 
+/// A validator-set entry for the `GET /validator-set` endpoint.
+///
+/// Serializes the current validator set as JSON so a new validator
+/// joining mid-epoch can discover the current set + peer addresses
+/// without a genesis file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorSetEntry {
+    /// The validator's staking address (hex, 20 bytes).
+    pub address: String,
+    /// The validator's BLS12-381 public key (hex, 48 bytes).
+    pub public_key: String,
+    /// The validator's stake in atomic units.
+    pub stake: u64,
+}
+
+/// Trait for providing the current validator set via the
+/// `GET /validator-set` endpoint.
+///
+/// Implemented by the node's validator-set handle — the consensus
+/// engine writes the updated set after each epoch rotation; the RPC
+/// handler reads it.
+///
+/// The trait is `Send + Sync` so an `Arc<dyn ValidatorSetProvider>`
+/// can be shared across the HTTP handler's async tasks.
+pub trait ValidatorSetProvider: Send + Sync {
+    /// The current validator set entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(reason)` if the validator set cannot be read
+    /// (e.g. the engine is not yet initialized).
+    fn validator_set(&self) -> Result<Vec<ValidatorSetEntry>, String>;
+}
+
 /// The JSON-RPC 2.0 request envelope.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RpcRequest {
@@ -375,6 +409,11 @@ pub struct RpcServer {
     /// When set, the endpoint returns the codec-encoded snapshot as
     /// hex. When `None`, the endpoint returns 404.
     snapshot_provider: Option<Arc<dyn SnapshotProvider>>,
+    /// Optional validator-set provider for the `GET /validator-set`
+    /// endpoint. When set, the endpoint returns the current validator
+    /// set as JSON (addresses, public keys, stakes). When `None`,
+    /// the endpoint returns 404.
+    validator_set_provider: Option<Arc<dyn ValidatorSetProvider>>,
 }
 
 impl RpcServer {
@@ -395,6 +434,7 @@ impl RpcServer {
             rate_window_start_ms: AtomicU64::new(0),
             rate_window_count: AtomicU64::new(0),
             snapshot_provider: None,
+            validator_set_provider: None,
         }
     }
 
@@ -422,6 +462,21 @@ impl RpcServer {
     #[must_use]
     pub fn snapshot_provider(&self) -> Option<&Arc<dyn SnapshotProvider>> {
         self.snapshot_provider.as_ref()
+    }
+
+    /// Attach a validator-set provider so `GET /validator-set`
+    /// returns the current validator set as JSON.
+    ///
+    /// Without this call, `/validator-set` returns 404 — the endpoint
+    /// is disabled for stateless test configurations.
+    pub fn set_validator_set_provider(&mut self, provider: Arc<dyn ValidatorSetProvider>) {
+        self.validator_set_provider = Some(provider);
+    }
+
+    /// Get the validator-set provider, if attached.
+    #[must_use]
+    pub fn validator_set_provider(&self) -> Option<&Arc<dyn ValidatorSetProvider>> {
+        self.validator_set_provider.as_ref()
     }
 
     /// Attach a latency recorder for RPC handler metrics.

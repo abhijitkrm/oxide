@@ -80,6 +80,17 @@ mod msg_type {
     /// Key change: update a validator's BLS consensus public key.
     /// The new key takes effect at the next epoch rotation.
     pub const KEY_CHANGE: u8 = 0x05;
+    /// Validator add: register a new validator in the set. Takes
+    /// effect at the next epoch rotation — the new validator joins
+    /// the validator set, participates in consensus, and receives
+    /// block rewards.
+    pub const VALIDATOR_ADD: u8 = 0x06;
+    /// Validator remove: remove a validator from the set. Takes
+    /// effect at the next epoch rotation — the validator is removed
+    /// from consensus and stops receiving block rewards. Their
+    /// stake enters unbonding (reclaimable after the unbonding
+    /// period).
+    pub const VALIDATOR_REMOVE: u8 = 0x07;
 }
 
 /// The unbonding period in blocks.
@@ -159,6 +170,15 @@ pub struct StakingModule {
     /// engine reads these via `take_key_changes` at the epoch
     /// boundary.
     pending_key_changes: Mutex<BTreeMap<Address, Vec<u8>>>,
+    /// Pending validator additions: `(address, bls_public_key,
+    /// stake)`. The new validator joins the set at the next epoch
+    /// rotation. The consensus engine reads these via
+    /// `take_validator_changes`.
+    pending_validator_adds: Mutex<Vec<(Address, Vec<u8>, u64)>>,
+    /// Pending validator removals: addresses to remove at the next
+    /// epoch rotation. The consensus engine reads these via
+    /// `take_validator_changes`.
+    pending_validator_removes: Mutex<Vec<Address>>,
     /// The unbonding period in blocks.
     unbonding_period: u64,
     /// The block reward in atomic units.
@@ -177,6 +197,8 @@ impl StakingModule {
             unbonding: Mutex::new(Vec::new()),
             rewards: Mutex::new(BTreeMap::new()),
             pending_key_changes: Mutex::new(BTreeMap::new()),
+            pending_validator_adds: Mutex::new(Vec::new()),
+            pending_validator_removes: Mutex::new(Vec::new()),
             unbonding_period: DEFAULT_UNBONDING_PERIOD_BLOCKS,
             block_reward: DEFAULT_BLOCK_REWARD,
             current_height: Mutex::new(0),
@@ -289,6 +311,34 @@ impl StakingModule {
         )
         .into_iter()
         .collect()
+    }
+
+    /// Take all pending validator changes, clearing both queues.
+    /// Called by the consensus engine at the epoch boundary to apply
+    /// validator additions and removals to the validator set.
+    ///
+    /// Returns a [`framework::ValidatorChanges`] — `adds` is a list
+    /// of `(address, bls_public_key, stake)` tuples for new
+    /// validators; `removes` is a list of addresses to remove.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn take_validator_changes(&self) -> executor::ValidatorChanges {
+        executor::ValidatorChanges {
+            adds: std::mem::take(
+                &mut *self
+                    .pending_validator_adds
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            removes: std::mem::take(
+                &mut *self
+                    .pending_validator_removes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        }
     }
 
     /// Check if a validator has a pending key change.
@@ -418,6 +468,41 @@ pub mod msg {
         msg.extend_from_slice(new_key);
         msg
     }
+
+    /// A validator-add message: `[type: 0x06][new_validator: 20B][bls_key: 48B][stake: 8B LE]`.
+    ///
+    /// Registers a new validator in the set. Only a current validator
+    /// can submit this (governance-by-committee — the validator set
+    /// admits new members). The new validator joins at the next epoch
+    /// rotation.
+    ///
+    /// `new_validator` is the staking address. `bls_key` is the
+    /// 48-byte BLS12-381 compressed public key. `stake` is the
+    /// initial stake in atomic units.
+    pub fn validator_add(
+        new_validator: primitives::Address,
+        bls_key: &[u8],
+        stake: u64,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(77);
+        msg.push(super::msg_type::VALIDATOR_ADD);
+        msg.extend_from_slice(&new_validator.0);
+        msg.extend_from_slice(bls_key);
+        msg.extend_from_slice(&stake.to_le_bytes());
+        msg
+    }
+
+    /// A validator-remove message: `[type: 0x07][validator: 20B]`.
+    ///
+    /// Removes a validator from the set. Only a current validator
+    /// can submit this. The validator is removed at the next epoch
+    /// rotation; their stake enters unbonding.
+    pub fn validator_remove(validator: primitives::Address) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(21);
+        msg.push(super::msg_type::VALIDATOR_REMOVE);
+        msg.extend_from_slice(&validator.0);
+        msg
+    }
 }
 
 impl Module for StakingModule {
@@ -436,8 +521,11 @@ impl Module for StakingModule {
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (msg_type, validator) = Self::parse_message_header(msg).ok_or(ExecError::Malformed)?;
 
-        if msg_type == msg_type::KEY_CHANGE {
-            return self.handle_key_change(ctx, validator, msg);
+        match msg_type {
+            msg_type::KEY_CHANGE => return self.handle_key_change(ctx, validator, msg),
+            msg_type::VALIDATOR_ADD => return self.handle_validator_add(ctx, validator, msg),
+            msg_type::VALIDATOR_REMOVE => return self.handle_validator_remove(ctx, validator, msg),
+            _ => {}
         }
         let (_, _, amount) = Self::parse_message(msg).ok_or(ExecError::Malformed)?;
         match msg_type {
@@ -466,6 +554,10 @@ impl Module for StakingModule {
 
     fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
         StakingModule::take_key_changes(self)
+    }
+
+    fn take_validator_changes(&self) -> executor::ValidatorChanges {
+        StakingModule::take_validator_changes(self)
     }
 }
 
@@ -630,6 +722,158 @@ impl StakingModule {
             .insert(validator, new_key);
 
         Ok(vec![Event { module: "staking", kind: "key_change", data: msg.to_vec() }])
+    }
+
+    /// Handle a validator-add message: `[type: 0x06][new_validator: 20B][bls_key: 48B][stake: 8B LE]`.
+    ///
+    /// The sender must be a current validator — only the validator
+    /// set itself can admit new members (governance-by-committee).
+    /// The new validator joins at the next epoch rotation.
+    ///
+    /// `validator` is the new validator's staking address. The
+    /// `bls_key` is the 48-byte BLS12-381 compressed public key.
+    /// `stake` is the initial stake in atomic units.
+    ///
+    /// # Errors
+    ///
+    /// - `ModuleRejected` if the sender is not a current validator.
+    /// - `ModuleRejected` if the new validator is already in the set
+    ///   or has a pending add.
+    /// - `ModuleRejected` if the BLS key is not exactly 48 bytes.
+    /// - `ModuleRejected` if the stake is 0.
+    fn handle_validator_add(
+        &self,
+        ctx: &TxContext,
+        new_validator: Address,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        // Governance check: only a current validator can propose
+        // adding a new validator. This prevents an arbitrary account
+        // from flooding the set with sybil validators.
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !validators.contains_key(&ctx.sender) {
+            return Err(ExecError::ModuleRejected(
+                "validator_add: sender is not a current validator".to_string(),
+            ));
+        }
+        // The new validator must not already exist.
+        if validators.contains_key(&new_validator) {
+            return Err(ExecError::ModuleRejected(
+                "validator_add: validator already exists".to_string(),
+            ));
+        }
+        // The new validator must not already be pending.
+        let pending_adds =
+            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending_adds.iter().any(|(a, _, _)| *a == new_validator) {
+            return Err(ExecError::ModuleRejected(
+                "validator_add: validator already pending".to_string(),
+            ));
+        }
+        // Parse [bls_key: 48B][stake: 8B LE] after the validator field.
+        if msg.len() != 21 + 48 + 8 {
+            return Err(ExecError::ModuleRejected(format!(
+                "validator_add: expected 77-byte message, got {} bytes",
+                msg.len()
+            )));
+        }
+        let bls_key = msg[21..69].to_vec();
+        let stake = u64::from_le_bytes(msg[69..77].try_into().map_err(|_| ExecError::Malformed)?);
+        if stake == 0 {
+            return Err(ExecError::ModuleRejected("validator_add: zero stake".to_string()));
+        }
+        drop(pending_adds);
+
+        // Register the validator in the staking map immediately —
+        // they can receive delegations and be removed before the
+        // epoch rotation. They only join consensus at the rotation.
+        validators.insert(new_validator, stake);
+        drop(validators);
+
+        self.pending_validator_adds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((new_validator, bls_key, stake));
+
+        Ok(vec![Event { module: "staking", kind: "validator_add", data: msg.to_vec() }])
+    }
+
+    /// Handle a validator-remove message: `[type: 0x07][validator: 20B]`.
+    ///
+    /// The sender must be a current validator — only the validator
+    /// set itself can remove members. The validator is removed at
+    /// the next epoch rotation; their stake enters unbonding.
+    ///
+    /// # Errors
+    ///
+    /// - `ModuleRejected` if the sender is not a current validator.
+    /// - `ModuleRejected` if the validator is not in the set.
+    /// - `ModuleRejected` if the validator is already pending removal.
+    /// - `ModuleRejected` if removing this validator would leave the
+    ///   set empty.
+    fn handle_validator_remove(
+        &self,
+        ctx: &TxContext,
+        validator: Address,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !validators.contains_key(&ctx.sender) {
+            return Err(ExecError::ModuleRejected(
+                "validator_remove: sender is not a current validator".to_string(),
+            ));
+        }
+        if !validators.contains_key(&validator) {
+            return Err(ExecError::ModuleRejected(
+                "validator_remove: validator not found".to_string(),
+            ));
+        }
+
+        // If the validator is pending add, cancel the add instead of
+        // adding a remove — the validator never joins the set.
+        let mut pending_adds =
+            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pos) = pending_adds.iter().position(|(a, _, _)| *a == validator) {
+            pending_adds.remove(pos);
+            validators.remove(&validator);
+            drop(pending_adds);
+            drop(validators);
+            return Ok(vec![Event {
+                module: "staking",
+                kind: "validator_remove",
+                data: msg.to_vec(),
+            }]);
+        }
+        drop(pending_adds);
+
+        let pending_removes = self
+            .pending_validator_removes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending_removes.contains(&validator) {
+            return Err(ExecError::ModuleRejected(
+                "validator_remove: validator already pending removal".to_string(),
+            ));
+        }
+        // Cannot remove the last validator — a chain must have at
+        // least one validator.
+        let active_count = validators.values().filter(|&&s| s > 0).count();
+        if active_count <= 1 {
+            return Err(ExecError::ModuleRejected(
+                "validator_remove: cannot remove last validator".to_string(),
+            ));
+        }
+        drop(pending_removes);
+        drop(validators);
+
+        self.pending_validator_removes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(validator);
+
+        Ok(vec![Event { module: "staking", kind: "validator_remove", data: msg.to_vec() }])
     }
 
     /// Distribute block rewards to active validators proportional

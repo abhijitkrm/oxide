@@ -737,6 +737,82 @@ impl OxideBft {
         Ok(applied)
     }
 
+    /// Apply pending validator set changes to the validator set and
+    /// schedule the result for the next epoch rotation.
+    ///
+    /// `changes.adds` is a list of `(staking_address, bls_public_key,
+    /// stake)` tuples for new validators. `changes.removes` is a list
+    /// of staking addresses to remove.
+    ///
+    /// Removes are applied first (in descending index order to avoid
+    /// index shifting), then adds are appended at the end. The
+    /// resulting `ValidatorSet` is scheduled via
+    /// [`schedule_rotation`](Self::schedule_rotation) — it takes
+    /// effect at the next [`complete_rotation`](Self::complete_rotation)
+    /// or [`rotate_epoch`](Self::rotate_epoch) call.
+    ///
+    /// # Errors
+    ///
+    /// - [`KeyChangeError::InvalidKeyLength`] if a `bls_public_key` is
+    ///   not exactly 48 bytes.
+    /// - [`KeyChangeError::InvalidSet`] if the resulting set would be
+    ///   invalid (empty, zero stake, etc.).
+    /// - [`KeyChangeError::RotationAlreadyPending`] if a rotation is
+    ///   already scheduled.
+    ///
+    /// # Returns
+    ///
+    /// The number of changes applied (adds + removes).
+    pub fn apply_validator_changes(
+        &mut self,
+        adds: &[(primitives::Address, Vec<u8>, u64)],
+        removes: &[primitives::Address],
+    ) -> Result<usize, KeyChangeError> {
+        if adds.is_empty() && removes.is_empty() {
+            return Ok(0);
+        }
+        let mut keys = self.validator_set.public_keys().to_vec();
+        let mut stakes = self.validator_set.stakes().to_vec();
+        let mut addresses = self.validator_set.validator_addresses().to_vec();
+        let mut applied = 0usize;
+
+        // Apply removes first — collect indices and sort descending
+        // so removing index 2 doesn't shift index 3.
+        let mut to_remove: Vec<usize> = Vec::new();
+        for addr in removes {
+            if let Some(idx) = self.validator_set.index_of(addr) {
+                to_remove.push(usize::from(idx));
+            }
+        }
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in to_remove {
+            keys.remove(idx);
+            stakes.remove(idx);
+            addresses.remove(idx);
+            applied += 1;
+        }
+
+        // Apply adds.
+        for (addr, key_bytes, stake) in adds {
+            let new_key = crypto::bls::PublicKey::from_slice(key_bytes)
+                .map_err(|_| KeyChangeError::InvalidKeyLength)?;
+            if *stake == 0 {
+                return Err(KeyChangeError::InvalidSet);
+            }
+            keys.push(new_key);
+            stakes.push(*stake);
+            addresses.push(*addr);
+            applied += 1;
+        }
+
+        if applied > 0 {
+            let new_set = ValidatorSet::with_addresses(keys, stakes, addresses)
+                .map_err(|_| KeyChangeError::InvalidSet)?;
+            self.schedule_rotation(new_set).map_err(|_| KeyChangeError::RotationAlreadyPending)?;
+        }
+        Ok(applied)
+    }
+
     /// Whether this engine is the leader for the current view.
     #[must_use]
     pub fn is_leader(&self) -> bool {

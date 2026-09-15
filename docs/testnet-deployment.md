@@ -167,21 +167,28 @@ done
 # 3. Distribute: each validator gets ca.crt + its own .key + .crt.
 ```
 
-**Option B: Self-signed (simpler, less secure)**
+**Option B: Self-signed via `tls-gen` (testnet)**
 
-Each validator generates its own self-signed certificate. All
-validators must trust all peer certificates — the `peer_id_map`
-maps cert DER → peer ID.
+`oxide-validator tls-gen` generates self-signed certificates for all
+validators and writes per-node `--tls-dir` directories:
 
-```rust
-// The current TlsConfig::self_signed() generates a cert at startup.
-// For a testnet, pre-generate and distribute the certs so all
-// validators trust each other's peer IDs.
+```sh
+oxide-validator tls-gen --num-nodes 4 --output-dir tls/
+# Generates: tls/node-{i}/cert.pem, key.pem, peer-{j}.pem
+
+# Each validator runs with:
+oxide-validator --devnet-node 0 --tls-dir tls/node-0 ...
 ```
 
-**Recommendation:** Option A (shared CA) for a public testnet —
-it's closer to production PKI and avoids the cert-distribution
-complexity of self-signed.
+Each node's `peer-{j}.pem` files are the other validators' `cert.pem`
+files — the `peer_id_map` binds cert DER → peer ID. For a testnet
+on a single operator's machines, this is sufficient. For a public
+testnet with multiple operators, use Option A (shared CA) — each
+operator generates their own key, submits a CSR to the shared CA,
+and receives a signed cert + the CA's certificate.
+
+**Recommendation:** `tls-gen` for a single-operator testnet;
+shared CA for multi-operator.
 
 ### 3.3 Staking addresses
 
@@ -746,28 +753,43 @@ After deploying, verify each item:
 
 ---
 
-## 12. What's NOT covered
+## 12. What's covered vs. remaining blockers
 
-This guide covers the **deployment mechanics**. The following are
-still needed for a full production testnet and are not yet
-implemented:
+The following production features are **now implemented** and covered
+by this guide:
 
-- **BLS key loading from files** — `--devnet-node` derives keys
-  deterministically; production needs `--bls-key-file`.
-- **TLS cert loading from files** — `TlsConfig::from_files` exists
-  in the p2p crate but is not wired into the validator binary.
-- **Peer discovery** — validators must know each other's addresses
-  upfront (static peer list). A proper discovery mechanism (DNS,
-  seed nodes, or a rendezvous protocol) is not implemented.
-- **Genesis file loading** — `--devnet-node` uses hardcoded genesis;
-  production needs `--genesis-file` to load `genesis.json`.
+- **BLS key loading** — `--bls-key-file` loads a 32-byte BLS secret
+  key (hex or raw). `oxide-validator genesis` fills `public_key` in
+  `genesis.json`; production operators provide their own keys.
+- **TLS cert loading** — `--tls-dir` loads `cert.pem`, `key.pem`,
+  and `peer-{i}.pem` files. `oxide-validator tls-gen` generates
+  self-signed certs for testnet; production uses a proper CA.
+- **Genesis file loading** — `--genesis-file` loads `genesis.json`
+  with validator addresses, public keys, stakes, and bank balances.
+- **WAL persistence** — `--wal-file` persists consensus safety state
+  (last voted view, high QC, voted heights). Recovered on restart.
+- **Snapshot persistence** — `--data-dir` auto-exports on shutdown
+  and auto-imports on startup. `--export-snapshot`/`--import-snapshot`
+  for manual control.
+- **Validator set changes** — `VALIDATOR_ADD` (0x06) and
+  `VALIDATOR_REMOVE` (0x07) staking messages for epoch-boundary
+  validator set changes. `GET /validator-set` returns the current
+  set for mid-epoch joins.
+- **Graceful shutdown** — SIGINT/SIGTERM triggers clean shutdown
+  with snapshot export.
+
+### Remaining blockers for a public testnet
+
+- **External security audit** — all 14 internal findings (4 critical,
+  6 high, 4 medium) are fixed, but an external audit is required
+  before production.
 - **Rate limiting / DDoS protection** — the p2p layer has admission
-  control but no IP-based rate limiting for public endpoints.
-- **Persistent storage backend** — the journal is in-memory; a
-  durable backend (RocksDB, sled) is planned but not wired.
-- **Governance-based validator set changes** — adding/removing
-  validators requires a governance proposal; currently only
-  `KEY_CHANGE` (key rotation for existing validators) is supported.
-
-These are the remaining blockers before the testnet can be
-considered production-ready.
+  control but no IP-based rate limiting for public endpoints. The
+  RPC has a per-IP rate limiter (`--max-rps`).
+- **Write-through persistent storage** — `--data-dir` provides
+  snapshot persistence, but the `KVStore` is still in-memory
+  (write-through to disk on every commit is a future optimization).
+- **Full-node peer discovery** — validators use a static peer list
+  (correct for a known validator set). Full nodes joining the
+  network need bootstrap nodes or a rendezvous protocol — a separate
+  concern for `oxide-fullnode`.

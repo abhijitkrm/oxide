@@ -137,6 +137,10 @@ fn main() {
                 run_genesis(&args[2..]);
                 return;
             }
+            "tls-gen" => {
+                run_tls_gen(&args[2..]);
+                return;
+            }
             "help" | "--help" | "-h" => {
                 print_help();
                 return;
@@ -493,8 +497,10 @@ fn run_devnet_node(node_index_str: &str) {
     // otherwise.
     let mut transport = build_transport(&listen_addr, node_index, peers);
 
-    // Give connections time to establish.
-    thread::sleep(Duration::from_millis(500));
+    // Give connections time to establish. TLS handshakes take
+    // longer than plain TCP — 2s gives all peers time to connect
+    // and complete the handshake before the first proposal.
+    thread::sleep(Duration::from_millis(2000));
 
     // Create the consensus engine.
     let validator_set_clone = validator_set.clone();
@@ -513,8 +519,42 @@ fn run_devnet_node(node_index_str: &str) {
         println!("oxide-validator[{node_index}]: WAL loaded from {wal_path}");
     }
 
+    // Data directory: --data-dir <dir> enables auto-snapshot
+    // persistence — on startup, if `<dir>/snapshot.bin` exists,
+    // import it; on shutdown, export the current state to
+    // `<dir>/snapshot.bin`.
+    //
+    // This gives a restarting validator full state persistence
+    // without requiring manual `--export-snapshot` /
+    // `--import-snapshot` flags. The WAL (if `--wal-file` is also
+    // given) protects consensus safety state across the restart.
+    let data_dir = parse_cli_flag("--data-dir");
+    if let Some(ref dir) = data_dir {
+        std::fs::create_dir_all(dir)
+            .unwrap_or_else(|e| panic!("failed to create data dir {dir}: {e}"));
+        let snap_path = format!("{dir}/snapshot.bin");
+        if std::path::Path::new(&snap_path).exists() {
+            let bytes = std::fs::read(&snap_path)
+                .unwrap_or_else(|e| panic!("failed to read snapshot {snap_path}: {e}"));
+            let mut reader = codec::Reader::new(&bytes);
+            let snap = executor::ExecutorSnapshot::decode(&mut reader)
+                .unwrap_or_else(|e| panic!("failed to decode snapshot {snap_path}: {e}"));
+            app.import_snapshot(&snap)
+                .unwrap_or_else(|e| panic!("failed to import snapshot {snap_path}: {e}"));
+            println!(
+                "oxide-validator[{node_index}]: imported snapshot from {snap_path} (height {})",
+                snap.height
+            );
+        }
+    }
+
+    // Shared validator set — the consensus loop writes the updated
+    // set after each epoch rotation; the RPC handler reads it for
+    // `GET /validator-set`.
+    let shared_validator_set = Arc::new(std::sync::RwLock::new(validator_set_clone.clone()));
+
     // Start the RPC server if --rpc-listen or rpc.listen_addr is set.
-    let rpc_handle = start_devnet_rpc(&rpc_config, &app, node_index);
+    let rpc_handle = start_devnet_rpc(&rpc_config, &app, node_index, shared_validator_set.clone());
 
     println!("oxide-validator[{node_index}]: consensus engine started, waiting for blocks...");
 
@@ -529,7 +569,9 @@ fn run_devnet_node(node_index_str: &str) {
     println!("oxide-validator[{node_index}]: node running (press Ctrl+C to stop)");
 
     // Graceful shutdown: SIGINT/SIGTERM sets the shutdown flag, which
-    // `run_consensus_loop` checks each iteration.
+    // `run_consensus_loop` checks each iteration. On Unix, SIGTERM
+    // is handled via `signal(SignalKind::terminate())`; on other
+    // platforms, only SIGINT (Ctrl+C) is caught.
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     std::thread::spawn(move || {
@@ -538,7 +580,20 @@ fn run_devnet_node(node_index_str: &str) {
             .build()
             .expect("signal runtime");
         rt.block_on(async {
-            tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("sigterm handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+            }
             shutdown_clone.store(true, Ordering::Relaxed);
         });
     });
@@ -553,7 +608,25 @@ fn run_devnet_node(node_index_str: &str) {
         num_nodes,
         shutdown.as_ref(),
         rpc_handle.as_deref(),
+        &shared_validator_set,
     );
+
+    // Graceful shutdown: if --data-dir is set, export the current
+    // state to `<dir>/snapshot.bin` so a restart can resume with
+    // the full chain state (not just the WAL).
+    if let Some(ref dir) = data_dir {
+        let snap = app.export_snapshot();
+        let mut buf = Vec::new();
+        snap.encode(&mut buf);
+        let snap_path = format!("{dir}/snapshot.bin");
+        std::fs::write(&snap_path, &buf)
+            .unwrap_or_else(|e| panic!("failed to write snapshot {snap_path}: {e}"));
+        println!(
+            "oxide-validator[{node_index}]: exported snapshot to {snap_path} (height {})",
+            snap.height
+        );
+    }
+    println!("oxide-validator[{node_index}]: shutdown complete");
 }
 
 /// Load a BLS secret key: `--bls-key-file` (hex or raw 32 bytes) or
@@ -751,6 +824,33 @@ fn build_transport(
     }
 }
 
+/// A `ValidatorSetProvider` that reads from a shared
+/// `Arc<RwLock<ValidatorSet>>` — the consensus loop writes the
+/// updated set after each epoch rotation; the RPC handler reads it.
+struct SharedValidatorSetProvider {
+    /// The shared validator set — written by the consensus loop
+    /// after `rotate_epoch`, read by the RPC handler.
+    set: std::sync::Arc<std::sync::RwLock<consensus::ValidatorSet>>,
+}
+
+impl rpc::ValidatorSetProvider for SharedValidatorSetProvider {
+    fn validator_set(&self) -> Result<Vec<rpc::ValidatorSetEntry>, String> {
+        let set = self.set.read().map_err(|e| format!("validator set lock poisoned: {e}"))?;
+        let entries = set
+            .validator_addresses()
+            .iter()
+            .zip(set.public_keys().iter())
+            .zip(set.stakes().iter())
+            .map(|((addr, pk), stake)| rpc::ValidatorSetEntry {
+                address: format!("0x{}", hex_encode(&addr.0)),
+                public_key: format!("0x{}", hex_encode(pk.as_bytes())),
+                stake: *stake,
+            })
+            .collect();
+        Ok(entries)
+    }
+}
+
 /// Start the RPC server for a devnet node: `--rpc-listen` overrides
 /// the config's `rpc.listen_addr`.
 ///
@@ -763,6 +863,7 @@ fn start_devnet_rpc(
     rpc_config: &config::RpcConfig,
     app: &Arc<executor::Executor>,
     node_index: usize,
+    shared_validator_set: Arc<std::sync::RwLock<consensus::ValidatorSet>>,
 ) -> Option<Arc<rpc::RpcServer>> {
     let listen = parse_cli_flag("--rpc-listen").or_else(|| {
         if rpc_config.listen_addr.is_empty() { None } else { Some(rpc_config.listen_addr.clone()) }
@@ -771,6 +872,9 @@ fn start_devnet_rpc(
     let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
     rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: app.clone() }));
     rpc_server.set_snapshot_provider(Arc::new(ExecutorSnapshotProvider { executor: app.clone() }));
+    rpc_server.set_validator_set_provider(Arc::new(SharedValidatorSetProvider {
+        set: shared_validator_set,
+    }));
     let rpc = Arc::new(rpc_server);
     let http_server = rpc::server::HttpServer::from_shared(rpc.clone(), listen.clone());
 
@@ -811,6 +915,7 @@ fn run_consensus_loop(
     num_nodes: usize,
     shutdown: &AtomicBool,
     rpc: Option<&rpc::RpcServer>,
+    shared_validator_set: &std::sync::RwLock<consensus::ValidatorSet>,
 ) {
     // Track proposals received from the network. Followers vote on
     // these proposals; the leader proposes locally.
@@ -832,6 +937,10 @@ fn run_consensus_loop(
     // stalls forever when the leader stops proposing.
     let mut view_start = std::time::Instant::now();
     let mut timeout_sent_for_view: Option<u64> = None;
+    // Track the last epoch — when `engine.epoch()` increments, the
+    // validator set was rotated by `complete_rotation`. Update the
+    // shared set so `GET /validator-set` reflects the new set.
+    let mut last_epoch = engine.epoch().value();
 
     loop {
         // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
@@ -1145,6 +1254,18 @@ fn run_consensus_loop(
         voted_views.retain(|v| *v >= current_view.saturating_sub(10));
         proposed_views.retain(|v| *v >= current_view.saturating_sub(10));
 
+        // Epoch boundary: `commit_block` (called from `deliver_qc`
+        // inside the drain loop and Phase 4) may have swapped the
+        // validator set via `complete_rotation`. Update the shared
+        // set so `GET /validator-set` reflects the new set for new
+        // validators joining mid-epoch.
+        if engine.epoch().value() != last_epoch {
+            last_epoch = engine.epoch().value();
+            if let Ok(mut shared) = shared_validator_set.write() {
+                *shared = engine.validator_set().clone();
+            }
+        }
+
         // Yield to avoid busy-spinning when no messages are available.
         // `transport.recv()` uses non-blocking `try_recv()`, so the loop
         // would spin at 100% CPU without this sleep. A 1ms sleep keeps
@@ -1300,6 +1421,7 @@ fn print_help() {
     println!("    (default)    Run a single-node devnet");
     println!("    init         Initialize a new node directory with config + genesis");
     println!("    genesis      Generate a genesis file");
+    println!("    tls-gen      Generate TLS certificates for a multi-node testnet");
     println!("    version      Print version information");
     println!("    help         Print this help message");
     println!();
@@ -1316,6 +1438,7 @@ fn print_help() {
     println!("    --bls-key-file <path>     BLS secret key file (hex or raw 32 bytes)");
     println!("    --tls-dir <dir>           TLS directory (cert.pem, key.pem, peer-{{i}}.pem)");
     println!("    --wal-file <path>         Consensus WAL file path");
+    println!("    --data-dir <dir>          Persistent data dir (auto snapshot on shutdown)");
     println!("    --rpc-listen <addr>       RPC listen address (default: from config)");
     println!("    --export-snapshot <path>  Export state snapshot to file and exit");
     println!("    --import-snapshot <path>  Import state snapshot before starting");
@@ -1324,6 +1447,7 @@ fn print_help() {
     println!("EXAMPLES:");
     println!("    oxide-validator init --chain-id 1");
     println!("    oxide-validator genesis --chain-id 1 --validators 4");
+    println!("    oxide-validator tls-gen --num-nodes 4 --output-dir tls/");
     println!("    oxide-validator --config config/devnet.toml");
     println!("    oxide-validator --engine oxidebft");
     println!("    oxide-validator --export-snapshot snapshot.bin");
@@ -1331,8 +1455,8 @@ fn print_help() {
     println!("    oxide-validator --submit-key-change 0xabcdef...");
     println!("    oxide-validator --devnet-node 0 --num-nodes 4 --base-port 22000");
     println!("    oxide-validator --devnet-node 0 --genesis-file genesis.json \\");
-    println!("        --bls-key-file key.bin --tls-dir tls/ --wal-file wal/ \\");
-    println!("        --rpc-listen 0.0.0.0:8545");
+    println!("        --bls-key-file key.bin --tls-dir tls/node-0 --wal-file wal/ \\");
+    println!("        --data-dir data/ --rpc-listen 0.0.0.0:8545");
 }
 
 /// `oxide-validator init` — initialize a new node directory.
@@ -1431,5 +1555,102 @@ fn run_genesis(args: &[String]) {
     println!(
         "oxide-validator genesis: wrote {} (chain_id={chain_id}, validators={num_validators})",
         path.display()
+    );
+}
+
+/// `oxide-validator tls-gen` — generate TLS certificates for a
+/// multi-node testnet.
+///
+/// Generates a self-signed certificate + private key for each node,
+/// then writes a per-node `--tls-dir` containing `cert.pem`,
+/// `key.pem`, and `peer-{j}.pem` for every peer `j != i`.
+///
+/// Flags:
+/// - `--num-nodes <N>`: number of validators (default: 4)
+/// - `--output-dir <dir>`: target directory (default: ./tls)
+///
+/// The output layout is:
+/// ```text
+/// tls/
+/// ├── node-0/
+/// │   ├── cert.pem       — node 0's certificate
+/// │   ├── key.pem        — node 0's private key
+/// │   ├── peer-1.pem     — node 1's certificate
+/// │   ├── peer-2.pem     — node 2's certificate
+/// │   └── peer-3.pem     — node 3's certificate
+/// ├── node-1/
+/// │   ├── cert.pem
+/// │   ├── key.pem
+/// │   ├── peer-0.pem
+/// │   ├── peer-2.pem
+/// │   └── peer-3.pem
+/// └── ...
+/// ```
+///
+/// Each node runs with `--tls-dir tls/node-{i}`.
+///
+/// # Security
+///
+/// These are **self-signed** certificates — suitable for devnet and
+/// testnet but NOT production. For production, generate certificates
+/// from a proper CA (e.g., `step ca`, `HashiCorp` Vault PKI, or
+/// cloud-native `cert-manager`) and distribute via `--tls-dir` with
+/// the CA's certificate chain in each `peer-{i}.pem`.
+fn run_tls_gen(args: &[String]) {
+    let mut num_nodes: usize = 4;
+    let mut output_dir = "tls".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--num-nodes" => {
+                if let Some(v) = args.get(i + 1) {
+                    num_nodes = v.parse().unwrap_or(4);
+                }
+                i += 2;
+            }
+            "--output-dir" | "-o" => {
+                if let Some(v) = args.get(i + 1) {
+                    output_dir.clone_from(v);
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let base = PathBuf::from(&output_dir);
+
+    // Generate a cert+key pair for each node. The peer_id is the
+    // node index as a single byte — matching the devnet's
+    // `vec![i]` peer ID convention.
+    let certs: Vec<(String, String)> = (0..num_nodes)
+        .map(|i| {
+            let peer_id = vec![u8::try_from(i).expect("node index fits in u8")];
+            p2p::tls::generate_ca_cert_pem(&peer_id)
+        })
+        .collect();
+
+    // Write per-node directories: cert.pem + key.pem + peer-{j}.pem.
+    for i in 0..num_nodes {
+        let dir = base.join(format!("node-{i}"));
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
+        std::fs::write(dir.join("cert.pem"), &certs[i].0)
+            .unwrap_or_else(|e| panic!("failed to write cert.pem: {e}"));
+        std::fs::write(dir.join("key.pem"), &certs[i].1)
+            .unwrap_or_else(|e| panic!("failed to write key.pem: {e}"));
+        for (j, (cert, _)) in certs.iter().enumerate() {
+            if j != i {
+                std::fs::write(dir.join(format!("peer-{j}.pem")), cert)
+                    .unwrap_or_else(|e| panic!("failed to write peer-{j}.pem: {e}"));
+            }
+        }
+    }
+
+    println!(
+        "oxide-validator tls-gen: wrote {} node dirs to {} (use --tls-dir {}/node-<i>)",
+        num_nodes,
+        base.display(),
+        base.display()
     );
 }

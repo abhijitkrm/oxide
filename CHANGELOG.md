@@ -167,6 +167,67 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     locked behind a feature flag. It cannot accidentally ship in a
     production validator.
 
+- **TLS certificate generation (`oxide-validator tls-gen`)**
+  (`bin/oxide-validator/src/main.rs`)
+  - New `tls-gen` subcommand generates self-signed certificates +
+    private keys for a multi-node testnet, then writes per-node
+    `--tls-dir` directories (`tls/node-{i}/`) with `cert.pem`,
+    `key.pem`, and `peer-{j}.pem` for every peer.
+  - Each node runs with `--tls-dir tls/node-{i}` — mTLS is enforced
+    by the existing `TlsConfig::from_files` + `with_tls` path (C4).
+  - **In plain words:** A testnet operator can generate all TLS
+    certificates with one command instead of manually creating
+    self-signed certs for each validator. For production, use a
+    proper CA (`step ca`, Vault PKI, cert-manager).
+
+- **Governance validator set changes (`VALIDATOR_ADD`/`VALIDATOR_REMOVE`)**
+  (`modules/staking/src/lib.rs`, `crates/consensus/src/engine.rs`,
+  `crates/consensus/src/validator.rs`, `crates/executor/src/lib.rs`)
+  - `VALIDATOR_ADD` (0x06): `[type][address:20B][bls_key:48B][stake:8B]`
+    — registers a new validator in `validators` and
+    `pending_validator_adds`. Joins consensus at the next epoch.
+  - `VALIDATOR_REMOVE` (0x07): `[type][address:20B]` — adds the
+    validator to `pending_validator_removes`. Removed from consensus
+    at the next epoch.
+  - Only a current validator can submit — the validator set admits
+    and evicts its own members (governance-by-committee).
+  - `ValidatorSet::add_validator(pk, stake, address)` and
+    `remove_validator(index)` return new sets with recomputed
+    quorum thresholds and leader-election weights.
+  - `OxideBft::apply_validator_changes` applies removes first
+    (descending index to avoid shifting), then adds, then
+    `schedule_rotation`.
+  - **In plain words:** A validator set can now grow or shrink at
+    epoch boundaries via transactions — no restart or genesis
+    regeneration needed. A new validator submits `VALIDATOR_ADD`
+    (proposed by an existing validator), waits for the epoch
+    rotation, then joins consensus.
+
+- **Automatic state persistence (`--data-dir`)**
+  (`bin/oxide-validator/src/main.rs`)
+  - `--data-dir <dir>` enables auto-snapshot persistence: on startup,
+    imports `<dir>/snapshot.bin` if it exists; on shutdown
+    (SIGINT/SIGTERM), exports the current state to
+    `<dir>/snapshot.bin`.
+  - SIGTERM is now handled via `tokio::signal::unix::signal` —
+    `pkill -TERM` or `docker stop` triggers graceful shutdown +
+    snapshot export.
+  - **In plain words:** A validator that restarts (crash, upgrade,
+    machine reboot) resumes with its full chain state — no manual
+    snapshot export/import needed.
+
+- **Validator set discovery (`GET /validator-set`)**
+  (`crates/rpc/src/lib.rs`, `crates/rpc/src/server.rs`,
+  `bin/oxide-validator/src/main.rs`)
+  - New RPC endpoint returns the current validator set as JSON:
+    `[{address, public_key, stake}, ...]`.
+  - `ValidatorSetProvider` trait decouples the RPC from `consensus` —
+    the validator binary wraps `Arc<RwLock<ValidatorSet>>` and
+    updates it after each epoch rotation.
+  - **In plain words:** A new validator joining mid-epoch queries
+    `GET /validator-set` on an existing validator to discover the
+    current set + peer addresses — no genesis file needed.
+
 ### Fixed
 
 - **Signature malleability: reject recovery IDs 2 and 3**

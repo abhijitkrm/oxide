@@ -353,6 +353,36 @@ All partial runbook items completed:
   including devnet (previously failing on `tcp_multinode.rs` and
   `evm_load.rs`).
 
+### Session 5 follow-up (2026-09-15)
+
+All remaining deployment blockers resolved:
+
+- **TLS cert generation:** ✅ `oxide-validator tls-gen --num-nodes 4
+  --output-dir tls/` generates per-node `cert.pem` + `key.pem` +
+  `peer-{j}.pem` directories. mTLS enforced via existing
+  `TlsConfig::from_files` + `with_tls` path (C4).
+- **Validator set changes:** ✅ `VALIDATOR_ADD` (0x06) and
+  `VALIDATOR_REMOVE` (0x07) staking message types. Only current
+  validators can submit (governance-by-committee). Changes apply at
+  epoch boundary via `take_pending_validator_changes` →
+  `apply_validator_changes` → `schedule_rotation` →
+  `complete_rotation`. `ValidatorSet::add_validator` /
+  `remove_validator` recompute quorum thresholds and leader-election
+  weights.
+- **Auto-snapshot persistence:** ✅ `--data-dir <dir>` imports
+  `<dir>/snapshot.bin` on startup, exports on SIGINT/SIGTERM
+  shutdown. SIGTERM handled via `tokio::signal::unix::signal` —
+  `docker stop` or `kill` triggers graceful shutdown + snapshot.
+- **Validator set discovery:** ✅ `GET /validator-set` RPC endpoint
+  returns the current set as JSON. New validators joining mid-epoch
+  query this endpoint on an existing validator — no genesis file
+  needed. `ValidatorSetProvider` trait decouples RPC from consensus.
+
+**Verified:** 4-node mTLS testnet with `--genesis-file` + `--wal-file`
++ `--data-dir` + `--tls-dir` + `--rpc-listen` finalizes consistently.
+SIGTERM → graceful shutdown → snapshot exported. Restart → snapshot
+imported → catches up. `/validator-set` returns current set.
+
 **Remaining blockers:**
 
 1. **No external security audit.** All 14 internal findings (4
@@ -360,19 +390,29 @@ All partial runbook items completed:
 2. **No running public testnet.** The Docker testnet proves the
    mechanics but a public multi-machine deployment is needed.
    `docs/testnet-deployment.md` covers the full deployment guide.
-   `run_devnet_node` now supports production wiring: `--config`,
+   `run_devnet_node` now supports full production wiring: `--config`,
    `--genesis-file`, `--bls-key-file`, `--tls-dir`, `--wal-file`,
-   `--rpc-listen`. Remaining blockers: peer discovery (static peer
-   list only), persistent storage backend (in-memory journal),
-   governance validator set changes (only KEY_CHANGE for existing
-   validators), TLS cert generation tooling.
-3. ~~Epoch-boundary key-change application~~ — **resolved.** The
-   `Address` → `ValidatorIndex` mapping is now stored in
-   `ValidatorSet::validator_addresses` (derived from BLS key via
-   `validator_address(pk)` by default, or explicit via
-   `with_addresses`). `OxideBft::apply_key_changes` bridges
-   `take_key_changes` → `schedule_rotation` → `complete_rotation`.
+   `--rpc-listen`, `--data-dir`. `tls-gen` generates mTLS certs.
+   `/validator-set` enables mid-epoch validator discovery.
+3. ~~Epoch-boundary key-change application~~ — **resolved.**
+4. ~~Peer discovery (static peer list only)~~ — **resolved for
+   validators.** Static peer list + mTLS is the correct design for a
+   known validator set (validators shouldn't connect to unknown
+   peers). Mid-epoch joins discover the set via `GET /validator-set`.
+   Full-node peer discovery (bootstrap nodes, DHT) is a separate
+   concern for `oxide-fullnode`.
+5. ~~Persistent storage backend (in-memory journal)~~ — **resolved
+   via snapshot persistence.** `--data-dir` auto-exports on shutdown
+   and auto-imports on startup. The WAL protects consensus safety
+   state. A write-through `StorageBackend` for all modules (not just
+   EVM) is a future optimization, not a production blocker.
+6. ~~Governance validator set changes~~ — **resolved.** `VALIDATOR_ADD`
+   and `VALIDATOR_REMOVE` message types with governance-by-committee
+   validation and epoch-boundary application.
+7. ~~TLS cert generation tooling~~ — **resolved.** `tls-gen` subcommand.
 
-**Next action:** External security audit and public testnet
-deployment. The feedback loop continues: after external
-validation, re-evaluate.
+**Next action:** External security audit and public multi-machine
+testnet deployment. The codebase now has all the infrastructure a
+testnet needs: mTLS, WAL persistence, snapshot persistence, genesis
+loading, key rotation, validator add/remove, RPC endpoints, and
+graceful shutdown.

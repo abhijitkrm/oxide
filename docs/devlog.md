@@ -12407,3 +12407,114 @@ by `Drop`.
   validators — no add/remove)
 - TLS cert generation tooling (`rcgen` exists in p2p but no CLI
   wrapper for CA + node certs)
+
+---
+
+## 2026-09-15 — Session 6: remaining production blockers
+
+### TLS cert generation (`oxide-validator tls-gen`)
+
+`oxide-validator tls-gen --num-nodes 4 --output-dir tls/` generates a
+self-signed certificate + private key for each node, then writes
+per-node `--tls-dir` directories (`tls/node-{i}/`) containing
+`cert.pem`, `key.pem`, and `peer-{j}.pem` for every peer `j != i`.
+Each node runs with `--tls-dir tls/node-{i}` — mTLS is enforced by
+the existing `TlsConfig::from_files` + `with_tls` path (C4).
+
+**Verified:** 4-node testnet with `--tls-dir` + `--genesis-file` +
+`--wal-file` + `--data-dir` + `--rpc-listen` finalizes consistently
+at ~48 blk/s. The 2s connection wait accounts for TLS handshake
+latency (longer than plain TCP).
+
+### Governance validator set changes (`VALIDATOR_ADD` / `VALIDATOR_REMOVE`)
+
+Two new staking message types:
+
+- `VALIDATOR_ADD` (0x06): `[type][address:20B][bls_key:48B][stake:8B]`
+  — registers a new validator in `validators` (staking map) and
+  `pending_validator_adds`. The validator joins consensus at the
+  next epoch rotation.
+- `VALIDATOR_REMOVE` (0x07): `[type][address:20B]` — adds the
+  validator to `pending_validator_removes`. The validator is removed
+  from the consensus set at the next epoch rotation.
+
+Governance rule: only a current validator (non-zero stake in
+`validators`) can submit `VALIDATOR_ADD`/`VALIDATOR_REMOVE` — the
+validator set admits/evicts its own members. A `VALIDATOR_REMOVE`
+for a pending-add validator cancels the add (removes from
+`pending_validator_adds` + `validators`) instead of adding to
+`pending_removes` — the validator never joins.
+
+`ValidatorSet` gains `add_validator(pk, stake, address)` and
+`remove_validator(index)` — both return a new `ValidatorSet` with
+recomputed `cumulative_stakes`, `total_stake`, `f`, and `quorum`.
+`OxideBft::apply_validator_changes` applies removes first (descending
+index to avoid shifting), then adds, then `schedule_rotation`.
+
+`Module::take_validator_changes` (default empty) →
+`StakingModule::take_validator_changes` →
+`Executor::take_pending_validator_changes` →
+`OxideBft::apply_validator_changes` → `schedule_rotation` →
+`complete_rotation` at epoch boundary.
+
+`executor::ValidatorChanges` is a `struct { adds, removes }` —
+returned by `take_pending_validator_changes`, destructured into
+slices for `apply_validator_changes`.
+
+**Verified:** `tcp_multinode_validator_add_remove` test — 4 validators
+→ delegate + validator_add for `Address([0xAA; 20])` →
+`rotate_epoch_with_validator_changes` → set grows to 5 →
+validator_remove → set shrinks to 4. `index_of` finds the new
+validator's address; after removal, `index_of` returns `None`.
+
+### Auto-snapshot persistence (`--data-dir`)
+
+`--data-dir <dir>` enables automatic state persistence:
+
+- On startup: if `<dir>/snapshot.bin` exists, `import_snapshot` it.
+- On shutdown (SIGINT/SIGTERM): `export_snapshot` to
+  `<dir>/snapshot.bin`.
+
+The shutdown handler now catches both SIGINT (`ctrl_c()`) and
+SIGTERM (`signal(SignalKind::terminate())`) — `pkill -TERM` triggers
+graceful shutdown + snapshot export. Without SIGTERM handling, a
+`docker stop` or `kill` would skip the snapshot export.
+
+**Verified:** started node 3, let it reach height 19, `pkill -TERM` →
+snapshot exported (229 bytes). Restarted with `--data-dir` →
+snapshot imported at height 19 → caught up to height 60.
+
+### Validator set discovery (`GET /validator-set`)
+
+New RPC endpoint returns the current validator set as JSON:
+
+```json
+[{"address":"0x...","public_key":"0x...","stake":1000000}, ...]
+```
+
+A `ValidatorSetProvider` trait decouples the RPC from `consensus` —
+the validator binary implements it via `SharedValidatorSetProvider`
+wrapping `Arc<RwLock<ValidatorSet>>`. The consensus loop updates the
+shared set after each epoch rotation (`engine.epoch()` increments →
+`complete_rotation` swapped the set).
+
+A new validator joining mid-epoch queries `GET /validator-set` on an
+existing validator, constructs the `ValidatorSet` from the returned
+entries, and connects via `--devnet-node` — no genesis file needed.
+
+### Verified
+
+- `cargo build --workspace` ✅
+- `cargo test --workspace` ✅ (0 failures — 109 consensus, 31 devnet,
+  all others)
+- `cargo fmt --check` ✅
+- `cargo clippy --workspace --all-targets -- -D warnings` ✅
+- 4-node mTLS testnet: all nodes finalize consistently at ~48 blk/s
+- `GET /validator-set` returns the current validator set
+- SIGTERM → graceful shutdown → snapshot exported
+- `--data-dir` restart → snapshot imported → catches up
+
+### Remaining for production
+
+- External security audit
+- Public multi-machine testnet deployment

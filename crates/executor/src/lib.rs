@@ -586,6 +586,44 @@ pub trait Module: Send + Sync {
     fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
         Vec::new()
     }
+
+    /// Take all pending validator additions and removals, clearing
+    /// the queues. Called by the consensus engine at the epoch
+    /// boundary to apply validator set changes.
+    ///
+    /// Returns `(adds, removes)` — `adds` is a list of `(address,
+    /// bls_public_key, stake)` tuples for new validators; `removes`
+    /// is a list of addresses to remove.
+    ///
+    /// # Default
+    ///
+    /// Returns empty — most modules don't track validator set
+    /// changes. Only the staking module overrides this.
+    fn take_validator_changes(&self) -> ValidatorChanges {
+        ValidatorChanges::default()
+    }
+}
+
+/// A pending validator set change: additions and removals to apply
+/// at the next epoch rotation.
+///
+/// `adds` is a list of `(staking_address, bls_public_key, stake)`
+/// tuples for new validators. `removes` is a list of staking
+/// addresses to remove.
+#[derive(Debug, Clone, Default)]
+pub struct ValidatorChanges {
+    /// Validators to add: `(address, bls_public_key, stake)`.
+    pub adds: Vec<(Address, Vec<u8>, u64)>,
+    /// Validator addresses to remove.
+    pub removes: Vec<Address>,
+}
+
+impl ValidatorChanges {
+    /// Whether there are no pending changes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.adds.is_empty() && self.removes.is_empty()
+    }
 }
 
 /// An event emitted by a module during execution.
@@ -950,6 +988,23 @@ impl Executor {
     #[must_use]
     pub fn take_pending_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
         self.modules.iter().flatten().flat_map(|m| m.take_key_changes()).collect()
+    }
+
+    /// Take all pending validator additions and removals across all
+    /// modules, clearing the queues. Called by the consensus engine
+    /// at the epoch boundary.
+    ///
+    /// Returns a [`ValidatorChanges`] — `adds` is a list of `(address,
+    /// bls_public_key, stake)` tuples for new validators; `removes`
+    /// is a list of addresses to remove.
+    pub fn take_pending_validator_changes(&self) -> ValidatorChanges {
+        let mut changes = ValidatorChanges::default();
+        for m in self.modules.iter().flatten() {
+            let c = m.take_validator_changes();
+            changes.adds.extend(c.adds);
+            changes.removes.extend(c.removes);
+        }
+        changes
     }
 
     /// Save executed nonces to a storage backend (C10 fix).

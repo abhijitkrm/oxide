@@ -1348,6 +1348,35 @@ impl TcpMultiNodeDevnet {
         }
         applied
     }
+
+    /// Take pending validator additions and removals from the first
+    /// app, apply them to every engine's validator set, rotate the
+    /// epoch, and update the devnet's own `ValidatorSet` copy.
+    ///
+    /// Returns the number of changes applied (adds + removes).
+    /// Returns 0 if no changes are pending.
+    pub fn rotate_epoch_with_validator_changes(&mut self) -> usize {
+        let changes = self.apps[0].take_pending_validator_changes();
+        if changes.is_empty() {
+            return 0;
+        }
+        let mut applied = 0;
+        for engine in &mut self.engines {
+            match engine.apply_validator_changes(&changes.adds, &changes.removes) {
+                Ok(n) => applied = n,
+                Err(e) => {
+                    eprintln!("validator-change apply failed: {e}");
+                }
+            }
+        }
+        if applied > 0 {
+            for engine in &mut self.engines {
+                let _ = engine.rotate_epoch();
+            }
+            self.validator_set = self.engines[0].validator_set().clone();
+        }
+        applied
+    }
 }
 
 /// Construct a deterministic BLS secret key from a single byte.
@@ -1436,6 +1465,65 @@ mod tests {
             devnet.validator_set().validator_addresses()[0],
             primitives::Address::ZERO,
             "staking address must be preserved across key rotation",
+        );
+    }
+
+    /// End-to-end validator add + remove: submit `VALIDATOR_ADD` and
+    /// `VALIDATOR_REMOVE` txs, finalize them, apply the epoch
+    /// rotation, verify the set grew and shrank.
+    ///
+    /// Exercises the full flow: `staking::msg::validator_add` →
+    /// `handle_validator_add` → `pending_validator_adds` →
+    /// `take_pending_validator_changes` → `apply_validator_changes` →
+    /// `schedule_rotation` → `rotate_epoch`. Then the same for
+    /// `validator_remove`.
+    #[test]
+    fn tcp_multinode_validator_add_remove() {
+        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21600);
+        let initial_n = devnet.validator_set().n();
+
+        // Address::ZERO must be a validator (have stake) to submit
+        // governance txs — delegate first.
+        let delegate_msg = staking::msg::delegate(primitives::Address::ZERO, 1);
+        devnet.apps[0].ingest_tx(make_staking_tx(&delegate_msg, 0));
+        devnet.run_batch(2, 0);
+
+        // Submit a validator_add for a new validator.
+        let new_key = bls_key(0xAA).public_key();
+        let new_addr = primitives::Address([0xAA; 20]);
+        let add_msg = staking::msg::validator_add(new_addr, new_key.as_bytes(), 1000);
+        devnet.apps[0].ingest_tx(make_staking_tx(&add_msg, 1));
+        devnet.run_batch(3, 0);
+
+        // Apply the pending validator change — should add 1 validator.
+        let applied = devnet.rotate_epoch_with_validator_changes();
+        assert_eq!(applied, 1, "one validator add should be applied");
+        assert_eq!(devnet.validator_set().n(), initial_n + 1, "validator set must grow by 1");
+
+        // The new validator's key and address are in the set.
+        let new_idx =
+            devnet.validator_set().index_of(&new_addr).expect("new validator must be in set");
+        assert_eq!(
+            devnet.validator_set().validator(new_idx).expect("new validator key").as_bytes(),
+            new_key.as_bytes(),
+            "new validator's BLS key must match",
+        );
+
+        // Now remove the new validator.
+        let remove_msg = staking::msg::validator_remove(new_addr);
+        devnet.apps[0].ingest_tx(make_staking_tx(&remove_msg, 2));
+        devnet.run_batch(3, 0);
+
+        let applied = devnet.rotate_epoch_with_validator_changes();
+        assert_eq!(applied, 1, "one validator remove should be applied");
+        assert_eq!(
+            devnet.validator_set().n(),
+            initial_n,
+            "validator set must return to original size"
+        );
+        assert!(
+            devnet.validator_set().index_of(&new_addr).is_none(),
+            "removed validator must not be in the set",
         );
     }
 
