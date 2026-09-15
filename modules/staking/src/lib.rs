@@ -202,6 +202,24 @@ impl StakingModule {
         self
     }
 
+    /// Register a validator at genesis — sets stake directly without
+    /// requiring a delegate transaction.
+    ///
+    /// This is the genesis-state path: the `genesis.json` `staking.validators`
+    /// list is applied before the first block, so validators have stake
+    /// when consensus starts. It bypasses the `ctx.sender == validator`
+    /// check that `handle(DELEGATE)` enforces — genesis registration is
+    /// not a user transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stake == 0` — a zero-stake validator is useless and
+    /// likely a genesis bug.
+    pub fn genesis_register_validator(&self, validator: Address, stake: u64) {
+        assert!(stake > 0, "genesis validator {validator:?} has zero stake");
+        self.validators.lock().unwrap().insert(validator, stake);
+    }
+
     /// Get a validator's total stake.
     ///
     /// # Panics

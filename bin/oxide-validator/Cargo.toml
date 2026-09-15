@@ -25,7 +25,10 @@ config = { workspace = true }
 crypto = { workspace = true }
 consensus = { workspace = true }
 executor = { workspace = true }
-p2p = { workspace = true }
+# TLS enabled for production validator connections (mTLS per C4).
+# The `tls` feature is mandatory for the validator binary — a public
+# testnet cannot run without encrypted, authenticated peer connections.
+p2p = { workspace = true, features = ["tls"] }
 oxide-core = { workspace = true }
 staking = { workspace = true }
 rpc = { workspace = true }

@@ -12325,3 +12325,85 @@ by key-rotation tests to verify the new key is active).
 - `cargo test --workspace` — all pass, 0 failures
 - `cargo fmt --check` — clean
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean
+
+### Docs
+
+- `docs/testnet-deployment.md` — public multi-machine testnet
+  deployment guide: infrastructure requirements, key generation
+  (BLS + TLS), genesis/config files, bare-binary and Docker
+  deployment, firewall rules, monitoring, operational procedures,
+  validation checklist, and the remaining blockers (BLS key file
+  loading, TLS cert wiring, peer discovery, genesis file loading,
+  persistent storage backend, governance validator set changes).
+
+## Session 5 — `run_devnet_node` production wiring
+
+### What changed
+
+`run_devnet_node` (the `--devnet-node` multi-process mode) now uses
+the same production infrastructure as `run_single_node`:
+
+**New flags:**
+- `--config <path>` — TOML config (executor params, genesis,
+  consensus, RPC). Overrides `--num-nodes`, `--base-port`,
+  `genesis_balance`, `num_prefunded_senders`.
+- `--genesis-file <path>` — `genesis.json` with `staking.validators`
+  (address, `public_key`, stake) and `bank.balances`. Builds
+  `ValidatorSet::with_addresses` from the genesis file instead of
+  deterministic devnet keys.
+- `--bls-key-file <path>` — BLS secret key (hex or raw 32 bytes).
+  If omitted, falls back to deterministic `bls_key(index + 1)`
+  (devnet convention — **not suitable for production**).
+- `--tls-dir <dir>` — TLS directory containing `cert.pem`,
+  `key.pem`, `peer-{i}.pem` for each peer index. Enables mTLS via
+  `TlsConfig::from_files` + `TcpTransport::with_tls` (C4).
+- `--wal-file <path>` — consensus WAL file path. Enables
+  `Wal::open` + `engine.with_wal(wal)` + `engine.recover_from_wal()`
+  (C9 restart safety).
+- `--rpc-listen <addr>` — RPC listen address. Starts the JSON-RPC
+  HTTP server with `eth_*` endpoints, `/health`, `/metrics`, and
+  `/snapshot` on a dedicated tokio runtime thread.
+
+**`GenesisValidator` gets `public_key: Option<String>`** — hex-encoded
+48-byte BLS public key. Required for `--genesis-file` multi-node
+genesis; optional for single-node devnet (key generated
+deterministically). `Genesis::devnet` and `add_validator` default
+to `None`; `run_genesis` fills it with the deterministic key.
+
+**`StakingModule::genesis_register_validator(addr, stake)`** — sets
+stake directly without a delegate transaction. Called by
+`build_devnet_executor` for each `genesis.staking.validators` entry
+when `--genesis-file` is given.
+
+**Graceful shutdown** — SIGINT/SIGTERM sets an `AtomicBool` flag
+that `run_consensus_loop` checks each iteration. On shutdown, the
+loop breaks cleanly, the transport flushes, and the WAL is closed
+by `Drop`.
+
+**RPC block height** — `run_consensus_loop` calls
+`rpc.set_block_height(h)` on each finalized block so
+`eth_blockNumber` and `/metrics` reflect the current height.
+
+### Verified
+
+- `oxide-validator genesis --chain-id 1 --validators 4` generates
+  `genesis.json` with `public_key` per validator.
+- 4-node testnet with `--genesis-file`, `--wal-file`, `--rpc-listen`:
+  all nodes finalize consistently (~48 blk/s loopback), RPC
+  endpoints respond (`/health`, `/metrics`, `eth_blockNumber`,
+  `/snapshot`).
+- WAL recovery: killed node 3 at height 724, restarted — recovered
+  from WAL and caught up to 1321.
+- `cargo build --workspace` ✅
+- `cargo test --workspace` ✅ (0 failures)
+- `cargo fmt --check` ✅
+- `cargo clippy --workspace --all-targets -- -D warnings` ✅
+
+### Remaining for production
+
+- Peer discovery (static peer list only — no DHT/bootstrap)
+- Persistent storage backend (in-memory journal only)
+- Governance validator set changes (only `KEY_CHANGE` for existing
+  validators — no add/remove)
+- TLS cert generation tooling (`rcgen` exists in p2p but no CLI
+  wrapper for CA + node certs)

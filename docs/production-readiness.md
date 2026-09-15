@@ -359,6 +359,13 @@ All partial runbook items completed:
    critical, 6 high, 4 medium) are now fixed.
 2. **No running public testnet.** The Docker testnet proves the
    mechanics but a public multi-machine deployment is needed.
+   `docs/testnet-deployment.md` covers the full deployment guide.
+   `run_devnet_node` now supports production wiring: `--config`,
+   `--genesis-file`, `--bls-key-file`, `--tls-dir`, `--wal-file`,
+   `--rpc-listen`. Remaining blockers: peer discovery (static peer
+   list only), persistent storage backend (in-memory journal),
+   governance validator set changes (only KEY_CHANGE for existing
+   validators), TLS cert generation tooling.
 3. ~~Epoch-boundary key-change application~~ — **resolved.** The
    `Address` → `ValidatorIndex` mapping is now stored in
    `ValidatorSet::validator_addresses` (derived from BLS key via

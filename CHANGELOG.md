@@ -126,6 +126,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     `executed_nonces` into the authenticated `state_root`. A crafted
     snapshot can no longer zero or corrupt replay-protection nonces
     without detection.
+
+- **Production deployment wiring for `--devnet-node`**
+  (`bin/oxide-validator/src/main.rs`, `crates/config/src/genesis.rs`,
+  `modules/staking/src/lib.rs`)
+  - `run_devnet_node` now uses the same production infrastructure as
+    `run_single_node`: `--config` TOML, `--genesis-file`, BLS key
+    file, TLS/mTLS, WAL persistence, RPC server, and graceful
+    shutdown — plus multi-node TCP networking.
+  - New flags: `--genesis-file`, `--bls-key-file`, `--tls-dir`,
+    `--wal-file`, `--rpc-listen`. The `--config` flag now applies to
+    devnet mode too.
+  - `GenesisValidator` gains `public_key: Option<String>` — a hex-
+    encoded 48-byte BLS public key. `oxide-validator genesis`
+    generates keys and fills it in; production deployments provide
+    their own.
+  - `StakingModule::genesis_register_validator(addr, stake)` registers
+    validators at genesis without requiring a delegate transaction.
+  - SIGINT/SIGTERM triggers graceful shutdown: the consensus loop
+    breaks cleanly, transport flushes, WAL closes.
+  - `eth_blockNumber`, `/health`, `/metrics`, and `/snapshot` are now
+    available on every devnet node.
+  - **In plain words:** A validator can now be deployed on a real
+    machine with proper keys, TLS-encrypted peer connections, WAL
+    persistence for crash recovery, and monitoring endpoints — the
+    same infrastructure a production node uses.
   - **In plain words:** When a new node syncs state from a snapshot,
     the replay-protection nonce map is now cryptographically
     authenticated. A malicious peer cannot tamper with nonces to

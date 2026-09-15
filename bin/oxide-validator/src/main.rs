@@ -33,6 +33,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -163,7 +164,7 @@ fn main() {
 /// for either the server to exit or a SIGTERM/SIGINT shutdown signal,
 /// enabling graceful shutdown.
 fn run_single_node() {
-    let (node_config, rpc_config) = load_config();
+    let (node_config, rpc_config, _genesis_config) = load_config();
     tracing::info!(
         engine = node_config.consensus.as_str(),
         max_mempool_entries = node_config.max_mempool_entries,
@@ -367,31 +368,83 @@ fn handle_key_change(node: &mut Node) {
     }
 }
 
-/// Run a single validator node in multi-process devnet mode.
+/// Run a single validator node in a multi-process testnet.
 ///
-/// This mode is used by the `MultiProcessDevnet` launcher. Each
-/// process runs one validator node, connecting to the other nodes
-/// over TCP.
+/// This is the production deployment path for a validator node. It
+/// uses the same `--config` TOML loading, `--genesis-file`, BLS key
+/// file, TLS/mTLS, WAL persistence, RPC server, and graceful
+/// shutdown infrastructure as `run_single_node`, plus multi-node
+/// TCP networking for consensus message passing.
 ///
-/// # CLI flags
+/// # Flags
 ///
-/// - `--devnet-node <i>`: this node's index (0-based).
-/// - `--num-nodes <N>`: total number of validator nodes.
-/// - `--base-port <port>`: base TCP port. Node `i` listens on
-///   `{bind_host}:{base_port + i}`.
-/// - `--bind-host <host>`: host to bind on (default `127.0.0.1`).
-/// - `--peer-host <host>`: host to connect to peers on (default
-///   `127.0.0.1`). For Docker, use the container service name or
-///   the peer's IP address.
-/// - `--peer-host-template <fmt>`: template for peer addresses,
-///   where `{i}` is replaced with the peer index (e.g.
-///   `validator-{i}`). Overrides `--peer-host`.
+/// | Flag | Description |
+/// |------|-------------|
+/// | `--devnet-node <i>` | This node's validator index (required) |
+/// | `--num-nodes <N>` | Total validators (default: from genesis/config) |
+/// | `--base-port <p>` | Base TCP port (default: from genesis/config) |
+/// | `--bind-host <h>` | Bind address (default: `127.0.0.1`) |
+/// | `--peer-host-template <fmt>` | Peer hostname template (`{i}` = index) |
+/// | `--config <path>` | TOML config file |
+/// | `--genesis-file <path>` | `genesis.json` (validator set + balances) |
+/// | `--bls-key-file <path>` | BLS secret key (hex or raw 32 bytes) |
+/// | `--tls-dir <dir>` | TLS directory (`cert.pem`, `key.pem`, `peer-{i}.pem`) |
+/// | `--wal-file <path>` | Consensus WAL file path |
+/// | `--rpc-listen <addr>` | RPC listen address (default: from config) |
+/// | `--export-snapshot <path>` | Export snapshot to file and exit |
+/// | `--import-snapshot <path>` | Import snapshot from file before starting |
+/// | `--submit-key-change <hex>` | Submit a validator key-change tx |
+///
+/// # Key loading
+///
+/// `--bls-key-file` loads a 32-byte BLS secret key. The file can be
+/// hex-encoded (64 hex chars, with or without `0x`) or raw binary.
+/// If omitted, a deterministic key is generated from the node index
+/// (devnet convention — **not suitable for production**).
+///
+/// # Genesis file
+///
+/// `--genesis-file` loads a `genesis.json` that specifies the
+/// validator set (address, BLS public key, stake per validator) and
+/// genesis balances. If omitted, a deterministic validator set is
+/// generated from `--num-nodes` (devnet convention).
+///
+/// # TLS
+///
+/// `--tls-dir` points to a directory containing:
+/// - `cert.pem` — this node's X.509 certificate (PEM)
+/// - `key.pem` — this node's private key (PEM)
+/// - `peer-{i}.pem` — peer `i`'s certificate (for each peer index)
+///
+/// mTLS is enforced: both sides of every connection authenticate
+/// via certificates bound to peer IDs (C4).
+///
+/// # WAL
+///
+/// `--wal-file` persists safety-critical consensus state
+/// (`last_voted_view`, `voted_at_height`, `high_qc`, `current_view`,
+/// `next_height`, `epoch`) to a CRC32-protected file. On restart,
+/// `recover_from_wal` restores the state, preventing double-voting
+/// and conflicting votes (C9).
+///
+/// # RPC
+///
+/// `--rpc-listen` starts the JSON-RPC HTTP server with `eth_*`
+/// endpoints, `/health`, `/metrics`, and `/snapshot`. If omitted,
+/// the node's `rpc.listen_addr` config is used.
+#[allow(clippy::too_many_lines)]
 fn run_devnet_node(node_index_str: &str) {
+    // Load base config (TOML + env vars + CLI overrides).
+    let (node_config, rpc_config, genesis_config) = load_config();
+
     let node_index: usize =
         node_index_str.parse().unwrap_or_else(|e| panic!("invalid --devnet-node index: {e}"));
-    let num_nodes: usize = parse_cli_flag("--num-nodes").and_then(|s| s.parse().ok()).unwrap_or(4);
-    let base_port: u16 =
-        parse_cli_flag("--base-port").and_then(|s| s.parse().ok()).unwrap_or(22000);
+    let num_nodes: usize = parse_cli_flag("--num-nodes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(genesis_config.num_validators);
+    let base_port: u16 = parse_cli_flag("--base-port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(genesis_config.base_port);
     let bind_host = parse_cli_flag("--bind-host").unwrap_or_else(|| "127.0.0.1".to_string());
     let peer_host_template =
         parse_cli_flag("--peer-host-template").or_else(|| parse_cli_flag("--peer-host"));
@@ -400,25 +453,12 @@ fn run_devnet_node(node_index_str: &str) {
         "oxide-validator[{node_index}]: devnet node mode — index={node_index}, num_nodes={num_nodes}, base_port={base_port}, bind_host={bind_host}"
     );
 
-    // Generate BLS keys for all nodes (deterministic, same as
-    // TcpMultiNodeDevnet). We need all public keys to construct the
-    // validator set, but only use our own secret key.
-    let secret_keys: Vec<crypto::BlsSecretKey> =
-        (1..=u8::try_from(num_nodes).expect("num_nodes fits in u8")).map(bls_key).collect();
-    let pks: Vec<crypto::bls::PublicKey> =
-        secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
-    let stakes = vec![1u64; num_nodes];
-    // Devnet convention: validator `i` has staking address
-    // `Address([i as u8; 20])` — `Address::ZERO` for validator 0.
-    // `with_addresses` preserves these explicit identities so
-    // `handle_key_change`'s `ctx.sender == validator` check works
-    // with the devnet's `Address([i; 20])` sender convention.
-    let addresses: Vec<primitives::Address> =
-        (0..num_nodes).map(|i| primitives::Address([u8::try_from(i).unwrap_or(0); 20])).collect();
-    let validator_set =
-        consensus::ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set");
+    // BLS key: --bls-key-file or deterministic.
+    let our_key = load_bls_key(node_index);
 
-    let our_key = secret_keys[node_index].clone();
+    // ValidatorSet: --genesis-file or deterministic.
+    let validator_set = load_validator_set(num_nodes, node_index);
+
     let listen_port = base_port + u16::try_from(node_index).expect("port fits in u16");
     let listen_addr = format!("{bind_host}:{listen_port}");
 
@@ -437,28 +477,21 @@ fn run_devnet_node(node_index_str: &str) {
 
     println!("oxide-validator[{node_index}]: listening on {listen_addr}, {} peers", peers.len());
 
-    // Create the executor with modules.
-    let mut executor = executor::Executor::new(10_000);
-    executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-    let bank_module = bank::BankModule::new();
-    for sender_byte in 0u8..32 {
-        bank_module.mint(&primitives::Address([sender_byte; 20]), 1_000_000_000_000);
-    }
-    executor.register_module(Arc::new(bank_module));
-    // The bank collects fees for all native-module txs — without
-    // this only bank txs paid (other modules ran free).
-    executor.set_fee_module(framework::module_id::BANK);
-    executor.register_module(Arc::new(staking::StakingModule::new()));
+    // Create the executor with modules. If --genesis-file was given,
+    // the staking module registers the genesis validators directly
+    // (bypassing the delegate-transaction path — genesis state is
+    // not a user tx).
+    let genesis = parse_cli_flag("--genesis-file").map(|p| {
+        config::genesis::Genesis::from_json_file(&PathBuf::from(&p))
+            .unwrap_or_else(|e| panic!("failed to load genesis file {p}: {e}"))
+    });
+    let executor = build_devnet_executor(&genesis_config, &node_config, genesis.as_ref());
     let app: Arc<executor::Executor> = Arc::new(executor);
     let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
 
-    // Create the TCP transport. Keep it alive for the lifetime of
-    // the node — the transport runs background threads.
-    let mut transport = p2p::tcp::TcpTransport::new(
-        &listen_addr,
-        vec![u8::try_from(node_index).expect("peer id fits in u8")],
-        peers,
-    );
+    // Create the TCP transport: --tls-dir for mTLS, plain TCP
+    // otherwise.
+    let mut transport = build_transport(&listen_addr, node_index, peers);
 
     // Give connections time to establish.
     thread::sleep(Duration::from_millis(500));
@@ -472,6 +505,17 @@ fn run_devnet_node(node_index_str: &str) {
     )
     .with_secret_key(our_key.clone());
 
+    // WAL persistence: --wal-file.
+    if let Some(wal_path) = parse_cli_flag("--wal-file") {
+        let wal = consensus::wal::Wal::open(&wal_path).expect("wal open");
+        engine = engine.with_wal(wal);
+        engine.recover_from_wal().expect("wal recover");
+        println!("oxide-validator[{node_index}]: WAL loaded from {wal_path}");
+    }
+
+    // Start the RPC server if --rpc-listen or rpc.listen_addr is set.
+    let rpc_handle = start_devnet_rpc(&rpc_config, &app, node_index);
+
     println!("oxide-validator[{node_index}]: consensus engine started, waiting for blocks...");
 
     // Submit a smoke-test transaction.
@@ -480,16 +524,24 @@ fn run_devnet_node(node_index_str: &str) {
     let tx = build_tx(framework::module_id::BANK, &module_payload);
     engine.submit_tx(tx);
 
-    // Note: we do NOT call `run_until_idle()` here — that would
-    // consume the proposal before the consensus loop can broadcast
-    // it to peers. The loop handles proposal, voting, and QC
-    // formation with proper network I/O.
     let height = engine.finalized_height();
     println!("oxide-validator[{node_index}]: finalized height = {height:?}");
-
-    // Keep running until killed (in a real node, this would be the
-    // main event loop).
     println!("oxide-validator[{node_index}]: node running (press Ctrl+C to stop)");
+
+    // Graceful shutdown: SIGINT/SIGTERM sets the shutdown flag, which
+    // `run_consensus_loop` checks each iteration.
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("signal runtime");
+        rt.block_on(async {
+            tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+            shutdown_clone.store(true, Ordering::Relaxed);
+        });
+    });
 
     // Run the consensus message pump loop.
     run_consensus_loop(
@@ -499,7 +551,244 @@ fn run_devnet_node(node_index_str: &str) {
         &our_key,
         node_index,
         num_nodes,
+        shutdown.as_ref(),
+        rpc_handle.as_deref(),
     );
+}
+
+/// Load a BLS secret key: `--bls-key-file` (hex or raw 32 bytes) or
+/// deterministic from node index (devnet fallback).
+///
+/// # Panics
+///
+/// Panics if `--bls-key-file` is given but the file cannot be read,
+/// decoded, or parsed into a valid `BlsSecretKey`.
+fn load_bls_key(index: usize) -> crypto::BlsSecretKey {
+    if let Some(path) = parse_cli_flag("--bls-key-file") {
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read BLS key file {path}: {e}"));
+        // Try hex decode first (64 hex chars), fall back to raw bytes.
+        let bytes: Vec<u8> = if raw.len() == 64 || (raw.len() == 66 && raw.starts_with(b"0x")) {
+            let text = std::str::from_utf8(&raw).expect("hex BLS key is UTF-8");
+            hex_decode(text).expect("hex decode BLS key")
+        } else {
+            raw
+        };
+        crypto::BlsSecretKey::from_bytes(&bytes)
+            .unwrap_or_else(|e| panic!("invalid BLS secret key in {path}: {e:?}"))
+    } else {
+        // Deterministic devnet fallback — NOT suitable for production.
+        bls_key(u8::try_from(index + 1).expect("index + 1 fits in u8"))
+    }
+}
+
+/// Build a `ValidatorSet`: `--genesis-file` (from `genesis.json`) or
+/// deterministic devnet convention.
+///
+/// # Panics
+///
+/// Panics if `--genesis-file` is given but the file cannot be loaded,
+/// or if the genesis validator count doesn't match `--num-nodes`, or
+/// if a validator's `public_key` is missing/invalid.
+fn load_validator_set(num_nodes: usize, _node_index: usize) -> consensus::ValidatorSet {
+    if let Some(path) = parse_cli_flag("--genesis-file") {
+        let genesis = config::genesis::Genesis::from_json_file(&PathBuf::from(&path))
+            .unwrap_or_else(|e| panic!("failed to load genesis file {path}: {e}"));
+        let validators = &genesis.staking.validators;
+        assert_eq!(
+            validators.len(),
+            num_nodes,
+            "genesis validator count {} doesn't match --num-nodes {num_nodes}",
+            validators.len()
+        );
+        let pks: Vec<crypto::bls::PublicKey> = validators
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let hex = v.public_key.as_ref().unwrap_or_else(|| {
+                    panic!("genesis validator {i} missing public_key — required for multi-node")
+                });
+                let bytes = hex_decode(hex).unwrap_or_else(|e| {
+                    panic!("genesis validator {i} invalid public_key hex: {e}")
+                });
+                crypto::bls::PublicKey::from_slice(&bytes)
+                    .unwrap_or_else(|_| panic!("genesis validator {i} invalid BLS public key"))
+            })
+            .collect();
+        let stakes: Vec<u64> = validators.iter().map(|v| v.stake).collect();
+        let addresses: Vec<primitives::Address> = validators
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let bytes = hex_decode(&v.address)
+                    .unwrap_or_else(|e| panic!("genesis validator {i} invalid address hex: {e}"));
+                primitives::Address(
+                    bytes.try_into().unwrap_or_else(|_| {
+                        panic!("genesis validator {i} address must be 20 bytes")
+                    }),
+                )
+            })
+            .collect();
+        consensus::ValidatorSet::with_addresses(pks, stakes, addresses)
+            .expect("genesis validator set")
+    } else {
+        // Deterministic devnet fallback — NOT suitable for production.
+        let secret_keys: Vec<crypto::BlsSecretKey> =
+            (1..=u8::try_from(num_nodes).expect("num_nodes fits in u8")).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let stakes = vec![1u64; num_nodes];
+        let addresses: Vec<primitives::Address> = (0..num_nodes)
+            .map(|i| primitives::Address([u8::try_from(i).unwrap_or(0); 20]))
+            .collect();
+        consensus::ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set")
+    }
+}
+
+/// Build the devnet executor with core, bank, and staking modules.
+///
+/// Uses `genesis_config` for the number of pre-funded senders and
+/// genesis balance, and `node_config` for executor params
+/// (mempool size, parallel threshold).
+fn build_devnet_executor(
+    genesis_config: &config::GenesisConfig,
+    node_config: &NodeConfig,
+    genesis: Option<&config::genesis::Genesis>,
+) -> executor::Executor {
+    let mut executor = executor::Executor::with_config(
+        node_config.max_mempool_entries,
+        node_config.parallel_threshold,
+    );
+    executor.register_module(Arc::new(oxide_core::CoreModule::new()));
+    let bank_module = bank::BankModule::new();
+
+    // Apply genesis balances if --genesis-file was given; otherwise
+    // use the deterministic devnet pre-funded senders.
+    if let Some(genesis) = genesis {
+        for (addr_hex, balance_val) in &genesis.bank.balances {
+            let balance = balance_val.as_u64().unwrap_or(0);
+            if let Ok(bytes) = hex_decode(addr_hex) {
+                if let Ok(addr) = <[u8; 20]>::try_from(bytes.as_slice()) {
+                    bank_module.mint(&primitives::Address(addr), balance);
+                }
+            }
+        }
+    } else {
+        for sender_byte in 0..genesis_config.num_prefunded_senders {
+            bank_module
+                .mint(&primitives::Address([sender_byte; 20]), genesis_config.genesis_balance);
+        }
+    }
+    executor.register_module(Arc::new(bank_module));
+    // The bank collects fees for all native-module txs — without
+    // this only bank txs paid (other modules ran free).
+    executor.set_fee_module(framework::module_id::BANK);
+
+    // Staking module: register genesis validators directly if
+    // --genesis-file was given; otherwise use deterministic devnet
+    // validators (Address([i; 20]) with stake 1).
+    let staking_module = staking::StakingModule::new();
+    if let Some(genesis) = genesis {
+        for v in &genesis.staking.validators {
+            let addr_bytes = hex_decode(&v.address)
+                .unwrap_or_else(|e| panic!("genesis validator invalid address: {e}"));
+            let addr: [u8; 20] = addr_bytes
+                .try_into()
+                .unwrap_or_else(|_| panic!("genesis validator address must be 20 bytes"));
+            staking_module.genesis_register_validator(primitives::Address(addr), v.stake);
+        }
+    } else {
+        // Deterministic devnet fallback — NOT suitable for production.
+        for i in 0..genesis_config.num_validators {
+            let addr = primitives::Address([u8::try_from(i).unwrap_or(0); 20]);
+            staking_module.genesis_register_validator(addr, 1_000_000);
+        }
+    }
+    executor.register_module(Arc::new(staking_module));
+    executor
+}
+
+/// Build the TCP transport: `--tls-dir` for mTLS, plain TCP otherwise.
+///
+/// # Panics
+///
+/// Panics if `--tls-dir` is given but the TLS config cannot be built
+/// (missing cert/key files, invalid PEM, etc.).
+fn build_transport(
+    listen_addr: &str,
+    node_index: usize,
+    peers: Vec<(Vec<u8>, String)>,
+) -> p2p::tcp::TcpTransport {
+    if let Some(tls_dir) = parse_cli_flag("--tls-dir") {
+        let cert_path = format!("{tls_dir}/cert.pem");
+        let key_path = format!("{tls_dir}/key.pem");
+        let trusted_peers: Vec<(Vec<u8>, String)> = peers
+            .iter()
+            .map(|(peer_id, _)| {
+                let peer_num = peer_id[0] as usize;
+                (peer_id.clone(), format!("{tls_dir}/peer-{peer_num}.pem"))
+            })
+            .collect();
+        let trusted_peers_refs: Vec<(Vec<u8>, &str)> =
+            trusted_peers.iter().map(|(id, path)| (id.clone(), path.as_str())).collect();
+        let tls_config =
+            p2p::tls::TlsConfig::from_files(&cert_path, &key_path, &trusted_peers_refs)
+                .unwrap_or_else(|e| panic!("failed to build TLS config from {tls_dir}: {e}"));
+        println!("oxide-validator[{node_index}]: mTLS enabled ({tls_dir})");
+        p2p::tcp::TcpTransport::with_tls(
+            listen_addr,
+            vec![u8::try_from(node_index).expect("peer id fits in u8")],
+            peers,
+            p2p::tcp::TcpTransportConfig::default(),
+            tls_config,
+        )
+    } else {
+        p2p::tcp::TcpTransport::new(
+            listen_addr,
+            vec![u8::try_from(node_index).expect("peer id fits in u8")],
+            peers,
+        )
+    }
+}
+
+/// Start the RPC server for a devnet node: `--rpc-listen` overrides
+/// the config's `rpc.listen_addr`.
+///
+/// Returns a handle to the `RpcServer` for metrics updates, or
+/// `None` if no RPC address is configured.
+///
+/// The HTTP server is spawned on a dedicated tokio runtime thread so
+/// the consensus loop can run on the main thread.
+fn start_devnet_rpc(
+    rpc_config: &config::RpcConfig,
+    app: &Arc<executor::Executor>,
+    node_index: usize,
+) -> Option<Arc<rpc::RpcServer>> {
+    let listen = parse_cli_flag("--rpc-listen").or_else(|| {
+        if rpc_config.listen_addr.is_empty() { None } else { Some(rpc_config.listen_addr.clone()) }
+    })?;
+
+    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
+    rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: app.clone() }));
+    rpc_server.set_snapshot_provider(Arc::new(ExecutorSnapshotProvider { executor: app.clone() }));
+    let rpc = Arc::new(rpc_server);
+    let http_server = rpc::server::HttpServer::from_shared(rpc.clone(), listen.clone());
+
+    // Spawn the HTTP server on a dedicated tokio runtime thread so
+    // the consensus loop can run on the main thread.
+    let rpc_clone = rpc.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rpc runtime");
+        rt.block_on(async move {
+            http_server.serve().await;
+        });
+    });
+
+    println!("oxide-validator[{node_index}]: RPC server on http://{listen}");
+    Some(rpc_clone)
 }
 
 /// The consensus message pump loop: proposes, votes, drains the
@@ -512,7 +801,7 @@ fn run_devnet_node(node_index_str: &str) {
 /// 3. Drain inbound transport messages (proposals, votes, QCs).
 /// 4. Form QC if quorum reached, broadcast to peers.
 /// 5. Advance views and sync heights.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn run_consensus_loop(
     engine: &mut consensus::OxideBft,
     transport: &mut p2p::tcp::TcpTransport,
@@ -520,6 +809,8 @@ fn run_consensus_loop(
     our_key: &crypto::BlsSecretKey,
     node_index: usize,
     num_nodes: usize,
+    shutdown: &AtomicBool,
+    rpc: Option<&rpc::RpcServer>,
 ) {
     // Track proposals received from the network. Followers vote on
     // these proposals; the leader proposes locally.
@@ -543,6 +834,14 @@ fn run_consensus_loop(
     let mut timeout_sent_for_view: Option<u64> = None;
 
     loop {
+        // Graceful shutdown: SIGINT/SIGTERM sets the flag, we break
+        // cleanly so the transport can flush and the WAL can be
+        // closed by `Drop`.
+        if shutdown.load(Ordering::Relaxed) {
+            println!("oxide-validator[{node_index}]: shutdown signal received, stopping");
+            break;
+        }
+
         iter_count += 1;
 
         // Phase 0: submit a keep-alive transaction every 50 iterations
@@ -553,7 +852,7 @@ fn run_consensus_loop(
             let module_payload = bank::msg::transfer(to, 100);
             let tx =
                 build_tx_with_nonce(framework::module_id::BANK, &module_payload, keepalive_nonce);
-            engine.submit_tx(tx);
+            let _ack = engine.submit_tx(tx);
             keepalive_nonce += 1;
         }
 
@@ -831,6 +1130,12 @@ fn run_consensus_loop(
             if h_val > last_reported_height {
                 println!("oxide-validator[{node_index}]: finalized height = {h_val}");
                 last_reported_height = h_val;
+                // Update the RPC server's block height so
+                // `eth_blockNumber` and `/metrics` reflect the
+                // current finalized height.
+                if let Some(rpc) = rpc {
+                    rpc.set_block_height(h_val);
+                }
             }
         }
 
@@ -863,7 +1168,7 @@ fn bls_key(byte: u8) -> crypto::BlsSecretKey {
 /// Load the node configuration from CLI flags, env vars, and TOML file.
 ///
 /// Priority: CLI > env vars > TOML > defaults.
-fn load_config() -> (NodeConfig, config::RpcConfig) {
+fn load_config() -> (NodeConfig, config::RpcConfig, config::GenesisConfig) {
     let mut config = config::Config::default();
 
     // 1. Load from TOML file if --config is given.
@@ -913,6 +1218,7 @@ fn load_config() -> (NodeConfig, config::RpcConfig) {
             min_fee: 0,
         },
         rpc_config,
+        config.genesis,
     )
 }
 
@@ -931,6 +1237,15 @@ fn parse_cli_flag(flag: &str) -> Option<String> {
 
 fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
     build_tx_with_nonce(module_id, module_payload, 0)
+}
+
+/// Encode bytes as a hex string (lowercase, no `0x` prefix).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+        write!(acc, "{b:02x}").expect("write to String cannot fail");
+        acc
+    })
 }
 
 /// Decode a hex string (with or without `0x` prefix) into bytes.
@@ -997,6 +1312,11 @@ fn print_help() {
     println!("    --bind-host <host>        Host to bind on (default 127.0.0.1)");
     println!("    --peer-host <host>        Peer host (default 127.0.0.1)");
     println!("    --peer-host-template <f>  Peer host template with {{i}} (e.g. validator-{{i}})");
+    println!("    --genesis-file <path>     Load genesis.json (validator set + balances)");
+    println!("    --bls-key-file <path>     BLS secret key file (hex or raw 32 bytes)");
+    println!("    --tls-dir <dir>           TLS directory (cert.pem, key.pem, peer-{{i}}.pem)");
+    println!("    --wal-file <path>         Consensus WAL file path");
+    println!("    --rpc-listen <addr>       RPC listen address (default: from config)");
     println!("    --export-snapshot <path>  Export state snapshot to file and exit");
     println!("    --import-snapshot <path>  Import state snapshot before starting");
     println!("    --submit-key-change <hex> Submit a BLS key-change transaction");
@@ -1009,6 +1329,10 @@ fn print_help() {
     println!("    oxide-validator --export-snapshot snapshot.bin");
     println!("    oxide-validator --import-snapshot snapshot.bin");
     println!("    oxide-validator --submit-key-change 0xabcdef...");
+    println!("    oxide-validator --devnet-node 0 --num-nodes 4 --base-port 22000");
+    println!("    oxide-validator --devnet-node 0 --genesis-file genesis.json \\");
+    println!("        --bls-key-file key.bin --tls-dir tls/ --wal-file wal/ \\");
+    println!("        --rpc-listen 0.0.0.0:8545");
 }
 
 /// `oxide-validator init` — initialize a new node directory.
@@ -1088,7 +1412,20 @@ fn run_genesis(args: &[String]) {
         }
     }
 
-    let genesis = config::genesis::Genesis::devnet(chain_id, num_validators, 32, 1_000_000_000_000);
+    let mut genesis =
+        config::genesis::Genesis::devnet(chain_id, num_validators, 32, 1_000_000_000_000);
+
+    // Generate deterministic BLS keys for each validator and set
+    // `public_key` so `--genesis-file` can build the `ValidatorSet`
+    // without regenerating keys. For production, each validator
+    // generates its own key and provides the public key to the
+    // genesis coordinator.
+    for (idx, validator) in genesis.staking.validators.iter_mut().enumerate() {
+        let key = bls_key(u8::try_from(idx + 1).expect("index + 1 fits in u8"));
+        let pk = key.public_key();
+        validator.public_key = Some(format!("0x{}", hex_encode(pk.as_bytes())));
+    }
+
     let path = PathBuf::from(&output);
     genesis.to_json_file(&path).expect("write genesis file");
     println!(

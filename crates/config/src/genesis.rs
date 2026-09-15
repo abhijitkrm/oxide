@@ -140,7 +140,15 @@ fn default_block_reward() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GenesisValidator {
     /// The validator's address as a hex string (`0x` + 40 hex chars).
+    /// This is the staking identity — it survives BLS key rotation.
     pub address: String,
+    /// The validator's BLS public key as a hex string (`0x` + 96 hex
+    /// chars = 48 bytes). Required for multi-node genesis — the
+    /// `ValidatorSet` needs the public key to verify vote/QC
+    /// signatures. Optional for single-node devnet (a key is
+    /// generated deterministically).
+    #[serde(default)]
+    pub public_key: Option<String>,
     /// The validator's initial stake.
     pub stake: u64,
 }
@@ -224,7 +232,11 @@ impl Genesis {
             let addr = format!(
                 "0x{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}"
             );
-            genesis.staking.validators.push(GenesisValidator { address: addr, stake: 1_000_000 });
+            genesis.staking.validators.push(GenesisValidator {
+                address: addr,
+                public_key: None,
+                stake: 1_000_000,
+            });
         }
 
         genesis
@@ -241,7 +253,11 @@ impl Genesis {
     ///
     /// `address` must be a hex string with `0x` prefix (20 bytes).
     pub fn add_validator(&mut self, address: &str, stake: u64) {
-        self.staking.validators.push(GenesisValidator { address: address.to_string(), stake });
+        self.staking.validators.push(GenesisValidator {
+            address: address.to_string(),
+            public_key: None,
+            stake,
+        });
     }
 }
 
