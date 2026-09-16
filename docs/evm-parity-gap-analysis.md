@@ -46,13 +46,13 @@ WebSocket (`GET /` upgrade, same port — the geth convention).
 | `eth_getLogs` | ✅ bloom-prefiltered scan, `block-range-cap` 10k | ✅ | bloom-prefiltered scan over sealed history (`blockHash`/range/address/topics); result count capped at 10,000 (`MAX_LOG_RESULTS`) |
 | `eth_newFilter` / `eth_getFilterChanges` / `eth_getFilterLogs` / `eth_newBlockFilter` / `eth_newPendingTransactionFilter` / `eth_uninstallFilter` | ✅ | ✅ | filter registry with 300s TTL (geth's timeout): log filters share `eth_getLogs` semantics + `MAX_LOG_RESULTS` cap, block filters serve hashes, pending filters serve mempool-arrival tx hashes by sequence cursor; expired filters return `filter not found` |
 | `eth_sendRawTransaction` | ✅ | ✅ | decodes, submits to local mempool, **and gossips the raw tx to peers** with dedup (100k-hash FIFO) |
-| `eth_call` | ✅ EVM simulation, `gas-cap`, `evm-timeout` | ✅ | real `call_read` revm simulation (nonce/base-fee/gas-limit checks off, balance on — geth `DoCall`); `gas` clamped to `CHAIN_BLOCK_GAS_LIMIT` (our gas-cap); no `evm-timeout` yet |
-| `eth_estimateGas` | ✅ binary search + state overrides | 🟡 | binary search over `call_read` with revert/halt propagation; no state-override support |
-| `eth_createAccessList` | ✅ | ❌ | not implemented |
+| `eth_call` | ✅ EVM simulation, `gas-cap`, `evm-timeout` | ✅ | real `call_read` revm simulation (nonce/base-fee/gas-limit checks off, balance on — geth `DoCall`); `gas` clamped to `CHAIN_BLOCK_GAS_LIMIT` (our gas-cap); wall-clock `evm-timeout` via `DeadlineInspector`; historical heights via the versioned window |
+| `eth_estimateGas` | ✅ binary search + state overrides | 🟡 | binary search over `call_read` with revert/halt propagation + historical heights; no state-override support |
+| `eth_createAccessList` | ✅ | ✅ | touched-set accounting with geth accessListTracer semantics — sender/recipient/coinbase/precompiles excluded at address level, their touched storage keys still included |
 | `eth_gasPrice` | ✅ | 🟡 | returns configured base fee, not a market quote |
 | `eth_maxPriorityFeePerGas` | ✅ | 🟡 | stub `0x3b9aca00` (1 gwei) — should reflect recent block tips |
 | `eth_feeHistory` | ✅ | 🟡 | real base fees + reward percentiles over the retained window; `blockCount` capped at 1,024 (`MAX_FEE_HISTORY_BLOCKS`) |
-| `eth_getProof` | ✅ (height > 2) | ❌ | needs Merkle proof generation over the state trie (`trie.rs` computes roots; no proof path) |
+| `eth_getProof` | ✅ (height > 2) | ✅ | EIP-1186 account + storage proofs at any retained height — trie rebuilt at the versioned view via `HashBuilder` + `ProofRetainer`; non-inclusion proofs supported; tests verify nodes against the sealed state root |
 | `eth_sign` / `eth_signTypedData` | ✅/partial | ❌ | keyring-backed — deliberately omit (nodes should not custody user keys) |
 | `eth_sendTransaction` / `eth_pendingTransactions` | ❌/partial | ❌ | `sendTransaction` is a node-custody API — omit; `pendingTransactions` needs the txpool index |
 | `eth_subscribe` / `eth_unsubscribe` | ✅ WS: `newHeads`, `logs`, `newPendingTransactions` | ✅ | **WS transport shipped** (axum `ws` on `GET /`, geth same-port convention): `newHeads` + filtered `logs` push on finalization; `newPendingTransactions` pushes canonical EVM tx hashes for locally submitted + gossip-accepted txs (1024-hash bounded ring, dedup by hash) |
@@ -60,20 +60,23 @@ WebSocket (`GET /` upgrade, same port — the geth convention).
 | `debug_traceTransaction` / `debug_traceBlock*` / `debug_traceCall` | ✅ re-execution via EVM | ✅ | callTracer shipped via revm inspector composition (`NativeJournalInspector` + `CallRecorder` tuple); traces captured **at execution time** and retained in `evm::history` — no historical-state re-execution (state store is latest-only), so tracing is bounded by the 8192-block history window; `debug_traceCall`/`traceBlockByNumber`/`traceBlockByHash` included; unsupported tracers rejected explicitly |
 | `debug_*` runtime profiling endpoints | ✅ | ❌ | Go-specific; equivalent Rust profiling hooks not needed |
 | `personal_*` (keyring) | ✅ partial | ❌ | out of scope — node-custodied keys are a security liability |
-| JSON-RPC resource limits | `gas-cap` 25M, `evm-timeout`, `filter-cap` 200, `feehistory-cap` 100, `batch-request-limit`, `max-open-connections`, `http-timeout` 30s | 🟡 | per-client rate limiting + `gas-cap` (`eth_call`/`debug_traceCall` clamp to `CHAIN_BLOCK_GAS_LIMIT`), log-cap (`MAX_LOG_RESULTS` = 10k on `eth_getLogs` + filter polls), `feehistory-cap` (`MAX_FEE_HISTORY_BLOCKS` = 1,024), filter TTL (300s); remaining: `evm-timeout`, `batch-request-limit`, `max-open-connections`, `http-timeout` |
+| JSON-RPC resource limits | `gas-cap` 25M, `evm-timeout`, `filter-cap` 200, `feehistory-cap` 100, `batch-request-limit`, `max-open-connections`, `http-timeout` 30s | 🟡 | per-client rate limiting + `gas-cap` (`eth_call`/`debug_traceCall` clamp to `CHAIN_BLOCK_GAS_LIMIT`), `evm-timeout` (`DeadlineInspector` wall-clock halt on sim paths), log-cap (`MAX_LOG_RESULTS` = 10k on `eth_getLogs` + filter polls), `feehistory-cap` (`MAX_FEE_HISTORY_BLOCKS` = 1,024), filter TTL (300s), `batch-request-limit` (`MAX_BATCH_REQUESTS` = 1,024), `max-open-connections` (listener-level accept bound); remaining: `filter-cap` on total filters, `http-timeout` |
 | WS endpoint `:8546` | ✅ | ✅ | WS rides the same port as HTTP (`ws://host:8545/`, geth convention) rather than a separate `:8546` listener |
 
 **Summary (updated):** the advertised `eth_*` surface now serves real data —
 blocks/txs/receipts/logs come from `evm::history` (8192-block retained
-window), `eth_call`/`eth_estimateGas` run real revm simulations,
+window, **durable across restart**), `eth_call`/`eth_estimateGas` run real
+revm simulations (gas-cap + wall-clock timeout, historical heights),
 `eth_subscribe` pushes `newHeads`/`logs`/`newPendingTransactions` over
 WebSocket, pollable filter APIs track logs/blocks/pending txs, `txpool_*`
-exposes the mempool's nonce-gap queues, and `debug_trace*` serves callTracer
-output captured at execution time. Remaining gaps: `eth_getProof`,
-historical state reads, `eth_createAccessList`, and
-the remaining resource limits (`evm-timeout`, `batch-request-limit`,
-`max-open-connections`). The generic `indexer` crate (451 lines) remains
-unwired — EVM history superseded it for the `eth_*` surface.
+exposes the mempool's nonce-gap queues, `debug_trace*` serves callTracer
+output captured at execution time, `eth_createAccessList` matches geth's
+tracer semantics, and `eth_getProof` produces EIP-1186 account/storage
+proofs at any retained height over the versioned state window. Remaining
+gaps: `filter-cap` on total filters, `http-timeout`, `eth_estimateGas`
+state overrides, `eth_gasPrice`/`maxPriorityFeePerGas` market quotes. The
+generic `indexer` crate (451 lines) remains unwired — EVM history
+superseded it for the `eth_*` surface.
 
 ## 2. EVM execution semantics
 
@@ -84,7 +87,7 @@ unwired — EVM history superseded it for the `eth_*` surface.
 | EIP-2930 access-list tx (type 1) | ✅ | ✅ | — |
 | EIP-1559 dynamic-fee tx (type 2) | ✅ | ✅ | — |
 | EIP-4844 blob tx (type 3) | ✅ parsed | ❌ rejected `Malformed` | acceptable to reject — no blob lane in consensus; document it |
-| EIP-7702 SetCodeTx (type 4) | ✅ (v0.5+) | ❌ | not parsed; revm supports authorization lists — wire if Prague-complete is claimed |
+| EIP-7702 SetCodeTx (type 4) | ✅ (v0.5+) | ✅ | `TxEip7702` + `TxAuthorization` decode/sign/recover, revm `authorization_list` wiring, Prague spec gate; `authorizationList` emitted in RPC tx JSON |
 | EIP-155 chain-ID replay protection | ✅ | ✅ | — |
 | `allow_unprotected_txs` policy | rejects pre-EIP-155 by default | 🟡 | verify unprotected legacy txs are rejected at `validate` |
 | secp256k1 sender recovery | ✅ | ✅ | — |
@@ -97,7 +100,7 @@ unwired — EVM history superseded it for the `eth_*` surface.
 | Genesis `alloc` (accounts/code/storage) | ✅ | ✅ | `evm.alloc` section wired in both single-node and devnet assembly (balance/nonce/code/storage) |
 | `access_control` — permissioned create/call whitelists | ✅ | ❌ | optional; needed only for permissioned-deployment chains |
 | `extra_eips` / custom opcode hooks | ✅ | ❌ | out of scope — revm fork schedule is fixed at compile time |
-| Historical state queries (`history_serve_window`, default 8192) | ✅ | ❌ | **architectural gap** — state DB is mutable, no versioned reads; needs snapshot-per-window or versioned store |
+| Historical state queries (`history_serve_window`, default 8192) | ✅ | ✅ | versioned reads via first-write-wins per-block undo (`versioned.rs`) over the same 8192-block window; `StateView` overlay serves balance/nonce/code/storage/`eth_call` at `h ∈ [floor−1, latest]` |
 
 ## 3. Precompiles
 
@@ -142,10 +145,10 @@ native message path** — no unchecked debits.
 
 | Capability | cosmos-evm | Oxide | Gap |
 |---|---|---|---|
-| Canonical block store | CometBFT blockstore + `BlockResults` | 🟡 | `evm::history` retains the last 8192 sealed EVM blocks (hash/height/tx indexed) — bounded, in-memory, not durable across restarts |
+| Canonical block store | CometBFT blockstore + `BlockResults` | ✅ | `evm::history` retains the last 8192 sealed EVM blocks (hash/height/tx indexed) **and persists across restart** — records flush to the storage backend in the same atomic per-block batch as account state |
 | Tx index | `KVIndexer` (hash→(h,i), (h,i)→tx) | ✅ | `tx_hash → (height, index)` in `evm::history` for the retained window |
 | Receipt/log persistence | per-block logs+bloom in store; receipts via indexer | ✅ | receipts + logs + blooms retained per block in `evm::history`; `eth_getLogs`/`eth_getBlockReceipts` serve them |
-| Historical state | `history_serve_window` 8192; EIP-2935 for BLOCKHASH | ❌ | no versioned state reads |
+| Historical state | `history_serve_window` 8192; EIP-2935 for BLOCKHASH | ✅ | versioned undo window (default 8192) serves balance/nonce/code/storage/`eth_call`/proofs at retained heights — persisted across restart alongside history |
 | State sync / snapshots | SDK snapshot-interval + keep-recent | 🟡 | snapshot export/import + `/snapshot` endpoint exist; no interval/retention policy, no state-sync bootstrap protocol |
 | Pruning | SDK strategies (default/nothing/everything/custom) | ❌ | no pruning policy for journal/history |
 | Archive-node recipe | documented config combo | ❌ | needs the stores above first |
@@ -250,20 +253,30 @@ surface is the reference for "complete L1 functionality":
    Safe proxy+singleton at canonical addresses (bytecode verified against
    mainnet `eth_getCode`); `evm.alloc` in `GenesisConfig`. Remaining:
    EIP-2935 history contract.
-10. **RPC resource limits** — 🟡 **partial**: `gas-cap` (`eth_call` +
-    `debug_traceCall` clamp to `CHAIN_BLOCK_GAS_LIMIT`), log-cap
-    (`MAX_LOG_RESULTS` = 10k on `eth_getLogs` + all filter log paths),
-    `feehistory-cap` (`MAX_FEE_HISTORY_BLOCKS` = 1,024), filter TTL
-    (300s). Remaining: `evm-timeout`, `filter-cap` on total filters,
-    `batch-request-limit`, `max-open-connections`.
+10. **RPC resource limits** — 🟡 **mostly shipped**: `gas-cap` (`eth_call` +
+    `debug_traceCall` clamp to `CHAIN_BLOCK_GAS_LIMIT`), `evm-timeout`
+    (`DeadlineInspector` halts the sim interpreter on a wall-clock
+    deadline; consensus path unaffected), log-cap (`MAX_LOG_RESULTS` =
+    10k on `eth_getLogs` + all filter log paths), `feehistory-cap`
+    (`MAX_FEE_HISTORY_BLOCKS` = 1,024), filter TTL (300s),
+    `batch-request-limit` (`MAX_BATCH_REQUESTS` = 1,024 per JSON array),
+    `max-open-connections` (listener-level accept bound). Remaining:
+    `filter-cap` on total filters, `http-timeout`.
 
 ### P2 — conformance and completeness
 
-11. **Historical state queries** — versioned reads over a serve window
-    (cosmos-evm's `history_serve_window`≈8192 is a sane default); enables
-    `eth_call`/`eth_getBalance`/`eth_getStorageAt` at past heights and
-    `eth_getProof`.
-12. **`eth_getProof`** — Merkle proofs over the state trie.
+11. ~~**Historical state queries**~~ — **shipped**: first-write-wins
+    per-block undo (`versioned.rs`) indexed per-account over the
+    `history_serve_window` (default 8192); `StateView` overlay serves
+    balance/nonce/code/storage and full `eth_call`/`estimateGas`/
+    `traceCall`/`createAccessList` simulations at `h ∈ [floor−1, latest]`;
+    too-new → `header not found`, pruned → `missing trie node` (geth's
+    strings). Persisted across restart with history.
+12. ~~**`eth_getProof`**~~ — **shipped**: EIP-1186 account + storage
+    proofs at any retained height; the account/storage tries are rebuilt
+    at the versioned view while `ProofRetainer` keeps the path nodes;
+    non-inclusion proofs included; parity tests verify nodes against the
+    sealed state root.
 13. ~~**`debug_trace*` namespace**~~ — **shipped**: callTracer via revm
     inspector composition (`(NativeJournalInspector, CallRecorder)`
     tuple); `debug_traceTransaction`/`traceCall`/`traceBlockByNumber`/
@@ -275,8 +288,11 @@ surface is the reference for "complete L1 functionality":
     `content`/`contentFrom`/`inspect` over a `TxpoolProvider` trait so
     the RPC crate stays executor-agnostic (validator wires the impl);
     pending/queued split follows the mempool's nonce-gap queues.
-15. **EIP-7702 SetCodeTx** — parse type-4 + authorization lists (revm
-    supports; wire decode + spec gate).
+15. ~~**EIP-7702 SetCodeTx**~~ — **shipped**: `TxEip7702` +
+    `TxAuthorization` RLP decode/encode/recover (type `0x04`, `0x05`
+    authorization domain), revm `authorization_list` wiring, Prague spec
+    gate, `authorizationList` in RPC tx JSON; delegated-EOA execution
+    verified end-to-end.
 16. **EIP-712 signing for native module txs** — MetaMask-signable staking/
     exchange messages.
 17. **ERC20 facade over bank denoms** — dynamic precompile per denom

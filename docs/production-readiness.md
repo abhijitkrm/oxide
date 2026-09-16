@@ -428,21 +428,31 @@ imported → catches up. `/validator-set` returns current set.
    300s TTL), `newPendingTransactions` push, `txpool_status`/
    `content`/`inspect` over the mempool's nonce-gap queues, and
    `debug_trace*` (callTracer captured at execution time into
-   `evm::history`). **Remaining (P2):** historical state window,
-   `eth_getProof`, `eth_createAccessList`,
-   EIP-7702, the remaining RPC resource limits (`evm-timeout`,
-   `batch-request-limit`, `max-open-connections`), and persistent
-   history across restart.
+   `evm::history`). **P2 resolved:** versioned historical-state
+   window (first-write-wins undo; all gated reads honor tags/
+   numbers/EIP-1898 at retained heights), `eth_getProof`
+   (EIP-1186 account+storage proofs, non-inclusion included),
+   `eth_createAccessList` (geth accessListTracer semantics),
+   EIP-7702 type-4 transactions (decode/sign/recover/execute +
+   Prague gate), the remaining RPC resource limits (wall-clock
+   `evm-timeout` on sim paths, 1,024 batch-request cap,
+   max-open-connections listener bound), and durable
+   `evm::history` — sealed blocks + the undo window flush to the
+   storage backend in the atomic per-block batch and restore on
+   restart with parent linkage intact.
 
 **Next action:** External security audit and public multi-machine
 testnet deployment. The codebase now has all the infrastructure a
 testnet needs: mTLS, WAL persistence, snapshot persistence, genesis
 loading (incl. EVM alloc + canonical preinstalls), key rotation,
 validator add/remove, a real `eth_*` RPC surface over HTTP **and
-WebSocket** (blocks/txs/receipts/logs/call/estimate/feeHistory,
+WebSocket** (blocks/txs/receipts/logs/call/estimate/feeHistory at
+current **and historical** heights, EIP-1186 proofs, access lists,
 `eth_subscribe` `newHeads`/`logs`/`newPendingTransactions` pushes,
 pollable filters, `txpool_*` inspection, and `debug_trace*`
-callTracer output), tx gossip, and graceful shutdown. Remaining
-P2 items in `docs/evm-parity-gap-analysis.md` are `eth_getProof`,
-historical state reads, `eth_createAccessList`,
-EIP-7702, and the remaining RPC resource limits.
+callTracer output — all durable across restart), tx gossip, and
+graceful shutdown. The EVM-RPC parity gap list in
+`docs/evm-parity-gap-analysis.md` is closed out through P2; the
+only remaining rows are non-EVM (distribution, slashing, state
+sync) and minor knobs (`filter-cap`, `http-timeout`, gas-price
+oracles, `eth_estimateGas` state overrides).

@@ -687,12 +687,28 @@ impl NativePrecompiles {
         journal: Rc<RefCell<NativeJournal>>,
     ) -> Self {
         let eth = EthPrecompiles::new(spec);
+        let warm = Self::warm_with_native(&eth);
+        Self { eth, warm, reader, staking: None, journal, read_only: false }
+    }
+
+    /// `eth`'s warm set unioned with every native precompile. These
+    /// are the addresses geth's access-list tracer treats as
+    /// protocol-warmed and excludes from `eth_createAccessList`
+    /// output.
+    fn warm_with_native(eth: &EthPrecompiles) -> AddressSet {
         let mut warm = AddressSet::default();
         warm.clone_from(eth.warm_addresses());
         for &(module_id, op_id) in NATIVE_PRECOMPILES {
             warm.insert(revm::primitives::Address::from(precompile_address(module_id, op_id).0));
         }
-        Self { eth, warm, reader, staking: None, journal, read_only: false }
+        warm
+    }
+
+    /// The warm address set for `spec` without constructing a
+    /// provider — for `eth_createAccessList`'s exclusion set.
+    #[must_use]
+    pub fn warm_addresses_for(spec: SpecId) -> AddressSet {
+        Self::warm_with_native(&EthPrecompiles::new(spec))
     }
 
     /// Wire the staking module so `0x0C_*` precompiles can mutate
@@ -731,12 +747,7 @@ where
             spec,
         );
         if changed {
-            self.warm.clone_from(self.eth.warm_addresses());
-            for &(module_id, op_id) in NATIVE_PRECOMPILES {
-                self.warm.insert(revm::primitives::Address::from(
-                    precompile_address(module_id, op_id).0,
-                ));
-            }
+            self.warm = Self::warm_with_native(&self.eth);
         }
         changed
     }

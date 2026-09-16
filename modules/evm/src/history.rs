@@ -108,8 +108,13 @@ pub struct StoredTx {
     pub value: U256,
     /// Calldata / initcode bytes.
     pub input: Vec<u8>,
-    /// EIP-2718 transaction type (0=legacy, 1=EIP-2930, 2=EIP-1559).
+    /// EIP-2718 transaction type (0=legacy, 1=EIP-2930, 2=EIP-1559,
+    /// 4=EIP-7702).
     pub tx_type: u8,
+    /// The EIP-7702 authorization list — empty for every other type.
+    /// Retained verbatim so `eth_getTransaction*` can return the
+    /// `authorizationList` field geth/reth emit for type-4 txs.
+    pub authorization_list: Vec<tx::TxAuthorization>,
     /// `v`, `r`, `s` signature components — needed verbatim for the
     /// `eth_getTransactionByHash` response. For typed txs `v` is the
     /// `y_parity` (0/1); for legacy it is the full EIP-155 `v`
@@ -320,6 +325,10 @@ impl History {
     ///
     /// `state_root` is the module's post-execution MPT root, already
     /// computed by `end_block`'s flush/state-root path.
+    ///
+    /// Returns the heights evicted by the retention window — the
+    /// caller (`end_block`) issues matching backend `Delete`s so the
+    /// persisted records track the in-memory window exactly.
     pub fn seal_block(
         &mut self,
         number: u64,
@@ -328,7 +337,7 @@ impl History {
         base_fee: u64,
         coinbase: Address,
         state_root: B256,
-    ) {
+    ) -> Vec<u64> {
         let pending = std::mem::take(&mut self.pending);
         let cumulative = Receipt::cumulative_gas(&pending.receipts);
         let gas_used = cumulative.last().copied().unwrap_or(0);
@@ -375,12 +384,32 @@ impl History {
         block.hash = block_hash(&block);
         self.hash_index.insert(block.hash, number);
         self.blocks.insert(number, block);
-        self.evict();
+        self.evict()
+    }
+
+    /// Insert a previously-persisted block record on startup —
+    /// [`seal_block`] without recomputing the hash (the record's
+    /// hash is authoritative: it was derived from the same fields
+    /// by the writer). Rebuilds the tx/hash indexes and applies the
+    /// retention window.
+    ///
+    /// Returns evicted heights like `seal_block`; on restore the
+    /// caller deletes the corresponding backend records so stale
+    /// on-disk entries don't outlive the window.
+    pub fn restore_block(&mut self, block: ExecutedBlock) -> Vec<u64> {
+        for (i, tx) in block.txs.iter().enumerate() {
+            self.tx_index.insert(tx.hash, (block.number, u32::try_from(i).unwrap_or(u32::MAX)));
+        }
+        self.hash_index.insert(block.hash, block.number);
+        self.blocks.insert(block.number, block);
+        self.evict()
     }
 
     /// Drop the oldest sealed blocks beyond `capacity`, removing their
-    /// transaction and block-hash index entries.
-    fn evict(&mut self) {
+    /// transaction and block-hash index entries. Returns the evicted
+    /// heights (ascending).
+    fn evict(&mut self) -> Vec<u64> {
+        let mut evicted = Vec::new();
         while self.blocks.len() > self.capacity {
             // `BTreeMap` iterates ascending — `first_key_value` is the
             // oldest (lowest) height.
@@ -392,16 +421,25 @@ impl History {
                 }
                 self.blocks.remove(&height);
                 self.hash_index.remove(&hash);
+                evicted.push(height);
             } else {
                 break;
             }
         }
+        evicted
     }
 
     /// The highest sealed block height, if any.
     #[must_use]
     pub fn latest(&self) -> Option<u64> {
         self.blocks.keys().next_back().copied()
+    }
+
+    /// The lowest sealed block height — the retention floor the
+    /// versioned-state window prunes to.
+    #[must_use]
+    pub fn blocks_floor(&self) -> Option<u64> {
+        self.blocks.keys().next().copied()
     }
 
     /// Look up a sealed block by height.
@@ -626,6 +664,7 @@ pub fn stored_tx(signed: &tx::SignedTx, from: Address, hash: B256, tx_index: u32
         tx::SignedTx::Legacy(t, s) => (t.fields.to, s),
         tx::SignedTx::Eip2930(t, s) => (t.fields.to, s),
         tx::SignedTx::Eip1559(t, s) => (t.fields.to, s),
+        tx::SignedTx::Eip7702(t, s) => (t.fields.to, s),
     };
     let to = match to {
         tx::TxKind::Call(addr) => Some(addr),
@@ -658,6 +697,7 @@ pub fn stored_tx(signed: &tx::SignedTx, from: Address, hash: B256, tx_index: u32
         value: signed.value(),
         input: signed.data().to_vec(),
         tx_type: signed.tx_type(),
+        authorization_list: signed.authorization_list().to_vec(),
         v,
         r: sig.r,
         s: sig.s,
@@ -697,6 +737,7 @@ mod tests {
             value: U256::ZERO,
             input: Vec::new(),
             tx_type: 0,
+            authorization_list: Vec::new(),
             v: U256::ZERO,
             r: U256::ZERO,
             s: U256::ZERO,

@@ -1,16 +1,18 @@
 //! Signed EVM transaction types (Phase A).
 //!
-//! This module implements the three Ethereum transaction types:
-//! Legacy (pre-EIP-155 and EIP-155), EIP-2930 (access lists), and
-//! EIP-1559 (base fee + priority fee). Each type is RLP-encoded per
-//! the Ethereum spec and carries a secp256k1 signature for sender
-//! recovery.
+//! This module implements the four Ethereum transaction types:
+//! Legacy (pre-EIP-155 and EIP-155), EIP-2930 (access lists),
+//! EIP-1559 (base fee + priority fee), and EIP-7702 (set-code
+//! transactions carrying an authorization list). Each type is
+//! RLP-encoded per the Ethereum spec and carries a secp256k1
+//! signature for sender recovery.
 //!
 //! # Reference
 //!
 //! - EIP-155: Simple replay attack protection (chain ID in v).
 //! - EIP-2930: Optional access lists with type prefix `0x01`.
 //! - EIP-1559: Fee market change with type prefix `0x02`.
+//! - EIP-7702: Set EOA account code with type prefix `0x04`.
 //!
 //! reth is the canonical reference for encoding/decoding behavior.
 //!
@@ -26,6 +28,12 @@
 //!   value, data, access_list, y_parity, r, s])`.
 //! - EIP-1559: `0x02 || rlp([chain_id, nonce, max_priority_fee, max_fee,
 //!   gas_limit, to, value, data, access_list, y_parity, r, s])`.
+//! - EIP-7702: `0x04 || rlp([chain_id, nonce, max_priority_fee, max_fee,
+//!   gas_limit, destination, value, data, access_list,
+//!   authorization_list, y_parity, r, s])`, where `destination` is a
+//!   mandatory 20-byte address (7702 forbids contract creation) and
+//!   `authorization_list` is `[[chain_id, address, nonce, y_parity, r,
+//!   s], ...]`.
 
 use alloy_rlp::{BufMut, Decodable, Encodable, Header};
 use crypto::secp::{self, RecoveryId};
@@ -251,6 +259,179 @@ fn decode_access_list(buf: &mut &[u8]) -> alloy_rlp::Result<AccessList> {
     Ok(items)
 }
 
+// ── EIP-7702 authorization ───────────────────────────────────────────
+
+/// The EIP-7702 "MAGIC" byte that prefixes the authorization signing
+/// payload, domain-separating authority signatures from transaction
+/// signatures (`keccak256(0x05 || rlp([chain_id, address, nonce]))`).
+const EIP7702_MAGIC: u8 = 0x05;
+
+/// A signed EIP-7702 authorization tuple.
+///
+/// On the wire each entry is `rlp([chain_id, address, nonce, y_parity,
+/// r, s])`. The `sig` field carries the authority's signature over
+/// `0x05 || rlp([chain_id, address, nonce])`; the recovered signer is
+/// the *authority* whose account gets delegated to `address`.
+///
+/// Per EIP-7702, `chain_id == 0` authorizes on any chain (the
+/// signature is chain-agnostic); a non-zero chain ID binds the
+/// authorization to that chain only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxAuthorization {
+    /// The chain the authorization is valid on (0 = any chain).
+    pub chain_id: U256,
+    /// The delegation target — the authority's account code becomes
+    /// `0xef0100 || address` while the authorization is in effect.
+    pub address: Address,
+    /// The authority's nonce at signing time. The authorization is
+    /// invalid once the authority's nonce advances past this value.
+    pub nonce: u64,
+    /// The authority's secp256k1 signature (`y_parity`, `r`, `s`).
+    pub sig: TxSignature,
+}
+
+impl TxAuthorization {
+    /// The EIP-7702 authorization signing hash:
+    /// `keccak256(0x05 || rlp([chain_id, address, nonce]))`.
+    ///
+    /// The 0x05 domain byte ensures an authorization signature can
+    /// never be reinterpreted as a transaction signature and vice
+    /// versa.
+    #[must_use]
+    pub fn signing_hash(chain_id: U256, address: Address, nonce: u64) -> [u8; 32] {
+        let payload_len =
+            u256_length(&chain_id) + address.length() + u256_length(&U256::from(nonce));
+        let mut buf = Vec::with_capacity(1 + payload_len + 8);
+        buf.push(EIP7702_MAGIC);
+        Header { list: true, payload_length: payload_len }.encode(&mut buf);
+        encode_u256(&chain_id, &mut buf);
+        address.encode(&mut buf);
+        encode_u256(&U256::from(nonce), &mut buf);
+        crypto::secp::keccak256(&buf)
+    }
+
+    /// Sign an authorization tuple, producing the signed entry for a
+    /// type-4 transaction's `authorization_list`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`secp::SecpError`] if the private key is invalid.
+    pub fn sign(
+        chain_id: U256,
+        address: Address,
+        nonce: u64,
+        privkey: &[u8],
+    ) -> Result<Self, secp::SecpError> {
+        let hash = Self::signing_hash(chain_id, address, nonce);
+        let sig = secp::sign(privkey, &hash)?;
+        Ok(Self { chain_id, address, nonce, sig: sig_to_txsig(&sig) })
+    }
+
+    /// Recover the *authority* — the EOA whose account this
+    /// authorization delegates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`secp::SecpError`] if the signature is invalid.
+    pub fn recover_authority(&self) -> Result<Address, secp::SecpError> {
+        let hash = Self::signing_hash(self.chain_id, self.address, self.nonce);
+        let r = self.sig.r.to_be_bytes::<32>();
+        let s = self.sig.s.to_be_bytes::<32>();
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&r);
+        sig_bytes[32..].copy_from_slice(&s);
+        let recovered = secp::recover_sender(&hash, &sig_bytes, self.sig.recid.as_u8())?;
+        Ok(Address::from(recovered.0))
+    }
+}
+
+/// Encode one authorization tuple: `rlp([chain_id, address, nonce,
+/// y_parity, r, s])`.
+fn encode_authorization(auth: &TxAuthorization, out: &mut dyn BufMut) {
+    let payload_len = u256_length(&auth.chain_id)
+        + auth.address.length()
+        + u256_length(&U256::from(auth.nonce))
+        + u256_length(&U256::from(auth.sig.recid.as_u8()))
+        + u256_length(&auth.sig.r)
+        + u256_length(&auth.sig.s);
+    Header { list: true, payload_length: payload_len }.encode(out);
+    encode_u256(&auth.chain_id, out);
+    auth.address.encode(out);
+    encode_u256(&U256::from(auth.nonce), out);
+    encode_u256(&U256::from(auth.sig.recid.as_u8()), out);
+    encode_u256(&auth.sig.r, out);
+    encode_u256(&auth.sig.s, out);
+}
+
+/// Length of one encoded authorization tuple.
+fn authorization_length(auth: &TxAuthorization) -> usize {
+    let payload_len = u256_length(&auth.chain_id)
+        + auth.address.length()
+        + u256_length(&U256::from(auth.nonce))
+        + u256_length(&U256::from(auth.sig.recid.as_u8()))
+        + u256_length(&auth.sig.r)
+        + u256_length(&auth.sig.s);
+    Header { list: true, payload_length: payload_len }.length() + payload_len
+}
+
+/// Encode an authorization list: `rlp([[chain_id, address, nonce,
+/// y_parity, r, s], ...])`.
+fn encode_authorization_list(list: &[TxAuthorization], out: &mut dyn BufMut) {
+    let payload_len: usize = list.iter().map(authorization_length).sum();
+    Header { list: true, payload_length: payload_len }.encode(out);
+    for auth in list {
+        encode_authorization(auth, out);
+    }
+}
+
+/// Length of an encoded authorization list.
+fn authorization_list_length(list: &[TxAuthorization]) -> usize {
+    let payload_len: usize = list.iter().map(authorization_length).sum();
+    Header { list: true, payload_length: payload_len }.length() + payload_len
+}
+
+/// Decode an authorization list from RLP.
+///
+/// The payload is decoded inside a bounded sub-slice so a malformed
+/// inner tuple cannot consume bytes belonging to subsequent
+/// transaction fields.
+fn decode_authorization_list(buf: &mut &[u8]) -> alloy_rlp::Result<Vec<TxAuthorization>> {
+    let header = Header::decode(buf)?;
+    if !header.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    let payload_len = header.payload_length;
+    if buf.len() < payload_len {
+        return Err(alloy_rlp::Error::InputTooShort);
+    }
+    let mut remaining = &buf[..payload_len];
+    let mut list = Vec::new();
+    while !remaining.is_empty() {
+        let item_header = Header::decode(&mut remaining)?;
+        if !item_header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let item_payload = item_header.payload_length;
+        if remaining.len() < item_payload {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
+        let mut item_buf = &remaining[..item_payload];
+        let chain_id = decode_u256(&mut item_buf)?;
+        let address = Address::decode(&mut item_buf)?;
+        let nonce = u256_to_u64(decode_u256(&mut item_buf)?)?;
+        let recid = SignedTx::decode_recid(&mut item_buf)?;
+        let r = decode_u256(&mut item_buf)?;
+        let s = decode_u256(&mut item_buf)?;
+        if !item_buf.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        list.push(TxAuthorization { chain_id, address, nonce, sig: TxSignature { r, s, recid } });
+        remaining = &remaining[item_payload..];
+    }
+    *buf = &buf[payload_len..];
+    Ok(list)
+}
+
 // ── Signature ────────────────────────────────────────────────────────
 
 /// An ECDSA signature: `r`, `s`, and a recovery ID (`y_parity`).
@@ -317,11 +498,32 @@ pub struct TxEip1559 {
     pub access_list: AccessList,
 }
 
+/// EIP-7702 "set code" transaction: EIP-1559 fee fields plus an
+/// authorization list of signed delegation tuples.
+///
+/// The destination is a mandatory call target — EIP-7702 forbids
+/// contract creation, so `fields.to` is always [`TxKind::Call`]
+/// (enforced at decode time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxEip7702 {
+    /// Shared fields (`to` is always `Call` per EIP-7702).
+    pub fields: TxFields,
+    /// The maximum priority fee per gas (tip, in wei).
+    pub max_priority_fee_per_gas: U256,
+    /// The maximum total fee per gas (tip + base fee, in wei).
+    pub max_fee_per_gas: U256,
+    /// The access list (EIP-2930).
+    pub access_list: AccessList,
+    /// The signed authorization list (EIP-7702). Non-empty per spec;
+    /// enforced at decode time.
+    pub authorization_list: Vec<TxAuthorization>,
+}
+
 // ── SignedTx ─────────────────────────────────────────────────────────
 
 /// A signed EVM transaction. The type prefix byte determines the
 /// variant: no prefix (or >= 0xc0) = Legacy, 0x01 = EIP-2930,
-/// 0x02 = EIP-1559.
+/// 0x02 = EIP-1559, 0x04 = EIP-7702.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignedTx {
     /// Legacy transaction (pre-EIP-155 or EIP-155).
@@ -330,11 +532,19 @@ pub enum SignedTx {
     Eip2930(TxEip2930, TxSignature),
     /// EIP-1559 transaction (base fee + priority fee).
     Eip1559(TxEip1559, TxSignature),
+    /// EIP-7702 transaction (set-code / delegation authorization).
+    Eip7702(TxEip7702, TxSignature),
 }
 
 /// Type prefix bytes for typed transactions (EIP-2718).
+///
+/// `0x03` (EIP-4844 blob transactions) is intentionally unassigned:
+/// blob txs require beacon-side blob data Oxide does not carry, so
+/// a `0x03` prefix still falls through to the legacy decoder and fails
+/// there — a deterministic rejection either way.
 const TX_TYPE_EIP2930: u8 = 0x01;
 const TX_TYPE_EIP1559: u8 = 0x02;
+const TX_TYPE_EIP7702: u8 = 0x04;
 
 impl SignedTx {
     /// Sign a legacy transaction with the given private key and return
@@ -368,6 +578,21 @@ impl SignedTx {
         let signing_hash = temp.signing_hash();
         let sig = secp::sign(privkey, &signing_hash)?;
         Ok(Self::Eip1559(tx, sig_to_txsig(&sig)))
+    }
+
+    /// Sign an EIP-7702 transaction with the given private key and
+    /// return the signed transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`secp::SecpError`] if the private key is invalid or
+    /// signing fails.
+    pub fn sign_eip7702(tx: TxEip7702, privkey: &[u8]) -> Result<Self, secp::SecpError> {
+        let dummy_sig = TxSignature { r: U256::ZERO, s: U256::ZERO, recid: RecoveryId::new(0) };
+        let temp = Self::Eip7702(tx.clone(), dummy_sig);
+        let signing_hash = temp.signing_hash();
+        let sig = secp::sign(privkey, &signing_hash)?;
+        Ok(Self::Eip7702(tx, sig_to_txsig(&sig)))
     }
 
     /// Decode a signed transaction from raw RLP bytes.
@@ -416,11 +641,13 @@ impl SignedTx {
             Self::Legacy(tx, _) => tx.fields.chain_id,
             Self::Eip2930(tx, _) => tx.fields.chain_id,
             Self::Eip1559(tx, _) => tx.fields.chain_id,
+            Self::Eip7702(tx, _) => tx.fields.chain_id,
         }
     }
 
     /// The EIP-2718 transaction type byte: `0` for legacy (implicit,
-    /// not prefixed on the wire), `1` for EIP-2930, `2` for EIP-1559.
+    /// not prefixed on the wire), `1` for EIP-2930, `2` for EIP-1559,
+    /// `4` for EIP-7702.
     /// Used by the receipts root to prefix typed receipts per
     /// EIP-2718 (a typed tx's receipt is `type_byte || rlp(...)`).
     #[must_use]
@@ -429,6 +656,7 @@ impl SignedTx {
             Self::Legacy(_, _) => 0,
             Self::Eip2930(_, _) => TX_TYPE_EIP2930,
             Self::Eip1559(_, _) => TX_TYPE_EIP1559,
+            Self::Eip7702(_, _) => TX_TYPE_EIP7702,
         }
     }
 
@@ -439,6 +667,7 @@ impl SignedTx {
             Self::Legacy(tx, _) => tx.fields.nonce,
             Self::Eip2930(tx, _) => tx.fields.nonce,
             Self::Eip1559(tx, _) => tx.fields.nonce,
+            Self::Eip7702(tx, _) => tx.fields.nonce,
         }
     }
 
@@ -449,6 +678,7 @@ impl SignedTx {
             Self::Legacy(tx, _) => tx.fields.gas_limit,
             Self::Eip2930(tx, _) => tx.fields.gas_limit,
             Self::Eip1559(tx, _) => tx.fields.gas_limit,
+            Self::Eip7702(tx, _) => tx.fields.gas_limit,
         }
     }
 
@@ -459,6 +689,7 @@ impl SignedTx {
             Self::Legacy(tx, _) => tx.fields.to,
             Self::Eip2930(tx, _) => tx.fields.to,
             Self::Eip1559(tx, _) => tx.fields.to,
+            Self::Eip7702(tx, _) => tx.fields.to,
         }
     }
 
@@ -469,6 +700,7 @@ impl SignedTx {
             Self::Legacy(tx, _) => tx.fields.value,
             Self::Eip2930(tx, _) => tx.fields.value,
             Self::Eip1559(tx, _) => tx.fields.value,
+            Self::Eip7702(tx, _) => tx.fields.value,
         }
     }
 
@@ -479,6 +711,7 @@ impl SignedTx {
             Self::Legacy(tx, _) => &tx.fields.data,
             Self::Eip2930(tx, _) => &tx.fields.data,
             Self::Eip1559(tx, _) => &tx.fields.data,
+            Self::Eip7702(tx, _) => &tx.fields.data,
         }
     }
 
@@ -491,6 +724,7 @@ impl SignedTx {
             Self::Legacy(tx, _) => tx.gas_price,
             Self::Eip2930(tx, _) => tx.gas_price,
             Self::Eip1559(tx, _) => tx.max_fee_per_gas,
+            Self::Eip7702(tx, _) => tx.max_fee_per_gas,
         }
     }
 
@@ -502,6 +736,7 @@ impl SignedTx {
             Self::Legacy(tx, _) => tx.gas_price,
             Self::Eip2930(tx, _) => tx.gas_price,
             Self::Eip1559(tx, _) => tx.max_priority_fee_per_gas,
+            Self::Eip7702(tx, _) => tx.max_priority_fee_per_gas,
         }
     }
 
@@ -512,6 +747,16 @@ impl SignedTx {
             Self::Legacy(_, _) => &EMPTY_ACCESS_LIST_VEC,
             Self::Eip2930(tx, _) => &tx.access_list,
             Self::Eip1559(tx, _) => &tx.access_list,
+            Self::Eip7702(tx, _) => &tx.access_list,
+        }
+    }
+
+    /// The EIP-7702 authorization list (empty for all other types).
+    #[must_use]
+    pub fn authorization_list(&self) -> &[TxAuthorization] {
+        match self {
+            Self::Eip7702(tx, _) => &tx.authorization_list,
+            _ => &[],
         }
     }
 
@@ -623,6 +868,30 @@ impl SignedTx {
                 tx.fields.data.encode(&mut buf);
                 encode_access_list(&tx.access_list, &mut buf);
             }
+            Self::Eip7702(tx, _) => {
+                buf.push(TX_TYPE_EIP7702);
+                let payload_len = u256_length(&U256::from(tx.fields.chain_id))
+                    + u256_length(&U256::from(tx.fields.nonce))
+                    + u256_length(&tx.max_priority_fee_per_gas)
+                    + u256_length(&tx.max_fee_per_gas)
+                    + u256_length(&U256::from(tx.fields.gas_limit))
+                    + tx.fields.to.length()
+                    + u256_length(&tx.fields.value)
+                    + tx.fields.data.length()
+                    + access_list_length(&tx.access_list)
+                    + authorization_list_length(&tx.authorization_list);
+                Header { list: true, payload_length: payload_len }.encode(&mut buf);
+                encode_u256(&U256::from(tx.fields.chain_id), &mut buf);
+                encode_u256(&U256::from(tx.fields.nonce), &mut buf);
+                encode_u256(&tx.max_priority_fee_per_gas, &mut buf);
+                encode_u256(&tx.max_fee_per_gas, &mut buf);
+                encode_u256(&U256::from(tx.fields.gas_limit), &mut buf);
+                tx.fields.to.encode(&mut buf);
+                encode_u256(&tx.fields.value, &mut buf);
+                tx.fields.data.encode(&mut buf);
+                encode_access_list(&tx.access_list, &mut buf);
+                encode_authorization_list(&tx.authorization_list, &mut buf);
+            }
         }
         buf
     }
@@ -630,7 +899,10 @@ impl SignedTx {
     /// The 64-byte compact signature (r ‖ s).
     fn signature_bytes(&self) -> [u8; 64] {
         let sig = match self {
-            Self::Legacy(_, s) | Self::Eip2930(_, s) | Self::Eip1559(_, s) => s,
+            Self::Legacy(_, s)
+            | Self::Eip2930(_, s)
+            | Self::Eip1559(_, s)
+            | Self::Eip7702(_, s) => s,
         };
         let r_bytes = sig.r.to_be_bytes::<32>();
         let s_bytes = sig.s.to_be_bytes::<32>();
@@ -643,7 +915,10 @@ impl SignedTx {
     /// The recovery ID (0 or 1).
     fn recid(&self) -> u8 {
         match self {
-            Self::Legacy(_, s) | Self::Eip2930(_, s) | Self::Eip1559(_, s) => s.recid.as_u8(),
+            Self::Legacy(_, s)
+            | Self::Eip2930(_, s)
+            | Self::Eip1559(_, s)
+            | Self::Eip7702(_, s) => s.recid.as_u8(),
         }
     }
 }
@@ -753,7 +1028,45 @@ impl Encodable for SignedTx {
                 encode_u256(&sig.r, out);
                 encode_u256(&sig.s, out);
             }
+            Self::Eip7702(tx, sig) => Self::encode_eip7702(tx, sig, out),
         }
+    }
+}
+
+impl SignedTx {
+    /// Encode a signed EIP-7702 transaction:
+    /// `0x04 || rlp([chain_id, nonce, max_priority_fee, max_fee,
+    /// gas_limit, destination, value, data, access_list,
+    /// authorization_list, y_parity, r, s])`.
+    fn encode_eip7702(tx: &TxEip7702, sig: &TxSignature, out: &mut dyn BufMut) {
+        out.put_u8(TX_TYPE_EIP7702);
+        let payload_len = u256_length(&U256::from(tx.fields.chain_id))
+            + u256_length(&U256::from(tx.fields.nonce))
+            + u256_length(&tx.max_priority_fee_per_gas)
+            + u256_length(&tx.max_fee_per_gas)
+            + u256_length(&U256::from(tx.fields.gas_limit))
+            + tx.fields.to.length()
+            + u256_length(&tx.fields.value)
+            + tx.fields.data.length()
+            + access_list_length(&tx.access_list)
+            + authorization_list_length(&tx.authorization_list)
+            + u256_length(&U256::from(sig.recid.as_u8())) // y_parity
+            + u256_length(&sig.r)
+            + u256_length(&sig.s);
+        Header { list: true, payload_length: payload_len }.encode(out);
+        encode_u256(&U256::from(tx.fields.chain_id), out);
+        encode_u256(&U256::from(tx.fields.nonce), out);
+        encode_u256(&tx.max_priority_fee_per_gas, out);
+        encode_u256(&tx.max_fee_per_gas, out);
+        encode_u256(&U256::from(tx.fields.gas_limit), out);
+        tx.fields.to.encode(out);
+        encode_u256(&tx.fields.value, out);
+        tx.fields.data.encode(out);
+        encode_access_list(&tx.access_list, out);
+        encode_authorization_list(&tx.authorization_list, out);
+        encode_u256(&U256::from(sig.recid.as_u8()), out);
+        encode_u256(&sig.r, out);
+        encode_u256(&sig.s, out);
     }
 }
 
@@ -769,6 +1082,8 @@ impl Decodable for SignedTx {
             Self::decode_eip2930(buf)
         } else if first_byte == TX_TYPE_EIP1559 {
             Self::decode_eip1559(buf)
+        } else if first_byte == TX_TYPE_EIP7702 {
+            Self::decode_eip7702(buf)
         } else {
             Self::decode_legacy(buf)
         }
@@ -860,6 +1175,59 @@ impl SignedTx {
                 max_priority_fee_per_gas: max_priority_fee,
                 max_fee_per_gas: max_fee,
                 access_list,
+            },
+            TxSignature { r, s, recid },
+        ))
+    }
+
+    /// Decode an EIP-7702 typed transaction.
+    ///
+    /// Two spec-level constraints are enforced at decode time so a
+    /// malformed type-4 payload never reaches execution:
+    /// - `destination` is a mandatory 20-byte address — EIP-7702
+    ///   forbids contract creation, so a `Create` (empty `to`) is a
+    ///   decode error.
+    /// - `authorization_list` must be non-empty — a type-4 tx with no
+    ///   authorizations is invalid per the spec and rejected by
+    ///   geth/reth alike.
+    fn decode_eip7702(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        *buf = &buf[1..];
+        let header = Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let chain_id = decode_u256(buf)?;
+        let nonce = decode_u256(buf)?;
+        let max_priority_fee = decode_u256(buf)?;
+        let max_fee = decode_u256(buf)?;
+        let gas_limit = decode_u256(buf)?;
+        // EIP-7702: `to` is a mandatory address, not TxKind — an
+        // empty-string `to` (Create) fails Address::decode.
+        let to = Address::decode(buf)?;
+        let value = decode_u256(buf)?;
+        let data = Bytes::decode(buf)?;
+        let access_list = decode_access_list(buf)?;
+        let authorization_list = decode_authorization_list(buf)?;
+        if authorization_list.is_empty() {
+            return Err(alloy_rlp::Error::Custom("empty authorization list"));
+        }
+        let recid = Self::decode_recid(buf)?;
+        let r = decode_u256(buf)?;
+        let s = decode_u256(buf)?;
+        Ok(Self::Eip7702(
+            TxEip7702 {
+                fields: TxFields {
+                    nonce: u256_to_u64(nonce)?,
+                    gas_limit: u256_to_u64(gas_limit)?,
+                    to: TxKind::Call(to),
+                    value,
+                    data,
+                    chain_id: u256_to_u64(chain_id)?,
+                },
+                max_priority_fee_per_gas: max_priority_fee,
+                max_fee_per_gas: max_fee,
+                access_list,
+                authorization_list,
             },
             TxSignature { r, s, recid },
         ))
@@ -1222,5 +1590,110 @@ mod tests {
         let mut slice = buf.as_slice();
         let decoded = TxKind::decode(&mut slice).expect("decode must succeed");
         assert!(matches!(decoded, TxKind::Call(a) if a == addr));
+    }
+
+    #[test]
+    fn eip7702_tx_round_trip_and_recover() {
+        let (privkey, expected_addr) = make_signer();
+        let (auth_privkey, expected_authority) = make_signer();
+        let delegate = Address::from([0x77; 20]);
+        let auth = TxAuthorization::sign(U256::from(1), delegate, 0, &auth_privkey)
+            .expect("auth sign must succeed");
+        // The authority recovered from the tuple is the signing EOA.
+        assert_eq!(
+            auth.recover_authority().expect("authority recovery"),
+            Address::from(expected_authority.0)
+        );
+        let signed = SignedTx::sign_eip7702(
+            TxEip7702 {
+                fields: TxFields {
+                    nonce: 0,
+                    gas_limit: 100_000,
+                    to: TxKind::Call(Address::from([0x42; 20])),
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    chain_id: 1,
+                },
+                max_priority_fee_per_gas: U256::from(1_000_000_000),
+                max_fee_per_gas: U256::from(2_000_000_000),
+                access_list: Vec::new(),
+                authorization_list: vec![auth],
+            },
+            &privkey,
+        )
+        .expect("7702 sign must succeed");
+        assert_eq!(signed.tx_type(), TX_TYPE_EIP7702);
+        let recovered = signed.recover_sender().expect("recover must succeed");
+        assert_eq!(recovered, expected_addr);
+        let mut encoded = Vec::new();
+        signed.encode(&mut encoded);
+        assert_eq!(encoded[0], TX_TYPE_EIP7702, "EIP-7702 tx must start with 0x04");
+        let mut buf = encoded.as_slice();
+        let decoded = SignedTx::decode(&mut buf).expect("decode must succeed");
+        assert_eq!(decoded, signed);
+        assert_eq!(decoded.authorization_list().len(), 1);
+        assert_eq!(decoded.authorization_list()[0].address, delegate);
+        // The decoded authorization still recovers the same authority.
+        assert_eq!(
+            decoded.authorization_list()[0]
+                .recover_authority()
+                .expect("authority recovery after decode"),
+            Address::from(expected_authority.0)
+        );
+    }
+
+    #[test]
+    fn eip7702_rejects_create_and_empty_auth_list() {
+        // `to` = empty string (Create) must fail Address::decode.
+        // Build the RLP manually: 0x04 || rlp([..., 0x80, ...]).
+        let mut inner = Vec::new();
+        encode_u256(&U256::from(1), &mut inner); // chain_id
+        encode_u256(&U256::ZERO, &mut inner); // nonce
+        encode_u256(&U256::from(1), &mut inner); // max_priority
+        encode_u256(&U256::from(1), &mut inner); // max_fee
+        encode_u256(&U256::from(21000), &mut inner); // gas
+        Header { list: false, payload_length: 0 }.encode(&mut inner); // to = ""
+        encode_u256(&U256::ZERO, &mut inner); // value
+        Header { list: false, payload_length: 0 }.encode(&mut inner); // data = ""
+        Header { list: true, payload_length: 0 }.encode(&mut inner); // acl = []
+        // One valid authorization so only the `to` check can fail.
+        let (auth_privkey, _) = make_signer();
+        let auth =
+            TxAuthorization::sign(U256::from(1), Address::from([0x77; 20]), 0, &auth_privkey)
+                .expect("auth sign");
+        encode_authorization_list(&[auth], &mut inner);
+        encode_u256(&U256::ZERO, &mut inner); // y_parity
+        encode_u256(&U256::from(1), &mut inner); // r
+        encode_u256(&U256::from(1), &mut inner); // s
+        let mut raw = vec![TX_TYPE_EIP7702];
+        Header { list: true, payload_length: inner.len() }.encode(&mut raw);
+        raw.extend_from_slice(&inner);
+        assert!(
+            SignedTx::decode_raw(&raw).is_err(),
+            "type-4 tx with Create destination must be rejected"
+        );
+
+        // Empty authorization list must be rejected.
+        let mut inner2 = Vec::new();
+        encode_u256(&U256::from(1), &mut inner2);
+        encode_u256(&U256::ZERO, &mut inner2);
+        encode_u256(&U256::from(1), &mut inner2);
+        encode_u256(&U256::from(1), &mut inner2);
+        encode_u256(&U256::from(21000), &mut inner2);
+        Address::from([0x42; 20]).encode(&mut inner2);
+        encode_u256(&U256::ZERO, &mut inner2);
+        Header { list: false, payload_length: 0 }.encode(&mut inner2);
+        Header { list: true, payload_length: 0 }.encode(&mut inner2); // acl
+        Header { list: true, payload_length: 0 }.encode(&mut inner2); // auths = []
+        encode_u256(&U256::ZERO, &mut inner2);
+        encode_u256(&U256::from(1), &mut inner2);
+        encode_u256(&U256::from(1), &mut inner2);
+        let mut raw2 = vec![TX_TYPE_EIP7702];
+        Header { list: true, payload_length: inner2.len() }.encode(&mut raw2);
+        raw2.extend_from_slice(&inner2);
+        assert!(
+            SignedTx::decode_raw(&raw2).is_err(),
+            "type-4 tx with empty authorization list must be rejected"
+        );
     }
 }

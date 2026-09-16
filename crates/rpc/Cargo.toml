@@ -55,6 +55,12 @@ executor = { workspace = true }
 # MIT-licensed; same workspace pins the matcher uses.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+# alloy-trie: `verify_proof` lets `eth_getProof` tests check the
+# emitted node path against the sealed block's state root — a real
+# soundness check, not just a shape check. MIT/Apache-2.0.
+alloy-trie = { workspace = true }
+# alloy-rlp: decoding proof-verification leaf values in tests.
+alloy-rlp = { workspace = true }
 
 [lints]
 workspace = true

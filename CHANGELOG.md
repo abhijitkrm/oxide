@@ -12,6 +12,72 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Historical state reads + `eth_getProof` (EIP-1186)**
+  (`modules/evm`, `crates/rpc`)
+  - A versioned state window now records first-write-wins
+    per-block undo entries, so `eth_getBalance`,
+    `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`,
+    `eth_call`, `eth_estimateGas`, `debug_traceCall`, and
+    `eth_createAccessList` all answer at any retained height —
+    block tags, hex numbers, and EIP-1898 `{blockHash}`/
+    `{blockNumber}` objects. Heights above the tip return
+    `header not found`; heights below the window return geth's
+    `missing trie node` error.
+  - `eth_getProof` returns the account's Merkle-Patricia proof
+    plus one storage proof per requested key at the requested
+    height — including proofs of non-inclusion — matching geth's
+    JSON shape (`accountProof`, `balance`, `codeHash`, `nonce`,
+    `storageHash`, `storageProof[]`).
+  - **In plain words:** block explorers, indexers, bridges, and
+    light-client tooling can now query balances/storage *as of a
+    past block* and fetch real Merkle proofs — the archive-read
+    surface geth-compatible tooling expects.
+
+- **EVM history + undo persistence across restart**
+  (`modules/evm`, `crates/storage`)
+  - Sealed `ExecutedBlock` records (headers, transactions,
+    receipts, logs, call traces) and the versioned undo window now
+    flush to the storage backend in the same atomic per-block
+    batch as account state, under dedicated namespaces. A restart
+    restores history, rebuilds the tx-hash/block-hash indexes,
+    and resumes sealing with correct parent linkage; pruning
+    keeps the in-memory and on-disk windows identical.
+  - **In plain words:** a node that restarts no longer forgets
+    every transaction and receipt it ever served — `eth_getBlock*`,
+    `eth_getTransaction*`, `eth_getLogs`, traces, and historical
+    reads all survive a crash or upgrade.
+
+- **`eth_createAccessList` + EIP-7702 SetCode transactions**
+  (`modules/evm`, `crates/rpc`)
+  - `eth_createAccessList` returns the accessed
+    addresses/storage keys and `gasUsed` with geth's
+    accessListTracer semantics: sender/recipient/coinbase/
+    precompiles are excluded at address level, but their touched
+    storage keys still appear.
+  - Type-4 (`0x04`) transactions decode, sign, recover, and
+    execute: `TxEip7702` + `TxAuthorization` RLP, secp256k1
+    recovery, revm `authorization_list` wiring, and a Prague spec
+    gate. RPC responses expose `type:"0x4"` and the
+    `authorizationList` array.
+  - **In plain words:** dapps that gas-optimize via
+    `eth_createAccessList` work, and EOAs can delegate to contract
+    code (smart-account UX) exactly as on post-Prague Ethereum.
+
+- **RPC resource limits (second tranche)** (`modules/evm`,
+  `crates/rpc`)
+  - Simulation calls (`eth_call`, `debug_traceCall`,
+    `eth_estimateGas`, `eth_createAccessList`) enforce a
+    wall-clock EVM timeout via a `DeadlineInspector` that halts
+    the interpreter mid-execution — an infinite-loop contract can
+    no longer pin a worker forever.
+  - JSON-RPC batch arrays are accepted and capped at 1,024
+    requests per batch (geth's default); the HTTP listener drops
+    accepts beyond a maximum-open-connections bound.
+  - **In plain words:** three more standard guardrails — no
+    request can burn unbounded CPU, no single connection can
+    smuggle an unbounded workload in one POST, and a flood of
+    sockets can't exhaust the node.
+
 - **`debug_trace*` namespace — callTracer over revm inspector
   composition** (`modules/evm`, `crates/rpc`)
   - `debug_traceTransaction`, `debug_traceCall`,

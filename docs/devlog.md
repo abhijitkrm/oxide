@@ -13049,3 +13049,179 @@ archive state backend. Follow-up lever if it ever matters: pool
 - `evm-timeout`, `batch-request-limit`, `max-open-connections`.
 - Persistent `evm::history` across restart (currently RAM-only —
   node restart clears the 8192-block window).
+
+## 2026-09-16 — Session: P2 tail — createAccessList, EIP-7702, resource limits, versioned state, getProof, history persistence
+
+### `eth_createAccessList` — geth-faithful touched-set accounting
+
+- Implemented in `modules/evm/src/lib.rs::create_access_list` +
+  `crates/rpc::eth_create_access_list`. Runs the call on a scratch
+  sim, reads back the touched `EvmState`, and emits the
+  `{accessList, gasUsed}` pair geth returns.
+- Semantics matched to geth's `accessListTracer`: the sender,
+  recipient, coinbase, and the native-precompile warm set are
+  excluded at *address* level but their *storage keys* still
+  appear when touched (geth's `addSlot` bypasses the exclusion
+  set); caller-provided `accessList` entries for excluded
+  addresses are dropped, not echoed. Zero slots are pruned.
+- `NativePrecompiles` gained a static `warm_addresses()` helper —
+  the exclusion set is the same table the interpreter warms, so
+  the two can never drift.
+
+### EIP-7702 SetCode transactions
+
+- `modules/evm/src/tx.rs`: `TxAuthorization` (chain_id, address,
+  nonce, y-parity, r, s) + `TxEip7702` fields, full RLP
+  encode/decode/encode_unsigned, `sign_eip7702`, and recovery —
+  type byte `0x04`, secp256k1 over `keccak(0x05 || rlp(...))` for
+  both the tx and each authorization.
+- `build_tx_env` maps the variant to revm's
+  `TxEnv{tx_type:4, authorization_list}` via
+  `Either::Right(SignedAuthorization::new_unchecked)`; the spec
+  gate rejects type-4 before Prague (`SpecId::PRAGUE` floor) at
+  the same seam as the other type gates.
+- `eth_getTransactionByHash`/receipts emit `type:"0x4"` and the
+  `authorizationList` array — reth's `TxEnvelope` JSON shape.
+- Verified end-to-end: a delegated EOA executing contract code,
+  codec round-trip, malformed-authorization rejection vectors,
+  and the raw-RPC path (`eth_sendRawTransaction` type-4 →
+  `authorizationList` round-trip).
+
+### Remaining resource limits
+
+- **EVM timeout** (`modules/evm/src/deadline.rs`):
+  `DeadlineInspector` halts the interpreter with `OutOfGas` once a
+  wall-clock deadline passes (revm reserves `FatalExternalError`
+  for DB-level aborts — it panics in post_execution). Composed as
+  a third inspector on the *simulation* EVM only — the consensus
+  path keeps the 2-tuple and pays zero. `set_sim_timeout` exposes
+  it; timeout surfaces as a bounded `execution reverted` with the
+  `timed_out` flag, never an unbounded hang.
+- **Batch requests**: the HTTP handler now accepts a JSON array,
+  caps it at `MAX_BATCH_REQUESTS` (1024, geth's default), and
+  answers an ordered array of responses; over-limit batches get a
+  single `-32600` error, not partial work.
+- **Max open connections** (`crates/rpc/src/server.rs`): a
+  `Listener` wrapper drops over-cap accepts at the socket layer
+  (bounded `MAX_OPEN_CONNECTIONS` counter, decremented on
+  connection close) — the cheap geth equivalent of its
+  `--maxconns` rlimit guard.
+
+### Versioned state window — historical reads
+
+- `modules/evm/src/versioned.rs`: first-write-wins per-block undo.
+  Before the first mutation of an account in block `h`, the
+  pre-block `DbAccount` (balance, nonce, code_hash, full storage
+  map — code bytes omitted, they persist immutably in
+  `contracts`) is captured into `BlockUndo`. `VersionedState`
+  indexes entries per-account for O(log) reads and prunes with
+  the history window.
+- `StateView` (`DatabaseRef`) overlays `latest + undo`: to answer
+  state at `h`, the earliest undo entry strictly above `h` wins;
+  absent ⇒ the account was untouched ⇒ latest value answers.
+  `Some(None)` marks provably-absent accounts.
+- Capture is wired at every main-db write site: `execute_signed`,
+  `execute_decoded` (local accumulator, first-write-wins merge),
+  the fast paths, and the parallel path's `committed_touched`
+  merge. `begin_block` resets the accumulator, `end_block` pushes.
+- Valid window: `h ∈ [floor − 1, latest]` — the undo entry *at*
+  `floor` itself is still needed to answer `floor − 1`, so it is
+  retained one block past eviction. `TooNew` → "header not found";
+  pruned → "missing trie node" (geth's exact error strings).
+- All gated reads now accept block tags/numbers/EIP-1898 objects:
+  `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
+  `eth_getStorageAt`, `eth_call`, `eth_estimateGas`,
+  `debug_traceCall`, `eth_createAccessList`. `"latest"`/`"safe"`/
+  `"finalized"`/`"pending"` resolve to the sealed tip;
+  `"earliest"` → 0. `latest_sealed_height` now prefers the EVM's
+  own servable tip over the RPC block counter — the two diverged
+  in tests that set a synthetic RPC height.
+
+### `eth_getProof` (EIP-1186)
+
+- `account_proof` rebuilds the account trie at `h` from the union
+  `latest ∪ undo-known` address set (covers accounts deleted since
+  `h`), running a `ProofRetainer` beside the `HashBuilder` to keep
+  the nodes on the target path. Storage proofs reuse one trie for
+  all requested keys. Non-inclusion returns the divergent path,
+  not an error (geth parity).
+- Storage roots at `h` come from the undo storage map when the
+  account was rewritten above `h`, else a cached latest root —
+  `storage_root_cache` (Mutex<BTreeMap>) avoids re-hashing the
+  untouched majority on every proof.
+- RPC emits geth's shape: `address`, `accountProof[]`, `balance`,
+  `codeHash`, `nonce`, `storageHash`, `storageProof[]{key,value,
+  proof[]}`. Parity tests verify proofs against the sealed block's
+  state root using `alloy_trie::proof::verify_proof` — a real
+  soundness check, not a shape check (dev-deps: alloy-trie,
+  alloy-rlp).
+
+### `evm::history` + undo persistence across restart
+
+- Two new storage namespaces: `0x02` = serialized `ExecutedBlock`
+  (header fields, full txs, receipts, logs+bloom, call traces,
+  tx-index, cumulative gas), `0x03` = serialized `BlockUndo`.
+  Height-major big-endian keys → `range()` replays in order.
+- `end_block` commits **one atomic batch**: account writes +
+  block record + undo blob + deletes for evicted/pruned heights —
+  a crash mid-commit cannot leave state and history skewed.
+  `seal_block`/`prune_below` now return the evicted heights so
+  memory and backend windows stay aligned.
+- `with_storage` restores accounts → history → undo, rebuilds the
+  tx-hash/block-hash indexes, and resumes sealing with correct
+  parent linkage. `restart_restores_history_and_versioned_state`
+  proves tx/receipt/trace/block-hash lookups, historical reads,
+  and new-block parent linkage all survive; `restart_prunes_
+  persisted_window` proves pruned heights still fail closed.
+- Codec is the repo's manual byte-cursor style (no serde dep on
+  the hot-path crate): a `Reader`/`put_*` pair per record type,
+  `read_opt` distinguishes malformed (`None`) from valid-absent
+  (`Some(None)`).
+
+### Tests
+
+- `evm` lib: +8 versioned-window tests (first-write-wins capture,
+  prune floor, historical balance/nonce/code/storage, historical
+  `eth_call` with old env, pruned-height rejection) + 2 restart
+  tests + EIP-7702 codec/delegation vectors + deadline-halt test.
+- `evm_parity.rs`: +13 — createAccessList (incl. excluded-address
+  slot inclusion), type-4 RPC round-trip, historical reads at
+  `"earliest"`/numeric heights, `eth_getProof` incl. verified
+  proofs and non-inclusion, batch-array dispatch + cap.
+- `rpc` lib: batch dispatch/cap, connection-limiter unit test.
+- 179 evm lib, 76 rpc lib, 29 parity, 18 integration, 5 WS —
+  workspace 100 binaries green; clippy `-D warnings` + fmt clean.
+
+### Benchmarks
+
+`cargo bench -p evm --bench tps_rw` vs the post-`debug_trace*`
+baseline:
+
+- `read_ops/balance_read`: 11.4ns (+23%) — pure reads don't touch
+  the versioned path; this is `EvmModule` struct growth (two new
+  `Mutex` fields) shifting `db` across a cache-line boundary.
+- `write_ops/end_block_*`: +9–30% — per-block `BlockUndo` push +
+  `prune_below` + `blocks_floor` bookkeeping (backend serialization
+  is gated off without a backend; benches run in-memory).
+- `batch_parallel` 100/1k/10k: +27%/+11%/+17%; `multi_sender`
+  +28%/+23%/+18%; `conflict` +6%/+8%/+14% — the first-write
+  `DbAccount` clone (storage map included) plus one hash probe per
+  write site. Cost concentrates on first touches; repeat writes in
+  a block are probe-only.
+- `full_block_cycle`/`native_vs_revm` revm paths: no change to
+  +17% — the capture is noise against revm execution cost.
+- `preverified_*`: +16–32% — same capture, on the lightest path.
+
+Honest read: this is the same cost class as reth's `BundleState`
+changeset capture — you cannot serve historical state or proofs
+without remembering what changed. Absolute cost is ~0.2µs/tx on
+light paths and inside noise once revm does real work. Levers if
+it ever matters: per-slot lazy undo (clone storage maps only for
+accounts whose slots are actually read historically), or
+`window=0` to disable capture on nodes that don't serve archive
+queries.
+
+### Open items (next)
+
+- P2 is now **complete**: all EVM-RPC parity items shipped.
+- Phase gate work: external security audit, multi-machine deploy.

@@ -3693,6 +3693,8 @@ name = "rpc"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
  "axum",
  "evm",
  "executor",

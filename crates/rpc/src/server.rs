@@ -37,8 +37,11 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -47,7 +50,9 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use tokio::net::TcpListener;
+use axum::serve::Listener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::{RpcServer, WsConn};
 
@@ -59,6 +64,153 @@ use crate::{RpcServer, WsConn};
 /// safer but may reject legitimate bursty clients; higher = more
 /// permissive but more vulnerable to `DoS`.
 const DEFAULT_RATE_LIMIT_PER_SEC: u32 = 100;
+
+/// Maximum number of simultaneously open client connections
+/// (HTTP + WebSocket share one pool). reth's `--rpc.max-connections`
+/// is 500 by default; geth has no equivalent cap. Past the limit the
+/// listener drops freshly accepted sockets — clients see a reset and
+/// can retry — rather than queueing unbounded work.
+/// Units: open sockets. Tradeoff: too low starves real traffic behind
+/// idle keep-alive conns; too high weakens fd/memory exhaustion
+/// protection.
+const DEFAULT_MAX_OPEN_CONNECTIONS: usize = 512;
+
+/// A process-wide cap on open RPC connections.
+///
+/// The counter is acquired in [`LimitedListener::accept`] — before a
+/// socket is ever served — and released when the connection closes
+/// (the permit rides inside [`CountedIo`]). That makes the bound a
+/// true open-connection limit, including idle keep-alive sockets and
+/// long-lived `WebSocket`s, not just in-flight requests.
+struct ConnectionLimiter {
+    /// Currently open connections.
+    open: AtomicUsize,
+    /// The cap.
+    max: usize,
+}
+
+impl ConnectionLimiter {
+    fn new(max: usize) -> Self {
+        Self { open: AtomicUsize::new(0), max }
+    }
+
+    /// Try to admit one more connection. `None` when at the cap.
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        // CAS loop: increment only while under the cap so a racing
+        // acquire cannot push the count past `max`.
+        let mut cur = self.open.load(Ordering::Acquire);
+        loop {
+            if cur >= self.max {
+                return None;
+            }
+            match self.open.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(ConnectionPermit { limiter: Arc::clone(self) }),
+                Err(next) => cur = next,
+            }
+        }
+    }
+
+    /// Number of currently open connections (metrics/tests).
+    #[cfg(test)]
+    fn open_count(&self) -> usize {
+        self.open.load(Ordering::Acquire)
+    }
+}
+
+/// Held inside [`CountedIo`] for a connection's lifetime; releases
+/// the slot on drop.
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.limiter.open.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A `TcpStream` that holds a [`ConnectionPermit`] until the socket
+/// is closed — the permit's `Drop` releases the slot.
+struct CountedIo {
+    inner: TcpStream,
+    _permit: ConnectionPermit,
+}
+
+impl AsyncRead for CountedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for CountedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+/// A `TcpListener` that drops accepted sockets once the connection
+/// cap is reached. Implements axum's [`Listener`] so `serve` uses it
+/// directly.
+struct LimitedListener {
+    inner: TcpListener,
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl Listener for LimitedListener {
+    type Io = CountedIo;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (CountedIo, SocketAddr) {
+        loop {
+            // A failed accept is not a connection — keep listening
+            // rather than wedging the server on a transient
+            // EMFILE/EINTR.
+            let Ok((socket, addr)) = self.inner.accept().await else { continue };
+            if let Some(permit) = self.limiter.try_acquire() {
+                return (CountedIo { inner: socket, _permit: permit }, addr);
+            }
+            // Over the cap: drop the socket. The client sees a reset;
+            // pending backlog connections are pulled next iteration
+            // until a slot frees.
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
 
 /// A simple per-IP fixed-window rate limiter (HIGH fix).
 ///
@@ -117,6 +269,8 @@ pub struct HttpServer {
     /// Per-IP rate limiter (HIGH fix). Prevents a single client
     /// from flooding the RPC with requests.
     rate_limiter: Arc<RateLimiter>,
+    /// Open-connection cap shared by HTTP and WebSocket.
+    conn_limiter: Arc<ConnectionLimiter>,
 }
 
 impl HttpServer {
@@ -130,6 +284,7 @@ impl HttpServer {
             rpc: Arc::new(rpc),
             addr,
             rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
+            conn_limiter: Arc::new(ConnectionLimiter::new(DEFAULT_MAX_OPEN_CONNECTIONS)),
         }
     }
 
@@ -138,7 +293,12 @@ impl HttpServer {
     /// executor updates the block height).
     #[must_use]
     pub fn from_shared(rpc: Arc<RpcServer>, addr: String) -> Self {
-        Self { rpc, addr, rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)) }
+        Self {
+            rpc,
+            addr,
+            rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
+            conn_limiter: Arc::new(ConnectionLimiter::new(DEFAULT_MAX_OPEN_CONNECTIONS)),
+        }
     }
 
     /// Get a clone of the inner `Arc<RpcServer>` (for external state
@@ -161,6 +321,7 @@ impl HttpServer {
             panic!("RPC HTTP server: failed to bind {addr}: {e}", addr = self.addr)
         });
         eprintln!("RPC HTTP server: listening on http://{}", self.addr);
+        let listener = LimitedListener { inner: listener, limiter: self.conn_limiter };
         axum::serve(listener, app).await.unwrap_or_else(|e| panic!("RPC HTTP server: {e}"));
     }
 
@@ -492,5 +653,20 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":42}"#;
         let req: RpcRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.method, "eth_blockNumber");
+    }
+
+    /// The connection limiter admits up to `max` concurrent
+    /// connections and frees slots when permits drop.
+    #[test]
+    fn connection_limiter_caps_and_releases() {
+        let limiter = Arc::new(ConnectionLimiter::new(2));
+        let p1 = limiter.try_acquire().expect("first connection admitted");
+        let p2 = limiter.try_acquire().expect("second connection admitted");
+        assert!(limiter.try_acquire().is_none(), "third connection at cap");
+        assert_eq!(limiter.open_count(), 2);
+        drop(p1);
+        assert_eq!(limiter.open_count(), 1);
+        let _p3 = limiter.try_acquire().expect("slot freed after close");
+        drop(p2);
     }
 }

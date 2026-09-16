@@ -68,6 +68,7 @@ use types::CHAIN_BLOCK_GAS_LIMIT;
 // turns that into 88%/N_cores.
 use rayon::prelude::*;
 
+pub mod deadline;
 pub mod fee;
 pub mod history;
 pub mod native_journal;
@@ -79,6 +80,7 @@ pub mod spec;
 pub mod trace;
 pub mod trie;
 pub mod tx;
+pub mod versioned;
 
 // revm imports. The `revm` crate re-exports all sub-crates.
 use revm::Context;
@@ -296,11 +298,84 @@ pub enum CallError {
     Rejected(ExecError),
 }
 
+/// Why a state read at a requested height cannot be served — maps
+/// onto geth's `header not found` / `missing trie node` errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateError {
+    /// The requested height is beyond the latest sealed block.
+    TooNew {
+        /// Requested height.
+        requested: u64,
+        /// Latest sealed height.
+        latest: u64,
+    },
+    /// The requested height is below the retained undo window — the
+    /// pre-values needed to reconstruct it were pruned.
+    Pruned {
+        /// Requested height.
+        requested: u64,
+        /// Oldest height still servable.
+        floor: u64,
+    },
+}
+
+impl StateError {
+    /// The height the caller asked for.
+    #[must_use]
+    pub fn requested(&self) -> u64 {
+        match *self {
+            Self::TooNew { requested, .. } | Self::Pruned { requested, .. } => requested,
+        }
+    }
+}
+
+/// An `eth_getProof` (EIP-1186) response: the account fields plus
+/// the Merkle-Patricia proof path as RLP-encoded nodes, and one
+/// proof per requested storage key.
+#[derive(Debug, Clone)]
+pub struct AccountProof {
+    /// The queried address.
+    pub address: revm::primitives::Address,
+    /// Account balance at the queried height (0 for absent accounts).
+    pub balance: revm::primitives::U256,
+    /// Account `code_hash` (`KECCAK_EMPTY` for EOAs / absent).
+    pub code_hash: revm::primitives::B256,
+    /// Account nonce at the queried height.
+    pub nonce: u64,
+    /// The account's storage-root at the queried height.
+    pub storage_hash: revm::primitives::B256,
+    /// RLP-encoded trie nodes from the state root to the account
+    /// leaf (or the divergence point for an absent account).
+    pub account_proof: Vec<revm::primitives::Bytes>,
+    /// One entry per requested storage key.
+    pub storage_proofs: Vec<StorageProof>,
+}
+
+/// One storage-slot entry in an [`AccountProof`].
+#[derive(Debug, Clone)]
+pub struct StorageProof {
+    /// The requested slot (unhashed — geth echoes the query key).
+    pub key: revm::primitives::B256,
+    /// The slot's value at the queried height.
+    pub value: revm::primitives::U256,
+    /// RLP-encoded storage-trie nodes from `storageHash` to the leaf.
+    pub proof: Vec<revm::primitives::Bytes>,
+}
+
 /// One element of a decoded batch: the signed transaction, its
 /// recovered sender, the canonical `keccak256(raw)` hash, and the raw
 /// signed RLP (retained for the `transactionsRoot` trie at seal).
 type DecodedTx =
     Result<(tx::SignedTx, revm::primitives::Address, alloy_primitives::B256, Vec<u8>), ExecError>;
+
+/// Default wall-clock bound for one read-only simulation — geth's
+/// `--rpc.evmtimeout` default. Bounds the worst case a single
+/// `eth_call`-family request can hold the state lock; the block gas
+/// limit alone does not (30M gas of pure looping is seconds of CPU).
+/// Units: seconds. Tradeoff: shorter rejects legitimate heavy
+/// simulations; longer weakens the `DoS` bound. Consensus execution is
+/// unaffected — the deadline inspector is sim-only.
+const DEFAULT_SIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The EVM module: wraps `revm` and exposes it as an Oxide `Module`.
 ///
@@ -363,6 +438,13 @@ pub struct EvmModule {
     /// different op order on every validator — identical logical
     /// state, divergent journal/MMR histories.
     touched: Mutex<std::collections::BTreeSet<revm::primitives::Address>>,
+    /// Wall-clock bound applied to read-only simulations
+    /// (`eth_call`/`eth_estimateGas`/`eth_createAccessList`/
+    /// `debug_traceCall`) — the geth `--rpc.evmtimeout` equivalent.
+    /// Enforced inside the interpreter by [`deadline::DeadlineInspector`];
+    /// never applied to committed execution (a wall clock cannot be
+    /// a consensus input).
+    sim_timeout: std::time::Duration,
     /// Per-account storage root cache. Updated incrementally in
     /// `state_root` — only touched accounts have their storage
     /// roots recomputed; the rest are reused from the cache.
@@ -439,6 +521,15 @@ pub struct EvmModule {
     /// wall-clock timestamp) is *not* known to the module — it lives
     /// in the RPC layer's `BlockIndex`, joined on height.
     history: Mutex<history::History>,
+    /// The current block's inverse-diff accumulator — every mutation
+    /// site records the pre-write value of each account it touches
+    /// (first-write-wins). Folded into `versioned` at `end_block`.
+    /// See `versioned.rs` for the reconstruction semantics.
+    block_undo: Mutex<versioned::BlockUndo>,
+    /// The bounded historical-state window: per-block undo entries
+    /// indexed by account and height, pruned with `history`'s
+    /// retention. Backs all `eth_*` reads at past heights.
+    versioned: Mutex<versioned::VersionedState>,
 }
 
 impl EvmModule {
@@ -452,6 +543,15 @@ impl EvmModule {
     ///   2 v0 uses a fixed base fee; dynamic adjustment arrives later.
     #[must_use]
     pub fn new(chain_id: u64, base_fee: u64) -> Self {
+        Self::with_history_window(chain_id, base_fee, history::DEFAULT_HISTORY_BLOCKS)
+    }
+
+    /// Construct with a specific history retention window — also the
+    /// undo-log window for historical state reads. Tests use small
+    /// windows to exercise pruning; production keeps
+    /// [`history::DEFAULT_HISTORY_BLOCKS`].
+    #[must_use]
+    pub fn with_history_window(chain_id: u64, base_fee: u64, window_blocks: usize) -> Self {
         Self {
             db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
@@ -462,6 +562,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
+            sim_timeout: DEFAULT_SIM_TIMEOUT,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -471,7 +572,9 @@ impl EvmModule {
             exchange: Mutex::new(None),
             perps: Mutex::new(None),
             staking: Mutex::new(None),
-            history: Mutex::new(history::History::new(history::DEFAULT_HISTORY_BLOCKS)),
+            history: Mutex::new(history::History::new(window_blocks)),
+            block_undo: Mutex::new(versioned::BlockUndo::default()),
+            versioned: Mutex::new(versioned::VersionedState::default()),
         }
     }
 
@@ -489,6 +592,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
+            sim_timeout: DEFAULT_SIM_TIMEOUT,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -499,6 +603,8 @@ impl EvmModule {
             perps: Mutex::new(None),
             staking: Mutex::new(None),
             history: Mutex::new(history::History::new(history::DEFAULT_HISTORY_BLOCKS)),
+            block_undo: Mutex::new(versioned::BlockUndo::default()),
+            versioned: Mutex::new(versioned::VersionedState::default()),
         }
     }
 
@@ -520,6 +626,19 @@ impl EvmModule {
         base_fee: u64,
         backend: Box<dyn storage::StorageBackend + Send>,
     ) -> Self {
+        Self::with_storage_and_window(chain_id, base_fee, backend, history::DEFAULT_HISTORY_BLOCKS)
+    }
+
+    /// `with_storage` with a configurable history/undo retention
+    /// window — tests use small windows to exercise restore-time
+    /// pruning; production uses [`history::DEFAULT_HISTORY_BLOCKS`].
+    #[must_use]
+    pub fn with_storage_and_window(
+        chain_id: u64,
+        base_fee: u64,
+        backend: Box<dyn storage::StorageBackend + Send>,
+        window_blocks: usize,
+    ) -> Self {
         let module = Self {
             db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
@@ -530,6 +649,7 @@ impl EvmModule {
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
             block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
+            sim_timeout: DEFAULT_SIM_TIMEOUT,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -539,11 +659,14 @@ impl EvmModule {
             exchange: Mutex::new(None),
             perps: Mutex::new(None),
             staking: Mutex::new(None),
-            history: Mutex::new(history::History::new(history::DEFAULT_HISTORY_BLOCKS)),
+            history: Mutex::new(history::History::new(window_blocks)),
+            block_undo: Mutex::new(versioned::BlockUndo::default()),
+            versioned: Mutex::new(versioned::VersionedState::default()),
         };
         // Load initial state from the backend into the CacheDB, then
         // install the backend for future flushes.
-        module.load_from_storage(&*backend);
+        let mut backend = backend;
+        module.load_from_storage(backend.as_mut());
         *module.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(backend);
         module
     }
@@ -644,15 +767,24 @@ impl EvmModule {
         self.build_evm_with_mode(db, coinbase, block_number, block_timestamp, false)
     }
 
+    /// Assemble the pieces both EVM builders share: the context
+    /// (with the sim flag applied to `CfgEnv`), the instruction set,
+    /// the native precompiles wired to the undo journal, and the
+    /// journal handle itself (the inspector needs the same `Rc`).
+    ///
+    /// Splitting assembly this way keeps the consensus-path builder
+    /// and the simulation builder identical except for the inspector
+    /// — the sim path adds the wall-clock deadline, which must never
+    /// exist on a committed path.
     #[allow(clippy::type_complexity)]
-    fn build_evm_with_mode<'db, DB>(
+    fn evm_parts<'db, DB>(
         &self,
         db: &'db mut DB,
         coinbase: revm::primitives::Address,
         block_number: u64,
         block_timestamp: u64,
         sim: bool,
-    ) -> revm::context::Evm<
+    ) -> (
         revm::context::Context<
             revm::context::BlockEnv,
             TxEnv,
@@ -661,7 +793,6 @@ impl EvmModule {
             revm::context::Journal<&'db mut DB>,
             (),
         >,
-        (native_journal::NativeJournalInspector, trace::CallRecorder),
         revm::handler::instructions::EthInstructions<
             revm::interpreter::interpreter::EthInterpreter,
             revm::context::Context<
@@ -674,8 +805,8 @@ impl EvmModule {
             >,
         >,
         precompiles::NativePrecompiles,
-        revm::handler::EthFrame<revm::interpreter::interpreter::EthInterpreter>,
-    >
+        std::rc::Rc<std::cell::RefCell<native_journal::NativeJournal>>,
+    )
     where
         DB: revm::database_interface::Database,
     {
@@ -733,6 +864,102 @@ impl EvmModule {
         if sim {
             precompiles = precompiles.read_only();
         }
+        (ctx, instruction, precompiles, journal)
+    }
+
+    /// Simulation-path EVM builder — same machine as
+    /// [`build_evm`](Self::build_evm) plus a
+    /// [`deadline::DeadlineInspector`] enforcing the wall-clock
+    /// simulation bound. Used only by read-only calls; committed
+    /// execution must never carry a wall clock (determinism).
+    #[allow(clippy::type_complexity)]
+    fn build_sim_evm<'db, DB>(
+        &self,
+        db: &'db mut DB,
+        coinbase: revm::primitives::Address,
+        block_number: u64,
+        block_timestamp: u64,
+        deadline: std::time::Instant,
+    ) -> revm::context::Evm<
+        revm::context::Context<
+            revm::context::BlockEnv,
+            TxEnv,
+            revm::context::CfgEnv,
+            &'db mut DB,
+            revm::context::Journal<&'db mut DB>,
+            (),
+        >,
+        (
+            (native_journal::NativeJournalInspector, trace::CallRecorder),
+            deadline::DeadlineInspector,
+        ),
+        revm::handler::instructions::EthInstructions<
+            revm::interpreter::interpreter::EthInterpreter,
+            revm::context::Context<
+                revm::context::BlockEnv,
+                TxEnv,
+                revm::context::CfgEnv,
+                &'db mut DB,
+                revm::context::Journal<&'db mut DB>,
+                (),
+            >,
+        >,
+        precompiles::NativePrecompiles,
+        revm::handler::EthFrame<revm::interpreter::interpreter::EthInterpreter>,
+    >
+    where
+        DB: revm::database_interface::Database,
+    {
+        let (ctx, instruction, precompiles, journal) =
+            self.evm_parts(db, coinbase, block_number, block_timestamp, true);
+        revm::context::Evm::new_with_inspector(
+            ctx,
+            (
+                (native_journal::NativeJournalInspector::new(journal), trace::CallRecorder::new()),
+                deadline::DeadlineInspector::new(deadline),
+            ),
+            instruction,
+            precompiles,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_evm_with_mode<'db, DB>(
+        &self,
+        db: &'db mut DB,
+        coinbase: revm::primitives::Address,
+        block_number: u64,
+        block_timestamp: u64,
+        sim: bool,
+    ) -> revm::context::Evm<
+        revm::context::Context<
+            revm::context::BlockEnv,
+            TxEnv,
+            revm::context::CfgEnv,
+            &'db mut DB,
+            revm::context::Journal<&'db mut DB>,
+            (),
+        >,
+        (native_journal::NativeJournalInspector, trace::CallRecorder),
+        revm::handler::instructions::EthInstructions<
+            revm::interpreter::interpreter::EthInterpreter,
+            revm::context::Context<
+                revm::context::BlockEnv,
+                TxEnv,
+                revm::context::CfgEnv,
+                &'db mut DB,
+                revm::context::Journal<&'db mut DB>,
+                (),
+            >,
+        >,
+        precompiles::NativePrecompiles,
+        revm::handler::EthFrame<revm::interpreter::interpreter::EthInterpreter>,
+    >
+    where
+        DB: revm::database_interface::Database,
+    {
+        let (ctx, instruction, precompiles, journal) =
+            self.evm_parts(db, coinbase, block_number, block_timestamp, sim);
         revm::context::Evm::new_with_inspector(
             ctx,
             (
@@ -758,6 +985,17 @@ impl EvmModule {
     #[must_use]
     pub fn block_gas_limit(&self) -> u64 {
         self.block_gas_limit
+    }
+
+    /// Override the read-only simulation wall-clock bound (the
+    /// geth `--rpc.evmtimeout` equivalent). Applied per simulation;
+    /// `eth_estimateGas` shares one deadline across its binary search
+    /// so the bound covers the whole request.
+    ///
+    /// Never applied to committed execution — a wall clock cannot be
+    /// a consensus input.
+    pub fn set_sim_timeout(&mut self, timeout: std::time::Duration) {
+        self.sim_timeout = timeout;
     }
 
     /// Set the coinbase / fee recipient for the current block.
@@ -830,7 +1068,7 @@ impl EvmModule {
         let caller = alloy_primitives_address(sender.0);
 
         // Build the transaction environment from the signed tx fields.
-        let tx = Self::build_tx_env(signed, caller)?;
+        let tx = Self::build_tx_env(signed, caller, self.spec)?;
 
         // Build and run the EVM. `transact_commit` executes the tx and
         // commits the state changes to the CacheDB in one step.
@@ -882,9 +1120,45 @@ impl EvmModule {
                 self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             touched.extend(result_and_state.state.keys().copied());
         }
+        // Capture every account the commit is about to overwrite —
+        // the undo entry must hold the pre-block value, so it reads
+        // the map before `commit` lands.
+        {
+            let mut undo =
+                self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for addr in result_and_state.state.keys() {
+                undo.capture(*addr, evm.ctx.journaled_state.database.cache.accounts.get(addr));
+            }
+        }
         evm.commit(result_and_state.state);
 
         Ok((result_and_state.result, caller, call_trace))
+    }
+
+    /// Capture the fast-path write set into the block's undo
+    /// accumulator.
+    ///
+    /// `try_native_transfer`/`try_empty_code_call` mutate exactly
+    /// {caller, recipient, coinbase} — the same accounts the call
+    /// sites already record as touched. Called *before* the fast-path
+    /// attempt so the undo entry holds the pre-block value; if the
+    /// fast path declines and revm runs instead, the entries remain
+    /// correct (first-write-wins).
+    fn undo_capture_fast_path<DB: DatabaseRef>(
+        undo: &mut versioned::BlockUndo,
+        db: &CacheDB<DB>,
+        signed: &tx::SignedTx,
+        caller: revm::primitives::Address,
+        coinbase: revm::primitives::Address,
+    ) {
+        undo.capture(caller, db.cache.accounts.get(&caller));
+        if let tx::TxKind::Call(addr) = signed.to() {
+            undo.capture(
+                revm::primitives::Address::from(addr.0),
+                db.cache.accounts.get(&revm::primitives::Address::from(addr.0)),
+            );
+        }
+        undo.capture(coinbase, db.cache.accounts.get(&coinbase));
     }
 
     /// Try to execute a simple ETH transfer natively, bypassing revm.
@@ -969,8 +1243,10 @@ impl EvmModule {
             return None;
         }
 
-        // 3. Empty access list.
-        if !signed.access_list().is_empty() {
+        // 3. Empty access list and no EIP-7702 authorizations. A
+        //    type-4 tx carries delegation tuples that must execute —
+        //    a fast path that skips revm would silently drop them.
+        if !signed.access_list().is_empty() || !signed.authorization_list().is_empty() {
             return None;
         }
 
@@ -1157,8 +1433,10 @@ impl EvmModule {
             return None;
         }
 
-        // 3. Empty access list.
-        if !signed.access_list().is_empty() {
+        // 3. Empty access list and no EIP-7702 authorizations (see
+        //    `try_native_transfer` — a fast path would drop the
+        //    delegation tuples).
+        if !signed.access_list().is_empty() || !signed.authorization_list().is_empty() {
             return None;
         }
 
@@ -1336,7 +1614,17 @@ impl EvmModule {
     fn build_tx_env(
         signed: &tx::SignedTx,
         caller: revm::primitives::Address,
+        spec: SpecId,
     ) -> Result<TxEnv, ExecError> {
+        // EIP-7702 gate: type-4 transactions are only valid from the
+        // Prague hardfork onward (EIP-7702 shipped in Prague). On
+        // Ethereum, submitting a type-4 tx pre-Prague is a validity
+        // failure, not a decode failure — mirror that here so the
+        // rejection is deterministic at every entry point that
+        // builds a TxEnv.
+        if signed.tx_type() == 4 && !spec.is_enabled_in(SpecId::PRAGUE) {
+            return Err(ExecError::Malformed);
+        }
         let to = match signed.to() {
             tx::TxKind::Create => TxKind::Create,
             tx::TxKind::Call(addr) => TxKind::Call(revm::primitives::Address::from(addr.0)),
@@ -1365,6 +1653,33 @@ impl EvmModule {
             })
             .collect::<Vec<_>>()
             .into();
+        // EIP-7702 authorization list — convert each decoded tuple to
+        // revm's `SignedAuthorization`. revm recovers each authority,
+        // applies the delegation designator, and charges the
+        // PER_EMPTY_ACCOUNT_COST intrinsic gas per authorization.
+        let authorization_list: Vec<
+            revm::context_interface::either::Either<
+                revm::context_interface::transaction::SignedAuthorization,
+                revm::context_interface::transaction::RecoveredAuthorization,
+            >,
+        > = signed
+            .authorization_list()
+            .iter()
+            .map(|auth| {
+                revm::context_interface::either::Either::Left(
+                    revm::context_interface::transaction::SignedAuthorization::new_unchecked(
+                        revm::context_interface::transaction::Authorization {
+                            chain_id: auth.chain_id,
+                            address: auth.address,
+                            nonce: auth.nonce,
+                        },
+                        auth.sig.recid.as_u8(),
+                        auth.sig.r,
+                        auth.sig.s,
+                    ),
+                )
+            })
+            .collect();
         let tx = TxEnv::builder()
             .gas_limit(signed.gas_limit())
             .caller(caller)
@@ -1375,6 +1690,8 @@ impl EvmModule {
             .gas_price(gas_price)
             .gas_priority_fee(Some(priority_fee))
             .access_list(access_list)
+            .tx_type(Some(signed.tx_type()))
+            .authorization_list(authorization_list)
             .build()
             .map_err(|_| ExecError::Malformed)?;
         Ok(tx)
@@ -1641,6 +1958,10 @@ impl EvmModule {
         // locking the mutex per tx. Merge once at the end.
         let mut local_touched: std::collections::HashSet<revm::primitives::Address> =
             std::collections::HashSet::new();
+        // Per-block inverse-diff accumulator — merged into
+        // `self.block_undo` once at the end (same pattern as
+        // `local_touched`).
+        let mut local_undo = versioned::BlockUndo::default();
 
         for item in decoded {
             let (signed, caller, tx_hash, raw) = match item {
@@ -1656,6 +1977,13 @@ impl EvmModule {
             // bypasses revm entirely — just balance + nonce
             // updates. The native path accesses the CacheDB
             // directly, so no EVM context is needed.
+            //
+            // Capture the fast-path write set ({caller, recipient,
+            // coinbase}) unconditionally — if the path declines and
+            // the tx falls through to revm, the entries still hold
+            // the correct pre-block values and the later capture is
+            // a no-op (first-write-wins).
+            Self::undo_capture_fast_path(&mut local_undo, db, &signed, caller, coinbase);
             if let Some(result) =
                 Self::try_native_transfer(&signed, caller, &mut *db, coinbase, self.base_fee)
             {
@@ -1701,7 +2029,7 @@ impl EvmModule {
             // the EVM context in a scoped block — the `&mut *db`
             // borrow is released when the block exits, allowing
             // the next tx to use the native path if it qualifies.
-            let tx = match Self::build_tx_env(&signed, caller) {
+            let tx = match Self::build_tx_env(&signed, caller, self.spec) {
                 Ok(t) => t,
                 Err(e) => {
                     results.push(Err(e));
@@ -1732,6 +2060,10 @@ impl EvmModule {
                 // Track the exact modified-account set locally
                 // (no lock per tx), then commit.
                 local_touched.extend(result_and_state.state.keys().copied());
+                for addr in result_and_state.state.keys() {
+                    local_undo
+                        .capture(*addr, evm.ctx.journaled_state.database.cache.accounts.get(addr));
+                }
                 evm.commit(result_and_state.state);
                 (result_and_state.result, call_trace)
             };
@@ -1748,6 +2080,13 @@ impl EvmModule {
             let mut touched =
                 self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             touched.extend(local_touched);
+        }
+        {
+            let mut undo =
+                self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (addr, entry) in local_undo.accounts {
+                undo.accounts.entry(addr).or_insert(entry);
+            }
         }
 
         // Silence unused-ctx warning — ctx is part of the Module
@@ -2152,7 +2491,7 @@ impl EvmModule {
                     }
 
                     // Fall through to revm.
-                    let tx_env = match Self::build_tx_env(signed, caller) {
+                    let tx_env = match Self::build_tx_env(signed, caller, self.spec) {
                         Ok(t) => t,
                         Err(e) => {
                             per_tx_accessed.push((*idx, std::collections::HashSet::new()));
@@ -2284,6 +2623,11 @@ impl EvmModule {
         let mut total_coinbase_delta = revm::primitives::U256::ZERO;
         let mut all_touched: std::collections::HashSet<revm::primitives::Address> =
             std::collections::HashSet::new();
+        // Inverse-diff accumulator for the parallel path — captures
+        // only writes that land in the *main* DB (conflict
+        // re-execution and non-conflict merges), never the
+        // speculative scratch caches.
+        let mut committed_undo = versioned::BlockUndo::default();
         // Results from sequential re-execution of conflicting groups.
         // Keyed by original tx index. Takes precedence over the
         // speculative results in `group_results`.
@@ -2371,6 +2715,7 @@ impl EvmModule {
                     let idx = *idx;
 
                     // Try native fast path first.
+                    Self::undo_capture_fast_path(&mut committed_undo, db, signed, caller, coinbase);
                     if let Some(result) =
                         Self::try_native_transfer(signed, caller, &mut *db, coinbase, self.base_fee)
                     {
@@ -2411,7 +2756,7 @@ impl EvmModule {
                     }
 
                     // Fall through to revm.
-                    let tx_env = match Self::build_tx_env(signed, caller) {
+                    let tx_env = match Self::build_tx_env(signed, caller, self.spec) {
                         Ok(t) => t,
                         Err(e) => {
                             reexec_results.insert(idx, Err(e));
@@ -2427,6 +2772,10 @@ impl EvmModule {
                                 for addr in rs.state.keys() {
                                     all_touched.insert(*addr);
                                     committed_touched.insert(*addr);
+                                    committed_undo.capture(
+                                        *addr,
+                                        evm.ctx.journaled_state.database.cache.accounts.get(addr),
+                                    );
                                 }
                                 evm.precompiles.clear_native_journal();
                                 let call_trace = evm.inspector.1.take_root();
@@ -2457,6 +2806,7 @@ impl EvmModule {
                 // tips (once from the merge, once from the delta).
                 for (addr, account) in &gr.touched_accounts {
                     if *addr != coinbase {
+                        committed_undo.capture(*addr, db.cache.accounts.get(addr));
                         db.cache.accounts.insert(*addr, account.clone());
                     }
                 }
@@ -2477,6 +2827,10 @@ impl EvmModule {
 
         // Apply the total coinbase balance delta.
         if total_coinbase_delta != revm::primitives::U256::ZERO {
+            // Capture coinbase's pre-block value before the delta
+            // lands (first-write-wins — the delta may not be its
+            // first write this block).
+            committed_undo.capture(coinbase, db.cache.accounts.get(&coinbase));
             let coinbase_account =
                 db.cache.accounts.entry(coinbase).or_insert_with(|| revm::database::DbAccount {
                     info: revm::database::state::AccountInfo {
@@ -2507,6 +2861,13 @@ impl EvmModule {
             let mut touched =
                 self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             touched.extend(all_touched);
+        }
+        {
+            let mut undo =
+                self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (addr, entry) in committed_undo.accounts {
+                undo.accounts.entry(addr).or_insert(entry);
+            }
         }
 
         // Phase 6: assemble results in original order.
@@ -2758,6 +3119,11 @@ impl Module for EvmModule {
         // Clearing here (not in `end_block`) lets `state_root` see
         // which accounts were touched in this block.
         self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+
+        // Start a fresh undo accumulator — any residue here means a
+        // previous block never sealed, which is a bug, but dropping
+        // it is safer than mixing two blocks' pre-values.
+        self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner).accounts.clear();
     }
 
     /// A4: validate a signed EVM transaction for mempool admission.
@@ -3084,16 +3450,6 @@ impl Module for EvmModule {
     }
 
     fn end_block(&self, height: Height) {
-        // If a StorageBackend is attached, flush the current CacheDB
-        // state to durable storage. This makes the EVM state
-        // persistent across restarts and shareable between nodes.
-        let mut backend_guard =
-            self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(ref mut backend) = *backend_guard {
-            self.flush_to_storage(backend.as_mut());
-        }
-        drop(backend_guard);
-
         // Seal the executed-block history for RPC queries. Every
         // block seals an entry — including blocks with zero EVM txs —
         // so `eth_getBlockByNumber` can distinguish "empty block" from
@@ -3110,14 +3466,78 @@ impl Module for EvmModule {
         let timestamp =
             *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner).seal_block(
-            height.value(),
-            timestamp,
-            self.block_gas_limit,
-            self.base_fee,
-            coinbase,
-            alloy_primitives::B256::from(root.0),
+        let (sealed_block, evicted) = {
+            let mut history =
+                self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let evicted = history.seal_block(
+                height.value(),
+                timestamp,
+                self.block_gas_limit,
+                self.base_fee,
+                coinbase,
+                alloy_primitives::B256::from(root.0),
+            );
+            // Clone the sealed record for persistence — the clone is
+            // once per block (cold path) and keeps the backend write
+            // off the history lock's critical section.
+            let sealed = history.block(height.value()).cloned();
+            (sealed, evicted)
+        };
+
+        // Fold the block's captured pre-values into the versioned
+        // index, then prune it to the same retention window as
+        // `history` so the two stay aligned. Reads at heights below
+        // the floor fail closed ("state not available") — see
+        // `versioned.rs`.
+        let undo = std::mem::take(
+            &mut *self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        // Serialize the undo blob only when a backend will consume
+        // it — pointless work otherwise (per-block, cold path, but
+        // free is better).
+        let has_backend =
+            self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some();
+        let undo_blob = has_backend.then(|| persist::serialize_undo(&undo));
+        let pruned_undo = {
+            let mut versioned =
+                self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            versioned.push(height.value(), undo);
+            let history = self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            history.blocks_floor().map_or_else(Vec::new, |floor| versioned.prune_below(floor))
+        };
+
+        // If a StorageBackend is attached, flush accounts + the
+        // sealed block record + the undo blob in ONE `apply_batch`.
+        // Atomicity matters: a crash between the account flush and
+        // the history write would otherwise leave durable state at
+        // height N with durable history at N-1 — on restart the node
+        // would then serve state-N answers labelled as height N-1.
+        let mut backend_guard =
+            self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref mut backend) = *backend_guard {
+            let mut ops = self.account_flush_ops();
+            if let Some(block) = sealed_block {
+                ops.push(storage::Op::Set {
+                    key: persist::block_key(height.value()),
+                    value: persist::serialize_block(&block),
+                });
+            }
+            if let Some(blob) = undo_blob {
+                ops.push(storage::Op::Set { key: persist::undo_key(height.value()), value: blob });
+            }
+            // `evicted` (history window) and `pruned_undo` (undo
+            // window) cover the same heights — the two indexes are
+            // kept aligned — but they namespace different keys.
+            for h in evicted {
+                ops.push(storage::Op::Delete { key: persist::block_key(h) });
+            }
+            for h in pruned_undo {
+                ops.push(storage::Op::Delete { key: persist::undo_key(h) });
+            }
+            backend.apply_batch(&ops);
+        }
+        drop(backend_guard);
+
         self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 
@@ -3407,9 +3827,9 @@ impl Module for EvmModule {
             }
         }
         // Reload the in-memory cache from the backend.
-        let backend = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(ref b) = *backend {
-            self.load_from_storage(b.as_ref());
+        let mut backend = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref mut b) = *backend {
+            self.load_from_storage(b.as_mut());
         }
         // The account set was wholesale replaced — the incremental
         // leaf map and retained branches are stale. The next
@@ -3538,8 +3958,19 @@ impl EvmModule {
     /// - [`CallError::Rejected`] — validation failed before execution
     ///   (e.g. insufficient funds for `gas*price + value`).
     pub fn call_read(&self, req: &CallRequest) -> Result<CallOutcome, CallError> {
-        let (result, _trace) = self.simulate(req, req.gas.unwrap_or(self.block_gas_limit))?;
-        let gas_used = result.tx_gas_used();
+        self.call_read_impl(req, None)
+    }
+
+    /// Shared body of `call_read`/`call_read_at` — `at` is the
+    /// `simulate` height selector (`None` = latest).
+    fn call_read_impl(&self, req: &CallRequest, at: Option<u64>) -> Result<CallOutcome, CallError> {
+        let (rs, _trace, timed_out) =
+            self.simulate(req, req.gas.unwrap_or(self.block_gas_limit), self.sim_deadline(), at)?;
+        let gas_used = rs.result.tx_gas_used();
+        let result = rs.result;
+        if timed_out {
+            return Err(CallError::Halt { reason: "execution timed out".to_string(), gas_used });
+        }
         match result {
             revm::context::result::ExecutionResult::Success { output, .. } => {
                 Ok(CallOutcome { output: output.into_data().to_vec(), gas_used })
@@ -3572,12 +4003,42 @@ impl EvmModule {
     ///
     /// Same [`CallError`] variants as `call_read`.
     pub fn estimate_call_gas(&self, req: &CallRequest) -> Result<u64, CallError> {
+        self.estimate_call_gas_impl(req, None)
+    }
+
+    /// `eth_estimateGas` at height `h` — historical form; same
+    /// binary-search semantics over the undo-log overlay.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when `h` is outside the retained
+    /// window; otherwise the same variants as `estimate_call_gas`.
+    pub fn estimate_call_gas_at(&self, req: &CallRequest, h: u64) -> Result<u64, CallError> {
+        let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
+        self.estimate_call_gas_impl(req, at)
+    }
+
+    /// Shared body — `at` selects the state view (`None` = latest).
+    fn estimate_call_gas_impl(&self, req: &CallRequest, at: Option<u64>) -> Result<u64, CallError> {
         let cap = req.gas.unwrap_or(self.block_gas_limit).min(self.block_gas_limit);
+        // One deadline bounds the whole request: geth's evmtimeout
+        // covers `eth_estimateGas` end-to-end, not each probe. Sharing
+        // the instant across binary-search iterations means a
+        // timed-out estimate fails instead of silently converging on
+        // a wrong bound.
+        let deadline = self.sim_deadline();
         // If it cannot succeed at the cap, it can never succeed —
         // surface the failure (revert data included) immediately.
         // `simulate` returns `Ok` for Revert/Halt too (they are valid
         // execution outcomes), so check the variant, not just Ok/Err.
-        match self.simulate(req, cap)?.0 {
+        let (rs, _trace, timed_out) = self.simulate(req, cap, deadline, at)?;
+        if timed_out {
+            return Err(CallError::Halt {
+                reason: "execution timed out".to_string(),
+                gas_used: rs.result.tx_gas_used(),
+            });
+        }
+        match rs.result {
             revm::context::result::ExecutionResult::Success { .. } => {}
             revm::context::result::ExecutionResult::Revert { output, gas, .. } => {
                 return Err(CallError::Revert {
@@ -3596,24 +4057,49 @@ impl EvmModule {
         let mut hi = cap;
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.simulate(req, mid) {
-                Ok((revm::context::result::ExecutionResult::Success { .. }, _)) => hi = mid,
-                Ok(_) | Err(_) => lo = mid,
+            match self.simulate(req, mid, deadline, at) {
+                Ok((rs, _, timed_out)) => {
+                    if timed_out {
+                        return Err(CallError::Halt {
+                            reason: "execution timed out".to_string(),
+                            gas_used: rs.result.tx_gas_used(),
+                        });
+                    }
+                    if matches!(rs.result, revm::context::result::ExecutionResult::Success { .. }) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                Err(_) => lo = mid,
             }
         }
         Ok(hi)
     }
 
     /// Run one simulated execution at `gas_limit`. Shared by
-    /// `call_read`, `estimate_call_gas`, and `call_read_traced`.
-    /// Returns the execution result plus the recorded call tree
-    /// (only the trace consumer uses it — dropping it costs
-    /// nothing).
+    /// `call_read`, `estimate_call_gas`, `call_read_traced`, and
+    /// `create_access_list`. Returns the full `ResultAndState` (the
+    /// touched `EvmState` is the accessed-account/slot set that
+    /// `eth_createAccessList` answers from) plus the recorded call
+    /// tree (only the trace consumer uses it — dropping it costs
+    /// nothing) and whether the wall-clock deadline fired
+    /// (`timed_out` — the caller maps it to a timeout error).
+    ///
+    /// `at_height` selects the state view: `None` runs against the
+    /// live `CacheDB` (latest); `Some(h)` runs against a
+    /// [`versioned::StateView`] at `h` — the undo-log overlay — with
+    /// the block env taken from `h`'s sealed history record
+    /// (timestamp/coinbase/base fee), matching geth, which evaluates
+    /// `eth_call` under the target block's env.
     fn simulate(
         &self,
         req: &CallRequest,
         gas_limit: u64,
-    ) -> Result<(revm::context::result::ExecutionResult, Option<trace::CallFrame>), CallError> {
+        deadline: std::time::Instant,
+        at_height: Option<u64>,
+    ) -> Result<(revm::context::result::ResultAndState, Option<trace::CallFrame>, bool), CallError>
+    {
         let caller =
             req.from.map_or(revm::primitives::Address::ZERO, |a| alloy_primitives_address(a.0));
         let kind = match req.to {
@@ -3648,25 +4134,67 @@ impl EvmModule {
             .map_err(|_| CallError::Rejected(ExecError::Malformed))?;
 
         let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let db = Arc::make_mut(&mut *db_guard);
         let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let block_number =
             *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let block_timestamp =
             *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut evm =
-            self.build_evm_with_mode(&mut *db, coinbase, block_number, block_timestamp, true);
-        // No `commit`: simulation state dies with the EvmState. The
-        // call trace rides out alongside the result for
-        // `debug_traceCall` — `call_read`/`estimate_call_gas` ignore
-        // it.
-        let result = evm
-            .inspect_tx(tx_env)
-            .map(|rs| rs.result)
-            .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
-        let call_trace = evm.inspector.1.take_root();
-        evm.precompiles.clear_native_journal();
-        result.map(|r| (r, call_trace))
+
+        match at_height {
+            None => {
+                let db = Arc::make_mut(&mut *db_guard);
+                let mut evm =
+                    self.build_sim_evm(&mut *db, coinbase, block_number, block_timestamp, deadline);
+                // No `commit`: simulation state dies with the
+                // EvmState. The call trace rides out alongside the
+                // result for `debug_traceCall` —
+                // `call_read`/`estimate_call_gas` ignore it.
+                let result = evm
+                    .inspect_tx(tx_env)
+                    .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
+                // Inspector is ((NativeJournalInspector,
+                // CallRecorder), DeadlineInspector): trace at `.0.1`,
+                // timeout flag at `.1`.
+                let timed_out = evm.inspector.1.timed_out();
+                let call_trace = evm.inspector.0.1.take_root();
+                evm.precompiles.clear_native_journal();
+                result.map(|rs| (rs, call_trace, timed_out))
+            }
+            Some(h) => {
+                // Historical simulation: serve reads through the
+                // undo-log overlay and take the block env from the
+                // sealed record at `h` (the env a tx in that block
+                // actually ran under).
+                let env = {
+                    let history =
+                        self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    history.block(h).map(|b| (b.timestamp, b.coinbase, b.number))
+                };
+                let Some((ts, cb, num)) = env else {
+                    return Err(CallError::Rejected(ExecError::ModuleRejected(format!(
+                        "state for block {h} unavailable"
+                    ))));
+                };
+                let versioned =
+                    self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let view = versioned::StateView::new(&db_guard, &versioned, &self.history, h);
+                let mut cache = CacheDB::new(view);
+                let mut evm = self.build_sim_evm(&mut cache, cb, num, ts, deadline);
+                let result = evm
+                    .inspect_tx(tx_env)
+                    .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
+                let timed_out = evm.inspector.1.timed_out();
+                let call_trace = evm.inspector.0.1.take_root();
+                evm.precompiles.clear_native_journal();
+                result.map(|rs| (rs, call_trace, timed_out))
+            }
+        }
+    }
+
+    /// The wall-clock deadline applied to the next simulation —
+    /// `Instant::now() + sim_timeout`.
+    fn sim_deadline(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.sim_timeout
     }
 
     /// `debug_traceCall` — run a simulated call and return the
@@ -3690,8 +4218,487 @@ impl EvmModule {
         &self,
         req: &CallRequest,
     ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
-        let (result, call_trace) = self.simulate(req, req.gas.unwrap_or(self.block_gas_limit))?;
-        Ok((result.tx_gas_used(), call_trace))
+        self.call_read_traced_impl(req, None)
+    }
+
+    /// `debug_traceCall` at height `h` — historical form.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when `h` is outside the retained
+    /// window; otherwise the same variants as `call_read_traced`.
+    pub fn call_read_traced_at(
+        &self,
+        req: &CallRequest,
+        h: u64,
+    ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
+        let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
+        self.call_read_traced_impl(req, at)
+    }
+
+    /// Shared body — `at` selects the state view (`None` = latest).
+    fn call_read_traced_impl(
+        &self,
+        req: &CallRequest,
+        at: Option<u64>,
+    ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
+        let (rs, call_trace, timed_out) =
+            self.simulate(req, req.gas.unwrap_or(self.block_gas_limit), self.sim_deadline(), at)?;
+        if timed_out {
+            return Err(CallError::Halt {
+                reason: "execution timed out".to_string(),
+                gas_used: rs.result.tx_gas_used(),
+            });
+        }
+        Ok((rs.result.tx_gas_used(), call_trace))
+    }
+
+    /// `eth_createAccessList` — generate the EIP-2930 access list a
+    /// call would touch, plus the gas it used.
+    ///
+    /// The touched set is the journal's final `EvmState`: every
+    /// account loaded (read *or* written — journal loads land in
+    /// `state` either way) and every slot `sload`/`sstore` touched.
+    /// Matching geth's `accessListTracer`, the caller, the call
+    /// target, and all protocol-warmed precompiles (Ethereum's
+    /// active set plus the native `0x0B_*`–`0x0E_*` range) are
+    /// excluded — they come warm for free, so listing them buys
+    /// nothing. Entries the caller supplied in `req.access_list`
+    /// are kept verbatim and merged with the generated ones (geth
+    /// preserves the provided list as the base).
+    ///
+    /// `gas_used` is the simulated execution's gas — i.e. measured
+    /// *with* the caller-provided access list applied (empty if none
+    /// was supplied), matching geth, which does not re-run the call
+    /// with the generated list.
+    ///
+    /// # Errors
+    ///
+    /// Same [`CallError`] variants as `call_read` — a reverting call
+    /// is an error here (geth fails `eth_createAccessList` on
+    /// revert rather than returning a list).
+    pub fn create_access_list(
+        &self,
+        req: &CallRequest,
+    ) -> Result<(tx::AccessList, u64), CallError> {
+        self.create_access_list_impl(req, None)
+    }
+
+    /// `eth_createAccessList` at height `h` — historical form.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when `h` is outside the retained
+    /// window; otherwise the same variants as `create_access_list`.
+    pub fn create_access_list_at(
+        &self,
+        req: &CallRequest,
+        h: u64,
+    ) -> Result<(tx::AccessList, u64), CallError> {
+        let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
+        self.create_access_list_impl(req, at)
+    }
+
+    /// Shared body — `at` selects the state view (`None` = latest).
+    fn create_access_list_impl(
+        &self,
+        req: &CallRequest,
+        at: Option<u64>,
+    ) -> Result<(tx::AccessList, u64), CallError> {
+        let (rs, _trace, timed_out) =
+            self.simulate(req, req.gas.unwrap_or(self.block_gas_limit), self.sim_deadline(), at)?;
+        let gas_used = rs.result.tx_gas_used();
+        if timed_out {
+            return Err(CallError::Halt { reason: "execution timed out".to_string(), gas_used });
+        }
+        match rs.result {
+            revm::context::result::ExecutionResult::Success { .. } => {}
+            revm::context::result::ExecutionResult::Revert { output, .. } => {
+                return Err(CallError::Revert { output: output.to_vec(), gas_used });
+            }
+            revm::context::result::ExecutionResult::Halt { reason, .. } => {
+                return Err(CallError::Halt { reason: format!("{reason:?}"), gas_used });
+            }
+        }
+
+        // Map the journal's touched-account set onto geth's
+        // opcode-level `accessListTracer` semantics
+        // (`eth/tracers/logger/access_list_tracer.go`):
+        //
+        // - `excl` gates *address-level* entries only: {caller, `to`,
+        //   precompiles}. `addSlot` ignores `excl`, so `to`'s storage
+        //   keys still appear — hence `to` is excluded below only when
+        //   it touched no slots.
+        // - Coinbase is not in geth's `excl` but also never appears —
+        //   tip crediting is not an opcode touch — so it is excluded
+        //   here unconditionally.
+        // - Every other journal account corresponds to an opcode-level
+        //   access (EXT*/BALANCE/CALL-family targets, SLOAD/SSTORE
+        //   storage owners, SELFDESTRUCT beneficiaries) and is emitted
+        //   with its touched slot set — including entries with no
+        //   slots, which geth also emits.
+        let caller =
+            req.from.map_or(revm::primitives::Address::ZERO, |a| alloy_primitives_address(a.0));
+        let to = req.to.map(|a| alloy_primitives_address(a.0));
+        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut excluded = precompiles::NativePrecompiles::warm_addresses_for(self.spec);
+        excluded.insert(caller);
+        excluded.insert(coinbase);
+        // geth's `excl` set for *address-level* entries — the same
+        // plus `to` — also filters the caller-provided acl
+        // (`NewAccessListTracer` skips them when seeding `list`).
+        let mut addr_excl = excluded.clone();
+        if let Some(t) = to {
+            addr_excl.insert(t);
+        }
+
+        // Base map = caller-provided entries (excl-filtered, as geth
+        // seeds), then merge in every accessed slot per touched
+        // account.
+        let mut merged: std::collections::BTreeMap<
+            revm::primitives::Address,
+            std::collections::BTreeSet<revm::primitives::B256>,
+        > = std::collections::BTreeMap::new();
+        for item in &req.access_list {
+            if addr_excl.contains(&item.address) {
+                continue;
+            }
+            merged.entry(item.address).or_default().extend(item.storage_keys.iter().copied());
+        }
+        for (addr, account) in &rs.state {
+            if excluded.contains(addr) {
+                continue;
+            }
+            let is_to = Some(*addr) == to;
+            if is_to && account.storage.is_empty() {
+                // `to` is address-excluded in geth — it only appears
+                // when the call actually touched its storage.
+                continue;
+            }
+            // Journal storage keys are `U256` slot indices; the wire
+            // format wants `B256`.
+            merged
+                .entry(*addr)
+                .or_default()
+                .extend(account.storage.keys().map(|k| revm::primitives::B256::from(*k)));
+        }
+        let list = merged
+            .into_iter()
+            .map(|(address, keys)| tx::AccessListItem {
+                address,
+                storage_keys: keys.into_iter().collect(),
+            })
+            .collect();
+        Ok((list, gas_used))
+    }
+
+    // ── Historical state reads (undo-log window) ────────────────
+
+    /// Validate `h` against the servable window.
+    ///
+    /// - `h > latest` → [`StateError::TooNew`] ("header not found").
+    /// - `h == latest` → always servable (live `CacheDB`).
+    /// - `h < latest` → servable iff the undo log covers `(h, latest]`,
+    ///   i.e. `h >= floor - 1` where `floor` is the oldest retained
+    ///   height; otherwise [`StateError::Pruned`] ("missing trie
+    ///   node", geth's non-archive behavior).
+    fn check_state_height(&self, h: u64) -> Result<u64, StateError> {
+        let latest = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest()
+            .unwrap_or_else(|| self.current_height());
+        if h > latest {
+            return Err(StateError::TooNew { requested: h, latest });
+        }
+        if h == latest {
+            return Ok(h);
+        }
+        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // `floor - 1` is the oldest servable height; an empty index
+        // means nothing is retained — only `latest` answers.
+        let min = versioned.floor().map_or(latest, |f| f.saturating_sub(1));
+        if h < min {
+            return Err(StateError::Pruned { requested: h, floor: min });
+        }
+        Ok(h)
+    }
+
+    /// Map a requested height onto the `simulate` `at_height` arg:
+    /// `None` for `latest` (the live-db fast path), `Some(h)` for a
+    /// historical overlay.
+    fn resolve_at(&self, h: u64) -> Result<Option<u64>, StateError> {
+        let h = self.check_state_height(h)?;
+        let latest = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest()
+            .unwrap_or_else(|| self.current_height());
+        Ok(if h == latest { None } else { Some(h) })
+    }
+
+    /// [`StateError`] → [`CallError`] for the simulation entry
+    /// points (which surface height errors through `Rejected`).
+    fn state_as_call_err(e: StateError) -> CallError {
+        CallError::Rejected(ExecError::ModuleRejected(format!(
+            "state for block {} unavailable: {e:?}",
+            e.requested()
+        )))
+    }
+
+    /// A [`versioned::StateView`] at `h` over the live db and undo
+    /// index. Callers hold both guards for the view's lifetime.
+    fn state_view<'a>(
+        db: &'a CacheDB<EmptyDB>,
+        versioned: &'a versioned::VersionedState,
+        history: &'a Mutex<history::History>,
+        h: u64,
+    ) -> versioned::StateView<'a> {
+        versioned::StateView::new(db, versioned, history, h)
+    }
+
+    /// `eth_getBalance` at height `h`.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] when `h` is outside the retained window.
+    pub fn balance_at(&self, addr: &Address, h: u64) -> Result<u128, StateError> {
+        self.check_state_height(h)?;
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+        Ok(view
+            .basic_ref(evm_addr)
+            .unwrap_or_default()
+            .map_or(0, |a| u128::try_from(a.balance).unwrap_or(u128::MAX)))
+    }
+
+    /// `eth_getTransactionCount` at height `h`.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] when `h` is outside the retained window.
+    pub fn nonce_at(&self, addr: &Address, h: u64) -> Result<u64, StateError> {
+        self.check_state_height(h)?;
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+        Ok(view.basic_ref(evm_addr).unwrap_or_default().map_or(0, |a| a.nonce))
+    }
+
+    /// `eth_getCode` at height `h`. Old bytecode is always servable —
+    /// `cache.contracts` retains every deployed blob keyed by hash.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] when `h` is outside the retained window.
+    pub fn code_at(&self, addr: &Address, h: u64) -> Result<Vec<u8>, StateError> {
+        self.check_state_height(h)?;
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+        let Some(info) = view.basic_ref(evm_addr).unwrap_or_default() else {
+            return Ok(Vec::new());
+        };
+        if let Some(code) = &info.code {
+            return Ok(code.original_bytes().to_vec());
+        }
+        Ok(view.code_by_hash_ref(info.code_hash).unwrap_or_default().original_bytes().to_vec())
+    }
+
+    /// `eth_getStorageAt` at height `h`.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] when `h` is outside the retained window.
+    pub fn storage_at_height(
+        &self,
+        addr: &Address,
+        slot: &revm::primitives::U256,
+        h: u64,
+    ) -> Result<revm::primitives::U256, StateError> {
+        self.check_state_height(h)?;
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+        Ok(view.storage_ref(evm_addr, *slot).unwrap_or_default())
+    }
+
+    /// `eth_call` at height `h` — the historical form of
+    /// [`call_read`](Self::call_read). The simulation runs over a
+    /// `CacheDB<StateView>`: identical code path to `latest`, with
+    /// reads served by the undo overlay and the block env taken from
+    /// `h`'s sealed record.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when `h` is outside the retained
+    /// window or the block record is missing; otherwise the same
+    /// [`CallError`] variants as `call_read`.
+    pub fn call_read_at(&self, req: &CallRequest, h: u64) -> Result<CallOutcome, CallError> {
+        let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
+        self.call_read_impl(req, at)
+    }
+
+    /// `eth_getProof` (EIP-1186): the account's Merkle-Patricia proof
+    /// plus one proof per requested storage key, all at height `h`.
+    ///
+    /// The state trie is not persisted — the proof is produced by
+    /// rebuilding the trie from the state at `h` while a
+    /// [`alloy_trie::proof::ProofRetainer`] keeps the nodes on the
+    /// target path. This is `O(accounts + touched_since_h)` per call —
+    /// expensive, but bounded, and proofs are a cold-path archive
+    /// query (bridges/light clients hit `latest` almost always).
+    ///
+    /// Absent accounts/slots return proofs of non-inclusion (geth
+    /// parity), not errors.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when `h` is outside the retained
+    /// window.
+    #[allow(clippy::too_many_lines)]
+    pub fn account_proof(
+        &self,
+        addr: &Address,
+        slots: &[revm::primitives::B256],
+        h: u64,
+    ) -> Result<AccountProof, CallError> {
+        let h = self.check_state_height(h).map_err(|e| {
+            CallError::Rejected(ExecError::ModuleRejected(format!(
+                "state for block {} unavailable: {e:?}",
+                e.requested()
+            )))
+        })?;
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+
+        // ── Account-trie proof ──────────────────────────────────
+        // Materialize every account at `h`: latest map ∪ undo-known
+        // addresses (the union covers accounts deleted since `h`).
+        // Each entry contributes `keccak(addr) → rlp(TrieAccount)`.
+        let mut leaves: std::collections::BTreeMap<revm::primitives::B256, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let addrs: std::collections::BTreeSet<revm::primitives::Address> =
+            db.cache.accounts.keys().copied().chain(versioned.known_accounts().copied()).collect();
+        let mut storage_root_cache =
+            self.storage_root_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for a in addrs {
+            let Some(info) = view.info_at(&a) else { continue };
+            // Storage root at `h`: the undo map when the account was
+            // rewritten above `h`, else the latest map. The cached
+            // root is only reused on the untouched path.
+            let storage_map = view.storage_map_at(&a).unwrap_or_default();
+            let sroot = if storage_map.is_empty() {
+                trie::EMPTY_ROOT
+            } else if versioned.entry_at(&a, h).is_none() {
+                // Untouched since `h` — the cached root is valid.
+                if let Some(r) = storage_root_cache.get(&a) {
+                    *r
+                } else {
+                    let r = trie::storage_root(
+                        storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+                    );
+                    storage_root_cache.insert(a, r);
+                    r
+                }
+            } else {
+                trie::storage_root(
+                    storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+                )
+            };
+            let trie_account =
+                trie::build_trie_account(info.nonce, info.balance, sroot, info.code_hash);
+            let mut leaf = Vec::with_capacity(80);
+            alloy_rlp::Encodable::encode(&trie_account, &mut leaf);
+            leaves.insert(alloy_primitives::keccak256(a), leaf);
+        }
+        drop(storage_root_cache);
+
+        let target = alloy_trie::Nibbles::unpack(alloy_primitives::keccak256(evm_addr));
+        let retainer = alloy_trie::proof::ProofRetainer::new(vec![target]);
+        let mut hb = alloy_trie::hash_builder::HashBuilder::default().with_proof_retainer(retainer);
+        for (hashed, leaf) in &leaves {
+            hb.add_leaf(alloy_trie::Nibbles::unpack(*hashed), leaf);
+        }
+        hb.root();
+        let account_proof: Vec<revm::primitives::Bytes> = hb
+            .take_proof_nodes()
+            .matching_nodes_sorted(&target)
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect();
+
+        // ── Account fields at `h` ───────────────────────────────
+        let info = view.info_at(&evm_addr);
+        let storage_map = view.storage_map_at(&evm_addr).unwrap_or_default();
+        let storage_hash = if storage_map.is_empty() {
+            trie::EMPTY_ROOT
+        } else {
+            trie::storage_root(
+                storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+            )
+        };
+
+        // ── Storage proofs ──────────────────────────────────────
+        // One storage trie serves all requested keys — build it
+        // once with every requested slot as a retainer target.
+        let mut storage_proofs = Vec::with_capacity(slots.len());
+        if !slots.is_empty() {
+            let targets: Vec<alloy_trie::Nibbles> = slots
+                .iter()
+                .map(|s| alloy_trie::Nibbles::unpack(alloy_primitives::keccak256(*s)))
+                .collect();
+            let retainer = alloy_trie::proof::ProofRetainer::new(targets.clone());
+            let mut shb =
+                alloy_trie::hash_builder::HashBuilder::default().with_proof_retainer(retainer);
+            // Storage leaves: hashed_slot → rlp(value) — zero slots
+            // are never stored (EVM sparse-storage convention).
+            let mut sleaves: std::collections::BTreeMap<revm::primitives::B256, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for (slot, value) in &storage_map {
+                if value.is_zero() {
+                    continue;
+                }
+                let mut leaf = Vec::with_capacity(40);
+                alloy_rlp::Encodable::encode(&alloy_primitives::U256::from(*value), &mut leaf);
+                sleaves
+                    .insert(alloy_primitives::keccak256(revm::primitives::B256::from(*slot)), leaf);
+            }
+            for (hashed, leaf) in &sleaves {
+                shb.add_leaf(alloy_trie::Nibbles::unpack(*hashed), leaf);
+            }
+            shb.root();
+            let nodes = shb.take_proof_nodes();
+            for (slot, target) in slots.iter().zip(targets.iter()) {
+                let proof: Vec<revm::primitives::Bytes> =
+                    nodes.matching_nodes_sorted(target).into_iter().map(|(_, n)| n).collect();
+                let slot_u256 = revm::primitives::U256::from_be_bytes(slot.0);
+                storage_proofs.push(StorageProof {
+                    key: *slot,
+                    value: storage_map.get(&slot_u256).copied().unwrap_or_default(),
+                    proof,
+                });
+            }
+        }
+
+        Ok(AccountProof {
+            address: evm_addr,
+            balance: info.as_ref().map_or(revm::primitives::U256::ZERO, |i| i.balance),
+            code_hash: info.as_ref().map_or(revm::primitives::KECCAK_EMPTY, |i| i.code_hash),
+            nonce: info.as_ref().map_or(0, |i| i.nonce),
+            storage_hash,
+            account_proof,
+            storage_proofs,
+        })
     }
 
     /// Lock and return the executed-block history for RPC queries.
@@ -3913,13 +4920,21 @@ impl EvmModule {
     ///
     /// Panics if the DB mutex is poisoned.
     fn flush_to_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
+        let ops = self.account_flush_ops();
+        if !ops.is_empty() {
+            backend.apply_batch(&ops);
+        }
+    }
+
+    /// Build the account write ops for the block's `touched` set —
+    /// the pure form of [`flush_to_storage`], split out so
+    /// `end_block` can commit accounts, the sealed history record,
+    /// and the undo blob in one `apply_batch` (a crash must never
+    /// leave state ahead of history, or a restarted node would serve
+    /// newer state under an older height label).
+    fn account_flush_ops(&self) -> Vec<storage::Op> {
         let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let touched = self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // If nothing was touched, skip the flush entirely.
-        if touched.is_empty() {
-            return;
-        }
 
         let mut ops = Vec::with_capacity(touched.len());
         for evm_addr in touched.iter() {
@@ -3969,11 +4984,7 @@ impl EvmModule {
             );
             ops.push(storage::Op::Set { key, value });
         }
-        backend.apply_batch(&ops);
-
-        // The touched set is cleared in `begin_block` (not here) so
-        // that `state_root` can use it for incremental storage root
-        // updates.
+        ops
     }
 
     /// Load EVM state from the `StorageBackend` into the `CacheDB`.
@@ -3985,7 +4996,7 @@ impl EvmModule {
     /// # Panics
     ///
     /// Panics if the DB mutex is poisoned.
-    fn load_from_storage(&self, backend: &(dyn storage::StorageBackend + Send)) {
+    fn load_from_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
         let entries = backend.range(&persist::account_prefix());
         if entries.is_empty() {
             return;
@@ -4045,6 +5056,53 @@ impl EvmModule {
                     )),
                 );
             }
+        }
+        drop(db_guard);
+
+        // Restore the sealed-block history (`0x02` records) and the
+        // undo window (`0x03` blobs) so historical state reads, log
+        // queries, receipts, and `debug_trace*` survive restart.
+        // Both scans come back height-ascending (the key layout is
+        // height-major); `restore_block`/`push` rebuild the in-memory
+        // indexes as they insert.
+        let mut stale: Vec<Hash> = Vec::new();
+        let floor = {
+            let mut history =
+                self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (_key, value) in backend.range(&persist::block_prefix()) {
+                let Some(block) = persist::deserialize_block(&value) else {
+                    continue; // Malformed record — a storage bug, skip it.
+                };
+                for evicted in history.restore_block(block) {
+                    // Restored-then-evicted records are stale on disk
+                    // (the configured window shrank since the records
+                    // were written). Delete them below.
+                    stale.push(persist::block_key(evicted));
+                }
+            }
+            history.blocks_floor()
+        };
+
+        {
+            let mut versioned =
+                self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (key, value) in backend.range(&persist::undo_prefix()) {
+                let Some(height) = persist::key_to_height(&key) else { continue };
+                if floor.is_some_and(|f| height < f) {
+                    stale.push(key); // Below the restored window.
+                    continue;
+                }
+                let Some(undo) = persist::deserialize_undo(&value) else { continue };
+                versioned.push(height, undo);
+            }
+        }
+
+        // One cleanup batch for stale records discovered during
+        // restore (over-capacity or below-floor entries).
+        if !stale.is_empty() {
+            let ops: Vec<storage::Op> =
+                stale.into_iter().map(|key| storage::Op::Delete { key }).collect();
+            backend.apply_batch(&ops);
         }
     }
 }
@@ -6691,5 +7749,398 @@ mod tests {
         );
         assert_eq!(bank.balance(&staking::BONDED_POOL), 0);
         m.end_block(Height::new(1));
+    }
+
+    #[test]
+    fn handle_eip7702_delegates_authority_code() {
+        let (sender_key, sender) = test_keypair();
+        let (auth_key, authority) = test_keypair();
+        let delegate = Address([0x77; 20]);
+        let m = make_module();
+        fund(&m, &sender);
+        fund(&m, &authority);
+
+        // The authority signs an authorization delegating its account
+        // to `delegate`. chain_id 1 matches the module's chain.
+        let auth = tx::TxAuthorization::sign(
+            U256::from(1),
+            revm::primitives::Address::from(delegate.0),
+            0,
+            &auth_key,
+        )
+        .expect("auth sign must succeed");
+
+        // A different sender relays the type-4 transaction (the
+        // common sponsored-delegation pattern).
+        let signed = tx::SignedTx::sign_eip7702(
+            tx::TxEip7702 {
+                fields: tx::TxFields {
+                    nonce: 0,
+                    gas_limit: 200_000,
+                    to: tx::TxKind::Call(revm::primitives::Address::from(sender.0)),
+                    value: U256::ZERO,
+                    data: revm::primitives::Bytes::new(),
+                    chain_id: 1,
+                },
+                max_priority_fee_per_gas: U256::from(1_000_000_000),
+                max_fee_per_gas: U256::from(2_000_000_000),
+                access_list: Vec::new(),
+                authorization_list: vec![auth],
+            },
+            &sender_key,
+        )
+        .expect("7702 sign must succeed");
+        let msg = signed.encode_to_bytes();
+
+        let result = m.handle(&dummy_ctx(), &msg).expect("handle must succeed");
+        assert_eq!(result[0].kind, "evm_call");
+
+        // The authority's account now holds the delegation designator
+        // `0xef0100 || delegate` (EIP-7702 set-code), 23 bytes.
+        let code = m.code(&authority);
+        let mut want = vec![0xef, 0x01, 0x00];
+        want.extend_from_slice(&delegate.0);
+        assert_eq!(code, want, "authority must carry the delegation designator");
+    }
+
+    #[test]
+    fn eip7702_rejected_pre_prague() {
+        let (sender_key, sender) = test_keypair();
+        let (auth_key, _) = test_keypair();
+        // Berlin predates Prague — type-4 txs must not execute.
+        let m = EvmModule::with_spec(1, 7, SpecId::BERLIN);
+        fund(&m, &sender);
+        let auth = tx::TxAuthorization::sign(
+            U256::from(1),
+            revm::primitives::Address::from([0x77; 20]),
+            0,
+            &auth_key,
+        )
+        .expect("auth sign");
+        let signed = tx::SignedTx::sign_eip7702(
+            tx::TxEip7702 {
+                fields: tx::TxFields {
+                    nonce: 0,
+                    gas_limit: 200_000,
+                    to: tx::TxKind::Call(revm::primitives::Address::from(sender.0)),
+                    value: U256::ZERO,
+                    data: revm::primitives::Bytes::new(),
+                    chain_id: 1,
+                },
+                max_priority_fee_per_gas: U256::from(1_000_000_000),
+                max_fee_per_gas: U256::from(2_000_000_000),
+                access_list: Vec::new(),
+                authorization_list: vec![auth],
+            },
+            &sender_key,
+        )
+        .expect("sign must succeed");
+        let result = m.handle(&dummy_ctx(), &signed.encode_to_bytes());
+        assert!(
+            matches!(result, Err(ExecError::Malformed)),
+            "type-4 tx on a pre-Prague spec must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn simulation_respects_wall_clock_timeout() {
+        // `JUMPDEST PUSH1 0 JUMP` — an unbounded loop that would run
+        // until the gas cap without a deadline.
+        let loop_contract = Address([0x99; 20]);
+        let mut m = make_module();
+        m.set_sim_timeout(std::time::Duration::from_millis(50));
+        m.genesis_insert_account(&loop_contract, 0, 1, vec![0x5b, 0x60, 0x00, 0x56], Vec::new());
+        let req = CallRequest {
+            to: Some(loop_contract),
+            gas: Some(30_000_000),
+            ..CallRequest::default()
+        };
+        let started = std::time::Instant::now();
+        let result = m.call_read(&req);
+        // The deadline inspector halts the interpreter within ~50ms
+        // — not the seconds a 30M-gas loop would take.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        match result {
+            Err(CallError::Halt { reason, .. }) => {
+                assert_eq!(reason, "execution timed out", "timeout must surface distinctly");
+            }
+            other => panic!("expected a timeout halt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simulation_without_deadline_runs_to_gas_cap() {
+        // A default-timeout module running the same loop burns the
+        // whole gas limit and halts OutOfGas — no timeout fires.
+        let loop_contract = Address([0x98; 20]);
+        let m = make_module();
+        m.genesis_insert_account(&loop_contract, 0, 1, vec![0x5b, 0x60, 0x00, 0x56], Vec::new());
+        let req = CallRequest {
+            to: Some(loop_contract),
+            gas: Some(21_000), // small gas: OOG long before any timeout
+            ..CallRequest::default()
+        };
+        match m.call_read(&req) {
+            Err(CallError::Halt { reason, .. }) => {
+                assert_ne!(reason, "execution timed out", "OOG, not a timeout");
+            }
+            other => panic!("expected OOG halt, got {other:?}"),
+        }
+    }
+
+    // ── Historical state window (undo-log) ──────────────────────
+
+    /// Drive a full block lifecycle: `begin` → batch → `end`. The
+    /// undo accumulator folds into `versioned` only at `end_block`,
+    /// so tests must seal to make heights readable.
+    fn drive_block(m: &EvmModule, height: u64, txs: &[Vec<u8>]) {
+        m.begin_block(Height::new(height));
+        if !txs.is_empty() {
+            let results = m.handle_batch(&dummy_ctx(), txs);
+            for (i, r) in results.iter().enumerate() {
+                assert!(r.is_ok(), "tx {i} in block {height} must execute: {r:?}");
+            }
+        }
+        m.end_block(Height::new(height));
+    }
+
+    fn signed_transfer(privkey: &[u8], nonce: u64, to: Address, value: u128) -> Vec<u8> {
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                to: tx::TxKind::Call(revm::primitives::Address::from(to.0)),
+                value: U256::from(value),
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        tx::SignedTx::sign_legacy(tx, privkey).expect("sign").encode_to_bytes()
+    }
+
+    /// The core historical-read guarantee: a value overwritten in a
+    /// later block reads correctly at both heights.
+    #[test]
+    fn historical_reads_serve_past_heights() {
+        let (privkey, sender) = test_keypair();
+        let m = make_module();
+        fund(&m, &sender);
+        let recipient = Address([0x42; 20]);
+
+        drive_block(&m, 1, &[signed_transfer(&privkey, 0, recipient, 1_000_000)]);
+        drive_block(&m, 2, &[signed_transfer(&privkey, 1, recipient, 1_000_000)]);
+
+        // Recipient balance: 1M at h=1, 2M at h=2/latest.
+        assert_eq!(m.balance_at(&recipient, 1).unwrap(), 1_000_000);
+        assert_eq!(m.balance_at(&recipient, 2).unwrap(), 2_000_000);
+        // Sender nonce: 1 at h=1, 2 at h=2.
+        assert_eq!(m.nonce_at(&sender, 1).unwrap(), 1);
+        assert_eq!(m.nonce_at(&sender, 2).unwrap(), 2);
+        // Future height rejects.
+        assert!(matches!(m.balance_at(&recipient, 9), Err(StateError::TooNew { .. })));
+    }
+
+    /// Storage slots read correctly at past heights — the undo map
+    /// preserves the pre-write slot set.
+    #[test]
+    fn historical_storage_reads() {
+        let (privkey, sender) = test_keypair();
+        let m = make_module();
+        fund(&m, &sender);
+        // Contract: `SSTORE(0, 0x2a)` then STOP — writes slot 0.
+        let writer = Address([0x77; 20]);
+        m.genesis_insert_account(
+            &writer,
+            0,
+            1,
+            vec![0x60, 0x2a, 0x60, 0x00, 0x55, 0x00], // PUSH1 42 PUSH1 0 SSTORE STOP
+            Vec::new(),
+        );
+        drive_block(&m, 1, &[]); // contract exists but slot untouched
+        drive_block(&m, 2, &[signed_tx(&privkey, 0, tx::TxKind::Call(writer.0.into()), &[])]);
+
+        let slot = U256::ZERO;
+        assert_eq!(m.storage_at_height(&writer, &slot, 1).unwrap(), U256::ZERO);
+        assert_eq!(m.storage_at_height(&writer, &slot, 2).unwrap(), U256::from(42));
+    }
+
+    /// Reads below the retained window fail closed — the undo
+    /// entries needed to reconstruct them were pruned.
+    #[test]
+    fn pruned_heights_fail_closed() {
+        let (privkey, sender) = test_keypair();
+        let m = EvmModule::with_history_window(1, 7, 3);
+        fund(&m, &sender);
+        let recipient = Address([0x55; 20]);
+        for h in 1..=6u64 {
+            drive_block(&m, h, &[signed_transfer(&privkey, h - 1, recipient, 1)]);
+        }
+        // Window keeps the newest 3 sealed blocks: heights 4,5,6.
+        // Servable reads: h >= floor-1 = 3. h=2 must fail.
+        assert!(matches!(
+            m.balance_at(&recipient, 2),
+            Err(StateError::Pruned { requested: 2, .. })
+        ));
+        assert!(m.balance_at(&recipient, 3).is_ok());
+        assert!(m.balance_at(&recipient, 6).is_ok());
+    }
+
+    /// `eth_call` at a past height sees that height's storage — the
+    /// overlay serves `SLOAD` through the undo log.
+    #[test]
+    fn eth_call_at_past_height() {
+        let (privkey, sender) = test_keypair();
+        let m = make_module();
+        fund(&m, &sender);
+        // One contract doubles as writer+reader:
+        //   CALLDATALOAD(0) SSTORE(0, v) → SLOAD(0) → return 32B.
+        //   600035 600055 600054 600052 6020 6000 f3
+        // One contract, two entry points:
+        //   empty calldata   → return SLOAD(0)         (pure read)
+        //   nonempty calldata → SSTORE(0, calldata[0]) then read.
+        let store = Address([0x78; 20]);
+        m.genesis_insert_account(
+            &store,
+            0,
+            1,
+            vec![
+                0x36, //       CALLDATASIZE
+                0x15, //       ISZERO          → [size==0]
+                0x60, 0x0B, // PUSH1 0x0B      → [dest, cond]
+                0x57, //       JUMPI           → read path if empty
+                0x60, 0x00, // PUSH1 0
+                0x35, //       CALLDATALOAD(0) → [v]
+                0x60, 0x00, // PUSH1 0         → [key, v]
+                0x55, //       SSTORE(0, v)
+                0x5B, //       JUMPDEST (0x0B) — read path lands here
+                0x60, 0x00, // PUSH1 0
+                0x54, //       SLOAD(0)        → [val]
+                0x60, 0x00, // PUSH1 0
+                0x52, //       MSTORE(0, val)
+                0x60, 0x20, // PUSH1 32
+                0x60, 0x00, // PUSH1 0
+                0xF3, //       RETURN(0, 32)
+            ],
+            vec![(U256::ZERO, U256::from(3))], // slot 0 = 3 at genesis
+        );
+        drive_block(&m, 1, &[]);
+        // Block 2: write 42 into slot 0 via the calldata path.
+        drive_block(
+            &m,
+            2,
+            &[signed_tx(
+                &privkey,
+                0,
+                tx::TxKind::Call(store.0.into()),
+                &U256::from(42).to_be_bytes::<32>(),
+            )],
+        );
+
+        // eth_call at h=1 must see the pre-write value (3); at h=2,
+        // the post-write value (42) — SLOAD served by the overlay.
+        let read = CallRequest {
+            to: Some(store),
+            gas: Some(200_000),
+            data: Vec::new(),
+            ..CallRequest::default()
+        };
+        let at_1 = m.call_read_at(&read, 1).expect("eth_call at h=1");
+        assert_eq!(U256::from_be_slice(&at_1.output), U256::from(3));
+        let at_2 = m.call_read_at(&read, 2).expect("eth_call at h=2");
+        assert_eq!(U256::from_be_slice(&at_2.output), U256::from(42));
+    }
+    /// Restart persistence: sealed history (blocks, txs, receipts,
+    /// traces) and the undo window are written to the backend on
+    /// every `end_block` and rebuilt by `load_from_storage`.
+    #[test]
+    fn restart_restores_history_and_versioned_state() {
+        use storage::Volatile;
+
+        let (pk, sender) = test_keypair();
+        let recipient = Address([0x42; 20]);
+        let m = EvmModule::with_storage(1, 7, Box::new(Volatile::new()));
+        fund(&m, &sender);
+        drive_block(&m, 1, &[signed_transfer_tx(&pk, 0, recipient.0.into(), 1_000_000)]);
+        drive_block(&m, 2, &[signed_transfer_tx(&pk, 1, recipient.0.into(), 1_000_000)]);
+
+        let block1_hash = m.history().block(1).unwrap().hash;
+        let block2_hash = m.history().block(2).unwrap().hash;
+        let bal_h1 = m.balance_at(&recipient, 1).unwrap();
+        assert_eq!(bal_h1, 1_000_000);
+
+        // "Restart": hand the same backend to a fresh module.
+        let backend = m.backend_for_test();
+        let m2 = EvmModule::with_storage(1, 7, backend);
+
+        // History survived: heights, hashes, tx lookups, receipts.
+        assert_eq!(m2.history().latest(), Some(2));
+        assert_eq!(m2.history().block(1).unwrap().hash, block1_hash);
+        assert_eq!(m2.history().block(2).unwrap().hash, block2_hash);
+        let tx_hash = m2.history().block(2).unwrap().txs[0].hash;
+        assert_eq!(m2.history().tx_location(&tx_hash), Some((2, 0)));
+        assert_eq!(m2.history().block_by_hash(&block1_hash).unwrap().number, 1);
+        // Receipts and call-traces round-trip too — `debug_trace*`
+        // keeps working across restart.
+        let block2 = m2.history().block(2).unwrap().clone();
+        assert_eq!(block2.receipts.len(), 1);
+        assert!(block2.receipts[0].status);
+        let root_frame = block2.traces[0].as_ref().expect("trace must round-trip");
+        assert_eq!(root_frame.kind, "CALL");
+        assert_eq!(root_frame.to, Some(recipient.0.into()));
+
+        // The undo window survived too: state at h=1 reads the
+        // pre-block-2 balance even though latest is 2.
+        assert_eq!(m2.balance_at(&recipient, 1).unwrap(), 1_000_000);
+        assert_eq!(m2.balance_at(&recipient, 2).unwrap(), 2_000_000);
+        // A block below the window that was never persisted still
+        // fail-closes (h=0 < floor-1? floor=1 → h=0 is servable as
+        // the genesis view: recipient absent → 0).
+        assert_eq!(m2.balance_at(&recipient, 0).unwrap(), 0);
+
+        // The chain keeps sealing with correct parent linkage — the
+        // restored block-2 hash feeds block 3's parent_hash.
+        drive_block(&m2, 3, &[signed_transfer_tx(&pk, 2, recipient.0.into(), 5)]);
+        {
+            let hist = m2.history();
+            assert_eq!(hist.block(3).unwrap().parent_hash, block2_hash);
+        }
+        assert_eq!(m2.balance_at(&recipient, 3).unwrap(), 2_000_005);
+    }
+
+    /// Window pruning applies to persisted records: evicted block
+    /// records and undo blobs are deleted from the backend, and a
+    /// restart sees exactly the in-memory window.
+    #[test]
+    fn restart_prunes_persisted_window() {
+        use storage::Volatile;
+
+        let (pk, sender) = test_keypair();
+        let recipient = Address([0x42; 20]);
+        // Window of 2: blocks 1,2 evicted once 3,4 seal.
+        let m = EvmModule::with_storage_and_window(1, 7, Box::new(Volatile::new()), 2);
+        fund(&m, &sender);
+        for h in 1..=4u64 {
+            let tx = signed_transfer_tx(&pk, h - 1, recipient.0.into(), 100);
+            drive_block(&m, h, &[tx]);
+        }
+        assert_eq!(m.history().blocks_floor(), Some(3));
+
+        let backend = m.backend_for_test();
+        // The evicted records must be gone from durable storage too.
+        assert!(backend.get(&persist::block_key(1)).is_none());
+        assert!(backend.get(&persist::undo_key(1)).is_none());
+        assert!(backend.get(&persist::block_key(4)).is_some());
+
+        let m2 = EvmModule::with_storage_and_window(1, 7, backend, 2);
+        assert_eq!(m2.history().latest(), Some(4));
+        assert_eq!(m2.history().blocks_floor(), Some(3));
+        assert!(m2.history().block(2).is_none(), "evicted block must not restore");
+        // h=1/2 undo blobs were deleted → reads below floor fail.
+        assert!(m2.balance_at(&recipient, 1).is_err());
+        // h=2 == floor-1: servable from undo[3] (pre-block-3 state =
+        // end of block 2 → recipient has 200).
+        assert_eq!(m2.balance_at(&recipient, 2).unwrap(), 200);
+        assert_eq!(m2.balance_at(&recipient, 4).unwrap(), 400);
     }
 }

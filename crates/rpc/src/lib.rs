@@ -907,6 +907,7 @@ impl RpcServer {
             "eth_getTransactionCount" => self.eth_get_transaction_count(&request.params),
             "eth_getCode" => self.eth_get_code(&request.params),
             "eth_getStorageAt" => self.eth_get_storage_at(&request.params),
+            "eth_getProof" => self.eth_get_proof(&request.params),
             // ---- Block queries ----
             "eth_getBlockByNumber" => self.eth_get_block_by_number(&request.params),
             "eth_getBlockByHash" => self.eth_get_block_by_hash(&request.params),
@@ -929,6 +930,7 @@ impl RpcServer {
             // ---- Call / estimate ----
             "eth_call" => self.eth_call(&request.params),
             "eth_estimateGas" => self.eth_estimate_gas(&request.params),
+            "eth_createAccessList" => self.eth_create_access_list(&request.params),
             "eth_maxPriorityFeePerGas" => Ok(self.eth_max_priority_fee_per_gas()),
             "eth_getBlockReceipts" => self.eth_get_block_receipts(&request.params),
             // ---- Logs ----
@@ -988,24 +990,28 @@ impl RpcServer {
     ///
     /// Returns a parse error response if the JSON is invalid.
     pub fn handle_raw(&self, raw: &str) -> String {
-        let Ok(request): Result<RpcRequest, _> = serde_json::from_str(raw) else {
-            let response = RpcResponse {
-                id: Value::Null,
-                jsonrpc: "2.0".to_string(),
-                result: None,
-                error: Some(RpcError::parse_error()),
-            };
-            return serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        };
-        let response = self.handle(&request);
-        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
+        self.dispatch_raw(raw, None)
     }
 
     /// Handle a raw JSON-RPC string arriving on a WebSocket
     /// connection. Identical to [`handle_raw`](Self::handle_raw)
     /// except `eth_subscribe` registers against `conn`'s sink.
     pub(crate) fn handle_ws_raw(&self, raw: &str, conn: &WsConn) -> String {
-        let Ok(request): Result<RpcRequest, _> = serde_json::from_str(raw) else {
+        self.dispatch_raw(raw, Some(conn))
+    }
+
+    /// Parse a raw request body — a single request object or a
+    /// JSON-RPC 2.0 batch array — and dispatch it.
+    ///
+    /// Batch semantics follow geth/reth: each element produces one
+    /// response in order; a body that isn't valid JSON is a `-32700`
+    /// parse error; an empty array is a `-32600` Invalid Request;
+    /// and a batch larger than [`MAX_BATCH_REQUESTS`] is rejected as
+    /// a whole with a `-32005` limit error (reth's shape) rather than
+    /// partially processed — an oversized batch is a resource attack,
+    /// not a request to honor.
+    fn dispatch_raw(&self, raw: &str, conn: Option<&WsConn>) -> String {
+        let Ok(body): Result<Value, _> = serde_json::from_str(raw) else {
             let response = RpcResponse {
                 id: Value::Null,
                 jsonrpc: "2.0".to_string(),
@@ -1014,8 +1020,80 @@ impl RpcServer {
             };
             return serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
         };
-        let response = self.handle_ws(&request, conn);
+        let response = self.handle_value(&body, conn);
         serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Dispatch a parsed request body (single object or batch array)
+    /// to a response [`Value`].
+    fn handle_value(&self, body: &Value, conn: Option<&WsConn>) -> Value {
+        match body {
+            Value::Array(elements) => {
+                if elements.is_empty() {
+                    // JSON-RPC 2.0: an empty batch is itself an
+                    // Invalid Request, not an empty response.
+                    return serde_json::to_value(RpcResponse {
+                        id: Value::Null,
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32_600,
+                            message: "Invalid Request".to_string(),
+                            data: None,
+                        }),
+                    })
+                    .unwrap_or_default();
+                }
+                if elements.len() > MAX_BATCH_REQUESTS {
+                    return serde_json::to_value(RpcResponse {
+                        id: Value::Null,
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32_005,
+                            message: format!(
+                                "batch request count {} exceeds limit {MAX_BATCH_REQUESTS}",
+                                elements.len()
+                            ),
+                            data: None,
+                        }),
+                    })
+                    .unwrap_or_default();
+                }
+                Value::Array(elements.iter().map(|e| self.handle_element(e, conn)).collect())
+            }
+            _ => self.handle_element(body, conn),
+        }
+    }
+
+    /// Dispatch one parsed element: deserialize as [`RpcRequest`] and
+    /// run the method, or answer with a `-32600` Invalid Request when
+    /// the element is not a request object (JSON-RPC 2.0 convention —
+    /// `-32700` is reserved for unparseable bodies, not malformed
+    /// elements).
+    fn handle_element(&self, element: &Value, conn: Option<&WsConn>) -> Value {
+        match serde_json::from_value::<RpcRequest>(element.clone()) {
+            Ok(request) => {
+                let response = match conn {
+                    Some(c) => self.handle_ws(&request, c),
+                    None => self.handle(&request),
+                };
+                serde_json::to_value(response).unwrap_or_default()
+            }
+            Err(_) => serde_json::to_value(RpcResponse {
+                // Preserve the element's `id` when present so the
+                // client can correlate the failure.
+                id: element.get("id").cloned().unwrap_or(Value::Null),
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(RpcError {
+                    code: -32_600,
+                    message: "Invalid Request".to_string(),
+                    data: None,
+                }),
+            })
+            .unwrap_or_default(),
+        }
     }
 
     /// Allocate a connection ID for a newly upgraded WebSocket.
@@ -1096,14 +1174,14 @@ impl RpcServer {
     ///
     /// Params: `[address: String, block: String?]`
     ///
-    /// Only the latest state is servable (no historical trie window
-    /// yet); a tag resolving to an older sealed block returns the
-    /// geth-style "missing trie node" error.
+    /// Heights within the retained undo window are served from the
+    /// versioned overlay; older tags return geth's "missing trie
+    /// node" error.
     fn eth_get_balance(&self, params: &[Value]) -> Result<Value, RpcError> {
         let addr = parse_address(params.first())?;
         let evm = self.require_evm()?;
-        self.require_latest(params.get(1))?;
-        Ok(hex_quantity_u128(evm.balance(&addr)))
+        let h = self.resolve_block_ref(params.get(1))?;
+        evm.balance_at(&addr, h).map(hex_quantity_u128).map_err(state_error)
     }
 
     /// `eth_getTransactionCount` — returns an account's nonce as a
@@ -1113,8 +1191,8 @@ impl RpcServer {
     fn eth_get_transaction_count(&self, params: &[Value]) -> Result<Value, RpcError> {
         let addr = parse_address(params.first())?;
         let evm = self.require_evm()?;
-        self.require_latest(params.get(1))?;
-        Ok(json!(format!("0x{:x}", evm.nonce(&addr))))
+        let h = self.resolve_block_ref(params.get(1))?;
+        evm.nonce_at(&addr, h).map(|n| json!(format!("0x{n:x}"))).map_err(state_error)
     }
 
     /// `eth_subscribe` — creates a WebSocket subscription.
@@ -1378,9 +1456,9 @@ impl RpcServer {
             message: "missing call object".to_string(),
             data: None,
         })?)?;
-        // Optional block tag — only `latest`-resolving tags are
-        // servable (no historical state).
-        self.require_latest(params.get(1))?;
+        // Optional block tag — historical heights within the
+        // retained undo window are servable.
+        let h = self.resolve_block_ref(params.get(1))?;
         parse_trace_options(params.get(2))?;
         // Same gas-cap clamp as `eth_call` — an unbounded simulation
         // is a resource-exhaustion vector.
@@ -1391,7 +1469,7 @@ impl RpcServer {
         let gas_cap = req.gas.unwrap_or(evm.block_gas_limit());
         // Revert/halt is a *trace result*, not an RPC error — geth
         // returns the call tree with the frame's `error` set.
-        let (gas_used, frame) = evm.call_read_traced(&req).map_err(call_error)?;
+        let (gas_used, frame) = evm.call_read_traced_at(&req, h).map_err(call_error)?;
         let Some(frame) = frame else {
             return Err(RpcError {
                 code: -32_000,
@@ -1652,8 +1730,8 @@ impl RpcServer {
     fn eth_get_code(&self, params: &[Value]) -> Result<Value, RpcError> {
         let addr = parse_address(params.first())?;
         let evm = self.require_evm()?;
-        self.require_latest(params.get(1))?;
-        Ok(json!(format!("0x{}", hex::encode(evm.code(&addr)))))
+        let h = self.resolve_block_ref(params.get(1))?;
+        evm.code_at(&addr, h).map(|c| json!(format!("0x{}", hex::encode(c)))).map_err(state_error)
     }
 
     /// `eth_getStorageAt` — returns the storage value at a given
@@ -1666,9 +1744,57 @@ impl RpcServer {
             params.get(1).ok_or_else(|| RpcError::invalid_params("missing storage slot"))?,
         )?;
         let evm = self.require_evm()?;
-        self.require_latest(params.get(2))?;
-        let value = evm.storage_at(&addr, &slot);
+        let h = self.resolve_block_ref(params.get(2))?;
+        let value = evm.storage_at_height(&addr, &slot, h).map_err(state_error)?;
         Ok(json!(format!("0x{value:064x}")))
+    }
+
+    /// `eth_getProof` — EIP-1186 account + storage Merkle proofs.
+    ///
+    /// Params: `[address: String, storageKeys: String[], block: String?]`
+    ///
+    /// The proof is rebuilt from the state at the requested height
+    /// via `HashBuilder` + `ProofRetainer` — `O(state)` per call, a
+    /// cold-path archive query. Heights below the retained window
+    /// return geth's `missing trie node` error.
+    fn eth_get_proof(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let addr = parse_address(params.first())?;
+        let keys = params
+            .get(1)
+            .and_then(Value::as_array)
+            .ok_or_else(|| RpcError::invalid_params("missing storage keys array"))?;
+        let mut slots = Vec::with_capacity(keys.len());
+        for k in keys {
+            slots.push(parse_b256(k)?);
+        }
+        let evm = self.require_evm()?;
+        let h = self.resolve_block_ref(params.get(2))?;
+        let proof = evm.account_proof(&addr, &slots, h).map_err(call_error)?;
+        Ok(json!({
+            "address": format!("0x{}", hex::encode(proof.address.0)),
+            "accountProof": proof
+                .account_proof
+                .iter()
+                .map(|n| format!("0x{}", hex::encode(n)))
+                .collect::<Vec<_>>(),
+            "balance": format!("0x{:x}", proof.balance),
+            "codeHash": format!("0x{}", hex::encode(proof.code_hash)),
+            "nonce": format!("0x{:x}", proof.nonce),
+            "storageHash": format!("0x{}", hex::encode(proof.storage_hash)),
+            "storageProof": proof
+                .storage_proofs
+                .iter()
+                .map(|sp| json!({
+                    "key": format!("0x{}", hex::encode(sp.key)),
+                    "value": format!("0x{:x}", sp.value),
+                    "proof": sp
+                        .proof
+                        .iter()
+                        .map(|n| format!("0x{}", hex::encode(n)))
+                        .collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        }))
     }
 
     /// `eth_getBlockByNumber` — returns a block by number.
@@ -1905,8 +2031,8 @@ impl RpcServer {
             req.gas = Some(types::CHAIN_BLOCK_GAS_LIMIT);
         }
         let evm = self.require_evm()?;
-        self.require_latest(params.get(1))?;
-        match evm.call_read(&req) {
+        let h = self.resolve_block_ref(params.get(1))?;
+        match evm.call_read_at(&req, h) {
             Ok(outcome) => Ok(json!(format!("0x{}", hex::encode(outcome.output)))),
             Err(e) => Err(call_error(e)),
         }
@@ -1923,9 +2049,42 @@ impl RpcServer {
         let call = params.first().ok_or_else(|| RpcError::invalid_params("missing call object"))?;
         let req = parse_call_object(call)?;
         let evm = self.require_evm()?;
-        self.require_latest(params.get(1))?;
-        match evm.estimate_call_gas(&req) {
+        let h = self.resolve_block_ref(params.get(1))?;
+        match evm.estimate_call_gas_at(&req, h) {
             Ok(gas) => Ok(json!(format!("0x{gas:x}"))),
+            Err(e) => Err(call_error(e)),
+        }
+    }
+
+    /// `eth_createAccessList` — generate the access list a call
+    /// would touch (`{accessList, gasUsed}`).
+    ///
+    /// Params: `[call: Object, block: String?]`. Same call-object
+    /// semantics as `eth_call` including a caller-supplied
+    /// `accessList` (kept verbatim in the result, per geth).
+    /// `gasUsed` is measured with the provided list applied — geth
+    /// does not re-run with the generated one. Gas is clamped to the
+    /// block limit exactly like `eth_call` (`gas-cap`).
+    fn eth_create_access_list(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let call = params.first().ok_or_else(|| RpcError::invalid_params("missing call object"))?;
+        let mut req = parse_call_object(call)?;
+        if req.gas.is_some_and(|g| g > types::CHAIN_BLOCK_GAS_LIMIT) {
+            req.gas = Some(types::CHAIN_BLOCK_GAS_LIMIT);
+        }
+        let evm = self.require_evm()?;
+        let h = self.resolve_block_ref(params.get(1))?;
+        match evm.create_access_list_at(&req, h) {
+            Ok((list, gas_used)) => Ok(json!({
+                "accessList": list.iter().map(|item| json!({
+                    "address": format!("0x{}", hex::encode(item.address.0)),
+                    "storageKeys": item
+                        .storage_keys
+                        .iter()
+                        .map(|k| format!("0x{}", hex::encode(k.0)))
+                        .collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "gasUsed": format!("0x{gas_used:x}"),
+            })),
             Err(e) => Err(call_error(e)),
         }
     }
@@ -2163,32 +2322,19 @@ impl RpcServer {
     }
 
     /// The height of the most recent sealed block — the height
-    /// `"latest"` resolves to. Falls back to the executor-reported
-    /// height before the first block seals.
+    /// `"latest"` resolves to for state reads.
+    ///
+    /// The EVM module is authoritative: `history.latest()` when at
+    /// least one block has sealed, else `current_height()` (the
+    /// in-flight or genesis height). The RPC `block_height` counter
+    /// is only the fallback when no EVM is attached — the two can
+    /// diverge (the counter is set by the driver, while state reads
+    /// must land inside the EVM's servable window).
     fn latest_sealed_height(&self) -> u64 {
-        self.evm
-            .as_deref()
-            .and_then(|evm| evm.history().latest())
-            .unwrap_or_else(|| self.block_height())
-    }
-
-    /// Gate for *state* queries (`eth_call`, `eth_getBalance`, …):
-    /// only the latest state is servable (no historical trie window
-    /// yet). A tag resolving below the latest sealed height returns
-    /// the geth-style "missing trie node" error; above it, "header
-    /// not found".
-    fn require_latest(&self, tag: Option<&Value>) -> Result<(), RpcError> {
-        let h = self.resolve_block_ref(tag)?;
-        let latest = self.latest_sealed_height();
-        if h > latest {
-            return Err(RpcError::internal_error("header not found"));
-        }
-        if h < latest {
-            return Err(RpcError::internal_error(&format!(
-                "missing trie node: state for block {h} unavailable (latest is {latest})"
-            )));
-        }
-        Ok(())
+        self.evm.as_deref().map_or_else(
+            || self.block_height(),
+            |evm| evm.history().latest().unwrap_or_else(|| evm.current_height()),
+        )
     }
 
     /// Parse an `eth_getLogs`/`eth_newFilter` filter object into the
@@ -2266,10 +2412,33 @@ const MAX_LOG_RESULTS: usize = 10_000;
 /// inside the 8192-block retained window.
 const MAX_FEE_HISTORY_BLOCKS: u64 = 1024;
 
+/// Maximum number of elements in one JSON-RPC batch body. geth's
+/// `--rpc.batch-request-limit` default; a batch larger than this is
+/// rejected whole (reth shape: one `-32005` error object), because
+/// per-element dispatch of an unbounded array is a resource attack —
+/// each element can be a full `eth_call` against the state lock.
+/// Units: requests per batch. Tradeoff: lower breaks legitimate
+/// multicall-style clients that batch hundreds of reads; higher
+/// weakens the `DoS` bound.
+const MAX_BATCH_REQUESTS: usize = 1000;
+
 /// Map a [`evm::CallError`] onto the Ethereum JSON-RPC error
 /// surface: reverts use code `3` ("execution reverted") with the
 /// revert data attached for ABI decoding; halts and validation
 /// rejections use `-32000` with a human-readable reason.
+/// Map a [`evm::StateError`] onto geth's RPC error shape:
+/// `header not found` above the chain, `missing trie node` below
+/// the retained state window (a pruned geth node's answer).
+fn state_error(e: evm::StateError) -> RpcError {
+    match e {
+        evm::StateError::TooNew { .. } => RpcError::internal_error("header not found"),
+        evm::StateError::Pruned { requested, floor } => RpcError::internal_error(&format!(
+            "missing trie node: state for block {requested} unavailable \
+             (earliest retained is {floor})"
+        )),
+    }
+}
+
 fn call_error(e: evm::CallError) -> RpcError {
     match e {
         evm::CallError::Revert { output, .. } => RpcError {
@@ -2278,7 +2447,14 @@ fn call_error(e: evm::CallError) -> RpcError {
             data: Some(json!(format!("0x{}", hex::encode(output)))),
         },
         evm::CallError::Halt { reason, .. } => {
-            RpcError::internal_error(&format!("execution halted: {reason}"))
+            // The deadline inspector surfaces its own reason string
+            // — report it verbatim rather than double-prefixing it
+            // ("execution halted: execution timed out").
+            if reason == "execution timed out" {
+                RpcError::internal_error("execution timed out")
+            } else {
+                RpcError::internal_error(&format!("execution halted: {reason}"))
+            }
         }
         evm::CallError::Rejected(err) => {
             RpcError::internal_error(&format!("execution rejected: {err:?}"))
@@ -2340,7 +2516,7 @@ fn block_reward_percentiles(block: &ExecutedBlock, percentiles: &[f64]) -> Vec<S
 /// Serialize a stored transaction to the `eth_getTransactionByHash`
 /// object shape. `block` supplies the positional metadata.
 fn tx_json(tx: &StoredTx, block: &ExecutedBlock) -> Value {
-    json!({
+    let mut v = json!({
         "hash": format!("0x{:x}", tx.hash),
         "nonce": format!("0x{:x}", tx.nonce),
         "blockHash": format!("0x{:x}", block.hash),
@@ -2359,7 +2535,30 @@ fn tx_json(tx: &StoredTx, block: &ExecutedBlock) -> Value {
         "v": format!("0x{:x}", tx.v),
         "r": format!("0x{:x}", tx.r),
         "s": format!("0x{:x}", tx.s),
-    })
+    });
+    attach_authorization_list(&mut v, tx.tx_type, &tx.authorization_list);
+    v
+}
+
+/// Attach the `authorizationList` field for EIP-7702 (type-4)
+/// transactions, matching the geth/reth JSON shape:
+/// `[{chainId, address, nonce, yParity, r, s}]`.
+fn attach_authorization_list(v: &mut Value, tx_type: u8, list: &[evm::tx::TxAuthorization]) {
+    if tx_type != 4 {
+        return;
+    }
+    v["authorizationList"] = json!(
+        list.iter()
+            .map(|a| json!({
+                "chainId": format!("0x{:x}", a.chain_id),
+                "address": format!("0x{:x}", a.address),
+                "nonce": format!("0x{:x}", a.nonce),
+                "yParity": format!("0x{:x}", a.sig.recid.as_u8()),
+                "r": format!("0x{:x}", a.sig.r),
+                "s": format!("0x{:x}", a.sig.s),
+            }))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Serialize a pooled transaction to the pending-tx object shape —
@@ -2373,7 +2572,7 @@ fn tx_json(tx: &StoredTx, block: &ExecutedBlock) -> Value {
 fn pending_tx_json(signed: &evm::tx::SignedTx, from: Address, raw: &[u8]) -> Value {
     let hash = B256::from(keccak256(raw));
     let stx = evm::history::stored_tx(signed, from, hash, 0);
-    json!({
+    let mut v = json!({
         "hash": format!("0x{:x}", stx.hash),
         "nonce": format!("0x{:x}", stx.nonce),
         "blockHash": Value::Null,
@@ -2392,7 +2591,9 @@ fn pending_tx_json(signed: &evm::tx::SignedTx, from: Address, raw: &[u8]) -> Val
         "v": format!("0x{:x}", stx.v),
         "r": format!("0x{:x}", stx.r),
         "s": format!("0x{:x}", stx.s),
-    })
+    });
+    attach_authorization_list(&mut v, stx.tx_type, &stx.authorization_list);
+    v
 }
 
 /// Serialize one pooled envelope for `txpool_content`: decode the
@@ -3874,5 +4075,67 @@ mod tests {
             let resp = s.handle(&make_request(method, vec![], json!(1)));
             assert_eq!(resp.error.unwrap().code, -32_000, "{method} must error when unbacked");
         }
+    }
+
+    // ---- JSON-RPC batch + request limits --------------------------------
+
+    /// A batch body must return one response per element, in order.
+    #[test]
+    fn batch_returns_one_response_per_element() {
+        let s = make_server();
+        let body = r#"[
+            {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1},
+            {"jsonrpc":"2.0","method":"net_version","params":[],"id":2},
+            {"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":"three"}
+        ]"#;
+        let out: Value = serde_json::from_str(&s.handle_raw(body)).expect("batch response");
+        let arr = out.as_array().expect("batch returns an array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["id"], json!(1));
+        assert_eq!(arr[0]["result"], json!("0x1"));
+        assert_eq!(arr[1]["id"], json!(2));
+        assert_eq!(arr[2]["id"], json!("three"));
+    }
+
+    /// A batch with a malformed element still answers the rest —
+    /// the bad element gets -32600 Invalid Request (not -32700,
+    /// which is for unparseable bodies).
+    #[test]
+    fn batch_malformed_element_gets_invalid_request() {
+        let s = make_server();
+        let body = r#"[
+            {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1},
+            {"not":"a request","id":7},
+            {"jsonrpc":"2.0","method":"net_version","params":[],"id":3}
+        ]"#;
+        let out: Value = serde_json::from_str(&s.handle_raw(body)).expect("batch response");
+        let arr = out.as_array().expect("batch array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["result"], json!("0x1"));
+        assert_eq!(arr[1]["id"], json!(7), "element id is preserved");
+        assert_eq!(arr[1]["error"]["code"], json!(-32600));
+        assert_eq!(arr[2]["result"], json!("1"), "net_version is decimal");
+    }
+
+    /// An empty batch is Invalid Request per JSON-RPC 2.0.
+    #[test]
+    fn batch_empty_array_is_invalid_request() {
+        let s = make_server();
+        let out: Value = serde_json::from_str(&s.handle_raw("[]")).expect("response");
+        assert_eq!(out["error"]["code"], json!(-32600));
+    }
+
+    /// A batch over `MAX_BATCH_REQUESTS` is rejected as a whole with a
+    /// single limit error — not partially processed.
+    #[test]
+    fn batch_over_limit_rejected() {
+        let s = make_server();
+        let elements: Vec<Value> = (0..=MAX_BATCH_REQUESTS)
+            .map(|i| json!({"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":i}))
+            .collect();
+        let body = serde_json::to_string(&elements).expect("serialize");
+        let out: Value = serde_json::from_str(&s.handle_raw(&body)).expect("response");
+        assert!(out.is_object(), "over-cap batch returns one error object");
+        assert_eq!(out["error"]["code"], json!(-32005));
     }
 }
