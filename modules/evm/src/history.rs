@@ -74,6 +74,26 @@ const EMPTY_REQUESTS_HASH: B256 = B256::new([
     0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
 ]);
 
+/// Gas-price-oracle sampling window — geth's `GpoConfig.CheckBlocks`
+/// default (the newest 20 sealed blocks).
+const GPO_CHECK_BLOCKS: usize = 20;
+
+/// Transactions sampled per block — geth's `GpoConfig.SampleNumber`
+/// default (3). Sampling the *cheapest* included txs keeps the
+/// estimate at the inclusion floor rather than the market top.
+const GPO_SAMPLE_PER_BLOCK: usize = 3;
+
+/// Sample percentile — geth's `GpoConfig.Percentile` default (60).
+const GPO_PERCENTILE: usize = 60;
+
+/// Tip returned when no samples exist — geth's `GpoConfig.Default`
+/// (1 gwei).
+const GPO_DEFAULT_TIP: u128 = 1_000_000_000;
+
+/// Hard ceiling on the suggested tip — geth's `GpoConfig.MaxPrice`
+/// (500 gwei).
+const GPO_MAX_TIP: u128 = 500_000_000_000;
+
 /// The metadata of a single executed transaction, retained for RPC
 /// `eth_getTransactionByHash` / `eth_getBlockByNumber` responses.
 ///
@@ -452,6 +472,41 @@ impl History {
     #[must_use]
     pub fn block_by_hash(&self, hash: &B256) -> Option<&ExecutedBlock> {
         self.hash_index.get(hash).and_then(|h| self.blocks.get(h))
+    }
+
+    /// Suggest a priority-fee cap for `eth_maxPriorityFeePerGas` /
+    /// `eth_gasPrice` — geth's `GasPriceOracle` sampling scheme.
+    ///
+    /// From each of the last [`GPO_CHECK_BLOCKS`] sealed blocks, take
+    /// the [`GPO_SAMPLE_PER_BLOCK`] *lowest* effective tips (a tx's
+    /// `effective_gas_price − base_fee`) — geth samples the cheapest
+    /// included txs so the estimate tracks the inclusion floor, not
+    /// the top of the market. The answer is the
+    /// [`GPO_PERCENTILE`]th percentile of the pooled samples,
+    /// capped at [`GPO_MAX_TIP`]; with no samples (young chain,
+    /// all-empty blocks) it returns [`GPO_DEFAULT_TIP`].
+    #[must_use]
+    pub fn suggest_gas_tip(&self) -> u128 {
+        let mut samples: Vec<u128> = Vec::new();
+        for block in self.blocks.values().rev().take(GPO_CHECK_BLOCKS) {
+            let mut tips: Vec<u128> = block
+                .txs
+                .iter()
+                .map(|stx| {
+                    effective_gas_price(stx, block.base_fee)
+                        .saturating_sub(u128::from(block.base_fee))
+                })
+                .collect();
+            tips.sort_unstable();
+            samples.extend(tips.into_iter().take(GPO_SAMPLE_PER_BLOCK));
+        }
+        if samples.is_empty() {
+            return GPO_DEFAULT_TIP;
+        }
+        samples.sort_unstable();
+        // geth's index: `(len-1) * percentile / 100` — the p60 of
+        // 60 samples is index 35, etc.
+        samples[(samples.len() - 1) * GPO_PERCENTILE / 100].min(GPO_MAX_TIP)
     }
 
     /// Look up `(block, tx_index)` for a transaction hash.

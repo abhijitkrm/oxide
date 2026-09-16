@@ -75,6 +75,28 @@ const DEFAULT_RATE_LIMIT_PER_SEC: u32 = 100;
 /// protection.
 const DEFAULT_MAX_OPEN_CONNECTIONS: usize = 512;
 
+/// Wall-clock bound on a single HTTP request's dispatch — the
+/// `http-timeout` role (geth's `--http.timeouts` default: 30 s
+/// read/write/idle). The handler is synchronous CPU work, so the
+/// dispatch runs on `tokio::task::spawn_blocking` and the timeout
+/// abandons the *response* — the orphaned task still drains on the
+/// blocking pool (it cannot be killed mid-flight; the EVM sim
+/// timeout bounds the expensive cases anyway). What this guard
+/// buys: a client never waits past 30 s, and a runaway request
+/// occupies at most one blocking-pool slot rather than a
+/// core-blocking handler slot indefinitely.
+/// Units: seconds. Tradeoff: lower protects the pool sooner but
+/// can cut off legitimately heavy `eth_getProof`/log sweeps.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wall-clock bound on a single WebSocket frame write — geth's
+/// `--ws.timeouts` is the same 30 s default. A slow/stalled
+/// consumer otherwise holds the connection (and its
+/// `ConnectionLimiter` slot) forever: `send` on a full TCP buffer
+/// never returns. On timeout the connection is closed, freeing
+/// the slot.
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A process-wide cap on open RPC connections.
 ///
 /// The counter is acquired in [`LimitedListener::accept`] — before a
@@ -363,7 +385,31 @@ async fn handle_rpc(
                     .unwrap()
             });
     }
-    let response = rpc.handle_raw(&body);
+    // `handle_raw` is synchronous CPU work — run it on the
+    // blocking pool so a heavy request (proof rebuild, 10k-log
+    // sweep, max-size batch) cannot pin a tokio worker thread,
+    // and bound it with `HTTP_REQUEST_TIMEOUT`: past the deadline
+    // the client gets a timeout response while the orphaned task
+    // drains to completion on the blocking pool.
+    let rpc2 = Arc::clone(&rpc);
+    let work = tokio::task::spawn_blocking(move || rpc2.handle_raw(&body));
+    let response = match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, work).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_join_err)) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"internal error"},"id":null}"#.to_string())
+                .unwrap_or_else(|_| Response::new("{}".to_string()));
+        }
+        Err(_elapsed) => {
+            return Response::builder()
+                .status(StatusCode::REQUEST_TIMEOUT)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"request timed out"},"id":null}"#.to_string())
+                .unwrap_or_else(|_| Response::new("{}".to_string()));
+        }
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
@@ -407,8 +453,13 @@ async fn handle_ws_socket(mut socket: WebSocket, rpc: Arc<RpcServer>) {
         tokio::select! {
             out = rx.recv() => match out {
                 Some(text) => {
-                    if socket.send(Message::Text(text.into())).await.is_err() {
-                        break;
+                    // Bound the write: a stalled consumer otherwise
+                    // holds the connection slot forever. `Err` outer
+                    // = timed out; `Err` inner = socket write failed.
+                    let send = socket.send(Message::Text(text.into()));
+                    match tokio::time::timeout(WS_WRITE_TIMEOUT, send).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => break,
                     }
                 }
                 // All senders dropped (conn reaped) — close cleanly.
@@ -424,8 +475,10 @@ async fn handle_ws_socket(mut socket: WebSocket, rpc: Arc<RpcServer>) {
                 // Protocol-level keepalive: reply to pings so
                 // intermediaries don't drop the idle connection.
                 Some(Ok(Message::Ping(payload))) => {
-                    if socket.send(Message::Pong(payload)).await.is_err() {
-                        break;
+                    let send = socket.send(Message::Pong(payload));
+                    match tokio::time::timeout(WS_WRITE_TIMEOUT, send).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => break,
                     }
                 }
                 // Binary frames carry no JSON-RPC and pong frames

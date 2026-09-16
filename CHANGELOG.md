@@ -12,6 +12,48 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **EVM-RPC surface closeout** (`modules/evm`, `crates/rpc`)
+  - `eth_call`, `eth_estimateGas`, and `debug_traceCall` now accept
+    geth's state-override argument — per-account
+    `balance`/`nonce`/`code`/`state`/`stateDiff` applied through a
+    read-only `OverrideView` for the duration of one simulation and
+    never persisted. `debug_traceCall` reads `stateOverrides` from
+    its config object, matching geth's `TraceCallConfig`.
+  - `eth_gasPrice` and `eth_maxPriorityFeePerGas` quote the history
+    oracle instead of constants: the p60 of the three lowest
+    effective tips sampled from each of the last 20 sealed blocks
+    (geth `GasPriceOracle` policy), capped at 500 gwei with a 1 gwei
+    default on a young chain.
+  - `eth_pendingTransactions` returns the pool's pending
+    (executable) transactions as geth-shaped tx objects —
+    `blockHash`/`blockNumber`/`transactionIndex` null — excluding
+    queued nonce-gap entries.
+  - The pollable-filter registry is now count-bounded at 1,024 live
+    entries (`filter-cap`), and HTTP dispatch carries a 30 s
+    wall-clock timeout (`http-timeout`): past the deadline the
+    client receives HTTP 408 plus a JSON-RPC error. WebSocket frame
+    writes are bounded at 30 s so a stalled consumer cannot hold a
+    connection slot forever.
+  - **In plain words:** tooling can now simulate transactions "as
+    if" an account had different code/balances/storage — the trick
+    every dapp debugger relies on — gas-price queries return real
+    market quotes instead of stubs, `eth_pendingTransactions` shows
+    what the mempool will execute next, and two more standard
+    resource ceilings close out the abuse-surface checklist.
+
+- **EIP-2935 history-storage contract** (`modules/evm`)
+  - The canonical Prague history contract is preinstalled at
+    `0x0000F90827F1C53a10cb7A02335B175320002935` (bytecode identical
+    to `alloy_eips::eip2935`), and `begin_block` records the parent
+    block's hash at slot `(h−1) % 8191` — the same observable state
+    geth's system call produces, captured into the block's undo so
+    historical reads stay correct. The preinstall and the write are
+    both Prague-gated: a chain configured for an earlier fork
+    carries neither.
+  - **In plain words:** contracts can now read block hashes older
+    than the BLOCKHASH opcode's 256-block limit — up to 8,191 blocks
+    back — the same way they do on post-Prague Ethereum.
+
 - **Historical state reads + `eth_getProof` (EIP-1186)**
   (`modules/evm`, `crates/rpc`)
   - A versioned state window now records first-write-wins

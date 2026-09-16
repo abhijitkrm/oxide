@@ -13225,3 +13225,80 @@ queries.
 
 - P2 is now **complete**: all EVM-RPC parity items shipped.
 - Phase gate work: external security audit, multi-machine deploy.
+
+## 2026-10-05 — Session: EVM-RPC surface closeout — overrides, oracle, pending txs, EIP-2935
+
+### What
+
+Finished the remaining small EVM-RPC surface items — the surface is
+now complete modulo the deliberate omissions (`eth_sendTransaction`/
+`personal_*` key custody, EIP-4844 blobs).
+
+- **`filter-cap`**: `register_filter` reaps expired entries then
+  rejects at `MAX_FILTERS` = 1,024 live registrations — the TTL
+  sweep bounds *time*, this bounds *count* against
+  register-and-abandon clients.
+- **`http-timeout`**: HTTP dispatch runs on `spawn_blocking` under a
+  30 s `HTTP_REQUEST_TIMEOUT` (geth `--http.timeouts` default); past
+  the deadline the client gets HTTP 408 + a JSON-RPC error while the
+  orphan drains on the blocking pool. WS frame writes bounded by
+  `WS_WRITE_TIMEOUT` = 30 s so a stalled consumer can't hold a
+  connection slot forever.
+- **State overrides** (`eth_call`/`eth_estimateGas` param 2, and
+  geth's `stateOverrides` nested in the `debug_traceCall` config):
+  `modules/evm/src/overrides.rs` — an `OverrideView` `DatabaseRef`
+  decorator answering balance/nonce/code/state/stateDiff from a side
+  table. Sims run on a `SharedCacheDB` scratch or the versioned
+  `StateView` — fake entries can never touch the authoritative
+  `CacheDB`. `state`+`stateDiff` together rejected (`-32602`), as in
+  geth. `movePrecompileToAddress` intentionally unsupported (native
+  precompiles are fixed protocol code).
+- **Gas oracle**: `History::suggest_gas_tip` samples the
+  `GPO_SAMPLE_PER_BLOCK` = 3 lowest effective tips
+  (`effective_gas_price − base_fee`) from each of the last
+  `GPO_CHECK_BLOCKS` = 20 blocks and returns the `GPO_PERCENTILE` =
+  p60, capped at `GPO_MAX_TIP` = 500 gwei with `GPO_DEFAULT_TIP` =
+  1 gwei on empty history — geth's `GasPriceOracle` policy.
+  `eth_gasPrice` = latest base fee + tip; `eth_maxPriorityFeePerGas`
+  = tip. Both fall back sanely without an EVM attached.
+- **`eth_pendingTransactions`**: flat array of the pool's *pending*
+  entries via `pooled_tx_json` (queued nonce-gap entries excluded —
+  geth's pending-set definition).
+- **EIP-2935**: the history-storage contract is preinstalled at
+  `0x0000F90827F1C53a10cb7A02335B175320002935` (bytecode matches
+  `alloy_eips::eip2935::HISTORY_STORAGE_CODE` byte-for-byte — I
+  initially hand-wrote the wrong address/bytecode; the alloy source
+  caught it). `begin_block` writes `hash(h−1)` to slot
+  `(h−1) % 8191` — state-equivalent to geth's gasless system call
+  (no tx, receipt, or log) and captured into block h's undo, so a
+  historical read at h−1 still sees the pre-write slot. Both the
+  preinstall (`Preinstall::requires_spec`) and the write are gated
+  on `SpecId::PRAGUE` — a Cancun chain carries neither, or its
+  genesis/state roots diverge from the real fork. The contract's
+  `get` path serves `eth_call`s for ancestor hashes beyond the
+  BLOCKHASH opcode's 256-block window.
+
+### Notes / debugging
+
+- Test-authoring trap found: `0x0000…00abc`-style addresses are
+  **Oxide native precompiles** (`precompile_address(module_id,
+  op_id)` — first 18 bytes zero, byte 18 = module). A test calling
+  `0x…0abc` "reverts" correctly — it dispatched to native module
+  `0x0a` op `0xbc`. Not a bug; test addresses need a nonzero byte in
+  the first 18.
+- No bench impact expected: the EIP-2935 write is one storage insert
+  + one undo capture per *block* (not per tx); the oracle/override/
+  timeout paths are all read-side. No `cargo bench` rerun needed.
+
+### Tests
+
+- `evm` lib: +2 (`eip2935_history_contract` — install, ring-buffer
+  writes, undo attribution, end-to-end `get` through real bytecode;
+  `eip2935_gated_on_prague` — Cancun installs/writes nothing).
+- `rpc` lib: +9 — pending-txs pending/queued split + no-pool error,
+  filter cap + uninstall-frees-slot, `eth_call` code/state/stateDiff
+  overrides + conflict rejection + non-persistence,
+  `debug_traceCall` nested `stateOverrides`, `eth_estimateGas`
+  override, oracle populated-history + empty-history fallback.
+- Workspace: 100 test binaries green; `cargo clippy --workspace
+  --all-targets -D warnings` + `cargo fmt --check` clean.

@@ -46,37 +46,39 @@ WebSocket (`GET /` upgrade, same port — the geth convention).
 | `eth_getLogs` | ✅ bloom-prefiltered scan, `block-range-cap` 10k | ✅ | bloom-prefiltered scan over sealed history (`blockHash`/range/address/topics); result count capped at 10,000 (`MAX_LOG_RESULTS`) |
 | `eth_newFilter` / `eth_getFilterChanges` / `eth_getFilterLogs` / `eth_newBlockFilter` / `eth_newPendingTransactionFilter` / `eth_uninstallFilter` | ✅ | ✅ | filter registry with 300s TTL (geth's timeout): log filters share `eth_getLogs` semantics + `MAX_LOG_RESULTS` cap, block filters serve hashes, pending filters serve mempool-arrival tx hashes by sequence cursor; expired filters return `filter not found` |
 | `eth_sendRawTransaction` | ✅ | ✅ | decodes, submits to local mempool, **and gossips the raw tx to peers** with dedup (100k-hash FIFO) |
-| `eth_call` | ✅ EVM simulation, `gas-cap`, `evm-timeout` | ✅ | real `call_read` revm simulation (nonce/base-fee/gas-limit checks off, balance on — geth `DoCall`); `gas` clamped to `CHAIN_BLOCK_GAS_LIMIT` (our gas-cap); wall-clock `evm-timeout` via `DeadlineInspector`; historical heights via the versioned window |
-| `eth_estimateGas` | ✅ binary search + state overrides | 🟡 | binary search over `call_read` with revert/halt propagation + historical heights; no state-override support |
+| `eth_call` | ✅ EVM simulation, `gas-cap`, `evm-timeout` | ✅ | real `call_read` revm simulation (nonce/base-fee/gas-limit checks off, balance on — geth `DoCall`); `gas` clamped to `CHAIN_BLOCK_GAS_LIMIT` (our gas-cap); wall-clock `evm-timeout` via `DeadlineInspector`; historical heights via the versioned window; `stateOverride` (param 2) via read-only `OverrideView` — balance/nonce/code/state/stateDiff per geth, never persisted |
+| `eth_estimateGas` | ✅ binary search + state overrides | ✅ | binary search over `call_read` with revert/halt propagation, historical heights, and `stateOverride` (param 2) applied through a read-only `OverrideView` — never persisted |
 | `eth_createAccessList` | ✅ | ✅ | touched-set accounting with geth accessListTracer semantics — sender/recipient/coinbase/precompiles excluded at address level, their touched storage keys still included |
-| `eth_gasPrice` | ✅ | 🟡 | returns configured base fee, not a market quote |
-| `eth_maxPriorityFeePerGas` | ✅ | 🟡 | stub `0x3b9aca00` (1 gwei) — should reflect recent block tips |
+| `eth_gasPrice` | ✅ | ✅ | history oracle quote: latest sealed base fee + sampled tip (geth `SuggestGasPrice` = `suggestTip + head.BaseFee`); configured base fee is the no-EVM fallback |
+| `eth_maxPriorityFeePerGas` | ✅ | ✅ | geth GPO parity: p60 of the 3 lowest effective tips in each of the last 20 blocks, capped at 500 gwei, 1 gwei default when no samples |
 | `eth_feeHistory` | ✅ | 🟡 | real base fees + reward percentiles over the retained window; `blockCount` capped at 1,024 (`MAX_FEE_HISTORY_BLOCKS`) |
 | `eth_getProof` | ✅ (height > 2) | ✅ | EIP-1186 account + storage proofs at any retained height — trie rebuilt at the versioned view via `HashBuilder` + `ProofRetainer`; non-inclusion proofs supported; tests verify nodes against the sealed state root |
 | `eth_sign` / `eth_signTypedData` | ✅/partial | ❌ | keyring-backed — deliberately omit (nodes should not custody user keys) |
-| `eth_sendTransaction` / `eth_pendingTransactions` | ❌/partial | ❌ | `sendTransaction` is a node-custody API — omit; `pendingTransactions` needs the txpool index |
+| `eth_sendTransaction` / `eth_pendingTransactions` | ❌/partial | ❌/✅ | `sendTransaction` is a node-custody API — omit; `eth_pendingTransactions` ships over the `TxpoolProvider` seam — flat array of pending (executable) pool entries as geth-shaped tx objects, queued entries excluded |
 | `eth_subscribe` / `eth_unsubscribe` | ✅ WS: `newHeads`, `logs`, `newPendingTransactions` | ✅ | **WS transport shipped** (axum `ws` on `GET /`, geth same-port convention): `newHeads` + filtered `logs` push on finalization; `newPendingTransactions` pushes canonical EVM tx hashes for locally submitted + gossip-accepted txs (1024-hash bounded ring, dedup by hash) |
 | `txpool_content` / `txpool_contentFrom` / `txpool_inspect` / `txpool_status` | ✅ | ✅ | all four shipped over a `TxpoolProvider` seam (executor → mempool nonce-gap queues); `contentFrom` filters by sender |
 | `debug_traceTransaction` / `debug_traceBlock*` / `debug_traceCall` | ✅ re-execution via EVM | ✅ | callTracer shipped via revm inspector composition (`NativeJournalInspector` + `CallRecorder` tuple); traces captured **at execution time** and retained in `evm::history` — no historical-state re-execution (state store is latest-only), so tracing is bounded by the 8192-block history window; `debug_traceCall`/`traceBlockByNumber`/`traceBlockByHash` included; unsupported tracers rejected explicitly |
 | `debug_*` runtime profiling endpoints | ✅ | ❌ | Go-specific; equivalent Rust profiling hooks not needed |
 | `personal_*` (keyring) | ✅ partial | ❌ | out of scope — node-custodied keys are a security liability |
-| JSON-RPC resource limits | `gas-cap` 25M, `evm-timeout`, `filter-cap` 200, `feehistory-cap` 100, `batch-request-limit`, `max-open-connections`, `http-timeout` 30s | 🟡 | per-client rate limiting + `gas-cap` (`eth_call`/`debug_traceCall` clamp to `CHAIN_BLOCK_GAS_LIMIT`), `evm-timeout` (`DeadlineInspector` wall-clock halt on sim paths), log-cap (`MAX_LOG_RESULTS` = 10k on `eth_getLogs` + filter polls), `feehistory-cap` (`MAX_FEE_HISTORY_BLOCKS` = 1,024), filter TTL (300s), `batch-request-limit` (`MAX_BATCH_REQUESTS` = 1,024), `max-open-connections` (listener-level accept bound); remaining: `filter-cap` on total filters, `http-timeout` |
+| JSON-RPC resource limits | `gas-cap` 25M, `evm-timeout`, `filter-cap` 200, `feehistory-cap` 100, `batch-request-limit`, `max-open-connections`, `http-timeout` 30s | 🟡 | per-client rate limiting + `gas-cap` (`eth_call`/`debug_traceCall` clamp to `CHAIN_BLOCK_GAS_LIMIT`), `evm-timeout` (`DeadlineInspector` wall-clock halt on sim paths), log-cap (`MAX_LOG_RESULTS` = 10k on `eth_getLogs` + filter polls), `feehistory-cap` (`MAX_FEE_HISTORY_BLOCKS` = 1,024), filter TTL (300s), `batch-request-limit` (`MAX_BATCH_REQUESTS` = 1,024), `max-open-connections` (listener-level accept bound), `filter-cap` (`MAX_FILTERS` = 1,024 live registrations, expired reaped first), `http-timeout` (30 s `spawn_blocking` dispatch bound → HTTP 408 + JSON-RPC error; WS writes bounded by `WS_WRITE_TIMEOUT` = 30 s) |
 | WS endpoint `:8546` | ✅ | ✅ | WS rides the same port as HTTP (`ws://host:8545/`, geth convention) rather than a separate `:8546` listener |
 
 **Summary (updated):** the advertised `eth_*` surface now serves real data —
 blocks/txs/receipts/logs come from `evm::history` (8192-block retained
 window, **durable across restart**), `eth_call`/`eth_estimateGas` run real
-revm simulations (gas-cap + wall-clock timeout, historical heights),
-`eth_subscribe` pushes `newHeads`/`logs`/`newPendingTransactions` over
-WebSocket, pollable filter APIs track logs/blocks/pending txs, `txpool_*`
-exposes the mempool's nonce-gap queues, `debug_trace*` serves callTracer
-output captured at execution time, `eth_createAccessList` matches geth's
-tracer semantics, and `eth_getProof` produces EIP-1186 account/storage
-proofs at any retained height over the versioned state window. Remaining
-gaps: `filter-cap` on total filters, `http-timeout`, `eth_estimateGas`
-state overrides, `eth_gasPrice`/`maxPriorityFeePerGas` market quotes. The
-generic `indexer` crate (451 lines) remains unwired — EVM history
-superseded it for the `eth_*` surface.
+revm simulations (gas-cap + wall-clock timeout, historical heights,
+`stateOverride`), `eth_subscribe` pushes `newHeads`/`logs`/`newPendingTransactions`
+over WebSocket, pollable filter APIs track logs/blocks/pending txs under a
+count cap + TTL, `txpool_*` exposes the mempool's nonce-gap queues and
+`eth_pendingTransactions` flattens the pending set, `debug_trace*` serves
+callTracer output captured at execution time (with `stateOverrides` in the
+`debug_traceCall` config), `eth_createAccessList` matches geth's tracer
+semantics, `eth_getProof` produces EIP-1186 account/storage proofs at any
+retained height over the versioned state window, and the gas oracle quotes
+`eth_gasPrice`/`eth_maxPriorityFeePerGas` from sampled inclusion tips. The
+deliberate omissions stand: `eth_sendTransaction`/`personal_*` key custody,
+EIP-4844 blobs (no blob lane). The generic `indexer` crate (451 lines)
+remains unwired — EVM history superseded it for the `eth_*` surface.
 
 ## 2. EVM execution semantics
 
@@ -93,10 +95,10 @@ superseded it for the `eth_*` surface.
 | secp256k1 sender recovery | ✅ | ✅ | — |
 | Intrinsic gas / calldata gas / access-list warm costs | geth | revm | conformance suite needed to prove parity |
 | Gas refund semantics | ✅ | ✅ via revm | — |
-| `BLOCKHASH` last-256-blocks | ✅ (+EIP-2935 history contract) | 🟡 | `block_hash_ref` exists — verify it serves real hashes for N−1..N−256 and zero beyond |
+| `BLOCKHASH` last-256-blocks | ✅ (+EIP-2935 history contract) | ✅ | `block_hash_ref` serves sealed hashes (revm's opcode handler enforces the N−256 window); EIP-2935 history contract preinstalled at `0x0000F90827F1C53a10cb7A02335B175320002935` with `begin_block` writing `parent_hash` to slot `(h−1) % 8191` — state-equivalent to geth's system call, undo-captured and Prague-gated |
 | Base fee | EIP-1559 via `x/feemarket`, **distributed to validators** | EIP-1559 `BaseFeeState`, **burned** (revm default) | design choice — burning is Ethereum-L1-faithful; distribution is Cosmos-faithful. Decide + document |
 | `evm_denom` / native-token-as-gas | ✅ | ✅ | native balance == EVM balance (single account space — simpler than dual-model) |
-| Preinstalls (Create2 `0x4e59…`, Multicall3 `0xcA11…`, Permit2 `0x0000…D473`, Safe singleton `0x914d…`, EIP-2935 history `0x0000F908…`) | ✅ at genesis | 🟡 | Create2 factory, Multicall3, Permit2, Safe proxy+singleton installed at canonical addresses (bytecode verified against mainnet `eth_getCode`); EIP-2935 history contract not installed |
+| Preinstalls (Create2 `0x4e59…`, Multicall3 `0xcA11…`, Permit2 `0x0000…D473`, Safe singleton `0x914d…`, EIP-2935 history `0x0000F908…`) | ✅ at genesis | ✅ | Create2 factory, Multicall3, Permit2, Safe proxy+singleton, and the EIP-2935 history contract installed at canonical addresses (bytecode verified against `alloy_eips::eip2935` constants); fork-gated entries (`requires_spec`) skip on pre-Prague specs |
 | Genesis `alloc` (accounts/code/storage) | ✅ | ✅ | `evm.alloc` section wired in both single-node and devnet assembly (balance/nonce/code/storage) |
 | `access_control` — permissioned create/call whitelists | ✅ | ❌ | optional; needed only for permissioned-deployment chains |
 | `extra_eips` / custom opcode hooks | ✅ | ❌ | out of scope — revm fork schedule is fixed at compile time |
@@ -250,18 +252,22 @@ surface is the reference for "complete L1 functionality":
    (the exploit-safe path — see §3 note), rolled back on EVM-frame revert
    by the native journal. Remaining: redelegate, queries, gov precompile.
 9. ~~**Preinstalls**~~ — **shipped**: Create2 factory, Multicall3, Permit2,
-   Safe proxy+singleton at canonical addresses (bytecode verified against
-   mainnet `eth_getCode`); `evm.alloc` in `GenesisConfig`. Remaining:
-   EIP-2935 history contract.
-10. **RPC resource limits** — 🟡 **mostly shipped**: `gas-cap` (`eth_call` +
+   Safe proxy+singleton, and the EIP-2935 history contract (Prague-gated)
+   at canonical addresses (bytecode verified against
+   `alloy_eips::eip2935`/mainnet `eth_getCode`); `evm.alloc` in
+   `GenesisConfig`. The contract's ring buffer is populated by a
+   `begin_block` parent-hash write — state-equivalent to geth's system
+   call.
+10. ~~**RPC resource limits**~~ — **shipped**: `gas-cap` (`eth_call` +
     `debug_traceCall` clamp to `CHAIN_BLOCK_GAS_LIMIT`), `evm-timeout`
     (`DeadlineInspector` halts the sim interpreter on a wall-clock
     deadline; consensus path unaffected), log-cap (`MAX_LOG_RESULTS` =
     10k on `eth_getLogs` + all filter log paths), `feehistory-cap`
     (`MAX_FEE_HISTORY_BLOCKS` = 1,024), filter TTL (300s),
+    `filter-cap` (`MAX_FILTERS` = 1,024 live entries),
     `batch-request-limit` (`MAX_BATCH_REQUESTS` = 1,024 per JSON array),
-    `max-open-connections` (listener-level accept bound). Remaining:
-    `filter-cap` on total filters, `http-timeout`.
+    `max-open-connections` (listener-level accept bound), `http-timeout`
+    (30 s dispatch bound → HTTP 408; WS writes bounded at 30 s).
 
 ### P2 — conformance and completeness
 

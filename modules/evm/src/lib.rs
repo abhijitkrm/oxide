@@ -72,6 +72,7 @@ pub mod deadline;
 pub mod fee;
 pub mod history;
 pub mod native_journal;
+pub mod overrides;
 mod persist;
 pub mod precompiles;
 pub mod preinstalls;
@@ -376,6 +377,20 @@ type DecodedTx =
 /// simulations; longer weakens the `DoS` bound. Consensus execution is
 /// unaffected — the deadline inspector is sim-only.
 const DEFAULT_SIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// EIP-2935 ring-buffer size: the history-storage contract serves
+/// block hashes for the last 8191 blocks (one slot per block,
+/// `slot = block_number % HISTORY_SERVE_WINDOW`). The value is
+/// fixed by the EIP and hardcoded in the contract bytecode — it is
+/// not a tunable.
+const HISTORY_SERVE_WINDOW: u64 = 8_191;
+
+/// EIP-2935 canonical deployment address — identical on every
+/// Prague+ EVM chain (tooling and clients hardcode it). Matches
+/// `alloy_eips::eip2935::HISTORY_STORAGE_ADDRESS`; the constant is
+/// inlined here to avoid a dep taken for two constants.
+const HISTORY_STORAGE_ADDRESS: revm::primitives::Address =
+    revm::primitives::address!("0000f90827f1c53a10cb7a02335b175320002935");
 
 /// The EVM module: wraps `revm` and exposes it as an Oxide `Module`.
 ///
@@ -3124,6 +3139,61 @@ impl Module for EvmModule {
         // previous block never sealed, which is a bug, but dropping
         // it is safer than mixing two blocks' pre-values.
         self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner).accounts.clear();
+
+        // EIP-2935: record the parent block's hash in the
+        // history-storage contract's ring buffer. Geth performs this
+        // as a gasless system call (caller `SYSTEM_ADDRESS`) at the
+        // start of block processing — before any transaction — that
+        // stores `parent_hash` at slot `(h-1) % HISTORY_SERVE_WINDOW`.
+        // A direct storage write is state-equivalent (the system call
+        // produces no transaction, receipt, or log) and is captured
+        // into this block's undo like any other write, so historical
+        // reads at `h-1` still observe the pre-write slot. Prague
+        // gate: a pre-Prague spec must not mutate this storage or the
+        // state root diverges from the real fork.
+        if h > 0 && self.spec.is_enabled_in(SpecId::PRAGUE) {
+            let parent_hash = self
+                .history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .block(h - 1)
+                .map(|b| b.hash);
+            if let Some(parent_hash) = parent_hash {
+                let mut db_guard =
+                    self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let db = Arc::make_mut(&mut *db_guard);
+                self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner).capture(
+                    HISTORY_STORAGE_ADDRESS,
+                    db.cache.accounts.get(&HISTORY_STORAGE_ADDRESS),
+                );
+                let account =
+                    db.cache.accounts.entry(HISTORY_STORAGE_ADDRESS).or_insert_with(|| {
+                        revm::database::DbAccount {
+                            info: revm::database::state::AccountInfo {
+                                balance: revm::primitives::U256::ZERO,
+                                nonce: 0,
+                                code_hash: revm::primitives::KECCAK_EMPTY,
+                                account_id: None,
+                                code: Some(revm::bytecode::Bytecode::new_raw(
+                                    revm::primitives::Bytes::new(),
+                                )),
+                            },
+                            account_state: revm::database::AccountState::Touched,
+                            storage: revm::primitives::HashMap::default(),
+                        }
+                    });
+                account.storage.insert(
+                    revm::primitives::U256::from((h - 1) % HISTORY_SERVE_WINDOW),
+                    revm::primitives::U256::from_be_bytes(parent_hash.0),
+                );
+                account.account_state = revm::database::AccountState::Touched;
+                drop(db_guard);
+                self.touched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(HISTORY_STORAGE_ADDRESS);
+            }
+        }
     }
 
     /// A4: validate a signed EVM transaction for mempool admission.
@@ -3958,14 +4028,45 @@ impl EvmModule {
     /// - [`CallError::Rejected`] — validation failed before execution
     ///   (e.g. insufficient funds for `gas*price + value`).
     pub fn call_read(&self, req: &CallRequest) -> Result<CallOutcome, CallError> {
-        self.call_read_impl(req, None)
+        self.call_read_impl(req, None, &overrides::StateOverrides::new())
+    }
+
+    /// `eth_call` with geth's `stateOverride` argument — `at`
+    /// selects the height (`None` = latest, `Some(h)` = historical
+    /// overlay), `ovr` the per-account replacements.
+    ///
+    /// # Errors
+    ///
+    /// Same [`CallError`] variants as `call_read`, plus
+    /// [`CallError::Rejected`] when `h` is outside the window.
+    pub fn call_read_with_overrides(
+        &self,
+        req: &CallRequest,
+        at: Option<u64>,
+        ovr: &overrides::StateOverrides,
+    ) -> Result<CallOutcome, CallError> {
+        let at = match at {
+            Some(h) => self.resolve_at(h).map_err(Self::state_as_call_err)?,
+            None => None,
+        };
+        self.call_read_impl(req, at, ovr)
     }
 
     /// Shared body of `call_read`/`call_read_at` — `at` is the
     /// `simulate` height selector (`None` = latest).
-    fn call_read_impl(&self, req: &CallRequest, at: Option<u64>) -> Result<CallOutcome, CallError> {
-        let (rs, _trace, timed_out) =
-            self.simulate(req, req.gas.unwrap_or(self.block_gas_limit), self.sim_deadline(), at)?;
+    fn call_read_impl(
+        &self,
+        req: &CallRequest,
+        at: Option<u64>,
+        ovr: &overrides::StateOverrides,
+    ) -> Result<CallOutcome, CallError> {
+        let (rs, _trace, timed_out) = self.simulate(
+            req,
+            req.gas.unwrap_or(self.block_gas_limit),
+            self.sim_deadline(),
+            at,
+            ovr,
+        )?;
         let gas_used = rs.result.tx_gas_used();
         let result = rs.result;
         if timed_out {
@@ -4003,7 +4104,7 @@ impl EvmModule {
     ///
     /// Same [`CallError`] variants as `call_read`.
     pub fn estimate_call_gas(&self, req: &CallRequest) -> Result<u64, CallError> {
-        self.estimate_call_gas_impl(req, None)
+        self.estimate_call_gas_impl(req, None, &overrides::StateOverrides::new())
     }
 
     /// `eth_estimateGas` at height `h` — historical form; same
@@ -4015,11 +4116,34 @@ impl EvmModule {
     /// window; otherwise the same variants as `estimate_call_gas`.
     pub fn estimate_call_gas_at(&self, req: &CallRequest, h: u64) -> Result<u64, CallError> {
         let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
-        self.estimate_call_gas_impl(req, at)
+        self.estimate_call_gas_impl(req, at, &overrides::StateOverrides::new())
+    }
+
+    /// `eth_estimateGas` with geth's `stateOverride` argument.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as `estimate_call_gas`/`call_read_with_overrides`.
+    pub fn estimate_call_gas_with_overrides(
+        &self,
+        req: &CallRequest,
+        at: Option<u64>,
+        ovr: &overrides::StateOverrides,
+    ) -> Result<u64, CallError> {
+        let at = match at {
+            Some(h) => self.resolve_at(h).map_err(Self::state_as_call_err)?,
+            None => None,
+        };
+        self.estimate_call_gas_impl(req, at, ovr)
     }
 
     /// Shared body — `at` selects the state view (`None` = latest).
-    fn estimate_call_gas_impl(&self, req: &CallRequest, at: Option<u64>) -> Result<u64, CallError> {
+    fn estimate_call_gas_impl(
+        &self,
+        req: &CallRequest,
+        at: Option<u64>,
+        ovr: &overrides::StateOverrides,
+    ) -> Result<u64, CallError> {
         let cap = req.gas.unwrap_or(self.block_gas_limit).min(self.block_gas_limit);
         // One deadline bounds the whole request: geth's evmtimeout
         // covers `eth_estimateGas` end-to-end, not each probe. Sharing
@@ -4031,7 +4155,7 @@ impl EvmModule {
         // surface the failure (revert data included) immediately.
         // `simulate` returns `Ok` for Revert/Halt too (they are valid
         // execution outcomes), so check the variant, not just Ok/Err.
-        let (rs, _trace, timed_out) = self.simulate(req, cap, deadline, at)?;
+        let (rs, _trace, timed_out) = self.simulate(req, cap, deadline, at, ovr)?;
         if timed_out {
             return Err(CallError::Halt {
                 reason: "execution timed out".to_string(),
@@ -4057,7 +4181,7 @@ impl EvmModule {
         let mut hi = cap;
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.simulate(req, mid, deadline, at) {
+            match self.simulate(req, mid, deadline, at, ovr) {
                 Ok((rs, _, timed_out)) => {
                     if timed_out {
                         return Err(CallError::Halt {
@@ -4092,12 +4216,21 @@ impl EvmModule {
     /// the block env taken from `h`'s sealed history record
     /// (timestamp/coinbase/base fee), matching geth, which evaluates
     /// `eth_call` under the target block's env.
+    ///
+    /// `ovr` carries geth's `stateOverride` table — applied through
+    /// [`overrides::OverrideView`], a read-only `DatabaseRef`
+    /// wrapper, so fake state can never leak into the authoritative
+    /// cache. On the latest path with non-empty overrides the sim
+    /// runs on a `SharedCacheDB`-nested scratch (same trick the
+    /// parallel executor uses) precisely so the live `CacheDB` is
+    /// never borrowed mutably while fake entries exist.
     fn simulate(
         &self,
         req: &CallRequest,
         gas_limit: u64,
         deadline: std::time::Instant,
         at_height: Option<u64>,
+        ovr: &overrides::StateOverrides,
     ) -> Result<(revm::context::result::ResultAndState, Option<trace::CallFrame>, bool), CallError>
     {
         let caller =
@@ -4141,7 +4274,7 @@ impl EvmModule {
             *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         match at_height {
-            None => {
+            None if ovr.is_empty() => {
                 let db = Arc::make_mut(&mut *db_guard);
                 let mut evm =
                     self.build_sim_evm(&mut *db, coinbase, block_number, block_timestamp, deadline);
@@ -4155,6 +4288,27 @@ impl EvmModule {
                 // Inspector is ((NativeJournalInspector,
                 // CallRecorder), DeadlineInspector): trace at `.0.1`,
                 // timeout flag at `.1`.
+                let timed_out = evm.inspector.1.timed_out();
+                let call_trace = evm.inspector.0.1.take_root();
+                evm.precompiles.clear_native_journal();
+                result.map(|rs| (rs, call_trace, timed_out))
+            }
+            None => {
+                // Overrides on latest state: run on a nested
+                // scratch cache — fake entries must never land in
+                // the authoritative `CacheDB`.
+                let base = SharedCacheDB(Arc::clone(&db_guard));
+                let mut cache = CacheDB::new(overrides::OverrideView::new(base, ovr));
+                let mut evm = self.build_sim_evm(
+                    &mut cache,
+                    coinbase,
+                    block_number,
+                    block_timestamp,
+                    deadline,
+                );
+                let result = evm
+                    .inspect_tx(tx_env)
+                    .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
                 let timed_out = evm.inspector.1.timed_out();
                 let call_trace = evm.inspector.0.1.take_root();
                 evm.precompiles.clear_native_journal();
@@ -4178,7 +4332,7 @@ impl EvmModule {
                 let versioned =
                     self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let view = versioned::StateView::new(&db_guard, &versioned, &self.history, h);
-                let mut cache = CacheDB::new(view);
+                let mut cache = CacheDB::new(overrides::OverrideView::new(view, ovr));
                 let mut evm = self.build_sim_evm(&mut cache, cb, num, ts, deadline);
                 let result = evm
                     .inspect_tx(tx_env)
@@ -4218,7 +4372,7 @@ impl EvmModule {
         &self,
         req: &CallRequest,
     ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
-        self.call_read_traced_impl(req, None)
+        self.call_read_traced_impl(req, None, &overrides::StateOverrides::new())
     }
 
     /// `debug_traceCall` at height `h` — historical form.
@@ -4233,7 +4387,25 @@ impl EvmModule {
         h: u64,
     ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
         let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
-        self.call_read_traced_impl(req, at)
+        self.call_read_traced_impl(req, at, &overrides::StateOverrides::new())
+    }
+
+    /// `debug_traceCall` with geth's `stateOverride` argument.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as `call_read_traced`.
+    pub fn call_read_traced_with_overrides(
+        &self,
+        req: &CallRequest,
+        at: Option<u64>,
+        ovr: &overrides::StateOverrides,
+    ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
+        let at = match at {
+            Some(h) => self.resolve_at(h).map_err(Self::state_as_call_err)?,
+            None => None,
+        };
+        self.call_read_traced_impl(req, at, ovr)
     }
 
     /// Shared body — `at` selects the state view (`None` = latest).
@@ -4241,9 +4413,15 @@ impl EvmModule {
         &self,
         req: &CallRequest,
         at: Option<u64>,
+        ovr: &overrides::StateOverrides,
     ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
-        let (rs, call_trace, timed_out) =
-            self.simulate(req, req.gas.unwrap_or(self.block_gas_limit), self.sim_deadline(), at)?;
+        let (rs, call_trace, timed_out) = self.simulate(
+            req,
+            req.gas.unwrap_or(self.block_gas_limit),
+            self.sim_deadline(),
+            at,
+            ovr,
+        )?;
         if timed_out {
             return Err(CallError::Halt {
                 reason: "execution timed out".to_string(),
@@ -4281,7 +4459,7 @@ impl EvmModule {
         &self,
         req: &CallRequest,
     ) -> Result<(tx::AccessList, u64), CallError> {
-        self.create_access_list_impl(req, None)
+        self.create_access_list_impl(req, None, &overrides::StateOverrides::new())
     }
 
     /// `eth_createAccessList` at height `h` — historical form.
@@ -4296,7 +4474,7 @@ impl EvmModule {
         h: u64,
     ) -> Result<(tx::AccessList, u64), CallError> {
         let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
-        self.create_access_list_impl(req, at)
+        self.create_access_list_impl(req, at, &overrides::StateOverrides::new())
     }
 
     /// Shared body — `at` selects the state view (`None` = latest).
@@ -4304,9 +4482,15 @@ impl EvmModule {
         &self,
         req: &CallRequest,
         at: Option<u64>,
+        ovr: &overrides::StateOverrides,
     ) -> Result<(tx::AccessList, u64), CallError> {
-        let (rs, _trace, timed_out) =
-            self.simulate(req, req.gas.unwrap_or(self.block_gas_limit), self.sim_deadline(), at)?;
+        let (rs, _trace, timed_out) = self.simulate(
+            req,
+            req.gas.unwrap_or(self.block_gas_limit),
+            self.sim_deadline(),
+            at,
+            ovr,
+        )?;
         let gas_used = rs.result.tx_gas_used();
         if timed_out {
             return Err(CallError::Halt { reason: "execution timed out".to_string(), gas_used });
@@ -4543,7 +4727,7 @@ impl EvmModule {
     /// [`CallError`] variants as `call_read`.
     pub fn call_read_at(&self, req: &CallRequest, h: u64) -> Result<CallOutcome, CallError> {
         let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
-        self.call_read_impl(req, at)
+        self.call_read_impl(req, at, &overrides::StateOverrides::new())
     }
 
     /// `eth_getProof` (EIP-1186): the account's Merkle-Patricia proof
@@ -4726,6 +4910,30 @@ impl EvmModule {
         *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// The latest sealed block's base fee — geth's `head.BaseFee`,
+    /// the base component of `eth_gasPrice`. Falls back to the
+    /// configured initial base fee before the first block seals.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the history mutex is poisoned.
+    #[must_use]
+    pub fn latest_base_fee(&self) -> u64 {
+        let history = self.history();
+        history.latest().and_then(|h| history.block(h)).map_or(self.base_fee, |b| b.base_fee)
+    }
+
+    /// The oracle-suggested priority fee — `eth_maxPriorityFeePerGas`.
+    /// Delegates to [`history::History::suggest_gas_tip`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the history mutex is poisoned.
+    #[must_use]
+    pub fn suggest_gas_tip(&self) -> u128 {
+        self.history().suggest_gas_tip()
+    }
+
     /// Extract the `StorageBackend` for testing. The backend is
     /// removed from the module (set to `None`), so subsequent
     /// `end_block` calls will not flush. The returned backend can
@@ -4848,6 +5056,13 @@ impl EvmModule {
     /// table is malformed.
     pub fn install_preinstalls(&self) {
         for p in preinstalls::PREINSTALLS {
+            // Fork-gated contracts (EIP-2935's history contract is
+            // Prague+) must not exist on an earlier-spec chain —
+            // installing them would diverge the genesis state root
+            // from the real fork's.
+            if !p.requires_spec.is_none_or(|req| self.spec.is_enabled_in(req)) {
+                continue;
+            }
             self.genesis_insert_account(
                 &preinstalls::preinstall_address(p),
                 0,
@@ -8142,5 +8357,72 @@ mod tests {
         // end of block 2 → recipient has 200).
         assert_eq!(m2.balance_at(&recipient, 2).unwrap(), 200);
         assert_eq!(m2.balance_at(&recipient, 4).unwrap(), 400);
+    }
+
+    /// EIP-2935: the history contract is preinstalled at the
+    /// canonical address, `begin_block` records the parent hash in
+    /// its ring buffer, and the contract's `get` path serves it to
+    /// ordinary callers through a real EVM call.
+    #[test]
+    fn eip2935_history_contract() {
+        let m = make_module();
+        m.install_preinstalls();
+        let hist_addr = Address(HISTORY_STORAGE_ADDRESS.0.0);
+
+        // Preinstall landed with the canonical bytecode.
+        assert!(!m.code_at(&hist_addr, 0).unwrap().is_empty());
+
+        drive_block(&m, 1, &[]);
+        drive_block(&m, 2, &[]);
+        drive_block(&m, 3, &[]);
+
+        let hash1 = m.history().block(1).unwrap().hash;
+        let hash2 = m.history().block(2).unwrap().hash;
+        // Slot `(n) % 8191` holds hash(n), written during block n+1.
+        assert_eq!(m.storage_at(&hist_addr, &U256::from(1)), U256::from_be_bytes(hash1.0));
+        assert_eq!(m.storage_at(&hist_addr, &U256::from(2)), U256::from_be_bytes(hash2.0));
+
+        // Attribution: the slot-2 write belongs to block 3, so a
+        // historical read at h=2 still sees the empty slot.
+        assert_eq!(m.storage_at_height(&hist_addr, &U256::from(2), 2).unwrap(), U256::ZERO);
+        assert_eq!(
+            m.storage_at_height(&hist_addr, &U256::from(2), 3).unwrap(),
+            U256::from_be_bytes(hash2.0)
+        );
+
+        // End-to-end through real bytecode: `get` with calldata =
+        // 32-byte block number returns the stored hash.
+        let mut calldata = [0u8; 32];
+        calldata[31] = 1;
+        let out = m
+            .call_read(&CallRequest {
+                from: None,
+                to: Some(hist_addr),
+                gas: None,
+                gas_price: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                value: U256::ZERO,
+                data: calldata.to_vec(),
+                nonce: None,
+                access_list: tx::AccessList::default(),
+            })
+            .expect("history get must succeed");
+        assert_eq!(out.output, hash1.0.to_vec());
+    }
+
+    /// EIP-2935 is Prague-gated: a Cancun spec neither installs the
+    /// contract nor writes its storage (the write would diverge the
+    /// state root from the real fork).
+    #[test]
+    fn eip2935_gated_on_prague() {
+        let m = EvmModule::with_spec(1, 7, SpecId::CANCUN);
+        m.install_preinstalls();
+        let hist_addr = Address(HISTORY_STORAGE_ADDRESS.0.0);
+        assert!(m.code_at(&hist_addr, 0).unwrap().is_empty());
+
+        drive_block(&m, 1, &[]);
+        drive_block(&m, 2, &[]);
+        assert_eq!(m.storage_at(&hist_addr, &U256::from(1)), U256::ZERO);
     }
 }

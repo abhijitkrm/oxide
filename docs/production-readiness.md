@@ -449,10 +449,11 @@ validator add/remove, a real `eth_*` RPC surface over HTTP **and
 WebSocket** (blocks/txs/receipts/logs/call/estimate/feeHistory at
 current **and historical** heights, EIP-1186 proofs, access lists,
 `eth_subscribe` `newHeads`/`logs`/`newPendingTransactions` pushes,
-pollable filters, `txpool_*` inspection, and `debug_trace*`
-callTracer output — all durable across restart), tx gossip, and
-graceful shutdown. The EVM-RPC parity gap list in
-`docs/evm-parity-gap-analysis.md` is closed out through P2; the
-only remaining rows are non-EVM (distribution, slashing, state
-sync) and minor knobs (`filter-cap`, `http-timeout`, gas-price
-oracles, `eth_estimateGas` state overrides).
+pollable filters, `txpool_*` inspection, `eth_pendingTransactions`,
+`debug_trace*` callTracer output, `stateOverride` simulations,
+oracle-quoted gas prices, and the EIP-2935 history contract — all
+durable across restart), tx gossip, and graceful shutdown. The
+EVM-RPC parity gap list in `docs/evm-parity-gap-analysis.md` is
+closed out through P2; the only remaining rows are non-EVM
+(distribution, slashing, state sync) and the deliberate omissions
+(key-custody `eth_sendTransaction`/`personal_*`, EIP-4844 blobs).

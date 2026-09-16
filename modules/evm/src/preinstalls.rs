@@ -18,6 +18,7 @@
 //! address stays reproducible) and zero balance.
 
 use primitives::Address;
+use revm::primitives::hardfork::SpecId;
 
 /// A single preinstalled contract: fixed address + runtime bytecode.
 pub struct Preinstall {
@@ -30,6 +31,13 @@ pub struct Preinstall {
     pub nonce: u64,
     /// Runtime bytecode (hex, no `0x` prefix), verified against mainnet.
     pub code: &'static str,
+    /// Earliest hardfork that carries this contract, or `None` for
+    /// fork-independent preinstalls. Fork-gated contracts (e.g. the
+    /// EIP-2935 history contract exists only on Prague+) must not be
+    /// installed under an earlier spec — a Cancun genesis carrying
+    /// the contract would diverge from the real fork's genesis state
+    /// root.
+    pub requires_spec: Option<SpecId>,
 }
 
 const CREATE2_FACTORY_CODE: &str = concat!(
@@ -329,6 +337,21 @@ const PERMIT2_CODE: &str = concat!(
     "5b3d9150612337565b6040513d84823e3d90fdfea164736f6c6343000811000a",
 );
 
+/// EIP-2935 block-hash history contract (Prague). Verbatim
+/// `alloy_eips::eip2935::HISTORY_STORAGE_CODE` / geth
+/// `params.HistoryStorageCode`: callers other than `SYSTEM_ADDRESS`
+/// (`0xffff…fffe`) pass a block number in calldata and receive
+/// `storage[number % 8191]` (rejecting numbers outside the
+/// 8191-block window behind the current block); the system caller's
+/// calldata word is stored at slot `(block_number - 1) % 8191`.
+/// Oxide performs the equivalent direct storage write in
+/// `begin_block` — the contract's `set` path is never invoked, but
+/// its `get` path serves `eth_call`s from user contracts.
+const HISTORY_STORAGE_CODE: &str = concat!(
+    "3373fffffffffffffffffffffffffffffffffffffffe14604657602036036042575f3560014303811160425761",
+    "1fff81430311604257611fff9006545f5260205ff35b5f5ffd5b5f35611fff60014303065500",
+);
+
 /// The canonical preinstall set, applied at genesis.
 ///
 /// Order is irrelevant — each lands at an address nothing else uses.
@@ -343,6 +366,7 @@ pub const PREINSTALLS: &[Preinstall] = &[
         address: "4e59b44847b379578588920ca78fbf26c0b4956c",
         nonce: 1,
         code: CREATE2_FACTORY_CODE,
+        requires_spec: None,
     },
     // EIP-2470 SingletonFactory — pre-CREATE2-era deterministic
     // deployer still used by older Safe/AA tooling.
@@ -351,6 +375,7 @@ pub const PREINSTALLS: &[Preinstall] = &[
         address: "ce0042b868300000d44a59004da54a005ffdcf9f",
         nonce: 1,
         code: EIP2470_FACTORY_CODE,
+        requires_spec: None,
     },
     // Safe Singleton Factory — Safe{Wallet} deployments look it up.
     Preinstall {
@@ -358,6 +383,7 @@ pub const PREINSTALLS: &[Preinstall] = &[
         address: "914d7fec6aac8cd542e72bca78b30650d45643d7",
         nonce: 1,
         code: SAFE_FACTORY_CODE,
+        requires_spec: None,
     },
     // Multicall3 — batch `eth_call`s; wagmi/viem block tags assume it.
     Preinstall {
@@ -365,6 +391,7 @@ pub const PREINSTALLS: &[Preinstall] = &[
         address: "ca11bde05977b3631167028862be2a173976ca11",
         nonce: 1,
         code: MULTICALL3_CODE,
+        requires_spec: None,
     },
     // Uniswap Permit2 — signature-based token approvals; the Permit2
     // SDK hardcodes this address.
@@ -373,6 +400,17 @@ pub const PREINSTALLS: &[Preinstall] = &[
         address: "000000000022d473030f116ddee9f6b43ac78ba3",
         nonce: 1,
         code: PERMIT2_CODE,
+        requires_spec: None,
+    },
+    // EIP-2935 history-storage contract — Prague+ only. Contracts
+    // read ancestor hashes through it beyond the BLOCKHASH opcode's
+    // 256-block window.
+    Preinstall {
+        name: "eip2935-history-storage",
+        address: "0000f90827f1c53a10cb7a02335b175320002935",
+        nonce: 1,
+        code: HISTORY_STORAGE_CODE,
+        requires_spec: Some(SpecId::PRAGUE),
     },
 ];
 

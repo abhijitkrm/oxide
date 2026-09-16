@@ -506,6 +506,16 @@ impl WsConn {
 /// without polling can't grow the map unboundedly.
 const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Maximum concurrently-registered pollable filters — the
+/// `filter-cap` role (cosmos-evm defaults to 200). The TTL sweep
+/// bounds *time*; this bounds *count*: without it a client that
+/// registers-and-abandons faster than the 300 s reap can still
+/// grow the map without limit. 1,024 is generous for real
+/// workloads (a live client polls within the TTL and needs only a
+/// handful of filters) while still capping memory at
+/// `1024 × size_of::<FilterEntry>` ≈ tens of KB.
+const MAX_FILTERS: usize = 1024;
+
 /// A pollable filter's kind and per-kind cursor.
 #[derive(Debug)]
 enum FilterKind {
@@ -955,6 +965,7 @@ impl RpcServer {
             "eth_getFilterLogs" => self.eth_get_filter_logs(&request.params),
             "eth_uninstallFilter" => self.eth_uninstall_filter(&request.params),
             // ---- Transaction pool ----
+            "eth_pendingTransactions" => self.eth_pending_transactions(),
             "txpool_status" => self.txpool_status(),
             "txpool_content" => self.txpool_content(),
             "txpool_contentFrom" => self.txpool_content_from(&request.params),
@@ -1153,10 +1164,16 @@ impl RpcServer {
         json!(format!("0x{:x}", self.block_height()))
     }
 
-    /// `eth_gasPrice` — returns the current gas price (base fee) as
-    /// a hex string in wei.
+    /// `eth_gasPrice` — the oracle-suggested gas price: latest
+    /// sealed block's base fee plus the sampled priority tip —
+    /// geth's `SuggestGasPrice` = `suggestTip + head.BaseFee`.
+    /// Without an attached EVM (stateless serving) the configured
+    /// base fee is the honest fallback.
     fn eth_gas_price(&self) -> Value {
-        json!(format!("0x{:x}", self.base_fee))
+        let price = self.evm.as_deref().map_or(u128::from(self.base_fee), |evm| {
+            u128::from(evm.latest_base_fee()).saturating_add(evm.suggest_gas_tip())
+        });
+        json!(format!("0x{price:x}"))
     }
 
     /// `net_version` — returns the network ID as a decimal string.
@@ -1253,13 +1270,25 @@ impl RpcServer {
     /// Register a pollable filter and return its hex ID. Reaps any
     /// expired filters first so the map can't grow on
     /// register-and-abandon clients.
-    fn register_filter(&self, kind: FilterKind) -> String {
+    ///
+    /// # Errors
+    ///
+    /// `-32000 "filter limit reached"` once [`MAX_FILTERS`] live
+    /// filters are registered — the `filter-cap` guard.
+    fn register_filter(&self, kind: FilterKind) -> Result<String, RpcError> {
         let mut filters = self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         filters.retain(|_, e| now.duration_since(e.last_poll) < FILTER_TIMEOUT);
+        if filters.len() >= MAX_FILTERS {
+            return Err(RpcError {
+                code: -32000,
+                message: format!("filter limit reached (max {MAX_FILTERS})"),
+                data: None,
+            });
+        }
         let id = format!("0x{:x}", self.next_filter_id.fetch_add(1, Ordering::Relaxed));
         filters.insert(id.clone(), FilterEntry { kind, last_poll: now });
-        id
+        Ok(id)
     }
 
     /// `eth_newFilter` — create a pollable log filter.
@@ -1272,7 +1301,7 @@ impl RpcServer {
         let filter = self.parse_log_filter(obj)?;
         self.require_evm()?;
         let latest = self.latest_sealed_height();
-        Ok(json!(self.register_filter(FilterKind::Log { filter, last_served: latest })))
+        Ok(json!(self.register_filter(FilterKind::Log { filter, last_served: latest })?))
     }
 
     /// `eth_newBlockFilter` — create a pollable block filter.
@@ -1281,7 +1310,7 @@ impl RpcServer {
     fn eth_new_block_filter(&self) -> Result<Value, RpcError> {
         self.require_evm()?;
         let latest = self.latest_sealed_height();
-        Ok(json!(self.register_filter(FilterKind::Block { last_served: latest })))
+        Ok(json!(self.register_filter(FilterKind::Block { last_served: latest })?))
     }
 
     /// `eth_newPendingTransactionFilter` — create a pollable
@@ -1289,14 +1318,10 @@ impl RpcServer {
     /// the hashes of txs that entered the mempool since the last
     /// poll.
     ///
-    /// `Result` for uniformity with the sibling filter constructors —
-    /// the dispatch shape stays `Result<Value, RpcError>` across the
-    /// namespace.
-    #[allow(clippy::unnecessary_wraps)]
     fn eth_new_pending_transaction_filter(&self) -> Result<Value, RpcError> {
         let next_seq =
             self.pending_txs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next_seq;
-        Ok(json!(self.register_filter(FilterKind::PendingTx { next_seq })))
+        Ok(json!(self.register_filter(FilterKind::PendingTx { next_seq })?))
     }
 
     /// `eth_uninstallFilter` — drop a pollable filter. Returns
@@ -1368,6 +1393,18 @@ impl RpcServer {
                 data: None,
             })?;
         Ok(txpool_content_json(&pool.txpool_snapshot(), Some(addr)))
+    }
+
+    /// `eth_pendingTransactions` — a flat array of the pool's
+    /// *pending* (executable) transactions as full tx objects
+    /// (`blockHash`/`blockNumber`/`transactionIndex` null — geth's
+    /// shape for unmined txs). Queued txs behind nonce gaps are
+    /// excluded, matching geth's pending-set definition.
+    fn eth_pending_transactions(&self) -> Result<Value, RpcError> {
+        let pool = self.require_txpool()?;
+        let txs: Vec<Value> =
+            pool.txpool_snapshot().iter().filter(|item| item.pending).map(pooled_tx_json).collect();
+        Ok(json!(txs))
     }
 
     /// `txpool_inspect` — same grouping as `txpool_content` but each
@@ -1459,7 +1496,7 @@ impl RpcServer {
         // Optional block tag — historical heights within the
         // retained undo window are servable.
         let h = self.resolve_block_ref(params.get(1))?;
-        parse_trace_options(params.get(2))?;
+        let ovr = parse_trace_options(params.get(2))?;
         // Same gas-cap clamp as `eth_call` — an unbounded simulation
         // is a resource-exhaustion vector.
         if req.gas.is_some_and(|g| g > types::CHAIN_BLOCK_GAS_LIMIT) {
@@ -1469,7 +1506,8 @@ impl RpcServer {
         let gas_cap = req.gas.unwrap_or(evm.block_gas_limit());
         // Revert/halt is a *trace result*, not an RPC error — geth
         // returns the call tree with the frame's `error` set.
-        let (gas_used, frame) = evm.call_read_traced_at(&req, h).map_err(call_error)?;
+        let (gas_used, frame) =
+            evm.call_read_traced_with_overrides(&req, Some(h), &ovr).map_err(call_error)?;
         let Some(frame) = frame else {
             return Err(RpcError {
                 code: -32_000,
@@ -2032,7 +2070,8 @@ impl RpcServer {
         }
         let evm = self.require_evm()?;
         let h = self.resolve_block_ref(params.get(1))?;
-        match evm.call_read_at(&req, h) {
+        let ovr = parse_state_overrides(params.get(2))?;
+        match evm.call_read_with_overrides(&req, Some(h), &ovr) {
             Ok(outcome) => Ok(json!(format!("0x{}", hex::encode(outcome.output)))),
             Err(e) => Err(call_error(e)),
         }
@@ -2050,7 +2089,8 @@ impl RpcServer {
         let req = parse_call_object(call)?;
         let evm = self.require_evm()?;
         let h = self.resolve_block_ref(params.get(1))?;
-        match evm.estimate_call_gas_at(&req, h) {
+        let ovr = parse_state_overrides(params.get(2))?;
+        match evm.estimate_call_gas_with_overrides(&req, Some(h), &ovr) {
             Ok(gas) => Ok(json!(format!("0x{gas:x}"))),
             Err(e) => Err(call_error(e)),
         }
@@ -2089,11 +2129,16 @@ impl RpcServer {
         }
     }
 
-    /// `eth_maxPriorityFeePerGas` — returns the current priority fee.
+    /// `eth_maxPriorityFeePerGas` — the oracle's suggested tip
+    /// (p60 of recent-block inclusion tips, geth `GasPriceOracle`).
+    /// Without an EVM there is no sample history — return the 1 gwei
+    /// default geth falls back to.
     fn eth_max_priority_fee_per_gas(&self) -> Value {
-        // Phase E v0: return 1 gwei (typical priority fee).
-        let _ = self;
-        json!("0x3b9aca00")
+        let tip = match self.evm.as_deref() {
+            Some(evm) => evm.suggest_gas_tip(),
+            None => 1_000_000_000,
+        };
+        json!(format!("0x{tip:x}"))
     }
 
     /// `eth_getBlockReceipts` — returns all receipts for a block.
@@ -2735,11 +2780,16 @@ fn log_json(m: &evm::history::LogMatch) -> Value {
 /// default). A named-but-unsupported tracer is a `-32602` error:
 /// returning the callTracer shape to a caller expecting struct logs
 /// would silently hand them the wrong data.
-fn parse_trace_options(v: Option<&Value>) -> Result<(), RpcError> {
+/// Parse the `debug_trace*` config object — `{tracer, stateOverrides?}`.
+/// Returns the parsed `stateOverrides` table (geth `TraceCallConfig`
+/// nests it inside the config); only `debug_traceCall` consumes it —
+/// block tracers validate the shape and drop it (the block already
+/// executed; overrides can't retroactively change it).
+fn parse_trace_options(v: Option<&Value>) -> Result<evm::overrides::StateOverrides, RpcError> {
     let Some(Value::Object(obj)) = v else {
         // Absent or non-object options: defaults apply.
         return match v {
-            None | Some(Value::Null) => Ok(()),
+            None | Some(Value::Null) => Ok(evm::overrides::StateOverrides::new()),
             Some(_) => Err(RpcError::invalid_params("trace options must be an object")),
         };
     };
@@ -2759,7 +2809,7 @@ fn parse_trace_options(v: Option<&Value>) -> Result<(), RpcError> {
             }
         }
     }
-    Ok(())
+    parse_state_overrides(obj.get("stateOverrides"))
 }
 
 /// Serialize a [`evm::trace::CallFrame`] to the geth `callTracer`
@@ -3004,6 +3054,66 @@ fn parse_call_object(v: &Value) -> Result<evm::CallRequest, RpcError> {
         }
     }
     Ok(req)
+}
+
+/// Parse geth's `stateOverride` argument (`eth_call`/`eth_estimateGas`
+/// param 2/3): `{ "0xaddr": { balance?, nonce?, code?, state?,
+/// stateDiff? } }`.
+///
+/// `state` replaces an account's whole storage map; `stateDiff`
+/// merges into it — geth rejects supplying both for one account.
+/// `movePrecompileToAddress` is intentionally unimplemented (native
+/// precompiles are fixed-address protocol code, not movable
+/// bytecode) — unknown fields are otherwise ignored, matching
+/// geth's permissive decode.
+fn parse_state_overrides(v: Option<&Value>) -> Result<evm::overrides::StateOverrides, RpcError> {
+    let mut out = evm::overrides::StateOverrides::new();
+    let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(out) };
+    let obj = v.as_object().ok_or_else(|| {
+        RpcError::invalid_params("stateOverride must be an address→override object")
+    })?;
+    for (key, entry) in obj {
+        let addr = parse_eth_address(Some(&Value::String(key.clone())))?;
+        let fields = entry
+            .as_object()
+            .ok_or_else(|| RpcError::invalid_params("override entry must be an object"))?;
+        let get = |k: &str| fields.get(k).filter(|v| !v.is_null());
+        let mut ovr = evm::overrides::AccountOverride::default();
+        if let Some(v) = get("balance") {
+            ovr.balance = Some(parse_u256(v)?);
+        }
+        if let Some(v) = get("nonce") {
+            ovr.nonce = Some(parse_u64(v)?);
+        }
+        if let Some(v) = get("code") {
+            let s =
+                v.as_str().ok_or_else(|| RpcError::invalid_params("code must be a hex string"))?;
+            ovr.code = Some(hex_decode(s)?);
+        }
+        if let Some(v) = get("state") {
+            ovr.state = Some(parse_override_slots(v)?);
+        }
+        if let Some(v) = get("stateDiff") {
+            ovr.state_diff = Some(parse_override_slots(v)?);
+        }
+        if ovr.state.is_some() && ovr.state_diff.is_some() {
+            return Err(RpcError::invalid_params("both state and stateDiff given"));
+        }
+        out.insert(addr, ovr);
+    }
+    Ok(out)
+}
+
+/// Parse a `state`/`stateDiff` slot map `{ "0xslot": "0xvalue" }`.
+fn parse_override_slots(v: &Value) -> Result<std::collections::BTreeMap<U256, U256>, RpcError> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| RpcError::invalid_params("state override must be a slot→value object"))?;
+    let mut slots = std::collections::BTreeMap::new();
+    for (slot, value) in obj {
+        slots.insert(parse_u256(&Value::String(slot.clone()))?, parse_u256(value)?);
+    }
+    Ok(slots)
 }
 
 /// Decode a hex string (with or without `0x` prefix) to bytes.
@@ -4137,5 +4247,315 @@ mod tests {
         let out: Value = serde_json::from_str(&s.handle_raw(&body)).expect("response");
         assert!(out.is_object(), "over-cap batch returns one error object");
         assert_eq!(out["error"]["code"], json!(-32005));
+    }
+
+    // ---- RPC surface leftovers --------------------------------------
+
+    /// `eth_pendingTransactions` returns only the pool's *pending*
+    /// (executable) entries as geth-shaped tx objects — `blockHash`,
+    /// `blockNumber`, `transactionIndex` null for unmined txs —
+    /// excluding queued entries behind nonce gaps.
+    #[test]
+    fn eth_pending_transactions_returns_pending_only() {
+        let mut s = make_server();
+        let mut pending = signed_envelope([0x01; 32], 0);
+        pending.pending = true;
+        let queued = signed_envelope([0x02; 32], 3); // pending: false
+        s.set_txpool_provider(Arc::new(MockTxpool { items: vec![pending, queued] }));
+
+        let resp = s.handle(&make_request("eth_pendingTransactions", vec![], json!(1)));
+        let arr = resp.result.unwrap().as_array().unwrap().clone();
+        assert_eq!(arr.len(), 1, "queued entries must be excluded");
+        assert_eq!(arr[0]["nonce"], json!("0x0"));
+        assert_eq!(arr[0]["to"], json!("0x4242424242424242424242424242424242424242"));
+        assert_eq!(arr[0]["blockHash"], Value::Null);
+        assert_eq!(arr[0]["blockNumber"], Value::Null);
+        assert_eq!(arr[0]["transactionIndex"], Value::Null);
+    }
+
+    /// A node with no mempool attached has no pending txs to serve —
+    /// the method errors rather than silently returning `[]` (geth
+    /// parity: the method exists only when a txpool is present).
+    #[test]
+    fn eth_pending_transactions_without_pool_errors() {
+        let s = make_server();
+        let resp = s.handle(&make_request("eth_pendingTransactions", vec![], json!(1)));
+        assert!(resp.error.is_some());
+    }
+
+    /// The filter registry is count-bounded (`filter-cap`): the
+    /// `MAX_FILTERS + 1`th live registration is refused, and
+    /// uninstalling one frees a slot.
+    #[test]
+    fn filter_cap_rejects_over_limit_and_frees_on_uninstall() {
+        let s = make_server();
+        let mut first_id = String::new();
+        for i in 0..MAX_FILTERS {
+            let req = make_request("eth_newPendingTransactionFilter", vec![], json!(i));
+            let resp = s.handle(&req);
+            let id = resp
+                .result
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("filter {i} must register: {:?}", resp.error))
+                .to_string();
+            if i == 0 {
+                first_id = id;
+            }
+        }
+        let over = make_request("eth_newPendingTransactionFilter", vec![], json!(MAX_FILTERS));
+        let err = s.handle(&over).error.expect("over-cap must error");
+        assert_eq!(err.code, -32_000);
+        assert!(err.message.contains("filter limit"), "msg: {}", err.message);
+
+        // Uninstall frees a slot — the next registration succeeds.
+        let unsub = make_request("eth_uninstallFilter", vec![json!(first_id)], json!(9000));
+        assert_eq!(s.handle(&unsub).result, Some(json!(true)));
+        let again = make_request("eth_newPendingTransactionFilter", vec![], json!(9001));
+        assert!(s.handle(&again).error.is_none());
+    }
+
+    /// `eth_call` `stateOverride` (param 2): a `code` override makes
+    /// an EOA execute as a contract for the call's duration; the
+    /// authoritative state is untouched afterwards.
+    #[test]
+    fn eth_call_state_override_code_not_persisted() {
+        use executor::Module;
+        use primitives::Height;
+        let (s, evm) = make_evm_server();
+        // `0x4242…` is outside the native precompile range
+        // (`0x0000…00XX`): a plain EOA that returns empty output.
+        let target = "0x4242424242424242424242424242424242424243";
+        evm.begin_block(Height::new(1));
+        evm.end_block(Height::new(1));
+
+        // Baseline: the account has no code → empty return.
+        let plain =
+            make_request("eth_call", vec![json!({"to": target}), json!("latest")], json!(1));
+        let r = s.handle(&plain);
+        assert_eq!(r.result, Some(json!("0x")), "err: {:?}", r.error);
+
+        // Override code: `PUSH1 0x2a; PUSH1 0; MSTORE; PUSH1 0x20;
+        // PUSH1 0; RETURN` — returns the word 42.
+        let ovr = make_request(
+            "eth_call",
+            vec![
+                json!({"to": target}),
+                json!("latest"),
+                json!({target: {"code": "0x602a60005260206000f3"}}),
+            ],
+            json!(2),
+        );
+        let resp = s.handle(&ovr);
+        let out = resp.result.expect("override call must succeed");
+        assert_eq!(out, json!(format!("0x{:064x}", 42)));
+
+        // The override must not leak into state — still no code.
+        let still = make_request("eth_getCode", vec![json!(target), json!("latest")], json!(3));
+        assert_eq!(s.handle(&still).result, Some(json!("0x")));
+    }
+
+    /// `state` replaces the account's whole storage map while
+    /// `stateDiff` merges — observable on slots the override omits.
+    #[test]
+    fn eth_call_state_vs_statediff() {
+        use executor::Module;
+        use primitives::Height;
+        use revm::primitives::U256;
+        let (s, evm) = make_evm_server();
+        let contract = primitives::Address([0xCC; 20]);
+        // Runtime `PUSH1 0; SLOAD; PUSH1 0; MSTORE; PUSH1 0x20;
+        // PUSH1 0; RETURN` — echoes storage slot 0. Real slot 0 = 7.
+        evm.genesis_insert_account(
+            &contract,
+            0,
+            1,
+            hex::decode("60005460005260206000f3").expect("contract hex"),
+            vec![(U256::ZERO, U256::from(7))],
+        );
+        evm.begin_block(Height::new(1));
+        evm.end_block(Height::new(1));
+
+        let target = "0xcccccccccccccccccccccccccccccccccccccccc";
+        let call = |ovr: Value, id| {
+            let req = make_request(
+                "eth_call",
+                vec![json!({"to": target}), json!("latest"), ovr],
+                json!(id),
+            );
+            s.handle(&req).result.expect("call must succeed")
+        };
+        // Baseline: the real slot value.
+        let plain =
+            make_request("eth_call", vec![json!({"to": target}), json!("latest")], json!(1));
+        assert_eq!(s.handle(&plain).result, Some(json!(format!("0x{:064x}", 7))));
+        // stateDiff: slot 0 overridden → 42; unlisted slots keep
+        // base values.
+        assert_eq!(
+            call(json!({target: {"stateDiff": {"0x00": "0x2a"}}}), 2),
+            json!(format!("0x{:064x}", 42))
+        );
+        // state (replace): slot 0 not listed → reads 0 even though
+        // base state has 7.
+        assert_eq!(
+            call(json!({target: {"state": {"0x05": "0x09"}}}), 3),
+            json!(format!("0x{:064x}", 0))
+        );
+        // state + stateDiff together → invalid params (geth).
+        let req = make_request(
+            "eth_call",
+            vec![
+                json!({"to": target}),
+                json!("latest"),
+                json!({target: {"state": {}, "stateDiff": {}}}),
+            ],
+            json!(4),
+        );
+        let err = s.handle(&req).error.expect("conflict must error");
+        assert_eq!(err.code, -32_602);
+    }
+
+    /// geth nests `stateOverrides` inside the `debug_traceCall`
+    /// config object — it must be parsed from there, not param 3.
+    #[test]
+    fn debug_trace_call_applies_nested_state_overrides() {
+        use executor::Module;
+        use primitives::Height;
+        let (s, evm) = make_evm_server();
+        evm.begin_block(Height::new(1));
+        evm.end_block(Height::new(1));
+
+        let target = "0x4242424242424242424242424242424242424243";
+        let req = make_request(
+            "debug_traceCall",
+            vec![
+                json!({"to": target}),
+                json!("latest"),
+                json!({
+                    "tracer": "callTracer",
+                    "stateOverrides": {target: {"code": "0x602a60005260206000f3"}},
+                }),
+            ],
+            json!(1),
+        );
+        let res = s.handle(&req).result.expect("trace must succeed");
+        assert_eq!(res["output"], json!(format!("0x{:064x}", 42)));
+        assert_eq!(res["type"], json!("CALL"));
+    }
+
+    /// `eth_gasPrice` / `eth_maxPriorityFeePerGas` quote the history
+    /// oracle — p60 of recent inclusion tips — not a stub constant.
+    #[test]
+    fn gas_price_oracle_samples_history() {
+        use evm::tx::{SignedTx, TxFields, TxKind, TxLegacy};
+        use executor::Module;
+        use primitives::Height;
+        use revm::primitives::{Bytes, U256};
+
+        let (s, evm) = make_evm_server();
+        // Fund and recover the `[0x11;32]` sender.
+        let probe = SignedTx::sign_legacy(
+            TxLegacy {
+                fields: TxFields {
+                    nonce: 0,
+                    gas_limit: 21_000,
+                    to: TxKind::Call(alloy_primitives::Address::ZERO),
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    chain_id: 1,
+                },
+                gas_price: U256::from(1_000_000_000u64),
+            },
+            &[0x11; 32],
+        )
+        .expect("sign");
+        let sender = probe.recover_sender().expect("recover");
+        evm.fund_account_for_test(&sender, u128::MAX / 2);
+
+        // One block with legacy txs priced 1g/2g/3g. Legacy
+        // effective price == gas_price, so the inclusion tips are
+        // {price - base_fee(7)}: {999999993, 1999999993, 2999999993}.
+        // The oracle's p60 of three samples is the middle one.
+        let raws: Vec<Vec<u8>> = [(1u64, 1_000_000_000u64), (2, 2_000_000_000), (3, 3_000_000_000)]
+            .iter()
+            .enumerate()
+            .map(|(nonce, (_, price))| {
+                SignedTx::sign_legacy(
+                    TxLegacy {
+                        fields: TxFields {
+                            nonce: nonce as u64,
+                            gas_limit: 21_000,
+                            to: TxKind::Call(alloy_primitives::Address::ZERO),
+                            value: U256::ZERO,
+                            data: Bytes::new(),
+                            chain_id: 1,
+                        },
+                        gas_price: U256::from(*price),
+                    },
+                    &[0x11; 32],
+                )
+                .expect("sign")
+                .encode_to_bytes()
+            })
+            .collect();
+        evm.begin_block(Height::new(1));
+        let ctx = executor::TxContext { sender, nonce: 0, fee: 0 };
+        for (i, r) in evm.handle_batch(&ctx, &raws).iter().enumerate() {
+            assert!(r.is_ok(), "tx {i} must execute: {r:?}");
+        }
+        evm.end_block(Height::new(1));
+
+        let tip = s.handle(&make_request("eth_maxPriorityFeePerGas", vec![], json!(1)));
+        assert_eq!(tip.result, Some(json!(format!("0x{:x}", 1_999_999_993u64))));
+        // gasPrice = latest base fee (7) + tip → 2_000_000_000.
+        let price = s.handle(&make_request("eth_gasPrice", vec![], json!(2)));
+        assert_eq!(price.result, Some(json!(format!("0x{:x}", 2_000_000_000u64))));
+    }
+
+    /// With an EVM attached but no sealed history the oracle falls
+    /// back to the configured base fee plus the 1-gwei default tip —
+    /// geth's `SuggestGasPrice` behavior on a young chain.
+    #[test]
+    fn gas_price_oracle_empty_history_fallback() {
+        let (s, _evm) = make_evm_server();
+        let price = s.handle(&make_request("eth_gasPrice", vec![], json!(1)));
+        assert_eq!(price.result, Some(json!(format!("0x{:x}", 1_000_000_007u64))));
+        let tip = s.handle(&make_request("eth_maxPriorityFeePerGas", vec![], json!(2)));
+        assert_eq!(tip.result, Some(json!(format!("0x{:x}", 1_000_000_000u64))));
+    }
+
+    /// `eth_estimateGas` accepts the same `stateOverride` argument —
+    /// a code override makes the estimate include execution gas
+    /// instead of the plain-transfer intrinsic.
+    #[test]
+    fn eth_estimate_gas_applies_state_override() {
+        use executor::Module;
+        use primitives::Height;
+        let (s, evm) = make_evm_server();
+        evm.begin_block(Height::new(1));
+        evm.end_block(Height::new(1));
+
+        let target = "0x4242424242424242424242424242424242424243";
+        // Baseline: call to a codeless account is intrinsic-only.
+        let plain =
+            make_request("eth_estimateGas", vec![json!({"to": target}), json!("latest")], json!(1));
+        assert_eq!(s.handle(&plain).result, Some(json!("0x5208"))); // 21000
+
+        // With the SLOAD+return contract as a code override the
+        // estimate must cover the executed opcodes (> 21000).
+        let ovr = make_request(
+            "eth_estimateGas",
+            vec![
+                json!({"to": target}),
+                json!("latest"),
+                json!({target: {"code": "0x60005460005260206000f3"}}),
+            ],
+            json!(2),
+        );
+        let resp = s.handle(&ovr);
+        let gas = resp.result.expect("estimate must succeed");
+        let gas = u64::from_str_radix(gas.as_str().unwrap().trim_start_matches("0x"), 16)
+            .expect("hex gas");
+        assert!(gas > 21_000, "override code must add execution gas, got {gas}");
     }
 }
