@@ -131,6 +131,34 @@ impl ExecutorTxSubmitter {
     }
 }
 
+/// Adapter that lets the RPC server serve the `txpool_*` namespace
+/// from the executor's mempool.
+///
+/// The executor's `txpool_snapshot` takes the mempool lock once and
+/// clones the pooled envelopes — a cold-path read; the RPC layer
+/// holds no lock across the snapshot and the block path is
+/// unaffected. Keeping this an adapter (rather than having `rpc`
+/// depend on `executor`) preserves the workspace's dependency
+/// direction.
+struct ExecutorTxpoolProvider {
+    executor: Arc<executor::Executor>,
+}
+
+impl rpc::TxpoolProvider for ExecutorTxpoolProvider {
+    fn txpool_snapshot(&self) -> Vec<rpc::TxpoolItem> {
+        self.executor
+            .txpool_snapshot()
+            .into_iter()
+            .map(|(sender, nonce, envelope, pending)| rpc::TxpoolItem {
+                sender,
+                nonce,
+                envelope,
+                pending,
+            })
+            .collect()
+    }
+}
+
 /// Adapter that lets the RPC server export the executor's state
 /// snapshot via the `rpc::SnapshotProvider` trait.
 ///
@@ -345,6 +373,8 @@ fn build_single_node_rpc(
     // Wire the executor into the RPC so `eth_sendRawTransaction`
     // decodes, wraps, and submits EVM transactions into the mempool.
     rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: node.app_handle() }));
+    rpc_server
+        .set_txpool_provider(Arc::new(ExecutorTxpoolProvider { executor: node.app_handle() }));
     // Share the executor's EVM module with the RPC so `eth_call`,
     // `eth_getBalance`, and the block/tx/receipt/log lookups serve
     // the same state the executor is committing.
@@ -1033,6 +1063,7 @@ fn start_devnet_rpc(
         gossip: gossip_tx,
     }));
     rpc_server.set_evm(evm_module.clone());
+    rpc_server.set_txpool_provider(Arc::new(ExecutorTxpoolProvider { executor: app.clone() }));
     rpc_server.set_snapshot_provider(Arc::new(ExecutorSnapshotProvider { executor: app.clone() }));
     rpc_server.set_validator_set_provider(Arc::new(SharedValidatorSetProvider {
         set: shared_validator_set,
@@ -1252,6 +1283,15 @@ fn run_consensus_loop(
                             seen_txs.remove(&old);
                         }
                         let _ = engine.submit_tx(TxBytes::new(payload.to_vec()));
+                        // Feed pending-tx subscribers/filters — the
+                        // Ethereum hash is keccak256 of the signed
+                        // RLP inside the envelope, not the envelope
+                        // hash used for dedup.
+                        if let Some(rpc) = rpc
+                            && let Some(raw) = evm::unwrap_evm_tx_envelope(payload)
+                        {
+                            rpc.record_pending_tx(alloy_primitives::keccak256(raw));
+                        }
                     }
                 }
                 MSG_TIMEOUT => {

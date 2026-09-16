@@ -63,6 +63,8 @@ fn keccak256(data: &[u8]) -> String {
 
 struct Harness {
     rpc: RpcServer,
+    /// The module — kept so tests can seal additional blocks.
+    evm: Arc<EvmModule>,
     sender: Address,
     log_contract: Address,
     return_contract: Address,
@@ -113,7 +115,7 @@ fn make_harness() -> Harness {
     let mut rpc = RpcServer::new(1, 7);
     rpc.set_evm(evm.clone());
     rpc.set_block_height(1);
-    Harness { rpc, sender, log_contract, return_contract, revert_contract }
+    Harness { rpc, evm, sender, log_contract, return_contract, revert_contract }
 }
 
 fn handle(server: &RpcServer, method: &str, params: Vec<Value>) -> Value {
@@ -353,4 +355,176 @@ fn block_receipts_and_counts_and_fee_history() {
     assert_eq!(fees["oldestBlock"], json!("0x1"));
     // The sealed block's reward percentile row exists.
     assert!(fees["reward"].as_array().unwrap().iter().any(|r| !r.is_null()));
+}
+
+// ---- debug_trace* ----------------------------------------------------
+
+/// A re-signable call: same privkey/nonces as `make_harness`, so the
+/// tx hashes recomputed here match the sealed block's entries.
+fn signed_call_raw(nonce: u64, to: Address) -> Vec<u8> {
+    sign_call(&PRIVKEY, nonce, to)
+}
+
+#[test]
+fn trace_transaction_returns_call_tracer_root() {
+    let h = make_harness();
+    let log_raw = signed_call_raw(1, h.log_contract);
+    let hash = keccak256(&log_raw);
+
+    let trace = handle(&h.rpc, "debug_traceTransaction", vec![json!(hash)]);
+    assert_eq!(trace["type"], json!("CALL"));
+    assert_eq!(trace["from"], json!(hex_addr(&h.sender)));
+    assert_eq!(trace["to"], json!(hex_addr(&h.log_contract)));
+    // Tx-level gas fields patched over the frame-scoped values:
+    // 30M limit, 21_649 used (LOG0 + 32B data).
+    assert_eq!(trace["gas"], json!("0x1c9c380"));
+    assert_eq!(trace["gasUsed"], json!("0x5491"));
+    assert_eq!(trace["output"], json!("0x"));
+    assert!(trace.get("error").is_none());
+}
+
+#[test]
+fn trace_transaction_transfer_root_frame() {
+    let h = make_harness();
+    let transfer = sign_transfer(&PRIVKEY, 0, Address([0x42; 20]), 1_000_000);
+    let hash = keccak256(&transfer);
+
+    let trace = handle(&h.rpc, "debug_traceTransaction", vec![json!(hash)]);
+    assert_eq!(trace["type"], json!("CALL"));
+    assert_eq!(trace["to"], json!(hex_addr(&Address([0x42; 20]))));
+    assert_eq!(trace["value"], json!("0xf4240"));
+    assert_eq!(trace["gasUsed"], json!("0x5208")); // 21_000
+}
+
+#[test]
+fn trace_transaction_unknown_hash_errors() {
+    let h = make_harness();
+    let req = RpcRequest {
+        method: "debug_traceTransaction".to_string(),
+        params: vec![json!("0x0000000000000000000000000000000000000000000000000000000000000001")],
+        id: json!(1),
+        jsonrpc: "2.0".to_string(),
+    };
+    let resp = h.rpc.handle(&req);
+    assert_eq!(resp.error.unwrap().code, -32_000);
+}
+
+#[test]
+fn trace_transaction_revert_shows_error_and_reason() {
+    let h = make_harness();
+    // Seal a second block with a call to the always-reverting contract.
+    let revert_raw = signed_call_raw(2, h.revert_contract);
+    let hash = keccak256(&revert_raw);
+    let ctx = executor::TxContext { sender: Address([0u8; 20]), nonce: 0, fee: 0 };
+    h.evm.begin_block(Height::new(2));
+    let results = h.evm.handle_batch(&ctx, &[revert_raw]);
+    assert!(results[0].is_ok(), "revert tx still executes: {:?}", results[0]);
+    h.evm.end_block(Height::new(2));
+    h.rpc.set_block_height(2);
+
+    let trace = handle(&h.rpc, "debug_traceTransaction", vec![json!(hash)]);
+    assert_eq!(trace["error"], json!("execution reverted"));
+    // The contract reverts with empty data — no revertReason.
+    assert!(trace.get("revertReason").is_none());
+}
+
+#[test]
+fn trace_call_returns_output_for_success_and_error_for_revert() {
+    let h = make_harness();
+    let ok = handle(
+        &h.rpc,
+        "debug_traceCall",
+        vec![json!({"to": hex_addr(&h.return_contract), "gas": "0x100000"})],
+    );
+    assert_eq!(ok["type"], json!("CALL"));
+    // Runtime returns 32 bytes ending 0x2a.
+    let output = ok["output"].as_str().unwrap();
+    assert!(output.starts_with("0x"));
+    assert!(output.ends_with('a'), "output should end in 0x2a: {output}");
+
+    let reverted = handle(
+        &h.rpc,
+        "debug_traceCall",
+        vec![json!({"to": hex_addr(&h.revert_contract), "gas": "0x100000"})],
+    );
+    assert_eq!(reverted["error"], json!("execution reverted"));
+}
+
+#[test]
+fn trace_block_by_number_returns_per_tx_results() {
+    let h = make_harness();
+    let traces = handle(
+        &h.rpc,
+        "debug_traceBlockByNumber",
+        vec![json!("0x1"), json!({"tracer": "callTracer"})],
+    );
+    let arr = traces.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr[0]["txHash"].is_string());
+    assert_eq!(arr[0]["result"]["type"], json!("CALL"));
+    assert_eq!(arr[1]["result"]["gasUsed"], json!("0x5491"));
+}
+
+#[test]
+fn trace_unsupported_tracer_errors() {
+    let h = make_harness();
+    let req = RpcRequest {
+        method: "debug_traceTransaction".to_string(),
+        params: vec![
+            json!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            json!({"tracer": "structLogger"}),
+        ],
+        id: json!(1),
+        jsonrpc: "2.0".to_string(),
+    };
+    let resp = h.rpc.handle(&req);
+    assert_eq!(resp.error.unwrap().code, -32_602);
+}
+
+#[test]
+fn trace_call_create_frame_type() {
+    let h = make_harness();
+    // A create call (no `to`) — the recorder should mark it CREATE
+    // and fill `to` with the deployed address at create_end.
+    let trace = handle(
+        &h.rpc,
+        "debug_traceCall",
+        vec![json!({"data": format!("0x{}", RETURN_CONTRACT), "gas": "0x100000"})],
+    );
+    assert_eq!(trace["type"], json!("CREATE"));
+    assert!(trace["to"].is_string(), "create_end must fill `to`: {trace}");
+}
+
+#[test]
+fn trace_call_nested_calls_nest_under_root() {
+    let h = make_harness();
+    // Deploy a caller contract whose runtime does a bare CALL into
+    // `return_contract` then stops:
+    //   PUSH1 0 ×5 (ret/args empty, value 0) PUSH20 target PUSH2 ffff
+    //   (gas) CALL STOP.
+    let caller_addr = Address([0xDD; 20]);
+    let target = hex_addr(&h.return_contract);
+    let code = format!("6000600060006000600073{}61fffff100", &target[2..]);
+    h.evm.genesis_insert_account(
+        &caller_addr,
+        0,
+        1,
+        hex::decode(code).expect("caller hex"),
+        Vec::new(),
+    );
+
+    let trace = handle(
+        &h.rpc,
+        "debug_traceCall",
+        vec![json!({"to": hex_addr(&caller_addr), "gas": "0x100000"})],
+    );
+    assert_eq!(trace["type"], json!("CALL"));
+    assert_eq!(trace["to"], json!(hex_addr(&caller_addr)));
+    let calls = trace["calls"].as_array().expect("nested calls array");
+    assert_eq!(calls.len(), 1, "one nested CALL frame");
+    assert_eq!(calls[0]["type"], json!("CALL"));
+    assert_eq!(calls[0]["to"], json!(hex_addr(&h.return_contract)));
+    assert_eq!(calls[0]["from"], json!(hex_addr(&caller_addr)));
+    // The inner call returns the 32-byte 0x2a payload.
+    assert!(calls[0]["output"].as_str().unwrap().ends_with('a'));
 }

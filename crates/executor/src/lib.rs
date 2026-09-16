@@ -1007,6 +1007,18 @@ impl Executor {
         changes
     }
 
+    /// Snapshot the mempool for `txpool_*` RPC introspection.
+    ///
+    /// Returns `(sender, nonce, tx_bytes, is_pending)` for every
+    /// pooled transaction — see [`Mempool::txpool_snapshot`] for the
+    /// pending/queued split rule. This is a cold-path read used by
+    /// the JSON-RPC layer; it takes the mempool lock and clones the
+    /// tx bytes, so it must never appear on the block path.
+    #[must_use]
+    pub fn txpool_snapshot(&self) -> Vec<(Address, u64, TxBytes, bool)> {
+        self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).txpool_snapshot()
+    }
+
     /// Save executed nonces to a storage backend (C10 fix).
     ///
     /// Persists the per-sender `executed_nonce` map to the storage

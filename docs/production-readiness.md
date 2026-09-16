@@ -424,18 +424,25 @@ imported → catches up. `/validator-set` returns current set.
    factory, Multicall3, Permit2, Safe), bank-backed staking
    delegation with revert-safe `0x0C_*` precompiles, and WebSocket
    transport with `eth_subscribe` (`newHeads` + filtered `logs`).
-   **Remaining (P1.5/P2):** filter APIs (`eth_newFilter`…),
-   `newPendingTransactions`, historical state window,
-   `eth_getProof`, `debug_trace*`, `txpool_*`, EIP-7702, RPC
-   resource limits, and persistent history across restart.
+   **P1.5 resolved:** pollable filter APIs (`eth_newFilter`… with
+   300s TTL), `newPendingTransactions` push, `txpool_status`/
+   `content`/`inspect` over the mempool's nonce-gap queues, and
+   `debug_trace*` (callTracer captured at execution time into
+   `evm::history`). **Remaining (P2):** historical state window,
+   `eth_getProof`, `eth_createAccessList`,
+   EIP-7702, the remaining RPC resource limits (`evm-timeout`,
+   `batch-request-limit`, `max-open-connections`), and persistent
+   history across restart.
 
 **Next action:** External security audit and public multi-machine
 testnet deployment. The codebase now has all the infrastructure a
 testnet needs: mTLS, WAL persistence, snapshot persistence, genesis
 loading (incl. EVM alloc + canonical preinstalls), key rotation,
 validator add/remove, a real `eth_*` RPC surface over HTTP **and
-WebSocket** (blocks/txs/receipts/logs/call/estimate/feeHistory plus
-`eth_subscribe` `newHeads`/`logs` pushes on finalization), tx gossip,
-and graceful shutdown. Remaining P1.5 items in
-`docs/evm-parity-gap-analysis.md` are filter APIs,
-`newPendingTransactions`, and RPC resource limits.
+WebSocket** (blocks/txs/receipts/logs/call/estimate/feeHistory,
+`eth_subscribe` `newHeads`/`logs`/`newPendingTransactions` pushes,
+pollable filters, `txpool_*` inspection, and `debug_trace*`
+callTracer output), tx gossip, and graceful shutdown. Remaining
+P2 items in `docs/evm-parity-gap-analysis.md` are `eth_getProof`,
+historical state reads, `eth_createAccessList`,
+EIP-7702, and the remaining RPC resource limits.

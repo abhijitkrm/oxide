@@ -12896,3 +12896,156 @@ No new bench: this is the RPC cold path — the only per-block cost
 added to the node is `has_subscriptions()` (one Mutex + is_empty),
 and `handle_raw` per-request dispatch is unchanged. No hot-path
 crate touched; the previous `tps_rw` numbers stand.
+
+## 2026-09-16 — Session: P1.5/P2 — filter APIs, pending-tx feed, resource limits, txpool_*, debug_trace*
+
+The remaining cosmos-evm parity items for the RPC surface. All
+cold-path work except the trace recorder, which runs on the
+execution hot path (see Benchmarks).
+
+### Pollable filter APIs (crates/rpc/src/lib.rs)
+
+- `FilterRegistry`: `filter_id → FilterEntry { kind, last_poll }`
+  behind a Mutex; IDs are 64-bit sequential hex (geth-compatible
+  opaque tokens). `FILTER_TIMEOUT = 300s` — geth's liveness rule:
+  a filter unpolled for 5 min is reaped, and `eth_getFilterChanges`
+  on it returns `filter not found` (`-32000`).
+- `eth_newFilter` stores a `LogFilter` (same parser/semantics as
+  `eth_getLogs`); `eth_newBlockFilter` cursors on sealed height;
+  `eth_newPendingTransactionFilter` cursors on the pending ring's
+  sequence number. `eth_getFilterChanges` advances the cursor and
+  returns only the delta; `eth_getFilterLogs` returns the full
+  match set for log filters.
+- Every log-producing path (direct `eth_getLogs`, filter
+  `getFilterChanges`, `getFilterLogs`) enforces
+  `MAX_LOG_RESULTS = 10_000` — the review pass caught
+  `getFilterChanges` missing the cap; fixed.
+
+### Pending-tx feed (`newPendingTransactions` + pending filters)
+
+- `PendingRing`: bounded 1024-entry ring of `(seq, tx_hash)` with a
+  dedup set; monotonically increasing `next_seq` is the filter
+  cursor so polls never re-serve entries.
+- `record_pending_tx` is called on `eth_sendRawTransaction` (local
+  submit) and on the gossip `MSG_TX` arm (peer-accepted txs).
+  Both feed `SubscriptionType::PendingTx` pushes and pending
+  filters — one code path.
+- Hashes are the *canonical EVM tx hash* (keccak of the raw signed
+  RLP inside the envelope), not the Oxide envelope hash — explorers
+  correlate by `eth_getTransactionByHash`, which indexes EVM
+  hashes. Non-EVM envelopes (module byte at offset 36 ≠ `EVM`)
+  never enter the feed; `unwrap_evm_tx_envelope` is the single
+  decoder for that split.
+
+### RPC resource limits
+
+- `eth_call` and `debug_traceCall` clamp `req.gas` to
+  `CHAIN_BLOCK_GAS_LIMIT` (geth's `gas-cap` role — a node must not
+  let one RPC call simulate beyond a block's worth of work).
+  Review caught `traceCall` missing the clamp; fixed.
+- `eth_feeHistory` rejects `blockCount > MAX_FEE_HISTORY_BLOCKS`
+  (1,024) — matches the retained window so responses never lie.
+- Filter TTL (300s) bounds filter state; `PENDING_RING_CAP` bounds
+  the pending feed. Still open: `evm-timeout`, `batch-request-limit`,
+  `max-open-connections` — tracked in the gap analysis.
+
+### `txpool_*` namespace
+
+- `TxpoolProvider` trait on `RpcServer` (`txpool_snapshot()`)
+  keeps the RPC crate executor-agnostic — the validator wires
+  `ExecutorTxpoolProvider` → `Executor::txpool_snapshot` →
+  `Mempool::txpool_snapshot`, which walks the per-sender nonce
+  queues and tags each tx pending (next executable nonce chain)
+  vs queued (behind a gap) — geth's pending/queued split.
+- `txpool_status` → `{pending, queued}` hex counts;
+  `txpool_content`/`contentFrom` → `{pending, queued}` maps
+  `sender → nonce → full tx object` (reuses `stored_tx` so pending
+  objects match mined-tx shape); `txpool_inspect` → geth's summary
+  strings (`"to: value wei + gas × price"`), with a decode-failure
+  fallback instead of dropping the entry.
+- Pending objects carry the canonical EVM hash (same decoder as the
+  pending feed) — a txpool row and its `newPendingTransactions`
+  push are the same identity.
+
+### `debug_trace*` — execution-time capture, not re-execution
+
+- The state store is `CacheDB<EmptyDB>` — latest-only, no
+  versioned reads. Re-executing an old tx against current state
+  would return *wrong* traces silently, so instead the trace is
+  captured during real execution and stored in `evm::history`
+  beside the receipt. `debug_traceTransaction` then answers from
+  the retained window (honest bound: 8192 blocks), never lies.
+- `modules/evm/src/trace.rs`: `CallRecorder` — a revm `Inspector`
+  that records call/create frames (type, from, to, input, output,
+  value, gas, gasUsed, error, revertReason, nested `calls`).
+  revm composes inspectors as tuples, so the EVM runs
+  `(NativeJournalInspector, CallRecorder)` — staking-precompile
+  undo behavior is preserved byte-for-byte.
+- Traces thread through every execution path: the serial path
+  returns them from `execute_signed`; the parallel path carries
+  them in `GroupExecResult` and the conflict-reexec map (the
+  committed execution's trace wins); the fast paths (native
+  transfer, empty-code call) synthesize a root CALL frame so
+  `debug_traceTransaction` on a plain transfer still matches
+  geth's callTracer shape.
+- `debug_traceCall` simulates with the recorder on live state;
+  reverts return the trace with `error`/`revertReason` inside the
+  root frame (geth semantics — a trace call never surfaces an
+  execution revert as an RPC error). `debug_traceBlockByNumber`/
+  `ByHash` return per-tx traces for the retained block.
+- Tracer option parsing accepts only `callTracer`; everything else
+  errors `-32602`/`unsupported tracer` rather than silently
+  returning call frames.
+- `CreateScheme::Custom` handled exhaustively (revm 42 added it);
+  `Gas::total_gas_spent()` replaces deprecated `spent()`.
+
+### Tests
+
+- `rpc` lib: filter lifecycle (create→poll→expire→not-found),
+  block/pending cursors, log-cap enforcement on both filter paths,
+  `txpool_*` grouping/inspect strings, `contentFrom` filtering,
+  `eth_call` gas clamp regression.
+- `evm_parity.rs`: +9 trace tests over the real block harness —
+  transfer root frame, contract call with output, revert → trace
+  with `error` field (not RPC error), nested `calls`, create
+  frames, unknown-hash/`block-not-found`/unsupported-tracer edges,
+  block-by-number multi-tx shape.
+- 21/21 parity, 71 rpc lib, 163 evm — workspace 100 binaries green.
+
+### Benchmarks
+
+`cargo bench -p evm --bench tps_rw` (same baseline machine as the
+P0 history-recording numbers):
+
+- `tps_simple_transfer/1_tx`: 35.4µs (−6.8% — systemic drift, not a
+  real improvement).
+- `full_block_cycle` 10/100/1000: **no change** (within noise).
+- `batch_parallel` single-sender 10/100/1k/10k: **no change**.
+- `batch_parallel_multi_sender`: +3.3% @100 txs, +5.1% @10k.
+- `batch_parallel_conflict` (reexec path): +11.8% @100, +17.4%
+  @10k — conflicted txs now move `CallFrame` trees through the
+  reexec map.
+- `native_vs_revm` native fast path: +10–30% (wide CI) — the
+  synthesized root frame is one `Vec` alloc on a ~10µs baseline.
+- `native_vs_revm` revm path: +3–5%. `preverified_vs_recovery`:
+  +9–12%. `preverified_parallel` and `read_write_conflict`: no
+  change or improved (−8 to −20% on two groups — scheduler noise).
+
+Honest read: always-on trace recording costs roughly 0.3–1.5µs/tx
+(one root-frame alloc + per-frame pushes), visible only where the
+per-tx baseline is lightest; on the ~35µs+/tx revm paths it is
+inside noise. Same magnitude class as the P0 history recording.
+This is the price of `debug_traceTransaction` honesty without an
+archive state backend. Follow-up lever if it ever matters: pool
+`CallFrame` allocations, or gate recording behind a node flag
+(trade-off: a tracing-disabled node can't serve past traces).
+
+### Open items (next)
+
+- `eth_getProof` + versioned state window (P2-11/12) — the storage
+  layer needs height-indexed reads before tracing can become
+  re-execution-based and before `eth_call` honors past blocks.
+- `eth_createAccessList`, EIP-7702 SetCodeTx decode gate.
+- `evm-timeout`, `batch-request-limit`, `max-open-connections`.
+- Persistent `evm::history` across restart (currently RAM-only —
+  node restart clears the 8192-block window).

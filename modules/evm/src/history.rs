@@ -159,6 +159,15 @@ pub struct ExecutedBlock {
     /// One receipt per entry in `txs`, same order. `logs` carry
     /// per-tx data; block/tx indices are joined at query time.
     pub receipts: Vec<Receipt>,
+    /// One call-tree trace per entry in `txs`, same order — recorded
+    /// at execution time by the `CallRecorder` inspector (see
+    /// `trace.rs`). `None` only when a tx ran without producing a
+    /// frame, which cannot happen for an executed tx; `None` entries
+    /// exist solely so a buggy recorder can't misalign the index.
+    /// `debug_traceTransaction`/`debug_traceBlock*` read these —
+    /// tracing is a history lookup, not a re-execution, so it needs
+    /// no archive state.
+    pub traces: Vec<Option<crate::trace::CallFrame>>,
 }
 
 /// Per-block accumulator used between `begin_block` and `end_block`.
@@ -172,6 +181,10 @@ struct Pending {
     /// Raw signed-RLP bytes in the same order — retained only for the
     /// block's duration to compute `transactionsRoot` at seal.
     raws: Vec<Vec<u8>>,
+    /// Call-tree traces in the same order — recorded by the
+    /// `CallRecorder` inspector during execution and moved into the
+    /// sealed block at `seal_block`.
+    traces: Vec<Option<crate::trace::CallFrame>>,
 }
 
 /// One topic-position matcher in an `eth_getLogs` filter.
@@ -278,8 +291,16 @@ impl History {
     /// recording).
     ///
     /// `raw` is the signed-RLP bytes, kept only until `seal_block`
-    /// computes `transactionsRoot` and then dropped.
-    pub fn record(&mut self, mut tx: StoredTx, receipt: Receipt, raw: &[u8]) {
+    /// computes `transactionsRoot` and then dropped. `trace` is the
+    /// `CallRecorder` root frame drained from the EVM inspector —
+    /// retained for `debug_trace*`, dropped only by window eviction.
+    pub fn record(
+        &mut self,
+        mut tx: StoredTx,
+        receipt: Receipt,
+        raw: &[u8],
+        trace: Option<crate::trace::CallFrame>,
+    ) {
         // A block cannot hold more than u32::MAX txs by gas-limit
         // arithmetic alone (10 GG / 21k ≈ 476k) — saturate instead of
         // truncate on the unreachable path.
@@ -287,6 +308,7 @@ impl History {
         self.pending.txs.push(tx);
         self.pending.receipts.push(receipt);
         self.pending.raws.push(raw.to_vec());
+        self.pending.traces.push(trace);
     }
 
     /// Seal the pending accumulator as block `number` and insert it
@@ -348,6 +370,7 @@ impl History {
             state_root,
             txs: pending.txs,
             receipts: pending.receipts,
+            traces: pending.traces,
         };
         block.hash = block_hash(&block);
         self.hash_index.insert(block.hash, number);
@@ -698,7 +721,7 @@ mod tests {
     #[test]
     fn seal_and_lookup_block() {
         let mut h = History::new(4);
-        h.record(dummy_tx(0xAA), dummy_receipt(21_000), &[0xde, 0xad]);
+        h.record(dummy_tx(0xAA), dummy_receipt(21_000), &[0xde, 0xad], None);
         seal(&mut h, 1);
         let block = h.block(1).expect("block sealed");
         assert_eq!(block.txs.len(), 1);
@@ -730,7 +753,7 @@ mod tests {
         let mut h = History::new(2);
         for height in 1..=4u64 {
             let tag = u8::try_from(height).unwrap();
-            h.record(dummy_tx(tag), dummy_receipt(21_000), &[tag]);
+            h.record(dummy_tx(tag), dummy_receipt(21_000), &[tag], None);
             seal(&mut h, height);
         }
         assert_eq!(h.len(), 2, "capacity bound must hold");
@@ -769,7 +792,7 @@ mod tests {
             data: LogData::new(vec![topic], vec![0x02].into()).unwrap(),
         });
         receipt.bloom = receipts::bloom_from_logs(&receipt.logs);
-        h.record(dummy_tx(0x11), receipt, &[0x01]);
+        h.record(dummy_tx(0x11), receipt, &[0x01], None);
         seal(&mut h, 1);
 
         // Block 2: matching address but wrong topic.
@@ -779,7 +802,7 @@ mod tests {
             data: LogData::new(vec![B256::from([0x55; 32])], vec![0x03].into()).unwrap(),
         });
         receipt2.bloom = receipts::bloom_from_logs(&receipt2.logs);
-        h.record(dummy_tx(0x22), receipt2, &[0x02]);
+        h.record(dummy_tx(0x22), receipt2, &[0x02], None);
         seal(&mut h, 2);
 
         let filter = LogFilter {

@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use evm::history::{ExecutedBlock, LogFilter, StoredTx, TopicMatcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -105,6 +105,41 @@ pub struct ValidatorSetEntry {
     pub public_key: String,
     /// The validator's stake in atomic units.
     pub stake: u64,
+}
+
+/// One pooled transaction as the `txpool_*` methods report it.
+///
+/// The tuple mirrors `Mempool::txpool_snapshot`'s element shape:
+/// the Oxide-envelope sender, the envelope nonce, the raw envelope
+/// bytes (sender/nonce/fee header + module payload), and whether
+/// the transaction sits in the sender's contiguous-nonce run
+/// (*pending*, executable next block) or behind a nonce gap
+/// (*queued*).
+#[derive(Debug)]
+pub struct TxpoolItem {
+    /// The Oxide-envelope sender (20 bytes).
+    pub sender: primitives::Address,
+    /// The envelope nonce.
+    pub nonce: u64,
+    /// The raw wrapped-envelope bytes.
+    pub envelope: TxBytes,
+    /// `true` when the tx is in the executable contiguous-nonce run;
+    /// `false` when it sits behind a nonce gap.
+    pub pending: bool,
+}
+
+/// Read-only transaction-pool introspection for the `txpool_*`
+/// namespace.
+///
+/// Implemented by the node's executor handle — the adapter calls
+/// `Executor::txpool_snapshot`, which takes the mempool lock once
+/// and clones the pooled bytes. This is a cold-path query: the RPC
+/// layer holds no lock across the whole snapshot and never touches
+/// the block path.
+pub trait TxpoolProvider: Send + Sync {
+    /// Snapshot the pool into pending/queued items. See
+    /// [`TxpoolItem`] for the shape.
+    fn txpool_snapshot(&self) -> Vec<TxpoolItem>;
 }
 
 /// Trait for providing the current validator set via the
@@ -221,6 +256,11 @@ pub enum SubscriptionType {
     NewHeads,
     /// Notify on matching logs (optional address + topics filter).
     Logs,
+    /// Notify with the Ethereum tx hash of each transaction that
+    /// enters this node's mempool (local `eth_sendRawTransaction`
+    /// or gossiped). geth also offers a `fullTx` variant — we only
+    /// push the hash (hash is what wallet/provider polling needs).
+    PendingTx,
 }
 
 impl SubscriptionType {
@@ -231,6 +271,7 @@ impl SubscriptionType {
         match s {
             "newHeads" => Some(Self::NewHeads),
             "logs" => Some(Self::Logs),
+            "newPendingTransactions" => Some(Self::PendingTx),
             _ => None,
         }
     }
@@ -360,40 +401,64 @@ impl SubscriptionManager {
 
     /// Fan out a finalized block to all subscribers: the header to
     /// `newHeads` subs, each matching log to `logs` subs.
-    ///
-    /// A dead sink (connection closed but not yet reaped) simply
-    /// fails the `send` — the subscription is removed so we don't
-    /// retry it on the next block.
     fn publish(&self, header: &Value, logs: &[evm::history::LogMatch]) {
+        self.for_each_sub(|sub, send| match sub.kind {
+            SubscriptionType::NewHeads => send(header.clone()),
+            SubscriptionType::Logs => {
+                for log in logs {
+                    if sub.filter.as_ref().is_none_or(|f| f.matches(log)) {
+                        send(log_json(log));
+                    }
+                }
+            }
+            SubscriptionType::PendingTx => {}
+        });
+    }
+
+    /// Push a newly arrived mempool transaction hash to
+    /// `newPendingTransactions` subscribers.
+    fn publish_pending_tx(&self, hash: B256) {
+        let result = json!(format!("0x{hash:x}"));
+        self.for_each_sub(|sub, send| {
+            if sub.kind == SubscriptionType::PendingTx {
+                send(result.clone());
+            }
+        });
+    }
+
+    /// Walk the subscription table invoking `f` with each active
+    /// subscription and a `send` closure that pushes a notification
+    /// to its connection. A dead sink (connection closed but not
+    /// yet reaped) fails `send` and the subscription is removed so
+    /// we don't retry it on the next event.
+    fn for_each_sub(&self, mut f: impl FnMut(&ActiveSubscription, &mut dyn FnMut(Value))) {
         let mut dead = Vec::new();
         {
             let active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for (id, sub) in active.iter() {
-                let send = |result: Value| {
-                    sub.sink.send(
-                        serde_json::to_string(&SubscriptionNotification {
-                            jsonrpc: "2.0".to_string(),
-                            method: "eth_subscription".to_string(),
-                            params: SubscriptionParams { subscription: id.clone(), result },
-                        })
-                        .unwrap_or_else(|_| "{}".to_string()),
-                    )
+                let mut failed = false;
+                let mut send = |result: Value| {
+                    if failed {
+                        return;
+                    }
+                    if sub
+                        .sink
+                        .send(
+                            serde_json::to_string(&SubscriptionNotification {
+                                jsonrpc: "2.0".to_string(),
+                                method: "eth_subscription".to_string(),
+                                params: SubscriptionParams { subscription: id.clone(), result },
+                            })
+                            .unwrap_or_else(|_| "{}".to_string()),
+                        )
+                        .is_err()
+                    {
+                        failed = true;
+                    }
                 };
-                match sub.kind {
-                    SubscriptionType::NewHeads => {
-                        if send(header.clone()).is_err() {
-                            dead.push(id.clone());
-                        }
-                    }
-                    SubscriptionType::Logs => {
-                        for log in logs {
-                            let matches = sub.filter.as_ref().is_none_or(|f| f.matches(log));
-                            if matches && send(log_json(log)).is_err() {
-                                dead.push(id.clone());
-                                break;
-                            }
-                        }
-                    }
+                f(sub, &mut send);
+                if failed {
+                    dead.push(id.clone());
                 }
             }
         }
@@ -434,6 +499,62 @@ impl WsConn {
     }
 }
 
+/// How long a pollable filter may sit unpolluted before it is
+/// reaped — geth's `filterLogTimeout` default (5 minutes). The
+/// sweep is lazy: entries are dropped when next accessed, plus a
+/// full sweep on each registration so a client creating filters
+/// without polling can't grow the map unboundedly.
+const FILTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A pollable filter's kind and per-kind cursor.
+#[derive(Debug)]
+enum FilterKind {
+    /// `eth_newFilter`: the parsed `eth_getLogs`-shaped filter plus
+    /// the height last served by `eth_getFilterChanges` — each poll
+    /// returns matching logs in `(last_served, latest]`.
+    Log { filter: LogFilter, last_served: u64 },
+    /// `eth_newBlockFilter`: `eth_getFilterChanges` returns the
+    /// hashes of blocks in `(last_served, latest]`.
+    Block { last_served: u64 },
+    /// `eth_newPendingTransactionFilter`: a sequence cursor into
+    /// the pending ring — each poll returns hashes appended since.
+    PendingTx { next_seq: u64 },
+}
+
+/// A registered pollable filter.
+#[derive(Debug)]
+struct FilterEntry {
+    /// What the filter watches and its per-kind cursor.
+    kind: FilterKind,
+    /// When the filter was last polled (or created). Entries older
+    /// than [`FILTER_TIMEOUT`] are reaped — geth's liveness rule:
+    /// clients must poll to keep a filter alive.
+    last_poll: std::time::Instant,
+}
+
+/// The pending-tx feed: a bounded ring of `(seq, eth_tx_hash)` for
+/// every transaction that entered this node's mempool via
+/// `eth_sendRawTransaction` or tx gossip.
+///
+/// `newPendingTransactions` subscribers get each hash pushed live;
+/// `eth_newPendingTransactionFilter` polls drain the ring by seq.
+/// The cap bounds memory when a filter stops polling — hashes older
+/// than the cap are simply missed, matching geth's "only what the
+/// feed carried" semantics.
+const PENDING_RING_CAP: usize = 1024;
+
+/// Ring state: monotonically increasing sequence and the retained
+/// `(seq, hash)` window.
+#[derive(Debug, Default)]
+struct PendingRing {
+    /// Sequence number that will be assigned to the next appended
+    /// hash. A new pending filter starts here — only future txs are
+    /// seen.
+    next_seq: u64,
+    /// Retained `(seq, hash)` entries, oldest first.
+    entries: std::collections::VecDeque<(u64, B256)>,
+}
+
 /// The RPC server state. Holds references to the EVM module and
 /// chain state needed to answer queries.
 pub struct RpcServer {
@@ -455,6 +576,12 @@ pub struct RpcServer {
     /// handle. When `None`, the RPC returns a computed hash but does not
     /// submit (the Phase 2 v0 behaviour, kept for stateless tests).
     tx_submitter: Option<Arc<dyn TxSubmitter>>,
+    /// Optional read-only mempool handle for the `txpool_*`
+    /// namespace. When `None`, the namespace returns a
+    /// method-not-found-style error (not silently empty results — an
+    /// unbacked `txpool_status` that claims the pool is empty is a
+    /// lie a debugger would trust).
+    txpool: Option<Arc<dyn TxpoolProvider>>,
     /// Optional latency recorder for RPC handler metrics. When set,
     /// `eth_sendRawTransaction` records its duration under the
     /// `"rpc_send_raw_tx"` operation. Exposed via `prometheus()`.
@@ -495,6 +622,14 @@ pub struct RpcServer {
     /// `Mutex`es serialize against block execution), so sharing the
     /// `Arc` with the HTTP handler tasks is safe.
     evm: Option<Arc<evm::EvmModule>>,
+    /// Pollable filters created by `eth_newFilter`,
+    /// `eth_newBlockFilter`, and `eth_newPendingTransactionFilter`.
+    filters: std::sync::Mutex<HashMap<String, FilterEntry>>,
+    /// The next pollable filter ID to assign.
+    next_filter_id: AtomicU64,
+    /// The pending-tx ring feeding `newPendingTransactions` subs and
+    /// `eth_newPendingTransactionFilter` polls.
+    pending_txs: std::sync::Mutex<PendingRing>,
 }
 
 impl RpcServer {
@@ -508,6 +643,7 @@ impl RpcServer {
             client_version: format!("oxide/{}", env!("CARGO_PKG_VERSION")),
             subscriptions: SubscriptionManager::new(),
             tx_submitter: None,
+            txpool: None,
             recorder: None,
             tx_count: AtomicU64::new(0),
             mempool_size: AtomicU64::new(0),
@@ -517,6 +653,9 @@ impl RpcServer {
             snapshot_provider: None,
             validator_set_provider: None,
             evm: None,
+            filters: std::sync::Mutex::new(HashMap::new()),
+            next_filter_id: AtomicU64::new(1),
+            pending_txs: std::sync::Mutex::new(PendingRing::default()),
         }
     }
 
@@ -528,6 +667,16 @@ impl RpcServer {
     /// Phase 2 v0 behaviour, retained for stateless unit tests.
     pub fn set_tx_submitter(&mut self, submitter: Arc<dyn TxSubmitter>) {
         self.tx_submitter = Some(submitter);
+    }
+
+    /// Attach a read-only mempool handle so the `txpool_*` namespace
+    /// reports the real pending/queued split.
+    ///
+    /// Without this call the namespace errors — an unbacked
+    /// `txpool_status` claiming the pool is empty would mislead
+    /// tooling that trusts the counts.
+    pub fn set_txpool_provider(&mut self, provider: Arc<dyn TxpoolProvider>) {
+        self.txpool = Some(provider);
     }
 
     /// Attach a snapshot provider so `GET /snapshot` returns the
@@ -796,6 +945,23 @@ impl RpcServer {
             // ---- Subscriptions ----
             "eth_subscribe" => self.eth_subscribe(&request.params, conn),
             "eth_unsubscribe" => self.eth_unsubscribe(&request.params),
+            // ---- Pollable filters ----
+            "eth_newFilter" => self.eth_new_filter(&request.params),
+            "eth_newBlockFilter" => self.eth_new_block_filter(),
+            "eth_newPendingTransactionFilter" => self.eth_new_pending_transaction_filter(),
+            "eth_getFilterChanges" => self.eth_get_filter_changes(&request.params),
+            "eth_getFilterLogs" => self.eth_get_filter_logs(&request.params),
+            "eth_uninstallFilter" => self.eth_uninstall_filter(&request.params),
+            // ---- Transaction pool ----
+            "txpool_status" => self.txpool_status(),
+            "txpool_content" => self.txpool_content(),
+            "txpool_contentFrom" => self.txpool_content_from(&request.params),
+            "txpool_inspect" => self.txpool_inspect(),
+            // ---- Debug / tracing ----
+            "debug_traceTransaction" => self.debug_trace_transaction(&request.params),
+            "debug_traceCall" => self.debug_trace_call(&request.params),
+            "debug_traceBlockByNumber" => self.debug_trace_block_by_number(&request.params),
+            "debug_traceBlockByHash" => self.debug_trace_block_by_hash(&request.params),
             _ => Err(RpcError::method_not_found(&request.method)),
         };
 
@@ -1002,6 +1168,451 @@ impl RpcServer {
             .as_str()
             .ok_or_else(|| RpcError::invalid_params("subscription ID must be a string"))?;
         Ok(json!(self.subscriptions.unregister(id)))
+    }
+
+    // ---- Pollable filters (`eth_newFilter` family) ----
+
+    /// Register a pollable filter and return its hex ID. Reaps any
+    /// expired filters first so the map can't grow on
+    /// register-and-abandon clients.
+    fn register_filter(&self, kind: FilterKind) -> String {
+        let mut filters = self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        filters.retain(|_, e| now.duration_since(e.last_poll) < FILTER_TIMEOUT);
+        let id = format!("0x{:x}", self.next_filter_id.fetch_add(1, Ordering::Relaxed));
+        filters.insert(id.clone(), FilterEntry { kind, last_poll: now });
+        id
+    }
+
+    /// `eth_newFilter` — create a pollable log filter.
+    ///
+    /// Params: `[filter: Object]` — the same `eth_getLogs` shape.
+    /// `eth_getFilterChanges` then returns matching logs in
+    /// `(last_served, latest]` per poll (geth semantics).
+    fn eth_new_filter(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let obj = params.first().ok_or_else(|| RpcError::invalid_params("missing filter"))?;
+        let filter = self.parse_log_filter(obj)?;
+        self.require_evm()?;
+        let latest = self.latest_sealed_height();
+        Ok(json!(self.register_filter(FilterKind::Log { filter, last_served: latest })))
+    }
+
+    /// `eth_newBlockFilter` — create a pollable block filter.
+    /// Each `eth_getFilterChanges` poll returns the hashes of blocks
+    /// finalized since the last poll.
+    fn eth_new_block_filter(&self) -> Result<Value, RpcError> {
+        self.require_evm()?;
+        let latest = self.latest_sealed_height();
+        Ok(json!(self.register_filter(FilterKind::Block { last_served: latest })))
+    }
+
+    /// `eth_newPendingTransactionFilter` — create a pollable
+    /// pending-tx filter. Each `eth_getFilterChanges` poll returns
+    /// the hashes of txs that entered the mempool since the last
+    /// poll.
+    ///
+    /// `Result` for uniformity with the sibling filter constructors —
+    /// the dispatch shape stays `Result<Value, RpcError>` across the
+    /// namespace.
+    #[allow(clippy::unnecessary_wraps)]
+    fn eth_new_pending_transaction_filter(&self) -> Result<Value, RpcError> {
+        let next_seq =
+            self.pending_txs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next_seq;
+        Ok(json!(self.register_filter(FilterKind::PendingTx { next_seq })))
+    }
+
+    /// `eth_uninstallFilter` — drop a pollable filter. Returns
+    /// `true` if it existed (geth returns `false` for unknown IDs).
+    fn eth_uninstall_filter(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let id = parse_filter_id(params.first())?;
+        let removed = self
+            .filters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id)
+            .is_some();
+        Ok(json!(removed))
+    }
+
+    // ---- Transaction pool ----
+
+    /// Require the txpool provider or return the unbacked-namespace
+    /// error — an unbacked `txpool_*` that answers as if the pool
+    /// were empty is worse than an error.
+    fn require_txpool(&self) -> Result<&dyn TxpoolProvider, RpcError> {
+        self.txpool.as_deref().ok_or_else(|| RpcError {
+            code: -32_000,
+            message: "txpool namespace not enabled on this node".to_string(),
+            data: None,
+        })
+    }
+
+    /// `txpool_status` — `{pending, queued}` counts of pooled
+    /// transactions (hex-encoded, per geth).
+    fn txpool_status(&self) -> Result<Value, RpcError> {
+        let pool = self.require_txpool()?;
+        let (mut pending, mut queued) = (0u64, 0u64);
+        for item in pool.txpool_snapshot() {
+            if item.pending {
+                pending += 1;
+            } else {
+                queued += 1;
+            }
+        }
+        Ok(json!({
+            "pending": format!("0x{pending:x}"),
+            "queued": format!("0x{queued:x}"),
+        }))
+    }
+
+    /// `txpool_content` — `{pending: {addr: {nonce: tx}}, queued: …}`
+    /// with full pending-transaction objects (geth shape: positional
+    /// block fields are `null` for pooled txs).
+    fn txpool_content(&self) -> Result<Value, RpcError> {
+        let pool = self.require_txpool()?;
+        Ok(txpool_content_json(&pool.txpool_snapshot(), None))
+    }
+
+    /// `txpool_contentFrom` — like `txpool_content` but restricted to
+    /// one sender address (geth extension used by block explorers).
+    fn txpool_content_from(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let pool = self.require_txpool()?;
+        let addr = params
+            .first()
+            .and_then(Value::as_str)
+            .and_then(|s| s.strip_prefix("0x").map(str::to_owned).or_else(|| Some(s.to_owned())))
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok())
+            .map(primitives::Address)
+            .ok_or_else(|| RpcError {
+                code: -32_602,
+                message: "invalid address parameter".to_string(),
+                data: None,
+            })?;
+        Ok(txpool_content_json(&pool.txpool_snapshot(), Some(addr)))
+    }
+
+    /// `txpool_inspect` — same grouping as `txpool_content` but each
+    /// leaf is geth's summary string `"to: value wei + gas × price"`.
+    fn txpool_inspect(&self) -> Result<Value, RpcError> {
+        let pool = self.require_txpool()?;
+        let mut pending = serde_json::Map::new();
+        let mut queued = serde_json::Map::new();
+        for item in pool.txpool_snapshot() {
+            let addr = format!("0x{}", hex::encode(item.sender.0));
+            let bucket = if item.pending { &mut pending } else { &mut queued };
+            let entry = bucket.entry(addr).or_insert_with(|| json!({}));
+            if let Some(m) = entry.as_object_mut() {
+                m.insert(format!("0x{:x}", item.nonce), txpool_inspect_summary(&item));
+            }
+        }
+        Ok(json!({ "pending": pending, "queued": queued }))
+    }
+
+    // ---- Debug / tracing ----
+
+    /// `debug_traceTransaction` — the recorded call tree for a
+    /// sealed transaction.
+    ///
+    /// Traces are captured at execution time (see `evm::trace`):
+    /// there is no archive state to re-execute against, so this is a
+    /// history lookup bounded by the same retention window as every
+    /// other history query. A hash outside the window returns the
+    /// geth-style "transaction not found" error; a missing trace
+    /// (impossible for an executed tx) returns a server error rather
+    /// than fabricated output.
+    ///
+    /// Options: `{"tracer": "callTracer"}` is the only supported
+    /// tracer — the struct-logger (`{structLogs}`) output geth
+    /// produces by default is not recorded (per-step tracing is too
+    /// expensive to run on every committed tx). An absent `tracer`
+    /// therefore returns the callTracer shape — a documented
+    /// deviation from geth; a named-but-unsupported tracer is a
+    /// `-32602` error rather than a silently wrong shape.
+    fn debug_trace_transaction(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let hash = params
+            .first()
+            .map(parse_b256)
+            .transpose()?
+            .ok_or_else(|| RpcError::invalid_params("missing tx hash"))?;
+        parse_trace_options(params.get(1))?;
+        let evm = self.require_evm()?;
+        let history = evm.history();
+        let Some((height, tx_index)) = history.tx_location(&hash) else {
+            return Err(RpcError {
+                code: -32_000,
+                message: "transaction not found (or evicted from the history window)".to_string(),
+                data: None,
+            });
+        };
+        let Some(block) = history.block(height) else {
+            return Err(RpcError {
+                code: -32_000,
+                message: "block evicted from history window".to_string(),
+                data: None,
+            });
+        };
+        let idx = tx_index as usize;
+        let Some(Some(frame)) = block.traces.get(idx) else {
+            return Err(RpcError {
+                code: -32_000,
+                message: "no call trace recorded for this transaction".to_string(),
+                data: None,
+            });
+        };
+        // Root-frame `gas`/`gasUsed` are tx-level in geth's
+        // callTracer (the recorder reports frame-scoped values —
+        // patch with the tx gas limit and the receipt's total gas
+        // used, which includes the intrinsic cost).
+        let tx = &block.txs[idx];
+        let receipt = &block.receipts[idx];
+        Ok(call_frame_json(frame, Some((tx.gas_limit, receipt.gas_used))))
+    }
+
+    /// `debug_traceCall` — simulate a call against latest state and
+    /// return its call tree. Always servable: it executes fresh
+    /// rather than needing recorded history.
+    fn debug_trace_call(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let mut req = parse_call_object(params.first().ok_or_else(|| RpcError {
+            code: -32_602,
+            message: "missing call object".to_string(),
+            data: None,
+        })?)?;
+        // Optional block tag — only `latest`-resolving tags are
+        // servable (no historical state).
+        self.require_latest(params.get(1))?;
+        parse_trace_options(params.get(2))?;
+        // Same gas-cap clamp as `eth_call` — an unbounded simulation
+        // is a resource-exhaustion vector.
+        if req.gas.is_some_and(|g| g > types::CHAIN_BLOCK_GAS_LIMIT) {
+            req.gas = Some(types::CHAIN_BLOCK_GAS_LIMIT);
+        }
+        let evm = self.require_evm()?;
+        let gas_cap = req.gas.unwrap_or(evm.block_gas_limit());
+        // Revert/halt is a *trace result*, not an RPC error — geth
+        // returns the call tree with the frame's `error` set.
+        let (gas_used, frame) = evm.call_read_traced(&req).map_err(call_error)?;
+        let Some(frame) = frame else {
+            return Err(RpcError {
+                code: -32_000,
+                message: "call produced no trace".to_string(),
+                data: None,
+            });
+        };
+        Ok(call_frame_json(&frame, Some((gas_cap, gas_used))))
+    }
+
+    /// `debug_traceBlockByNumber` — per-tx call trees for a sealed
+    /// block, `[{txHash, result}]` in block order (geth shape).
+    fn debug_trace_block_by_number(&self, params: &[Value]) -> Result<Value, RpcError> {
+        parse_trace_options(params.get(1))?;
+        let height = self.resolve_block_ref(params.first())?;
+        self.trace_block_at(height)
+    }
+
+    /// `debug_traceBlockByHash` — same body keyed by block hash.
+    fn debug_trace_block_by_hash(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let hash = params
+            .first()
+            .map(parse_b256)
+            .transpose()?
+            .ok_or_else(|| RpcError::invalid_params("missing block hash"))?;
+        parse_trace_options(params.get(1))?;
+        let evm = self.require_evm()?;
+        let history = evm.history();
+        let Some(block) = history.block_by_hash(&hash) else {
+            return Err(RpcError {
+                code: -32_000,
+                message: "block not found (or evicted from the history window)".to_string(),
+                data: None,
+            });
+        };
+        let number = block.number;
+        drop(history);
+        self.trace_block_at(number)
+    }
+
+    /// Shared per-block trace body for `debug_traceBlock*`.
+    fn trace_block_at(&self, height: u64) -> Result<Value, RpcError> {
+        let evm = self.require_evm()?;
+        let history = evm.history();
+        let Some(block) = history.block(height) else {
+            return Err(RpcError {
+                code: -32_000,
+                message: "block not found (or evicted from the history window)".to_string(),
+                data: None,
+            });
+        };
+        let out: Vec<Value> = block
+            .txs
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| {
+                let result = match block.traces.get(i) {
+                    Some(Some(frame)) => {
+                        call_frame_json(frame, Some((tx.gas_limit, block.receipts[i].gas_used)))
+                    }
+                    _ => Value::Null,
+                };
+                json!({ "txHash": format!("0x{:x}", tx.hash), "result": result })
+            })
+            .collect();
+        Ok(Value::Array(out))
+    }
+
+    /// Fetch a filter by ID, refreshing its liveness timestamp.
+    /// Expired or unknown IDs produce geth's `filter not found`
+    /// error (-32000).
+    fn take_filter(&self, id: &str) -> Result<FilterEntry, RpcError> {
+        let mut filters = self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let not_found =
+            || RpcError { code: -32_000, message: "filter not found".to_string(), data: None };
+        let entry = filters.get_mut(id).ok_or_else(not_found)?;
+        let now = std::time::Instant::now();
+        if now.duration_since(entry.last_poll) >= FILTER_TIMEOUT {
+            filters.remove(id);
+            return Err(not_found());
+        }
+        entry.last_poll = now;
+        // The caller mutates cursors through the entry; simplest
+        // correct approach is to remove and let the caller re-insert
+        // — but then a concurrent poll could see a missing filter.
+        // Filters are per-client state and the lock is held for the
+        // whole update, so take-and-reinsert under one lock hold is
+        // equivalent; we take to keep ownership simple.
+        Ok(filters.remove(id).expect("entry present"))
+    }
+
+    /// `eth_getFilterChanges` — poll a filter for new results.
+    ///
+    /// - Log filter → logs in `(last_served, latest]`
+    /// - Block filter → block hashes in `(last_served, latest]`
+    /// - `PendingTx` filter → mempool-arrival tx hashes since last poll
+    fn eth_get_filter_changes(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let id = parse_filter_id(params.first())?;
+        let mut entry = self.take_filter(&id)?;
+        let latest = self.latest_sealed_height();
+        let result = match &mut entry.kind {
+            FilterKind::Log { filter, last_served } => {
+                let changes = if latest > *last_served {
+                    let delta = LogFilter {
+                        from_block: *last_served + 1,
+                        to_block: latest,
+                        addresses: filter.addresses.clone(),
+                        topics: filter.topics.clone(),
+                        ..LogFilter::default()
+                    };
+                    let evm = self.require_evm()?;
+                    let matches = evm.history().logs(&delta);
+                    if matches.len() > MAX_LOG_RESULTS {
+                        // Reinsert the filter before erroring so the
+                        // poll cursor survives — the client can still
+                        // narrow the filter via a new `eth_newFilter`.
+                        *last_served = latest;
+                        let result = Err(RpcError {
+                            code: -32_005,
+                            message: format!(
+                                "query returned more than {MAX_LOG_RESULTS} results; \
+                                 narrow the filter"
+                            ),
+                            data: None,
+                        });
+                        self.filters
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(id.clone(), entry);
+                        return result;
+                    }
+                    matches.iter().map(log_json).collect()
+                } else {
+                    Vec::new()
+                };
+                *last_served = latest;
+                Value::Array(changes)
+            }
+            FilterKind::Block { last_served } => {
+                let mut hashes = Vec::new();
+                if latest > *last_served {
+                    let evm = self.require_evm()?;
+                    let history = evm.history();
+                    for h in (*last_served + 1)..=latest {
+                        if let Some(block) = history.block(h) {
+                            hashes.push(json!(format!("0x{:x}", block.hash)));
+                        }
+                    }
+                }
+                *last_served = latest;
+                Value::Array(hashes)
+            }
+            FilterKind::PendingTx { next_seq } => {
+                let ring =
+                    self.pending_txs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let hashes: Vec<Value> = ring
+                    .entries
+                    .iter()
+                    .filter(|(seq, _)| *seq >= *next_seq)
+                    .map(|(_, hash)| json!(format!("0x{hash:x}")))
+                    .collect();
+                *next_seq = ring.next_seq;
+                drop(ring);
+                Value::Array(hashes)
+            }
+        };
+        self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, entry);
+        Ok(result)
+    }
+
+    /// `eth_getFilterLogs` — all logs matching a log filter's stored
+    /// criteria (unlike `getFilterChanges`, this does not advance a
+    /// cursor). Non-log filters and unknown IDs produce geth's
+    /// `filter not found` error.
+    fn eth_get_filter_logs(&self, params: &[Value]) -> Result<Value, RpcError> {
+        let id = parse_filter_id(params.first())?;
+        let entry = self.take_filter(&id)?;
+        let not_found =
+            || RpcError { code: -32_000, message: "filter not found".to_string(), data: None };
+        let FilterKind::Log { filter, .. } = &entry.kind else {
+            // Re-insert before erroring so a block/pending filter
+            // survives an erroneous `getFilterLogs` call.
+            self.filters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id, entry);
+            return Err(not_found());
+        };
+        let evm = self.require_evm()?;
+        let matches = evm.history().logs(filter);
+        let result = if matches.len() > MAX_LOG_RESULTS {
+            Err(RpcError {
+                code: -32_005,
+                message: format!(
+                    "query returned more than {MAX_LOG_RESULTS} results; narrow the filter"
+                ),
+                data: None,
+            })
+        } else {
+            Ok(Value::Array(matches.iter().map(log_json).collect()))
+        };
+        self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, entry);
+        result
+    }
+
+    /// Record a transaction entering this node's mempool — feeds
+    /// `newPendingTransactions` subscribers and pending-tx filters.
+    /// `hash` is the Ethereum tx hash (keccak256 of the signed RLP),
+    /// not the envelope hash.
+    pub fn record_pending_tx(&self, hash: B256) {
+        {
+            let mut ring =
+                self.pending_txs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if ring.entries.len() >= PENDING_RING_CAP {
+                ring.entries.pop_front();
+            }
+            let seq = ring.next_seq;
+            ring.entries.push_back((seq, hash));
+            ring.next_seq = seq.saturating_add(1);
+        }
+        self.subscriptions.publish_pending_tx(hash);
     }
 
     // ---- Phase E: extended RPC methods ----
@@ -1262,6 +1873,9 @@ impl RpcServer {
             submitter
                 .submit_tx(TxBytes::new(envelope))
                 .map_err(|reason| RpcError::transaction_rejected(&reason))?;
+            // Feed pending-tx subscribers/filters — the tx is now
+            // in this node's mempool.
+            self.record_pending_tx(B256::from(hash));
         }
 
         if let Some(recorder) = &self.recorder {
@@ -1282,7 +1896,14 @@ impl RpcServer {
     /// decode into `Error(string)` reasons.
     fn eth_call(&self, params: &[Value]) -> Result<Value, RpcError> {
         let call = params.first().ok_or_else(|| RpcError::invalid_params("missing call object"))?;
-        let req = parse_call_object(call)?;
+        let mut req = parse_call_object(call)?;
+        // Gas cap: a request may ask for more gas than any real tx
+        // can carry. geth clamps `msg.GasLimit` to `--rpc.gascap`
+        // (50M default) rather than erroring; our equivalent ceiling
+        // is the block gas limit — a simulation can never need more.
+        if req.gas.is_some_and(|g| g > types::CHAIN_BLOCK_GAS_LIMIT) {
+            req.gas = Some(types::CHAIN_BLOCK_GAS_LIMIT);
+        }
         let evm = self.require_evm()?;
         self.require_latest(params.get(1))?;
         match evm.call_read(&req) {
@@ -1741,6 +2362,107 @@ fn tx_json(tx: &StoredTx, block: &ExecutedBlock) -> Value {
     })
 }
 
+/// Serialize a pooled transaction to the pending-tx object shape —
+/// identical to `tx_json` except `blockHash`, `blockNumber`, and
+/// `transactionIndex` are `null` (the tx is not yet included) and
+/// `gasPrice` is the max-fee cap (no base fee exists yet).
+///
+/// `signed` must already be validated; `from` is the recovered
+/// sender. Returns `None` for non-EVM envelopes — see
+/// [`pooled_tx_json`], which falls back to a minimal object.
+fn pending_tx_json(signed: &evm::tx::SignedTx, from: Address, raw: &[u8]) -> Value {
+    let hash = B256::from(keccak256(raw));
+    let stx = evm::history::stored_tx(signed, from, hash, 0);
+    json!({
+        "hash": format!("0x{:x}", stx.hash),
+        "nonce": format!("0x{:x}", stx.nonce),
+        "blockHash": Value::Null,
+        "blockNumber": Value::Null,
+        "transactionIndex": Value::Null,
+        "from": format!("0x{:x}", stx.from),
+        "to": stx.to.map_or(Value::Null, |a| json!(format!("0x{a:x}"))),
+        "value": format!("0x{:x}", stx.value),
+        "gas": format!("0x{:x}", stx.gas_limit),
+        "gasPrice": format!("0x{:x}", stx.gas_price),
+        "maxFeePerGas": format!("0x{:x}", stx.gas_price),
+        "maxPriorityFeePerGas": format!("0x{:x}", stx.max_priority_fee_per_gas),
+        "input": format!("0x{}", hex::encode(&stx.input)),
+        "type": format!("0x{:x}", stx.tx_type),
+        "chainId": format!("0x{:x}", signed.chain_id()),
+        "v": format!("0x{:x}", stx.v),
+        "r": format!("0x{:x}", stx.r),
+        "s": format!("0x{:x}", stx.s),
+    })
+}
+
+/// Serialize one pooled envelope for `txpool_content`: decode the
+/// inner signed EVM tx when possible, else emit a minimal
+/// `{hash, from, nonce}` object — non-EVM module txs share the
+/// mempool and hiding them would under-report `txpool_status`.
+fn pooled_tx_json(item: &TxpoolItem) -> Value {
+    let raw = evm::unwrap_evm_tx_envelope(item.envelope.as_bytes());
+    let decoded = raw.and_then(|r| evm::tx::SignedTx::decode_raw(r).ok());
+    if let (Some(raw), Some(signed)) = (raw, decoded) {
+        // The envelope sender was already recovered and validated at
+        // ingest — trust it over re-recovering here.
+        return pending_tx_json(&signed, Address::from(item.sender.0), raw);
+    }
+    let hash = B256::from(keccak256(item.envelope.as_bytes()));
+    json!({
+        "hash": format!("0x{hash:x}"),
+        "nonce": format!("0x{:x}", item.nonce),
+        "blockHash": Value::Null,
+        "blockNumber": Value::Null,
+        "transactionIndex": Value::Null,
+        "from": format!("0x{}", hex::encode(item.sender.0)),
+        "to": Value::Null,
+        "value": "0x0",
+        "gas": "0x0",
+        "input": format!("0x{}", hex::encode(item.envelope.as_bytes())),
+    })
+}
+
+/// geth's `txpool_inspect` leaf: `"to: value wei + gas gas ×
+/// price wei"`, or `"contract creation: …"` for creates.
+fn txpool_inspect_summary(item: &TxpoolItem) -> Value {
+    let raw = evm::unwrap_evm_tx_envelope(item.envelope.as_bytes());
+    let decoded = raw.and_then(|r| evm::tx::SignedTx::decode_raw(r).ok());
+    let Some(signed) = decoded else {
+        return json!(format!("non-EVM envelope: {} bytes", item.envelope.as_bytes().len()));
+    };
+    let to = match signed.to() {
+        evm::tx::TxKind::Call(addr) => format!("0x{addr:x}"),
+        evm::tx::TxKind::Create => "contract creation".to_string(),
+    };
+    json!(format!(
+        "{to}: {} wei + {} gas × {} wei",
+        signed.value(),
+        signed.gas_limit(),
+        signed.max_fee_per_gas()
+    ))
+}
+
+/// Build the `{pending, queued}` body shared by `txpool_content`
+/// and `txpool_contentFrom`. `only` restricts to one sender.
+fn txpool_content_json(items: &[TxpoolItem], only: Option<primitives::Address>) -> Value {
+    let mut pending = serde_json::Map::new();
+    let mut queued = serde_json::Map::new();
+    for item in items {
+        if let Some(addr) = only {
+            if item.sender != addr {
+                continue;
+            }
+        }
+        let addr = format!("0x{}", hex::encode(item.sender.0));
+        let bucket = if item.pending { &mut pending } else { &mut queued };
+        let entry = bucket.entry(addr).or_insert_with(|| json!({}));
+        if let Some(m) = entry.as_object_mut() {
+            m.insert(format!("0x{:x}", item.nonce), pooled_tx_json(item));
+        }
+    }
+    json!({ "pending": pending, "queued": queued })
+}
+
 /// Serialize a receipt to the `eth_getTransactionReceipt` object
 /// shape. `cumulative` is the block-cumulative gas up to and
 /// including this tx; `log_base` is the block-wide index of this
@@ -1804,6 +2526,74 @@ fn log_json(m: &evm::history::LogMatch) -> Value {
         "logIndex": format!("0x{:x}", m.log_index),
         "removed": false,
     })
+}
+
+/// Validate the `debug_trace*` options object. The only supported
+/// `tracer` is `"callTracer"` (or absent — this implementation's
+/// default, a documented deviation from geth's struct-logger
+/// default). A named-but-unsupported tracer is a `-32602` error:
+/// returning the callTracer shape to a caller expecting struct logs
+/// would silently hand them the wrong data.
+fn parse_trace_options(v: Option<&Value>) -> Result<(), RpcError> {
+    let Some(Value::Object(obj)) = v else {
+        // Absent or non-object options: defaults apply.
+        return match v {
+            None | Some(Value::Null) => Ok(()),
+            Some(_) => Err(RpcError::invalid_params("trace options must be an object")),
+        };
+    };
+    if let Some(tracer) = obj.get("tracer") {
+        match tracer.as_str() {
+            None | Some("callTracer") => {}
+            Some(other) => {
+                return Err(RpcError {
+                    code: -32_602,
+                    message: format!(
+                        "unsupported tracer {other:?}: only \"callTracer\" is implemented \
+                         (the default geth struct-logger output is not recorded — see \
+                         docs/evm-parity-gap-analysis.md)"
+                    ),
+                    data: None,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Serialize a [`evm::trace::CallFrame`] to the geth `callTracer`
+/// object shape, recursively. `root_override` patches the top frame's
+/// `gas`/`gasUsed` with the tx-level values (geth reports the tx gas
+/// limit and total gas used including intrinsic cost; the recorder
+/// reports the frame-scoped post-intrinsic numbers).
+fn call_frame_json(f: &evm::trace::CallFrame, root_override: Option<(u64, u64)>) -> Value {
+    let (gas, gas_used) = root_override.unwrap_or((f.gas_limit, f.gas_used));
+    let mut obj = json!({
+        "type": f.kind,
+        "from": format!("0x{:x}", f.from),
+        "to": f.to.map_or(Value::Null, |a| json!(format!("0x{a:x}"))),
+        "value": format!("0x{:x}", f.value),
+        "gas": format!("0x{gas:x}"),
+        "gasUsed": format!("0x{gas_used:x}"),
+        "input": format!("0x{}", hex::encode(&f.input)),
+    });
+    // geth emits `output` on success and `error` (+ `revertReason`)
+    // on failure — not both.
+    match &f.error {
+        None => {
+            obj["output"] = json!(format!("0x{}", hex::encode(&f.output)));
+        }
+        Some(err) => {
+            obj["error"] = json!(err);
+            if let Some(reason) = &f.revert_reason {
+                obj["revertReason"] = json!(reason);
+            }
+        }
+    }
+    if !f.calls.is_empty() {
+        obj["calls"] = Value::Array(f.calls.iter().map(|c| call_frame_json(c, None)).collect());
+    }
+    obj
 }
 
 /// Serialize a sealed block to the `eth_getBlockBy*` object shape.
@@ -1870,6 +2660,15 @@ fn block_header_json(block: &ExecutedBlock) -> Value {
         "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
         "withdrawalsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
     })
+}
+
+/// Parse a pollable-filter ID param (`"0x…"` hex string as geth
+/// returns them).
+fn parse_filter_id(v: Option<&Value>) -> Result<String, RpcError> {
+    let v = v.ok_or_else(|| RpcError::invalid_params("missing filter ID"))?;
+    v.as_str()
+        .map(str::to_string)
+        .ok_or_else(|| RpcError::invalid_params("filter ID must be a string"))
 }
 
 /// Parse a 20-byte hex address param into `primitives::Address`.
@@ -2724,5 +3523,356 @@ mod tests {
         let err = resp.error.expect("expected rejection error");
         assert_eq!(err.code, -32_000, "expected transaction-rejected code");
         assert!(err.message.contains("mock rejection"), "error must carry the rejection reason");
+    }
+
+    // ---- Pollable filter tests ----
+
+    /// Seal a block containing one LOG0-emitting call so filters
+    /// have something to observe. Returns the emitting contract.
+    #[cfg(test)]
+    fn seal_log_block(
+        evm: &evm::EvmModule,
+        height: u64,
+        contract: primitives::Address,
+        sender: primitives::Address,
+        nonce: u64,
+    ) {
+        use evm::tx::{SignedTx, TxFields, TxKind, TxLegacy};
+        use executor::Module;
+        use primitives::Height;
+        use revm::primitives::{Bytes, U256};
+        let tx = TxLegacy {
+            fields: TxFields {
+                nonce,
+                gas_limit: 30_000_000,
+                to: TxKind::Call(alloy_primitives::Address::from(contract.0)),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000u64),
+        };
+        let raw = SignedTx::sign_legacy(tx, &[0x11; 32]).expect("sign").encode_to_bytes();
+        let ctx = executor::TxContext { sender, nonce: 0, fee: 0 };
+        evm.begin_block(Height::new(height));
+        let results = evm.handle_batch(&ctx, &[raw]);
+        assert!(results[0].is_ok(), "block tx must execute: {:?}", results[0]);
+        evm.end_block(Height::new(height));
+    }
+
+    /// EVM server with a LOG0 contract installed at `0xAA…` and a
+    /// funded sender at the `[0x11;32]` key's recovered address.
+    #[cfg(test)]
+    fn make_log_server() -> (RpcServer, Arc<evm::EvmModule>, primitives::Address) {
+        use evm::tx::{SignedTx, TxFields, TxKind, TxLegacy};
+        use revm::primitives::{Bytes, U256};
+        let (s, evm) = make_evm_server();
+        let contract = primitives::Address([0xAA; 20]);
+        // LOG0 with 32 bytes ending 0x42.
+        evm.genesis_insert_account(
+            &contract,
+            0,
+            1,
+            hex::decode("604260005260206000a0").expect("contract hex"),
+            Vec::new(),
+        );
+        let probe = TxLegacy {
+            fields: TxFields {
+                nonce: 0,
+                gas_limit: 30_000_000,
+                to: TxKind::Call(alloy_primitives::Address::from([0xAA; 20])),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000u64),
+        };
+        let raw = SignedTx::sign_legacy(probe, &[0x11; 32]).expect("sign").encode_to_bytes();
+        let sender = SignedTx::decode_raw(&raw).expect("decode").recover_sender().expect("recover");
+        evm.genesis_insert_account(&sender, u128::MAX, 0, Vec::new(), Vec::new());
+        (s, evm, contract)
+    }
+
+    #[test]
+    fn new_filter_changes_returns_new_logs() {
+        let (s, evm, contract) = make_log_server();
+        let new = make_request("eth_newFilter", vec![json!({})], json!(1));
+        let id = s.handle(&new).result.unwrap().as_str().unwrap().to_string();
+
+        // Seal block 1 with a log; the filter polls it.
+        seal_log_block(&evm, 1, contract, primitives::Address([0; 20]), 0);
+        let changes = make_request("eth_getFilterChanges", vec![json!(id.clone())], json!(2));
+        let logs = s.handle(&changes).result.unwrap().as_array().unwrap().clone();
+        assert_eq!(logs.len(), 1, "one LOG0 expected, got {logs:?}");
+        assert_eq!(logs[0]["address"].as_str().unwrap(), format!("0x{}", hex::encode(contract.0)));
+        assert_eq!(logs[0]["blockNumber"], json!("0x1"));
+
+        // A second poll with no new block returns [].
+        let again = make_request("eth_getFilterChanges", vec![json!(id)], json!(3));
+        assert_eq!(s.handle(&again).result, Some(json!([])));
+    }
+
+    #[test]
+    fn new_filter_address_restriction_excludes_other_logs() {
+        let (s, evm, _contract) = make_log_server();
+        // Filter for a different contract — sees nothing.
+        let new = make_request(
+            "eth_newFilter",
+            vec![json!({"address": format!("0x{}", hex::encode([0xBBu8; 20]))})],
+            json!(1),
+        );
+        let id = s.handle(&new).result.unwrap().as_str().unwrap().to_string();
+        seal_log_block(&evm, 1, primitives::Address([0xAA; 20]), primitives::Address([0; 20]), 0);
+        let changes = make_request("eth_getFilterChanges", vec![json!(id)], json!(2));
+        assert_eq!(s.handle(&changes).result, Some(json!([])));
+    }
+
+    #[test]
+    fn new_block_filter_changes_returns_real_hashes() {
+        use executor::Module;
+        use primitives::Height;
+        let (s, evm) = make_evm_server();
+        let new = make_request("eth_newBlockFilter", vec![], json!(1));
+        let id = s.handle(&new).result.unwrap().as_str().unwrap().to_string();
+
+        for h in 1..=2 {
+            evm.begin_block(Height::new(h));
+            evm.end_block(Height::new(h));
+        }
+        let changes = make_request("eth_getFilterChanges", vec![json!(id.clone())], json!(2));
+        let hashes = s.handle(&changes).result.unwrap().as_array().unwrap().clone();
+        assert_eq!(hashes.len(), 2);
+        for hash in &hashes {
+            assert_eq!(hash.as_str().unwrap().len(), 66, "real 32-byte block hash");
+        }
+        // The served heights match `eth_getBlockByNumber`.
+        let b1 = make_request("eth_getBlockByNumber", vec![json!("0x1"), json!(false)], json!(3));
+        assert_eq!(s.handle(&b1).result.unwrap()["hash"], hashes[0]);
+    }
+
+    #[test]
+    fn pending_tx_filter_drains_the_feed() {
+        let s = make_server();
+        let new = make_request("eth_newPendingTransactionFilter", vec![], json!(1));
+        let id = s.handle(&new).result.unwrap().as_str().unwrap().to_string();
+
+        let hash = B256::from([0xAB; 32]);
+        s.record_pending_tx(hash);
+        s.record_pending_tx(B256::from([0xCD; 32]));
+
+        let changes = make_request("eth_getFilterChanges", vec![json!(id.clone())], json!(2));
+        let hashes = s.handle(&changes).result.unwrap().as_array().unwrap().clone();
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0], json!(format!("0x{hash:x}")));
+
+        // A second poll sees nothing new.
+        let again = make_request("eth_getFilterChanges", vec![json!(id)], json!(3));
+        assert_eq!(s.handle(&again).result, Some(json!([])));
+    }
+
+    #[test]
+    fn uninstall_filter_then_poll_fails() {
+        let s = make_evm_server().0;
+        let new = make_request("eth_newBlockFilter", vec![], json!(1));
+        let id = s.handle(&new).result.unwrap().as_str().unwrap().to_string();
+
+        let unsub = make_request("eth_uninstallFilter", vec![json!(id.clone())], json!(2));
+        assert_eq!(s.handle(&unsub).result, Some(json!(true)));
+        // Unknown after uninstall — geth's `filter not found`.
+        let poll = make_request("eth_getFilterChanges", vec![json!(id.clone())], json!(3));
+        let err = s.handle(&poll).error.expect("removed filter must error");
+        assert_eq!(err.code, -32_000);
+        assert_eq!(err.message, "filter not found");
+        // Uninstalling again returns false.
+        let unsub2 = make_request("eth_uninstallFilter", vec![json!(id)], json!(4));
+        assert_eq!(s.handle(&unsub2).result, Some(json!(false)));
+    }
+
+    #[test]
+    fn get_filter_changes_unknown_id_errors() {
+        let s = make_server();
+        let req = make_request("eth_getFilterChanges", vec![json!("0xdead")], json!(1));
+        let err = s.handle(&req).error.expect("unknown filter must error");
+        assert_eq!(err.code, -32_000);
+        assert_eq!(err.message, "filter not found");
+    }
+
+    #[test]
+    fn get_filter_logs_rejects_non_log_filter() {
+        let s = make_evm_server().0;
+        let new = make_request("eth_newBlockFilter", vec![], json!(1));
+        let id = s.handle(&new).result.unwrap().as_str().unwrap().to_string();
+        let req = make_request("eth_getFilterLogs", vec![json!(id.clone())], json!(2));
+        let err = s.handle(&req).error.expect("block filter must error");
+        assert_eq!(err.code, -32_000);
+        // The block filter must still work afterwards.
+        let poll = make_request("eth_getFilterChanges", vec![json!(id)], json!(3));
+        assert!(s.handle(&poll).error.is_none());
+    }
+
+    #[test]
+    fn new_pending_transactions_subscription_pushes_hash() {
+        let s = make_server();
+        let (conn, mut rx) = ws_conn();
+        let sub = make_request("eth_subscribe", vec![json!("newPendingTransactions")], json!(1));
+        let id = s.handle_ws(&sub, &conn).result.unwrap().as_str().unwrap().to_string();
+
+        let hash = B256::from([0x5A; 32]);
+        s.record_pending_tx(hash);
+        let text = rx.try_recv().expect("pending-tx notification must arrive");
+        let notif: Value = serde_json::from_str(&text).expect("notification must be JSON");
+        assert_eq!(notif["method"], json!("eth_subscription"));
+        assert_eq!(notif["params"]["subscription"], json!(id));
+        assert_eq!(notif["params"]["result"], json!(format!("0x{hash:x}")));
+    }
+
+    #[test]
+    fn eth_call_gas_above_block_limit_is_clamped_not_rejected() {
+        let (s, _evm) = make_evm_server();
+        let req = make_request(
+            "eth_call",
+            vec![
+                json!({
+                    "to": "0x0000000000000000000000000000000000000000",
+                    // Way above the 10 GG block gas limit.
+                    "gas": "0x100000000000"
+                }),
+                json!("latest"),
+            ],
+            json!(1),
+        );
+        let resp = s.handle(&req);
+        assert!(resp.error.is_none(), "clamped call must succeed: {:?}", resp.error);
+        assert_eq!(resp.result, Some(json!("0x")));
+    }
+
+    // ---- txpool_* ---------------------------------------------------
+
+    /// A mock txpool provider returning a fixed item list.
+    struct MockTxpool {
+        items: Vec<TxpoolItem>,
+    }
+
+    impl TxpoolProvider for MockTxpool {
+        fn txpool_snapshot(&self) -> Vec<TxpoolItem> {
+            // TxBytes is cheap to clone for tests; the provider
+            // returns a fresh snapshot per call like the real
+            // executor adapter.
+            self.items
+                .iter()
+                .map(|i| TxpoolItem {
+                    sender: i.sender,
+                    nonce: i.nonce,
+                    envelope: TxBytes::new(i.envelope.as_bytes().to_vec()),
+                    pending: i.pending,
+                })
+                .collect()
+        }
+    }
+
+    /// Build a signed EIP-1559 envelope for `TxpoolItem` tests.
+    fn signed_envelope(privkey: [u8; 32], nonce: u64) -> TxpoolItem {
+        use evm::tx::{SignedTx, TxEip1559, TxFields, TxKind};
+        use revm::primitives::{Address, Bytes, U256};
+
+        let signed = SignedTx::sign_eip1559(
+            TxEip1559 {
+                fields: TxFields {
+                    nonce,
+                    gas_limit: 21_000,
+                    to: TxKind::Call(Address::from([0x42; 20])),
+                    value: U256::from(5u64),
+                    data: Bytes::new(),
+                    chain_id: 1,
+                },
+                max_fee_per_gas: U256::from(10_000_000_000u64),
+                max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+                access_list: Vec::new(),
+            },
+            &privkey,
+        )
+        .expect("signing must succeed");
+        let sender = signed.recover_sender().expect("sender recovery");
+        let raw = signed.encode_to_bytes();
+        let envelope = evm::wrap_evm_tx_envelope(&sender, nonce, 10_000_000_000, &raw);
+        TxpoolItem { sender, nonce, envelope: TxBytes::new(envelope), pending: false }
+    }
+
+    #[test]
+    fn txpool_status_reports_pending_and_queued_counts() {
+        let mut s = make_server();
+        let mut a = signed_envelope([0x01; 32], 0);
+        a.pending = true;
+        let mut b = signed_envelope([0x02; 32], 3);
+        b.pending = false;
+        s.set_txpool_provider(Arc::new(MockTxpool { items: vec![a, b] }));
+
+        let resp = s.handle(&make_request("txpool_status", vec![], json!(1)));
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), json!({ "pending": "0x1", "queued": "0x1" }));
+    }
+
+    #[test]
+    fn txpool_content_groups_by_sender_and_nonce() {
+        let mut s = make_server();
+        let mut item = signed_envelope([0x01; 32], 0);
+        item.pending = true;
+        s.set_txpool_provider(Arc::new(MockTxpool { items: vec![item] }));
+
+        let resp = s.handle(&make_request("txpool_content", vec![], json!(1)));
+        let body = resp.result.unwrap();
+        let pending = &body["pending"];
+        // Exactly one sender bucket with a nonce-"0x0" tx object.
+        let bucket = pending.as_object().expect("pending map");
+        assert_eq!(bucket.len(), 1);
+        let by_nonce = bucket.values().next().unwrap().as_object().unwrap();
+        let tx = &by_nonce["0x0"];
+        assert_eq!(tx["nonce"], json!("0x0"));
+        assert_eq!(tx["value"], json!("0x5"));
+        assert_eq!(tx["to"], json!("0x4242424242424242424242424242424242424242"));
+        assert_eq!(tx["blockHash"], Value::Null);
+        assert_eq!(tx["blockNumber"], Value::Null);
+    }
+
+    #[test]
+    fn txpool_inspect_returns_geth_summary_strings() {
+        let mut s = make_server();
+        let item = signed_envelope([0x01; 32], 0);
+        s.set_txpool_provider(Arc::new(MockTxpool { items: vec![item] }));
+
+        let resp = s.handle(&make_request("txpool_inspect", vec![], json!(1)));
+        let body = resp.result.unwrap();
+        let summary = body["queued"].as_object().unwrap().values().next().unwrap()["0x0"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            summary.contains("5 wei + 21000 gas"),
+            "summary must be geth-shaped, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn txpool_content_from_filters_to_one_sender() {
+        let mut s = make_server();
+        let keep = signed_envelope([0x01; 32], 0);
+        let drop_item = signed_envelope([0x02; 32], 0);
+        let keep_addr = format!("0x{}", hex::encode(keep.sender.0));
+        s.set_txpool_provider(Arc::new(MockTxpool { items: vec![keep, drop_item] }));
+
+        let resp = s.handle(&make_request("txpool_contentFrom", vec![json!(keep_addr)], json!(1)));
+        let body = resp.result.unwrap();
+        let total = body["pending"].as_object().unwrap().values().count()
+            + body["queued"].as_object().unwrap().values().count();
+        assert_eq!(total, 1, "only the requested sender's bucket survives");
+    }
+
+    #[test]
+    fn txpool_methods_error_without_provider() {
+        let s = make_server();
+        for method in ["txpool_status", "txpool_content", "txpool_inspect"] {
+            let resp = s.handle(&make_request(method, vec![], json!(1)));
+            assert_eq!(resp.error.unwrap().code, -32_000, "{method} must error when unbacked");
+        }
     }
 }

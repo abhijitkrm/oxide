@@ -12,6 +12,65 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **`debug_trace*` namespace — callTracer over revm inspector
+  composition** (`modules/evm`, `crates/rpc`)
+  - `debug_traceTransaction`, `debug_traceCall`,
+    `debug_traceBlockByNumber`, and `debug_traceBlockByHash` return
+    geth-shaped callTracer output: per-frame `type`/`from`/`to`/
+    `input`/`output`/`value`/`gas`/`gasUsed`/`calls`/`error`/
+    `revertReason`, including nested calls and creates.
+  - Traces are recorded *during* execution by a `CallRecorder`
+    inspector composed with the native-journal inspector, and
+    retained in `evm::history` — the honest approach while the
+    state store serves latest-only state (no silent re-execution
+    against wrong state). Coverage is bounded by the 8192-block
+    history window.
+  - `debug_traceCall` returns the trace for reverted executions
+    (error inside the root frame), matching geth; unsupported
+    tracers are rejected explicitly.
+  - **In plain words:** `debug_traceTransaction` works — explorers
+    and indexers get the same call-tree JSON geth produces, for any
+    transaction still inside the node's retained history window.
+
+- **`txpool_*` namespace** (`crates/rpc`, `crates/mempool`,
+  `crates/executor`, `bin/oxide-validator`)
+  - `txpool_status` (pending/queued hex counts),
+    `txpool_content`/`txpool_contentFrom` (sender → nonce → full
+    transaction objects), and `txpool_inspect` (geth summary
+    strings) expose the mempool's per-sender nonce queues.
+    Pending = contiguous executable nonces, queued = behind a gap.
+  - The RPC crate talks to a `TxpoolProvider` trait; the validator
+    wires the executor-backed implementation — the RPC/mempool seam
+    stays replaceable.
+  - **In plain words:** wallets and operators can now inspect
+    exactly which transactions are about to execute and which are
+    stuck behind nonce gaps — the same view geth exposes.
+
+- **Pollable filter APIs + `newPendingTransactions` (P1.5)**
+  (`crates/rpc`, `bin/oxide-validator`)
+  - `eth_newFilter`/`eth_getFilterChanges`/`eth_getFilterLogs`
+    (log filters reuse `eth_getLogs` semantics),
+    `eth_newBlockFilter` (block-hash deltas),
+    `eth_newPendingTransactionFilter` (mempool-arrival tx hashes),
+    and `eth_uninstallFilter`. Filters live 300s between polls
+    (geth's TTL); expired filters return `filter not found`.
+  - `eth_subscribe` supports `newPendingTransactions`: canonical
+    EVM tx hashes push on local submit *and* on gossip-accepted
+    peer transactions (1024-hash bounded ring, dedup by hash).
+  - **In plain words:** standard wallet tooling that polls
+    `eth_getFilterChanges` (MetaMask, ethers, web3.js) now works
+    unchanged, and pending transactions stream to subscribers —
+    the last pieces needed for explorer and bot backends.
+
+- **RPC resource limits (first tranche)** (`crates/rpc`)
+  - `eth_call` and `debug_traceCall` clamp requested gas to the
+    chain block gas limit (the `gas-cap` role); `eth_getLogs` and
+    all filter log paths cap results at 10,000 entries;
+    `eth_feeHistory` caps `blockCount` at 1,024.
+  - **In plain words:** a single expensive RPC request can no
+    longer consume unbounded node resources — the same guardrails
+    geth ships with.
+
 - **WebSocket transport + `eth_subscribe` (P1)** (`crates/rpc`,
   `bin/oxide-validator`)
   - `GET /` with `Upgrade: websocket` now upgrades to a JSON-RPC

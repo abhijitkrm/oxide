@@ -76,6 +76,7 @@ pub mod precompiles;
 pub mod preinstalls;
 pub mod receipts;
 pub mod spec;
+pub mod trace;
 pub mod trie;
 pub mod tx;
 
@@ -97,6 +98,16 @@ use std::sync::Arc;
 /// Reserved by `framework::module_id::EVM` (3). Native modules use
 /// IDs 0–2 (core, bank, staking); the EVM is the first VM module.
 pub const MODULE_ID: u8 = module_id::EVM;
+
+/// One traced execution: the execution result paired with the
+/// call-trace root recorded beside it (`None` when recording was
+/// off or the tx never entered the interpreter).
+///
+/// Aliased because the parallel batch path threads `(position,
+/// result)` pairs through several helper signatures — the
+/// fully-spelled type obscured the plumbing.
+type TracedResult =
+    Result<(revm::context::result::ExecutionResult, Option<trace::CallFrame>), ExecError>;
 
 /// Wrap an RLP-encoded signed EVM transaction in the Oxide v0 tx
 /// envelope format for mempool submission.
@@ -133,6 +144,23 @@ pub fn wrap_evm_tx_envelope(
     bytes.push(MODULE_ID);
     bytes.extend_from_slice(rlp_signed_tx);
     bytes
+}
+
+/// Inverse of [`wrap_evm_tx_envelope`]: return the raw signed-EVM
+/// RLP bytes carried by a v0 envelope.
+///
+/// Returns `None` when the envelope is too short to hold the
+/// header or routes to a different module — non-EVM envelopes pass
+/// through the same mempool/gossip path and must not be mistaken
+/// for EVM payloads (e.g. by the pending-tx feed).
+#[must_use]
+pub fn unwrap_evm_tx_envelope(envelope: &[u8]) -> Option<&[u8]> {
+    /// Envelope header: `[sender:20][nonce:8][fee:8][module:1]`.
+    const HEADER_LEN: usize = 20 + 8 + 8 + 1;
+    if envelope.len() <= HEADER_LEN || envelope[HEADER_LEN - 1] != MODULE_ID {
+        return None;
+    }
+    Some(&envelope[HEADER_LEN..])
 }
 
 /// The base intrinsic gas cost for any EVM transaction (EIP-2028).
@@ -595,7 +623,7 @@ impl EvmModule {
             revm::context::Journal<&'db mut DB>,
             (),
         >,
-        native_journal::NativeJournalInspector,
+        (native_journal::NativeJournalInspector, trace::CallRecorder),
         revm::handler::instructions::EthInstructions<
             revm::interpreter::interpreter::EthInterpreter,
             revm::context::Context<
@@ -633,7 +661,7 @@ impl EvmModule {
             revm::context::Journal<&'db mut DB>,
             (),
         >,
-        native_journal::NativeJournalInspector,
+        (native_journal::NativeJournalInspector, trace::CallRecorder),
         revm::handler::instructions::EthInstructions<
             revm::interpreter::interpreter::EthInterpreter,
             revm::context::Context<
@@ -707,7 +735,13 @@ impl EvmModule {
         }
         revm::context::Evm::new_with_inspector(
             ctx,
-            native_journal::NativeJournalInspector::new(journal),
+            (
+                native_journal::NativeJournalInspector::new(journal),
+                // Call-tree recorder: feeds `debug_trace*` — see
+                // trace.rs for why traces are captured at execution
+                // time rather than re-executed on demand.
+                trace::CallRecorder::new(),
+            ),
             instruction,
             precompiles,
         )
@@ -717,6 +751,13 @@ impl EvmModule {
     #[must_use]
     pub fn base_fee(&self) -> u64 {
         self.base_fee
+    }
+
+    /// The EVM block gas limit the module enforces — the cap
+    /// `eth_call`/`eth_estimateGas`/`debug_traceCall` clamp against.
+    #[must_use]
+    pub fn block_gas_limit(&self) -> u64 {
+        self.block_gas_limit
     }
 
     /// Set the coinbase / fee recipient for the current block.
@@ -770,8 +811,14 @@ impl EvmModule {
     fn execute_signed(
         &self,
         signed: &tx::SignedTx,
-    ) -> Result<(revm::context::result::ExecutionResult, revm::primitives::Address), ExecError>
-    {
+    ) -> Result<
+        (
+            revm::context::result::ExecutionResult,
+            revm::primitives::Address,
+            Option<trace::CallFrame>,
+        ),
+        ExecError,
+    > {
         // Enforce chain ID (EIP-155 replay protection).
         if signed.chain_id() != self.chain_id {
             return Err(ExecError::Malformed);
@@ -819,6 +866,10 @@ impl EvmModule {
             .inspect_tx(tx)
             .map_err(|e| ExecError::ModuleRejected(format!("evm transact failed: {e:?}")))?;
         evm.precompiles.clear_native_journal();
+        // Drain the call-tree recorder before the Evm is dropped —
+        // the trace lands in `history` beside this tx's receipt for
+        // `debug_trace*` lookups.
+        let call_trace = evm.inspector.1.take_root();
 
         // Phase D: track touched accounts for incremental flush.
         // `state` contains EVERY account revm modified (including
@@ -833,7 +884,7 @@ impl EvmModule {
         }
         evm.commit(result_and_state.state);
 
-        Ok((result_and_state.result, caller))
+        Ok((result_and_state.result, caller, call_trace))
     }
 
     /// Try to execute a simple ETH transfer natively, bypassing revm.
@@ -1243,6 +1294,40 @@ impl EvmModule {
 
         Some(result)
     }
+
+    /// Synthesize the geth-callTracer-equivalent root frame for a
+    /// transaction that executed on a native fast path (no revm
+    /// frame machinery ran, so the `CallRecorder` saw nothing).
+    ///
+    /// The fast paths only ever produce `Success` — every check that
+    /// could fail falls through to revm — so `error` is always
+    /// `None` and `output` is empty. `gas`/`gasUsed` use the tx-level
+    /// values (the frame gas equals the tx gas for a single-frame
+    /// call, and geth's callTracer reports the same).
+    fn fast_path_frame(
+        signed: &tx::SignedTx,
+        caller: revm::primitives::Address,
+        result: &ExecutionResult,
+    ) -> trace::CallFrame {
+        let to = match signed.to() {
+            tx::TxKind::Call(addr) => Some(revm::primitives::Address::from(addr.0)),
+            tx::TxKind::Create => None,
+        };
+        trace::CallFrame {
+            kind: "CALL",
+            from: caller,
+            to,
+            value: signed.value(),
+            gas_limit: signed.gas_limit(),
+            gas_used: result.tx_gas_used(),
+            input: signed.data().clone(),
+            output: revm::primitives::Bytes::new(),
+            error: None,
+            revert_reason: None,
+            calls: Vec::new(),
+        }
+    }
+
     ///
     /// # Errors
     ///
@@ -1579,9 +1664,15 @@ impl EvmModule {
                     local_touched.insert(revm::primitives::Address::from(addr.0));
                 }
                 local_touched.insert(coinbase);
+                // Fast paths bypass revm's frame machinery, so no
+                // `CallRecorder` ran — but geth's callTracer still
+                // reports a root CALL frame for a plain transfer.
+                // Synthesize the equivalent frame so every sealed tx
+                // has a trace.
+                let frame = Self::fast_path_frame(&signed, caller, &result);
                 results.push(self.exec_result_to_events(
                     Ok(result),
-                    Some((history::stored_tx(&signed, caller, tx_hash, 0), raw)),
+                    Some((history::stored_tx(&signed, caller, tx_hash, 0), raw, Some(frame))),
                 ));
                 continue;
             }
@@ -1597,9 +1688,10 @@ impl EvmModule {
                     local_touched.insert(revm::primitives::Address::from(addr.0));
                 }
                 local_touched.insert(coinbase);
+                let frame = Self::fast_path_frame(&signed, caller, &result);
                 results.push(self.exec_result_to_events(
                     Ok(result),
-                    Some((history::stored_tx(&signed, caller, tx_hash, 0), raw)),
+                    Some((history::stored_tx(&signed, caller, tx_hash, 0), raw, Some(frame))),
                 ));
                 continue;
             }
@@ -1636,16 +1728,18 @@ impl EvmModule {
                     }
                 };
                 evm.precompiles.clear_native_journal();
+                let call_trace = evm.inspector.1.take_root();
                 // Track the exact modified-account set locally
                 // (no lock per tx), then commit.
                 local_touched.extend(result_and_state.state.keys().copied());
                 evm.commit(result_and_state.state);
-                result_and_state.result
+                (result_and_state.result, call_trace)
             };
 
+            let (result, call_trace) = result;
             results.push(self.exec_result_to_events(
                 Ok(result),
-                Some((history::stored_tx(&signed, caller, tx_hash, 0), raw)),
+                Some((history::stored_tx(&signed, caller, tx_hash, 0), raw, call_trace)),
             ));
         }
 
@@ -1992,10 +2086,7 @@ impl EvmModule {
                 // Context rebuild is ~100 ns; negligible vs the
                 // ~3.7 µs EVM execution cost for non-native txs.
 
-                let mut tx_results: Vec<(
-                    usize,
-                    Result<revm::context::result::ExecutionResult, ExecError>,
-                )> = Vec::with_capacity(txs.len());
+                let mut tx_results: Vec<(usize, TracedResult)> = Vec::with_capacity(txs.len());
                 // Ceiling 2: per-tx accessed account sets. For each
                 // tx, we record the set of accounts it accessed
                 // (read OR written). This enables tx-granular
@@ -2035,7 +2126,8 @@ impl EvmModule {
                         }
                         accessed.insert(coinbase);
                         per_tx_accessed.push((*idx, accessed));
-                        tx_results.push((*idx, Ok(result)));
+                        let frame = Self::fast_path_frame(signed, caller, &result);
+                        tx_results.push((*idx, Ok((result, Some(frame)))));
                         continue;
                     }
 
@@ -2054,7 +2146,8 @@ impl EvmModule {
                         }
                         accessed.insert(coinbase);
                         per_tx_accessed.push((*idx, accessed));
-                        tx_results.push((*idx, Ok(result)));
+                        let frame = Self::fast_path_frame(signed, caller, &result);
+                        tx_results.push((*idx, Ok((result, Some(frame)))));
                         continue;
                     }
 
@@ -2078,14 +2171,15 @@ impl EvmModule {
                             self.build_evm(&mut db, coinbase, block_number, block_timestamp);
                         let rs = evm.inspect_tx(tx_env);
                         evm.precompiles.clear_native_journal();
+                        let call_trace = evm.inspector.1.take_root();
                         if let Ok(ref rs) = rs {
                             evm.commit(rs.state.clone());
                         }
-                        rs
+                        (rs, call_trace)
                     };
 
                     match result {
-                        Ok(rs) => {
+                        (Ok(rs), call_trace) => {
                             // Per-tx accessed accounts: the union of
                             // cache keys before and after the tx, plus
                             // the accounts in the EvmState (which may
@@ -2094,9 +2188,9 @@ impl EvmModule {
                             accessed.extend(rs.state.keys().copied());
                             accessed.extend(db.cache.accounts.keys().copied());
                             per_tx_accessed.push((*idx, accessed));
-                            tx_results.push((*idx, Ok(rs.result)));
+                            tx_results.push((*idx, Ok((rs.result, call_trace))));
                         }
-                        Err(e) => {
+                        (Err(e), _) => {
                             per_tx_accessed.push((*idx, cache_keys_before));
                             tx_results.push((
                                 *idx,
@@ -2195,7 +2289,7 @@ impl EvmModule {
         // speculative results in `group_results`.
         let mut reexec_results: std::collections::HashMap<
             usize,
-            Result<revm::context::result::ExecutionResult, ExecError>,
+            Result<(revm::context::result::ExecutionResult, Option<trace::CallFrame>), ExecError>,
         > = std::collections::HashMap::new();
 
         for gr in &group_results {
@@ -2290,7 +2384,8 @@ impl EvmModule {
                             committed_touched.insert(revm::primitives::Address::from(addr.0));
                         }
                         committed_touched.insert(coinbase);
-                        reexec_results.insert(idx, Ok(result));
+                        let frame = Self::fast_path_frame(signed, caller, &result);
+                        reexec_results.insert(idx, Ok((result, Some(frame))));
                         continue;
                     }
 
@@ -2310,7 +2405,8 @@ impl EvmModule {
                             committed_touched.insert(revm::primitives::Address::from(addr.0));
                         }
                         committed_touched.insert(coinbase);
-                        reexec_results.insert(idx, Ok(result));
+                        let frame = Self::fast_path_frame(signed, caller, &result);
+                        reexec_results.insert(idx, Ok((result, Some(frame))));
                         continue;
                     }
 
@@ -2333,8 +2429,9 @@ impl EvmModule {
                                     committed_touched.insert(*addr);
                                 }
                                 evm.precompiles.clear_native_journal();
+                                let call_trace = evm.inspector.1.take_root();
                                 evm.commit(rs.state);
-                                reexec_results.insert(idx, Ok(r));
+                                reexec_results.insert(idx, Ok((r, call_trace)));
                             }
                             Err(e) => {
                                 reexec_results.insert(
@@ -2421,7 +2518,7 @@ impl EvmModule {
         // O(groups * txs).
         let mut spec_index: std::collections::HashMap<
             usize,
-            &Result<revm::context::result::ExecutionResult, ExecError>,
+            &Result<(revm::context::result::ExecutionResult, Option<trace::CallFrame>), ExecError>,
         > = std::collections::HashMap::with_capacity(n_txs);
         for gr in &group_results {
             for (idx, result) in &gr.tx_results {
@@ -2435,15 +2532,33 @@ impl EvmModule {
                 results.push(Err(e.clone()));
                 continue;
             }
+            // Split `(result, trace)` out of the Ok payload and merge
+            // the trace into `metas[i]` — `exec_result_to_events`
+            // takes the 3-tuple so the trace lands in history beside
+            // the receipt.
+            let attach = |r: Result<
+                (revm::context::result::ExecutionResult, Option<trace::CallFrame>),
+                ExecError,
+            >,
+                          meta: Option<(history::StoredTx, Vec<u8>)>| {
+                let (res, call_trace) = match r {
+                    Ok((res, t)) => (Ok(res), t),
+                    Err(e) => (Err(e), None),
+                };
+                let meta = meta.map(|(s, raw)| (s, raw, call_trace));
+                (res, meta)
+            };
             // Check re-executed results first (conflict fallback).
             if let Some(r) = reexec_results.remove(&i) {
-                results.push(self.exec_result_to_events(r, metas[i].take()));
+                let (res, meta) = attach(r, metas[i].take());
+                results.push(self.exec_result_to_events(res, meta));
                 continue;
             }
             // Fall back to speculative results.
             match spec_index.get(&i) {
                 Some(result) => {
-                    results.push(self.exec_result_to_events((*result).clone(), metas[i].take()));
+                    let (res, meta) = attach((*result).clone(), metas[i].take());
+                    results.push(self.exec_result_to_events(res, meta));
                 }
                 None => {
                     results.push(Err(ExecError::ModuleRejected(
@@ -2476,17 +2591,18 @@ impl EvmModule {
     fn exec_result_to_events(
         &self,
         result: Result<revm::context::result::ExecutionResult, ExecError>,
-        meta: Option<(history::StoredTx, Vec<u8>)>,
+        meta: Option<(history::StoredTx, Vec<u8>, Option<trace::CallFrame>)>,
     ) -> Result<Vec<Event>, ExecError> {
         match result {
             Ok(r) => {
                 let tx_type = meta.as_ref().map_or(0, |m| m.0.tx_type);
                 let receipt = receipts::Receipt::from_execution_result(&r, tx_type);
-                if let Some((stored, raw)) = meta {
+                if let Some((stored, raw, call_trace)) = meta {
                     self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(
                         stored,
                         receipt.clone(),
                         &raw,
+                        call_trace,
                     );
                 }
                 let status_str = if receipt.status { "success" } else { "revert" };
@@ -2580,7 +2696,10 @@ struct GroupExecResult {
     /// The sender address for this group.
     sender: revm::primitives::Address,
     /// Per-tx results, indexed by original position in the batch.
-    tx_results: Vec<(usize, Result<revm::context::result::ExecutionResult, ExecError>)>,
+    /// The `Ok` payload carries the trace recorded beside the
+    /// execution result — for conflict-reexecuted txs the reexec
+    /// map's trace wins (it's the committed execution).
+    tx_results: Vec<(usize, TracedResult)>,
     /// Touched accounts from the nested cache (final state of all
     /// accounts modified by this group). Extracted directly from
     /// `CacheDB::cache::accounts`, filtered to only touched
@@ -2814,7 +2933,7 @@ impl Module for EvmModule {
         // The canonical Ethereum tx hash is keccak256 of the raw
         // RLP — the same value `eth_sendRawTransaction` returns.
         let tx_hash = alloy_primitives::keccak256(msg);
-        let (result, caller) = self.execute_signed(&signed)?;
+        let (result, caller, call_trace) = self.execute_signed(&signed)?;
 
         // Phase C: build a receipt from the execution result.
         // The receipt captures status, gas used, logs, bloom, and
@@ -2832,6 +2951,7 @@ impl Module for EvmModule {
             history::stored_tx(&signed, caller, tx_hash, 0),
             receipt.clone(),
             msg,
+            call_trace,
         );
 
         let status_str = if receipt.status { "success" } else { "revert" };
@@ -3418,7 +3538,7 @@ impl EvmModule {
     /// - [`CallError::Rejected`] — validation failed before execution
     ///   (e.g. insufficient funds for `gas*price + value`).
     pub fn call_read(&self, req: &CallRequest) -> Result<CallOutcome, CallError> {
-        let result = self.simulate(req, req.gas.unwrap_or(self.block_gas_limit))?;
+        let (result, _trace) = self.simulate(req, req.gas.unwrap_or(self.block_gas_limit))?;
         let gas_used = result.tx_gas_used();
         match result {
             revm::context::result::ExecutionResult::Success { output, .. } => {
@@ -3457,7 +3577,7 @@ impl EvmModule {
         // surface the failure (revert data included) immediately.
         // `simulate` returns `Ok` for Revert/Halt too (they are valid
         // execution outcomes), so check the variant, not just Ok/Err.
-        match self.simulate(req, cap)? {
+        match self.simulate(req, cap)?.0 {
             revm::context::result::ExecutionResult::Success { .. } => {}
             revm::context::result::ExecutionResult::Revert { output, gas, .. } => {
                 return Err(CallError::Revert {
@@ -3477,7 +3597,7 @@ impl EvmModule {
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
             match self.simulate(req, mid) {
-                Ok(revm::context::result::ExecutionResult::Success { .. }) => hi = mid,
+                Ok((revm::context::result::ExecutionResult::Success { .. }, _)) => hi = mid,
                 Ok(_) | Err(_) => lo = mid,
             }
         }
@@ -3485,12 +3605,15 @@ impl EvmModule {
     }
 
     /// Run one simulated execution at `gas_limit`. Shared by
-    /// `call_read` and `estimate_gas`.
+    /// `call_read`, `estimate_call_gas`, and `call_read_traced`.
+    /// Returns the execution result plus the recorded call tree
+    /// (only the trace consumer uses it — dropping it costs
+    /// nothing).
     fn simulate(
         &self,
         req: &CallRequest,
         gas_limit: u64,
-    ) -> Result<revm::context::result::ExecutionResult, CallError> {
+    ) -> Result<(revm::context::result::ExecutionResult, Option<trace::CallFrame>), CallError> {
         let caller =
             req.from.map_or(revm::primitives::Address::ZERO, |a| alloy_primitives_address(a.0));
         let kind = match req.to {
@@ -3533,13 +3656,42 @@ impl EvmModule {
             *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut evm =
             self.build_evm_with_mode(&mut *db, coinbase, block_number, block_timestamp, true);
-        // No `commit`: simulation state dies with the EvmState.
-        let out = evm
+        // No `commit`: simulation state dies with the EvmState. The
+        // call trace rides out alongside the result for
+        // `debug_traceCall` — `call_read`/`estimate_call_gas` ignore
+        // it.
+        let result = evm
             .inspect_tx(tx_env)
             .map(|rs| rs.result)
             .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
+        let call_trace = evm.inspector.1.take_root();
         evm.precompiles.clear_native_journal();
-        out
+        result.map(|r| (r, call_trace))
+    }
+
+    /// `debug_traceCall` — run a simulated call and return the
+    /// recorded call tree (geth `callTracer` shape).
+    ///
+    /// Same semantics as [`call_read`](Self::call_read) — latest
+    /// state, no commit — plus the root [`trace::CallFrame`].
+    ///
+    /// Unlike `call_read`, a reverted or halted call is **not** an
+    /// error: geth's `debug_traceCall` returns the trace with the
+    /// frame's `error` field set — the revert *is* the answer the
+    /// caller asked for. Only pre-execution rejection (malformed
+    /// env, unpayable) is an `Err`. The `u64` is the total gas used
+    /// for the root-frame `gasUsed` patch.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when the call cannot be simulated at
+    /// all.
+    pub fn call_read_traced(
+        &self,
+        req: &CallRequest,
+    ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
+        let (result, call_trace) = self.simulate(req, req.gas.unwrap_or(self.block_gas_limit))?;
+        Ok((result.tx_gas_used(), call_trace))
     }
 
     /// Lock and return the executed-block history for RPC queries.

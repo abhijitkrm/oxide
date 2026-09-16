@@ -530,6 +530,47 @@ impl Mempool {
         selected
     }
 
+    /// Snapshot the pool for `txpool_*`-style introspection.
+    ///
+    /// Returns `(sender, nonce, tx_bytes, is_pending)` for every
+    /// pooled transaction. The pending/queued split follows geth's
+    /// `txpool_content` rule: starting at `executed_nonce + 1` (or
+    /// the sender's minimum queued nonce when no execution record
+    /// exists), each contiguous nonce is *pending* — executable in
+    /// the next block; the first gap makes every later nonce
+    /// *queued*. Entries below the start nonce are stale and
+    /// omitted (they can't execute — `select` skips them too).
+    ///
+    /// Takes `&self`: this is a cold-path read for the RPC layer —
+    /// it clones `TxBytes` (bytes up to pool size) and must never
+    /// appear on the block path.
+    #[must_use]
+    pub fn txpool_snapshot(&self) -> Vec<(Address, u64, TxBytes, bool)> {
+        let mut out = Vec::with_capacity(self.by_hash.len());
+        for (sender, queue) in &self.by_sender {
+            let mut next_expected = match self.executed_nonces.get(sender) {
+                Some(&executed) => Some(executed + 1),
+                None => queue.keys().next().copied(),
+            };
+            for (&nonce, hash) in queue {
+                let Some(entry) = self.by_hash.get(hash) else { continue };
+                let pending = match next_expected {
+                    // Below the start nonce: stale — can't execute.
+                    Some(expected) if nonce < expected => continue,
+                    Some(expected) if nonce == expected => {
+                        next_expected = Some(expected + 1);
+                        true
+                    }
+                    // Gap opened (or no executed-nonce anchor) — this
+                    // and all later nonces queue behind the hole.
+                    _ => false,
+                };
+                out.push((*sender, nonce, entry.tx.clone(), pending));
+            }
+        }
+        out
+    }
+
     /// Remove a single transaction by hash from all indices. This is
     /// the per-tx removal path — used by same-nonce replacement in
     /// [`submit`](Self::submit) and when a specific tx needs to be
