@@ -32,6 +32,8 @@
 //!     storage_path: None,
 //!     settlement_operator: None,
 //!     min_fee: 0,
+//!     chain_id: 1,
+//!     require_signed_txs: false,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.
@@ -111,6 +113,19 @@ pub struct NodeConfig {
     /// declare 0 and execute for free. Self-funded modules (EVM: gas
     /// is the fee) are exempt. `0` = no floor.
     pub min_fee: u64,
+    /// The chain ID mixed into the EIP-712 domain separator for
+    /// native transaction signature verification. Must match the
+    /// chain ID wallets sign against. Default `1` (devnet).
+    pub chain_id: u64,
+    /// Whether to reject unsigned transactions to
+    /// non-self-authenticating modules (everything but the EVM).
+    ///
+    /// `false` (default) admits unsigned envelopes — the historical
+    /// devnet behaviour, where `ctx.sender` is trusted as declared.
+    /// `true` enforces EIP-712 envelope signatures at mempool
+    /// admission and execution. Required for production: without it,
+    /// any native-module tx can claim any sender.
+    pub require_signed_txs: bool,
 }
 
 impl Default for NodeConfig {
@@ -123,6 +138,8 @@ impl Default for NodeConfig {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         }
     }
 }
@@ -182,7 +199,13 @@ impl Node {
         // session — rayon overhead amortizes at 32+).
         let mut executor =
             Executor::with_config(config.max_mempool_entries, config.parallel_threshold)
-                .with_min_fee(config.min_fee);
+                .with_min_fee(config.min_fee)
+                .with_chain_id(config.chain_id)
+                .with_unsigned_tx_policy(if config.require_signed_txs {
+                    executor::UnsignedTxPolicy::Reject
+                } else {
+                    executor::UnsignedTxPolicy::Allow
+                });
         // Enable the async execution lane (plan.md §13 Phase D):
         // defer block execution to `attest_state`, overlapping
         // execution of block h-1 with consensus for block h.
@@ -525,6 +548,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
         // The engine should be ready (no blocks yet).
@@ -541,6 +566,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
         assert!(node.engine().finalized_height().is_none());
@@ -570,6 +597,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let bft_config = NodeConfig {
             consensus: ConsensusConfig::OxideBft,
@@ -579,6 +608,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
 
         let mut seq_node = Node::assemble(&seq_config);
@@ -619,6 +650,8 @@ mod tests {
             storage_path: Some(tmp.clone()),
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -657,6 +690,8 @@ mod tests {
             storage_path: Some(tmp1.clone()),
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node_src = Node::assemble(&config_src);
         // Submit a tx and finalize a block to produce EVM state.
@@ -683,6 +718,8 @@ mod tests {
             storage_path: Some(tmp2.clone()),
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let node_dst = Node::assemble(&config_dst);
 
@@ -728,6 +765,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -845,6 +884,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
         // Finalize one block.
@@ -889,6 +930,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node1 = Node::assemble(&config);
         let mut node2 = Node::assemble(&config);
@@ -930,6 +973,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
         // Finalize a block.
@@ -955,6 +1000,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
         let to = Address([2u8; 20]);

@@ -260,6 +260,8 @@ mod tests {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
 

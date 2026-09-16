@@ -510,6 +510,27 @@ pub trait Module: Send + Sync {
         false
     }
 
+    /// Whether this module authenticates the transaction sender
+    /// inside its own payload, making an envelope signature
+    /// redundant.
+    ///
+    /// `false` (default): the module trusts `ctx.sender`, which is
+    /// only as trustworthy as the envelope — for these modules the
+    /// executor enforces the EIP-712 envelope signature when
+    /// [`Executor::unsigned_tx_policy`] rejects unsigned txs, and
+    /// always verifies the signature when one is attached.
+    ///
+    /// `true`: the module recovers the real sender from a signature
+    /// inside its own payload — the EVM is the canonical case (the
+    /// RLP transaction carries its own secp256k1 signature, which
+    /// the module verifies in `handle`). For self-authenticating
+    /// modules an envelope signature is meaningless *and* harmful —
+    /// it would shift the payload offset — so flagged txs for these
+    /// modules are rejected as malformed.
+    fn authenticates_sender(&self) -> bool {
+        false
+    }
+
     /// Estimate the gas cost of a message for block gas limit
     /// enforcement.
     ///
@@ -626,6 +647,31 @@ impl ValidatorChanges {
     }
 }
 
+/// Policy for transactions to non-self-authenticating modules that
+/// carry no envelope signature.
+///
+/// Module dispatch is unaffected — this only governs whether an
+/// unsigned envelope routed to a module that does not authenticate
+/// its own sender is admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsignedTxPolicy {
+    /// Accept unsigned txs for non-self-authenticating modules.
+    ///
+    /// This is the devnet/test default: the sender field is trusted
+    /// as declared, so any account can be impersonated. Never enable
+    /// this on a network that faces untrusted submitters.
+    Allow,
+    /// Reject unsigned txs for non-self-authenticating modules at
+    /// mempool admission and skip them at execution.
+    ///
+    /// Required for production: without it, `ctx.sender` is
+    /// unauthenticated and any native-module tx can claim any
+    /// sender — e.g. draining another account's bank balance.
+    /// Self-authenticating modules (EVM) are unaffected — their
+    /// payload carries its own signature.
+    Reject,
+}
+
 /// An event emitted by a module during execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
@@ -645,26 +691,79 @@ pub struct Event {
 /// `[module_id: 1B][module_payload: ...]`.
 const MODULE_ID_OFFSET: usize = 36; // 20 + 8 + 8
 
+/// The high bit of the `module_id` byte marks a *signed* envelope
+/// (v1): the module ID byte is followed by a 65-byte secp256k1
+/// signature (`r ‖ s ‖ v`, v ∈ {0,1}) over the EIP-712 typed-data
+/// digest of the transaction (`crypto::eip712::tx_signing_digest`).
+///
+/// Signed layout:
+/// `[sender: 20B][nonce: 8B LE][fee: 8B LE][module_id|0x80: 1B]
+///  [sig: 65B][module_payload: ...]`.
+///
+/// Putting the flag in the module-ID byte keeps every header field
+/// at its v0 offset and makes the signature position a fixed offset
+/// (37..102), so parsing stays branch-cheap. Module dispatch IDs
+/// are conventionally ≤ 127 — all registered IDs today are 0–6 — so
+/// the high bit is unambiguous.
+const SIGNED_FLAG: u8 = 0x80;
+
+/// Length of the secp256k1 signature in a signed envelope:
+/// 32-byte `r` ‖ 32-byte `s` ‖ 1-byte recovery id.
+const ENVELOPE_SIG_LEN: usize = 65;
+
+/// Offset where the signature starts in a signed envelope
+/// (immediately after the flagged module-ID byte).
+const ENVELOPE_SIG_OFFSET: usize = MODULE_ID_OFFSET + 1; // 37
+
+/// Offset where the module payload starts in a signed envelope.
+const SIGNED_PAYLOAD_OFFSET: usize = ENVELOPE_SIG_OFFSET + ENVELOPE_SIG_LEN; // 102
+
 /// A tx grouped by module for batch execution. The payload is a
 /// zero-copy slice into the original tx bytes (no per-tx Vec
 /// allocation). The hash is the full tx hash (used for preverify
 /// cache lookup).
 type GroupedTx<'a> = (TxContext, &'a [u8], Hash);
 
-/// Parse the module ID from a tx's payload section.
+/// Parse the dispatch module ID from a tx's payload section.
+///
+/// The high bit of the stored byte is the [`SIGNED_FLAG`] marker,
+/// not part of the module ID — this returns `byte & 0x7F`, the
+/// actual dispatch ID.
 fn parse_module_id(bytes: &[u8]) -> Option<u8> {
     if bytes.len() < MODULE_ID_OFFSET + 1 {
         return None;
     }
-    Some(bytes[MODULE_ID_OFFSET])
+    Some(bytes[MODULE_ID_OFFSET] & !SIGNED_FLAG)
 }
 
-/// Extract the module payload from a tx (everything after `module_id`).
-fn module_payload(bytes: &[u8]) -> &[u8] {
-    if bytes.len() <= MODULE_ID_OFFSET + 1 {
-        return &[];
+/// Whether the tx envelope carries an EIP-712 signature
+/// ([`SIGNED_FLAG`] set on the module-ID byte).
+fn is_signed_envelope(bytes: &[u8]) -> bool {
+    bytes.len() > MODULE_ID_OFFSET && bytes[MODULE_ID_OFFSET] & SIGNED_FLAG != 0
+}
+
+/// Extract the 65-byte signature from a signed envelope.
+/// Returns `None` if the envelope is unsigned or too short to hold
+/// a signature.
+fn envelope_signature(bytes: &[u8]) -> Option<&[u8]> {
+    if !is_signed_envelope(bytes) {
+        return None;
     }
-    &bytes[MODULE_ID_OFFSET + 1..]
+    bytes.get(ENVELOPE_SIG_OFFSET..SIGNED_PAYLOAD_OFFSET)
+}
+
+/// Extract the module payload from a tx (everything after
+/// `module_id` for unsigned txs, everything after the signature
+/// for signed txs). The signature is envelope-level metadata — the
+/// module only ever sees its own payload bytes.
+fn module_payload(bytes: &[u8]) -> &[u8] {
+    if is_signed_envelope(bytes) {
+        bytes.get(SIGNED_PAYLOAD_OFFSET..).unwrap_or(&[])
+    } else if bytes.len() <= MODULE_ID_OFFSET + 1 {
+        &[]
+    } else {
+        &bytes[MODULE_ID_OFFSET + 1..]
+    }
 }
 
 /// Parse the tx context (sender, nonce, fee) from the tx envelope.
@@ -830,6 +929,17 @@ pub struct Executor {
     /// `0` = no floor (the fee module's own rules apply — e.g.
     /// zero-fee txs are free).
     min_fee: u64,
+    /// The chain ID mixed into the EIP-712 domain separator for
+    /// native transaction signature verification. Binds every
+    /// signed native tx to this chain — a signature produced for
+    /// another chain ID fails verification (cross-chain replay
+    /// protection). Default `1` (devnet); production must set it
+    /// from chain config via [`Executor::with_chain_id`].
+    chain_id: u64,
+    /// Whether unsigned txs to non-self-authenticating modules are
+    /// admitted. See [`UnsignedTxPolicy`]. Default `Allow` for
+    /// devnet/test compatibility; production wiring sets `Reject`.
+    unsigned_tx_policy: UnsignedTxPolicy,
 }
 
 impl Executor {
@@ -870,7 +980,36 @@ impl Executor {
             block_gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
             fee_module: None,
             min_fee: 0,
+            chain_id: 1,
+            unsigned_tx_policy: UnsignedTxPolicy::Allow,
         }
+    }
+
+    /// Set the chain ID used for native transaction signature
+    /// verification (the EIP-712 domain separator's `chainId`
+    /// field).
+    ///
+    /// Must match the chain ID the wallets sign against — a
+    /// mismatch rejects every signed native tx as unverifiable.
+    /// Default `1` (devnet convention).
+    #[must_use]
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = chain_id;
+        self
+    }
+
+    /// Set the policy for unsigned txs to non-self-authenticating
+    /// modules. See [`UnsignedTxPolicy`].
+    ///
+    /// The default is [`UnsignedTxPolicy::Allow`] — the historical
+    /// devnet behaviour — because every devnet/test harness today
+    /// emits unsigned envelopes. Production deployments must call
+    /// this with [`UnsignedTxPolicy::Reject`]; without it,
+    /// `ctx.sender` is unauthenticated for all native modules.
+    #[must_use]
+    pub fn with_unsigned_tx_policy(mut self, policy: UnsignedTxPolicy) -> Self {
+        self.unsigned_tx_policy = policy;
+        self
     }
 
     /// Set the block gas limit.
@@ -1294,6 +1433,199 @@ impl Executor {
         }
     }
 
+    /// Check the envelope authentication of a tx routed to `module`.
+    ///
+    /// Returns:
+    /// - `Ok(true)` — the envelope carries a signature and it
+    ///   verified: the recovered signer equals `ctx.sender`. The
+    ///   caller should record the tx hash in the preverify cache so
+    ///   `execute_block` can skip re-verification.
+    /// - `Ok(false)` — the envelope is unsigned and admitted (either
+    ///   the module self-authenticates or the policy allows it).
+    /// - `Err(reason)` — rejected: bad signature, sender mismatch,
+    ///   malformed signature field, flag set on a self-authenticating
+    ///   module, or unsigned tx under [`UnsignedTxPolicy::Reject`].
+    ///
+    /// The signature covers the EIP-712 digest of
+    /// `(chain_id, sender, nonce, fee, module_id, payload)` — see
+    /// [`crypto::eip712`]. Because `sender` is a field of the signed
+    /// struct, verifying `recovered == ctx.sender` binds the whole
+    /// envelope: the signer, the declared sender, and the exact
+    /// module message bytes.
+    ///
+    /// This is deterministic and state-free, so all validators agree
+    /// on the outcome — safe to run in `execute_block` (skip on
+    /// failure) as well as at mempool admission (reject).
+    fn check_envelope_auth(
+        &self,
+        bytes: &[u8],
+        ctx: &TxContext,
+        module_id: u8,
+        module: &dyn Module,
+        verified: Option<&HashMap<Hash, [u8; 20]>>,
+    ) -> Result<bool, &'static str> {
+        let signed = is_signed_envelope(bytes);
+        if module.authenticates_sender() {
+            // The module's payload carries its own signature (EVM
+            // RLP). An envelope signature would shift the payload
+            // offset and serves no purpose — reject as malformed so
+            // the flag can never silently corrupt an EVM payload.
+            return if signed {
+                Err("malformed: envelope signature on self-authenticating module")
+            } else {
+                Ok(false)
+            };
+        }
+        if !signed {
+            return match self.unsigned_tx_policy {
+                UnsignedTxPolicy::Allow => Ok(false),
+                UnsignedTxPolicy::Reject => Err("unsigned native tx (signature required)"),
+            };
+        }
+        // Signed envelope: recover and compare.
+        //
+        // If the caller supplies a `verified` map (the preverify
+        // cache at execution time), a hit means this node's
+        // `ingest_tx` already ran the secp256k1 recovery for these
+        // exact tx bytes — the cache key is `Domain::Transaction` of
+        // the full envelope, so a hit implies the signature was
+        // verified. Skip re-verification (~40 µs saved per tx).
+        if let Some(cache) = verified {
+            let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
+            if cache.contains_key(&tx_hash) {
+                return Ok(true);
+            }
+        }
+        let Some(sig_bytes) = envelope_signature(bytes) else {
+            return Err("malformed: truncated envelope signature");
+        };
+        // v is the last byte. We accept only 0/1 — the canonical
+        // recovery IDs secp256k1 produces. IDs 2/3 correspond to
+        // provably-unused keys and 27/28 is the Ethereum `v`
+        // convention; MetaMask returns 27/28, which submitters must
+        // normalize to 0/1 before building the envelope.
+        let recid = sig_bytes[64];
+        if recid > 1 {
+            return Err("malformed: envelope signature recovery id must be 0 or 1");
+        }
+        let sig = crypto::secp::RecoverableSignature::from_bytes(&sig_bytes[..64], recid)
+            .map_err(|_| "malformed: envelope signature")?;
+        let payload = module_payload(bytes);
+        let recovered = crypto::eip712::verify_tx_sender(
+            self.chain_id,
+            &ctx.sender,
+            ctx.nonce,
+            ctx.fee,
+            module_id,
+            payload,
+            &sig,
+        )
+        .map_err(|_| "invalid envelope signature")?;
+        if recovered != ctx.sender {
+            return Err("envelope signature does not match declared sender");
+        }
+        Ok(true)
+    }
+
+    /// Group a finalized block's txs by module for batch execution,
+    /// applying the execution-time admission gates in block order.
+    ///
+    /// Each tx must pass, in order:
+    /// 1. envelope parse — malformed bytes are skipped;
+    /// 2. nonce continuity — `ctx.nonce` must equal the next expected
+    ///    nonce for `ctx.sender` in the local copy of `executed_nonce`
+    ///    (H5; closes the cross-block replay window for byzantine
+    ///    proposers that bypass `process_proposal`);
+    /// 3. known module — the routed module must be registered;
+    /// 4. envelope authentication — `check_envelope_auth`; a tx in
+    ///    `preverify_cache` was verified at this node's `ingest_tx`
+    ///    (same full-tx-hash key), so it skips the ~40 µs recovery,
+    ///    while a tx arriving via a foreign proposal is verified
+    ///    inline. Failures skip the tx — deterministic across
+    ///    validators, so all produce the same state root;
+    /// 5. block gas limit — cumulative `estimate_gas` across the
+    ///    block (execution-time enforcement of the proposal-time
+    ///    check in `process_proposal`);
+    /// 6. fee floor + fee charge — non-self-funded modules pay
+    ///    `ctx.fee` via the configured fee module. The fee is kept
+    ///    even if `handle` later fails (work was attempted — like
+    ///    gas on revert), and the nonce only advances after the
+    ///    charge succeeds.
+    ///
+    /// Entries are `(ctx, payload, full_tx_hash)`; the payload is a
+    /// zero-copy borrow into the block bytes and the hash is the
+    /// preverify-cache key. `BTreeMap` ordering makes module-group
+    /// processing deterministic (sorted by module ID).
+    fn group_block_txs<'b>(
+        &self,
+        txs: &'b [TxBytes],
+        local_nonce: &mut HashMap<primitives::Address, u64>,
+        preverify_cache: &HashMap<Hash, [u8; 20]>,
+    ) -> BTreeMap<u8, Vec<GroupedTx<'b>>> {
+        let mut groups: BTreeMap<u8, Vec<GroupedTx<'b>>> = BTreeMap::new();
+        let mut cumulative_gas: u64 = 0;
+        for tx in txs {
+            let bytes = tx.as_bytes();
+            let Some(ctx) = parse_tx_context(bytes) else {
+                continue; // skip malformed txs
+            };
+            // H5: each tx's nonce must equal the next expected nonce
+            // for its sender; txs that fail are skipped and do not
+            // advance the counter.
+            let expected = local_nonce.get(&ctx.sender).copied().unwrap_or(0);
+            if ctx.nonce != expected {
+                continue; // stale or out-of-order nonce — skip
+            }
+            let Some(module_id) = parse_module_id(bytes) else {
+                continue; // skip malformed txs
+            };
+            let Some(module) = self.modules[module_id as usize].as_ref() else {
+                continue; // unknown module — skip
+            };
+            if self
+                .check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), Some(preverify_cache))
+                .is_err()
+            {
+                continue; // bad/missing signature — skip
+            }
+            let payload = module_payload(bytes);
+            let gas = module.estimate_gas(payload);
+            if cumulative_gas.saturating_add(gas) > self.block_gas_limit {
+                continue; // block gas limit exceeded — skip remaining txs
+            }
+            // Fee gate: every tx routed to a non-self-funded module
+            // pays `ctx.fee` through the configured fee collector
+            // (the bank) — not the target module. `min_fee` is
+            // enforced first because the envelope's fee field is
+            // sender-declared — without a floor every tx could
+            // declare 0. Self-funded modules (EVM: gas is the fee)
+            // are exempt — charging here would double-charge.
+            if !module.pays_own_fee() {
+                if ctx.fee < self.min_fee {
+                    continue; // below the fee floor — skip
+                }
+                if let Some(fee_module) =
+                    self.fee_module.and_then(|id| self.modules[usize::from(id)].as_ref())
+                {
+                    if fee_module.charge_fee(&ctx).is_err() {
+                        continue; // insufficient balance for fee — skip
+                    }
+                }
+            }
+            // Advance the local nonce counter for this sender — only
+            // after the fee charge succeeds; a tx that can't pay its
+            // fee doesn't get its nonce advanced.
+            local_nonce.insert(ctx.sender, expected + 1);
+            cumulative_gas = cumulative_gas.saturating_add(gas);
+            // Zero-copy: the payload is borrowed from the block tx
+            // bytes; the full-tx hash is the same key `ingest_tx`
+            // used for the preverify cache.
+            let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
+            groups.entry(module_id).or_default().push((ctx, payload, tx_hash));
+        }
+        groups
+    }
+
     /// Execute a finalized block: call `begin_block`, group txs by
     /// module, call `handle_batch` per module group, call `end_block`,
     /// compute the state root.
@@ -1337,104 +1669,20 @@ impl Executor {
             module.begin_block(block.height);
         }
 
-        // Group txs by module ID, preserving block order within each
-        // group. Each entry is (ctx, payload_bytes, full_tx_hash). We
-        // collect the payload as a Vec<u8> so we can pass a slice of
-        // slices to handle_batch. The full tx hash is the same key
-        // used by `ingest_tx` to cache preverified senders — using it
-        // here (not the payload hash) is what makes the preverify
-        // cache actually hit. See docs/devlog.md session N for the
-        // root-cause analysis of the prior key mismatch.
-        //
-        // We use a BTreeMap so module groups are processed in a
-        // deterministic order (sorted by module ID).
-        //
-        // H5: we also validate per-sender nonce continuity against
-        // the executed_nonce map. Txs with stale or out-of-order
-        // nonces are skipped (not executed) — this is the defense
-        // against a byzantine proposer that bypassed
-        // `process_proposal` (e.g. via a direct finalize path).
-        let mut groups: BTreeMap<u8, Vec<GroupedTx<'_>>> = BTreeMap::new();
-        let mut cumulative_gas: u64 = 0;
-        for tx in &block.txs {
-            let bytes = tx.as_bytes();
-            let Some(ctx) = parse_tx_context(bytes) else {
-                continue; // skip malformed txs
-            };
-            // H5: check nonce continuity. Each tx's nonce must equal
-            // the next expected nonce for its sender. Txs that fail
-            // this check are skipped — they are not executed, and
-            // they do not advance the nonce counter.
-            let expected = local_nonce.get(&ctx.sender).copied().unwrap_or(0);
-            if ctx.nonce != expected {
-                continue; // stale or out-of-order nonce — skip
-            }
-            let Some(module_id) = parse_module_id(bytes) else {
-                continue; // skip malformed txs
-            };
-            let Some(module) = self.modules[module_id as usize].as_ref() else {
-                continue; // unknown module — skip
-            };
-            // Enforce block gas limit: skip txs that would exceed
-            // the cumulative gas limit. This is the execution-time
-            // enforcement (the proposal-time check is in
-            // `process_proposal`). A byzantine proposer that
-            // bypasses `process_proposal` still hits this gate.
-            let payload = module_payload(bytes);
-            let gas = module.estimate_gas(payload);
-            if cumulative_gas.saturating_add(gas) > self.block_gas_limit {
-                continue; // block gas limit exceeded — skip remaining txs
-            }
-            // Fee gate: every tx routed to a non-self-funded module
-            // pays `ctx.fee` through the configured fee collector
-            // (the bank) — not the target module. Previously the
-            // charge was dispatched to `module.charge_fee`, whose
-            // default no-op meant any module without an override
-            // (exchange, perps, EVM, ...) executed for free.
-            //
-            // `min_fee` is enforced first: the envelope's fee field
-            // is sender-declared, so without a floor every tx could
-            // declare 0. Self-funded modules (EVM: gas is the fee)
-            // are exempt — charging here would double-charge.
-            //
-            // The fee is kept even if `handle` later fails —
-            // standard chain semantics (work was attempted; the fee
-            // pays for the resources consumed, like gas on revert).
-            if !module.pays_own_fee() {
-                if ctx.fee < self.min_fee {
-                    continue; // below the fee floor — skip
-                }
-                if let Some(fee_module) =
-                    self.fee_module.and_then(|id| self.modules[usize::from(id)].as_ref())
-                {
-                    if fee_module.charge_fee(&ctx).is_err() {
-                        continue; // insufficient balance for fee — skip
-                    }
-                }
-            }
-            // Advance the local nonce counter for this sender.
-            // (Only after fee charge succeeds — a tx that can't pay
-            // its fee doesn't get its nonce advanced.)
-            local_nonce.insert(ctx.sender, expected + 1);
-            cumulative_gas = cumulative_gas.saturating_add(gas);
-            // Zero-copy: store a reference to the payload in the
-            // original tx bytes, avoiding a per-tx Vec allocation.
-            // The payload is only cloned later if the tx is not in
-            // the preverify cache (uncached txs).
-            let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
-            groups.entry(module_id).or_default().push((ctx, payload, tx_hash));
-        }
-
-        // Execute each module's txs as a batch.
-        let mut block_events: Vec<Event> = Vec::new();
-
-        // Clear the preverify cache after the block is executed —
-        // the cached senders are no longer needed (re-execution would
-        // re-preverify). We move the cache out in one lock acquisition
-        // (zero-copy: `mem::take` swaps in an empty map, no clone).
+        // Move the preverify cache out before the grouping loop —
+        // the loop consults it to skip re-verifying envelope
+        // signatures that were already verified at mempool
+        // admission, and the dispatch loop below consumes it.
+        // (`mem::take` swaps in an empty map — zero-copy, one lock
+        // acquisition for the whole block.)
         let mut preverify_cache = std::mem::take(
             &mut *self.preverify_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+
+        let groups = self.group_block_txs(&block.txs, &mut local_nonce, &preverify_cache);
+
+        // Execute each module's txs as a batch.
+        let mut block_events: Vec<Event> = Vec::new();
 
         for (module_id, group) in &groups {
             let Some(module) = self.modules[*module_id as usize].as_ref() else {
@@ -1546,6 +1794,21 @@ impl AppInterface for Executor {
         let Some(module) = self.modules[module_id as usize].as_ref() else {
             return MempoolAck::Rejected { reason: format!("unknown module {module_id}") };
         };
+        // Envelope authentication: for modules that don't recover the
+        // sender inside their own payload (everything but the EVM),
+        // a signed envelope's secp256k1 signature must recover to the
+        // declared sender — otherwise `ctx.sender` is just a claim.
+        // Unsigned txs are admitted or rejected per
+        // `unsigned_tx_policy`.
+        if let Err(reason) = self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None)
+        {
+            return MempoolAck::Rejected { reason: reason.to_string() };
+        }
+        // Verified or admitted-unsigned: the preverify insert below
+        // already records this tx's hash in the cache (the default
+        // `preverify_batch` returns Ok for every module), which is
+        // what `execute_block` checks to skip re-running the ~40 µs
+        // signature recovery.
         let payload = module_payload(bytes);
         if let Err(e) = module.validate(&ctx, payload) {
             return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
@@ -1645,6 +1908,15 @@ impl AppInterface for Executor {
                     .push(MempoolAck::Rejected { reason: format!("unknown module {module_id}") });
                 continue;
             };
+            // Envelope authentication — same rules as `ingest_tx`.
+            // Verified txs are recorded via the preverify insert
+            // below so `execute_block` skips the re-verification.
+            if let Err(reason) =
+                self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None)
+            {
+                results.push(MempoolAck::Rejected { reason: reason.to_string() });
+                continue;
+            }
             let payload = module_payload(bytes);
             if let Err(e) = module.validate(&ctx, payload) {
                 results.push(MempoolAck::Rejected { reason: format!("validate: {e:?}") });
@@ -1776,9 +2048,12 @@ impl AppInterface for Executor {
         //    out-of-order nonces (silent skip, not block rejection).
         //
         // Dynamic checks (balance, signature) are not done here —
-        // they require state access and are checked during execution.
-        // Signature verification arrives when the tx envelope format
-        // includes signatures (Phase 2).
+        // they require state access or per-tx cryptography and are
+        // enforced elsewhere: envelope signatures are verified at
+        // `ingest_tx`/`ingest_tx_batch` (rejected) and `execute_block`
+        // (skipped), so a bad-sig tx in an accepted proposal is a
+        // deterministically-skipped no-op rather than a consensus
+        // failure.
         let mut last_nonce: HashMap<primitives::Address, u64> = HashMap::new();
         let mut total_gas: u64 = 0;
         for tx in &proposal.txs {
@@ -1826,6 +2101,18 @@ impl AppInterface for Executor {
             let Some(module) = self.modules[module_id as usize].as_ref() else {
                 return Verdict::Reject { reason: format!("unknown module ID {module_id}") };
             };
+            // Static malformed check: an envelope signature on a
+            // self-authenticating module (EVM) is meaningless — the
+            // flag shifts the payload offset, so the module's own
+            // payload would be corrupted. This check is state-free
+            // (module registration and the flag bit only), unlike
+            // signature verification which is intentionally left to
+            // `ingest_tx`/`execute_block` for cost reasons.
+            if is_signed_envelope(bytes) && module.authenticates_sender() {
+                return Verdict::Reject {
+                    reason: "envelope signature on self-authenticating module".to_string(),
+                };
+            }
             // Enforce block gas limit: sum the gas estimate of each
             // tx and reject the block if the total exceeds the limit.
             // This prevents a byzantine proposer from including
@@ -2682,5 +2969,253 @@ mod tests {
             matches!(executor.process_proposal(&proposal), Verdict::Accept),
             "a gas-bounded proposal must be accepted"
         );
+    }
+
+    // ---- EIP-712 signed native transactions (item 16) ----
+
+    /// A module that self-authenticates (like the EVM): its payload
+    /// carries its own signature, so an envelope signature on it is
+    /// malformed by definition.
+    struct SelfAuthModule;
+
+    impl Module for SelfAuthModule {
+        fn name(&self) -> &'static str {
+            "selfauth"
+        }
+        fn id(&self) -> u8 {
+            3
+        }
+        fn authenticates_sender(&self) -> bool {
+            true
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            Ok(vec![])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+    }
+
+    /// Build a signed tx to the counter module with a fresh keypair.
+    /// Returns `(tx_bytes, sender)`.
+    fn signed_counter_tx(chain_id: u64, nonce: u64, payload: &[u8]) -> (TxBytes, Address) {
+        let (privkey, sender) = crypto::secp::generate_keypair_for_test();
+        let tx = mempool::build_signed_tx(&privkey, chain_id, nonce, 0, 1, payload)
+            .expect("valid key must sign");
+        (tx, sender)
+    }
+
+    /// The signed-envelope codec: `module_id` masks the flag bit and
+    /// the payload excludes the 65-byte signature.
+    #[test]
+    fn signed_envelope_parses_correctly() {
+        let (tx, sender) = signed_counter_tx(1, 5, b"my-payload");
+        let bytes = tx.as_bytes();
+        assert!(is_signed_envelope(bytes));
+        assert_eq!(parse_module_id(bytes), Some(1));
+        assert_eq!(envelope_signature(bytes).map(<[u8]>::len), Some(65));
+        assert_eq!(module_payload(bytes), b"my-payload");
+        let ctx = parse_tx_context(bytes).unwrap();
+        assert_eq!(ctx.sender, sender);
+        assert_eq!(ctx.nonce, 5);
+    }
+
+    /// A properly signed native tx is admitted and executes.
+    #[test]
+    fn signed_tx_executes_end_to_end() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        let (tx, _sender) = signed_counter_tx(1, 0, b"inc");
+        assert!(matches!(executor.ingest_tx(tx), MempoolAck::Accepted));
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        assert_eq!(proposal.txs.len(), 1);
+        executor.finalize_block(&FinalizedBlock { height: Height::new(0), txs: proposal.txs });
+        assert_eq!(*counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
+    }
+
+    /// A corrupted signature is rejected at mempool admission.
+    #[test]
+    fn bad_signature_rejected_at_ingest() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let (tx, _sender) = signed_counter_tx(1, 0, b"inc");
+        let mut bytes = tx.as_bytes().to_vec();
+        bytes[ENVELOPE_SIG_OFFSET] ^= 0xFF; // corrupt first byte of r
+        let ack = executor.ingest_tx(TxBytes::new(bytes));
+        assert!(matches!(ack, MempoolAck::Rejected { .. }), "bad sig must be rejected");
+    }
+
+    /// A signature produced for chain 2 is rejected on chain 1 —
+    /// the domain separator binds the chain ID.
+    #[test]
+    fn cross_chain_signature_rejected() {
+        let mut executor = Executor::new(100).with_chain_id(1);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let (tx, _sender) = signed_counter_tx(2, 0, b"inc");
+        assert!(matches!(executor.ingest_tx(tx), MempoolAck::Rejected { .. }));
+    }
+
+    /// A signed envelope whose declared sender was overwritten with
+    /// a victim's address is rejected — the signature proves the
+    /// signer's key, not the claimed field.
+    #[test]
+    fn forged_declared_sender_rejected() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let victim = Address([0xEE; 20]);
+        let (tx, _sender) = signed_counter_tx(1, 0, b"inc");
+        let mut bytes = tx.as_bytes().to_vec();
+        bytes[..20].copy_from_slice(&victim.0); // forge sender
+        assert!(matches!(executor.ingest_tx(TxBytes::new(bytes)), MempoolAck::Rejected { .. }));
+    }
+
+    /// Under `UnsignedTxPolicy::Reject`, an unsigned native tx is
+    /// rejected at admission — closing the unauthenticated-sender
+    /// hole.
+    #[test]
+    fn unsigned_tx_rejected_when_required() {
+        let mut executor = Executor::new(100).with_unsigned_tx_policy(UnsignedTxPolicy::Reject);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let ack = executor.ingest_tx(make_tx(1, b"unsigned"));
+        assert!(matches!(ack, MempoolAck::Rejected { .. }), "unsigned must be rejected");
+    }
+
+    /// Under `Reject`, an unsigned tx injected into a finalized block
+    /// (bypassing this node's mempool — e.g. proposed by another
+    /// validator) is skipped deterministically at execution.
+    #[test]
+    fn unsigned_tx_skipped_at_execution_when_required() {
+        let mut executor = Executor::new(100).with_unsigned_tx_policy(UnsignedTxPolicy::Reject);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![make_tx(1, b"unsigned")],
+        });
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "unsigned tx must not execute under Reject"
+        );
+    }
+
+    /// A signed tx that never touched this node's mempool (foreign
+    /// proposal) is verified inline at execution and executes.
+    #[test]
+    fn foreign_signed_tx_verified_at_execution() {
+        let mut executor = Executor::new(100).with_unsigned_tx_policy(UnsignedTxPolicy::Reject);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        let (tx, _sender) = signed_counter_tx(1, 0, b"inc");
+        executor.finalize_block(&FinalizedBlock { height: Height::new(0), txs: vec![tx] });
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "foreign signed tx must execute"
+        );
+    }
+
+    /// A signed tx whose signature was computed over a different
+    /// payload is skipped at execution — the signature binds the
+    /// exact module message bytes.
+    #[test]
+    fn tampered_payload_rejected_at_execution() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        let (tx, _sender) = signed_counter_tx(1, 0, b"orig");
+        let mut bytes = tx.as_bytes().to_vec();
+        // Rewrite the payload (last 4 bytes).
+        let n = bytes.len();
+        bytes[n - 4..].copy_from_slice(b"evil");
+
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![TxBytes::new(bytes)],
+        });
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "tampered payload must not execute"
+        );
+    }
+
+    /// An envelope signature on a self-authenticating module is
+    /// malformed — it would corrupt the module's own payload.
+    #[test]
+    fn flagged_self_auth_module_rejected() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(SelfAuthModule));
+
+        // Flagged envelope routed to module 3 (SelfAuthModule).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&Address([1; 20]).0);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.push(3 | 0x80); // SIGNED_FLAG on a self-auth module
+        bytes.extend_from_slice(&[0u8; 65]); // dummy sig
+        bytes.extend_from_slice(b"payload");
+
+        assert!(matches!(executor.ingest_tx(TxBytes::new(bytes)), MempoolAck::Rejected { .. }));
+    }
+
+    /// The same malformed tx is rejected statically at proposal
+    /// validation — the flag on a self-auth module is a structural
+    /// error, no crypto needed.
+    #[test]
+    fn proposal_rejects_flagged_self_auth() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(SelfAuthModule));
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&Address([1; 20]).0);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.push(3 | 0x80);
+        bytes.extend_from_slice(&[0u8; 65]);
+        bytes.extend_from_slice(b"payload");
+
+        let proposal =
+            Proposal { height: Height::new(0), txs: vec![TxBytes::new(bytes)], attestation: None };
+        let verdict = executor.process_proposal(&proposal);
+        assert!(matches!(verdict, Verdict::Reject { .. }), "flagged self-auth must reject");
+    }
+
+    /// A signed tx truncated inside the signature field is a clean
+    /// rejection, not a panic.
+    #[test]
+    fn truncated_signed_envelope_rejected_cleanly() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let (tx, _s) = signed_counter_tx(1, 0, b"inc");
+        let bytes = tx.as_bytes().to_vec();
+        let truncated = bytes[..ENVELOPE_SIG_OFFSET + 30].to_vec();
+        assert!(matches!(executor.ingest_tx(TxBytes::new(truncated)), MempoolAck::Rejected { .. }));
+    }
+
+    /// Batch ingestion applies the same signature policy per tx.
+    #[test]
+    fn batch_ingest_enforces_signatures() {
+        let mut executor = Executor::new(100).with_unsigned_tx_policy(UnsignedTxPolicy::Reject);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let (signed, _s) = signed_counter_tx(1, 0, b"ok");
+        let unsigned = make_tx(1, b"no-sig");
+        let results = executor.ingest_tx_batch(vec![signed, unsigned]);
+        assert!(matches!(results[0], MempoolAck::Accepted));
+        assert!(matches!(results[1], MempoolAck::Rejected { .. }));
     }
 }

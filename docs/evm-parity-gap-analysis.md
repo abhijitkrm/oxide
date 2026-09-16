@@ -187,7 +187,7 @@ surface is the reference for "complete L1 functionality":
 | Blockscout/explorers | ✅ | ❌ | needs full block/tx/receipt/log APIs |
 | HD keys `m/44'/60'` | ✅ | ✅ | secp256k1, coin-type-60 compatible keys work |
 | Ledger via Ethereum app | ✅ | ❌ | optional |
-| EIP-712 typed-data signing of native msgs | ✅ | ❌ | needed if MetaMask should sign staking/exchange txs |
+| EIP-712 typed-data signing of native msgs | ✅ | ✅ | `Tx(address sender,uint64 nonce,uint64 fee,uint8 moduleId,bytes payload)` over `Oxide`-v1 domain; `eth_signTypedData_v4` signs bank/staking/exchange txs |
 | Dual bech32+hex addressing | ✅ | ➖ | single 20-byte space — simpler; document `0x` as canonical |
 
 ## 8. Operations
@@ -299,8 +299,19 @@ surface is the reference for "complete L1 functionality":
     authorization domain), revm `authorization_list` wiring, Prague spec
     gate, `authorizationList` in RPC tx JSON; delegated-EOA execution
     verified end-to-end.
-16. **EIP-712 signing for native module txs** — MetaMask-signable staking/
-    exchange messages.
+16. ~~**EIP-712 signing for native module txs**~~ — **shipped**: signed
+    native envelope (`module_id | 0x80` flag + `r‖s‖v` between module ID
+    and payload), `Tx(address sender,uint64 nonce,uint64 fee,uint8
+    moduleId,bytes payload)` struct over the `Oxide`-v1 EIP-712 domain (chain-ID-bound,
+    cross-chain replay-proof); `crypto::eip712` sign/verify helpers with
+    spec-vector KATs; executor verifies at ingest/batch/execute and
+    `process_proposal` statically rejects the flag on self-authenticating
+    modules; `Module::authenticates_sender` (EVM = true, its RLP sig is
+    authoritative); `UnsignedTxPolicy` (`Allow` compat default, validator
+    `--require-signed-txs` rejects unsigned); `mempool::build_signed_tx`
+    helper; `oxide_sendRawTransaction` RPC submits hex envelopes and
+    returns the BLAKE3 tx hash. This also closed the pre-existing hole
+    where native senders were merely *declared*, not proven.
 17. **ERC20 facade over bank denoms** — dynamic precompile per denom
     (STRv2-lite, no IBC).
 

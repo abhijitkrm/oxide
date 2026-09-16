@@ -12,6 +12,44 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **EIP-712-signed native module transactions** (`crates/crypto`,
+  `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,
+  `crates/node`, `bin/oxide-validator`, `bin/oxide-fullnode`)
+  - Native transactions can now carry a secp256k1 EIP-712 signature.
+    The signed envelope sets `0x80` on the module-ID byte and places
+    `r‖s‖v` (65 bytes) between the module ID and the payload, so the
+    module payload stays "the rest of the bytes" and every module
+    decoder is unchanged.
+  - The signature covers `Tx(address sender,uint64 nonce,uint64 fee,uint8
+    moduleId,bytes payload)` over the EIP-712 domain `name="Oxide"`,
+    `version="1"`, `chainId=<configured>` — the chain ID makes
+    cross-chain replay impossible, and sender/recovered-signer
+    equality binds the declared `sender` field.
+  - Wallets sign via `eth_signTypedData_v4` (MetaMask/Ledger) — the
+    same key controls the EVM account and the native bank/staking/
+    exchange identity. `mempool::build_signed_tx` and
+    `crypto::eip712::{sign_tx, verify_tx_sender}` are the
+    signing-side helpers.
+  - Verification runs at mempool admission, batch admission, and
+    block execution; `process_proposal` statically rejects an
+    envelope signature on a self-authenticating module. The
+    preverify cache makes verified-at-ingest txs skip re-recovery
+    during execution.
+  - `oxide_sendRawTransaction` submits a hex-encoded signed native
+    envelope and returns the BLAKE3 transaction hash.
+  - Operators: `oxide-validator --require-signed-txs` rejects
+    unsigned native transactions outright (production posture); the
+    default `Allow` policy keeps devnets and tests working during
+    the migration. Chain ID flows from the RPC config.
+  - **In plain words:** before this change a native transaction's
+    "who sent this" field was just a claim — anyone could submit a
+    transfer spending your bank balance, because only EVM
+    transactions carried real signatures. Now native transactions
+    can be signed with the same Ethereum key MetaMask already
+    holds, forged senders are rejected at every boundary, and
+    validators can require signatures so no unauthenticated spend
+    ever executes.
+
 - **EVM-RPC surface closeout** (`modules/evm`, `crates/rpc`)
   - `eth_call`, `eth_estimateGas`, and `debug_traceCall` now accept
     geth's state-override argument — per-account

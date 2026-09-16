@@ -851,7 +851,13 @@ fn build_devnet_executor(
     let mut executor = executor::Executor::with_config(
         node_config.max_mempool_entries,
         node_config.parallel_threshold,
-    );
+    )
+    .with_chain_id(rpc_config.chain_id)
+    .with_unsigned_tx_policy(if node_config.require_signed_txs {
+        executor::UnsignedTxPolicy::Reject
+    } else {
+        executor::UnsignedTxPolicy::Allow
+    });
     executor.register_module(Arc::new(oxide_core::CoreModule::new()));
     let bank_module = bank::BankModule::new();
 
@@ -1604,6 +1610,13 @@ fn load_config() -> (NodeConfig, config::RpcConfig, config::GenesisConfig) {
             storage_path: None,
             settlement_operator: None,
             min_fee: 0,
+            chain_id: rpc_config.chain_id,
+            // `--require-signed-txs` enforces EIP-712 envelope
+            // signatures on native-module txs. Default off because
+            // devnet flows (key-change keep-alive, scripted test txs)
+            // still submit unsigned envelopes — production must
+            // enable it.
+            require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
         },
         rpc_config,
         config.genesis,

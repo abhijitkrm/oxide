@@ -30,6 +30,7 @@
 pub mod bls;
 pub mod bls_signer;
 pub mod ed25519;
+pub mod eip712;
 pub mod hash;
 pub mod secp;
 
@@ -42,5 +43,5 @@ pub use ed25519::{
 pub use hash::{Domain, Hasher};
 pub use secp::{
     RecoverableSignature, RecoveryId, SecpError, generate_keypair_for_test, keccak256,
-    recover_sender, sign,
+    recover_sender, sign, signable_pubkey_address,
 };

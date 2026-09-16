@@ -3337,6 +3337,16 @@ impl Module for EvmModule {
         true
     }
 
+    /// The EVM is self-authenticating: the sender is recovered from
+    /// the secp256k1 signature inside the RLP transaction, so the
+    /// envelope's declared `sender` is a mempool-ordering hint only.
+    /// An envelope signature (`SIGNED_FLAG`) on an EVM tx is rejected
+    /// as malformed — it would shift the payload offset and add a
+    /// redundant recovery on top of the RLP's own verification.
+    fn authenticates_sender(&self) -> bool {
+        true
+    }
+
     /// Gas estimate = the tx's declared `gas_limit`, decoded from
     /// the RLP payload. The default `1000 + len` proxy would let a
     /// tx with a 30M gas limit count as ~150 gas and blow through

@@ -13302,3 +13302,116 @@ now complete modulo the deliberate omissions (`eth_sendTransaction`/
   override, oracle populated-history + empty-history fallback.
 - Workspace: 100 test binaries green; `cargo clippy --workspace
   --all-targets -D warnings` + `cargo fmt --check` clean.
+
+## 2026-10-06 — Session: P3 #16 — EIP-712-signed native module transactions
+
+### Why
+
+The native tx envelope was `[sender:20][nonce:8][fee:8][module_id:1]
+[payload]` with **no signature** — `ctx.sender` was merely declared.
+Only EVM txs self-authenticated (the sender is recovered from the
+RLP tx's secp256k1 signature inside the payload). Every other module
+— bank, staking, exchange, governance — trusted an unauthenticated
+field, so any node could submit a "transfer" debiting a victim's
+balance. Gap-analysis item #16 framed this as MetaMask-compat UX;
+the honest reading is that it was an auth hole that also needed an
+Ethereum-tooling-signable scheme. secp256k1 + EIP-712 satisfies
+both: one key controls the EVM account *and* the native identity
+(the cosmos-evm model), and `eth_signTypedData_v4` works unmodified.
+Ed25519 (already in-tree for other uses) was considered and rejected
+— MetaMask can't sign it and it would split the account space.
+
+### Wire format
+
+Signed v1 envelope (backward-compatible — unsigned v0 still parses):
+
+```
+[sender:20][nonce:8LE][fee:8LE][module_id|0x80:1][r:32][s:32][v:1][payload]
+```
+
+- `0x80` on the module-ID byte flags a signed envelope; the low 7
+  bits remain the module ID (127 module slots is plenty).
+- The 65-byte `r‖s‖v` sits between the module ID and the payload so
+  `module_payload` stays "rest of bytes" — every module decoder is
+  unchanged.
+- `v` accepts 0/1 only. MetaMask returns 27/28 — submitters must
+  normalize; 2/3 are rejected at parse (keys provably unused) and
+  `RecoveryId` already refuses them at construction.
+
+### EIP-712 schema
+
+```
+domain: EIP712Domain(string name,string version,uint256 chainId)
+        name="Oxide", version="1", chainId=<configured>
+type:   Tx(address sender,uint64 nonce,uint64 fee,uint8 moduleId,bytes payload)
+digest: keccak256("\x19\x01" ‖ domain_separator ‖ struct_hash)
+```
+
+The domain binds the chain ID → cross-chain replay is impossible.
+The struct binds sender/nonce/fee/module/payload directly — and the
+verifier additionally requires `recovered == ctx.sender`, so a
+forged declared sender produces a mismatch even before the digest
+check. `crypto::eip712` exposes `sign_tx` / `verify_tx_sender` /
+digest helpers; `secp::signable_pubkey_address` was added to derive
+the 20-byte address from a pubkey for tests/devnet.
+
+Spec correctness is pinned by a known-answer test reproducing the
+canonical EIP-712 `Mail` domain separator (`f2cee375…` — the vector
+published in the EIP) plus computed Oxide vectors.
+
+### Executor integration
+
+- New config: `chain_id` (domain separator input) and
+  `unsigned_tx_policy` (`Allow` default for devnet/test compat;
+  `Reject` for production). `NodeConfig` gained `chain_id` +
+  `require_signed_txs`; the validator wires chain_id from the RPC
+  config and exposes `--require-signed-txs`; the fullnode passes
+  both through.
+- `Module::authenticates_sender()` (default `false`) declares a
+  module self-authenticating; the EVM overrides it to `true` because
+  its RLP sig is authoritative. `SIGNED_FLAG` on a self-auth module
+  is **malformed** — it would shift the payload offset — and is
+  rejected statically in `process_proposal` (no crypto needed) as
+  well as at ingest/execute.
+- `check_envelope_auth` runs the same rules at `ingest_tx`,
+  `ingest_tx_batch`, and `execute_block` (extracted into
+  `group_block_txs` to keep `execute_block` under the line limit).
+  At execution, the `preverify_cache` (keyed by the full-tx
+  `Domain::Transaction` hash — the same key ingest uses) marks txs
+  already verified at admission, so verified-at-ingest txs skip the
+  ~40 µs recovery; foreign-proposal txs are verified inline.
+- The extraction moved `execute_block`'s grouping loop into
+  `group_block_txs` — no behavior change, keeps clippy's
+  `too_many_lines` gate happy.
+
+### Mempool / RPC
+
+- `mempool::build_signed_tx(privkey, chain_id, nonce, fee,
+  module_id, payload)` builds a signed envelope — the test/devnet
+  counterpart of `build_tx`.
+- `oxide_sendRawTransaction` RPC: hex-decodes a signed native
+  envelope and pushes it to the mempool (signature verification
+  happens inside `ingest_tx` — the RPC stays a thin decode+submit).
+  Returns the domain-tagged BLAKE3 tx hash, **not** keccak256 — the
+  envelope isn't an Ethereum tx.
+
+### Tests
+
+- `crypto`: +7 — sign/verify roundtrip, spec-vector KAT (`Mail`
+  domain), Oxide domain/digest KATs, tampered nonce/fee/module/
+  payload, wrong-sender, cross-chain replay, recid>1 rejection.
+- `executor` unit: +13 — codec parse, end-to-end signed execution,
+  bad-sig/cross-chain/forged-sender rejections, `Reject` policy at
+  admission + execution skip, foreign-proposal inline verify,
+  tampered payload, self-auth flag malformed (ingest + proposal),
+  truncated sig, batch-ingress policy.
+- `executor` integration (`tests/signed_tx.rs`): +5 — a real
+  `BankModule` settles a signed transfer (fee + debit + credit),
+  forged sender can't debit a victim, unsigned forgery rejected
+  under `Reject`, foreign signed tx executes without ingest,
+  compat `Allow` policy documents the migration path. These live
+  in `tests/` because `bank` depends on `executor` — a unit-test
+  build resolves `Module` to the wrong crate instance.
+- `rpc`: +2 — envelope submit + hash shape, error paths.
+- Workspace: 101 test binaries green; clippy `-D warnings` and
+  `fmt --check` clean.

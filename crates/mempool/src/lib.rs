@@ -621,6 +621,59 @@ pub fn build_tx(sender: Address, nonce: u64, fee: u64, payload: &[u8]) -> TxByte
     TxBytes::new(bytes)
 }
 
+/// The high bit of the `module_id` byte marking a signed envelope
+/// (v1). Mirrors `executor`'s `SIGNED_FLAG` — kept here so test and
+/// devnet code can build signed envelopes without depending on the
+/// executor crate's internals.
+const SIGNED_FLAG: u8 = 0x80;
+
+/// Build a signed (v1) native transaction: an envelope whose
+/// `module_id` byte carries the signed flag and whose signature is
+/// a secp256k1 ECDSA signature over the EIP-712 typed-data digest of
+/// `(chain_id, sender, nonce, fee, module_id, module_payload)` —
+/// see `crypto::eip712`.
+///
+/// Wire layout: `[sender:20][nonce:8LE][fee:8LE][module_id|0x80:1]
+/// [sig:65B][module_payload]`, where `sig = r ‖ s ‖ v` and `v` is
+/// the recovery ID (0 or 1 — `MetaMask`'s 27/28 is normalized by
+/// subtracting 27).
+///
+/// The sender is derived from `privkey` — passing a key that doesn't
+/// correspond to an intended account produces a correctly-signed tx
+/// for the key's own address, never a forgery.
+///
+/// For tests and devnet tooling. Production signing happens in the
+/// user's wallet; nodes only verify.
+///
+/// # Errors
+///
+/// Returns `None` if the private key is invalid for secp256k1.
+#[must_use]
+pub fn build_signed_tx(
+    privkey: &[u8],
+    chain_id: u64,
+    nonce: u64,
+    fee: u64,
+    module_id: u8,
+    module_payload: &[u8],
+) -> Option<TxBytes> {
+    // Derive the sender from the private key so the declared sender
+    // can never disagree with the signing key.
+    let sender = crypto::secp::signable_pubkey_address(privkey)?;
+    let digest =
+        crypto::eip712::tx_signing_digest(chain_id, &sender, nonce, fee, module_id, module_payload);
+    let sig = crypto::secp::sign(privkey, &digest).ok()?;
+    let mut bytes = Vec::with_capacity(TX_MIN_SIZE + 1 + 65 + module_payload.len());
+    bytes.extend_from_slice(&sender.0);
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&fee.to_le_bytes());
+    bytes.push(module_id | SIGNED_FLAG);
+    bytes.extend_from_slice(&sig.sig);
+    bytes.push(sig.recid.as_u8());
+    bytes.extend_from_slice(module_payload);
+    Some(TxBytes::new(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

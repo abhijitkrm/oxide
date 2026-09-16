@@ -3696,6 +3696,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-trie",
  "axum",
+ "crypto",
  "evm",
  "executor",
  "futures-util",

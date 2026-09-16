@@ -937,6 +937,7 @@ impl RpcServer {
             }
             "eth_getTransactionReceipt" => self.eth_get_transaction_receipt(&request.params),
             "eth_sendRawTransaction" => self.eth_send_raw_transaction(&request.params),
+            "oxide_sendRawTransaction" => self.oxide_send_raw_transaction(&request.params),
             // ---- Call / estimate ----
             "eth_call" => self.eth_call(&request.params),
             "eth_estimateGas" => self.eth_estimate_gas(&request.params),
@@ -2047,6 +2048,40 @@ impl RpcServer {
         }
 
         Ok(json!(format!("0x{}", hex::encode(hash))))
+    }
+
+    /// `oxide_sendRawTransaction` — submits a raw *native* module
+    /// transaction (non-EVM).
+    ///
+    /// Params: `[rawTx: String]` (hex-encoded signed v1 envelope:
+    /// `[sender][nonce][fee][module_id|0x80][sig:65B][payload]`).
+    ///
+    /// The envelope is pushed into the mempool as-is — admission
+    /// checks (EIP-712 signature verification, replay protection,
+    /// module validation) run inside `ingest_tx`, so this method is
+    /// a thin decode+submit. The returned hash is the domain-tagged
+    /// BLAKE3 transaction hash the executor/mempool index by — not
+    /// keccak256 of the raw bytes, since the envelope is not an
+    /// Ethereum tx.
+    fn oxide_send_raw_transaction(&self, params: &[Value]) -> Result<Value, RpcError> {
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing raw transaction"));
+        }
+        let raw_hex = params[0]
+            .as_str()
+            .ok_or_else(|| RpcError::invalid_params("raw tx must be a hex string"))?;
+        let raw = hex_decode(raw_hex)?;
+        // The executor/mempool tx hash is BLAKE3 over the full
+        // envelope under Domain::Transaction.
+        let hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, &raw);
+
+        if let Some(submitter) = &self.tx_submitter {
+            submitter
+                .submit_tx(TxBytes::new(raw))
+                .map_err(|reason| RpcError::transaction_rejected(&reason))?;
+        }
+
+        Ok(json!(format!("0x{}", hex::encode(hash.0))))
     }
 
     /// `eth_call` — executes a call without persisting state.
@@ -4557,5 +4592,64 @@ mod tests {
         let gas = u64::from_str_radix(gas.as_str().unwrap().trim_start_matches("0x"), 16)
             .expect("hex gas");
         assert!(gas > 21_000, "override code must add execution gas, got {gas}");
+    }
+
+    // ---- oxide_sendRawTransaction (native signed envelopes) ----
+
+    /// A hex-encoded native envelope is decoded and submitted; the
+    /// returned hash is the domain-tagged BLAKE3 tx hash.
+    #[test]
+    fn oxide_send_raw_transaction_submits_envelope() {
+        let mut s = make_server();
+        let submitter = Arc::new(MockSubmitter::new());
+        s.set_tx_submitter(submitter.clone());
+
+        // [sender:20][nonce:8][fee:8][module_id|0x80][sig:65][payload]
+        let mut raw = vec![0xAA; 20];
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.push(1 | 0x80);
+        raw.extend_from_slice(&[0xBB; 65]);
+        raw.extend_from_slice(b"payload");
+
+        let req = make_request(
+            "oxide_sendRawTransaction",
+            vec![json!(format!("0x{}", hex::encode(&raw)))],
+            json!(1),
+        );
+        let resp = s.handle(&req);
+        assert!(resp.error.is_none(), "envelope should submit: {:?}", resp.error);
+        let hash = resp.result.unwrap().as_str().unwrap().to_string();
+        assert_eq!(hash.len(), 66);
+        assert_eq!(submitter.count(), 1);
+        assert_eq!(submitter.last().as_bytes(), raw.as_slice());
+        // The returned hash is the BLAKE3 tx hash, not keccak256.
+        let expected = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, &raw);
+        assert_eq!(hash, format!("0x{}", hex::encode(expected.0)));
+    }
+
+    /// Bad hex is an invalid-params error; a submitter rejection
+    /// surfaces as a transaction-rejected error.
+    #[test]
+    fn oxide_send_raw_transaction_error_paths() {
+        let mut s = make_server();
+        let submitter = Arc::new(MockSubmitter::new());
+        s.set_tx_submitter(submitter.clone());
+
+        // Non-hex input.
+        let req = make_request("oxide_sendRawTransaction", vec![json!("0xZZ")], json!(1));
+        let resp = s.handle(&req);
+        assert!(resp.error.is_some());
+        assert_eq!(submitter.count(), 0);
+
+        // Missing param.
+        let req = make_request("oxide_sendRawTransaction", vec![], json!(2));
+        assert!(s.handle(&req).error.is_some());
+
+        // Submitter rejection surfaces as -32003 (transaction rejected).
+        *submitter.reject_next.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        let req = make_request("oxide_sendRawTransaction", vec![json!("0xdeadbeef")], json!(3));
+        let resp = s.handle(&req);
+        assert!(resp.error.is_some(), "rejection must surface as error");
     }
 }

@@ -279,6 +279,33 @@ pub fn sign(privkey: &[u8], msg_hash: &[u8]) -> Result<RecoverableSignature, Sec
     Ok(RecoverableSignature { sig, recid: RecoveryId::from_secp(recid) })
 }
 
+/// Derive the Ethereum address for a secp256k1 private key.
+///
+/// The address is the last 20 bytes of `keccak256` of the
+/// uncompressed public key (bytes 1..65, skipping the 0x04 prefix).
+/// Used by transaction builders so the declared sender is always the
+/// signing key's own address — never a forged one.
+///
+/// # Errors
+///
+/// Returns `None` if the key is not a valid 32-byte secp256k1
+/// secret.
+#[must_use]
+pub fn signable_pubkey_address(privkey: &[u8]) -> Option<Address> {
+    if privkey.len() != 32 {
+        return None;
+    }
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(privkey);
+    let secret = secp256k1::SecretKey::from_byte_array(key_arr).ok()?;
+    let pubkey = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &secret);
+    let serialized = pubkey.serialize_uncompressed();
+    let hash = keccak256(&serialized[1..65]);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&hash[12..32]);
+    Some(Address(addr))
+}
+
 /// Generate a random private key for testing. Not for production use.
 ///
 /// # Panics

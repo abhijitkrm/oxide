@@ -70,6 +70,10 @@ fn load_config() -> NodeConfig {
         config::ConsensusEngineKind::OxideBft => ConsensusConfig::OxideBft,
     };
 
+    // The RPC config carries the chain ID — the executor needs it for
+    // EIP-712 native-tx signature verification (domain separator).
+    let chain_id = config.rpc.as_ref().map_or(1, |r| r.chain_id);
+
     NodeConfig {
         consensus,
         max_mempool_entries: config.executor.max_mempool_entries,
@@ -78,6 +82,8 @@ fn load_config() -> NodeConfig {
         storage_path: None,
         settlement_operator: None,
         min_fee: 0,
+        chain_id,
+        require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
     }
 }
 
