@@ -153,6 +153,19 @@ pub struct Validator {
     pub stake: u64,
 }
 
+/// The bonded-pool module account.
+///
+/// Delegated funds are held at this address in the bank module: a
+/// `delegate` moves `delegator → BONDED_POOL`, and completed unbonding
+/// moves `BONDED_POOL → delegator` back. The pool balance therefore
+/// always equals total live delegations + in-flight unbonding — the
+/// same accounting identity Cosmos keeps between `x/bank` and the
+/// bonded-tokens pool.
+///
+/// The address is a fixed 20-byte tag — no private key exists, so
+/// only the staking module's own calls can move funds out.
+pub const BONDED_POOL: Address = Address(*b"oxide/staking/pool!!");
+
 /// The staking module: delegation, unbonding, slashing, rewards.
 pub struct StakingModule {
     /// The KV store for state root computation.
@@ -161,6 +174,22 @@ pub struct StakingModule {
     store: framework::KVStore,
     /// Validator stakes, keyed by address.
     validators: Mutex<BTreeMap<Address, u64>>,
+    /// Live delegations: `(delegator, validator) → bonded amount`.
+    ///
+    /// This is the record that makes delegation real: `delegate`
+    /// debits the delegator's bank balance into [`BONDED_POOL`] and
+    /// credits this map; `undelegate` requires the delegator's own
+    /// delegation to cover the amount. Without it, `delegate` was
+    /// unbacked stake inflation (any tx could grow any validator's
+    /// stake for free) and `undelegate` let any account unbond any
+    /// validator's stake.
+    delegations: Mutex<BTreeMap<(Address, Address), u64>>,
+    /// The bank module handle for bond/unbond settlement. `None` in
+    /// bare unit tests only — `delegate`/`unbond_immediate` fail
+    /// closed when unset (an unbacked delegation is a consensus
+    /// accounting hole; see `docs/evm-parity-gap-analysis.md` for why
+    /// precompile→module paths must reuse the native invariants).
+    bank: Mutex<Option<std::sync::Arc<bank::BankModule>>>,
     /// Pending unbonding entries (completed at `end_block`).
     unbonding: Mutex<Vec<UnbondingEntry>>,
     /// Accumulated rewards per validator address.
@@ -194,6 +223,8 @@ impl StakingModule {
         Self {
             store: Mutex::new(BTreeMap::new()),
             validators: Mutex::new(BTreeMap::new()),
+            delegations: Mutex::new(BTreeMap::new()),
+            bank: Mutex::new(None),
             unbonding: Mutex::new(Vec::new()),
             rewards: Mutex::new(BTreeMap::new()),
             pending_key_changes: Mutex::new(BTreeMap::new()),
@@ -222,6 +253,29 @@ impl StakingModule {
     pub fn with_block_reward(mut self, reward: u64) -> Self {
         self.block_reward = reward;
         self
+    }
+
+    /// Register a validator with zero stake — the "can receive
+    /// delegations" state used by tests and devnet assembly.
+    ///
+    /// A registered-but-empty validator participates in no weight
+    /// accounting until a real `delegate` bonds funds. This exists
+    /// because [`handle_delegate`] requires the validator to be
+    /// registered — delegation can no longer fabricate consensus
+    /// stake for unknown addresses.
+    ///
+    /// `#[doc(hidden)]` — assembly/test seam, not a message path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a mutex is poisoned.
+    #[doc(hidden)]
+    pub fn register_validator(&self, validator: Address) {
+        self.validators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(validator)
+            .or_insert(0);
     }
 
     /// Register a validator at genesis — sets stake directly without
@@ -293,6 +347,104 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     pub fn pending_unbonding(&self) -> Vec<UnbondingEntry> {
         self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Undo a delegation immediately — the EVM-precompile revert path.
+    ///
+    /// [`handle_delegate`](Self::handle_delegate) bonds funds via the
+    /// normal message path. When the enclosing EVM frame later reverts,
+    /// the EVM journal calls this to restore the exact pre-call state:
+    /// delegation and stake reduced, funds returned pool → delegator
+    /// without entering the unbonding queue.
+    ///
+    /// `#[doc(hidden)]` — only the EVM module's native-side-effect
+    /// journal may call this; it is not a user-facing message path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a mutex is poisoned.
+    #[doc(hidden)]
+    pub fn unbond_immediate(
+        &self,
+        delegator: Address,
+        validator: Address,
+        amount: u64,
+    ) -> Result<(), ExecError> {
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let delegation = delegations
+            .get_mut(&(delegator, validator))
+            .ok_or(ExecError::ModuleRejected("undo: delegation missing".to_string()))?;
+        if *delegation < amount {
+            return Err(ExecError::ModuleRejected("undo: delegation underflow".to_string()));
+        }
+        *delegation -= amount;
+        let new_delegation = *delegation;
+        if new_delegation == 0 {
+            delegations.remove(&(delegator, validator));
+        }
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("undo: validator missing".to_string()))?;
+        *stake -= amount;
+        self.store_delegation_state(validator, delegator, *stake, new_delegation);
+        drop(delegations);
+        drop(validators);
+        // Refund the bond — same funds the delegate moved in.
+        self.require_bank()?.transfer(&BONDED_POOL, &delegator, amount)
+    }
+
+    /// Undo an undelegation — the EVM-precompile revert path.
+    ///
+    /// Restores the delegation and stake and removes the unbonding
+    /// entry the failed frame created. No bank movement: undelegate
+    /// never moved funds (the payout happens at completion).
+    ///
+    /// `#[doc(hidden)]` — only the EVM module's native-side-effect
+    /// journal may call this.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a mutex is poisoned.
+    #[doc(hidden)]
+    pub fn cancel_unbond(
+        &self,
+        delegator: Address,
+        validator: Address,
+        amount: u64,
+    ) -> Result<(), ExecError> {
+        // Remove the most recent matching unbonding entry (the one the
+        // reverted frame appended — same (delegator, validator,
+        // amount) triple).
+        {
+            let mut unbonding =
+                self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pos = unbonding
+                .iter()
+                .rposition(|e| {
+                    e.delegator == delegator && e.validator == validator && e.amount == amount
+                })
+                .ok_or(ExecError::ModuleRejected("undo: unbonding entry missing".to_string()))?;
+            unbonding.remove(pos);
+        }
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("undo: validator missing".to_string()))?;
+        *stake = stake
+            .checked_add(amount)
+            .ok_or(ExecError::ModuleRejected("undo: stake overflow".to_string()))?;
+        let delegation = delegations.entry((delegator, validator)).or_insert(0);
+        *delegation = delegation
+            .checked_add(amount)
+            .ok_or(ExecError::ModuleRejected("undo: delegation overflow".to_string()))?;
+        self.store_delegation_state(validator, delegator, *stake, *delegation);
+        Ok(())
     }
 
     /// Take all pending key changes, clearing the queue. Called by
@@ -538,11 +690,30 @@ impl Module for StakingModule {
     }
 
     fn end_block(&self, height: Height) {
-        // Process completed unbonding entries.
+        // Process completed unbonding entries: pay each delegator out
+        // of the bonded pool. Before this, unbonded funds vanished
+        // (entries were dropped with no payout — the bonded pool kept
+        // tokens nobody could reclaim).
         let current = height.value();
+        let bank = self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let mut unbonding =
             self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        unbonding.retain(|entry| entry.completion_height > current);
+        unbonding.retain(|entry| {
+            if entry.completion_height > current {
+                return true;
+            }
+            if let Some(bank) = &bank {
+                // Pool → delegator. The pool always holds the funds
+                // (delegations + in-flight unbonding sum to the pool
+                // balance), so this cannot fail; if it does, keep the
+                // entry so the delegator can still be paid later.
+                if bank.transfer(&BONDED_POOL, &entry.delegator, entry.amount).is_err() {
+                    return true;
+                }
+            }
+            false
+        });
+        drop(unbonding);
 
         // Distribute block rewards to active validators.
         self.distribute_rewards();
@@ -562,34 +733,293 @@ impl Module for StakingModule {
 }
 
 impl StakingModule {
-    /// Handle a delegate message: add `amount` to `validator`'s stake.
+    /// Wire the bank module used for bond/unbond settlement.
+    ///
+    /// Must be called at assembly (before any block executes). Once
+    /// set, `delegate` debits the delegator into [`BONDED_POOL`] and
+    /// completed unbonding credits the delegator back — the precompile
+    /// path (`0x0C01`) goes through the same `handle` entry point, so
+    /// EVM callers get identical accounting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn set_bank(&self, bank: std::sync::Arc<bank::BankModule>) {
+        *self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bank);
+    }
+
+    /// The delegator's bonded amount with a validator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn delegation(&self, delegator: &Address, validator: &Address) -> u64 {
+        self.delegations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(*delegator, *validator))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record a stake + delegation mutation in the KV store so
+    /// `state_root` covers it. Lock order: callers must already hold
+    /// (or not need) `validators`/`delegations`; this only takes
+    /// `store`.
+    fn store_delegation_state(
+        &self,
+        validator: Address,
+        delegator: Address,
+        stake: u64,
+        delegation: u64,
+    ) {
+        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
+        let mut key = Vec::with_capacity(4 + 40);
+        key.extend_from_slice(b"del/");
+        key.extend_from_slice(&delegator.0);
+        key.extend_from_slice(&validator.0);
+        store.insert(key, delegation.to_le_bytes().to_vec());
+    }
+
+    /// Take the bank handle, failing closed when unwired.
+    ///
+    /// An unbacked delegation is an accounting hole — never run the
+    /// debit path without a bank.
+    fn require_bank(&self) -> Result<std::sync::Arc<bank::BankModule>, ExecError> {
+        self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().ok_or_else(
+            || {
+                ExecError::ModuleRejected(
+                    "staking: bank module not wired (cannot settle delegation)".to_string(),
+                )
+            },
+        )
+    }
+
+    /// Handle a delegate message: move `amount` from the sender's bank
+    /// balance into the bonded pool and record the delegation.
+    ///
+    /// Invariants enforced (shared by the native and EVM-precompile
+    /// paths — both call `handle`):
+    /// - The validator must be registered (`genesis_register_validator`
+    ///   or `VALIDATOR_ADD`); delegation to an unknown validator is
+    ///   rejected rather than silently fabricating consensus stake.
+    /// - The sender's bank balance must cover `amount` — the bank's
+    ///   `transfer` enforces this, so the EVM precompile cannot inflate
+    ///   stake for free.
     fn handle_delegate(
         &self,
-        _ctx: &TxContext,
+        ctx: &TxContext,
         validator: Address,
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stake = validators.entry(validator).or_insert(0);
-        *stake = stake
-            .checked_add(amount)
-            .ok_or(ExecError::ModuleRejected("stake overflow".to_string()))?;
-
-        // Record in store for state root.
-        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
-
+        self.delegate_for(ctx.sender, validator, amount)?;
         Ok(vec![Event { module: "staking", kind: "delegate", data: msg.to_vec() }])
     }
 
-    /// Handle an undelegate message: start unbonding `amount` from
-    /// `validator`'s stake.
+    /// Bond `amount` of `delegator`'s bank balance to `validator`.
     ///
-    /// The amount is removed from the validator's stake immediately
-    /// and placed in the unbonding queue. After `unbonding_period`
-    /// blocks, the funds are withdrawable.
+    /// This is the shared core of [`handle_delegate`] and the EVM
+    /// staking precompile: identical invariant enforcement regardless
+    /// of which path the request arrives on. The delegator is debited
+    /// through the bank into [`BONDED_POOL`]; the validator must be
+    /// registered.
+    ///
+    /// # Errors
+    ///
+    /// `ExecError::ModuleRejected` if the validator is unregistered,
+    /// the bank is unwired, the transfer fails, or stake/delegation
+    /// arithmetic overflows.
+    pub fn delegate_for(
+        &self,
+        delegator: Address,
+        validator: Address,
+        amount: u64,
+    ) -> Result<(), ExecError> {
+        let bank = self.require_bank()?;
+        {
+            let validators =
+                self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !validators.contains_key(&validator) {
+                return Err(ExecError::ModuleRejected(
+                    "delegate: validator not registered".to_string(),
+                ));
+            }
+        }
+        // Debit first: if the transfer fails nothing is recorded.
+        bank.transfer(&delegator, &BONDED_POOL, amount)?;
+
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("delegate: validator vanished".to_string()))?;
+        *stake = stake
+            .checked_add(amount)
+            .ok_or(ExecError::ModuleRejected("stake overflow".to_string()))?;
+        let delegation = delegations.entry((delegator, validator)).or_insert(0);
+        *delegation = delegation
+            .checked_add(amount)
+            .ok_or(ExecError::ModuleRejected("delegation overflow".to_string()))?;
+        self.store_delegation_state(validator, delegator, *stake, *delegation);
+        Ok(())
+    }
+
+    /// Reverse a [`delegate_for`] — used by the EVM journal when the
+    /// calling frame reverts. Subtracts stake/delegation and refunds
+    /// the delegator from the bonded pool.
+    ///
+    /// # Errors
+    ///
+    /// `ExecError::ModuleRejected` if the delegation is smaller than
+    /// `amount` (the undo would make accounting inconsistent — this
+    /// indicates a journal bug, not user error).
+    pub fn undo_delegate(
+        &self,
+        delegator: Address,
+        validator: Address,
+        amount: u64,
+    ) -> Result<(), ExecError> {
+        let bank = self.require_bank()?;
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let delegation = delegations
+            .get_mut(&(delegator, validator))
+            .ok_or(ExecError::ModuleRejected("undo_delegate: no delegation".to_string()))?;
+        if *delegation < amount {
+            return Err(ExecError::ModuleRejected(
+                "undo_delegate: delegation smaller than undo amount".to_string(),
+            ));
+        }
+        *delegation -= amount;
+        let new_delegation = *delegation;
+        if new_delegation == 0 {
+            delegations.remove(&(delegator, validator));
+        }
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("undo_delegate: validator gone".to_string()))?;
+        *stake -= amount;
+        self.store_delegation_state(validator, delegator, *stake, new_delegation);
+        drop(delegations);
+        drop(validators);
+        // Refund after ledger state is consistent — a failed refund
+        // leaves the pool over-funded rather than stake inflated.
+        bank.transfer(&BONDED_POOL, &delegator, amount)
+    }
+
+    /// Start unbonding `amount` of `delegator`'s own delegation to
+    /// `validator` — shared core of [`handle_undelegate`] and the EVM
+    /// staking precompile.
+    ///
+    /// Stake drops immediately; the amount enters the unbonding queue
+    /// and is paid from the bonded pool at `completion_height`.
+    ///
+    /// # Errors
+    ///
+    /// `ExecError::ModuleRejected` if `delegator` has no delegation to
+    /// `validator` or it is smaller than `amount`.
+    pub fn undelegate_for(
+        &self,
+        delegator: Address,
+        validator: Address,
+        amount: u64,
+    ) -> Result<u64, ExecError> {
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let delegation = delegations.get_mut(&(delegator, validator)).ok_or_else(|| {
+            ExecError::ModuleRejected(
+                "undelegate: no delegation from this sender to this validator".to_string(),
+            )
+        })?;
+        if *delegation < amount {
+            return Err(ExecError::ModuleRejected(
+                "undelegate: insufficient delegation".to_string(),
+            ));
+        }
+        *delegation -= amount;
+        let new_delegation = *delegation;
+        if new_delegation == 0 {
+            delegations.remove(&(delegator, validator));
+        }
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("undelegate: validator not found".to_string()))?;
+        *stake -= amount; // delegation ≤ stake by construction
+        self.store_delegation_state(validator, delegator, *stake, new_delegation);
+        drop(delegations);
+        drop(validators);
+
+        let current =
+            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let completion = current.saturating_add(self.unbonding_period);
+        self.unbonding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(UnbondingEntry { delegator, validator, amount, completion_height: completion });
+        Ok(completion)
+    }
+
+    /// Reverse an [`undelegate_for`] — EVM journal rollback. Removes
+    /// the most recent matching unbonding entry and restores the
+    /// delegation and stake.
+    ///
+    /// # Errors
+    ///
+    /// `ExecError::ModuleRejected` if no matching unbonding entry
+    /// exists (journal bug).
+    pub fn undo_undelegate(
+        &self,
+        delegator: Address,
+        validator: Address,
+        amount: u64,
+    ) -> Result<(), ExecError> {
+        {
+            let mut unbonding =
+                self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Remove the *last* matching entry — journal undos run in
+            // reverse order of mutation within the frame.
+            let pos = unbonding
+                .iter()
+                .rposition(|e| {
+                    e.delegator == delegator && e.validator == validator && e.amount == amount
+                })
+                .ok_or(ExecError::ModuleRejected(
+                    "undo_undelegate: no matching unbonding entry".to_string(),
+                ))?;
+            unbonding.remove(pos);
+        }
+        let mut validators =
+            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("undo_undelegate: validator gone".to_string()))?;
+        *stake = stake
+            .checked_add(amount)
+            .ok_or(ExecError::ModuleRejected("stake overflow on undo".to_string()))?;
+        let delegation = delegations.entry((delegator, validator)).or_insert(0);
+        *delegation = delegation
+            .checked_add(amount)
+            .ok_or(ExecError::ModuleRejected("delegation overflow on undo".to_string()))?;
+        self.store_delegation_state(validator, delegator, *stake, *delegation);
+        Ok(())
+    }
+
+    /// Handle an undelegate message: start unbonding `amount` of the
+    /// **sender's own** delegation to `validator`.
+    ///
+    /// The delegation is removed immediately (stake drops now) and the
+    /// amount enters the unbonding queue; at `completion_height` the
+    /// bank pays it out of the bonded pool to the delegator.
     fn handle_undelegate(
         &self,
         ctx: &TxContext,
@@ -597,40 +1027,20 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stake = validators
-            .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("undelegate: validator not found".to_string()))?;
-        if *stake < amount {
-            return Err(ExecError::ModuleRejected("undelegate: insufficient stake".to_string()));
-        }
-        *stake -= amount;
-
-        // Record updated stake in store.
-        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
-
-        // Add to unbonding queue.
-        let current =
-            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let completion = current.saturating_add(self.unbonding_period);
-        let entry = UnbondingEntry {
-            delegator: ctx.sender,
-            validator,
-            amount,
-            completion_height: completion,
-        };
-        self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(entry);
-
+        self.undelegate_for(ctx.sender, validator, amount)?;
         Ok(vec![Event { module: "staking", kind: "undelegate", data: msg.to_vec() }])
     }
 
-    /// Handle a slash message: reduce `validator`'s stake by `amount`.
+    /// Handle a slash message: reduce `validator`'s stake by `amount`,
+    /// burning the same proportion from every delegation to it.
     ///
-    /// The slashed amount is burned (removed from circulation). This
-    /// is called by the consensus engine (double-sign evidence) or
-    /// governance proposals.
+    /// Slashing must hit the delegations, not just the aggregate —
+    /// otherwise the bonded pool still owes the full pre-slash amount
+    /// (a slash would effectively refund itself on unbond). Each
+    /// delegation loses `floor(amount · delegation / stake)`; the
+    /// rounding remainder is distributed 1 unit per delegation in
+    /// deterministic `(delegator, validator)` order so all replicas
+    /// slash identically.
     fn handle_slash(
         &self,
         _ctx: &TxContext,
@@ -640,15 +1050,72 @@ impl StakingModule {
     ) -> Result<Vec<Event>, ExecError> {
         let mut validators =
             self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("slash: validator not found".to_string()))?;
         let slash_amount = amount.min(*stake);
+        let stake_before = *stake;
         *stake -= slash_amount;
+        let new_stake = *stake;
 
-        // Record updated stake in store.
-        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
+        let mut burned_from_pool = 0u64;
+        if slash_amount > 0 && stake_before > 0 {
+            // floor-share each delegation, then hand out the remainder
+            // one unit at a time in BTreeMap (sorted) order.
+            let mut affected: Vec<(Address, u64)> = delegations
+                .range(..)
+                .filter(|((_, v), _)| *v == validator)
+                .map(|((d, _), a)| (*d, *a))
+                .collect();
+            let mut applied = 0u64;
+            let mut dust_keys = Vec::with_capacity(affected.len());
+            for (d, a) in &mut affected {
+                let share = u128::from(slash_amount) * u128::from(*a) / u128::from(stake_before);
+                let share = u64::try_from(share).unwrap_or(u64::MAX).min(*a);
+                *a -= share;
+                applied = applied.saturating_add(share);
+                if *a > 0 {
+                    dust_keys.push(*d);
+                }
+            }
+            // Leftover from flooring: at most `affected.len()` units.
+            let mut rem = slash_amount.saturating_sub(applied);
+            for d in &dust_keys {
+                if rem == 0 {
+                    break;
+                }
+                if let Some((_, a)) = affected.iter_mut().find(|(dd, _)| dd == d) {
+                    *a -= 1;
+                    rem -= 1;
+                    applied += 1;
+                }
+            }
+            for (d, a) in affected {
+                if a == 0 {
+                    delegations.remove(&(d, validator));
+                } else {
+                    delegations.insert((d, validator), a);
+                }
+                self.store_delegation_state(validator, d, new_stake, a);
+            }
+            burned_from_pool = applied;
+        }
+        drop(delegations);
+        drop(validators);
+
+        // Burn only the amount removed from pool-backed delegations —
+        // unattributed stake (genesis self-stake) was never in the
+        // pool, so burning it would overdraw.
+        if burned_from_pool > 0 {
+            if let Some(bank) =
+                self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+            {
+                // Burn = send to the zero address (no key holder).
+                let _ = bank.transfer(&BONDED_POOL, &Address::ZERO, burned_from_pool);
+            }
+        }
 
         Ok(vec![Event { module: "staking", kind: "slash", data: msg.to_vec() }])
     }
@@ -664,18 +1131,41 @@ impl StakingModule {
     /// module).
     fn handle_claim_reward(
         &self,
-        _ctx: &TxContext,
+        ctx: &TxContext,
         validator: Address,
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut rewards = self.rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let accumulated = rewards.get(&validator).copied().unwrap_or(0);
-        let claim_amount = if amount == 0 { accumulated } else { amount.min(accumulated) };
-        if claim_amount == 0 {
-            return Err(ExecError::ModuleRejected("claim_reward: no rewards to claim".to_string()));
+        // Only the validator may withdraw their own rewards — the
+        // rewards ledger is a claimable balance, not a public pool.
+        // (Matches the key_change authorization model.)
+        if ctx.sender != validator {
+            return Err(ExecError::ModuleRejected(
+                "claim_reward: only the validator can claim its rewards".to_string(),
+            ));
         }
-        *rewards.entry(validator).or_insert(0) -= claim_amount;
+        let bank = self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let bank = bank
+            .ok_or_else(|| ExecError::ModuleRejected("claim_reward: bank not wired".to_string()))?;
+
+        let claim_amount = {
+            let mut rewards =
+                self.rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accumulated = rewards.get(&validator).copied().unwrap_or(0);
+            let claim_amount = if amount == 0 { accumulated } else { amount.min(accumulated) };
+            if claim_amount == 0 {
+                return Err(ExecError::ModuleRejected(
+                    "claim_reward: no rewards to claim".to_string(),
+                ));
+            }
+            *rewards.entry(validator).or_insert(0) -= claim_amount;
+            claim_amount
+        };
+
+        // Rewards are new issuance authorized by the block-reward
+        // schedule — mint lazily at claim time so the bonded pool is
+        // never touched by reward payouts.
+        bank.mint(&validator, claim_amount);
 
         Ok(vec![Event { module: "staking", kind: "claim_reward", data: msg.to_vec() }])
     }
@@ -916,6 +1406,38 @@ mod tests {
         Address([byte; 20])
     }
 
+    /// A staking module with a bank wired and each address `0..=9`
+    /// funded with 1M units, plus every listed validator registered
+    /// (zero stake — delegations build it up).
+    fn setup(validators: &[u8]) -> StakingModule {
+        let staking = StakingModule::new();
+        let bank = std::sync::Arc::new(bank::BankModule::new());
+        for s in 0u8..=9 {
+            bank.mint(&addr(s), 1_000_000);
+        }
+        staking.set_bank(bank);
+        for v in validators {
+            staking.register_validator(addr(*v));
+        }
+        staking
+    }
+
+    /// The bank behind a setup — needed by tests asserting pool
+    /// movement. (`setup` keeps the handle internally; tests that
+    /// need bank assertions build it directly.)
+    fn setup_with_bank(validators: &[u8]) -> (StakingModule, std::sync::Arc<bank::BankModule>) {
+        let staking = StakingModule::new();
+        let bank = std::sync::Arc::new(bank::BankModule::new());
+        for s in 0u8..=9 {
+            bank.mint(&addr(s), 1_000_000);
+        }
+        staking.set_bank(bank.clone());
+        for v in validators {
+            staking.register_validator(addr(*v));
+        }
+        (staking, bank)
+    }
+
     fn ctx() -> TxContext {
         TxContext { sender: addr(0), nonce: 0, fee: 0 }
     }
@@ -926,7 +1448,7 @@ mod tests {
 
     #[test]
     fn delegate_increases_stake() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         assert_eq!(staking.stake(&v), 1000);
@@ -934,7 +1456,7 @@ mod tests {
 
     #[test]
     fn multiple_delegates_accumulate() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 100)).unwrap();
         staking.handle(&ctx(), &msg::delegate(v, 200)).unwrap();
@@ -943,16 +1465,16 @@ mod tests {
 
     #[test]
     fn undelegate_reduces_stake_and_creates_unbonding_entry() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.begin_block(Height::new(10));
-        staking.handle(&ctx_with_sender(5), &msg::undelegate(v, 300)).unwrap();
+        staking.handle(&ctx(), &msg::undelegate(v, 300)).unwrap();
         assert_eq!(staking.stake(&v), 700, "stake should be reduced");
         let pending = staking.pending_unbonding();
         assert_eq!(pending.len(), 1, "one unbonding entry");
         assert_eq!(pending[0].amount, 300);
-        assert_eq!(pending[0].delegator, addr(5));
+        assert_eq!(pending[0].delegator, addr(0));
         assert_eq!(
             pending[0].completion_height,
             10 + DEFAULT_UNBONDING_PERIOD_BLOCKS,
@@ -962,7 +1484,7 @@ mod tests {
 
     #[test]
     fn undelegate_rejects_insufficient_stake() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 100)).unwrap();
         let result = staking.handle(&ctx(), &msg::undelegate(v, 200));
@@ -970,8 +1492,74 @@ mod tests {
     }
 
     #[test]
+    fn undelegate_rejects_non_delegator() {
+        // Security regression: previously any sender could unbond any
+        // validator's stake — the delegation is owned by sender 0, so
+        // sender 5's undelegate must be rejected.
+        let staking = setup(&[1]);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let result = staking.handle(&ctx_with_sender(5), &msg::undelegate(v, 300));
+        assert!(result.is_err(), "non-delegator must not unbond someone else's stake");
+        assert_eq!(staking.stake(&v), 1000, "stake unchanged after rejected undelegate");
+    }
+
+    #[test]
+    fn delegate_moves_funds_to_bonded_pool() {
+        let (staking, bank) = setup_with_bank(&[1]);
+        let v = addr(1);
+        let before = bank.balance(&addr(0));
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        assert_eq!(bank.balance(&addr(0)), before - 1000, "delegator debited");
+        assert_eq!(bank.balance(&BONDED_POOL), 1000, "bonded pool credited");
+        assert_eq!(staking.delegation(&addr(0), &v), 1000);
+    }
+
+    #[test]
+    fn delegate_rejects_insufficient_balance() {
+        let (staking, bank) = setup_with_bank(&[1]);
+        let v = addr(1);
+        let result = staking.handle(&ctx(), &msg::delegate(v, 2_000_000));
+        assert!(result.is_err(), "delegate exceeding balance must fail");
+        assert_eq!(staking.stake(&v), 0, "no stake created on failure");
+        assert_eq!(bank.balance(&BONDED_POOL), 0, "pool untouched on failure");
+    }
+
+    #[test]
+    fn unbonding_refunds_delegator_via_bank() {
+        let (staking, bank) = setup_with_bank(&[1]);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let after_delegate = bank.balance(&addr(0));
+        staking.begin_block(Height::new(10));
+        staking.handle(&ctx(), &msg::undelegate(v, 400)).unwrap();
+        // Still in the pool while unbonding.
+        assert_eq!(bank.balance(&BONDED_POOL), 1000);
+        assert_eq!(bank.balance(&addr(0)), after_delegate, "not refunded yet");
+        staking.begin_block(Height::new(10 + DEFAULT_UNBONDING_PERIOD_BLOCKS));
+        staking.end_block(Height::new(10 + DEFAULT_UNBONDING_PERIOD_BLOCKS));
+        assert_eq!(
+            bank.balance(&addr(0)),
+            after_delegate + 400,
+            "unbonded funds returned to the delegator"
+        );
+        assert_eq!(bank.balance(&BONDED_POOL), 600, "pool keeps the bonded remainder");
+    }
+
+    #[test]
+    fn slash_burns_only_bonded_funds() {
+        let (staking, bank) = setup_with_bank(&[1]);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.handle(&ctx(), &msg::slash(v, 100)).unwrap();
+        assert_eq!(staking.stake(&v), 900);
+        assert_eq!(staking.delegation(&addr(0), &v), 900, "delegation reduced proportionally");
+        assert_eq!(bank.balance(&BONDED_POOL), 900, "slashed amount burned from pool");
+    }
+
+    #[test]
     fn undelegate_rejects_unknown_validator() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         let result = staking.handle(&ctx(), &msg::undelegate(v, 100));
         assert!(result.is_err(), "should reject undelegate of unknown validator");
@@ -979,7 +1567,7 @@ mod tests {
 
     #[test]
     fn unbonding_completes_after_period() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.begin_block(Height::new(10));
@@ -997,7 +1585,7 @@ mod tests {
 
     #[test]
     fn unbonding_not_completed_before_period() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.begin_block(Height::new(10));
@@ -1009,7 +1597,7 @@ mod tests {
 
     #[test]
     fn slash_reduces_stake() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let slash_amount = msg::double_sign_slash_amount(1000);
@@ -1020,7 +1608,7 @@ mod tests {
 
     #[test]
     fn slash_capped_at_stake() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 100)).unwrap();
         // Try to slash more than the stake.
@@ -1030,7 +1618,7 @@ mod tests {
 
     #[test]
     fn slash_rejects_unknown_validator() {
-        let staking = StakingModule::new();
+        let staking = setup(&[]);
         let v = addr(1);
         let result = staking.handle(&ctx(), &msg::slash(v, 100));
         assert!(result.is_err(), "should reject slash of unknown validator");
@@ -1038,7 +1626,7 @@ mod tests {
 
     #[test]
     fn rewards_accumulate_per_block() {
-        let staking = StakingModule::new().with_block_reward(1_000_000);
+        let staking = setup(&[1, 2]).with_block_reward(1_000_000);
         let v1 = addr(1);
         let v2 = addr(2);
         staking.handle(&ctx(), &msg::delegate(v1, 1000)).unwrap();
@@ -1055,7 +1643,7 @@ mod tests {
 
     #[test]
     fn rewards_accumulate_over_multiple_blocks() {
-        let staking = StakingModule::new().with_block_reward(1_000_000);
+        let staking = setup(&[1]).with_block_reward(1_000_000);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.begin_block(Height::new(1));
@@ -1067,8 +1655,8 @@ mod tests {
 
     #[test]
     fn claim_reward_withdraws_accumulated() {
-        let staking = StakingModule::new().with_block_reward(1_000_000);
-        let v = addr(1);
+        let staking = setup(&[0]).with_block_reward(1_000_000);
+        let v = addr(0); // sender addr(0) is the validator — claims its own rewards
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.begin_block(Height::new(1));
         staking.end_block(Height::new(1));
@@ -1079,8 +1667,8 @@ mod tests {
 
     #[test]
     fn claim_reward_partial_withdrawal() {
-        let staking = StakingModule::new().with_block_reward(1_000_000);
-        let v = addr(1);
+        let staking = setup(&[0]).with_block_reward(1_000_000);
+        let v = addr(0);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.begin_block(Height::new(1));
         staking.end_block(Height::new(1));
@@ -1090,8 +1678,8 @@ mod tests {
 
     #[test]
     fn claim_reward_rejects_zero_balance() {
-        let staking = StakingModule::new();
-        let v = addr(1);
+        let staking = setup(&[0]);
+        let v = addr(0);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let result = staking.handle(&ctx(), &msg::claim_reward(v, 0));
         assert!(result.is_err(), "should reject claim with no rewards");
@@ -1099,7 +1687,7 @@ mod tests {
 
     #[test]
     fn top_validators_sorted_by_stake() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1, 2, 3]);
         staking.handle(&ctx(), &msg::delegate(addr(1), 100)).unwrap();
         staking.handle(&ctx(), &msg::delegate(addr(2), 500)).unwrap();
         staking.handle(&ctx(), &msg::delegate(addr(3), 300)).unwrap();
@@ -1112,7 +1700,7 @@ mod tests {
 
     #[test]
     fn zero_stake_validators_excluded() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         staking.handle(&ctx(), &msg::delegate(addr(1), 100)).unwrap();
         let top = staking.top_validators(10);
         assert_eq!(top.len(), 1, "only non-zero-stake validators");
@@ -1126,7 +1714,7 @@ mod tests {
 
     #[test]
     fn unknown_message_type_rejected() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         let mut msg = msg::delegate(v, 100);
         msg[0] = 0xFF; // unknown type
@@ -1136,7 +1724,7 @@ mod tests {
 
     #[test]
     fn state_root_changes_after_delegate() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let root0 = staking.state_root();
         staking.handle(&ctx(), &msg::delegate(addr(1), 100)).unwrap();
         let root1 = staking.state_root();
@@ -1145,7 +1733,7 @@ mod tests {
 
     #[test]
     fn state_root_changes_after_slash() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let root0 = staking.state_root();
@@ -1156,7 +1744,7 @@ mod tests {
 
     #[test]
     fn custom_unbonding_period() {
-        let staking = StakingModule::new().with_unbonding_period(10);
+        let staking = setup(&[1]).with_unbonding_period(10);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.begin_block(Height::new(5));
@@ -1167,7 +1755,7 @@ mod tests {
 
     #[test]
     fn key_change_stores_pending_key() {
-        let staking = StakingModule::new();
+        let staking = setup(&[0]);
         let v = addr(0); // sender is addr(0) in ctx()
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let new_key = vec![0xAA; 48];
@@ -1183,7 +1771,7 @@ mod tests {
 
     #[test]
     fn key_change_rejects_wrong_sender() {
-        let staking = StakingModule::new();
+        let staking = setup(&[1]);
         let v = addr(1); // sender is addr(0), but validator is addr(1)
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let new_key = vec![0xAA; 48];
@@ -1193,7 +1781,7 @@ mod tests {
 
     #[test]
     fn key_change_rejects_unknown_validator() {
-        let staking = StakingModule::new();
+        let staking = setup(&[]);
         let v = addr(0); // sender is addr(0) but no stake delegated
         let new_key = vec![0xAA; 48];
         let result = staking.handle(&ctx(), &msg::key_change(v, &new_key));
@@ -1202,7 +1790,7 @@ mod tests {
 
     #[test]
     fn key_change_rejects_wrong_key_length() {
-        let staking = StakingModule::new();
+        let staking = setup(&[0]);
         let v = addr(0);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let short_key = vec![0xAA; 32]; // not 48 bytes

@@ -200,7 +200,15 @@ impl Node {
         // this, only bank txs paid fees — exchange/perps/core txs
         // ran free.
         executor.set_fee_module(framework::module_id::BANK);
-        executor.register_module(Arc::new(staking::StakingModule::new()));
+        // Staking is bank-backed: delegation debits the delegator
+        // into the bonded pool, unbonding refunds from it. Register
+        // the devnet sender/validator identity so self-delegation
+        // (e.g. the key-change keep-alive delegate) has a registered
+        // target.
+        let staking_module = staking::StakingModule::new();
+        staking_module.set_bank(bank.clone());
+        staking_module.register_validator(primitives::Address([0u8; 20]));
+        executor.register_module(Arc::new(staking_module));
         // Register the exchange module with a default spot market
         // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
         // exchange is wired to the bank for quote-currency settlement.
@@ -264,6 +272,10 @@ impl Node {
             Arc::new(evm::EvmModule::new(1, 7_000_000_000))
         };
         evm_module.fund_account_for_test(&primitives::Address([0u8; 20]), u128::MAX);
+        // Canonical preinstalls (CREATE2 factory, Multicall3, Permit2,
+        // singleton factories) — Foundry/Hardhat/Safe tooling assumes
+        // they exist at fixed addresses on every EVM chain.
+        evm_module.install_preinstalls();
         evm_module.set_native_modules(Some(exchange), Some(perps));
         executor.register_module(evm_module.clone());
         let app: Arc<Executor> = Arc::new(executor);

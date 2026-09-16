@@ -12686,3 +12686,142 @@ stubs.
 `cargo test --workspace`: **1194 passed, 0 failed**. New coverage:
 evm history/call/estimate unit + integration tests; rpc parity
 suite (12); gossip dedup exercised via devnet path.
+
+---
+
+## 2026-10-04 — Session: P1 — mempool replacement, genesis preinstalls, bank-backed staking + precompile side effects
+
+### Mempool: geth/legacypool-style same-nonce replacement
+
+`Mempool::insert` now detects same-sender/same-nonce submissions and
+applies geth's replacement rule instead of silently overwriting the
+sender-queue entry (which orphaned the old tx in `by_hash`/`by_fee` —
+a memory leak — and let a *lower*-fee tx displace a higher-fee one):
+
+- Replacement requires a **≥10% fee bump** (`fee*11/10`, checked with
+  `u128` to avoid `u64` overflow on `fee*11`).
+- Equal, lower, or insufficiently bumped fees are rejected.
+- The old entry is removed from **all** indexes (`by_hash`,
+  `by_sender`, `by_fee`) before the replacement inserts.
+- Replacement is allowed even when the pool is full — it displaces an
+  existing entry rather than adding one.
+
+Tests cover underpriced/equal/lower rejection, successful bump,
+full-pool replacement, and normal different-nonce insertion
+(24 mempool tests green).
+
+### Genesis preinstalls (`modules/evm/src/preinstalls.rs`)
+
+Canonical Ethereum singleton contracts are installed at genesis via
+`genesis_insert_account`, so Foundry/Hardhat/Safe tooling works
+unchanged. Bytecode was fetched from three independent mainnet RPCs
+and cross-checked (the CREATE2 factory's 69-byte runtime verified
+against EIP-7997's specified code; its nonce must be 1):
+
+| Contract | Address | Runtime bytes |
+|---|---|---|
+| CREATE2 deploy proxy (EIP-7997) | `0x4e59b448…b4956c` | 69 |
+| EIP-2470 singleton factory | `0xce0042B8…ffdcf9f` | 616 |
+| Multicall3 | `0xcA11bde0…76CA11` | 7 616 |
+| Permit2 | `0x00000000…aC78BA3` | 18 304 |
+| Safe proxy factory | `0x914d7Fec…45643d7` | 138 (proxy) |
+
+Installed in `Node::assemble` and the devnet executor **before**
+`evm.alloc`, so a user alloc can still intentionally override.
+Functional test deploys a real contract through the CREATE2 factory
+preinstall and asserts the deployed code at the derived address.
+
+### Staking: bank-backed delegation accounting (security fix)
+
+The preexisting `handle_delegate`/`handle_undelegate` were insecure in
+a way that mattered the moment an EVM precompile touched them:
+
+- `delegate` inflated validator stake with **no delegator debit** —
+  free stake inflation (the cosmos-evm precompile exploit class).
+- `undelegate` reduced aggregate stake with **no ownership check** —
+  anyone could unbond anyone.
+- `claim_reward` let anyone burn any validator's accrued rewards.
+
+Rewrote the module around a `BONDED_POOL` account (module-internal
+`oxide/staking/pool` address, 20-byte padded):
+
+- `delegate_for(delegator, validator, amount)`: requires the validator
+  be registered; debits `delegator → BONDED_POOL` via bank *before*
+  recording stake; records per-`(delegator, validator)` delegations.
+- `undelegate_for`: requires the caller's own delegation ≥ amount;
+  drops stake immediately and queues an `UnbondingEntry`; at
+  `completion_height` `end_block` pays `BONDED_POOL → delegator`.
+- `handle_slash`: pro-rata reduction across the validator's
+  delegations; burns exactly what was removed (genesis/governance
+  stake is unattributed — not pool-backed — and is slashed without
+  burning nonexistent pool funds).
+- `claim_reward`: `sender == validator` required (key_change model);
+  rewards mint lazily at claim (issuance authorized by the reward
+  schedule, never touching the pool).
+- `register_validator` (doc-hidden, zero-stake) for tests/devnet;
+  `genesis_register_validator` keeps unattributed genesis stake.
+- `undo_delegate`/`undo_undelegate` — exact inverses used by the EVM
+  frame journal.
+
+All three assembly sites wire `set_bank`: `Node::assemble` (registers
+`Address::ZERO` for the devnet self-delegate keep-alive), the
+tcp-multinode executor, and `oxide-validator` (genesis/devnet
+validator registration unchanged).
+
+### EVM native journal — frame-scoped undo for precompile side effects
+
+`modules/evm/src/native_journal.rs` implements geth `StateDB`-journal
+semantics for state that lives *outside* revm's journal:
+
+- `NativeJournal { depth, ops }` — per-transaction, shared
+  `Rc<RefCell>` between `NativePrecompiles` and
+  `NativeJournalInspector` (each tx builds its own; `Rc` never crosses
+  the parallel executor's threads).
+- `frame_start`/`frame_end` increment/decrement depth; a failing
+  frame pops and replays undos tagged ≥ its depth (reverse order); a
+  succeeding frame retags its ops to `depth − 1` — the exact
+  merge-to-parent semantics of `checkpoint_commit`.
+- The execution paths moved from `transact`/`transact_commit` to
+  `inspect_tx`/`inspect_tx_commit` — revm's identical pipeline plus
+  hooks — so the inspector sees every frame boundary, including
+  precompile frames (which never enter the interpreter loop).
+- The journal is drained after every tx; committed ops are the
+  depth-0 survivors.
+
+### `0x0C_*` staking precompiles now have real side effects
+
+- `0x0C_01` delegate, `0x0C_02` undelegate. Input
+  `[validator:20B][amount:32B]`; amount is **native units** (the
+  `u64` bank/staking ledger unit), not wei — `> u64::MAX` reverts.
+- Identity is `msg.sender` (`CallInputs.caller`) — `DELEGATECALL`
+  preserves the real caller, matching cosmos-evm semantics.
+- Guards: `STATICCALL`, read-only simulation (`eth_call`/
+  `eth_estimateGas`), and value-transferring calls all revert; an
+  unwired staking module reverts (never fake-success).
+- The precompile calls `delegate_for`/`undelegate_for` — the same
+  invariant path as native messages — then records the undo in the
+  journal before reporting success.
+
+### Tests
+
+- `staking`: 31 tests — delegation ownership, pool conservation,
+  unbonding refund, slash proportional burn, insufficient-balance
+  rejection, non-delegator rejection (the old exploit, now pinned).
+- `evm` precompiles: wired/unwired/static/foreign-delegation unit
+  tests.
+- `evm` end-to-end (`modules/evm/src/lib.rs` tests): a genesis-
+  installed contract `CALL`s the delegate precompile then `REVERT`s —
+  assert stake, delegation, pool, and delegator balance are all
+  untouched. Plus the success variant and the `call_read` read-only
+  guard.
+- `cargo test --workspace`: all suites green; `clippy -D warnings`
+  and `fmt` clean.
+
+### Benchmarks (`cargo bench -p evm --bench tps_rw`)
+
+The inspect path's frame hooks cost is below noise on every gate:
+serial transfer 36–38 µs (vs ~35 µs baseline — within run-to-run
+noise on this machine); all parallel/conflict groups within noise or
+improved (machine variance dominates). No per-tx regression to pay
+for — `frame_start`/`frame_end` are two counter ops per frame and the
+journal stays empty unless a `0x0C_*` call actually runs.

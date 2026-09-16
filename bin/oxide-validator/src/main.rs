@@ -819,7 +819,8 @@ fn build_devnet_executor(
                 .mint(&primitives::Address([sender_byte; 20]), genesis_config.genesis_balance);
         }
     }
-    executor.register_module(Arc::new(bank_module));
+    let bank = Arc::new(bank_module);
+    executor.register_module(bank.clone());
     // The bank collects fees for all native-module txs — without
     // this only bank txs paid (other modules ran free).
     executor.set_fee_module(framework::module_id::BANK);
@@ -844,6 +845,11 @@ fn build_devnet_executor(
             staking_module.genesis_register_validator(addr, 1_000_000);
         }
     }
+    // Delegation is bank-backed: `delegate` debits the delegator into
+    // the bonded pool, unbonding refunds from it. Genesis stake
+    // registered above is unattributed (declaration stake, not
+    // pool-backed) and cannot be undelegated.
+    staking_module.set_bank(bank);
     executor.register_module(Arc::new(staking_module));
 
     // EVM module: registered in devnet mode too so `eth_*` RPCs serve
@@ -851,6 +857,9 @@ fn build_devnet_executor(
     // executes. Uses the RPC-config chain ID/base fee so the
     // advertised and enforced parameters agree.
     let evm_module = Arc::new(evm::EvmModule::new(rpc_config.chain_id, rpc_config.base_fee));
+    // Canonical preinstalls first — a user `alloc` entry below can
+    // still intentionally override a preinstall address.
+    evm_module.install_preinstalls();
     // Apply the genesis `alloc` map (Ethereum `genesis.json`
     // convention): balances, nonces, code, and storage for
     // pre-funded accounts and preinstalled contracts.

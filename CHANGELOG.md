@@ -12,6 +12,52 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Bank-backed staking + real `0x0C_*` precompile side effects (P1)**
+  (`modules/staking`, `modules/evm`)
+  - `delegate` now debits the delegator into a bonded-pool account and
+    records per-`(delegator, validator)` delegations; `undelegate`
+    requires owning the delegation and queues an unbonding entry that
+    pays out at `completion_height`; `slash` burns pro-rata across
+    real delegations; `claim_reward` is validator-only and mints at
+    claim. Previously stake inflated for free and anyone could unbond
+    or burn anyone's rewards — wiring a precompile to that would have
+    been the cosmos-evm exploit class.
+  - `0x0C_01` (delegate) and `0x0C_02` (undelegate) EVM precompiles
+    now perform the real staking operation for `msg.sender` through
+    the same invariant-checked path as native messages.
+  - **In plain words:** contracts can now stake and unstake from
+    Solidity/EVM — and if a contract call reverts, the stake change
+    reverts with it, exactly like a state write.
+
+- **EVM native journal — frame-scoped undo for precompile side
+  effects** (`modules/evm/src/native_journal.rs`)
+  - Mutating native precompiles journal each mutation with an undo
+    closure tagged by call depth; a reverted frame replays its undos,
+    a successful frame merges them into the parent — geth StateDB
+    journal semantics applied to non-EVM state.
+  - **In plain words:** an EVM call that fails can never leave a
+    half-applied staking change behind.
+
+- **Genesis preinstalls** (`modules/evm/src/preinstalls.rs`)
+  - CREATE2 deploy proxy (EIP-7997), EIP-2470 singleton factory,
+    Multicall3, Permit2, and the Safe proxy factory are installed at
+    their canonical mainnet addresses at genesis.
+  - **In plain words:** Foundry/Hardhat/Safe contracts deploy to the
+    same addresses as on Ethereum, and contracts that assume
+    Multicall3/Permit2 just work.
+
+- **Mempool same-nonce replacement** (`crates/mempool`)
+  - Resubmitting a transaction for a sender+nonce already in the pool
+    requires a ≥10% fee bump (geth legacypool rule); the old entry is
+    removed from every index. Lower- or equal-fee resubmissions are
+    rejected, and replacement works even when the pool is full.
+  - **In plain words:** "speed up" works — bump the fee and the new
+    transaction replaces the old one instead of silently corrupting
+    the pool.
+
+
+### Added
+
 - **EVM execution history + real `eth_*` RPC surface (P0 parity)**
   (`modules/evm/src/history.rs`, `crates/rpc`, `bin/oxide-validator`)
   - `History` retains a bounded window (8192 blocks) of executed

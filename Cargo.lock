@@ -1749,6 +1749,7 @@ dependencies = [
  "primitives",
  "rayon",
  "revm",
+ "staking",
  "storage",
  "types",
 ]
@@ -4230,6 +4231,7 @@ dependencies = [
 name = "staking"
 version = "0.1.0"
 dependencies = [
+ "bank",
  "codec",
  "crypto",
  "executor",

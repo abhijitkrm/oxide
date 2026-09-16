@@ -172,6 +172,19 @@ impl FeeDensity {
     }
 }
 
+/// Minimum fee bump required to replace a pending same-nonce tx.
+///
+/// geth's legacypool uses `PriceBumpPercent = 10`: a replacement must
+/// pay at least 110% of the displaced tx's fee. Without a bump floor,
+/// an attacker could replace a victim's pending tx with a same-nonce
+/// tx paying 1 wei less, and wallets' "speed up" resubmits would
+/// randomly lose to the old entry.
+///
+/// Compared as `new_fee * 10 >= old_fee * 11` in `u128` (exact, no
+/// division truncation, no overflow at u64 fee range).
+const REPLACEMENT_BUMP_NUMERATOR: u128 = 11;
+const REPLACEMENT_BUMP_DENOMINATOR: u128 = 10;
+
 /// Error returned by `submit`. A rejected transaction is acknowledged
 /// but not stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +195,10 @@ pub enum MempoolError {
     PoolFull,
     /// The transaction bytes are malformed (couldn't parse sender/nonce/fee).
     Malformed,
+    /// A same-nonce tx from this sender is already pending and the
+    /// replacement's fee is below the required bump (≥110% of the
+    /// displaced fee — geth legacypool `ErrReplaceUnderpriced`).
+    ReplacementUnderpriced,
 }
 
 /// A simple v0 transaction format: `[sender: 20 bytes][nonce: 8 bytes
@@ -260,6 +277,32 @@ impl Mempool {
         let (sender, nonce, fee) = parse_tx(bytes).ok_or(MempoolError::Malformed)?;
         let size = bytes.len() as u64;
         let density = FeeDensity { fee, size };
+
+        // Same-nonce replacement (geth legacypool semantics): if this
+        // sender already has a pending tx at this nonce, the new tx
+        // may replace it only if its fee is at least 110% of the old
+        // one. The displaced tx is removed from every index — the
+        // previous implementation just overwrote the `by_sender` slot,
+        // leaking the old entry in `by_hash`/`by_fee` forever (it kept
+        // counting toward `max_entries` and could be "evicted" as a
+        // ghost) and letting a *lower*-fee resubmit shadow a
+        // higher-fee tx.
+        if let Some(&old_hash) = self.by_sender.get(&sender).and_then(|q| q.get(&nonce)) {
+            if let Some(old) = self.by_hash.get(&old_hash) {
+                let bumped = u128::from(fee) * REPLACEMENT_BUMP_DENOMINATOR
+                    >= u128::from(old.fee) * REPLACEMENT_BUMP_NUMERATOR;
+                if !bumped {
+                    return Err(MempoolError::ReplacementUnderpriced);
+                }
+                // The bump check passed — displace the old entry from
+                // all indices. A replacement frees its own slot, so
+                // the capacity check below sees the post-removal size.
+                self.remove(&old_hash);
+            }
+            // If `by_sender` holds a hash `by_hash` doesn't know
+            // (inconsistent state), the `insert` below overwrites the
+            // slot — no orphan is created.
+        }
 
         // If the pool is full, try to evict the lowest-fee entry —
         // but only if the new tx has a higher fee than the lowest.
@@ -488,10 +531,10 @@ impl Mempool {
     }
 
     /// Remove a single transaction by hash from all indices. This is
-    /// the per-tx removal path — used when a specific tx needs to be
+    /// the per-tx removal path — used by same-nonce replacement in
+    /// [`submit`](Self::submit) and when a specific tx needs to be
     /// dropped (e.g. after a failed proposal or mempool eviction).
     /// [`select`](Self::select) removes in bulk for the block path.
-    #[allow(dead_code)]
     fn remove(&mut self, hash: &Hash) {
         if let Some(entry) = self.by_hash.remove(hash) {
             let density = FeeDensity { fee: entry.fee, size: entry.size };
@@ -818,6 +861,89 @@ mod tests {
         // Next select drains the spammer's remaining nonce chain.
         let selected2 = pool.select(1 << 20);
         assert_eq!(selected2.len(), 2, "next block takes the next 2 capped txs");
+    }
+
+    // ---- Same-nonce replacement (geth legacypool price-bump) ----
+
+    /// A same-nonce resubmit with a ≥110% fee replaces the pending
+    /// tx — the wallet "speed up" path. The displaced tx must leave
+    /// every index: `by_hash` (len/dedup), `by_fee` (eviction order),
+    /// and `by_sender` (selection).
+    #[test]
+    fn replacement_with_bump_displaces_old_tx() {
+        let mut pool = Mempool::new(100);
+        let old_tx = build_tx(addr(1), 0, 100, &[1]);
+        let old_hash = Hasher::hash_one(Domain::Transaction, old_tx.as_bytes());
+        pool.submit(old_tx).unwrap();
+        // Same nonce, fee 110 ≥ 100 × 1.1 → replaces.
+        pool.submit(build_tx(addr(1), 0, 110, &[2])).unwrap();
+        assert_eq!(pool.len(), 1, "replaced tx must not linger in by_hash");
+        assert!(!pool.contains(&old_hash), "displaced tx must leave dedup index");
+        let selected = pool.select(1 << 20);
+        assert_eq!(selected.len(), 1);
+        let (_, _, fee) = parse_tx(selected[0].as_bytes()).unwrap();
+        assert_eq!(fee, 110, "the replacement must be selected");
+    }
+
+    /// A same-nonce resubmit below the bump floor is rejected and the
+    /// original stays — without this, an attacker could shadow a
+    /// victim's pending tx with a cheaper one.
+    #[test]
+    fn replacement_underpriced_is_rejected() {
+        let mut pool = Mempool::new(100);
+        pool.submit(build_tx(addr(1), 0, 100, &[1])).unwrap();
+        // Fee 109 < 110 required → rejected, original survives.
+        assert_eq!(
+            pool.submit(build_tx(addr(1), 0, 109, &[2])),
+            Err(MempoolError::ReplacementUnderpriced)
+        );
+        assert_eq!(pool.len(), 1);
+        let selected = pool.select(1 << 20);
+        let (_, _, fee) = parse_tx(selected[0].as_bytes()).unwrap();
+        assert_eq!(fee, 100, "original tx must still be pending");
+    }
+
+    /// Equal-fee and lower-fee resubmits are also rejected.
+    #[test]
+    fn replacement_equal_and_lower_fee_rejected() {
+        let mut pool = Mempool::new(100);
+        pool.submit(build_tx(addr(1), 0, 100, &[1])).unwrap();
+        assert_eq!(
+            pool.submit(build_tx(addr(1), 0, 100, &[2])),
+            Err(MempoolError::ReplacementUnderpriced)
+        );
+        assert_eq!(
+            pool.submit(build_tx(addr(1), 0, 50, &[3])),
+            Err(MempoolError::ReplacementUnderpriced)
+        );
+        assert_eq!(pool.len(), 1);
+    }
+
+    /// Replacement doesn't consume an extra slot: a replacement in a
+    /// full pool succeeds even though the pool is at capacity (the
+    /// displaced tx frees the slot it occupied).
+    #[test]
+    fn replacement_works_in_full_pool() {
+        let mut pool = Mempool::new(1);
+        pool.submit(build_tx(addr(1), 0, 100, &[1])).unwrap();
+        assert!(pool.submit(build_tx(addr(1), 0, 200, &[2])).is_ok());
+        assert_eq!(pool.len(), 1, "pool size unchanged by replacement");
+    }
+
+    /// A different nonce from the same sender is NOT a replacement —
+    /// it inserts alongside, preserving the nonce chain.
+    #[test]
+    fn different_nonce_inserts_normally() {
+        let mut pool = Mempool::new(100);
+        pool.submit(build_tx(addr(1), 0, 100, &[1])).unwrap();
+        // Same sender, nonce 1, lower fee — not a replacement.
+        pool.submit(build_tx(addr(1), 1, 10, &[2])).unwrap();
+        assert_eq!(pool.len(), 2);
+        let selected = pool.select(1 << 20);
+        assert_eq!(selected.len(), 2);
+        let (_, n0, _) = parse_tx(selected[0].as_bytes()).unwrap();
+        let (_, n1, _) = parse_tx(selected[1].as_bytes()).unwrap();
+        assert_eq!((n0, n1), (0, 1), "nonce chain preserved");
     }
 
     /// Prove the cap is enforced mid-chain: the nonce chain stops

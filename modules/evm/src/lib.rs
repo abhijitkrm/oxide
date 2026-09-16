@@ -70,8 +70,10 @@ use rayon::prelude::*;
 
 pub mod fee;
 pub mod history;
+pub mod native_journal;
 mod persist;
 pub mod precompiles;
+pub mod preinstalls;
 pub mod receipts;
 pub mod spec;
 pub mod trie;
@@ -84,8 +86,8 @@ use revm::context::result::{ExecutionResult, Output, SuccessReason};
 use revm::context_interface::result::ResultGas;
 use revm::database::CacheDB;
 use revm::database_interface::{DatabaseRef, EmptyDB};
-use revm::handler::{ExecuteCommitEvm, ExecuteEvm, MainContext};
-use revm::inspector::NoOpInspector;
+use revm::handler::{ExecuteCommitEvm, MainContext};
+use revm::inspector::InspectEvm;
 use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
 use std::sync::Arc;
@@ -395,6 +397,11 @@ pub struct EvmModule {
     /// When `Some`, EVM contracts can read perps positions, mark
     /// prices, and insurance fund balance.
     perps: Mutex<Option<Arc<perps::PerpsModule>>>,
+    /// Optional staking module handle for the `0x0C_*` mutating
+    /// precompiles (delegate/undelegate). Mutations apply through the
+    /// module's own invariant-checked path and are journaled per
+    /// frame via [`native_journal`] — a reverted call undoes them.
+    staking: Mutex<Option<Arc<staking::StakingModule>>>,
     /// Executed-block history for Ethereum JSON-RPC queries
     /// (`eth_getTransactionByHash`, `eth_getTransactionReceipt`,
     /// `eth_getLogs`, `eth_feeHistory`, …). Every executed tx records
@@ -435,6 +442,7 @@ impl EvmModule {
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
             perps: Mutex::new(None),
+            staking: Mutex::new(None),
             history: Mutex::new(history::History::new(history::DEFAULT_HISTORY_BLOCKS)),
         }
     }
@@ -461,6 +469,7 @@ impl EvmModule {
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
             perps: Mutex::new(None),
+            staking: Mutex::new(None),
             history: Mutex::new(history::History::new(history::DEFAULT_HISTORY_BLOCKS)),
         }
     }
@@ -501,6 +510,7 @@ impl EvmModule {
             cached_state_root: Mutex::new(None),
             exchange: Mutex::new(None),
             perps: Mutex::new(None),
+            staking: Mutex::new(None),
             history: Mutex::new(history::History::new(history::DEFAULT_HISTORY_BLOCKS)),
         };
         // Load initial state from the backend into the CacheDB, then
@@ -532,6 +542,19 @@ impl EvmModule {
     ) {
         *self.exchange.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = exchange;
         *self.perps.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = perps;
+    }
+
+    /// Wire the staking module for the `0x0C_*` mutating
+    /// precompiles. Mutations go through `delegate_for`/
+    /// `undelegate_for` — the same invariant-checked path as native
+    /// staking messages — and are journaled for frame-scoped revert
+    /// (see [`native_journal`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn set_staking(&self, staking: Arc<staking::StakingModule>) {
+        *self.staking.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(staking);
     }
 
     /// Build a `NativeMarketReader` from the wired exchange and
@@ -572,7 +595,7 @@ impl EvmModule {
             revm::context::Journal<&'db mut DB>,
             (),
         >,
-        NoOpInspector,
+        native_journal::NativeJournalInspector,
         revm::handler::instructions::EthInstructions<
             revm::interpreter::interpreter::EthInterpreter,
             revm::context::Context<
@@ -610,7 +633,7 @@ impl EvmModule {
             revm::context::Journal<&'db mut DB>,
             (),
         >,
-        NoOpInspector,
+        native_journal::NativeJournalInspector,
         revm::handler::instructions::EthInstructions<
             revm::interpreter::interpreter::EthInterpreter,
             revm::context::Context<
@@ -666,8 +689,28 @@ impl EvmModule {
             revm::interpreter::interpreter::EthInterpreter,
             _,
         >::new_mainnet_with_spec(self.spec);
-        let precompiles = precompiles::NativePrecompiles::new(self.spec, reader);
-        revm::context::Evm::new_with_inspector(ctx, NoOpInspector, instruction, precompiles)
+        // Frame-scoped undo journal for native mutations (staking
+        // delegate/undelegate): the precompile records an undo op per
+        // mutation, the inspector replays them on frame revert — the
+        // geth `StateDB` journal semantics for non-EVM state.
+        let journal =
+            std::rc::Rc::new(std::cell::RefCell::new(native_journal::NativeJournal::new()));
+        let mut precompiles =
+            precompiles::NativePrecompiles::new(self.spec, reader, journal.clone());
+        if let Some(staking) =
+            self.staking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        {
+            precompiles = precompiles.with_staking(staking);
+        }
+        if sim {
+            precompiles = precompiles.read_only();
+        }
+        revm::context::Evm::new_with_inspector(
+            ctx,
+            native_journal::NativeJournalInspector::new(journal),
+            instruction,
+            precompiles,
+        )
     }
 
     /// The current EIP-1559 base fee (wei per gas).
@@ -768,9 +811,14 @@ impl EvmModule {
         // third accounts — those accounts were updated in the
         // CacheDB but never flushed or reflected in the incremental
         // state root, diverging durable state from in-memory state.
+        // `inspect_tx` is `transact` plus inspector hooks — the
+        // native journal inspector replays precompile side-effect
+        // undos when a frame reverts. Result/state semantics are
+        // identical.
         let result_and_state = evm
-            .transact(tx)
+            .inspect_tx(tx)
             .map_err(|e| ExecError::ModuleRejected(format!("evm transact failed: {e:?}")))?;
+        evm.precompiles.clear_native_journal();
 
         // Phase D: track touched accounts for incremental flush.
         // `state` contains EVERY account revm modified (including
@@ -1577,15 +1625,17 @@ impl EvmModule {
                 // selfdestruct beneficiaries — not just the
                 // top-level caller/to/created/coinbase set that
                 // under-tracked durable state.
-                let result_and_state = match evm.transact(tx) {
+                let result_and_state = match evm.inspect_tx(tx) {
                     Ok(rs) => rs,
                     Err(e) => {
+                        evm.precompiles.clear_native_journal();
                         results.push(Err(ExecError::ModuleRejected(format!(
                             "evm transact failed: {e:?}"
                         ))));
                         continue;
                     }
                 };
+                evm.precompiles.clear_native_journal();
                 // Track the exact modified-account set locally
                 // (no lock per tx), then commit.
                 local_touched.extend(result_and_state.state.keys().copied());
@@ -2026,7 +2076,8 @@ impl EvmModule {
                     let result = {
                         let mut evm =
                             self.build_evm(&mut db, coinbase, block_number, block_timestamp);
-                        let rs = evm.transact(tx_env);
+                        let rs = evm.inspect_tx(tx_env);
+                        evm.precompiles.clear_native_journal();
                         if let Ok(ref rs) = rs {
                             evm.commit(rs.state.clone());
                         }
@@ -2274,13 +2325,14 @@ impl EvmModule {
                     {
                         let mut evm =
                             self.build_evm(&mut *db, coinbase, block_number, block_timestamp);
-                        match evm.transact(tx_env) {
+                        match evm.inspect_tx(tx_env) {
                             Ok(rs) => {
                                 let r = rs.result;
                                 for addr in rs.state.keys() {
                                     all_touched.insert(*addr);
                                     committed_touched.insert(*addr);
                                 }
+                                evm.precompiles.clear_native_journal();
                                 evm.commit(rs.state);
                                 reexec_results.insert(idx, Ok(r));
                             }
@@ -3482,9 +3534,12 @@ impl EvmModule {
         let mut evm =
             self.build_evm_with_mode(&mut *db, coinbase, block_number, block_timestamp, true);
         // No `commit`: simulation state dies with the EvmState.
-        evm.transact(tx_env)
+        let out = evm
+            .inspect_tx(tx_env)
             .map(|rs| rs.result)
-            .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))))
+            .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
+        evm.precompiles.clear_native_journal();
+        out
     }
 
     /// Lock and return the executed-block history for RPC queries.
@@ -3611,6 +3666,37 @@ impl EvmModule {
         }
         drop(db_guard);
         self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(evm_addr);
+    }
+
+    /// Install the canonical preinstalled contracts (CREATE2 factory,
+    /// singleton factories, Multicall3, Permit2) at their well-known
+    /// addresses.
+    ///
+    /// Must be called at genesis assembly, before the first
+    /// `begin_block` — each entry is inserted via
+    /// [`genesis_insert_account`](Self::genesis_insert_account) with
+    /// nonce 1 (matching the keyless deployments on other chains, so
+    /// `CREATE`-derived addresses stay reproducible) and zero balance.
+    /// Idempotent by construction: re-inserting overwrites with the
+    /// same values. A user-supplied `genesis.json` `alloc` entry at a
+    /// preinstall address wins only if applied *after* this call —
+    /// callers apply alloc afterwards so genesis can intentionally
+    /// override (e.g. a dev chain seeding a different factory).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a mutex is poisoned or the compile-time preinstall
+    /// table is malformed.
+    pub fn install_preinstalls(&self) {
+        for p in preinstalls::PREINSTALLS {
+            self.genesis_insert_account(
+                &preinstalls::preinstall_address(p),
+                0,
+                p.nonce,
+                preinstalls::preinstall_code(p),
+                Vec::new(),
+            );
+        }
     }
 
     /// Mark an account as touched for the current block — the
@@ -6235,5 +6321,223 @@ mod tests {
         let h = m.history();
         let block = h.block(1).expect("block sealed");
         assert_eq!(block.txs.len(), 1, "only the executed tx is in history");
+    }
+
+    // ---- Preinstalls ----
+
+    /// Every preinstall lands at its canonical address with nonce 1
+    /// and bytecode byte-identical to the mainnet deployment.
+    #[test]
+    fn preinstalls_install_all_contracts() {
+        let m = make_module();
+        m.install_preinstalls();
+        for p in preinstalls::PREINSTALLS {
+            let addr = preinstalls::preinstall_address(p);
+            let code = m.code(&addr);
+            assert_eq!(
+                code,
+                preinstalls::preinstall_code(p),
+                "{} must have its canonical runtime code",
+                p.name
+            );
+            assert_eq!(m.nonce(&addr), 1, "{} must carry nonce 1", p.name);
+        }
+    }
+
+    /// The CREATE2 factory actually works end-to-end: send a real tx
+    /// with `salt ++ initcode`, get the deployed address back in the
+    /// receipt-returned... (the factory returns it; we verify by
+    /// reading the deployed code from state).
+    #[test]
+    fn preinstalled_create2_factory_deploys() {
+        let (pk, caller) = test_keypair();
+        let m = make_module();
+        m.install_preinstalls();
+        fund(&m, &caller);
+        m.begin_block(Height::new(1));
+
+        // Initcode that returns RETURN42_RUNTIME as the deployed code:
+        // `PUSH1 len PUSH1 offset PUSH1 0 CODECOPY PUSH1 len PUSH1 0
+        // RETURN` — offset 0x0c = the 12-byte prefix length.
+        let runtime: &[u8] = &RETURN42_RUNTIME;
+        let rt_len = u8::try_from(runtime.len()).expect("test runtime < 256 bytes");
+        let mut initcode =
+            vec![0x60, rt_len, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, rt_len, 0x60, 0x00, 0xf3];
+        initcode.extend_from_slice(runtime);
+
+        // Factory calldata: salt (32B) ++ initcode.
+        let factory = preinstalls::preinstall_address(&preinstalls::PREINSTALLS[0]);
+        let mut calldata = [0u8; 32].to_vec();
+        calldata.extend_from_slice(&initcode);
+        let to = tx::TxKind::Call(revm::primitives::Address::from_slice(&factory.0));
+        let msg = signed_tx(&pk, 0, to, &calldata);
+        let res = m.handle(&dummy_ctx(), &msg);
+        assert!(res.is_ok(), "factory call must succeed: {res:?}");
+
+        // The deployed address is derivable: keccak256(0xff ++
+        // factory ++ salt ++ keccak256(initcode))[12:].
+        let code_hash = alloy_primitives::keccak256(&initcode);
+        let mut preimage = vec![0xffu8];
+        preimage.extend_from_slice(&factory.0);
+        preimage.extend_from_slice(&[0u8; 32]);
+        preimage.extend_from_slice(code_hash.as_slice());
+        let deployed = alloy_primitives::keccak256(&preimage);
+        let deployed_addr = Address(deployed[12..].try_into().unwrap());
+        assert_eq!(
+            m.code(&deployed_addr),
+            runtime.to_vec(),
+            "CREATE2-deployed contract must exist at the derived address"
+        );
+    }
+
+    /// Runtime bytecode: `CALL` the staking-delegate precompile
+    /// (`0x0C_01`) with `[validator:20B][amount:32B]` calldata built
+    /// in memory, then either `STOP` (keep the delegation) or
+    /// `REVERT` (the delegation must be undone by the native journal).
+    fn delegate_then_revert_runtime(validator: [u8; 20], amount: u64, revert: bool) -> Vec<u8> {
+        let precompile = precompiles::precompile_address(
+            precompiles::STAKING_DELEGATE.0,
+            precompiles::STAKING_DELEGATE.1,
+        );
+        let mut code = Vec::new();
+        // mstore(0, validator << 96) — validator left-aligned at mem[0..20].
+        code.push(0x73); // PUSH20
+        code.extend_from_slice(&validator);
+        code.extend_from_slice(&[0x60, 0x60, 0x1b, 0x60, 0x00, 0x52]); // PUSH1 96 SHL PUSH1 0 MSTORE
+        // mstore(20, amount) — amount BE at mem[20..52].
+        code.push(0x67); // PUSH8
+        code.extend_from_slice(&amount.to_be_bytes());
+        code.extend_from_slice(&[0x60, 0x14, 0x52]); // PUSH1 20 MSTORE
+        // CALL(gas=0xffff, to=precompile, value=0, in=0..52, out=0..0).
+        code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00]); // out_size, out_offset
+        code.extend_from_slice(&[0x60, 0x34, 0x60, 0x00]); // in_size=52, in_offset=0
+        code.push(0x60);
+        code.push(0x00); // value=0
+        code.push(0x73); // PUSH20
+        code.extend_from_slice(precompile.as_bytes());
+        code.extend_from_slice(&[0x61, 0xff, 0xff]); // gas = 65535
+        code.push(0xf1); // CALL
+        code.push(0x50); // POP the success flag
+        if revert {
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]); // REVERT(0,0)
+        } else {
+            code.push(0x00); // STOP
+        }
+        code
+    }
+
+    /// A bank+staking pair wired into the module, with `contract`
+    /// funded on the bank side (it will be the delegator).
+    fn staking_wired_module(
+        contract: Address,
+        bank_balance: u64,
+    ) -> (EvmModule, Arc<staking::StakingModule>, Arc<bank::BankModule>) {
+        let m = make_module();
+        let bank = Arc::new(bank::BankModule::new());
+        bank.mint(&contract, bank_balance);
+        let staking_mod = Arc::new(staking::StakingModule::new());
+        staking_mod.set_bank(bank.clone());
+        m.set_staking(staking_mod.clone());
+        (m, staking_mod, bank)
+    }
+
+    #[test]
+    fn staking_delegate_precompile_applies_on_success() {
+        let (pk, caller) = test_keypair();
+        let contract = Address([0xC0; 20]);
+        let validator = Address([0xAA; 20]);
+        let (m, staking_mod, bank) = staking_wired_module(contract, 10_000);
+        staking_mod.register_validator(validator);
+        fund(&m, &caller);
+        m.genesis_insert_account(
+            &contract,
+            0,
+            0,
+            delegate_then_revert_runtime(validator.0, 1_000, false),
+            vec![],
+        );
+
+        m.begin_block(Height::new(1));
+        let to = tx::TxKind::Call(revm::primitives::Address::from_slice(&contract.0));
+        let msg = signed_tx(&pk, 0, to, &[]);
+        m.handle(&dummy_ctx(), &msg).expect("tx must be included");
+
+        assert_eq!(
+            staking_mod.delegation(&contract, &validator),
+            1_000,
+            "delegation must persist after a successful frame"
+        );
+        assert_eq!(staking_mod.stake(&validator), 1_000);
+        assert_eq!(bank.balance(&contract), 9_000, "delegator debited");
+        assert_eq!(bank.balance(&staking::BONDED_POOL), 1_000);
+        m.end_block(Height::new(1));
+    }
+
+    #[test]
+    fn staking_delegate_precompile_undone_on_revert() {
+        // The security property: a contract that delegates then
+        // reverts must leave NO trace in staking or bank — the native
+        // journal replays `undo_delegate` when the calling frame fails.
+        let (pk, caller) = test_keypair();
+        let contract = Address([0xC0; 20]);
+        let validator = Address([0xAA; 20]);
+        let (m, staking_mod, bank) = staking_wired_module(contract, 10_000);
+        staking_mod.register_validator(validator);
+        fund(&m, &caller);
+        m.genesis_insert_account(
+            &contract,
+            0,
+            0,
+            delegate_then_revert_runtime(validator.0, 1_000, true),
+            vec![],
+        );
+
+        m.begin_block(Height::new(1));
+        let to = tx::TxKind::Call(revm::primitives::Address::from_slice(&contract.0));
+        let msg = signed_tx(&pk, 0, to, &[]);
+        // The tx executes and is included (revert is a valid receipt),
+        // but its native side effects must be fully rolled back.
+        m.handle(&dummy_ctx(), &msg).expect("tx must be included");
+
+        assert_eq!(
+            staking_mod.delegation(&contract, &validator),
+            0,
+            "reverted frame must undo the delegation"
+        );
+        assert_eq!(staking_mod.stake(&validator), 0, "no stake may survive a revert");
+        assert_eq!(bank.balance(&contract), 10_000, "delegator refunded by the undo path");
+        assert_eq!(bank.balance(&staking::BONDED_POOL), 0, "pool unchanged");
+        m.end_block(Height::new(1));
+    }
+
+    #[test]
+    fn staking_delegate_precompile_rejects_static_and_sim() {
+        // eth_call must never touch native state: the same contract
+        // through `call_read` (read_only mode) gets a precompile
+        // revert, not a delegation.
+        let (_pk, caller) = test_keypair();
+        let contract = Address([0xC0; 20]);
+        let validator = Address([0xAA; 20]);
+        let (m, staking_mod, bank) = staking_wired_module(contract, 10_000);
+        staking_mod.register_validator(validator);
+        fund(&m, &caller);
+        m.genesis_insert_account(
+            &contract,
+            0,
+            0,
+            delegate_then_revert_runtime(validator.0, 1_000, false),
+            vec![],
+        );
+
+        m.begin_block(Height::new(1));
+        let req = call_req(revm::primitives::Address::from_slice(&contract.0), &[]);
+        let _ = m.call_read(&req); // outcome irrelevant; state is what matters
+        assert_eq!(
+            staking_mod.delegation(&contract, &validator),
+            0,
+            "read-only simulation must not mutate staking state"
+        );
+        assert_eq!(bank.balance(&staking::BONDED_POOL), 0);
+        m.end_block(Height::new(1));
     }
 }

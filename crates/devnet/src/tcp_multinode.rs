@@ -379,7 +379,15 @@ impl TcpMultiNodeDevnet {
             // The bank collects fees for all native-module txs —
             // without this only bank txs paid (other modules ran free).
             executor.set_fee_module(framework::module_id::BANK);
-            executor.register_module(Arc::new(staking::StakingModule::new()));
+            // Bank-backed staking: delegation debits the delegator
+            // into the bonded pool (no free stake inflation). The
+            // devnet validator identity `Address::ZERO` is registered
+            // so the key-change/validator-change keep-alive delegate
+            // has a registered target.
+            let staking_module = staking::StakingModule::new();
+            staking_module.set_bank(bank.clone());
+            staking_module.register_validator(primitives::Address::ZERO);
+            executor.register_module(Arc::new(staking_module));
             // Optionally register the exchange module backed by this
             // validator's bank. Each validator gets its own exchange
             // instance; state diverges during proposal but converges

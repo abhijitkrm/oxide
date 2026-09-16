@@ -23,6 +23,9 @@ framework = { workspace = true }
 exchange = { workspace = true }
 perps = { workspace = true }
 bank = { workspace = true }
+# staking: the `0x0C_*` precompiles delegate through the module's own
+# invariant-checked path; mutations are journaled per frame.
+staking = { workspace = true }
 revm = { workspace = true }
 storage = { workspace = true }
 # alloy-rlp: Ethereum RLP encoding for signed tx types (Phase A).
