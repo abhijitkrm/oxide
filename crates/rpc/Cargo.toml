@@ -49,6 +49,12 @@ revm = { workspace = true }
 # executor: the `Module` trait lives here — needed by tests that drive
 # `EvmModule::begin_block`/`end_block` to seal history entries.
 executor = { workspace = true }
+# tokio-tungstenite + futures-util: a real WebSocket client so the
+# `eth_subscribe` tests exercise the actual transport (upgrade,
+# frames, notifications) rather than the in-process dispatch shim.
+# MIT-licensed; same workspace pins the matcher uses.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 [lints]
 workspace = true

@@ -488,6 +488,22 @@ fn block_may_match(bloom: &[u8; 256], filter: &LogFilter) -> bool {
     true
 }
 
+impl LogFilter {
+    /// Check whether a single [`LogMatch`] satisfies this filter's
+    /// address OR-set and positional topic matchers.
+    ///
+    /// Block-range fields (`from_block`/`to_block`/`block_hash`) are
+    /// ignored: callers use this at subscription-publish time, where
+    /// the scan is already restricted to the newly finalized block.
+    /// A `block_hash`-only filter never matches a stream push — that
+    /// shape is only meaningful for `eth_getLogs` point queries.
+    #[must_use]
+    pub fn matches(&self, log: &LogMatch) -> bool {
+        (self.addresses.is_empty() || self.addresses.contains(&log.address))
+            && topics_match(self, &log.topics)
+    }
+}
+
 /// Per-log topic matching: position i of the filter constrains the
 /// log's topic i. A filter position beyond the log's topic count can
 /// only match when it is `Any`.

@@ -254,28 +254,8 @@ fn run_single_node() {
     // Create a shared latency recorder for the block pipeline and RPC.
     let recorder = Arc::new(metrics::Recorder::new());
 
-    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
-    // Wire the executor into the RPC so `eth_sendRawTransaction`
-    // decodes, wraps, and submits EVM transactions into the mempool.
-    rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: node.app_handle() }));
-    // Share the executor's EVM module with the RPC so `eth_call`,
-    // `eth_getBalance`, and the block/tx/receipt/log lookups serve
-    // the same state the executor is committing.
-    if let Some(evm_module) = node.evm_module_handle() {
-        rpc_server.set_evm(evm_module);
-    }
-    // Wire the executor into the RPC so `GET /snapshot` returns the
-    // codec-encoded state snapshot.
-    rpc_server
-        .set_snapshot_provider(Arc::new(ExecutorSnapshotProvider { executor: node.app_handle() }));
-    // Attach the latency recorder for RPC handler metrics.
-    rpc_server.set_recorder(recorder.clone());
-    // Seed the metrics with the current block height and mempool size.
-    if let Some(h) = height {
-        rpc_server.set_block_height(h.value());
-    }
-    rpc_server.set_mempool_size(0);
-    let http_server = rpc::server::HttpServer::new(rpc_server, rpc_config.listen_addr.clone());
+    let (rpc_shared, http_server) =
+        build_single_node_rpc(&node, &rpc_config, height, recorder.clone());
 
     // Build a single tokio runtime for the consensus driver, HTTP
     // server, and signal handling.
@@ -286,8 +266,12 @@ fn run_single_node() {
         // Start the autonomous consensus driver. This continuously
         // drives the consensus engine in a background task,
         // finalizing blocks as transactions arrive.
-        let consensus_driver = driver::ConsensusDriver::with_defaults();
+        let mut consensus_driver = driver::ConsensusDriver::with_defaults();
         let driver_metrics = consensus_driver.metrics();
+        consensus_driver.set_block_observer(Arc::new(move |height: u64| {
+            rpc_shared.set_block_height(height);
+            rpc_shared.publish_new_block(height);
+        }));
         consensus_driver.start(node);
         tracing::info!("oxide-validator: consensus driver started (autonomous mode)");
 
@@ -346,6 +330,45 @@ fn run_single_node() {
     });
 
     tracing::info!("oxide-validator: node stopped");
+}
+
+/// Build the single-node JSON-RPC server: wire the executor and EVM
+/// module into `RpcServer`, seed metrics, and return the shared
+/// `Arc` (for the driver's block observer) plus the HTTP server.
+fn build_single_node_rpc(
+    node: &Node,
+    rpc_config: &config::RpcConfig,
+    height: Option<primitives::Height>,
+    recorder: Arc<metrics::Recorder>,
+) -> (Arc<rpc::RpcServer>, rpc::server::HttpServer) {
+    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
+    // Wire the executor into the RPC so `eth_sendRawTransaction`
+    // decodes, wraps, and submits EVM transactions into the mempool.
+    rpc_server.set_tx_submitter(Arc::new(ExecutorTxSubmitter { executor: node.app_handle() }));
+    // Share the executor's EVM module with the RPC so `eth_call`,
+    // `eth_getBalance`, and the block/tx/receipt/log lookups serve
+    // the same state the executor is committing.
+    if let Some(evm_module) = node.evm_module_handle() {
+        rpc_server.set_evm(evm_module);
+    }
+    // Wire the executor into the RPC so `GET /snapshot` returns the
+    // codec-encoded state snapshot.
+    rpc_server
+        .set_snapshot_provider(Arc::new(ExecutorSnapshotProvider { executor: node.app_handle() }));
+    // Attach the latency recorder for RPC handler metrics.
+    rpc_server.set_recorder(recorder);
+    // Seed the metrics with the current block height and mempool size.
+    if let Some(h) = height {
+        rpc_server.set_block_height(h.value());
+    }
+    rpc_server.set_mempool_size(0);
+    // Share the RPC server as `Arc` so the consensus driver's
+    // block observer can update the height and push
+    // `eth_subscribe` notifications on every finalized block.
+    let rpc_shared = Arc::new(rpc_server);
+    let http_server =
+        rpc::server::HttpServer::from_shared(rpc_shared.clone(), rpc_config.listen_addr.clone());
+    (rpc_shared, http_server)
 }
 
 /// Handle `--import-snapshot <path>`: restore state from a snapshot
@@ -1442,9 +1465,12 @@ fn run_consensus_loop(
                 last_reported_height = h_val;
                 // Update the RPC server's block height so
                 // `eth_blockNumber` and `/metrics` reflect the
-                // current finalized height.
+                // current finalized height, then push the block to
+                // WebSocket subscribers (no-op when nobody is
+                // subscribed or no EVM is attached).
                 if let Some(rpc) = rpc {
                     rpc.set_block_height(h_val);
+                    rpc.publish_new_block(h_val);
                 }
             }
         }

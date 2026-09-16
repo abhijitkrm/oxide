@@ -12825,3 +12825,74 @@ noise on this machine); all parallel/conflict groups within noise or
 improved (machine variance dominates). No per-tx regression to pay
 for — `frame_start`/`frame_end` are two counter ops per frame and the
 journal stays empty unless a `0x0C_*` call actually runs.
+
+## 2026-09-16 — Session: P1 — WebSocket transport + eth_subscribe
+
+### WS transport (crates/rpc/src/server.rs)
+
+- `GET /` with `Upgrade: websocket` upgrades in-place on the same
+  axum port — the geth convention (`ws://host:8545`, not a separate
+  `:8546` listener). Enabled axum's `ws` feature (pulls
+  tokio-tungstenite + sha1 + base64, all MIT — feature-only dep
+  change, axum 0.8.4 itself unchanged).
+- `handle_ws_socket` runs one `tokio::select!` loop multiplexing
+  inbound frames (JSON-RPC → `handle_ws_raw` → response) against
+  outbound notifications (per-connection unbounded mpsc → socket).
+  No `split()` — the writer half is just the channel drain, so a
+  dead socket can't leak a detached writer task. Pings get pongs so
+  intermediaries don't reap idle conns.
+- Why `handle_ctx(conn: Option<&WsConn>)` instead of a separate
+  dispatch table: every method except `eth_subscribe` is
+  transport-agnostic; one match keeps them identical. Only the
+  subscribe arm consumes `conn`.
+
+### Subscription registry (crates/rpc/src/lib.rs)
+
+- `SubscriptionManager` went from an ID-minting stub to a real
+  registry: `subscription_id → ActiveSubscription { conn_id, kind,
+  filter, sink }`. Connection IDs scope subs so a dropped socket
+  reaps all of them in one pass (`drop_connection`); a send that
+  fails mid-publish is also reaped (dead sink = dead conn).
+- `eth_subscribe` over HTTP now returns `-32000 "notifications not
+  supported"` — geth parity, and honest: previously it minted an ID
+  that could never deliver anything.
+- `logs` subscriptions reuse `parse_log_filter` (same
+  `address`/`topics` semantics as `eth_getLogs`); block-range keys
+  are parsed but ignored — pushes only cover newly finalized blocks.
+- `eth_unsubscribe` returns `false` for unknown IDs (geth), not an
+  error.
+
+### Publish path
+
+- `RpcServer::publish_new_block(height)` is called right after
+  `set_block_height` on the finalization path. Gates: exits on
+  empty-subscription map (one Mutex lock per block when nobody's
+  subscribed), then reads the sealed `evm::history` block once and
+  fans out — `newHeads` gets `block_header_json` (header-only, no
+  tx list — geth's shape), `logs` subs get `LogFilter::matches` per
+  `LogMatch` (new `history.rs` method sharing the same address +
+  positional-topic rules as `eth_getLogs`).
+- Wiring: multi-node loop calls it beside the existing
+  `set_block_height`; single-node mode needed a new
+  `ConsensusDriver::set_block_observer` (per-finalized-height
+  callback) — which also fixes a real bug: `eth_blockNumber` in
+  single-node mode was frozen at its startup seed because nothing
+  updated `block_height` after the driver took over.
+
+### Tests
+
+- 14 new/rewritten unit tests in `rpc` lib (WS-path subscribe,
+  HTTP rejection, unsubscribe true/false, conn reaping, publish
+  notification shape, no-subscriber noop).
+- New `crates/rpc/tests/ws_subscribe.rs`: 5 tests over a real
+  `tokio-tungstenite` client — 101 upgrade, newHeads push with real
+  header hash, filtered logs push, unsubscribe stops delivery,
+  malformed JSON → -32700, unknown type → -32602, ordinary methods
+  over WS.
+
+### Benchmarks
+
+No new bench: this is the RPC cold path — the only per-block cost
+added to the node is `has_subscriptions()` (one Mutex + is_empty),
+and `handle_raw` per-request dispatch is unchanged. No hot-path
+crate touched; the previous `tps_rw` numbers stand.

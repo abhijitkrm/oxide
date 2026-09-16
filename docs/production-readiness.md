@@ -419,18 +419,23 @@ imported → catches up. `/validator-set` returns current set.
    block tags resolve correctly; `eth_sendRawTransaction` gossips
    wrapped transactions to peers; genesis supports `evm.alloc`;
    and the devnet path registers an EVM module so `eth_*` is backed
-   in multi-node mode. **Remaining (P1+):** legacypool-style mempool
-   ordering, WebSocket transport for `eth_subscribe`, filter APIs,
-   staking-precompile side effects, genesis preinstalls, historical
-   state window, `eth_getProof`, `debug_trace*`, `txpool_*`,
-   EIP-7702, and persistent history across restart.
+   in multi-node mode. **P1 resolved:** legacypool-style same-nonce
+   mempool replacement (≥10% bump), genesis preinstalls (Create2
+   factory, Multicall3, Permit2, Safe), bank-backed staking
+   delegation with revert-safe `0x0C_*` precompiles, and WebSocket
+   transport with `eth_subscribe` (`newHeads` + filtered `logs`).
+   **Remaining (P1.5/P2):** filter APIs (`eth_newFilter`…),
+   `newPendingTransactions`, historical state window,
+   `eth_getProof`, `debug_trace*`, `txpool_*`, EIP-7702, RPC
+   resource limits, and persistent history across restart.
 
 **Next action:** External security audit and public multi-machine
 testnet deployment. The codebase now has all the infrastructure a
 testnet needs: mTLS, WAL persistence, snapshot persistence, genesis
-loading (incl. EVM alloc), key rotation, validator add/remove, a
-real `eth_*` RPC surface (blocks/txs/receipts/logs/call/estimate/
-feeHistory), tx gossip, and graceful shutdown. The P1 tier in
-`docs/evm-parity-gap-analysis.md` (mempool ordering, WS transport,
-filters, precompile side effects, preinstalls, RPC limits) is next
-for external-developer-facing completeness.
+loading (incl. EVM alloc + canonical preinstalls), key rotation,
+validator add/remove, a real `eth_*` RPC surface over HTTP **and
+WebSocket** (blocks/txs/receipts/logs/call/estimate/feeHistory plus
+`eth_subscribe` `newHeads`/`logs` pushes on finalization), tx gossip,
+and graceful shutdown. Remaining P1.5 items in
+`docs/evm-parity-gap-analysis.md` are filter APIs,
+`newPendingTransactions`, and RPC resource limits.

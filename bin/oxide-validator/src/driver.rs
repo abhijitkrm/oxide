@@ -110,19 +110,33 @@ pub struct ConsensusDriver {
     config: DriverConfig,
     /// Shared metrics (updated by the driver, read by RPC).
     metrics: Arc<DriverMetrics>,
+    /// Optional observer invoked once per newly finalized height.
+    /// The validator wires this to the RPC server so
+    /// `eth_blockNumber` tracks finalization live and
+    /// `eth_subscribe(newHeads)` pushes fire — without it the RPC
+    /// height is frozen at its startup seed.
+    block_observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 impl ConsensusDriver {
     /// Create a new driver with the given configuration.
     #[must_use]
     pub fn new(config: DriverConfig) -> Self {
-        Self { config, metrics: Arc::new(DriverMetrics::new()) }
+        Self { config, metrics: Arc::new(DriverMetrics::new()), block_observer: None }
     }
 
     /// Create a new driver with default configuration.
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(DriverConfig::default())
+    }
+
+    /// Install a callback invoked with each newly finalized height,
+    /// on the driver task's tick. The callback runs synchronously on
+    /// the block-production loop, so it must be cheap — the RPC
+    /// publish path is (one lock + channel send per subscriber).
+    pub fn set_block_observer(&mut self, observer: Arc<dyn Fn(u64) + Send + Sync>) {
+        self.block_observer = Some(observer);
     }
 
     /// Get a handle to the shared metrics (for wiring into the RPC
@@ -147,6 +161,7 @@ impl ConsensusDriver {
         let block_time = Duration::from_millis(self.config.block_time_ms);
         let metrics_interval = Duration::from_millis(self.config.metrics_interval_ms);
         let metrics = self.metrics;
+        let block_observer = self.block_observer;
 
         // The last finalized height we saw. Used to detect new
         // finalization events for metrics reporting.
@@ -188,6 +203,12 @@ impl ConsensusDriver {
                         {
                             let txs = u64::try_from(block.txs.len()).unwrap_or(0);
                             metrics.tx_count.fetch_add(txs, Ordering::Relaxed);
+                        }
+
+                        // Notify the RPC server (block height +
+                        // `eth_subscribe` pushes).
+                        if let Some(observer) = &block_observer {
+                            observer(h);
                         }
                     }
                     last_height = current_height;

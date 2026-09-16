@@ -12,6 +12,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **WebSocket transport + `eth_subscribe` (P1)** (`crates/rpc`,
+  `bin/oxide-validator`)
+  - `GET /` with `Upgrade: websocket` now upgrades to a JSON-RPC
+    WebSocket on the same port as HTTP — the geth convention
+    (`ws://host:8545`). All `eth_*`/`web3_*`/`net_*` methods work
+    over WS identically to HTTP.
+  - `eth_subscribe` over WS creates real subscriptions: `newHeads`
+    pushes the block header on every finalized block, `logs` pushes
+    each log matching an `eth_getLogs`-shaped `address`/`topics`
+    filter. `eth_unsubscribe` cancels (`true`/`false`, geth
+    semantics). Subscriptions are reaped when their connection
+    closes.
+  - Over HTTP, `eth_subscribe` now returns the geth-parity error
+    `-32000 "notifications not supported"` instead of minting an ID
+    that could never deliver.
+  - The single-node consensus driver gained a block observer that
+    keeps `eth_blockNumber` live and drives the notification fan-out
+    (previously the RPC height stayed frozen at its startup seed).
+  - **In plain words:** wallets, explorers, and dapp backends can now
+    subscribe to the chain live over `ws://` — new blocks and
+    filtered contract events push to subscribers the moment they
+    finalize, instead of polling `eth_getBlockByNumber` in a loop.
+
 - **Bank-backed staking + real `0x0C_*` precompile side effects (P1)**
   (`modules/staking`, `modules/evm`)
   - `delegate` now debits the delegator into a bonded-pool account and

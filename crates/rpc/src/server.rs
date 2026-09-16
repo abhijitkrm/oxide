@@ -16,6 +16,9 @@
 //! # Endpoints
 //!
 //! - `POST /` — JSON-RPC 2.0 request/response (Ethereum-compatible)
+//! - `GET /` — WebSocket upgrade (geth convention: WS shares the
+//!   HTTP port on the root path). Serves `eth_subscribe` /
+//!   `eth_unsubscribe` and pushes `eth_subscription` notifications.
 //! - `GET /health` — simple health check (returns 200 OK)
 //! - `GET /metrics` — Prometheus-format node metrics
 //! - `GET /snapshot` — codec-encoded state snapshot (hex)
@@ -40,12 +43,13 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
 
-use crate::RpcServer;
+use crate::{RpcServer, WsConn};
 
 /// Default rate limit: max requests per second per IP. Prevents a
 /// single client from flooding the RPC with requests and exhausting
@@ -163,7 +167,7 @@ impl HttpServer {
     /// Build the axum router with the RPC handler and rate limiter.
     fn router(rpc: Arc<RpcServer>, rate_limiter: Arc<RateLimiter>) -> Router {
         Router::new()
-            .route("/", post(handle_rpc))
+            .route("/", post(handle_rpc).get(ws_handler))
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))
             .route("/snapshot", get(snapshot_handler))
@@ -209,6 +213,71 @@ async fn handle_rpc(
                 .body("{}".to_string())
                 .unwrap()
         })
+}
+
+/// WebSocket upgrade endpoint (`GET /` with `Upgrade: websocket`).
+///
+/// geth serves WS on the same port and root path as HTTP; clients
+/// like ethers/MetaMask default to `ws://host:8545`. A plain
+/// `GET /` without the upgrade header fails extraction with 426.
+async fn ws_handler(
+    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_ws_socket(socket, rpc))
+}
+
+/// Drive one WebSocket connection: inbound text frames are
+/// JSON-RPC requests dispatched through [`RpcServer::handle_ws_raw`]
+/// (so `eth_subscribe` binds to this connection's outbound
+/// channel); outbound frames are request responses plus
+/// `eth_subscription` notifications pushed by the publish path.
+///
+/// A single `select!` loop multiplexes the two directions on one
+/// socket — no `split()` needed because the writer half never
+/// outlives the reader (`rx` closes when every sender drops; the
+/// last sender lives in the subscription table and is reaped by
+/// `drop_connection` below).
+async fn handle_ws_socket(mut socket: WebSocket, rpc: Arc<RpcServer>) {
+    let conn_id = rpc.next_connection_id();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let conn = WsConn::new(conn_id, tx.clone());
+    loop {
+        tokio::select! {
+            out = rx.recv() => match out {
+                Some(text) => {
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                // All senders dropped (conn reaped) — close cleanly.
+                None => break,
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    let response = rpc.handle_ws_raw(&text, &conn);
+                    if conn.sink.send(response).is_err() {
+                        break;
+                    }
+                }
+                // Protocol-level keepalive: reply to pings so
+                // intermediaries don't drop the idle connection.
+                Some(Ok(Message::Ping(payload))) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                // Binary frames carry no JSON-RPC and pong frames
+                // need no reply — the catch-all ignores both;
+                // close/error/stream-end terminate the connection.
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    // Reap this connection's subscriptions before `conn`/`tx` drop
+    // so a publish racing the shutdown can't target a dead sink.
+    rpc.drop_connection(conn_id);
 }
 
 /// State snapshot endpoint (`GET /snapshot`).

@@ -9,6 +9,7 @@ sparse retained trie for state roots.
 This document inventories release-grade functionality cosmos-evm ships and
 maps each item to Oxide's current state: **implemented**, **partial/stub**,
 **missing**, or **out of scope** (deliberately not planned — e.g. IBC).
+Rows are updated as items ship — the "Gap" column records what remains.
 
 ## Legend
 
@@ -22,7 +23,8 @@ maps each item to Oxide's current state: **implemented**, **partial/stub**,
 ## 1. Ethereum JSON-RPC surface
 
 cosmos-evm namespaces: `eth`, `web3`, `net`, `txpool`, `debug`, `personal`
-(miner/admin stubs). Oxide implements `eth` + `web3` + `net` over HTTP only.
+(miner/admin stubs). Oxide implements `eth` + `web3` + `net` over HTTP and
+WebSocket (`GET /` upgrade, same port — the geth convention).
 
 | Method / capability | cosmos-evm | Oxide | Gap |
 |---|---|---|---|
@@ -41,11 +43,11 @@ cosmos-evm namespaces: `eth`, `web3`, `net`, `txpool`, `debug`, `personal`
 | `eth_getTransactionByBlock*AndIndex` | ✅ | ❌ | returns `null` |
 | `eth_getTransactionReceipt` | ✅ | ❌ | returns `null` — receipts built for events then dropped, never stored |
 | `eth_getBlockReceipts` | ✅ (cosmos ext) | ❌ | returns `null` |
-| `eth_getLogs` | ✅ bloom-prefiltered scan, `block-range-cap` 10k | ❌ | returns `[]` — no log index over receipts |
+| `eth_getLogs` | ✅ bloom-prefiltered scan, `block-range-cap` 10k | ✅ | bloom-prefiltered scan over sealed history (`blockHash`/range/address/topics) — no range cap yet |
 | `eth_newFilter` / `eth_getFilterChanges` / `eth_getFilterLogs` / `eth_newBlockFilter` / `eth_newPendingTransactionFilter` / `eth_uninstallFilter` | ✅ | ❌ | no filter registry at all |
-| `eth_sendRawTransaction` | ✅ | 🟡 | decodes + submits to **local mempool only** — no tx gossip to peers (see §4) |
-| `eth_call` | ✅ EVM simulation, `gas-cap`, `evm-timeout` | ❌ | returns `"0x"` — `execute_signed` requires signature recovery; **no read-only call path exists in the EVM module** |
-| `eth_estimateGas` | ✅ binary search + state overrides | ❌ | returns `0x5208` unconditionally |
+| `eth_sendRawTransaction` | ✅ | ✅ | decodes, submits to local mempool, **and gossips the raw tx to peers** with dedup (100k-hash FIFO) |
+| `eth_call` | ✅ EVM simulation, `gas-cap`, `evm-timeout` | ✅ | real `call_read` revm simulation (nonce/base-fee/gas-limit checks off, balance on — geth `DoCall`); no `gas-cap`/`evm-timeout` resource limits yet |
+| `eth_estimateGas` | ✅ binary search + state overrides | 🟡 | binary search over `call_read` with revert/halt propagation; no state-override support |
 | `eth_createAccessList` | ✅ | ❌ | not implemented |
 | `eth_gasPrice` | ✅ | 🟡 | returns configured base fee, not a market quote |
 | `eth_maxPriorityFeePerGas` | ✅ | 🟡 | stub `0x3b9aca00` (1 gwei) — should reflect recent block tips |
@@ -53,20 +55,22 @@ cosmos-evm namespaces: `eth`, `web3`, `net`, `txpool`, `debug`, `personal`
 | `eth_getProof` | ✅ (height > 2) | ❌ | needs Merkle proof generation over the state trie (`trie.rs` computes roots; no proof path) |
 | `eth_sign` / `eth_signTypedData` | ✅/partial | ❌ | keyring-backed — deliberately omit (nodes should not custody user keys) |
 | `eth_sendTransaction` / `eth_pendingTransactions` | ❌/partial | ❌ | `sendTransaction` is a node-custody API — omit; `pendingTransactions` needs the txpool index |
-| `eth_subscribe` / `eth_unsubscribe` | ✅ WS: `newHeads`, `logs`, `newPendingTransactions` | ❌ | subscription manager exists but **no WebSocket transport** (no `tokio-tungstenite` dep); subs never deliver |
+| `eth_subscribe` / `eth_unsubscribe` | ✅ WS: `newHeads`, `logs`, `newPendingTransactions` | 🟡 | **WS transport shipped** (axum `ws` on `GET /`, geth same-port convention): `newHeads` + filtered `logs` push on finalization, real unsubscribe, per-connection reaping; `newPendingTransactions` still missing |
 | `txpool_content` / `txpool_contentFrom` / `txpool_inspect` / `txpool_status` | ✅ | ❌ | no txpool namespace — mempool has no nonce-gap queue to expose |
 | `debug_traceTransaction` / `debug_traceBlock*` / `debug_traceCall` | ✅ re-execution via EVM | ❌ | needs revm inspector hooks — feasible, not built |
 | `debug_*` runtime profiling endpoints | ✅ | ❌ | Go-specific; equivalent Rust profiling hooks not needed |
 | `personal_*` (keyring) | ✅ partial | ❌ | out of scope — node-custodied keys are a security liability |
 | JSON-RPC resource limits | `gas-cap` 25M, `evm-timeout`, `filter-cap` 200, `feehistory-cap` 100, `batch-request-limit`, `max-open-connections`, `http-timeout` 30s | 🟡 | only per-client rate limiting exists |
-| WS endpoint `:8546` | ✅ | ❌ | no WS listener |
+| WS endpoint `:8546` | ✅ | ✅ | WS rides the same port as HTTP (`ws://host:8545/`, geth convention) rather than a separate `:8546` listener |
 
-**Summary:** ~17 of ~35 advertised `eth_*` methods return correct data today;
-the rest are stubs returning `null`/`[]`/fixed values. The single biggest
-structural gap is that **finalized blocks, transactions, receipts, and logs
-are not retained anywhere** — the `indexer` crate exists (451 lines, indexes
-`FinalizedBlock` events + tx hashes) but is not wired to the validator or
-RPC and does not capture EVM receipts/logs/blooms.
+**Summary (updated):** the advertised `eth_*` surface now serves real data —
+blocks/txs/receipts/logs come from `evm::history` (8192-block retained
+window), `eth_call`/`eth_estimateGas` run real revm simulations, and
+`eth_subscribe` pushes over WebSocket. Remaining gaps: the filter APIs
+(`eth_newFilter`…), `txpool_*`, `debug_trace*`, `eth_getProof`, historical
+state reads, and `newPendingTransactions`. The generic `indexer` crate
+(451 lines) remains unwired — EVM history superseded it for the `eth_*`
+surface.
 
 ## 2. EVM execution semantics
 
@@ -86,8 +90,8 @@ RPC and does not capture EVM receipts/logs/blooms.
 | `BLOCKHASH` last-256-blocks | ✅ (+EIP-2935 history contract) | 🟡 | `block_hash_ref` exists — verify it serves real hashes for N−1..N−256 and zero beyond |
 | Base fee | EIP-1559 via `x/feemarket`, **distributed to validators** | EIP-1559 `BaseFeeState`, **burned** (revm default) | design choice — burning is Ethereum-L1-faithful; distribution is Cosmos-faithful. Decide + document |
 | `evm_denom` / native-token-as-gas | ✅ | ✅ | native balance == EVM balance (single account space — simpler than dual-model) |
-| Preinstalls (Create2 `0x4e59…`, Multicall3 `0xcA11…`, Permit2 `0x0000…D473`, Safe singleton `0x914d…`, EIP-2935 history `0x0000F908…`) | ✅ at genesis | ❌ | **high value, low cost** — Foundry/Hardhat/DeFi tooling assumes these exist at canonical addresses |
-| Genesis `alloc` (accounts/code/storage) | ✅ | 🟡 | genesis covers validators + bank balances; EVM `alloc` not exposed in `GenesisConfig` |
+| Preinstalls (Create2 `0x4e59…`, Multicall3 `0xcA11…`, Permit2 `0x0000…D473`, Safe singleton `0x914d…`, EIP-2935 history `0x0000F908…`) | ✅ at genesis | 🟡 | Create2 factory, Multicall3, Permit2, Safe proxy+singleton installed at canonical addresses (bytecode verified against mainnet `eth_getCode`); EIP-2935 history contract not installed |
+| Genesis `alloc` (accounts/code/storage) | ✅ | ✅ | `evm.alloc` section wired in both single-node and devnet assembly (balance/nonce/code/storage) |
 | `access_control` — permissioned create/call whitelists | ✅ | ❌ | optional; needed only for permissioned-deployment chains |
 | `extra_eips` / custom opcode hooks | ✅ | ❌ | out of scope — revm fork schedule is fixed at compile time |
 | Historical state queries (`history_serve_window`, default 8192) | ✅ | ❌ | **architectural gap** — state DB is mutable, no versioned reads; needs snapshot-per-window or versioned store |
@@ -101,7 +105,7 @@ cosmos-evm static registry (`0x…0100`–`0x…0807`) + dynamic ERC20/WERC20:
 | Standard geth set (ecrecover, sha256, ripemd160, identity, modexp, ecadd, ecmul, ecpairing, blake2f, kzg) | ✅ | ✅ via revm | — |
 | P256 `0x…0100` | ✅ | ❌ | add if requested — cheap |
 | Bech32 `0x…0400` | ✅ | ➖ | no bech32 in Oxide addressing |
-| Staking `0x…0800` (delegate/redelegate/undelegate/queries) | ✅ **state-mutating** | 🟡 | `0x0C01` delegate **explicitly reverts — side effect not wired** (`precompiles.rs` test asserts revert) |
+| Staking `0x…0800` (delegate/redelegate/undelegate/queries) | ✅ **state-mutating** | 🟡 | `0x0C01` delegate + `0x0C02` undelegate **wired with real side effects** — caller-scoped, bank-backed, same native invariants, revert-safe via frame-scoped native journal; redelegate + queries still missing |
 | Distribution `0x…0801` | ✅ | ❌ | no rewards/distribution module yet |
 | ICS20 `0x…0802` | ✅ | ➖ | no IBC |
 | Vesting `0x…0803` | ✅ | ➖ | no vesting module |
@@ -125,19 +129,19 @@ native message path** — no unchecked debits.
 
 | Capability | cosmos-evm | Oxide | Gap |
 |---|---|---|---|
-| Mempool model | geth `legacypool` port — nonce-gap queue, replacement-by-tip, insert-time validation | FIFO `VecDeque` + size cap | **critical** — no nonce ordering, no replacement, no `pending`/`queued` split |
-| Tx gossip | CometBFT mempool gossip | ❌ | **critical** — `eth_sendRawTransaction` lands in the local node's mempool only; if that node isn't the current leader the tx waits for its leader turn |
+| Mempool model | geth `legacypool` port — nonce-gap queue, replacement-by-tip, insert-time validation | per-sender nonce queues + fee-ordered select + **same-nonce replacement with geth's ≥10% bump** | close — still missing: insert-time validation against account balance/nonce floor, and a separate `queued` pool for gapped nonces |
+| Tx gossip | CometBFT mempool gossip | ✅ | raw-tx gossip to peers on `eth_sendRawTransaction` (dedup, no rebroadcast of inbound) |
 | Pending-tx visibility | `PendingTxListener` feeds `newPendingTransactions` + `"pending"` block tag | ❌ | no pending overlay |
-| Priority ordering | tip-based (`min(tip_cap, fee_cap − base_fee)`) | insertion order | needed for fair fee market + trading-stack ordering guarantees |
+| Priority ordering | tip-based (`min(tip_cap, fee_cap − base_fee)`) | fee-density ordering at select time | adequate for now; per-tip-cap ordering matters once EIP-1559 tips exist |
 | `max_gas_wanted` per-tx cap | ✅ | 🟡 | `BlockBudget` exists; per-tx cap not enforced at RPC ingress |
 
 ## 5. State, history, and indexing
 
 | Capability | cosmos-evm | Oxide | Gap |
 |---|---|---|---|
-| Canonical block store | CometBFT blockstore + `BlockResults` | ❌ | `FinalizedBlock`s stream to listeners; `MAX_RETAINED_FINALIZED` in devnet is a test fixture, not a store |
-| Tx index | `KVIndexer` (hash→(h,i), (h,i)→tx) | ❌ | `indexer` crate not wired; doesn't index EVM receipts anyway |
-| Receipt/log persistence | per-block logs+bloom in store; receipts via indexer | ❌ | receipts dropped after event emission |
+| Canonical block store | CometBFT blockstore + `BlockResults` | 🟡 | `evm::history` retains the last 8192 sealed EVM blocks (hash/height/tx indexed) — bounded, in-memory, not durable across restarts |
+| Tx index | `KVIndexer` (hash→(h,i), (h,i)→tx) | ✅ | `tx_hash → (height, index)` in `evm::history` for the retained window |
+| Receipt/log persistence | per-block logs+bloom in store; receipts via indexer | ✅ | receipts + logs + blooms retained per block in `evm::history`; `eth_getLogs`/`eth_getBlockReceipts` serve them |
 | Historical state | `history_serve_window` 8192; EIP-2935 for BLOCKHASH | ❌ | no versioned state reads |
 | State sync / snapshots | SDK snapshot-interval + keep-recent | 🟡 | snapshot export/import + `/snapshot` endpoint exist; no interval/retention policy, no state-sync bootstrap protocol |
 | Pruning | SDK strategies (default/nothing/everything/custom) | ❌ | no pruning policy for journal/history |
@@ -223,19 +227,23 @@ surface is the reference for "complete L1 functionality":
 
 ### P1 — production-grade EVM service
 
-5. **Mempool ordering** — nonce-gap queue + tip ordering + replacement
-   (port of legacypool semantics, sized for the trading stack's needs).
-6. **WebSocket transport** — `newHeads`, `logs`, `newPendingTransactions`
-   on `:8546` (`tokio-tungstenite`); the `SubscriptionManager` is already
-   in place.
+5. ~~**Mempool ordering**~~ — **shipped**: per-sender nonce queues,
+   fee-ordered select, and same-nonce replacement enforcing geth's
+   ≥10% bump (`ReplacementUnderpriced` below the threshold).
+6. **WebSocket transport** — ~~`newHeads`, `logs`~~ **shipped**: axum `ws`
+   upgrade on `GET /` (same port as HTTP, geth convention), per-connection
+   subscription registry, `publish_new_block` fans out on finalization.
+   Remaining: `newPendingTransactions`.
 7. **Filter APIs** — `eth_newFilter`/`eth_getFilterChanges`/`eth_newBlockFilter`
    over the log index from (1).
-8. **Staking precompile side effects** — wire `0x0C01` delegate through the
-   native staking path with full invariant checks (see §3 security note);
-   add gov precompile.
-9. **Preinstalls** — deploy Create2 factory, Multicall3, Permit2, Safe
-   singleton at canonical addresses in genesis; add EVM `alloc` to
-   `GenesisConfig`.
+8. ~~**Staking precompile side effects**~~ — **shipped**: `0x0C01`/`0x0C02`
+   run the same bank-backed native cores as `MsgDelegate`/`MsgUndelegate`
+   (the exploit-safe path — see §3 note), rolled back on EVM-frame revert
+   by the native journal. Remaining: redelegate, queries, gov precompile.
+9. ~~**Preinstalls**~~ — **shipped**: Create2 factory, Multicall3, Permit2,
+   Safe proxy+singleton at canonical addresses (bytecode verified against
+   mainnet `eth_getCode`); `evm.alloc` in `GenesisConfig`. Remaining:
+   EIP-2935 history contract.
 10. **RPC resource limits** — `gas-cap`, `evm-timeout`, `filter-cap`,
     `feehistory-cap`, `batch-request-limit`, `max-open-connections`.
 

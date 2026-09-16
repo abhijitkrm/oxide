@@ -41,6 +41,7 @@
 
 pub mod server;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -235,19 +236,6 @@ impl SubscriptionType {
     }
 }
 
-/// A WebSocket subscription.
-///
-/// Created by `eth_subscribe`, cancelled by `eth_unsubscribe`.
-/// Each subscription has a unique hex ID and a type that
-/// determines what events it receives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Subscription {
-    /// The subscription ID (hex string, e.g. `"0x1"`).
-    pub id: String,
-    /// The subscription type.
-    pub sub_type: SubscriptionType,
-}
-
 /// A subscription notification message (sent to subscribers).
 ///
 /// This is the JSON-RPC notification envelope for `eth_subscription`:
@@ -272,91 +260,148 @@ pub struct SubscriptionParams {
     pub result: Value,
 }
 
-/// The subscription manager: tracks active subscriptions and
-/// generates notifications.
+/// An active subscription bound to one WebSocket connection.
 ///
-/// Each subscription gets a monotonically increasing ID. The
-/// manager is `Send + Sync` so it can be shared across WebSocket
+/// The `sink` is the connection's outbound channel: notification
+/// JSON is serialized once and pushed per-subscription. When the
+/// socket closes the server calls
+/// [`SubscriptionManager::drop_connection`], which removes every
+/// subscription tagged with the connection's `conn_id`.
+#[derive(Debug)]
+struct ActiveSubscription {
+    /// Owning WebSocket connection ID.
+    conn_id: u64,
+    /// What the subscriber asked for.
+    kind: SubscriptionType,
+    /// `logs` subscriptions carry an optional address/topics filter
+    /// (parsed at `eth_subscribe` time with the same semantics as
+    /// `eth_getLogs`). `None` = match every log.
+    filter: Option<LogFilter>,
+    /// Outbound channel to the connection's writer loop.
+    sink: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+/// The subscription manager: tracks active subscriptions across
+/// WebSocket connections and fans out notifications when a block
+/// finalizes.
+///
+/// Each subscription gets a monotonically increasing hex ID scoped
+/// to this server instance (geth uses the same scheme). The manager
+/// is `Send + Sync` so it can be shared across WebSocket
 /// connections via `Arc`.
+///
+/// Concurrency: a `Mutex<HashMap>` guards the subscription table.
+/// This is a cold path — registrations happen per `eth_subscribe`
+/// call and publishes happen once per finalized block — so a
+/// lock-free structure buys nothing.
 pub struct SubscriptionManager {
     /// The next subscription ID to assign.
-    next_id: Arc<AtomicU64>,
+    next_id: AtomicU64,
+    /// The next WebSocket connection ID to assign. Connection IDs
+    /// scope subscriptions so a dropped socket cleans up all of its
+    /// subscriptions in one pass.
+    next_conn_id: AtomicU64,
+    /// `subscription_id -> active subscription`.
+    active: std::sync::Mutex<HashMap<String, ActiveSubscription>>,
 }
 
 impl SubscriptionManager {
     /// Create a fresh subscription manager.
     #[must_use]
     pub fn new() -> Self {
-        Self { next_id: Arc::new(AtomicU64::new(1)) }
-    }
-
-    /// Create a new subscription.
-    ///
-    /// Parses the subscription type from the params, assigns a
-    /// unique ID, and returns the subscription.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RpcError` if the subscription type is unknown
-    /// or params are invalid.
-    pub fn subscribe(&self, params: &[Value]) -> Result<Subscription, RpcError> {
-        if params.is_empty() {
-            return Err(RpcError::invalid_params("missing subscription type"));
-        }
-        let type_str = params[0]
-            .as_str()
-            .ok_or_else(|| RpcError::invalid_params("subscription type must be a string"))?;
-        let sub_type = SubscriptionType::parse(type_str).ok_or_else(|| {
-            RpcError::invalid_params(&format!("unknown subscription type: {type_str}"))
-        })?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        Ok(Subscription { id: format!("0x{id:x}"), sub_type })
-    }
-
-    /// Build a `newHeads` notification for a subscription.
-    ///
-    /// The `result` is a block header object with `number`,
-    /// `hash`, `gasUsed`, etc.
-    #[must_use]
-    pub fn new_heads_notification(
-        sub: &Subscription,
-        block_height: u64,
-    ) -> SubscriptionNotification {
-        SubscriptionNotification {
-            jsonrpc: "2.0".to_string(),
-            method: "eth_subscription".to_string(),
-            params: SubscriptionParams {
-                subscription: sub.id.clone(),
-                result: json!({
-                    "number": format!("0x{block_height:x}"),
-                    "hash": format!("0x{block_height:064x}"),
-                    "gasUsed": "0x0",
-                }),
-            },
+        Self {
+            next_id: AtomicU64::new(1),
+            next_conn_id: AtomicU64::new(1),
+            active: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Build a `logs` notification for a subscription.
+    /// Allocate a connection ID for a freshly upgraded WebSocket.
+    fn next_connection_id(&self) -> u64 {
+        self.next_conn_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Register a subscription for a connection. Returns the
+    /// subscription ID.
+    fn register(
+        &self,
+        kind: SubscriptionType,
+        filter: Option<LogFilter>,
+        conn_id: u64,
+        sink: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> String {
+        let id = format!("0x{:x}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), ActiveSubscription { conn_id, kind, filter, sink });
+        id
+    }
+
+    /// Cancel a subscription by ID. Returns `true` if it existed
+    /// (geth returns `false` — not an error — for unknown IDs).
+    fn unregister(&self, id: &str) -> bool {
+        self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id).is_some()
+    }
+
+    /// Remove every subscription owned by a closed connection.
+    fn drop_connection(&self, conn_id: u64) {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, sub| sub.conn_id != conn_id);
+    }
+
+    /// Cheap gate so the per-block publish path exits without
+    /// touching the EVM history lock when nobody is subscribed.
+    fn has_subscriptions(&self) -> bool {
+        !self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+    }
+
+    /// Fan out a finalized block to all subscribers: the header to
+    /// `newHeads` subs, each matching log to `logs` subs.
     ///
-    /// The `result` is a log object with `address`, `data`,
-    /// `topics`, etc.
-    #[must_use]
-    pub fn logs_notification(
-        sub: &Subscription,
-        address: &str,
-        data: &str,
-    ) -> SubscriptionNotification {
-        SubscriptionNotification {
-            jsonrpc: "2.0".to_string(),
-            method: "eth_subscription".to_string(),
-            params: SubscriptionParams {
-                subscription: sub.id.clone(),
-                result: json!({
-                    "address": address,
-                    "data": data,
-                    "topics": [],
-                }),
-            },
+    /// A dead sink (connection closed but not yet reaped) simply
+    /// fails the `send` — the subscription is removed so we don't
+    /// retry it on the next block.
+    fn publish(&self, header: &Value, logs: &[evm::history::LogMatch]) {
+        let mut dead = Vec::new();
+        {
+            let active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (id, sub) in active.iter() {
+                let send = |result: Value| {
+                    sub.sink.send(
+                        serde_json::to_string(&SubscriptionNotification {
+                            jsonrpc: "2.0".to_string(),
+                            method: "eth_subscription".to_string(),
+                            params: SubscriptionParams { subscription: id.clone(), result },
+                        })
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    )
+                };
+                match sub.kind {
+                    SubscriptionType::NewHeads => {
+                        if send(header.clone()).is_err() {
+                            dead.push(id.clone());
+                        }
+                    }
+                    SubscriptionType::Logs => {
+                        for log in logs {
+                            let matches = sub.filter.as_ref().is_none_or(|f| f.matches(log));
+                            if matches && send(log_json(log)).is_err() {
+                                dead.push(id.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !dead.is_empty() {
+            let mut active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for id in dead {
+                active.remove(&id);
+            }
         }
     }
 }
@@ -364,6 +409,28 @@ impl SubscriptionManager {
 impl Default for SubscriptionManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A live WebSocket connection, passed down the dispatch for the
+/// duration of one request so `eth_subscribe` can bind the new
+/// subscription to the caller's outbound channel.
+///
+/// `sink` is unbounded: the writer loop drains it continuously, and
+/// notification volume is bounded by subscription count × block
+/// rate — both small relative to memory. Requests responses go
+/// through the same channel.
+pub(crate) struct WsConn {
+    /// The connection's unique ID (scopes its subscriptions).
+    pub(crate) conn_id: u64,
+    /// Outbound channel to the socket writer loop.
+    pub(crate) sink: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl WsConn {
+    /// Create a connection handle for `conn_id` writing to `sink`.
+    pub(crate) fn new(conn_id: u64, sink: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
+        Self { conn_id, sink }
     }
 }
 
@@ -646,6 +713,21 @@ impl RpcServer {
     /// Returns `RpcError` in the response for unknown methods,
     /// invalid params, or internal errors.
     pub fn handle(&self, request: &RpcRequest) -> RpcResponse {
+        self.handle_ctx(request, None)
+    }
+
+    /// Handle a single JSON-RPC request over a WebSocket
+    /// connection. `eth_subscribe` binds the subscription to
+    /// `conn`'s outbound channel; every other method behaves
+    /// identically to the HTTP path.
+    pub(crate) fn handle_ws(&self, request: &RpcRequest, conn: &WsConn) -> RpcResponse {
+        self.handle_ctx(request, Some(conn))
+    }
+
+    /// Dispatch one request. `conn` is `Some` only for WebSocket
+    /// transport — `eth_subscribe` rejects notifications over HTTP
+    /// (geth parity: `"notifications not supported"`).
+    fn handle_ctx(&self, request: &RpcRequest, conn: Option<&WsConn>) -> RpcResponse {
         // Rate limit check: reject requests exceeding the configured
         // rate. Returns a -32005 "requests rate limited" error (the
         // convention used by Ethereum JSON-RPC servers).
@@ -712,7 +794,7 @@ impl RpcServer {
             "eth_coinbase" => Ok(self.eth_coinbase()),
             "eth_hashrate" => Ok(self.eth_hashrate()),
             // ---- Subscriptions ----
-            "eth_subscribe" => self.eth_subscribe(&request.params),
+            "eth_subscribe" => self.eth_subscribe(&request.params, conn),
             "eth_unsubscribe" => self.eth_unsubscribe(&request.params),
             _ => Err(RpcError::method_not_found(&request.method)),
         };
@@ -751,6 +833,67 @@ impl RpcServer {
         };
         let response = self.handle(&request);
         serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Handle a raw JSON-RPC string arriving on a WebSocket
+    /// connection. Identical to [`handle_raw`](Self::handle_raw)
+    /// except `eth_subscribe` registers against `conn`'s sink.
+    pub(crate) fn handle_ws_raw(&self, raw: &str, conn: &WsConn) -> String {
+        let Ok(request): Result<RpcRequest, _> = serde_json::from_str(raw) else {
+            let response = RpcResponse {
+                id: Value::Null,
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(RpcError::parse_error()),
+            };
+            return serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+        };
+        let response = self.handle_ws(&request, conn);
+        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Allocate a connection ID for a newly upgraded WebSocket.
+    /// Called by the transport layer (`server.rs`).
+    pub(crate) fn next_connection_id(&self) -> u64 {
+        self.subscriptions.next_connection_id()
+    }
+
+    /// Drop every subscription owned by a closed WebSocket
+    /// connection. Called by the transport layer when the socket
+    /// read loop ends.
+    pub(crate) fn drop_connection(&self, conn_id: u64) {
+        self.subscriptions.drop_connection(conn_id);
+    }
+
+    /// Fan a newly finalized block out to subscribers: the header
+    /// to `newHeads` subs, each matching log to `logs` subs.
+    ///
+    /// Called from the consensus finalization path right after
+    /// `set_block_height` — the EVM history for `height` is already
+    /// sealed by then (the executor's `end_block` runs inside
+    /// `commit_block`, before the engine reports the height).
+    ///
+    /// Exits early when no subscriptions are active or no EVM
+    /// module is attached, so the per-block cost on nodes serving
+    /// no WS clients is one lock + empty-map check.
+    pub fn publish_new_block(&self, height: u64) {
+        if !self.subscriptions.has_subscriptions() {
+            return;
+        }
+        let Some(evm) = self.evm.as_ref() else { return };
+        let (header, logs) = {
+            let history = evm.history();
+            let Some(block) = history.block(height) else { return };
+            (
+                block_header_json(block),
+                history.logs(&LogFilter {
+                    from_block: height,
+                    to_block: height,
+                    ..LogFilter::default()
+                }),
+            )
+        };
+        self.subscriptions.publish(&header, &logs);
     }
 
     // ---- Ethereum RPC methods ----
@@ -812,28 +955,53 @@ impl RpcServer {
     ///
     /// Params: `[subscriptionType: String, options?: Object]`
     ///
-    /// Returns the subscription ID as a hex string.
-    fn eth_subscribe(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let sub = self.subscriptions.subscribe(params)?;
-        Ok(json!(sub.id))
+    /// Returns the subscription ID as a hex string. Over HTTP the
+    /// method errors with `"notifications not supported"` — the
+    /// geth behaviour, since there is no push channel.
+    ///
+    /// For `logs` subscriptions, `options` is an `eth_getLogs`-shaped
+    /// filter object (`address`, `topics`); block-range fields are
+    /// accepted but ignored — pushes only cover newly finalized
+    /// blocks.
+    fn eth_subscribe(&self, params: &[Value], conn: Option<&WsConn>) -> Result<Value, RpcError> {
+        let Some(conn) = conn else {
+            return Err(RpcError {
+                code: -32_000,
+                message: "notifications not supported".to_string(),
+                data: None,
+            });
+        };
+        if params.is_empty() {
+            return Err(RpcError::invalid_params("missing subscription type"));
+        }
+        let type_str = params[0]
+            .as_str()
+            .ok_or_else(|| RpcError::invalid_params("subscription type must be a string"))?;
+        let kind = SubscriptionType::parse(type_str).ok_or_else(|| {
+            RpcError::invalid_params(&format!("unknown subscription type: {type_str}"))
+        })?;
+        let filter = match (kind.clone(), params.get(1)) {
+            (SubscriptionType::Logs, Some(obj)) => Some(self.parse_log_filter(obj)?),
+            (SubscriptionType::Logs, None) => Some(LogFilter::default()),
+            _ => None,
+        };
+        Ok(json!(self.subscriptions.register(kind, filter, conn.conn_id, conn.sink.clone())))
     }
 
     /// `eth_unsubscribe` — cancels a WebSocket subscription.
     ///
     /// Params: `[subscriptionId: String]`
     ///
-    /// Returns `true` on success. Phase 2 v0 always returns `true`
-    /// (subscriptions are stateless until wired to a real WebSocket
-    /// connection).
+    /// Returns `true` if the subscription existed, `false` for
+    /// unknown IDs (geth semantics — not an error).
     fn eth_unsubscribe(&self, params: &[Value]) -> Result<Value, RpcError> {
-        let _ = self;
         if params.is_empty() {
             return Err(RpcError::invalid_params("missing subscription ID"));
         }
-        // Phase 2 v0: always return true (no persistent subscription
-        // state to cancel — the subscription manager assigns IDs
-        // but doesn't track active connections yet).
-        Ok(json!(true))
+        let id = params[0]
+            .as_str()
+            .ok_or_else(|| RpcError::invalid_params("subscription ID must be a string"))?;
+        Ok(json!(self.subscriptions.unregister(id)))
     }
 
     // ---- Phase E: extended RPC methods ----
@@ -1677,6 +1845,33 @@ fn block_json(block: &ExecutedBlock, full: bool) -> Value {
     })
 }
 
+/// Serialize a block header for a `newHeads` subscription
+/// notification. geth sends the header object without the
+/// transaction list, `uncles`, `size`, or `totalDifficulty` —
+/// same fields, same hex encoding as [`block_json`].
+fn block_header_json(block: &ExecutedBlock) -> Value {
+    json!({
+        "number": format!("0x{:x}", block.number),
+        "hash": format!("0x{:x}", block.hash),
+        "parentHash": format!("0x{:x}", block.parent_hash),
+        "nonce": "0x0000000000000000",
+        "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+        "logsBloom": format!("0x{}", hex::encode(block.bloom)),
+        "transactionsRoot": format!("0x{:x}", block.tx_root),
+        "stateRoot": format!("0x{:x}", block.state_root),
+        "receiptsRoot": format!("0x{:x}", block.receipts_root),
+        "miner": format!("0x{:x}", block.coinbase),
+        "difficulty": "0x0",
+        "extraData": "0x",
+        "gasLimit": format!("0x{:x}", block.gas_limit),
+        "gasUsed": format!("0x{:x}", block.gas_used),
+        "timestamp": format!("0x{:x}", block.timestamp),
+        "baseFeePerGas": format!("0x{:x}", block.base_fee),
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "withdrawalsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+    })
+}
+
 /// Parse a 20-byte hex address param into `primitives::Address`.
 fn parse_address(v: Option<&Value>) -> Result<primitives::Address, RpcError> {
     let v = v.ok_or_else(|| RpcError::invalid_params("missing address"))?;
@@ -2018,58 +2213,104 @@ mod tests {
 
     // ---- WebSocket subscription tests ----
 
+    /// A `WsConn` writing into a test channel — what the WS
+    /// transport hands the dispatch for each socket.
+    fn ws_conn() -> (WsConn, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (WsConn::new(1, tx), rx)
+    }
+
     #[test]
-    fn eth_subscribe_new_heads_returns_id() {
+    fn eth_subscribe_over_http_errors_notifications_not_supported() {
+        // geth parity: subscriptions need a push channel; HTTP has
+        // none, so every `eth_subscribe` on `handle` errors -32000.
         let s = make_server();
+        for params in [vec![json!("newHeads")], vec![json!("logs")], vec![]] {
+            let req = make_request("eth_subscribe", params, json!(1));
+            let resp = s.handle(&req);
+            let err = resp.error.expect("HTTP subscribe must fail");
+            assert_eq!(err.code, -32_000);
+            assert_eq!(err.message, "notifications not supported");
+        }
+    }
+
+    #[test]
+    fn eth_subscribe_new_heads_returns_id_over_ws() {
+        let s = make_server();
+        let (conn, _rx) = ws_conn();
         let req = make_request("eth_subscribe", vec![json!("newHeads")], json!(1));
-        let resp = s.handle(&req);
+        let resp = s.handle_ws(&req, &conn);
         assert!(resp.error.is_none());
         let id = resp.result.unwrap().as_str().unwrap().to_string();
         assert!(id.starts_with("0x"), "subscription ID must be hex: {id}");
     }
 
     #[test]
-    fn eth_subscribe_logs_returns_id() {
+    fn eth_subscribe_logs_returns_id_over_ws() {
         let s = make_server();
+        let (conn, _rx) = ws_conn();
         let req = make_request("eth_subscribe", vec![json!("logs")], json!(1));
-        let resp = s.handle(&req);
+        let resp = s.handle_ws(&req, &conn);
         assert!(resp.error.is_none());
         assert!(resp.result.unwrap().as_str().unwrap().starts_with("0x"));
     }
 
     #[test]
-    fn eth_subscribe_unknown_type_errors() {
+    fn eth_subscribe_logs_rejects_bad_filter_over_ws() {
         let s = make_server();
+        let (conn, _rx) = ws_conn();
+        let req = make_request(
+            "eth_subscribe",
+            vec![json!("logs"), json!({"address": "not-an-address"})],
+            json!(1),
+        );
+        let resp = s.handle_ws(&req, &conn);
+        assert_eq!(resp.error.expect("bad filter must fail").code, -32602);
+    }
+
+    #[test]
+    fn eth_subscribe_unknown_type_errors_over_ws() {
+        let s = make_server();
+        let (conn, _rx) = ws_conn();
         let req = make_request("eth_subscribe", vec![json!("unknownType")], json!(1));
-        let resp = s.handle(&req);
-        assert!(resp.error.is_some());
+        let resp = s.handle_ws(&req, &conn);
         assert_eq!(resp.error.unwrap().code, -32602);
     }
 
     #[test]
-    fn eth_subscribe_missing_type_errors() {
+    fn eth_subscribe_missing_type_errors_over_ws() {
         let s = make_server();
+        let (conn, _rx) = ws_conn();
         let req = make_request("eth_subscribe", vec![], json!(1));
-        let resp = s.handle(&req);
-        assert!(resp.error.is_some());
+        let resp = s.handle_ws(&req, &conn);
         assert_eq!(resp.error.unwrap().code, -32602);
     }
 
     #[test]
-    fn eth_subscribe_non_string_type_errors() {
+    fn eth_subscribe_non_string_type_errors_over_ws() {
         let s = make_server();
+        let (conn, _rx) = ws_conn();
         let req = make_request("eth_subscribe", vec![json!(42)], json!(1));
-        let resp = s.handle(&req);
-        assert!(resp.error.is_some());
+        let resp = s.handle_ws(&req, &conn);
         assert_eq!(resp.error.unwrap().code, -32602);
     }
 
     #[test]
-    fn eth_unsubscribe_returns_true() {
+    fn eth_unsubscribe_returns_true_for_active_sub() {
         let s = make_server();
-        let req = make_request("eth_unsubscribe", vec![json!("0x1")], json!(1));
-        let resp = s.handle(&req);
-        assert_eq!(resp.result, Some(json!(true)));
+        let (conn, _rx) = ws_conn();
+        let sub = make_request("eth_subscribe", vec![json!("newHeads")], json!(1));
+        let id = s.handle_ws(&sub, &conn).result.unwrap().as_str().unwrap().to_string();
+        let req = make_request("eth_unsubscribe", vec![json!(id)], json!(2));
+        assert_eq!(s.handle_ws(&req, &conn).result, Some(json!(true)));
+    }
+
+    #[test]
+    fn eth_unsubscribe_returns_false_for_unknown_id() {
+        let s = make_server();
+        let (conn, _rx) = ws_conn();
+        let req = make_request("eth_unsubscribe", vec![json!("0xdead")], json!(1));
+        assert_eq!(s.handle_ws(&req, &conn).result, Some(json!(false)));
     }
 
     #[test]
@@ -2077,48 +2318,93 @@ mod tests {
         let s = make_server();
         let req = make_request("eth_unsubscribe", vec![], json!(1));
         let resp = s.handle(&req);
-        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[test]
+    fn eth_unsubscribe_non_string_id_errors() {
+        let s = make_server();
+        let req = make_request("eth_unsubscribe", vec![json!(42)], json!(1));
+        let resp = s.handle(&req);
         assert_eq!(resp.error.unwrap().code, -32602);
     }
 
     #[test]
     fn subscription_ids_are_unique() {
-        let mgr = SubscriptionManager::new();
-        let sub1 = mgr.subscribe(&[json!("newHeads")]).unwrap();
-        let sub2 = mgr.subscribe(&[json!("newHeads")]).unwrap();
-        assert_ne!(sub1.id, sub2.id, "subscription IDs must be unique");
+        let s = make_server();
+        let (conn, _rx) = ws_conn();
+        let req = || make_request("eth_subscribe", vec![json!("newHeads")], json!(1));
+        let id1 = s.handle_ws(&req(), &conn).result.unwrap().as_str().unwrap().to_string();
+        let id2 = s.handle_ws(&req(), &conn).result.unwrap().as_str().unwrap().to_string();
+        assert_ne!(id1, id2, "subscription IDs must be unique");
     }
 
     #[test]
-    fn new_heads_notification_has_block_number() {
-        let mgr = SubscriptionManager::new();
-        let sub = mgr.subscribe(&[json!("newHeads")]).unwrap();
-        let notif = SubscriptionManager::new_heads_notification(&sub, 42);
-        assert_eq!(notif.method, "eth_subscription");
-        assert_eq!(notif.params.subscription, sub.id);
-        let number = notif.params.result["number"].as_str().unwrap();
-        assert_eq!(number, "0x2a");
+    fn drop_connection_reaps_its_subscriptions() {
+        let s = make_server();
+        let (conn, _rx) = ws_conn();
+        let req = make_request("eth_subscribe", vec![json!("newHeads")], json!(1));
+        let id = s.handle_ws(&req, &conn).result.unwrap().as_str().unwrap().to_string();
+        s.drop_connection(conn.conn_id);
+        // After the connection drops, the ID is unknown.
+        let unsub = make_request("eth_unsubscribe", vec![json!(id)], json!(2));
+        assert_eq!(s.handle(&unsub).result, Some(json!(false)));
     }
 
     #[test]
-    fn logs_notification_has_address_and_data() {
-        let mgr = SubscriptionManager::new();
-        let sub = mgr.subscribe(&[json!("logs")]).unwrap();
-        let notif = SubscriptionManager::logs_notification(&sub, "0xabc", "0xdead");
-        assert_eq!(notif.method, "eth_subscription");
-        assert_eq!(notif.params.subscription, sub.id);
-        assert_eq!(notif.params.result["address"], json!("0xabc"));
-        assert_eq!(notif.params.result["data"], json!("0xdead"));
+    fn publish_new_block_pushes_new_heads_notification() {
+        use executor::Module;
+        let (s, evm) = make_evm_server();
+        let (conn, mut rx) = ws_conn();
+        let sub = make_request("eth_subscribe", vec![json!("newHeads")], json!(1));
+        let id = s.handle_ws(&sub, &conn).result.unwrap().as_str().unwrap().to_string();
+
+        // Seal a real block, then publish — the notification must
+        // carry the real header fields, not a fabricated hash.
+        evm.begin_block(primitives::Height::new(1));
+        evm.end_block(primitives::Height::new(1));
+        s.publish_new_block(1);
+
+        let text = rx.try_recv().expect("newHeads notification must arrive");
+        let notif: Value = serde_json::from_str(&text).expect("notification must be JSON");
+        assert_eq!(notif["jsonrpc"], json!("2.0"));
+        assert_eq!(notif["method"], json!("eth_subscription"));
+        assert_eq!(notif["params"]["subscription"], json!(id));
+        let result = &notif["params"]["result"];
+        assert_eq!(result["number"], json!("0x1"));
+        assert_eq!(
+            result["hash"].as_str().unwrap().len(),
+            66,
+            "hash must be a 32-byte hex quantity"
+        );
+        assert!(result["gasUsed"].as_str().unwrap().starts_with("0x"));
+        assert!(result["stateRoot"].as_str().unwrap().starts_with("0x"));
+    }
+
+    #[test]
+    fn publish_new_block_without_subscriptions_is_noop() {
+        use executor::Module;
+        let (s, evm) = make_evm_server();
+        evm.begin_block(primitives::Height::new(1));
+        evm.end_block(primitives::Height::new(1));
+        // Must not panic or require the history lookup.
+        s.publish_new_block(1);
     }
 
     #[test]
     fn notification_serializes_to_json() {
-        let mgr = SubscriptionManager::new();
-        let sub = mgr.subscribe(&[json!("newHeads")]).unwrap();
-        let notif = SubscriptionManager::new_heads_notification(&sub, 1);
+        let notif = SubscriptionNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "eth_subscription".to_string(),
+            params: SubscriptionParams {
+                subscription: "0x1".to_string(),
+                result: json!({"number": "0x2a"}),
+            },
+        };
         let json_str = serde_json::to_string(&notif).unwrap();
         assert!(json_str.contains("eth_subscription"));
-        assert!(json_str.contains(&sub.id));
+        assert!(json_str.contains("0x1"));
+        assert!(json_str.contains("0x2a"));
     }
 
     // ---- Phase E: extended RPC method tests ----

@@ -189,11 +189,17 @@ fn blockscout_web3_client_version_works() {
 
 #[test]
 fn blockscout_eth_subscribe_new_heads_works() {
-    // Blockscout subscribes to newHeads for live block updates.
+    // Blockscout subscribes to newHeads over a WebSocket
+    // connection for live block updates. Over HTTP the method must
+    // reject with the geth-style "notifications not supported"
+    // error — the real subscription path is exercised end-to-end
+    // over the WS transport in `ws_subscribe.rs`.
     let s = make_server();
-    let result = handle(&s, "eth_subscribe", vec![json!("newHeads")]);
-    let id = result.as_str().expect("subscription ID must be a string");
-    assert!(id.starts_with("0x"), "Blockscout expects hex subscription ID: {id}");
+    let req = make_request("eth_subscribe", vec![json!("newHeads")], json!(1));
+    let resp = s.handle(&req);
+    let err = resp.error.expect("HTTP subscribe must error");
+    assert_eq!(err.code, -32_000);
+    assert_eq!(err.message, "notifications not supported");
 }
 
 // ---- Cross-tool error handling ----
