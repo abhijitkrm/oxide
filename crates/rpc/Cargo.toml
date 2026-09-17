@@ -13,6 +13,10 @@ repository.workspace = true
 [dependencies]
 primitives = { workspace = true }
 types = { workspace = true }
+codec = { workspace = true }
+# statesync: manifest/chunk helpers for the `/snapshot/manifest`
+# and `/snapshot/chunk/{i}` endpoints.
+statesync = { workspace = true }
 evm = { workspace = true }
 # crypto: domain-separated BLAKE3 tx hashing for
 # `oxide_sendRawTransaction` — the returned hash must match the

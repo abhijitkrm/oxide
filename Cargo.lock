@@ -2803,8 +2803,12 @@ dependencies = [
 name = "oxide-fullnode"
 version = "0.1.0"
 dependencies = [
+ "codec",
  "config",
+ "executor",
  "node",
+ "primitives",
+ "statesync",
 ]
 
 [[package]]
@@ -3678,6 +3682,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-trie",
  "axum",
+ "codec",
  "crypto",
  "evm",
  "executor",
@@ -3690,6 +3695,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
+ "statesync",
  "tokio",
  "tokio-tungstenite 0.27.0",
  "tower",
@@ -4227,6 +4233,15 @@ dependencies = [
  "framework",
  "primitives",
  "types",
+]
+
+[[package]]
+name = "statesync"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "crypto",
+ "primitives",
 ]
 
 [[package]]

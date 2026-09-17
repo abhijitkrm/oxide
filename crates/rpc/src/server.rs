@@ -45,8 +45,8 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -338,11 +338,22 @@ impl HttpServer {
     /// Panics if the TCP listener cannot bind to `addr` (e.g. port in
     /// use). In production, the caller should handle this gracefully.
     pub async fn serve(self) {
-        let app = Self::router(self.rpc, self.rate_limiter);
         let listener = TcpListener::bind(&self.addr).await.unwrap_or_else(|e| {
             panic!("RPC HTTP server: failed to bind {addr}: {e}", addr = self.addr)
         });
         eprintln!("RPC HTTP server: listening on http://{}", self.addr);
+        self.serve_on(listener).await;
+    }
+
+    /// Serve on an already-bound listener — the caller owns the
+    /// socket choice (e.g. tests binding `127.0.0.1:0` and reading
+    /// back the OS-assigned port).
+    ///
+    /// # Panics
+    ///
+    /// Panics if axum fails while serving.
+    pub async fn serve_on(self, listener: TcpListener) {
+        let app = Self::router(self.rpc, self.rate_limiter);
         let listener = LimitedListener { inner: listener, limiter: self.conn_limiter };
         axum::serve(listener, app).await.unwrap_or_else(|e| panic!("RPC HTTP server: {e}"));
     }
@@ -354,6 +365,8 @@ impl HttpServer {
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))
             .route("/snapshot", get(snapshot_handler))
+            .route("/snapshot/manifest", get(snapshot_manifest_handler))
+            .route("/snapshot/chunk/{index}", get(snapshot_chunk_handler))
             .route("/validator-set", get(validator_set_handler))
             .with_state((rpc, rate_limiter))
     }
@@ -541,6 +554,75 @@ async fn snapshot_handler(
                     .unwrap()
             }),
     }
+}
+
+/// Helper for the snapshot-sync endpoints: hex-encode a byte body
+/// or map the error to a status code. Kept small and shared so the
+/// two handlers stay identical in framing.
+fn hex_response(result: Result<Vec<u8>, String>, err_status: StatusCode) -> Response<String> {
+    match result {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body(format!("0x{}", hex_encode(&bytes)))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(String::new())
+                    .unwrap()
+            }),
+        Err(e) => Response::builder()
+            .status(err_status)
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"error":"{e}"}}"#))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body("{}".to_string())
+                    .unwrap()
+            }),
+    }
+}
+
+/// Sync manifest endpoint (`GET /snapshot/manifest`).
+///
+/// Returns the codec-encoded `statesync::Manifest` as hex — the
+/// trust anchor a syncing node verifies against its out-of-band
+/// (height, `state_root`) before fetching any chunk. A request
+/// re-exports the snapshot so the manifest always describes the
+/// latest finalized state.
+///
+/// 404 when no snapshot provider is attached.
+async fn snapshot_manifest_handler(
+    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+) -> Response<String> {
+    if rpc.snapshot_provider().is_none() {
+        return hex_response(
+            Err("snapshot provider not configured".to_string()),
+            StatusCode::NOT_FOUND,
+        );
+    }
+    hex_response(rpc.snapshot_manifest(), StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Sync chunk endpoint (`GET /snapshot/chunk/{index}`).
+///
+/// Returns the raw bytes of chunk `index` as hex — the client
+/// verifies each chunk against `manifest.chunk_hashes[index]`
+/// before assembling. Out-of-range indices get a 404: the client
+/// should re-fetch the manifest (the cached snapshot may have been
+/// replaced by a newer export).
+async fn snapshot_chunk_handler(
+    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    Path(index): Path<usize>,
+) -> Response<String> {
+    if rpc.snapshot_provider().is_none() {
+        return hex_response(
+            Err("snapshot provider not configured".to_string()),
+            StatusCode::NOT_FOUND,
+        );
+    }
+    hex_response(rpc.snapshot_chunk(index), StatusCode::NOT_FOUND)
 }
 
 /// Validator set endpoint (`GET /validator-set`).

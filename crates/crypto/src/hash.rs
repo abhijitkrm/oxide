@@ -86,6 +86,10 @@ pub enum Domain {
     /// key (`validator_address(pk)`). Appended after `Proposal` —
     /// never renumber.
     ValidatorAddress = 10,
+    /// A state-sync snapshot chunk (`H(tag ‖ chunk_bytes)` in the
+    /// manifest's `chunk_hashes`). Appended after
+    /// `ValidatorAddress` — never renumber.
+    StateSyncChunk = 11,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

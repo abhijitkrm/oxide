@@ -25,10 +25,80 @@ fn main() {
         config.max_mempool_entries
     );
 
-    let _node = Node::assemble(&config);
+    let mut node = Node::assemble(&config);
+    bootstrap_state_sync(&mut node);
 
     println!("oxide-fullnode: assembled stack (executor + core/staking/evm modules)");
-    println!("oxide-fullnode: ready (sync not yet implemented — Phase 2)");
+    println!("oxide-fullnode: ready (consensus sync not yet implemented — Phase 2)");
+}
+
+/// `--state-sync <host:port>` bootstrap: fetch a chunked snapshot
+/// from a peer's `/snapshot/*` endpoints and import it.
+///
+/// The trust anchor is `--trusted-height` + `--trusted-root`
+/// (0x-prefixed 32-byte hex) — a finalized (height, `state_root`)
+/// the operator obtained from a source they already trust. Both
+/// are required with `--state-sync`: syncing without them would
+/// take whatever state the endpoint feels like serving.
+///
+/// Verified twice: the manifest must match before a byte of state
+/// is downloaded (fail fast), and the imported root must recompute
+/// to the trusted value after import (fail closed).
+fn bootstrap_state_sync(node: &mut Node) {
+    let Some(addr) = parse_cli_flag("--state-sync") else {
+        return;
+    };
+    let height_str = parse_cli_flag("--trusted-height").unwrap_or_else(|| {
+        panic!("--state-sync requires --trusted-height — refusing to sync unverified state")
+    });
+    let root_str = parse_cli_flag("--trusted-root").unwrap_or_else(|| {
+        panic!("--state-sync requires --trusted-root — refusing to sync unverified state")
+    });
+    let trusted_height: u64 =
+        height_str.parse().unwrap_or_else(|_| panic!("invalid --trusted-height {height_str}"));
+    let root_hex = root_str.strip_prefix("0x").unwrap_or(&root_str);
+    let root_bytes = hex_decode(root_hex).unwrap_or_else(|e| panic!("invalid --trusted-root: {e}"));
+    let trusted_root = primitives::Hash(
+        <[u8; 32]>::try_from(root_bytes.as_slice())
+            .unwrap_or_else(|_| panic!("--trusted-root must be 32 bytes")),
+    );
+
+    let blob = statesync::fetch_snapshot(
+        &addr,
+        trusted_height,
+        &trusted_root,
+        executor::SNAPSHOT_FORMAT_VERSION,
+    )
+    .unwrap_or_else(|e| panic!("state sync from {addr} failed: {e}"));
+    let mut reader = codec::Reader::new(&blob);
+    let snapshot = <executor::ExecutorSnapshot as codec::Decode>::decode(&mut reader)
+        .unwrap_or_else(|e| panic!("snapshot decode failed: {e}"));
+    node.import_snapshot(&snapshot).unwrap_or_else(|e| panic!("snapshot import failed: {e}"));
+
+    // Post-import anchor: the imported root at the trusted height
+    // must equal what we already trusted — catches a snapshot whose
+    // KV payload decoded and imported but doesn't recompute.
+    let imported_root = node.app_handle().state_root_at(trusted_height);
+    assert_eq!(
+        imported_root, trusted_root,
+        "imported state root does not match trusted root — refusing to run"
+    );
+    println!(
+        "oxide-fullnode: state synced to height {trusted_height} ({} chunks, {} bytes)",
+        blob.len().div_ceil(statesync::DEFAULT_CHUNK_SIZE),
+        blob.len()
+    );
+}
+
+/// Decode a bare hex string (no `0x` needed — CLI args).
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd-length hex".to_string());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
 }
 
 /// Load the node configuration from CLI flags, env vars, and TOML file.

@@ -68,6 +68,8 @@ p2p = { path = "crates/p2p", version = "0.1.0" }
 devnet = { path = "crates/devnet", version = "0.1.0" }
 node = { path = "crates/node", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0" }
+# State-sync bootstrap: chunked snapshot fetch + verification (plan.md §8).
+statesync = { path = "crates/statesync", version = "0.1.0" }
 config = { path = "crates/config", version = "0.1.0" }
 metrics = { path = "crates/metrics", version = "0.1.0" }
 # HFT-grade matching engine core (plan.md §9.1; hot-path, std-only).

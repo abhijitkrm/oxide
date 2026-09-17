@@ -17,6 +17,12 @@ path = "src/main.rs"
 [dependencies]
 node = { workspace = true }
 config = { workspace = true }
+# statesync/codec/executor/primitives: `--state-sync` bootstrap —
+# manifest fetch, chunked download, snapshot decode + import.
+statesync = { workspace = true }
+codec = { workspace = true }
+executor = { workspace = true }
+primitives = { workspace = true }
 
 [lints]
 workspace = true

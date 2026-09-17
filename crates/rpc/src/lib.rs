@@ -75,6 +75,16 @@ pub trait TxSubmitter: Send + Sync {
     fn submit_tx(&self, tx: TxBytes) -> Result<(), String>;
 }
 
+/// One exported snapshot instance kept for chunk serving: the
+/// encoded blob plus the manifest describing its chunks.
+struct CachedSnapshot {
+    /// Codec-encoded `ExecutorSnapshot` bytes — chunks are byte
+    /// slices of this blob (`[i*chunk_size .. min((i+1)*cs, len)]`).
+    blob: Vec<u8>,
+    /// The chunk-hash manifest for `blob`.
+    manifest: statesync::Manifest,
+}
+
 /// Trait for providing a state snapshot via the `/snapshot` endpoint.
 ///
 /// Implemented by the node's executor handle. The snapshot is returned
@@ -90,6 +100,17 @@ pub trait SnapshotProvider: Send + Sync {
     /// Returns `Err(reason)` if the snapshot cannot be produced (e.g.
     /// the node is not yet initialized, or state is being written).
     fn export_snapshot(&self) -> Result<Vec<u8>, String>;
+
+    /// Metadata of the snapshot `export_snapshot` would produce:
+    /// `(height, state_root, format_version)`. The manifest
+    /// endpoint needs these values without decoding the blob —
+    /// the implementor returns them straight from its typed
+    /// snapshot (`ExecutorSnapshot`'s fields).
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`export_snapshot`](Self::export_snapshot).
+    fn snapshot_meta(&self) -> Result<(u64, primitives::Hash, u32), String>;
 }
 
 /// A validator-set entry for the `GET /validator-set` endpoint.
@@ -615,6 +636,16 @@ pub struct RpcServer {
     /// When set, the endpoint returns the codec-encoded snapshot as
     /// hex. When `None`, the endpoint returns 404.
     snapshot_provider: Option<Arc<dyn SnapshotProvider>>,
+    /// The most recent chunked snapshot export — the blob the
+    /// `/snapshot/chunk/{i}` handlers slice and the manifest that
+    /// describes it. Populated lazily by the first manifest or
+    /// chunk request; a manifest request re-exports so the served
+    /// manifest always describes the latest finalized state.
+    /// Single-slot by design: a second sync's manifest call
+    /// replaces the blob, which the first client detects as a
+    /// chunk-hash mismatch and retries — integrity is guaranteed
+    /// by the hash manifest regardless of interleaving.
+    snapshot_cache: std::sync::Mutex<Option<CachedSnapshot>>,
     /// Optional validator-set provider for the `GET /validator-set`
     /// endpoint. When set, the endpoint returns the current validator
     /// set as JSON (addresses, public keys, stakes). When `None`,
@@ -661,6 +692,7 @@ impl RpcServer {
             rate_window_start_ms: AtomicU64::new(0),
             rate_window_count: AtomicU64::new(0),
             snapshot_provider: None,
+            snapshot_cache: std::sync::Mutex::new(None),
             validator_set_provider: None,
             evm: None,
             filters: std::sync::Mutex::new(HashMap::new()),
@@ -703,6 +735,79 @@ impl RpcServer {
     #[must_use]
     pub fn snapshot_provider(&self) -> Option<&Arc<dyn SnapshotProvider>> {
         self.snapshot_provider.as_ref()
+    }
+
+    /// Export-or-load the cached chunked snapshot. `refresh`
+    /// re-exports (the manifest endpoint wants the freshest state);
+    /// chunk serving accepts whatever is cached.
+    fn cached_snapshot(
+        &self,
+        refresh: bool,
+    ) -> Result<std::sync::MutexGuard<'_, Option<CachedSnapshot>>, String> {
+        let mut guard =
+            self.snapshot_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if refresh || guard.is_none() {
+            let provider = self
+                .snapshot_provider
+                .as_ref()
+                .ok_or_else(|| "snapshot provider not configured".to_string())?;
+            let blob = provider.export_snapshot()?;
+            let (height, state_root, format_version) = provider.snapshot_meta()?;
+            let (manifest, _) = statesync::chunk_blob(
+                height,
+                state_root,
+                format_version,
+                &blob,
+                statesync::DEFAULT_CHUNK_SIZE,
+            );
+            *guard = Some(CachedSnapshot { blob, manifest });
+        }
+        Ok(guard)
+    }
+
+    /// The codec-encoded sync manifest for the latest snapshot
+    /// (`GET /snapshot/manifest` body before hex-encoding).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the provider's export/meta errors; `Err` also
+    /// when no provider is configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache mutex is poisoned or the populate step
+    /// left the slot empty (invariant: `cached_snapshot` only
+    /// returns `Ok` after writing `Some`).
+    pub fn snapshot_manifest(&self) -> Result<Vec<u8>, String> {
+        let guard = self.cached_snapshot(true)?;
+        let cached = guard.as_ref().expect("populated by cached_snapshot");
+        let mut buf = Vec::new();
+        codec::Encode::encode(&cached.manifest, &mut buf);
+        Ok(buf)
+    }
+
+    /// Chunk `index` of the cached snapshot blob
+    /// (`GET /snapshot/chunk/{index}` body before hex-encoding).
+    ///
+    /// # Errors
+    ///
+    /// `Err` when no provider is configured or `index` is out of
+    /// range — the client should re-fetch the manifest (the cached
+    /// snapshot may have been replaced by a newer export).
+    ///
+    /// # Panics
+    ///
+    /// Same invariants as [`snapshot_manifest`](Self::snapshot_manifest).
+    pub fn snapshot_chunk(&self, index: usize) -> Result<Vec<u8>, String> {
+        let guard = self.cached_snapshot(false)?;
+        let cached = guard.as_ref().expect("populated by cached_snapshot");
+        let cs = cached.manifest.chunk_size as usize;
+        let start = index.checked_mul(cs).ok_or_else(|| "chunk index out of range".to_string())?;
+        if index >= cached.manifest.chunk_count() || start >= cached.blob.len() {
+            return Err("chunk index out of range".to_string());
+        }
+        let end = (start + cs).min(cached.blob.len());
+        Ok(cached.blob[start..end].to_vec())
     }
 
     /// Attach a validator-set provider so `GET /validator-set`

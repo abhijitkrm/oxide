@@ -13798,3 +13798,54 @@ replaced.
 - #21 state-sync bootstrap hardening — snapshot manifest + chunked
   fetch over RPC, trusted-root verify, fullnode bootstrap.
 - #22 pruning — height-indexed retention policies + archive recipe.
+
+## 2026-10-07 — Session: P3 #21 — state-sync bootstrap: manifests, chunked fetch, trusted-root verify
+
+### What
+
+- **`crates/statesync`** — new std-only crate: `Manifest` (height,
+  claimed `state_root`, snapshot format version, chunk size, total
+  length, per-chunk BLAKE3 hashes under new `Domain::StateSyncChunk`
+  =11), `chunk_blob`/`verify_chunk`/`assemble`, `check_trusted`
+  (the *only* trust decision — operator's out-of-band
+  (height, root)), `fetch_hex` (blocking `TcpStream` HTTP GET —
+  bootstrap runs before any async runtime exists) and
+  `fetch_snapshot` (manifest → trusted-check → format gate →
+  hash-verified chunks → assembled blob).
+- **RPC endpoints** — `GET /snapshot/manifest` (codec-encoded
+  manifest hex; re-exports so it always describes latest state)
+  and `GET /snapshot/chunk/{i}` (raw chunk hex, 404 out of range).
+  `SnapshotProvider` gains `snapshot_meta() -> (height, root,
+  format_version)` so the manifest is built without decoding the
+  blob; `RpcServer` keeps a single-slot `snapshot_cache` —
+  concurrent syncs detect interleaving as chunk-hash mismatches
+  and retry (integrity is hash-guaranteed regardless).
+- **`HttpServer::serve_on(listener)`** — serve on a caller-bound
+  socket (tests bind `127.0.0.1:0`).
+- **`oxide-fullnode --state-sync <addr> --trusted-height H
+  --trusted-root 0x<64hex>`** — downloads, decodes, imports, then
+  asserts `state_root_at(trusted_height) == trusted_root` before
+  starting. Trusted params are *required* — without them the node
+  would take whatever state the endpoint felt like serving.
+
+### Wire contract
+
+- Chunks: fixed 4 MiB slices of the codec-encoded
+  `ExecutorSnapshot`; last chunk may be short; `chunk_hashes[i]`
+  = `H(11 ‖ chunk_i)`.
+- Manifest decode validates `count == ceil(total_len/chunk_size)`
+  before allocating — a forged count can't OOM the reader.
+
+### Tests
+
+- statesync +6 (round-trip, tampered chunk, codec, forged-count
+  decode guard, empty blob, trusted check).
+- rpc +2 real-socket e2e (full fetch over axum+TCP; wrong-root
+  abort). Caught a current_thread-runtime starvation in the test
+  itself: blocking client on the runtime thread froze the server
+  task — `spawn_blocking` fixed the harness, not the code.
+- Gates: touched-crate clippy `-D warnings` clean; fmt applied.
+
+### Next
+
+- #22 pruning — height-indexed retention policies + archive recipe.

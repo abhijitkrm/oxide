@@ -123,6 +123,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     and the new binary knows exactly how old the data it's
     loading is — upgrading it cleanly or refusing loudly
     instead of corrupting state.
+
+- **State-sync bootstrap for fullnodes** (`crates/statesync`,
+  `crates/rpc`, `bin/oxide-fullnode`, `bin/oxide-validator`)
+  - New `/snapshot/manifest` and `/snapshot/chunk/{i}` endpoints
+    on the validator RPC: a small manifest (height, state root,
+    format version, per-chunk BLAKE3 hashes) plus the snapshot
+    served in 4 MiB hash-verified chunks.
+  - `oxide-fullnode --state-sync <peer> --trusted-height H
+    --trusted-root 0x...` downloads a recent snapshot instead of
+    replaying the journal from genesis. Both trusted values are
+    required: the manifest is checked before downloading and the
+    imported state root must recompute to the trusted root, so a
+    peer serving wrong state is detected twice.
+  - **In plain words:** joining the network used to mean
+    re-executing every block since genesis — fine at week one,
+    impossible at year three. Now a new node downloads a recent
+    snapshot in verified pieces from any validator, checks it
+    against a root the operator already trusts, and starts
+    serving from that height.
   - Downtime tracking: each block now records which validators
     signed it (`FinalizedBlock.signers`), and a validator who
     misses more than half of the last 100 blocks is jailed

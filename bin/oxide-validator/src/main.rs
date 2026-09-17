@@ -177,6 +177,11 @@ impl rpc::SnapshotProvider for ExecutorSnapshotProvider {
         snap.encode(&mut buf);
         Ok(buf)
     }
+
+    fn snapshot_meta(&self) -> Result<(u64, primitives::Hash, u32), String> {
+        let snap = self.executor.export_snapshot();
+        Ok((snap.height, snap.state_root, executor::SNAPSHOT_FORMAT_VERSION))
+    }
 }
 
 fn main() {

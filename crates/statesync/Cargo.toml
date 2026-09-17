@@ -1,0 +1,17 @@
+# Oxide blockchain — `statesync` crate
+# (workspace: github.com/abhijitkrm/oxide; bare-name convention per
+# docs/devlog.md session 2)
+
+[package]
+name = "statesync"
+description = "State-sync bootstrap: snapshot manifests, hash-verified chunked fetch, and a minimal sync HTTP client for fullnode bootstrap."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+codec = { workspace = true }
+crypto = { workspace = true }
