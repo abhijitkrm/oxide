@@ -214,7 +214,14 @@ impl Mmr {
             peak_hashes.len(),
             "checkpoint peaks must match the forest shape for leaf_count"
         );
-        let node_base = usize::try_from(2 * leaf_count - u64::from(leaf_count.count_ones()))
+        // `2 * leaf_count` overflows for counts ≥ 2^63 — a forged
+        // checkpoint (state-sync input) can carry one. Such a forest
+        // cannot exist in memory; saturating to usize::MAX keeps the
+        // index arithmetic honest instead of panicking.
+        let node_base = leaf_count
+            .checked_mul(2)
+            .and_then(|v| v.checked_sub(u64::from(leaf_count.count_ones())))
+            .and_then(|v| usize::try_from(v).ok())
             .unwrap_or(usize::MAX);
         Self {
             nodes: Vec::new(),

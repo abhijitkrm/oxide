@@ -1772,10 +1772,13 @@ impl Executor {
             };
             // H5: each tx's nonce must equal the next expected nonce
             // for its sender; txs that fail are skipped and do not
-            // advance the counter.
+            // advance the counter. u64::MAX is reserved — skipping it
+            // here keeps `expected + 1` below overflow-free (a MAX
+            // nonce would wrap the counter to 0 and reopen the
+            // sender's whole nonce range to replay).
             let expected = local_nonce.get(&ctx.sender).copied().unwrap_or(0);
-            if ctx.nonce != expected {
-                continue; // stale or out-of-order nonce — skip
+            if ctx.nonce != expected || ctx.nonce == u64::MAX {
+                continue; // stale, out-of-order, or reserved nonce — skip
             }
             let Some(module_id) = parse_module_id(bytes) else {
                 continue; // skip malformed txs
@@ -1815,7 +1818,9 @@ impl Executor {
             }
             // Advance the local nonce counter for this sender — only
             // after the fee charge succeeds; a tx that can't pay its
-            // fee doesn't get its nonce advanced.
+            // fee doesn't get its nonce advanced. `expected + 1`
+            // cannot overflow: the reserved-nonce skip above keeps
+            // `expected ≤ u64::MAX - 1`.
             local_nonce.insert(ctx.sender, expected + 1);
             cumulative_gas = cumulative_gas.saturating_add(gas);
             // Zero-copy: the payload is borrowed from the block tx
@@ -2007,6 +2012,14 @@ impl AppInterface for Executor {
                 };
             }
         }
+        // Nonce u64::MAX is reserved: executing it would wrap the
+        // next-expected counter (MAX + 1 → 0) and reopen the sender's
+        // entire nonce range to replay. Rejecting it at admission
+        // keeps `expected + 1` in `group_block_txs` overflow-free —
+        // no honest account can exhaust 2^64 − 1 nonces anyway.
+        if ctx.nonce == u64::MAX {
+            return MempoolAck::Rejected { reason: "nonce `u64::MAX` is reserved".to_string() };
+        }
         let Some(module_id) = parse_module_id(bytes) else {
             return MempoolAck::Rejected { reason: "malformed: no module ID".to_string() };
         };
@@ -2117,6 +2130,13 @@ impl AppInterface for Executor {
                     continue;
                 }
             }
+            // Same reserved-nonce rule as `ingest_tx`.
+            if ctx.nonce == u64::MAX {
+                results.push(MempoolAck::Rejected {
+                    reason: "nonce `u64::MAX` is reserved".to_string(),
+                });
+                continue;
+            }
             let Some(module_id) = parse_module_id(bytes) else {
                 results
                     .push(MempoolAck::Rejected { reason: "malformed: no module ID".to_string() });
@@ -2194,7 +2214,9 @@ impl AppInterface for Executor {
         // scheduled halt, propose empty blocks only — the chain
         // keeps committing (deterministic liveness) while state
         // stays frozen at the halt height.
-        let past_halt = self.halt_height().is_some_and(|halt| self.current_height() + 1 > halt);
+        // `current + 1 > halt` ⟺ `current >= halt`, written without
+        // the addition so a height of u64::MAX can't wrap.
+        let past_halt = self.halt_height().is_some_and(|halt| self.current_height() >= halt);
         // Select txs from the mempool by fee priority.
         let candidates = if past_halt {
             Vec::new()
@@ -2300,12 +2322,17 @@ impl AppInterface for Executor {
             // Cross-block anchoring is NOT checked here (see comment
             // above — pipelined consensus means execution may lag).
             match last_nonce.get(&ctx.sender) {
-                Some(&prev) if ctx.nonce != prev + 1 => {
+                // `prev + 1` must not wrap: a previous nonce of
+                // u64::MAX has no valid successor — `checked_add`
+                // yields `None`, which falls through to `_` and
+                // rejects the tx (the match arm ordering makes the
+                // non-contiguous case the failure path).
+                Some(&prev) if prev.checked_add(1).is_none_or(|next| ctx.nonce != next) => {
                     return Verdict::Reject {
                         reason: format!(
                             "nonce gap/reorder: sender {:?} expected {} got {}",
                             ctx.sender,
-                            prev + 1,
+                            prev.wrapping_add(1),
                             ctx.nonce
                         ),
                     };
@@ -2317,6 +2344,11 @@ impl AppInterface for Executor {
                 _ => {}
             }
             last_nonce.insert(ctx.sender, ctx.nonce);
+            // u64::MAX is a reserved nonce (see `group_block_txs`):
+            // a block containing one is invalid.
+            if ctx.nonce == u64::MAX {
+                return Verdict::Reject { reason: "nonce `u64::MAX` is reserved".to_string() };
+            }
             // Check that the tx has a module ID byte.
             if bytes.len() < MODULE_ID_OFFSET + 1 {
                 return Verdict::Reject { reason: "tx too short for module ID".to_string() };
@@ -3027,6 +3059,48 @@ mod tests {
             *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             1,
             "stale nonce tx must be skipped during execution"
+        );
+    }
+
+    /// Regression: nonce `u64::MAX` is reserved. Executing it would
+    /// wrap the sender's next-expected counter (`MAX + 1` → 0) and
+    /// reopen the whole nonce range to replay. The tx must be
+    /// rejected at admission, skipped at execution, and rejected at
+    /// proposal validation.
+    #[test]
+    fn nonce_u64_max_is_reserved() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+
+        // Admission: nonce MAX is rejected outright.
+        let tx_max = make_tx_with_nonce(1, &[9], u64::MAX);
+        assert!(
+            matches!(executor.ingest_tx(tx_max.clone()), MempoolAck::Rejected { .. }),
+            "nonce u64::MAX must be rejected at admission"
+        );
+
+        // Execution: a MAX-nonce tx smuggled into a block is skipped
+        // — the counter does not move and the nonce map is not
+        // poisoned.
+        let block =
+            FinalizedBlock { height: Height::new(0), txs: vec![tx_max], signers: Vec::new() };
+        executor.finalize_block(&block);
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "reserved nonce must not execute"
+        );
+
+        // The nonce map must still expect 0 — a subsequent nonce-0 tx
+        // executes normally (no wrap-induced replay window).
+        let tx0 = make_tx_with_nonce(1, &[0], 0);
+        let block1 = FinalizedBlock { height: Height::new(1), txs: vec![tx0], signers: Vec::new() };
+        executor.finalize_block(&block1);
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "nonce 0 must still execute after a smuggled MAX nonce"
         );
     }
 

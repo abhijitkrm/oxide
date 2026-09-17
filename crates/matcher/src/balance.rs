@@ -175,256 +175,328 @@ impl Default for BalanceCache {
     }
 }
 
-// ── ShardedBalanceCache ──────────────────────────────────────────────
+// ── AtomicBalanceCache ───────────────────────────────────────────────
 
-/// A thread-safe balance cache sharded by account hash.
+/// A thread-safe balance cache: a flat array of per-account
+/// `AtomicU64`s plus a locked `HashMap` fallback for non-canonical
+/// addresses.
 ///
 /// Used by the multi-market parallel matcher where N worker threads
-/// (one per market) share a single balance store. Each shard is a
-/// `Mutex<HashMap<[u8; 20], u64>>` — the shard for an account is
-/// `first_4_bytes(addr) % N_SHARDS`.
+/// (one per market) share a single balance store. This replaces the
+/// earlier per-shard `Mutex<HashMap>` design: shard locks serialized
+/// threads that only collided on a shard (1/64 of accounts) rather
+/// than on the actual account, capping 8-thread throughput at
+/// ~22M ops/s (`benches/balance_contention.rs`). Per-account
+/// atomics make false sharing impossible — two threads conflict
+/// only when they touch the SAME account, which is the real race
+/// the risk gate exists for.
 ///
 /// # Concurrency model
 ///
-/// - **Read/debit/credit on one account**: locks only that account's
-///   shard. No cross-shard coordination.
-/// - **Cross-shard transfer (buyer in shard A, seller in shard B)**:
-///   locks both shards in canonical order (lower index first) to
-///   avoid deadlock. This is the classic two-phase locking pattern
-///   for transfers.
-/// - **Check-and-debit (atomic balance check + reservation)**: done
-///   under the shard lock, so two workers trading the same account
-///   on different markets cannot overdraw.
+/// - **Read/credit/debit on one flat account**: a single atomic
+///   operation on that account's word. No locks, no cross-account
+///   coordination.
+/// - **Check-and-debit**: one `fetch_update` CAS loop — the
+///   sufficient-balance check and the subtraction are one atomic
+///   step, so two workers trading the same account on different
+///   markets cannot overdraw.
+/// - **Transfer**: CAS-debit `from` first; on success, credit `to`
+///   (the credit is a saturating add — it cannot fail). The
+///   operation linearizes at the debit; the credit lands a few
+///   instructions later. That transient "in-flight" state is safe
+///   for a risk cache: a concurrent `check_and_debit` on `to` sees
+///   the pre-credit balance and conservatively rejects — funds can
+///   never be double-spent or created.
+/// - **Sparse addresses** (non-canonical form): all sparse ops run
+///   under one `Mutex<HashMap>`. Mixed flat↔sparse transfers take
+///   the sparse lock for the sparse side only — the flat side is
+///   already atomic.
 ///
-/// # Why not the flat-array `BalanceCache`?
+/// # Memory ordering
 ///
-/// `BalanceCache` is `&mut self` — single-threaded. The sharded
-/// version trades the flat array's O(1) direct-index access for
-/// `HashMap` + `Mutex` per shard, but gains parallelism across 128+
-/// market threads. For 1M accounts across 64 shards, each shard
-/// holds ~15k entries — small enough that the `HashMap` lookup is
-/// still cache-friendly.
+/// `Acquire` on reads and `AcqRel` on read-modify-writes. For a pure
+/// accounting word `Relaxed` would suffice today — the balance IS
+/// the state, with no dependent invariants — but the stronger
+/// ordering is free on x86/ARM here and protects against future
+/// code that keys off balance values.
 ///
-/// # Shard count tradeoff
+/// # Capacity
 ///
-/// - More shards = less contention, more memory overhead.
-/// - Fewer shards = more contention, less memory.
-/// - Default: 64 shards (good for 16-32 core machines with 128+
-///   markets; each shard is contended by ~2 market threads on
-///   average).
-pub struct ShardedBalanceCache {
-    /// One `HashMap` per shard, each behind its own `Mutex`.
-    shards: Vec<std::sync::Mutex<HashMap<[u8; 20], u64>>>,
-    /// Number of shards (power of 2 for fast modulo).
-    num_shards: usize,
+/// The flat array is sized at construction (default 1M accounts =
+/// 8 MB of atomics) and does NOT grow — `Vec` reallocation would be
+/// unsound under shared `&` access. Non-canonical or out-of-range
+/// addresses transparently use the sparse map.
+pub struct AtomicBalanceCache {
+    /// `flat[i]` = balance of canonical account `i` (address form
+    /// `[u32 index LE][0; 16]`).
+    flat: Vec<std::sync::atomic::AtomicU64>,
+    /// Fallback for non-canonical addresses: full 20-byte key, so
+    /// arbitrary addresses can never alias a flat slot.
+    sparse: std::sync::Mutex<HashMap<[u8; 20], u64>>,
 }
 
-/// Default number of shards. 64 is a good fit for 16-32 core
-/// machines running 128+ market threads — each shard is contended
-/// by ~2 threads on average, and the `Mutex` is uncontended in the
-/// common case (accounts spread across shards).
-pub const DEFAULT_SHARD_COUNT: usize = 64;
+/// Backwards-compatible alias: the type was previously a
+/// per-shard `Mutex<HashMap>` design named `ShardedBalanceCache`.
+/// The constructor's argument changed meaning (was shard count, is
+/// now flat capacity) — see [`AtomicBalanceCache::new`].
+pub type ShardedBalanceCache = AtomicBalanceCache;
 
-impl ShardedBalanceCache {
-    /// Create a sharded balance cache with the given number of
-    /// shards. Each shard starts with an empty `HashMap`.
+/// Default flat-array capacity: 1M accounts = 8 MB of `AtomicU64`.
+/// Matches `DEFAULT_CAPACITY` for the single-threaded cache.
+pub const DEFAULT_SHARD_COUNT: usize = 1_000_000;
+
+impl AtomicBalanceCache {
+    /// Create a cache whose flat array holds `capacity` accounts.
+    /// The parameter previously meant "shard count" when this type
+    /// was lock-based; it is now a flat capacity — pass the number
+    /// of funded sequential accounts (or more).
     ///
     /// # Panics
     ///
-    /// Panics if `num_shards` is 0.
+    /// Panics if `capacity` is 0.
     #[must_use]
-    pub fn new(num_shards: usize) -> Self {
-        assert!(num_shards > 0, "must have at least one shard");
-        let shards = (0..num_shards).map(|_| std::sync::Mutex::new(HashMap::new())).collect();
-        Self { shards, num_shards }
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "flat capacity must be at least 1");
+        let mut flat = Vec::with_capacity(capacity);
+        flat.resize_with(capacity, || std::sync::atomic::AtomicU64::new(0));
+        Self { flat, sparse: std::sync::Mutex::new(HashMap::new()) }
     }
 
-    /// Create with the default shard count (64).
+    /// Create with the default capacity (1M accounts).
     #[must_use]
     pub fn with_default_shards() -> Self {
         Self::new(DEFAULT_SHARD_COUNT)
     }
 
-    /// Map an address to its shard index: first 4 bytes mod
-    /// `num_shards`. This is deterministic and spreads sequential
-    /// accounts across shards (account 0 → shard 0, account 1 →
-    /// shard 1, ..., account 64 → shard 0, ...).
-    #[inline]
-    fn shard_idx(&self, addr: &Address) -> usize {
-        let raw = u32::from_le_bytes([addr.0[0], addr.0[1], addr.0[2], addr.0[3]]);
-        (raw as usize) % self.num_shards
-    }
-
-    /// Get an account's balance (0 if not funded). Locks one shard.
+    /// Get an account's balance (0 if not funded). Flat path: one
+    /// atomic load. Sparse path: locked `HashMap` read.
     ///
     /// # Panics
     ///
-    /// Panics if the shard mutex is poisoned.
+    /// Panics if the sparse mutex is poisoned (sparse addresses only).
     #[inline]
     pub fn get(&self, addr: &Address) -> u64 {
-        let idx = self.shard_idx(addr);
-        self.shards[idx]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&addr.0)
-            .copied()
-            .unwrap_or(0)
+        if is_flat(addr, self.flat.len()) {
+            self.flat[addr_index(addr)].load(std::sync::atomic::Ordering::Acquire)
+        } else {
+            self.sparse
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&addr.0)
+                .copied()
+                .unwrap_or(0)
+        }
     }
 
-    /// Set an account's balance (fund or overwrite). Locks one shard.
+    /// Set an account's balance (fund or overwrite). Flat path: one
+    /// atomic store. Intended for funding/setup; concurrent `set`s
+    /// on the same account have no ordering guarantee beyond the
+    /// final value being one of the stored ones.
     ///
     /// # Panics
     ///
-    /// Panics if the shard mutex is poisoned.
+    /// Panics if the sparse mutex is poisoned (sparse addresses only).
     #[inline]
     pub fn set(&self, addr: &Address, amount: u64) {
-        let idx = self.shard_idx(addr);
-        self.shards[idx]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(addr.0, amount);
+        if is_flat(addr, self.flat.len()) {
+            self.flat[addr_index(addr)].store(amount, std::sync::atomic::Ordering::Release);
+        } else {
+            self.sparse
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(addr.0, amount);
+        }
     }
 
-    /// Credit an account (add to balance). Locks one shard.
+    /// Credit an account (add to balance). Flat path: one CAS that
+    /// saturates at `u64::MAX` instead of wrapping — matching the
+    /// old `saturating_add` semantics (an account at MAX cannot be
+    /// credited further; value is not silently wrapped).
     ///
     /// # Panics
     ///
-    /// Panics if the shard mutex is poisoned.
+    /// Panics if the sparse mutex is poisoned (sparse addresses only).
     #[inline]
     pub fn credit(&self, addr: &Address, amount: u64) {
-        let idx = self.shard_idx(addr);
-        let mut shard = self.shards[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = shard.entry(addr.0).or_insert(0);
-        *entry = entry.saturating_add(amount);
+        if is_flat(addr, self.flat.len()) {
+            let idx = addr_index(addr);
+            // `fetch_update` retries the CAS under contention; the
+            // closure always returns Some so this cannot fail.
+            let _ = self.flat[idx].fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |b| Some(b.saturating_add(amount)),
+            );
+        } else {
+            let mut sparse = self.sparse.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = sparse.entry(addr.0).or_insert(0);
+            *entry = entry.saturating_add(amount);
+        }
+    }
+
+    /// Debit an account (subtract from balance, saturating at 0).
+    /// Does NOT check sufficiency — the caller must pre-check with
+    /// `get` or use [`Self::check_and_debit`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sparse mutex is poisoned (sparse addresses only).
+    #[inline]
+    pub fn debit(&self, addr: &Address, amount: u64) {
+        if is_flat(addr, self.flat.len()) {
+            let idx = addr_index(addr);
+            let _ = self.flat[idx].fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |b| Some(b.saturating_sub(amount)),
+            );
+        } else {
+            let mut sparse = self.sparse.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = sparse.entry(addr.0).or_insert(0);
+            *entry = entry.saturating_sub(amount);
+        }
     }
 
     /// Atomically check that the account has at least `amount` and
     /// debit it. Returns `true` if the debit succeeded, `false` if
-    /// the balance was insufficient. Locks one shard for the entire
-    /// check-and-debit — no TOCTOU race.
+    /// the balance was insufficient. Flat path: one `fetch_update`
+    /// CAS — the check and the subtraction are a single atomic step,
+    /// so two workers trading the same account cannot overdraw.
     ///
-    /// This is the anti-spam gate for buy orders: the balance check
-    /// and reservation happen under the same lock, so two market
-    /// workers trading the same account on different markets cannot
-    /// overdraw.
+    /// This is the anti-spam gate for buy orders.
     ///
     /// # Panics
     ///
-    /// Panics if the shard mutex is poisoned.
+    /// Panics if the sparse mutex is poisoned (sparse addresses only).
     #[inline]
     pub fn check_and_debit(&self, addr: &Address, amount: u64) -> bool {
-        let idx = self.shard_idx(addr);
-        let mut shard = self.shards[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = shard.entry(addr.0).or_insert(0);
-        if *entry >= amount {
-            *entry -= amount;
-            true
+        if is_flat(addr, self.flat.len()) {
+            let idx = addr_index(addr);
+            self.flat[idx]
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |b| b.checked_sub(amount),
+                )
+                .is_ok()
         } else {
-            false
+            let mut sparse = self.sparse.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = sparse.entry(addr.0).or_insert(0);
+            if *entry >= amount {
+                *entry -= amount;
+                true
+            } else {
+                false
+            }
         }
     }
 
-    /// Transfer `amount` from `from` to `to` atomically. Locks both
-    /// shards in canonical order (lower index first) to avoid
-    /// deadlock. If both accounts are in the same shard, locks only
-    /// once.
+    /// Transfer `amount` from `from` to `to`. Returns `false` — with
+    /// NOTHING moved — if `from` cannot cover `amount`.
     ///
-    /// Solvency is checked under the same locks: `false` if `from`
-    /// cannot cover `amount`, in which case NOTHING is debited or
-    /// credited. Previously the debit saturated to zero while the
-    /// full amount was credited — minting the difference out of
-    /// thin air (an underfunded `from` paid `to` in full).
+    /// Flat↔flat: CAS-debit `from` (the linearization point), then
+    /// saturating-credit `to`. The credit cannot fail, so the
+    /// transfer cannot be left half-applied; a concurrent observer
+    /// may see the debit before the credit lands — a transient
+    /// in-flight state that is conservative for a risk cache.
+    ///
+    /// Sparse involvement: the sparse side runs under the sparse
+    /// mutex; the flat side stays atomic.
     ///
     /// # Panics
     ///
-    /// Panics if either shard mutex is poisoned.
+    /// Panics if the sparse mutex is poisoned (sparse addresses only).
     pub fn transfer(&self, from: &Address, to: &Address, amount: u64) -> bool {
-        let from_idx = self.shard_idx(from);
-        let to_idx = self.shard_idx(to);
-        if from_idx == to_idx {
-            // Same shard — one lock.
-            let mut shard =
-                self.shards[from_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let from_entry = shard.entry(from.0).or_insert(0);
-            if *from_entry < amount {
-                return false; // insolvent — nothing moved
+        let from_flat = is_flat(from, self.flat.len());
+        let to_flat = is_flat(to, self.flat.len());
+        match (from_flat, to_flat) {
+            (true, true) => {
+                if !self.check_and_debit(from, amount) {
+                    return false; // insolvent — nothing moved
+                }
+                self.credit(to, amount);
+                true
             }
-            *from_entry -= amount;
-            let to_entry = shard.entry(to.0).or_insert(0);
-            *to_entry = to_entry.saturating_add(amount);
-            true
-        } else {
-            // Different shards — lock in canonical order (lower
-            // index first) to avoid deadlock. Both locks are held
-            // for the entire debit+credit, making the transfer
-            // atomic even if other threads are touching these
-            // accounts on other markets.
-            let (first_lock, second_lock) = if from_idx < to_idx {
-                (
-                    self.shards[from_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-                    self.shards[to_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-                )
-            } else {
-                (
-                    self.shards[to_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-                    self.shards[from_idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-                )
-            };
-            let (mut first, mut second) = (first_lock, second_lock);
-            // `from` and `to` are in different shards; figure out
-            // which lock guards which account.
-            let (from_shard, to_shard) = if from_idx < to_idx {
-                (&mut first, &mut second)
-            } else {
-                (&mut second, &mut first)
-            };
-            let from_entry = from_shard.entry(from.0).or_insert(0);
-            if *from_entry < amount {
-                return false; // insolvent — nothing moved
+            (true, false) => {
+                if !self.check_and_debit(from, amount) {
+                    return false;
+                }
+                let mut sparse =
+                    self.sparse.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entry = sparse.entry(to.0).or_insert(0);
+                *entry = entry.saturating_add(amount);
+                true
             }
-            *from_entry -= amount;
-            let to_entry = to_shard.entry(to.0).or_insert(0);
-            *to_entry = to_entry.saturating_add(amount);
-            true
+            (false, true) => {
+                // Debit the sparse side under its lock first; only
+                // then credit the flat side — keeps the
+                // insolvency-check atomic w.r.t. other sparse ops.
+                {
+                    let mut sparse =
+                        self.sparse.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let entry = sparse.entry(from.0).or_insert(0);
+                    if *entry < amount {
+                        return false;
+                    }
+                    *entry -= amount;
+                }
+                self.credit(to, amount);
+                true
+            }
+            (false, false) => {
+                let mut sparse =
+                    self.sparse.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let from_entry = sparse.entry(from.0).or_insert(0);
+                if *from_entry < amount {
+                    return false;
+                }
+                *from_entry -= amount;
+                let to_entry = sparse.entry(to.0).or_insert(0);
+                *to_entry = to_entry.saturating_add(amount);
+                true
+            }
         }
     }
 
-    /// Number of accounts with non-zero balance across all shards.
-    /// This is `O(num_shards)` — locks each shard briefly.
+    /// Number of accounts with non-zero balance (flat + sparse).
+    /// `O(capacity)` on the flat array — a debug/stats path, not
+    /// hot.
     ///
     /// # Panics
     ///
-    /// Panics if any shard mutex is poisoned.
+    /// Panics if the sparse mutex is poisoned.
     pub fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| {
-                s.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .values()
-                    .filter(|&&b| b > 0)
-                    .count()
-            })
-            .sum()
+        let flat =
+            self.flat.iter().filter(|a| a.load(std::sync::atomic::Ordering::Acquire) > 0).count();
+        let sparse = self
+            .sparse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|&&b| b > 0)
+            .count();
+        flat + sparse
     }
 
     /// Is the cache empty?
     ///
     /// # Panics
     ///
-    /// Panics if any shard mutex is poisoned.
+    /// Panics if the sparse mutex is poisoned.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Number of shards.
+    /// Flat-array capacity in accounts (was `num_shards` — kept the
+    /// getter name out of the hot path's way; the cache is no longer
+    /// sharded).
     #[must_use]
     pub fn num_shards(&self) -> usize {
-        self.num_shards
+        self.flat.len()
     }
 }
 
-impl Default for ShardedBalanceCache {
+impl Default for AtomicBalanceCache {
     fn default() -> Self {
         Self::with_default_shards()
     }
@@ -490,19 +562,19 @@ mod tests {
         assert_eq!(cache.get(&addr_idx(500_000)), 1_000_000_000);
     }
 
-    // ── ShardedBalanceCache tests ───────────────────────────────
+    // ── AtomicBalanceCache tests ────────────────────────────────
 
     #[test]
-    fn sharded_fund_and_check() {
-        let cache = ShardedBalanceCache::new(8);
+    fn atomic_fund_and_check() {
+        let cache = AtomicBalanceCache::new(8);
         cache.set(&addr_idx(1), 1_000_000);
         assert_eq!(cache.get(&addr_idx(1)), 1_000_000);
         assert_eq!(cache.get(&addr_idx(2)), 0, "unfunded is 0");
     }
 
     #[test]
-    fn sharded_credit_and_debit() {
-        let cache = ShardedBalanceCache::new(8);
+    fn atomic_credit_and_debit() {
+        let cache = AtomicBalanceCache::new(8);
         cache.set(&addr_idx(1), 1_000_000);
         cache.credit(&addr_idx(1), 500_000);
         assert_eq!(cache.get(&addr_idx(1)), 1_500_000);
@@ -511,8 +583,8 @@ mod tests {
     }
 
     #[test]
-    fn sharded_check_and_debit_rejects_overdraw() {
-        let cache = ShardedBalanceCache::new(8);
+    fn atomic_check_and_debit_rejects_overdraw() {
+        let cache = AtomicBalanceCache::new(8);
         cache.set(&addr_idx(1), 1_000);
         // Cannot debit more than balance.
         assert!(!cache.check_and_debit(&addr_idx(1), 2_000));
@@ -521,8 +593,8 @@ mod tests {
     }
 
     #[test]
-    fn sharded_transfer_same_shard() {
-        let cache = ShardedBalanceCache::new(8);
+    fn atomic_transfer_same_shard() {
+        let cache = AtomicBalanceCache::new(8);
         // addr_idx(0) and addr_idx(8) both map to shard 0 (0 % 8 = 0,
         // 8 % 8 = 0).
         cache.set(&addr_idx(0), 1_000_000);
@@ -532,8 +604,8 @@ mod tests {
     }
 
     #[test]
-    fn sharded_transfer_cross_shard() {
-        let cache = ShardedBalanceCache::new(8);
+    fn atomic_transfer_cross_shard() {
+        let cache = AtomicBalanceCache::new(8);
         // addr_idx(0) → shard 0, addr_idx(1) → shard 1 — different.
         cache.set(&addr_idx(0), 1_000_000);
         assert!(cache.transfer(&addr_idx(0), &addr_idx(1), 300_000));
@@ -545,16 +617,16 @@ mod tests {
     /// moving anything. Before the fix the debit saturated to zero
     /// while the full amount was credited — minting the difference.
     #[test]
-    fn sharded_transfer_insolvent_moves_nothing() {
+    fn atomic_transfer_insolvent_moves_nothing() {
         // Same shard.
-        let cache = ShardedBalanceCache::new(8);
+        let cache = AtomicBalanceCache::new(8);
         cache.set(&addr_idx(0), 100);
         assert!(!cache.transfer(&addr_idx(0), &addr_idx(8), 300));
         assert_eq!(cache.get(&addr_idx(0)), 100, "debit must not happen");
         assert_eq!(cache.get(&addr_idx(8)), 0, "credit must not happen");
 
         // Cross shard.
-        let cache = ShardedBalanceCache::new(8);
+        let cache = AtomicBalanceCache::new(8);
         cache.set(&addr_idx(0), 100);
         assert!(!cache.transfer(&addr_idx(0), &addr_idx(1), 300));
         assert_eq!(cache.get(&addr_idx(0)), 100);
@@ -607,10 +679,10 @@ mod tests {
     }
 
     #[test]
-    fn sharded_concurrent_transfers_no_overdraw() {
+    fn atomic_concurrent_transfers_no_overdraw() {
         // 16 threads each try to debit the same account by 100.
         // Account starts with 1000 — only 10 should succeed.
-        let cache = Arc::new(ShardedBalanceCache::new(8));
+        let cache = Arc::new(AtomicBalanceCache::new(8));
         cache.set(&addr_idx(0), 1_000);
         let mut handles = Vec::new();
         for _ in 0..16 {

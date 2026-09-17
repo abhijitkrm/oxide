@@ -73,7 +73,7 @@ pub mod risk;
 pub mod server;
 pub mod ws;
 
-pub use balance::{BalanceCache, DEFAULT_SHARD_COUNT, ShardedBalanceCache};
+pub use balance::{AtomicBalanceCache, BalanceCache, DEFAULT_SHARD_COUNT, ShardedBalanceCache};
 pub use protocol::{
     ActionRequest, ActionType, OrderAction, OrderRequest, OrderResponse, RejectReason,
 };
@@ -1011,7 +1011,7 @@ struct WorkerStats {
 
 /// A multi-market parallel matcher: one worker thread per market,
 /// each owning its own `MatchingEngine`, all sharing a single
-/// `ShardedBalanceCache`.
+/// `AtomicBalanceCache` (aliased `ShardedBalanceCache`).
 ///
 /// # Architecture
 ///
@@ -1029,7 +1029,7 @@ struct WorkerStats {
 ///         │                        │
 ///         ▼                        ▼
 ///   ┌──────────────┐    ┌──────────────────────┐
-///   │ Each worker: │    │ ShardedBalanceCache  │
+///   │ Each worker: │    │ AtomicBalanceCache   │
 ///   │ 1 Engine     │───►│ (64 shards, Mutex    │
 ///   │ 1 fill buf   │    │  per shard)           │
 ///   │ 1 settle buf │    └──────────────────────┘
@@ -1084,7 +1084,7 @@ impl MultiMarketMatcher {
     /// Panics if `configs` is empty or if any engine/book fails to
     /// create from the given config.
     #[must_use]
-    pub fn new(configs: Vec<MarketConfig>, balances: Arc<ShardedBalanceCache>) -> Self {
+    pub fn new(configs: Vec<MarketConfig>, balances: Arc<AtomicBalanceCache>) -> Self {
         assert!(!configs.is_empty(), "must have at least one market");
         let num_markets = configs.len();
         let mut market_senders = Vec::with_capacity(num_markets);
@@ -1239,7 +1239,7 @@ struct MarketWorker {
     /// The matching engine for this market (single-writer).
     engine: MatchingEngine,
     /// Shared sharded balance cache (cross-market).
-    balances: Arc<ShardedBalanceCache>,
+    balances: Arc<AtomicBalanceCache>,
     /// Reusable fill buffer — zero alloc after the first order.
     fills: Vec<FillEvent>,
     /// The pending settlement batch (local to this worker).
@@ -1260,7 +1260,7 @@ impl MarketWorker {
     /// control commands.
     fn run(
         cfg: MarketConfig,
-        balances: Arc<ShardedBalanceCache>,
+        balances: Arc<AtomicBalanceCache>,
         rx: std::sync::mpsc::Receiver<MarketMessage>,
     ) {
         let engine = MatchingEngine::new(cfg, DenseBook::new(cfg).expect("book creation"))
@@ -1319,7 +1319,7 @@ impl MarketWorker {
 
     /// Submit one order: balance check, match, settle. Mirrors
     /// `MatchingServer::submit_order` but uses the shared
-    /// `ShardedBalanceCache` instead of a local `BalanceCache`.
+    /// `AtomicBalanceCache` instead of a local `BalanceCache`.
     fn submit_order(&mut self, req: &OrderRequest) -> OrderResponse {
         self.orders_processed += 1;
 
@@ -1414,7 +1414,7 @@ impl MarketWorker {
 
     /// Submit an order action (cancel/amend/replace). Mirrors
     /// `MatchingServer::submit_action` but uses the shared
-    /// `ShardedBalanceCache`.
+    /// `AtomicBalanceCache` (aliased `ShardedBalanceCache`).
     fn submit_action(&mut self, action: &OrderAction) -> OrderResponse {
         self.orders_processed += 1;
         match action {
@@ -1761,7 +1761,7 @@ mod tests {
         // Two markets, each with its own book. The same seller and
         // buyer trade on both — balances are shared (sharded), books
         // are independent.
-        let balances = Arc::new(ShardedBalanceCache::new(8));
+        let balances = Arc::new(AtomicBalanceCache::new(8));
         balances.set(&addr(9), 1_000_000_000); // Seller.
         balances.set(&addr(1), 1_000_000_000); // Buyer.
         let configs = vec![cfg_for(0), cfg_for(1)];
@@ -1840,7 +1840,7 @@ mod tests {
         // Account 1 has exactly 15_000 quote (enough for ONE fill at
         // $15 × 1000 qty). Two markets try to debit simultaneously —
         // only one should succeed.
-        let balances = Arc::new(ShardedBalanceCache::new(8));
+        let balances = Arc::new(AtomicBalanceCache::new(8));
         balances.set(&addr(9), 1_000_000_000); // Seller (funded).
         balances.set(&addr(1), 15_000); // Buyer: exactly one fill's worth.
         let configs = vec![cfg_for(0), cfg_for(1)];

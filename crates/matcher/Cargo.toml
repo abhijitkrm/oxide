@@ -48,3 +48,7 @@ workspace = true
 [[bench]]
 name = "matcher_throughput"
 harness = false
+
+[[bench]]
+name = "balance_contention"
+harness = false

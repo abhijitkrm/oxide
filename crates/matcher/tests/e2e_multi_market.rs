@@ -17,7 +17,7 @@
 #![allow(clippy::cast_possible_wrap)]
 
 use matcher::protocol::OrderRequest;
-use matcher::{MultiMarketMatcher, ShardedBalanceCache};
+use matcher::{AtomicBalanceCache, MultiMarketMatcher};
 use primitives::fixed::{Price, Qty};
 use std::sync::Arc;
 use trading::{MarketConfig, OrderType, Side, TimeInForce};
@@ -53,8 +53,8 @@ fn make_order(market: u8, side: Side, owner: u8, price: u64) -> OrderRequest {
 }
 
 /// Set up a matcher with `n_markets` markets and two funded accounts.
-fn setup(n_markets: u8) -> (MultiMarketMatcher, Arc<ShardedBalanceCache>) {
-    let balances = Arc::new(ShardedBalanceCache::new(8));
+fn setup(n_markets: u8) -> (MultiMarketMatcher, Arc<AtomicBalanceCache>) {
+    let balances = Arc::new(AtomicBalanceCache::new(8));
     balances.set(&addr(9), 1_000_000_000_000); // Seller.
     balances.set(&addr(1), 1_000_000_000_000); // Buyer.
     let configs: Vec<MarketConfig> = (0..n_markets).map(cfg_for).collect();
@@ -196,7 +196,7 @@ fn multi_market_e2e_128_markets_stress() {
 fn multi_market_e2e_rejection_does_not_block_other_markets() {
     // If one market rejects (e.g. insufficient balance), other
     // markets should still process normally.
-    let balances = Arc::new(ShardedBalanceCache::new(8));
+    let balances = Arc::new(AtomicBalanceCache::new(8));
     balances.set(&addr(9), 1_000_000_000_000); // Seller.
     balances.set(&addr(1), 0); // Buyer: NO balance.
     balances.set(&addr(2), 1_000_000_000_000); // Buyer 2: funded.

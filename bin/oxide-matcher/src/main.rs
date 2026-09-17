@@ -61,7 +61,7 @@ const DEFAULT_BALANCE: u64 = 1_000_000_000_000;
 const DEFAULT_MARKETS: usize = 128;
 
 /// Default balance shard count.
-const DEFAULT_SHARDS: usize = 64;
+const DEFAULT_ACCOUNTS_CAP: usize = 1_000_000;
 
 /// CLI configuration parsed from command-line flags.
 struct CliConfig {
@@ -73,7 +73,7 @@ struct CliConfig {
     batch_interval: u64,
     mode: String,
     markets: usize,
-    shards: usize,
+    accounts_cap: usize,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -87,7 +87,7 @@ fn parse_cli() -> CliConfig {
         batch_interval: parse_flag("--batch-interval", 100u64),
         mode: parse_flag("--mode", "multi".to_string()),
         markets: parse_flag("--markets", DEFAULT_MARKETS),
-        shards: parse_flag("--shards", DEFAULT_SHARDS),
+        accounts_cap: parse_flag("--accounts-cap", DEFAULT_ACCOUNTS_CAP),
     }
 }
 
@@ -103,7 +103,7 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
 }
 
 /// Fund `n` accounts in a sharded balance cache, each with `DEFAULT_BALANCE`.
-fn fund_sharded(balances: &matcher::ShardedBalanceCache, n: usize) {
+fn fund_sharded(balances: &matcher::AtomicBalanceCache, n: usize) {
     for i in 0..u32::try_from(n).unwrap_or(u32::MAX) {
         let mut addr = [0u8; 20];
         addr[..4].copy_from_slice(&i.to_le_bytes());
@@ -154,7 +154,7 @@ fn main() {
     println!("  balance/account: {DEFAULT_BALANCE}");
     if cli.mode == "multi" {
         println!("  markets:         {}", cli.markets);
-        println!("  balance shards:  {}", cli.shards);
+        println!("  balance capacity: {}", cli.accounts_cap);
     }
     println!("  binary TCP:      127.0.0.1:{}", cli.tcp_port);
     println!("  JSON-RPC:        127.0.0.1:{}", cli.jsonrpc_port);
@@ -195,7 +195,7 @@ fn main() {
                 "oxide-matcher: funding {} accounts across {} markets...",
                 cli.accounts, cli.markets
             );
-            let balances = Arc::new(matcher::ShardedBalanceCache::new(cli.shards));
+            let balances = Arc::new(matcher::AtomicBalanceCache::new(cli.accounts_cap));
             fund_sharded(&balances, cli.accounts);
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             let configs = build_market_configs(cli.markets);

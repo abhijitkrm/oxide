@@ -14001,3 +14001,75 @@ not the ledger.
 - devnet +2 ignored load tests (`settle_tps_default`,
   `settle_tps_large`) — ignored like `trading_tps` since they bind
   TCP ports; run with `--release --ignored`.
+
+## 2026-10-08 — Session: M2 overflow sweep + lock-free balance cache
+
+### What
+
+- **Arithmetic-overflow sweep** across mempool, executor, storage
+  journal, and MMR (the M2 item from the security review). The
+  journal and `occ` chunking were already clean; the MMR's
+  `peak_positions` had been fuzz-hardened earlier. Findings fixed:
+  - **`u64::MAX` nonce replay bug (executor)** — a tx with nonce
+    `u64::MAX` executed, then `expected + 1` wrapped the sender's
+    next-expected counter to 0 and reopened the entire nonce range
+    to replay. `u64::MAX` is now a reserved nonce: rejected at
+    mempool admission (`ingest_tx` + `ingest_tx_batch`), skipped at
+    execution (`group_block_txs`), and rejected at proposal
+    validation (`process_proposal`).
+  - **Mempool anchor wrap** — `executed + 1` and `expected + 1` in
+    `select`/`txpool_snapshot` now use `checked_add`; a sender whose
+    executed nonce is MAX is skipped instead of re-anchoring at 0.
+  - **Halt-height wrap** — `current_height() + 1 > halt` rewritten
+    as `current_height() >= halt`.
+  - **`Mmr::from_checkpoint`** — `2 * leaf_count` on an untrusted
+    (state-sync) count now uses checked arithmetic.
+  - **`process_proposal` contiguity** — `prev + 1` →
+    `checked_add`/`is_none_or` (a `prev = MAX` block would have
+    panicked debug builds / wrapped in release).
+- **`ShardedBalanceCache` → `AtomicBalanceCache`** — the multi-market
+  matcher's shared balance store was `Vec<Mutex<HashMap>>` (64 shard
+  locks). Replaced with a flat `Vec<AtomicU64>` (canonical
+  sequential addresses) + a `Mutex<HashMap>` sparse fallback for
+  non-canonical addresses — the same dual-path layout as the
+  single-threaded `BalanceCache`. `check_and_debit` is now one
+  `fetch_update` CAS per account instead of a shard lock; transfers
+  CAS-debit then saturating-credit (linearizes at the debit; the
+  infallible credit lands instructions later — conservative and
+  sound for a risk cache). Type kept source-compatible via a
+  `ShardedBalanceCache` alias; `new(n)` now means flat capacity.
+
+### Measured (`benches/balance_contention`, criterion)
+
+| Workload | Mutex shards | Atomic | Speedup |
+|---|---|---|---|
+| spread 1t | 8.9M ops/s | 158M | ~18× |
+| hot64 1t | 30M | 159M | ~5× |
+| spread 4t | 18.7M | 465M | ~25× |
+| hot64 4t | 30.6M | 124M | ~4× |
+| spread 8t | 22.2M | **670M** | **~30×** |
+| hot64 8t | 28.4M | ~89M | ~3× |
+
+`hot64` = all threads CAS-ing the same 64 accounts — real
+contention, still 3–4× faster. `spread` = disjoint accounts — no
+false shard sharing, so it scales with cores.
+
+### Bugs caught by the sweep
+
+- The nonce-MAX wrap is a genuine replay vulnerability fixed here,
+  not a theoretical one: `finalize_block` on a crafted MAX-nonce tx
+  would have zeroed the sender's replay protection.
+
+### Remaining debt (documented, not blocking)
+
+- p2p per-frame `Vec` allocation — pooling requires an owned-buffer
+  type plumbed through the `PeerStream` trait; deferred.
+- Trading hot path already zero-alloc (`place` takes `&mut Vec`
+  fills from the caller); executor preverify cache already
+  `mem::take`'d once per block.
+
+### Tests
+
+- mempool +1 (`executed_nonce_max_does_not_wrap_anchor`),
+  executor +1 (`nonce_u64_max_is_reserved`), matcher suite green
+  under the new cache (94 tests incl. 6 multi-market e2e).

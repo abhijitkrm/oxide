@@ -465,7 +465,15 @@ impl Mempool {
             // block). If we don't know the executed nonce, start at
             // the minimum queued nonce (the old behavior).
             let start_nonce = match self.executed_nonces.get(&sender) {
-                Some(&executed) => executed + 1,
+                // `executed` is a decoded u64 nonce — an adversarial
+                // tx with nonce u64::MAX would wrap `executed + 1`
+                // to 0 (panic in debug), re-anchoring selection at
+                // nonce 0. No valid nonce follows MAX: skip the
+                // sender entirely.
+                Some(&executed) => match executed.checked_add(1) {
+                    Some(next) => next,
+                    None => continue,
+                },
                 None => match queue.keys().next() {
                     Some(&min) => min,
                     None => continue,
@@ -549,7 +557,10 @@ impl Mempool {
         let mut out = Vec::with_capacity(self.by_hash.len());
         for (sender, queue) in &self.by_sender {
             let mut next_expected = match self.executed_nonces.get(sender) {
-                Some(&executed) => Some(executed + 1),
+                // `executed + 1` must not wrap: an executed nonce of
+                // u64::MAX leaves no valid successor, so every queued
+                // nonce is stale — `None` marks them all non-pending.
+                Some(&executed) => executed.checked_add(1),
                 None => queue.keys().next().copied(),
             };
             for (&nonce, hash) in queue {
@@ -558,7 +569,9 @@ impl Mempool {
                     // Below the start nonce: stale — can't execute.
                     Some(expected) if nonce < expected => continue,
                     Some(expected) if nonce == expected => {
-                        next_expected = Some(expected + 1);
+                        // `expected == nonce == u64::MAX` → no valid
+                        // successor; `None` marks the rest non-pending.
+                        next_expected = expected.checked_add(1);
                         true
                     }
                     // Gap opened (or no executed-nonce anchor) — this
@@ -1050,7 +1063,26 @@ mod tests {
         }
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 3, "chain stops at cap even with more nonces");
-        // Nonces 0..2 selected, 3..5 remain.
+        // Nonces `0..2` selected, `3..5` remain.
         assert_eq!(pool.len(), 3);
+    }
+
+    /// Regression: an executed nonce of `u64::MAX` must not wrap the
+    /// `executed + 1` anchor back to 0 — no valid nonce follows `MAX`,
+    /// so the sender's queued txs stay unselected and non-pending.
+    #[test]
+    fn executed_nonce_max_does_not_wrap_anchor() {
+        let mut pool = Mempool::new(100);
+        pool.submit(build_tx(addr(1), 0, 100, &[1])).unwrap();
+        pool.submit(build_tx(addr(1), u64::MAX, 100, &[2])).unwrap();
+        pool.set_executed_nonce(addr(1), u64::MAX);
+        // Selection: nothing follows `MAX` — the sender is skipped.
+        let selected = pool.select(1 << 20);
+        assert!(selected.is_empty(), "no nonce follows u64::MAX");
+        // Snapshot: both queued txs report non-pending (never
+        // executable) rather than wrapping the anchor to nonce 0.
+        let snap = pool.txpool_snapshot();
+        assert_eq!(snap.len(), 2);
+        assert!(snap.iter().all(|(_, _, _, pending)| !pending));
     }
 }

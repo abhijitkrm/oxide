@@ -210,6 +210,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     taking the median, updates are smoothed, and the old manual
     path is locked to validators as an emergency fallback.
 
+- **Lock-free balance cache + nonce-overflow hardening**
+  (`crates/matcher`, `crates/mempool`, `crates/executor`,
+  `crates/storage`)
+  - `ShardedBalanceCache` (now `AtomicBalanceCache`) replaces
+    per-shard `Mutex<HashMap>` locks with a flat array of
+    per-account atomics: measured 3-30x higher throughput under
+    contention (up to ~670M ops/s at 8 threads spread; ~89M ops/s
+    even with all threads on the same 64 accounts). The sparse
+    fallback keeps arbitrary 20-byte addresses collision-free.
+  - **Security fix:** a transaction carrying nonce `u64::MAX` could
+    execute and wrap the sender's next-expected nonce to 0,
+    reopening the account's entire history to replay. `u64::MAX` is
+    now a reserved nonce — rejected at admission, skipped at
+    execution, rejected at proposal.
+  - Arithmetic-overflow sweep across mempool, executor, journal,
+    and MMR: checked nonce/height/count arithmetic on all paths
+    reachable by untrusted input.
+  - **In plain words:** two safety wins and one big speed win —
+    a crafted nonce can no longer rewind an account's replay
+    protection, and the off-chain matcher's shared balance book
+    now scales with cores instead of fighting over 64 locks.
+
 - **Batch-settlement throughput proven ≥1M orders/s on-chain**
   (`modules/exchange`, `crates/devnet`)
   - Two new `settlement` benches measure the `batch_settle` path —
