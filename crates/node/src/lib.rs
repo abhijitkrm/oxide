@@ -264,7 +264,10 @@ impl Node {
         let staking_module = staking::StakingModule::new();
         staking_module.set_ledger(evm_module.clone());
         staking_module.register_validator(primitives::Address([0u8; 20]));
-        executor.register_module(Arc::new(staking_module));
+        // Shared: perps consults it for committee-gated mark/funding
+        // overrides, the oracle for feed authorization + quorum sizing.
+        let staking_module = Arc::new(staking_module);
+        executor.register_module(staking_module.clone());
         // Register the exchange module with a default spot market
         // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
         // exchange settles fills against EVM balances (plan.md §9.2).
@@ -288,7 +291,10 @@ impl Node {
         // (10x max leverage, 0.5% maintenance margin). The perps
         // module settles margin deposits/withdrawals against EVM
         // balances (plan.md §9.3).
-        let perps = Arc::new(perps::PerpsModule::with_ledger(evm_module.clone()));
+        let perps = Arc::new(
+            perps::PerpsModule::with_ledger(evm_module.clone())
+                .with_committee(staking_module.clone()),
+        );
         perps
             .list_market(perps::PerpsMarketConfig {
                 base: trading::MarketConfig {
@@ -304,6 +310,17 @@ impl Node {
             })
             .expect("default perps market config is valid");
         executor.register_module(perps.clone());
+        // The oracle module: validators submit per-market price
+        // observations during the block; at end_block it aggregates
+        // them (strict-majority quorum → median → EMA) and pushes the
+        // result into perps through `MarkSink`. Staking supplies both
+        // feeder authorization and the quorum denominator.
+        let oracle = Arc::new(oracle::OracleModule::new().with_committee(staking_module.clone()));
+        oracle.with_sink(perps.clone());
+        executor.register_module(oracle);
+        // Governance: minimal on-chain parameter votes (plan.md §7 —
+        // Phase 4 scope: propose/vote/finalize, no timelock/veto).
+        executor.register_module(Arc::new(governance::GovernanceModule::new()));
         // Wire the exchange and perps modules into the EVM for
         // read-only precompiles (plan.md §10), then register the EVM.
         evm_module.set_native_modules(Some(exchange), Some(perps));

@@ -22,6 +22,8 @@ types = { workspace = true }
 ports = { workspace = true }
 framework = { workspace = true }
 staking = { workspace = true }
+exchange = { workspace = true }
+trading = { workspace = true }
 evm = { workspace = true }
 executor = { workspace = true }
 crypto = { workspace = true }

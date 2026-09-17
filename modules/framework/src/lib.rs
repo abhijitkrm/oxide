@@ -42,6 +42,11 @@ pub mod module_id {
     /// The perps module: perpetual futures — margin, funding,
     /// liquidations, insurance fund, ADL (plan.md §9.3).
     pub const PERPS: u8 = 6;
+    /// The oracle module: median-of-validator-feeds mark price with
+    /// EMA smoothing and heartbeat staleness (plan.md §7, §9.3).
+    /// The sole authorized writer of perps mark prices at
+    /// production wiring.
+    pub const ORACLE: u8 = 7;
 }
 
 /// Wei per native **base unit** — the fixed conversion at the
@@ -120,6 +125,42 @@ pub trait Balances {
     /// block-reward issuance. Not a `transfer` from a supply account:
     /// the total supply genuinely grows.
     fn mint(&self, addr: &Address, amount: u64);
+}
+
+/// The validator-committee seam — who may perform
+/// committee-privileged actions right now.
+///
+/// Staking implements this; the oracle and perps consume it to gate
+/// price feeds and emergency mark/funding overrides without taking a
+/// direct dependency on the staking crate. "Active" means in the
+/// current validator set *and not jailed*: a jailed validator is by
+/// definition suspected of misbehavior and must not keep feeding
+/// prices or signing governance actions during its jail period.
+pub trait Committee {
+    /// `true` if `addr` is an active (non-jailed) validator.
+    fn is_active_validator(&self, addr: &Address) -> bool;
+    /// Number of currently active validators — the denominator the
+    /// oracle uses to size its submission quorum.
+    fn active_validator_count(&self) -> usize;
+}
+
+/// The mark-price sink seam — where the oracle's aggregated price
+/// lands.
+///
+/// Perps implements this as [`PerpsModule::set_mark_price`], which
+/// keeps its own per-update deviation cap and per-block rate limit
+/// as a second defensive layer: even if the oracle's median is
+/// somehow manipulated past its quorum, the consumer-side circuit
+/// breaker still bounds the per-block move.
+pub trait MarkSink {
+    /// Publish `mark` as the current mark price for `market`.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::ModuleRejected`] if the consumer rejects the
+    /// price (unknown market, deviation cap exceeded, per-block
+    /// update budget exhausted).
+    fn set_mark_price(&self, market: u8, mark: u64) -> Result<(), ExecError>;
 }
 
 /// A minimal in-memory [`Balances`] for tests and tooling.

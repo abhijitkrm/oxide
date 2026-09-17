@@ -182,6 +182,34 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     still bootstrap by verified snapshot rather than replaying
     the archive.
 
+- **Oracle module: median-of-feeds mark price** (`modules/oracle`,
+  `modules/perps`, `modules/staking`, `modules/framework`,
+  `crates/node`)
+  - Validators submit per-market price observations; at end of
+    each block the oracle requires a strict majority of eligible
+    feeders, takes the median, smooths it through an EMA, and
+    pushes the result into perps. A single bad feed can no longer
+    move the mark.
+  - **Security fix:** the perps `set_mark`/`apply_funding`
+    transaction paths were previously unauthenticated — any
+    account could move the mark within the deviation cap. They are
+    now gated to active (non-jailed) validators as an emergency
+    override, and closed entirely when no committee is wired.
+  - External price feeds can be whitelisted via committee-gated
+    register/unregister messages; staleness tracking flags marks
+    that stop being updated.
+  - The governance module (previously built but unwired) is now
+    registered in `Node::assemble`.
+  - `oxide-spammer --orders` adds an order-load mode for the
+    matching path (~144K orders/s through mempool→block→match→
+    settle on a dev machine).
+  - **In plain words:** the price that decides when traders get
+    liquidated used to be set by a single message anyone could
+    send (rate-limited, but still one actor). Now a majority of
+    validators must agree on the price, outliers are discarded by
+    taking the median, updates are smoothed, and the old manual
+    path is locked to validators as an emergency fallback.
+
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,
   `crates/node`, `bin/oxide-validator`, `bin/oxide-fullnode`)

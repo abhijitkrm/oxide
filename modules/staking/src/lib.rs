@@ -496,6 +496,57 @@ impl StakingModule {
         self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(addr)
     }
 
+    /// `true` if `addr` is in the current validator set and not
+    /// jailed — i.e. eligible to perform committee-privileged
+    /// actions (oracle price feeds, governance overrides) right
+    /// now.
+    ///
+    /// Jailed validators keep their stake (so `is_jailed` alone is
+    /// not the check) but are excluded from committee duties until
+    /// they unjail: a jailed validator is by definition suspected
+    /// of misbehavior, and letting it keep feeding prices or voting
+    /// on slashes would let the fault continue during the jail
+    /// period.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    #[must_use]
+    pub fn is_active_validator(&self, addr: &Address) -> bool {
+        let in_set = self
+            .validators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(addr);
+        in_set && !self.is_jailed(addr)
+    }
+
+    /// Number of validators eligible for committee duties right now
+    /// (in set, not jailed). Used by the oracle to size its
+    /// submission quorum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    #[must_use]
+    pub fn active_validator_count(&self) -> usize {
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        validators.keys().filter(|v| !jailed.contains_key(*v)).count()
+    }
+}
+
+impl framework::Committee for StakingModule {
+    fn is_active_validator(&self, addr: &Address) -> bool {
+        Self::is_active_validator(self, addr)
+    }
+
+    fn active_validator_count(&self) -> usize {
+        Self::active_validator_count(self)
+    }
+}
+
+impl StakingModule {
     /// Get a validator's total stake.
     ///
     /// # Panics

@@ -1,0 +1,19 @@
+# Oxide blockchain — `oracle` module
+# (workspace: github.com/abhijitkumar/oxide; bare-name convention)
+
+[package]
+name = "oracle"
+description = "Oracle module — median-of-feeds mark price, EMA smoothing, staleness tracking (plan.md §7, §9.3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+executor = { workspace = true }
+framework = { workspace = true }
+
+[lints]
+workspace = true

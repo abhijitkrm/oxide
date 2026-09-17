@@ -59,6 +59,8 @@ governance = { path = "modules/governance", version = "0.1.0" }
 exchange = { path = "modules/exchange", version = "0.1.0" }
 # Perpetual futures module (plan.md §9.3; margin/funding/liquidations/ADL).
 perps = { path = "modules/perps", version = "0.1.0" }
+# Oracle module (plan.md §7, §9.3; median-of-feeds mark price + EMA).
+oracle = { path = "modules/oracle", version = "0.1.0" }
 # RPC server (plan.md §13: JSON-RPC + WebSocket for MetaMask/Foundry).
 rpc = { path = "crates/rpc", version = "0.1.0" }
 # Indexer/explorer (plan.md §13: indexes finalized blocks for explorer).

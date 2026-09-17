@@ -24,6 +24,8 @@ staking = { workspace = true }
 evm = { workspace = true }
 exchange = { workspace = true }
 perps = { workspace = true }
+oracle = { workspace = true }
+governance = { workspace = true }
 trading = { workspace = true }
 storage = { workspace = true, features = ["redb"] }
 # tracing: structured diagnostic logging for node lifecycle events

@@ -13885,3 +13885,57 @@ replaced.
   active-segment immunity, unindexed-segment skip.
 - Gates: `cargo build --workspace`, touched tests green; fmt +
   clippy clean.
+
+## 2026-10-08 — Session: P3 tail — oracle module, committee-gated marks, order-load spammer
+
+### What
+
+- **`modules/oracle` (module_id 7)** — the median-of-feeds mark
+  price pipeline from plan.md §7/§9.3, replacing perps' previously
+  *unauthenticated* `TAG_SET_MARK` path. Validators submit
+  `[market][price]` observations via `TAG_SUBMIT` txs; `end_block`
+  aggregates markets that reach strict-majority quorum
+  (`eligible/2 + 1` over active validators + registered external
+  feeds), takes the lower median (deterministic, no averaging),
+  smooths through a span-4 EMA in u128, and pushes the result to
+  perps through a new `framework::MarkSink` seam. Perps keeps its
+  own deviation cap + per-block rate limit as an independent second
+  layer — a sink that trusted its producer would turn one oracle
+  bug into an unbounded move.
+- **`framework::Committee` seam** — `is_active_validator` /
+  `active_validator_count`, implemented by staking. Jailed
+  validators are excluded: a validator suspected of misbehavior
+  must not keep feeding prices during its jail period.
+- **Perps `TAG_SET_MARK` / `TAG_APPLY_FUNDING` gated** — now
+  committee-only (`with_committee`); with no committee wired the
+  tx path rejects everything (closed by default). The oracle's
+  `MarkSink` push never goes through `handle`, so the normal
+  pipeline is unaffected. Before this change, any account could
+  submit a mark/funding tx — an open manipulation primitive.
+- **External feeds** — committee-gated `TAG_REGISTER_FEED` /
+  `TAG_UNREGISTER_FEED` whitelist non-validator feed addresses
+  (e.g. a dedicated price-service signer); they count toward the
+  same quorum denominator.
+- **Staleness** — `last_update[market]` tracks the last
+  *successful* sink write; `is_stale(market, h)` after
+  `STALE_AFTER_BLOCKS`=60. Quorum failures and sink rejections
+  don't advance it, so staleness honestly reflects
+  consumer-visible freshness.
+- **Governance wired into `Node`** — `GovernanceModule` existed
+  but was never registered; now part of `Node::assemble`.
+- **`oxide-spammer --orders`** — order-load mode: 100 funded
+  senders split sell/buy halves crossing at mid price, ~50% fill
+  rate, per-sender contiguous nonces. Measured ~144K orders/s
+  through the full mempool→block→match→settle path on this dev
+  machine (sequencer engine, debug build).
+
+### Tests
+
+- oracle +14: quorum gate, median/EMA math, outlier rejection,
+  resubmission overwrite, sink rejection keeping staleness honest,
+  external-feed registration, per-market independence, closed-
+  by-default without committee, state-root commits.
+- perps +3: committee gate on mark/funding tx paths (non-committee
+  and no-committee rejections).
+- `Node::assemble` wiring: staking now shared `Arc` (perps
+  committee + oracle feed auth + quorum denominator).

@@ -322,6 +322,14 @@ pub struct PerpsModule {
     /// `None` = margin accounting only (unit-test mode): deposits and
     /// withdrawals update the margin field without moving funds.
     ledger: Option<Arc<dyn framework::Balances + Send + Sync>>,
+    /// The validator-committee handle gating the `TAG_SET_MARK` /
+    /// `TAG_APPLY_FUNDING` tx paths. `None` (bare `new()`) means the
+    /// tx path is *closed*: only the in-process `set_mark_price` /
+    /// `apply_funding` calls work. That is the safe default — an
+    /// unauthenticated mark update is a free market-manipulation
+    /// primitive, so production wiring must attach the staking
+    /// committee before these txs are accepted.
+    committee: Option<Arc<dyn framework::Committee + Send + Sync>>,
 }
 
 struct Inner {
@@ -364,6 +372,7 @@ impl PerpsModule {
             }),
             store: Mutex::new(BTreeMap::new()),
             ledger: None,
+            committee: None,
         }
     }
 
@@ -375,6 +384,31 @@ impl PerpsModule {
         let mut m = Self::new();
         m.ledger = Some(ledger);
         m
+    }
+
+    /// Attach the validator-committee handle that authorizes the
+    /// `TAG_SET_MARK` / `TAG_APPLY_FUNDING` transaction paths. These
+    /// are the emergency/manual override: the normal mark pipeline
+    /// is the oracle module pushing through [`MarkSink`], which never
+    /// goes through `handle`.
+    ///
+    /// Without a committee the tx paths reject everything — closed
+    /// by default, since an unauthenticated mark update is a market-
+    /// manipulation primitive.
+    #[must_use]
+    pub fn with_committee(
+        mut self,
+        committee: Arc<dyn framework::Committee + Send + Sync>,
+    ) -> Self {
+        self.committee = Some(committee);
+        self
+    }
+
+    /// `true` if `sender` may submit `TAG_SET_MARK` /
+    /// `TAG_APPLY_FUNDING` transactions: an active (non-jailed)
+    /// validator when a committee is wired, nobody otherwise.
+    fn is_committee(&self, sender: &Address) -> bool {
+        self.committee.as_ref().is_some_and(|c| c.is_active_validator(sender))
     }
 
     /// List a new perps market with the given configuration. Returns
@@ -1110,12 +1144,21 @@ impl Module for PerpsModule {
             TAG_SET_MARK => {
                 let (market, mark) = Self::parse_set_mark(body).ok_or(ExecError::Malformed)?;
                 drop(inner);
-                // M4 fix: use `set_mark_price` which enforces both
-                // the per-update deviation check (MAX_MARK_CHANGE_BPS)
-                // and the per-block rate limit
-                // (MAX_ORACLE_UPDATES_PER_BLOCK). The previous inline
-                // check bypassed the rate limit, allowing many small
-                // updates to compound within a single block.
+                // Committee-gated emergency override. The normal mark
+                // pipeline is the oracle module pushing the aggregated
+                // median through `MarkSink`; this tx path exists so the
+                // validator set can still force a mark if the oracle
+                // feed stalls entirely. Without a wired committee the
+                // path is closed — an unauthenticated mark update is a
+                // free manipulation primitive.
+                if !self.is_committee(&ctx.sender) {
+                    return Err(ExecError::ModuleRejected(
+                        "set_mark: sender is not an active validator".to_string(),
+                    ));
+                }
+                // `set_mark_price` enforces both the per-update
+                // deviation check (MAX_MARK_CHANGE_BPS) and the
+                // per-block rate limit (MAX_ORACLE_UPDATES_PER_BLOCK).
                 self.set_mark_price(market, mark)?;
                 Ok(vec![Event { module: "perps", kind: "mark_updated", data: vec![market] }])
             }
@@ -1123,6 +1166,15 @@ impl Module for PerpsModule {
                 let (market, rate_bits) = Self::parse_funding(body).ok_or(ExecError::Malformed)?;
                 let rate = i64::from_le_bytes(rate_bits);
                 drop(inner);
+                // Same committee gate as `TAG_SET_MARK` — an
+                // unauthenticated funding rate is an unauthenticated
+                // balance transfer between every long and short on
+                // the market.
+                if !self.is_committee(&ctx.sender) {
+                    return Err(ExecError::ModuleRejected(
+                        "apply_funding: sender is not an active validator".to_string(),
+                    ));
+                }
                 self.apply_funding(market, rate)
             }
             _ => Err(ExecError::Malformed),
@@ -1133,6 +1185,18 @@ impl Module for PerpsModule {
 
     fn state_root(&self) -> Hash {
         subtree_root(&self.store)
+    }
+}
+
+impl framework::MarkSink for PerpsModule {
+    /// The oracle's push target. Deliberately routes through the
+    /// *checked* setter: the oracle's median+EMA is the primary
+    /// defense, and this module's deviation cap + per-block rate
+    /// limit stay armed as an independent second layer — a sink that
+    /// trusted its producer would turn one oracle bug into an
+    /// unbounded price move.
+    fn set_mark_price(&self, market: u8, mark: u64) -> Result<(), ExecError> {
+        Self::set_mark_price(self, market, mark)
     }
 }
 
@@ -1749,17 +1813,60 @@ mod tests {
         assert!(matches!(err, ExecError::ModuleRejected(_)));
     }
 
+    /// A committee stub treating `addr(1)` as the sole validator —
+    /// the tx-path tests for the gated `TAG_SET_MARK` override.
+    struct SingleValidatorCommittee;
+
+    impl framework::Committee for SingleValidatorCommittee {
+        fn is_active_validator(&self, a: &Address) -> bool {
+            *a == addr(1)
+        }
+        fn active_validator_count(&self) -> usize {
+            1
+        }
+    }
+
     #[test]
     fn set_mark_price() {
-        let perps = PerpsModule::new();
+        let perps = PerpsModule::new().with_committee(Arc::new(SingleValidatorCommittee));
         let mid = perps.list_market(test_cfg()).unwrap();
         perps.handle(&ctx(1), &msg::set_mark(mid, 1_600_000_000)).unwrap();
         assert_eq!(perps.mark_price(mid), Some(1_600_000_000));
     }
 
+    /// The emergency mark/funding tx path must reject non-committee
+    /// senders — before the gate, any account could move the mark
+    /// within the deviation cap, which is a free manipulation
+    /// primitive (the oracle quorum path is the intended pipeline).
+    #[test]
+    fn set_mark_rejects_non_committee() {
+        let perps = PerpsModule::new().with_committee(Arc::new(SingleValidatorCommittee));
+        let mid = perps.list_market(test_cfg()).unwrap();
+        let err = perps.handle(&ctx(9), &msg::set_mark(mid, 1_600_000_000)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// With no committee wired the tx path is closed entirely — a
+    /// bare module must not accept unauthenticated mark updates.
+    #[test]
+    fn set_mark_rejected_without_committee() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        let err = perps.handle(&ctx(1), &msg::set_mark(mid, 1_600_000_000)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    #[test]
+    fn apply_funding_rejects_non_committee() {
+        let perps = PerpsModule::new().with_committee(Arc::new(SingleValidatorCommittee));
+        let mid = perps.list_market(test_cfg()).unwrap();
+        let err = perps.handle(&ctx(9), &msg::apply_funding(mid, 100)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
     #[test]
     fn set_mark_nonexistent_rejected() {
-        let perps = PerpsModule::new();
+        let perps = PerpsModule::new().with_committee(Arc::new(SingleValidatorCommittee));
         let err = perps.handle(&ctx(1), &msg::set_mark(5, 1_600_000_000)).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
     }
