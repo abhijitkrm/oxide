@@ -42,6 +42,19 @@ const SEGMENT_MAGIC: [u8; 8] = *b"OXDJRN01";
 /// Filename prefix for segments; `segment-<seq>.log` (seq 0-based).
 const SEGMENT_PREFIX: &str = "segment-";
 
+/// Sidecar index mapping `segment seq → max block height it
+/// contains`. Append-only log of 12-byte records
+/// `[seq:u32 LE][max_height:u64 LE]` written at segment rotation —
+/// the height-indexed half of pruning (`prune_below_height`) reads
+/// it to map "delete history below height H" onto segment files.
+///
+/// Only segments sealed *through `rotate`* get an entry: a segment
+/// left active by a crash has no final height recorded, so the
+/// height-pruner conservatively skips it (never deletes unknown
+/// state — count-based pruning remains the bound for unindexed
+/// segments).
+const HEIGHT_INDEX_FILE: &str = "heights.idx";
+
 /// Maximum record payload: 16 MiB.
 ///
 /// Origin: spec §2 rule 1. A bound is required so replay of a corrupted
@@ -135,6 +148,11 @@ pub struct JournalWriter {
     segment_bytes: usize,
     /// Byte offset of the next record within the active segment.
     next_offset: u64,
+    /// Highest block height appended to the *active* segment via
+    /// [`append_at_height`](Self::append_at_height). `None` when the
+    /// segment holds no height-tagged records — such segments get
+    /// no `heights.idx` entry and are skipped by height pruning.
+    current_segment_max: Option<u64>,
     config: JournalConfig,
 }
 
@@ -159,6 +177,7 @@ impl JournalWriter {
             buf,
             segment_bytes: 0,
             next_offset: 0,
+            current_segment_max: None,
             config,
         })
     }
@@ -198,6 +217,31 @@ impl JournalWriter {
         Ok(location)
     }
 
+    /// [`append`](Self::append) + tag the record with its block
+    /// height. The tag only feeds the segment height index (the
+    /// `heights.idx` sidecar) — the payload itself is untouched,
+    /// so callers that already encode heights inside their records
+    /// pay nothing extra.
+    ///
+    /// Heights need not be contiguous or unique: the index tracks
+    /// the *max* height per segment, which is all the height-pruner
+    /// needs to know a segment is entirely below a watermark.
+    ///
+    /// # Errors
+    /// Same as [`append`](Self::append).
+    pub fn append_at_height(
+        &mut self,
+        height: u64,
+        payload: &[u8],
+    ) -> Result<Location, JournalError> {
+        // Rotation happens inside `append` — set the max first so a
+        // triggering append is indexed under the NEW segment, not
+        // the one it just sealed.
+        let location = self.append(payload)?;
+        self.current_segment_max = Some(self.current_segment_max.map_or(height, |m| m.max(height)));
+        Ok(location)
+    }
+
     /// Hand the group buffer to the OS in one sequential write.
     ///
     /// # Errors
@@ -226,6 +270,15 @@ impl JournalWriter {
     /// Finish the active segment and start the next one.
     fn rotate(&mut self) -> Result<(), JournalError> {
         self.flush()?;
+        // Seal the height index FIRST: the entry
+        // `[sealed_seq → max_height]` must exist before the new
+        // segment file does, or a concurrent height-prune could
+        // see the old segment as "sealed but unindexed" (which it
+        // conservatively skips anyway — but the entry is cheap:
+        // 12 bytes on a path already doing IO).
+        if let Some(max_height) = self.current_segment_max.take() {
+            append_height_index(&self.dir, self.segment, max_height)?;
+        }
         self.segment += 1;
         let (file, buf) = new_segment_file(&self.dir, self.segment)?;
         self.file = file;
@@ -233,6 +286,44 @@ impl JournalWriter {
         self.segment_bytes = 0;
         self.next_offset = 0;
         Ok(())
+    }
+
+    /// Delete sealed segments whose every record is below
+    /// `keep_height` — the height-indexed counterpart of
+    /// [`prune_below`](Self::prune_below).
+    ///
+    /// A segment is deletable only when the `heights.idx` sidecar
+    /// records a `max_height < keep_height` for it. Segments with
+    /// no index entry — the segment active at a crash, or segments
+    /// written without [`append_at_height`] — are *never* deleted
+    /// by this call: unknown contents are kept, and count-based
+    /// pruning (`prune_below`, `prune::prune_segments`) remains
+    /// their bound. The active segment is never touched.
+    ///
+    /// The same one-way-door contract as `prune_below` applies:
+    /// deleted records are unrecoverable — the caller needs a
+    /// checkpoint covering `keep_height` or accepts a suffix-only
+    /// replay.
+    ///
+    /// # Errors
+    /// [`JournalError::Io`] on flush failure or a filesystem error
+    /// removing a file. Returns `Ok(0)` when `heights.idx` does not
+    /// exist (no height-tagged appends ever ran).
+    pub fn prune_below_height(&mut self, keep_height: u64) -> Result<u32, JournalError> {
+        self.flush()?;
+        let index = read_height_index(&self.dir)?;
+        let mut deleted = 0u32;
+        for (seq, path) in segment_files(&self.dir)? {
+            if seq == self.segment {
+                continue;
+            }
+            let Some(max_height) = index.get(&seq) else { continue };
+            if *max_height < keep_height {
+                std::fs::remove_file(&path).map_err(JournalError::Io)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// The sequence number of the currently-active segment.
@@ -401,6 +492,49 @@ fn segment_files(dir: &Path) -> Result<Vec<(u32, PathBuf)>, JournalError> {
 /// Highest existing segment seq + 1 (0 for a fresh directory).
 fn next_segment_seq(dir: &Path) -> Result<u32, JournalError> {
     Ok(segment_files(dir)?.into_iter().map(|(seq, _)| seq).max().map_or(0, |m| m + 1))
+}
+
+/// Append one `[seq:u32 LE][max_height:u64 LE]` record to the
+/// `heights.idx` sidecar. Written once per sealed segment, at
+/// rotation — the write piggybacks a code path that already
+/// touched the filesystem, so the index adds no extra fsync
+/// cadence (the next `sync()` covers it; a lost tail entry just
+/// leaves the segment unindexed, which pruning skips).
+fn append_height_index(dir: &Path, seq: u32, max_height: u64) -> Result<(), JournalError> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(HEIGHT_INDEX_FILE))
+        .map_err(JournalError::Io)?;
+    file.write_all(&seq.to_le_bytes()).map_err(JournalError::Io)?;
+    file.write_all(&max_height.to_le_bytes()).map_err(JournalError::Io)
+}
+
+/// Read the `heights.idx` sidecar: `segment seq → max recorded
+/// height`. Last record wins per seq (the file is append-only; a
+/// seq can repeat only if a rotation entry was torn and retried).
+///
+/// A missing index is an empty map — callers treat unindexed
+/// segments as "unknown contents, never delete by height".
+/// Trailing partial records (< 12 bytes, torn write) are ignored.
+///
+/// # Errors
+/// [`JournalError::Io`] when the file exists but can't be read.
+pub fn read_height_index(dir: &Path) -> Result<std::collections::BTreeMap<u32, u64>, JournalError> {
+    let bytes = match std::fs::read(dir.join(HEIGHT_INDEX_FILE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        Err(e) => return Err(JournalError::Io(e)),
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for record in bytes.chunks_exact(12) {
+        let seq = u32::from_le_bytes(record[0..4].try_into().unwrap_or([0; 4]));
+        let height = u64::from_le_bytes(record[4..12].try_into().unwrap_or([0; 8]));
+        out.insert(seq, height);
+    }
+    Ok(out)
 }
 
 /// Create `segment-<seq>.log` with the magic header; returns the file
@@ -596,5 +730,83 @@ mod tests {
     fn test_crc32_known_answer() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0);
+    }
+
+    /// Height-indexed pruning: a sealed segment whose max recorded
+    /// height falls below the watermark is deleted; the active
+    /// segment and unindexed segments are untouched.
+    #[test]
+    fn test_prune_below_height_deletes_only_indexed_sealed() {
+        let dir = temp_dir("hbp");
+        // Small segments force rotation so several sealed segments
+        // accumulate with distinct height ranges.
+        let config = JournalConfig { max_segment_bytes: 64 };
+        let mut j = JournalWriter::create(&dir, config).unwrap();
+        // ~4-byte payloads + 8-byte framing = 12B/record → a new
+        // segment every ~5 records.
+        for h in 1..=40u64 {
+            j.append_at_height(h, &h.to_le_bytes()).unwrap();
+        }
+        j.sync().unwrap();
+        let index = read_height_index(&dir).unwrap();
+        assert!(index.len() > 2, "several segments should be indexed, got {index:?}");
+
+        // Prune below height 20: sealed segments with max < 20 go.
+        let deleted = j.prune_below_height(20).unwrap();
+        assert!(deleted > 0, "at least one old segment must be pruned");
+        // Heights ≥ some boundary survive: replay must still find
+        // records for heights ≥ 20 somewhere.
+        let replayed = replay(&dir).unwrap();
+        let surviving: Vec<u64> = replayed
+            .records
+            .iter()
+            .map(|r| u64::from_le_bytes(r.payload.as_slice().try_into().unwrap()))
+            .collect();
+        assert!(surviving.contains(&40), "the tip height must survive");
+        // Segments straddling the watermark keep all their records
+        // (granularity is the segment, not the height) — but every
+        // segment *fully* below it is gone, and heights ≥ 20 must
+        // still be represented.
+        assert!(surviving.iter().any(|h| *h >= 20));
+        assert!(deleted >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The active segment is never pruned by height, even when its
+    /// recorded max is below the watermark.
+    #[test]
+    fn test_prune_below_height_keeps_active_segment() {
+        let dir = temp_dir("hbp-active");
+        let config = JournalConfig { max_segment_bytes: 1 << 20 };
+        let mut j = JournalWriter::create(&dir, config).unwrap();
+        for h in 1..=5u64 {
+            j.append_at_height(h, &h.to_le_bytes()).unwrap();
+        }
+        j.sync().unwrap();
+        // One segment only (no rotation); it is active AND unindexed
+        // (index entries are written at rotation).
+        let deleted = j.prune_below_height(1_000).unwrap();
+        assert_eq!(deleted, 0, "the active segment must never be pruned");
+        let replayed = replay(&dir).unwrap();
+        assert_eq!(replayed.records.len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Untagged (`append`) segments carry no heights — the
+    /// height-pruner must leave them alone rather than guess.
+    #[test]
+    fn test_prune_below_height_skips_unindexed_segments() {
+        let dir = temp_dir("hbp-unindexed");
+        let config = JournalConfig { max_segment_bytes: 64 };
+        let mut j = JournalWriter::create(&dir, config).unwrap();
+        // Untagged appends → no heights.idx entries at all.
+        for i in 0..30u32 {
+            j.append(&i.to_le_bytes()).unwrap();
+        }
+        j.sync().unwrap();
+        assert!(read_height_index(&dir).unwrap().is_empty());
+        let deleted = j.prune_below_height(1_000).unwrap();
+        assert_eq!(deleted, 0, "unindexed segments are never deleted by height");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

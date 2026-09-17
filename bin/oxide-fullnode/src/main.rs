@@ -154,6 +154,7 @@ fn load_config() -> NodeConfig {
         min_fee: 0,
         chain_id,
         require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
+        history_retention: Some(config.storage.history_retention),
     }
 }
 

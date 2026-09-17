@@ -1665,6 +1665,7 @@ fn load_config() -> (NodeConfig, config::RpcConfig, config::GenesisConfig) {
             // still submit unsigned envelopes — production must
             // enable it.
             require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
+            history_retention: Some(config.storage.history_retention),
         },
         rpc_config,
         config.genesis,

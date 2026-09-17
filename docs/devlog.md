@@ -13849,3 +13849,39 @@ replaced.
 ### Next
 
 - #22 pruning — height-indexed retention policies + archive recipe.
+
+## 2026-10-07 — Session: P3 #22 — pruning: height-indexed journal retention + archive recipe
+
+### What
+
+- **`heights.idx` sidecar** (`crates/storage/journal.rs`) —
+  append-only `[seg:u32][max_height:u64]` records written at
+  segment rotation (12B on a path already doing IO, no extra
+  fsync cadence). `append_at_height(height, payload)` tags the
+  record's height into the active segment's max — the journal
+  itself stays payload-agnostic.
+- **`JournalWriter::prune_below_height(keep_height)`** — deletes
+  sealed segments whose indexed `max_height` is below the
+  watermark. Conservative by construction: the active segment is
+  never touched, and segments with no index entry (the one active
+  at a crash, untagged appends) are *never* deleted by height —
+  unknown contents are kept; count pruning bounds them instead.
+- **`Executor::with_history_retention(n)`** — the `finalized`/
+  `state_roots` in-memory bound (`MAX_RETAINED_HISTORY` = 4096)
+  is now a field, plumbed `config.storage.history_retention` →
+  `NodeConfig::history_retention` → validator + fullnode.
+- **`[storage]` config section** — `journal_retain_segments`
+  (default 1000 ≈ 256 GiB), `history_retention`, `archive` bool +
+  `OXIDE_ARCHIVE`/`OXIDE_JOURNAL_RETAIN_SEGMENTS`/
+  `OXIDE_HISTORY_RETENTION` env overrides.
+- **`docs/archive-recipe.md`** — the two-tier answer: pruning
+  nodes for everyone, `archive = true` for the history keeper,
+  cold-tiering sealed segments, and bootstrap-by-state-sync
+  rather than archive replay.
+
+### Tests
+
+- journal +3: sealed-below-watermark deletion with tip survival,
+  active-segment immunity, unindexed-segment skip.
+- Gates: `cargo build --workspace`, touched tests green; fmt +
+  clippy clean.

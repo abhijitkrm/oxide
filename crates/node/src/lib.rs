@@ -34,6 +34,7 @@
 //!     min_fee: 0,
 //!     chain_id: 1,
 //!     require_signed_txs: false,
+//!     history_retention: None,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.
@@ -126,6 +127,10 @@ pub struct NodeConfig {
     /// admission and execution. Required for production: without it,
     /// any native-module tx can claim any sender.
     pub require_signed_txs: bool,
+    /// Heights of finalized-block / state-root history the executor
+    /// retains in memory (`Executor::with_history_retention`).
+    /// `None` = the executor default (4096).
+    pub history_retention: Option<usize>,
 }
 
 impl Default for NodeConfig {
@@ -140,6 +145,7 @@ impl Default for NodeConfig {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         }
     }
 }
@@ -208,6 +214,9 @@ impl Node {
                 } else {
                     executor::UnsignedTxPolicy::Allow
                 });
+        if let Some(n) = config.history_retention {
+            executor = executor.with_history_retention(n);
+        }
         // Enable the async execution lane (plan.md §13 Phase D):
         // defer block execution to `attest_state`, overlapping
         // execution of block h-1 with consensus for block h.
@@ -549,6 +558,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node = Node::assemble(&config);
         // The engine should be ready (no blocks yet).
@@ -567,6 +577,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node = Node::assemble(&config);
         assert!(node.engine().finalized_height().is_none());
@@ -598,6 +609,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let bft_config = NodeConfig {
             consensus: ConsensusConfig::OxideBft,
@@ -609,6 +621,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
 
         let mut seq_node = Node::assemble(&seq_config);
@@ -651,6 +664,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -690,6 +704,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node_src = Node::assemble(&config_src);
         // Submit a tx and finalize a block to produce EVM state.
@@ -717,6 +732,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let node_dst = Node::assemble(&config_dst);
 
@@ -764,6 +780,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -882,6 +899,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node = Node::assemble(&config);
         // Finalize one block.
@@ -926,6 +944,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node1 = Node::assemble(&config);
         let mut node2 = Node::assemble(&config);
@@ -968,6 +987,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node = Node::assemble(&config);
         // Finalize a block.
@@ -994,6 +1014,7 @@ mod tests {
             min_fee: 0,
             chain_id: 1,
             require_signed_txs: false,
+            history_retention: None,
         };
         let mut node = Node::assemble(&config);
         let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);

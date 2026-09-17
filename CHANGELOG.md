@@ -95,6 +95,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - Jailing and unjailing: jailed validators stop signing and stop
     earning rewards until they unjail (after ~10 minutes). Their
     stake is not confiscated beyond the evidence slash.
+  - Downtime tracking: each block now records which validators
+    signed it (`FinalizedBlock.signers`), and a validator who
+    misses more than half of the last 100 blocks is jailed
+    automatically — without slashing, since going offline is a
+    liveness fault, not malice.
+  - Governance fix: the raw slash message now requires a validator
+    sender — previously any account could slash anyone, an open
+    confiscation hole.
+  - **In plain words:** validators can now actually be punished.
+    If a validator double-signs (the provable kind of cheating),
+    anyone can submit the proof — two of their own signatures —
+    and the chain takes 10% of their stake and kicks them out.
+    If a validator just goes quiet and stops signing blocks, they
+    get temporarily removed too, but without losing stake. And a
+    scary hole is closed: before this, literally any account could
+    have sent a "slash" message and zeroed out a validator's
+    stake.
 
 - **Coordinated upgrades: halt heights and schema migrations**
   (`crates/executor`, `modules/staking`, `modules/evm`)
@@ -142,23 +159,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     snapshot in verified pieces from any validator, checks it
     against a root the operator already trusts, and starts
     serving from that height.
-  - Downtime tracking: each block now records which validators
-    signed it (`FinalizedBlock.signers`), and a validator who
-    misses more than half of the last 100 blocks is jailed
-    automatically — without slashing, since going offline is a
-    liveness fault, not malice.
-  - Governance fix: the raw slash message now requires a validator
-    sender — previously any account could slash anyone, an open
-    confiscation hole.
-  - **In plain words:** validators can now actually be punished.
-    If a validator double-signs (the provable kind of cheating),
-    anyone can submit the proof — two of their own signatures —
-    and the chain takes 10% of their stake and kicks them out.
-    If a validator just goes quiet and stops signing blocks, they
-    get temporarily removed too, but without losing stake. And a
-    scary hole is closed: before this, literally any account could
-    have sent a "slash" message and zeroed out a validator's
-    stake.
+
+- **Height-indexed pruning and archive mode** (`crates/storage`,
+  `crates/config`, `crates/executor`, `docs/archive-recipe.md`)
+  - The journal now records each sealed segment's max block
+    height in a `heights.idx` sidecar, so history can be pruned
+    by *height* ("delete everything below H"), not just by
+    segment count. Segments with unknown contents are never
+    deleted.
+  - New `[storage]` config: `journal_retain_segments`,
+    `history_retention` (the executor's in-memory
+    finalized-block window), and `archive = true` for
+    keep-everything nodes.
+  - `docs/archive-recipe.md` documents the two-tier deployment:
+    pruned validators + one archive node for explorers/audits,
+    with state-sync for new joins instead of full replay.
+  - **In plain words:** disk usage was going to grow forever —
+    at target speed, a node writes a terabyte of history a day.
+    Now operators choose: prune by count or by block height for
+    normal nodes, or flip one flag and keep everything on an
+    archive node that serves explorers and auditors. New nodes
+    still bootstrap by verified snapshot rather than replaying
+    the archive.
 
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,

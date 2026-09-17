@@ -49,14 +49,14 @@ const MAX_RETAINED_HISTORY: usize = 4096;
 /// newest [`MAX_RETAINED_HISTORY`] entries by dropping the oldest.
 trait InsertRetained<K: Ord, V> {
     /// Insert `v` at `k`, then evict oldest entries until at most
-    /// [`MAX_RETAINED_HISTORY`] remain.
-    fn insert_retained(&mut self, k: K, v: V);
+    /// `max` remain.
+    fn insert_retained(&mut self, k: K, v: V, max: usize);
 }
 
 impl<K: Ord, V> InsertRetained<K, V> for BTreeMap<K, V> {
-    fn insert_retained(&mut self, k: K, v: V) {
+    fn insert_retained(&mut self, k: K, v: V, max: usize) {
         self.insert(k, v);
-        while self.len() > MAX_RETAINED_HISTORY {
+        while self.len() > max {
             self.pop_first();
         }
     }
@@ -1075,6 +1075,14 @@ pub struct Executor {
     /// protection). Default `1` (devnet); production must set it
     /// from chain config via [`Executor::with_chain_id`].
     chain_id: u64,
+    /// Heights of `finalized`/`state_roots` kept in memory —
+    /// `MAX_RETAINED_HISTORY` by default, tunable via
+    /// [`with_history_retention`](Self::with_history_retention)
+    /// (archive nodes raise it; constrained nodes lower it).
+    /// Recent-height queries (`state_root_at`, `finalized_block`)
+    /// only serve within this window; full history is the
+    /// journal's job.
+    history_retention: usize,
     /// Whether unsigned txs to non-self-authenticating modules are
     /// admitted. See [`UnsignedTxPolicy`]. Default `Allow` for
     /// devnet/test compatibility; production wiring sets `Reject`.
@@ -1121,6 +1129,7 @@ impl Executor {
             min_fee: 0,
             chain_id: 1,
             unsigned_tx_policy: UnsignedTxPolicy::Allow,
+            history_retention: MAX_RETAINED_HISTORY,
         }
     }
 
@@ -1159,6 +1168,16 @@ impl Executor {
     #[must_use]
     pub fn with_gas_limit(mut self, limit: u64) -> Self {
         self.block_gas_limit = limit;
+        self
+    }
+
+    /// Set how many finalized heights `finalized`/`state_roots`
+    /// retain in memory (default `MAX_RETAINED_HISTORY` = 4096).
+    /// Raise for archive-style nodes serving deep `state_root_at`
+    /// queries; lower to bound RAM on lean followers.
+    #[must_use]
+    pub fn with_history_retention(mut self, n: usize) -> Self {
+        self.history_retention = n;
         self
     }
 
@@ -2361,7 +2380,7 @@ impl AppInterface for Executor {
             self.finalized
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert_retained(block.height.value(), block.clone());
+                .insert_retained(block.height.value(), block.clone(), self.history_retention);
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 block.height.value().saturating_add(1); // M2 fix
         } else {
@@ -2371,11 +2390,11 @@ impl AppInterface for Executor {
             self.state_roots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert_retained(block.height.value(), root);
+                .insert_retained(block.height.value(), root, self.history_retention);
             self.finalized
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert_retained(block.height.value(), block.clone());
+                .insert_retained(block.height.value(), block.clone(), self.history_retention);
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 block.height.value().saturating_add(1); // M2 fix
         }

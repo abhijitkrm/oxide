@@ -84,6 +84,10 @@ pub struct Config {
     #[serde(default)]
     pub executor: ExecutorConfig,
 
+    /// Storage / retention configuration.
+    #[serde(default)]
+    pub storage: StorageConfig,
+
     /// Genesis state configuration.
     #[serde(default)]
     pub genesis: GenesisConfig,
@@ -153,6 +157,7 @@ impl Config {
         self.network.apply_env_vars();
         self.consensus.apply_env_vars();
         self.executor.apply_env_vars();
+        self.storage.apply_env_vars();
         self.genesis.apply_env_vars();
     }
 }
@@ -428,6 +433,73 @@ impl ExecutorConfig {
             if let Ok(n) = v.parse() {
                 self.parallel_threshold = n;
             }
+        }
+    }
+}
+
+// ── Storage / retention config ──────────────────────────────────
+
+/// Storage and pruning configuration.
+///
+/// Bounds how much history a node keeps. Everything here is a
+/// retention *policy*: none of it changes consensus or execution,
+/// only how much past state this node can serve after the fact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageConfig {
+    /// Journal segments to retain (count-based bound). Old sealed
+    /// segments beyond this are deleted once their contents are
+    /// checkpointed. Default: 1000 (~256 GiB at 256 MiB segments).
+    /// Ignored when `archive` is set.
+    #[serde(default = "default_journal_retain_segments")]
+    pub journal_retain_segments: u32,
+
+    /// Heights of finalized-block / state-root history the
+    /// executor keeps in memory (`Executor::with_history_retention`).
+    /// Default: 4096.
+    #[serde(default = "default_history_retention")]
+    pub history_retention: usize,
+
+    /// Archive mode: keep ALL history — journal segments, executor
+    /// state roots, module undo windows. An archive node is the
+    /// cold-tier answer to pruning: queryable back to genesis,
+    /// sized by adding disk rather than by keeping less.
+    /// Default: false.
+    #[serde(default)]
+    pub archive: bool,
+}
+
+fn default_journal_retain_segments() -> u32 {
+    1000
+}
+fn default_history_retention() -> usize {
+    4096
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            journal_retain_segments: default_journal_retain_segments(),
+            history_retention: default_history_retention(),
+            archive: false,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Apply env var overrides.
+    fn apply_env_vars(&mut self) {
+        if let Ok(v) = env::var("OXIDE_JOURNAL_RETAIN_SEGMENTS") {
+            if let Ok(n) = v.parse() {
+                self.journal_retain_segments = n;
+            }
+        }
+        if let Ok(v) = env::var("OXIDE_HISTORY_RETENTION") {
+            if let Ok(n) = v.parse() {
+                self.history_retention = n;
+            }
+        }
+        if let Ok(v) = env::var("OXIDE_ARCHIVE") {
+            self.archive = matches!(v.as_str(), "1" | "true" | "yes");
         }
     }
 }
