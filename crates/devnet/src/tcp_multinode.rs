@@ -1208,22 +1208,39 @@ impl TcpMultiNodeDevnet {
         }
     }
 
+    /// Timeout-path advance for all engines: collect every
+    /// validator's real timeout signature into a TC, which each
+    /// engine then records as the view-change evidence (`last_tc`)
+    /// so the next leader's proposal carries legitimate-successor
+    /// proof — required for same-height lock release after a failed
+    /// view.
+    fn timeout_advance_all(&mut self) {
+        let sigs: Vec<crypto::bls::Signature> = self
+            .engines
+            .iter_mut()
+            .map(|e| e.on_timeout().unwrap_or(crypto::bls::Signature::ZERO))
+            .collect();
+        for collector in 0..self.n {
+            for (signer, sig) in sigs.iter().enumerate() {
+                let _ = self.engines[collector]
+                    .collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig);
+            }
+        }
+        let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+        for engine in &mut self.engines {
+            engine.sync_next_height(max_height);
+        }
+    }
+
     /// Run one consensus round with messages routed through TCP.
     #[allow(clippy::too_many_lines)]
     fn run_round_tcp(&mut self) {
         let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
 
         // Leader proposes (direct — proposal broadcast is a separate
-        // layer). If the leader can't propose, skip the round.
+        // layer). If the leader can't propose, the view times out.
         let Some((header, proposal)) = self.engines[leader_idx].propose() else {
-            for engine in &mut self.engines {
-                engine.advance_view();
-            }
-            let max_height =
-                self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
-            for engine in &mut self.engines {
-                engine.sync_next_height(max_height);
-            }
+            self.timeout_advance_all();
             return;
         };
         let block_hash = OxideBft::block_hash(&header);
@@ -1279,16 +1296,11 @@ impl TcpMultiNodeDevnet {
             }
         }
 
-        // Leader forms QC.
+        // Leader forms QC. No quorum → the view timed out: run the
+        // real TC path so locked voters can re-vote the failed
+        // height next view.
         let Some(qc) = self.engines[leader_idx].try_form_qc() else {
-            for engine in &mut self.engines {
-                engine.advance_view();
-            }
-            let max_height =
-                self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
-            for engine in &mut self.engines {
-                engine.sync_next_height(max_height);
-            }
+            self.timeout_advance_all();
             return;
         };
 

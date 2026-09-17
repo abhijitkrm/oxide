@@ -43,3 +43,8 @@ plan.md
 
 docs/evidence/*
 
+
+# TLC model-check artifacts
+spec/**/states/
+spec/**/*_TTrace_*
+states/

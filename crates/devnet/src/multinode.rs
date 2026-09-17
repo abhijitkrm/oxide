@@ -512,6 +512,30 @@ impl MultiNodeDevnet {
         }
     }
 
+    /// Timeout-path advance for all engines: collect every
+    /// validator's real timeout signature into a TC, which each
+    /// engine records as view-change evidence (`last_tc`) so the
+    /// next leader's proposal carries legitimate-successor proof —
+    /// required for same-height lock release after a failed view.
+    /// Used by the round drivers' failure paths.
+    fn timeout_advance_all(&mut self) {
+        let sigs: Vec<crypto::bls::Signature> = self
+            .engines
+            .iter_mut()
+            .map(|e| e.on_timeout().unwrap_or(crypto::bls::Signature::ZERO))
+            .collect();
+        for collector in 0..self.n {
+            for (signer, sig) in sigs.iter().enumerate() {
+                let _ = self.engines[collector]
+                    .collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig);
+            }
+        }
+        let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+        for engine in &mut self.engines {
+            engine.sync_next_height(max_height);
+        }
+    }
+
     /// Run one consensus round: propose → vote → QC → advance.
     ///
     /// This is the deterministic message-delivery loop. The order is
@@ -614,16 +638,11 @@ impl MultiNodeDevnet {
         // leader's view is stale). In that case, skip the round —
         // the view will advance via the flush round.
         let Some((header, proposal)) = self.engines[leader_idx].propose() else {
-            // Leader can't propose (partitioned or no txs).
-            // Advance all views and return.
-            for engine in &mut self.engines {
-                engine.advance_view();
-            }
-            let max_height =
-                self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
-            for engine in &mut self.engines {
-                engine.sync_next_height(max_height);
-            }
+            // Leader can't propose (partitioned or no txs) — the
+            // view times out. Run the real TC path so the next
+            // leader carries successor evidence and locked voters
+            // can re-vote the failed height.
+            self.timeout_advance_all();
             return;
         };
         let block_hash = OxideBft::block_hash(&header);
@@ -681,17 +700,10 @@ impl MultiNodeDevnet {
 
         // Leader forms QC.
         // Leader forms QC. If the leader can't reach quorum (e.g.,
-        // too many partitioned followers), skip the QC and advance.
+        // too many partitioned followers), the view timed out — run
+        // the real TC path so locked voters can re-vote next view.
         let Some(qc) = self.engines[leader_idx].try_form_qc() else {
-            // Not enough votes for quorum (partitioned followers).
-            for engine in &mut self.engines {
-                engine.advance_view();
-            }
-            let max_height =
-                self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
-            for engine in &mut self.engines {
-                engine.sync_next_height(max_height);
-            }
+            self.timeout_advance_all();
             return;
         };
 

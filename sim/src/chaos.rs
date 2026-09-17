@@ -99,6 +99,12 @@ impl ChaosReport {
     /// content: for every height present in two honest nodes'
     /// finalized sets, the tx payload must be identical. Same height +
     /// different txs = a fork = violation.
+    ///
+    /// It also asserts each honest node's committed heights form a
+    /// contiguous prefix from 0 — the property both TLA+ findings
+    /// violated (forged heights, prev/justify decoupling). The engine
+    /// retains up to 4096 finalized entries, far above scenario
+    /// lengths, so pruning never masquerades as a gap here.
     #[must_use]
     pub fn safety_holds(&self, strategies: &HashMap<usize, ByzantineStrategy>) -> bool {
         let mut reference: Option<std::collections::BTreeMap<u64, &FinalizedBlock>> = None;
@@ -108,6 +114,13 @@ impl ChaosReport {
             }
             let mine: std::collections::BTreeMap<u64, &FinalizedBlock> =
                 blocks.iter().map(|b| (b.height.value(), b)).collect();
+            // Contiguous prefix: every height below the node's
+            // committed tip must be present.
+            if let Some((&max_h, _)) = mine.iter().next_back() {
+                if mine.len() as u64 != max_h + 1 {
+                    return false;
+                }
+            }
             if let Some(reference) = &reference {
                 for (h, block) in &mine {
                     if let Some(ref_block) = reference.get(h) {
@@ -280,15 +293,15 @@ fn run_chaos_round(
     }
 
     // A withholding leader emits no proposal: followers observe the
-    // silence and the view advances empty (timeout path — the devnet
-    // harness models it as advance_view without a QC).
+    // silence and the view advances empty via the real timeout path
+    // (timeout signatures -> TC -> view change).
     if matches!(leader_strat, Some(ByzantineStrategy::Withhold)) {
-        advance_all(devnet);
+        timeout_all(devnet);
         return;
     }
 
     let Some((header, proposal)) = devnet.engines_mut()[leader_idx].propose() else {
-        advance_all(devnet);
+        timeout_all(devnet);
         return;
     };
     let hash_a = OxideBft::block_hash(&header);
@@ -413,8 +426,10 @@ fn run_chaos_round(
     }
 
     let Some(qc) = devnet.engines_mut()[leader_idx].try_form_qc() else {
-        // Split vote / withheld votes: no quorum this view.
-        advance_all(devnet);
+        // Split vote / withheld votes: no quorum this view — the
+        // timeout path forms a TC so the next leader carries
+        // successor evidence (and locked voters can re-vote).
+        timeout_all(devnet);
         return;
     };
 
@@ -477,9 +492,36 @@ fn send_vote(
 
 /// Advance every engine's view and re-sync heights — the harness's
 /// model of a completed view (with or without a QC).
+/// Happy-path advance: every engine moves to the next view after a
+/// QC (no timeout evidence — the view succeeded).
 fn advance_all(devnet: &mut MultiNodeDevnet) {
     for engine in devnet.engines_mut() {
         engine.advance_view();
+    }
+    let max_height = devnet.engines().iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+    for engine in devnet.engines_mut() {
+        engine.sync_next_height(max_height);
+    }
+}
+
+/// Timeout-path advance: every engine emits its real timeout
+/// signature, all engines collect a quorum of them into a TC, and
+/// each records the TC as the view-change evidence (engines set
+/// `last_tc` inside `collect_timeout_signature`). The next proposal
+/// then embeds the TC (legitimate-successor rule), which is what
+/// lets voters release same-height vote locks left over from the
+/// timed-out view — without TC evidence, a split view wedges
+/// forever.
+fn timeout_all(devnet: &mut MultiNodeDevnet) {
+    let n = devnet.engines().len();
+    let sigs: Vec<crypto::bls::Signature> = (0..n)
+        .map(|i| devnet.engines_mut()[i].on_timeout().unwrap_or(crypto::bls::Signature::ZERO))
+        .collect();
+    for collector in 0..n {
+        for (signer, sig) in sigs.iter().enumerate() {
+            let _ = devnet.engines_mut()[collector]
+                .collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig);
+        }
     }
     let max_height = devnet.engines().iter().map(OxideBft::next_height_value).max().unwrap_or(0);
     for engine in devnet.engines_mut() {

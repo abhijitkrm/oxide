@@ -75,6 +75,74 @@ the commit vote for *h−2*, the pre-commit for *h−1*, and the prepare
 for *h*. The three certificates travel in the proposals of *h*, *h+1*,
 *h+2* respectively.
 
+### Vote validity (engine-enforced)
+
+A validator's prepare vote is gated on all of the following — each
+rule exists because a concrete attack or wedge was found without it:
+
+- **Current view.** The proposal's view must equal the voter's current
+  view; stale views are already decided, premature ones would break
+  one-vote-per-view.
+- **One vote per view.** `last_voted_view` is monotonic; a second
+  proposal in the same view is refused (and two conflicting votes
+  for one view are slashing-grade evidence).
+- **Height continuity.** The stamped height must be exactly
+  `parent.height + 1`, where *parent* is the voter's highQC block
+  (or the committed anchor below). Without this a Byzantine leader
+  can stamp an arbitrary future height: the forged block is then
+  committable at a height the chain never filled — a finalized gap —
+  and every voter that signed it becomes per-height-locked at a
+  height the honest chain still needs, permanently wedging quorum.
+  Heights are therefore *derived*, never free.
+- **Committed anchor.** With no highQC, the only voteable proposal
+  extends the committed tip — height 0 / zero parent at genesis, or
+  `last_committed + 1` across an epoch rotation (rotation resets the
+  QC chain but heights continue). A made-up parent hash with a forged
+  height is refused.
+- **Parent binding.** `prev_block` must equal the voter's highQC
+  block, and the embedded justify QC must be at least as recent
+  (view ≥ highQC.view) — tail-fork resistance: a proposal that does
+  not extend the highest notarized block is bypassed.
+- **Structural justify rule.** `prev_block` must equal the embedded
+  QC's `block_hash`: a block extends *exactly* the block its
+  certificate notarizes. Honest proposals always satisfy this;
+  decoupling them is a Byzantine-only construct — the commit rule
+  walks justify edges while voters store the prev chain, so a
+  crafted `prev ≠ justify` finalizes a block whose real parent was
+  never committed (a finalized gap, and a same-height fork against
+  validators that committed through the justify chain). The embedded
+  QC's aggregate signature is also verified at vote time: it is
+  commit evidence — its bitmap becomes the committed parent's
+  attendance — so it must be a certificate, not claimed bytes.
+- **Per-height lock with TC release.** Once a validator votes at
+  height *h* it votes only that block at *h* — until a proposal
+  arrives carrying a valid TC for the immediately preceding view.
+  The TC is quorum-certified proof that the earlier view ended
+  undecided, so re-voting the height cannot produce two commits:
+  QC adoption is view-monotonic, and only the *newest* notarization
+  can gather the child votes a commit needs. Without the release,
+  a single equivocating leader could split the vote and wedge a
+  height forever.
+
+### The commit rule (recursive)
+
+Adopting QC(*b*) for a stored block *b* finalizes **the whole
+certified ancestor chain beneath it**, not just the single pending
+tip: QC(*b*) plus *b*'s embedded QC satisfy two-chain for *b*'s
+parent, and since `prev == justify` is enforced at vote time every
+stored ancestor is itself certified with a certified child. The
+engine walks `prev` links from *b*'s parent back to the finalized
+prefix (or an unstored block — storage is prefix-closed, so a gap
+means "already finalized") and commits in height order.
+
+A single-link "commit the pending block when a child QC arrives"
+rule is *incomplete*: if a QC is adopted before its block is stored,
+or a newer QC leapfrogs an undelivered one, the skipped link is never
+revisited and the finalized map gains a hole — the `InvNoGap`
+counterexample the TLA+ model produced. The recursive rule also makes
+the future block-import/catch-up seam safe by construction: imported
+ancestors commit with the chain that certifies them.
+
 ### Why two-chain, not three-chain or one-chain
 
 - **One-chain (basic HotStuff)** finalizes in one round but requires
@@ -130,9 +198,12 @@ a height; views advance on timeout or on a timeout certificate.
   under a faulty leader.
 - **Timeout certificate (TC).** Once ≥2f+1 validators sign a timeout
   for view *v*, the next leader (view *v+1*) embeds the TC in its
-  proposal, proving it is the legitimate successor. A TC is the
-  "force a view change without the leader" mechanism — tail-fork
-  resistance.
+  proposal (`header.timeout_cert`), proving it is the legitimate
+  successor. The embedded TC has a second, load-bearing role: it is
+  the evidence that releases per-height vote locks left over from
+  the timed-out view, so a split view can be retried at the same
+  height. A TC is the "force a view change without the leader"
+  mechanism — tail-fork resistance.
 - **Continuous.** The pacemaker does not stop on finality; it
   advances views as long as there is work, which (with pipelining)
   is always.

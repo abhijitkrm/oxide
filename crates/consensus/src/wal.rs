@@ -79,6 +79,18 @@ pub struct WalEntry {
     /// The current epoch. Needed for validator-set lookup
     /// and vote signing.
     pub epoch: Epoch,
+    /// The committed anchor `(block_hash, height)`: the parent a
+    /// proposal must extend while `high_qc` is `None` — the
+    /// post-rotation boundary case. Safety-critical: a restart that
+    /// forgets it falls back to the true-genesis arm and would
+    /// accept a forged height-0 chain in a later epoch (or reject
+    /// the legitimate continuation and wedge). Written on every
+    /// append, and `commit_block` appends when it advances so the
+    /// WAL never holds a stale anchor.
+    ///
+    /// Encoded as an optional trailer (1-byte flag + height + hash)
+    /// so entries written by older binaries still decode.
+    pub last_committed: Option<(Hash, Height)>,
 }
 
 impl Encode for WalEntry {
@@ -109,6 +121,18 @@ impl Encode for WalEntry {
         self.current_view.encode(buf);
         self.next_height.encode(buf);
         self.epoch.encode(buf);
+        // last_committed: optional trailer (1-byte flag + height +
+        // hash) — appended last so entries written before the field
+        // existed still decode (the decoder reads it only if bytes
+        // remain).
+        match self.last_committed {
+            Some((hash, height)) => {
+                buf.push(1);
+                height.encode(buf);
+                hash.encode(buf);
+            }
+            None => buf.push(0),
+        }
     }
 }
 
@@ -132,7 +156,25 @@ impl<'a> Decode<'a> for WalEntry {
         let current_view = View::decode(reader)?;
         let next_height = Height::decode(reader)?;
         let epoch = Epoch::decode(reader)?;
-        Ok(Self { last_voted_view, voted_at_height, high_qc, current_view, next_height, epoch })
+        // Optional trailer: entries written before `last_committed`
+        // existed end here — decode them as `None` rather than
+        // failing on a short buffer.
+        let last_committed = if reader.remaining() > 0 && reader.read_u8()? == 1 {
+            let height = Height::decode(reader)?;
+            let hash = Hash::decode(reader)?;
+            Some((hash, height))
+        } else {
+            None
+        };
+        Ok(Self {
+            last_voted_view,
+            voted_at_height,
+            high_qc,
+            current_view,
+            next_height,
+            epoch,
+            last_committed,
+        })
     }
 }
 
@@ -362,6 +404,7 @@ mod tests {
             current_view: View::new(0),
             next_height: Height::new(0),
             epoch: Epoch::new(0),
+            last_committed: None,
         }
     }
 
@@ -376,6 +419,7 @@ mod tests {
             current_view: View::new(6),
             next_height: Height::new(4),
             epoch: Epoch::new(0),
+            last_committed: Some((Hash([0xBB; 32]), Height::new(2))),
         }
     }
 

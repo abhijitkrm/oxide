@@ -14238,3 +14238,214 @@ pre-existing artifact was a stale OOM whose fix already landed).
 
 Nightly `fuzz` job now covers all 9 targets at 10 min each
 (was 6 targets at 5 min).
+
+## Session — oxideBFT forged-height fix + TC-in-proposal + TLA+ model
+
+Item 6: TLA+ model of oxideBFT — and the engine-level safety bug it
+surfaced.
+
+### The bug: proposer-stamped heights were arbitrary
+
+`vote()` never checked that a proposal's stamped `height` equals the
+parent's height + 1. A Byzantine leader could stamp any height on a
+proposal extending the real highQC:
+
+- **Forged future height**: the block stays in `blocks` (the commit
+  prune only evicts heights ≤ committed), gathers votes (nobody held
+  a lock at the unreachable height), forms a QC, and — once a child
+  justifies it — is committed into `finalized[forged_h]` while the
+  honest chain sits at height 2. Worse, every voter that signed it is
+  now per-height-locked at forged_h — when the honest chain reaches
+  that height, those voters refuse the real block: permanent wedge.
+- **Forged low height** (replay): accidentally defended — the
+  `blocks.retain(h > committed)` prune evicts the replayed block
+  before its commit can fire. The first regression test passed
+  vacuously for this reason; instrumentation showed the QC never
+  exercised the commit path.
+
+TLA+ modelling found the shape; the engine regression test
+(`forged_height_block_cannot_commit_or_wedge_chain`) reproduces it
+deterministically.
+
+### The fix: heights are derived, never stamped freely
+
+- `propose()` stamps `parent.height + 1` where parent = the highQC
+  block — or the **committed anchor** (`last_committed`, new field)
+  when no highQC exists. `next_height` is now only an
+  observed-height watermark for sync/WAL — stamping from it would
+  let a forged observed height poison honest proposals forever.
+- `vote()` enforces the same rule: `header.height ==
+  parent.height + 1`. The parent must be the highQC block (existing
+  tail-fork binding) whose header the voter has stored; an adopted
+  QC for an unseen block means the voter cannot verify continuity —
+  it refuses until the block arrives (it could not execute the child
+  without the parent's state anyway).
+- No-highQC arm: the proposal must extend `last_committed` — genesis
+  (height 0 / zero parent) before anything commits, or the last
+  committed block after epoch rotation (rotation resets `high_qc`
+  but heights continue; previously `next_height` carried this —
+  now the anchor does, and `voted_at_height` is cleared on rotation
+  since stale in-flight locks would collide with the new epoch's
+  heights).
+
+### The wedge it exposed: per-height locks never released
+
+With heights honest, a same-height equivocation that produces no QC
+(e.g. view-0 leader sends A and A') leaves honest voters locked —
+the next leader must re-propose the *same* height, and the lock
+correctly refuses a different block there. Without a release, one
+Byzantine leader permanently kills the chain — worse than the bug
+being fixed. (Pre-fix this was masked: leaders "recovered" by
+inflating the stamped height past the locks — the exploit itself.)
+
+The release is the mechanism the spec always intended (§view-changes:
+"the next leader embeds the TC in its proposal, proving it is the
+legitimate successor") — stage 4's `timeout_cert` field was never
+populated. Now:
+
+- The engine records `last_tc` whenever a TC advances its view
+  (`collect_timeout_signature` formation, `on_timeout_certificate`
+  receipt); QC/sync advances clear it.
+- `propose()` embeds it iff `tc.view + 1 == current_view` and the
+  epoch matches — the exact successor-evidence shape.
+- `vote()` releases the per-height lock iff the proposal carries a
+  fully validated TC (epoch, quorum bitmap, aggregate signature when
+  verification is on) for `header.view - 1`. The locked vote's view
+  is always `< header.view` (one-vote-per-view), so TC(view−1)
+  automatically covers the view the lock was taken in.
+- Safety holds via QC-adoption monotonicity: if a hidden QC for the
+  locked block exists, its adopters refuse the new proposal
+  (`prev != highQC.block`), and even if both sides somehow
+  notarize, only the newest-view QC can gather child votes — the
+  two-chain commit follows justify edges and `deliver_qc` rejects
+  stale QC views, so at most one chain commits per height.
+
+Devnet + chaos harnesses now drive the real timeout path on failed
+views (`timeout_advance_all` / `timeout_all`: collect timeout sigs →
+form TC → all engines record it), matching `oxide-validator`, which
+already did this — `last_tc` populates automatically in production.
+
+### Tests
+
+- `forged_height_block_cannot_commit_or_wedge_chain` — the attack:
+  forged future height is rejected at vote time, never forms a QC,
+  honest chain proceeds.
+- `same_height_lock_releases_on_timeout_certificate` — equivocation
+  at height 0 → TC(0) → re-proposal with embedded TC → locked voters
+  release → quorum recovers.
+- `same_height_lock_holds_without_timeout_certificate` — the
+  complement: no TC, no release.
+- Three pre-existing tests updated (`tail_fork_*`, `vote_lock_*`):
+  they hand-crafted `height = 99` headers or voted children without
+  holding the QC — now stamp correctly / store the parent header,
+  exercising the same rules they were written for.
+
+### TLA+ model updated to match the fix
+
+`spec/oxidebft/OxideBft.tla`: blocks gain `tcView`; the vote rule
+enforces `b.height = b.prev.height + 1` plus the anchor rule
+(`highQC = Genesis ⇒ prev = Genesis`); the per-height lock releases
+on `TCReleases(b)` (valid TC for view−1); `Genesis.height = -1` so
+the first block stamps 0 like the engine; new invariant `InvNoGap`
+(committed heights per validator form a contiguous prefix — exactly
+what the forged-height bug violated). Byzantine proposals still
+stamp arbitrary heights — TLC now verifies they can never be
+notarized. Full + hunt configs running; state counts in the commit.
+
+### Second TLC counterexample: prev/justify decoupling
+
+With the height fix landed, the hunt config (`InvNoGap` added) found
+a real second violation at depth 13 — and sharper than the trace
+suggested. The two-chain commit walks **justify** edges (a QC'd block
+commits its embedded QC's target) while `vote()` bound `prev_block`
+to the voter's own highQC — nothing required `prev = justify`. A
+Byzantine leader could craft `prev = the stale voters' highQC block`
+with `justify = a real QC for a different, newer-view block`: every
+vote check passed (prev binds, justify view newer, height
+continuous, TC releases the height lock), the block was stored,
+became `pending`, and committed via its child — while the voter's
+true parent was never finalized. Same-height fork against peers that
+committed through the justify chain, plus a permanent gap. Two
+compounding findings in one: (a) **structural** — `prev_block` must
+equal `high_qc.block_hash` (a block extends exactly the block its
+certificate notarizes); (b) **cryptographic** — the embedded QC's
+aggregate was never verified in `vote()` (only the outer QC in
+`deliver_qc`), so the justify edge and its attendance bitmap could
+be fabricated wholesale. Both now enforced at vote time: structural
+check always, aggregate verify in production mode (one pairing per
+accepted-position proposal — same class as `deliver_qc`'s check,
+ordered after the cheap rejects). Regression tests:
+`prev_justify_divergence_cannot_fork_commits` (TC-released quorum
+votes for a crafted `prev=a / justify=QC(b)` block — rejected) and
+`proposal_with_forged_embedded_qc_is_rejected` (zeroed aggregate).
+Model updated: `b.prev = b.justify` in both vote predicates, and a
+per-validator `stored` set gates `AdoptQC`'s pending/commit — the
+engine's `blocks.get` gate, which the model had been
+over-approximating (that over-approximation is what made the
+counterexample reachable at depth 13; the engine path needs the
+crafted justify, which is why the fix is structural, not just
+visibility).
+
+### Third TLC counterexample: the commit rule itself was single-link
+
+After the `prev = justify` + `stored`-gate fixes, the hunt config
+still caught `InvNoGap` at depth 13 — this time the commit rule
+itself. The model's `AdoptQC` committed only `pending` when the new
+QC's block extended it. Counterexample: a validator adopts QC(b0)
+before storing b0 (pending stays empty), later adopts QC(b1) — its
+justify target b0 ≠ pending → commit skipped, pending := b1 — then
+QC(b2) commits b1 with no b0 beneath it. Finalized map: {h1} with a
+hole at h0.
+
+Engine reachability today: **none** — storage is prefix-closed
+(`vote` requires the parent stored, `propose` idles when the highQC
+block's header is unknown), so a missing block stalls the node
+rather than gap-committing it. But the rule as specified is
+incomplete, and the planned block-import seam (catch-up delivering
+QC'd blocks without the vote path — see the follow-up note) would
+create exactly the storage state that exposes it. Fixed at the
+protocol level: `deliver_qc` now walks the stored parent chain from
+the adopted QC's block, committing every uncommitted ancestor in
+height order (each is certified — its child's embedded QC — and has
+a certified child). `pending` remains as the pipeline tip for
+rotation gating and the empty-tx check; it no longer gates commits.
+Model updated with `CommitChain` (recursive justify-edge walk,
+gated on `stored` membership and uncommitted height) — the engine
+and spec now state the same rule. Regression test
+`leapfrog_qc_commits_full_ancestor_chain` seeds a stored chain with
+a lagging pending pointer and asserts the leapfrog QC finalizes the
+full prefix in order.
+
+### Crash-safety follow-through: rotation must persist the lock reset
+
+`complete_rotation` clears `voted_at_height` (above) — but that map
+is WAL-serialized safety state. Clearing it in memory without
+appending a WAL record meant a crash between rotation and the next
+vote restored the *stale* pre-rotation locks, and the new epoch's
+first proposals at continued heights would collide with ghosts of
+the old epoch's votes — a restart-only wedge. `complete_rotation`
+now calls `append_wal` after the reset, matching the rule that
+safety-state mutations persist before they can be acted on.
+
+The same audit caught a second hole: the new `last_committed`
+anchor itself was not persisted. It gates the no-highQC vote arm
+(post-rotation proposals must extend it), so a restart inside the
+epoch boundary would restore `None` — rejecting the legitimate
+continuation (wedge) and, worse, falling back to the true-genesis
+arm that accepts a forged height-0/zero-parent chain in a later
+epoch. `last_committed` is now a `WalEntry` field and a
+`save_state` trailer — both encoded as optional trailers so
+pre-change entries decode as `None` — and `commit_block` appends
+the WAL when it advances the anchor (a commit is the safety
+transition the WAL exists for; without an append there, a
+commit → crash → restart → rotation sequence would persist a stale
+anchor).
+
+### Follow-up noted (not this fix)
+
+There is no engine-level *block import* path: a node that adopts
+QC(b) without ever seeing b's proposal cannot later vote for b's
+children (continuity needs the parent's header; stale-view proposals
+aren't stored). Pre-fix this node voted for unexecutable children —
+worse. Real recovery is node-level block/state sync; worth an
+`import_block` seam when the sync protocol lands.

@@ -309,6 +309,74 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     wasn't listening, so journal replay is now actually being
     attacked instead of just looking attacked.
 
+- **oxideBFT: forged-height fix + prev=justify structural rule +
+  TC-in-proposal (spec stage 4 completed)** (`crates/consensus`,
+  `crates/devnet`, `sim/`, `spec/oxidebft`, `docs/oxidebft-spec.md`)
+  - **Security fix 1:** a Byzantine leader could stamp an arbitrary
+    *future* height on an otherwise-valid proposal. The forged block
+    was committable at a height the chain never reached — a gap in
+    the finalized map — and every voter that signed it became
+    permanently locked at that height, wedging the honest chain when
+    it arrived. Heights are now *derived*: proposers stamp
+    `parent.height + 1` (the highQC block, or the new committed
+    anchor across epoch boundaries), and voters enforce the same
+    rule — forged heights can no longer gather a single honest vote.
+  - **Security fix 2 (TLA+ counterexample):** a Byzantine leader
+    could decouple a proposal's `prev_block` (the stored parent
+    chain voters check) from its embedded QC's target (the chain the
+    two-chain commit rule walks). Crafted `prev ≠ justify` proposals
+    passed every check, committed through the justify edge, and left
+    the voter's real parent unfinalized — a finalized gap and a
+    same-height fork. Voters now require `prev_block ==
+    high_qc.block_hash` (a block extends exactly the block its
+    certificate notarizes) and verify the embedded QC's aggregate
+    signature at vote time — it is commit evidence, not claimed
+    bytes.
+  - **Liveness fix that the height fix exposed:** with honest
+    heights, a same-height equivocation producing no QC would wedge
+    the height forever (re-proposals hit the per-height lock).
+    Proposals now carry the timeout certificate that justified the
+    leader's view (`header.timeout_cert` — the field existed but was
+    never populated), and voters release the lock only on a fully
+    validated TC for the immediately preceding view.
+  - **Commit-rule completeness (TLA+ counterexample 3):** adopting
+    a QC now commits the entire certified ancestor chain beneath it,
+    not just the single pending link — a QC adopted before its block
+    was stored (or leapfrogging an undelivered QC) previously skipped
+    intermediate commits forever, leaving holes in the finalized
+    map. Not reachable through `vote()` today (storage is
+    prefix-closed), but the rule is now correct for the planned
+    block-import/catch-up seam.
+  - Devnet and chaos harnesses now drive the real timeout→TC path on
+    failed views, matching `oxide-validator`.
+  - Epoch rotation now WAL-persists the cleared per-height vote
+    locks, and the committed anchor (`last_committed`) is itself
+    persisted to the WAL and snapshots — a restart at the epoch
+    boundary previously lost it, leaving the validator unable to
+    recognize the continuation proposal (and open to a forged
+    genesis replay).
+  - New `spec/oxidebft/` TLA+ model: pipelined two-chain commits,
+    justify-edge commit rule, high-QC propagation, per-height locks
+    with TC release, timeout certificates, QC catch-up, and
+    Byzantine proposals/votes — with invariants for height
+    conflicts, single-chain commits, contiguous committed heights
+    (`InvNoGap`), one-vote-per-view, and QC uniqueness. TLC's
+    `InvNoGap` counterexample drove security fix 2; the model now
+    also tracks per-validator block visibility (`stored`) matching
+    the engine's store-before-pending gate.
+  - **In plain words:** a malicious leader could previously print a
+    fake page number onto a block and get it filed as real history —
+    leaving a hole in the ledger and freezing the honest pages that
+    came after. Block numbers are now derived from the parent, not
+    chosen by the proposer; a block must also point back at the exact
+    page its notarized receipt covers — no more citing a receipt for
+    a different page — and the receipt itself is checked, not just
+    claimed. When a round genuinely fails, the next leader carries
+    the certified proof of failure that lets honest validators retry
+    that page instead of deadlocking. And when a receipt for a whole
+    batch of pages arrives at once, every page in the batch is filed
+    — not just the last one.
+
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,
   `crates/node`, `bin/oxide-validator`, `bin/oxide-fullnode`)

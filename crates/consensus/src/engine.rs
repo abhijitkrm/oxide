@@ -80,11 +80,10 @@ const MAX_RETAINED_FINALIZED: usize = 4096;
 ///
 /// When the *next* block (which extends this one) gets a QC, this
 /// block is committed. The engine tracks exactly one pending block at
-/// a time (the tip of the pipeline).
+/// a time (the tip of the pipeline). The hash is not stored — it is
+/// always the hash of the QC that installed it.
 #[derive(Debug, Clone)]
 struct PendingBlock {
-    /// The block's hash.
-    hash: Hash,
     /// The block's proposal (txs).
     proposal: Proposal,
 }
@@ -323,6 +322,19 @@ pub struct OxideBft {
     /// so external consumers can't rely on it for full history).
     #[allow(clippy::type_complexity)]
     commit_listener: Option<Box<dyn Fn(&FinalizedBlock) + Send + Sync>>,
+    /// Hash and height of the most recently committed block — the
+    /// anchor a proposal must extend when no `high_qc` is known.
+    ///
+    /// `high_qc = None` has three legitimate cases: true genesis
+    /// (nothing committed — anchor is `None`), the first block after
+    /// an epoch rotation (the rotation resets `high_qc`, but the
+    /// chain's heights continue — the anchor is the last block the
+    /// old epoch committed), and a freshly synced node (no anchor —
+    /// it must obtain a QC before it can vote). Height continuity
+    /// is checked against this anchor so post-rotation stamps keep
+    /// increasing instead of colliding with the old epoch's
+    /// `finalized` entries.
+    last_committed: Option<(Hash, Height)>,
     /// The next height at which a block will be proposed. Advances in
     /// lockstep with the app's `next_proposal_height`.
     next_height: Height,
@@ -338,6 +350,21 @@ pub struct OxideBft {
     votes: Vec<Option<Vote>>,
     /// Number of votes collected in the current view.
     vote_count: usize,
+    /// The timeout certificate that justified entry into the current
+    /// view, when the view was reached via the timeout path. `None`
+    /// when the view was entered via QC progress (the happy path),
+    /// catch-up sync, or epoch rotation.
+    ///
+    /// The next leader embeds this TC in its proposal
+    /// (docs/oxidebft-spec.md §view-changes), proving it is the
+    /// legitimate successor of a timed-out view. On the voter side
+    /// it is the evidence that releases a per-height vote lock: a
+    /// view that timed out produced no QC, so re-voting a different
+    /// block at the same height cannot create conflicting commits
+    /// (only one notarization can gather commit momentum — QC
+    /// adoption is view-monotonic, so all honest voters converge on
+    /// the newest notarization's chain).
+    last_tc: Option<TimeoutCertificate>,
     /// Collected timeout signatures for the current view (TC safety).
     /// `None` = no timeout signature from that validator. Indexed by
     /// `ValidatorIndex`. Used to aggregate the TC's signature when
@@ -413,11 +440,13 @@ impl OxideBft {
             pending: None,
             finalized: BTreeMap::new(),
             commit_listener: None,
+            last_committed: None,
             next_height: Height::new(0),
             current_view: initial_view,
             epoch,
             votes: vec![None; n],
             vote_count: 0,
+            last_tc: None,
             timeout_signatures: vec![None; n],
             verify_signatures: true,
             // HIGH perf fix: default to skipping per-vote BLS
@@ -523,6 +552,7 @@ impl OxideBft {
             self.current_view = entry.current_view;
             self.next_height = entry.next_height;
             self.epoch = entry.epoch;
+            self.last_committed = entry.last_committed;
             // Sync the pacemaker to the recovered view.
             self.pacemaker.sync_to_view(self.current_view);
         }
@@ -540,6 +570,7 @@ impl OxideBft {
             current_view: self.current_view,
             next_height: self.next_height,
             epoch: self.epoch,
+            last_committed: self.last_committed,
         }
     }
 
@@ -556,6 +587,7 @@ impl OxideBft {
                 current_view: self.current_view,
                 next_height: self.next_height,
                 epoch: self.epoch,
+                last_committed: self.last_committed,
             };
             // If the WAL append fails, the engine continues —
             // the vote is already in memory. A WAL failure means
@@ -668,9 +700,21 @@ impl OxideBft {
         self.last_voted_view = None;
         self.high_qc = None;
         self.pending = None;
+        // Per-height vote locks are evidence of the old epoch's
+        // consensus instance: heights continue across the boundary
+        // (the anchor in `last_committed`), but stale locks must not
+        // constrain the new epoch's proposals at those heights.
+        self.voted_at_height.clear();
+        self.last_tc = None;
         self.votes = vec![None; self.validator_set.n()];
         self.vote_count = 0;
         self.timeout_signatures = vec![None; self.validator_set.n()];
+        // Persist the cleared locks: a crash between rotation and the
+        // next vote would otherwise restore the old epoch's locks
+        // from the WAL and wedge the new epoch's first heights (the
+        // new chain continues from `last_committed`, so those stale
+        // entries can never be released by a commit).
+        self.append_wal();
         // Reset the pacemaker for the new epoch.
         self.pacemaker =
             crate::pacemaker::Pacemaker::new(self.validator_set.clone(), View::new(0), self.epoch);
@@ -873,6 +917,12 @@ impl OxideBft {
         // - if high_qc present: encoded QuorumCertificate
         // - 8 bytes: voted_at_height.len()
         // - for each entry: 8 bytes height + 32 bytes hash
+        // - 1 byte: last_committed present (0 = None, 1 = Some)
+        // - if present: 8 bytes height + 32 bytes hash
+        //   (optional trailer — buffers written before the field
+        //   existed decode as None; it is safety state: the anchor
+        //   a proposal must extend while high_qc is None across an
+        //   epoch boundary)
 
         let mut buf = Vec::with_capacity(256);
         buf.extend_from_slice(&self.current_view.value().to_le_bytes());
@@ -895,6 +945,15 @@ impl OxideBft {
         for (height, hash) in &self.voted_at_height {
             buf.extend_from_slice(&height.to_le_bytes());
             buf.extend_from_slice(hash.as_bytes());
+        }
+
+        match self.last_committed {
+            Some((hash, height)) => {
+                buf.push(1);
+                buf.extend_from_slice(&height.value().to_le_bytes());
+                buf.extend_from_slice(hash.as_bytes());
+            }
+            None => buf.push(0),
         }
 
         buf
@@ -966,6 +1025,27 @@ impl OxideBft {
                 height,
                 Hash::from_slice(&hash_bytes).map_err(|_| ConsensusError::InvalidState)?,
             );
+        }
+
+        // Optional trailer: `last_committed` (1-byte flag + 8-byte
+        // height + 32-byte hash). Buffers written before the field
+        // existed end here — decode as `None`.
+        self.last_committed = None;
+        if offset < bytes.len() {
+            let flag = bytes[offset];
+            offset += 1;
+            if flag == 1 {
+                if offset + 40 > bytes.len() {
+                    return Err(ConsensusError::InvalidState);
+                }
+                let height = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+                let hash_bytes: [u8; 32] = bytes[offset..offset + 32].try_into().unwrap();
+                self.last_committed = Some((
+                    Hash::from_slice(&hash_bytes).map_err(|_| ConsensusError::InvalidState)?,
+                    Height::new(height),
+                ));
+            }
         }
 
         Ok(())
@@ -1089,12 +1169,15 @@ impl OxideBft {
     /// block. If there are no pending txs and the pending block is
     /// empty or None, return `None` (idle).
     ///
-    /// **Height tracking:** the engine maintains its own `next_height`
-    /// that advances on proposal (not finalization). This is required
-    /// because the 2-chain pipeline proposes multiple blocks before
-    /// committing any of them. The app's `next_proposal_height`
-    /// advances on finalization (in `finalize_block`); the engine's
-    /// `next_height` is the pipeline's height, which leads the app's.
+    /// **Height tracking:** the stamped height is derived from the
+    /// parent — `parent.height + 1` for the `high_qc` block, or the
+    /// committed anchor + 1 when no `high_qc` exists. It is never
+    /// taken from `next_height`: that field is only an
+    /// observed-height watermark (sync bookkeeping, WAL), and
+    /// stamping from it would let a forged observed height poison
+    /// every future honest proposal. The app's
+    /// `next_proposal_height` advances on finalization; the engine's
+    /// pipeline height leads it.
     ///
     /// # Errors
     ///
@@ -1144,15 +1227,45 @@ impl OxideBft {
         }
 
         let tx_root = Self::tx_root(&proposal.txs);
-        let prev_block = self.high_qc.as_ref().map_or(Hash::ZERO, |qc| qc.block_hash);
+        // Stamp `parent.height + 1` — the same rule `vote()` enforces.
+        // Stamping `self.next_height` instead would let a forged
+        // observed height poison every future honest proposal: the
+        // watermark only ever moves up, so one bad header would
+        // desynchronize stamps from the real chain forever. If the
+        // highQC block's header is unknown here (a QC can be adopted
+        // before its block arrives on catch-up), we cannot stamp a
+        // valid height — stay idle until gossip delivers the block.
+        let (height, prev_block) = match &self.high_qc {
+            Some(qc) => match self.blocks.get(&qc.block_hash) {
+                Some((parent, _)) => (parent.height.saturating_next(), qc.block_hash),
+                None => return None,
+            },
+            // No highQC: extend the committed anchor — genesis at
+            // height 0, or the last committed block across an epoch
+            // boundary. This is the same rule voters enforce.
+            None => match self.last_committed {
+                Some((hash, height)) => (height.saturating_next(), hash),
+                None => (Height::new(0), Hash::ZERO),
+            },
+        };
         let mut header = BlockHeader {
-            height: self.next_height,
+            height,
             view: self.current_view,
             epoch: self.epoch,
             prev_block,
             tx_root,
             high_qc: self.high_qc.clone(),
-            timeout_cert: None, // Stage 4: TC attached on view changes
+            // Embed the TC that brought us into this view, if any
+            // (spec §view-changes: "the next leader embeds the TC in
+            // its proposal, proving it is the legitimate successor").
+            // It must directly justify this view (`tc.view + 1 ==
+            // current_view`) and belong to this epoch — a stale TC
+            // from an earlier view or epoch is not evidence for this
+            // succession. Voters use it to release same-height vote
+            // locks left over from the timed-out view.
+            timeout_cert: self.last_tc.clone().filter(|tc| {
+                tc.epoch == self.epoch && tc.view.saturating_next() == self.current_view
+            }),
             proposer: proposer_hash(self.validator_set.leader(self.current_view)),
             timestamp: 0,             // deterministic: no real clock in the test model
             proposer_signature: None, // set below after signing
@@ -1171,13 +1284,11 @@ impl OxideBft {
         }
         let block_hash = Self::block_hash(&header);
         self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
-        // Advance the engine's height on proposal (not finalization).
-        // The 2-chain pipeline proposes multiple blocks before
-        // committing any; the engine's height leads the app's.
-        // Saturating: a legitimate chain never reaches u64::MAX height;
-        // if it somehow does, the chain is already dead and saturation
-        // makes that explicit instead of wrapping to 0.
-        self.next_height = self.next_height.saturating_next();
+        // Keep the observed-height watermark at least one past the
+        // stamp we just used. `next_height` no longer drives stamps
+        // (they are derived from the parent block) — it remains a
+        // watermark for catch-up sync and the WAL.
+        self.next_height = self.next_height.max(height.saturating_next());
         Some((header, proposal))
     }
 
@@ -1258,13 +1369,49 @@ impl OxideBft {
         // and voting here would notarize two conflicting blocks at
         // one height. Re-voting the same hash is safe and required
         // for liveness (a leader re-proposing an uncommitted block).
+        //
+        // Release (spec §view-changes): the lock yields when the
+        // proposal carries a valid TC for the immediately preceding
+        // view. A TC proves quorum-certified that the view ended
+        // undecided — the only way a same-height conflict can exist
+        // at all (a formed QC would have moved `high_qc` forward,
+        // changing the required `prev_block`/`height`). Without the
+        // release, one equivocating leader could split the vote and
+        // permanently wedge the height: neither side could gather a
+        // quorum again. Safety is preserved because QC adoption is
+        // view-monotonic (`deliver_qc` rejects stale views): if a
+        // hidden QC for the locked block exists, its later-view
+        // rival's adoption still wins, so only one of the two
+        // notarizations can gather the child-chain votes needed to
+        // commit.
         let block_hash = Self::block_hash(header);
         if self
             .voted_at_height
             .get(&header.height.value())
             .is_some_and(|voted| *voted != block_hash)
+            && !self.proposal_tc_releases_lock(header)
         {
             return None;
+        }
+        // Structural rule (spec §2): a block extends exactly the
+        // block its embedded QC certifies — `prev_block ==
+        // high_qc.block_hash`. Honest proposals always satisfy this
+        // (`propose` sets both from the same highQC), so only a
+        // crafted proposal can violate it — and the payoff is real:
+        // the tail-fork check below binds `prev` to OUR highQC block
+        // while the two-chain commit rule walks JUSTIFY edges (a
+        // QC'd block commits its embedded QC's target). Decoupling
+        // the two lets a Byzantine leader attach a newer-view QC for
+        // a different block: the proposal passes tail-fork on `prev`,
+        // but its adoption later commits through `justify` — the
+        // voter's real parent is never committed (finalized gap) and
+        // peers who adopted the justify chain commit a different
+        // block at the same height (fork). TLC's `InvNoGap`
+        // counterexample is exactly this shape.
+        if let Some(hqc) = &header.high_qc {
+            if header.prev_block != hqc.block_hash {
+                return None;
+            }
         }
         // Tail-fork resistance / extends-highest-QC rule
         // (docs/oxidebft-spec.md §4): reject proposals that don't
@@ -1321,6 +1468,59 @@ impl OxideBft {
             // yet), this is the expected case.
             if header.prev_block != our_high_qc.block_hash {
                 return None;
+            }
+            // Height continuity: the stamped height must be exactly
+            // the parent's height + 1. `header.height` is a
+            // proposer-chosen field — without this check a Byzantine
+            // leader can stamp an arbitrary future height, get the
+            // block committed at that height (creating a finalized
+            // gap and divergent `finalized_height()` across nodes),
+            // and — worse — the voters who signed it become
+            // per-height-locked at the height the honest chain still
+            // needs, permanently wedging quorum there. The parent is
+            // our highQC block (enforced above), so its height must
+            // be known: if we adopted a QC for a block whose header
+            // we never saw, we cannot verify continuity and must
+            // refuse until the block arrives via catch-up gossip.
+            let (parent_header, _) = self.blocks.get(&header.prev_block)?;
+            if header.height != parent_header.height.saturating_next() {
+                return None;
+            }
+        } else {
+            // No highQC: the only voteable proposal extends the
+            // committed anchor — height 0 / zero-hash parent at true
+            // genesis, or the last committed block at the
+            // post-rotation boundary (rotation resets `high_qc` but
+            // heights continue). Anything else is a forged chain:
+            // without an anchor check, a Byzantine leader could
+            // attach a made-up parent hash and stamp any height.
+            match self.last_committed {
+                Some((anchor_hash, anchor_height)) => {
+                    if header.prev_block != anchor_hash
+                        || header.height != anchor_height.saturating_next()
+                    {
+                        return None;
+                    }
+                }
+                None => {
+                    if header.height != Height::new(0) || header.prev_block != Hash::ZERO {
+                        return None;
+                    }
+                }
+            }
+        }
+        // The embedded QC is commit evidence — its bitmap becomes the
+        // committed parent's attendance record — so it must be a real
+        // certificate, not claimed bytes. Verified here (after the
+        // cheap structural checks) rather than in `deliver_qc`: a
+        // fabricated justify must never gather votes at all. Same
+        // cost class as the standalone QC verify in `deliver_qc` —
+        // one aggregate verify per accepted-position proposal.
+        if self.verify_signatures {
+            if let Some(hqc) = &header.high_qc {
+                if self.verify_qc_signature(hqc).is_err() {
+                    return None;
+                }
             }
         }
         // Divergence detection (docs/oxidebft-spec.md §6): if the
@@ -1575,13 +1775,17 @@ impl OxideBft {
         Some(qc)
     }
 
-    /// All validators: receive a QC, update `high_qc`, and check the
-    /// 2-chain commit rule. If the QC's block extends the pending
-    /// block, commit the pending block.
+    /// All validators: receive a QC, update `high_qc`, and run the
+    /// 2-chain commit rule.
     ///
-    /// The QC's block must already be stored (via `propose` or
-    /// `vote`); if not, the QC is accepted but no commit check runs
-    /// (the block will be committed when it's eventually received).
+    /// If the QC's block is stored (via `propose` or `vote`), the
+    /// commit walk fires: the block's parent and every uncommitted
+    /// stored ancestor beneath it are committed in height order —
+    /// see the commit-rule comment at the call site for why a
+    /// single pending link is insufficient. If the QC's block is
+    /// not stored, the QC still advances `high_qc`/view but no
+    /// commit runs (the block cannot be executed without its
+    /// content anyway; block catch-up is the node layer's job).
     ///
     /// # Signature verification (C1 fix)
     ///
@@ -1676,35 +1880,71 @@ impl OxideBft {
             self.pacemaker.on_progress();
             // Clear stale per-view state from the old view.
             self.clear_per_view_state();
+            // QC-driven catch-up — no TC evidence for this view.
+            self.last_tc = None;
         }
 
-        // 2-chain commit check: if the QC's block extends the pending
-        // block (i.e., the QC's block's high_qc matches the pending
-        // block's hash), commit the pending block.
-        if let Some(pending) = &self.pending {
-            if let Some((header, proposal)) = self.blocks.get(&qc.block_hash).cloned() {
-                // Does the QC's block extend the pending block?
-                if let Some(hqc) =
-                    header.high_qc.as_ref().filter(|hqc| hqc.block_hash == pending.hash)
-                {
-                    // 2-chain: pending.qc → new_block → new_qc → commit pending.
-                    // The committing QC for `pending` is the child
-                    // block's `high_qc` — its signer bitmap is the
-                    // committed block's attendance record.
-                    let pending_hash = pending.hash;
-                    let signer_bitmap = hqc.signer_bitmap.clone();
-                    self.commit_block(pending_hash, &signer_bitmap);
-                    // The QC's block becomes the new pending block.
-                    self.pending = Some(PendingBlock { hash: qc.block_hash, proposal });
-                    return Ok(());
+        // 2-chain commit — the general rule, not a single pending
+        // link (docs/oxidebft-spec.md §4): adopting QC(b) for a
+        // stored block b satisfies two-chain for b's parent —
+        // QC(b) is the child's certificate and b's embedded QC is
+        // the parent's — and recursively for every stored ancestor
+        // below it: `prev == justify` (enforced at vote time) makes
+        // the stored parent chain exactly the certified chain, and
+        // every stored block carries a verified QC for its parent,
+        // so each ancestor has a QC *and* a QC'd child.
+        //
+        // The single-link form (commit only `pending` when the new
+        // QC's block extends it) is incomplete: if QC(b0) arrives
+        // before b0's proposal is stored, or QC(b2) leapfrogs
+        // QC(b1), `pending` never holds the skipped link and it is
+        // never committed — a gap in the finalized prefix (the
+        // `InvNoGap` counterexample TLC produced). A commit that
+        // skips a link must never happen, so the commit walk runs
+        // the full ancestor chain and `commit_block` fires in
+        // height order (oldest first) — the app requires in-order
+        // finalization.
+        if let Some((header, proposal)) = self.blocks.get(&qc.block_hash).cloned() {
+            // Collect the uncommitted ancestor chain, newest→oldest:
+            // (block hash, bitmap of the QC certifying it). The
+            // certifying QC for a block X is the embedded `high_qc`
+            // of X's child — for the tip that is `header.high_qc`.
+            // The walk stops at genesis (prev ZERO / no stored
+            // parent), at a committed block (evicted from `blocks`
+            // by `commit_block`'s retain — a missing ancestor is
+            // always already finalized, since vote-time storage is
+            // prefix-closed: a block can only be stored after its
+            // parent was), or when the embedded-QC chain ends.
+            // The walk only applies when the stored block's parent IS
+            // its certified block — `prev == justify`, enforced at
+            // vote time. A divergent stored block (impossible via the
+            // vote path; only a future import seam could create one)
+            // would otherwise commit an *uncertified* parent: the
+            // embedded QC certifies `justify`, not `prev`.
+            let mut chain: Vec<(Hash, Vec<u8>)> = Vec::new();
+            if header.high_qc.as_ref().is_some_and(|qc| qc.block_hash == header.prev_block) {
+                let mut cursor_hash = header.prev_block;
+                let mut certifying = header.high_qc.clone();
+                while let Some(bitmap) = certifying.as_ref().map(|qc| qc.signer_bitmap.clone()) {
+                    let Some((cursor_header, _)) = self.blocks.get(&cursor_hash) else {
+                        break;
+                    };
+                    if self.finalized.contains_key(&cursor_header.height.value()) {
+                        break;
+                    }
+                    chain.push((cursor_hash, bitmap));
+                    certifying.clone_from(&cursor_header.high_qc);
+                    cursor_hash = cursor_header.prev_block;
                 }
             }
-        }
-
-        // No commit: the QC's block becomes the new pending block
-        // (if we have it stored).
-        if let Some((_, proposal)) = self.blocks.get(&qc.block_hash).cloned() {
-            self.pending = Some(PendingBlock { hash: qc.block_hash, proposal });
+            // Commit oldest-first so `finalize_block` sees a
+            // contiguous ascending prefix.
+            for (hash, bitmap) in chain.iter().rev() {
+                self.commit_block(*hash, bitmap);
+            }
+            // The QC's block becomes the new pending block: it is
+            // the most recent QC'd block awaiting its own child QC.
+            self.pending = Some(PendingBlock { proposal });
         }
         Ok(())
     }
@@ -1800,6 +2040,17 @@ impl OxideBft {
         }
         self.app.finalize_block(&block);
         self.finalized.insert(header.height.value(), block);
+        // Record the committed anchor: the parent a proposal must
+        // extend while `high_qc` is `None` (post-rotation boundary,
+        // or a node that has committed but not yet adopted a QC).
+        // It is persisted safety state (WalEntry/save_state), so the
+        // advance must hit the WAL before we act on it: otherwise a
+        // crash → restart → rotation sequence would WAL-append the
+        // *stale* anchor and the new epoch's first proposals would
+        // collide with it (or worse, a `None` restore would accept
+        // a forged genesis chain in a later epoch).
+        self.last_committed = Some((block_hash, header.height));
+        self.append_wal();
         // Prune per-height vote locks at-or-below the committed
         // height: a finalized prefix cannot be forked, so the lock
         // is no longer needed. Keeps the map bounded by the number
@@ -1858,6 +2109,9 @@ impl OxideBft {
         // new view's quorum accounting. Stale timeout signatures
         // must not leak into the new view's TC aggregation.
         self.clear_per_view_state();
+        // This advance was not driven by a TC — there is no
+        // successor evidence to embed in the next proposal.
+        self.last_tc = None;
     }
 
     /// Jump forward to `view` if it is higher than the current view.
@@ -1877,6 +2131,8 @@ impl OxideBft {
         self.pacemaker.sync_to_view(self.current_view);
         self.pacemaker.on_progress();
         self.clear_per_view_state();
+        // Sync-driven advance carries no TC evidence.
+        self.last_tc = None;
         true
     }
 
@@ -1981,6 +2237,10 @@ impl OxideBft {
             // old view must not pollute the new view.
             self.clear_per_view_state();
             self.current_view = self.pacemaker.current_view();
+            // Record the TC that brought us into this view — the
+            // next proposal we make must embed it (spec §view-
+            // changes: legitimate-successor evidence).
+            self.last_tc = Some(tc.clone());
         }
         Ok(tc)
     }
@@ -2032,8 +2292,37 @@ impl OxideBft {
             // produce an aggregate that fails verification because
             // the signatures were for a different view).
             self.clear_per_view_state();
+            // Record the TC that brought us into this view so the
+            // next proposal embeds it as successor evidence.
+            self.last_tc = Some(tc.clone());
         }
         Ok(())
+    }
+
+    /// Whether the proposal's embedded timeout certificate releases
+    /// our per-height vote lock for this view.
+    ///
+    /// The TC must be the exact certificate that justified the
+    /// leader's entry into `header.view` — `tc.view + 1 ==
+    /// header.view` (the legitimate-successor shape, spec
+    /// §view-changes). Because `header.view > last_voted_view` is
+    /// already enforced, `tc.view` is always >= the view in which
+    /// the conflicting earlier vote was cast, so this check alone
+    /// proves the locked vote's view timed out.
+    ///
+    /// The TC is fully validated here (epoch, quorum, aggregate
+    /// signature) — a forged TC must not release the lock.
+    fn proposal_tc_releases_lock(&self, header: &BlockHeader) -> bool {
+        let Some(tc) = &header.timeout_cert else {
+            return false;
+        };
+        if tc.epoch != self.epoch || tc.view.saturating_next() != header.view {
+            return false;
+        }
+        if Self::count_signers(&tc.signer_bitmap) < self.validator_set.quorum() {
+            return false;
+        }
+        !self.verify_signatures || self.verify_tc_signature(tc).is_ok()
     }
 
     /// Verify a TC's aggregate signature against the signer bitmap
@@ -2416,11 +2705,26 @@ mod tests {
         );
 
         // A block at the NEXT height is unaffected — normal
-        // progression continues.
+        // progression continues. Voting for a non-genesis block
+        // requires a highQC (the tail-fork rule needs `prev ==
+        // high_qc.block`), so give the follower QC(A) — its block
+        // header is already stored from the first vote.
+        let qc_a = QuorumCertificate {
+            view: header_a.view,
+            phase: VotePhase::Prepare,
+            block_hash: OxideBft::block_hash(&header_a),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0x01],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
         let mut header_c = header_a.clone();
         header_c.view = View::new(header_a.view.value() + 1);
         header_c.height = Height::new(header_a.height.value() + 1);
         header_c.prev_block = OxideBft::block_hash(&header_a);
+        // The child must justify with QC(A) — a proposal without a
+        // high_qc is refused while the voter holds one.
+        header_c.high_qc = Some(qc_a.clone());
+        follower.high_qc = Some(qc_a);
         // current_view already set to header_c.view above.
         assert!(
             follower.vote(&header_c, &prop_a).is_some(),
@@ -2472,6 +2776,517 @@ mod tests {
         assert_eq!(f1.finalized_height(), leader_h, "f1 height mismatch");
         assert_eq!(f2.finalized_height(), leader_h, "f2 height mismatch");
         assert_eq!(f3.finalized_height(), leader_h, "f3 height mismatch");
+    }
+
+    /// Regression test (safety + liveness): a Byzantine leader can
+    /// stamp an arbitrary `height` on a proposal — `vote()` never
+    /// checked that the stamped height is `parent.height + 1`. A
+    /// forged block is then committable at a height the honest chain
+    /// has not reached: `finalized.insert(forged_h, d)` creates a
+    /// finalized *gap*, and the voters who signed d's child are now
+    /// per-height-locked at the height the honest chain still needs —
+    /// the next honest proposal at that height can never reach quorum
+    /// again. The chain wedges permanently and finalized histories
+    /// diverge.
+    ///
+    /// Scenario: commit b0@0 and b1@1 honestly; at view 3 the
+    /// Byzantine leader proposes d with height forged to 5 (prev =
+    /// the real highQC block, so tail-fork checks pass — nobody holds
+    /// a height-5 lock); QC(d) forms; the honest view-4 leader adopts
+    /// QC(d) as its highQC and proposes a child; QC(child) commits d
+    /// at forged height 5 while only heights 0..=2 exist.
+    ///
+    /// The fix makes stamped heights chain coordinates: a voter
+    /// accepts a proposal only if `header.height ==
+    /// parent.height + 1` (genesis excepted), and the proposer
+    /// derives its stamp the same way.
+    #[test]
+    fn forged_height_block_cannot_commit_or_wedge_chain() {
+        let mut e0 = make_multi_engine(0);
+        let mut e1 = make_multi_engine(1);
+        let mut e2 = make_multi_engine(2);
+        let mut e3 = make_multi_engine(3);
+
+        // Views 0..=2: honest rounds — leaders rotate e0, e1, e2.
+        // After view 1 every engine has committed b0@0; after view 2,
+        // b1@1 (and pending = b2). drive_round's follower→voter-index
+        // mapping (i+1) mislabels indices for non-zero leaders but
+        // still collects quorum — conformance mode ignores identity.
+        drive_round(&mut e0, &mut [&mut e1, &mut e2, &mut e3], Some(TxBytes::new(vec![0xA0])));
+        drive_round(&mut e1, &mut [&mut e0, &mut e2, &mut e3], Some(TxBytes::new(vec![0xB0])));
+        drive_round(&mut e2, &mut [&mut e0, &mut e1, &mut e3], Some(TxBytes::new(vec![0xC0])));
+
+        // View 3 — Byzantine leader e3: take its honest proposal and
+        // forge the stamped height to 5 (skipping 3 and 4). Parent
+        // and justify pointers stay the real highQC — every existing
+        // vote check passes; only the height is a lie.
+        let (mut d_header, d_proposal) = e3.propose().expect("byz leader proposes");
+        assert_eq!(d_header.height, Height::new(3), "honest stamp would be 3");
+        d_header.height = Height::new(5); // the attack: a height the chain hasn't reached
+        let d_hash = OxideBft::block_hash(&d_header);
+        e3.blocks.insert(d_hash, (d_header.clone(), d_proposal.clone()));
+
+        // e0 and e1 vote for d: nobody holds a height-5 lock, the
+        // parent is the real highQC, and the view matches.
+        let d_vote0 = e0.vote(&d_header, &d_proposal);
+        let d_vote1 = e1.vote(&d_header, &d_proposal);
+        assert!(d_vote0.is_none(), "forged-height proposal must be rejected");
+        assert!(d_vote1.is_none(), "forged-height proposal must be rejected");
+        e3.collect_vote(
+            3,
+            Vote {
+                view: d_header.view,
+                phase: VotePhase::Prepare,
+                block_hash: d_hash,
+                signature: Signature::ZERO,
+            },
+        )
+        .expect("conformance mode");
+        assert!(e3.try_form_qc().is_none(), "a forged-height block must never reach quorum");
+
+        // The honest chain is unaffected: no forged commit, no
+        // finalized gap, and the next honest round still works. Move
+        // to view 4 (leader e0) — view 3's buffer on e3 still holds
+        // the forged self-vote; advancing clears per-view state.
+        assert!(e0.finalized_block(Height::new(5)).is_none(), "no forged commit");
+        assert!(e0.finalized_height().map_or(0, Height::value) <= 2, "no height gap");
+        e0.advance_view();
+        e1.advance_view();
+        e2.advance_view();
+        e3.advance_view();
+        drive_round(&mut e0, &mut [&mut e1, &mut e2, &mut e3], Some(TxBytes::new(vec![0xD0])));
+        assert!(
+            e0.finalized_block(Height::new(2)).is_some(),
+            "honest chain still finalizes (b2 lands at height 2)"
+        );
+    }
+
+    /// Regression test (liveness, complements the forged-height fix):
+    /// once stamped heights are bound to `parent.height + 1`, a
+    /// same-height equivocation that produces no QC leaves honest
+    /// voters per-height-locked — the only recovery is re-voting the
+    /// height after the view provably timed out. The proposal's
+    /// embedded TC is that proof (spec §view-changes: the new leader
+    /// is the TC's legitimate successor). Without the release, one
+    /// Byzantine leader could wedge a height forever.
+    #[test]
+    fn same_height_lock_releases_on_timeout_certificate() {
+        let mut e0 = make_multi_engine(0);
+        let mut e1 = make_multi_engine(1);
+        let mut e2 = make_multi_engine(2);
+        let mut e3 = make_multi_engine(3);
+
+        // View 0: leader e0 equivocates — block A goes to e1, a
+        // conflicting block A' (same height, same view, different
+        // tx_root) goes to e2 and e3. Votes split 2-2; no QC forms.
+        e0.submit_tx(TxBytes::new(vec![0xA0]));
+        let (ha, pa) = e0.propose().expect("leader proposes A");
+        let mut ha2 = ha.clone();
+        ha2.tx_root = Hash([0xAB; 32]);
+        let pa2 = Proposal { height: ha2.height, ..pa.clone() };
+        let hash_a = OxideBft::block_hash(&ha);
+        let hash_a2 = OxideBft::block_hash(&ha2);
+        assert_ne!(hash_a, hash_a2, "equivocated blocks must differ");
+
+        e0.collect_vote(
+            0,
+            Vote {
+                view: ha.view,
+                phase: VotePhase::Prepare,
+                block_hash: hash_a,
+                signature: Signature::ZERO,
+            },
+        )
+        .expect("conformance mode");
+        assert!(e1.vote(&ha, &pa).is_some(), "e1 votes A");
+        assert!(e2.vote(&ha2, &pa2).is_some(), "e2 votes A'");
+        assert!(e3.vote(&ha2, &pa2).is_some(), "e3 votes A'");
+        assert!(e0.try_form_qc().is_none(), "2 votes < quorum 3");
+
+        // All four validators time out view 0 and collect each
+        // other's signatures — every engine forms TC(0) and advances
+        // to view 1 with `last_tc` set.
+        let sigs: Vec<Signature> = [&mut e0, &mut e1, &mut e2, &mut e3]
+            .iter_mut()
+            .map(|e| e.on_timeout().expect("timeout signature"))
+            .collect();
+        for engine in [&mut e0, &mut e1, &mut e2, &mut e3] {
+            for (signer, sig) in sigs.iter().enumerate() {
+                let _ = engine.collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig);
+            }
+        }
+        assert_eq!(e1.current_view(), View::new(1), "TC(0) advances to view 1");
+
+        // View 1: new leader e1 re-proposes at height 0 (its highQC
+        // is still genesis — no block was ever notarized). The
+        // proposal embeds TC(0).
+        e1.submit_tx(TxBytes::new(vec![0xB0]));
+        let (hb, pb) = e1.propose().expect("new leader re-proposes the height");
+        assert_eq!(hb.height, Height::new(0), "the failed height is retried");
+        assert_eq!(hb.prev_block, Hash::ZERO, "genesis anchor parent");
+        assert_eq!(
+            hb.timeout_cert.as_ref().map(|tc| tc.view),
+            Some(View::new(0)),
+            "proposal embeds TC(0) as successor evidence"
+        );
+
+        // Locked voters release: e0 voted A, e2/e3 voted A' — all
+        // accept B because TC(0) proves the split view ended
+        // undecided.
+        assert!(e0.vote(&hb, &pb).is_some(), "A-voter releases on TC evidence");
+        assert!(e2.vote(&hb, &pb).is_some(), "A'-voter releases on TC evidence");
+        assert!(e3.vote(&hb, &pb).is_some(), "A'-voter releases on TC evidence");
+    }
+
+    /// Regression test (safety): a Byzantine leader can decouple a
+    /// proposal's `prev_block` from the block its embedded QC
+    /// certifies (`justify`). The tail-fork rule binds `prev` to the
+    /// voter's own highQC block, while the two-chain commit rule in
+    /// `deliver_qc` walks *justify* edges — the QC'd block commits
+    /// its embedded QC's target. A proposal with `prev = our highQC
+    /// block` but `justify = a different, newer-view notarized block`
+    /// passes every pre-fix check: it is stored, gathers votes,
+    /// becomes `pending`, and commits via its child — while the
+    /// voter's real parent chain is never committed. Result: a gap
+    /// in `finalized`, and a same-height conflict against validators
+    /// that committed through the justify chain.
+    ///
+    /// The fix is the structural `HotStuff` rule: a block extends
+    /// exactly the block its embedded QC certifies —
+    /// `header.prev_block == header.high_qc.block_hash`. Honest
+    /// proposers always satisfy this (`propose()` sets both from the
+    /// same highQC); only a crafted proposal can violate it.
+    ///
+    /// Scenario: all validators hold highQC = QC(a), pending = a.
+    /// `b@1` is honestly proposed and notarized at view 1, but QC(b)
+    /// is delivered to nobody — e0/e2/e3 keep highQC = QC(a) and a
+    /// per-height-1 lock on b. View 1 then times out (TC(1) exists:
+    /// honest voters can both vote and later timeout-sign a view).
+    /// The Byzantine view-2 leader crafts `d` with prev = a (the
+    /// stale voters' highQC block), justify = QC(b) (a real QC for
+    /// a DIFFERENT block), and TC(1) (which legitimately releases
+    /// the h1 locks). Pre-fix all three vote for d — QC(d) forms,
+    /// adoption sets pending = d without committing a, and a child's
+    /// QC would commit d@1: a finalized gap on e0/e2/e3 and a
+    /// height-1 fork against e1, which commits b through QC(d)'s
+    /// justify edge. Post-fix every vote must be rejected.
+    #[test]
+    fn prev_justify_divergence_cannot_fork_commits() {
+        let mut e0 = make_multi_engine(0);
+        let mut e1 = make_multi_engine(1);
+        let mut e2 = make_multi_engine(2);
+        let mut e3 = make_multi_engine(3);
+
+        // View 0: e0 proposes a@0, everyone votes, QC(a) delivered to
+        // all four — pending = a, highQC = QC(a).
+        e0.submit_tx(TxBytes::new(vec![0xA0]));
+        let (ha, pa) = e0.propose().expect("e0 proposes a@0");
+        let hash_a = OxideBft::block_hash(&ha);
+        e0.collect_vote(
+            0,
+            Vote {
+                view: ha.view,
+                phase: VotePhase::Prepare,
+                block_hash: hash_a,
+                signature: Signature::ZERO,
+            },
+        )
+        .expect("conformance mode");
+        for (idx, e) in [&mut e1, &mut e2, &mut e3].iter_mut().enumerate() {
+            let v = e.vote(&ha, &pa).expect("honest vote for a");
+            e0.collect_vote(u16::try_from(idx + 1).unwrap_or(0), v).expect("collect");
+        }
+        let qc_a = e0.try_form_qc().expect("QC(a)");
+        for e in [&mut e0, &mut e1, &mut e2, &mut e3] {
+            e.deliver_qc(qc_a.clone()).expect("deliver QC(a)");
+            e.advance_view();
+        }
+
+        // View 1: e1 honestly proposes b@1 (prev = a, justify =
+        // QC(a)). All four vote so QC(b) is real — but it is
+        // delivered to NOBODY: e0/e2/e3 keep highQC = QC(a),
+        // pending = a, and a height-1 lock on b.
+        e1.submit_tx(TxBytes::new(vec![0xB0]));
+        let (hb, pb) = e1.propose().expect("e1 proposes b@1");
+        let hash_b = OxideBft::block_hash(&hb);
+        assert_eq!(hb.prev_block, hash_a, "honest b extends a");
+        e1.collect_vote(
+            1,
+            Vote {
+                view: hb.view,
+                phase: VotePhase::Prepare,
+                block_hash: hash_b,
+                signature: Signature::ZERO,
+            },
+        )
+        .expect("conformance mode");
+        for (voter_idx, e) in [(0u16, &mut e0), (2, &mut e2), (3, &mut e3)] {
+            let v = e.vote(&hb, &pb).expect("honest vote for b");
+            e1.collect_vote(voter_idx, v).expect("collect");
+        }
+        let qc_b = e1.try_form_qc().expect("QC(b) is real");
+
+        // View 1 times out everywhere: TC(1) forms and advances all
+        // engines to view 2 — the release evidence the crafted
+        // proposal will carry.
+        let sigs: Vec<Signature> = [&mut e0, &mut e1, &mut e2, &mut e3]
+            .iter_mut()
+            .map(|e| e.on_timeout().expect("timeout signature"))
+            .collect();
+        let mut tc1 = None;
+        for engine in [&mut e0, &mut e1, &mut e2, &mut e3] {
+            for (signer, sig) in sigs.iter().enumerate() {
+                if let Ok(Some(tc)) =
+                    engine.collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig)
+                {
+                    tc1 = Some(tc);
+                }
+            }
+        }
+        let tc1 = tc1.expect("TC(1) formed");
+        assert_eq!(e0.current_view(), View::new(2), "TC(1) advances to view 2");
+
+        // View 2 — Byzantine leader e2 crafts `d`: prev = a (the
+        // stale voters' highQC block), justify = QC(b), height = 1,
+        // and TC(1) as the lock-release evidence. Every pre-fix
+        // check passes for e0/e2/e3: prev == their highQC block,
+        // justify.view > theirs, height = parent + 1, and the TC
+        // releases their b-lock at height 1.
+        let d_header = BlockHeader {
+            view: View::new(2),
+            height: Height::new(1),
+            prev_block: hash_a,          // the stale voters' highQC block
+            high_qc: Some(qc_b.clone()), // justify: a DIFFERENT, newer notarized block
+            timeout_cert: Some(tc1),
+            ..hb.clone()
+        };
+        // d carries its own payload so a commit is distinguishable
+        // from b's.
+        let d_proposal = Proposal {
+            height: d_header.height,
+            txs: vec![TxBytes::new(vec![0xD0])],
+            attestation: None,
+        };
+        let hash_d = OxideBft::block_hash(&d_header);
+        assert_ne!(hash_d, hash_b, "crafted block is distinct from b");
+
+        assert!(
+            e0.vote(&d_header, &d_proposal).is_none(),
+            "prev=a / justify=b divergence must be rejected"
+        );
+        assert!(
+            e2.vote(&d_header, &d_proposal).is_none(),
+            "TC-released lock does not rescue a divergent justify"
+        );
+        assert!(
+            e3.vote(&d_header, &d_proposal).is_none(),
+            "prev=a / justify=b divergence must be rejected"
+        );
+
+        // The honest chain is unaffected: deliver QC(b) (commits a
+        // via the justify edge on voters that stored b), advance,
+        // and the pipeline keeps committing contiguous heights.
+        for e in [&mut e0, &mut e1, &mut e2, &mut e3] {
+            e.deliver_qc(qc_b.clone()).expect("deliver QC(b)");
+            e.advance_view();
+        }
+        drive_round(&mut e3, &mut [&mut e0, &mut e1, &mut e2], Some(TxBytes::new(vec![0xC0])));
+
+        // b@1 — not d — commits, and the committed prefix is
+        // contiguous from genesis.
+        let b1 = e1.finalized_block(Height::new(1)).expect("b@1 committed");
+        assert_eq!(b1.txs[0].as_bytes(), [0xB0], "height 1 must contain b, not d");
+        let h = e1.finalized_height().map_or(0, Height::value);
+        for height in 0..=h {
+            assert!(e1.finalized_block(Height::new(height)).is_some(), "height {height} committed");
+        }
+    }
+
+    /// Commit-rule completeness (third TLC finding): adopting a QC
+    /// must commit the *entire* certified ancestor chain, not just
+    /// the single `pending` link. With the single-link rule, a
+    /// validator whose stored blocks outpace its pending pointer —
+    /// the state a block-import/catch-up seam produces — skips the
+    /// intermediate commits forever: adopting QC(b3) with pending
+    /// b0 committed nothing, and the chain finalized b3 later with
+    /// heights 1..2 missing (`InvNoGap` counterexample shape).
+    ///
+    /// The scenario is not reachable through `vote()` today —
+    /// storage is prefix-closed (a vote requires the parent stored)
+    /// so pending can never actually lag the stored chain — but the
+    /// commit rule must be correct against the storage states the
+    /// planned import seam will create, so the test seeds `blocks`
+    /// directly.
+    #[test]
+    fn leapfrog_qc_commits_full_ancestor_chain() {
+        let mut e0 = make_multi_engine(0);
+        e0.current_view = View::new(10);
+
+        let qc = |view: u64, block_hash: Hash| QuorumCertificate {
+            view: View::new(view),
+            phase: VotePhase::Prepare,
+            block_hash,
+            epoch: Epoch::new(0),
+            // 3-of-4 signers: meets quorum under conformance mode.
+            signer_bitmap: vec![0x07],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        let store = |e: &mut OxideBft,
+                     height: u64,
+                     view: u64,
+                     prev_block: Hash,
+                     high_qc: Option<QuorumCertificate>,
+                     tag: u8| {
+            let header = BlockHeader {
+                height: Height::new(height),
+                view: View::new(view),
+                epoch: Epoch::new(0),
+                prev_block,
+                tx_root: Hash([tag; 32]),
+                high_qc,
+                timeout_cert: None,
+                proposer: Hash([tag; 32]),
+                timestamp: 0,
+                proposer_signature: None,
+                exec_cert: None,
+            };
+            let proposal = Proposal {
+                height: header.height,
+                txs: vec![TxBytes::new(vec![tag])],
+                attestation: None,
+            };
+            let hash = OxideBft::block_hash(&header);
+            e.blocks.insert(hash, (header, proposal.clone()));
+            (hash, proposal)
+        };
+
+        let (h0, p0) = store(&mut e0, 0, 0, Hash::ZERO, None, 0xB0);
+        let (h1, _) = store(&mut e0, 1, 1, h0, Some(qc(0, h0)), 0xB1);
+        let (h2, _) = store(&mut e0, 2, 2, h1, Some(qc(1, h1)), 0xB2);
+        let (h3, _) = store(&mut e0, 3, 3, h2, Some(qc(2, h2)), 0xB3);
+
+        // Simulate the pending pointer lagging the stored chain —
+        // QC(b0) was adopted long ago; QC(b1)/QC(b2) never arrived.
+        e0.pending = Some(PendingBlock { proposal: p0 });
+
+        // QC(b3) arrives (e.g. via catch-up): commits b2, and the
+        // recursive walk must finalize b0 and b1 beneath it —
+        // oldest first.
+        e0.deliver_qc(qc(3, h3)).expect("leapfrog QC accepted");
+
+        for (height, tag) in [(0u64, 0xB0u8), (1, 0xB1), (2, 0xB2)] {
+            let block = e0
+                .finalized_block(Height::new(height))
+                .unwrap_or_else(|| panic!("height {height} must be committed"));
+            assert_eq!(block.txs[0].as_bytes(), [tag], "height {height} content");
+        }
+        assert!(
+            e0.finalized_block(Height::new(3)).is_none(),
+            "b3 is notarized, not committed — commits need its child QC"
+        );
+    }
+
+    /// Companion (integrity): the embedded QC's aggregate signature
+    /// is commit evidence — its bitmap becomes the committed
+    /// parent's attendance record in `commit_block`. A proposal
+    /// carrying a structurally consistent but *unverifiable* QC must
+    /// be rejected at vote time, not deferred to commit.
+    #[test]
+    fn proposal_with_forged_embedded_qc_is_rejected() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+        let mut voter = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+            .with_secret_key(keys[1].clone());
+
+        // Real QC(a) for a genesis block: voter adopts it so the
+        // proposal's embedded QC is a newer-view claim.
+        let mut leader = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+            .with_secret_key(keys[0].clone());
+        leader.submit_tx(TxBytes::new(vec![0xA0]));
+        let (ha, pa) = leader.propose().expect("leader proposes a");
+        let hash_a = OxideBft::block_hash(&ha);
+        // Sign a real quorum of votes for a.
+        let mut sigs = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            let mut msg = Vec::with_capacity(49);
+            msg.extend_from_slice(&ha.view.value().to_le_bytes());
+            msg.push(VotePhase::Prepare as u8);
+            msg.extend_from_slice(hash_a.as_bytes());
+            msg.extend_from_slice(&leader.epoch.value().to_le_bytes());
+            sigs.push((i, k.sign(crypto::hash::Domain::Vote, &msg)));
+        }
+        for (i, sig) in sigs.iter().take(3) {
+            leader
+                .collect_vote(
+                    u16::try_from(*i).unwrap_or(0),
+                    Vote {
+                        view: ha.view,
+                        phase: VotePhase::Prepare,
+                        block_hash: hash_a,
+                        signature: *sig,
+                    },
+                )
+                .expect("real votes");
+        }
+        let qc_a = leader.try_form_qc().expect("real QC(a)");
+        // The voter must have `a` stored (the height-continuity check
+        // needs the parent header), so it votes for a first, then
+        // adopts QC(a).
+        assert!(voter.vote(&ha, &pa).is_some(), "voter stores a via its vote");
+        voter.deliver_qc(qc_a.clone()).expect("adopt real QC(a)");
+        voter.advance_view();
+
+        // Craft a child proposal whose embedded QC has a valid
+        // structure (certifies a, the real parent) but a garbage
+        // aggregate signature. Pre-fix: the embedded QC was never
+        // verified, so the vote passed. Post-fix: reject.
+        let mut forged_qc = qc_a.clone();
+        forged_qc.aggregate_signature = AggregateSignature::ZERO;
+        let mut header_c = ha.clone();
+        header_c.view = View::new(1);
+        header_c.height = Height::new(1);
+        header_c.prev_block = hash_a;
+        header_c.high_qc = Some(forged_qc);
+        // Re-sign the crafted header as the view-1 leader so the
+        // proposer check passes and only the embedded QC is bad.
+        let leader_idx = vs.leader(header_c.view);
+        header_c.proposer = proposer_hash(leader_idx);
+        let signing_hash = OxideBft::proposal_signing_hash(&header_c);
+        header_c.proposer_signature = Some(
+            keys[usize::from(leader_idx)]
+                .sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()),
+        );
+        voter.current_view = header_c.view;
+        assert!(
+            voter.vote(&header_c, &pa).is_none(),
+            "a proposal carrying an unverifiable embedded QC must be rejected"
+        );
+    }
+
+    /// Complement: without the TC the lock still holds — a retried
+    /// proposal at a locked height with different content is refused.
+    #[test]
+    fn same_height_lock_holds_without_timeout_certificate() {
+        let mut e0 = make_multi_engine(0);
+        let mut e1 = make_multi_engine(1);
+
+        e0.submit_tx(TxBytes::new(vec![0xA0]));
+        let (ha, pa) = e0.propose().expect("leader proposes A");
+        assert!(e1.vote(&ha, &pa).is_some(), "e1 votes A at height 0");
+
+        // Advance the view WITHOUT a TC (models the QC/happy-path
+        // advance the driver performs) and craft a conflicting
+        // same-height block — no TC is attached, so the lock holds.
+        e1.advance_view();
+        let mut hb = ha.clone();
+        hb.view = View::new(1);
+        hb.tx_root = Hash([0xAB; 32]);
+        assert!(
+            e1.vote(&hb, &pa).is_none(),
+            "same-height conflict without TC evidence must be refused"
+        );
     }
 
     // ---- BLS integration tests (stage 5) ----
@@ -2801,6 +3616,10 @@ mod tests {
         // Simulate a vote at height 0 for this block.
         leader.voted_at_height.insert(0, block_hash);
 
+        // The committed anchor must also round-trip: it is safety
+        // state (the no-highQC vote arm's parent check).
+        leader.last_committed = Some((block_hash, header.height));
+
         // Save the state.
         let state_bytes = leader.save_state();
         assert!(!state_bytes.is_empty(), "save_state must produce non-empty bytes");
@@ -2818,6 +3637,7 @@ mod tests {
         assert_eq!(restored.epoch, leader.epoch, "epoch must match");
         assert_eq!(restored.high_qc, leader.high_qc, "high_qc must match");
         assert_eq!(restored.voted_at_height, leader.voted_at_height, "voted_at_height must match");
+        assert_eq!(restored.last_committed, leader.last_committed, "last_committed must match");
     }
 
     /// C9 fix: `restore_state` must reject malformed buffers.
@@ -3190,8 +4010,17 @@ mod tests {
         engine.run_until_idle();
         let our_high_qc = engine.high_qc.clone().expect("high_qc set");
 
+        // The stamped height must be the parent's height + 1 —
+        // vote() now enforces height continuity, so derive it from
+        // the stored parent header.
+        let stamped_height = engine
+            .blocks
+            .get(&our_high_qc.block_hash)
+            .map(|(h, _)| h.height.saturating_next())
+            .expect("high_qc block must be in the block map");
+
         let proposal = Proposal {
-            height: Height::new(99),
+            height: stamped_height,
             txs: vec![TxBytes::new(vec![2])],
             attestation: None,
         };
@@ -3199,7 +4028,7 @@ mod tests {
         // Set current_view to match the test proposal's view.
         engine.current_view = View::new(99);
         let header = BlockHeader {
-            height: Height::new(99),
+            height: stamped_height,
             view: View::new(99),
             epoch: Epoch::new(0),
             prev_block: our_high_qc.block_hash,
@@ -3241,19 +4070,42 @@ mod tests {
             aggregate_signature: AggregateSignature::ZERO,
         };
 
-        let proposal = Proposal {
-            height: Height::new(99),
-            txs: vec![TxBytes::new(vec![2])],
-            attestation: None,
-        };
         // HIGH fix: vote() now requires header.view == current_view
         // and prev_block == high_qc.block_hash. Set current_view to
-        // match, and update high_qc so prev_block matches.
+        // match, and update high_qc so prev_block matches. The voter
+        // must also have the parent block stored — height continuity
+        // (`header.height == parent.height + 1`) is verified against
+        // the stored header — so insert the block the newer QC
+        // points at, stamped at the chain tip's height.
+        let parent_height = engine.next_height;
+        let parent_proposal =
+            Proposal { height: parent_height, txs: vec![TxBytes::new(vec![9])], attestation: None };
+        let parent_header = BlockHeader {
+            height: parent_height,
+            view: View::new(our_high_qc.view.value() + 1),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: OxideBft::tx_root(&parent_proposal.txs),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+        };
+        engine.blocks.insert(newer_qc.block_hash, (parent_header, parent_proposal));
+
+        let stamped_height = parent_height.saturating_next();
         let proposal_view = View::new(our_high_qc.view.value() + 2);
         engine.current_view = proposal_view;
         engine.high_qc = Some(newer_qc.clone());
+        let proposal = Proposal {
+            height: stamped_height,
+            txs: vec![TxBytes::new(vec![2])],
+            attestation: None,
+        };
         let header = BlockHeader {
-            height: Height::new(99),
+            height: stamped_height,
             view: proposal_view,
             epoch: Epoch::new(0),
             prev_block: newer_qc.block_hash,
@@ -4410,6 +5262,7 @@ mod tests {
             engine.voted_at_height.insert(3, Hash([0xAA; 32]));
             engine.current_view = View::new(6);
             engine.next_height = Height::new(4);
+            engine.last_committed = Some((Hash([0xBB; 32]), Height::new(2)));
             engine.append_wal();
         }
 
@@ -4435,6 +5288,13 @@ mod tests {
             // The recovered state must have the correct view and height.
             assert_eq!(engine.current_view, View::new(6));
             assert_eq!(engine.next_height, Height::new(4));
+            // The committed anchor must survive restart — it gates
+            // the no-highQC vote arm after epoch rotation.
+            assert_eq!(
+                engine.last_committed,
+                Some((Hash([0xBB; 32]), Height::new(2))),
+                "last_committed must be recovered from WAL"
+            );
         }
     }
 
