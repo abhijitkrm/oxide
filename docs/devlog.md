@@ -14171,3 +14171,70 @@ identical scenario → identical result (determinism).
 - `swarm.rs` remains the config-level container; `chaos.rs` is the
   injection driver. The swarm's "strategies are tracked, not
   injected" doc stays true of swarm itself.
+
+## Session — fuzz soak, corpus, coverage, and a real harness bug
+
+Phase 4 fuzz gate: 9 targets, 10-minute soaks, committed minimized
+corpus, LLVM coverage, nightly CI wiring.
+
+### Soak results
+
+All 9 targets ran 10-minute campaigns (plus 90–180 s supplementary runs
+for the three shallow-corpus targets). **Zero crashes.** The fast
+targets (`trading-order-validate` ~1.5M exec/s, `types-decode` ~1M+)
+each completed ~100M+ executions; journal-replay is slower
+(~3.5–4K exec/s) because every input spawns a temp dir + replay.
+
+Corpus minimized via libFuzzer `-merge=1` (not `cargo fuzz cmin`,
+which merges the *argument* into the default corpus — wrong
+direction): ~8.7k files → 2,337. `corpus/` is now committed;
+`artifacts/`, `target/`, `coverage/`, `soak_logs/` stay ignored.
+
+### The real bug this audit caught: journal-replay was fuzzing nothing
+
+`journal-replay` sat at a flat `cov: 63` for its whole soak. Cause:
+the harness wrote the fuzz input as `0.log`, but
+`segment_files()` only accepts `segment-<seq>.log`
+(`SEGMENT_PREFIX`) — foreign names are intentionally ignored, so
+every replay saw an empty journal. Zero crashes was vacuous: the
+record loop never ran.
+
+Fixed the filename; coverage immediately climbed 63 → 132 edges /
+263 features in 90 s, with the fuzzer independently discovering the
+`OXDJRN01` magic via CMP-guided dictionary entries. `llvm-cov` on
+the new corpus: `journal.rs` 24.8% lines / 28.7% regions (replay,
+segment discovery, CRC, torn-tail) vs ~0 before.
+
+Seeded four named cases exercising the record-level contract:
+`jr_valid` (two CRC'd records), `jr_torn` (truncated tail),
+`jr_badcrc`, `jr_badlen`.
+
+Also extended `codec-decode` to walk the remainder of the input as a
+varint/length-prefixed stream — the fixed-width decoders were
+saturated (cov 83); the stream walk reached `read_varint`/`read_bytes`
+length paths (cov 144, lib.rs now ~47% lines).
+
+`trading-order-validate` stays at cov:14 *with* all branch seeds
+loaded — the harness genuinely has ~14 reachable edge sites; seeded
+all seven `validate` reject branches as `seed_*` corpus files anyway
+so each branch has a named regression input.
+
+### Harness-contract lesson
+
+Added `fuzz/README.md`: per-target input contract, coverage
+snapshot, crash-vs-corpus artifact distinction (bare SHA1 files in
+`artifacts/` are corpus units, not crashes — verified the one
+pre-existing artifact was a stale OOM whose fix already landed).
+
+### Coverage numbers (llvm-cov, post-soak corpus)
+
+- `types-decode` → `types/lib.rs` ~28.9% lines
+- `codec-decode` → `codec/lib.rs` ~47.3% lines
+- `trading-engine` → `trading/engine.rs` ~56.4% regions
+- `journal-replay` → `storage/journal.rs` ~24.8% lines (was ~0 —
+  harness bug)
+
+### CI
+
+Nightly `fuzz` job now covers all 9 targets at 10 min each
+(was 6 targets at 5 min).

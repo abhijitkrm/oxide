@@ -12,11 +12,11 @@
 //! is fixed (tick 1M, lot 1K, [$1B, $2B], 64 max resting) — the
 //! same default as the exchange module.
 
+use primitives::fixed::{Price, Qty};
 use trading::{
     DenseBook, FillEvent, MarketConfig, MatchingEngine, NewOrder, OrderType, Side, StpMode,
     TimeInForce,
 };
-use primitives::fixed::{Price, Qty};
 
 /// Fixed market configuration for fuzzing. Matches the exchange
 /// module's default market.
@@ -54,12 +54,11 @@ fn parse_order(data: &[u8]) -> Option<NewOrder> {
     let raw_price = u64::from_le_bytes(data[3..11].try_into().ok()?);
     let raw_qty = u64::from_le_bytes(data[11..19].try_into().ok()?);
     // Clamp price to [min, max] and align to tick.
-    let price = raw_price
-        .max(FUZZ_CFG.min_price)
-        .min(FUZZ_CFG.max_price);
+    let price = raw_price.max(FUZZ_CFG.min_price).min(FUZZ_CFG.max_price);
     let price = price - (price % FUZZ_CFG.tick_size);
     // Align qty to lot boundary (at least 1 lot).
-    let qty = if raw_qty == 0 { FUZZ_CFG.lot_size } else { raw_qty - (raw_qty % FUZZ_CFG.lot_size) };
+    let qty =
+        if raw_qty == 0 { FUZZ_CFG.lot_size } else { raw_qty - (raw_qty % FUZZ_CFG.lot_size) };
     let qty = if qty == 0 { FUZZ_CFG.lot_size } else { qty };
     Some(NewOrder {
         side,

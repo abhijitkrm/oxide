@@ -28,4 +28,18 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     fuzz_decode::<Hash>(data);
     fuzz_decode::<Address>(data);
     fuzz_decode::<Height>(data);
+
+    // Variable-length paths — the real fuzz surface: overlong varint
+    // encodings, truncated varints, and `read_bytes` length prefixes
+    // that disagree with the remaining bytes. Walk the input as a
+    // varint/bytes stream; every step must Err, never panic or hang.
+    let mut stream = Reader::new(data);
+    while !stream.is_empty() {
+        if stream.read_varint().is_err() {
+            break;
+        }
+        if stream.read_bytes().is_err() {
+            break;
+        }
+    }
 });

@@ -27,12 +27,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     if data.len() < 16 {
         // Not enough for a leaf_index + leaf_count; still call verify
         // with a degenerate proof.
-        let proof = MmrProof {
-            leaf_index: 0,
-            leaf_count: 0,
-            path: Vec::new(),
-            peaks: Vec::new(),
-        };
+        let proof = MmrProof { leaf_index: 0, leaf_count: 0, path: Vec::new(), peaks: Vec::new() };
         let _ = Mmr::verify(&leaf, &proof, &root);
         return;
     }
@@ -48,10 +43,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         let mut sibling = [0u8; 32];
         sibling.copy_from_slice(&cursor[..32]);
         let target_is_left = cursor[32] != 0;
-        path.push(PathStep {
-            sibling: Hash(sibling),
-            target_is_left,
-        });
+        path.push(PathStep { sibling: Hash(sibling), target_is_left });
         cursor = &cursor[33..];
     }
 
@@ -64,12 +56,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         cursor = &cursor[32..];
     }
 
-    let proof = MmrProof {
-        leaf_index,
-        leaf_count,
-        path,
-        peaks,
-    };
+    let proof = MmrProof { leaf_index, leaf_count, path, peaks };
 
     // Must not panic — only return true or false.
     let _ = Mmr::verify(&leaf, &proof, &root);

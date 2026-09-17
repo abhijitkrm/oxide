@@ -63,21 +63,26 @@ jobs:
           sudo swapon /swapfile
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
-      - name: Run fuzz targets (5 min each)
+      - name: Run fuzz targets (10 min each)
         run: |
-          # Run each fuzz target for 5 minutes (300s). This is a
-          # bounded budget — not exhaustive, but catches regressions
-          # in decoders and journal/MMR handling.
-          for target in codec-decode journal-replay mmr-proof-verify types-decode consensus-msg evm-execute; do
+          # Each of the 9 targets gets a 10-minute soak against the
+          # committed corpus (fuzz/corpus/<target>) — the corpus is
+          # checked in so coverage accretes across runs instead of
+          # starting cold. `-rss_limit_mb` keeps an OOM-prone decode
+          # path from starving the runner; a genuine OOM bug still
+          # fails the job via the artifact + nonzero exit.
+          for target in codec-decode consensus-msg evm-execute journal-replay mmr-proof-verify sync-decode trading-engine trading-order-validate types-decode; do
             echo "=== Fuzzing $target ==="
-            cargo +nightly fuzz run "$target" -- -max_total_time=300
+            cargo +nightly fuzz run "$target" -- -max_total_time=600 -rss_limit_mb=4096 -timeout=25
           done
-      - name: Upload fuzz artifacts
+      - name: Upload fuzz artifacts and corpus
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts
-          path: fuzz/artifacts/
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
 
   audit:
     name: cargo audit (known vulnerabilities)

@@ -31,10 +31,13 @@ dhat-heap.json
 # Criterion reports (regenerated on demand)
 /target/criterion
 
-# Fuzz artifacts (corpus, crash inputs, coverage data)
-fuzz/corpus/
+# Fuzz artifacts (crash inputs, coverage data, build output). The
+# corpus itself is committed — fuzz/corpus/<target>/ holds the
+# minimized seed set so coverage accretes across runs.
 fuzz/artifacts/
 fuzz/target/
+fuzz/coverage/
+fuzz/soak_logs/
 
 plan.md
 

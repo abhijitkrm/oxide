@@ -6,8 +6,8 @@
 //! possible field combination without crashing — invalid orders
 //! return `RejectReason`, valid orders return `Ok(())`.
 
-use trading::{NewOrder, OrderType, RejectReason, Side, StpMode, TimeInForce};
 use primitives::fixed::{Price, Qty};
+use trading::{NewOrder, OrderType, RejectReason, Side, StpMode, TimeInForce};
 
 /// Fixed market parameters for validation.
 const TICK: u64 = 1_000_000;

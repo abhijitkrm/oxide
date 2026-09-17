@@ -287,6 +287,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     nodes mid-run, 10,000 different ways, and honest validators
     never once finalized two different histories.
 
+- **Fuzz campaign: soaks, committed corpus, coverage, nightly CI**
+  (`fuzz/`, `.github/workflows/nightly.yml`, `.gitignore`)
+  - All 9 targets ran 10-minute libFuzzer soaks — zero crashes,
+    ~100M+ executions each on the fast targets. The corpus is
+    minimized (`-merge=1`: ~8.7k → 2,337 files) and committed so
+    coverage accretes; `fuzz/README.md` documents every harness's
+    input contract and the coverage snapshot.
+  - The soak caught a real harness bug: `journal-replay` wrote its
+    input as `0.log`, which `segment_files()` ignores — the record
+    loop never ran. Renamed to `segment-0.log`; journal.rs coverage
+    went from ~0 to ~25% lines, and named seeds now pin the valid,
+    torn-tail, bad-CRC, and bad-length cases.
+  - `codec-decode` now also walks inputs as a varint/length-prefixed
+    stream, reaching `read_varint`/`read_bytes` paths the
+    fixed-width decoders never touched.
+  - Nightly CI fuzzes all 9 targets at 10 minutes each (was 6 at 5).
+  - **In plain words:** we ran nine automated sabotage programs for
+    ten minutes apiece and found no crashes — and in the process
+    discovered one saboteur had been whispering to a parser that
+    wasn't listening, so journal replay is now actually being
+    attacked instead of just looking attacked.
+
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,
   `crates/node`, `bin/oxide-validator`, `bin/oxide-fullnode`)

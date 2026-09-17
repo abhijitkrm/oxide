@@ -22,8 +22,10 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
             .as_nanos()
     ));
     let _ = std::fs::create_dir_all(&dir);
-    // Segment files are named `<seq>.log`; seq 0 is the first segment.
-    let path = dir.join("0.log");
+    // Segment files are named `segment-<seq>.log` (SEGMENT_PREFIX in
+    // the journal); anything else is ignored by `segment_files` — a
+    // bare `0.log` would exercise only the empty-replay path.
+    let path = dir.join("segment-0.log");
     let _ = std::fs::write(&path, data);
 
     // Attempt replay — must not panic regardless of content.
