@@ -803,6 +803,8 @@ mod tests {
             module_state: vec![],
             executed_nonces: vec![],
             nonce_root: primitives::Hash::ZERO,
+            version: executor::SNAPSHOT_FORMAT_VERSION,
+            module_versions: vec![],
         };
         let err = node.import_snapshot(&empty_snapshot).expect_err("empty snapshot must fail");
         assert_eq!(err, executor::SnapshotImportError::EmptySnapshot);

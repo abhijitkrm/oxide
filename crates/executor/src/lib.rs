@@ -95,6 +95,17 @@ pub enum ExecError {
 /// allows a new node to restore complete state without replaying.
 /// When `module_state` is empty, the snapshot is metadata-only
 /// (height + roots) — the v0 snapshot sync.
+///
+/// The current `ExecutorSnapshot` *format* version. v1 is the
+/// pre-versioning layout (implicit — decoded snapshots that end at
+/// `nonce_root` read as 1); v2 adds `version` + `module_versions`.
+/// Bumped whenever the snapshot layout or semantics change so an
+/// importer can reject bytes written by a newer binary.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+
+/// A point-in-time snapshot of the executor's state — see the
+/// header comment above [`SNAPSHOT_FORMAT_VERSION`] for the full
+/// contract (determinism, full vs metadata-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorSnapshot {
     /// The chain height (highest finalized block).
@@ -121,6 +132,19 @@ pub struct ExecutorSnapshot {
     /// `keccak256(concat(address || nonce_le))` over all entries,
     /// sorted by address for determinism.
     pub nonce_root: Hash,
+    /// The snapshot *format* version — bumped whenever this
+    /// struct's layout or semantics change, so an importer can
+    /// reject bytes written by a newer binary before touching
+    /// state. Decoded snapshots that predate versioning read as 1.
+    pub version: u32,
+    /// Each module's declared [`Module::state_version`] at export
+    /// time, in registration order — parallel to `module_roots`.
+    /// On import, a module whose stored version is older than its
+    /// declared version gets `Module::migrate(from)` after
+    /// `import_state`, so an old-binary snapshot is upgraded in
+    /// place. Empty for pre-versioning snapshots (treated as "all
+    /// current" — v1 state predates the hook entirely).
+    pub module_versions: Vec<u32>,
 }
 
 /// A snapshot import error.
@@ -169,6 +193,23 @@ pub enum SnapshotImportError {
         /// The recomputed root from the `executed_nonces`.
         actual: Hash,
     },
+    /// The snapshot's format `version` is newer than this binary's
+    /// [`SNAPSHOT_FORMAT_VERSION`] — it was written by a newer
+    /// binary and cannot be safely interpreted.
+    UnsupportedVersion {
+        /// The snapshot's claimed format version.
+        snapshot: u32,
+        /// The highest format this binary supports.
+        supported: u32,
+    },
+    /// A module's `migrate` hook failed while upgrading imported
+    /// state from an older `module_versions` entry.
+    MigrationFailed {
+        /// The module's name.
+        module: String,
+        /// The schema version the imported state was written at.
+        from: u32,
+    },
 }
 
 impl std::fmt::Display for SnapshotImportError {
@@ -190,6 +231,12 @@ impl std::fmt::Display for SnapshotImportError {
             }
             Self::NonceRootMismatch { expected, actual } => {
                 write!(f, "nonce root mismatch: expected {expected}, got {actual}")
+            }
+            Self::UnsupportedVersion { snapshot, supported } => {
+                write!(f, "snapshot format v{snapshot} exceeds supported v{supported}")
+            }
+            Self::MigrationFailed { module, from } => {
+                write!(f, "module {module} failed migrating state from schema v{from}")
             }
         }
     }
@@ -223,6 +270,13 @@ impl codec::Encode for ExecutorSnapshot {
             codec::write::u64(buf, *nonce);
         }
         self.nonce_root.encode(buf);
+        // Version tail (v2): appended last so pre-versioning
+        // payloads still decode — an empty tail reads as version 1.
+        codec::write::u32(buf, self.version);
+        codec::write::u32(buf, u32::try_from(self.module_versions.len()).unwrap_or(u32::MAX));
+        for v in &self.module_versions {
+            codec::write::u32(buf, *v);
+        }
     }
 }
 
@@ -257,7 +311,29 @@ impl<'a> codec::Decode<'a> for ExecutorSnapshot {
             executed_nonces.push((addr, nonce));
         }
         let nonce_root = Hash::decode(reader)?;
-        Ok(Self { height, state_root, module_roots, module_state, executed_nonces, nonce_root })
+        // Tolerant tail: snapshots encoded before versioning end at
+        // `nonce_root` — read them as format v1 with no recorded
+        // module versions (all treated as current on import).
+        let mut version = 1u32;
+        let mut module_versions = Vec::new();
+        if reader.remaining() > 0 {
+            version = reader.read_u32()?;
+            let versions_count = reader.read_u32()?;
+            module_versions.reserve(versions_count as usize);
+            for _ in 0..versions_count {
+                module_versions.push(reader.read_u32()?);
+            }
+        }
+        Ok(Self {
+            height,
+            state_root,
+            module_roots,
+            module_state,
+            executed_nonces,
+            nonce_root,
+            version,
+            module_versions,
+        })
     }
 }
 
@@ -491,6 +567,55 @@ pub trait Module: Send + Sync {
     /// The default is a no-op; only modules that track consensus
     /// participation (staking's downtime tracking) override it.
     fn record_block_attendance(&self, _height: Height, _signers: &[Address]) {}
+
+    /// The module's declared state-schema version — bumped by a
+    /// release whenever the module's persisted/encoded state layout
+    /// changes. Recorded into snapshots (`module_versions`) so an
+    /// importer knows what schema produced the bytes it is about to
+    /// load, and consulted by `migrate` when restoring older state.
+    ///
+    /// Modules whose state only rebuilds from journal replay can
+    /// leave the default — their "schema" is the tx format, not
+    /// stored bytes. Modules with durable backends (EVM's
+    /// `StorageBackend`) must bump this on layout changes.
+    fn state_version(&self) -> u32 {
+        1
+    }
+
+    /// Migrate module state written at schema version `from` to the
+    /// module's current [`state_version`](Self::state_version).
+    /// Called when older-versioned state is loaded — snapshot
+    /// imports (per `module_versions`) and durable-backend loads.
+    ///
+    /// The default is a no-op returning the declared version: most
+    /// releases need no state transform. A release that changes
+    /// layout overrides this to run the from→to transform and MUST
+    /// return the new version on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `from` is newer than the declared
+    /// version (state written by a newer binary — cannot safely
+    /// downgrade) or the transform itself fails.
+    fn migrate(&self, from: u32) -> Result<u32, ExecError> {
+        if from > self.state_version() {
+            return Err(ExecError::ModuleRejected(format!(
+                "state version {from} is newer than module's declared {}",
+                self.state_version()
+            )));
+        }
+        Ok(self.state_version())
+    }
+
+    /// A scheduled coordinated halt height, if the module's
+    /// governance has set one. The executor freezes execution for
+    /// heights above it — every node stops at the same height, so
+    /// operators can snapshot, swap binaries, and resume with
+    /// migrations applied. The earliest non-`None` value across
+    /// modules wins. `None` (default) = no halt scheduled.
+    fn scheduled_halt_height(&self) -> Option<u64> {
+        None
+    }
 
     /// Charge the transaction fee from the sender's account.
     ///
@@ -1128,6 +1253,19 @@ impl Executor {
         self.state_root_at(self.current_height())
     }
 
+    /// The earliest scheduled coordinated halt height across
+    /// modules, if any module's governance set one. Above this
+    /// height the chain freezes: `prepare_proposal` emits empty
+    /// blocks and `execute_block` is a no-op returning the frozen
+    /// root — every node stops mutating state at the same height,
+    /// so operators can snapshot and swap binaries deterministically.
+    ///
+    /// `None` = no halt scheduled.
+    #[must_use]
+    pub fn halt_height(&self) -> Option<u64> {
+        self.modules.iter().flatten().filter_map(|m| m.scheduled_halt_height()).min()
+    }
+
     /// Drain pending validator key changes from all modules.
     ///
     /// Called by the consensus layer at epoch boundary. Iterates all
@@ -1273,6 +1411,11 @@ impl Executor {
             module_state,
             executed_nonces,
             nonce_root,
+            version: SNAPSHOT_FORMAT_VERSION,
+            // Record each module's declared schema version so an
+            // importer restoring this state under a newer binary
+            // knows which `migrate(from)` calls to run.
+            module_versions: self.modules.iter().flatten().map(|m| m.state_version()).collect(),
         }
     }
 
@@ -1353,6 +1496,15 @@ impl Executor {
             });
         }
 
+        // Format gate: a snapshot written by a newer binary cannot
+        // be safely interpreted — reject before touching state.
+        if snapshot.version > SNAPSHOT_FORMAT_VERSION {
+            return Err(SnapshotImportError::UnsupportedVersion {
+                snapshot: snapshot.version,
+                supported: SNAPSHOT_FORMAT_VERSION,
+            });
+        }
+
         // If the snapshot includes full KV state, import it into
         // each module that supports `import_state`. This restores
         // the complete key-value state, not just the roots.
@@ -1364,11 +1516,27 @@ impl Executor {
         // root is accepted — the KV data doesn't actually produce
         // the claimed per-module roots.
         if !snapshot.module_state.is_empty() {
-            for (module, state) in self.modules.iter().flatten().zip(&snapshot.module_state) {
+            for (i, (module, state)) in
+                self.modules.iter().flatten().zip(&snapshot.module_state).enumerate()
+            {
                 if let Some(state) = state {
                     module
                         .import_state(state)
                         .map_err(|_| SnapshotImportError::StateImportFailed)?;
+                    // Schema upgrade: the snapshot records the module
+                    // version its state was written at. Older than
+                    // declared → run the module's `migrate` hook on
+                    // the freshly imported bytes. Empty
+                    // `module_versions` (v1 snapshots) means "all
+                    // current" — v1 state predates the hook entirely.
+                    let from =
+                        snapshot.module_versions.get(i).copied().unwrap_or(module.state_version());
+                    if from < module.state_version() {
+                        module.migrate(from).map_err(|_| SnapshotImportError::MigrationFailed {
+                            module: module.name().to_string(),
+                            from,
+                        })?;
+                    }
                 }
             }
 
@@ -1655,6 +1823,18 @@ impl Executor {
     /// per-tx interleaved execution. Events are grouped by module
     /// rather than interleaved, but state roots are unchanged.
     fn execute_block(&self, block: &FinalizedBlock) -> Hash {
+        // Coordinated halt: above the scheduled height the chain is
+        // frozen — no begin/handle/end_block, no fee charge, no
+        // attendance record. The returned root is the state at the
+        // halt height, so every replica freezes on identical state.
+        // Deterministic across live and replayed execution (the
+        // schedule lives in module state, journaled like any other).
+        if let Some(halt) = self.halt_height() {
+            if block.height.value() > halt {
+                return self.state_root_at(halt);
+            }
+        }
+
         // Single lock acquisition for the events vector: clear at start,
         // extend after execution. The lock is released between the clear
         // and the extend because module execution can take milliseconds
@@ -1991,12 +2171,20 @@ impl AppInterface for Executor {
                 let _ = pool.submit(tx);
             }
         }
+        // Coordinated halt: once the next height is past the
+        // scheduled halt, propose empty blocks only — the chain
+        // keeps committing (deterministic liveness) while state
+        // stays frozen at the halt height.
+        let past_halt = self.halt_height().is_some_and(|halt| self.current_height() + 1 > halt);
         // Select txs from the mempool by fee priority.
-        let candidates = self
-            .mempool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .select(budget.max_bytes);
+        let candidates = if past_halt {
+            Vec::new()
+        } else {
+            self.mempool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .select(budget.max_bytes)
+        };
         // Enforce the block gas limit at proposal time. The binding
         // constraint is `min(budget.max_gas, block_gas_limit)` —
         // `process_proposal` rejects blocks over `block_gas_limit`,
@@ -3266,5 +3454,238 @@ mod tests {
         let results = executor.ingest_tx_batch(vec![signed, unsigned]);
         assert!(matches!(results[0], MempoolAck::Accepted));
         assert!(matches!(results[1], MempoolAck::Rejected { .. }));
+    }
+
+    /// A module with a declared schema version, a migration spy, an
+    /// optional halt schedule, and trivial KV export/import — the
+    /// fixture for every upgrade-mechanism test.
+    struct VersionedModule {
+        /// Declared `state_version` — what this "binary" writes.
+        version: u32,
+        /// Heights at which `scheduled_halt_height` reports a halt.
+        halt: Mutex<Option<u64>>,
+        /// Records every `migrate(from)` argument — the assertion
+        /// surface proving the executor drove the migration.
+        migrate_calls: Mutex<Vec<u32>>,
+        /// When set, `migrate` fails — exercises the fail-closed
+        /// import path.
+        migrate_fails: bool,
+        /// Trivial in-memory KV so `export_state`/`import_state` have
+        /// something to round-trip.
+        kv: Mutex<Vec<(Hash, Vec<u8>)>>,
+    }
+
+    impl VersionedModule {
+        fn new(version: u32) -> Arc<Self> {
+            Arc::new(Self {
+                version,
+                halt: Mutex::new(None),
+                migrate_calls: Mutex::new(Vec::new()),
+                migrate_fails: false,
+                kv: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl Module for VersionedModule {
+        fn name(&self) -> &'static str {
+            "versioned"
+        }
+        fn id(&self) -> u8 {
+            9
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            Ok(vec![Event { module: "versioned", kind: "noop", data: vec![] }])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            // A stable non-zero root — upgrade tests assert on
+            // version plumbing, not root math.
+            Hash([9u8; 32])
+        }
+        fn state_version(&self) -> u32 {
+            self.version
+        }
+        fn migrate(&self, from: u32) -> Result<u32, ExecError> {
+            self.migrate_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(from);
+            if self.migrate_fails {
+                return Err(ExecError::ModuleRejected("boom".to_string()));
+            }
+            Ok(self.version)
+        }
+        fn scheduled_halt_height(&self) -> Option<u64> {
+            *self.halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        fn export_state(&self) -> Option<storage::Snapshot> {
+            Some(storage::Snapshot {
+                height: 0,
+                entries: self.kv.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            })
+        }
+        fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+            *self.kv.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                snapshot.entries.clone();
+            Ok(())
+        }
+    }
+
+    /// The snapshot must carry the format version and each module's
+    /// declared schema version — the importer needs both to decide
+    /// which `migrate(from)` calls to run.
+    #[test]
+    fn snapshot_export_records_format_and_module_versions() {
+        let mut executor = Executor::new(100);
+        executor.register_module(VersionedModule::new(3) as Arc<dyn Module>);
+        let snapshot = executor.export_snapshot();
+        assert_eq!(snapshot.version, SNAPSHOT_FORMAT_VERSION);
+        assert_eq!(snapshot.module_versions, vec![3]);
+    }
+
+    /// A v1 (pre-versioning) snapshot payload must still decode:
+    /// the version tail is absent → version 1, empty `module_versions`.
+    #[test]
+    fn snapshot_v1_payload_decodes_as_version_one() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let snapshot = executor.export_snapshot();
+        let mut buf = Vec::new();
+        codec::Encode::encode(&snapshot, &mut buf);
+        // Strip the v2 tail: u32 version + u32 count + N*u32 = 8 + 4 bytes.
+        let v1_len = buf.len() - 8 - 4;
+        let v1_bytes = &buf[..v1_len];
+        let mut reader = codec::Reader::new(v1_bytes);
+        let decoded = <ExecutorSnapshot as codec::Decode>::decode(&mut reader)
+            .expect("v1 payload must decode");
+        assert_eq!(decoded.version, 1, "absent tail reads as format v1");
+        assert!(decoded.module_versions.is_empty());
+        assert_eq!(decoded.height, snapshot.height);
+    }
+
+    /// A snapshot from a newer binary must be refused — importing
+    /// state it can't interpret would corrupt the validator.
+    #[test]
+    fn snapshot_newer_version_rejected() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let mut snapshot = executor.export_snapshot();
+        snapshot.version = SNAPSHOT_FORMAT_VERSION + 1;
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(CounterModule::new()));
+        match executor2.import_snapshot(&snapshot) {
+            Err(SnapshotImportError::UnsupportedVersion { snapshot, supported }) => {
+                assert_eq!(snapshot, SNAPSHOT_FORMAT_VERSION + 1);
+                assert_eq!(supported, SNAPSHOT_FORMAT_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    /// A module whose snapshot version trails its declared version
+    /// must get `migrate(from)` called with the recorded version.
+    #[test]
+    fn snapshot_import_runs_module_migration() {
+        let mut executor = Executor::new(100);
+        executor.register_module(VersionedModule::new(1) as Arc<dyn Module>);
+        let mut snapshot = executor.export_snapshot();
+        // Forge an old-schema record: the importer declares v2 but
+        // the snapshot's state was written at v1.
+        snapshot.module_versions = vec![1];
+
+        let module = VersionedModule::new(2);
+        let spy = Arc::clone(&module);
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(module as Arc<dyn Module>);
+        executor2.import_snapshot(&snapshot).expect("import + migrate must succeed");
+        assert_eq!(
+            *spy.migrate_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1],
+            "migrate must be called with the snapshot's recorded version"
+        );
+    }
+
+    /// A failing migration must fail the whole import — a partially
+    /// migrated state set is worse than no import at all.
+    #[test]
+    fn snapshot_import_fails_closed_on_migration_error() {
+        let mut executor = Executor::new(100);
+        executor.register_module(VersionedModule::new(1) as Arc<dyn Module>);
+        let mut snapshot = executor.export_snapshot();
+        snapshot.module_versions = vec![1];
+
+        let module = VersionedModule {
+            version: 2,
+            halt: Mutex::new(None),
+            migrate_calls: Mutex::new(Vec::new()),
+            migrate_fails: true,
+            kv: Mutex::new(Vec::new()),
+        };
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(module) as Arc<dyn Module>);
+        match executor2.import_snapshot(&snapshot) {
+            Err(SnapshotImportError::MigrationFailed { module, from }) => {
+                assert_eq!(module, "versioned");
+                assert_eq!(from, 1);
+            }
+            other => panic!("expected MigrationFailed, got {other:?}"),
+        }
+    }
+
+    /// Past the scheduled halt, `execute_block` must return the
+    /// frozen root and run no handlers — every replica stops
+    /// mutating state at the same height.
+    #[test]
+    fn halt_height_freezes_execution() {
+        let mut executor = Executor::new(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+        let halter = VersionedModule::new(1);
+        *halter.halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(1);
+        executor.register_module(halter as Arc<dyn Module>);
+
+        // Height 1 executes normally (halt = last live height).
+        let tx = make_tx(1, &[0]);
+        executor.ingest_tx(tx);
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(1),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        });
+        let live_root = executor.current_state_root();
+        let live_count = *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Height 2 is past the halt: state must not change even
+        // though the block carries a tx.
+        let block2 = FinalizedBlock {
+            height: Height::new(2),
+            txs: vec![make_tx(1, &[1])],
+            signers: Vec::new(),
+        };
+        executor.finalize_block(&block2);
+        assert_eq!(executor.current_state_root(), live_root, "state must freeze at halt");
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            live_count,
+            "no handlers run past the halt"
+        );
+    }
+
+    /// Past the halt, proposals carry no txs — the chain keeps
+    /// committing empty blocks so consensus stays live while
+    /// operators swap binaries.
+    #[test]
+    fn prepare_proposal_empty_past_halt() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let halter = VersionedModule::new(1);
+        *halter.halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(0);
+        executor.register_module(halter as Arc<dyn Module>);
+
+        executor.ingest_tx(make_tx(1, &[0]));
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        assert!(proposal.txs.is_empty(), "no txs may be proposed past the halt");
     }
 }

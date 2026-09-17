@@ -3367,6 +3367,14 @@ impl Module for EvmModule {
         true
     }
 
+    /// The durable schema version this binary writes (`0x04` meta
+    /// namespace). Bump when the on-disk account/history/undo
+    /// encoding or cache layout changes in a way that needs a
+    /// migration step; leave `migrate` to fill it in.
+    fn state_version(&self) -> u32 {
+        1
+    }
+
     /// Charge the envelope fee from the sender's EVM balance. When
     /// the node configured a `fee_recipient` (the staking module's
     /// `FEE_POOL` in production wiring) the fee is *collected* —
@@ -5263,6 +5271,15 @@ impl EvmModule {
             );
             ops.push(storage::Op::Set { key, value });
         }
+        // The schema version rides every flush batch: one extra op
+        // per block keeps the `0x04` meta slot in lockstep with the
+        // binary that last wrote state — a downgraded binary's
+        // `state_version` would rewrite it honestly instead of
+        // inheriting a newer label it can't interpret.
+        ops.push(storage::Op::Set {
+            key: persist::state_version_key(),
+            value: self.state_version().to_le_bytes().to_vec(),
+        });
         ops
     }
 
@@ -5382,6 +5399,26 @@ impl EvmModule {
             let ops: Vec<storage::Op> =
                 stale.into_iter().map(|key| storage::Op::Delete { key }).collect();
             backend.apply_batch(&ops);
+        }
+
+        // Schema version check: the backend records the layout
+        // version it was last written at (`0x04` meta namespace,
+        // absent = v1 pre-versioning). Older than this binary's
+        // declared `state_version` → run `migrate` on the freshly
+        // loaded state and persist the new version. A failed
+        // migration leaves the stored version untouched — the next
+        // restart retries it.
+        let stored_version = backend
+            .get(&persist::state_version_key())
+            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok().map(u32::from_le_bytes))
+            .unwrap_or(1);
+        if stored_version < self.state_version()
+            && let Ok(new_version) = self.migrate(stored_version)
+        {
+            backend.apply_batch(&[storage::Op::Set {
+                key: persist::state_version_key(),
+                value: new_version.to_le_bytes().to_vec(),
+            }]);
         }
     }
 }
@@ -8435,6 +8472,30 @@ mod tests {
             assert_eq!(hist.block(3).unwrap().parent_hash, block2_hash);
         }
         assert_eq!(m2.balance_at(&recipient, 3).unwrap(), 2_000_005);
+    }
+
+    /// The schema-version meta slot (`0x04`) must be written on the
+    /// first flush and survive a restart — it's what `migrate`
+    /// reads to know which upgrade steps an old backend needs.
+    #[test]
+    fn state_version_persists_across_restart() {
+        use storage::Volatile;
+
+        let (pk, sender) = test_keypair();
+        let m = EvmModule::with_storage(1, 7, Box::new(Volatile::new()));
+        fund(&m, &sender);
+        drive_block(&m, 1, &[signed_transfer_tx(&pk, 0, Address([0x42; 20]).0.into(), 5)]);
+
+        // The flush batch carried the version write.
+        let backend = m.backend_for_test();
+        let raw = backend.get(&persist::state_version_key()).expect("version must persist");
+        let stored = u32::from_le_bytes(raw.as_slice().try_into().expect("4-byte version"));
+        assert_eq!(stored, m.state_version());
+
+        // A fresh module over the same backend reads the stored
+        // version; stored == declared → no migration needed.
+        let m2 = EvmModule::with_storage(1, 7, backend);
+        assert_eq!(m2.state_version(), stored);
     }
 
     /// Window pruning applies to persisted records: evicted block

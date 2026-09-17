@@ -13732,3 +13732,69 @@ replaced.
 
 - #20 upgrades — coordinated halt-height + `Module::state_version`/
   `migrate` hook + snapshot versions.
+
+## 2026-10-07 — Session: P3 #20 — coordinated upgrades: halt height, schema versions, migrations
+
+### What
+
+- **`Module` trait upgrade hooks** (`crates/executor`) — three
+  default no-op methods: `state_version() -> u32` (the schema the
+  binary writes), `migrate(from) -> Result<u32>` (upgrade step run
+  on imported/loaded state), `scheduled_halt_height() -> Option<u64>`
+  (a module's requested chain freeze). Defaults keep every existing
+  module compiling unchanged.
+- **Coordinated halt** — `Executor::halt_height()` aggregates the
+  min of all module schedules. Past the halt, `execute_block`
+  returns the frozen `state_root_at(halt)` and runs no
+  begin/handle/end — every replica stops mutating state at the
+  same height, deterministically (the schedule lives in journaled
+  module state, so replayed nodes halt identically).
+  `prepare_proposal` emits empty blocks past the halt: consensus
+  stays live while operators swap binaries — the Jolteon-style
+  "commit empty, freeze state" upgrade pattern.
+- **`SCHEDULE_HALT` (0x0A)** — staking committee members schedule,
+  reschedule, or cancel (height 0) the halt. Must be in the
+  future — a retroactive halt can never trigger cleanly.
+- **Snapshot format v2** — `ExecutorSnapshot` gains `version` +
+  `module_versions` as a trailing extension: pre-versioning (v1)
+  payloads decode as version 1 with empty module versions
+  ("all current"), newer-than-binary versions are rejected with
+  `UnsupportedVersion` before touching state.
+- **Import-time migration** — after `import_state`, each module's
+  recorded version is compared to its declared `state_version`;
+  older → `migrate(from)` runs on the freshly imported bytes.
+  `migrate` failure fails the whole import (`MigrationFailed`) —
+  a partially migrated state set is worse than no import.
+- **EVM durable schema version** — new `0x04` meta namespace in
+  `modules/evm/persist.rs`: `state_version_key()` written on every
+  flush batch (in lockstep with whatever binary last wrote state)
+  and read on `load_from_storage`; `stored < declared` runs
+  `migrate` then persists the new version. This is the durable half
+  of the snapshot hook — the same mechanism protects a *restart*,
+  not just a state-sync import.
+
+### Bug found by the new test
+
+- **`record_block_attendance` self-deadlock** — the function held
+  the `jailed` read-guard through its validator loop, then
+  re-locked `self.jailed` to write a new jailing. std `Mutex` is
+  non-reentrant: the first actual downtime-jailing deadlocked the
+  test binary (>60s, 0% CPU). The guard set is now dropped before
+  the write section. `downtime_jails_after_full_window_of_absence`
+  went from hang to instant.
+
+### Tests
+
+- executor +7: format/module-version export, v1-payload tolerant
+  decode, newer-version rejection, migrate-on-import (spy), fail-
+  closed migration error, freeze-past-halt, empty-proposal-past-halt.
+- staking +2: committee/future-only schedule gate, reschedule+cancel.
+- evm +1: `0x04` version slot persists across restart.
+- Gates: `cargo build --workspace`, touched-crate tests green,
+  `clippy -D warnings` clean, `fmt` applied.
+
+### Next
+
+- #21 state-sync bootstrap hardening — snapshot manifest + chunked
+  fetch over RPC, trusted-root verify, fullnode bootstrap.
+- #22 pruning — height-indexed retention policies + archive recipe.

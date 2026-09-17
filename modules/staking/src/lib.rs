@@ -104,6 +104,10 @@ mod msg_type {
     /// Unjail: a jailed validator rejoins the set after the jail
     /// period. Sender must be the validator itself.
     pub const UNJAIL: u8 = 0x09;
+    /// Schedule halt: set (or clear) the coordinated halt height.
+    /// Committee-gated — sender must be a current validator.
+    /// Height 0 clears the schedule.
+    pub const SCHEDULE_HALT: u8 = 0x0A;
 }
 
 /// The unbonding period in blocks.
@@ -344,6 +348,13 @@ pub struct StakingModule {
     /// (with their `bls_keys` entry and current stake) so the
     /// engine re-admits them at the next rotation.
     pending_unjails: Mutex<Vec<Address>>,
+    /// The coordinated halt height scheduled by governance
+    /// (`SCHEDULE_HALT`): the chain freezes state for heights
+    /// above it. Read by the executor via
+    /// `Module::scheduled_halt_height`. `None` = no halt. Lives in
+    /// module state (set by a tx), so every replica schedules the
+    /// same halt deterministically.
+    scheduled_halt: Mutex<Option<u64>>,
     /// Hashes of evidence payloads already applied — replaying the
     /// same double-sign proof must not re-slash. Keyed by
     /// BLAKE3 of the two-vote payload (deterministic, no sender
@@ -386,6 +397,7 @@ impl StakingModule {
             jailed: Mutex::new(BTreeMap::new()),
             pending_jails: Mutex::new(Vec::new()),
             pending_unjails: Mutex::new(Vec::new()),
+            scheduled_halt: Mutex::new(None),
             seen_evidence: Mutex::new(std::collections::BTreeSet::new()),
             attendance: Mutex::new(BTreeMap::new()),
             unbonding_period: DEFAULT_UNBONDING_PERIOD_BLOCKS,
@@ -878,6 +890,21 @@ pub mod msg {
         msg.extend_from_slice(&validator.0);
         msg
     }
+
+    /// A schedule-halt message: `[type: 0x0A][validator: 20B][halt_height: 8B LE]`.
+    ///
+    /// Sets the coordinated halt height — the chain freezes state
+    /// for heights above it so operators can snapshot and swap
+    /// binaries. `halt_height` must be in the future; `0` clears
+    /// the schedule. Committee-gated: the sender must be a current
+    /// validator (the `validator` field identifies the sender).
+    pub fn schedule_halt(validator: primitives::Address, halt_height: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(29);
+        msg.push(super::msg_type::SCHEDULE_HALT);
+        msg.extend_from_slice(&validator.0);
+        msg.extend_from_slice(&halt_height.to_le_bytes());
+        msg
+    }
 }
 
 impl Module for StakingModule {
@@ -904,6 +931,12 @@ impl Module for StakingModule {
             // they must not reach `parse_message` below.
             msg_type::EVIDENCE => return self.handle_evidence(ctx, validator, msg),
             msg_type::UNJAIL => return self.handle_unjail(ctx, validator, msg),
+            // Schedule-halt's second field is a height, not an
+            // amount — same parse, different meaning.
+            msg_type::SCHEDULE_HALT => {
+                let (_, _, halt_height) = Self::parse_message(msg).ok_or(ExecError::Malformed)?;
+                return self.handle_schedule_halt(ctx, validator, halt_height, msg);
+            }
             _ => {}
         }
         let (_, _, amount) = Self::parse_message(msg).ok_or(ExecError::Malformed)?;
@@ -1001,8 +1034,14 @@ impl Module for StakingModule {
                 newly_jailed.push(*addr);
             }
         }
+        // Release every read guard before re-locking `jailed` for
+        // the write below — the first guard lives until scope end
+        // (std `Mutex` is non-reentrant), so holding it here would
+        // self-deadlock the first validator jailing.
         drop(attendance);
         drop(validators);
+        drop(pending_removes);
+        drop(jailed);
 
         if !newly_jailed.is_empty() {
             let mut jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1013,6 +1052,13 @@ impl Module for StakingModule {
                 pending_jails.push(addr);
             }
         }
+    }
+
+    /// The governance-scheduled halt height, if any. Set by
+    /// `SCHEDULE_HALT` (a tx, so every replica schedules the same
+    /// halt deterministically — including on journal replay).
+    fn scheduled_halt_height(&self) -> Option<u64> {
+        *self.scheduled_halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn state_root(&self) -> Hash {
@@ -1725,6 +1771,43 @@ impl StakingModule {
             .push(validator);
 
         Ok(vec![Event { module: "staking", kind: "unjail", data: msg.to_vec() }])
+    }
+
+    /// Handle a schedule-halt message:
+    /// `[type: 0x0A][validator: 20B][halt_height: 8B LE]`.
+    ///
+    /// Committee-gated (same model as `validator_add`/`slash`) —
+    /// coordinating an upgrade halt is a validator-set decision.
+    /// `halt_height` must be in the future (a past/present halt
+    /// freezes immediately, which governance cannot intend
+    /// mid-block); `0` clears the schedule.
+    fn handle_schedule_halt(
+        &self,
+        ctx: &TxContext,
+        _validator: Address,
+        halt_height: u64,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let is_committee = self
+            .validators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&ctx.sender);
+        if !is_committee {
+            return Err(ExecError::ModuleRejected(
+                "schedule_halt: sender is not a current validator".to_string(),
+            ));
+        }
+        let current =
+            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if halt_height != 0 && halt_height <= current {
+            return Err(ExecError::ModuleRejected(format!(
+                "schedule_halt: height {halt_height} is not in the future (current {current})"
+            )));
+        }
+        *self.scheduled_halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            if halt_height == 0 { None } else { Some(halt_height) };
+        Ok(vec![Event { module: "staking", kind: "schedule_halt", data: msg.to_vec() }])
     }
 
     /// Handle a claim-reward message: withdraw accumulated rewards.
@@ -2890,5 +2973,42 @@ mod tests {
         let msg = msg::key_change(v, &short_key);
         let result = staking.handle(&ctx(), &msg);
         assert!(result.is_err(), "must reject non-48-byte key");
+    }
+
+    // ── Coordinated halt scheduling (SCHEDULE_HALT) ─────────────
+
+    #[test]
+    fn schedule_halt_committee_only_and_future_only() {
+        let staking = setup(&[1]);
+        staking.begin_block(Height::new(10));
+
+        // Non-validator sender is refused.
+        assert!(staking.handle(&ctx_with_sender(9), &msg::schedule_halt(addr(9), 100)).is_err());
+        // A past/current height is refused (already executed —
+        // scheduling behind the tip can never trigger cleanly).
+        assert!(staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 10)).is_err());
+        assert!(staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 5)).is_err());
+        assert_eq!(staking.scheduled_halt_height(), None);
+
+        // A validator schedules a future halt.
+        staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 100)).unwrap();
+        assert_eq!(staking.scheduled_halt_height(), Some(100));
+    }
+
+    #[test]
+    fn schedule_halt_reschedule_and_cancel() {
+        let staking = setup(&[1]);
+        staking.begin_block(Height::new(10));
+
+        staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 100)).unwrap();
+        assert_eq!(staking.scheduled_halt_height(), Some(100));
+
+        // Re-schedule moves the halt (still future).
+        staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 200)).unwrap();
+        assert_eq!(staking.scheduled_halt_height(), Some(200));
+
+        // Height 0 cancels the schedule.
+        staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 0)).unwrap();
+        assert_eq!(staking.scheduled_halt_height(), None);
     }
 }

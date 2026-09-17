@@ -95,6 +95,34 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - Jailing and unjailing: jailed validators stop signing and stop
     earning rewards until they unjail (after ~10 minutes). Their
     stake is not confiscated beyond the evidence slash.
+
+- **Coordinated upgrades: halt heights and schema migrations**
+  (`crates/executor`, `modules/staking`, `modules/evm`)
+  - Halt scheduling: a validator can submit a `SCHEDULE_HALT`
+    transaction naming a future block height. Once the chain
+    passes that height, every replica stops applying
+    transactions and keeps committing empty blocks — the
+    deterministic "freeze state, stay live" posture operators
+    need to swap binaries for an upgrade.
+  - Schema versions: modules declare a `state_version`, and a
+    `migrate(from)` hook upgrades imported or reloaded state
+    written by an older schema. Snapshots now record the format
+    version plus every module's version; a snapshot from a newer
+    binary is refused outright, and a failed migration fails the
+    whole import rather than booting half-upgraded state.
+  - Old snapshots still load — a pre-versioning snapshot decodes
+    as format v1 and imports normally.
+  - The EVM's durable backend stamps the schema version it was
+    written at (`0x04` meta namespace) and runs the same
+    migration on restart, so a binary upgrade protects both
+    state-synced nodes and plain reboots.
+  - **In plain words:** upgrades used to mean "stop the chain,
+    hope everyone restarts on the same software at the same
+    time". Now a validator schedules a height, every node
+    freezes state there automatically while staying online,
+    and the new binary knows exactly how old the data it's
+    loading is — upgrading it cleanly or refusing loudly
+    instead of corrupting state.
   - Downtime tracking: each block now records which validators
     signed it (`FinalizedBlock.signers`), and a validator who
     misses more than half of the last 100 blocks is jailed

@@ -75,6 +75,21 @@ const NS_BLOCK: u8 = 0x02;
 /// is preserved exactly.
 const NS_UNDO: u8 = 0x03;
 
+/// Namespace prefix for module metadata — the schema version the
+/// stored state was written at. Read on load so `migrate` knows
+/// what it's migrating *from*; rewritten on flush so the stored
+/// version always matches the binary that last wrote state.
+const NS_META: u8 = 0x04;
+
+/// The fixed key for the stored schema version:
+/// `[0x04][0x00: 31B]` — a single slot, value is `u32 LE`.
+/// Absent on backends written before versioning = v1.
+pub(crate) fn state_version_key() -> Hash {
+    let mut key = [0u8; Hash::LEN];
+    key[0] = NS_META;
+    Hash(key)
+}
+
 /// Build the 32-byte storage key for an EVM account.
 ///
 /// Format: `[0x01][address: 20B][0x00: 11B]` = 32 bytes.
