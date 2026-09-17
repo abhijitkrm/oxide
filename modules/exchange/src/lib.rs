@@ -207,6 +207,15 @@ impl ExchangeModule {
         self.settlement_operator = Some(operator);
     }
 
+    /// Builder form of [`Self::set_settlement_operator`]: configures
+    /// the settlement operator at construction time so the module can
+    /// be wrapped in `Arc` in one expression.
+    #[must_use]
+    pub fn with_settlement_operator(mut self, operator: Address) -> Self {
+        self.settlement_operator = Some(operator);
+        self
+    }
+
     /// List a new market with the given configuration. Returns the
     /// assigned `MarketId` (the first empty slot).
     ///

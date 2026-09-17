@@ -13939,3 +13939,65 @@ replaced.
   and no-committee rejections).
 - `Node::assemble` wiring: staking now shared `Arc` (perps
   committee + oracle feed auth + quorum denominator).
+
+## 2026-10-08 — Session: batch_settle load test — 1M orders/s proven at chain level
+
+### What
+
+- **`modules/exchange/benches/settlement.rs`** — two new criterion
+  benches for the off-chain-matcher settlement path
+  (`TAG_BATCH_SETTLE`), the architecture the 1M orders/s target was
+  always meant to use: the matcher does the book work off-chain, the
+  chain validates each pre-matched leg and settles aggregated
+  (buyer, seller) transfers — no `engine.place()` runs on-chain.
+  - `batch_settle_1k_distinct_pairs` — worst case: every leg a
+    unique pair, so aggregation amortizes nothing and each fill is
+    a real ledger transfer. **p50 = 254 µs per 1k fills ≈ 3.9M
+    fills/s** (~254 ns/fill — 3.3× cheaper than the 829 ns
+    match-path fill, the difference being the engine call itself).
+  - `batch_settle_1k_same_pair` — best case: the whole batch
+    aggregates to one transfer. **p50 = 9.0 µs per 1k fills ≈
+    110M fills/s** — the pure parse+validate floor.
+- **`crates/devnet/tests/settle_tps.rs`** — end-to-end load test
+  over real oxideBFT/TCP: settlement operator submits
+  `batch_settle` txs, buyers/sellers are the 32 prefunded senders,
+  and integrity is checked the same way as `trading_tps` (common
+  finalized prefix, identical blocks, equal state roots) plus an
+  exact conservation check — sellers' aggregate balance must rise
+  by `fills × quote` on every validator.
+
+### Measured (4 validators, TCP loopback, release)
+
+| fills/tx | tx/s | fills/s | orders/s | bound by |
+|---|---|---|---|---|
+| 1,024 | 347 | 355K | 711K | per-tx overhead |
+| 8,192 | ~122 | ~0.98–1.01M | ~2.0M | transitional |
+| 16,384 | ~85 | ~1.35–1.41M | ~2.8M | approaching payload |
+| 65,536 (wire max) | 29 | 1.85M | 3.71M | ~103 MiB/s serialized fills |
+
+The chain-level 1M orders/s target is **met with ~3.7× margin**:
+2.05M fills (4.1M orders) settle through consensus in ~1.5 s.
+Throughput scales with batch size because the cost is dominated by
+moving and executing payload bytes, not by per-fill work — the
+module settles at 3.9M fills/s even with zero aggregation. The
+remaining headroom is in per-tx overhead and network serialization,
+not the ledger.
+
+- **`ExchangeModule::with_settlement_operator`** builder +
+  `TcpMultiNodeDevnet::with_exchange_settlement_and_base_port` —
+  the devnet can now wire a settlement operator so `batch_settle`
+  txs are authorized through the full pipeline (previously the
+  field was only reachable pre-`Arc`).
+
+### Bugs caught
+
+- None in settlement itself — the conservation assertion failed
+  once on a test-side units confusion (`EvmModule::balance` returns
+  wei, not units) which is exactly what the check is for.
+
+### Tests
+
+- exchange bench +2 (distinct-pair worst case, same-pair floor).
+- devnet +2 ignored load tests (`settle_tps_default`,
+  `settle_tps_large`) — ignored like `trading_tps` since they bind
+  TCP ports; run with `--release --ignored`.

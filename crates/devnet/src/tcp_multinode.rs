@@ -285,6 +285,35 @@ impl TcpMultiNodeDevnet {
             executor::DEFAULT_PARALLEL_THRESHOLD,
             p2p::tcp::TcpTransportConfig::default(),
             true, // register_exchange
+            None, // no settlement operator
+        )
+    }
+
+    /// Like [`Self::with_exchange_and_base_port`], but also configures
+    /// `operator` as the exchange's settlement operator — the only
+    /// account allowed to submit `batch_settle` txs. Use this for
+    /// tests of the off-chain-matcher settlement path (the operator
+    /// should be one of the 32 prefunded senders so its txs pay fees).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` or if any TCP port cannot be bound.
+    pub fn with_exchange_settlement_and_base_port(
+        n: usize,
+        max_mempool_entries: usize,
+        base_port: u16,
+        operator: primitives::Address,
+    ) -> Self {
+        Self::build_with_modules(
+            n,
+            base_port,
+            GENESIS_BALANCE,
+            32,
+            max_mempool_entries,
+            executor::DEFAULT_PARALLEL_THRESHOLD,
+            p2p::tcp::TcpTransportConfig::default(),
+            true, // register_exchange
+            Some(operator),
         )
     }
 
@@ -307,6 +336,7 @@ impl TcpMultiNodeDevnet {
             parallel_threshold,
             tcp_config,
             false, // do not register exchange
+            None,  // no settlement operator
         )
     }
 
@@ -318,6 +348,10 @@ impl TcpMultiNodeDevnet {
     /// `EvmModule` that consensus executes. The exchange module
     /// handles (as `Arc<ExchangeModule>`) are stored in
     /// `exchange_modules` for post-run inspection.
+    ///
+    /// When `settlement_operator` is `Some`, the exchange modules are
+    /// additionally configured to accept `batch_settle` txs from that
+    /// address (the off-chain-matcher settlement path).
     #[allow(clippy::too_many_arguments)]
     fn build_with_modules(
         n: usize,
@@ -328,6 +362,7 @@ impl TcpMultiNodeDevnet {
         parallel_threshold: usize,
         tcp_config: p2p::tcp::TcpTransportConfig,
         register_exchange: bool,
+        settlement_operator: Option<primitives::Address>,
     ) -> Self {
         assert!(n > 0, "devnet must have at least one validator");
 
@@ -403,7 +438,11 @@ impl TcpMultiNodeDevnet {
             // converges after finality (all validators execute the
             // same block).
             if register_exchange {
-                let ex = Arc::new(exchange::ExchangeModule::with_ledger(evm_module.clone()));
+                let mut ex = exchange::ExchangeModule::with_ledger(evm_module.clone());
+                if let Some(operator) = settlement_operator {
+                    ex.set_settlement_operator(operator);
+                }
+                let ex = Arc::new(ex);
                 executor.register_module(ex.clone());
                 exchange_modules.push(ex);
             }

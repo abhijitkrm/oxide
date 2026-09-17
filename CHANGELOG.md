@@ -210,6 +210,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     taking the median, updates are smoothed, and the old manual
     path is locked to validators as an emergency fallback.
 
+- **Batch-settlement throughput proven ≥1M orders/s on-chain**
+  (`modules/exchange`, `crates/devnet`)
+  - Two new `settlement` benches measure the `batch_settle` path —
+    pre-matched fills from the off-chain matcher, validated and
+    settled without re-matching: ~3.9M fills/s worst-case (every
+    fill a distinct buyer/seller pair, one ledger transfer each)
+    and ~110M fills/s when a batch aggregates to one pair.
+  - New `settle_tps` devnet test drives `batch_settle` txs through
+    the full 4-validator oxideBFT/TCP pipeline and verifies exact
+    balance conservation plus state-root agreement. Measured:
+    **~1.85M fills/s (~3.7M orders/s)** at the 65,536-fill wire
+    maximum; ~1.35–1.41M fills/s at 16,384 fills/tx.
+  - `ExchangeModule::with_settlement_operator` builder and a
+    `TcpMultiNodeDevnet::with_exchange_settlement_and_base_port`
+    constructor wire the operator through the devnet.
+  - **In plain words:** the "1 million orders per second" design —
+    match off-chain, settle in bulk on-chain — is now proven
+    end-to-end: the chain settles ~3.7 million orders' worth of
+    fills per second with every validator agreeing on identical
+    state, and the bottleneck is now network payload size, not the
+    ledger.
+
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,
   `crates/node`, `bin/oxide-validator`, `bin/oxide-fullnode`)

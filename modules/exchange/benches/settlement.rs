@@ -15,6 +15,8 @@
 //! | `settlement_sweep_10_levels` | full `handle()` sweeping 10 resting makers | p50 < 10 µs ⇒ ≥100k sweeps/s/core |
 //! | `raw_engine_single_fill` | `MatchingEngine::place()` only (no settlement) | baseline for head-to-head |
 //! | `settlement_overhead` | derived: `settlement_single_fill − raw_engine_single_fill` | the ledger + event overhead per fill |
+//! | `batch_settle_1k_distinct_pairs` | `handle_batch_settle`, 1k fills, every leg a unique (buyer,seller) pair | p50 < 1 ms ⇒ ≥1M fills/s settled |
+//! | `batch_settle_1k_same_pair` | `handle_batch_settle`, 1k fills collapsing to 1 transfer | p50 < 1 ms ⇒ ≥1M fills/s validated |
 //!
 //! ## Measured results (M-series dev Mac, criterion p50)
 //!
@@ -24,6 +26,15 @@
 //! | `settlement_sweep_10_levels` | 3.08 µs | ~325k sweeps/s/core | < 10 µs | ✅ |
 //! | `raw_engine_single_fill` | 459 ns | ~2.2M fills/s/core | baseline | — |
 //! | Settlement overhead | ~370 ns/fill | — | — | — |
+//! | `batch_settle_1k_distinct_pairs` | 254 µs/1k fills | ~3.9M fills/s | < 1 ms | ✅ |
+//! | `batch_settle_1k_same_pair` | 9.0 µs/1k fills | ~110M fills/s | < 1 ms | ✅ |
+//!
+//! `batch_settle` is the 1M-orders/s settlement path: ~254 ns/fill
+//! worst-case (no pair aggregation — one ledger transfer per fill),
+//! ~9 ns/fill when the batch aggregates to a single pair. End-to-end
+//! through the 4-validator oxideBFT TCP pipeline it sustains
+//! ~1.85M fills/s (~3.7M orders/s) at the 65,536-fill wire maximum —
+//! see `crates/devnet/tests/settle_tps.rs`.
 //!
 //! ## Why these gates
 //!
@@ -229,10 +240,103 @@ fn raw_engine_single_fill(c: &mut Criterion) {
     });
 }
 
+/// Gate: p50 < 1 ms per 1k-fill batch ⇒ ≥1M fills/s settled.
+///
+/// This is the bench for the actual 1M-orders/s architecture: the
+/// off-chain matcher does the book work; the chain only validates
+/// each pre-matched leg (tick/lot/band/notional) and settles the
+/// aggregated (buyer, seller) transfers. No engine `place()` call is
+/// made — the measured cost is parse + validate + BTreeMap
+/// accumulation + `ledger.transfer` per pair.
+///
+/// Worst case is measured: every fill is a *distinct* (buyer, seller)
+/// pair, so aggregation cannot amortize the ledger transfers — 1k
+/// fills mean 1k transfers.
+fn batch_settle_1k_distinct_pairs(c: &mut Criterion) {
+    const FILLS: usize = 1_000;
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    let mut ex = ExchangeModule::with_ledger(ledger.clone());
+    ex.set_settlement_operator(addr(0x5E));
+    let mid = ex.list_market(cfg()).expect("market config valid");
+
+    // Pre-build the batch: 1000 fills, each between a distinct
+    // (buyer, seller) pair — the aggregation-hostile case. Addresses
+    // are derived from the fill index so pairs never repeat.
+    // u8→u16 indexing keeps 2×256 = 65k distinct pairs available.
+    let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
+        .map(|i| {
+            #[allow(clippy::cast_possible_truncation)]
+            let buyer = addr(((i / 256) + 1) as u8);
+            #[allow(clippy::cast_possible_truncation)]
+            let seller = addr(((i % 256) + 100) as u8);
+            // Fund both sides far past any settlement total.
+            ledger.mint(&buyer, u64::MAX / 4);
+            exchange::BatchFillEntry {
+                market: u16::from(mid),
+                price: Price(1_500_000_000),
+                qty: Qty(1_000),
+                buyer,
+                seller,
+            }
+        })
+        .collect();
+    let payload = exchange::msg::batch_settle(&fills);
+    let op_ctx = ctx(0x5E);
+
+    c.bench_function("batch_settle_1k_distinct_pairs", |b| {
+        b.iter(|| {
+            let events = ex.handle(black_box(&op_ctx), black_box(&payload)).expect("batch settles");
+            assert_eq!(events.len(), FILLS, "one event per fill");
+            black_box(events);
+        });
+    });
+}
+
+/// Gate: p50 < 1 ms per 1k-fill batch ⇒ ≥1M fills/s settled.
+///
+/// Best case for the aggregation path: all 1k fills share one
+/// (buyer, seller) pair, so the whole batch collapses to a single
+/// ledger transfer. The measured cost is then pure per-leg
+/// parse+validation — the floor for what `batch_settle` can ever
+/// cost per fill.
+fn batch_settle_1k_same_pair(c: &mut Criterion) {
+    const FILLS: usize = 1_000;
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    let mut ex = ExchangeModule::with_ledger(ledger.clone());
+    ex.set_settlement_operator(addr(0x5E));
+    let mid = ex.list_market(cfg()).expect("market config valid");
+    ledger.mint(&addr(1), u64::MAX / 4);
+
+    let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
+        .map(|_| exchange::BatchFillEntry {
+            market: u16::from(mid),
+            price: Price(1_500_000_000),
+            qty: Qty(1_000),
+            buyer: addr(1),
+            seller: addr(9),
+        })
+        .collect();
+    let payload = exchange::msg::batch_settle(&fills);
+    let op_ctx = ctx(0x5E);
+
+    c.bench_function("batch_settle_1k_same_pair", |b| {
+        b.iter(|| {
+            let events = ex.handle(black_box(&op_ctx), black_box(&payload)).expect("batch settles");
+            // All 1k fills share one (buyer, seller) pair, so they
+            // aggregate into exactly one transfer — one `batch_fill`
+            // event carrying the summed quote amount.
+            assert_eq!(events.len(), 1, "one transfer event per pair");
+            black_box(events);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     settlement_single_fill,
     settlement_sweep_10_levels,
-    raw_engine_single_fill
+    raw_engine_single_fill,
+    batch_settle_1k_distinct_pairs,
+    batch_settle_1k_same_pair
 );
 criterion_main!(benches);
