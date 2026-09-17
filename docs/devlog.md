@@ -13633,3 +13633,102 @@ replaced.
 - #19 slashing+evidence — double-sign evidence msg (verify two
   conflicting BLS votes), jail, downtime tracking via
   `FinalizedBlock` absent validators.
+
+## 2026-10-07 — Session: P3 #19 — slashing + evidence: double-sign proofs, jail, downtime tracking
+
+### What
+
+- **`bls_keys` persistent key store** — staking now keeps the
+  validator's *current* 48-byte BLS key forever (set at
+  `VALIDATOR_ADD` / `genesis_set_bls_key`, updated when
+  `take_key_changes` applies a rotation, never deleted). Without
+  it, evidence had nothing to verify against: `pending_key_changes`
+  drains to the engine at each rotation.
+- **`EVIDENCE` msg (0x08)** — permissionless double-sign proof:
+  `[validator][view][phase][epoch][hash_a][sig_a][hash_b][sig_b]`
+  (294 B). Verified by reconstructing the engine's exact
+  `vote_signing_message` layout (view LE | phase | block_hash |
+  epoch LE, `Domain::Vote`) and checking both signatures against
+  `bls_keys[validator]`. Identical hashes, forged signatures,
+  replays (`seen_evidence` BLAKE3 dedup), and keyless validators
+  all reject. A valid proof applies the 10% double-sign slash and
+  jails the offender.
+- **Jail** — `jailed: addr → height` + `pending_jails`/`pending_unjails`
+  folded into `take_validator_changes` (removes / re-adds with the
+  `bls_keys` entry and post-slash stake). Jailed validators stop
+  earning rewards (`distribute_rewards` excludes them) and leave
+  consensus at the next rotation; their stake is NOT confiscated
+  beyond the slash. `UNJAIL` (0x09) re-admits after
+  `MIN_JAIL_BLOCKS` (600 ≈ 10 min at ~1 s blocks), sender must be
+  the validator, stake and consensus key required.
+- **Slash governance hole closed** — `handle_slash` (arbitrary
+  amount) now requires the sender to be a current validator
+  (committee model, same as `validator_add`/`remove`). Before this,
+  ANY account could slash ANY validator to zero — an open
+  confiscation hole. Evidence is the permissionless path because
+  it authenticates itself.
+- **Downtime tracking** — `FinalizedBlock` gains
+  `signers: Vec<Address>`: the committing QC's bitmap resolved to
+  staking addresses in `commit_block`. Carried on the block and in
+  its encoding because the journal replays `finalize_block` —
+  downtime jails must derive identically on replay. Decode is
+  tolerant of pre-change journals (empty tail = "no data").
+  Sequencer/mock engines emit empty signers (meaningless
+  attendance). New `Module::record_block_attendance` hook fires
+  inside `execute_block` (after `end_block`); staking keeps a
+  100-block sliding window per validator and auto-jails (no slash)
+  when signed < 50 of the window — Cosmos `SignedBlocksWindow` /
+  `MinSignedPerWindow` semantics including the full-window grace
+  period.
+- **Validator binary** — `genesis.staking.validators[].public_key`
+  now feeds `genesis_set_bls_key`, so a real multi-node genesis
+  gives staking the keys evidence needs.
+
+### Why
+
+- Slashing needs *proof*, not privilege: the only safe
+  permissionless slash is one the offender's own signatures prove.
+  Replaying the engine's signing layout makes the check airtight —
+  a proof is valid iff the registered key signed two different
+  blocks at the same (view, phase, epoch).
+- Attendance on `FinalizedBlock` (vs an engine→app side channel)
+  is the only replay-safe channel: `execute_block` is the shared
+  path for live, deferred, and replayed execution.
+- Downtime jails WITHOUT slashing — absence is a liveness fault,
+  not provable malice; confiscation is reserved for the
+  signature-proven equivocation path (v1 policy, documented).
+
+### Decisions & dead ends
+
+- **`bls_keys` never deletes** — dropping on remove would lose the
+  key a jailed-then-unjailed validator needs for re-add; stale keys
+  are bounded and harmless (evidence requires the validator to
+  exist anyway).
+- **Key-change sync at `take` time, not handle time** — the
+  pending key is only "current" once the rotation applies it;
+  evidence for the old key stays verifiable until then. Documented
+  bound: proofs must land before the offender rotates keys.
+- **`seen_evidence` dedup** — without it the same proof could
+  re-slash every submission.
+- **`signers` is NOT in the state root path** — it's block
+  metadata; execution state stays unchanged (attendance effects
+  live in staking's own maps).
+
+### Workspace state
+
+- Staking: `bls_keys`/`jailed`/`pending_jails`/`pending_unjails`/
+  `seen_evidence`/`attendance` fields; `EVIDENCE`+`UNJAIL` msgs;
+  `apply_slash` extracted (committee `handle_slash` + evidence
+  share it); `record_block_attendance`; 48 tests green.
+- `types::FinalizedBlock.signers` (+tolerant decode), engine
+  `commit_block` resolves bitmap→addresses, sequencer/mock emit
+  empty.
+- `Module::record_block_attendance` default no-op; executor calls
+  it inside `execute_block`.
+- Gates: staking/types/consensus/executor/storage/indexer tests
+  green; `clippy -D warnings` clean; `fmt` applied.
+
+### Next
+
+- #20 upgrades — coordinated halt-height + `Module::state_version`/
+  `migrate` hook + snapshot versions.

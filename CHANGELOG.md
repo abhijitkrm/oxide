@@ -82,6 +82,36 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     delegated to them, proportional to stake. Anyone who staked —
     not just validator operators — can withdraw exactly what their
     position earned, whenever they want.
+- **Slashing, evidence, and jailing** (`modules/staking`,
+  `crates/types`, `crates/consensus`, `crates/executor`,
+  `bin/oxide-validator`)
+  - Double-sign evidence: anyone can submit a proof that a
+    validator signed two conflicting blocks at the same view —
+    `[validator][view][phase][epoch]` plus two block hashes and
+    their BLS signatures. The chain verifies both signatures
+    against the validator's registered consensus key; a valid
+    proof slashes 10% of their stake and jails them out of the
+    validator set. Forged or replayed proofs are rejected.
+  - Jailing and unjailing: jailed validators stop signing and stop
+    earning rewards until they unjail (after ~10 minutes). Their
+    stake is not confiscated beyond the evidence slash.
+  - Downtime tracking: each block now records which validators
+    signed it (`FinalizedBlock.signers`), and a validator who
+    misses more than half of the last 100 blocks is jailed
+    automatically — without slashing, since going offline is a
+    liveness fault, not malice.
+  - Governance fix: the raw slash message now requires a validator
+    sender — previously any account could slash anyone, an open
+    confiscation hole.
+  - **In plain words:** validators can now actually be punished.
+    If a validator double-signs (the provable kind of cheating),
+    anyone can submit the proof — two of their own signatures —
+    and the chain takes 10% of their stake and kicks them out.
+    If a validator just goes quiet and stops signing blocks, they
+    get temporarily removed too, but without losing stake. And a
+    scary hole is closed: before this, literally any account could
+    have sent a "slash" message and zeroed out a validator's
+    stake.
 
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,

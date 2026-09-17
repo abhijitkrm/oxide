@@ -894,7 +894,17 @@ fn build_devnet_executor(
             let addr: [u8; 20] = addr_bytes
                 .try_into()
                 .unwrap_or_else(|_| panic!("genesis validator address must be 20 bytes"));
-            staking_module.genesis_register_validator(primitives::Address(addr), v.stake);
+            let validator = primitives::Address(addr);
+            staking_module.genesis_register_validator(validator, v.stake);
+            // The genesis `public_key` is the validator's consensus
+            // identity — staking keeps it so double-sign evidence
+            // can be verified on-chain. Optional: single-node
+            // devnets have no real signatures to prove against.
+            if let Some(pk_hex) = &v.public_key {
+                let key = hex_decode(pk_hex)
+                    .unwrap_or_else(|e| panic!("genesis validator invalid BLS key: {e}"));
+                staking_module.genesis_set_bls_key(validator, &key);
+            }
         }
     } else {
         // Deterministic devnet fallback — NOT suitable for production.

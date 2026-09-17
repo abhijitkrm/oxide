@@ -6835,7 +6835,11 @@ mod tests {
         }
 
         // Finalize the block — executes the EVM txs.
-        let block = types::FinalizedBlock { height: Height::new(0), txs: proposal.txs };
+        let block = types::FinalizedBlock {
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         let ack = executor.finalize_block(&block);
         assert_eq!(ack.height, Height::new(0));
 
@@ -6916,7 +6920,11 @@ mod tests {
         let budget = types::CHAIN_BLOCK_BUDGET;
         let proposal = executor.prepare_proposal(&budget);
         assert_eq!(proposal.txs.len(), 5, "mempool must select all 5 EVM txs");
-        let block = types::FinalizedBlock { height: Height::new(1), txs: proposal.txs };
+        let block = types::FinalizedBlock {
+            height: Height::new(1),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
         let tx_root = executor.attest_state(Height::new(1)).root;
 
@@ -6926,7 +6934,8 @@ mod tests {
         evm_module_empty.fund_account_for_test(&oxide_addr, u128::MAX);
         let mut exec_empty = executor::Executor::new(1000);
         exec_empty.register_module(Arc::new(evm_module_empty));
-        let empty_block = types::FinalizedBlock { height: Height::new(1), txs: vec![] };
+        let empty_block =
+            types::FinalizedBlock { height: Height::new(1), txs: vec![], signers: Vec::new() };
         exec_empty.finalize_block(&empty_block);
         let empty_root = exec_empty.attest_state(Height::new(1)).root;
 

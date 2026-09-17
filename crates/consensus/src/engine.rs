@@ -48,7 +48,7 @@ use codec::{Decode, Encode};
 use crypto::bls::{AggregateSignature, Signature};
 use crypto::hash::{Domain, Hasher};
 use ports::{AppInterface, ConsensusEngine};
-use primitives::{Epoch, Hash, Height, View};
+use primitives::{Address, Epoch, Hash, Height, View};
 use types::{
     BlockBudget, BlockHeader, FinalizedBlock, MempoolAck, Proposal, QuorumCertificate,
     TimeoutCertificate, TxBytes, Verdict, Vote, VotePhase,
@@ -1672,10 +1672,16 @@ impl OxideBft {
         if let Some(pending) = &self.pending {
             if let Some((header, proposal)) = self.blocks.get(&qc.block_hash).cloned() {
                 // Does the QC's block extend the pending block?
-                if header.high_qc.as_ref().is_some_and(|hqc| hqc.block_hash == pending.hash) {
+                if let Some(hqc) =
+                    header.high_qc.as_ref().filter(|hqc| hqc.block_hash == pending.hash)
+                {
                     // 2-chain: pending.qc → new_block → new_qc → commit pending.
+                    // The committing QC for `pending` is the child
+                    // block's `high_qc` — its signer bitmap is the
+                    // committed block's attendance record.
                     let pending_hash = pending.hash;
-                    self.commit_block(pending_hash);
+                    let signer_bitmap = hqc.signer_bitmap.clone();
+                    self.commit_block(pending_hash, &signer_bitmap);
                     // The QC's block becomes the new pending block.
                     self.pending = Some(PendingBlock { hash: qc.block_hash, proposal });
                     return Ok(());
@@ -1746,15 +1752,34 @@ impl OxideBft {
     /// Commit `block_hash`: look up the block, create a
     /// `FinalizedBlock`, call `app.finalize_block`, and store it.
     ///
+    /// `signer_bitmap` is the committing QC's bitmap — bit `i` marks
+    /// `validator_addresses()[i]` as a signer. It is resolved to
+    /// staking addresses here so the app receives attendance in its
+    /// own identity space, never in consensus-internal indices.
+    ///
     /// Note: `next_height` is NOT advanced here — it was already
     /// advanced when the block was proposed (the 2-chain pipeline
     /// proposes before committing). The app's `next_proposal_height`
     /// advances here (via `finalize_block`).
-    fn commit_block(&mut self, block_hash: Hash) {
+    fn commit_block(&mut self, block_hash: Hash, signer_bitmap: &[u8]) {
         let Some((header, proposal)) = self.blocks.remove(&block_hash) else {
             return; // already committed or unknown
         };
-        let block = FinalizedBlock { height: header.height, txs: proposal.txs };
+        let addresses = self.validator_set.validator_addresses();
+        let signers: Vec<Address> = signer_bitmap
+            .iter()
+            .enumerate()
+            .flat_map(|(byte_i, byte)| {
+                (0..8).filter_map(move |bit| {
+                    if byte & (1u8 << bit) != 0 {
+                        addresses.get(byte_i * 8 + bit).copied()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let block = FinalizedBlock { height: header.height, txs: proposal.txs, signers };
         // Notify the commit listener before inserting into `finalized`
         // — the map prunes at `MAX_RETAINED_FINALIZED`, so external
         // consumers that need full history must observe commits here.

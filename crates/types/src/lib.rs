@@ -17,7 +17,7 @@
 
 use codec::{Decode, DecodeError, Encode, Reader, write};
 use crypto::bls::{AggregateSignature, Signature};
-use primitives::{Epoch, Hash, Height, View};
+use primitives::{Address, Epoch, Hash, Height, View};
 
 /// Read a length/count varint as `usize`. A varint larger than
 /// `usize::MAX` (only possible on 32-bit targets) is surfaced as
@@ -283,6 +283,18 @@ pub struct FinalizedBlock {
     /// The ordered transactions. This is the complete consensus output;
     /// execution happens downstream.
     pub txs: Vec<TxBytes>,
+    /// The staking addresses of the validators whose votes formed the
+    /// committing QC — the attendance record for this height. Resolved
+    /// from the QC's signer bitmap against the engine's validator set,
+    /// so it survives consensus-internal index changes.
+    ///
+    /// Carried *on* the block (and in its encoding) because the journal
+    /// replays `finalize_block`: downtime tracking must derive the same
+    /// jails on replay, which is only possible if the signer set is
+    /// part of the recorded block. Engines that cannot attribute
+    /// signers (sequencer mode, mock) leave it empty — the app reads
+    /// empty as "no attendance data", never as "everyone absent".
+    pub signers: Vec<Address>,
 }
 
 impl Encode for FinalizedBlock {
@@ -291,6 +303,10 @@ impl Encode for FinalizedBlock {
         write::varint(buf, self.txs.len() as u64);
         for tx in &self.txs {
             tx.encode(buf);
+        }
+        write::varint(buf, self.signers.len() as u64);
+        for signer in &self.signers {
+            buf.extend_from_slice(&signer.0);
         }
     }
 }
@@ -306,7 +322,20 @@ impl<'a> Decode<'a> for FinalizedBlock {
         for _ in 0..count {
             txs.push(TxBytes::decode(reader)?);
         }
-        Ok(Self { height, txs })
+        // Tolerant tail: journals written before `signers` existed end
+        // here — read as "no attendance data" instead of failing, so
+        // pre-change histories stay replayable.
+        let mut signers = Vec::new();
+        if reader.remaining() > 0 {
+            let count = read_count(reader)?;
+            // Each signer is exactly `Address::LEN` bytes — the count
+            // is capped by remaining input the same way `txs` is.
+            signers.reserve(count.min(reader.remaining() / Address::LEN));
+            for _ in 0..count {
+                signers.push(Address(reader.read_fixed::<{ Address::LEN }>()?));
+            }
+        }
+        Ok(Self { height, txs, signers })
     }
 }
 
@@ -879,11 +908,16 @@ mod tests {
 
     #[test]
     fn finalized_block_wire() {
-        let fb = FinalizedBlock { height: Height::new(7), txs: vec![TxBytes(vec![0x01])] };
+        let fb = FinalizedBlock {
+            height: Height::new(7),
+            txs: vec![TxBytes(vec![0x01])],
+            signers: Vec::new(),
+        };
         let mut expected = Vec::new();
         expected.extend_from_slice(&7u64.to_le_bytes());
         expected.push(1); // tx count
         expected.extend_from_slice(&[1, 0x01]); // tx
+        expected.push(0); // signer count
         roundtrip(&fb, &expected);
     }
 

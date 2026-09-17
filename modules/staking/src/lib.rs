@@ -96,6 +96,14 @@ mod msg_type {
     /// stake enters unbonding (reclaimable after the unbonding
     /// period).
     pub const VALIDATOR_REMOVE: u8 = 0x07;
+    /// Evidence: submit cryptographic proof of a consensus fault
+    /// (double-sign). Permissionless — the proof itself
+    /// authenticates the report; no committee check applies.
+    /// On a valid proof the offender is slashed and jailed.
+    pub const EVIDENCE: u8 = 0x08;
+    /// Unjail: a jailed validator rejoins the set after the jail
+    /// period. Sender must be the validator itself.
+    pub const UNJAIL: u8 = 0x09;
 }
 
 /// The unbonding period in blocks.
@@ -129,6 +137,41 @@ const DEFAULT_BLOCK_REWARD: u64 = 1_000_000_000;
 /// floating-point non-determinism.
 ///
 /// 10% slash for double-signing (the Cosmos SDK default).
+/// Minimum jail time in blocks before `unjail` is accepted.
+///
+/// Unit: blocks. At the ~1 s/view block cadence this is ~10 min —
+/// the Cosmos `x/slashing` `DowntimeJailDuration` order of
+/// magnitude. It exists so a jailed validator cannot slash-evade by
+/// unjailing in the very next block; the epoch rotation that drops
+/// them from consensus must happen first.
+const MIN_JAIL_BLOCKS: u64 = 600;
+
+/// Byte length of a double-sign evidence payload after the
+/// `[type][validator]` header:
+/// `[view:8B][phase:1B][epoch:8B][hash_a:32B][sig_a:96B][hash_b:32B][sig_b:96B]`.
+///
+/// The layout mirrors `vote_signing_message` in
+/// `crates/consensus/src/engine.rs` (49 bytes per vote:
+/// view LE + phase + `block_hash` + epoch LE) so the reporter only
+/// has to forward what the wire carried.
+const EVIDENCE_PAYLOAD_LEN: usize = 8 + 1 + 8 + 32 + 96 + 32 + 96;
+
+/// Sliding window (blocks) over which downtime is measured.
+///
+/// Unit: blocks. Mirrors Cosmos `SignedBlocksWindow` (= 100
+/// default) — big enough that a few missed blocks never jail, small
+/// enough that a dead validator is evicted in ~2 minutes at ~1 s
+/// blocks. Each tracked validator keeps at most this many outcome
+/// bits, so memory stays O(validators × 100).
+const DOWNTIME_WINDOW: usize = 100;
+
+/// Minimum blocks a validator must sign within `DOWNTIME_WINDOW`
+/// to avoid jailing (50% — Cosmos `MinSignedPerWindow` = 0.5).
+/// Evaluated only once the window is full: a validator cannot be
+/// jailed before they have been live for `DOWNTIME_WINDOW` blocks,
+/// so fresh joins get a full grace period.
+const DOWNTIME_MIN_SIGNED: usize = 50;
+
 const SLASH_FRACTION_DOUBLE_SIGN_NUMERATOR: u64 = 10;
 /// The denominator for slash fractions (100 = percentage basis).
 const SLASH_FRACTION_DENOMINATOR: u64 = 100;
@@ -276,6 +319,42 @@ pub struct StakingModule {
     /// epoch rotation. The consensus engine reads these via
     /// `take_validator_changes`.
     pending_validator_removes: Mutex<Vec<Address>>,
+    /// The *current* BLS consensus key per validator — 48-byte
+    /// BLS12-381 compressed public key. Unlike
+    /// `pending_key_changes` (drained each rotation), this map
+    /// persists so `handle_evidence` can verify vote signatures
+    /// against the key the validator is known by. Set at
+    /// `VALIDATOR_ADD` / `genesis_set_bls_key`, updated when
+    /// `take_key_changes` applies a rotation, never deleted — a
+    /// stale key is harmless (evidence requires the validator to
+    /// still exist) and re-adds overwrite it.
+    bls_keys: Mutex<BTreeMap<Address, Vec<u8>>>,
+    /// Jailed validators: address → height jailed. Jailed
+    /// validators are emitted as `removes` at the next epoch
+    /// rotation (out of consensus), stop earning rewards, and keep
+    /// their (already-slashed) stake — jailing is exclusion, not
+    /// confiscation. `unjail` re-admits them after
+    /// [`MIN_JAIL_BLOCKS`].
+    jailed: Mutex<BTreeMap<Address, u64>>,
+    /// Validators jailed since the last `take_validator_changes`
+    /// drain — emitted as `removes` so the engine drops them from
+    /// consensus at the next rotation.
+    pending_jails: Mutex<Vec<Address>>,
+    /// Validators unjailed since the last drain — emitted as `adds`
+    /// (with their `bls_keys` entry and current stake) so the
+    /// engine re-admits them at the next rotation.
+    pending_unjails: Mutex<Vec<Address>>,
+    /// Hashes of evidence payloads already applied — replaying the
+    /// same double-sign proof must not re-slash. Keyed by
+    /// BLAKE3 of the two-vote payload (deterministic, no sender
+    /// component — any reporter resubmitting hits the same key).
+    seen_evidence: Mutex<std::collections::BTreeSet<Hash>>,
+    /// Per-validator attendance ring: `true` = signed the block's
+    /// committing QC, `false` = absent. Fed by
+    /// `record_block_attendance` (called inside `execute_block`,
+    /// so journal replay rebuilds identical windows). Each entry
+    /// is capped at [`DOWNTIME_WINDOW`] outcomes.
+    attendance: Mutex<BTreeMap<Address, std::collections::VecDeque<bool>>>,
     /// The unbonding period in blocks.
     unbonding_period: u64,
     /// The block reward in atomic units.
@@ -303,6 +382,12 @@ impl StakingModule {
             pending_key_changes: Mutex::new(BTreeMap::new()),
             pending_validator_adds: Mutex::new(Vec::new()),
             pending_validator_removes: Mutex::new(Vec::new()),
+            bls_keys: Mutex::new(BTreeMap::new()),
+            jailed: Mutex::new(BTreeMap::new()),
+            pending_jails: Mutex::new(Vec::new()),
+            pending_unjails: Mutex::new(Vec::new()),
+            seen_evidence: Mutex::new(std::collections::BTreeSet::new()),
+            attendance: Mutex::new(BTreeMap::new()),
             unbonding_period: DEFAULT_UNBONDING_PERIOD_BLOCKS,
             block_reward: DEFAULT_BLOCK_REWARD,
             current_height: Mutex::new(0),
@@ -367,6 +452,36 @@ impl StakingModule {
     pub fn genesis_register_validator(&self, validator: Address, stake: u64) {
         assert!(stake > 0, "genesis validator {validator:?} has zero stake");
         self.validators.lock().unwrap().insert(validator, stake);
+    }
+
+    /// Register a genesis validator's BLS consensus key — the
+    /// evidence-verification counterpart of
+    /// `genesis_register_validator`. Genesis JSON carries
+    /// `validators[].public_key` optionally; single-node devnets
+    /// skip it (mock consensus never produces real signatures, so
+    /// no verifiable evidence can exist anyway).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` is not 48 bytes or the mutex is poisoned.
+    pub fn genesis_set_bls_key(&self, validator: Address, key: &[u8]) {
+        assert_eq!(key.len(), crypto::bls::PublicKey::LEN, "BLS key must be 48 bytes");
+        self.bls_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(validator, key.to_vec());
+    }
+
+    /// Whether `addr` is currently jailed (excluded from consensus
+    /// and rewards until unjailed). Exposed for tests and the
+    /// validator-status RPC surface.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    #[must_use]
+    pub fn is_jailed(&self, addr: &Address) -> bool {
+        self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(addr)
     }
 
     /// Get a validator's total stake.
@@ -474,21 +589,34 @@ impl StakingModule {
     /// the consensus engine at the epoch boundary to apply new BLS
     /// keys to the validator set.
     ///
+    /// Draining means the rotation *applied* — the new key is now
+    /// the validator's current consensus key, so `bls_keys` is
+    /// updated here (not at `handle_key_change`, which is only the
+    /// pending stage). Evidence for votes signed with the previous
+    /// key stops verifying from this point — a documented v1
+    /// bound: double-sign proofs must be submitted before the
+    /// offender rotates keys.
+    ///
     /// # Panics
     ///
     /// Panics if the mutex is poisoned.
     pub fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
-        std::mem::take(
+        let changes: Vec<(Address, Vec<u8>)> = std::mem::take(
             &mut *self
                 .pending_key_changes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
         .into_iter()
-        .collect()
+        .collect();
+        let mut bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (addr, key) in &changes {
+            bls_keys.insert(*addr, key.clone());
+        }
+        changes
     }
 
-    /// Take all pending validator changes, clearing both queues.
+    /// Take all pending validator changes, clearing all queues.
     /// Called by the consensus engine at the epoch boundary to apply
     /// validator additions and removals to the validator set.
     ///
@@ -496,24 +624,51 @@ impl StakingModule {
     /// of `(address, bls_public_key, stake)` tuples for new
     /// validators; `removes` is a list of addresses to remove.
     ///
+    /// Jails fold into `removes` (a jailed validator leaves
+    /// consensus at the rotation) and unjails fold into `adds`
+    /// (re-admitted with their `bls_keys` entry and current stake).
+    /// A validator that is somehow both pending-remove and jailed
+    /// appears in `removes` once — the merge goes through a set.
+    ///
     /// # Panics
     ///
     /// Panics if the mutex is poisoned.
     pub fn take_validator_changes(&self) -> executor::ValidatorChanges {
-        executor::ValidatorChanges {
-            adds: std::mem::take(
-                &mut *self
-                    .pending_validator_adds
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ),
-            removes: std::mem::take(
-                &mut *self
-                    .pending_validator_removes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ),
+        let removes: std::collections::BTreeSet<Address> = std::mem::take(
+            &mut *self
+                .pending_validator_removes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .chain(std::mem::take(
+            &mut *self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        ))
+        .collect();
+        let mut adds = std::mem::take(
+            &mut *self
+                .pending_validator_adds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let unjails = std::mem::take(
+            &mut *self.pending_unjails.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if !unjails.is_empty() {
+            let bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let validators =
+                self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for addr in unjails {
+                // `handle_unjail` already required both — a missing
+                // entry here means the validator was removed between
+                // unjail and rotation; skip rather than re-add a
+                // phantom.
+                if let (Some(key), Some(stake)) = (bls_keys.get(&addr), validators.get(&addr)) {
+                    adds.push((addr, key.clone(), *stake));
+                }
+            }
         }
+        executor::ValidatorChanges { adds, removes: removes.into_iter().collect() }
     }
 
     /// Check if a validator has a pending key change.
@@ -678,6 +833,51 @@ pub mod msg {
         msg.extend_from_slice(&validator.0);
         msg
     }
+
+    /// A double-sign evidence message:
+    /// `[type: 0x08][validator: 20B][view: 8B LE][phase: 1B]`
+    /// `[epoch: 8B LE][hash_a: 32B][sig_a: 96B][hash_b: 32B][sig_b: 96B]`.
+    ///
+    /// `view`/`phase`/`epoch` must be identical for both votes —
+    /// they are the shared context the offender equivocated within;
+    /// the two `block_hash`/`signature` pairs are the conflicting
+    /// votes themselves. Anyone may submit: the signatures are the
+    /// authentication.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evidence(
+        validator: primitives::Address,
+        view: u64,
+        phase: u8,
+        epoch: u64,
+        hash_a: &[u8],
+        sig_a: &[u8],
+        hash_b: &[u8],
+        sig_b: &[u8],
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(21 + super::EVIDENCE_PAYLOAD_LEN);
+        msg.push(super::msg_type::EVIDENCE);
+        msg.extend_from_slice(&validator.0);
+        msg.extend_from_slice(&view.to_le_bytes());
+        msg.push(phase);
+        msg.extend_from_slice(&epoch.to_le_bytes());
+        msg.extend_from_slice(hash_a);
+        msg.extend_from_slice(sig_a);
+        msg.extend_from_slice(hash_b);
+        msg.extend_from_slice(sig_b);
+        msg
+    }
+
+    /// An unjail message: `[type: 0x09][validator: 20B]`.
+    ///
+    /// Re-admits a jailed validator at the next epoch rotation.
+    /// Only the validator itself can submit this, after
+    /// `MIN_JAIL_BLOCKS` have passed since jailing.
+    pub fn unjail(validator: primitives::Address) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(21);
+        msg.push(super::msg_type::UNJAIL);
+        msg.extend_from_slice(&validator.0);
+        msg
+    }
 }
 
 impl Module for StakingModule {
@@ -700,6 +900,10 @@ impl Module for StakingModule {
             msg_type::KEY_CHANGE => return self.handle_key_change(ctx, validator, msg),
             msg_type::VALIDATOR_ADD => return self.handle_validator_add(ctx, validator, msg),
             msg_type::VALIDATOR_REMOVE => return self.handle_validator_remove(ctx, validator, msg),
+            // Evidence and unjail carry no `[amount: 8B]` field —
+            // they must not reach `parse_message` below.
+            msg_type::EVIDENCE => return self.handle_evidence(ctx, validator, msg),
+            msg_type::UNJAIL => return self.handle_unjail(ctx, validator, msg),
             _ => {}
         }
         let (_, _, amount) = Self::parse_message(msg).ok_or(ExecError::Malformed)?;
@@ -745,6 +949,69 @@ impl Module for StakingModule {
         if let Some(ledger) = &ledger {
             let total_reward = self.collect_block_reward(ledger.as_ref());
             self.distribute_rewards(total_reward);
+        }
+    }
+
+    /// Record QC signers for `height` and jail validators whose
+    /// attendance window has filled without meeting
+    /// [`DOWNTIME_MIN_SIGNED`].
+    ///
+    /// Called inside `execute_block` — journal replay re-runs it
+    /// with the journaled `signers`, so downtime jails derive
+    /// identically on every replica.
+    ///
+    /// Downtime jails without slashing: absence is a liveness
+    /// fault, not provable malice — the evidence path handles the
+    /// confiscatory case. (v1 policy; a small downtime slash can be
+    /// added once slash parameters are governance-controlled.)
+    fn record_block_attendance(&self, height: Height, signers: &[Address]) {
+        // Empty = "no attendance data" (sequencer/mock engines) —
+        // never "everyone absent".
+        if signers.is_empty() {
+            return;
+        }
+        let signer_set: std::collections::BTreeSet<Address> = signers.iter().copied().collect();
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_removes = self
+            .pending_validator_removes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut attendance =
+            self.attendance.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut newly_jailed = Vec::new();
+        for (addr, stake) in validators.iter() {
+            // Only live members accrue attendance: no stake → not in
+            // consensus; jailed/departing → already excluded.
+            if *stake == 0 || jailed.contains_key(addr) || pending_removes.contains(addr) {
+                continue;
+            }
+            let window = attendance.entry(*addr).or_default();
+            window.push_back(signer_set.contains(addr));
+            if window.len() > DOWNTIME_WINDOW {
+                window.pop_front();
+            }
+            // Evaluate only a full window — a validator cannot be
+            // jailed before being live for `DOWNTIME_WINDOW` blocks
+            // (fresh-join grace period, same as Cosmos).
+            if window.len() == DOWNTIME_WINDOW
+                && window.iter().filter(|signed| **signed).count() < DOWNTIME_MIN_SIGNED
+            {
+                newly_jailed.push(*addr);
+            }
+        }
+        drop(attendance);
+        drop(validators);
+
+        if !newly_jailed.is_empty() {
+            let mut jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pending_jails =
+                self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for addr in newly_jailed {
+                jailed.insert(addr, height.value());
+                pending_jails.push(addr);
+            }
         }
     }
 
@@ -1137,8 +1404,36 @@ impl StakingModule {
         Ok(vec![Event { module: "staking", kind: "undelegate", data: msg.to_vec() }])
     }
 
-    /// Handle a slash message: reduce `validator`'s stake by `amount`,
-    /// burning the same proportion from every delegation to it.
+    /// Handle a slash message: reduce `validator`'s stake by `amount`.
+    ///
+    /// Arbitrary-amount slashing is a governance action — the sender
+    /// must be a current validator (same committee model as
+    /// `validator_add`/`validator_remove`). The permissionless path
+    /// is [`msg_type::EVIDENCE`], which authenticates itself with the
+    /// proof it carries. Before this check, any account could slash
+    /// any validator to zero — an open confiscation hole.
+    fn handle_slash(
+        &self,
+        ctx: &TxContext,
+        validator: Address,
+        amount: u64,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let is_committee = self
+            .validators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&ctx.sender);
+        if !is_committee {
+            return Err(ExecError::ModuleRejected(
+                "slash: sender is not a current validator".to_string(),
+            ));
+        }
+        self.apply_slash(validator, amount, msg)
+    }
+
+    /// Reduce `validator`'s stake by `amount`, burning the same
+    /// proportion from every delegation to it.
     ///
     /// Slashing must hit the delegations, not just the aggregate —
     /// otherwise the bonded pool still owes the full pre-slash amount
@@ -1147,9 +1442,11 @@ impl StakingModule {
     /// rounding remainder is distributed 1 unit per delegation in
     /// deterministic `(delegator, validator)` order so all replicas
     /// slash identically.
-    fn handle_slash(
+    ///
+    /// Shared by `handle_slash` (committee governance) and
+    /// `handle_evidence` (permissionless, proof-authenticated).
+    fn apply_slash(
         &self,
-        _ctx: &TxContext,
         validator: Address,
         amount: u64,
         msg: &[u8],
@@ -1256,6 +1553,178 @@ impl StakingModule {
         }
 
         Ok(vec![Event { module: "staking", kind: "slash", data: msg.to_vec() }])
+    }
+
+    /// Handle a double-sign evidence message:
+    /// `[type: 0x08][validator: 20B][view: 8B][phase: 1B][epoch: 8B]`
+    /// `[hash_a: 32B][sig_a: 96B][hash_b: 32B][sig_b: 96B]`.
+    ///
+    /// Permissionless — anyone may submit; the two BLS signatures
+    /// are the authentication. Both are verified against the
+    /// validator's registered consensus key over the exact
+    /// `vote_signing_message` layout the engine signs
+    /// (`view LE | phase | block_hash | epoch LE`, `Domain::Vote`):
+    /// a forged or misattributed proof fails verification and the
+    /// reporter loses only their envelope fee.
+    ///
+    /// On a valid proof: the offender is slashed
+    /// [`double_sign_slash_amount`](msg::double_sign_slash_amount)
+    /// (10%) and jailed — emitted as a `removes` entry at the next
+    /// epoch rotation via `take_validator_changes`.
+    fn handle_evidence(
+        &self,
+        _ctx: &TxContext,
+        validator: Address,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        if msg.len() != 21 + EVIDENCE_PAYLOAD_LEN {
+            return Err(ExecError::ModuleRejected(format!(
+                "evidence: expected {}-byte message, got {} bytes",
+                21 + EVIDENCE_PAYLOAD_LEN,
+                msg.len()
+            )));
+        }
+        let view = u64::from_le_bytes(msg[21..29].try_into().map_err(|_| ExecError::Malformed)?);
+        let phase = msg[29];
+        let epoch = u64::from_le_bytes(msg[30..38].try_into().map_err(|_| ExecError::Malformed)?);
+        let hash_a = &msg[38..70];
+        let hash_b = &msg[166..198];
+        // Equivocation is two votes for *different* blocks at the
+        // same (view, phase, epoch). Identical hashes are just one
+        // vote presented twice — no fault.
+        if hash_a == hash_b {
+            return Err(ExecError::ModuleRejected(
+                "evidence: identical block hashes — no equivocation".to_string(),
+            ));
+        }
+        let sig_a =
+            crypto::bls::Signature::from_slice(&msg[70..166]).map_err(|_| ExecError::Malformed)?;
+        let sig_b =
+            crypto::bls::Signature::from_slice(&msg[198..294]).map_err(|_| ExecError::Malformed)?;
+
+        let key = self
+            .bls_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&validator)
+            .cloned()
+            .ok_or(ExecError::ModuleRejected(
+                "evidence: no consensus key on record for validator".to_string(),
+            ))?;
+        let pk = crypto::bls::PublicKey::from_slice(&key).map_err(|_| ExecError::Malformed)?;
+
+        // Replay guard: the same proof must not slash twice.
+        let evidence_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Vote, &msg[21..]);
+        {
+            let seen = self.seen_evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if seen.contains(&evidence_hash) {
+                return Err(ExecError::ModuleRejected("evidence: already applied".to_string()));
+            }
+        }
+
+        // Rebuild the exact 49-byte signing messages and verify
+        // both signatures — a valid proof is two verifying
+        // signatures over different block hashes.
+        let mut vote_msg_a = [0u8; 49];
+        vote_msg_a[..8].copy_from_slice(&view.to_le_bytes());
+        vote_msg_a[8] = phase;
+        vote_msg_a[9..41].copy_from_slice(hash_a);
+        vote_msg_a[41..49].copy_from_slice(&epoch.to_le_bytes());
+        let mut vote_msg_b = [0u8; 49];
+        vote_msg_b[..8].copy_from_slice(&view.to_le_bytes());
+        vote_msg_b[8] = phase;
+        vote_msg_b[9..41].copy_from_slice(hash_b);
+        vote_msg_b[41..49].copy_from_slice(&epoch.to_le_bytes());
+        if crypto::bls_signer::verify(&sig_a, crypto::hash::Domain::Vote, &vote_msg_a, &pk).is_err()
+            || crypto::bls_signer::verify(&sig_b, crypto::hash::Domain::Vote, &vote_msg_b, &pk)
+                .is_err()
+        {
+            return Err(ExecError::ModuleRejected(
+                "evidence: signature verification failed".to_string(),
+            ));
+        }
+
+        // Proof verified — slash and jail. `apply_slash` resolves
+        // "validator not found" with the same rejection it already
+        // produces.
+        let slash_amount = msg::double_sign_slash_amount(self.stake(&validator));
+        let mut events = self.apply_slash(validator, slash_amount, msg)?;
+
+        let height = *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let already_jailed = self
+            .jailed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(validator, height)
+            .is_some();
+        if !already_jailed {
+            self.pending_jails
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(validator);
+        }
+        self.seen_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(evidence_hash);
+
+        events.push(Event { module: "staking", kind: "evidence", data: msg.to_vec() });
+        Ok(events)
+    }
+
+    /// Handle an unjail message: `[type: 0x09][validator: 20B]`.
+    ///
+    /// Re-admits a jailed validator to the set at the next epoch
+    /// rotation. Sender must be the validator itself (same
+    /// authorization model as `key_change`), the jail must have
+    /// lasted at least [`MIN_JAIL_BLOCKS`], and the validator must
+    /// still have stake and a consensus key on record — the engine
+    /// cannot re-admit a keyless validator.
+    fn handle_unjail(
+        &self,
+        ctx: &TxContext,
+        validator: Address,
+        msg: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        if ctx.sender != validator {
+            return Err(ExecError::ModuleRejected(
+                "unjail: only the validator can unjail itself".to_string(),
+            ));
+        }
+        let jailed_at = self
+            .jailed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&validator)
+            .copied()
+            .ok_or(ExecError::ModuleRejected("unjail: validator is not jailed".to_string()))?;
+        let height = *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if height.saturating_sub(jailed_at) < MIN_JAIL_BLOCKS {
+            return Err(ExecError::ModuleRejected(format!(
+                "unjail: {MIN_JAIL_BLOCKS}-block jail period not elapsed"
+            )));
+        }
+        if self.stake(&validator) == 0 {
+            return Err(ExecError::ModuleRejected("unjail: validator has no stake".to_string()));
+        }
+        if !self
+            .bls_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&validator)
+        {
+            return Err(ExecError::ModuleRejected(
+                "unjail: no consensus key on record".to_string(),
+            ));
+        }
+
+        self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&validator);
+        self.pending_unjails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(validator);
+
+        Ok(vec![Event { module: "staking", kind: "unjail", data: msg.to_vec() }])
     }
 
     /// Handle a claim-reward message: withdraw accumulated rewards.
@@ -1431,6 +1900,13 @@ impl StakingModule {
         // epoch rotation. They only join consensus at the rotation.
         validators.insert(new_validator, stake);
         drop(validators);
+
+        // Record the consensus key immediately — evidence submitted
+        // before the rotation still needs it for verification.
+        self.bls_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(new_validator, bls_key.clone());
 
         self.pending_validator_adds
             .lock()
@@ -1669,18 +2145,20 @@ impl StakingModule {
             .pending_validator_removes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let eligible: u64 = validators
-            .iter()
-            .filter(|(a, s)| **s > 0 && !pending_removes.contains(a))
-            .map(|(_, s)| *s)
-            .sum();
+        // Jailed validators stop earning too — jailing is exclusion
+        // from consensus and rewards, not just consensus.
+        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_eligible =
+            |a: &Address, s: u64| s > 0 && !pending_removes.contains(a) && !jailed.contains_key(a);
+        let eligible: u64 =
+            validators.iter().filter(|(a, s)| is_eligible(a, **s)).map(|(_, s)| *s).sum();
         if eligible == 0 {
             return;
         }
         let mut rpt =
             self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (addr, stake) in validators.iter() {
-            if *stake == 0 || pending_removes.contains(addr) {
+            if !is_eligible(addr, *stake) {
                 continue;
             }
             let reward = total_reward.saturating_mul(*stake) / eligible;
@@ -1838,7 +2316,7 @@ mod tests {
         let (staking, ledger) = setup_with_ledger(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
-        staking.handle(&ctx(), &msg::slash(v, 100)).unwrap();
+        staking.handle(&ctx_with_sender(1), &msg::slash(v, 100)).unwrap();
         assert_eq!(staking.stake(&v), 900);
         assert_eq!(staking.delegation(&addr(0), &v), 900, "delegation reduced proportionally");
         assert_eq!(ledger.balance(&BONDED_POOL), 900, "slashed amount burned from pool");
@@ -1889,7 +2367,7 @@ mod tests {
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let slash_amount = msg::double_sign_slash_amount(1000);
         assert_eq!(slash_amount, 100, "10% of 1000 = 100");
-        staking.handle(&ctx(), &msg::slash(v, slash_amount)).unwrap();
+        staking.handle(&ctx_with_sender(1), &msg::slash(v, slash_amount)).unwrap();
         assert_eq!(staking.stake(&v), 900, "stake reduced by slash");
     }
 
@@ -1899,16 +2377,264 @@ mod tests {
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 100)).unwrap();
         // Try to slash more than the stake.
-        staking.handle(&ctx(), &msg::slash(v, 500)).unwrap();
+        staking.handle(&ctx_with_sender(1), &msg::slash(v, 500)).unwrap();
         assert_eq!(staking.stake(&v), 0, "stake floored at 0");
     }
 
     #[test]
     fn slash_rejects_unknown_validator() {
-        let staking = setup(&[]);
+        let staking = setup(&[2]);
         let v = addr(1);
-        let result = staking.handle(&ctx(), &msg::slash(v, 100));
+        let result = staking.handle(&ctx_with_sender(2), &msg::slash(v, 100));
         assert!(result.is_err(), "should reject slash of unknown validator");
+    }
+
+    #[test]
+    fn slash_rejects_non_committee_sender() {
+        // The permissionless slash path must not exist — evidence
+        // carries its own proof; raw slash is governance.
+        let staking = setup(&[1]);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let result = staking.handle(&ctx(), &msg::slash(v, 100));
+        assert!(result.is_err(), "non-validator sender must not slash");
+        assert_eq!(staking.stake(&v), 1000, "stake untouched");
+    }
+
+    // ── Evidence (double-sign) + jail ────────────────────────────
+
+    /// A real BLS secret key for deterministic tests — same
+    /// `from_ikm` path consensus tests use.
+    fn bls_key(byte: u8) -> crypto::BlsSecretKey {
+        let ikm = vec![byte; 32];
+        crypto::BlsSecretKey::from_ikm(&ikm).expect("key gen")
+    }
+
+    /// Build a valid double-sign evidence message for `key`'s
+    /// validator: two votes over `(view, phase, epoch)` for two
+    /// different block hashes, both really signed.
+    fn signed_evidence(
+        validator: Address,
+        key: &crypto::BlsSecretKey,
+        view: u64,
+        epoch: u64,
+    ) -> Vec<u8> {
+        let hash_a = [0xAAu8; 32];
+        let hash_b = [0xBBu8; 32];
+        let vote_msg = |hash: &[u8; 32]| {
+            let mut m = [0u8; 49];
+            m[..8].copy_from_slice(&view.to_le_bytes());
+            m[8] = 0; // phase — matches the engine's current_phase_byte
+            m[9..41].copy_from_slice(hash);
+            m[41..49].copy_from_slice(&epoch.to_le_bytes());
+            m
+        };
+        let sig_a = key.sign(crypto::hash::Domain::Vote, &vote_msg(&hash_a));
+        let sig_b = key.sign(crypto::hash::Domain::Vote, &vote_msg(&hash_b));
+        msg::evidence(
+            validator,
+            view,
+            0,
+            epoch,
+            &hash_a,
+            sig_a.as_bytes(),
+            &hash_b,
+            sig_b.as_bytes(),
+        )
+    }
+
+    #[test]
+    fn evidence_slashes_and_jails_on_valid_proof() {
+        let (staking, ledger) = setup_with_ledger(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        staking.genesis_set_bls_key(v, key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        let evidence = signed_evidence(v, &key, 7, 0);
+        staking.handle(&ctx(), &evidence).unwrap();
+
+        assert_eq!(staking.stake(&v), 900, "10% double-sign slash applied");
+        assert_eq!(ledger.balance(&BONDED_POOL), 900, "slashed funds burned");
+        assert!(staking.is_jailed(&v), "offender jailed");
+        // The jail reaches consensus at the next rotation.
+        let changes = staking.take_validator_changes();
+        assert!(changes.removes.contains(&v), "jailed validator emitted as remove");
+    }
+
+    #[test]
+    fn evidence_rejects_identical_hashes() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        staking.genesis_set_bls_key(v, key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        // Same block hash twice is one vote, not equivocation.
+        let hash = [0xAAu8; 32];
+        let mut vote_msg = [0u8; 49];
+        vote_msg[..8].copy_from_slice(&7u64.to_le_bytes());
+        vote_msg[9..41].copy_from_slice(&hash);
+        let sig = key.sign(crypto::hash::Domain::Vote, &vote_msg);
+        let evidence = msg::evidence(v, 7, 0, 0, &hash, sig.as_bytes(), &hash, sig.as_bytes());
+        assert!(staking.handle(&ctx(), &evidence).is_err());
+        assert_eq!(staking.stake(&v), 1000);
+    }
+
+    #[test]
+    fn evidence_rejects_forged_signature() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        // Register key 1, but sign the "evidence" with key 2 —
+        // verification must fail against the registered key.
+        let registered = bls_key(1);
+        let forger = bls_key(2);
+        staking.genesis_set_bls_key(v, registered.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        let evidence = signed_evidence(v, &forger, 7, 0);
+        assert!(staking.handle(&ctx(), &evidence).is_err(), "forged proof must reject");
+        assert_eq!(staking.stake(&v), 1000, "no slash on forged evidence");
+        assert!(!staking.is_jailed(&v));
+    }
+
+    #[test]
+    fn evidence_rejects_replay() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        staking.genesis_set_bls_key(v, key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        let evidence = signed_evidence(v, &key, 7, 0);
+        staking.handle(&ctx(), &evidence).unwrap();
+        let result = staking.handle(&ctx(), &evidence);
+        assert!(result.is_err(), "same proof must not slash twice");
+        assert_eq!(staking.stake(&v), 900, "still exactly one slash");
+    }
+
+    #[test]
+    fn evidence_rejects_validator_without_key() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        // No genesis_set_bls_key — the validator exists in staking
+        // but has no consensus key on record to verify against.
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let evidence = signed_evidence(v, &key, 7, 0);
+        assert!(staking.handle(&ctx(), &evidence).is_err());
+    }
+
+    #[test]
+    fn jailed_validator_stops_earning_rewards() {
+        let staking = setup(&[1, 2]).with_block_reward(1_000);
+        let (v1, v2) = (addr(1), addr(2));
+        let key = bls_key(1);
+        staking.genesis_set_bls_key(v1, key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v1, 1000)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v2, 1000)).unwrap();
+
+        staking.handle(&ctx(), &signed_evidence(v1, &key, 7, 0)).unwrap();
+        // v1 jailed with 900 stake; v2 free with 1000 — v2 must take
+        // the whole block reward.
+        staking.end_block(Height::new(1));
+        assert_eq!(staking.claimable(&addr(0)), 1_000, "all rewards to v2's delegator");
+    }
+
+    #[test]
+    fn unjail_readmits_after_period() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        staking.genesis_set_bls_key(v, key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.handle(&ctx(), &signed_evidence(v, &key, 7, 0)).unwrap();
+
+        // Too early — jail period not elapsed.
+        staking.begin_block(Height::new(100));
+        assert!(staking.handle(&ctx_with_sender(1), &msg::unjail(v)).is_err());
+
+        // After MIN_JAIL_BLOCKS the unjail is accepted and the
+        // validator is re-admitted via the changes drain.
+        staking.begin_block(Height::new(100 + MIN_JAIL_BLOCKS));
+        staking.handle(&ctx_with_sender(1), &msg::unjail(v)).unwrap();
+        assert!(!staking.is_jailed(&v));
+        let changes = staking.take_validator_changes();
+        assert_eq!(changes.adds.len(), 1, "unjailed validator re-admitted");
+        assert_eq!(changes.adds[0].0, v);
+        assert_eq!(changes.adds[0].1, key.public_key().as_bytes(), "re-adds with current key");
+        assert_eq!(changes.adds[0].2, 900, "re-adds with post-slash stake");
+    }
+
+    #[test]
+    fn unjail_rejects_non_jailed_and_other_sender() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        // Not jailed at all.
+        assert!(staking.handle(&ctx_with_sender(1), &msg::unjail(v)).is_err());
+    }
+
+    // ── Downtime tracking (record_block_attendance) ──────────────
+
+    #[test]
+    fn downtime_jails_after_full_window_of_absence() {
+        let staking = setup(&[1, 2]);
+        let (v1, v2) = (addr(1), addr(2));
+        staking.handle(&ctx(), &msg::delegate(v1, 1000)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v2, 1000)).unwrap();
+
+        // v1 never signs; v2 signs every block.
+        for h in 1..=DOWNTIME_WINDOW as u64 {
+            staking.record_block_attendance(Height::new(h), &[v2]);
+        }
+        assert!(staking.is_jailed(&v1), "absent for the full window → jailed");
+        assert!(!staking.is_jailed(&v2), "perfect attendance stays free");
+        assert_eq!(staking.stake(&v1), 1000, "downtime jail does not slash");
+        let changes = staking.take_validator_changes();
+        assert!(changes.removes.contains(&v1), "auto-jail emitted as remove");
+    }
+
+    #[test]
+    fn downtime_grace_period_before_window_fills() {
+        let staking = setup(&[1, 2]);
+        let (v1, v2) = (addr(1), addr(2));
+        staking.handle(&ctx(), &msg::delegate(v1, 1000)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v2, 1000)).unwrap();
+
+        // 99 absent blocks — one short of a full window: no jail yet
+        // (fresh-join grace, same as Cosmos SignedBlocksWindow).
+        for h in 1..DOWNTIME_WINDOW as u64 {
+            staking.record_block_attendance(Height::new(h), &[v2]);
+        }
+        assert!(!staking.is_jailed(&v1), "cannot jail before the window fills");
+    }
+
+    #[test]
+    fn downtime_partial_absence_does_not_jail() {
+        let staking = setup(&[1, 2]);
+        let (v1, v2) = (addr(1), addr(2));
+        staking.handle(&ctx(), &msg::delegate(v1, 1000)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v2, 1000)).unwrap();
+
+        // v1 signs exactly half the window (≥ DOWNTIME_MIN_SIGNED).
+        for h in 1..=DOWNTIME_WINDOW as u64 {
+            let signers = if h % 2 == 0 { vec![v1, v2] } else { vec![v2] };
+            staking.record_block_attendance(Height::new(h), &signers);
+        }
+        assert!(!staking.is_jailed(&v1), "50% attendance stays free");
+    }
+
+    #[test]
+    fn attendance_empty_signers_is_noop() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        // Sequencer/mock engines report no attendance — an empty
+        // signer list must never read as "everyone absent".
+        for h in 1..=DOWNTIME_WINDOW as u64 {
+            staking.record_block_attendance(Height::new(h), &[]);
+        }
+        assert!(!staking.is_jailed(&v));
     }
 
     #[test]
@@ -2104,7 +2830,7 @@ mod tests {
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let root0 = staking.state_root();
-        staking.handle(&ctx(), &msg::slash(v, 100)).unwrap();
+        staking.handle(&ctx_with_sender(1), &msg::slash(v, 100)).unwrap();
         let root1 = staking.state_root();
         assert_ne!(root0, root1, "state root must change after slash");
     }

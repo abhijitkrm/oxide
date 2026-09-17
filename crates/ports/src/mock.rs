@@ -222,7 +222,10 @@ impl crate::ConsensusEngine for MockEngine {
                     panic!("MockEngine: proposal rejected: {reason}");
                 }
             }
-            let block = FinalizedBlock { height: proposal.height, txs: proposal.txs };
+            // Mock engine attributes no signers — attendance is
+            // meaningless without real consensus; empty = no data.
+            let block =
+                FinalizedBlock { height: proposal.height, txs: proposal.txs, signers: Vec::new() };
             self.app.finalize_block(&block);
             self.finalized.insert(block.height.value(), block);
             self.next_height = Height::new(self.next_height.value() + 1);

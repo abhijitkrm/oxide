@@ -295,7 +295,7 @@ mod tests {
 
     fn make_block(height: u64, txs: Vec<Vec<u8>>) -> FinalizedBlock {
         let txs: Vec<TxBytes> = txs.into_iter().map(TxBytes::new).collect();
-        FinalizedBlock { height: Height::new(height), txs }
+        FinalizedBlock { height: Height::new(height), txs, signers: Vec::new() }
     }
 
     #[test]

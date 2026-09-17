@@ -99,7 +99,11 @@ fn journal_replay_reproduces_state_root_bit_exact() {
         // Build a block with 3 staking-delegate txs.
         let txs: Vec<types::TxBytes> =
             (0..3).map(|i| delegate_tx(u64::try_from(h * 10 + i).unwrap(), 1)).collect();
-        let block = FinalizedBlock { height: Height::new(u64::try_from(h).unwrap()), txs };
+        let block = FinalizedBlock {
+            height: Height::new(u64::try_from(h).unwrap()),
+            txs,
+            signers: Vec::new(),
+        };
 
         // Execute the block (produces and records the state root).
         executor.finalize_block(&block);
@@ -190,7 +194,11 @@ fn journal_replay_torn_tail_preserves_prefix() {
 
     // Write 5 complete blocks.
     for h in 0..5u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, 1)] };
+        let block = FinalizedBlock {
+            height: Height::new(h),
+            txs: vec![delegate_tx(h, 1)],
+            signers: Vec::new(),
+        };
         let payload = encode_block(&block);
         writer.append(&payload).expect("journal append should succeed");
     }
@@ -229,7 +237,11 @@ fn journal_replay_bad_crc_preserves_prefix() {
 
     // Write 3 complete blocks.
     for h in 0..3u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, 1)] };
+        let block = FinalizedBlock {
+            height: Height::new(h),
+            txs: vec![delegate_tx(h, 1)],
+            signers: Vec::new(),
+        };
         let payload = encode_block(&block);
         writer.append(&payload).expect("journal append should succeed");
     }
@@ -273,7 +285,11 @@ fn journal_replay_multiple_segments() {
     // Write 20 blocks (each ~60 bytes, so rotation happens ~every 17 blocks
     // with the 1024-byte segment limit).
     for h in 0..20u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, 1)] };
+        let block = FinalizedBlock {
+            height: Height::new(h),
+            txs: vec![delegate_tx(h, 1)],
+            signers: Vec::new(),
+        };
         let payload = encode_block(&block);
         writer.append(&payload).expect("journal append should succeed");
     }
@@ -311,7 +327,11 @@ fn journal_replay_deterministic_state_roots() {
         .expect("journal create should succeed");
 
     for h in 0..5u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, h + 1)] };
+        let block = FinalizedBlock {
+            height: Height::new(h),
+            txs: vec![delegate_tx(h, h + 1)],
+            signers: Vec::new(),
+        };
         exec1.finalize_block(&block);
         writer1.append(&encode_block(&block)).expect("append should succeed");
     }
@@ -331,7 +351,11 @@ fn journal_replay_deterministic_state_roots() {
         .expect("journal create should succeed");
 
     for h in 0..5u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, h + 1)] };
+        let block = FinalizedBlock {
+            height: Height::new(h),
+            txs: vec![delegate_tx(h, h + 1)],
+            signers: Vec::new(),
+        };
         exec2.finalize_block(&block);
         writer2.append(&encode_block(&block)).expect("append should succeed");
     }

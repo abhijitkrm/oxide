@@ -80,7 +80,11 @@ fn signed_delegate_executes_and_settles() {
     let budget = BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
     let proposal = executor.prepare_proposal(&budget);
     assert_eq!(proposal.txs.len(), 1);
-    executor.finalize_block(&FinalizedBlock { height: Height::new(0), txs: proposal.txs });
+    executor.finalize_block(&FinalizedBlock {
+        height: Height::new(0),
+        txs: proposal.txs,
+        signers: Vec::new(),
+    });
 
     assert_eq!(Balances::balance(ledger.as_ref(), &sender), 1_000 - 10 - 200);
     assert_eq!(Balances::balance(ledger.as_ref(), &staking::BONDED_POOL), 200);
@@ -127,7 +131,11 @@ fn unsigned_forgery_rejected_when_signatures_required() {
 
     // Even if a foreign proposer injects it into a block, execution
     // skips it deterministically.
-    executor.finalize_block(&FinalizedBlock { height: Height::new(0), txs: vec![forged] });
+    executor.finalize_block(&FinalizedBlock {
+        height: Height::new(0),
+        txs: vec![forged],
+        signers: Vec::new(),
+    });
     assert_eq!(Balances::balance(evm.as_ref(), &victim), 10_000, "victim funds untouched");
 }
 
@@ -147,7 +155,11 @@ fn foreign_signed_tx_executes_without_ingest() {
     let (tx, sender) = signed_delegate_tx(1, 0, 0, 200);
     evm.mint(&sender, 1_000);
 
-    executor.finalize_block(&FinalizedBlock { height: Height::new(0), txs: vec![tx] });
+    executor.finalize_block(&FinalizedBlock {
+        height: Height::new(0),
+        txs: vec![tx],
+        signers: Vec::new(),
+    });
     assert_eq!(Balances::balance(evm.as_ref(), &staking::BONDED_POOL), 200);
     assert_eq!(Balances::balance(evm.as_ref(), &sender), 800);
 }
@@ -165,6 +177,10 @@ fn unsigned_tx_executes_under_compat_policy() {
     assert!(matches!(executor.ingest_tx(tx), MempoolAck::Accepted));
     let budget = BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
     let proposal = executor.prepare_proposal(&budget);
-    executor.finalize_block(&FinalizedBlock { height: Height::new(0), txs: proposal.txs });
+    executor.finalize_block(&FinalizedBlock {
+        height: Height::new(0),
+        txs: proposal.txs,
+        signers: Vec::new(),
+    });
     assert_eq!(Balances::balance(ledger.as_ref(), &staking::BONDED_POOL), 300);
 }

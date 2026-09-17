@@ -120,7 +120,10 @@ impl ports::ConsensusEngine for SequencerEngine {
                     break;
                 }
             }
-            let block = FinalizedBlock { height: proposal.height, txs: proposal.txs };
+            // Sequencer mode has one signer (itself) — attendance
+            // tracking is meaningless; empty = no data.
+            let block =
+                FinalizedBlock { height: proposal.height, txs: proposal.txs, signers: Vec::new() };
             self.app.finalize_block(&block);
             self.finalized.insert(block.height.value(), block);
             self.next_height = Height::new(self.next_height.value() + 1);
