@@ -47,14 +47,19 @@
 //!
 //! # Rewards
 //!
-//! At each `end_block`, a block reward is distributed to all active
-//! validators proportional to their stake fraction. Rewards
-//! accumulate in a `rewards` map. Delegators claim rewards via the
-//! `claim_reward` message.
+//! At each `end_block`, the block reward — swept envelope fees
+//! (collected in [`FEE_POOL`]) plus fixed issuance — is distributed
+//! to all active validators proportional to their stake, credited
+//! to a *reward-per-token* accumulator per validator. Delegators
+//! and the validator's self-share both earn pro-rata through lazy
+//! accrual: positions settle into `pending_rewards` when they
+//! mutate or when the owner claims via `claim_reward`. Claims pay
+//! out of [`REWARD_POOL`], which `end_block` funds with the swept
+//! fees plus an issuance mint.
 //!
-//! The block reward is a fixed amount per block (configurable). In
-//! a production chain, this would be combined with transaction fees
-//! and an inflation schedule.
+//! Validators pending removal stop earning. Rounding remainders
+//! stay in the reward pool as unclaimable dust — a deterministic
+//! rounding burn.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -167,6 +172,35 @@ pub struct Validator {
 /// only the staking module's own calls can move funds out.
 pub const BONDED_POOL: Address = Address(*b"oxide/staking/pool!!");
 
+/// The fee-collection module account.
+///
+/// The EVM ledger's `charge_fee` transfers each envelope fee
+/// `sender → FEE_POOL` when the node wires it as the fee recipient
+/// (`EvmModule::with_fee_recipient`). At `end_block` the pool's
+/// balance is swept into [`REWARD_POOL`] and distributed
+/// pro-rata to validators and their delegators. No private key
+/// exists for the address.
+pub const FEE_POOL: Address = Address(*b"oxide/staking/fee!!!");
+
+/// The claim-funding module account.
+///
+/// `end_block` funds it with the swept [`FEE_POOL`] balance plus the
+/// issuance `block_reward` mint; `claim_reward` pays out of it. Its
+/// balance therefore always equals total accrued-but-unclaimed
+/// rewards plus integer-division dust (rounding remainders are
+/// unclaimable — they accumulate deterministically, a rounding burn).
+pub const REWARD_POOL: Address = Address(*b"oxide/staking/rwd!!!");
+
+/// Fixed-point scale for the reward-per-token accumulator.
+///
+/// `reward_per_token[v]` is a cumulative `u128` of reward units per
+/// bonded stake unit, scaled by 1e18 so integer division keeps
+/// sub-unit precision across many small blocks — the same scheme
+/// Synthetix's `StakingRewards` uses, chosen because it makes
+/// per-block distribution O(validators) and each delegation
+/// mutation O(1) instead of O(total delegators) per block.
+const RPT_SCALE: u128 = 1_000_000_000_000_000_000;
+
 /// The staking module: delegation, unbonding, slashing, rewards.
 pub struct StakingModule {
     /// The KV store for state root computation.
@@ -200,8 +234,34 @@ pub struct StakingModule {
     ledger: Mutex<Option<std::sync::Arc<dyn Balances + Send + Sync>>>,
     /// Pending unbonding entries (completed at `end_block`).
     unbonding: Mutex<Vec<UnbondingEntry>>,
-    /// Accumulated rewards per validator address.
-    rewards: Mutex<BTreeMap<Address, u64>>,
+    /// Settled-but-unclaimed rewards per account (validators and
+    /// delegators alike). Lazy accrual lives in
+    /// `reward_per_token`/`reward_debt`; this map is only topped up
+    /// when a position settles (delegation mutation or claim).
+    pending_rewards: Mutex<BTreeMap<Address, u64>>,
+    /// Cumulative reward units per bonded stake unit per validator,
+    /// scaled by [`RPT_SCALE`] — the "reward-per-token" accumulator.
+    /// `end_block` grows it by `block_reward_v × SCALE / stake_v`.
+    reward_per_token: Mutex<BTreeMap<Address, u128>>,
+    /// The `reward_per_token` value at which each delegation last
+    /// settled — `(delegator, validator) → debt`. Pending reward =
+    /// `delegation × (rpt − debt) / SCALE`.
+    reward_debt: Mutex<BTreeMap<(Address, Address), u128>>,
+    /// The `reward_per_token` value at which each validator's
+    /// *self-share* last settled. A validator's reward splits two
+    /// ways: delegations accrue through `reward_debt`, and the
+    /// non-delegated remainder (`stake − delegated_total`, e.g.
+    /// genesis self-stake) accrues to the validator itself through
+    /// this map.
+    self_debt: Mutex<BTreeMap<Address, u128>>,
+    /// Delegator → validators index: which validators each account
+    /// delegates to, so `claim_reward` can settle all of a sender's
+    /// positions without scanning the full delegation map.
+    delegator_index: Mutex<BTreeMap<Address, std::collections::BTreeSet<Address>>>,
+    /// Sum of live delegations per validator — `stake −
+    /// delegated_total` is the validator's self-share that accrues
+    /// through `self_debt`.
+    delegated_total: Mutex<BTreeMap<Address, u64>>,
     /// Pending BLS key changes per validator address. The new key
     /// takes effect at the next epoch rotation — the consensus
     /// engine reads these via `take_key_changes` at the epoch
@@ -234,7 +294,12 @@ impl StakingModule {
             delegations: Mutex::new(BTreeMap::new()),
             ledger: Mutex::new(None),
             unbonding: Mutex::new(Vec::new()),
-            rewards: Mutex::new(BTreeMap::new()),
+            pending_rewards: Mutex::new(BTreeMap::new()),
+            reward_per_token: Mutex::new(BTreeMap::new()),
+            reward_debt: Mutex::new(BTreeMap::new()),
+            self_debt: Mutex::new(BTreeMap::new()),
+            delegator_index: Mutex::new(BTreeMap::new()),
+            delegated_total: Mutex::new(BTreeMap::new()),
             pending_key_changes: Mutex::new(BTreeMap::new()),
             pending_validator_adds: Mutex::new(Vec::new()),
             pending_validator_removes: Mutex::new(Vec::new()),
@@ -318,18 +383,66 @@ impl StakingModule {
             .unwrap_or(&0)
     }
 
-    /// Get a validator's accumulated rewards.
+    /// The account's claimable rewards *as if it settled now* —
+    /// stored `pending_rewards` plus lazy accrual on every position
+    /// it holds (delegations + validator self-share). Read-only:
+    /// the same arithmetic `settle_all` performs, without writing.
     ///
     /// # Panics
     ///
     /// Panics if the mutex is poisoned.
-    pub fn rewards(&self, addr: &Address) -> u64 {
-        *self
-            .rewards
+    pub fn claimable(&self, addr: &Address) -> u64 {
+        let rpts = self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let debts = self.reward_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut total = *self
+            .pending_rewards
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(addr)
-            .unwrap_or(&0)
+            .unwrap_or(&0);
+        let delegator_vs = self
+            .delegator_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(addr)
+            .cloned()
+            .unwrap_or_default();
+        let delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for v in &delegator_vs {
+            let amount = delegations.get(&(*addr, *v)).copied().unwrap_or(0);
+            let rpt = rpts.get(v).copied().unwrap_or(0);
+            let debt = debts.get(&(*addr, *v)).copied().unwrap_or(0);
+            if rpt > debt && amount > 0 {
+                let accrued = u128::from(amount).saturating_mul(rpt - debt) / RPT_SCALE;
+                total = total.saturating_add(u64::try_from(accrued).unwrap_or(u64::MAX));
+            }
+        }
+        drop(delegations);
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(&stake) = validators.get(addr) {
+            let delegated = self
+                .delegated_total
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(addr)
+                .copied()
+                .unwrap_or(0);
+            let self_share = Self::self_share_of(stake, delegated);
+            let rpt = rpts.get(addr).copied().unwrap_or(0);
+            let debt = self
+                .self_debt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(addr)
+                .copied()
+                .unwrap_or(0);
+            if rpt > debt && self_share > 0 {
+                let accrued = u128::from(self_share).saturating_mul(rpt - debt) / RPT_SCALE;
+                total = total.saturating_add(u64::try_from(accrued).unwrap_or(u64::MAX));
+            }
+        }
+        total
     }
 
     /// Get the top-N validators by stake (descending).
@@ -625,8 +738,14 @@ impl Module for StakingModule {
         });
         drop(unbonding);
 
-        // Distribute block rewards to active validators.
-        self.distribute_rewards();
+        // Fund the reward pool and distribute this block's reward:
+        // swept envelope fees (real, pre-collected) + fixed issuance
+        // (minted). With no ledger wired there is nothing to
+        // distribute — reward accounting requires the pool.
+        if let Some(ledger) = &ledger {
+            let total_reward = self.collect_block_reward(ledger.as_ref());
+            self.distribute_rewards(total_reward);
+        }
     }
 
     fn state_root(&self) -> Hash {
@@ -775,6 +894,27 @@ impl StakingModule {
             self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut delegations =
             self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Reward accounting must settle on the *pre-mutation*
+        // position: the delegation earns rewards accrued while it
+        // existed, and the validator's self-share shrinks as
+        // `delegated_total` grows.
+        let current_delegation = delegations.get(&(delegator, validator)).copied().unwrap_or(0);
+        self.settle_delegation(delegator, validator, current_delegation);
+        {
+            let mut totals =
+                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stake_now = validators.get(&validator).copied().unwrap_or(0);
+            let self_share =
+                Self::self_share_of(stake_now, totals.get(&validator).copied().unwrap_or(0));
+            self.settle_self_share(validator, self_share);
+            *totals.entry(validator).or_insert(0) += amount;
+        }
+        self.delegator_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(delegator)
+            .or_default()
+            .insert(validator);
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("delegate: validator vanished".to_string()))?;
@@ -824,6 +964,19 @@ impl StakingModule {
         let new_delegation = *delegation;
         if new_delegation == 0 {
             delegations.remove(&(delegator, validator));
+            self.delegator_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&delegator)
+                .map(|set| set.remove(&validator));
+        }
+        if let Some(t) = self
+            .delegated_total
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&validator)
+        {
+            *t = t.saturating_sub(amount);
         }
         let stake = validators
             .get_mut(&validator)
@@ -864,10 +1017,31 @@ impl StakingModule {
                 "undelegate: insufficient delegation".to_string(),
             ));
         }
+        // Settle on the pre-mutation amounts: the full delegation
+        // earned rewards up to now; the validator's self-share grows
+        // as `delegated_total` shrinks.
+        let old_delegation = *delegation;
+        self.settle_delegation(delegator, validator, old_delegation);
+        {
+            let mut totals =
+                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stake_now = validators.get(&validator).copied().unwrap_or(0);
+            let self_share =
+                Self::self_share_of(stake_now, totals.get(&validator).copied().unwrap_or(0));
+            self.settle_self_share(validator, self_share);
+            if let Some(t) = totals.get_mut(&validator) {
+                *t = t.saturating_sub(amount);
+            }
+        }
         *delegation -= amount;
         let new_delegation = *delegation;
         if new_delegation == 0 {
             delegations.remove(&(delegator, validator));
+            self.delegator_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&delegator)
+                .map(|set| set.remove(&validator));
         }
         let stake = validators
             .get_mut(&validator)
@@ -930,6 +1104,18 @@ impl StakingModule {
         *delegation = delegation
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("delegation overflow on undo".to_string()))?;
+        *self
+            .delegated_total
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(validator)
+            .or_insert(0) += amount;
+        self.delegator_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(delegator)
+            .or_default()
+            .insert(validator);
         self.store_delegation_state(validator, delegator, *stake, *delegation);
         Ok(())
     }
@@ -977,6 +1163,23 @@ impl StakingModule {
             .ok_or(ExecError::ModuleRejected("slash: validator not found".to_string()))?;
         let slash_amount = amount.min(*stake);
         let stake_before = *stake;
+
+        // Reward accounting settles on the pre-slash positions: every
+        // delegation earned its accrued share while it existed, and
+        // the self-share settles before it shrinks. (Slash must not
+        // confiscate already-earned rewards.)
+        {
+            let totals =
+                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let self_share =
+                Self::self_share_of(stake_before, totals.get(&validator).copied().unwrap_or(0));
+            drop(totals);
+            self.settle_self_share(validator, self_share);
+            for ((d, v), a) in delegations.range(..).filter(|((_, v), _)| *v == validator) {
+                self.settle_delegation(*d, *v, *a);
+            }
+        }
+
         *stake -= slash_amount;
         let new_stake = *stake;
 
@@ -1015,10 +1218,23 @@ impl StakingModule {
             for (d, a) in affected {
                 if a == 0 {
                     delegations.remove(&(d, validator));
+                    self.delegator_index
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_mut(&d)
+                        .map(|set| set.remove(&validator));
                 } else {
                     delegations.insert((d, validator), a);
                 }
                 self.store_delegation_state(validator, d, new_stake, a);
+            }
+            if let Some(t) = self
+                .delegated_total
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&validator)
+            {
+                *t = t.saturating_sub(applied);
             }
             burned_from_pool = applied;
         }
@@ -1047,9 +1263,11 @@ impl StakingModule {
     /// If `amount` is 0, all accumulated rewards are claimed.
     /// Otherwise, up to `amount` rewards are claimed.
     ///
-    /// The claimed amount is minted to the validator's account —
-    /// rewards are new issuance authorized by the block-reward
-    /// schedule, not a transfer out of the bonded pool.
+    /// The claimed amount is paid out of [`REWARD_POOL`] — the pool
+    /// `end_block` funds with swept fees + issuance — so a claim is
+    /// a transfer, never new minting at claim time. Validators claim
+    /// their self-share; delegators claim their share of every
+    /// delegation they hold.
     fn handle_claim_reward(
         &self,
         ctx: &TxContext,
@@ -1057,36 +1275,48 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        // Only the validator may withdraw their own rewards — the
-        // rewards ledger is a claimable balance, not a public pool.
-        // (Matches the key_change authorization model.)
+        // An account claims only its own rewards — the pending
+        // ledger is a claimable balance, not a public pool. (Matches
+        // the key_change authorization model.) The `validator` field
+        // is the *claimer* — delegators pass their own address.
         if ctx.sender != validator {
             return Err(ExecError::ModuleRejected(
-                "claim_reward: only the validator can claim its rewards".to_string(),
+                "claim_reward: only the account can claim its rewards".to_string(),
             ));
         }
         let ledger = self.require_ledger().map_err(|_| {
             ExecError::ModuleRejected("claim_reward: balance ledger not wired".to_string())
         })?;
 
+        // Lazy accrual: settle every position the claimer holds so
+        // `pending_rewards` reflects rewards through the last
+        // `end_block` — delegations via `reward_debt`, self-share
+        // via `self_debt`.
+        self.settle_all(validator);
+
         let claim_amount = {
-            let mut rewards =
-                self.rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let accumulated = rewards.get(&validator).copied().unwrap_or(0);
+            let mut pending =
+                self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let accumulated = pending.get(&validator).copied().unwrap_or(0);
             let claim_amount = if amount == 0 { accumulated } else { amount.min(accumulated) };
             if claim_amount == 0 {
                 return Err(ExecError::ModuleRejected(
                     "claim_reward: no rewards to claim".to_string(),
                 ));
             }
-            *rewards.entry(validator).or_insert(0) -= claim_amount;
+            *pending.entry(validator).or_insert(0) -= claim_amount;
             claim_amount
         };
 
-        // Rewards are new issuance authorized by the block-reward
-        // schedule — mint lazily at claim time so the bonded pool is
-        // never touched by reward payouts.
-        ledger.mint(&validator, claim_amount);
+        // Pay from the reward pool: pending_rewards only grows by
+        // what `end_block` funded into the pool, so the transfer
+        // cannot overdraw. Failure leaves `pending` decremented —
+        // acceptable because the pool-conservation invariant makes
+        // it unreachable; a poisoned ledger would have failed the
+        // block earlier.
+        ledger
+            .transfer(&REWARD_POOL, &validator, claim_amount)
+            .map_err(|_| ExecError::ModuleRejected("claim_reward: pool underfunded".to_string()))?;
 
         Ok(vec![Event { module: "staking", kind: "claim_reward", data: msg.to_vec() }])
     }
@@ -1287,33 +1517,176 @@ impl StakingModule {
         Ok(vec![Event { module: "staking", kind: "validator_remove", data: msg.to_vec() }])
     }
 
-    /// Distribute block rewards to active validators proportional
-    /// to their stake.
+    /// The validator's self-share: bonded stake not attributable to
+    /// any delegation record (genesis self-stake, validator-add
+    /// stake). Accrues rewards to the validator through `self_debt`.
     ///
-    /// Called at `end_block`. The block reward is split among all
-    /// active validators (stake > 0) proportional to their stake
-    /// fraction. Uses integer arithmetic to avoid floating-point
-    /// non-determinism.
-    ///
-    /// Any remainder (from integer division) is not distributed —
-    /// it stays in the "mint" (effectively burned). This is simpler
-    /// than tracking a fractional remainder and is deterministic.
-    fn distribute_rewards(&self) {
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let total_stake: u64 = validators.values().copied().filter(|&s| s > 0).sum();
-        if total_stake == 0 {
-            return; // no active validators — no distribution
-        }
+    /// Callers must hold `validators` and `delegated_total` (or pass
+    /// the values in) — lock order is `validators → delegated_total
+    /// → reward_per_token → reward_debt/self_debt → pending_rewards`.
+    fn self_share_of(stake: u64, delegated_total: u64) -> u64 {
+        stake.saturating_sub(delegated_total)
+    }
 
-        let mut rewards = self.rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (&addr, &stake) in validators.iter() {
-            if stake == 0 {
+    /// Settle one delegation position: move accrued rewards into
+    /// `pending_rewards[delegator]` and stamp the debt at the
+    /// current `reward_per_token`. Must run BEFORE the delegation
+    /// amount changes — the accrual is a function of the position
+    /// that existed while rewards were distributed.
+    ///
+    /// Lock order: callers may hold `validators`/`delegations`;
+    /// this only takes `reward_per_token`, `reward_debt`,
+    /// `pending_rewards` — always in that order.
+    fn settle_delegation(&self, delegator: Address, validator: Address, delegation: u64) {
+        let rpt = *self
+            .reward_per_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&validator)
+            .unwrap_or(&0);
+        let mut debts = self.reward_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let debt = debts.entry((delegator, validator)).or_insert(0);
+        if rpt > *debt && delegation > 0 {
+            let accrued = u128::from(delegation).saturating_mul(rpt - *debt) / RPT_SCALE;
+            if accrued > 0 {
+                let mut pending =
+                    self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let current = pending.get(&delegator).copied().unwrap_or(0);
+                pending.insert(
+                    delegator,
+                    current.saturating_add(u64::try_from(accrued).unwrap_or(u64::MAX)),
+                );
+            }
+        }
+        *debt = rpt;
+    }
+
+    /// Settle a validator's self-share position into
+    /// `pending_rewards[validator]`. Same settle-before-mutate rule
+    /// as [`Self::settle_delegation`].
+    fn settle_self_share(&self, validator: Address, self_share: u64) {
+        let rpt = *self
+            .reward_per_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&validator)
+            .unwrap_or(&0);
+        let mut debts = self.self_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let debt = debts.entry(validator).or_insert(0);
+        if rpt > *debt && self_share > 0 {
+            let accrued = u128::from(self_share).saturating_mul(rpt - *debt) / RPT_SCALE;
+            if accrued > 0 {
+                let mut pending =
+                    self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let current = pending.get(&validator).copied().unwrap_or(0);
+                pending.insert(
+                    validator,
+                    current.saturating_add(u64::try_from(accrued).unwrap_or(u64::MAX)),
+                );
+            }
+        }
+        *debt = rpt;
+    }
+
+    /// Settle every position an account holds — all delegations in
+    /// `delegator_index[account]` plus the self-share if the account
+    /// is a registered validator. Called by `claim_reward`.
+    fn settle_all(&self, account: Address) {
+        let delegator_vs: Vec<Address> = self
+            .delegator_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&account)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        let delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for v in delegator_vs {
+            let amount = delegations.get(&(account, v)).copied().unwrap_or(0);
+            self.settle_delegation(account, v, amount);
+        }
+        drop(delegations);
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(&stake) = validators.get(&account) {
+            let delegated =
+                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let self_share =
+                Self::self_share_of(stake, delegated.get(&account).copied().unwrap_or(0));
+            self.settle_self_share(account, self_share);
+        }
+    }
+
+    /// Sweep collected fees into [`REWARD_POOL`] and mint the block
+    /// issuance, returning the total reward for this block.
+    ///
+    /// The fee component is a *transfer* (real, pre-collected funds
+    /// in [`FEE_POOL`]); the issuance component is a *mint* (new
+    /// supply authorized by the reward schedule). Both land in the
+    /// reward pool so claims are always pool-funded — a claim can
+    /// never overdraw because `pending_rewards` only grows by the
+    /// same total distributed here (minus rounding dust, which is
+    /// unclaimable).
+    fn collect_block_reward(&self, ledger: &dyn Balances) -> u64 {
+        let fee_collected = ledger.balance(&FEE_POOL);
+        if fee_collected > 0 {
+            // The pool can only hold what was deposited — the
+            // transfer cannot fail; treat failure as zero collected
+            // (defensive: a partially-wired ledger must not halt the
+            // block).
+            let _ = ledger.transfer(&FEE_POOL, &REWARD_POOL, fee_collected);
+        }
+        if self.block_reward > 0 {
+            ledger.mint(&REWARD_POOL, self.block_reward);
+        }
+        fee_collected.saturating_add(self.block_reward)
+    }
+
+    /// Distribute `total_reward` to active validators proportional
+    /// to their stake, growing each validator's
+    /// `reward_per_token` accumulator.
+    ///
+    /// Called at `end_block` with the swept fees + issuance. The
+    /// accumulator divides the reward across *all* bonded stake of
+    /// the validator — delegations earn through `reward_debt`, the
+    /// self-share earns through `self_debt` — so delegators and the
+    /// validator's own bond share pro-rata with no commission
+    /// parameter (v1 policy; a commission field can be added to the
+    /// validator record later without changing the accounting).
+    ///
+    /// Validators pending removal stop earning — the removal
+    /// decision is the point at which they "stop receiving block
+    /// rewards" (module docs).
+    ///
+    /// Integer-division remainders are not distributed — they stay
+    /// in [`REWARD_POOL`] as unclaimable dust (deterministic
+    /// rounding burn).
+    fn distribute_rewards(&self, total_reward: u64) {
+        if total_reward == 0 {
+            return;
+        }
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_removes = self
+            .pending_validator_removes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let eligible: u64 = validators
+            .iter()
+            .filter(|(a, s)| **s > 0 && !pending_removes.contains(a))
+            .map(|(_, s)| *s)
+            .sum();
+        if eligible == 0 {
+            return;
+        }
+        let mut rpt =
+            self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (addr, stake) in validators.iter() {
+            if *stake == 0 || pending_removes.contains(addr) {
                 continue;
             }
-            // reward = block_reward * stake / total_stake
-            let reward = self.block_reward.saturating_mul(stake) / total_stake;
+            let reward = total_reward.saturating_mul(*stake) / eligible;
             if reward > 0 {
-                *rewards.entry(addr).or_insert(0) += reward;
+                *rpt.entry(*addr).or_insert(0) +=
+                    u128::from(reward).saturating_mul(RPT_SCALE).saturating_div(u128::from(*stake));
             }
         }
     }
@@ -1547,12 +1920,14 @@ mod tests {
         staking.handle(&ctx(), &msg::delegate(v2, 3000)).unwrap();
         staking.begin_block(Height::new(1));
         staking.end_block(Height::new(1));
-        // v1 has 25% of stake (1000/4000), v2 has 75% (3000/4000).
-        // reward = 1_000_000 * stake / total_stake
-        // v1: 1_000_000 * 1000 / 4000 = 250_000
-        // v2: 1_000_000 * 3000 / 4000 = 750_000
-        assert_eq!(staking.rewards(&v1), 250_000, "v1 gets 25% of reward");
-        assert_eq!(staking.rewards(&v2), 750_000, "v2 gets 75% of reward");
+        // addr(0) is the only delegator: 25% accrues through v1's
+        // reward-per-token and 75% through v2's — the delegator
+        // claimable total is the full block reward.
+        assert_eq!(staking.claimable(&addr(0)), 1_000_000, "delegator earns all positions");
+        // The validators hold no self-share — their entire stake is
+        // addr(0)'s delegation, so they accrue nothing directly.
+        assert_eq!(staking.claimable(&v1), 0, "validator self-share is zero");
+        assert_eq!(staking.claimable(&v2), 0, "validator self-share is zero");
     }
 
     #[test]
@@ -1564,7 +1939,85 @@ mod tests {
         staking.end_block(Height::new(1));
         staking.begin_block(Height::new(2));
         staking.end_block(Height::new(2));
-        assert_eq!(staking.rewards(&v), 2_000_000, "2 blocks * 1M reward");
+        assert_eq!(staking.claimable(&addr(0)), 2_000_000, "2 blocks * 1M reward");
+    }
+
+    #[test]
+    fn rewards_split_between_delegator_and_self_share() {
+        // Validator v1 has 4000 genesis self-stake (no delegation
+        // record); delegator d bonds 4000 to it. The 1M block
+        // reward splits pro-rata: half to the validator's
+        // self-share, half to the delegator.
+        let staking = setup(&[]).with_block_reward(1_000_000);
+        staking.genesis_register_validator(addr(1), 4_000);
+        let d = addr(0);
+        staking.handle(&ctx_with_sender(0), &msg::delegate(addr(1), 4_000)).unwrap();
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        assert_eq!(staking.claimable(&d), 500_000, "delegator gets half");
+        assert_eq!(staking.claimable(&addr(1)), 500_000, "self-share gets half");
+    }
+
+    #[test]
+    fn rewards_do_not_accrue_retroactively_to_new_delegator() {
+        // A delegation made after rewards accrued starts at the
+        // current reward-per-token — it cannot claim past rewards.
+        let staking = setup(&[1]).with_block_reward(1_000_000);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        // addr(2) delegates at block 2 — it must not share block 1's
+        // reward.
+        staking.handle(&ctx_with_sender(2), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(2));
+        staking.end_block(Height::new(2));
+        assert_eq!(staking.claimable(&addr(0)), 1_500_000, "early delegator: b1 full + b2 half");
+        assert_eq!(staking.claimable(&addr(2)), 500_000, "late delegator: b2 half only");
+    }
+
+    #[test]
+    fn fees_collected_in_fee_pool_distribute_to_delegators() {
+        // The fee sweep is the "distribution" half of #18: whatever
+        // landed in FEE_POOL during the block is added to the
+        // issuance and distributed pro-rata.
+        let (staking, ledger) = setup_with_ledger(&[1]);
+        let staking = staking.with_block_reward(0);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        // Simulate the executor's charge_fee path: 3 txs x 700 fee
+        // collected into FEE_POOL.
+        ledger.mint(&FEE_POOL, 2_100);
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        assert_eq!(ledger.balance(&FEE_POOL), 0, "fee pool swept");
+        assert_eq!(ledger.balance(&REWARD_POOL), 2_100);
+        assert_eq!(staking.claimable(&addr(0)), 2_100, "fees distributed pro-rata");
+    }
+
+    #[test]
+    fn claim_pays_delegator_from_reward_pool() {
+        // Conservation: a claim transfers real funds out of
+        // REWARD_POOL — no minting at claim time.
+        let (staking, ledger) = setup_with_ledger(&[1]);
+        let staking = staking.with_block_reward(1_000);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let delegator_before = ledger.balance(&addr(0));
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        let pool_funded = ledger.balance(&REWARD_POOL);
+        staking.handle(&ctx(), &msg::claim_reward(addr(0), 0)).unwrap();
+        assert_eq!(
+            ledger.balance(&addr(0)),
+            delegator_before + 1_000,
+            "claim pays real funds to the delegator"
+        );
+        assert_eq!(
+            ledger.balance(&REWARD_POOL),
+            pool_funded - 1_000,
+            "pool decremented by exactly the claim"
+        );
     }
 
     #[test]
@@ -1574,9 +2027,9 @@ mod tests {
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.begin_block(Height::new(1));
         staking.end_block(Height::new(1));
-        assert_eq!(staking.rewards(&v), 1_000_000);
+        assert_eq!(staking.claimable(&v), 1_000_000);
         staking.handle(&ctx(), &msg::claim_reward(v, 0)).unwrap();
-        assert_eq!(staking.rewards(&v), 0, "rewards claimed");
+        assert_eq!(staking.claimable(&v), 0, "rewards claimed");
     }
 
     #[test]
@@ -1587,7 +2040,7 @@ mod tests {
         staking.begin_block(Height::new(1));
         staking.end_block(Height::new(1));
         staking.handle(&ctx(), &msg::claim_reward(v, 400_000)).unwrap();
-        assert_eq!(staking.rewards(&v), 600_000, "600K remaining");
+        assert_eq!(staking.claimable(&v), 600_000, "600K remaining");
     }
 
     #[test]

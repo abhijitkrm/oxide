@@ -466,6 +466,13 @@ pub struct EvmModule {
     /// never applied to committed execution (a wall clock cannot be
     /// a consensus input).
     sim_timeout: std::time::Duration,
+    /// Envelope-fee destination for `charge_fee`: `Some` → fees are
+    /// *collected* at this address (staking's `FEE_POOL` in
+    /// production wiring, swept into rewards at `end_block`);
+    /// `None` → fees burn (Ethereum base-fee semantics). Set at
+    /// construction via [`Self::with_fee_recipient`] — a fixed
+    /// chain parameter, not per-block state.
+    fee_recipient: Option<primitives::Address>,
     /// Per-account storage root cache. Updated incrementally in
     /// `state_root` — only touched accounts have their storage
     /// roots recomputed; the rest are reused from the cache.
@@ -586,6 +593,7 @@ impl EvmModule {
             block_timestamp: Mutex::new(0),
             block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
             sim_timeout: DEFAULT_SIM_TIMEOUT,
+            fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -616,6 +624,7 @@ impl EvmModule {
             block_timestamp: Mutex::new(0),
             block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
             sim_timeout: DEFAULT_SIM_TIMEOUT,
+            fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -673,6 +682,7 @@ impl EvmModule {
             block_timestamp: Mutex::new(0),
             block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
             sim_timeout: DEFAULT_SIM_TIMEOUT,
+            fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
             storage_root_cache: Mutex::new(std::collections::HashMap::new()),
             trie_leaves: Mutex::new(std::collections::BTreeMap::new()),
@@ -729,6 +739,18 @@ impl EvmModule {
     /// Panics if the mutex is poisoned.
     pub fn set_staking(&self, staking: Arc<staking::StakingModule>) {
         *self.staking.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(staking);
+    }
+
+    /// Set the envelope-fee recipient: every `charge_fee` transfers
+    /// `sender → recipient` instead of burning. Production wiring
+    /// passes `staking::FEE_POOL`, whose balance `end_block` sweeps
+    /// into validator/delegator rewards — the distribution half of
+    /// the fee policy. `None` (the default) keeps Ethereum-style
+    /// fee burning.
+    #[must_use]
+    pub fn with_fee_recipient(mut self, recipient: primitives::Address) -> Self {
+        self.fee_recipient = Some(recipient);
+        self
     }
 
     /// Build a `NativeMarketReader` from the wired exchange and
@@ -3345,19 +3367,28 @@ impl Module for EvmModule {
         true
     }
 
-    /// Charge the envelope fee from the sender's EVM balance — the
-    /// fee is **burned** (debited, credited to nobody), matching
-    /// Ethereum's base-fee semantics. `ctx.fee` is in `u64` base
-    /// units; [`Balances::debit`] converts to wei at
-    /// [`WEI_PER_UNIT`](framework::WEI_PER_UNIT). Zero-fee txs skip
-    /// the ledger touch entirely (fresh senders with `fee = 0`
-    /// succeed without an account record — same admission behavior
-    /// the old bank fee module had).
+    /// Charge the envelope fee from the sender's EVM balance. When
+    /// the node configured a `fee_recipient` (the staking module's
+    /// `FEE_POOL` in production wiring) the fee is *collected* —
+    /// transferred to the pool for `end_block` distribution to
+    /// validators and delegators. Without a recipient the fee is
+    /// **burned** (debited, credited to nobody), matching
+    /// Ethereum's base-fee semantics — the operator's policy choice.
+    ///
+    /// `ctx.fee` is in `u64` base units; the `Balances` impl
+    /// converts to wei at [`WEI_PER_UNIT`](framework::WEI_PER_UNIT).
+    /// Zero-fee txs skip the ledger touch entirely (fresh senders
+    /// with `fee = 0` succeed without an account record — same
+    /// admission behavior the old bank fee module had).
     fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
         if ctx.fee == 0 {
             return Ok(());
         }
-        self.debit(&ctx.sender, ctx.fee)
+        if let Some(recipient) = self.fee_recipient {
+            self.transfer(&ctx.sender, &recipient, ctx.fee)
+        } else {
+            self.debit(&ctx.sender, ctx.fee)
+        }
     }
 
     /// The EVM is self-authenticating: the sender is recovered from
@@ -7301,6 +7332,37 @@ mod tests {
     fn evm_module_pays_own_fee() {
         let m = make_module();
         assert!(m.pays_own_fee());
+    }
+
+    /// `charge_fee` collects the envelope fee into the configured
+    /// recipient (staking's `FEE_POOL` in production wiring) when
+    /// one is set — the collection half of the distribution loop.
+    /// Without a recipient the fee burns: sender debited, nobody
+    /// credited (Ethereum base-fee semantics).
+    #[test]
+    fn charge_fee_collects_or_burns() {
+        use framework::Balances;
+        let sender = primitives::Address([0xAA; 20]);
+        let pool = primitives::Address(*b"oxide/staking/fee!!!");
+
+        // Recipient wired → transfer: sender −fee, pool +fee.
+        let m = make_module().with_fee_recipient(pool);
+        m.fund_account_for_test(&sender, u128::from(1_000u64) * framework::WEI_PER_UNIT);
+        let ctx = TxContext { sender: primitives::Address([0xAA; 20]), nonce: 0, fee: 5 };
+        m.charge_fee(&ctx).unwrap();
+        assert_eq!(Balances::balance(&m, &pool), 5, "pool must collect the fee");
+        assert_eq!(Balances::balance(&m, &sender), 995, "sender loses the fee");
+
+        // No recipient → burn: sender −fee, total supply shrinks.
+        let m = make_module();
+        m.fund_account_for_test(&sender, u128::from(1_000u64) * framework::WEI_PER_UNIT);
+        m.charge_fee(&ctx).unwrap();
+        assert_eq!(Balances::balance(&m, &sender), 995);
+        assert_eq!(Balances::balance(&m, &pool), 0, "nothing collects the burn");
+
+        // Zero fee → no ledger touch (fresh-sender admission).
+        let ctx0 = TxContext { fee: 0, ..ctx };
+        m.charge_fee(&ctx0).unwrap();
     }
 
     // ───────────────────────────────────────────────────────────

@@ -869,7 +869,10 @@ fn build_devnet_executor(
     // module settles through, so it must exist before staking wires
     // its `Balances` handle. Uses the RPC-config chain ID/base fee
     // so the advertised and enforced parameters agree.
-    let evm_module = Arc::new(evm::EvmModule::new(rpc_config.chain_id, rpc_config.base_fee));
+    let evm_module = Arc::new(
+        evm::EvmModule::new(rpc_config.chain_id, rpc_config.base_fee)
+            .with_fee_recipient(staking::FEE_POOL),
+    );
     // Canonical preinstalls first — a user `alloc` entry below can
     // still intentionally override a preinstall address.
     evm_module.install_preinstalls();

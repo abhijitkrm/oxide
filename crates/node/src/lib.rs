@@ -231,9 +231,12 @@ impl Node {
                 Some(path) => Box::new(storage::RedbBackend::open(path).expect("redb backend")),
                 None => Box::new(storage::Volatile::new()),
             };
-            Arc::new(evm::EvmModule::with_storage(1, 7_000_000_000, backend))
+            Arc::new(
+                evm::EvmModule::with_storage(1, 7_000_000_000, backend)
+                    .with_fee_recipient(staking::FEE_POOL),
+            )
         } else {
-            Arc::new(evm::EvmModule::new(1, 7_000_000_000))
+            Arc::new(evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL))
         };
         evm_module.fund_account_for_test(&primitives::Address([0u8; 20]), u128::MAX);
         // Canonical preinstalls (CREATE2 factory, Multicall3, Permit2,

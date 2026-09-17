@@ -136,7 +136,9 @@ impl MultiNodeDevnet {
             // M4: mint to a range of sender addresses ([0u8; 20]
             // through [31u8; 20]) so the multi-sender throughput
             // test can use distinct senders.
-            let evm = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+            let evm = Arc::new(
+                evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL),
+            );
             for sender_byte in 0u8..32 {
                 framework::Balances::mint(
                     evm.as_ref(),

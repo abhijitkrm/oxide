@@ -58,6 +58,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     shows is the same balance your staking bond, exchange fills,
     and perps margin actually use — and it turned out to be
     faster, too.
+- **Validator rewards and fee distribution** (`modules/staking`,
+  `modules/evm`, `crates/node`, `crates/devnet`, `bin/*`)
+  - Transaction fees are now *collected*, not burned: the executor
+    charges each envelope fee into staking's `FEE_POOL` address
+    (wired via `EvmModule::with_fee_recipient`). Nodes that prefer
+    Ethereum-style fee burning simply don't set a recipient.
+  - At every block's end the pool is swept into `REWARD_POOL`
+    together with fixed per-block issuance, and the total is
+    distributed to validators proportional to bonded stake through
+    a reward-per-token accumulator — the same accounting model
+    Cosmos `x/distribution` uses, so work stays O(validators) per
+    block and O(1) per delegation change.
+  - Delegators earn too: each delegation accrues its pro-rata
+    share lazily and `claim_reward` pays the claimer's own pending
+    balance out of `REWARD_POOL` — validators claim their
+    self-bonded share, delegators claim across every delegation
+    they hold. Rewards already earned stay claimable after
+    undelegating or being slashed.
+  - **In plain words:** staking finally pays. Fees people pay to
+    send transactions plus a fixed block reward flow into a pool
+    each block and are split between validators and the people who
+    delegated to them, proportional to stake. Anyone who staked —
+    not just validator operators — can withdraw exactly what their
+    position earned, whenever they want.
 
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,

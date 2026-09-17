@@ -13544,3 +13544,92 @@ replaced.
   AGENTS.md structure map.
 - Gates: `fmt --check` clean; `clippy --workspace --all-targets
   -D warnings` clean; workspace tests green.
+
+## 2026-10-07 — Session: P3 #18 — distribution: fee collection + reward-per-token accrual
+
+### What
+
+- **`staking::FEE_POOL`** — fixed ledger address collecting envelope
+  fees. `EvmModule::with_fee_recipient(FEE_POOL)` converts
+  `charge_fee` from *burn* to *transfer*; every production wiring
+  (node, validator, both devnets) sets it. `None` keeps
+  Ethereum-style burning — an operator policy, not a hardcoded
+  supply decision.
+- **`staking::REWARD_POOL`** — the claim-side pool. Staking's
+  `end_block` sweeps the `FEE_POOL` balance (real, pre-collected
+  fees) and mints `block_reward` issuance into it, then distributes
+  the total via the accumulator below. Claims transfer
+  `REWARD_POOL → claimer` — never mint-at-claim — so a claim can
+  never overdraw what `end_block` funded (minus integer-division
+  dust, which is unclaimable by construction).
+- **Reward-per-token accumulator** replaces the old
+  per-block `rewards[v] += share` map: `reward_per_token[v]` is a
+  cumulative `u128` (`RPT_SCALE`-fixed-point) per bonded unit.
+  Delegations snapshot `reward_debt`; the validator's self-share
+  (`stake − delegated_total`) snapshots `self_debt`. Settling a
+  position pays `stake × (rpt − debt)` into `pending_rewards`.
+- **Lazy settlement** at every mutation boundary: `delegate_for`,
+  `undelegate_for`, `handle_slash`, and `claim_reward` settle the
+  affected positions *before* amounts change. `settle_all` walks a
+  claimer's `delegator_index` — O(positions held), never a scan of
+  all delegations. Earned rewards survive stake changes: a
+  delegator who exits keeps `pending_rewards` claimable.
+- **Claims are account-owned**: `claim_reward` requires
+  `ctx.sender == claimer` and pays the claimer's own positions —
+  delegators and validators use the same message.
+
+### Why
+
+- The old model burned fees and credited rewards to *validators*
+  only — delegators earned nothing and the reward map grew O(V)/block
+  with no bound on who could claim what. The accumulator model is
+  the Synthetix/Cosmos `x/distribution` design: O(validators) work
+  per block, O(1) per delegation op, exact integer accounting.
+- Fee *collection* (vs burn) only matters if the fees reach
+  stakers — wiring the pool through `end_block` keeps reward
+  conservation provable: `pending_rewards` can never exceed what
+  the pool was funded with.
+- `reward_per_token` is `u128` scaled by `RPT_SCALE` (2⁶⁴): at
+  10⁹ wei-scale stakes and block rewards the per-unit accumulator
+  never loses sub-unit rewards to integer division, so small
+  delegators aren't systematically starved.
+
+### Decisions & dead ends
+
+- **Fees burned vs collected**: kept as a wiring choice
+  (`Option<Address>`), not a genesis knob — changing it is a chain
+  parameter decision, and an `Option` makes "burn" the honest
+  default rather than a sentinel address.
+- **Reward debt on delegation *records*, not accounts**: two
+  delegations to the same validator by one account still settle
+  independently; `delegator_index` exists so `settle_all` finds
+  them without scanning `delegations`.
+- **Slash ordering**: `handle_slash` settles positions before
+  shrinking them — otherwise the post-slash rpt delta would pay
+  rewards on stake that was just destroyed.
+- **Undo paths**: `undo_delegate`/`undo_undelegate` reverse the
+  bookkeeping (amounts, `delegated_total`, index) but *not* the
+  settled rewards — earned rewards stay earned; the undo only
+  rewinds the position mutation.
+
+### Workspace state
+
+- Staking: `reward_per_token`/`reward_debt`/`self_debt`/
+  `delegated_total`/`delegator_index`/`pending_rewards` fields;
+  `collect_block_reward` + `distribute_rewards` +
+  `settle_delegation`/`settle_self_share`/`settle_all`;
+  `claimable()` read API; 35 tests green.
+- EVM: `fee_recipient` field, `with_fee_recipient` builder,
+  `charge_fee` collect-or-burn; `charge_fee_collects_or_burns`
+  test.
+- Wiring: `with_fee_recipient(staking::FEE_POOL)` at
+  `node::assemble`, validator `build_devnet_executor`,
+  `devnet::{multinode,tcp_multinode}`.
+- Gates: touched-crate tests green; `clippy -D warnings` clean;
+  `fmt` applied.
+
+### Next
+
+- #19 slashing+evidence — double-sign evidence msg (verify two
+  conflicting BLS votes), jail, downtime tracking via
+  `FinalizedBlock` absent validators.
