@@ -1,24 +1,24 @@
-//! Trading TPS test — exchange order matching + bank settlement
+//! Trading TPS test — exchange order matching + ledger settlement
 //! through the full oxideBFT consensus pipeline.
 //!
 //! This is the honest trading TPS number: it includes consensus
 //! overhead (propose, vote, QC formation, QC broadcast over TCP),
 //! network I/O, execution (exchange module dispatch, matching,
-//! bank transfer settlement), and state root computation.
+//! ledger transfer settlement), and state root computation.
 //!
 //! # What this measures
 //!
 //! Each round submits `txs_per_round` exchange place-order txs to the
 //! leader's mempool. Half are maker sells (resting), half are taker
 //! buys (matching the makers). Each maker+taker pair produces one
-//! fill + one bank transfer (debit buyer, credit seller). The test
+//! fill + one ledger transfer (debit buyer, credit seller). The test
 //! verifies:
 //!
 //! - All txs are finalized (no txs dropped).
 //! - All validators agree on the same blocks (same heights, same txs).
 //! - All validators' exchange modules have the same resting count.
-//! - All validators' bank balances are consistent (buyer debited,
-//!   seller credited by the same amount).
+//! - All validators' ledger balances are consistent (buyer debited,
+//!   seller credited by the same amount on the EVM account store).
 //!
 //! # Running
 //!
@@ -114,7 +114,7 @@ fn make_taker_buy_tx(sender_byte: u8, nonce: u64) -> types::TxBytes {
 /// - All validators finalized the same blocks.
 /// - All txs were finalized.
 /// - All validators' exchange modules have consistent resting counts.
-/// - All validators' bank balances are consistent.
+/// - All validators' ledger balances are consistent.
 #[allow(clippy::too_many_lines)]
 fn run_trading_tps(
     n_validators: usize,

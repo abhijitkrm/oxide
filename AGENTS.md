@@ -51,8 +51,10 @@ nightly adds fuzz and long simulations.
   `trading` (matching engine), `executor`, `ports` (the
   plug-and-play seams + conformance suites).
 - `modules/` — Cosmos-SDK-style module framework (`framework/`) and chain
-  modules (`core`, `bank`, `staking`, `evm`, `exchange`, `perps`, `oracle`,
-  `governance`).
+  modules (`core`, `staking`, `evm`, `exchange`, `perps`, `oracle`,
+  `governance`). The `evm` account store is the chain's single
+  native-token ledger (no bank module); native modules settle through
+  `framework::Balances`.
 - `bin/` — node binaries and tooling (`oxide-validator`, `oxide-fullnode`,
   `oxide-spammer`, `oxide-deploy`, `oxide-bench`).
 - `sim/`, `fuzz/` — deterministic swarm simulations (`oxide-sim` crate, echo sim now; Phase 4 adds byzantine strategies); cargo-fuzz targets.

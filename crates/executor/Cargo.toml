@@ -25,8 +25,13 @@ storage = { workspace = true }
 [dev-dependencies]
 consensus = { workspace = true }
 criterion = "0.7.0"
-bank = { workspace = true }
 framework = { workspace = true }
+# Integration tests + benches register the real modules (staking
+# settles through the EVM ledger — the single native-token store).
+# Dev-dep cycles: `evm`/`staking` depend on `executor`; cargo builds
+# the extern crates against the published lib, so no cycle forms.
+evm = { workspace = true }
+staking = { workspace = true }
 
 [[bench]]
 name = "uniswap_transfer"

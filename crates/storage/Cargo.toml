@@ -67,8 +67,10 @@ codec = { workspace = true }
 types = { workspace = true }
 framework = { workspace = true }
 oxide-core = { workspace = true }
-bank = { workspace = true }
 staking = { workspace = true }
+# The EVM module supplies the ledger (account store) the staking
+# module settles through — there is no bank module.
+evm = { workspace = true }
 ports = { workspace = true }
 tempfile = "3.27.0"
 

@@ -2,7 +2,7 @@
 //! module registration, and node lifecycle.
 //!
 //! This crate is the **production** node assembly path. It wires the
-//! executor (with all registered modules: core, bank, staking, EVM)
+//! executor (with all registered modules: core, staking, EVM)
 //! behind the selected consensus engine (`Sequencer` or `oxideBFT`).
 //! The `oxide-validator` and `oxide-fullnode` binaries call
 //! [`Node::assemble`] to build their stack.
@@ -147,7 +147,7 @@ impl Default for NodeConfig {
 /// A fully assembled Oxide node: consensus engine + app (executor).
 ///
 /// The engine drives the app through the [`AppInterface`] boundary.
-/// The app is the executor with registered modules (core, bank,
+/// The app is the executor with registered modules (core,
 /// staking, EVM).
 ///
 /// Created via [`Node::assemble`]. The node is ready to accept
@@ -174,18 +174,20 @@ pub struct Node {
 impl Node {
     /// Assemble a node from config.
     ///
-    /// Registers the core, bank, staking, and EVM modules on the
+    /// Registers the core, staking, and EVM modules on the
     /// executor, then wires the executor behind the selected
     /// consensus engine.
     ///
     /// # Modules registered
     ///
     /// - [`CoreModule`](oxide_core::CoreModule) — block height, timestamps.
-    /// - [`BankModule`](bank::BankModule) — native token transfers. Genesis-mints
-    ///   1T to `[0u8; 20]` so bank transfers can debit.
     /// - [`StakingModule`](staking::StakingModule) — validator staking.
     /// - [`EvmModule`](evm::EvmModule) — `revm`-based EVM. Base fee 7 gwei.
-    ///   Funds `[0u8; 20]` with `u128::MAX` for test/devnet use.
+    ///   Funds `[0u8; 20]` with `u128::MAX` for test/devnet use. The
+    ///   EVM account store is also the chain's **single balance
+    ///   ledger**: envelope fees, staking bonds, exchange settlement,
+    ///   and perps margin all debit/credit the same accounts EVM
+    ///   transactions move (there is no separate bank ledger).
     ///
     /// # Panics
     ///
@@ -211,71 +213,10 @@ impl Node {
         // execution of block h-1 with consensus for block h.
         executor.enable_async_execution();
         executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-        // Genesis-mint to the sender address so bank transfers can
-        // debit (C2 fix: the bank now debits the sender). The bank is
-        // shared with the exchange module for cross-module settlement
-        // (plan.md §9.2): fills debit the buyer and credit the seller.
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&primitives::Address([0u8; 20]), 1_000_000_000_000);
-        executor.register_module(bank.clone());
-        // The bank is the fee collector: every native-module tx is
-        // charged `ctx.fee` through it before execution. Without
-        // this, only bank txs paid fees — exchange/perps/core txs
-        // ran free.
-        executor.set_fee_module(framework::module_id::BANK);
-        // Staking is bank-backed: delegation debits the delegator
-        // into the bonded pool, unbonding refunds from it. Register
-        // the devnet sender/validator identity so self-delegation
-        // (e.g. the key-change keep-alive delegate) has a registered
-        // target.
-        let staking_module = staking::StakingModule::new();
-        staking_module.set_bank(bank.clone());
-        staking_module.register_validator(primitives::Address([0u8; 20]));
-        executor.register_module(Arc::new(staking_module));
-        // Register the exchange module with a default spot market
-        // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
-        // exchange is wired to the bank for quote-currency settlement.
-        let mut exchange_mod = exchange::ExchangeModule::with_bank(bank.clone());
-        if let Some(operator) = config.settlement_operator {
-            exchange_mod.set_settlement_operator(operator);
-        }
-        let exchange = Arc::new(exchange_mod);
-        exchange
-            .list_market(trading::MarketConfig {
-                market_id: 0,
-                tick_size: 1_000_000,
-                lot_size: 1_000,
-                min_price: 1_000_000_000,
-                max_price: 2_000_000_000,
-                max_resting: 64,
-            })
-            .expect("default market config is valid");
-        executor.register_module(exchange.clone());
-        // Register the perps module with a default perpetual market
-        // (10x max leverage, 0.5% maintenance margin). The perps
-        // module is wired to the bank for margin deposits/withdrawals
-        // (plan.md §9.3).
-        let perps = Arc::new(perps::PerpsModule::with_bank(bank.clone()));
-        perps
-            .list_market(perps::PerpsMarketConfig {
-                base: trading::MarketConfig {
-                    market_id: 0,
-                    tick_size: 1_000_000,
-                    lot_size: 1_000,
-                    min_price: 1_000_000_000,
-                    max_price: 2_000_000_000,
-                    max_resting: 64,
-                },
-                max_leverage: 10,
-                mmr_base_bps: 50,
-            })
-            .expect("default perps market config is valid");
-        executor.register_module(perps.clone());
-        // Register the EVM module and fund the default sender so EVM
-        // transactions can debit gas and value. The base fee is 7 gwei;
-        // the gas price in the workload generator is 10 gwei. Wire the
-        // exchange and perps modules into the EVM for read-only
-        // precompiles (plan.md §10).
+
+        // The EVM module is built FIRST: it is the chain's balance
+        // ledger, so staking/exchange/perps take its `Arc` for
+        // settlement and it is the executor's fee module.
         //
         // Persistence: when `evm_persistence` is enabled (the
         // default), the EVM module is created with a storage backend
@@ -299,6 +240,60 @@ impl Node {
         // singleton factories) — Foundry/Hardhat/Safe tooling assumes
         // they exist at fixed addresses on every EVM chain.
         evm_module.install_preinstalls();
+        // The EVM account store is the fee collector: every
+        // native-module tx is charged `ctx.fee` (base units → wei)
+        // from the sender's EVM balance before execution.
+        executor.set_fee_module(framework::module_id::EVM);
+        // Staking is EVM-ledger-backed: delegation debits the
+        // delegator into the bonded pool, unbonding refunds from it.
+        // Register the devnet sender/validator identity so
+        // self-delegation (e.g. the key-change keep-alive delegate)
+        // has a registered target.
+        let staking_module = staking::StakingModule::new();
+        staking_module.set_ledger(evm_module.clone());
+        staking_module.register_validator(primitives::Address([0u8; 20]));
+        executor.register_module(Arc::new(staking_module));
+        // Register the exchange module with a default spot market
+        // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
+        // exchange settles fills against EVM balances (plan.md §9.2).
+        let mut exchange_mod = exchange::ExchangeModule::with_ledger(evm_module.clone());
+        if let Some(operator) = config.settlement_operator {
+            exchange_mod.set_settlement_operator(operator);
+        }
+        let exchange = Arc::new(exchange_mod);
+        exchange
+            .list_market(trading::MarketConfig {
+                market_id: 0,
+                tick_size: 1_000_000,
+                lot_size: 1_000,
+                min_price: 1_000_000_000,
+                max_price: 2_000_000_000,
+                max_resting: 64,
+            })
+            .expect("default market config is valid");
+        executor.register_module(exchange.clone());
+        // Register the perps module with a default perpetual market
+        // (10x max leverage, 0.5% maintenance margin). The perps
+        // module settles margin deposits/withdrawals against EVM
+        // balances (plan.md §9.3).
+        let perps = Arc::new(perps::PerpsModule::with_ledger(evm_module.clone()));
+        perps
+            .list_market(perps::PerpsMarketConfig {
+                base: trading::MarketConfig {
+                    market_id: 0,
+                    tick_size: 1_000_000,
+                    lot_size: 1_000,
+                    min_price: 1_000_000_000,
+                    max_price: 2_000_000_000,
+                    max_resting: 64,
+                },
+                max_leverage: 10,
+                mmr_base_bps: 50,
+            })
+            .expect("default perps market config is valid");
+        executor.register_module(perps.clone());
+        // Wire the exchange and perps modules into the EVM for
+        // read-only precompiles (plan.md §10), then register the EVM.
         evm_module.set_native_modules(Some(exchange), Some(perps));
         executor.register_module(evm_module.clone());
         let app: Arc<Executor> = Arc::new(executor);
@@ -491,10 +486,11 @@ pub fn run_node_smoke_test() {
     let config = NodeConfig::default();
     let mut node = Node::assemble(&config);
 
-    // Submit a bank transfer tx.
-    let to = Address([2u8; 20]);
-    let module_payload = bank::msg::transfer(to, 100);
-    let tx = build_tx(framework::module_id::BANK, &module_payload);
+    // Submit a staking delegate tx — sender [0u8;20] is a
+    // registered validator and is genesis-funded on the EVM ledger.
+    let validator = Address([0u8; 20]);
+    let module_payload = staking::msg::delegate(validator, 100);
+    let tx = build_tx(framework::module_id::STAKING, &module_payload);
     node.engine().submit_tx(tx);
     node.metrics().incr_counter("txs_submitted", 1);
     node.engine().run_until_idle();
@@ -507,7 +503,7 @@ pub fn run_node_smoke_test() {
         node.metrics().set_gauge("finalized_height", i64::try_from(h.value()).unwrap_or(i64::MAX));
     }
 
-    // Verify the bank module processed the transfer.
+    // Verify the state transition executed.
     let balance = node.app().attest_state(primitives::Height::new(0));
     assert_ne!(balance.root, primitives::Hash::ZERO, "state root should be non-zero");
 
@@ -655,9 +651,8 @@ mod tests {
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
         assert!(node.engine().finalized_height().is_some(), "block finalized");
@@ -695,9 +690,8 @@ mod tests {
         };
         let mut node_src = Node::assemble(&config_src);
         // Submit a tx and finalize a block to produce EVM state.
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node_src.engine().submit_tx(tx);
         node_src.engine().run_until_idle();
         assert!(node_src.engine().finalized_height().is_some());
@@ -734,7 +728,7 @@ mod tests {
         );
 
         // Verify the EVM module's state root matches — this proves
-        // the full KV state was transferred. Other modules (bank,
+        // the full KV state was transferred. Other modules (core,
         // staking) don't have StorageBackends yet, so their state
         // remains at genesis; the aggregate root won't match until
         // all modules support export_state/import_state.
@@ -770,9 +764,8 @@ mod tests {
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
         assert!(node.engine().finalized_height().is_some(), "block finalized");
@@ -817,9 +810,8 @@ mod tests {
         let config = NodeConfig::default();
         let mut node = Node::assemble(&config);
         // Finalize a block to get a real snapshot.
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
 
@@ -842,9 +834,8 @@ mod tests {
         use crypto::hash::{Domain, Hasher};
         let config = NodeConfig::default();
         let mut node = Node::assemble(&config);
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
 
@@ -889,9 +880,8 @@ mod tests {
         };
         let mut node = Node::assemble(&config);
         // Finalize one block.
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
         let snapshot = node.export_snapshot();
@@ -907,9 +897,8 @@ mod tests {
             "executor height must match snapshot"
         );
         // Submit another tx and finalize — should produce a new block.
-        let to2 = Address([3u8; 20]);
-        let module_payload2 = bank::msg::transfer(to2, 50);
-        let tx2 = build_tx(framework::module_id::BANK, &module_payload2);
+        let module_payload2 = staking::msg::delegate(Address([0u8; 20]), 50);
+        let tx2 = build_tx(framework::module_id::STAKING, &module_payload2);
         node2.engine().submit_tx(tx2);
         node2.engine().run_until_idle();
         // The executor's height should have advanced.
@@ -936,9 +925,8 @@ mod tests {
         let mut node1 = Node::assemble(&config);
         let mut node2 = Node::assemble(&config);
         // Both finalize the same block.
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node1.engine().submit_tx(tx.clone());
         node2.engine().submit_tx(tx);
         node1.engine().run_until_idle();
@@ -978,9 +966,8 @@ mod tests {
         };
         let mut node = Node::assemble(&config);
         // Finalize a block.
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
 
@@ -1004,9 +991,8 @@ mod tests {
             require_signed_txs: false,
         };
         let mut node = Node::assemble(&config);
-        let to = Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
         let snapshot = node.export_snapshot();

@@ -62,7 +62,7 @@ Users / HFT ──gRPC/WS──▶ Gateway (sig verify, risk pre-check, rate lim
                     ┌──────────────────┬───────────────────────┐
                     │ NATIVE TRACK      │ EVM TRACK              │
                     │ module router:    │ revm host + optimistic │
-                    │ core / bank /     │ parallel execution     │
+                    │ core / staking /  │ parallel execution     │
                     │ staking /         │ (Block-STM-style OCC)  │
                     │ exchange / perps /│ native precompiles →   │
                     │ oracle / gov      │ trading core           │
@@ -145,8 +145,9 @@ oxide/
 │   ├── node/            # node assembly: config-driven wiring of all ports
 │   └── types/           # shared chain types (Tx, Header, QC, BlockRecord…)
 ├── modules/                   # Cosmos-SDK-style module framework + modules
-│   ├── framework/  core/  bank/  staking/
-│   ├── evm/        # revm host + native precompiles (the "x/vm" analog)
+│   ├── framework/  core/  staking/
+│   ├── evm/        # revm host + native precompiles; its account
+│   │               # store is also the chain's single native-token ledger
 │   └── exchange/  perps/  oracle/  governance/
 ├── bin/                       # oxide-validator, oxide-fullnode, oxide-spammer,
 │                              # oxide-deploy, oxide-bench
@@ -265,7 +266,9 @@ Phases 0–2 are complete, Phase 3 (trading core) is in progress. Here's what's 
 - **Broadcast**: erasure-coded dissemination + `PlainGossip` for tiny devnets.
 - **Mempool**: fee-priority pool, nonce queues, dedup.
 - **Executor**: sequential block executor with module router.
-- **Modules**: `core`, `bank`, `staking` (Cosmos-SDK-style framework).
+- **Modules**: `core`, `staking` (Cosmos-SDK-style framework); the EVM
+  account store doubles as the native-token ledger — there is no bank
+  module.
 - **Devnet tooling**: `oxide-deploy` (genesis generation), `oxide-validator`,
   `oxide-fullnode`, `oxide-spammer`.
 - **Deterministic replay**: bit-exact journal replay verified.
@@ -333,7 +336,7 @@ target. Remediation is in progress:
   (64 shards), 4 protocols (TCP, JSON-RPC, FIX, WebSocket).
   15.15M orders/s single-market, 11.68M orders/s across 128 markets.
 - **Exchange module** (`modules/exchange`): spot CLOB with
-  limit/market orders, settlement via bank module.
+  limit/market orders, settlement via the EVM account ledger.
 - **Perps module** (`modules/perps`): perpetuals with margin,
   funding, liquidations, insurance fund, ADL.
 - **EVM load test**: 100K EVM txs at 6,410 tx/s (4 validators),

@@ -34,7 +34,7 @@ secp256k1 = { workspace = true }
 sha3 = { workspace = true }
 # ed25519-dalek: Ed25519 signatures for native module authenticity
 # (Phase G). Pure Rust, constant-time. BSD-3-Clause. Used for
-# signing native (non-EVM) transactions: bank, staking, trading.
+# signing native (non-EVM) transactions: staking, exchange, perps.
 ed25519-dalek = { workspace = true }
 
 [lints]

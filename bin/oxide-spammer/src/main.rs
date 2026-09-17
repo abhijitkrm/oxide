@@ -6,15 +6,16 @@
 //!
 //! Usage: `oxide-spammer [--txs N] [--engine sequencer|oxideBFT] [--evm]`
 //!
-//! Default: 10,000 bank-transfer txs on the sequencer engine. The
+//! Default: 10,000 staking-delegate txs on the sequencer engine. The
 //! spammer builds a single-validator devnet in-process (no
 //! networking), submits txs to the mempool, runs the engine to
 //! finality, and reports txs/s.
 //!
 //! ## Modes
 //!
-//! - **Bank** (default): bank transfers from a genesis-funded sender
-//!   to a fixed recipient. Each tx increments the sender's nonce.
+//! - **Staking** (default): delegate txs bonding 1 unit to the
+//!   genesis validator from a funded sender. Each tx increments the
+//!   sender's nonce.
 //! - **EVM** (`--evm`): signed EVM transactions (transfers, deploys,
 //!   contract calls) from secp256k1-funded senders. Uses the
 //!   `devnet::evm_workload` generator to build a realistic tx mix.
@@ -44,7 +45,7 @@ fn main() {
         }
     }
 
-    let mode = if evm_mode { "evm" } else { "bank" };
+    let mode = if evm_mode { "evm" } else { "staking" };
     println!("oxide-spammer: engine = {}, mode = {}, txs = {txs}", engine.as_str(), mode);
 
     let config =
@@ -57,7 +58,7 @@ fn main() {
     if evm_mode {
         run_evm_load(&mut node, txs);
     } else {
-        run_bank_load(&mut node, txs);
+        run_staking_load(&mut node, txs);
     }
 
     let total_elapsed = start.elapsed();
@@ -84,19 +85,18 @@ fn main() {
     println!("oxide-spammer: load test complete");
 }
 
-/// Run bank-transfer load: submit `txs` bank transfers and run the
+/// Run staking-delegate load: submit `txs` delegates and run the
 /// engine to finality.
-fn run_bank_load(node: &mut Node, txs: usize) {
-    let to = primitives::Address([2u8; 20]);
-    let module_payload = bank::msg::transfer(to, 1);
+fn run_staking_load(node: &mut Node, txs: usize) {
+    let module_payload = staking::msg::delegate(primitives::Address::ZERO, 1);
     let submit_start = std::time::Instant::now();
     for i in 0..txs {
-        let tx = build_bank_tx(framework::module_id::BANK, &module_payload, i as u64);
+        let tx = build_staking_tx(framework::module_id::STAKING, &module_payload, i as u64);
         node.engine().submit_tx(tx);
     }
     let submit_elapsed = submit_start.elapsed();
     println!(
-        "oxide-spammer: submitted {txs} bank txs in {:.3}ms ({:.0} tx/s submit rate)",
+        "oxide-spammer: submitted {txs} txs in {:.3}ms ({:.0} tx/s submit rate)",
         submit_elapsed.as_secs_f64() * 1000.0,
         txs as f64 / submit_elapsed.as_secs_f64()
     );
@@ -185,8 +185,8 @@ fn run_evm_load(node: &mut Node, txs: usize) {
     );
 }
 
-/// Build a bank-transfer tx with the given nonce.
-fn build_bank_tx(module_id: u8, module_payload: &[u8], nonce: u64) -> types::TxBytes {
+/// Build a module tx with the given nonce.
+fn build_staking_tx(module_id: u8, module_payload: &[u8], nonce: u64) -> types::TxBytes {
     let sender = primitives::Address([0u8; 20]);
     let fee = 100u64;
     let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());

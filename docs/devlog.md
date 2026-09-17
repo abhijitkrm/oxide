@@ -13415,3 +13415,132 @@ published in the EIP) plus computed Oxide vectors.
 - `rpc`: +2 — envelope submit + hash shape, error paths.
 - Workspace: 101 test binaries green; clippy `-D warnings` and
   `fmt --check` clean.
+
+## 2026-09-17 — Session: ledger unification — bank module removed, EVM account store is THE ledger
+
+### Why
+
+The chain ran two disconnected money supplies: `bank::BankModule`
+(`BTreeMap<Address, u64>`) for native-module settlement, and the
+`revm` account store for EVM execution. The same 20-byte address had
+two unrelated balances — the EIP-712 work unified *identity* but
+left a split-brain *ledger*: `bank.mint` created tokens invisible to
+`eth_getBalance`, and a signed native tx could move funds the EVM
+view denied existing. The user call: "Remove bank, EVM becomes THE
+ledger" — one account store, ether-style.
+
+Considered and rejected: keeping bank "for future SVM support".
+Solana accounts are 32-byte pubkeys with a rent/owner/data model a
+20-byte `BTreeMap<u64>` cannot represent — a future SVM needs its
+own store regardless. What bank actually provided was an implicit
+*trait* (debit/credit/transfer/balance); preserving the seam as a
+trait, not a module, keeps that option open.
+
+### Design
+
+- `framework::Balances` — `balance/mint/debit/credit/transfer/burn`
+  over `u64` base units. Deliberately **no** `Send + Sync`
+  supertraits: production wiring uses
+  `Arc<dyn Balances + Send + Sync>` (staking/exchange/perps fields),
+  while the in-frame adapter `JournalBalances` wraps `&mut Journal`
+  in a `RefCell` and is `!Sync` by construction.
+- `framework::WEI_PER_UNIT = 10^9` — native base units ↔ wei. All
+  ledger ops denominate in units; the EVM adapter scales.
+- `modules/evm/src/ledger.rs` — `Balances for EvmModule`
+  out-of-transaction path: mutates `db.cache.accounts`, captures
+  `block_undo`, marks `touched`, sets `AccountState::Touched` +
+  `KECCAK_EMPTY` code hash so flush/state-root see the write.
+  `Module::charge_fee` override debits the envelope fee (wei-scaled;
+  `fee = 0` skips the account touch — same admission behavior the
+  bank fee path had).
+- `evm::precompiles::JournalBalances` — the in-transaction adapter:
+  every op rides **revm's own journal** (`transfer`/`incr_balance`/
+  `decr_balance` on `JournaledAccountTr`). Frame revert restores
+  balances for free; frame success commits them into `result.state`
+  with zero clobber risk against the outer cache.
+- `framework::MemoryBalances` — std-only test/tooling impl; its
+  `transfer` validates both sides before writing (an early draft
+  debited first, then could fail the credit — a real atomicity bug
+  caught on review).
+
+### Revert semantics — the subtle part
+
+A `0x0C01` delegate precompile does two mutations: the bond
+transfer (ledger) and the delegation record (staking). On frame
+revert, revm's journal already restores the transfer, so the
+frame-scoped `NativeJournal` must undo **only the record** —
+`undo_delegate`/`undo_undelegate` no longer refund. Keeping the
+refund would double-pay the bonded pool (verified by the
+`staking_delegate_precompile_undone_on_revert` test).
+
+### Wiring changes
+
+- Assembly order flipped everywhere (node, validator, devnet,
+  tcp_multinode): **EVM is built first**, then handed to
+  `staking.set_ledger` / `ExchangeModule::with_ledger` /
+  `PerpsModule::with_ledger` and registered as `fee_module`.
+- Bank precompiles `0x0B01/0x0B02` retired — `eth_getBalance` and
+  plain transfers already do what they did. The exploits suite
+  keeps them as *regression* tests: the addresses must revert
+  cleanly, not panic or misbehave.
+- `module_id::BANK` (1) reserved, not reused — signed envelopes
+  reference module IDs and old wire traffic must not reinterpret.
+- Genesis: legacy `bank.balances` still parses and is folded into
+  `evm.alloc` (units → wei at `WEI_PER_UNIT`) so existing genesis
+  files don't silently drop funds; `evm.alloc` is the canonical
+  path now.
+- Workloads that used bank transfers (devnet tps, tcp_multinode,
+  executor/node benches, spammer, smoke tests) now use
+  staking-delegate txs — the heaviest realistic native op and the
+  one that exercises the real ledger path.
+- Signed-tx integration tests moved to `tests/signed_tx.rs`
+  driving staking delegates through the EVM ledger (same
+  dep-cycle reasoning as before, now `staking→executor`).
+
+### Bugs found during the sweep
+
+- `MemoryBalances::transfer` non-atomic debit-then-credit (above).
+- `generate_keypair_for_test` seeded purely from
+  `SystemTime::now().as_nanos()` — same-nanosecond calls produced
+  identical keypairs, flaking `verify_rejects_wrong_key`. Mixed in
+  an atomic counter.
+- Perps `perps_place_with_margin` bench was structurally broken by
+  the IM gate added in `3aaca28` — positions accumulated across
+  criterion iterations until margin exhausted. Fixed by topping up
+  margin in the excluded setup; the timed section measures only the
+  taker/fill path (a first attempt that rebuilt the module per
+  iteration measured 30µs of book deallocation, not order
+  placement).
+
+### Benchmarks (M2 MacBook Pro, release)
+
+- exchange `settlement_single_fill`: **744 ns p50** (gate <2µs ⇒
+  ~1.3M fills/s/core) — ~20% **faster** than the last bank-ledger
+  measurement; the EVM account-cache write beats the bank's
+  `BTreeMap<Vec<u8>, Vec<u8>>` key allocation.
+- `settlement_sweep_10_levels`: 2.00µs; `raw_engine_single_fill`:
+  527ns baseline.
+- perps `perps_place_with_margin`: **375 ns** (gate <3µs);
+  `perps_deposit` **181 ns** (gate <2µs, ~5.5M deposits/s — −43% vs
+  bank path); `perps_liquidation_check` 24ns (gate <5µs);
+  `raw_perps_engine_place` 490ns.
+
+The ledger swap is not a performance compromise — the EVM account
+store is measurably faster on the settlement paths than the map it
+replaced.
+
+### Workspace state
+
+- `modules/bank` deleted; all Cargo.toml deps and the workspace
+  member glob updated; `rg` sweep shows remaining `bank` strings
+  only as intentional legacy-compat comments (genesis alias,
+  historical devlog/benchmark notes, retired-address regression
+  docs).
+- Docs updated: gap-analysis (#17 obviated — no denoms to wrap;
+  bank precompile row retired; x/bank row re-scoped), README,
+  plan.md (architecture diagram, modules v1, precompiles, phase-1
+  deliverables), testnet-deployment (genesis example → `evm.alloc`),
+  production-readiness (historical measurements annotated),
+  AGENTS.md structure map.
+- Gates: `fmt --check` clean; `clippy --workspace --all-targets
+  -D warnings` clean; workspace tests green.

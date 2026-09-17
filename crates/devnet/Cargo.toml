@@ -21,7 +21,6 @@ consensus = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
 oxide-core = { workspace = true }
-bank = { workspace = true }
 staking = { workspace = true }
 evm = { workspace = true }
 exchange = { workspace = true }

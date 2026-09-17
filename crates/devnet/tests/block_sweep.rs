@@ -1,6 +1,6 @@
 //! Block-size sweep — measures how TPS scales with `txs_per_round`.
 //!
-//! This test runs the same workload (bank transfers and EVM txs) with
+//! This test runs the same workload (staking delegates and EVM txs) with
 //! increasing block sizes to find the point where the executor becomes
 //! the bottleneck vs. consensus overhead.
 //!
@@ -32,9 +32,9 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// Block sizes to sweep.
 const BLOCK_SIZES: &[usize] = &[100, 250, 500, 1000];
 
-/// Run one bank-transfer sweep point: `rounds` blocks of `txs_per_round`
+/// Run one staking-delegate sweep point: `rounds` blocks of `txs_per_round`
 /// txs each over `n_validators` TCP-connected nodes.
-fn run_bank_sweep_point(
+fn run_delegate_sweep_point(
     n_validators: usize,
     rounds: usize,
     txs_per_round: usize,
@@ -47,7 +47,7 @@ fn run_bank_sweep_point(
 
     let n_blocks = result.finalized[0].len();
     let finalized_txs: usize = result.finalized[0].iter().map(|b| b.txs.len()).sum();
-    assert_eq!(finalized_txs, total_txs, "bank sweep: txs lost");
+    assert_eq!(finalized_txs, total_txs, "delegate sweep: txs lost");
 
     let tps = total_txs as f64 / elapsed.as_secs_f64();
     let blk_rate = n_blocks as f64 / elapsed.as_secs_f64();
@@ -102,7 +102,7 @@ fn run_evm_sweep_point(
     (finalized_txs, tps, blk_rate, txs_per_block)
 }
 
-/// Run the full block-size sweep for both bank transfers and EVM.
+/// Run the full block-size sweep for both staking delegates and EVM.
 ///
 /// Each block size is run with enough rounds to produce a stable
 /// measurement (at least 5 blocks). The sweep prints a table and
@@ -124,7 +124,7 @@ fn block_size_sweep() {
         "txs/round", "total txs", "tx/s", "blocks/s", "txs/block"
     );
 
-    let mut bank_results: Vec<(usize, f64)> = Vec::new();
+    let mut staking_results: Vec<(usize, f64)> = Vec::new();
     let mut port = 40000;
     for &txs_per_round in BLOCK_SIZES {
         // Use enough rounds to produce >= 5 blocks, but cap total
@@ -132,7 +132,7 @@ fn block_size_sweep() {
         let rounds = (10_000 / txs_per_round).clamp(5, 20);
         let start = Instant::now();
         let (total, tps, blk_rate, txs_per_blk) =
-            run_bank_sweep_point(n, rounds, txs_per_round, port);
+            run_delegate_sweep_point(n, rounds, txs_per_round, port);
         let wall = start.elapsed();
         eprintln!(
             "  {:>12}  {:>10}  {:>10.0}  {:>10.1}  {:>12.1}  (wall: {:.2}s)",
@@ -143,7 +143,7 @@ fn block_size_sweep() {
             txs_per_blk,
             wall.as_secs_f64()
         );
-        bank_results.push((txs_per_round, tps));
+        staking_results.push((txs_per_round, tps));
         port += 100;
     }
 
@@ -184,7 +184,7 @@ fn block_size_sweep() {
     eprintln!("=== Sweep Summary ===");
     eprintln!();
     eprintln!("Bank transfers:");
-    for &(size, tps) in &bank_results {
+    for &(size, tps) in &staking_results {
         eprintln!("  {size:>6} txs/block -> {tps:>8.0} tx/s");
     }
     eprintln!();
@@ -196,12 +196,12 @@ fn block_size_sweep() {
 
     // Assert that larger blocks are not slower (within 20% tolerance).
     // If they are, the executor is the bottleneck.
-    for window in bank_results.windows(2) {
+    for window in staking_results.windows(2) {
         let (small_size, small_tps) = window[0];
         let (large_size, large_tps) = window[1];
         assert!(
             large_tps >= small_tps * 0.8,
-            "bank TPS regressed at {large_size} txs/block: {large_tps:.0} < {small_tps:.0} * 0.8 (at {small_size}/block)"
+            "staking TPS regressed at {large_size} txs/block: {large_tps:.0} < {small_tps:.0} * 0.8 (at {small_size}/block)"
         );
     }
     for window in evm_results.windows(2) {

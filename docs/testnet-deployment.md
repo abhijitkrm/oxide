@@ -224,10 +224,17 @@ validator set, pre-funded accounts, and consensus parameters.
     "base_timeout_ms": 2000,
     "max_timeout_ms": 30000
   },
-  "bank": {
-    "balances": {
-      "0x0000000000000000000000000000000000000000": 1000000000000,
-      "0x0101010101010101010101010101010101010101": 1000000000000
+  // Legacy alias: "bank.balances" is still accepted and folded
+  // into the EVM account store (base units -> wei). New genesis
+  // files should use "evm.alloc" directly.
+  "evm": {
+    "alloc": {
+      "0x0000000000000000000000000000000000000000": {
+        "balance": "1000000000000000000000000000000"
+      },
+      "0x0101010101010101010101010101010101010101": {
+        "balance": "1000000000000000000000000000000"
+      }
     }
   },
   "staking": {
@@ -765,7 +772,9 @@ by this guide:
   and `peer-{i}.pem` files. `oxide-validator tls-gen` generates
   self-signed certs for testnet; production uses a proper CA.
 - **Genesis file loading** — `--genesis-file` loads `genesis.json`
-  with validator addresses, public keys, stakes, and bank balances.
+  with validator addresses, public keys, stakes, and account balances
+  (`evm.alloc`; a legacy `bank.balances` map is still accepted and
+  folded into the same EVM accounts, base units -> wei).
 - **WAL persistence** — `--wal-file` persists consensus safety state
   (last voted view, high QC, voted heights). Recovered on restart.
 - **Snapshot persistence** — `--data-dir` auto-exports on shutdown

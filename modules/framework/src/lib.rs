@@ -17,19 +17,22 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use executor::Module;
-use primitives::Hash;
+use executor::{ExecError, Module};
+use primitives::{Address, Hash};
 
 /// Canonical module dispatch IDs. These are stable wire constants —
 /// changing them is a consensus-breaking change.
 pub mod module_id {
     /// The core module: chain parameters, metadata.
     pub const CORE: u8 = 0;
-    /// The bank module: token transfers and balances.
-    pub const BANK: u8 = 1;
+    /// ID 1 was the bank module — removed when the ledger unified
+    /// into EVM account balances. The ID stays reserved: reusing it
+    /// would silently reinterpret any in-flight v0 envelopes or
+    /// historical state keys built for it.
     /// The staking module: delegation, validation, slashing.
     pub const STAKING: u8 = 2;
-    /// The EVM module: revm host, precompiles, EIP-1559.
+    /// The EVM module: revm host, precompiles, EIP-1559, and the
+    /// native-token ledger (account balances in wei).
     pub const EVM: u8 = 3;
     /// The governance module: parameter changes, market listing.
     pub const GOVERNANCE: u8 = 4;
@@ -39,6 +42,175 @@ pub mod module_id {
     /// The perps module: perpetual futures — margin, funding,
     /// liquidations, insurance fund, ADL (plan.md §9.3).
     pub const PERPS: u8 = 6;
+}
+
+/// Wei per native **base unit** — the fixed conversion at the
+/// module/ledger boundary.
+///
+/// Native modules keep every amount (envelope `fee`, staking
+/// delegations, exchange/perps settlement) in `u64` base units —
+/// the project's fixed-point convention — while the ledger itself
+/// is the EVM account store, which is wei-denominated (`U256`). One
+/// base unit is 10⁹ wei (a gwei): fine enough for fee granularity,
+/// coarse enough that `u64` spans ~1.8×10¹⁰ tokens of headroom for
+/// any single operation. The conversion lives in exactly two places
+/// — the [`Balances`] impls — so unit drift is impossible.
+pub const WEI_PER_UNIT: u128 = 1_000_000_000;
+
+/// The native-token ledger seam — how modules move value.
+///
+/// There is exactly one ledger in the system: the EVM account store
+/// (the native token is ether-like — balances live on the same
+/// 20-byte accounts contracts and EOAs already use). Every module
+/// that moves value — staking's bonded pool, exchange settlement,
+/// perps margin, the executor's fee charge — goes through this
+/// trait rather than a concrete ledger type, so the seam stays
+/// replaceable if a second VM with its own account model ever lands.
+///
+/// The trait deliberately does **not** require `Send`/`Sync`: the
+/// in-transaction impl (`JournalBalances`) wraps a `RefCell`-borrowed
+/// revm journal and lives only for the duration of one precompile
+/// call. Storage sites that share a ledger across threads declare
+/// `Arc<dyn Balances + Send + Sync>` themselves — auto-trait removal
+/// coerces `&dyn Balances + Send + Sync` down to `&dyn Balances` at
+/// call sites.
+///
+/// All amounts are `u64` **base units** (see [`WEI_PER_UNIT`]).
+///
+/// Two backends exist:
+/// - `EvmModule`'s `Balances` impl — the out-of-transaction path:
+///   native-tx `handle` calls, the executor's `charge_fee`, and
+///   `end_block` bookkeeping. Mutations write the account cache
+///   directly and capture block undo so versioned historical reads
+///   stay correct.
+/// - `evm::JournalBalances` — the in-transaction path: mutations go
+///   through revm's journaled state, so a reverting frame undoes
+///   them automatically and a committing frame lands them in the
+///   tx's state diff like any EVM balance change.
+///
+/// Both enforce the same contract: `debit` fails on insufficient
+/// funds, `credit` fails on overflow, `transfer` is all-or-nothing,
+/// and `mint` creates value (block rewards are inflationary by
+/// design — there is no separate issuance module).
+pub trait Balances {
+    /// The account's balance in base units. Saturates at `u64::MAX`
+    /// for the (unreachable in practice) balance above ~1.8×10¹⁰
+    /// tokens — callers comparing "has at least X" are unaffected.
+    fn balance(&self, addr: &Address) -> u64;
+    /// Decrease `addr`'s balance by `amount` base units.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::ModuleRejected`] if the balance is insufficient.
+    fn debit(&self, addr: &Address, amount: u64) -> Result<(), ExecError>;
+    /// Increase `addr`'s balance by `amount` base units.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::ModuleRejected`] if the balance would overflow.
+    fn credit(&self, addr: &Address, amount: u64) -> Result<(), ExecError>;
+    /// Move `amount` base units `from → to`, all-or-nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::ModuleRejected`] on insufficient funds or
+    /// recipient overflow; on error neither account changes.
+    fn transfer(&self, from: &Address, to: &Address, amount: u64) -> Result<(), ExecError>;
+    /// Create `amount` base units on `addr` out of thin air —
+    /// block-reward issuance. Not a `transfer` from a supply account:
+    /// the total supply genuinely grows.
+    fn mint(&self, addr: &Address, amount: u64);
+}
+
+/// A minimal in-memory [`Balances`] for tests and tooling.
+///
+/// This is **not** a chain ledger — it is never registered as a
+/// module and does not participate in state roots, undo, or
+/// persistence. It exists so module unit tests and sim harnesses can
+/// exercise ledger-dependent code paths without standing up a real
+/// EVM. On a live node the single ledger is always the EVM account
+/// store behind `EvmModule`.
+#[derive(Default)]
+pub struct MemoryBalances {
+    /// `Mutex` because the trait methods take `&self` while callers
+    /// hold the impl across threads (`Send + Sync` is satisfied).
+    inner: Mutex<BTreeMap<Address, u64>>,
+}
+
+impl MemoryBalances {
+    /// An empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Balances for MemoryBalances {
+    fn balance(&self, addr: &Address) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(addr)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn debit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
+        let mut m = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bal = m
+            .get_mut(addr)
+            .ok_or_else(|| ExecError::ModuleRejected(format!("debit: {addr:?} has no account")))?;
+        *bal = bal.checked_sub(amount).ok_or_else(|| {
+            ExecError::ModuleRejected(format!("debit: {addr:?} balance {bal} < {amount}"))
+        })?;
+        Ok(())
+    }
+
+    fn credit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
+        let mut m = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bal = m.entry(*addr).or_insert(0);
+        *bal = bal.checked_add(amount).ok_or_else(|| {
+            ExecError::ModuleRejected(format!("credit: {addr:?} balance overflows u64"))
+        })?;
+        Ok(())
+    }
+
+    fn transfer(&self, from: &Address, to: &Address, amount: u64) -> Result<(), ExecError> {
+        let mut m = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if from == to {
+            // Self-transfer: solvency check only — no state change.
+            let bal = m.get(from).copied().unwrap_or(0);
+            return if bal >= amount {
+                Ok(())
+            } else {
+                Err(ExecError::ModuleRejected(format!(
+                    "transfer: {from:?} balance {bal} < {amount}"
+                )))
+            };
+        }
+        // Validate both sides before writing either — a transfer is
+        // all-or-nothing: a credit overflow must not strand the debit.
+        let from_bal = m.get(from).copied().ok_or_else(|| {
+            ExecError::ModuleRejected(format!("transfer: {from:?} has no account"))
+        })?;
+        let new_from = from_bal.checked_sub(amount).ok_or_else(|| {
+            ExecError::ModuleRejected(format!("transfer: {from:?} balance {from_bal} < {amount}"))
+        })?;
+        let to_bal = m.get(to).copied().unwrap_or(0);
+        let new_to = to_bal.checked_add(amount).ok_or_else(|| {
+            ExecError::ModuleRejected(format!("transfer: {to:?} balance overflows u64"))
+        })?;
+        m.insert(*from, new_from);
+        m.insert(*to, new_to);
+        Ok(())
+    }
+
+    fn mint(&self, addr: &Address, amount: u64) {
+        let mut m = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // `mint` is infallible; saturate on the unreachable u64
+        // overflow rather than panic.
+        *m.entry(*addr).or_insert(0) = m.get(addr).copied().unwrap_or(0).saturating_add(amount);
+    }
 }
 
 /// A shared in-memory key-value store for module state.

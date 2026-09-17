@@ -22,7 +22,6 @@ framework = { workspace = true }
 # state through precompiles.
 exchange = { workspace = true }
 perps = { workspace = true }
-bank = { workspace = true }
 # staking: the `0x0C_*` precompiles delegate through the module's own
 # invariant-checked path; mutations are journaled per frame.
 staking = { workspace = true }

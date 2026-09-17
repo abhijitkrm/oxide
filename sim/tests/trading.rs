@@ -8,7 +8,7 @@
 //!
 //! The simulation exercises:
 //! - Exchange order placement and matching (spot CLOB).
-//! - Cross-module settlement (bank debit/credit on fills).
+//! - Cross-module settlement (ledger debit/credit on fills).
 //! - Perps margin deposits and position opens.
 //! - Perps funding settlement.
 //! - Perps liquidation on underwater positions.
@@ -20,9 +20,9 @@
 
 use std::sync::Arc;
 
-use bank::BankModule;
 use exchange::ExchangeModule;
 use executor::{Module, TxContext};
+use framework::{Balances, MemoryBalances};
 use perps::PerpsModule;
 use primitives::Address;
 use primitives::fixed::{Price, Qty};
@@ -62,17 +62,17 @@ fn perps_cfg() -> perps::PerpsMarketConfig {
 /// state at the end must match the expected values asserted below.
 #[test]
 fn deterministic_trading_scenario() {
-    // ── Setup: shared bank, exchange, perps ──────────────────────
-    let bank = Arc::new(BankModule::new());
+    // ── Setup: shared ledger, exchange, perps ────────────────────
+    let ledger = Arc::new(MemoryBalances::new());
     // Mint to traders so they can deposit margin and settle fills.
-    bank.mint(&addr(1), 10_000_000);
-    bank.mint(&addr(2), 10_000_000);
-    bank.mint(&addr(3), 10_000_000);
+    ledger.mint(&addr(1), 10_000_000);
+    ledger.mint(&addr(2), 10_000_000);
+    ledger.mint(&addr(3), 10_000_000);
 
-    let exchange = Arc::new(ExchangeModule::with_bank(bank.clone()));
+    let exchange = Arc::new(ExchangeModule::with_ledger(ledger.clone()));
     exchange.list_market(spot_cfg()).expect("market config valid");
 
-    let perps = Arc::new(PerpsModule::with_bank(bank.clone()));
+    let perps = Arc::new(PerpsModule::with_ledger(ledger.clone()));
     perps.list_market(perps_cfg()).expect("perps config valid");
 
     // ── Phase 1: Exchange order matching ─────────────────────────
@@ -172,11 +172,11 @@ fn place_perps_order(perps: &Arc<PerpsModule>, trader: u8, side: Side, qty: u64)
 /// less than the best ask (no crossed book).
 #[test]
 fn exchange_l1_invariant() {
-    let bank = Arc::new(BankModule::new());
-    bank.mint(&addr(1), 1_000_000);
-    bank.mint(&addr(2), 1_000_000);
+    let ledger = Arc::new(MemoryBalances::new());
+    ledger.mint(&addr(1), 1_000_000);
+    ledger.mint(&addr(2), 1_000_000);
 
-    let exchange = Arc::new(ExchangeModule::with_bank(bank.clone()));
+    let exchange = Arc::new(ExchangeModule::with_ledger(ledger.clone()));
     exchange.list_market(spot_cfg()).expect("market config valid");
 
     // Place a buy at $1.40.

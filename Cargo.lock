@@ -731,18 +731,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bank"
-version = "0.1.0"
-dependencies = [
- "codec",
- "crypto",
- "executor",
- "framework",
- "primitives",
- "types",
-]
-
-[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1542,7 +1530,6 @@ dependencies = [
 name = "devnet"
 version = "0.1.0"
 dependencies = [
- "bank",
  "broadcast",
  "codec",
  "config",
@@ -1739,7 +1726,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
- "bank",
  "codec",
  "consensus",
  "criterion",
@@ -1761,10 +1747,10 @@ dependencies = [
 name = "exchange"
 version = "0.1.0"
 dependencies = [
- "bank",
  "codec",
  "criterion",
  "crypto",
+ "evm",
  "executor",
  "framework",
  "primitives",
@@ -1776,16 +1762,17 @@ dependencies = [
 name = "executor"
 version = "0.1.0"
 dependencies = [
- "bank",
  "codec",
  "consensus",
  "criterion",
  "crypto",
+ "evm",
  "framework",
  "mempool",
  "metrics",
  "ports",
  "primitives",
+ "staking",
  "storage",
  "types",
 ]
@@ -2512,7 +2499,6 @@ dependencies = [
 name = "matcher"
 version = "0.1.0"
 dependencies = [
- "bank",
  "criterion",
  "crossbeam-channel",
  "crypto",
@@ -2618,7 +2604,6 @@ dependencies = [
 name = "node"
 version = "0.1.0"
 dependencies = [
- "bank",
  "codec",
  "consensus",
  "criterion",
@@ -2836,7 +2821,6 @@ dependencies = [
 name = "oxide-matcher"
 version = "0.1.0"
 dependencies = [
- "bank",
  "exchange",
  "executor",
  "framework",
@@ -2853,7 +2837,6 @@ dependencies = [
 name = "oxide-sim"
 version = "0.1.0"
 dependencies = [
- "bank",
  "codec",
  "consensus",
  "crypto",
@@ -2876,7 +2859,6 @@ dependencies = [
 name = "oxide-spammer"
 version = "0.1.0"
 dependencies = [
- "bank",
  "crypto",
  "devnet",
  "evm",
@@ -2886,6 +2868,7 @@ dependencies = [
  "ports",
  "primitives",
  "revm",
+ "staking",
  "types",
 ]
 
@@ -2894,7 +2877,6 @@ name = "oxide-validator"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "bank",
  "codec",
  "config",
  "consensus",
@@ -3018,10 +3000,10 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "perps"
 version = "0.1.0"
 dependencies = [
- "bank",
  "codec",
  "criterion",
  "crypto",
+ "evm",
  "executor",
  "framework",
  "primitives",
@@ -4239,7 +4221,6 @@ dependencies = [
 name = "staking"
 version = "0.1.0"
 dependencies = [
- "bank",
  "codec",
  "crypto",
  "executor",
@@ -4258,12 +4239,12 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "storage"
 version = "0.1.0"
 dependencies = [
- "bank",
  "blake3",
  "codec",
  "consensus",
  "criterion",
  "crypto",
+ "evm",
  "executor",
  "framework",
  "libmdbx",

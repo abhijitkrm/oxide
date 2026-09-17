@@ -242,14 +242,14 @@ fn run_single_node() {
     );
 
     let mut node = Node::assemble(&node_config);
-    tracing::info!("oxide-validator: assembled stack (executor + core/bank/staking modules)");
+    tracing::info!("oxide-validator: assembled stack (executor + core/staking/evm modules)");
 
     handle_import_snapshot(&mut node);
 
-    // Submit a smoke-test bank transfer.
-    let to = primitives::Address([2u8; 20]);
-    let module_payload = bank::msg::transfer(to, 100);
-    let tx = build_tx(framework::module_id::BANK, &module_payload);
+    // Submit a smoke-test staking delegate to the local validator
+    // identity (`Address::ZERO` is genesis-registered on devnet).
+    let module_payload = staking::msg::delegate(primitives::Address::ZERO, 100);
+    let tx = build_tx(framework::module_id::STAKING, &module_payload);
     node.engine().submit_tx(tx);
 
     // Drive consensus once to finalize the smoke-test block.
@@ -670,10 +670,11 @@ fn run_devnet_node(node_index_str: &str) {
 
     println!("oxide-validator[{node_index}]: consensus engine started, waiting for blocks...");
 
-    // Submit a smoke-test transaction.
-    let to = primitives::Address([2u8; 20]);
-    let module_payload = bank::msg::transfer(to, 100);
-    let tx = build_tx(framework::module_id::BANK, &module_payload);
+    // Submit a smoke-test transaction: a staking delegate to the
+    // devnet validator identity `Address::ZERO` (registered at
+    // genesis in `build_devnet_executor`).
+    let module_payload = staking::msg::delegate(primitives::Address::ZERO, 100);
+    let tx = build_tx(framework::module_id::STAKING, &module_payload);
     engine.submit_tx(tx);
 
     let height = engine.finalized_height();
@@ -831,8 +832,12 @@ fn load_validator_set(num_nodes: usize, _node_index: usize) -> consensus::Valida
     }
 }
 
-/// Build the devnet executor with core, bank, staking, and EVM
-/// modules.
+/// Build the devnet executor with core, staking, and EVM modules.
+///
+/// The EVM account store is the single native-token ledger: it is
+/// built first so staking settles through it, genesis `bank`
+/// balances fold into `evm.alloc` (base units → wei), and the EVM
+/// module collects native-module fees.
 ///
 /// Uses `genesis_config` for the number of pre-funded senders and
 /// genesis balance, `node_config` for executor params (mempool size,
@@ -859,30 +864,21 @@ fn build_devnet_executor(
         executor::UnsignedTxPolicy::Allow
     });
     executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-    let bank_module = bank::BankModule::new();
 
-    // Apply genesis balances if --genesis-file was given; otherwise
-    // use the deterministic devnet pre-funded senders.
-    if let Some(genesis) = genesis {
-        for (addr_hex, balance_val) in &genesis.bank.balances {
-            let balance = balance_val.as_u64().unwrap_or(0);
-            if let Ok(bytes) = hex_decode(addr_hex) {
-                if let Ok(addr) = <[u8; 20]>::try_from(bytes.as_slice()) {
-                    bank_module.mint(&primitives::Address(addr), balance);
-                }
-            }
-        }
-    } else {
-        for sender_byte in 0..genesis_config.num_prefunded_senders {
-            bank_module
-                .mint(&primitives::Address([sender_byte; 20]), genesis_config.genesis_balance);
-        }
-    }
-    let bank = Arc::new(bank_module);
-    executor.register_module(bank.clone());
-    // The bank collects fees for all native-module txs — without
-    // this only bank txs paid (other modules ran free).
-    executor.set_fee_module(framework::module_id::BANK);
+    // EVM module first: it is the native-token ledger every other
+    // module settles through, so it must exist before staking wires
+    // its `Balances` handle. Uses the RPC-config chain ID/base fee
+    // so the advertised and enforced parameters agree.
+    let evm_module = Arc::new(evm::EvmModule::new(rpc_config.chain_id, rpc_config.base_fee));
+    // Canonical preinstalls first — a user `alloc` entry below can
+    // still intentionally override a preinstall address.
+    evm_module.install_preinstalls();
+
+    apply_genesis_balances(&evm_module, genesis_config, genesis);
+    executor.register_module(evm_module.clone());
+    // The EVM ledger collects fees for all native-module txs —
+    // without this the module txs ran free.
+    executor.set_fee_module(framework::module_id::EVM);
 
     // Staking module: register genesis validators directly if
     // --genesis-file was given; otherwise use deterministic devnet
@@ -904,21 +900,13 @@ fn build_devnet_executor(
             staking_module.genesis_register_validator(addr, 1_000_000);
         }
     }
-    // Delegation is bank-backed: `delegate` debits the delegator into
-    // the bonded pool, unbonding refunds from it. Genesis stake
-    // registered above is unattributed (declaration stake, not
-    // pool-backed) and cannot be undelegated.
-    staking_module.set_bank(bank);
+    // Delegation is EVM-ledger-backed: `delegate` debits the
+    // delegator into the bonded pool, unbonding refunds from it.
+    // Genesis stake registered above is unattributed (declaration
+    // stake, not pool-backed) and cannot be undelegated.
+    staking_module.set_ledger(evm_module.clone());
     executor.register_module(Arc::new(staking_module));
 
-    // EVM module: registered in devnet mode too so `eth_*` RPCs serve
-    // real state/history and `eth_sendRawTransaction` actually
-    // executes. Uses the RPC-config chain ID/base fee so the
-    // advertised and enforced parameters agree.
-    let evm_module = Arc::new(evm::EvmModule::new(rpc_config.chain_id, rpc_config.base_fee));
-    // Canonical preinstalls first — a user `alloc` entry below can
-    // still intentionally override a preinstall address.
-    evm_module.install_preinstalls();
     // Apply the genesis `alloc` map (Ethereum `genesis.json`
     // convention): balances, nonces, code, and storage for
     // pre-funded accounts and preinstalled contracts.
@@ -968,6 +956,46 @@ fn build_devnet_executor(
     }
     executor.register_module(evm_module.clone());
     (executor, evm_module)
+}
+
+/// Apply genesis native-token balances to the EVM account store.
+///
+/// With `--genesis-file`: the legacy `bank.balances` map (base
+/// units) folds into the EVM ledger scaled to wei — the EVM store
+/// is the single ledger, there is no separate bank. Without one:
+/// the deterministic devnet pre-funded senders get
+/// `genesis_config.genesis_balance` units each.
+fn apply_genesis_balances(
+    evm_module: &evm::EvmModule,
+    genesis_config: &config::GenesisConfig,
+    genesis: Option<&config::genesis::Genesis>,
+) {
+    if let Some(genesis) = genesis {
+        for (addr_hex, balance_val) in &genesis.bank.balances {
+            let balance = balance_val.as_u64().unwrap_or(0);
+            if let Ok(bytes) = hex_decode(addr_hex) {
+                if let Ok(addr) = <[u8; 20]>::try_from(bytes.as_slice()) {
+                    evm_module.genesis_insert_account(
+                        &primitives::Address(addr),
+                        u128::from(balance) * framework::WEI_PER_UNIT,
+                        0,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                }
+            }
+        }
+    } else {
+        for sender_byte in 0..genesis_config.num_prefunded_senders {
+            evm_module.genesis_insert_account(
+                &primitives::Address([sender_byte; 20]),
+                u128::from(genesis_config.genesis_balance) * framework::WEI_PER_UNIT,
+                0,
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+    }
 }
 
 /// Build the TCP transport: `--tls-dir` for mTLS, plain TCP otherwise.
@@ -1166,10 +1194,12 @@ fn run_consensus_loop(
         // to ensure the mempool is never empty (the leader won't propose
         // empty blocks without pending txs).
         if iter_count % 50 == 1 {
-            let to = primitives::Address([2u8; 20]);
-            let module_payload = bank::msg::transfer(to, 100);
-            let tx =
-                build_tx_with_nonce(framework::module_id::BANK, &module_payload, keepalive_nonce);
+            let module_payload = staking::msg::delegate(primitives::Address::ZERO, 1);
+            let tx = build_tx_with_nonce(
+                framework::module_id::STAKING,
+                &module_payload,
+                keepalive_nonce,
+            );
             let _ack = engine.submit_tx(tx);
             keepalive_nonce += 1;
         }

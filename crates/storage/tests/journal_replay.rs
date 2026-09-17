@@ -2,13 +2,13 @@
 //! bit-exact (plan.md §13).
 //!
 //! This test writes finalized blocks to the journal, replays them,
-//! re-executes through the real executor + core/bank/staking modules,
+//! re-executes through the real executor + core/evm/staking modules,
 //! and verifies the state root after replay matches the state root
 //! from the original execution — byte for byte.
 //!
 //! The flow:
-//! 1. Build an executor with core/bank/staking modules.
-//! 2. Finalize N blocks (each with bank-transfer txs).
+//! 1. Build an executor with core/evm/staking modules.
+//! 2. Finalize N blocks (each with staking-delegate txs).
 //! 3. After each block, record the state root and append the encoded
 //!    `FinalizedBlock` to the journal.
 //! 4. Sync the journal.
@@ -27,32 +27,38 @@ use storage::replay;
 use storage::{JournalConfig, JournalWriter};
 use types::FinalizedBlock;
 
-/// Construct a bank-transfer tx: sender 0x00..00 sends `amount`
-/// tokens to recipient 0x02..02. The nonce makes each tx unique.
-fn bank_tx(nonce: u64, amount: u64) -> types::TxBytes {
+/// Construct a staking-delegate tx: sender 0x00..00 bonds `amount`
+/// units to validator 0x00..00 (registered at genesis). The nonce
+/// makes each tx unique.
+fn delegate_tx(nonce: u64, amount: u64) -> types::TxBytes {
     let sender = Address([0u8; 20]);
-    let to = Address([2u8; 20]);
     let fee = 100u64;
-    let module_payload = bank::msg::transfer(to, amount);
+    let module_payload = staking::msg::delegate(sender, amount);
     let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::BANK);
+    bytes.push(framework::module_id::STAKING);
     bytes.extend_from_slice(&module_payload);
     types::TxBytes::new(bytes)
 }
 
-/// Build an executor with core/bank/staking modules (same as the
+/// Build an executor with core/evm/staking modules (same as the
 /// devnet multi-node runner). Genesis-mints to the sender address
-/// so bank transfers can debit (C2 fix).
+/// so delegates can bond and fees can debit.
 fn build_executor() -> Arc<Executor> {
     let mut executor = Executor::new(10_000);
     executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-    let bank = bank::BankModule::new();
-    bank.mint(&primitives::Address([0u8; 20]), 1_000_000_000_000);
-    executor.register_module(Arc::new(bank));
-    executor.register_module(Arc::new(staking::StakingModule::new()));
+    // The EVM account store is the native-token ledger: fund the
+    // sender, register it, and set it as the fee module.
+    let evm = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    framework::Balances::mint(evm.as_ref(), &primitives::Address([0u8; 20]), 1_000_000_000_000);
+    executor.register_module(evm.clone());
+    executor.set_fee_module(framework::module_id::EVM);
+    let staking_module = staking::StakingModule::new();
+    staking_module.set_ledger(evm);
+    staking_module.genesis_register_validator(primitives::Address([0u8; 20]), 1);
+    executor.register_module(Arc::new(staking_module));
     Arc::new(executor)
 }
 
@@ -90,9 +96,9 @@ fn journal_replay_reproduces_state_root_bit_exact() {
     let mut original_roots = Vec::with_capacity(n_blocks);
 
     for h in 0..n_blocks {
-        // Build a block with 3 bank-transfer txs.
+        // Build a block with 3 staking-delegate txs.
         let txs: Vec<types::TxBytes> =
-            (0..3).map(|i| bank_tx(u64::try_from(h * 10 + i).unwrap(), 1)).collect();
+            (0..3).map(|i| delegate_tx(u64::try_from(h * 10 + i).unwrap(), 1)).collect();
         let block = FinalizedBlock { height: Height::new(u64::try_from(h).unwrap()), txs };
 
         // Execute the block (produces and records the state root).
@@ -184,7 +190,7 @@ fn journal_replay_torn_tail_preserves_prefix() {
 
     // Write 5 complete blocks.
     for h in 0..5u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![bank_tx(h, 1)] };
+        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, 1)] };
         let payload = encode_block(&block);
         writer.append(&payload).expect("journal append should succeed");
     }
@@ -223,7 +229,7 @@ fn journal_replay_bad_crc_preserves_prefix() {
 
     // Write 3 complete blocks.
     for h in 0..3u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![bank_tx(h, 1)] };
+        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, 1)] };
         let payload = encode_block(&block);
         writer.append(&payload).expect("journal append should succeed");
     }
@@ -267,7 +273,7 @@ fn journal_replay_multiple_segments() {
     // Write 20 blocks (each ~60 bytes, so rotation happens ~every 17 blocks
     // with the 1024-byte segment limit).
     for h in 0..20u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![bank_tx(h, 1)] };
+        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, 1)] };
         let payload = encode_block(&block);
         writer.append(&payload).expect("journal append should succeed");
     }
@@ -305,7 +311,7 @@ fn journal_replay_deterministic_state_roots() {
         .expect("journal create should succeed");
 
     for h in 0..5u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![bank_tx(h, h + 1)] };
+        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, h + 1)] };
         exec1.finalize_block(&block);
         writer1.append(&encode_block(&block)).expect("append should succeed");
     }
@@ -325,7 +331,7 @@ fn journal_replay_deterministic_state_roots() {
         .expect("journal create should succeed");
 
     for h in 0..5u64 {
-        let block = FinalizedBlock { height: Height::new(h), txs: vec![bank_tx(h, h + 1)] };
+        let block = FinalizedBlock { height: Height::new(h), txs: vec![delegate_tx(h, h + 1)] };
         exec2.finalize_block(&block);
         writer2.append(&encode_block(&block)).expect("append should succeed");
     }

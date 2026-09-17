@@ -21,7 +21,7 @@ primitives = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
 framework = { workspace = true }
-bank = { workspace = true }
+staking = { workspace = true }
 evm = { workspace = true }
 executor = { workspace = true }
 crypto = { workspace = true }

@@ -9,8 +9,8 @@
 //!
 //! v0 is a **sequential** executor: one tx at a time, in block order.
 //! No parallel execution, no OCC, no EVM. The module router dispatches
-//! native messages to registered modules (bank, staking, etc.). EVM
-//! integration arrives in Phase 2.
+//! native messages to registered modules (staking, exchange, etc.)
+//! and EVM transactions.
 //!
 //! # Architecture
 //!
@@ -284,9 +284,9 @@ fn compute_nonce_root(nonces: &[(primitives::Address, u64)]) -> Hash {
 ///
 /// Carries the sender, nonce, and fee parsed from the tx envelope.
 /// This is the C2 fix: before, `handle` received only the message
-/// bytes and had no way to know who sent the tx — so the bank module
-/// could only mint to the recipient, never debit the sender. Now
-/// modules have the sender's identity and can enforce balance
+/// bytes and had no way to know who sent the tx — so a module could
+/// only credit the recipient, never debit the sender. Now modules
+/// have the sender's identity and can enforce balance
 /// checks, nonce ordering, and fee deduction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxContext {
@@ -486,8 +486,8 @@ pub trait Module: Send + Sync {
     /// — it is not executed, and its nonce is not advanced.
     ///
     /// The default implementation is a no-op (no fee charged).
-    /// Modules that manage account balances (e.g. the bank module)
-    /// override this to debit the sender's balance.
+    /// The module that owns the native-token ledger (the EVM
+    /// module) overrides this to debit the sender's balance.
     ///
     /// # Errors
     ///
@@ -666,7 +666,7 @@ pub enum UnsignedTxPolicy {
     ///
     /// Required for production: without it, `ctx.sender` is
     /// unauthenticated and any native-module tx can claim any
-    /// sender — e.g. draining another account's bank balance.
+    /// sender — e.g. bonding another account's balance as stake.
     /// Self-authenticating modules (EVM) are unaffected — their
     /// payload carries its own signature.
     Reject,
@@ -913,11 +913,11 @@ pub struct Executor {
     /// Default: 30 million gas per block (comparable to Ethereum's
     /// 30M gas limit). Configurable via [`Executor::with_gas_limit`].
     block_gas_limit: u64,
-    /// The module that collects transaction fees (the bank). When
-    /// set, every non-self-funded module's txs are charged `ctx.fee`
-    /// through this module before execution — previously the charge
-    /// was dispatched to the *target* module, so any module that
-    /// didn't implement `charge_fee` executed for free.
+    /// The module that collects transaction fees (the EVM ledger).
+    /// When set, every non-self-funded module's txs are charged
+    /// `ctx.fee` through this module before execution — previously
+    /// the charge was dispatched to the *target* module, so any
+    /// module that didn't implement `charge_fee` executed for free.
     ///
     /// `None` = no fee collection (tests and dev-mode executors).
     fee_module: Option<u8>,
@@ -1023,7 +1023,7 @@ impl Executor {
         self
     }
 
-    /// Designate a module as the fee collector (the bank).
+    /// Designate a module as the fee collector (the EVM ledger).
     ///
     /// Once set, every tx routed to a non-self-funded module is
     /// charged `ctx.fee` through this module before execution —
@@ -1595,7 +1595,7 @@ impl Executor {
             }
             // Fee gate: every tx routed to a non-self-funded module
             // pays `ctx.fee` through the configured fee collector
-            // (the bank) — not the target module. `min_fee` is
+            // (the EVM ledger) — not the target module. `min_fee` is
             // enforced first because the envelope's fee field is
             // sender-declared — without a floor every tx could
             // declare 0. Self-funded modules (EVM: gas is the fee)
@@ -2413,10 +2413,10 @@ mod tests {
     /// Regression test: txs routed to a module that never implements
     /// `charge_fee` must still pay — through the configured fee
     /// collector. Before the fix, the charge was dispatched to the
-    /// *target* module, whose default no-op meant only bank txs ever
-    /// paid a fee.
+    /// *target* module, whose default no-op meant only self-funded
+    /// txs ever paid a fee.
     #[test]
-    fn fee_module_charges_non_bank_txs() {
+    fn fee_module_charges_other_module_txs() {
         let mut executor = Executor::new(100);
         let counter = Arc::new(CounterModule::new());
         let collector = Arc::new(FeeCollector { charged: Mutex::new(0) });

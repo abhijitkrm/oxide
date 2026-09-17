@@ -1,7 +1,7 @@
 //! oxide-matcher — the off-chain matching server binary.
 //!
-//! Assembles a single-node Oxide devnet (executor + bank + exchange
-//! modules), creates a matching server with funded accounts, wires
+//! Assembles a single-node Oxide devnet (executor + exchange
+//! modules on the EVM ledger), creates a matching server with funded accounts, wires
 //! the batch settler to the executor's mempool, and starts all four
 //! order-entry protocol servers (binary TCP, JSON-RPC, FIX, WebSocket).
 //!
@@ -169,7 +169,7 @@ fn main() {
         ..NodeConfig::default()
     };
     let mut node = Node::assemble(&node_config);
-    println!("oxide-matcher: devnet assembled (executor + bank + exchange + perps + EVM)");
+    println!("oxide-matcher: devnet assembled (executor + exchange + perps on the EVM ledger)");
 
     let submitter: Arc<dyn TxSubmitter> =
         Arc::new(ExecutorTxSubmitter { executor: node.app_handle() });

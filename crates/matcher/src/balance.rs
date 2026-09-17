@@ -14,9 +14,9 @@
 //! the account index IS the address (first 4 bytes), so there's no
 //! hash computation — just a bounds check and an array access (~5 ns).
 //!
-//! # Why not the bank module directly?
+//! # Why not the shared ledger directly?
 //!
-//! The bank's `BTreeMap<Vec<u8>, Vec<u8>>` allocates a `Vec` key on
+//! A generic account map allocates a `Vec` key on
 //! every lookup and does a tree traversal (O(log n)). For 1M
 //! accounts and 1B orders, that's 1B `Vec` allocations + 1B tree
 //! traversals — the GC pressure alone would dominate throughput.

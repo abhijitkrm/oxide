@@ -20,7 +20,6 @@ primitives = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
 framework = { workspace = true }
-bank = { workspace = true }
 config = { workspace = true }
 crypto = { workspace = true }
 consensus = { workspace = true }

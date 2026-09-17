@@ -9,22 +9,22 @@ use node::{ConsensusConfig, Node, NodeConfig};
 use ports::AppInterface;
 use primitives::Address;
 
-/// Build a bank-transfer tx with a given nonce.
-fn build_bank_tx(nonce: u64) -> types::TxBytes {
-    let to = Address([2u8; 20]);
-    let payload = bank::msg::transfer(to, 1);
+/// Build a staking-delegate tx with a given nonce.
+/// `Address::ZERO` is genesis-registered by `Node::assemble`.
+fn build_staking_tx(nonce: u64) -> types::TxBytes {
+    let payload = staking::msg::delegate(Address::ZERO, 1);
     let sender = Address([0u8; 20]);
     let fee = 100u64;
     let mut bytes = Vec::with_capacity(36 + 1 + payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::BANK);
+    bytes.push(framework::module_id::STAKING);
     bytes.extend_from_slice(&payload);
     types::TxBytes::new(bytes)
 }
 
-/// Submit 100 bank-transfer txs and verify at least one block
+/// Submit 100 staking-delegate txs and verify at least one block
 /// finalizes with a non-zero state root. This is the spammer's
 /// core flow: batch submit -> run to completion -> verify.
 #[test]
@@ -37,7 +37,7 @@ fn smoke_spammer_batch_100_txs() {
     let mut node = Node::assemble(&config);
 
     for nonce in 0..100u64 {
-        node.engine().submit_tx(build_bank_tx(nonce));
+        node.engine().submit_tx(build_staking_tx(nonce));
     }
     node.engine().run_until_idle();
 

@@ -3,7 +3,7 @@
 //! Oxide uses two signature schemes:
 //! - **secp256k1** (EVM): for Ethereum-compatible transactions. The
 //!   sender is recovered from the signature (ECDSA with recovery ID).
-//! - **Ed25519** (native): for native module transactions (bank,
+//! - **Ed25519** (native): for native module transactions (staking,
 //!   staking, trading). Ed25519 is faster, has no malleability, and
 //!   is simpler to implement securely.
 //!
@@ -60,11 +60,20 @@ pub fn generate_keypair_for_test() -> (Ed25519SecretKey, Ed25519PublicKey) {
     // Generate a random seed using the system entropy source.
     // We use `std::time` as a fallback seed source to avoid adding
     // a `getrandom`/`rand_core` version dependency mismatch.
+    //
+    // A process-wide counter is mixed in because two calls inside
+    // one nanosecond would otherwise produce identical keypairs —
+    // `verify_rejects_wrong_key` flaked on exactly that: both
+    // "different" keys were the same, so the forged signature
+    // verified.
+    static SEED_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut seed = [0u8; 32];
     let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_nanos(),
         Err(_) => 1,
-    };
+    }
+    .wrapping_add(u128::from(counter));
     // Mix the nanos into the seed using simple multiplication.
     for (i, byte) in seed.iter_mut().enumerate() {
         *byte = ((nanos.wrapping_mul((i as u128) + 1)) & 0xFF) as u8;

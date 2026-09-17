@@ -42,7 +42,8 @@ use ports::{AppInterface, ConsensusEngine};
 use types::{FinalizedBlock, TxBytes};
 
 /// The genesis balance minted to each sender on every validator's
-/// bank module. Large enough that the simulation never exhausts it.
+/// EVM account store. Large enough that the simulation never
+/// exhausts it.
 const GENESIS_BALANCE: u64 = 1_000_000_000_000;
 
 /// The base port for TCP transport. Each node gets `base_port + i`.
@@ -99,9 +100,10 @@ pub struct TcpMultiNodeDevnet {
     evm_modules: Vec<Arc<evm::EvmModule>>,
     /// Exchange module handles (one per validator) for direct state
     /// access. Only populated when the devnet is built with
-    /// `with_exchange_and_base_port`; empty for the default bank-only
+    /// `with_exchange_and_base_port`; empty for the default
+    /// staking-only
     /// devnet. Each validator gets its own `ExchangeModule` instance
-    /// backed by that validator's `BankModule` — all validators
+    /// settling through that validator's `EvmModule` ledger — all validators
     /// execute the same blocks, so their exchange state converges
     /// after finality.
     exchange_modules: Vec<Arc<exchange::ExchangeModule>>,
@@ -255,16 +257,16 @@ impl TcpMultiNodeDevnet {
 
     /// Assemble a TCP-based multi-node devnet with `n` validators,
     /// registering the exchange module (backed by each validator's
-    /// bank module) on every validator. Use this for trading TPS
+    /// EVM ledger) on every validator. Use this for trading TPS
     /// tests that need the exchange module's `handle()` path through
     /// the full consensus pipeline.
     ///
     /// Each validator gets:
-    /// - Its own `BankModule` (funded with `GENESIS_BALANCE` per
-    ///   prefunded sender).
-    /// - Its own `ExchangeModule::with_bank(bank_clone)` — the
-    ///   exchange settles fills by debiting/crediting the same bank
-    ///   module that consensus executes.
+    /// - Its own `EvmModule` account store (funded with
+    ///   `GENESIS_BALANCE` units per prefunded sender).
+    /// - Its own `ExchangeModule::with_ledger(evm_clone)` — the
+    ///   exchange settles fills by debiting/crediting the same EVM
+    ///   ledger that consensus executes.
     ///
     /// # Panics
     ///
@@ -312,8 +314,8 @@ impl TcpMultiNodeDevnet {
     /// an optional exchange module registration.
     ///
     /// When `register_exchange` is true, each validator gets an
-    /// `ExchangeModule::with_bank(bank_clone)` backed by the same
-    /// `BankModule` that consensus executes. The exchange module
+    /// `ExchangeModule::with_ledger(evm_clone)` backed by the same
+    /// `EvmModule` that consensus executes. The exchange module
     /// handles (as `Arc<ExchangeModule>`) are stored in
     /// `exchange_modules` for post-run inspection.
     #[allow(clippy::too_many_arguments)]
@@ -368,46 +370,41 @@ impl TcpMultiNodeDevnet {
                 // under the declared-gas proposal check.
                 .with_gas_limit(1 << 30);
             executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-            // Create the bank as an `Arc` so the exchange module (if
-            // registered) can share the same bank instance — the
-            // exchange settles fills by debiting/crediting this bank.
-            let bank = Arc::new(bank::BankModule::new());
+            // The EVM account store is the single native-token
+            // ledger: it is created first so staking and exchange
+            // settle through it, and it collects native-module fees.
+            // Prefunded senders are credited `genesis_balance` base
+            // units (scaled to wei) so delegation bonds, fills, gas,
+            // and fees all debit the same accounts EVM txs see.
+            let evm_module = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+            let genesis_wei = u128::from(genesis_balance) * framework::WEI_PER_UNIT;
             for sender_byte in 0u8..num_senders {
-                bank.mint(&primitives::Address([sender_byte; 20]), genesis_balance);
+                evm_module
+                    .fund_account_for_test(&primitives::Address([sender_byte; 20]), genesis_wei);
             }
-            executor.register_module(bank.clone());
-            // The bank collects fees for all native-module txs —
-            // without this only bank txs paid (other modules ran free).
-            executor.set_fee_module(framework::module_id::BANK);
-            // Bank-backed staking: delegation debits the delegator
+            executor.register_module(evm_module.clone());
+            // The EVM ledger collects fees for all native-module txs
+            // — without this the module txs ran free.
+            executor.set_fee_module(framework::module_id::EVM);
+            // EVM-ledger staking: delegation debits the delegator
             // into the bonded pool (no free stake inflation). The
             // devnet validator identity `Address::ZERO` is registered
             // so the key-change/validator-change keep-alive delegate
             // has a registered target.
             let staking_module = staking::StakingModule::new();
-            staking_module.set_bank(bank.clone());
+            staking_module.set_ledger(evm_module.clone());
             staking_module.register_validator(primitives::Address::ZERO);
             executor.register_module(Arc::new(staking_module));
             // Optionally register the exchange module backed by this
-            // validator's bank. Each validator gets its own exchange
-            // instance; state diverges during proposal but converges
-            // after finality (all validators execute the same block).
+            // validator's EVM ledger. Each validator gets its own
+            // exchange instance; state diverges during proposal but
+            // converges after finality (all validators execute the
+            // same block).
             if register_exchange {
-                let ex = Arc::new(exchange::ExchangeModule::with_bank(bank.clone()));
+                let ex = Arc::new(exchange::ExchangeModule::with_ledger(evm_module.clone()));
                 executor.register_module(ex.clone());
                 exchange_modules.push(ex);
             }
-            // Register the EVM module and fund the prefunded senders
-            // so EVM transactions (transfers, deploys, calls) can
-            // debit gas and value. Each validator gets its own EVM
-            // module instance; state diverges until consensus
-            // finalizes a block and all validators execute it.
-            let evm_module = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
-            for sender_byte in 0u8..num_senders {
-                evm_module
-                    .fund_account_for_test(&primitives::Address([sender_byte; 20]), u128::MAX);
-            }
-            executor.register_module(evm_module.clone());
             evm_modules.push(evm_module);
             let app: Arc<Executor> = Arc::new(executor);
             let app_dyn: Arc<dyn AppInterface> = app.clone();
@@ -546,8 +543,8 @@ impl TcpMultiNodeDevnet {
         &self.evm_modules[i]
     }
 
-    /// Run `rounds` consensus rounds with `txs_per_round` bank
-    /// transfer txs, routing messages through TCP transport.
+    /// Run `rounds` consensus rounds with `txs_per_round` staking
+    /// delegate txs, routing messages through TCP transport.
     ///
     /// Each round:
     /// 1. Submit `txs_per_round` txs to the leader's mempool.
@@ -698,16 +695,16 @@ impl TcpMultiNodeDevnet {
     /// view's leader before the pipelined loop starts.
     ///
     /// This is the EVM-compatible variant of `run_pipelined`: instead
-    /// of building bank-transfer txs internally, it accepts pre-built
-    /// `TxBytes` envelopes (which can be EVM txs, bank txs, or any
+    /// of building staking-delegate txs internally, it accepts pre-built
+    /// `TxBytes` envelopes (which can be EVM txs, staking txs, or any
     /// module's txs). The caller is responsible for:
     ///
     /// - Using correct nonces (the mempool rejects stale/duplicate
     ///   nonces per sender).
     /// - Funding the sender accounts (the EVM module rejects txs from
     ///   accounts with insufficient balance).
-    /// - Using the correct module ID in the envelope (EVM = 3, bank =
-    ///   1, etc.).
+    /// - Using the correct module ID in the envelope (EVM = 3,
+    ///   staking = 2, etc.).
     ///
     /// `txs_per_round` txs are submitted per round, drawn from the
     /// flat `all_txs` slice in order. The total txs submitted is
@@ -1393,18 +1390,19 @@ fn bls_key(byte: u8) -> crypto::BlsSecretKey {
     crypto::BlsSecretKey::from_ikm(&ikm).expect("BLS key generation from valid IKM")
 }
 
-/// Construct a bank transfer tx for batch throughput testing.
+/// Construct a staking-delegate tx for batch throughput testing.
+/// Delegation bonds 1 unit to `Address::ZERO` (registered in the
+/// constructor), exercising the real EVM-ledger transfer path.
 fn make_batch_tx(round: usize, tx_i: usize) -> TxBytes {
     let sender = primitives::Address([0u8; 20]);
     let nonce = u64::try_from(round * 1000 + tx_i).unwrap();
     let fee = 100u64;
-    let to = primitives::Address([2u8; 20]);
-    let module_payload = bank::msg::transfer(to, 1);
+    let module_payload = staking::msg::delegate(primitives::Address::ZERO, 1);
     let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::BANK);
+    bytes.push(framework::module_id::STAKING);
     bytes.extend_from_slice(&module_payload);
     TxBytes::new(bytes)
 }
@@ -1571,10 +1569,10 @@ mod tests {
         }
     }
 
-    /// The bank module should have processed transfers: the state
+    /// The EVM ledger should have processed state: the state
     /// root should be non-zero after running.
     #[test]
-    fn tcp_multinode_bank_module_executes() {
+    fn tcp_multinode_evm_ledger_executes() {
         let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21200);
         devnet.run_batch(3, 10);
         let root = devnet.app(0).attest_state(primitives::Height::new(0));

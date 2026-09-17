@@ -10,17 +10,17 @@ use node::{ConsensusConfig, Node, NodeConfig};
 use ports::AppInterface;
 use primitives::Address;
 
-/// Build a bank-transfer tx in the same wire format the binary uses.
-fn build_bank_tx(nonce: u64) -> types::TxBytes {
-    let to = Address([2u8; 20]);
-    let payload = bank::msg::transfer(to, 100);
+/// Build a staking-delegate tx in the same wire format the binary
+/// uses. `Address::ZERO` is genesis-registered by `Node::assemble`.
+fn build_staking_tx(nonce: u64) -> types::TxBytes {
+    let payload = staking::msg::delegate(Address::ZERO, 100);
     let sender = Address([0u8; 20]);
     let fee = 100u64;
     let mut bytes = Vec::with_capacity(36 + 1 + payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::BANK);
+    bytes.push(framework::module_id::STAKING);
     bytes.extend_from_slice(&payload);
     types::TxBytes::new(bytes)
 }
@@ -39,14 +39,14 @@ fn smoke_assemble_sequencer() {
 }
 
 /// The full submit -> finalize -> state-root pipeline works under the
-/// sequencer engine: a bank transfer finalizes in one block and the
+/// sequencer engine: a staking delegate finalizes in one block and the
 /// state root is non-zero.
 #[test]
 fn smoke_submit_finalize_state_root_sequencer() {
     let config = NodeConfig::default();
     let mut node = Node::assemble(&config);
 
-    node.engine().submit_tx(build_bank_tx(0));
+    node.engine().submit_tx(build_staking_tx(0));
     node.engine().run_until_idle();
 
     let height = node.engine().finalized_height();
@@ -68,7 +68,7 @@ fn smoke_submit_finalize_state_root_oxidebft() {
     };
     let mut node = Node::assemble(&config);
 
-    node.engine().submit_tx(build_bank_tx(0));
+    node.engine().submit_tx(build_staking_tx(0));
     node.engine().run_until_idle();
 
     let height = node.engine().finalized_height();

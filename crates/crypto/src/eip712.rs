@@ -1,6 +1,6 @@
 //! EIP-712 typed-data hashing for native module transaction signing.
 //!
-//! Native (non-EVM) module transactions — bank transfers, staking
+//! Native (non-EVM) module transactions — staking bonds, exchange
 //! delegations, exchange orders — are authenticated by a secp256k1
 //! signature over an [EIP-712] typed-data digest. This is the same
 //! signing scheme `MetaMask` implements as `eth_signTypedData_v4`, so a
@@ -20,7 +20,7 @@
 //! 2. **Unified account space**: the recovered signer is an
 //!    Ethereum-style address (`keccak256(pubkey)[12..]`), identical
 //!    to the EVM account space — one keypair controls the EVM
-//!    account *and* the native bank/staking/exchange identity (the
+//!    account *and* the native staking/exchange identity (the
 //!    cosmos-evm model).
 //!
 //! # Typed-data schema
@@ -283,7 +283,7 @@ mod tests {
             &hex("68f9dc83056daa9742a3399bc39fcc7f1b9d49e8ddeb63a2a4adcbc0c33c2a17")[..],
         );
         // sender = 0x1111…, nonce = 5, fee = 100, moduleId = 1,
-        // payload = [0x01] ‖ 0x2222… ‖ 1000_u64_le (a bank transfer).
+        // payload = [0x01] ‖ 0x2222… ‖ 1000_u64_le (a module op).
         let sender = Address([0x11; 20]);
         let mut payload = vec![1u8];
         payload.extend_from_slice(&[0x22; 20]);

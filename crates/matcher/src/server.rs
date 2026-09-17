@@ -208,7 +208,7 @@ impl BatchSettler {
     ///
     /// Aggregates fills by (buyer, seller) pair before encoding —
     /// multiple fills between the same pair are combined into one
-    /// net transfer. This reduces the number of bank operations from
+    /// net transfer. This reduces the number of ledger operations from
     /// `fill_count` to `unique_pair_count` (typically 2-5x fewer).
     ///
     /// # Errors

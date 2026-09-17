@@ -1,14 +1,15 @@
 //! Networked TPS test — real multi-node oxideBFT consensus over TCP.
 //!
 //! This test spins up N validator nodes in-process, connected over real
-//! TCP loopback connections, submits a large batch of bank-transfer
+//! TCP loopback connections, submits a large batch of native-module
 //! transactions, runs consensus to finality, and reports end-to-end
 //! throughput.
 //!
 //! This is the honest TPS number: it includes consensus overhead
 //! (propose, vote, QC formation, QC broadcast), network I/O (TCP
 //! framing, per-peer writer channels), and execution (module dispatch,
-//! bank transfer, state root computation).
+//! ledger debit/credit on the EVM account store, state root
+//! computation).
 //!
 //! # Why this matters
 //!
@@ -46,7 +47,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 /// Run a networked TPS test with the given parameters.
 ///
 /// Spins up `n_validators` nodes over TCP, submits `rounds *
-/// txs_per_round` bank-transfer txs, runs consensus to finality,
+/// txs_per_round` staking-delegate txs, runs consensus to finality,
 /// and asserts that all validators agree on the same finalized blocks.
 ///
 /// `base_port` must be unique per test to avoid port collisions when
@@ -157,9 +158,9 @@ fn run_networked_tps(
 /// ports. Run with `cargo test -p devnet --test tps -- --ignored --nocapture`.
 ///
 /// The default block size is 500 txs/round. The block-size sweep
-/// showed bank-transfer TPS scales linearly with block size
+/// showed native-tx TPS scales linearly with block size
 /// (100→1000 txs/block gives 6.3× TPS). The block budget allows
-/// 1 MiB / 1 gigagas, so 500 bank txs (~18 KB) fit easily.
+/// 1 MiB / 1 gigagas, so 500 delegate txs (~18 KB) fit easily.
 ///
 /// The TPS floor is 500 tx/s for debug builds — conservative because
 /// debug-mode consensus + TCP framing is 5–20× slower than release.

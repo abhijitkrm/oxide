@@ -14,13 +14,13 @@
 //! - `0x02` Undelegate: start unbonding `amount` from `validator`.
 //!   The unbonded amount is locked until `completion_height =
 //!   current_height + UNBONDING_PERIOD_BLOCKS`. After completion,
-//!   the delegator can withdraw via a bank transfer (future: a
-//!   `withdraw` message).
+//!   the delegator is paid from the bonded pool at
+//!   `end_block` (completed automatically).
 //! - `0x03` Slash: reduce `validator`'s stake by `slash_fraction`
 //!   of `amount`. Called by consensus (double-sign evidence) or
 //!   governance. The slashed amount is burned.
 //! - `0x04` Claim reward: withdraw accumulated rewards for
-//!   `validator` (transferred to the sender's bank balance).
+//!   `validator` (minted to the sender's account balance).
 //!
 //! # Unbonding
 //!
@@ -60,7 +60,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use executor::{Event, ExecError, Module, TxContext};
-use framework::{module_id, subtree_root};
+use framework::{Balances, module_id, subtree_root};
 use primitives::{Address, Hash, Height};
 
 /// Message type byte for staking messages.
@@ -155,12 +155,13 @@ pub struct Validator {
 
 /// The bonded-pool module account.
 ///
-/// Delegated funds are held at this address in the bank module: a
-/// `delegate` moves `delegator → BONDED_POOL`, and completed unbonding
-/// moves `BONDED_POOL → delegator` back. The pool balance therefore
-/// always equals total live delegations + in-flight unbonding — the
-/// same accounting identity Cosmos keeps between `x/bank` and the
-/// bonded-tokens pool.
+/// Delegated funds are held at this address in the EVM account
+/// ledger: a `delegate` moves `delegator → BONDED_POOL`, and completed
+/// unbonding moves `BONDED_POOL → delegator` back. The pool balance
+/// therefore always equals total live delegations + in-flight
+/// unbonding — the same accounting identity Cosmos keeps between its
+/// ledger and the bonded-tokens pool, except here the "account"
+/// is a real EVM address whose balance is part of the state root.
 ///
 /// The address is a fixed 20-byte tag — no private key exists, so
 /// only the staking module's own calls can move funds out.
@@ -177,19 +178,26 @@ pub struct StakingModule {
     /// Live delegations: `(delegator, validator) → bonded amount`.
     ///
     /// This is the record that makes delegation real: `delegate`
-    /// debits the delegator's bank balance into [`BONDED_POOL`] and
+    /// debits the delegator's balance into [`BONDED_POOL`] and
     /// credits this map; `undelegate` requires the delegator's own
     /// delegation to cover the amount. Without it, `delegate` was
     /// unbacked stake inflation (any tx could grow any validator's
     /// stake for free) and `undelegate` let any account unbond any
     /// validator's stake.
     delegations: Mutex<BTreeMap<(Address, Address), u64>>,
-    /// The bank module handle for bond/unbond settlement. `None` in
+    /// The balance ledger used for bond/unbond settlement — the
+    /// EVM account store behind `framework::Balances`. `None` in
     /// bare unit tests only — `delegate`/`unbond_immediate` fail
     /// closed when unset (an unbacked delegation is a consensus
     /// accounting hole; see `docs/evm-parity-gap-analysis.md` for why
     /// precompile→module paths must reuse the native invariants).
-    bank: Mutex<Option<std::sync::Arc<bank::BankModule>>>,
+    ///
+    /// Note: the EVM *precompile* path does not go through this
+    /// handle — inside a revm frame the bond moves through
+    /// [`JournalBalances`] so revm's checkpoint machinery owns the
+    /// revert. This field serves native `handle_delegate` txs,
+    /// `end_block` unbond payouts, reward mints, and slash burns.
+    ledger: Mutex<Option<std::sync::Arc<dyn Balances + Send + Sync>>>,
     /// Pending unbonding entries (completed at `end_block`).
     unbonding: Mutex<Vec<UnbondingEntry>>,
     /// Accumulated rewards per validator address.
@@ -224,7 +232,7 @@ impl StakingModule {
             store: Mutex::new(BTreeMap::new()),
             validators: Mutex::new(BTreeMap::new()),
             delegations: Mutex::new(BTreeMap::new()),
-            bank: Mutex::new(None),
+            ledger: Mutex::new(None),
             unbonding: Mutex::new(Vec::new()),
             rewards: Mutex::new(BTreeMap::new()),
             pending_key_changes: Mutex::new(BTreeMap::new()),
@@ -347,104 +355,6 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     pub fn pending_unbonding(&self) -> Vec<UnbondingEntry> {
         self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
-    }
-
-    /// Undo a delegation immediately — the EVM-precompile revert path.
-    ///
-    /// [`handle_delegate`](Self::handle_delegate) bonds funds via the
-    /// normal message path. When the enclosing EVM frame later reverts,
-    /// the EVM journal calls this to restore the exact pre-call state:
-    /// delegation and stake reduced, funds returned pool → delegator
-    /// without entering the unbonding queue.
-    ///
-    /// `#[doc(hidden)]` — only the EVM module's native-side-effect
-    /// journal may call this; it is not a user-facing message path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a mutex is poisoned.
-    #[doc(hidden)]
-    pub fn unbond_immediate(
-        &self,
-        delegator: Address,
-        validator: Address,
-        amount: u64,
-    ) -> Result<(), ExecError> {
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let delegation = delegations
-            .get_mut(&(delegator, validator))
-            .ok_or(ExecError::ModuleRejected("undo: delegation missing".to_string()))?;
-        if *delegation < amount {
-            return Err(ExecError::ModuleRejected("undo: delegation underflow".to_string()));
-        }
-        *delegation -= amount;
-        let new_delegation = *delegation;
-        if new_delegation == 0 {
-            delegations.remove(&(delegator, validator));
-        }
-        let stake = validators
-            .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("undo: validator missing".to_string()))?;
-        *stake -= amount;
-        self.store_delegation_state(validator, delegator, *stake, new_delegation);
-        drop(delegations);
-        drop(validators);
-        // Refund the bond — same funds the delegate moved in.
-        self.require_bank()?.transfer(&BONDED_POOL, &delegator, amount)
-    }
-
-    /// Undo an undelegation — the EVM-precompile revert path.
-    ///
-    /// Restores the delegation and stake and removes the unbonding
-    /// entry the failed frame created. No bank movement: undelegate
-    /// never moved funds (the payout happens at completion).
-    ///
-    /// `#[doc(hidden)]` — only the EVM module's native-side-effect
-    /// journal may call this.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a mutex is poisoned.
-    #[doc(hidden)]
-    pub fn cancel_unbond(
-        &self,
-        delegator: Address,
-        validator: Address,
-        amount: u64,
-    ) -> Result<(), ExecError> {
-        // Remove the most recent matching unbonding entry (the one the
-        // reverted frame appended — same (delegator, validator,
-        // amount) triple).
-        {
-            let mut unbonding =
-                self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pos = unbonding
-                .iter()
-                .rposition(|e| {
-                    e.delegator == delegator && e.validator == validator && e.amount == amount
-                })
-                .ok_or(ExecError::ModuleRejected("undo: unbonding entry missing".to_string()))?;
-            unbonding.remove(pos);
-        }
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stake = validators
-            .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("undo: validator missing".to_string()))?;
-        *stake = stake
-            .checked_add(amount)
-            .ok_or(ExecError::ModuleRejected("undo: stake overflow".to_string()))?;
-        let delegation = delegations.entry((delegator, validator)).or_insert(0);
-        *delegation = delegation
-            .checked_add(amount)
-            .ok_or(ExecError::ModuleRejected("undo: delegation overflow".to_string()))?;
-        self.store_delegation_state(validator, delegator, *stake, *delegation);
-        Ok(())
     }
 
     /// Take all pending key changes, clearing the queue. Called by
@@ -695,19 +605,19 @@ impl Module for StakingModule {
         // (entries were dropped with no payout — the bonded pool kept
         // tokens nobody could reclaim).
         let current = height.value();
-        let bank = self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let ledger = self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let mut unbonding =
             self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         unbonding.retain(|entry| {
             if entry.completion_height > current {
                 return true;
             }
-            if let Some(bank) = &bank {
+            if let Some(ledger) = &ledger {
                 // Pool → delegator. The pool always holds the funds
                 // (delegations + in-flight unbonding sum to the pool
                 // balance), so this cannot fail; if it does, keep the
                 // entry so the delegator can still be paid later.
-                if bank.transfer(&BONDED_POOL, &entry.delegator, entry.amount).is_err() {
+                if ledger.transfer(&BONDED_POOL, &entry.delegator, entry.amount).is_err() {
                     return true;
                 }
             }
@@ -733,19 +643,21 @@ impl Module for StakingModule {
 }
 
 impl StakingModule {
-    /// Wire the bank module used for bond/unbond settlement.
+    /// Wire the balance ledger used for bond/unbond settlement.
     ///
-    /// Must be called at assembly (before any block executes). Once
-    /// set, `delegate` debits the delegator into [`BONDED_POOL`] and
-    /// completed unbonding credits the delegator back — the precompile
-    /// path (`0x0C01`) goes through the same `handle` entry point, so
-    /// EVM callers get identical accounting.
+    /// Must be called at assembly (before any block executes). On a
+    /// live node this is the [`EvmModule`]-backed `Balances` impl —
+    /// delegation debits land in the same account store EVM contracts
+    /// read, so a delegator's `eth_getBalance` already reflects the
+    /// bonded amount. `delegate` debits the delegator into
+    /// [`BONDED_POOL`] and completed unbonding credits the delegator
+    /// back.
     ///
     /// # Panics
     ///
     /// Panics if the mutex is poisoned.
-    pub fn set_bank(&self, bank: std::sync::Arc<bank::BankModule>) {
-        *self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bank);
+    pub fn set_ledger(&self, ledger: std::sync::Arc<dyn Balances + Send + Sync>) {
+        *self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ledger);
     }
 
     /// The delegator's bonded amount with a validator.
@@ -782,21 +694,21 @@ impl StakingModule {
         store.insert(key, delegation.to_le_bytes().to_vec());
     }
 
-    /// Take the bank handle, failing closed when unwired.
+    /// Take the ledger handle, failing closed when unwired.
     ///
     /// An unbacked delegation is an accounting hole — never run the
-    /// debit path without a bank.
-    fn require_bank(&self) -> Result<std::sync::Arc<bank::BankModule>, ExecError> {
-        self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().ok_or_else(
+    /// debit path without a ledger.
+    fn require_ledger(&self) -> Result<std::sync::Arc<dyn Balances + Send + Sync>, ExecError> {
+        self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().ok_or_else(
             || {
                 ExecError::ModuleRejected(
-                    "staking: bank module not wired (cannot settle delegation)".to_string(),
+                    "staking: balance ledger not wired (cannot settle delegation)".to_string(),
                 )
             },
         )
     }
 
-    /// Handle a delegate message: move `amount` from the sender's bank
+    /// Handle a delegate message: move `amount` from the sender's
     /// balance into the bonded pool and record the delegation.
     ///
     /// Invariants enforced (shared by the native and EVM-precompile
@@ -804,7 +716,7 @@ impl StakingModule {
     /// - The validator must be registered (`genesis_register_validator`
     ///   or `VALIDATOR_ADD`); delegation to an unknown validator is
     ///   rejected rather than silently fabricating consensus stake.
-    /// - The sender's bank balance must cover `amount` — the bank's
+    /// - The sender's balance must cover `amount` — the ledger's
     ///   `transfer` enforces this, so the EVM precompile cannot inflate
     ///   stake for free.
     fn handle_delegate(
@@ -814,30 +726,39 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        self.delegate_for(ctx.sender, validator, amount)?;
+        let ledger = self.require_ledger()?;
+        self.delegate_for(ctx.sender, validator, amount, ledger.as_ref())?;
         Ok(vec![Event { module: "staking", kind: "delegate", data: msg.to_vec() }])
     }
 
-    /// Bond `amount` of `delegator`'s bank balance to `validator`.
+    /// Bond `amount` of `delegator`'s balance to `validator` through
+    /// `ledger`.
     ///
     /// This is the shared core of [`handle_delegate`] and the EVM
     /// staking precompile: identical invariant enforcement regardless
     /// of which path the request arrives on. The delegator is debited
-    /// through the bank into [`BONDED_POOL`]; the validator must be
-    /// registered.
+    /// into [`BONDED_POOL`]; the validator must be registered.
+    ///
+    /// The `ledger` is a parameter, not `self.ledger`, because the
+    /// two call sites need *different* revert scopes: a native
+    /// `delegate` tx settles against the block-undo'd account cache
+    /// (the `EvmModule` impl), while the EVM precompile must move the
+    /// bond through revm's journal so a reverting frame restores both
+    /// balances — refunding in `undo_delegate` would then double-pay
+    /// the pool.
     ///
     /// # Errors
     ///
     /// `ExecError::ModuleRejected` if the validator is unregistered,
-    /// the bank is unwired, the transfer fails, or stake/delegation
+    /// the transfer fails (insufficient balance), or stake/delegation
     /// arithmetic overflows.
     pub fn delegate_for(
         &self,
         delegator: Address,
         validator: Address,
         amount: u64,
+        ledger: &dyn Balances,
     ) -> Result<(), ExecError> {
-        let bank = self.require_bank()?;
         {
             let validators =
                 self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -848,7 +769,7 @@ impl StakingModule {
             }
         }
         // Debit first: if the transfer fails nothing is recorded.
-        bank.transfer(&delegator, &BONDED_POOL, amount)?;
+        ledger.transfer(&delegator, &BONDED_POOL, amount)?;
 
         let mut validators =
             self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -868,9 +789,13 @@ impl StakingModule {
         Ok(())
     }
 
-    /// Reverse a [`delegate_for`] — used by the EVM journal when the
-    /// calling frame reverts. Subtracts stake/delegation and refunds
-    /// the delegator from the bonded pool.
+    /// Reverse a [`delegate_for`]'s *record* — used by the EVM
+    /// native journal when the calling frame reverts.
+    ///
+    /// Subtracts stake/delegation only. The bonded funds need no
+    /// refund here: the precompile moved them through revm's journal,
+    /// so `checkpoint_revert` already restored both balances before
+    /// this undo runs. Refunding again would double-pay the pool.
     ///
     /// # Errors
     ///
@@ -883,7 +808,6 @@ impl StakingModule {
         validator: Address,
         amount: u64,
     ) -> Result<(), ExecError> {
-        let bank = self.require_bank()?;
         let mut validators =
             self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut delegations =
@@ -906,11 +830,7 @@ impl StakingModule {
             .ok_or(ExecError::ModuleRejected("undo_delegate: validator gone".to_string()))?;
         *stake -= amount;
         self.store_delegation_state(validator, delegator, *stake, new_delegation);
-        drop(delegations);
-        drop(validators);
-        // Refund after ledger state is consistent — a failed refund
-        // leaves the pool over-funded rather than stake inflated.
-        bank.transfer(&BONDED_POOL, &delegator, amount)
+        Ok(())
     }
 
     /// Start unbonding `amount` of `delegator`'s own delegation to
@@ -1018,8 +938,8 @@ impl StakingModule {
     /// **sender's own** delegation to `validator`.
     ///
     /// The delegation is removed immediately (stake drops now) and the
-    /// amount enters the unbonding queue; at `completion_height` the
-    /// bank pays it out of the bonded pool to the delegator.
+    /// amount enters the unbonding queue; at `completion_height`
+    /// `end_block` pays it out of the bonded pool to the delegator.
     fn handle_undelegate(
         &self,
         ctx: &TxContext,
@@ -1109,11 +1029,13 @@ impl StakingModule {
         // unattributed stake (genesis self-stake) was never in the
         // pool, so burning it would overdraw.
         if burned_from_pool > 0 {
-            if let Some(bank) =
-                self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+            if let Some(ledger) =
+                self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
             {
-                // Burn = send to the zero address (no key holder).
-                let _ = bank.transfer(&BONDED_POOL, &Address::ZERO, burned_from_pool);
+                // Burn = debit the pool with no credit — supply
+                // shrinks (Ethereum burn semantics; cleaner than
+                // accumulating at the zero address).
+                let _ = ledger.debit(&BONDED_POOL, burned_from_pool);
             }
         }
 
@@ -1125,10 +1047,9 @@ impl StakingModule {
     /// If `amount` is 0, all accumulated rewards are claimed.
     /// Otherwise, up to `amount` rewards are claimed.
     ///
-    /// The claimed rewards are recorded as an event — the actual
-    /// bank transfer is handled by a future `withdraw` step (or
-    /// directly by the executor wiring the reward to the bank
-    /// module).
+    /// The claimed amount is minted to the validator's account —
+    /// rewards are new issuance authorized by the block-reward
+    /// schedule, not a transfer out of the bonded pool.
     fn handle_claim_reward(
         &self,
         ctx: &TxContext,
@@ -1144,9 +1065,9 @@ impl StakingModule {
                 "claim_reward: only the validator can claim its rewards".to_string(),
             ));
         }
-        let bank = self.bank.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let bank = bank
-            .ok_or_else(|| ExecError::ModuleRejected("claim_reward: bank not wired".to_string()))?;
+        let ledger = self.require_ledger().map_err(|_| {
+            ExecError::ModuleRejected("claim_reward: balance ledger not wired".to_string())
+        })?;
 
         let claim_amount = {
             let mut rewards =
@@ -1165,7 +1086,7 @@ impl StakingModule {
         // Rewards are new issuance authorized by the block-reward
         // schedule — mint lazily at claim time so the bonded pool is
         // never touched by reward payouts.
-        bank.mint(&validator, claim_amount);
+        ledger.mint(&validator, claim_amount);
 
         Ok(vec![Event { module: "staking", kind: "claim_reward", data: msg.to_vec() }])
     }
@@ -1406,36 +1327,29 @@ mod tests {
         Address([byte; 20])
     }
 
-    /// A staking module with a bank wired and each address `0..=9`
-    /// funded with 1M units, plus every listed validator registered
-    /// (zero stake — delegations build it up).
+    /// A staking module with a `MemoryBalances` ledger wired and each
+    /// address `0..=9` funded with 1M base units, plus every listed
+    /// validator registered (zero stake — delegations build it up).
     fn setup(validators: &[u8]) -> StakingModule {
-        let staking = StakingModule::new();
-        let bank = std::sync::Arc::new(bank::BankModule::new());
-        for s in 0u8..=9 {
-            bank.mint(&addr(s), 1_000_000);
-        }
-        staking.set_bank(bank);
-        for v in validators {
-            staking.register_validator(addr(*v));
-        }
-        staking
+        setup_with_ledger(validators).0
     }
 
-    /// The bank behind a setup — needed by tests asserting pool
-    /// movement. (`setup` keeps the handle internally; tests that
-    /// need bank assertions build it directly.)
-    fn setup_with_bank(validators: &[u8]) -> (StakingModule, std::sync::Arc<bank::BankModule>) {
+    /// The ledger behind a setup — needed by tests asserting pool
+    /// movement. The ledger is `MemoryBalances`: a unit-test double
+    /// over the same `Balances` seam the real EVM-backed impl serves.
+    fn setup_with_ledger(
+        validators: &[u8],
+    ) -> (StakingModule, std::sync::Arc<framework::MemoryBalances>) {
         let staking = StakingModule::new();
-        let bank = std::sync::Arc::new(bank::BankModule::new());
+        let ledger = std::sync::Arc::new(framework::MemoryBalances::new());
         for s in 0u8..=9 {
-            bank.mint(&addr(s), 1_000_000);
+            ledger.mint(&addr(s), 1_000_000);
         }
-        staking.set_bank(bank.clone());
+        staking.set_ledger(ledger.clone());
         for v in validators {
             staking.register_validator(addr(*v));
         }
-        (staking, bank)
+        (staking, ledger)
     }
 
     fn ctx() -> TxContext {
@@ -1506,55 +1420,55 @@ mod tests {
 
     #[test]
     fn delegate_moves_funds_to_bonded_pool() {
-        let (staking, bank) = setup_with_bank(&[1]);
+        let (staking, ledger) = setup_with_ledger(&[1]);
         let v = addr(1);
-        let before = bank.balance(&addr(0));
+        let before = ledger.balance(&addr(0));
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
-        assert_eq!(bank.balance(&addr(0)), before - 1000, "delegator debited");
-        assert_eq!(bank.balance(&BONDED_POOL), 1000, "bonded pool credited");
+        assert_eq!(ledger.balance(&addr(0)), before - 1000, "delegator debited");
+        assert_eq!(ledger.balance(&BONDED_POOL), 1000, "bonded pool credited");
         assert_eq!(staking.delegation(&addr(0), &v), 1000);
     }
 
     #[test]
     fn delegate_rejects_insufficient_balance() {
-        let (staking, bank) = setup_with_bank(&[1]);
+        let (staking, ledger) = setup_with_ledger(&[1]);
         let v = addr(1);
         let result = staking.handle(&ctx(), &msg::delegate(v, 2_000_000));
         assert!(result.is_err(), "delegate exceeding balance must fail");
         assert_eq!(staking.stake(&v), 0, "no stake created on failure");
-        assert_eq!(bank.balance(&BONDED_POOL), 0, "pool untouched on failure");
+        assert_eq!(ledger.balance(&BONDED_POOL), 0, "pool untouched on failure");
     }
 
     #[test]
-    fn unbonding_refunds_delegator_via_bank() {
-        let (staking, bank) = setup_with_bank(&[1]);
+    fn unbonding_refunds_delegator_via_ledger() {
+        let (staking, ledger) = setup_with_ledger(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
-        let after_delegate = bank.balance(&addr(0));
+        let after_delegate = ledger.balance(&addr(0));
         staking.begin_block(Height::new(10));
         staking.handle(&ctx(), &msg::undelegate(v, 400)).unwrap();
         // Still in the pool while unbonding.
-        assert_eq!(bank.balance(&BONDED_POOL), 1000);
-        assert_eq!(bank.balance(&addr(0)), after_delegate, "not refunded yet");
+        assert_eq!(ledger.balance(&BONDED_POOL), 1000);
+        assert_eq!(ledger.balance(&addr(0)), after_delegate, "not refunded yet");
         staking.begin_block(Height::new(10 + DEFAULT_UNBONDING_PERIOD_BLOCKS));
         staking.end_block(Height::new(10 + DEFAULT_UNBONDING_PERIOD_BLOCKS));
         assert_eq!(
-            bank.balance(&addr(0)),
+            ledger.balance(&addr(0)),
             after_delegate + 400,
             "unbonded funds returned to the delegator"
         );
-        assert_eq!(bank.balance(&BONDED_POOL), 600, "pool keeps the bonded remainder");
+        assert_eq!(ledger.balance(&BONDED_POOL), 600, "pool keeps the bonded remainder");
     }
 
     #[test]
     fn slash_burns_only_bonded_funds() {
-        let (staking, bank) = setup_with_bank(&[1]);
+        let (staking, ledger) = setup_with_ledger(&[1]);
         let v = addr(1);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         staking.handle(&ctx(), &msg::slash(v, 100)).unwrap();
         assert_eq!(staking.stake(&v), 900);
         assert_eq!(staking.delegation(&addr(0), &v), 900, "delegation reduced proportionally");
-        assert_eq!(bank.balance(&BONDED_POOL), 900, "slashed amount burned from pool");
+        assert_eq!(ledger.balance(&BONDED_POOL), 900, "slashed amount burned from pool");
     }
 
     #[test]

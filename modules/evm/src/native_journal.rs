@@ -5,8 +5,10 @@
 //!
 //! Oxide native precompiles (e.g. the staking delegate precompile
 //! `0x0C_01`) mutate state that lives *outside* the EVM journal — the
-//! staking module's delegation ledger and the bank's balances. revm
-//! checkpoints and reverts only EVM state (accounts/storage). Without a
+//! staking module's delegation ledger. revm checkpoints and reverts
+//! only EVM state (accounts/storage — which now includes the balance
+//! ledger, since the EVM account store is the single token ledger).
+//! Without a
 //! parallel undo mechanism, a contract could:
 //!
 //! 1. `CALL` the delegate precompile (succeeds — stake bonded), then

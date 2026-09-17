@@ -11,10 +11,10 @@
 //!
 //! | Bench | What | Gate (source: plan.md §13 Phase 3, §9.2) |
 //! |---|---|---|
-//! | `settlement_single_fill` | full `handle()`: parse + pre-trade check + match + bank transfer + event emit | p50 < 2 µs ⇒ ≥500k orders/s/core settled |
+//! | `settlement_single_fill` | full `handle()`: parse + pre-trade check + match + ledger transfer + event emit | p50 < 2 µs ⇒ ≥500k orders/s/core settled |
 //! | `settlement_sweep_10_levels` | full `handle()` sweeping 10 resting makers | p50 < 10 µs ⇒ ≥100k sweeps/s/core |
 //! | `raw_engine_single_fill` | `MatchingEngine::place()` only (no settlement) | baseline for head-to-head |
-//! | `settlement_overhead` | derived: `settlement_single_fill − raw_engine_single_fill` | the bank + event overhead per fill |
+//! | `settlement_overhead` | derived: `settlement_single_fill − raw_engine_single_fill` | the ledger + event overhead per fill |
 //!
 //! ## Measured results (M-series dev Mac, criterion p50)
 //!
@@ -29,12 +29,12 @@
 //!
 //! The matching engine alone sustains 22.5M ops/s/core (44.5 ns/op,
 //! `crates/trading/benches/matching.rs`). Settlement adds, per fill:
-//! - one `bank.balance()` BTreeMap lookup (pre-trade check),
-//! - one `bank.transfer()` = two BTreeMap lookups + two inserts,
+//! - one `ledger.balance()` account-cache read (pre-trade check),
+//! - one `ledger.transfer()` = two BTreeMap lookups + two inserts,
 //! - one `fill_event` Vec allocation + byte copies,
 //! - one `outcome_event` Vec allocation.
 //!
-//! The bank's `BTreeMap<Vec<u8>, Vec<u8>>` is the dominant settlement
+//! The ledger's account-cache write (plus undo capture) is the dominant settlement
 //! cost: each `transfer` does two key lookups and two key allocations
 //! (`addr.0.to_vec()`). The gate (≥500k orders/s/core settled) is
 //! conservative — it is 1/40th of the raw engine throughput, reflecting
@@ -43,11 +43,11 @@
 //! ## Method notes
 //!
 //! - `black_box` on every input and consumed output.
-//! - The exchange + bank are created ONCE outside the bench (the
+//! - The exchange + ledger are created ONCE outside the bench (the
 //!   `Module::handle` takes `&self` via internal Mutex, so no RefCell
 //!   is needed). Setup only rests a maker; the measured section places
 //!   a taker that fills it. After the fill, the book is empty, so the
-//!   next iteration's setup rests a new maker. The bank is funded with
+//!   next iteration's setup rests a new maker. The ledger is funded with
 //!   1T quote per trader — enough for ~13M fills at 75k each.
 //! - This avoids the `iter_batched` by-value drop-in-measured-section
 //!   regression documented in `crates/trading/benches/matching.rs`
@@ -58,6 +58,7 @@
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use executor::{Module, TxContext};
+use framework::Balances;
 use primitives::Address;
 use primitives::fixed::{Price, Qty};
 use std::cell::RefCell;
@@ -110,19 +111,22 @@ fn limit(side: Side, ticks: u64, lots: u64, owner: u8) -> NewOrder {
 /// Gate: p50 < 2 µs (≥500k orders/s/core settled).
 ///
 /// Measures the full `ExchangeModule::handle()` path for a single
-/// fill: message parse, pre-trade balance check, engine match, bank
+/// fill: message parse, pre-trade balance check, engine match, ledger
 /// transfer (debit buyer + credit seller), and event emission. The
 /// setup rests one maker sell; the measured section places one taker
 /// buy that fills it.
 fn settlement_single_fill(c: &mut Criterion) {
-    // Create exchange + bank ONCE; reuse across all iterations.
+    // Create exchange + ledger ONCE; reuse across all iterations.
     // handle() takes &self (internal Mutex), so no RefCell needed.
     // Fund with 1e15 (1 quadrillion) quote — each fill costs 75k, so
     // the bench can run ~13 billion fills before exhausting funds.
-    let bank = Arc::new(bank::BankModule::new());
-    bank.mint(&addr(1), 1_000_000_000_000_000); // 1e15 for buyer
-    bank.mint(&addr(9), 1_000_000_000_000_000); // 1e15 for seller
-    let ex = ExchangeModule::with_bank(bank);
+    // The ledger is the real EVM account store — the production
+    // `Balances` impl — so the measured fill cost includes the undo
+    // capture + touched marking every production transfer pays.
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    ledger.mint(&addr(1), 1_000_000_000_000_000); // 1e15 units for buyer
+    ledger.mint(&addr(9), 1_000_000_000_000_000); // 1e15 units for seller
+    let ex = ExchangeModule::with_ledger(ledger);
     let mid = ex.list_market(cfg()).expect("market config valid");
     let maker = limit(Side::Sell, 500, 5, 9);
     let taker = limit(Side::Buy, 500, 5, 1);
@@ -150,13 +154,13 @@ fn settlement_single_fill(c: &mut Criterion) {
 ///
 /// Measures the full `handle()` path for a 10-level sweep: 10 resting
 /// makers at ticks 500–509, one marketable taker buy that fills all
-/// 10. Each fill triggers a separate `bank.transfer()`, so settlement
+/// 10. Each fill triggers a separate `ledger.transfer()`, so settlement
 /// cost scales linearly with fill count.
 fn settlement_sweep_10_levels(c: &mut Criterion) {
-    let bank = Arc::new(bank::BankModule::new());
-    bank.mint(&addr(1), 1_000_000_000_000_000);
-    bank.mint(&addr(9), 1_000_000_000_000_000);
-    let ex = ExchangeModule::with_bank(bank);
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    ledger.mint(&addr(1), 1_000_000_000_000_000);
+    ledger.mint(&addr(9), 1_000_000_000_000_000);
+    let ex = ExchangeModule::with_ledger(ledger);
     let mid = ex.list_market(cfg()).expect("market config valid");
     let taker = NewOrder {
         side: Side::Buy,
@@ -192,7 +196,7 @@ fn settlement_sweep_10_levels(c: &mut Criterion) {
 }
 
 /// Baseline: raw `MatchingEngine::place()` for a single fill (no
-/// settlement, no events, no bank). This is the head-to-head
+/// settlement, no events, no ledger). This is the head-to-head
 /// comparison point — the difference between this and
 /// `settlement_single_fill` is the settlement overhead.
 ///

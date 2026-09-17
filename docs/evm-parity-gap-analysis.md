@@ -113,15 +113,15 @@ cosmos-evm static registry (`0x…0100`–`0x…0807`) + dynamic ERC20/WERC20:
 | Standard geth set (ecrecover, sha256, ripemd160, identity, modexp, ecadd, ecmul, ecpairing, blake2f, kzg) | ✅ | ✅ via revm | — |
 | P256 `0x…0100` | ✅ | ❌ | add if requested — cheap |
 | Bech32 `0x…0400` | ✅ | ➖ | no bech32 in Oxide addressing |
-| Staking `0x…0800` (delegate/redelegate/undelegate/queries) | ✅ **state-mutating** | 🟡 | `0x0C01` delegate + `0x0C02` undelegate **wired with real side effects** — caller-scoped, bank-backed, same native invariants, revert-safe via frame-scoped native journal; redelegate + queries still missing |
+| Staking `0x…0800` (delegate/redelegate/undelegate/queries) | ✅ **state-mutating** | 🟡 | `0x0C01` delegate + `0x0C02` undelegate **wired with real side effects** — caller-scoped, settled through the EVM account store (the single native-token ledger), same native invariants, revert-safe via revm's own journal for the bond transfer + a frame-scoped native journal for the delegation record; redelegate + queries still missing |
 | Distribution `0x…0801` | ✅ | ❌ | no rewards/distribution module yet |
 | ICS20 `0x…0802` | ✅ | ➖ | no IBC |
 | Vesting `0x…0803` | ✅ | ➖ | no vesting module |
-| Bank `0x…0804` | ✅ | 🟡 | `0x0B01` transfer (mutating) + `0x0B02` balance — close parity |
+| Bank `0x…0804` | ✅ | ➖ | **retired** — there is no bank ledger; the native token is a first-class EVM balance, so `eth_getBalance`/plain transfers already do what those precompiles did |
 | Gov `0x…0805` | ✅ | ❌ | governance module exists, no precompile |
 | Slashing `0x…0806` | ✅ | ❌ | no slashing module |
 | ICS02 `0x…0807` | ✅ | ➖ | no IBC |
-| ERC20 dynamic precompiles (STRv2: denom ↔ ERC20 facade over bank state) | ✅ | ❌ | no bank-denom→ERC20 view; needed for wallet UX of issued assets |
+| ERC20 dynamic precompiles (STRv2: denom ↔ ERC20 facade over bank state) | ✅ | ➖ | **obviated** — no bank denoms exist; the native token is already an EVM balance (wallets/ERC20 tooling see it natively) |
 | WERC20 wrapped-native | ✅ | ❌ | same |
 | Exchange/perps read precompiles | ➖ n/a | ✅ `0x05_*`/`0x06_*` best bid/ask, position, mark, insurance | Oxide-only, no cosmos-evm equivalent |
 | IBC callbacks (`x/ibc/callbacks`) | ✅ | ➖ | no IBC |
@@ -163,7 +163,7 @@ surface is the reference for "complete L1 functionality":
 | Module | cosmos-evm | Oxide | Status |
 |---|---|---|---|
 | `x/auth` accounts + ante (sig verify, nonce, fee deduct) | ✅ | 🟡 | secp256k1 recovery in EVM path; native modules have no unified ante/nonce layer — executor tracks `executed_nonces` per module |
-| `x/bank` | ✅ | ✅ | balances, transfer, supply |
+| `x/bank` | ✅ | ✅ (different design) | no bank module — the EVM account store is the single native-token ledger: balances, transfer, supply all live in EVM state |
 | `x/staking` | ✅ | ✅ | delegate, undelegate, validator add/remove, key rotation |
 | `x/distribution` (staking rewards) | ✅ | ❌ | **missing** — validators earn only burned-fee remainder? Fee destination needs a design decision |
 | `x/slashing` + evidence | ✅ | ❌ | **missing** — no downtime/double-sign slashing; oxideBFT has BLS QC evidence to slash on |
@@ -187,7 +187,7 @@ surface is the reference for "complete L1 functionality":
 | Blockscout/explorers | ✅ | ❌ | needs full block/tx/receipt/log APIs |
 | HD keys `m/44'/60'` | ✅ | ✅ | secp256k1, coin-type-60 compatible keys work |
 | Ledger via Ethereum app | ✅ | ❌ | optional |
-| EIP-712 typed-data signing of native msgs | ✅ | ✅ | `Tx(address sender,uint64 nonce,uint64 fee,uint8 moduleId,bytes payload)` over `Oxide`-v1 domain; `eth_signTypedData_v4` signs bank/staking/exchange txs |
+| EIP-712 typed-data signing of native msgs | ✅ | ✅ | `Tx(address sender,uint64 nonce,uint64 fee,uint8 moduleId,bytes payload)` over `Oxide`-v1 domain; `eth_signTypedData_v4` signs staking/exchange/perps txs |
 | Dual bech32+hex addressing | ✅ | ➖ | single 20-byte space — simpler; document `0x` as canonical |
 
 ## 8. Operations
@@ -248,9 +248,11 @@ surface is the reference for "complete L1 functionality":
    `eth_getFilterChanges` (cursor semantics), `eth_getFilterLogs`,
    `eth_uninstallFilter`; 300s TTL with `filter not found` on expiry.
 8. ~~**Staking precompile side effects**~~ — **shipped**: `0x0C01`/`0x0C02`
-   run the same bank-backed native cores as `MsgDelegate`/`MsgUndelegate`
-   (the exploit-safe path — see §3 note), rolled back on EVM-frame revert
-   by the native journal. Remaining: redelegate, queries, gov precompile.
+   run the same native cores as `MsgDelegate`/`MsgUndelegate` (the
+   exploit-safe path — see §3 note), with the bond moving through
+   revm's journal (auto-reverted on frame failure) and the delegation
+   record rolled back by the frame-scoped native journal. Remaining:
+   redelegate, queries, gov precompile.
 9. ~~**Preinstalls**~~ — **shipped**: Create2 factory, Multicall3, Permit2,
    Safe proxy+singleton, and the EIP-2935 history contract (Prague-gated)
    at canonical addresses (bytecode verified against
@@ -312,8 +314,11 @@ surface is the reference for "complete L1 functionality":
     helper; `oxide_sendRawTransaction` RPC submits hex envelopes and
     returns the BLAKE3 tx hash. This also closed the pre-existing hole
     where native senders were merely *declared*, not proven.
-17. **ERC20 facade over bank denoms** — dynamic precompile per denom
-    (STRv2-lite, no IBC).
+17. ~~**ERC20 facade over bank denoms**~~ — **obviated by the ledger
+    unification**: there are no bank denoms; the EVM account store is
+    the single native-token ledger, so the native token already has
+    first-class wallet/EVM semantics. A *wrapper* (WETH-style ERC20
+    contract) remains possible but is a contract, not a precompile.
 
 ### P3 — chain completeness (non-EVM)
 

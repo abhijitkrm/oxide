@@ -2,7 +2,7 @@
 //!
 //! A genesis file defines the initial state of the chain at height 0:
 //! - Chain ID and consensus parameters
-//! - Pre-funded accounts (bank balances)
+//! - Pre-funded accounts (EVM `alloc` balances)
 //! - Initial validator set (addresses + stakes)
 //! - Staking parameters (unbonding period, block reward)
 //!
@@ -22,10 +22,12 @@
 //!     "base_timeout_ms": 2000,
 //!     "max_timeout_ms": 30000
 //!   },
-//!   "bank": {
-//!     "balances": {
-//!       "0x0000000000000000000000000000000000000000": 1000000000000,
-//!       "0x0101010101010101010101010101010101010101": 500000000000
+//!   "evm": {
+//!     "alloc": {
+//!       "0x0000000000000000000000000000000000000000":
+//!         { "balance": "1000000000000000000000" },
+//!       "0x0101010101010101010101010101010101010101":
+//!         { "balance": "500000000000000000000" }
 //!     }
 //!   },
 //!   "staking": {
@@ -55,7 +57,12 @@ pub struct Genesis {
     /// Consensus engine and parameters.
     #[serde(default)]
     pub consensus: GenesisConsensus,
-    /// Bank module: pre-funded account balances.
+    /// Legacy balance map: pre-funded account balances in base
+    /// units (1 unit = 10^9 wei). There is no bank module — the EVM
+    /// account store is the single native-token ledger — so these
+    /// are applied to `evm` accounts at genesis, scaled to wei.
+    /// Kept for file compatibility with genesis files written before
+    /// the ledger unification; new files should use `evm.alloc`.
     #[serde(default)]
     pub bank: GenesisBank,
     /// Staking module: initial validator set and parameters.
@@ -100,7 +107,8 @@ fn default_max_timeout_ms() -> u64 {
     30_000
 }
 
-/// Bank module genesis state: pre-funded account balances.
+/// Legacy balance map in genesis: pre-funded account balances in
+/// base units. Applied to the EVM account store (scaled to wei).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GenesisBank {
     /// Pre-funded account balances, keyed by hex address.
@@ -252,13 +260,22 @@ impl Genesis {
     pub fn devnet(chain_id: u64, num_validators: usize, num_prefunded: u8, balance: u64) -> Self {
         let mut genesis = Self::new(chain_id);
 
-        // Pre-fund senders [0x00; 20] through [n-1; 20].
+        // Pre-fund senders [0x00; 20] through [n-1; 20] in the EVM
+        // `alloc` map — the single native-token ledger. `balance` is
+        // base units; genesis applies it scaled to wei (10^9 wei per
+        // unit) so the same amounts native txs move are visible via
+        // `eth_getBalance`.
         // Each address is 20 bytes of the same value: [i; 20].
-        // Hex: 0x + 40 hex chars (2 per byte * 20 bytes).
         for i in 0..num_prefunded {
             let byte_hex = format!("{i:02x}");
             let addr = format!("0x{}", byte_hex.repeat(20));
-            genesis.bank.insert(addr, balance);
+            genesis.evm.alloc.insert(
+                addr,
+                GenesisEvmAccount {
+                    balance: (u128::from(balance) * 1_000_000_000).to_string(),
+                    ..GenesisEvmAccount::default()
+                },
+            );
         }
 
         // Create validators [0x0a; 20], [0x0b; 20], etc.
@@ -277,11 +294,18 @@ impl Genesis {
         genesis
     }
 
-    /// Add a pre-funded account balance.
+    /// Add a pre-funded account balance (base units → EVM `alloc`
+    /// in wei).
     ///
     /// `address` must be a hex string with `0x` prefix (20 bytes).
     pub fn add_balance(&mut self, address: &str, balance: u64) {
-        self.bank.insert(address.to_string(), balance);
+        self.evm.alloc.insert(
+            address.to_string(),
+            GenesisEvmAccount {
+                balance: (u128::from(balance) * 1_000_000_000).to_string(),
+                ..GenesisEvmAccount::default()
+            },
+        );
     }
 
     /// Add a validator to the genesis validator set.
@@ -369,7 +393,7 @@ mod tests {
         let genesis = Genesis::devnet(1, 4, 32, 1_000_000_000_000);
         assert_eq!(genesis.chain_id, 1);
         assert_eq!(genesis.staking.validators.len(), 4);
-        assert_eq!(genesis.bank.balances.len(), 32);
+        assert_eq!(genesis.evm.alloc.len(), 32);
         assert_eq!(genesis.consensus.engine, ConsensusEngineKind::OxideBft);
     }
 
@@ -377,8 +401,11 @@ mod tests {
     fn genesis_balance_lookup() {
         let mut genesis = Genesis::new(1);
         genesis.add_balance("0x0101010101010101010101010101010101010101", 500_000);
-        assert_eq!(genesis.bank.balance("0x0101010101010101010101010101010101010101"), 500_000);
-        assert_eq!(genesis.bank.balance("0x0202020202020202020202020202020202020202"), 0);
+        assert_eq!(
+            genesis.evm.alloc["0x0101010101010101010101010101010101010101"].balance,
+            "500000000000000"
+        );
+        assert!(!genesis.evm.alloc.contains_key("0x0202020202020202020202020202020202020202"));
     }
 
     #[test]

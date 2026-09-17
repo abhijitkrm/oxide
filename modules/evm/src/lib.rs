@@ -2,7 +2,7 @@
 //!
 //! This module is the `x/vm` analog (plan.md §2, §8): it wraps the
 //! `revm` EVM engine and exposes it as a Cosmos-SDK-style `Module`
-//! in the Oxide module router. Native messages (bank, staking,
+//! in the Oxide module router. Native messages (staking,
 //! trading) and EVM transactions share the same block and gas meter.
 //!
 //! # Reference implementation
@@ -51,14 +51,14 @@
 //! Future phases add:
 //! - Gas debiting, base-fee burn, and priority-fee tips (Phase A5).
 //! - Block context and coinbase/fee-recipient wiring (Phase A6).
-//! - Precompiles that call into native modules (bank, trading).
+//! - Precompiles that call into native modules (staking, trading).
 //! - Parallel OCC scheduler for cross-tx parallelism.
 //! - JSON-RPC + WebSocket server.
 
 use std::sync::Mutex;
 
 use executor::{Event, ExecError, Module, TxContext};
-use framework::module_id;
+use framework::{Balances, module_id};
 use primitives::{Address, Hash, Height};
 // Ceiling 1: the chain-configured block gas limit is the single
 // source of truth for the EVM's block gas limit too.
@@ -71,6 +71,7 @@ use rayon::prelude::*;
 pub mod deadline;
 pub mod fee;
 pub mod history;
+pub mod ledger;
 pub mod native_journal;
 pub mod overrides;
 mod persist;
@@ -99,7 +100,7 @@ use std::sync::Arc;
 /// The EVM module's dispatch ID in the module router.
 ///
 /// Reserved by `framework::module_id::EVM` (3). Native modules use
-/// IDs 0–2 (core, bank, staking); the EVM is the first VM module.
+/// IDs 0–2 (core, reserved, staking); the EVM is the first VM module.
 pub const MODULE_ID: u8 = module_id::EVM;
 
 /// One traced execution: the execution result paired with the
@@ -409,7 +410,10 @@ pub struct EvmModule {
     /// deep clone. Mutable access uses `Arc::make_mut`, which is
     /// free when the refcount is 1 (no outstanding snapshots) and
     /// only clones when a snapshot is actually held.
-    db: Mutex<Arc<CacheDB<EmptyDB>>>,
+    ///
+    /// `pub(crate)` so `ledger.rs` (the `Balances` impl) can mutate
+    /// balances through the same undo/touched bookkeeping.
+    pub(crate) db: Mutex<Arc<CacheDB<EmptyDB>>>,
     /// The chain ID for EIP-155 signed transactions.
     chain_id: u64,
     /// The base fee for EIP-1559 gas metering (wei per gas unit).
@@ -452,7 +456,9 @@ pub struct EvmModule {
     /// journaled state transition. A `HashSet` would produce a
     /// different op order on every validator — identical logical
     /// state, divergent journal/MMR histories.
-    touched: Mutex<std::collections::BTreeSet<revm::primitives::Address>>,
+    ///
+    /// `pub(crate)` for `ledger.rs` (`Balances` impl).
+    pub(crate) touched: Mutex<std::collections::BTreeSet<revm::primitives::Address>>,
     /// Wall-clock bound applied to read-only simulations
     /// (`eth_call`/`eth_estimateGas`/`eth_createAccessList`/
     /// `debug_traceCall`) — the geth `--rpc.evmtimeout` equivalent.
@@ -540,7 +546,9 @@ pub struct EvmModule {
     /// site records the pre-write value of each account it touches
     /// (first-write-wins). Folded into `versioned` at `end_block`.
     /// See `versioned.rs` for the reconstruction semantics.
-    block_undo: Mutex<versioned::BlockUndo>,
+    ///
+    /// `pub(crate)` for `ledger.rs` (`Balances` impl).
+    pub(crate) block_undo: Mutex<versioned::BlockUndo>,
     /// The bounded historical-state window: per-block undo entries
     /// indexed by account and height, pruned with `history`'s
     /// retention. Backs all `eth_*` reads at past heights.
@@ -3337,6 +3345,21 @@ impl Module for EvmModule {
         true
     }
 
+    /// Charge the envelope fee from the sender's EVM balance — the
+    /// fee is **burned** (debited, credited to nobody), matching
+    /// Ethereum's base-fee semantics. `ctx.fee` is in `u64` base
+    /// units; [`Balances::debit`] converts to wei at
+    /// [`WEI_PER_UNIT`](framework::WEI_PER_UNIT). Zero-fee txs skip
+    /// the ledger touch entirely (fresh senders with `fee = 0`
+    /// succeed without an account record — same admission behavior
+    /// the old bank fee module had).
+    fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
+        if ctx.fee == 0 {
+            return Ok(());
+        }
+        self.debit(&ctx.sender, ctx.fee)
+    }
+
     /// The EVM is self-authenticating: the sender is recovered from
     /// the secp256k1 signature inside the RLP transaction, so the
     /// envelope's declared `sender` is a mempool-ordering hint only.
@@ -5333,7 +5356,7 @@ impl EvmModule {
 }
 
 /// Convert an Oxide `Address` (20 bytes) to a revm `Address`.
-fn alloy_primitives_address(bytes: [u8; 20]) -> revm::primitives::Address {
+pub(crate) fn alloy_primitives_address(bytes: [u8; 20]) -> revm::primitives::Address {
     revm::primitives::Address::from(bytes)
 }
 
@@ -7861,19 +7884,33 @@ mod tests {
         code
     }
 
-    /// A bank+staking pair wired into the module, with `contract`
-    /// funded on the bank side (it will be the delegator).
+    /// A staking pair wired into the module, with `contract`
+    /// deployed carrying `balance_units` on the EVM ledger (it will
+    /// be the delegator) and `runtime` as its code. The balance is
+    /// set in the same genesis insert as the code — a separate mint
+    /// first would be overwritten by the insert. Returns the module
+    /// in an `Arc` so the same handle can serve as staking's
+    /// out-of-transaction ledger.
     fn staking_wired_module(
         contract: Address,
-        bank_balance: u64,
-    ) -> (EvmModule, Arc<staking::StakingModule>, Arc<bank::BankModule>) {
-        let m = make_module();
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&contract, bank_balance);
+        balance_units: u64,
+        runtime: Vec<u8>,
+    ) -> (Arc<EvmModule>, Arc<staking::StakingModule>) {
+        let m = Arc::new(make_module());
+        m.genesis_insert_account(
+            &contract,
+            u128::from(balance_units) * framework::WEI_PER_UNIT,
+            0,
+            runtime,
+            vec![],
+        );
         let staking_mod = Arc::new(staking::StakingModule::new());
-        staking_mod.set_bank(bank.clone());
+        // Wire the module's out-of-tx ledger for staking's native
+        // paths (end_block payouts, rewards); the precompile bond
+        // itself moves through revm's journal inside the frame.
+        staking_mod.set_ledger(m.clone());
         m.set_staking(staking_mod.clone());
-        (m, staking_mod, bank)
+        (m, staking_mod)
     }
 
     #[test]
@@ -7881,16 +7918,13 @@ mod tests {
         let (pk, caller) = test_keypair();
         let contract = Address([0xC0; 20]);
         let validator = Address([0xAA; 20]);
-        let (m, staking_mod, bank) = staking_wired_module(contract, 10_000);
+        let (m, staking_mod) = staking_wired_module(
+            contract,
+            10_000,
+            delegate_then_revert_runtime(validator.0, 1_000, false),
+        );
         staking_mod.register_validator(validator);
         fund(&m, &caller);
-        m.genesis_insert_account(
-            &contract,
-            0,
-            0,
-            delegate_then_revert_runtime(validator.0, 1_000, false),
-            vec![],
-        );
 
         m.begin_block(Height::new(1));
         let to = tx::TxKind::Call(revm::primitives::Address::from_slice(&contract.0));
@@ -7903,29 +7937,27 @@ mod tests {
             "delegation must persist after a successful frame"
         );
         assert_eq!(staking_mod.stake(&validator), 1_000);
-        assert_eq!(bank.balance(&contract), 9_000, "delegator debited");
-        assert_eq!(bank.balance(&staking::BONDED_POOL), 1_000);
+        assert_eq!(Balances::balance(m.as_ref(), &contract), 9_000, "delegator debited");
+        assert_eq!(Balances::balance(m.as_ref(), &staking::BONDED_POOL), 1_000);
         m.end_block(Height::new(1));
     }
 
     #[test]
     fn staking_delegate_precompile_undone_on_revert() {
         // The security property: a contract that delegates then
-        // reverts must leave NO trace in staking or bank — the native
-        // journal replays `undo_delegate` when the calling frame fails.
+        // reverts must leave NO trace in staking or the ledger — the
+        // native journal replays `undo_delegate` while revm's journal
+        // restores the bond transfer itself.
         let (pk, caller) = test_keypair();
         let contract = Address([0xC0; 20]);
         let validator = Address([0xAA; 20]);
-        let (m, staking_mod, bank) = staking_wired_module(contract, 10_000);
+        let (m, staking_mod) = staking_wired_module(
+            contract,
+            10_000,
+            delegate_then_revert_runtime(validator.0, 1_000, true),
+        );
         staking_mod.register_validator(validator);
         fund(&m, &caller);
-        m.genesis_insert_account(
-            &contract,
-            0,
-            0,
-            delegate_then_revert_runtime(validator.0, 1_000, true),
-            vec![],
-        );
 
         m.begin_block(Height::new(1));
         let to = tx::TxKind::Call(revm::primitives::Address::from_slice(&contract.0));
@@ -7940,8 +7972,12 @@ mod tests {
             "reverted frame must undo the delegation"
         );
         assert_eq!(staking_mod.stake(&validator), 0, "no stake may survive a revert");
-        assert_eq!(bank.balance(&contract), 10_000, "delegator refunded by the undo path");
-        assert_eq!(bank.balance(&staking::BONDED_POOL), 0, "pool unchanged");
+        assert_eq!(
+            Balances::balance(m.as_ref(), &contract),
+            10_000,
+            "delegator refunded by revm\'s journal revert"
+        );
+        assert_eq!(Balances::balance(m.as_ref(), &staking::BONDED_POOL), 0, "pool unchanged");
         m.end_block(Height::new(1));
     }
 
@@ -7953,16 +7989,13 @@ mod tests {
         let (_pk, caller) = test_keypair();
         let contract = Address([0xC0; 20]);
         let validator = Address([0xAA; 20]);
-        let (m, staking_mod, bank) = staking_wired_module(contract, 10_000);
+        let (m, staking_mod) = staking_wired_module(
+            contract,
+            10_000,
+            delegate_then_revert_runtime(validator.0, 1_000, false),
+        );
         staking_mod.register_validator(validator);
         fund(&m, &caller);
-        m.genesis_insert_account(
-            &contract,
-            0,
-            0,
-            delegate_then_revert_runtime(validator.0, 1_000, false),
-            vec![],
-        );
 
         m.begin_block(Height::new(1));
         let req = call_req(revm::primitives::Address::from_slice(&contract.0), &[]);
@@ -7972,7 +8005,7 @@ mod tests {
             0,
             "read-only simulation must not mutate staking state"
         );
-        assert_eq!(bank.balance(&staking::BONDED_POOL), 0);
+        assert_eq!(Balances::balance(m.as_ref(), &staking::BONDED_POOL), 0);
         m.end_block(Height::new(1));
     }
 

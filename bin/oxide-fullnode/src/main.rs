@@ -27,7 +27,7 @@ fn main() {
 
     let _node = Node::assemble(&config);
 
-    println!("oxide-fullnode: assembled stack (executor + core/bank/staking modules)");
+    println!("oxide-fullnode: assembled stack (executor + core/staking/evm modules)");
     println!("oxide-fullnode: ready (sync not yet implemented — Phase 2)");
 }
 

@@ -13,7 +13,7 @@
 //!   (positive = long, negative = short). Entry price is the
 //!   volume-weighted average.
 //! - **Margin** is quote currency held in the perps module (deposited
-//!   via bank transfer). Cross margin shares one margin pool across
+//!   via a balance transfer). Cross margin shares one margin pool across
 //!   all positions for an account; isolated margin is per-market.
 //! - **`PnL`** is unrealized: `position.size * (mark - entry)` for longs,
 //!   `position.size * (entry - mark)` for shorts. Realized on close.
@@ -317,7 +317,11 @@ impl AccountState {
 pub struct PerpsModule {
     inner: Mutex<Inner>,
     store: KVStore,
-    bank: Option<Arc<bank::BankModule>>,
+    /// The balance ledger for margin deposits/withdrawals — the EVM
+    /// account store behind `framework::Balances` on a live node.
+    /// `None` = margin accounting only (unit-test mode): deposits and
+    /// withdrawals update the margin field without moving funds.
+    ledger: Option<Arc<dyn framework::Balances + Send + Sync>>,
 }
 
 struct Inner {
@@ -345,7 +349,7 @@ struct Inner {
 }
 
 impl PerpsModule {
-    /// Construct a fresh perps module with no markets and no bank
+    /// Construct a fresh perps module with no markets and no ledger
     /// settlement.
     pub fn new() -> Self {
         Self {
@@ -359,15 +363,17 @@ impl PerpsModule {
                 oracle_updates_this_block: BTreeMap::new(),
             }),
             store: Mutex::new(BTreeMap::new()),
-            bank: None,
+            ledger: None,
         }
     }
 
-    /// Construct a perps module wired to a bank for margin deposits
-    /// and settlement.
-    pub fn with_bank(bank: Arc<bank::BankModule>) -> Self {
+    /// Construct a perps module wired to a balance ledger for
+    /// margin deposits and withdrawals. On a live node `ledger` is
+    /// the EVM account store — margin debits/credits move the same
+    /// balances EVM txs see.
+    pub fn with_ledger(ledger: Arc<dyn framework::Balances + Send + Sync>) -> Self {
         let mut m = Self::new();
-        m.bank = Some(bank);
+        m.ledger = Some(ledger);
         m
     }
 
@@ -781,10 +787,10 @@ impl PerpsModule {
             // Account has leftover margin after liquidation — return it.
             let leftover = u64::try_from(net).unwrap_or(0);
             if leftover > 0 {
-                if let Some(bank) = &self.bank {
-                    // Credit the leftover back to the account's bank
-                    // balance. (The margin was deposited from bank.)
-                    let _ = bank.credit(account, leftover);
+                if let Some(ledger) = &self.ledger {
+                    // Credit the leftover back to the account's
+                    // balance. (The margin was deposited from it.)
+                    let _ = ledger.credit(account, leftover);
                 }
             }
         }
@@ -1253,11 +1259,11 @@ impl PerpsModule {
     ///
     /// # Atomicity
     ///
-    /// The margin credit is validated **before** the bank debit: a
+    /// The margin credit is validated **before** the ledger debit: a
     /// deposit that would overflow the `u64` margin field is
-    /// rejected while the bank balance is still untouched. The
-    /// previous order — debit bank, then `saturating_add` the margin
-    /// — could take the user's bank funds while crediting less
+    /// rejected while the account balance is still untouched. The
+    /// previous order — debit ledger, then `saturating_add` the margin
+    /// — could take the user's funds while crediting less
     /// margin than was deposited (silent value destruction).
     fn handle_deposit(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (market, amount) = Self::parse_margin(body).ok_or(ExecError::Malformed)?;
@@ -1268,13 +1274,13 @@ impl PerpsModule {
         } else {
             &mut acct.positions.entry(market).or_default().isolated_margin
         };
-        // Overflow check first: never debit the bank for margin we
+        // Overflow check first: never debit the ledger for margin we
         // cannot represent.
         let new_balance = balance
             .checked_add(amount)
             .ok_or_else(|| ExecError::ModuleRejected("margin balance overflow".to_string()))?;
-        if let Some(bank) = &self.bank {
-            bank.debit(&ctx.sender, amount)?;
+        if let Some(ledger) = &self.ledger {
+            ledger.debit(&ctx.sender, amount)?;
         }
         *balance = new_balance;
         drop(inner);
@@ -1285,12 +1291,12 @@ impl PerpsModule {
     ///
     /// # Atomicity
     ///
-    /// The bank credit is attempted **while the margin lock is held
-    /// and before the margin debit**: if `bank.credit` fails (e.g.
-    /// the destination balance would overflow `u64`), the margin is
+    /// The ledger credit is attempted **while the margin lock is held
+    /// and before the margin debit**: if `ledger.credit` fails (e.g.
+    /// the destination balance would overflow), the margin is
     /// untouched and the error propagates. The previous order —
-    /// debit margin, then credit bank — destroyed the user's margin
-    /// when the bank credit failed.
+    /// debit margin, then credit the ledger — destroyed the user's
+    /// margin when the ledger credit failed.
     fn handle_withdraw(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (market, amount) = Self::parse_margin(body).ok_or(ExecError::Malformed)?;
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1303,11 +1309,11 @@ impl PerpsModule {
         if *balance < amount {
             return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
         }
-        // Bank credit first (margin lock held): on failure the
+        // Ledger credit first (margin lock held): on failure the
         // margin is untouched. The margin debit below cannot fail —
         // sufficiency was just checked.
-        if let Some(bank) = &self.bank {
-            bank.credit(&ctx.sender, amount)?;
+        if let Some(ledger) = &self.ledger {
+            ledger.credit(&ctx.sender, amount)?;
         }
         *balance -= amount;
         drop(inner);
@@ -1644,7 +1650,7 @@ mod tests {
         Side, StpMode, TimeInForce, encode_reject_reason, mark_price_deviation_bps, msg,
     };
     use executor::{ExecError, Module, TxContext};
-    use framework::module_id;
+    use framework::{Balances, module_id};
     use primitives::Address;
     use primitives::Height;
     use primitives::fixed::{Price, Qty};
@@ -1697,45 +1703,45 @@ mod tests {
 
     #[test]
     fn deposit_cross_margin() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         perps.list_market(test_cfg()).unwrap();
         // Deposit 500_000 into cross margin.
         perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
         assert_eq!(perps.cross_margin(&addr(1)), 500_000);
-        assert_eq!(bank.balance(&addr(1)), 500_000);
+        assert_eq!(ledger.balance(&addr(1)), 500_000);
     }
 
     #[test]
     fn deposit_isolated_margin() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
         perps.handle(&ctx(1), &msg::deposit(mid, 500_000)).unwrap();
         let pos = perps.position(&addr(1), mid);
         assert_eq!(pos.isolated_margin, 500_000);
-        assert_eq!(bank.balance(&addr(1)), 500_000);
+        assert_eq!(ledger.balance(&addr(1)), 500_000);
     }
 
     #[test]
     fn withdraw_cross_margin() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         perps.list_market(test_cfg()).unwrap();
         perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
         perps.handle(&ctx(1), &msg::withdraw(super::CROSS_MARGIN_MARKET, 200_000)).unwrap();
         assert_eq!(perps.cross_margin(&addr(1)), 300_000);
-        assert_eq!(bank.balance(&addr(1)), 700_000);
+        assert_eq!(ledger.balance(&addr(1)), 700_000);
     }
 
     #[test]
     fn withdraw_insufficient_rejected() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         perps.list_market(test_cfg()).unwrap();
         perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 100_000)).unwrap();
         let err =
@@ -1787,10 +1793,10 @@ mod tests {
 
     #[test]
     fn funding_long_pays_short() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000_000);
-        bank.mint(&addr(2), 1_000_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000_000);
+        ledger.mint(&addr(2), 1_000_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
 
         // Both deposit cross margin.
@@ -1826,9 +1832,9 @@ mod tests {
 
     #[test]
     fn liquidation_closes_underwater_position() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
 
         // Deposit small margin and open a position.
@@ -2065,10 +2071,10 @@ mod tests {
     /// are profitable counterparties to deleverage.
     #[test]
     fn adl_triggers_on_insurance_fund_depletion() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        bank.mint(&addr(2), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(2), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
 
         // Account 1: underwater long (will be liquidated).
@@ -2116,8 +2122,8 @@ mod tests {
     /// ADL ranking: the most profitable counterparty is deleveraged first.
     #[test]
     fn adl_ranks_by_profit_descending() {
-        let bank = Arc::new(bank::BankModule::new());
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
 
         // Account 1: underwater long (will be liquidated).
@@ -2169,8 +2175,8 @@ mod tests {
     /// ADL is deterministic: the same state produces the same events.
     #[test]
     fn adl_is_deterministic() {
-        let bank = Arc::new(bank::BankModule::new());
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
 
         // Setup: underwater long + profitable short counterparty.
@@ -2319,15 +2325,15 @@ mod tests {
     }
 
     /// Regression test: a deposit that would overflow the `u64`
-    /// margin field must be rejected BEFORE the bank debit. Before
-    /// the fix, `handle_deposit` debited the bank then
-    /// `saturating_add`ed the margin — the user's bank funds were
+    /// margin field must be rejected BEFORE the ledger debit. Before
+    /// the fix, `handle_deposit` debited the ledger then
+    /// `saturating_add`ed the margin — the user's funds were
     /// taken while the margin was silently capped.
     #[test]
-    fn deposit_overflow_rejected_bank_untouched() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+    fn deposit_overflow_rejected_ledger_untouched() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         perps.list_market(test_cfg()).unwrap();
 
         // Push cross margin near u64::MAX directly.
@@ -2336,39 +2342,39 @@ mod tests {
             PerpsModule::account_mut(&mut inner, &addr(1)).cross_margin = u64::MAX - 100;
         }
 
-        // Deposit 500 → margin would overflow → reject, bank intact.
+        // Deposit 500 → margin would overflow → reject, ledger intact.
         let err =
             perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500)).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
-        assert_eq!(bank.balance(&addr(1)), 1_000_000, "bank must not be debited");
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000, "ledger must not be debited");
         assert_eq!(perps.cross_margin(&addr(1)), u64::MAX - 100);
     }
 
-    /// Regression test: a failed bank credit must not destroy the
+    /// Regression test: a failed ledger credit must not destroy the
     /// user's margin. Before the fix, `handle_withdraw` debited
-    /// margin first and returned `Err` when `bank.credit` failed —
+    /// margin first and returned `Err` when `ledger.credit` failed —
     /// the margin was gone.
     #[test]
-    fn withdraw_bank_failure_preserves_margin() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), u64::MAX);
-        let perps = PerpsModule::with_bank(bank.clone());
+    fn withdraw_ledger_failure_preserves_margin() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), u64::MAX);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         perps.list_market(test_cfg()).unwrap();
 
-        // Deposit 500 (bank: MAX-500, margin: 500).
+        // Deposit 500 (balance: MAX-500, margin: 500).
         perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500)).unwrap();
-        // Top the bank balance back up so a 500 credit overflows.
-        bank.mint(&addr(1), 400);
-        assert_eq!(bank.balance(&addr(1)), u64::MAX - 100);
+        // Top the balance back up so a 500 credit overflows.
+        ledger.mint(&addr(1), 400);
+        assert_eq!(ledger.balance(&addr(1)), u64::MAX - 100);
 
-        // Withdraw 500 → bank credit overflows → error, margin intact.
+        // Withdraw 500 → ledger credit overflows → error, margin intact.
         let err =
             perps.handle(&ctx(1), &msg::withdraw(super::CROSS_MARGIN_MARKET, 500)).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
         assert_eq!(
             perps.cross_margin(&addr(1)),
             500,
-            "margin must be preserved when the bank credit fails"
+            "margin must be preserved when the ledger credit fails"
         );
     }
 
@@ -2380,10 +2386,10 @@ mod tests {
     /// nothing.
     #[test]
     fn funding_zero_sum_when_payer_insolvent() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000_000);
-        bank.mint(&addr(2), 1_000_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000_000);
+        ledger.mint(&addr(2), 1_000_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
 
         // Long deposits almost nothing (insolvent payer); short is
@@ -2427,10 +2433,10 @@ mod tests {
     /// the fix, positions could be opened with zero margin.
     #[test]
     fn place_rejected_without_initial_margin() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        bank.mint(&addr(9), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
 
         // addr(1) has NO margin — a 1-lot buy at tick 500 has
@@ -2448,10 +2454,10 @@ mod tests {
     /// position opens.
     #[test]
     fn place_allowed_with_sufficient_margin() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        bank.mint(&addr(9), 1_000_000);
-        let perps = PerpsModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
 
         // Seller needs margin too (its sell increases exposure).

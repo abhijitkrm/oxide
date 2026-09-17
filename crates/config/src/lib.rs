@@ -442,8 +442,8 @@ impl ExecutorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GenesisConfig {
     /// The genesis balance minted to each sender on every validator's
-    /// bank module. Large enough that the simulation never exhausts
-    /// it. Default: 10^12 (1 trillion).
+    /// EVM account store (base units, scaled to wei). Large enough
+    /// that the simulation never exhausts it. Default: 10^12.
     #[serde(default = "default_genesis_balance")]
     pub genesis_balance: u64,
 

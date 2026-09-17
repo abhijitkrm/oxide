@@ -146,7 +146,12 @@ level. Need evidence.
   executor pipeline against the raw matching engine and EVM
   execution layer. Results (M2 MacBook Pro, release):
 
-  **Executor (bank transfers, SequencerEngine — no BFT overhead):**
+  *(measured when the bank module was the ledger; the ledger is now
+  the EVM account store — `framework::Balances` over `EvmModule` —
+  which benched ~20% faster on the settlement path; numbers below are
+  the last bank-ledger measurements)*
+
+  **Executor (native transfers, SequencerEngine — no BFT overhead):**
   - Single-block: 662K tx/s at 1000 txs/block
     (gate: ≥10K tx/s — **PASS, 66× above**).
   - Sustained pipeline: 463K tx/s at 100tx×100blk
@@ -171,18 +176,18 @@ level. Need evidence.
   - Full block cycle (1000 txs): 35.46 ms → 28.2K tx/s.
   - Parallel batch (1000 txs, 100 senders): 7.99 ms → 125K tx/s
     (4.4× speedup from parallel sender recovery).
-  - Native vs EVM: native bank 9.45 ms/1000 tx vs EVM 35.41 ms/1000
-    tx → EVM is 3.7× slower than native bank transfers.
+  - Native vs EVM: native ledger 9.45 ms/1000 tx vs EVM 35.41 ms/1000
+    tx → EVM is 3.7× slower than native ledger transfers.
 
   **Overhead breakdown:**
   - Raw matching engine: 20.6M ops/s (mixed workload).
-  - Executor bank transfers: 662K tx/s.
+  - Executor native transfers: 662K tx/s.
   - EVM simple transfers: 28.7K tx/s (single-threaded).
   - The executor pipeline (662K tx/s) is 32× slower than the raw
     matching engine (20.6M ops/s). This overhead comes from: tx
     envelope parsing, mempool admission, preverification caching,
     module dispatch, state root computation, and block finalization.
-  - EVM execution (28.7K tx/s) is 23× slower than native bank
+  - EVM execution (28.7K tx/s) is 23× slower than native ledger
     transfers (662K tx/s). This is expected: EVM includes
     secp256k1 recovery, EVM bytecode interpretation, and trie
     state management. Parallel sender recovery recovers ~4.4× of
@@ -195,7 +200,7 @@ level. Need evidence.
   **Limitations:**
   - These are single-core, single-host measurements. Multi-host BFT
     consensus adds network round-trip overhead (~20 ms per block
-    with 20 ms latency, giving ~50 blocks/s → 1.4M bank tx/s or
+    with 20 ms latency, giving ~50 blocks/s → 1.4M native tx/s or
     1.4K EVM tx/s across 4 validators at 1000 txs/block).
   - The 1M orders/sec trading target requires the matching engine
     (20.6M ops/s single-core) integrated with the executor
@@ -421,7 +426,7 @@ imported → catches up. `/validator-set` returns current set.
    and the devnet path registers an EVM module so `eth_*` is backed
    in multi-node mode. **P1 resolved:** legacypool-style same-nonce
    mempool replacement (≥10% bump), genesis preinstalls (Create2
-   factory, Multicall3, Permit2, Safe), bank-backed staking
+   factory, Multicall3, Permit2, Safe), EVM-ledger-backed staking
    delegation with revert-safe `0x0C_*` precompiles, and WebSocket
    transport with `eth_subscribe` (`newHeads` + filtered `logs`).
    **P1.5 resolved:** pollable filter APIs (`eth_newFilter`… with

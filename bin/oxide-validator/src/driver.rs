@@ -265,10 +265,11 @@ mod tests {
         };
         let mut node = Node::assemble(&config);
 
-        // Submit a transaction so the engine has work to do.
-        let to = primitives::Address([2u8; 20]);
-        let module_payload = bank::msg::transfer(to, 100);
-        let tx = build_tx(framework::module_id::BANK, &module_payload);
+        // Submit a transaction so the engine has work to do —
+        // a staking delegate to `Address::ZERO` (registered at
+        // genesis by `Node::assemble`).
+        let module_payload = staking::msg::delegate(primitives::Address::ZERO, 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
         node.engine().submit_tx(tx);
 
         // Verify the engine can finalize directly (sanity check).
@@ -279,9 +280,8 @@ mod tests {
         // Now start the driver with the node (already has finalized
         // one block). Submit another tx and verify the driver
         // finalizes it.
-        let to2 = primitives::Address([3u8; 20]);
-        let module_payload2 = bank::msg::transfer(to2, 200);
-        let tx2 = build_tx(framework::module_id::BANK, &module_payload2);
+        let module_payload2 = staking::msg::delegate(primitives::Address::ZERO, 200);
+        let tx2 = build_tx(framework::module_id::STAKING, &module_payload2);
         node.engine().submit_tx(tx2);
 
         let driver = ConsensusDriver::with_defaults();

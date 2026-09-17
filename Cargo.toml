@@ -52,7 +52,6 @@ mempool = { path = "crates/mempool", version = "0.1.0" }
 executor = { path = "crates/executor", version = "0.1.0" }
 framework = { path = "modules/framework", version = "0.1.0" }
 oxide-core = { path = "modules/oxide-core", version = "0.1.0" }
-bank = { path = "modules/bank", version = "0.1.0" }
 staking = { path = "modules/staking", version = "0.1.0" }
 evm = { path = "modules/evm", version = "0.1.0" }
 governance = { path = "modules/governance", version = "0.1.0" }
@@ -131,7 +130,7 @@ alloy-primitives = { version = "1.7.2", features = ["std"] }
 # (Phase G). Pure Rust, constant-time, no_std-compatible. Used by
 # Solana, Signal, and many blockchain projects. BSD-3-Clause
 # (GPL-3.0-compatible). This is the native signature scheme for
-# Oxide's non-EVM modules (bank, staking, trading) — faster
+# Oxide's non-EVM modules (staking, trading) — faster
 # verification than secp256k1 and no malleability.
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 # rayon: data-parallelism for batch secp256k1 sender recovery.

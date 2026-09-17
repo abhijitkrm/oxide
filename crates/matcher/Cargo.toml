@@ -14,7 +14,6 @@ repository.workspace = true
 primitives = { workspace = true }
 types = { workspace = true }
 trading = { workspace = true }
-bank = { workspace = true }
 exchange = { workspace = true }
 framework = { workspace = true }
 executor = { workspace = true }

@@ -176,7 +176,7 @@ impl Indexer {
     /// Index an event from a block execution.
     ///
     /// Events are indexed by module for efficient module-specific
-    /// queries (e.g., "show all bank transfers").
+    /// queries (e.g., "show all staking ops").
     pub fn index_event(&mut self, event: IndexedEvent) {
         let event_idx = self.events.len();
         self.events_by_module.entry(event.module.clone()).or_default().push(event_idx);
@@ -386,21 +386,21 @@ mod tests {
         idx.index_event(IndexedEvent {
             height: 1,
             tx_index: 0,
-            module: "bank".to_string(),
+            module: "staking".to_string(),
             kind: "transfer".to_string(),
             data: b"100".to_vec(),
         });
         idx.index_event(IndexedEvent {
             height: 1,
             tx_index: 1,
-            module: "staking".to_string(),
+            module: "exchange".to_string(),
             kind: "delegate".to_string(),
             data: b"50".to_vec(),
         });
         assert_eq!(idx.event_count(), 2);
-        let bank_events = idx.get_events_by_module("bank");
-        assert_eq!(bank_events.len(), 1);
-        assert_eq!(bank_events[0].kind, "transfer");
+        let staking_events = idx.get_events_by_module("staking");
+        assert_eq!(staking_events.len(), 1);
+        assert_eq!(staking_events[0].kind, "transfer");
     }
 
     #[test]
@@ -409,14 +409,14 @@ mod tests {
         idx.index_event(IndexedEvent {
             height: 1,
             tx_index: 0,
-            module: "bank".to_string(),
+            module: "staking".to_string(),
             kind: "transfer".to_string(),
             data: vec![],
         });
         idx.index_event(IndexedEvent {
             height: 2,
             tx_index: 0,
-            module: "bank".to_string(),
+            module: "staking".to_string(),
             kind: "transfer".to_string(),
             data: vec![],
         });

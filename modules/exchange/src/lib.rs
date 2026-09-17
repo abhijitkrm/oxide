@@ -16,8 +16,8 @@
 //! - **No settlement in the engine:** the matching engine produces
 //!   [`FillEvent`]s (price, qty, maker/taker owners). Settlement —
 //!   debiting/crediting balances — is the module's job, and in v0 it
-//!   records fills as events without moving bank balances. Full
-//!   atomic settlement (bank + exchange in one tx) arrives with the
+//!   records fills as events unless a balance ledger is wired.
+//!   Atomic settlement (ledger + exchange in one tx) arrives with the
 //!   cross-module coordinator (plan.md §9.2).
 //! - **Deterministic fill ordering:** the engine emits fills in match
 //!   order (best price first, FIFO within a level). Two validators
@@ -113,10 +113,10 @@ const CANCEL_BODY_LEN: usize = 9;
 /// `[tick:8][lot:8][min:8][max:8][max_resting:4]` = 36.
 const LIST_MARKET_BODY_LEN: usize = 36;
 
-/// Quote-currency scale: the bank stores raw `u64` values. The
-/// notional from a fill is scale-14 (`qty_scale_6 × price_scale_8`);
-/// dividing by `PRICE_SCALE` (1e8) yields the quote amount in scale-6,
-/// which is the bank's native unit for this settlement path.
+/// Quote-currency scale: the ledger stores native `u64` base units.
+/// The notional from a fill is scale-14 (`qty_scale_6 × price_scale_8`);
+/// dividing by `PRICE_SCALE` (1e8) yields the quote amount in scale-6
+/// base units — the `Balances` unit for this settlement path.
 const PRICE_SCALE: u128 = 100_000_000;
 
 // ── Module ───────────────────────────────────────────────────────────
@@ -132,24 +132,25 @@ type L1 = (Option<(Price, Qty)>, Option<(Price, Qty)>);
 /// deterministic runtime calls `handle` serially, so the lock is
 /// uncontended on the hot path.
 ///
-/// **Settlement (plan.md §9.2):** when wired with a [`BankModule`]
-/// via [`ExchangeModule::with_bank`], the module settles each fill by
-/// debiting the buyer and crediting the seller (quote currency only,
-/// scale-6). Pre-trade balance checks reject buy orders that would
-/// overdraw. Base-asset tracking is deferred to multi-asset bank
-/// support; v0 is quote-settled cash markets.
+/// **Settlement (plan.md §9.2):** when wired with a [`Balances`]
+/// ledger via [`ExchangeModule::with_ledger`], the module settles each
+/// fill by debiting the buyer and crediting the seller (quote
+/// currency only, base units). Pre-trade balance checks reject buy
+/// orders that would overdraw. Base-asset tracking is deferred to
+/// multi-asset support; v0 is quote-settled cash markets.
 pub struct ExchangeModule {
     inner: Mutex<Inner>,
     store: KVStore,
-    /// Optional bank handle for cross-module settlement. `None` =
-    /// fills are recorded as events but no balances move (the v0
+    /// Optional balance-ledger handle for settlement — the EVM
+    /// account store behind `framework::Balances`. `None` = fills
+    /// are recorded as events but no balances move (the v0
     /// no-settlement mode, useful for testing the matching path in
     /// isolation).
-    bank: Option<Arc<bank::BankModule>>,
+    ledger: Option<Arc<dyn framework::Balances + Send + Sync>>,
     /// The address authorized to submit `batch_settle` transactions:
     /// the off-chain matching service's tx sender. `None` disables
     /// batch settlement entirely (fail-closed) — an unconfigured
-    /// operator must never be able to move bank balances.
+    /// operator must never be able to move balances.
     settlement_operator: Option<Address>,
 }
 
@@ -174,22 +175,24 @@ impl ExchangeModule {
                 fills: Vec::with_capacity(64),
             }),
             store: Mutex::new(BTreeMap::new()),
-            bank: None,
+            ledger: None,
             settlement_operator: None,
         }
     }
 
-    /// Construct an exchange module wired to a bank for settlement.
-    /// Fills debit the buyer and credit the seller (quote currency).
-    /// Pre-trade balance checks reject buy orders that would overdraw.
+    /// Construct an exchange module wired to a balance ledger for
+    /// settlement. Fills debit the buyer and credit the seller (quote
+    /// currency). Pre-trade balance checks reject buy orders that
+    /// would overdraw. On a live node `ledger` is the EVM account
+    /// store, so settled funds are the same balances EVM txs move.
     ///
     /// Note: `batch_settle` stays disabled until
     /// [`Self::set_settlement_operator`] configures the authorized
-    /// operator address — wiring a bank alone does not open the
+    /// operator address — wiring a ledger alone does not open the
     /// privileged settlement path.
-    pub fn with_bank(bank: Arc<bank::BankModule>) -> Self {
+    pub fn with_ledger(ledger: Arc<dyn framework::Balances + Send + Sync>) -> Self {
         let mut ex = Self::new();
-        ex.bank = Some(bank);
+        ex.ledger = Some(ledger);
         ex
     }
 
@@ -512,8 +515,8 @@ impl ExchangeModule {
             return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
         };
 
-        // Pre-trade risk check (plan.md §9.2): if the bank is
-        // wired, verify the buyer has enough quote balance for
+        // Pre-trade risk check (plan.md §9.2): if the ledger
+        // is wired, verify the buyer has enough quote balance for
         // the worst-case fill. Buy orders pay `price * qty`;
         // sell orders receive quote (no pre-check needed for v0
         // — base-asset tracking is deferred).
@@ -524,7 +527,7 @@ impl ExchangeModule {
         // `engine.sweep_cost`. Without this check an unfunded
         // taker could sweep the book and leave every fill
         // unsettled (makers' orders consumed, no payment).
-        if let Some(bank) = &self.bank {
+        if let Some(ledger) = &self.ledger {
             if order.side == Side::Buy {
                 // Scale-14 notional: limit buys use the
                 // worst-case `price × qty` bound (fills can
@@ -540,7 +543,7 @@ impl ExchangeModule {
                 let quote_needed = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
                     ExecError::ModuleRejected("buy notional exceeds u64 quote range".to_string())
                 })?;
-                if bank.balance(&ctx.sender) < quote_needed {
+                if ledger.balance(&ctx.sender) < quote_needed {
                     return Err(ExecError::ModuleRejected(
                         "insufficient balance for buy order".to_string(),
                     ));
@@ -572,7 +575,7 @@ impl ExchangeModule {
         // emitted a `settlement_failed` event but the fill stood —
         // the maker lost their resting order without receiving
         // payment, and the buyer kept their balance.
-        if let Some(bank) = &self.bank {
+        if let Some(ledger) = &self.ledger {
             for f in fills.iter() {
                 let notional = u128::from(f.price.0) * u128::from(f.qty.0);
                 // An over-u64 quote cannot transfer — reject the
@@ -588,7 +591,7 @@ impl ExchangeModule {
                 } else {
                     (f.maker_owner, f.taker_owner)
                 };
-                bank.transfer(&buyer, &seller, quote_amount).map_err(|_| {
+                ledger.transfer(&buyer, &seller, quote_amount).map_err(|_| {
                     ExecError::ModuleRejected(format!(
                         "settlement transfer failed (market {market})"
                     ))
@@ -613,7 +616,7 @@ impl ExchangeModule {
     /// - **Authorization:** only `ctx.sender == settlement_operator`
     ///   (the genesis-configured matcher identity) may submit batch
     ///   settlements. Without this check any account could forge
-    ///   fills and drain arbitrary bank balances.
+    ///   fills and drain arbitrary balances.
     /// - **Validation:** every leg is checked against the market's
     ///   config (listed market, positive lot-aligned qty, on-tick
     ///   price inside the configured band, distinct buyer/seller).
@@ -623,7 +626,7 @@ impl ExchangeModule {
     ///   `fill_rejected` event — invalid legs cannot move funds.
     /// - **Aggregation:** amounts are accumulated per (buyer, seller)
     ///   pair in a `BTreeMap` so transfer order is deterministic and
-    ///   each pair settles in one atomic `bank.transfer`.
+    ///   each pair settles in one atomic `ledger.transfer`.
     ///
     /// A leg whose buyer is insolvent is skipped with a
     /// `settlement_failed` event (the venue reconciles off-chain);
@@ -660,8 +663,8 @@ impl ExchangeModule {
             return Err(ExecError::Malformed);
         }
 
-        let bank = self.bank.as_ref().ok_or_else(|| {
-            ExecError::ModuleRejected("batch settle requires bank wiring".to_string())
+        let ledger = self.ledger.as_ref().ok_or_else(|| {
+            ExecError::ModuleRejected("batch settle requires ledger wiring".to_string())
         })?;
 
         // Snapshot the market configs once — batch settle never
@@ -733,7 +736,7 @@ impl ExchangeModule {
             // `transfer` instead of separate `debit` + `credit`
             // ensures atomicity — if the credit fails (e.g.
             // overflow), the debit is rolled back.
-            if bank.transfer(buyer, seller, *amount).is_err() {
+            if ledger.transfer(buyer, seller, *amount).is_err() {
                 events.push(Event {
                     module: "exchange",
                     kind: "settlement_failed",
@@ -950,7 +953,7 @@ mod tests {
         TAG_PLACE, TimeInForce, encode_reject_reason, msg,
     };
     use executor::{ExecError, Module, TxContext};
-    use framework::module_id;
+    use framework::{Balances, module_id};
     use primitives::Address;
     use primitives::fixed::{Price, Qty};
     use std::sync::Arc;
@@ -1167,29 +1170,29 @@ mod tests {
         assert_eq!(ex.name(), "exchange");
     }
 
-    // ── Settlement tests (cross-module: bank + exchange) ───────────
+    // ── Settlement tests (cross-module: ledger + exchange) ───────────
 
-    fn bank_and_exchange() -> (Arc<bank::BankModule>, ExchangeModule) {
-        let bank = Arc::new(bank::BankModule::new());
+    fn ledger_and_exchange() -> (Arc<framework::MemoryBalances>, ExchangeModule) {
+        let ledger = Arc::new(framework::MemoryBalances::new());
         // Fund two traders: buyer (owner 1) and seller (owner 9).
-        bank.mint(&addr(1), 1_000_000_000_000); // 1T quote
-        bank.mint(&addr(9), 1_000_000_000_000); // 1T quote
-        let ex = ExchangeModule::with_bank(bank.clone());
+        ledger.mint(&addr(1), 1_000_000_000_000); // 1T quote
+        ledger.mint(&addr(9), 1_000_000_000_000); // 1T quote
+        let ex = ExchangeModule::with_ledger(ledger.clone());
         ex.list_market(test_cfg()).unwrap();
-        (bank, ex)
+        (ledger, ex)
     }
 
     #[test]
     fn settlement_debits_buyer_credits_seller_on_fill() {
-        let (bank, ex) = bank_and_exchange();
+        let (ledger, ex) = ledger_and_exchange();
         let mid = 0;
 
         // Rest a sell at tick 500 ($15.00), 5 lots, owner 9.
         let maker = limit(Side::Sell, 500, 5, 9);
         ex.handle(&ctx(9), &msg::place(mid, maker)).unwrap();
 
-        let buyer_before = bank.balance(&addr(1));
-        let seller_before = bank.balance(&addr(9));
+        let buyer_before = ledger.balance(&addr(1));
+        let seller_before = ledger.balance(&addr(9));
 
         // Taker buy at tick 500, 5 lots, owner 1 — full fill.
         let taker = limit(Side::Buy, 500, 5, 1);
@@ -1198,16 +1201,16 @@ mod tests {
         // Notional = 5_000 * 1_500_000_000 = 7_500_000_000_000 (scale-14).
         // Quote amount = 7_500_000_000_000 / 100_000_000 = 75_000 (scale-6).
         let quote_amount = 75_000u64;
-        assert_eq!(bank.balance(&addr(1)), buyer_before - quote_amount);
-        assert_eq!(bank.balance(&addr(9)), seller_before + quote_amount);
+        assert_eq!(ledger.balance(&addr(1)), buyer_before - quote_amount);
+        assert_eq!(ledger.balance(&addr(9)), seller_before + quote_amount);
     }
 
     #[test]
     fn pre_trade_check_rejects_buy_with_insufficient_balance() {
-        let bank = Arc::new(bank::BankModule::new());
+        let ledger = Arc::new(framework::MemoryBalances::new());
         // Fund the buyer with only 1000 — not enough for 5 lots at $15.
-        bank.mint(&addr(1), 1_000);
-        let ex = ExchangeModule::with_bank(bank.clone());
+        ledger.mint(&addr(1), 1_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
         ex.list_market(test_cfg()).unwrap();
 
         // Buy 5 lots at tick 500 ($15): quote needed = 75_000.
@@ -1215,12 +1218,12 @@ mod tests {
         let err = ex.handle(&ctx(1), &msg::place(0, taker)).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
         // Balance unchanged.
-        assert_eq!(bank.balance(&addr(1)), 1_000);
+        assert_eq!(ledger.balance(&addr(1)), 1_000);
     }
 
     #[test]
-    fn no_bank_means_no_settlement() {
-        // Without a bank, fills are recorded as events but balances
+    fn no_ledger_means_no_settlement() {
+        // Without a ledger, fills are recorded as events but balances
         // don't move. This is the v0 no-settlement mode.
         let ex = ExchangeModule::new();
         let mid = ex.list_market(test_cfg()).unwrap();
@@ -1238,7 +1241,7 @@ mod tests {
 
     #[test]
     fn settlement_on_sweep_debits_all_fills() {
-        let (bank, ex) = bank_and_exchange();
+        let (ledger, ex) = ledger_and_exchange();
         let mid = 0;
 
         // Rest 3 sell orders at ticks 500, 501, 502 (1 lot each, owner 9).
@@ -1246,8 +1249,8 @@ mod tests {
             ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500 + i, 1, 9))).unwrap();
         }
 
-        let buyer_before = bank.balance(&addr(1));
-        let seller_before = bank.balance(&addr(9));
+        let buyer_before = ledger.balance(&addr(1));
+        let seller_before = ledger.balance(&addr(9));
 
         // Taker buy 3 lots at tick 502 (sweeps all 3 levels).
         let taker = NewOrder {
@@ -1264,8 +1267,8 @@ mod tests {
         // Total quote = (1_500M + 1_501M + 1_502M) * 1_000 / 1e8
         //            = (15_000 + 15_010 + 15_020) = 45_030
         let total_quote = 45_030u64;
-        assert_eq!(bank.balance(&addr(1)), buyer_before - total_quote);
-        assert_eq!(bank.balance(&addr(9)), seller_before + total_quote);
+        assert_eq!(ledger.balance(&addr(1)), buyer_before - total_quote);
+        assert_eq!(ledger.balance(&addr(9)), seller_before + total_quote);
     }
 
     /// Regression test: batch settlement must be atomic. If the
@@ -1275,17 +1278,17 @@ mod tests {
     /// debit would lose funds.
     #[test]
     fn batch_settle_rolls_back_on_credit_overflow() {
-        let bank = Arc::new(bank::BankModule::new());
+        let ledger = Arc::new(framework::MemoryBalances::new());
         // Fund buyer with enough for the transfer.
-        bank.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(1), 1_000_000);
         // Fund seller near u64::MAX so the credit overflows.
-        bank.mint(&addr(9), u64::MAX - 500_000);
-        let mut ex = ExchangeModule::with_bank(bank.clone());
+        ledger.mint(&addr(9), u64::MAX - 500_000);
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
         ex.set_settlement_operator(addr(1));
         ex.list_market(test_cfg()).unwrap();
 
-        let buyer_before = bank.balance(&addr(1));
-        let seller_before = bank.balance(&addr(9));
+        let buyer_before = ledger.balance(&addr(1));
+        let seller_before = ledger.balance(&addr(9));
 
         // Chain-computed quote = 1e9 * 100_000 / 1e8 = 1_000_000,
         // which overflows the seller's u64::MAX - 500_000 balance.
@@ -1301,12 +1304,12 @@ mod tests {
 
         // The settlement should fail atomically — buyer is NOT debited.
         assert_eq!(
-            bank.balance(&addr(1)),
+            ledger.balance(&addr(1)),
             buyer_before,
             "buyer must not be debited on failed settlement"
         );
         assert_eq!(
-            bank.balance(&addr(9)),
+            ledger.balance(&addr(9)),
             seller_before,
             "seller balance must not change on failed settlement"
         );
@@ -1321,13 +1324,13 @@ mod tests {
     /// Regression test: `batch_settle` must reject any sender that is
     /// not the configured settlement operator. Before the fix the
     /// handler ignored `ctx.sender` entirely — any account could
-    /// submit forged fills and drain arbitrary bank balances.
+    /// submit forged fills and drain arbitrary balances.
     #[test]
     fn batch_settle_rejects_unauthorized_sender() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        bank.mint(&addr(9), 1_000_000);
-        let mut ex = ExchangeModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
         ex.set_settlement_operator(addr(0xAA));
         ex.list_market(test_cfg()).unwrap();
 
@@ -1343,25 +1346,25 @@ mod tests {
         // ctx(1) is not the operator — must be rejected, no funds move.
         let err = ex.handle(&ctx(1), &msg).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
-        assert_eq!(bank.balance(&addr(1)), 1_000_000);
-        assert_eq!(bank.balance(&addr(9)), 1_000_000);
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000);
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000);
 
         // The configured operator is accepted.
         let events = ex.handle(&ctx(0xAA), &msg).unwrap();
         assert!(events.iter().any(|e| e.kind == "batch_fill"));
         // quote = 1e9 * 1_000 / 1e8 = 10_000
-        assert_eq!(bank.balance(&addr(1)), 1_000_000 - 10_000);
-        assert_eq!(bank.balance(&addr(9)), 1_000_000 + 10_000);
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000 - 10_000);
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000 + 10_000);
     }
 
     /// Regression test: `batch_settle` must be fail-closed when no
     /// settlement operator is configured.
     #[test]
     fn batch_settle_disabled_without_operator() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000);
-        bank.mint(&addr(9), 1_000_000);
-        let ex = ExchangeModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
         ex.list_market(test_cfg()).unwrap();
 
         let fill = BatchFillEntry {
@@ -1374,7 +1377,7 @@ mod tests {
         let msg = msg::batch_settle(&[fill]);
         let err = ex.handle(&ctx(1), &msg).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
-        assert_eq!(bank.balance(&addr(1)), 1_000_000);
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000);
     }
 
     /// Regression test: every batch-settle leg is validated against
@@ -1385,10 +1388,10 @@ mod tests {
     /// at all — the wire's `quote_amount` was trusted blindly.
     #[test]
     fn batch_settle_rejects_invalid_legs() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 10_000_000);
-        bank.mint(&addr(9), 10_000_000);
-        let mut ex = ExchangeModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 10_000_000);
+        ledger.mint(&addr(9), 10_000_000);
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
         ex.set_settlement_operator(addr(0xAA));
         ex.list_market(test_cfg()).unwrap();
 
@@ -1456,8 +1459,8 @@ mod tests {
         let rejected = events.iter().filter(|e| e.kind == "fill_rejected").count();
         assert_eq!(rejected, 6, "all six invalid legs must be rejected");
         // Only the valid leg settled: quote = 1e9 * 1_000 / 1e8 = 10_000.
-        assert_eq!(bank.balance(&addr(1)), 10_000_000 - 10_000);
-        assert_eq!(bank.balance(&addr(9)), 10_000_000 + 10_000);
+        assert_eq!(ledger.balance(&addr(1)), 10_000_000 - 10_000);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000 + 10_000);
     }
 
     /// Regression test: the chain computes settlement amounts itself.
@@ -1466,10 +1469,10 @@ mod tests {
     /// the operator cannot inflate or deflate the amount.
     #[test]
     fn batch_settle_computes_quote_onchain() {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 10_000_000);
-        bank.mint(&addr(9), 10_000_000);
-        let mut ex = ExchangeModule::with_bank(bank.clone());
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 10_000_000);
+        ledger.mint(&addr(9), 10_000_000);
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
         ex.set_settlement_operator(addr(0xAA));
         ex.list_market(test_cfg()).unwrap();
 
@@ -1494,8 +1497,8 @@ mod tests {
         let msg = msg::batch_settle(&legs);
         let events = ex.handle(&ctx(0xAA), &msg).unwrap();
 
-        assert_eq!(bank.balance(&addr(1)), 10_000_000 - 40_000);
-        assert_eq!(bank.balance(&addr(9)), 10_000_000 + 40_000);
+        assert_eq!(ledger.balance(&addr(1)), 10_000_000 - 40_000);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000 + 40_000);
         // Exactly one pair transfer → one batch_fill event.
         assert_eq!(events.iter().filter(|e| e.kind == "batch_fill").count(), 1);
     }
@@ -1507,13 +1510,13 @@ mod tests {
     /// unsettled — makers' orders consumed with no payment.
     #[test]
     fn market_buy_without_balance_rejected() {
-        let (bank, ex) = bank_and_exchange();
+        let (ledger, ex) = ledger_and_exchange();
         let mid = 0;
 
         // Rest a maker sell at tick 500 ($15.00), 1 lot.
         ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
 
-        // ctx(2) has no bank balance at all.
+        // ctx(2) has no ledger balance at all.
         let mkt = NewOrder {
             side: Side::Buy,
             order_type: OrderType::Market,
@@ -1527,14 +1530,14 @@ mod tests {
         assert!(matches!(err, ExecError::ModuleRejected(_)));
         // The maker's order must still be resting — nothing matched.
         assert_eq!(ex.resting_count(mid), 1);
-        assert_eq!(bank.balance(&addr(9)), 1_000_000_000_000);
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000);
     }
 
     /// A funded market buy sweeps and pays exactly the chain-computed
     /// fill cost (sweep price × qty), not a wire-supplied amount.
     #[test]
     fn market_buy_with_balance_settles_sweep() {
-        let (bank, ex) = bank_and_exchange();
+        let (ledger, ex) = ledger_and_exchange();
         let mid = 0;
 
         // Rest 2 maker sells: 1 lot @ tick 500 ($15.00), 1 lot @ tick
@@ -1542,8 +1545,8 @@ mod tests {
         ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
         ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 501, 1, 9))).unwrap();
 
-        let buyer_before = bank.balance(&addr(1));
-        let seller_before = bank.balance(&addr(9));
+        let buyer_before = ledger.balance(&addr(1));
+        let seller_before = ledger.balance(&addr(9));
 
         // Market buy 2 lots — sweeps both levels.
         let mkt = NewOrder {
@@ -1558,8 +1561,8 @@ mod tests {
         ex.handle(&ctx(1), &msg::place(mid, mkt)).unwrap();
 
         // Cost = 15_000 + 15_010 = 30_010 quote units.
-        assert_eq!(bank.balance(&addr(1)), buyer_before - 30_010);
-        assert_eq!(bank.balance(&addr(9)), seller_before + 30_010);
+        assert_eq!(ledger.balance(&addr(1)), buyer_before - 30_010);
+        assert_eq!(ledger.balance(&addr(9)), seller_before + 30_010);
         assert_eq!(ex.resting_count(mid), 0);
     }
 
@@ -1567,12 +1570,12 @@ mod tests {
     /// rejected entirely — the engine must not partially settle.
     #[test]
     fn market_buy_insufficient_for_full_sweep_rejected() {
-        let bank = Arc::new(bank::BankModule::new());
+        let ledger = Arc::new(framework::MemoryBalances::new());
         // Buyer has only 20_000 quote — enough for the cheap level
         // (15_000) but not the whole sweep (30_010).
-        bank.mint(&addr(1), 20_000);
-        bank.mint(&addr(9), 1_000_000_000_000);
-        let ex = ExchangeModule::with_bank(bank.clone());
+        ledger.mint(&addr(1), 20_000);
+        ledger.mint(&addr(9), 1_000_000_000_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
         ex.list_market(test_cfg()).unwrap();
         let mid = 0;
 
@@ -1592,6 +1595,6 @@ mod tests {
         assert!(matches!(err, ExecError::ModuleRejected(_)));
         // Nothing matched — both makers still rest, no funds moved.
         assert_eq!(ex.resting_count(mid), 2);
-        assert_eq!(bank.balance(&addr(1)), 20_000);
+        assert_eq!(ledger.balance(&addr(1)), 20_000);
     }
 }

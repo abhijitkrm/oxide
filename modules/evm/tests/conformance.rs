@@ -497,20 +497,16 @@ fn self_transfer_preserves_balance() {
 
 // ── Precompile conformance ────────────────────────────────────────
 
-/// The bank balance precompile (address 0x000...0801) must return
-/// the correct balance for a funded account.
+/// The EVM account store is the canonical native-token ledger:
+/// `balance` must return the funded wei balance — this is the same
+/// read `eth_getBalance` serves and the same store native modules
+/// settle through (`Balances`).
 #[test]
-fn precompile_bank_balance_returns_correct_value() {
+fn evm_ledger_balance_returns_funded_value() {
     let key = TestKey::new();
     let module = EvmModule::new(1, 7_000_000_000);
     fund(&module, &key.addr);
 
-    // Deploy a contract that calls the bank-balance precompile.
-    // The precompile is at address 0x000...0801 (module 1, precompile 1).
-    // We verify via the module's direct API instead of deploying
-    // a contract, since the precompile is already tested in the
-    // unit tests. Here we verify the EVM-level integration: the
-    // precompile address is recognized and returns data.
     let balance = module.balance(&key.addr);
     assert_eq!(balance, 10u128.pow(20), "funded balance must match");
 }

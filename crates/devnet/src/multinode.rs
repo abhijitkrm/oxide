@@ -5,7 +5,7 @@
 //!
 //! The Phase 1 acceptance gate (plan.md §13): "4–50 node local devnet
 //! sustains 50–100ms blocks on oxideBFT." This module assembles N
-//! validator nodes, each with its own [`Executor`] + core/bank/staking
+//! validator nodes, each with its own [`Executor`] + core/evm/staking
 //! modules behind an [`OxideBft`] engine, and drives them through the
 //! consensus round loop.
 //!
@@ -37,7 +37,7 @@ use ports::{AppInterface, ConsensusEngine};
 use types::{FinalizedBlock, TxBytes};
 
 /// The genesis balance minted to each sender on every validator's
-/// bank module. Large enough that the simulation never exhausts
+/// EVM account store. Large enough that the simulation never exhausts
 /// it (the max transfer in any round is `rounds` tokens; the
 /// throughput test sends 1 token per tx, up to ~30k txs).
 /// Source: plan.md §13 (Phase 1 gate: 200k tx/s sim).
@@ -62,7 +62,7 @@ fn vote_signing_message(
 /// A multi-node devnet: N validators running oxideBFT with the real
 /// app stack.
 ///
-/// Each validator has its own [`Executor`] (with core/bank/staking
+/// Each validator has its own [`Executor`] (with core/evm/staking
 /// modules) and its own [`OxideBft`] engine. The engines share a
 /// single [`ValidatorSet`]. The round loop drives all engines in a
 /// deterministic order.
@@ -95,7 +95,7 @@ pub struct DevnetResult {
 impl MultiNodeDevnet {
     /// Assemble a multi-node devnet with `n` validators.
     ///
-    /// Each validator gets a fresh [`Executor`] with core, bank, and
+    /// Each validator gets a fresh [`Executor`] with core, evm, and
     /// staking modules registered. The engines share a single
     /// [`ValidatorSet`] with equal stakes. Each validator gets a real
     /// BLS secret key (deterministic, from fixed IKM) so that vote
@@ -120,30 +120,42 @@ impl MultiNodeDevnet {
         // `Address([i as u8; 20])` — `Address::ZERO` for validator 0.
         let addresses: Vec<primitives::Address> =
             (0..n).map(|i| primitives::Address([u8::try_from(i).unwrap_or(0); 20])).collect();
-        let vs = ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set");
+        let vs =
+            ValidatorSet::with_addresses(pks, stakes, addresses.clone()).expect("validator set");
 
         let mut engines = Vec::with_capacity(n);
         let mut apps = Vec::with_capacity(n);
         for (i, key) in secret_keys.iter().cloned().enumerate() {
             let mut executor = Executor::new(max_mempool_entries);
             executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-            // Genesis-mint to the sender address so bank transfers
-            // can debit (C2 fix: the bank now debits the sender, so
-            // the sender needs an initial balance). The bank module
-            // is minted before registration.
+            // The EVM account store is the single native-token
+            // ledger: genesis-mint to the sender addresses so
+            // staking delegates can bond and fees can debit. The
+            // EVM module is minted into before registration.
             //
             // M4: mint to a range of sender addresses ([0u8; 20]
             // through [31u8; 20]) so the multi-sender throughput
             // test can use distinct senders.
-            let bank = bank::BankModule::new();
+            let evm = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
             for sender_byte in 0u8..32 {
-                bank.mint(&primitives::Address([sender_byte; 20]), GENESIS_BALANCE);
+                framework::Balances::mint(
+                    evm.as_ref(),
+                    &primitives::Address([sender_byte; 20]),
+                    GENESIS_BALANCE,
+                );
             }
-            executor.register_module(Arc::new(bank));
-            // The bank collects fees for all native-module txs —
-            // without this only bank txs paid (other modules ran free).
-            executor.set_fee_module(framework::module_id::BANK);
-            executor.register_module(Arc::new(staking::StakingModule::new()));
+            executor.register_module(evm.clone());
+            // The EVM ledger collects fees for all native-module txs
+            // — without this the module txs ran free.
+            executor.set_fee_module(framework::module_id::EVM);
+            let staking_mod = staking::StakingModule::new();
+            staking_mod.set_ledger(evm);
+            // Register the devnet validators so delegate txs have a
+            // real bond target. Stake mirrors the consensus set.
+            for addr in &addresses {
+                staking_mod.genesis_register_validator(*addr, 1);
+            }
+            executor.register_module(Arc::new(staking_mod));
             let app: Arc<Executor> = Arc::new(executor);
             let app_dyn: Arc<dyn AppInterface> = app.clone();
             let engine = OxideBft::with_index(app_dyn, vs.clone(), u16::try_from(i).unwrap())
@@ -201,7 +213,7 @@ impl MultiNodeDevnet {
     }
 
     /// Run `rounds` consensus rounds, each with `txs_per_round`
-    /// core-module txs (minimal dispatch, no bank `BTreeMap`
+    /// core-module txs (minimal dispatch, no ledger settlement
     /// overhead). Returns the finalized blocks and wall-clock
     /// elapsed time. This is the purest measure of consensus +
     /// dispatch throughput.
@@ -269,7 +281,7 @@ impl MultiNodeDevnet {
     /// ordering and dedup behavior.
     ///
     /// Each sender must have a genesis balance. This method mints
-    /// to each sender on every validator's bank module before
+    /// to each sender on every validator's EVM ledger before
     /// running the rounds.
     pub fn run_batch_multi_sender(
         &mut self,
@@ -704,37 +716,40 @@ fn bls_key(byte: u8) -> crypto::BlsSecretKey {
     crypto::BlsSecretKey::from_ikm(&ikm).expect("BLS key generation from valid IKM")
 }
 
-/// Construct a simple tx for round `r`: a bank transfer of `r+1`
-/// tokens to a fixed address. Uses the mempool's v0 format.
+/// Construct a simple tx for round `r`: a staking delegate of
+/// `r+1` units to validator `[0u8; 20]` (registered at genesis).
+/// Delegation exercises the real ledger path — an EVM account
+/// transfer into the bonded pool — so the throughput number
+/// includes ledger settlement, not just dispatch.
 fn make_round_tx(round: usize) -> TxBytes {
     let sender = primitives::Address([0u8; 20]);
     let nonce = u64::try_from(round).unwrap();
     let fee = 100u64;
-    let to = primitives::Address([2u8; 20]);
-    let module_payload = bank::msg::transfer(to, u64::try_from(round).unwrap_or(0) + 1);
+    let validator = primitives::Address([0u8; 20]);
+    let module_payload = staking::msg::delegate(validator, u64::try_from(round).unwrap_or(0) + 1);
     let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::BANK);
+    bytes.push(framework::module_id::STAKING);
     bytes.extend_from_slice(&module_payload);
     TxBytes::new(bytes)
 }
 
-/// Construct a simple tx for batch throughput testing: a bank
-/// transfer of 1 token to a fixed address. Each tx has a unique
-/// nonce (derived from round and tx index) to avoid dedup.
+/// Construct a simple tx for batch throughput testing: a staking
+/// delegate of 1 unit to validator `[0u8; 20]`. Each tx has a
+/// unique nonce (derived from round and tx index) to avoid dedup.
 fn make_batch_tx(round: usize, tx_i: usize) -> TxBytes {
     let sender = primitives::Address([0u8; 20]);
     let nonce = u64::try_from(round * 1000 + tx_i).unwrap();
     let fee = 100u64;
-    let to = primitives::Address([2u8; 20]);
-    let module_payload = bank::msg::transfer(to, 1);
+    let validator = primitives::Address([0u8; 20]);
+    let module_payload = staking::msg::delegate(validator, 1);
     let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::BANK);
+    bytes.push(framework::module_id::STAKING);
     bytes.extend_from_slice(&module_payload);
     TxBytes::new(bytes)
 }
@@ -742,7 +757,7 @@ fn make_batch_tx(round: usize, tx_i: usize) -> TxBytes {
 /// Construct a minimal tx for throughput testing: routes to the
 /// core module (ID 0) with an empty payload. The core module's
 /// `handle` is a no-op, so this measures the consensus + dispatch
-/// overhead without the bank module's `BTreeMap` cost.
+/// overhead without ledger settlement cost.
 fn make_core_tx(round: usize, tx_i: usize) -> TxBytes {
     let sender = primitives::Address([0u8; 20]);
     let nonce = u64::try_from(round * 1000 + tx_i).unwrap();
@@ -755,26 +770,26 @@ fn make_core_tx(round: usize, tx_i: usize) -> TxBytes {
     TxBytes::new(bytes)
 }
 
-/// Construct a multi-sender bank-transfer tx for throughput
+/// Construct a multi-sender staking-delegate tx for throughput
 /// testing. Each tx comes from a distinct sender (derived from
 /// `sender_idx`) with a per-sender nonce. This exercises the
-/// M4 scenario: multiple senders transferring concurrently,
+/// M4 scenario: multiple senders bonding concurrently,
 /// testing per-account nonce ordering and dedup behavior.
 ///
 /// The sender address is `[sender_idx; 20]` (deterministic). The
-/// genesis mint in `MultiNodeDevnet::new` mints to `[0u8; 20]`
-/// only, so this function also requires the caller to pre-mint
-/// to each sender address. See `run_batch_multi_sender`.
+/// genesis mint in `MultiNodeDevnet::new` funds `[0u8; 20]`
+/// through `[31u8; 20]`, so `sender_idx` must stay below 32.
+/// See `run_batch_multi_sender`.
 fn make_multi_sender_tx(sender_idx: u8, nonce: u64) -> TxBytes {
     let sender = primitives::Address([sender_idx; 20]);
     let fee = 100u64;
-    let to = primitives::Address([0xff; 20]);
-    let module_payload = bank::msg::transfer(to, 1);
+    let validator = primitives::Address([0u8; 20]);
+    let module_payload = staking::msg::delegate(validator, 1);
     let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::BANK);
+    bytes.push(framework::module_id::STAKING);
     bytes.extend_from_slice(&module_payload);
     TxBytes::new(bytes)
 }
@@ -858,10 +873,10 @@ mod tests {
         assert_eq!(total_txs, 3, "all 3 txs must be finalized");
     }
 
-    /// The bank module should have processed transfers: the state
+    /// The EVM ledger should have processed state: the state
     /// root should be non-zero after running.
     #[test]
-    fn multinode_bank_module_executes() {
+    fn multinode_evm_ledger_executes() {
         let mut devnet = MultiNodeDevnet::new(4, 10_000);
         devnet.run(3);
         // Check that the executor has a non-zero state root at height 0.
@@ -998,7 +1013,7 @@ mod tests {
     /// Throughput sim (core module): 32 validators, 3 rounds,
     /// 10000 txs/round. Uses the core module (no-op handle) to
     /// measure pure consensus + dispatch throughput without the
-    /// bank module's `BTreeMap` overhead.
+    /// ledger settlement overhead.
     #[test]
     #[ignore = "throughput sim: run with --release -- --ignored"]
     fn throughput_sim_32_validators_core() {

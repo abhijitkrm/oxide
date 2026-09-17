@@ -3,15 +3,15 @@
 //! ## What this module is
 //!
 //! Implements EVM precompiles that call into native Oxide modules
-//! (bank, staking, trading). This lets EVM smart contracts invoke
-//! native chain functionality — e.g., a Uniswap deployment can call
-//! the native bank module to transfer tokens, or a perps protocol
-//! can call the native trading module to place orders.
+//! (staking, exchange, perps). This lets EVM smart contracts invoke
+//! native chain functionality — e.g., a contract can bond stake or a
+//! perps protocol can read native mark prices — and move the native
+//! token through the same EVM account store the tx itself uses.
 //!
 //! ## Why native precompiles
 //!
 //! Oxide's architecture (plan.md §2) has two execution tracks:
-//! native modules (bank, staking, trading) and EVM. Native precompiles
+//! native modules (staking, exchange, perps) and EVM. Native precompiles
 //! bridge them: EVM contracts call native functionality via precompile
 //! addresses, getting the performance and safety of the native
 //! implementation without re-implementing it in Solidity.
@@ -24,8 +24,6 @@
 //! Ethereum's standard precompiles (addresses 0x01–0x0A).
 //!
 //! Current precompiles:
-//! - `0x0B_01` (bank, transfer): transfer native tokens between accounts.
-//! - `0x0B_02` (bank, balance): query an account's native balance.
 //! - `0x0C_01` (staking, delegate): delegate to a validator.
 //! - `0x05_01` (exchange, best bid): read best bid price+qty.
 //! - `0x05_02` (exchange, best ask): read best ask price+qty.
@@ -39,13 +37,18 @@ use std::sync::Arc;
 
 use primitives::Address;
 
+use executor::ExecError;
+use framework::{Balances, WEI_PER_UNIT};
 use revm::context::Cfg;
+use revm::context_interface::journaled_state::JournalTr;
+use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::handler::EthPrecompiles;
 use revm::interpreter::InterpreterResult;
 use revm::precompile::{PrecompileOutput, PrecompileStatus};
 use revm::primitives::hardfork::SpecId;
-use revm::primitives::{AddressSet, Bytes};
+use revm::primitives::{AddressSet, Bytes, U256};
 
+use crate::alloy_primitives_address;
 use crate::native_journal::NativeJournal;
 use crate::precompiles::native::NativeMarketReader;
 
@@ -71,6 +74,145 @@ impl PrecompileResult {
     #[must_use]
     pub fn revert(gas_used: u64) -> Self {
         Self { output: Vec::new(), gas_used, success: false }
+    }
+}
+
+/// The [`Balances`] view of revm's journal — the in-transaction
+/// ledger path.
+///
+/// Mutating native precompiles receive this so balance moves (staking
+/// bonds, settlement) land in the executing frame's journal:
+/// `checkpoint_revert` on a failed frame restores every balance
+/// automatically, and a committing frame lands them in the tx's state
+/// diff like any EVM balance change. Writing the module's account
+/// cache directly mid-frame would be clobbered by revm's journaled
+/// `result.state` on commit — never mix the two paths.
+///
+/// `RefCell` because [`Balances`] methods take `&self` while revm's
+/// journal methods need `&mut`. The struct is scoped to a single
+/// `run()` call — no re-entrancy hazard: each borrow ends before the
+/// next begins, and the borrow lifetime ties it to the borrower's
+/// stack frame.
+pub struct JournalBalances<'a, J: JournalTr> {
+    /// The live revm journal for the executing frame.
+    journal: RefCell<&'a mut J>,
+}
+
+impl<'a, J: JournalTr> JournalBalances<'a, J> {
+    /// Wrap the context's journal for one precompile call.
+    pub fn new(journal: &'a mut J) -> Self {
+        Self { journal: RefCell::new(journal) }
+    }
+
+    /// `u64` base units → wei (exact — see [`WEI_PER_UNIT`]).
+    fn units_to_wei(units: u64) -> U256 {
+        U256::from(units) * U256::from(WEI_PER_UNIT)
+    }
+
+    /// wei → `u64` base units, flooring the sub-unit remainder and
+    /// saturating at `u64::MAX` (same policy as `ledger.rs`).
+    fn wei_to_units(wei: U256) -> u64 {
+        (wei / U256::from(WEI_PER_UNIT)).saturating_to::<u64>()
+    }
+
+    /// `JournalTr` database errors have no `Debug` bound, so collapse
+    /// them into one opaque rejection — they are unreachable with the
+    /// in-memory `CacheDB<EmptyDB>` backend (its error type is
+    /// `Infallible`) but must still be handled for a generic `J`.
+    fn db_err(context: &str) -> ExecError {
+        ExecError::ModuleRejected(format!("ledger: {context} — db error"))
+    }
+}
+
+impl<J: JournalTr> Balances for JournalBalances<'_, J> {
+    fn balance(&self, addr: &Address) -> u64 {
+        let mut journal = self.journal.borrow_mut();
+        let Ok(load) = journal.load_account(alloy_primitives_address(addr.0)) else {
+            return 0;
+        };
+        Self::wei_to_units(load.data.info.balance)
+    }
+
+    fn debit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
+        let wei = Self::units_to_wei(amount);
+        if wei.is_zero() {
+            return Ok(());
+        }
+        let mut journal = self.journal.borrow_mut();
+        let mut load = journal
+            .load_account_mut(alloy_primitives_address(addr.0))
+            .map_err(|_| Self::db_err("debit load"))?;
+        // `decr_balance` touches + journals the account; `false` on
+        // underflow leaves the balance unchanged (checked_sub
+        // short-circuits before `set_balance` writes).
+        if load.data.decr_balance(wei) {
+            Ok(())
+        } else {
+            Err(ExecError::ModuleRejected(format!(
+                "ledger: {addr:?} insufficient balance for {amount} units"
+            )))
+        }
+    }
+
+    fn credit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
+        let wei = Self::units_to_wei(amount);
+        if wei.is_zero() {
+            return Ok(());
+        }
+        let mut journal = self.journal.borrow_mut();
+        let mut load = journal
+            .load_account_mut(alloy_primitives_address(addr.0))
+            .map_err(|_| Self::db_err("credit load"))?;
+        if load.data.incr_balance(wei) {
+            Ok(())
+        } else {
+            Err(ExecError::ModuleRejected(format!("ledger: {addr:?} balance overflows U256")))
+        }
+    }
+
+    fn transfer(&self, from: &Address, to: &Address, amount: u64) -> Result<(), ExecError> {
+        let wei = Self::units_to_wei(amount);
+        if wei.is_zero() {
+            return Ok(());
+        }
+        if from == to {
+            // Solvency check only — no state change.
+            return if self.balance(from) >= amount {
+                Ok(())
+            } else {
+                Err(ExecError::ModuleRejected(format!(
+                    "ledger: {from:?} insufficient balance for {amount} units"
+                )))
+            };
+        }
+        let mut journal = self.journal.borrow_mut();
+        match journal.transfer(
+            alloy_primitives_address(from.0),
+            alloy_primitives_address(to.0),
+            wei,
+        ) {
+            Ok(None) => Ok(()),
+            // `OutOfFunds`/`OverflowPayment`/`CreateCollision` — all
+            // reject the transfer with no balance moved.
+            Ok(Some(err)) => Err(ExecError::ModuleRejected(format!("ledger: {err:?}"))),
+            Err(_) => Err(Self::db_err("transfer")),
+        }
+    }
+
+    fn mint(&self, addr: &Address, amount: u64) {
+        let wei = Self::units_to_wei(amount);
+        if wei.is_zero() {
+            return;
+        }
+        let mut journal = self.journal.borrow_mut();
+        // Infallible by contract; with `EmptyDB` the load cannot fail.
+        // If a future backend does fail there is no error channel, so
+        // skip silently — mint is a block-reward path that must not
+        // panic, and a missed credit only lowers issuance.
+        if let Ok(mut load) = journal.load_account_mut(alloy_primitives_address(addr.0)) {
+            let next = load.data.account().info.balance.saturating_add(wei);
+            load.data.set_balance(next);
+        }
     }
 }
 
@@ -112,20 +254,6 @@ pub fn decode_precompile_address(addr: &Address) -> Option<(u8, u8)> {
 pub fn is_precompile(addr: &Address) -> bool {
     decode_precompile_address(addr).is_some()
 }
-
-/// The bank transfer precompile (module `0x0B`, op `0x01`).
-///
-/// Input: `[to: 20B][amount: 32B]` (EVM ABI: address + uint256).
-/// Output: empty on success.
-/// Gas: `21_000` (same as a standard ETH transfer).
-pub const BANK_TRANSFER: (u8, u8) = (0x0B, 0x01);
-
-/// The bank balance precompile (module `0x0B`, op `0x02`).
-///
-/// Input: `[addr: 20B]`.
-/// Output: `[balance: 32B]` (uint256).
-/// Gas: `1_000` (a cold read).
-pub const BANK_BALANCE: (u8, u8) = (0x0B, 0x02);
 
 /// The staking undelegate precompile (module `0x0C`, op `0x02`).
 ///
@@ -220,6 +348,12 @@ pub struct NativeCallCtx {
 /// - `gas_limit`: The gas limit for the precompile.
 /// - `reader`: The native market reader (exchange/perps read views).
 /// - `call`: The call context (caller, static flag, value, journal).
+/// - `ledger`: The balance-ledger view for this call. In a live EVM
+///   frame this is the [`JournalBalances`] over revm's journal —
+///   balance mutations land in the frame's checkpoint and revert
+///   with it. Mutating precompiles must never take another route to
+///   balances (e.g. locking the module cache mid-frame): revm's
+///   journaled `result.state` would silently clobber the write.
 ///
 /// # Returns
 ///
@@ -235,15 +369,14 @@ pub fn execute_precompile(
     gas_limit: u64,
     reader: &NativeMarketReader,
     call: &NativeCallCtx,
+    ledger: &dyn Balances,
 ) -> PrecompileResult {
     let Some((module_id, op_id)) = decode_precompile_address(addr) else {
         return PrecompileResult::revert(0);
     };
 
     match (module_id, op_id) {
-        BANK_TRANSFER => execute_bank_transfer(input, gas_limit),
-        BANK_BALANCE => execute_bank_balance(input, gas_limit),
-        STAKING_DELEGATE => execute_staking_delegate(input, gas_limit, call),
+        STAKING_DELEGATE => execute_staking_delegate(input, gas_limit, call, ledger),
         STAKING_UNDELEGATE => execute_staking_undelegate(input, gas_limit, call),
         EXCHANGE_BEST_BID => execute_exchange_best_bid(input, gas_limit, reader),
         EXCHANGE_BEST_ASK => execute_exchange_best_ask(input, gas_limit, reader),
@@ -254,62 +387,12 @@ pub fn execute_precompile(
     }
 }
 
-/// Execute the bank transfer precompile.
-///
-/// Input: `[to: 20B][amount: 32B]`.
-/// Gas: `21_000` (same as a standard ETH transfer).
-fn execute_bank_transfer(input: &[u8], gas_limit: u64) -> PrecompileResult {
-    const GAS_COST: u64 = 21_000;
-    if gas_limit < GAS_COST {
-        return PrecompileResult::revert(gas_limit);
-    }
-    // Input: 20-byte address + 32-byte amount = 52 bytes.
-    if input.len() != 52 {
-        return PrecompileResult::revert(GAS_COST);
-    }
-    // Validate the address (non-zero).
-    let to = &input[..20];
-    if to.iter().all(|&b| b == 0) {
-        return PrecompileResult::revert(GAS_COST);
-    }
-    // C5 fix: the bank transfer side effect is NOT yet wired. The
-    // previous code returned `success` without performing any
-    // transfer — a contract calling this precompile would believe
-    // the transfer succeeded, but no funds moved. Returning
-    // `revert` here is safer: the caller sees a failed call and
-    // knows the transfer did not happen. When the executor-side
-    // settlement is wired (passing mutable bank access into the
-    // precompile context), this will return `success` after
-    // performing the actual transfer.
-    PrecompileResult::revert(GAS_COST)
-}
-
-/// Execute the bank balance precompile.
-///
-/// Input: `[addr: 20B]`.
-/// Output: `[balance: 32B]`.
-/// Gas: `1_000`.
-fn execute_bank_balance(input: &[u8], gas_limit: u64) -> PrecompileResult {
-    const GAS_COST: u64 = 1_000;
-    if gas_limit < GAS_COST {
-        return PrecompileResult::revert(gas_limit);
-    }
-    if input.len() != 20 {
-        return PrecompileResult::revert(GAS_COST);
-    }
-    // Return a zero balance (stub — the actual balance comes from
-    // the native bank module via the executor).
-    let mut output = vec![0u8; 32];
-    output[31] = 0;
-    PrecompileResult::success(output, GAS_COST)
-}
-
 /// Parse `[validator: 20B][amount: 32B]` for the `0x0C_*` staking
 /// precompiles.
 ///
-/// `amount` is denominated in **native units** (the bank/staking
-/// `u64` ledger unit), not wei — staking operates on the native
-/// ledger, so a 256-bit wei amount would silently overflow or scale
+/// `amount` is denominated in **native units** (the `u64` base
+/// unit, 10^9 wei — see [`WEI_PER_UNIT`]), not wei — staking operates
+/// on base units, so a 256-bit wei amount would silently overflow or scale
 /// by the wrong factor. `U256 > u64::MAX` reverts rather than wraps.
 fn parse_staking_args(input: &[u8], gas_cost: u64) -> Result<(Address, u64), PrecompileResult> {
     if input.len() != 52 {
@@ -345,7 +428,7 @@ fn require_staking_mutability(
 /// Input: `[validator: 20B][amount: 32B]`.
 /// Gas: `50_000`.
 ///
-/// Bonds `amount` (native units) of `msg.sender`'s bank balance to
+/// Bonds `amount` (native units) of `msg.sender`'s balance to
 /// `validator` via [`StakingModule::delegate_for`] — the identical
 /// invariant path as a native `delegate` message, so EVM callers get
 /// no capability native senders lack. The mutation is journaled in
@@ -355,6 +438,7 @@ fn execute_staking_delegate(
     input: &[u8],
     gas_limit: u64,
     call: &NativeCallCtx,
+    ledger: &dyn Balances,
 ) -> PrecompileResult {
     const GAS_COST: u64 = 50_000;
     if gas_limit < GAS_COST {
@@ -366,7 +450,11 @@ fn execute_staking_delegate(
     let Ok(staking) = require_staking_mutability(call, GAS_COST) else {
         return PrecompileResult::revert(GAS_COST);
     };
-    if staking.delegate_for(call.caller, validator, amount).is_err() {
+    // The bond moves through the *journaled* ledger: on frame revert
+    // revm restores both balances, so the undo closure below only has
+    // to reverse the delegation record — refunding here would
+    // double-pay the pool.
+    if staking.delegate_for(call.caller, validator, amount, ledger).is_err() {
         return PrecompileResult::revert(GAS_COST);
     }
     // Journal the undo before returning success — if the frame (or an
@@ -666,8 +754,6 @@ pub struct NativePrecompiles {
 
 /// The Oxide precompile `(module, op)` pairs kept warm across a tx.
 const NATIVE_PRECOMPILES: &[(u8, u8)] = &[
-    BANK_TRANSFER,
-    BANK_BALANCE,
     STAKING_DELEGATE,
     STAKING_UNDELEGATE,
     EXCHANGE_BEST_BID,
@@ -775,12 +861,17 @@ where
                 staking: self.staking.clone(),
                 journal: Rc::clone(&self.journal),
             };
+            // The in-transaction ledger: mutations ride revm's
+            // journal so a reverting frame undoes them. Lives only
+            // for this call; the borrow releases before `run` returns.
+            let ledger = JournalBalances::new(context.journal_mut());
             let result = execute_precompile(
                 &oxide_addr,
                 &input_bytes,
                 inputs.gas_limit,
                 &self.reader,
                 &call,
+                &ledger,
             );
             let status =
                 if result.success { PrecompileStatus::Success } else { PrecompileStatus::Revert };
@@ -819,7 +910,7 @@ mod tests {
     use super::*;
 
     /// A reader with no native modules for testing precompile
-    /// validation logic (bank/staking stubs).
+    /// validation logic (staking/exchange/perps stubs).
     fn empty_reader() -> NativeMarketReader {
         NativeMarketReader::empty()
     }
@@ -837,17 +928,18 @@ mod tests {
         }
     }
 
-    /// A call context wired to a bank-backed staking module whose
-    /// `validator` is registered and `caller` funded with `balance`.
+    /// A call context wired to a staking module whose `validator` is
+    /// registered and `caller` funded with `balance` base units on a
+    /// [`framework::MemoryBalances`] test ledger.
     fn staking_ctx(
         caller: Address,
         validator: Address,
         balance: u64,
-    ) -> (NativeCallCtx, Arc<staking::StakingModule>, Arc<bank::BankModule>) {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&caller, balance);
+    ) -> (NativeCallCtx, Arc<staking::StakingModule>, Arc<framework::MemoryBalances>) {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&caller, balance);
         let staking = Arc::new(staking::StakingModule::new());
-        staking.set_bank(bank.clone());
+        staking.set_ledger(ledger.clone());
         staking.register_validator(validator);
         let ctx = NativeCallCtx {
             caller,
@@ -857,7 +949,13 @@ mod tests {
             staking: Some(staking.clone()),
             journal: Rc::new(RefCell::new(NativeJournal::new())),
         };
-        (ctx, staking, bank)
+        (ctx, staking, ledger)
+    }
+
+    /// A throwaway ledger for read-only precompile tests (the ledger
+    /// arg is unused by `0x05_*`/`0x06_*` handlers).
+    fn test_ledger() -> framework::MemoryBalances {
+        framework::MemoryBalances::new()
     }
 
     /// `[validator: 20B][amount: 32B BE]` calldata for `0x0C_*` ops.
@@ -870,18 +968,18 @@ mod tests {
 
     #[test]
     fn precompile_address_encoding() {
-        let addr = precompile_address(0x0B, 0x01);
+        let addr = precompile_address(0x0C, 0x01);
         let bytes = addr.as_bytes();
         assert_eq!(bytes[..18], [0u8; 18]);
-        assert_eq!(bytes[18], 0x0B);
+        assert_eq!(bytes[18], 0x0C);
         assert_eq!(bytes[19], 0x01);
     }
 
     #[test]
     fn decode_valid_precompile_address() {
-        let addr = precompile_address(0x0B, 0x02);
+        let addr = precompile_address(0x0C, 0x02);
         let decoded = decode_precompile_address(&addr);
-        assert_eq!(decoded, Some((0x0B, 0x02)));
+        assert_eq!(decoded, Some((0x0C, 0x02)));
     }
 
     #[test]
@@ -902,78 +1000,27 @@ mod tests {
 
     #[test]
     fn is_precompile_checks() {
-        assert!(is_precompile(&precompile_address(0x0B, 0x01)));
+        assert!(is_precompile(&precompile_address(0x0C, 0x01)));
         assert!(!is_precompile(&Address([0x42; 20])));
     }
 
     #[test]
-    fn bank_transfer_success() {
-        // C5 fix: bank_transfer returns revert (not success) until
-        // the executor-side settlement is wired. The precompile
-        // validates input but does not perform the transfer.
-        let addr = precompile_address(0x0B, 0x01);
-        let mut input = vec![0u8; 52];
-        input[0] = 0x42; // non-zero "to" address
-        let result = execute_precompile(&addr, &input, 100_000, &empty_reader(), &call_ctx());
-        assert!(!result.success, "bank_transfer must revert (side effect not wired)");
-        assert_eq!(result.gas_used, 21_000);
-        assert!(result.output.is_empty());
-    }
-
-    #[test]
-    fn bank_transfer_rejects_zero_recipient() {
-        let addr = precompile_address(0x0B, 0x01);
-        let input = vec![0u8; 52]; // all-zero "to" address
-        let result = execute_precompile(&addr, &input, 100_000, &empty_reader(), &call_ctx());
-        assert!(!result.success);
-        assert_eq!(result.gas_used, 21_000);
-    }
-
-    #[test]
-    fn bank_transfer_rejects_wrong_input_length() {
-        let addr = precompile_address(0x0B, 0x01);
-        let input = vec![0u8; 40]; // wrong length
-        let result = execute_precompile(&addr, &input, 100_000, &empty_reader(), &call_ctx());
-        assert!(!result.success);
-    }
-
-    #[test]
-    fn bank_transfer_reverts_on_insufficient_gas() {
-        let addr = precompile_address(0x0B, 0x01);
-        let mut input = vec![0u8; 52];
-        input[0] = 0x42;
-        let result = execute_precompile(&addr, &input, 20_000, &empty_reader(), &call_ctx()); // < 21_000
-        assert!(!result.success);
-        // C5 fix: OOG charges all available gas (gas_limit), not 0.
-        assert_eq!(result.gas_used, 20_000);
-    }
-
-    #[test]
-    fn bank_balance_returns_32_bytes() {
-        let addr = precompile_address(0x0B, 0x02);
-        let input = vec![0x42; 20];
-        let result = execute_precompile(&addr, &input, 10_000, &empty_reader(), &call_ctx());
-        assert!(result.success);
-        assert_eq!(result.output.len(), 32);
-        assert_eq!(result.gas_used, 1_000);
-    }
-
-    #[test]
     fn staking_delegate_success() {
-        // With a wired bank+staking module the precompile performs
+        // With a wired ledger+staking module the precompile performs
         // the real delegation through the module's invariant path:
         // caller debited, bonded pool credited, delegation recorded.
         let caller = Address([7u8; 20]);
         let validator = Address([0xAA; 20]);
-        let (ctx, staking, bank) = staking_ctx(caller, validator, 10_000);
+        let (ctx, staking, ledger) = staking_ctx(caller, validator, 10_000);
         let addr = precompile_address(0x0C, 0x01);
         let input = staking_input(validator, 1_000);
-        let result = execute_precompile(&addr, &input, 100_000, &empty_reader(), &ctx);
+        let result =
+            execute_precompile(&addr, &input, 100_000, &empty_reader(), &ctx, ledger.as_ref());
         assert!(result.success, "staking_delegate must succeed when wired");
         assert_eq!(result.gas_used, 50_000);
         assert_eq!(staking.delegation(&caller, &validator), 1_000);
         assert_eq!(staking.stake(&validator), 1_000);
-        assert_eq!(bank.balance(&caller), 9_000, "delegator debited");
+        assert_eq!(ledger.balance(&caller), 9_000, "delegator debited");
     }
 
     #[test]
@@ -983,7 +1030,14 @@ mod tests {
         let addr = precompile_address(0x0C, 0x01);
         let mut input = vec![0u8; 52];
         input[0] = 0x42; // non-zero validator
-        let result = execute_precompile(&addr, &input, 100_000, &empty_reader(), &call_ctx());
+        let result = execute_precompile(
+            &addr,
+            &input,
+            100_000,
+            &empty_reader(),
+            &call_ctx(),
+            &test_ledger(),
+        );
         assert!(!result.success, "staking_delegate must revert when unwired");
         assert_eq!(result.gas_used, 50_000);
     }
@@ -994,11 +1048,12 @@ mod tests {
         // changes in a static frame are forbidden.
         let caller = Address([7u8; 20]);
         let validator = Address([0xAA; 20]);
-        let (mut ctx, staking, _bank) = staking_ctx(caller, validator, 10_000);
+        let (mut ctx, staking, ledger) = staking_ctx(caller, validator, 10_000);
         ctx.is_static = true;
         let addr = precompile_address(0x0C, 0x01);
         let input = staking_input(validator, 1_000);
-        let result = execute_precompile(&addr, &input, 100_000, &empty_reader(), &ctx);
+        let result =
+            execute_precompile(&addr, &input, 100_000, &empty_reader(), &ctx, ledger.as_ref());
         assert!(!result.success, "static call must revert");
         assert_eq!(staking.delegation(&caller, &validator), 0);
     }
@@ -1009,12 +1064,29 @@ mod tests {
         // unbonding entry is queued for the delegator.
         let caller = Address([7u8; 20]);
         let validator = Address([0xAA; 20]);
-        let (ctx, staking, bank) = staking_ctx(caller, validator, 10_000);
+        let (ctx, staking, ledger) = staking_ctx(caller, validator, 10_000);
         let delegate_addr = precompile_address(0x0C, 0x01);
         let undelegate_addr = precompile_address(0x0C, 0x02);
         let input = staking_input(validator, 1_000);
-        assert!(execute_precompile(&delegate_addr, &input, 100_000, &empty_reader(), &ctx).success);
-        let result = execute_precompile(&undelegate_addr, &input, 100_000, &empty_reader(), &ctx);
+        assert!(
+            execute_precompile(
+                &delegate_addr,
+                &input,
+                100_000,
+                &empty_reader(),
+                &ctx,
+                ledger.as_ref()
+            )
+            .success
+        );
+        let result = execute_precompile(
+            &undelegate_addr,
+            &input,
+            100_000,
+            &empty_reader(),
+            &ctx,
+            ledger.as_ref(),
+        );
         assert!(result.success, "undelegate must succeed on an owned delegation");
         // Output carries the completion height (8B LE).
         assert_eq!(result.output.len(), 8);
@@ -1022,7 +1094,7 @@ mod tests {
         assert_eq!(staking.stake(&validator), 0);
         assert_eq!(staking.pending_unbonding().len(), 1);
         assert_eq!(staking.pending_unbonding()[0].delegator, caller);
-        assert_eq!(bank.balance(&staking::BONDED_POOL), 1_000, "still bonded until completion");
+        assert_eq!(ledger.balance(&staking::BONDED_POOL), 1_000, "still bonded until completion");
     }
 
     #[test]
@@ -1030,18 +1102,20 @@ mod tests {
         // Security regression: caller 7 has no delegation — its
         // undelegate must revert even though sender 8 delegated.
         let validator = Address([0xAA; 20]);
-        let (ctx, staking, bank) = staking_ctx(Address([7u8; 20]), validator, 10_000);
-        bank.mint(&Address([8u8; 20]), 10_000);
+        let (ctx, staking, ledger) = staking_ctx(Address([7u8; 20]), validator, 10_000);
+        ledger.mint(&Address([8u8; 20]), 10_000);
         let mut other = call_ctx();
         other.staking = ctx.staking.clone();
         other.journal = ctx.journal.clone();
         other.caller = Address([8u8; 20]);
         let addr = precompile_address(0x0C, 0x01);
         let input = staking_input(validator, 1_000);
-        let delegated = execute_precompile(&addr, &input, 100_000, &empty_reader(), &other);
+        let delegated =
+            execute_precompile(&addr, &input, 100_000, &empty_reader(), &other, ledger.as_ref());
         assert!(delegated.success, "sender 8's delegate must succeed");
         let undel = precompile_address(0x0C, 0x02);
-        let result = execute_precompile(&undel, &input, 100_000, &empty_reader(), &ctx);
+        let result =
+            execute_precompile(&undel, &input, 100_000, &empty_reader(), &ctx, ledger.as_ref());
         assert!(!result.success, "must not unbond another account's delegation");
         assert_eq!(staking.delegation(&Address([8u8; 20]), &validator), 1_000);
     }
@@ -1050,21 +1124,30 @@ mod tests {
     fn staking_delegate_rejects_zero_validator() {
         let addr = precompile_address(0x0C, 0x01);
         let input = vec![0u8; 52];
-        let result = execute_precompile(&addr, &input, 100_000, &empty_reader(), &call_ctx());
+        let result = execute_precompile(
+            &addr,
+            &input,
+            100_000,
+            &empty_reader(),
+            &call_ctx(),
+            &test_ledger(),
+        );
         assert!(!result.success);
     }
 
     #[test]
     fn unknown_precompile_reverts() {
         let addr = precompile_address(0xFF, 0xFF);
-        let result = execute_precompile(&addr, &[], 100_000, &empty_reader(), &call_ctx());
+        let result =
+            execute_precompile(&addr, &[], 100_000, &empty_reader(), &call_ctx(), &test_ledger());
         assert!(!result.success);
     }
 
     #[test]
     fn non_precompile_address_reverts() {
         let addr = Address([0x42; 20]);
-        let result = execute_precompile(&addr, &[], 100_000, &empty_reader(), &call_ctx());
+        let result =
+            execute_precompile(&addr, &[], 100_000, &empty_reader(), &call_ctx(), &test_ledger());
         assert!(!result.success);
     }
 
@@ -1073,7 +1156,8 @@ mod tests {
     #[test]
     fn exchange_best_bid_with_empty_reader_returns_empty() {
         let addr = precompile_address(EXCHANGE_BEST_BID.0, EXCHANGE_BEST_BID.1);
-        let result = execute_precompile(&addr, &[0u8], 10_000, &empty_reader(), &call_ctx());
+        let result =
+            execute_precompile(&addr, &[0u8], 10_000, &empty_reader(), &call_ctx(), &test_ledger());
         assert!(result.success);
         assert_eq!(result.gas_used, GAS_EXCHANGE_L1);
         assert!(result.output.is_empty());
@@ -1082,7 +1166,8 @@ mod tests {
     #[test]
     fn exchange_best_ask_with_empty_reader_returns_empty() {
         let addr = precompile_address(EXCHANGE_BEST_ASK.0, EXCHANGE_BEST_ASK.1);
-        let result = execute_precompile(&addr, &[0u8], 10_000, &empty_reader(), &call_ctx());
+        let result =
+            execute_precompile(&addr, &[0u8], 10_000, &empty_reader(), &call_ctx(), &test_ledger());
         assert!(result.success);
         assert_eq!(result.gas_used, GAS_EXCHANGE_L1);
         assert!(result.output.is_empty());
@@ -1093,7 +1178,8 @@ mod tests {
         let addr = precompile_address(PERPS_POSITION.0, PERPS_POSITION.1);
         let mut input = vec![0u8; 21];
         input[1] = 0x42;
-        let result = execute_precompile(&addr, &input, 10_000, &empty_reader(), &call_ctx());
+        let result =
+            execute_precompile(&addr, &input, 10_000, &empty_reader(), &call_ctx(), &test_ledger());
         assert!(result.success);
         assert_eq!(result.gas_used, GAS_PERPS_POSITION);
         assert_eq!(result.output.len(), 24);
@@ -1104,7 +1190,8 @@ mod tests {
     #[test]
     fn perps_mark_price_with_empty_reader_returns_empty() {
         let addr = precompile_address(PERPS_MARK_PRICE.0, PERPS_MARK_PRICE.1);
-        let result = execute_precompile(&addr, &[0u8], 10_000, &empty_reader(), &call_ctx());
+        let result =
+            execute_precompile(&addr, &[0u8], 10_000, &empty_reader(), &call_ctx(), &test_ledger());
         assert!(result.success);
         assert_eq!(result.gas_used, GAS_PERPS_MARK);
         assert!(result.output.is_empty());
@@ -1113,7 +1200,8 @@ mod tests {
     #[test]
     fn perps_insurance_fund_with_empty_reader_returns_zero() {
         let addr = precompile_address(PERPS_INSURANCE_FUND.0, PERPS_INSURANCE_FUND.1);
-        let result = execute_precompile(&addr, &[], 10_000, &empty_reader(), &call_ctx());
+        let result =
+            execute_precompile(&addr, &[], 10_000, &empty_reader(), &call_ctx(), &test_ledger());
         assert!(result.success);
         assert_eq!(result.gas_used, GAS_PERPS_INSURANCE);
         assert_eq!(result.output.len(), 8);
@@ -1123,7 +1211,14 @@ mod tests {
     #[test]
     fn exchange_best_bid_rejects_wrong_input_length() {
         let addr = precompile_address(EXCHANGE_BEST_BID.0, EXCHANGE_BEST_BID.1);
-        let result = execute_precompile(&addr, &[0u8; 2], 10_000, &empty_reader(), &call_ctx());
+        let result = execute_precompile(
+            &addr,
+            &[0u8; 2],
+            10_000,
+            &empty_reader(),
+            &call_ctx(),
+            &test_ledger(),
+        );
         assert!(!result.success);
         assert_eq!(result.gas_used, GAS_EXCHANGE_L1);
     }
@@ -1131,7 +1226,14 @@ mod tests {
     #[test]
     fn perps_position_rejects_wrong_input_length() {
         let addr = precompile_address(PERPS_POSITION.0, PERPS_POSITION.1);
-        let result = execute_precompile(&addr, &[0u8; 20], 10_000, &empty_reader(), &call_ctx());
+        let result = execute_precompile(
+            &addr,
+            &[0u8; 20],
+            10_000,
+            &empty_reader(),
+            &call_ctx(),
+            &test_ledger(),
+        );
         assert!(!result.success);
         assert_eq!(result.gas_used, GAS_PERPS_POSITION);
     }
@@ -1139,7 +1241,8 @@ mod tests {
     #[test]
     fn exchange_best_bid_reverts_on_insufficient_gas() {
         let addr = precompile_address(EXCHANGE_BEST_BID.0, EXCHANGE_BEST_BID.1);
-        let result = execute_precompile(&addr, &[0u8], 1_000, &empty_reader(), &call_ctx());
+        let result =
+            execute_precompile(&addr, &[0u8], 1_000, &empty_reader(), &call_ctx(), &test_ledger());
         assert!(!result.success);
         // C5 fix: OOG charges all available gas (gas_limit), not 0.
         assert_eq!(result.gas_used, 1_000);
@@ -1148,7 +1251,14 @@ mod tests {
     #[test]
     fn perps_insurance_fund_rejects_nonempty_input() {
         let addr = precompile_address(PERPS_INSURANCE_FUND.0, PERPS_INSURANCE_FUND.1);
-        let result = execute_precompile(&addr, &[0x42], 10_000, &empty_reader(), &call_ctx());
+        let result = execute_precompile(
+            &addr,
+            &[0x42],
+            10_000,
+            &empty_reader(),
+            &call_ctx(),
+            &test_ledger(),
+        );
         assert!(!result.success);
         assert_eq!(result.gas_used, GAS_PERPS_INSURANCE);
     }

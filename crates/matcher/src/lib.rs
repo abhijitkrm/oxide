@@ -51,7 +51,7 @@
 //!
 //! The balance cache is a flat `HashMap<[u8; 20], u64>` — O(1)
 //! lookup, no allocation (fixed 20-byte keys, not `Vec<u8>`). This
-//! is ~10x faster than the bank's `BTreeMap<Vec<u8>, Vec<u8>>` for
+//! is ~10x faster than a generic `BTreeMap<Vec<u8>, Vec<u8>>` for
 //! the hot path.
 //!
 //! # Settlement
@@ -202,7 +202,7 @@ impl MatchingServer {
     }
 
     /// Fund an account with the given quote balance. Called during
-    /// setup or when the balance cache is synced from the bank.
+    /// setup or when the balance cache is synced from the ledger.
     pub fn fund_account(&mut self, addr: &primitives::Address, amount: u64) {
         self.balances.set(addr, amount);
     }

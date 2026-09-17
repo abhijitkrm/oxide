@@ -12,7 +12,7 @@
 //! | Bench | What | Gate (source: plan.md §13 Phase 3, §9.3) |
 //! |---|---|---|
 //! | `perps_place_with_margin` | full `handle()`: parse + match + position update + margin check + event emit | p50 < 3 µs ⇒ ≥333k orders/s/core |
-//! | `perps_deposit` | full `handle()`: bank debit + margin credit | p50 < 2 µs ⇒ ≥500k deposits/s/core |
+//! | `perps_deposit` | full `handle()`: ledger debit + margin credit | p50 < 2 µs ⇒ ≥500k deposits/s/core |
 //! | `perps_liquidation_check` | `liquidation_check()`: equity + maintenance calc | p50 < 5 µs ⇒ ≥200k checks/s/core |
 //! | `raw_perps_engine_place` | `MatchingEngine::place()` only (no perps state) | baseline for head-to-head |
 //!
@@ -46,7 +46,7 @@
 //! ## Method notes
 //!
 //! - `black_box` on every input and consumed output.
-//! - The perps module + bank are created ONCE outside the bench
+//! - The perps module + ledger are created ONCE outside the bench
 //!   (`handle` takes `&self` via internal Mutex). Setup only rests a
 //!   maker; the measured section places a taker. After the fill, the
 //!   book is empty for the next iteration.
@@ -61,6 +61,7 @@
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use executor::{Module, TxContext};
+use framework::Balances;
 use primitives::Address;
 use primitives::fixed::{Price, Qty};
 use std::cell::RefCell;
@@ -122,24 +123,32 @@ fn limit(side: Side, ticks: u64, lots: u64, owner: u8) -> NewOrder {
 /// taker buy that fills it, opening a long for trader 1 and a short
 /// for trader 9.
 fn perps_place_with_margin(c: &mut Criterion) {
-    // Create perps + bank ONCE; reuse across all iterations.
-    // Fund with 1e15 quote — each fill costs ~75k, so the bench can
-    // run ~13 billion fills before exhausting funds.
-    let bank = Arc::new(bank::BankModule::new());
-    bank.mint(&addr(1), 1_000_000_000_000_000);
-    bank.mint(&addr(9), 1_000_000_000_000_000);
-    let perps = PerpsModule::with_bank(bank);
+    // Create perps + ledger ONCE; reuse across all iterations.
+    // Fund with 1e15 quote — the margin top-ups below draw from it.
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    ledger.mint(&addr(1), 1_000_000_000_000_000);
+    ledger.mint(&addr(9), 1_000_000_000_000_000);
+    let perps = PerpsModule::with_ledger(ledger);
     let mid = perps.list_market(perps_cfg()).expect("perps config valid");
-    // Deposit 500M cross-margin for both traders.
     perps.handle(&ctx(1), &perps::msg::deposit(0xFF, 500_000_000)).unwrap();
     perps.handle(&ctx(9), &perps::msg::deposit(0xFF, 500_000_000)).unwrap();
     let maker = limit(Side::Sell, 500, 5, 9);
     let taker = limit(Side::Buy, 500, 5, 1);
+    // Setup margin top-up (excluded): positions accumulate — the
+    // taker's long and maker's short each grow 5 lots per fill —
+    // so each iteration's setup deposits enough cross-margin to
+    // keep the initial-margin gate (notional/10x ≈ +7.5k per fill)
+    // comfortably ahead. Without this the reused module would hit
+    // "insufficient initial margin" after ~66k fills.
+    let top_up = |tag: u8| {
+        perps.handle(&ctx(tag), &perps::msg::deposit(0xFF, 1_000_000)).unwrap();
+    };
 
     c.bench_function("perps_place_with_margin", |b| {
         b.iter_batched(
             || {
-                // Setup (excluded): rest one maker sell.
+                top_up(1);
+                top_up(9);
                 perps.handle(&ctx(9), &perps::msg::place(mid, maker)).unwrap();
             },
             |_setup| {
@@ -158,14 +167,14 @@ fn perps_place_with_margin(c: &mut Criterion) {
 /// Gate: p50 < 2 µs (≥500k deposits/s/core).
 ///
 /// Measures the full `handle()` path for a margin deposit: message
-/// parse, `bank.debit()` (BTreeMap lookup + insert), margin credit
+/// parse, `ledger.debit()` (account-cache write + undo capture), margin credit
 /// (BTreeMap lookup/insert for the account + position), and event
-/// emission. The bank is funded with 1B quote; each deposit moves
+/// emission. The ledger is funded with 1B quote; each deposit moves
 /// 1k, so the bench can run ~1M iterations before exhausting funds.
 fn perps_deposit(c: &mut Criterion) {
-    let bank = Arc::new(bank::BankModule::new());
-    bank.mint(&addr(1), 1_000_000_000_000_000);
-    let perps = PerpsModule::with_bank(bank);
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    ledger.mint(&addr(1), 1_000_000_000_000_000);
+    let perps = PerpsModule::with_ledger(ledger);
     perps.list_market(perps_cfg()).expect("perps config valid");
 
     c.bench_function("perps_deposit", |b| {
@@ -195,10 +204,10 @@ fn perps_liquidation_check(c: &mut Criterion) {
     // Build a fresh perps module per iteration via RefCell — the
     // liquidation closes the position, so state must reset.
     let build = || {
-        let bank = Arc::new(bank::BankModule::new());
-        bank.mint(&addr(1), 1_000_000_000_000);
-        bank.mint(&addr(9), 1_000_000_000_000);
-        let perps = PerpsModule::with_bank(bank);
+        let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+        ledger.mint(&addr(1), 1_000_000_000_000);
+        ledger.mint(&addr(9), 1_000_000_000_000);
+        let perps = PerpsModule::with_ledger(ledger);
         let mid = perps.list_market(perps_cfg()).unwrap();
         perps.handle(&ctx(1), &perps::msg::deposit(0xFF, 500_000_000)).unwrap();
         perps.handle(&ctx(9), &perps::msg::deposit(0xFF, 500_000_000)).unwrap();

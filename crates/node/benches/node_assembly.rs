@@ -51,10 +51,10 @@ fn bench_node_smoke_test(c: &mut Criterion) {
             };
             let mut node = Node::assemble(&config);
 
-            // Submit a bank transfer tx.
-            let to = primitives::Address([2u8; 20]);
-            let module_payload = bank::msg::transfer(to, 100);
-            let tx = build_tx(framework::module_id::BANK, &module_payload);
+            // Submit a staking delegate tx (`Address::ZERO` is
+            // genesis-registered by `Node::assemble`).
+            let module_payload = staking::msg::delegate(primitives::Address::ZERO, 100);
+            let tx = build_tx(framework::module_id::STAKING, &module_payload);
             node.engine().submit_tx(tx);
             node.engine().run_until_idle();
         });

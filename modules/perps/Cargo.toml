@@ -18,13 +18,16 @@ types = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
 trading = { workspace = true }
-bank = { workspace = true }
 
 [dev-dependencies]
 # Benchmark harness (criterion gates: plan.md §13 Phase 3 acceptance).
 criterion = "0.7.0"
 # Property-based testing for perps invariants (margin, equity, liquidation).
 proptest = "1.11.0"
+# evm: benches settle margin against the real EVM ledger (the
+# production `Balances` impl) — dev-dep cycle with the precompile
+# dep is legal.
+evm = { workspace = true }
 
 [[bench]]
 name = "perps_settlement"

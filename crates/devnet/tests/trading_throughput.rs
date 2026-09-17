@@ -3,7 +3,7 @@
 //! no TCP, no BLS, no executor block storage).
 //!
 //! This measures the trading machine's full `handle()` path
-//! (matching + bank settlement + event emission) at scale, without
+//! (matching + ledger settlement + event emission) at scale, without
 //! consensus or executor overhead. It's the "how fast can the
 //! trading engine actually go" number — the upper bound on trading
 //! TPS before consensus, networking, and signature verification are
@@ -20,7 +20,7 @@
 //!
 //! 2. **Exchange settlement**: calls `ExchangeModule::handle()`
 //!    directly (via the `Module` trait). Each call parses the message,
-//!    matches, settles the fill through the bank (debit buyer,
+//!    matches, settles the fill through the EVM ledger (debit buyer,
 //!    credit seller), and emits events. Measures the full settlement
 //!    path that consensus would execute.
 //!
@@ -29,7 +29,7 @@
 //! - All orders are processed (no panics).
 //! - The matching engine's resting count is consistent.
 //! - The exchange module's resting count is consistent.
-//! - Bank balances are non-negative.
+//! - Ledger balances are non-negative.
 //!
 //! # Running
 //!
@@ -44,6 +44,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use executor::Module;
+use framework::Balances;
 use primitives::fixed::{Price, Qty};
 use std::sync::Arc;
 use std::time::Instant;
@@ -99,7 +100,7 @@ fn taker_buy(owner: primitives::Address) -> NewOrder {
 /// Creates a `MatchingEngine`, then places `n_trades` maker sells
 /// (each resting) followed by `n_trades` taker buys (each matching
 /// one maker). Measures pure matching throughput — no settlement,
-/// no event collection, no bank interaction.
+/// no event collection, no ledger interaction.
 fn run_raw_engine(n_trades: usize) {
     eprintln!("\n--- Raw Matching Engine Throughput ---");
     eprintln!("raw engine: {n_trades} maker sells + {n_trades} taker buys = {n_trades} fills");
@@ -160,22 +161,23 @@ fn run_raw_engine(n_trades: usize) {
 
 /// Run the exchange settlement throughput test.
 ///
-/// Creates an `ExchangeModule` backed by a `BankModule`, lists a
-/// market, then processes `n_trades` maker sells + `n_trades` taker
-/// buys via `Module::handle()`. Each taker buy matches one maker
-/// sell, producing a fill + bank transfer (debit buyer, credit
-/// seller). Measures the full settlement path that consensus would
-/// execute.
+/// Creates an `ExchangeModule` backed by the EVM account store,
+/// lists a market, then processes `n_trades` maker sells +
+/// `n_trades` taker buys via `Module::handle()`. Each taker buy
+/// matches one maker sell, producing a fill + ledger transfer
+/// (debit buyer, credit seller). Measures the full settlement path
+/// that consensus would execute.
 fn run_exchange_settlement(n_trades: usize) {
     eprintln!("\n--- Exchange Settlement Throughput ---");
     eprintln!("exchange: {n_trades} maker sells + {n_trades} taker buys = {n_trades} fills");
 
-    // Setup: bank + exchange with 10T quote each for buyer and seller.
-    // 100M fills at 15k quote/fill = 1.5T total. 10T is enough.
-    let bank = Arc::new(bank::BankModule::new());
-    bank.mint(&primitives::Address([0x01; 20]), 10_000_000_000_000);
-    bank.mint(&primitives::Address([0x09; 20]), 10_000_000_000_000);
-    let exchange = Arc::new(exchange::ExchangeModule::with_bank(bank));
+    // Setup: EVM ledger + exchange with 10T quote each for buyer
+    // and seller. 100M fills at 15k quote/fill = 1.5T total. 10T is
+    // enough.
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    ledger.mint(&primitives::Address([0x01; 20]), 10_000_000_000_000);
+    ledger.mint(&primitives::Address([0x09; 20]), 10_000_000_000_000);
+    let exchange = Arc::new(exchange::ExchangeModule::with_ledger(ledger));
     exchange.list_market(cfg()).expect("market config valid");
 
     let maker_ctx =
@@ -218,7 +220,7 @@ fn run_exchange_settlement(n_trades: usize) {
 
     // Gate: exchange settlement must sustain ≥ 100k ops/s
     // (plan.md §13 Phase 3). This is the full settlement path
-    // (matching + bank transfer + event emission), not just the
+    // (matching + ledger transfer + event emission), not just the
     // matching engine. The 100k floor is conservative for CI
     // runners; the 16-core x86_64 rig is the source for absolute
     // gate claims.

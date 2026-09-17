@@ -12,6 +12,53 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Unified ledger: the EVM account store is now the single
+  native-token ledger** (`modules/framework`, `modules/evm`,
+  `modules/staking`, `modules/exchange`, `modules/perps`,
+  `crates/node`, `crates/devnet`, `bin/*`, `crates/config`)
+  - The `bank` module is gone. One account store — the same
+    `revm`-backed accounts EVM transactions debit and credit —
+    now backs envelope fees, staking bonds and unbonding payouts,
+    exchange fill settlement, perps margin and liquidation flows,
+    and the insurance fund. `eth_getBalance`, plain transfers, and
+    every native money movement finally see the same numbers.
+  - Native modules settle through a new `framework::Balances`
+    trait instead of a concrete module: production wiring passes
+    `Arc<dyn Balances + Send + Sync>` fulfilled by `EvmModule`;
+    tests can substitute `framework::MemoryBalances`. Balances are
+    `u64` base units; `framework::WEI_PER_UNIT` (10⁹) defines the
+    wei conversion.
+  - In-transaction native calls (the `0x0C_*` staking precompiles)
+    move funds through **revm's own journal** via
+    `JournalBalances` — a reverted EVM frame restores the bond
+    transfer automatically, and the frame-scoped native journal
+    undoes only the staking record (no double refund).
+  - `EvmModule` implements `Module::charge_fee`, so the executor's
+    fee module is the ledger itself; zero-fee envelopes skip the
+    account touch exactly as before.
+  - The `0x0B01`/`0x0B02` bank precompiles are retired —
+    `eth_getBalance` and normal transfers already do their job;
+    regression tests pin the addresses to clean reverts. Module ID
+    1 is reserved and will not be reused.
+  - Genesis compatibility: a legacy `bank.balances` map is still
+    accepted and folded into `evm.alloc` (base units → wei), so
+    existing genesis files migrate without losing funds;
+    `evm.alloc` is the canonical allocation format going forward.
+  - Measured, not just assumed: exchange settlement on the new
+    ledger benches **744 ns/fill (~20% faster** than the old bank
+    path — the account-cache write beats the deleted
+    `BTreeMap<Vec<u8>, Vec<u8>>`), perps deposit **181 ns (−43%)**,
+    margin-gated order placement **375 ns**, liquidation check
+    **24 ns** — all well under their gates.
+  - **In plain words:** there used to be two separate banks that
+    didn't talk to each other — one for regular Ethereum-style
+    transactions and one for everything else, so the same account
+    could show two different balances depending on where you
+    looked. Now there is exactly one ledger: the balance MetaMask
+    shows is the same balance your staking bond, exchange fills,
+    and perps margin actually use — and it turned out to be
+    faster, too.
+
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,
   `crates/node`, `bin/oxide-validator`, `bin/oxide-fullnode`)
