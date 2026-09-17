@@ -14073,3 +14073,101 @@ false shard sharing, so it scales with cores.
 - mempool +1 (`executed_nonce_max_does_not_wrap_anchor`),
   executor +1 (`nonce_u64_max_is_reserved`), matcher suite green
   under the new cache (94 tests incl. 6 multi-market e2e).
+
+## 2026-10-08 — Session: chaos sim — engine-level Byzantine injection + 10k gate
+
+### The gap this closes
+
+`sim/` tracked Byzantine strategies (`Equivocate`, `Withhold`,
+`DoubleVote`, `Spam`, `Censor`) as scenario *configuration* — the
+swarm runner partitioned nodes and ran honest rounds underneath.
+Nothing adversarial ever reached an engine. This session wires the
+strategies into real consensus execution.
+
+### Design
+
+`sim/src/chaos.rs` — a second driver beside `swarm.rs` that owns the
+round loop itself (propose → vote → collect → QC → deliver) and
+calls the **real `OxideBft` API** on every node, injecting per-node
+deviations at the message boundary:
+
+- `Withhold`: node sends no vote — leader must reach quorum without
+  it or the view advances empty.
+- `DoubleVote`/`Equivocate` (voter): honest vote **plus** a second,
+  *validly signed* conflicting vote for a different block hash —
+  forged with the node's real BLS key via the now-public
+  `OxideBft::vote_signing_message`. Signature verification cannot be
+  the defense (the signature verifies); the QC consistency rule —
+  all votes in a view must agree on one block hash — is what has to
+  catch it, which is the same property production relies on.
+- `Equivocate` (leader): the leader re-signs a second header for the
+  same view (`OxideBft::proposal_signing_hash` + its real key) and
+  shows different halves of the follower set different blocks. The
+  split vote must not form a QC for either side.
+- `Spam{rate}`: malformed frames flood the leader's inbound queue;
+  decode drops them (`malformed_dropped` counts deliveries), the
+  honest vote still lands. A spamming *leader* broadcasts garbage
+  instead of the QC.
+- `Censor{censored}`: modelled at ingress — censored txs never enter
+  the censoring node's mempool, so its proposals exclude them;
+  honest leaders still carry them (delayed, not denied).
+- Partitions apply/heal mid-run via `devnet.partition/heal`.
+
+The harness drains queues tolerantly: malformed → counted drop;
+`collect_vote`/`deliver_qc` errors → counted rejections, never
+panics. Rejections are evidence the injection *happened* — tests
+assert the counters, not just safety.
+
+### API surface added (all documented as sim/test surface)
+
+- `OxideBft::proposal_signing_hash` and `vote_signing_message` are
+  now `pub` — the sim needs them to craft real signatures.
+- `ConsensusError` re-exported from the consensus crate root.
+- `MultiNodeDevnet`: `engines`, `engines_mut`, `validator_set`,
+  `secret_key(i)`, `transport(i)` accessors — sim drives the same
+  engines the devnet owns, so the behavior under test is the
+  production engine, not a model.
+
+### Two bugs found while building it
+
+- **`collect_vote` dedups by voter index before the conflict check**
+  (`votes[idx].is_some() → Ok`). A second vote from the same voter
+  is a silent no-op — so a forged-then-honest send order is what
+  actually exercises `ConflictingVote`. This is correct engine
+  behavior (one vote per voter per view); the sim now sends the
+  forgery first.
+- **Gap-vs-fork in my own safety check**: a partitioned honest node
+  misses QCs and ends with *missing* heights — comparing finalized
+  lists position-wise flags gaps as forks. Fixed to per-height
+  content comparison: same height + different txs = violation;
+  missing height = lag, not a violation.
+
+### The gate
+
+`sim/tests/chaos.rs::randomized_10k_zero_safety_violations`
+(`#[ignore]`d — runs in nightly via the existing `throughput-sims`
+job): per seed, randomized n∈{4,7}, Byzantine count (mostly ≤ f,
+~15% exceed), strategy per node, rounds ∈ 6..16, ~25% carry a
+temporary partition-then-heal. Safety asserted always; liveness only
+where within-bound and unpartitioned.
+
+**Measured result: 0 safety violations and 0/6899 liveness failures
+across 10,000 scenarios; 4,440 runs had confirmed Byzantine
+injection.** Single-threaded the gate takes ~17 min (per-scenario
+BLS keygen dominates); chunked `std::thread` fan-out over
+`available_parallelism` cores brings it to ~6 min — chunk boundaries
+are fixed so the scenario set is identical every run.
+
+### Targeted tests (9, all in default `cargo test`)
+
+honest baseline · double-vote detected+rejected · leader
+equivocation split-vote rejected · withhold within bound stays live
+· withhold beyond bound stays safe · spam flood dropped at decode ·
+censorship delays not denies · partition-then-heal recovers ·
+identical scenario → identical result (determinism).
+
+### Follow-ups
+
+- `swarm.rs` remains the config-level container; `chaos.rs` is the
+  injection driver. The swarm's "strategies are tracked, not
+  injected" doc stays true of swarm itself.

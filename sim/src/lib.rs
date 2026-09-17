@@ -37,6 +37,7 @@
 //! pattern that other crates can depend on.
 
 pub mod byzantine;
+pub mod chaos;
 pub mod network;
 pub mod swarm;
 

@@ -174,6 +174,47 @@ impl MultiNodeDevnet {
         self.n
     }
 
+    /// Read-only access to the validator engines, for simulation
+    /// harnesses that drive consensus rounds themselves.
+    pub fn engines(&self) -> &[OxideBft] {
+        &self.engines
+    }
+
+    /// Mutable access to the validator engines, for simulation
+    /// harnesses that drive consensus rounds themselves (the
+    /// `oxide-sim` chaos driver proposes/votes/collects through the
+    /// real engine API while injecting byzantine deviations).
+    pub fn engines_mut(&mut self) -> &mut [OxideBft] {
+        &mut self.engines
+    }
+
+    /// The shared validator set (leader rotation, quorum size).
+    pub fn validator_set(&self) -> &ValidatorSet {
+        &self.validator_set
+    }
+
+    /// Validator `index`'s BLS secret key. Simulation harnesses use
+    /// this to sign *conflicting* byzantine messages with the node's
+    /// real key — the honest engines then exercise their real
+    /// verification/equivocation paths on real signatures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= n`.
+    pub fn secret_key(&self, index: usize) -> &crypto::BlsSecretKey {
+        &self.secret_keys[index]
+    }
+
+    /// A `MeshTransport` handle for validator `index`. Requires
+    /// `enable_mesh()` to have been called.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mesh is not enabled or `index >= n`.
+    pub fn transport(&self, index: usize) -> p2p::MeshTransport {
+        self.network.as_ref().expect("mesh not enabled — call enable_mesh()").transport(index)
+    }
+
     /// Enable the mesh network for transport-routed rounds (H4 fix).
     /// After calling this, `run_round_transport` can be used to route
     /// consensus messages through `MeshTransport` instead of direct

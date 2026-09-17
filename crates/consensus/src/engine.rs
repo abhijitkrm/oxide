@@ -1058,7 +1058,13 @@ impl OxideBft {
     ///
     /// The clone is acceptable: this runs once per block per
     /// validator in `vote()`, not per-order or per-message.
-    fn proposal_signing_hash(header: &BlockHeader) -> Hash {
+    ///
+    /// Exposed for the deterministic-simulation harness (`oxide-sim`):
+    /// a byzantine-leader strategy must produce a second, validly
+    /// signed header for the same view to exercise equivocation
+    /// handling. Production callers should not need this — the engine
+    /// signs internally in `propose()`.
+    pub fn proposal_signing_hash(header: &BlockHeader) -> Hash {
         let mut unsigned = header.clone();
         unsigned.proposer_signature = None;
         Self::block_hash(&unsigned)
@@ -1370,7 +1376,13 @@ impl OxideBft {
     /// Returns a fixed stack array — this runs once per vote
     /// (verify + sign) on the quorum hot path, and a heap `Vec`
     /// allocated 49 bytes per call for no reason.
-    fn vote_signing_message(&self, view: View, phase_byte: u8, block_hash: &Hash) -> [u8; 49] {
+    ///
+    /// Exposed for the deterministic-simulation harness (`oxide-sim`):
+    /// a byzantine-voter strategy must sign a second, conflicting vote
+    /// for the same view with the node's real key to exercise
+    /// equivocation/double-vote handling. Production callers should
+    /// not need this — the engine signs internally in `vote()`.
+    pub fn vote_signing_message(&self, view: View, phase_byte: u8, block_hash: &Hash) -> [u8; 49] {
         let mut msg = [0u8; 49];
         msg[..8].copy_from_slice(&view.value().to_le_bytes());
         msg[8] = phase_byte;

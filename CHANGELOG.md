@@ -254,6 +254,39 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     state, and the bottleneck is now network payload size, not the
     ledger.
 
+- **Chaos simulation with real Byzantine injection**
+  (`sim/`, `crates/consensus`, `crates/devnet`)
+  - New `oxide_sim::chaos` driver runs consensus rounds through the
+    real `OxideBft` engine while Byzantine strategies deviate at the
+    message boundary: double-voters and equivocators emit *validly
+    signed* conflicting votes/headers (the QC consistency rule, not
+    signature verification, is what rejects them), withholders stay
+    silent, spammers flood leaders with malformed frames, censors
+    exclude targeted senders at ingress, and partitions apply and
+    heal mid-run.
+  - Injection is proven, not assumed: the report counts conflicting
+    votes rejected, malformed frames dropped, and leader
+    equivocations emitted — tests assert the counters.
+  - The Phase 4 acceptance gate
+    (`sim/tests/chaos.rs::randomized_10k_zero_safety_violations`)
+    runs 10,000 randomized scenarios — randomized validator counts,
+    Byzantine assignments, strategies, round counts, and
+    partition-then-heal plans — with **zero safety violations and
+    zero liveness failures on 6,899 within-bound runs**; ~6 minutes
+    when fanned across cores, picked up by the nightly
+    `throughput-sims` job.
+  - Engine surface: `OxideBft::proposal_signing_hash`,
+    `vote_signing_message`, and the `ConsensusError` re-export are
+    now public (documented simulation surface), and
+    `MultiNodeDevnet` exposes `engines`/`secret_key`/`transport`
+    accessors so the sim drives the same engines the devnet owns.
+  - **In plain words:** the safety net now actually attacks the
+    consensus engine instead of just describing attacks — we forge
+    real signatures, split votes between halves of the network,
+    flood leaders with garbage, censor transactions, and partition
+    nodes mid-run, 10,000 different ways, and honest validators
+    never once finalized two different histories.
+
 - **EIP-712-signed native module transactions** (`crates/crypto`,
   `crates/executor`, `crates/mempool`, `crates/rpc`, `modules/evm`,
   `crates/node`, `bin/oxide-validator`, `bin/oxide-fullnode`)

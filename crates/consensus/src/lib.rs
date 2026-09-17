@@ -25,7 +25,7 @@ pub mod sequencer;
 pub mod validator;
 pub mod wal;
 
-pub use engine::{EpochRotationError, OxideBft};
+pub use engine::{ConsensusError, EpochRotationError, OxideBft};
 pub use pacemaker::{Pacemaker, PacemakerEvent, PacemakerState};
 pub use sequencer::SequencerEngine;
 pub use validator::{ValidatorIndex, ValidatorSet};
