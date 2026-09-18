@@ -31,8 +31,9 @@
 //! `authenticated = false`, `encrypted = false`. This is for local
 //! devnet only — do not use across untrusted networks.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use codec::{Decode, Encode};
 use consensus::{OxideBft, ValidatorSet};
@@ -60,6 +61,22 @@ const MSG_VOTE: u8 = 0x01;
 
 /// Message type tag: QC.
 const MSG_QC: u8 = 0x02;
+
+/// Message type tag: block proposal (header + txs).
+///
+/// Only the threaded driver sends this: the single-threaded pipeline
+/// shares proposals in-process (`state.proposals`), which skips the
+/// largest real network cost — multi-MiB payload fan-out to every
+/// follower. Shipping the proposal over TCP makes the threaded run
+/// the first harness to pay the real distribution cost.
+const MSG_PROPOSAL: u8 = 0x03;
+
+/// Per-receiver reliable fallback queue: `(sender_index, frame)`.
+/// The threaded driver drops frames here when a peer's TCP writer
+/// channel reports `ChannelFull`, preserving the harness's "no
+/// message loss" invariant without blocking the sender's hot loop —
+/// the receiving validator drains its inbox each iteration.
+type Inboxes = Vec<Arc<std::sync::Mutex<VecDeque<(u8, Vec<u8>)>>>>;
 
 /// Build the BLS vote signing message: `(view, phase, block_hash,
 /// epoch)`. This must match the format used by
@@ -112,6 +129,14 @@ pub struct TcpMultiNodeDevnet {
     /// collects commits via `commit_listener` into these unbounded
     /// vectors for the integrity check.
     committed_blocks: Vec<Arc<std::sync::Mutex<Vec<FinalizedBlock>>>>,
+    /// Per-validator commit counters bumped inside the listener —
+    /// lets the threaded loop's completion check skip the block-store
+    /// mutex when nothing new committed.
+    commit_seqs: Vec<Arc<AtomicU64>>,
+    /// Phase timings from the most recent pipelined run — populated
+    /// by `run_pipelined`/`run_pipelined_txs`, read via
+    /// [`phase_timers`](Self::phase_timers).
+    last_phase_timers: PhaseTimers,
 }
 
 /// The result of running a TCP devnet: finalized blocks from each
@@ -120,6 +145,84 @@ pub struct TcpMultiNodeDevnet {
 pub struct TcpDevnetResult {
     /// Finalized blocks per validator.
     pub finalized: Vec<Vec<FinalizedBlock>>,
+}
+
+/// Wall-clock time spent in each pipelined-loop phase, accumulated
+/// across all ticks of a run.
+///
+/// The devnet drives every engine from one thread, so these timers
+/// measure how the single driver thread's time divides between
+/// consensus phases — the primary diagnostic for locating the
+/// throughput ceiling. `qc_deliver` covers `deliver_qc` calls, which
+/// is where block commit and transaction execution happen, so it is
+/// the closest proxy for "execution share of the round".
+///
+/// All fields are wall-clock [`Duration`]s on the driver thread, not
+/// CPU time; TCP wait shows up inside `drain`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PhaseTimers {
+    /// Submitting txs to leader intakes (includes intake-drain retries).
+    pub submit: std::time::Duration,
+    /// Leader `propose()` calls: mempool pull + block assembly + sign.
+    pub propose: std::time::Duration,
+    /// `vote()` calls: structural checks + embedded-QC verify + sign,
+    /// plus the TCP send and in-process collection of each vote.
+    pub vote: std::time::Duration,
+    /// Draining inbound TCP messages (votes/QCs decoded + delivered).
+    pub drain: std::time::Duration,
+    /// `try_form_qc` + QC TCP broadcast (aggregate-sign + fan-out).
+    pub qc_form: std::time::Duration,
+    /// `deliver_qc` to every engine — includes `commit_block` →
+    /// `app.finalize_block`, i.e. transaction execution.
+    pub qc_deliver: std::time::Duration,
+    /// View advancement + height sync bookkeeping.
+    pub advance: std::time::Duration,
+    /// Proposal-vector compaction between ticks.
+    pub compact: std::time::Duration,
+    /// Number of ticks measured.
+    pub ticks: u64,
+}
+
+impl PhaseTimers {
+    /// Total time accounted to instrumented phases.
+    fn total(&self) -> std::time::Duration {
+        self.submit
+            + self.propose
+            + self.vote
+            + self.drain
+            + self.qc_form
+            + self.qc_deliver
+            + self.advance
+            + self.compact
+    }
+}
+
+impl std::fmt::Display for PhaseTimers {
+    /// One-line-per-phase breakdown ordered by cost, with each phase's
+    /// share of the instrumented total. Printed at the end of pipelined
+    /// runs so the throughput ceiling's location is visible without a
+    /// profiler.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_ms = self.total().as_secs_f64() * 1e3;
+        let mut rows: [(&str, std::time::Duration); 8] = [
+            ("qc_deliver (commit+execute)", self.qc_deliver),
+            ("drain (TCP msgs)", self.drain),
+            ("vote (verify+sign+send)", self.vote),
+            ("qc_form (aggregate+fan-out)", self.qc_form),
+            ("propose (mempool+build+sign)", self.propose),
+            ("submit (tx intake)", self.submit),
+            ("advance views", self.advance),
+            ("compact proposals", self.compact),
+        ];
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+        writeln!(f, "phase breakdown ({:.1} ms instrumented, {} ticks):", total_ms, self.ticks)?;
+        for (name, d) in rows {
+            let ms = d.as_secs_f64() * 1e3;
+            let pct = if total_ms > 0.0 { ms / total_ms * 100.0 } else { 0.0 };
+            writeln!(f, "  {name:32} {ms:9.1} ms  {pct:5.1}%")?;
+        }
+        Ok(())
+    }
 }
 
 /// Mutable state shared across ticks of the pipelined event loop.
@@ -137,6 +240,8 @@ struct PipelineState {
     voted: HashSet<(usize, u64)>,
     /// Number of QCs formed across all ticks.
     qcs_formed: u64,
+    /// Accumulated per-phase wall-clock time (see [`PhaseTimers`]).
+    timers: PhaseTimers,
 }
 
 impl PipelineState {
@@ -146,6 +251,7 @@ impl PipelineState {
             proposed_views: HashSet::new(),
             voted: HashSet::new(),
             qcs_formed: 0,
+            timers: PhaseTimers::default(),
         }
     }
 
@@ -396,6 +502,14 @@ impl TcpMultiNodeDevnet {
         let mut exchange_modules = Vec::with_capacity(n);
         let committed_blocks: Vec<Arc<std::sync::Mutex<Vec<FinalizedBlock>>>> =
             (0..n).map(|_| Arc::new(std::sync::Mutex::new(Vec::new()))).collect();
+        // Commit sequence counters — bumped by the listener on every
+        // push. The threaded validator loop's completion check reads
+        // these to skip the `committed_blocks` mutex entirely when
+        // nothing new committed; without them the check locked +
+        // scanned on every spin iteration (~35% of each thread's
+        // time in measurement).
+        let commit_seqs: Vec<Arc<AtomicU64>> =
+            (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
 
         for (i, key) in secret_keys.iter().cloned().enumerate() {
             let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold)
@@ -475,12 +589,16 @@ impl TcpMultiNodeDevnet {
             // so the devnet needs an external copy for the integrity
             // check on tests > 4096 blocks.
             let committed = committed_blocks[i].clone();
+            let commit_seq = commit_seqs[i].clone();
             let mut engine = engine;
             engine.set_commit_listener(Box::new(move |block| {
                 committed
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(block.clone());
+                // Release so a reader that observes the bump is
+                // guaranteed to see the push that caused it.
+                commit_seq.fetch_add(1, Ordering::Release);
             }));
 
             engines.push(engine);
@@ -501,12 +619,25 @@ impl TcpMultiNodeDevnet {
             evm_modules,
             exchange_modules,
             committed_blocks,
+            commit_seqs,
+            last_phase_timers: PhaseTimers::default(),
         }
     }
 
     /// The number of validators.
     pub fn n(&self) -> usize {
         self.n
+    }
+
+    /// Per-phase wall-clock timings accumulated during the most recent
+    /// pipelined run (`run_pipelined` / `run_pipelined_txs`).
+    ///
+    /// The devnet drives all engines from one thread, so the breakdown
+    /// shows where the single driver thread spends its time — the
+    /// `qc_deliver` phase covers `deliver_qc` → `commit_block` →
+    /// `finalize_block` and is the closest proxy for "execution share".
+    pub fn phase_timers(&self) -> PhaseTimers {
+        self.last_phase_timers
     }
 
     /// Access the engines (mutable) — for Byzantine injection.
@@ -727,6 +858,9 @@ impl TcpMultiNodeDevnet {
             engine.sync_next_height(max_height);
         }
 
+        self.last_phase_timers = state.timers;
+        eprintln!("{}", state.timers);
+
         let elapsed = start.elapsed();
         (self.collect_result(), elapsed)
     }
@@ -756,6 +890,9 @@ impl TcpMultiNodeDevnet {
     /// Panics if `rounds * txs_per_round > all_txs.len()`, if a TCP
     /// send fails, or if the leader's self-delivered QC fails
     /// verification.
+    // Driver state machine — splitting phases across helpers
+    // would scatter the shared `PipelineState` bookkeeping.
+    #[allow(clippy::too_many_lines)]
     pub fn run_pipelined_txs(
         &mut self,
         rounds: usize,
@@ -852,6 +989,7 @@ impl TcpMultiNodeDevnet {
                 // from all_txs[1000..2000]. Those duplicate txs are
                 // rejected by the replay check (nonce already
                 // executed), and the pipeline stalls.
+                let t_sub = std::time::Instant::now();
                 tx_idx += self.submit_round_txs(
                     leader_idx,
                     txs_per_round,
@@ -860,6 +998,7 @@ impl TcpMultiNodeDevnet {
                     target_blocks,
                     deadline,
                 );
+                state.timers.submit += t_sub.elapsed();
                 next_submit_round += 1;
             }
 
@@ -895,6 +1034,7 @@ impl TcpMultiNodeDevnet {
             }
             let view = primitives::View::new(next_submit_round as u64);
             let leader_idx = usize::from(self.validator_set.leader(view));
+            let t_sub = std::time::Instant::now();
             tx_idx += self.submit_round_txs(
                 leader_idx,
                 txs_per_round,
@@ -903,6 +1043,7 @@ impl TcpMultiNodeDevnet {
                 u64::MAX,
                 remaining_deadline,
             );
+            state.timers.submit += t_sub.elapsed();
             next_submit_round += 1;
         }
 
@@ -942,8 +1083,642 @@ impl TcpMultiNodeDevnet {
             engine.sync_next_height(max_height);
         }
 
+        self.last_phase_timers = state.timers;
+        eprintln!("{}", state.timers);
+
         let elapsed = start.elapsed();
         (self.collect_result(), elapsed)
+    }
+
+    /// Run `rounds` blocks × `txs_per_round` pre-built txs with each
+    /// validator on its own OS thread — the closest single-machine
+    /// approximation of a real multi-machine deployment.
+    ///
+    /// # How this differs from `run_pipelined_txs`
+    ///
+    /// The pipelined driver drives every engine from one thread, so
+    /// all validators' propose/vote/verify/execute work serializes on
+    /// shared cores — a throughput ceiling no real deployment has.
+    /// Here each engine + executor runs an independent event loop on
+    /// its own thread; per-validator work parallelizes across cores.
+    ///
+    /// Two protocol-level differences fall out of that:
+    ///
+    /// 1. **Proposals go over the wire.** The single-threaded driver
+    ///    shares `(header, proposal)` pairs in-process, so payload
+    ///    fan-out costs nothing. The threaded leader broadcasts
+    ///    `MSG_PROPOSAL` frames (header + full tx bytes) over TCP —
+    ///    the first harness to pay real multi-MiB distribution cost.
+    /// 2. **Reliability comes from a fallback queue, not in-process
+    ///    delivery.** `TcpTransport::send` is best-effort
+    ///    (`try_send` into a bounded writer channel — `ChannelFull`
+    ///    drops). Failed sends are pushed into the receiver's shared
+    ///    inbox, which its thread drains alongside TCP. Ordering
+    ///    between TCP and fallback can interleave; the engine
+    ///    tolerates this (idempotent vote/QC delivery, ancestor-walk
+    ///    commit catches late blocks on the next QC, and leaders
+    ///    keep proposing empty blocks until every validator commits
+    ///    the target).
+    ///
+    /// # Termination
+    ///
+    /// Each thread exits when a shared `done` counter reaches `n` —
+    /// a validator marks itself done once its own commit count hits
+    /// `rounds`, but keeps voting/proposing until all peers finish,
+    /// so the flush views still reach quorum. The driver paces tx
+    /// submission on the global minimum committed height (same
+    /// `submit_ahead` lookahead as the pipelined path) and sets a
+    /// `stop` flag on any deadline so joins can't hang.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rounds * txs_per_round > all_txs.len()` or if a
+    /// validator thread panics.
+    // Harness orchestration: spawn/join + submit pacing share
+    // the same locals; splitting obscures the run protocol.
+    #[allow(clippy::too_many_lines)]
+    pub fn run_threaded_txs(
+        &mut self,
+        rounds: usize,
+        txs_per_round: usize,
+        all_txs: &[TxBytes],
+    ) -> (TcpDevnetResult, std::time::Duration) {
+        let n = self.n;
+        let start = std::time::Instant::now();
+        let needed = rounds.checked_mul(txs_per_round).expect("rounds * txs_per_round overflow");
+        assert!(
+            all_txs.len() >= needed,
+            "need {needed} txs for {rounds} rounds × {txs_per_round} txs/round, got {}",
+            all_txs.len()
+        );
+
+        // Shared mesh: per-receiver fallback inboxes (reliable path
+        // for sends the bounded TCP writer channel drops), a done
+        // counter, and a stop flag for deadline exits.
+        let inboxes: Inboxes =
+            (0..n).map(|_| Arc::new(std::sync::Mutex::new(VecDeque::new()))).collect();
+        let global_done = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Completion is measured in finalized *transactions*, not
+        // blocks: a tx whose round's leader proposed before the tx was
+        // selectable (nonce not yet contiguous with executed state)
+        // heals in a later view, so block count alone can reach the
+        // round target while txs are still pending — and every
+        // committed block must still be counted for integrity.
+        let target_txs = u64::try_from(rounds.saturating_mul(txs_per_round)).unwrap_or(u64::MAX);
+        // Per-validator current view, shared with the driver thread.
+        // Submission pacing uses `min(views)` — a leader cannot reach
+        // view k until the slowest validator is close behind, so
+        // pacing on the minimum view guarantees the round's txs land
+        // in the leader's intake *before* it proposes. (Pacing on
+        // committed height instead raced: commits lag views by the
+        // 2-chain delay plus execution time, letting a fast leader
+        // propose an empty block and then stall the next leader,
+        // whose `pending` then has no txs.)
+        let views: Vec<Arc<std::sync::atomic::AtomicU64>> =
+            (0..n).map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0))).collect();
+
+        // Pre-seed each leader's intake BEFORE the validator threads
+        // start. Once threads run, a leader can reach its view before
+        // the driver submits that round's txs and propose an empty
+        // block — the stranded txs then sit in the intake forever
+        // (a leader at view k never proposes again within `rounds`
+        // when k >= n). Seeding first removes the arrival race for
+        // every round the 10K-entry intake can hold; the paced loop
+        // below handles the overflow for larger runs.
+        let mut tx_idx = 0usize;
+        let mut next_submit_round = 0usize;
+        'seed: while next_submit_round < rounds {
+            let view = primitives::View::new(next_submit_round as u64);
+            let leader_idx = usize::from(self.validator_set.leader(view));
+            let round_end = (next_submit_round + 1) * txs_per_round;
+            while tx_idx < round_end {
+                match self.apps[leader_idx].ingest_tx(all_txs[tx_idx].clone()) {
+                    types::MempoolAck::Accepted => tx_idx += 1,
+                    // Intake channel full — stop seeding; the paced
+                    // loop continues once the pipeline is draining.
+                    types::MempoolAck::Rejected { .. } => break 'seed,
+                }
+            }
+            next_submit_round += 1;
+        }
+
+        // Move each engine + transport into its own thread. They are
+        // returned on join and restored into `self` so post-run
+        // inspection (`engines()`, `evm_module()`) keeps working.
+        let engines: Vec<OxideBft> = std::mem::take(&mut self.engines);
+        let transports: Vec<p2p::tcp::TcpTransport> = std::mem::take(&mut self.transports);
+        let mut handles = Vec::with_capacity(n);
+        for (i, (engine, transport)) in engines.into_iter().zip(transports).enumerate() {
+            let vs = self.validator_set.clone();
+            let key = self.secret_keys[i].clone();
+            let inboxes = inboxes.clone();
+            let committed = self.committed_blocks[i].clone();
+            let commit_seq = self.commit_seqs[i].clone();
+            let done = Arc::clone(&global_done);
+            let stop = Arc::clone(&stop);
+            let view = Arc::clone(&views[i]);
+            handles.push(std::thread::spawn(move || {
+                Self::validator_loop(
+                    engine,
+                    transport,
+                    key,
+                    u8::try_from(i).unwrap_or(0),
+                    n,
+                    vs,
+                    inboxes,
+                    committed,
+                    commit_seq,
+                    done,
+                    stop,
+                    view,
+                    target_txs,
+                )
+            }));
+        }
+
+        // Submit loop (driver thread): continues from where the
+        // pre-seed stopped, paced on the global minimum view +
+        // `submit_ahead` lookahead. `ingest_tx` goes straight to each
+        // app's bounded intake channel; a `Rejected` ack means the
+        // channel is full, which drains as the leader's own thread
+        // proposes — yield and retry.
+        let submit_ahead = n.max(4);
+        let deadline =
+            start + std::time::Duration::from_secs(60 + u64::try_from(rounds / 4).unwrap_or(0));
+        while next_submit_round < rounds && global_done.load(Ordering::Relaxed) != n {
+            if std::time::Instant::now() > deadline {
+                eprintln!("threaded run: submit deadline at round {next_submit_round}/{rounds}");
+                break;
+            }
+            let min_view = views.iter().map(|v| v.load(Ordering::Relaxed)).min().unwrap_or(0);
+            let submit_through = usize::try_from(min_view)
+                .unwrap_or(usize::MAX)
+                .saturating_add(submit_ahead)
+                .min(rounds);
+            while next_submit_round < submit_through {
+                let view = primitives::View::new(next_submit_round as u64);
+                let leader_idx = usize::from(self.validator_set.leader(view));
+                let round_end = (next_submit_round + 1) * txs_per_round;
+                while tx_idx < round_end {
+                    match self.apps[leader_idx].ingest_tx(all_txs[tx_idx].clone()) {
+                        types::MempoolAck::Accepted => tx_idx += 1,
+                        types::MempoolAck::Rejected { .. } => break,
+                    }
+                }
+                if tx_idx < round_end {
+                    break;
+                }
+                next_submit_round += 1;
+            }
+            std::thread::yield_now();
+        }
+
+        // Wait for every validator to commit `target_commits` blocks.
+        // Threads that finish early keep looping (voting/proposing)
+        // until `global_done == n`, so late flush views still reach
+        // quorum. On deadline, `stop` releases them for a clean join.
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while global_done.load(Ordering::Relaxed) != n && std::time::Instant::now() < wait_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            let (engine, transport) = h.join().expect("validator thread panicked");
+            self.engines.push(engine);
+            self.transports.push(transport);
+        }
+
+        // Final height sync (same as the pipelined drivers).
+        let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
+        for engine in &mut self.engines {
+            engine.sync_next_height(max_height);
+        }
+
+        // Diagnostic: leftover mempool entries mean a leader's txs
+        // arrived after its last proposal — a submission-timing gap,
+        // not an execution failure.
+        if std::env::var_os("THREADED_DEBUG").is_some() {
+            for (i, app) in self.apps.iter().enumerate() {
+                let leftover = app.mempool_len();
+                if leftover > 0 {
+                    eprintln!("  [v{i}] mempool leftover: {leftover} txs never proposed");
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        (self.collect_result(), elapsed)
+    }
+
+    /// Per-validator event loop for [`run_threaded_txs`](Self::run_threaded_txs).
+    ///
+    /// Mirrors the pipelined driver's five phases — drain, propose,
+    /// vote, form QC, advance — but on this validator's own thread
+    /// and with proposals arriving over the wire. Returns the engine
+    /// and transport so the devnet can restore them post-run.
+    // Per-thread consensus state machine — one poll loop driving
+    // propose/vote/qc/inbound phases; extraction would thread a
+    // dozen shared locals through helpers for no gain.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn validator_loop(
+        mut engine: OxideBft,
+        mut transport: p2p::tcp::TcpTransport,
+        secret_key: crypto::BlsSecretKey,
+        idx: u8,
+        n: usize,
+        validator_set: ValidatorSet,
+        inboxes: Inboxes,
+        committed: Arc<std::sync::Mutex<Vec<FinalizedBlock>>>,
+        commit_seq: Arc<AtomicU64>,
+        global_done: Arc<AtomicUsize>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        view_out: Arc<std::sync::atomic::AtomicU64>,
+        target_txs: u64,
+    ) -> (OxideBft, p2p::tcp::TcpTransport) {
+        let me = usize::from(idx);
+        // Pending proposals by view — filled by `MSG_PROPOSAL`
+        // frames, voted on in view order (BTreeMap keeps the oldest
+        // first so a burst of views resolves FIFO).
+        let mut pending: BTreeMap<u64, (types::BlockHeader, types::Proposal)> = BTreeMap::new();
+        let mut proposed_views: HashSet<u64> = HashSet::new();
+        let mut voted_views: HashSet<u64> = HashSet::new();
+        let mut marked_done = false;
+        let mut finalized_txs = 0u64;
+        let mut counted_blocks = 0usize;
+        let mut last_commit_seq = 0u64;
+        let mut last_debug = std::time::Instant::now();
+        // Hoisted out of the loop: `var_os` scans the environ block
+        // on every call — ~35M iterations made it the single biggest
+        // line item in the profile (~1.2s/thread).
+        let debug = std::env::var_os("THREADED_DEBUG").is_some();
+        // Per-thread phase accounting — printed at exit so the
+        // threaded profile shows where each validator's loop time
+        // actually goes (the same question `PhaseTimers` answers for
+        // the single-threaded driver). `qc_us` covers try_form_qc +
+        // fan-out + self-deliver; inbound QC delivery (the commit +
+        // execute hot path) is timed inside `dispatch_inbound` and
+        // reported as `commit_us`.
+        let mut t_inbound = std::time::Duration::ZERO;
+        let mut t_commit = std::time::Duration::ZERO;
+        let mut t_propose = std::time::Duration::ZERO;
+        let mut t_vote = std::time::Duration::ZERO;
+        let mut t_qc = std::time::Duration::ZERO;
+        let mut t_done = std::time::Duration::ZERO;
+        let loop_start = std::time::Instant::now();
+
+        loop {
+            // ── inbound: TCP first, then the reliable fallback ──
+            let t0 = std::time::Instant::now();
+            while let Some(msg) = transport.recv() {
+                let from = msg.from.first().copied().unwrap_or(0);
+                if let Some((v, vote)) = Self::dispatch_inbound(
+                    &mut engine,
+                    &mut pending,
+                    from,
+                    &msg.bytes,
+                    &mut t_commit,
+                ) {
+                    voted_views.insert(v);
+                    Self::send_vote(
+                        &mut engine,
+                        &mut transport,
+                        &inboxes,
+                        &validator_set,
+                        idx,
+                        v,
+                        vote,
+                    );
+                }
+            }
+            let drained: VecDeque<(u8, Vec<u8>)> = {
+                let mut guard =
+                    inboxes[me].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *guard)
+            };
+            for (from, bytes) in drained {
+                if let Some((v, vote)) =
+                    Self::dispatch_inbound(&mut engine, &mut pending, from, &bytes, &mut t_commit)
+                {
+                    voted_views.insert(v);
+                    Self::send_vote(
+                        &mut engine,
+                        &mut transport,
+                        &inboxes,
+                        &validator_set,
+                        idx,
+                        v,
+                        vote,
+                    );
+                }
+            }
+            t_inbound += t0.elapsed();
+
+            // ── propose: leader only, gated on high_qc like the sim ──
+            let t0 = std::time::Instant::now();
+            let view = engine.current_view().value();
+            if !proposed_views.contains(&view)
+                && usize::from(validator_set.leader(engine.current_view())) == me
+                && (view == 0 || engine.high_qc().is_some())
+            {
+                if let Some((header, proposal)) = engine.propose() {
+                    proposed_views.insert(view);
+                    let mut frame = Vec::with_capacity(64);
+                    frame.push(MSG_PROPOSAL);
+                    header.encode(&mut frame);
+                    proposal.encode(&mut frame);
+                    for peer in 0..n {
+                        if peer != me {
+                            Self::wire_send(
+                                &mut transport,
+                                &inboxes,
+                                idx,
+                                u8::try_from(peer).unwrap_or(0),
+                                &frame,
+                            );
+                        }
+                    }
+                    // Leader self-vote (same construction as the sim).
+                    let block_hash = OxideBft::block_hash(&header);
+                    let msg = vote_signing_message(
+                        header.view,
+                        types::VotePhase::Prepare,
+                        &block_hash,
+                        engine.epoch(),
+                    );
+                    let sig = secret_key.sign(crypto::hash::Domain::Vote, &msg);
+                    let _ = engine.collect_vote(
+                        u16::from(idx),
+                        types::Vote {
+                            view: header.view,
+                            phase: types::VotePhase::Prepare,
+                            block_hash,
+                            signature: sig,
+                        },
+                    );
+                    voted_views.insert(view);
+                }
+            }
+            t_propose += t0.elapsed();
+
+            // ── vote on pending proposals ──
+            let t0 = std::time::Instant::now();
+            // Entries here are future-view proposals (queued on
+            // arrival because we weren't at their view yet — their
+            // bodies are already stored in the engine). A retry
+            // fires only once our view catches up; stale entries
+            // (view passed while they waited) are dropped — the
+            // stored body still serves the QC commit walk.
+            let current = engine.current_view().value();
+            let pending_views: Vec<u64> = pending.keys().copied().collect();
+            for v in pending_views {
+                if voted_views.contains(&v) || v < current {
+                    voted_views.insert(v);
+                    pending.remove(&v);
+                    continue;
+                }
+                if v > current {
+                    continue;
+                }
+                let Some((header, proposal)) = pending.get(&v) else { continue };
+                if let Some(vote) = engine.vote(header, proposal) {
+                    voted_views.insert(v);
+                    Self::send_vote(
+                        &mut engine,
+                        &mut transport,
+                        &inboxes,
+                        &validator_set,
+                        idx,
+                        v,
+                        vote,
+                    );
+                }
+            }
+
+            t_vote += t0.elapsed();
+
+            // ── form QC: aggregate → broadcast → self-deliver ──
+            let t0 = std::time::Instant::now();
+            if let Some(qc) = engine.try_form_qc() {
+                let mut frame = Vec::with_capacity(1 + 150);
+                frame.push(MSG_QC);
+                qc.encode(&mut frame);
+                for peer in 0..n {
+                    if peer != me {
+                        Self::wire_send(
+                            &mut transport,
+                            &inboxes,
+                            idx,
+                            u8::try_from(peer).unwrap_or(0),
+                            &frame,
+                        );
+                    }
+                }
+                engine.deliver_qc(qc).expect("leader self-deliver QC");
+            }
+
+            // ── advance on a fresh high_qc ──
+            if let Some(hqc) = engine.high_qc() {
+                if hqc.view == engine.current_view() {
+                    engine.advance_view();
+                }
+            }
+            // Publish the view for the driver's submission pacing.
+            view_out.store(engine.current_view().value(), Ordering::Relaxed);
+            t_qc += t0.elapsed();
+
+            // ── done bookkeeping ──
+            let t0 = std::time::Instant::now();
+            // Debug heartbeat: `THREADED_DEBUG=1` prints each
+            // validator's position once per second — view, high_qc,
+            // pending proposals, commits. The primary liveness
+            // diagnostic for threaded runs.
+            if debug && last_debug.elapsed() >= std::time::Duration::from_secs(1) {
+                last_debug = std::time::Instant::now();
+                eprintln!(
+                    "  [v{idx}] view={} highqc={:?} pending={} proposed={} voted={} commits={}",
+                    engine.current_view().value(),
+                    engine.high_qc().map(|q| q.view.value()),
+                    pending.len(),
+                    proposed_views.len(),
+                    voted_views.len(),
+                    committed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
+                );
+            }
+            // Done = every submitted tx finalized. Gated on the
+            // commit counter so the block-store mutex is only taken
+            // when something actually committed since the last look —
+            // the spin loop iterates ~35M times/run and the naive
+            // always-lock version burned ~35% of every thread's time
+            // here. Counted incrementally over newly committed blocks
+            // so the check stays O(new blocks), not O(history).
+            if !marked_done {
+                // Snapshot BEFORE the lock: the listener bumps the
+                // counter after pushing, so a seq observed here is
+                // already visible under the mutex. Storing the
+                // pre-lock snapshot (not a post-count reload) means a
+                // commit landing mid-count re-triggers the check
+                // next iteration instead of being folded invisibly.
+                let seq_now = commit_seq.load(Ordering::Acquire);
+                if seq_now != last_commit_seq {
+                    let guard = committed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let new_txs: u64 = guard[counted_blocks..]
+                        .iter()
+                        .map(|b| u64::try_from(b.txs.len()).unwrap_or(u64::MAX))
+                        .sum();
+                    counted_blocks = guard.len();
+                    finalized_txs += new_txs;
+                    drop(guard);
+                    last_commit_seq = seq_now;
+                    if finalized_txs >= target_txs {
+                        marked_done = true;
+                        global_done.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            t_done += t0.elapsed();
+            if global_done.load(Ordering::Relaxed) == n || stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        // Threaded profile: per-validator loop-time breakdown.
+        // `commit` (inbound QC delivery → commit+execute) is the
+        // hot path the single-threaded driver serialized; inbound
+        // is everything else off the wire (proposal decode, vote,
+        // fallback); the remainder is idle spin (waiting on peers).
+        let total = loop_start.elapsed();
+        eprintln!(
+            "  [v{idx}] threaded profile: total={:.1}ms inbound={:.1} commit={:.1} propose={:.1} vote={:.1} qc={:.1} done={:.1} idle={:.1}",
+            total.as_secs_f64() * 1e3,
+            t_inbound.as_secs_f64() * 1e3,
+            t_commit.as_secs_f64() * 1e3,
+            t_propose.as_secs_f64() * 1e3,
+            t_vote.as_secs_f64() * 1e3,
+            t_qc.as_secs_f64() * 1e3,
+            t_done.as_secs_f64() * 1e3,
+            total
+                .saturating_sub(t_inbound)
+                .saturating_sub(t_propose)
+                .saturating_sub(t_vote)
+                .saturating_sub(t_qc)
+                .saturating_sub(t_done)
+                .as_secs_f64()
+                * 1e3,
+        );
+        (engine, transport)
+    }
+
+    /// Decode and deliver one inbound wire frame.
+    ///
+    /// `MSG_PROPOSAL` frames go straight through `engine.vote()`:
+    /// the engine stores the authenticated body on arrival — the QC
+    /// commit walk needs it even when the proposal lands too late to
+    /// vote on (a QC frequently arrives first over a different
+    /// network path) — and returns a `Vote` when we're already at
+    /// the proposal's view. Future-view proposals queue into
+    /// `pending` for the retry phase; stale ones are dropped (the
+    /// stored body still serves the commit walk). Returns
+    /// `(view, vote)` when a vote must go out to that view's leader.
+    ///
+    /// `MSG_VOTE` frames collect on the engine; `MSG_QC` frames
+    /// deliver (idempotent — stale QCs are rejected inside
+    /// `deliver_qc`). Malformed frames are dropped silently: this is
+    /// a devnet harness, not the hardened production ingress path.
+    fn dispatch_inbound(
+        engine: &mut OxideBft,
+        pending: &mut BTreeMap<u64, (types::BlockHeader, types::Proposal)>,
+        from: u8,
+        bytes: &[u8],
+        t_commit: &mut std::time::Duration,
+    ) -> Option<(u64, types::Vote)> {
+        let (&tag, rest) = bytes.split_first()?;
+        let mut reader = codec::Reader::new(rest);
+        match tag {
+            MSG_PROPOSAL => {
+                let header = types::BlockHeader::decode(&mut reader).ok()?;
+                let proposal = types::Proposal::decode(&mut reader).ok()?;
+                let v = header.view.value();
+                match engine.vote(&header, &proposal) {
+                    Some(vote) => Some((v, vote)),
+                    // Future view: queue for the retry phase — the
+                    // body is stored, only the vote waits for our
+                    // view to catch up.
+                    None if v >= engine.current_view().value() => {
+                        pending.entry(v).or_insert((header, proposal));
+                        None
+                    }
+                    // Stale: body stored, no vote possible or needed.
+                    None => None,
+                }
+            }
+            MSG_VOTE => {
+                if let Ok(vote) = types::Vote::decode(&mut reader) {
+                    let _ = engine.collect_vote(u16::from(from), vote);
+                }
+                None
+            }
+            MSG_QC => {
+                if let Ok(qc) = types::QuorumCertificate::decode(&mut reader) {
+                    // deliver_qc runs the commit walk — finalize_block
+                    // executes the payload — the dominant per-validator
+                    // cost. Timed separately so the profile splits
+                    // "execution" from "everything else off the wire".
+                    let t0 = std::time::Instant::now();
+                    let _ = engine.deliver_qc(qc);
+                    *t_commit += t0.elapsed();
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Route a produced vote to the leader of its view — direct
+    /// `collect_vote` when we are that leader, else a `MSG_VOTE`
+    /// frame over the wire/fallback mesh.
+    fn send_vote(
+        engine: &mut OxideBft,
+        transport: &mut p2p::tcp::TcpTransport,
+        inboxes: &Inboxes,
+        validator_set: &ValidatorSet,
+        idx: u8,
+        view: u64,
+        vote: types::Vote,
+    ) {
+        let leader_idx = usize::from(validator_set.leader(primitives::View::new(view)));
+        if leader_idx == usize::from(idx) {
+            let _ = engine.collect_vote(u16::from(idx), vote);
+            return;
+        }
+        let mut frame = Vec::with_capacity(1 + 137);
+        frame.push(MSG_VOTE);
+        vote.encode(&mut frame);
+        Self::wire_send(transport, inboxes, idx, u8::try_from(leader_idx).unwrap_or(0), &frame);
+    }
+
+    /// Send one wire frame to a peer: TCP first, fallback queue on
+    /// failure.
+    ///
+    /// `TcpTransport::send` is `try_send` into a bounded per-peer
+    /// writer channel — `ChannelFull`/`ChannelClosed` drop the frame.
+    /// Those go into the receiver's shared inbox instead, which its
+    /// thread drains every loop. Cross-path reordering is tolerated
+    /// by the engine (idempotent delivery + ancestor-walk commit).
+    fn wire_send(
+        transport: &mut p2p::tcp::TcpTransport,
+        inboxes: &Inboxes,
+        from: u8,
+        to: u8,
+        bytes: &[u8],
+    ) {
+        if transport.send(&vec![to], bytes).is_err() {
+            inboxes[usize::from(to)]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back((from, bytes.to_vec()));
+        }
     }
 
     /// Print a progress report for the pipelined TPS run.
@@ -1012,12 +1787,32 @@ impl TcpMultiNodeDevnet {
     /// (the main loop caps at `target_blocks`; the flush loop uses
     /// `u64::MAX`).
     fn pipelined_tick(&mut self, state: &mut PipelineState, view_cap: u64) {
+        let mut t = std::time::Instant::now();
         self.propose_phase(state, view_cap);
+        state.timers.propose += t.elapsed();
+
+        t = std::time::Instant::now();
         self.vote_phase(state);
+        state.timers.vote += t.elapsed();
+
+        t = std::time::Instant::now();
         state.compact_proposals(self.n);
+        state.timers.compact += t.elapsed();
+
+        t = std::time::Instant::now();
         self.drain_transports();
+        state.timers.drain += t.elapsed();
+
+        // `form_qc_phase` times its own halves (`qc_form` vs
+        // `qc_deliver`) — the deliver sub-loop is where commits and
+        // execution land, so it needs the split.
         self.form_qc_phase(state);
+
+        t = std::time::Instant::now();
         self.advance_views_phase();
+        state.timers.advance += t.elapsed();
+
+        state.timers.ticks += 1;
     }
 
     /// Phase 1: any leader with the `high_qc` that hasn't proposed yet.
@@ -1156,6 +1951,7 @@ impl TcpMultiNodeDevnet {
     /// The pipeline deadlocks at 0% CPU. The in-process delivery
     /// eliminates this failure mode for the devnet harness.
     fn form_qc_phase(&mut self, state: &mut PipelineState) {
+        let t_form = std::time::Instant::now();
         // Collect QCs formed this tick. We deliver them in-process
         // after the loop to avoid borrow conflicts (can't deliver to
         // other engines while iterating `self.engines` mutably).
@@ -1180,17 +1976,24 @@ impl TcpMultiNodeDevnet {
                 qcs_to_deliver.push(qc);
             }
         }
+        state.timers.qc_form += t_form.elapsed();
 
         // In-process delivery: deliver every QC formed this tick to
         // every engine. This is the reliable path — TCP is best-effort.
         // `deliver_qc` is idempotent for stale QCs — it rejects QCs
         // with view <= high_qc.view, so delivering to the engine that
         // already has it is a no-op.
+        //
+        // This loop is where block commits and transaction execution
+        // land (`deliver_qc` → `commit_block` → `finalize_block`), so
+        // it gets its own timer — it is typically the dominant phase.
+        let t_deliver = std::time::Instant::now();
         for qc in &qcs_to_deliver {
             for engine in &mut self.engines {
                 let _ = engine.deliver_qc(qc.clone());
             }
         }
+        state.timers.qc_deliver += t_deliver.elapsed();
     }
 
     /// Phase 5: advance views for engines with a `high_qc`, sync heights.

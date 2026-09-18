@@ -331,12 +331,63 @@ fn batch_settle_1k_same_pair(c: &mut Criterion) {
     });
 }
 
+/// The production-devnet fixture shape: 16,384 fills clustering into
+/// 16 buyers × 15 sellers = 240 distinct (buyer, seller) pairs — the
+/// workload `settle_tps` generates end-to-end. This is the
+/// aggregation-friendly case the flat map is built for: ~68 fills
+/// per pair, so the per-leg cost is the probe+accumulate and the 240
+/// transfers amortize away. Isolates the settle inner loop from the
+/// consensus-pipeline noise that makes end-to-end A/B runs
+/// unreliable.
+fn batch_settle_16k_clustered_pairs(c: &mut Criterion) {
+    const FILLS: usize = 16_384;
+    const BUYERS: u8 = 16;
+    const SELLERS: u8 = 15;
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    let mut ex = ExchangeModule::with_ledger(ledger.clone());
+    ex.set_settlement_operator(addr(0x5E));
+    let mid = ex.list_market(cfg()).expect("market config valid");
+
+    // Buyer ids 1..=16, seller ids 100..=114 — 240 disjoint pairs,
+    // matching the devnet fixture's fan-out.
+    let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
+        .map(|i| {
+            #[allow(clippy::cast_possible_truncation)]
+            let buyer = addr(((i % usize::from(BUYERS)) + 1) as u8);
+            #[allow(clippy::cast_possible_truncation)]
+            let seller = addr(((i % usize::from(SELLERS)) + 100) as u8);
+            ledger.mint(&buyer, u64::MAX / 4);
+            exchange::BatchFillEntry {
+                market: u16::from(mid),
+                price: Price(1_500_000_000),
+                qty: Qty(1_000),
+                buyer,
+                seller,
+            }
+        })
+        .collect();
+    let payload = exchange::msg::batch_settle(&fills);
+    let op_ctx = ctx(0x5E);
+
+    c.bench_function("batch_settle_16k_clustered_pairs", |b| {
+        b.iter(|| {
+            let events = ex.handle(black_box(&op_ctx), black_box(&payload)).expect("batch settles");
+            // gcd(16,15)=1 ⇒ the i%16 × i%15 cycle hits all 240
+            // combos; buyer/seller id ranges are disjoint so every
+            // leg is valid — exactly 240 aggregated transfers.
+            assert_eq!(events.len(), 240, "one transfer event per pair");
+            black_box(events);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     settlement_single_fill,
     settlement_sweep_10_levels,
     raw_engine_single_fill,
     batch_settle_1k_distinct_pairs,
-    batch_settle_1k_same_pair
+    batch_settle_1k_same_pair,
+    batch_settle_16k_clustered_pairs
 );
 criterion_main!(benches);

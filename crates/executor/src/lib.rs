@@ -1329,6 +1329,14 @@ impl Executor {
         self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).txpool_snapshot()
     }
 
+    /// Pending mempool entry count — cold-path diagnostic for the
+    /// devnet harness (a nonzero value after a run means txs were
+    /// accepted into the pool but never selected for a proposal).
+    #[must_use]
+    pub fn mempool_len(&self) -> usize {
+        self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+    }
+
     /// Save executed nonces to a storage backend (C10 fix).
     ///
     /// Persists the per-sender `executed_nonce` map to the storage
@@ -2267,6 +2275,14 @@ impl AppInterface for Executor {
             recorder.record("prepare_proposal", start.elapsed());
         }
         Proposal { height, txs, attestation: None }
+    }
+
+    /// `prepare_proposal` drains the intake ring into the pool before
+    /// selecting, so by the time consensus calls this the pool depth
+    /// already reflects every ingested tx — including ones `select`
+    /// skipped for a nonce gap (the case the liveness gate exists for).
+    fn has_queued_txs(&self) -> bool {
+        self.mempool_len() > 0
     }
 
     fn process_proposal(&self, proposal: &Proposal) -> Verdict {

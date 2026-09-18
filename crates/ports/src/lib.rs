@@ -83,6 +83,19 @@ pub trait AppInterface: Send + Sync {
     /// block.
     fn prepare_proposal(&self, budget: &BlockBudget) -> Proposal;
 
+    /// Whether the app holds *any* queued transactions — including
+    /// ones `prepare_proposal` cannot currently select (e.g. nonce-
+    /// blocked behind uncommitted earlier rounds).
+    ///
+    /// Consensus uses this for the leader liveness gate: a leader
+    /// whose queue is non-empty has outstanding work even when this
+    /// view's selection comes back empty, so it must still produce a
+    /// block — possibly empty-content — to keep the chain advancing
+    /// until the queued txs become selectable. Returning `false`
+    /// while txs remain queued can freeze the chain one view after
+    /// an empty block.
+    fn has_queued_txs(&self) -> bool;
+
     /// Replica hook: static validity (sizes, fee/nonce shape,
     /// availability pre-checks). **Never executes.** Rejecting here is a
     /// protocol message, not an application error — a proposal that

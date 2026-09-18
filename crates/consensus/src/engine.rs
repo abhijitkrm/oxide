@@ -16,9 +16,11 @@
 //! 3. There is a QC over *B'* (call it `QC_B'`).
 //!
 //! In the pipeline, this means each new QC commits the *previous*
-//! pending block (the one whose QC the new block extends). The
-//! engine tracks one pending block at a time — the last block with a
-//! QC that hasn't been committed yet.
+//! certified block (the one whose QC the new block extends). The
+//! "uncommitted certified tip" is derived on demand from `high_qc`
+//! vs `last_committed` — no separate pointer is tracked, so the
+//! answer can't go stale under message reorder (a QC that arrives
+//! before its proposal body).
 //!
 //! ## Multi-validator support
 //!
@@ -81,13 +83,6 @@ const MAX_RETAINED_FINALIZED: usize = 4096;
 /// When the *next* block (which extends this one) gets a QC, this
 /// block is committed. The engine tracks exactly one pending block at
 /// a time (the tip of the pipeline). The hash is not stored — it is
-/// always the hash of the QC that installed it.
-#[derive(Debug, Clone)]
-struct PendingBlock {
-    /// The block's proposal (txs).
-    proposal: Proposal,
-}
-
 /// Errors from epoch rotation (stage 6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EpochRotationError {
@@ -308,10 +303,6 @@ pub struct OxideBft {
     /// Block store: block hash → (header, proposal). Used to look up
     /// blocks at commit time.
     blocks: HashMap<Hash, (BlockHeader, Proposal)>,
-    /// The pending block: the last block with a QC, waiting for the
-    /// 2-chain commit rule to fire. `None` when no block is pending
-    /// (e.g. at genesis, or after the last pending block was committed).
-    pending: Option<PendingBlock>,
     /// Finalized blocks keyed by height. `BTreeMap` for ordered
     /// iteration (the conformance suite checks the height sequence).
     /// Bounded to `MAX_RETAINED_FINALIZED` — old blocks are pruned.
@@ -437,7 +428,6 @@ impl OxideBft {
             last_voted_view: None,
             voted_at_height: BTreeMap::new(),
             blocks: HashMap::new(),
-            pending: None,
             finalized: BTreeMap::new(),
             commit_listener: None,
             last_committed: None,
@@ -699,7 +689,6 @@ impl OxideBft {
         self.current_view = View::new(0);
         self.last_voted_view = None;
         self.high_qc = None;
-        self.pending = None;
         // Per-height vote locks are evidence of the old epoch's
         // consensus instance: heights continue across the boundary
         // (the anchor in `last_committed`), but stale locks must not
@@ -1190,20 +1179,47 @@ impl OxideBft {
     pub fn propose(&mut self) -> Option<(BlockHeader, Proposal)> {
         let proposal = self.app.prepare_proposal(&Self::BUDGET);
         let has_pending_txs = !proposal.txs.is_empty();
-        let pending_has_txs = self.pending.as_ref().is_some_and(|p| !p.proposal.txs.is_empty());
-
-        // No work: no pending txs and no pending block to flush.
-        // The leader returns None and waits for the next view. This
-        // is correct HotStuff behavior — an idle leader doesn't
-        // produce empty blocks. The 2-chain commit rule only needs
-        // a second block when there's actual work to commit.
+        // Liveness gate: the leader stays silent only when no work
+        // is locally visible. Two sources count as work:
         //
-        // Note: the pipelined devnet harness (`pipelined_tick`) calls
-        // `propose()` once per tick per leader, so this doesn't cause
-        // a busy-loop. The `tx_idx` accumulation fix in the submission
-        // loop ensures txs reach the correct leader's intake before
-        // the pipeline reaches that leader's view.
-        if !has_pending_txs && !pending_has_txs && self.next_height != Height::new(0) {
+        //  1. `app.has_queued_txs()` — the app holds txs at all, even
+        //     ones `prepare_proposal` can't yet select (e.g. nonce-
+        //     blocked behind uncommitted earlier rounds). A leader
+        //     holding such txs must keep the chain advancing — the
+        //     conveyor that reaches the later view where those txs
+        //     become contiguous with executed state. Without this, a
+        //     leader whose selection comes back empty would stay
+        //     silent and freeze the view.
+        //  2. A stored uncommitted block carrying txs — flush work:
+        //     extending the chain is how those blocks commit. `blocks`
+        //     holds only uncommitted entries (commit prunes at/below
+        //     the committed height), so any tx-carrying stored block
+        //     is live work. This also covers the post-submission
+        //     tail: leaders with drained pools must still extend the
+        //     chain to commit the last tx-carrying blocks.
+        //
+        // The earlier forms asked narrower questions — whether the
+        // QC'd tip itself carried txs, or whether it was committed —
+        // and each misjudged a real case: an empty tip with queued
+        // txs froze the conveyor, and "tip uncommitted" is perpetual
+        // (the newest QC'd block only ever commits via the NEXT QC),
+        // so it never let `run_until_idle` terminate.
+        let uncommitted_has_txs = self.blocks.values().any(|(_, p)| !p.txs.is_empty());
+        let work_outstanding = self.app.has_queued_txs() || uncommitted_has_txs;
+
+        // No work: nothing queued and nothing left to flush. The
+        // leader returns None and waits — an idle leader doesn't
+        // produce empty blocks. The 2-chain commit rule only needs a
+        // child block when there's actual work to commit.
+        if !has_pending_txs && !work_outstanding && self.next_height != Height::new(0) {
+            if std::env::var_os("OXIDE_DEBUG_PROPOSE").is_some() {
+                eprintln!(
+                    "propose() idle: view={:?} next_height={:?} highqc={:?} has_txs={has_pending_txs} work_outstanding={work_outstanding}",
+                    self.current_view,
+                    self.next_height,
+                    self.high_qc.as_ref().map(|q| q.view.value()),
+                );
+            }
             return None;
         }
 
@@ -1236,10 +1252,20 @@ impl OxideBft {
         // before its block arrives on catch-up), we cannot stamp a
         // valid height — stay idle until gossip delivers the block.
         let (height, prev_block) = match &self.high_qc {
-            Some(qc) => match self.blocks.get(&qc.block_hash) {
-                Some((parent, _)) => (parent.height.saturating_next(), qc.block_hash),
-                None => return None,
-            },
+            Some(qc) => {
+                let Some((parent, _)) = self.blocks.get(&qc.block_hash) else {
+                    if std::env::var_os("OXIDE_DEBUG_PROPOSE").is_some() {
+                        eprintln!(
+                            "propose() blocked: view={:?} highqc_view={:?} highqc_block={:?} unknown — waiting for block",
+                            self.current_view,
+                            qc.view.value(),
+                            qc.block_hash,
+                        );
+                    }
+                    return None;
+                };
+                (parent.height.saturating_next(), qc.block_hash)
+            }
             // No highQC: extend the committed anchor — genesis at
             // height 0, or the last committed block across an epoch
             // boundary. This is the same rule voters enforce.
@@ -1345,6 +1371,22 @@ impl OxideBft {
         // leader, we must propose at a height above any we've seen.
         self.observe_block_height(header.height);
 
+        // Store the authenticated block body BEFORE the vote-
+        // eligibility checks. The QC commit walk in `deliver_qc`
+        // can only run while the QC'd block is in `self.blocks`, and
+        // real networks reorder: a QC frequently reaches a validator
+        // before the proposal it certifies (different peers, different
+        // paths). If the proposal then arrives while its view is
+        // already past, the vote path below rejects it as stale — but
+        // the body is still required for the commit walk that the
+        // early QC could not complete. Storing here (after proposer-
+        // signature verification, so only the genuine leader's blocks
+        // land) keeps block availability independent of vote
+        // eligibility — the deciding factor for *commit* order is the
+        // QC chain, not local vote timing.
+        let block_hash = Self::block_hash(header);
+        self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
+
         // HIGH fix: require the proposal's view to match our current
         // view. A proposal for a different view is either stale
         // (already finalized) or premature (future round). Voting
@@ -1384,7 +1426,6 @@ impl OxideBft {
         // rival's adoption still wins, so only one of the two
         // notarizations can gather the child-chain votes needed to
         // commit.
-        let block_hash = Self::block_hash(header);
         if self
             .voted_at_height
             .get(&header.height.value())
@@ -1549,8 +1590,9 @@ impl OxideBft {
             Verdict::Accept => {}
             Verdict::Reject { .. } => return None,
         }
-        // Store the block for later commit lookup.
-        self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
+        // The block body was already stored above (before the
+        // eligibility checks) — commit-walk completeness must not
+        // depend on this vote succeeding.
         self.last_voted_view = Some(header.view);
         // Record the per-height lock: we may only ever vote this
         // hash at this height from now on.
@@ -1904,7 +1946,7 @@ impl OxideBft {
         // the full ancestor chain and `commit_block` fires in
         // height order (oldest first) — the app requires in-order
         // finalization.
-        if let Some((header, proposal)) = self.blocks.get(&qc.block_hash).cloned() {
+        if let Some((header, _)) = self.blocks.get(&qc.block_hash).cloned() {
             // Collect the uncommitted ancestor chain, newest→oldest:
             // (block hash, bitmap of the QC certifying it). The
             // certifying QC for a block X is the embedded `high_qc`
@@ -1921,7 +1963,7 @@ impl OxideBft {
             // vote path; only a future import seam could create one)
             // would otherwise commit an *uncertified* parent: the
             // embedded QC certifies `justify`, not `prev`.
-            let mut chain: Vec<(Hash, Vec<u8>)> = Vec::new();
+            let mut chain: Vec<(Hash, Vec<u8>, u64)> = Vec::new();
             if header.high_qc.as_ref().is_some_and(|qc| qc.block_hash == header.prev_block) {
                 let mut cursor_hash = header.prev_block;
                 let mut certifying = header.high_qc.clone();
@@ -1932,19 +1974,32 @@ impl OxideBft {
                     if self.finalized.contains_key(&cursor_header.height.value()) {
                         break;
                     }
-                    chain.push((cursor_hash, bitmap));
+                    chain.push((cursor_hash, bitmap, cursor_header.height.value()));
                     certifying.clone_from(&cursor_header.high_qc);
                     cursor_hash = cursor_header.prev_block;
                 }
             }
+            // Contiguity guard: commit only when the collected chain's
+            // oldest block is the direct child of the commit tip.
+            // A gap means an ancestor proposal is still in flight —
+            // the QC that certifies this chain arrived before the
+            // block body did (real networks reorder). Committing
+            // anyway would finalize out of order AND permanently
+            // orphan the missing height: later walks stop at the
+            // finalized sibling and never reach back. Deferring is
+            // safe — the walk re-runs on the next delivered QC, by
+            // which time the body has landed via the vote path.
+            let expected_next =
+                self.last_committed.map_or(0, |(_, committed_height)| committed_height.value() + 1);
+            let contiguous =
+                chain.last().is_none_or(|(_, _, oldest_height)| *oldest_height == expected_next);
             // Commit oldest-first so `finalize_block` sees a
             // contiguous ascending prefix.
-            for (hash, bitmap) in chain.iter().rev() {
-                self.commit_block(*hash, bitmap);
+            if contiguous {
+                for (hash, bitmap, _) in chain.iter().rev() {
+                    self.commit_block(*hash, bitmap);
+                }
             }
-            // The QC's block becomes the new pending block: it is
-            // the most recent QC'd block awaiting its own child QC.
-            self.pending = Some(PendingBlock { proposal });
         }
         Ok(())
     }
@@ -3160,14 +3215,10 @@ mod tests {
             (hash, proposal)
         };
 
-        let (h0, p0) = store(&mut e0, 0, 0, Hash::ZERO, None, 0xB0);
+        let (h0, _) = store(&mut e0, 0, 0, Hash::ZERO, None, 0xB0);
         let (h1, _) = store(&mut e0, 1, 1, h0, Some(qc(0, h0)), 0xB1);
         let (h2, _) = store(&mut e0, 2, 2, h1, Some(qc(1, h1)), 0xB2);
         let (h3, _) = store(&mut e0, 3, 3, h2, Some(qc(2, h2)), 0xB3);
-
-        // Simulate the pending pointer lagging the stored chain —
-        // QC(b0) was adopted long ago; QC(b1)/QC(b2) never arrived.
-        e0.pending = Some(PendingBlock { proposal: p0 });
 
         // QC(b3) arrives (e.g. via catch-up): commits b2, and the
         // recursive walk must finalize b0 and b1 beneath it —

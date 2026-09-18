@@ -103,6 +103,10 @@ impl AppInterface for MockApp {
         Proposal { height, txs, attestation: None }
     }
 
+    fn has_queued_txs(&self) -> bool {
+        !self.mempool.lock().unwrap().is_empty()
+    }
+
     fn process_proposal(&self, proposal: &Proposal) -> Verdict {
         // Static validity only. Never executes — a proposal that would
         // revert is still accepted (oai-spec.md §3, rule 4).

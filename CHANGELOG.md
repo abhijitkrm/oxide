@@ -897,7 +897,54 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     `GET /validator-set` on an existing validator to discover the
     current set + peer addresses — no genesis file needed.
 
+- **Threaded multi-validator devnet + flat-map batch settlement**
+  (`crates/devnet`, `modules/exchange`)
+  - `SETTLE_DRIVER=threaded` runs each validator's engine + executor
+    on its own OS thread — real parallel execution over real TCP,
+    with proposal bodies now traversing the wire (the pipelined
+    driver delivered them in-process). Per-round transactions are
+    pre-seeded into leader intakes, submissions pace on the slowest
+    validator's view, and completion counts finalized transactions.
+  - `handle_batch_settle` replaces its per-leg `BTreeMap` pair
+    aggregation with an open-addressed flat index map (u32 slot →
+    packed entries, FxHash-style pair hash) and a sort-once drain —
+    **2.2× faster** at the devnet fixture shape (466µs vs 1,039µs
+    per 16,384-fill batch; new `batch_settle_16k_clustered_pairs`
+    criterion bench), identical deterministic transfer/event order.
+  - Measured end-to-end (8 validators, threaded, TCP loopback):
+    **682,599 fills/s (1.37M orders/s)** at the 65,536-fill wire
+    maximum — the pipeline is now bounded by payload bytes and
+    per-view serialization, not settle compute (~230ms of ~2.7s
+    commit time per validator).
+  - **In plain words:** validators now run in parallel the way real
+    machines do, and the settlement loop got 2.2× cheaper — but the
+    next big speedup isn't more per-fill work, it's stopping 460MiB
+    of fill bodies from riding inside consensus messages.
+
 ### Fixed
+
+- **Consensus liveness under message reorder: QC before proposal**
+  (`crates/consensus/src/engine.rs`)
+  - `vote()` stores an authenticated proposal body *before*
+    view/vote-eligibility checks — a late-arriving proposal no longer
+    leaves a permanent hole in block storage.
+  - The commit walk now only finalizes when the oldest collected
+    ancestor is the direct child of the last committed height; a QC
+    for a block with a missing ancestor defers instead of committing
+    over the hole (which previously finalized out of order and pruned
+    the missing height forever).
+  - The liveness gate no longer reads the delivery-order-dependent
+    `pending` pointer (removed): leaders advance on `high_qc` vs
+    `last_committed` plus a new `AppInterface::has_queued_txs` probe —
+    an uncommitted QC'd block is work even when it carries no
+    transactions, while a genuinely idle leader still parks.
+  - Found by the threaded devnet: ~30–50% of runs stalled under real
+    TCP reorder; **12/12 clean** after the fix, 115/115 consensus
+    tests green.
+  - **In plain words:** when network messages arrive out of order —
+    a quorum certificate before the block it certifies — honest
+    validators used to freeze or skip a height; they now wait for the
+    missing block and finalize every height exactly once.
 
 - **Signature malleability: reject recovery IDs 2 and 3**
   (`crates/crypto/src/secp.rs`)

@@ -188,8 +188,18 @@ fn run_settle_tps(
     // `txs_per_round` chunks per round, so round 0 carries the
     // `list_market` setup tx plus `txs_per_round - 1` batches and
     // later rounds are all batches.
-    eprintln!("settle TPS test: running {rounds} rounds (pipelined)...");
-    let (result, elapsed) = devnet.run_pipelined_txs(rounds, txs_per_round, &all_txs);
+    //
+    // `SETTLE_DRIVER=threaded` switches to `run_threaded_txs`: each
+    // validator on its own OS thread with proposals shipped over TCP —
+    // the closer approximation of a real multi-machine deployment.
+    let driver = std::env::var("SETTLE_DRIVER").unwrap_or_else(|_| "pipelined".to_string());
+    let (result, elapsed) = if driver == "threaded" {
+        eprintln!("settle TPS test: running {rounds} rounds (threaded, {n_validators} threads)...");
+        devnet.run_threaded_txs(rounds, txs_per_round, &all_txs)
+    } else {
+        eprintln!("settle TPS test: running {rounds} rounds (pipelined)...");
+        devnet.run_pipelined_txs(rounds, txs_per_round, &all_txs)
+    };
     eprintln!("settle TPS test: completed in {:.3}s", elapsed.as_secs_f64());
 
     // ── Integrity checks ───────────────────────────────────────

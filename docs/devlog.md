@@ -14528,3 +14528,78 @@ All integrity checks pass at 8 validators — no safety degradation,
 ~2.1–2.4× throughput cost. Scaling knob identified: per-round vote
 fan-out + aggregate verify dominates the delta, so batch payload is
 the lever (same conclusion as the 4v runs).
+
+## Session — threaded 8-validator devnet + settle hot-path optimization
+
+Two changes landed together: (1) `SETTLE_DRIVER=threaded` runs each
+validator's engine + executor on its own OS thread with real TCP
+(proposal bodies now traverse the wire — the single-threaded driver
+delivered them in-process for free); (2) `handle_batch_settle`'s
+per-leg `BTreeMap<(Address,Address),u64>` aggregation replaced with an
+open-addressed flat index map (`u32` slot → entries index, FxHash-style
+pair hash, sort-once drain preserving the tree's exact transfer order).
+
+### Threaded-driver liveness bugs found + fixed (real engine bugs)
+
+The threaded harness surfaced reorder cases the in-process sim never
+hit — QC arriving before its proposal body. Root causes fixed in
+`engine.rs`:
+
+- `vote()` now stores the authenticated proposal body **before** the
+  view/vote-eligibility checks — a late proposal can no longer leave a
+  permanent hole in `self.blocks`.
+- The commit walk now requires the oldest collected ancestor to be the
+  direct child of `last_committed`; a QC over a missing middle block
+  defers instead of finalizing over the hole (out-of-order finalize +
+  pruning previously made holes permanent).
+- The liveness gate moved off the delivery-order-dependent `pending`
+  pointer (removed entirely) to `high_qc` vs `last_committed` + a new
+  `AppInterface::has_queued_txs` probe — an uncommitted QC'd block is
+  liveness work even when empty, but a fully-idle leader still parks.
+
+Harness-side: per-round txs pre-seeded into leader intakes before
+thread start, submissions paced on `min_view`, done-condition counts
+finalized txs not blocks, future-view proposals queued for retry, and
+a `commit_seq` atomic replaced the locked-vec done scan (~1.2s →
+~0.14s bookkeeping per validator — freed time becomes idle spin, not
+throughput).
+
+Stall reproduction after the fixes: **12/12 clean runs** (was ~30-50%
+failure). 115/115 consensus tests, 31/31 devnet tests green.
+
+### Settle hot-path: module-level A/B (criterion, same machine state)
+
+New bench `batch_settle_16k_clustered_pairs` = the real devnet fixture
+shape: 16,384 fills → 16 buyers × 15 sellers = 240 pairs.
+
+| Bench | flat map | BTreeMap | delta |
+|---|---|---|---|
+| 16k clustered (240 pairs) | **466 µs** | 1,039 µs | **2.2× faster** (28 vs 63 ns/fill) |
+| 1k distinct pairs (worst case) | ~450–588 µs | ~589 µs | ~even / +25% |
+| 1k same pair | ~24 µs | ~22 µs | even (noise) |
+
+End-to-end (8v threaded): 682,599 fills/s @ 65,536 fills/tx (1.37M
+orders/s, 460 MiB, 12.2s); 381K/424K fills/s @ 16,384 fills/tx across
+two runs — within run-to-run noise of the BTreeMap's 443K same-day
+sample and the earlier 566–619K threaded runs. The settle win shows in
+the commit phase (579–948ms vs 744–959ms per validator, same day) but
+is ~10% of pipeline time, so end-to-end moves less than the noise band.
+
+### Where the time actually goes now (8v, 65,536 fills/tx, per-validator)
+
+```
+inbound   4.8–5.8s   decode+hash ~57MiB/view + vote verify + QC collect
+commit    2.4–3.0s   settle ~0.23s; rest = payload copies + WAL + hashing
+propose   1.2–1.5s   mempool select + build + hash 3.8MiB + sign
+idle      2.7–3.5s   waiting on the serialized per-view critical path
+vote+qc   ~1.3s
+```
+
+**Conclusion:** settle compute is no longer the bottleneck. The 5M
+fills/s goal is bounded by payload bytes × 8 replicas moving through
+TCP + hashing + WAL, plus per-view serialization. The structural lever
+is DA separation — proposals carry batch commitments, bodies propagate
+off the consensus path (also the real-network answer: 460 MiB of
+consensus payload per 64-round run does not survive real latency).
+Cheaper interim wins: hash-once at decode (currently re-hashed per
+phase), dedupe proposal-body copies, batch or skip WAL in benches.
