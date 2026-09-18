@@ -14500,3 +14500,31 @@ batch mode: ~7M orders/s @ 8 conns, 500/batch — unchanged).
 
 - `cargo test -p matcher` — 94 green, 0 failures.
 - e2e bench: all four protocols verified end-to-end.
+
+## Session — 8-validator trading TPS runs (release, TCP loopback)
+
+First measurements of the trading paths on an 8-validator committee —
+the QC widens to 6-of-8, more BLS aggregate work and TCP fan-out per
+round. `TcpMultiNodeDevnet`, 8 engines + executors over real TCP.
+
+### settle_tps (batch_settle through consensus — the 1M architecture)
+
+| Config | 4 validators | 8 validators | slowdown |
+|---|---|---|---|
+| 16,384 fills/tx (2.05M fills) | ~1.38M fills/s | **595,308 fills/s** (1.19M orders/s) | 2.3× |
+| 65,536 fills/tx — wire max (8.32M fills, 460 MiB) | 1.85M fills/s | **885,355 fills/s** (1.77M orders/s) | 2.1× |
+
+Larger batches amortize the wider consensus: the 8v penalty shrinks
+from 2.3× to 2.1× as payload dominates. Both runs verified common
+prefix + exact seller conservation on all 8 validators.
+
+### trading_tps (on-chain match path)
+
+| | 4 validators | 8 validators |
+|---|---|---|
+| 200K order txs, 1000/blk | ~72–76K tx/s | **30,379 tx/s** (30.4 blocks/s) |
+
+All integrity checks pass at 8 validators — no safety degradation,
+~2.1–2.4× throughput cost. Scaling knob identified: per-round vote
+fan-out + aggregate verify dominates the delta, so batch payload is
+the lever (same conclusion as the 4v runs).
