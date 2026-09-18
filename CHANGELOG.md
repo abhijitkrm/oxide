@@ -1004,6 +1004,45 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Consensus keys were admitted without proof-of-possession, and
+  validator sets accepted duplicate keys and addresses**
+  (`crates/crypto`, `crates/consensus`, `modules/staking`,
+  `crates/devnet`, `bin/oxide-validator`, `docs/oxidebft-spec.md`)
+  - QC/TC verification aggregates votes over the same message with
+    `fast_aggregate_verify` — secure only if every signer key is a
+    real key. An attacker could previously register a *rogue key* (a
+    public key algebraically derived from honest validators' keys)
+    and make a single signature verify as a quorum aggregate over
+    the honest bitmap.
+  - Every consensus key must now carry a proof-of-possession at
+    admission: `pop = Sign(sk, pk)` under the new `Domain::BlsPop`
+    (tag 15, appended). `BlsSecretKey::pop_prove()` generates it;
+    `crypto::bls_signer::pop_verify` verifies it — which also
+    rejects malformed public keys.
+  - **Wire change:** `KEY_CHANGE` messages are now
+    `[0x05][validator:20B][key:48B][pop:96B]` (165 bytes, was 69)
+    and `VALIDATOR_ADD` is
+    `[0x06][addr:20B][key:48B][stake:8B][pop:96B]` (173 bytes, was
+    77). Old-length payloads are rejected; there is no silent
+    acceptance of pre-PoP formats.
+  - `ValidatorSet` now rejects duplicate consensus keys and
+    duplicate staking addresses at construction — one BLS identity
+    may hold exactly one bitmap slot, and one staking identity one
+    set position. The check covers genesis, key rotation, and
+    validator addition; a rotation that would create a duplicate
+    fails the whole rotation atomically.
+  - `oxide-validator --submit-key-change` now takes the new BLS
+    **secret** key (hex) — the PoP can only be produced from the
+    secret, which a node must hold anyway to sign with the rotated
+    key. Runbook 9 and the deployment guide updated.
+  - **In plain words:** before this fix, someone could register a
+    fake validator key crafted from real validators' keys and make
+    the network believe a quorum had signed something it never saw.
+    Now every key must prove it owns a secret before it's allowed
+    in — like requiring ID at the door instead of trusting a
+    hand-drawn badge — and no key or validator identity can occupy
+    two seats at once.
+
 - **Quorum was counted in validators, not stake — and under-counted
   even as a count** (`crates/consensus`, `crates/types`,
   `crates/devnet`, `docs/oxidebft-spec.md`)

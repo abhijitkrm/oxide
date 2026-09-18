@@ -174,6 +174,19 @@ ancestors commit with the chain that certifies them.
   check, not N individual checks — this is the throughput lever.
   Batch verification of many QCs at once is a further optimization
   (Phase 1 benchmarks gate this).
+- **Key admission (proof-of-possession).** Same-message aggregate
+  verification (`fast_aggregate_verify`) is secure only if every
+  signer key is a real key — otherwise an attacker can register a
+  *rogue key* (a public key algebraically derived from honest keys)
+  and make a single signature verify as a quorum aggregate. Every
+  consensus key must therefore carry a proof-of-possession at
+  admission: `pop = Sign(sk, pk)` under its own domain (`BlsPop`,
+  tag 15), verified by the staking module at `validator_add` and
+  `key_change` before the key can enter a `ValidatorSet`. A key that
+  cannot produce a PoP never reaches consensus. Additionally, a
+  `ValidatorSet` rejects duplicate consensus keys and duplicate
+  staking addresses — one BLS identity may hold exactly one bitmap
+  slot, and one staking identity exactly one set position.
 
 ### Why BLS (not Ed25519 or ECDSA)
 

@@ -682,9 +682,11 @@ oxide-validator --import-snapshot /backups/snapshot-20260914.bin
 ### 9.5 Key rotation (runbook 9)
 
 ```sh
-# 1. Generate a new BLS key (on a secure machine).
-# 2. Submit the key-change tx from the running validator:
-oxide-validator --submit-key-change <new_bls_pubkey_hex>
+# 1. Generate a new 32-byte BLS secret key (on a secure machine).
+# 2. Submit the key-change tx from the running validator — the flag
+#    takes the new SECRET key (hex); the node derives the public key
+#    and the mandatory proof-of-possession itself:
+oxide-validator --submit-key-change <new_bls_secret_key_hex>
 # 3. Wait for the block to finalize.
 # 4. Stop the validator, update the key file, restart.
 ```

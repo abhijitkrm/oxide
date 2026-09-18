@@ -15244,3 +15244,69 @@ could sit in the intersection). Throughput figures must be
 rebaselined once the remaining audit fixes land — the correct
 thresholds are stricter and certificate validation does strictly
 more work per QC/TC.
+
+## Session — audit fix C3: BLS proof-of-possession admission + key uniqueness
+
+Third fix from the audit list (critical finding C3). QC/TC
+verification aggregates votes over the *same* message with blst
+`fast_aggregate_verify`. That primitive is only sound when every
+signer key is a real key — an attacker who can register a public
+key algebraically derived from honest keys (`pk_rogue = pk_evil −
+pk_honest`) makes a single signature verify as a quorum aggregate
+over the honest bitmap slot. Nothing validated admitted keys:
+`validator_add` and `key_change` accepted any 48 bytes, and
+`ValidatorSet` accepted duplicate keys and duplicate staking
+addresses — one BLS identity could hold two bitmap slots (and two
+stakes) and silently inflate its voting power under C2's new
+stake-weighted quorum.
+
+Fix shape:
+
+- New `Domain::BlsPop` (tag 15, appended — discriminants are wire
+  consensus contract) + DST `oxide/bls-pop`. A PoP is
+  `Sign(sk, pk_compressed)` under that domain — the BLS PoP scheme
+  (draft-irtf-cfrg-bls-signature §3.3) with our own domain string.
+- `BlsSecretKey::pop_prove()` generates; `pop_verify(pk, pop)`
+  verifies via the existing single-signature path — which also
+  rejects malformed public keys, since blst refuses to uncompress a
+  non-point.
+- Staking messages gained a mandatory PoP field (wire change):
+  `KEY_CHANGE` `[0x05][validator:20B][key:48B][pop:96B]` (69→165 B)
+  and `VALIDATOR_ADD` `[0x06][addr:20B][key:48B][stake:8B][pop:96B]`
+  (77→173 B). Old formats are rejected by exact-length parsing —
+  no silent acceptance of pre-PoP payloads.
+- `handle_key_change` / `handle_validator_add` verify the PoP via
+  `verify_key_pop` before queueing anything; a key that cannot
+  prove possession never reaches a `ValidatorSet`.
+- `ValidatorSet::with_addresses` rejects `DuplicateKey` and
+  `DuplicateAddress` (O(n²) construction-time scan; sets are small
+  and this never runs on the hot path). Every construction path —
+  genesis, `apply_key_change`, `add_validator`, rotation rebuild —
+  funnels through it, so a rotation onto an existing key or an add
+  carrying an existing key/address fails `InvalidSet` atomically
+  (the whole batch is refused rather than partially applied).
+- `oxide-validator --submit-key-change` now takes the new **secret**
+  key (hex): the PoP is only producible from the secret, and a node
+  rotating to a key it does not possess could never sign with it
+  anyway. Runbook 9 and the deployment doc updated to match.
+- `docs/oxidebft-spec.md` §3 gained a key-admission paragraph: PoP
+  mandatory at `validator_add`/`key_change`, uniqueness of keys and
+  addresses in `ValidatorSet`.
+
+Tests (regression first): `rogue_key_attack_forges_aggregate_but_not_pop`
+in `bls_signer` constructs the actual rogue key via public-group
+algebra, demonstrates the forged `fast_aggregate_verify` pass, and
+shows the same key fails `pop_verify` — the vulnerability and its
+closure in one test. Crypto: PoP verify, wrong-key, garbage-input
+rejections. Consensus: `duplicate_consensus_key_rejected`,
+`duplicate_staking_address_rejected`,
+`key_rotation_onto_existing_key_rejected`,
+`validator_add_with_existing_key_rejected`. Staking: key-change and
+validator-add succeed with valid PoP; wrong-key PoP, garbage PoP,
+short key, malformed 48-byte non-point, zero stake, non-committee
+sender, and duplicate/pending addresses all rejected. Devnet:
+`tcp_multinode_key_rotation` and `tcp_multinode_validator_add_remove`
+now exercise the real PoP-bearing wire format end-to-end.
+
+Gates: 134 consensus + 57 staking + crypto + devnet suites green;
+full workspace suite green; fmt + clippy `-D warnings` clean.

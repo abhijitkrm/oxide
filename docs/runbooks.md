@@ -385,15 +385,19 @@ Key dashboards:
 
 ### Steps
 
-1. **Generate a new BLS key:**
+1. **Generate a new 32-byte BLS secret key** and keep it safe:
    ```sh
-   oxide-validator --generate-key --output /path/to/new-key.json
+   openssl rand -hex 32 > /path/to/new-key.hex   # 64 hex chars
    ```
 
-2. **Submit a key-change transaction** from the current validator:
+2. **Submit a key-change transaction** from the current validator.
+   The flag takes the new **secret** key (hex): the transaction must
+   attach a proof-of-possession (`Sign(sk, pk)` under the `BlsPop`
+   domain), which only the secret key can produce — the node derives
+   the public key and PoP automatically:
    ```sh
    oxide-validator --config /path/to/oxide.toml \
-     --submit-key-change /path/to/new-key.json
+     --submit-key-change "0x$(cat /path/to/new-key.hex)"
    ```
 
 3. **Wait for the key-change transaction to be finalized.** The
@@ -402,7 +406,8 @@ Key dashboards:
 
 4. **Stop the validator** (runbook 2).
 
-5. **Update the configuration** to point to the new key file.
+5. **Update the configuration** to point to the new key file
+   (`--bls-key-file` accepts the same hex/raw 32-byte format).
 
 6. **Restart the validator** (runbook 1).
 

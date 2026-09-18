@@ -9,16 +9,18 @@
 //!   vote hash. Domain separation is mandatory for consensus safety
 //!   (production-rust skill §6: every hash input carries a domain tag).
 //!
-//! - [`bls`] — BLS12-381 signature wire types for oxideBFT (Phase 1).
+//! - [`bls`] — BLS12-381 signature wire types for oxideBFT.
 //!   Defines the *types* (`PublicKey`, `Signature`, `AggregateSignature`)
 //!   and their codec impls; the actual signing/verification lives in
 //!   [`bls_signer`].
 //!
-//! - [`bls_signer`] — BLS12-381 signing, verification, and aggregation
-//!   via `blst` (Phase 1 stage 5). This is the production BLS layer:
-//!   sign votes, aggregate quorum certificates, verify them. The
-//!   wire types from [`bls`] carry the bytes; this module operates on
-//!   them.
+//! - [`bls_signer`] — BLS12-381 signing, verification, aggregation,
+//!   and proof-of-possession via `blst`. This is the production BLS
+//!   layer: sign votes, aggregate quorum certificates, verify them,
+//!   and prove/verify key possession (`pop_prove`/`pop_verify`) — the
+//!   admission gate that makes same-message aggregate verification
+//!   safe against rogue keys. The wire types from [`bls`] carry the
+//!   bytes; this module operates on them.
 //!
 //! # Why BLAKE3
 //!
@@ -35,7 +37,7 @@ pub mod hash;
 pub mod secp;
 
 pub use bls::{AggregateSignature, PublicKey, Signature, ValidatorIndex};
-pub use bls_signer::{BlsError, BlsSecretKey, aggregate, aggregate_verify, verify};
+pub use bls_signer::{BlsError, BlsSecretKey, aggregate, aggregate_verify, pop_verify, verify};
 pub use ed25519::{
     Ed25519Error, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, derive_public,
     generate_keypair_for_test as generate_ed25519_keypair, sign_message, verify_message,

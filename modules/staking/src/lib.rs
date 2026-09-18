@@ -847,22 +847,28 @@ pub mod msg {
             / super::SLASH_FRACTION_DENOMINATOR
     }
 
-    /// A key-change message: `[type: 0x05][validator: 20B][new_key: 48B]`.
+    /// A key-change message: `[type: 0x05][validator: 20B][new_key: 48B][pop: 96B]`.
     ///
     /// Updates a validator's BLS consensus public key. The new key
     /// takes effect at the next epoch rotation. Only the validator
     /// itself can submit this (the sender must equal `validator`).
     ///
-    /// `new_key` is a 48-byte BLS12-381 compressed public key.
-    pub fn key_change(validator: primitives::Address, new_key: &[u8]) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(69);
+    /// `new_key` is a 48-byte BLS12-381 compressed public key. `pop`
+    /// is the 96-byte proof-of-possession for that key
+    /// (`BlsSecretKey::pop_prove`) — required because QC verification
+    /// uses `fast_aggregate_verify`, which is unsafe unless every
+    /// admitted key proves possession (rogue-key attack).
+    pub fn key_change(validator: primitives::Address, new_key: &[u8], pop: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(165);
         msg.push(super::msg_type::KEY_CHANGE);
         msg.extend_from_slice(&validator.0);
         msg.extend_from_slice(new_key);
+        msg.extend_from_slice(pop);
         msg
     }
 
-    /// A validator-add message: `[type: 0x06][new_validator: 20B][bls_key: 48B][stake: 8B LE]`.
+    /// A validator-add message:
+    /// `[type: 0x06][new_validator: 20B][bls_key: 48B][stake: 8B LE][pop: 96B]`.
     ///
     /// Registers a new validator in the set. Only a current validator
     /// can submit this (governance-by-committee — the validator set
@@ -871,17 +877,22 @@ pub mod msg {
     ///
     /// `new_validator` is the staking address. `bls_key` is the
     /// 48-byte BLS12-381 compressed public key. `stake` is the
-    /// initial stake in atomic units.
+    /// initial stake in atomic units. `pop` is the 96-byte
+    /// proof-of-possession for `bls_key` (`BlsSecretKey::pop_prove`),
+    /// required so `fast_aggregate_verify` QC checks are safe from
+    /// rogue-key forgery.
     pub fn validator_add(
         new_validator: primitives::Address,
         bls_key: &[u8],
         stake: u64,
+        pop: &[u8],
     ) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(77);
+        let mut msg = Vec::with_capacity(173);
         msg.push(super::msg_type::VALIDATOR_ADD);
         msg.extend_from_slice(&new_validator.0);
         msg.extend_from_slice(bls_key);
         msg.extend_from_slice(&stake.to_le_bytes());
+        msg.extend_from_slice(pop);
         msg
     }
 
@@ -1927,12 +1938,19 @@ impl StakingModule {
     /// Handle a key-change message: record a new BLS consensus key
     /// for `validator`.
     ///
-    /// The message format is `[type: 0x05][validator: 20B][new_key: 48B]`.
+    /// The message format is
+    /// `[type: 0x05][validator: 20B][new_key: 48B][pop: 96B]`.
     /// The new key takes effect at the next epoch rotation — the
     /// consensus engine reads pending changes via `take_key_changes`.
     ///
     /// Only the validator itself can change its key (checked via
     /// `ctx.sender`). The sender must be the validator address.
+    ///
+    /// `pop` is a proof-of-possession for `new_key` — mandatory
+    /// because QC verification uses `fast_aggregate_verify`, which is
+    /// forgeable unless every signer key proves possession at
+    /// admission (rogue-key attack). A key that cannot produce a `PoP`
+    /// cannot enter the validator set.
     fn handle_key_change(
         &self,
         ctx: &TxContext,
@@ -1950,14 +1968,16 @@ impl StakingModule {
         if !validators.contains_key(&validator) {
             return Err(ExecError::ModuleRejected("key_change: validator not found".to_string()));
         }
-        // The new key is a 48-byte BLS12-381 compressed public key.
-        if msg.len() != 21 + 48 {
+        // The new key is a 48-byte BLS12-381 compressed public key,
+        // followed by its 96-byte proof-of-possession.
+        if msg.len() != 21 + 48 + 96 {
             return Err(ExecError::ModuleRejected(format!(
-                "key_change: expected 48-byte key, got {} bytes",
+                "key_change: expected 144-byte key+pop, got {} bytes",
                 msg.len().saturating_sub(21)
             )));
         }
         let new_key = msg[21..69].to_vec();
+        Self::verify_key_pop(&new_key, &msg[69..165], "key_change")?;
         drop(validators); // release lock before acquiring pending_key_changes
 
         self.pending_key_changes
@@ -1968,7 +1988,34 @@ impl StakingModule {
         Ok(vec![Event { module: "staking", kind: "key_change", data: msg.to_vec() }])
     }
 
-    /// Handle a validator-add message: `[type: 0x06][new_validator: 20B][bls_key: 48B][stake: 8B LE]`.
+    /// Verify a BLS proof-of-possession for a consensus key being
+    /// admitted (`validator_add` or `key_change`).
+    ///
+    /// `PoP` admission is the precondition that makes
+    /// `fast_aggregate_verify` safe for same-message QC aggregation:
+    /// a rogue key — a public key crafted as a linear combination of
+    /// honest keys so an attacker's lone signature verifies as a
+    /// quorum aggregate — cannot produce `Sign(sk_rogue, pk)` because
+    /// its discrete log is unknowable. Requiring the `PoP` here means
+    /// every key that reaches `ValidatorSet` is a real key the
+    /// presenter controls, not an algebraic forgery.
+    ///
+    /// # Errors
+    /// `ExecError::ModuleRejected` if `key` is not a 48-byte
+    /// compressed public key, `pop` is not a 96-byte signature, or
+    /// the `PoP` fails verification.
+    fn verify_key_pop(key: &[u8], pop: &[u8], op: &str) -> Result<(), ExecError> {
+        let pk = crypto::bls::PublicKey::from_slice(key)
+            .map_err(|_| ExecError::ModuleRejected(format!("{op}: malformed BLS public key")))?;
+        let pop_sig = crypto::bls::Signature::from_slice(pop)
+            .map_err(|_| ExecError::ModuleRejected(format!("{op}: malformed PoP signature")))?;
+        crypto::bls_signer::pop_verify(&pk, &pop_sig).map_err(|_| {
+            ExecError::ModuleRejected(format!("{op}: proof-of-possession verification failed"))
+        })
+    }
+
+    /// Handle a validator-add message:
+    /// `[type: 0x06][new_validator: 20B][bls_key: 48B][stake: 8B LE][pop: 96B]`.
     ///
     /// The sender must be a current validator — only the validator
     /// set itself can admit new members (governance-by-committee).
@@ -1976,14 +2023,18 @@ impl StakingModule {
     ///
     /// `validator` is the new validator's staking address. The
     /// `bls_key` is the 48-byte BLS12-381 compressed public key.
-    /// `stake` is the initial stake in atomic units.
+    /// `stake` is the initial stake in atomic units. `pop` is the
+    /// 96-byte proof-of-possession for `bls_key` — the rogue-key
+    /// admission gate that `fast_aggregate_verify` QC verification
+    /// relies on.
     ///
     /// # Errors
     ///
     /// - `ModuleRejected` if the sender is not a current validator.
     /// - `ModuleRejected` if the new validator is already in the set
     ///   or has a pending add.
-    /// - `ModuleRejected` if the BLS key is not exactly 48 bytes.
+    /// - `ModuleRejected` if the BLS key is not exactly 48 bytes or
+    ///   the `PoP` does not verify.
     /// - `ModuleRejected` if the stake is 0.
     fn handle_validator_add(
         &self,
@@ -2015,10 +2066,13 @@ impl StakingModule {
                 "validator_add: validator already pending".to_string(),
             ));
         }
-        // Parse [bls_key: 48B][stake: 8B LE] after the validator field.
-        if msg.len() != 21 + 48 + 8 {
+        // Parse [bls_key: 48B][stake: 8B LE][pop: 96B] after the
+        // validator field. The PoP is mandatory — a consensus key
+        // that cannot prove possession must never reach the
+        // ValidatorSet (rogue-key aggregate-forgery defense).
+        if msg.len() != 21 + 48 + 8 + 96 {
             return Err(ExecError::ModuleRejected(format!(
-                "validator_add: expected 77-byte message, got {} bytes",
+                "validator_add: expected 173-byte message, got {} bytes",
                 msg.len()
             )));
         }
@@ -2027,6 +2081,7 @@ impl StakingModule {
         if stake == 0 {
             return Err(ExecError::ModuleRejected("validator_add: zero stake".to_string()));
         }
+        Self::verify_key_pop(&bls_key, &msg[77..173], "validator_add")?;
         drop(pending_adds);
 
         // Register the validator in the staking map immediately —
@@ -2985,8 +3040,10 @@ mod tests {
         let staking = setup(&[0]);
         let v = addr(0); // sender is addr(0) in ctx()
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
-        let new_key = vec![0xAA; 48];
-        staking.handle(&ctx(), &msg::key_change(v, &new_key)).unwrap();
+        let new_sk = bls_key(0xAA);
+        let new_key = new_sk.public_key().as_bytes().to_vec();
+        let pop = new_sk.pop_prove();
+        staking.handle(&ctx(), &msg::key_change(v, &new_key, pop.as_bytes())).unwrap();
         assert!(staking.has_key_change(&v), "key change must be pending");
         let changes = staking.take_key_changes();
         assert_eq!(changes.len(), 1);
@@ -3001,8 +3058,10 @@ mod tests {
         let staking = setup(&[1]);
         let v = addr(1); // sender is addr(0), but validator is addr(1)
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
-        let new_key = vec![0xAA; 48];
-        let result = staking.handle(&ctx(), &msg::key_change(v, &new_key));
+        let new_sk = bls_key(0xAA);
+        let new_key = new_sk.public_key().as_bytes().to_vec();
+        let pop = new_sk.pop_prove();
+        let result = staking.handle(&ctx(), &msg::key_change(v, &new_key, pop.as_bytes()));
         assert!(result.is_err(), "must reject key change from non-validator sender");
     }
 
@@ -3010,8 +3069,10 @@ mod tests {
     fn key_change_rejects_unknown_validator() {
         let staking = setup(&[]);
         let v = addr(0); // sender is addr(0) but no stake delegated
-        let new_key = vec![0xAA; 48];
-        let result = staking.handle(&ctx(), &msg::key_change(v, &new_key));
+        let new_sk = bls_key(0xAA);
+        let new_key = new_sk.public_key().as_bytes().to_vec();
+        let pop = new_sk.pop_prove();
+        let result = staking.handle(&ctx(), &msg::key_change(v, &new_key, pop.as_bytes()));
         assert!(result.is_err(), "must reject key change for unknown validator");
     }
 
@@ -3021,9 +3082,171 @@ mod tests {
         let v = addr(0);
         staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
         let short_key = vec![0xAA; 32]; // not 48 bytes
-        let msg = msg::key_change(v, &short_key);
+        let pop = bls_key(0xBB).pop_prove();
+        let msg = msg::key_change(v, &short_key, pop.as_bytes());
         let result = staking.handle(&ctx(), &msg);
         assert!(result.is_err(), "must reject non-48-byte key");
+    }
+
+    /// C3: a consensus key must prove possession at admission.
+    /// Without `PoP`, `fast_aggregate_verify` QC checks admit a rogue
+    /// key — a public key crafted from honest keys so a lone attacker
+    /// signature verifies as a quorum aggregate.
+    #[test]
+    fn key_change_rejects_invalid_pop() {
+        let staking = setup(&[0]);
+        let v = addr(0);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let new_sk = bls_key(0xAA);
+        let new_key = new_sk.public_key().as_bytes().to_vec();
+        // A different key's PoP is not a PoP for `new_key`.
+        let wrong_pop = bls_key(0xBB).pop_prove();
+        let result = staking.handle(&ctx(), &msg::key_change(v, &new_key, wrong_pop.as_bytes()));
+        assert!(result.is_err(), "PoP for a different key must be rejected");
+        // Garbage bytes are not a PoP either.
+        let garbage = vec![0xCC; 96];
+        let result = staking.handle(&ctx(), &msg::key_change(v, &new_key, &garbage));
+        assert!(result.is_err(), "garbage PoP must be rejected");
+        // The real PoP admits the change.
+        let pop = new_sk.pop_prove();
+        staking.handle(&ctx(), &msg::key_change(v, &new_key, pop.as_bytes())).unwrap();
+        assert!(staking.has_key_change(&v), "valid PoP must admit the key change");
+    }
+
+    // ── Validator add / remove (committee-gated set changes) ────
+
+    /// A committee member can admit a new validator whose key carries
+    /// a valid proof-of-possession — the add lands in the pending
+    /// set changes for the next epoch rotation.
+    #[test]
+    fn validator_add_with_valid_pop_succeeds() {
+        let staking = setup(&[1]);
+        let new_addr = addr(9);
+        let new_sk = bls_key(0xAA);
+        let pop = new_sk.pop_prove();
+        staking
+            .handle(
+                &ctx_with_sender(1),
+                &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), 500, pop.as_bytes()),
+            )
+            .unwrap();
+        let changes = staking.take_validator_changes();
+        assert_eq!(changes.adds.len(), 1, "one pending add");
+        assert_eq!(changes.adds[0].0, new_addr);
+        assert_eq!(changes.adds[0].1, new_sk.public_key().as_bytes().to_vec());
+        assert_eq!(changes.adds[0].2, 500);
+    }
+
+    /// `PoP` is mandatory at admission: a `validator_add` carrying a
+    /// `PoP` for a different key — or garbage bytes — must be rejected.
+    /// Without this gate a rogue key (a public key algebraically
+    /// derived from honest keys) could enter the set and forge
+    /// `fast_aggregate_verify` quorum checks.
+    #[test]
+    fn validator_add_rejects_invalid_pop() {
+        let staking = setup(&[1]);
+        let new_addr = addr(9);
+        let new_sk = bls_key(0xAA);
+        // PoP for a different key.
+        let wrong_pop = bls_key(0xBB).pop_prove();
+        let result = staking.handle(
+            &ctx_with_sender(1),
+            &msg::validator_add(
+                new_addr,
+                new_sk.public_key().as_bytes(),
+                500,
+                wrong_pop.as_bytes(),
+            ),
+        );
+        assert!(result.is_err(), "PoP for a different key must be rejected");
+        // Garbage bytes.
+        let result = staking.handle(
+            &ctx_with_sender(1),
+            &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), 500, &[0xCC; 96]),
+        );
+        assert!(result.is_err(), "garbage PoP must be rejected");
+        // Nothing pending.
+        assert!(staking.take_validator_changes().adds.is_empty());
+    }
+
+    /// Only a current validator can propose set membership — an
+    /// arbitrary account must not sybil the committee.
+    #[test]
+    fn validator_add_rejects_non_committee_sender() {
+        let staking = setup(&[1]);
+        let new_sk = bls_key(0xAA);
+        let pop = new_sk.pop_prove();
+        let result = staking.handle(
+            &ctx_with_sender(8), // addr(8) is funded but not a validator
+            &msg::validator_add(addr(9), new_sk.public_key().as_bytes(), 500, pop.as_bytes()),
+        );
+        assert!(result.is_err(), "non-validator sender must be rejected");
+    }
+
+    /// Zero-stake validators carry no voting power and must not be
+    /// admitted — `ValidatorSet` rejects them too, so refuse early.
+    #[test]
+    fn validator_add_rejects_zero_stake() {
+        let staking = setup(&[1]);
+        let new_sk = bls_key(0xAA);
+        let pop = new_sk.pop_prove();
+        let result = staking.handle(
+            &ctx_with_sender(1),
+            &msg::validator_add(addr(9), new_sk.public_key().as_bytes(), 0, pop.as_bytes()),
+        );
+        assert!(result.is_err(), "zero stake must be rejected");
+    }
+
+    /// The staking address is the validator's identity — an existing
+    /// member (or a pending add) cannot be re-added under a new key.
+    #[test]
+    fn validator_add_rejects_duplicate_address() {
+        let staking = setup(&[1]);
+        let sk = bls_key(0xAA);
+        let pop = sk.pop_prove();
+        // addr(1) is already a validator.
+        let result = staking.handle(
+            &ctx_with_sender(1),
+            &msg::validator_add(addr(1), sk.public_key().as_bytes(), 500, pop.as_bytes()),
+        );
+        assert!(result.is_err(), "existing validator address must be rejected");
+        // Two pending adds of the same address.
+        let new_addr = addr(9);
+        staking
+            .handle(
+                &ctx_with_sender(1),
+                &msg::validator_add(new_addr, sk.public_key().as_bytes(), 500, pop.as_bytes()),
+            )
+            .unwrap();
+        let other_sk = bls_key(0xBB);
+        let other_pop = other_sk.pop_prove();
+        let result = staking.handle(
+            &ctx_with_sender(1),
+            &msg::validator_add(
+                new_addr,
+                other_sk.public_key().as_bytes(),
+                500,
+                other_pop.as_bytes(),
+            ),
+        );
+        assert!(result.is_err(), "pending duplicate address must be rejected");
+    }
+
+    /// A malformed BLS public key (48 bytes that do not encode a
+    /// valid compressed BLS12-381 point) must be rejected at
+    /// admission: `pop_verify` fails to uncompress it, so the add
+    /// never lands.
+    #[test]
+    fn validator_add_rejects_malformed_key() {
+        let staking = setup(&[1]);
+        // 48 bytes that do not encode a valid BLS12-381 G1 point.
+        let bogus_key = vec![0xFF; 48];
+        let pop = bls_key(0xAA).pop_prove();
+        let result = staking.handle(
+            &ctx_with_sender(1),
+            &msg::validator_add(addr(9), &bogus_key, 500, pop.as_bytes()),
+        );
+        assert!(result.is_err(), "malformed public key must be rejected");
     }
 
     // ── Coordinated halt scheduling (SCHEDULE_HALT) ─────────────

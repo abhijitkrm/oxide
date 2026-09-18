@@ -445,14 +445,25 @@ fn handle_export_snapshot(node: &mut Node) -> bool {
     false
 }
 
-/// Handle `--submit-key-change <new_bls_pubkey_hex>`: submit a
+/// Handle `--submit-key-change <new_bls_secret_key_hex>`: submit a
 /// staking key-change transaction for this validator. The transaction
 /// is included in the next block; the new key takes effect at the
 /// next epoch rotation.
+///
+/// The flag carries the **secret** key, not the public key: a
+/// key-change must attach a proof-of-possession (`Sign(sk, pk)` under
+/// `Domain::BlsPop`), which is only producible from the secret. A node
+/// rotating to a key it does not possess could never sign votes with
+/// it anyway, so requiring the secret here matches operational
+/// reality and the C3 rogue-key defense.
 fn handle_key_change(node: &mut Node) {
     if let Some(hex_key) = parse_cli_flag("--submit-key-change") {
-        let new_key_bytes =
-            hex_decode(&hex_key).unwrap_or_else(|e| panic!("invalid BLS key hex: {e}"));
+        let secret_bytes =
+            hex_decode(&hex_key).unwrap_or_else(|e| panic!("invalid BLS secret key hex: {e}"));
+        let new_sk = crypto::BlsSecretKey::from_bytes(&secret_bytes)
+            .unwrap_or_else(|e| panic!("invalid BLS secret key: {e:?}"));
+        let new_key_bytes = new_sk.public_key().as_bytes().to_vec();
+        let pop = new_sk.pop_prove();
         // The validator address is the tx sender (Address([0u8; 20])
         // in devnet mode). In production this would be the node's
         // configured validator address.
@@ -463,7 +474,7 @@ fn handle_key_change(node: &mut Node) {
         let delegate_tx = build_tx(framework::module_id::STAKING, &delegate_msg);
         node.engine().submit_tx(delegate_tx);
         node.engine().run_until_idle();
-        let msg_payload = staking::msg::key_change(validator_addr, &new_key_bytes);
+        let msg_payload = staking::msg::key_change(validator_addr, &new_key_bytes, pop.as_bytes());
         let tx = build_tx(framework::module_id::STAKING, &msg_payload);
         node.engine().submit_tx(tx);
         tracing::info!("oxide-validator: submitted key-change transaction");
@@ -499,7 +510,7 @@ fn handle_key_change(node: &mut Node) {
 /// | `--rpc-listen <addr>` | RPC listen address (default: from config) |
 /// | `--export-snapshot <path>` | Export snapshot to file and exit |
 /// | `--import-snapshot <path>` | Import snapshot from file before starting |
-/// | `--submit-key-change <hex>` | Submit a validator key-change tx |
+/// | `--submit-key-change <hex>` | Submit a key-change tx (new BLS **secret** key — `PoP` required) |
 ///
 /// # Key loading
 ///
@@ -1774,7 +1785,7 @@ fn print_help() {
     println!("    --rpc-listen <addr>       RPC listen address (default: from config)");
     println!("    --export-snapshot <path>  Export state snapshot to file and exit");
     println!("    --import-snapshot <path>  Import state snapshot before starting");
-    println!("    --submit-key-change <hex> Submit a BLS key-change transaction");
+    println!("    --submit-key-change <hex> Submit a BLS key-change transaction (new secret key)");
     println!();
     println!("EXAMPLES:");
     println!("    oxide-validator init --chain-id 1");

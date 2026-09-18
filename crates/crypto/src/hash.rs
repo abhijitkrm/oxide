@@ -62,6 +62,7 @@ use primitives::Hash;
 /// | `BodyShardLeaf` | 12 | dispersed-block shard leaf (Phase 5) |
 /// | `BodyShardNode` | 13 | dispersed-block shard tree node (Phase 5) |
 /// | `ExecAttest` | 14 | execution attestation signing (Phase 5) |
+/// | `BlsPop` | 15 | BLS proof-of-possession (validator key admission) |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -111,6 +112,12 @@ pub enum Domain {
     /// attestation signature can never be reinterpreted as a block
     /// vote (and vice versa).
     ExecAttest = 14,
+    /// A BLS proof-of-possession: `sign(sk, pk_bytes)` presented when
+    /// a validator's consensus key is admitted (`validator_add` /
+    /// `key_change`). Appended after `ExecAttest` — never renumber.
+    /// Its own domain so a `PoP` can never be reinterpreted as a
+    /// vote, timeout, or attestation signature over the same bytes.
+    BlsPop = 15,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

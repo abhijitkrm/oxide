@@ -346,8 +346,10 @@ All partial runbook items completed:
   reads + decodes snapshot, calls `node.import_snapshot()` before
   consensus starts.
 - **Runbook 9 (key rotation):** ✅ `--submit-key-change <hex>` CLI
-  flag + `KEY_CHANGE` (0x05) staking message type. Pending key
-  changes stored for epoch-boundary application.
+  flag + `KEY_CHANGE` (0x05) staking message type. The flag takes
+  the new BLS **secret** key so the tx carries the mandatory
+  proof-of-possession; pending key changes are stored for
+  epoch-boundary application.
 - **`trading_tps_large` (10M txs):** ✅ Fixed. Root cause was
   `MAX_RETAINED_FINALIZED` (4096) pruning old finalized blocks —
   `collect_result` only saw the last 4096. Added `commit_listener`

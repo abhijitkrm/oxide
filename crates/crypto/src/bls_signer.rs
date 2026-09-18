@@ -1,5 +1,5 @@
-//! BLS12-381 signing, verification, and aggregation via `blst`
-//! (Phase 1 stage 5).
+//! BLS12-381 signing, verification, aggregation, and
+//! proof-of-possession via `blst`.
 //!
 //! This module provides the cryptographic operations that the oxideBFT
 //! engine uses to sign votes, form quorum certificates, and verify
@@ -61,6 +61,7 @@ fn dst(domain: Domain) -> &'static [u8] {
         Domain::BodyShardLeaf => b"oxide/body-shard-leaf",
         Domain::BodyShardNode => b"oxide/body-shard-node",
         Domain::ExecAttest => b"oxide/exec-attest",
+        Domain::BlsPop => b"oxide/bls-pop",
     }
 }
 
@@ -103,6 +104,29 @@ impl BlsSecretKey {
         Signature(bytes)
     }
 
+    /// Produce a proof-of-possession for this key's public key: a
+    /// signature over the compressed public key under
+    /// [`Domain::BlsPop`].
+    ///
+    /// This is the BLS `PoP` scheme (`draft-irtf-cfrg-bls-signature`
+    /// §3.3) specialized to Oxide's domain: `pop = Sign(sk, pk)`. A
+    /// verifier checks it with [`pop_verify`]. Presenting a valid
+    /// `PoP` proves the presenter knows the secret key for `pk` —
+    /// which is exactly what a rogue public key (constructed as a
+    /// linear combination of honest keys to corrupt
+    /// `fast_aggregate_verify`) *cannot* produce, because its
+    /// discrete log is unknown to the attacker.
+    ///
+    /// The `PoP` is mandatory at every consensus-key admission point:
+    /// `fast_aggregate_verify` (the QC/TC verification path) is only
+    /// secure when every signer key either proves possession or signs
+    /// a distinct message. Oxide aggregates votes over the *same*
+    /// message, so `PoP` admission is the load-bearing precondition.
+    #[must_use]
+    pub fn pop_prove(&self) -> Signature {
+        self.sign(Domain::BlsPop, self.public_key().as_bytes())
+    }
+
     /// Serialize the secret key to 32 bytes.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 32] {
@@ -129,6 +153,31 @@ pub fn verify(sig: &Signature, domain: Domain, msg: &[u8], pk: &PublicKey) -> Re
     let blst_pk = BlstPk::from_bytes(pk.as_bytes())?;
     let result = blst_sig.verify(false, msg, dst(domain), b"", &blst_pk, true);
     if result == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::InvalidSignature) }
+}
+
+/// Verify a proof-of-possession: `pop` must be a valid signature over
+/// the compressed `pk` under [`Domain::BlsPop`], produced by
+/// [`BlsSecretKey::pop_prove`].
+///
+/// A valid `PoP` proves the presenter knows the secret key for `pk`.
+/// This is the admission gate every consensus key must pass before
+/// joining a [`consensus::ValidatorSet`]: without it, an attacker
+/// could register a rogue key — a public key crafted as a linear
+/// combination of honest validators' keys — and forge QC/TC
+/// aggregate signatures that `fast_aggregate_verify` accepts over
+/// the honest bitmap. The rogue key's discrete log is unknowable, so
+/// it cannot produce a `PoP`; the attack dies at admission.
+///
+/// The signature's `verify` call also validates that `pk` is a
+/// well-formed group element in the correct subgroup (blst
+/// `pk_validate`), so malformed keys are rejected here too.
+///
+/// # Errors
+/// Returns `BlsError::InvalidSignature` if `pop` does not verify
+/// against `pk`, or `BlsError::InvalidKeyMaterial` if either input
+/// is not a well-formed group element.
+pub fn pop_verify(pk: &PublicKey, pop: &Signature) -> Result<(), BlsError> {
+    verify(pop, Domain::BlsPop, pk.as_bytes(), pk)
 }
 
 /// Aggregate multiple signatures (over the same message) into one
@@ -326,5 +375,88 @@ mod tests {
         let key1 = sk(1);
         let key2 = sk(2);
         assert_ne!(key1.public_key(), key2.public_key(), "different keys → different PKs");
+    }
+
+    #[test]
+    fn pop_prove_and_verify() {
+        let key = sk(7);
+        let pk = key.public_key();
+        let pop = key.pop_prove();
+        assert!(pop_verify(&pk, &pop).is_ok(), "valid PoP must verify");
+    }
+
+    #[test]
+    fn pop_verify_rejects_wrong_key() {
+        let key1 = sk(1);
+        let key2 = sk(2);
+        let pop1 = key1.pop_prove();
+        // key1's PoP must not verify under key2's public key.
+        assert!(pop_verify(&key2.public_key(), &pop1).is_err());
+        // And key2's PoP is a different signature (BLS is deterministic,
+        // so the proof binds to the key, not the presenter).
+        assert_ne!(pop1, key2.pop_prove());
+    }
+
+    #[test]
+    fn pop_verify_rejects_garbage() {
+        let key = sk(1);
+        let pop = key.pop_prove();
+        // Malformed pk bytes and malformed pop bytes both fail —
+        // either deserialization or verification must error.
+        assert!(pop_verify(&PublicKey([0x00; PublicKey::LEN]), &pop).is_err());
+        assert!(pop_verify(&key.public_key(), &Signature([0x00; Signature::LEN])).is_err());
+    }
+
+    /// The attack `PoP` admission exists to stop. Without `PoP`, an
+    /// attacker can register a *rogue key* — `pk_rogue = pk_evil −
+    /// pk_honest` — so that `pk_honest + pk_rogue = pk_evil`. A
+    /// single signature by the attacker then verifies as a
+    /// quorum-certificate aggregate over the honest signer's bitmap
+    /// slot. `PoP` kills it: the attacker cannot produce `Sign(sk_rogue,
+    /// pk_rogue)` because `sk_rogue` is not computable from the
+    /// public points.
+    #[test]
+    fn rogue_key_attack_forges_aggregate_but_not_pop() {
+        let honest = sk(10);
+        let evil = sk(11);
+        let pk_honest = honest.public_key();
+        let pk_evil = evil.public_key();
+
+        // Construct the rogue key: pk_rogue = pk_evil − pk_honest.
+        // This is pure public-group algebra — no secret knowledge of
+        // sk_rogue required, which is exactly the attack.
+        let mut rogue = blst::min_pk::AggregatePublicKey::from_public_key(
+            &blst::min_pk::PublicKey::from_bytes(pk_evil.as_bytes()).expect("pk_evil"),
+        );
+        rogue.sub_aggregate(&blst::min_pk::AggregatePublicKey::from_public_key(
+            &blst::min_pk::PublicKey::from_bytes(pk_honest.as_bytes()).expect("pk_honest"),
+        ));
+        let pk_rogue = PublicKey(rogue.to_public_key().compress());
+        assert_ne!(pk_rogue, pk_evil);
+        assert_ne!(pk_rogue, pk_honest);
+
+        // The attack: a single evil signature verifies as the
+        // "aggregate" over [honest, rogue] — because
+        // pk_honest + pk_rogue = pk_evil.
+        let msg = b"vote payload";
+        let sig_evil = evil.sign(Domain::Vote, msg);
+        let forged = aggregate(&[sig_evil]).expect("aggregate");
+        assert!(
+            aggregate_verify(&forged, Domain::Vote, msg, &[pk_honest, pk_rogue]).is_ok(),
+            "rogue key admits a forged quorum aggregate — this is the vulnerability PoP closes",
+        );
+
+        // The defense: the attacker cannot produce a PoP for the
+        // rogue key. Signing over the rogue pk's bytes with sk_evil
+        // produces a signature that does not verify under pk_rogue
+        // (the PoP check binds the signature to the key itself).
+        let fake_pop = evil.sign(Domain::BlsPop, pk_rogue.as_bytes());
+        assert!(
+            pop_verify(&pk_rogue, &fake_pop).is_err(),
+            "rogue key must fail PoP verification — admission rejected",
+        );
+        // Even the evil key's own genuine PoP does not cover the
+        // rogue key.
+        assert!(pop_verify(&pk_rogue, &evil.pop_prove()).is_err());
     }
 }

@@ -106,6 +106,24 @@ impl ValidatorSet {
         if stakes.contains(&0) {
             return Err(ValidatorSetError::ZeroStake);
         }
+        // Uniqueness: each consensus key and each staking address may
+        // occupy exactly one slot. A duplicate key would let one
+        // signer claim two bitmap positions (and two stakes) for a
+        // single BLS identity; a duplicate address collides the
+        // staking identity used for rewards, evidence, and
+        // `index_of`. Validator sets are small (<~1000), so the
+        // O(n²) scan is fine — this runs at construction/rotation,
+        // never on the hot path.
+        for (i, pk) in validators.iter().enumerate() {
+            if validators[..i].contains(pk) {
+                return Err(ValidatorSetError::DuplicateKey { index: i });
+            }
+        }
+        for (i, addr) in validator_addresses.iter().enumerate() {
+            if validator_addresses[..i].contains(addr) {
+                return Err(ValidatorSetError::DuplicateAddress { index: i });
+            }
+        }
         let mut cumulative_stakes = Vec::with_capacity(stakes.len());
         let mut acc = 0u64;
         for &s in &stakes {
@@ -401,6 +419,19 @@ pub enum ValidatorSetError {
     },
     /// A validator with zero stake cannot lead or vote.
     ZeroStake,
+    /// The same consensus public key appears twice — one BLS
+    /// identity cannot hold two bitmap slots (it would count its
+    /// signatures and stake twice and break key-uniqueness).
+    DuplicateKey {
+        /// The second index at which the key appeared.
+        index: usize,
+    },
+    /// The same staking address appears twice — one staking identity
+    /// cannot hold two validator slots.
+    DuplicateAddress {
+        /// The second index at which the address appeared.
+        index: usize,
+    },
     /// Total stake exceeds `u64` — the set is too large.
     StakeOverflow,
     /// A validator index is past the end of the set.
@@ -423,6 +454,12 @@ impl std::fmt::Display for ValidatorSetError {
                 write!(f, "validators len {validators} != addresses len {addresses}")
             }
             Self::ZeroStake => write!(f, "a validator has zero stake"),
+            Self::DuplicateKey { index } => {
+                write!(f, "duplicate consensus key at index {index}")
+            }
+            Self::DuplicateAddress { index } => {
+                write!(f, "duplicate staking address at index {index}")
+            }
             Self::StakeOverflow => write!(f, "total stake overflows u64"),
             Self::OutOfBounds { index, n } => {
                 write!(f, "validator index {index} out of bounds (n={n})")
@@ -553,6 +590,95 @@ mod tests {
         // corrupt bitmap cannot inflate apparent power.
         let corrupt = [0b1111_0000u8];
         assert_eq!(vs.signer_stake(&corrupt), 0);
+    }
+
+    /// C3: a consensus key may occupy exactly one bitmap slot. Two
+    /// slots sharing one BLS identity would let a single signer claim
+    /// two positions (and two stakes) in every certificate — silently
+    /// inflating its voting power and breaking the `signer_stake`
+    /// accounting that quorum now depends on.
+    #[test]
+    fn duplicate_consensus_key_rejected() {
+        let addrs = vec![Address([1; 20]), Address([2; 20]), Address([3; 20])];
+        let result = ValidatorSet::with_addresses(
+            vec![pk(7), pk(8), pk(7)], // index 2 repeats index 0's key
+            vec![1, 1, 1],
+            addrs,
+        );
+        assert!(
+            matches!(result, Err(ValidatorSetError::DuplicateKey { index: 2 })),
+            "second occurrence of a key must be rejected at its index"
+        );
+    }
+
+    /// C3: a staking address may occupy exactly one slot — it is the
+    /// identity used by `index_of` for rewards, evidence, jailing,
+    /// and key rotation; a collision would make those operations
+    /// ambiguous.
+    #[test]
+    fn duplicate_staking_address_rejected() {
+        let result = ValidatorSet::with_addresses(
+            vec![pk(7), pk(8), pk(9)],
+            vec![1, 1, 1],
+            vec![Address([1; 20]), Address([2; 20]), Address([1; 20])],
+        );
+        assert!(
+            matches!(result, Err(ValidatorSetError::DuplicateAddress { index: 2 })),
+            "second occurrence of an address must be rejected at its index"
+        );
+    }
+
+    /// Rotating a validator's key onto another member's key would
+    /// create a duplicate in the post-rotation set — the rotation
+    /// must fail rather than let one BLS identity hold two slots.
+    /// `apply_key_change` routes through `with_addresses`, so the
+    /// uniqueness check fires here for free.
+    #[test]
+    fn key_rotation_onto_existing_key_rejected() {
+        let vs = ValidatorSet::with_addresses(
+            vec![pk(1), pk(2), pk(3)],
+            vec![1, 1, 1],
+            vec![Address([1; 20]), Address([2; 20]), Address([3; 20])],
+        )
+        .expect("validator set");
+        // Validator 0 tries to rotate onto validator 2's key.
+        let result = vs.apply_key_change(0, pk(3));
+        assert!(
+            matches!(result, Err(ValidatorSetError::DuplicateKey { .. })),
+            "rotation onto an existing key must be rejected"
+        );
+        // A genuinely fresh key still rotates fine.
+        let rotated = vs.apply_key_change(0, pk(9)).expect("fresh key rotates");
+        assert_eq!(*rotated.validator(0).expect("validator 0"), pk(9));
+    }
+
+    /// Admitting a validator whose key is already in the set would
+    /// duplicate a BLS identity — same bitmap-slot forgery as the
+    /// direct-duplicate case, reached through the add path.
+    #[test]
+    fn validator_add_with_existing_key_rejected() {
+        let vs = ValidatorSet::with_addresses(
+            vec![pk(1), pk(2)],
+            vec![1, 1],
+            vec![Address([1; 20]), Address([2; 20])],
+        )
+        .expect("validator set");
+        // New address, but validator 1's key.
+        let result = vs.add_validator(pk(2), 5, Address([9; 20]));
+        assert!(
+            matches!(result, Err(ValidatorSetError::DuplicateKey { .. })),
+            "add carrying an existing key must be rejected"
+        );
+        // New key but an existing address collides the staking
+        // identity.
+        let result = vs.add_validator(pk(9), 5, Address([1; 20]));
+        assert!(
+            matches!(result, Err(ValidatorSetError::DuplicateAddress { .. })),
+            "add carrying an existing address must be rejected"
+        );
+        // Fresh key + fresh address succeeds.
+        let grown = vs.add_validator(pk(9), 5, Address([9; 20])).expect("fresh add");
+        assert_eq!(grown.n(), 3);
     }
 
     #[test]

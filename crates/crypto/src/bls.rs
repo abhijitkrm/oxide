@@ -1,13 +1,11 @@
-//! BLS12-381 signature type stubs for oxideBFT (Phase 1).
+//! BLS12-381 signature types for oxideBFT.
 //!
-//! # Phase 0 scope
-//!
-//! Phase 0 defines the *types* and *traits* oxideBFT will program
-//! against. The actual signing and verification (via `blst` or
-//! `bls12_381`) lands in Phase 1 when the first consumer (oxideBFT's
-//! vote/QC pipeline) exists. This avoids pulling a BLS dependency
-//! before there is code that uses it, while ensuring the type shape
-//! is settled — Phase 1 fills in the trait impls, not the types.
+//! This module defines the wire types — `PublicKey` and `Signature`
+//! in their compressed forms — that oxideBFT's vote/QC pipeline
+//! programs against. The signing, verification, and aggregation
+//! implementation (via `blst`) lives in [`crate::bls_signer`];
+//! proof-of-possession generation and verification for validator
+//! admission (the rogue-key defense) lives there too.
 //!
 //! # Why BLS12-381
 //!
@@ -16,6 +14,9 @@
 //! is one pairing check. This is the throughput lever for oxideBFT's
 //! quorum certificates (docs/oxidebft-spec.md §3). Ed25519 QCs are a
 //! list of N signatures — N× the wire size and N× the verify cost.
+//! Same-message aggregation (`fast_aggregate_verify`) is only safe
+//! when every signer key proved possession at admission — enforced
+//! by the staking module's `validator_add`/`key_change` handlers.
 //!
 //! # Wire format
 //!
@@ -32,7 +33,7 @@ use primitives::Hash;
 ///
 /// Used to verify signatures and identify validators in the quorum
 /// certificate's signer bitmap. The compressed form is the wire
-/// format; Phase 1's `blst` integration decompresses for verification.
+/// format; [`crate::bls_signer`] decompresses it for verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PublicKey(pub [u8; PublicKey::LEN]);
 
@@ -100,8 +101,9 @@ impl<'a> Decode<'a> for PublicKey {
 /// A BLS12-381 signature in compressed form (96 bytes).
 ///
 /// A single validator's signature over a domain-separated hash (see
-/// [`crate::hash`]). Phase 1's `blst` integration provides `verify`;
-/// Phase 0 carries the type so the wire format and codec are settled.
+/// [`crate::hash`]). Verification lives in [`crate::bls_signer`];
+/// this module carries the type so the wire format and codec are
+/// settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Signature(pub [u8; Signature::LEN]);
 
@@ -126,11 +128,11 @@ impl Signature {
         &self.0
     }
 
-    /// The all-zero signature — a placeholder for "no signature yet"
-    /// (e.g. before BLS signing is wired in, stage 5). Phase 1
-    /// verification rejects this as invalid; it exists so consensus
-    /// types can carry a syntactically valid signature field before
-    /// the signer is implemented.
+    /// The all-zero signature — a placeholder for "no signature yet".
+    /// Verification rejects it as invalid (all-zero is not a valid
+    /// compressed point); it exists so consensus types can carry a
+    /// syntactically valid signature field before a signer is
+    /// attached (e.g. genesis construction).
     pub const ZERO: Self = Self([0u8; Self::LEN]);
 }
 
@@ -153,10 +155,12 @@ impl<'a> Decode<'a> for Signature {
 /// quorum certificate; the aggregate is the sum of the individual
 /// signatures over the same message.
 ///
-/// Verification (Phase 1): check that the aggregate signature is valid
-/// under the aggregate of the signers' public keys, over the
-/// domain-separated message. This is the single-pairing check that
-/// makes BLS QCs cheap to verify regardless of validator count.
+/// Verification: [`crate::bls_signer::aggregate_verify`] checks the
+/// aggregate signature under the signers' public keys over the
+/// domain-separated message — a single pairing check that makes BLS
+/// QCs cheap to verify regardless of validator count. Safe only
+/// because every admitted key proved possession (`PoP`) at staking
+/// admission; see `pop_verify` there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AggregateSignature(pub [u8; AggregateSignature::LEN]);
 
@@ -183,9 +187,9 @@ impl AggregateSignature {
     }
 
     /// The all-zero aggregate signature — a placeholder for "no
-    /// signatures" (e.g. a genesis QC with no signers). Phase 1
-    /// verification rejects this as invalid; it exists so genesis
-    /// blocks can carry a syntactically valid QC field.
+    /// signatures" (e.g. a genesis QC with no signers). Verification
+    /// rejects it as invalid; it exists so genesis blocks can carry
+    /// a syntactically valid QC field.
     pub const ZERO: Self = Self([0u8; Self::LEN]);
 }
 
@@ -212,8 +216,8 @@ pub type ValidatorIndex = u16;
 
 /// A message that can be signed by a BLS signer. Implemented by
 /// consensus objects (votes, timeout messages) that carry a
-/// domain-separated hash. Phase 1's signer calls `signing_hash` to
-/// get the message to sign.
+/// domain-separated hash. The signer calls `signing_hash` to get
+/// the message to sign.
 ///
 /// This trait decouples the signing primitive from the consensus
 /// types: oxideBFT signs votes and timeouts, but the BLS crate doesn't
@@ -227,8 +231,8 @@ pub trait Signable {
     /// is prepended by the hasher; this method returns only the payload.
     fn signing_bytes(&self) -> &[u8];
 
-    /// Convenience: the domain-separated hash to sign. Phase 1's
-    /// `blst` integration signs this 32-byte digest.
+    /// Convenience: the domain-separated hash to sign —
+    /// [`crate::bls_signer`] signs this 32-byte digest.
     fn signing_hash(&self) -> Hash {
         crate::hash::Hasher::hash_one(self.domain(), self.signing_bytes())
     }
@@ -236,10 +240,10 @@ pub trait Signable {
 
 #[cfg(test)]
 mod tests {
-    //! Wire-form pinning and round-trip for BLS types. The actual
-    //! sign/verify/aggregate operations are Phase 1; Phase 0 pins the
-    //! types and their codec so the wire format is settled before
-    //! oxideBFT is built.
+    //! Wire-form pinning and round-trip for BLS types. Sign/verify/
+    //! aggregate/PoP operations are tested in `bls_signer`; this
+    //! module pins the types and their codec so the wire format is
+    //! settled.
 
     use super::*;
 

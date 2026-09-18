@@ -2498,9 +2498,14 @@ mod tests {
         // Build a key-change tx for validator 0 (Address::ZERO in
         // the devnet's `Address([i; 20])` convention). The delegate
         // must come first so `handle_key_change` accepts the tx.
-        let new_key_bytes = [0xFF; 48];
+        // The new key carries its proof-of-possession — required
+        // since C3 made PoP admission mandatory (rogue-key defense).
+        let new_sk = bls_key(0xAA);
+        let new_key_bytes = new_sk.public_key().as_bytes().to_vec();
+        let pop = new_sk.pop_prove();
         let delegate_msg = staking::msg::delegate(primitives::Address::ZERO, 1);
-        let key_change_msg = staking::msg::key_change(primitives::Address::ZERO, &new_key_bytes);
+        let key_change_msg =
+            staking::msg::key_change(primitives::Address::ZERO, &new_key_bytes, pop.as_bytes());
 
         // Submit both txs to the first app's mempool — they'll be
         // included in the next block.
@@ -2517,7 +2522,7 @@ mod tests {
 
         // The new key is active for validator 0.
         let new_key = *devnet.validator_set().validator(0).expect("validator 0");
-        assert_eq!(new_key.as_bytes(), &new_key_bytes, "validator 0 key must be rotated");
+        assert_eq!(new_key.as_bytes(), new_key_bytes.as_slice(), "validator 0 key must be rotated");
         assert_ne!(new_key, original_key, "key must have changed");
 
         // The staking address is preserved (identity survives rotation).
@@ -2556,9 +2561,11 @@ mod tests {
         // validator offline. A large stake here would (correctly)
         // halt the chain — the dominant validator would be required
         // for every quorum.
-        let new_key = bls_key(0xAA).public_key();
+        let new_sk = bls_key(0xAA);
+        let new_key = new_sk.public_key();
+        let pop = new_sk.pop_prove();
         let new_addr = primitives::Address([0xAA; 20]);
-        let add_msg = staking::msg::validator_add(new_addr, new_key.as_bytes(), 1);
+        let add_msg = staking::msg::validator_add(new_addr, new_key.as_bytes(), 1, pop.as_bytes());
         devnet.apps[0].ingest_tx(make_staking_tx(&add_msg, 1));
         devnet.run_batch(3, 0);
 
