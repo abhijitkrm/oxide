@@ -14449,3 +14449,54 @@ children (continuity needs the parent's header; stale-view proposals
 aren't stored). Pre-fix this node voted for unexecutable children —
 worse. Real recovery is node-level block/state sync; worth an
 `import_block` seam when the sync protocol lands.
+
+## Session — all-protocol matcher TPS benchmark + FIX silent-drop fix
+
+### What
+
+- Ran `e2e_all_protocols::benchmark_all_protocols` (1M orders per
+  protocol, single synchronous connection, release build) — the
+  first clean per-protocol comparison post-C7.
+- **The benchmark itself was stale**: C7 nonce/pubkey/signature
+  requirements (order replay protection) made every protocol's
+  test orders invalid, so prior ad-hoc numbers measured *reject*
+  throughput, not matching:
+  - Binary TCP sent `nonce: 0` forever → all orders after the
+    first per account bounced `StaleNonce` (only ~500 real fills
+    per 1M).
+  - JSON-RPC/WS lacked `pubkey`/`signature` params →
+    `Invalid params` for every order.
+  - FIX lacked tags 9666/9700/9701 → `parse_fix_order` failed on
+    every message — and surfaced a real server bug below.
+- Test now carries per-owner incrementing nonces and the
+  mandatory pubkey/signature params/tags on all four protocols.
+
+### Bug found + fixed (the benchmark earned its keep)
+
+- **FIX server silently dropped parse failures** (both shared and
+  multi-market impls): `parse_fix_order`/`parse_fix_cancel`
+  returning `None` hit a bare `continue` — no response. A client
+  doing request/response per message blocks forever → the
+  benchmark hung on the very first order at 0% CPU. Both impls
+  now answer malformed messages with a rejected `ExecutionReport`
+  (`RejectReason::Malformed`) — a session must never wedge on a
+  bad message.
+
+### Measured (1M orders, 1k accounts, single sync conn, release)
+
+| Protocol | orders/s | notes |
+|---|---|---|
+| Binary TCP (43B frames) | **49,346** | fastest — fixed-size parse |
+| FIX 4.4 | 47,039 | tag-split beats JSON parse |
+| JSON-RPC (line-delimited) | 38,805 | serde_json per message |
+| WebSocket (JSON + frames) | 33,220 | masking + frame overhead |
+
+500,000 fills each (100% of pairs) — real matching throughput,
+not reject throughput. Single-flight round-trip bound: these are
+*per-connection* numbers; server ceiling is far higher (binary
+batch mode: ~7M orders/s @ 8 conns, 500/batch — unchanged).
+
+### Tests
+
+- `cargo test -p matcher` — 94 green, 0 failures.
+- e2e bench: all four protocols verified end-to-end.

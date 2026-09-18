@@ -813,6 +813,14 @@ async fn run_fix_server_impl(
                         crate::fix::parse_fix_cancel_replace(&text)
                     };
                     let Some(action_req) = action_req else {
+                        // Malformed action — answer with a rejected
+                        // ExecutionReport instead of dropping the
+                        // message: a client blocking on a response
+                        // per message must never be wedged by a
+                        // parse failure.
+                        let resp = OrderResponse::rejected(RejectReason::Malformed);
+                        let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
+                        let _ = socket.write_all(report.as_bytes()).await;
                         continue;
                     };
                     if !crate::protocol::verify_action(&action_req) {
@@ -834,6 +842,14 @@ async fn run_fix_server_impl(
 
                 // Default: parse as NewOrderSingle (D).
                 let Some(req) = crate::fix::parse_fix_order(&text) else {
+                    // Malformed order — answer with a rejected
+                    // ExecutionReport instead of dropping the
+                    // message: a client blocking on a response per
+                    // message must never be wedged by a parse
+                    // failure.
+                    let resp = OrderResponse::rejected(RejectReason::Malformed);
+                    let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
+                    let _ = socket.write_all(report.as_bytes()).await;
                     continue;
                 };
                 // Submit to the matching server — through the SPSC
@@ -1450,6 +1466,14 @@ pub async fn run_fix_server_multi(
                         crate::fix::parse_fix_cancel_replace(&text)
                     };
                     let Some(action_req) = action_req else {
+                        // Malformed action — answer with a rejected
+                        // ExecutionReport instead of dropping the
+                        // message: a client blocking on a response
+                        // per message must never be wedged by a
+                        // parse failure.
+                        let resp = OrderResponse::rejected(RejectReason::Malformed);
+                        let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
+                        let _ = socket.write_all(report.as_bytes()).await;
                         continue;
                     };
                     if !crate::protocol::verify_action(&action_req) {
@@ -1465,6 +1489,14 @@ pub async fn run_fix_server_multi(
                     continue;
                 }
                 let Some(req) = crate::fix::parse_fix_order(&text) else {
+                    // Malformed order — answer with a rejected
+                    // ExecutionReport instead of dropping the
+                    // message: a client blocking on a response per
+                    // message must never be wedged by a parse
+                    // failure.
+                    let resp = OrderResponse::rejected(RejectReason::Malformed);
+                    let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
+                    let _ = socket.write_all(report.as_bytes()).await;
                     continue;
                 };
                 let resp = submit_one_multi(&matcher, req);

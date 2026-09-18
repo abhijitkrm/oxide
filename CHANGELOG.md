@@ -1155,6 +1155,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** the oracle can't move the price by more than
     10% in a single update, protecting against manipulation and bugs.
 
+- **FIX order-entry server wedged sessions on malformed messages**
+  (`crates/matcher/src/server.rs`, `crates/matcher/tests/e2e_all_protocols.rs`)
+  - Both FIX server impls (shared and multi-market) silently dropped
+    messages that failed `parse_fix_order`/`parse_fix_cancel` — no
+    response was ever written, so a client doing request/response
+    per message blocked forever. Both impls now answer malformed
+    messages with a rejected `ExecutionReport`
+    (`RejectReason::Malformed`).
+  - The `e2e_all_protocols` benchmark was itself stale post-C7: it
+    sent orders without the now-mandatory `nonce`/`pubkey`/
+    `signature` fields, so prior numbers measured reject
+    throughput, not matching. It now sends per-owner incrementing
+    nonces and the full credential fields on all four protocols.
+  - **In plain words:** a FIX client that sent a malformed order
+    previously heard nothing back and would wait forever; the
+    server now always answers, even if the answer is "rejected".
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).
