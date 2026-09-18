@@ -190,9 +190,20 @@ fn run_trading_tps(
         build_elapsed.as_secs_f64(),
     );
 
-    // Run the pipelined consensus loop.
-    eprintln!("trading TPS test: running {rounds} rounds (pipelined)...");
-    let (result, elapsed) = devnet.run_pipelined_txs(rounds, txs_per_round, &all_txs);
+    // Run the consensus loop. `TRADING_DRIVER=threaded` switches to
+    // `run_threaded_txs`: each validator on its own OS thread with
+    // dispersed block bodies over TCP — the closer approximation of
+    // a real multi-machine deployment.
+    let driver = std::env::var("TRADING_DRIVER").unwrap_or_else(|_| "pipelined".to_string());
+    let (result, elapsed) = if driver == "threaded" {
+        eprintln!(
+            "trading TPS test: running {rounds} rounds (threaded, {n_validators} threads)..."
+        );
+        devnet.run_threaded_txs(rounds, txs_per_round, &all_txs)
+    } else {
+        eprintln!("trading TPS test: running {rounds} rounds (pipelined)...");
+        devnet.run_pipelined_txs(rounds, txs_per_round, &all_txs)
+    };
     eprintln!("trading TPS test: completed in {:.3}s", elapsed.as_secs_f64());
 
     // ── Integrity checks ───────────────────────────────────────
@@ -257,7 +268,13 @@ fn run_trading_tps(
     //    AND the same state root, their execution is deterministic and
     //    identical. We use the executor's `attest_state` (via the
     //    `AppInterface` trait) to read the post-finalization root.
-    let final_height = result.finalized[0].last().map_or(primitives::Height::new(0), |b| b.height);
+    // The attested height must be inside the *common* prefix — the
+    // last block every validator committed. `finalized[0].last()`
+    // can be one flush block beyond it (an extra empty block only
+    // some validators commit — legal under the 2-chain rule), and
+    // attesting there yields `Hash::ZERO` on validators that never
+    // reached that height, a false divergence.
+    let final_height = result.finalized[0][min_blocks - 1].height;
     let root_0 = devnet.app(0).attest_state(final_height).root;
     for i in 1..n_validators {
         let root_i = devnet.app(i).attest_state(final_height).root;

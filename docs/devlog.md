@@ -14702,3 +14702,38 @@ reassembly without extra copies, WAL batching in the commit path.
   reconstruction, disperse/verify/reconstruct.
 - Gates: 119 consensus + 26 types + 31 devnet tests green; workspace
   clippy and fmt clean.
+
+## Session — trading-TPS across drivers + attestation-height test fix
+
+Measured `trading_tps` (on-chain match path — 200K individual order
+txs, 1,000/block) on both drivers after the dispersed-broadcast work.
+Added `TRADING_DRIVER=threaded` to the test (same switch as
+`SETTLE_DRIVER`).
+
+### Results (200K order txs, release, TCP loopback)
+
+| Driver | 4 validators | 8 validators |
+|---|---|---|
+| Pipelined (in-process) | 67,182 tx/s | 29,998 tx/s |
+| Threaded + dispersed (TCP) | **110,227 tx/s** | **45,978 tx/s** |
+
+The threaded driver now *beats* pipelined at both sizes (+64% at 4v,
++53% at 8v): per-core engine/executor parallelism outruns the
+serialized driver loop even paying real TCP + shard reassembly.
+Reference ceilings (single node, no consensus): raw matching
+51.6M orders/s; full exchange settle path ~5.0M orders/s
+(2.5M fills/s).
+
+### Bug fixed in the test, not the engine
+
+First threaded trading run failed the state-root check: validator 2
+attested `Hash::ZERO` at `final_height` while validator 0 attested a
+real root. Cause: `final_height` was read as `finalized[0].last()` —
+validator 0 had committed one *extra* empty flush block (a legal
+2-chain artifact, documented in the same test file) beyond the
+200-block common prefix, and v2 legitimately had no state root at a
+height it never committed. Fix: attest at the last block **of the
+common prefix** (`finalized[0][min_blocks - 1]`), which every
+validator provably committed. Re-run: all 8 validators agree on the
+state root at height 199 — deterministic execution confirmed on the
+dispersed path.

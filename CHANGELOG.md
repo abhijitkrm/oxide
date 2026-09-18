@@ -949,7 +949,33 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     received and checked. Throughput rose by about a third; the next
     wall is now raw bytes through the network links themselves.
 
+- **`TRADING_DRIVER=threaded` for the trading-TPS harness**
+  (`crates/devnet/tests/trading_tps.rs`)
+  - The on-chain match path can now be measured on the threaded
+    dispersed-broadcast driver, same as `SETTLE_DRIVER`. Measured
+    (200K order txs, TCP loopback): **110,227 tx/s at 4 validators,
+    45,978 tx/s at 8 validators** — the threaded driver now beats
+    pipelined at both sizes (+64% / +53% over 67,182 and 29,998
+    tx/s), with identical state roots on every validator.
+  - **In plain words:** orders matched through full consensus over
+    a real network now run about 1.5× faster than the simulated
+    in-process loop — real parallelism wins even after paying for
+    the wire.
+
 ### Fixed
+
+- **Trading-TPS state-root check attested beyond the common prefix**
+  (`crates/devnet/tests/trading_tps.rs`)
+  - The integrity check read `finalized[0].last()` for the attested
+    height — validator 0 can legally commit one extra empty flush
+    block beyond the shared prefix (2-chain rule), leaving other
+    validators with `Hash::ZERO` at a height they never committed.
+    The check now attests at the last block *of the common prefix*,
+    matching the tx-consistency check above it.
+  - **In plain words:** a false "validators diverged" alarm in the
+    benchmark — the test asked a validator for state it never had,
+    not a real execution difference. Execution determinism itself is
+    confirmed identical across all 8 validators.
 
 - **Consensus liveness under message reorder: QC before proposal**
   (`crates/consensus/src/engine.rs`)
