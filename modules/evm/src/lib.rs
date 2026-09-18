@@ -3545,9 +3545,16 @@ impl Module for EvmModule {
     /// transaction does not abort the batch.
     fn handle_batch_preverified(
         &self,
-        ctx: &TxContext,
+        ctxs: &[TxContext],
         txs: &[executor::PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
+        // The per-tx envelope contexts are unused — the EVM recovers
+        // each sender from the transaction's own secp256k1 signature
+        // and verifies it against `pv.sender`. A zero ctx (same
+        // convention as `handle_batch` above) makes the ignoring
+        // explicit rather than passing an arbitrary tx's context.
+        let ctx = TxContext { sender: primitives::Address([0u8; 20]), nonce: 0, fee: 0 };
+        let _ = ctxs;
         // Convert the executor's `PreverifiedTx` (generic [u8; 20]
         // sender) to the EVM's `PreverifiedTx` (revm Address sender).
         // The raw bytes stay borrowed — no per-tx clone.
@@ -3559,7 +3566,7 @@ impl Module for EvmModule {
             })
             .collect();
         // Call the inherent `handle_batch_preverified` (3 args).
-        EvmModule::handle_batch_preverified(self, ctx, &evm_txs)
+        EvmModule::handle_batch_preverified(self, &ctx, &evm_txs)
     }
 
     /// Execute a batch of pre-verified EVM transactions in parallel.
@@ -3575,9 +3582,13 @@ impl Module for EvmModule {
     /// transaction does not abort the batch.
     fn handle_batch_parallel_preverified(
         &self,
-        ctx: &TxContext,
+        ctxs: &[TxContext],
         txs: &[executor::PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
+        // Same convention as `handle_batch_preverified`: envelope
+        // contexts are unused — senders come from the signatures.
+        let ctx = TxContext { sender: primitives::Address([0u8; 20]), nonce: 0, fee: 0 };
+        let _ = ctxs;
         // Convert the executor's `PreverifiedTx` to the EVM's.
         // The raw bytes stay borrowed — no per-tx clone.
         let evm_txs: Vec<PreverifiedTx<'_>> = txs
@@ -3588,7 +3599,7 @@ impl Module for EvmModule {
             })
             .collect();
         // Call the inherent `handle_batch_parallel_preverified` (3 args).
-        EvmModule::handle_batch_parallel_preverified(self, ctx, &evm_txs)
+        EvmModule::handle_batch_parallel_preverified(self, &ctx, &evm_txs)
     }
 
     fn end_block(&self, height: Height) {

@@ -15109,3 +15109,60 @@ it cannot certify the current combined design.
 5. Network/resource hardening + settlement reconciliation (C5, C9 +
    DA/backpressure items).
 6. Rebaseline production-like TPS under the metric set above.
+
+## Session — audit fix C1: per-transaction identity on the preverified path
+
+First fix from the audit list (critical finding C1). Root cause:
+`execute_block` detected a fully-cached module group and called
+`handle_batch_preverified(&group[0].0, ...)` — the **first** tx's
+`TxContext` — and the default trait impl replicated it across every
+tx. All txs in a cached group ran under the first sender's identity
+(sender, nonce, AND fee). Two aggravating details:
+
+- The default `preverify_batch` returns `Ok` with a zero-sender
+  placeholder for **every** module, so `ingest_tx` cached native txs
+  too — `all_cached` was true for native groups even though nothing
+  had been pre-verified. The ingest comment claimed a zero-sender
+  fallback existed; none did.
+- Proposer vs follower cache asymmetry was a live divergence vector:
+  a validator that ingested the txs took the wrong-sender path while
+  one that only saw the proposal (cache miss) executed correctly —
+  same block, different state roots.
+
+Fix shape (three parts):
+
+1. **Trait signature**: `handle_batch_preverified` and
+   `handle_batch_parallel_preverified` now take `ctxs: &[TxContext]`
+   — one authenticated context per tx. The default impl zips
+   `ctxs[i]` with `txs[i]` instead of replicating one ctx. The
+   footgun is gone for any future module that gains real
+   pre-verification.
+2. **Call site**: `execute_block` collects each grouped tx's own
+   parsed ctx (`group` already carried them — the correct contexts
+   were computed and then ignored).
+3. **Honest cache**: `ingest_tx`/`ingest_tx_batch` only cache a
+   sender that was actually authenticated — the module's own
+   recovery (non-zero `pv.sender`, e.g. EVM) or the
+   envelope-verified `ctx.sender` for signed native txs (keeps the
+   ~40 µs auth fast-path and makes `pv.sender` honest). An
+   admitted-unsigned tx with a zero placeholder sender is no longer
+   cached — `all_cached` stays false and the group keeps the plain
+   `handle_batch` path.
+
+EVM trait impls: signature updated; they build a zero ctx (same
+convention as `handle_batch` — the EVM re-recovers each sender from
+the tx's own signature and verifies it against `pv.sender`, so the
+envelope ctx is genuinely unused; passing an arbitrary tx's ctx would
+re-introduce the trap if the EVM ever consumed it).
+
+Test first, per standards: `preverified_path_preserves_per_tx_context`
+— a module with real preverify + the default `handle_batch_preverified`
+recording each tx's ctx; two senders in one group → before the fix
+both ran under the group leader's ctx (test failed with `0xB2`
+recorded for both), after the fix each runs under its own.
+`PreverifyTrackingModule` updated to return a non-zero sender (zero
+senders are no longer cacheable — and a non-zero return is the honest
+shape of a real preverify impl).
+
+Gates: 71 executor + 178 evm lib tests green; workspace builds;
+fmt + clippy `-D warnings` clean.

@@ -1004,6 +1004,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Cached execution ran every cached transaction under the first
+  transaction's identity** (`crates/executor`, `modules/evm`)
+  - `execute_block` passed the group leader's `TxContext` (sender,
+    nonce, fee) to `handle_batch_preverified` and the default impl
+    replicated it across the whole group. Every cached native
+    transaction executed as the first sender — and because the
+    preverify cache population differs between a validator that
+    ingested the txs and one that only saw the proposal, the same
+    block could execute differently across replicas.
+  - Both batch entry points now take `ctxs: &[TxContext]` — one
+    authenticated context per transaction — and the default impl
+    pairs `ctxs[i]` with `txs[i]`.
+  - `ingest_tx`/`ingest_tx_batch` no longer cache zero-sender
+    placeholders: a cache entry now asserts an authenticated sender
+    exists (module-level recovery, or the envelope-verified sender
+    for signed native txs). Unsigned-admitted txs stay off the
+    preverified path entirely.
+  - **In plain words:** a silent wrong-account bug — every cached
+    transaction in a group was charged to, and authorized as, the
+    first sender in the group, and two validators could honestly
+    disagree about the result of the same block.
+
 - **Trading-TPS state-root check attested beyond the common prefix**
   (`crates/devnet/tests/trading_tps.rs`)
   - The integrity check read `finalized[0].last()` for the attested

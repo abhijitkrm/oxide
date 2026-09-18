@@ -508,7 +508,14 @@ pub trait Module: Send + Sync {
     /// skips secp256k1 recovery entirely — only RLP decoding and
     /// chain ID validation remain.
     ///
-    /// The default implementation falls back to [`handle_batch`](Self::handle_batch).
+    /// `ctxs` carries the per-transaction envelope context parsed by
+    /// the executor: `ctxs[i]` is the authenticated context (sender,
+    /// nonce, fee) for `txs[i]`. Passing one context for the whole
+    /// batch was a silent wrong-sender bug — every tx in the group
+    /// executed under the first tx's identity.
+    ///
+    /// The default implementation pairs each context with its
+    /// payload and falls back to [`handle_batch`](Self::handle_batch).
     /// Modules with a pre-verified path (e.g. EVM) override this
     /// to skip sender recovery.
     ///
@@ -519,10 +526,16 @@ pub trait Module: Send + Sync {
     /// the batch.
     fn handle_batch_preverified(
         &self,
-        ctx: &TxContext,
+        ctxs: &[TxContext],
         txs: &[PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
-        let batch: Vec<(TxContext, &[u8])> = txs.iter().map(|pv| (*ctx, pv.raw)).collect();
+        debug_assert_eq!(
+            ctxs.len(),
+            txs.len(),
+            "each preverified tx must carry its own envelope context"
+        );
+        let batch: Vec<(TxContext, &[u8])> =
+            txs.iter().zip(ctxs.iter()).map(|(pv, ctx)| (*ctx, pv.raw)).collect();
         self.handle_batch(&batch)
     }
 
@@ -532,6 +545,9 @@ pub trait Module: Send + Sync {
     /// are grouped by sender to avoid write conflicts, and each
     /// group is executed on a separate rayon thread. Results are
     /// merged in original block order.
+    ///
+    /// `ctxs` carries the per-transaction envelope context:
+    /// `ctxs[i]` belongs to `txs[i]`.
     ///
     /// The default implementation falls back to
     /// [`handle_batch_preverified`](Self::handle_batch_preverified)
@@ -545,10 +561,10 @@ pub trait Module: Send + Sync {
     /// the batch.
     fn handle_batch_parallel_preverified(
         &self,
-        ctx: &TxContext,
+        ctxs: &[TxContext],
         txs: &[PreverifiedTx<'_>],
     ) -> Vec<Result<Vec<Event>, ExecError>> {
-        self.handle_batch_preverified(ctx, txs)
+        self.handle_batch_preverified(ctxs, txs)
     }
 
     /// Called at the end of each block, after all txs.
@@ -1998,13 +2014,19 @@ impl Executor {
                     })
                     .collect();
 
+                // Each tx keeps its own authenticated envelope
+                // context — `ctxs[i]` pairs with `preverified[i]`.
+                // Passing `group[0].0` here previously executed the
+                // whole group under the first tx's identity.
+                let ctxs: Vec<TxContext> = group.iter().map(|(ctx, _, _)| *ctx).collect();
+
                 // Use the pre-verified path. For large batches, use
                 // the parallel speculative path; for small batches,
                 // serial is faster (avoids rayon overhead).
                 if group.len() >= self.parallel_threshold {
-                    module.handle_batch_parallel_preverified(&group[0].0, &preverified)
+                    module.handle_batch_parallel_preverified(&ctxs, &preverified)
                 } else {
-                    module.handle_batch_preverified(&group[0].0, &preverified)
+                    module.handle_batch_preverified(&ctxs, &preverified)
                 }
             } else {
                 // Fall back to the recovery path — no preverified
@@ -2095,16 +2117,14 @@ impl AppInterface for Executor {
         // a signed envelope's secp256k1 signature must recover to the
         // declared sender — otherwise `ctx.sender` is just a claim.
         // Unsigned txs are admitted or rejected per
-        // `unsigned_tx_policy`.
-        if let Err(reason) = self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None)
-        {
-            return MempoolAck::Rejected { reason: reason.to_string() };
-        }
-        // Verified or admitted-unsigned: the preverify insert below
-        // already records this tx's hash in the cache (the default
-        // `preverify_batch` returns Ok for every module), which is
-        // what `execute_block` checks to skip re-running the ~40 µs
-        // signature recovery.
+        // `unsigned_tx_policy`. The returned bool records whether a
+        // signature actually verified — it decides what the preverify
+        // cache may claim below.
+        let envelope_verified =
+            match self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None) {
+                Ok(v) => v,
+                Err(reason) => return MempoolAck::Rejected { reason: reason.to_string() },
+            };
         let payload = module_payload(bytes);
         if let Err(e) = module.validate(&ctx, payload) {
             return MempoolAck::Rejected { reason: format!("validate: {e:?}") };
@@ -2116,23 +2136,46 @@ impl AppInterface for Executor {
         // cached sender is used to skip recovery entirely — the
         // execution hot path sees only RLP decode + chain ID check.
         //
-        // For modules without a preverify implementation (default
-        // returns a zero sender), this is a no-op that stores a
-        // placeholder. The execution path falls back to `handle_batch`
-        // when the sender is zero.
+        // A cache entry asserts "a trustworthy sender exists for this
+        // exact tx hash" — `check_envelope_auth` treats a hit as
+        // already-verified, and `execute_block` routes all-cached
+        // groups through the preverified path. We therefore only
+        // cache a sender that was actually authenticated:
+        //
+        // - a non-zero sender from `preverify_batch` means the module
+        //   verified the payload itself (EVM signature recovery);
+        // - otherwise, if the envelope signature verified, `ctx.sender`
+        //   is the authenticated sender — cache it so the entry is
+        //   honest rather than a zero placeholder;
+        // - an admitted-unsigned tx with a zero placeholder sender
+        //   has nothing verified to cache — skipping it keeps
+        //   `all_cached` false, so the group takes the plain
+        //   `handle_batch` path (correct per-tx contexts).
+        //
         // `msgs` must outlive `preverify_result` — the returned
         // `PreverifiedTx` borrows the payload slice.
         let msgs = [payload];
         let preverify_result = module.preverify_batch(&msgs);
         if let Ok(preverified) = &preverify_result[0] {
-            let tx_hash =
-                crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, tx.as_bytes());
-            // Only the sender is cached — the payload is re-borrowed
-            // from the block's tx at execution time.
-            self.preverify_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(tx_hash, preverified.sender);
+            let trustworthy = if preverified.sender != [0u8; 20] {
+                Some(preverified.sender)
+            } else if envelope_verified {
+                Some(ctx.sender.0)
+            } else {
+                None
+            };
+            if let Some(sender) = trustworthy {
+                let tx_hash = crypto::hash::Hasher::hash_one(
+                    crypto::hash::Domain::Transaction,
+                    tx.as_bytes(),
+                );
+                // Only the sender is cached — the payload is
+                // re-borrowed from the block's tx at execution time.
+                self.preverify_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(tx_hash, sender);
+            }
         }
 
         // Push to the bounded intake ring. The mempool submission
@@ -2212,35 +2255,52 @@ impl AppInterface for Executor {
                 continue;
             };
             // Envelope authentication — same rules as `ingest_tx`.
-            // Verified txs are recorded via the preverify insert
-            // below so `execute_block` skips the re-verification.
-            if let Err(reason) =
-                self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None)
-            {
-                results.push(MempoolAck::Rejected { reason: reason.to_string() });
-                continue;
-            }
+            // The bool records whether a signature verified, which
+            // decides what the preverify cache may claim below.
+            let envelope_verified =
+                match self.check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), None) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        results.push(MempoolAck::Rejected { reason: reason.to_string() });
+                        continue;
+                    }
+                };
             let payload = module_payload(bytes);
             if let Err(e) = module.validate(&ctx, payload) {
                 results.push(MempoolAck::Rejected { reason: format!("validate: {e:?}") });
                 continue;
             }
-            // Pre-recover the sender at ingestion time. `msgs` must
-            // outlive `preverify_result` — the returned
-            // `PreverifiedTx` borrows the payload slice.
+            // Pre-recover the sender at ingestion time. Only cache a
+            // sender that was actually authenticated — the module's
+            // own recovery (non-zero) or the envelope-verified
+            // `ctx.sender`. A zero placeholder on an
+            // admitted-unsigned tx is skipped so `all_cached` stays
+            // false and the group keeps the plain `handle_batch`
+            // path. `msgs` must outlive `preverify_result` — the
+            // returned `PreverifiedTx` borrows the payload slice.
             let msgs = [payload];
             let preverify_result = module.preverify_batch(&msgs);
             if let Ok(preverified) = &preverify_result[0] {
-                let tx_hash = crypto::hash::Hasher::hash_one(
-                    crypto::hash::Domain::Transaction,
-                    tx.as_bytes(),
-                );
-                // Only the sender is cached — the payload is
-                // re-borrowed from the block's tx at execution time.
-                self.preverify_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(tx_hash, preverified.sender);
+                let trustworthy = if preverified.sender != [0u8; 20] {
+                    Some(preverified.sender)
+                } else if envelope_verified {
+                    Some(ctx.sender.0)
+                } else {
+                    None
+                };
+                if let Some(sender) = trustworthy {
+                    let tx_hash = crypto::hash::Hasher::hash_one(
+                        crypto::hash::Domain::Transaction,
+                        tx.as_bytes(),
+                    );
+                    // Only the sender is cached — the payload is
+                    // re-borrowed from the block's tx at execution
+                    // time.
+                    self.preverify_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(tx_hash, sender);
+                }
             }
             accepted_txs.push(tx);
             results.push(MempoolAck::Accepted);
@@ -2948,11 +3008,14 @@ mod tests {
             &self,
             msgs: &'a [&'a [u8]],
         ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
-            msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0u8; 20] })).collect()
+            // Return a non-zero sender — a zero sender is the
+            // "no pre-verification" placeholder and is no longer
+            // cached by `ingest_tx`.
+            msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20] })).collect()
         }
         fn handle_batch_preverified(
             &self,
-            _ctx: &TxContext,
+            _ctxs: &[TxContext],
             txs: &[PreverifiedTx<'_>],
         ) -> Vec<Result<Vec<Event>, ExecError>> {
             *self.preverified_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) +=
@@ -2998,6 +3061,95 @@ mod tests {
             *tracker.fallback_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(preverified, 1, "preverified path should have been used (cache hit)");
         assert_eq!(fallback, 0, "fallback path should not have been used (no cache miss)");
+    }
+
+    /// A test module with a *real* `preverify_batch` (returns a
+    /// non-zero recovered sender, like the EVM's signature recovery)
+    /// that deliberately does NOT override `handle_batch_preverified`.
+    /// The default impl is what executes — this is the shape every
+    /// native module has once it gains payload-level pre-verification.
+    /// `handle` records the `TxContext` each tx ran under so the test
+    /// can prove per-tx identity propagation.
+    struct CtxRecordingModule {
+        seen: Mutex<Vec<TxContext>>,
+    }
+
+    impl CtxRecordingModule {
+        fn new() -> Self {
+            Self { seen: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl Module for CtxRecordingModule {
+        fn name(&self) -> &'static str {
+            "ctx-recorder"
+        }
+        fn id(&self) -> u8 {
+            7
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(*ctx);
+            Ok(vec![])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn preverify_batch<'a>(
+            &self,
+            msgs: &'a [&'a [u8]],
+        ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
+            // A non-zero sender marks "the module verified this
+            // payload" — the executor caches it so `execute_block`
+            // takes the preverified path.
+            msgs.iter().map(|raw| Ok(PreverifiedTx { raw, sender: [0x42; 20] })).collect()
+        }
+    }
+
+    /// Regression test for the cached-execution identity bug: the
+    /// preverified path must execute each tx under **its own**
+    /// `TxContext` — sender, nonce, and fee — not the first tx's.
+    /// Before the fix, `execute_block` passed `group[0].0` and the
+    /// default `handle_batch_preverified` replicated it across every
+    /// tx, so all txs in a cached group ran as the first sender.
+    /// Because every validator with the same cache population made
+    /// the same mistake the state roots still agreed — the bug was
+    /// silent — but a validator whose cache missed (never ingested
+    /// the tx, e.g. received it only via proposal) executed
+    /// correctly and *diverged*.
+    #[test]
+    fn preverified_path_preserves_per_tx_context() {
+        let mut executor = Executor::new(100);
+        let recorder = Arc::new(CtxRecordingModule::new());
+        executor.register_module(recorder.clone());
+
+        // Two txs from different senders — both nonce 0 is legal
+        // because nonces are per-sender.
+        let tx_a = make_tx_with_fee_and_sender(7, &[1], 0, 100, 0xA1);
+        let tx_b = make_tx_with_fee_and_sender(7, &[2], 0, 100, 0xB2);
+        executor.ingest_tx(tx_a);
+        executor.ingest_tx(tx_b);
+
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        assert_eq!(proposal.txs.len(), 2, "both txs should be in the proposal");
+        let block =
+            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        executor.finalize_block(&block);
+
+        let seen = recorder.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(seen.len(), 2, "both txs should have executed");
+        // The mempool may reorder txs, so don't assume group order —
+        // the property is that *each* tx ran under its own context:
+        // both senders must appear exactly once.
+        let mut senders: Vec<primitives::Address> = seen.iter().map(|c| c.sender).collect();
+        senders.sort();
+        assert_eq!(
+            senders,
+            vec![Address([0xA1; 20]), Address([0xB2; 20])],
+            "each tx must execute under its own sender, not the group leader's"
+        );
     }
 
     // ---- H4 fix: mempool replay protection ----
