@@ -14852,3 +14852,260 @@ it) precisely because the tradeoff is workload-dependent.
   rather than hanging (5s watchdog).
 - Gates: 125 consensus + 70 executor + 18 node + full workspace green;
   clippy `-D warnings` clean; fmt clean.
+
+## Session — full architecture & security audit (read-only)
+
+Broad review across consensus/crypto, executor, EVM, exchange, perps,
+matcher, networking, snapshots, and benchmarks at `a96b702`. Verdict:
+**the matching structures are promising but the code is not fund-safe
+yet; correctness work outranks further TPS.** This entry records the
+findings; fixes land one per section below in follow-up sessions.
+
+Method note: read-only source review — no adversarial tests executed,
+no files changed. Findings cite code paths; absence of a live exploit
+reproduction does not downgrade severity where the invariant violation
+is structural.
+
+### Corrections to prior claims (recorded honestly)
+
+- Skipping `verify_exec_cert` on matching roots does **not** establish
+  that an accepted certificate is quorum-signed — it establishes only
+  that the claimed root matches local execution. Cert validity and
+  root agreement are separate properties; the fast path conflates them.
+- Execution certs are optional in headers — not every block carries
+  one — and a single divergent validator need not halt the chain.
+- All TPS numbers to date are **dev-harness results**, not validated
+  production settlement capacity: unsigned native envelopes,
+  in-memory EVM, no consensus WAL attached, loopback-only transport.
+
+### C1 — CRITICAL: cached execution assigns every native tx the first tx's identity
+
+`crates/executor/src/lib.rs` ~1987-2015 + ~496-526: the preverified
+path is chosen when every tx in a module group is cached, but passes
+only the **first** transaction's `TxContext`; the default impl applies
+it to every payload. Later txs execute as the wrong sender — wrong
+authorization, and different mempool/cache histories across validators
+produce different executions of the same block. Fix direction: preserve
+each tx's authenticated context; caches are hints, not semantics.
+Required regression: identical block, {empty, partial, complete} cache
+→ identical per-tx outcomes and state.
+
+### C2 — CRITICAL: quorum formula unsafe for supported committee sizes
+
+`crates/consensus/src/validator.rs` ~223-236: `f = floor((n-1)/3)`,
+`quorum = 2f+1` — correct only for `n = 3f+1`. At n=8 (all benchmarks):
+f=2, quorum=5, min QC intersection = 2 → both could be Byzantine; the
+honest-intersection guarantee is gone. Also: quorums count validators
+while the spec promises stake-weighted voting, and embedded-proposal
+QCs hit `verify_qc_signature` (nonempty-signer check, ~1715-1726) —
+the actual quorum check lives only in `deliver_qc` (~2466-2498), so
+validation depends on the entry path. Fix: one voting-power model +
+one complete cert validator used everywhere (n=8 needs 6 under equal
+weight; PoS needs >2/3 authenticated power).
+
+### C3 — CRITICAL: BLS aggregation lacks key-admission proofs
+
+`crates/crypto/src/bls_signer.rs` ~167-185 uses
+`blst::fast_aggregate_verify`, which assumes every public key passed
+proof-of-possession. No PoP admission path exists; rotation accepts
+any 48-byte key (`modules/staking/src/lib.rs` ~1936-1966); no
+uniqueness checks on keys or addresses. Adversarially chosen keys void
+the aggregate-cert security argument (upstream blst documents the PoP
+prerequisite). Fix: PoP verify at genesis/add/rotate; encoding,
+subgroup, nonidentity checks; reject duplicate keys/identities; cache
+validated keys.
+
+### C4 — CRITICAL: parallel EVM execution is not generally equivalent to block order
+
+`modules/evm/src/lib.rs` ~2355-2390 + ~2684-2734: sender-grouped
+speculation commits whole groups in first-sender-appearance order —
+`A0,B0,A1` can effectively run `A0,A1,B0`. The "read-only group" fast
+path skips conflict detection while still reading state other txs
+mutated (gas, success, logs, return values). Coinbase is excluded from
+conflict sets though contracts observe its balance. Cross-module
+grouping assumes independence, but staking/exchange/perps share the
+EVM ledger. Speculative native precompiles can also touch shared
+staking state outside the EVM CacheDB clone. Fix: transaction-indexed
+validation/commit with complete dependency tracking; parallelize
+decode/sig-recovery/prefetch, reorder state transitions only where
+equivalence is proven.
+
+### C5 — CRITICAL: matcher authentication is incomplete and inconsistent
+
+`crates/matcher/src/protocol.rs` ~207-225: `verify_order` checks a
+signature against the **request-supplied** public key — no binding
+that the key controls the claimed owner. Single-order TCP path
+(`server.rs` ~546-568) submits without `verify_order`. Multi-market
+workers (`lib.rs` ~1320-1336) lack nonce tracking + risk engine.
+Cancel/amend drops the signed action nonce. Fix: one mandatory
+admission boundary (decode → authenticate → replay-check → risk →
+reserve → match) across TCP/WS/JSON-RPC/FIX, single/batch/multi-market;
+EVM-owned accounts need delegation/session keys for Ed25519 orders.
+
+### C6 — CRITICAL: matcher reservations mint fictitious balance
+
+`crates/matcher/src/lib.rs` ~263-362 + ~426-438: limit-buy reservation
+is debited in full; unfilled qty is refunded **even while still
+resting**; cancel refunds the resting qty again → buy+cancel grows
+available balance. Market buys skip reservation while fills still
+credit sellers. Price improvement is not reconciled against the
+reservation. `CanceledRemainder` treated as resting though IOC
+remainders die. On-chain exchange (`modules/exchange/src/lib.rs`
+~563-608) mutates the book before settlement and relies on a claimed
+executor rollback that **does not exist** — a failed later transfer
+leaves book + earlier transfers applied. Fix: explicit
+available/reserved/pending balances + an atomic journal over
+book/balances/fills/events.
+
+### C7 — CRITICAL: perps lacks core financial invariants
+
+`modules/perps/src/lib.rs`: withdrawal checks stored margin, not
+equity/required-margin-after (~1220-1260); position flips classified
+as reducing without checking the flipped magnitude (~1364-1384);
+resting-order exposure unreserved; reductions update size/entry
+without realizing PnL into collateral (~1434-1467); liquidation zeroes
+positions with no matched close/backstop transfer (~767-798). Fix:
+spec + enforce position conservation, realized/unrealized PnL
+reconciliation, withdrawal solvency, open-order margin reservation,
+explicit reduce-only, matched liquidation/backstop transfers.
+
+### C8 — CRITICAL: state roots do not authenticate the complete state machine
+
+`modules/exchange` ~494-498 and `modules/perps` ~1184-1188 hash KV
+stores only; resting books/order priority, positions, margin, marks,
+insurance, staking attendance/pending-changes live elsewhere. For
+exchange/perps the store mostly records market config. Separately,
+block-execution roots hash module roots while `export_snapshot`
+(~2034-2049 vs ~1495-1512) adds the nonce root — two different root
+definitions. Identical roots across validators therefore do not prove
+identical trading state. Fix: one canonical commitment over every
+future-affecting field, shared by execution/replay/snapshot/proofs;
+derived caches excluded, authoritative state included.
+
+### C9 — CRITICAL: "committee governance" grants single validators admin power
+
+`modules/staking/src/lib.rs` ~1994-2048 + ~2066-2078: add/remove only
+checks the sender is a validator — one signer's command, not a
+committee vote. Addition inserts declared stake with no bonded
+collateral in that path. Consensus on inclusion ≠ governance
+authorization. Fix: explicit governance auth, bonded admission + PoP,
+epoch-bound activation under the previous set; same scrutiny for
+privileged mark/funding overrides.
+
+### C10 — CRITICAL: durable signing fails open
+
+`crates/consensus/src/engine.rs` ~641-662: `append_wal` ignores
+append/fsync errors and signs anyway; `bin/oxide-validator/src/main.rs`
+~1231-1254 builds leader self-votes outside the normal path, bypassing
+the persistent vote-lock update. A validator can emit signatures whose
+safety state was never durably recorded, then restart with stale
+voting knowledge. Fix: one signing authority for leader+follower
+votes; no signature leaves before its anti-equivocation state is
+durable; WAL failure disables signing and alerts.
+
+### High-severity (below the critical bar, still release-blocking)
+
+- **Exec-cert validation shortcut** (`engine.rs` ~1740-1763,
+  ~1923-1976): root match bypasses sig/signer/epoch checks; attestation
+  sig cache keys on (height,root) not epoch. Fix: full validation once,
+  cache under complete cert identity + validator-set epoch; represent
+  "not yet executed" explicitly, not `Hash::ZERO`.
+- **Async lane ownership** (`executor` ~1267-1294, ~2466-2500,
+  ~1447-1488): unbounded queue, no join handle, worker panic leaves
+  waiters blocked, send failure runs a *newer* block inline skipping
+  the missing prefix; snapshot drain is racy (new block can start
+  post-drain); import mutates modules before finishing validation.
+  Fix: bounded execution actor, ordered seq checks, failure
+  propagation, graceful drain/join, snapshot-at-height-boundary,
+  stage-then-publish import.
+- **Dispersal is not Byzantine-resilient DA** (`types/src/shard.rs`
+  ~24-29, `devnet/src/tcp_multinode.rs` ~1787-1824): all-shards
+  reconstruction → one withheld shard stalls execution post-vote;
+  receiver allocates shard storage from unauthenticated `shard.total`.
+  Fix: authenticated limits, byte budgets, repair/retrieval, erasure
+  coding; commitment notarization ≠ recoverability proof.
+- **Market-creation memory DoS** (`exchange` ~478-485,
+  `trading/src/book.rs` ~94-115): permissionless listing +
+  `max_resting` sizes pool/hash directly. Fix: governance-gated
+  creation, hard memory caps, checked sizing, resource metering.
+- **Settlement submission ≠ completion** (`matcher/server.rs`
+  ~273-344): pending envelope dropped on mempool accept; unsigned
+  batches; qty aggregation changes rounding. Fix: durable outbox,
+  authenticated batches, stable fill/batch IDs, receipt
+  reconciliation, distinct matched/submitted/finalized/settled.
+- **Network backpressure/auth** (`p2p/src/tcp.rs` ~1323-1338,
+  `matcher/market_data.rs` ~235-253, `rpc/server.rs` ~379-409):
+  unbounded pre-timeout handshake read on accept thread; allowlisted
+  self-claimed peer ID is not auth; market-data unbounded queues
+  (comment claims "queue full" drops — false); RPC rate-limit key is a
+  shared fallback IP; timed-out blocking tasks keep running. Fix:
+  authenticated transport, handshake deadlines, bounded per-peer byte
+  budgets, concurrency caps, explicit slow-consumer eviction.
+
+### Performance redesigns worth doing — after semantics are fixed
+
+- Real accounts don't hit the flat balance cache (requires
+  `[u32 idx][16 zero]` addresses; ordinary wallets take the mutex
+  map). Resolve authenticated addresses to internal `AccountId`s at
+  admission instead of prefix tricks; adjacent `AtomicU64`s still
+  false-share.
+- Parallelize preparation (decode, sig recovery, prefetch), commit in
+  canonical tx order — the reth pattern.
+- Kill per-block full-state work: nonce-map clone per block, repeated
+  body encode/hash, Merkle proof rebuilds for root-only needs,
+  `mem::take` discarding fill-buffer capacity, per-fill event allocs.
+- Cross-market risk needs deterministic account-risk ownership or
+  bounded per-market collateral allocation — concurrent atomic balance
+  updates alone don't give portfolio solvency + replay determinism.
+- Separate control traffic (votes/QCs) from bulk (bodies, snapshots,
+  market data); profile the TLS stream-mutex under real encryption.
+- WAL group-commit + dedicated persistence lane, but keep the
+  durable-before-signing watermark; bench disk-backed execution and
+  crash recovery.
+
+### Benchmark methodology rebuild (required before citing TPS)
+
+- Threaded timer stops at consensus-thread join; exec workers may
+  still run (attest waits happen after timing ends).
+- Workloads use unsigned native envelopes; in-memory EVM; no WAL.
+- Settle workload: 16 buyers × 15 sellers = ≤240 pairs/batch —
+  pair-aggregation wins may not generalize.
+- `2 × fills/s` is order-side equivalents, not order-entry TPS.
+- Balance-contention bench starts the clock after thread spawn.
+- All 8v numbers ran under the unsafe quorum (C2).
+- Required metric set: admission (authed orders/s, p99), matching
+  (new/cancel/amend, p99.9), consensus (correct-quorum blocks/s,
+  finality, faulty-leader recovery), execution (txs+fills/s, lag),
+  settlement (finalized successful settlements/s, reconciliation lag),
+  durability (persisted execs/s, fsync, crash-recovery correctness) —
+  on separate machines, signed traffic, TLS, disk, slow consumers.
+
+### Adversarial test gates to add
+
+Consensus: n∈{4..10}, unequal stake, dup/rogue keys, subquorum
+embedded QCs, hidden-QC timeout schedules. Execution: cached vs
+uncached equivalence, serial vs parallel, interleaved senders/modules,
+read-only conflicts, coinbase reads. Trading: rest/place/cancel
+conservation, market-buy solvency, partial-settlement failure,
+rounding, replay across all protocols. Perps: withdrawal solvency,
+flips, resting exposure, realized PnL, liquidation conservation,
+insurance/ADL accounting. Recovery: crash pre/post-sign, fsync
+errors, worker panic, torn WAL, concurrent snapshots, failed import
+atomicity. Availability: missing shards, invalid body post-header-QC,
+alloc bounds, slow handshakes/subscribers.
+
+Formal-model caveat: `spec/oxidebft/OxideBft.tla` explicitly excludes
+epochs and exec certs, and the checked-in configs use 4 validators —
+it cannot certify the current combined design.
+
+### Remediation order (locked)
+
+1. Authenticated identity propagation (C1) + quorum/key admission
+   (C2, C3).
+2. One correct sequential execution/accounting reference.
+3. Optimized paths proven equivalent to it (C4, C6, C7 internals).
+4. Complete state commitments, tx rollback, durable signing, recovery
+   (C8, C10 + async lane).
+5. Network/resource hardening + settlement reconciliation (C5, C9 +
+   DA/backpressure items).
+6. Rebaseline production-like TPS under the metric set above.
