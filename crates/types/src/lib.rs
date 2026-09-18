@@ -553,6 +553,29 @@ pub struct Vote {
     pub block_hash: Hash,
     /// The validator's BLS signature over `(view, phase, block_hash)`.
     pub signature: Signature,
+    /// The voter's most recent execution attestation: the state root
+    /// of the newest block it has executed locally. Leaders harvest
+    /// matching attestations across votes and aggregate them into an
+    /// [`ExecCertificate`] carried by a later block header — the
+    /// chain's divergence-detection mechanism (every block carries
+    /// quorum proof of what its ancestors computed).
+    ///
+    /// `None` before the voter has executed anything, or in
+    /// conformance mode. The attestation height is embedded in the
+    /// value itself, so a stale attestation is never *wrong* — it
+    /// simply certifies an older height.
+    pub attestation: Option<StateAttestation>,
+    /// BLS signature over `(attestation.height, attestation.root,
+    /// epoch)` under `Domain::ExecAttest`. Kept separate from
+    /// `signature` because the two sign *different* messages: vote
+    /// signatures aggregate over `(view, phase, block_hash)` into a
+    /// QC, while attestation signatures aggregate over `(height,
+    /// state_root)` into an [`ExecCertificate`]. Folding them into
+    /// one signature would make QC formation depend on execution
+    /// agreement — a validator that diverged (or merely lagged)
+    /// could then never be aggregated, turning divergence detection
+    /// into a liveness break.
+    pub attestation_sig: Option<Signature>,
 }
 
 impl Encode for Vote {
@@ -561,6 +584,20 @@ impl Encode for Vote {
         buf.push(self.phase as u8);
         self.block_hash.encode(buf);
         self.signature.encode(buf);
+        match &self.attestation {
+            Some(att) => {
+                write::bool(buf, true);
+                att.encode(buf);
+            }
+            None => write::bool(buf, false),
+        }
+        match &self.attestation_sig {
+            Some(sig) => {
+                write::bool(buf, true);
+                sig.encode(buf);
+            }
+            None => write::bool(buf, false),
+        }
     }
 }
 
@@ -570,7 +607,11 @@ impl<'a> Decode<'a> for Vote {
         let phase = VotePhase::from_byte(reader.read_u8()?)?;
         let block_hash = Hash::decode(reader)?;
         let signature = Signature::decode(reader)?;
-        Ok(Self { view, phase, block_hash, signature })
+        let attestation =
+            if reader.read_bool()? { Some(StateAttestation::decode(reader)?) } else { None };
+        let attestation_sig =
+            if reader.read_bool()? { Some(Signature::decode(reader)?) } else { None };
+        Ok(Self { view, phase, block_hash, signature, attestation, attestation_sig })
     }
 }
 
@@ -1002,12 +1043,19 @@ mod tests {
             phase: VotePhase::PreCommit,
             block_hash: Hash([0xAB; 32]),
             signature: Signature([0xCD; 96]),
+            attestation: Some(StateAttestation { height: Height::new(6), root: Hash([0x42; 32]) }),
+            attestation_sig: Some(Signature([0xEE; 96])),
         };
         let mut expected = Vec::new();
         expected.extend_from_slice(&7u64.to_le_bytes()); // view
         expected.push(1); // phase = PreCommit
         expected.extend_from_slice(&[0xAB; 32]); // block_hash
         expected.extend_from_slice(&[0xCD; 96]); // signature
+        expected.push(1); // has attestation
+        expected.extend_from_slice(&6u64.to_le_bytes()); // attestation height
+        expected.extend_from_slice(&[0x42; 32]); // attestation root
+        expected.push(1); // has attestation_sig
+        expected.extend_from_slice(&[0xEE; 96]); // attestation sig
         roundtrip(&vote, &expected);
     }
 

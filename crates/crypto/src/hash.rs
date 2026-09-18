@@ -61,6 +61,7 @@ use primitives::Hash;
 /// | `StateSyncChunk` | 11 | state-sync snapshot chunks |
 /// | `BodyShardLeaf` | 12 | dispersed-block shard leaf (Phase 5) |
 /// | `BodyShardNode` | 13 | dispersed-block shard tree node (Phase 5) |
+/// | `ExecAttest` | 14 | execution attestation signing (Phase 5) |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -103,6 +104,13 @@ pub enum Domain {
     /// `H(tag ‖ left ‖ right)`. Appended after `BodyShardLeaf` —
     /// never renumber.
     BodyShardNode = 13,
+    /// A validator's execution attestation: the signature over
+    /// `(height, state_root, epoch)` carried on a consensus vote and
+    /// aggregated into an [`types::ExecCertificate`]. Appended after
+    /// `BodyShardNode` — never renumber. Distinct from `Vote` so an
+    /// attestation signature can never be reinterpreted as a block
+    /// vote (and vice versa).
+    ExecAttest = 14,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

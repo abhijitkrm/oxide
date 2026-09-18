@@ -143,6 +143,17 @@ impl AppInterface for MockApp {
             .unwrap_or_else(|| mock_state_root(height));
         StateAttestation { height, root }
     }
+
+    fn attest_latest(&self) -> StateAttestation {
+        // Newest executed height: the mock records one root per
+        // finalized block, so the max key is the execution tip.
+        // `Hash::ZERO` before the first block, matching the real
+        // executor's "nothing executed" sentinel.
+        match self.state_roots.lock().unwrap().iter().next_back() {
+            Some((h, root)) => StateAttestation { height: Height::new(*h), root: *root },
+            None => StateAttestation { height: Height::new(0), root: Hash::ZERO },
+        }
+    }
 }
 
 /// A deterministic, height-derived mock state root. Not a real hash —

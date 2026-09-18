@@ -336,6 +336,8 @@ fn run_chaos_round(
         phase: VotePhase::Prepare,
         block_hash: hash_a,
         signature: leader_sig,
+        attestation: None,
+        attestation_sig: None,
     };
     devnet.engines_mut()[leader_idx]
         .collect_vote(u16::try_from(leader_idx).unwrap_or(0), leader_vote)
@@ -389,6 +391,8 @@ fn run_chaos_round(
                     phase: VotePhase::Prepare,
                     block_hash: conflict,
                     signature: sig,
+                    attestation: None,
+                    attestation_sig: None,
                 };
                 let mut buf = Vec::with_capacity(64);
                 forged.encode(&mut buf);

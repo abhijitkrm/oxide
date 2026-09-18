@@ -560,11 +560,14 @@ impl MultiNodeDevnet {
             self.engines[leader_idx].epoch(),
         );
         let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
+        let (attestation, attestation_sig) = self.engines[leader_idx].vote_attestation();
         let leader_vote = types::Vote {
             view: header.view,
             phase: types::VotePhase::Prepare,
             block_hash,
             signature: leader_sig,
+            attestation,
+            attestation_sig,
         };
         self.engines[leader_idx]
             .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
@@ -656,11 +659,14 @@ impl MultiNodeDevnet {
             self.engines[leader_idx].epoch(),
         );
         let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
+        let (attestation, attestation_sig) = self.engines[leader_idx].vote_attestation();
         let leader_vote = types::Vote {
             view: header.view,
             phase: types::VotePhase::Prepare,
             block_hash,
             signature: leader_sig,
+            attestation,
+            attestation_sig,
         };
         self.engines[leader_idx]
             .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)

@@ -962,6 +962,46 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     in-process loop — real parallelism wins even after paying for
     the wire.
 
+- **Certified execution: blocks carry a quorum-signed state root,
+  and execution overlaps consensus** (`crates/types`,
+  `crates/consensus`, `crates/executor`, `crates/ports`,
+  `crates/crypto`, `crates/devnet`, `crates/node`)
+  - Every vote now carries the voter's newest executed
+    `(height, state_root)` attestation, BLS-signed under a dedicated
+    `ExecAttest` domain. Once ≥2f+1 validators attest the same root,
+    the leader aggregates their signatures into an
+    `ExecCertificate` and embeds it in a later block header
+    (heights ≤ proposal−2, matching the 2-chain execution lag).
+    A validator that computes a *different* root refuses to vote —
+    execution divergence becomes a consensus-visible halt instead
+    of silent state drift.
+  - The check is engineered to cost nothing on the happy path:
+    voters compare their local root first and only run the
+    aggregate-signature verify on a mismatch (a forged cert with the
+    *correct* root cannot change a vote, so verifying it buys no
+    safety); attestation signing is cached per `(height, root)`; and
+    attestation verifies stop once a height's cert exists.
+  - `Executor::spawn_exec_lane` replaces the old deferred-execution
+    flag with a real worker thread: `finalize_block` enqueues the
+    block and returns immediately, so executing block h overlaps
+    consensus on h+1. `attest_state` waits only for heights actually
+    owed to the lane; `attest_latest` never blocks; snapshot export
+    drains the lane first so it can't capture a mid-block mix of
+    module states.
+  - Measured (8 validators, threaded, wire-max settle): lane on
+    holds **827–957K fills/s (1.7–1.9M orders/s)** — statistically
+    the pre-upgrade baseline, with certified state roots now live.
+    On light-block workloads (individual order txs) the lane costs
+    more than microsecond execution saves, so it is opt-in via
+    `DEVNET_EXEC_LANE=1` (devnet) and enabled in `Node::assemble`.
+  - **In plain words:** validators previously ran every transaction
+    and trusted that everyone else got the same answer. Now each
+    block carries a quorum-signed receipt of the answer itself — if
+    any validator's math diverges, the chain visibly stops instead
+    of quietly agreeing on two different states. And while the
+    network agrees on the next block, the previous one is already
+    being executed on a separate thread.
+
 ### Fixed
 
 - **Trading-TPS state-root check attested beyond the common prefix**

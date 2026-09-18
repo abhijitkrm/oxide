@@ -588,6 +588,14 @@ impl TcpMultiNodeDevnet {
             }
             evm_modules.push(evm_module);
             let app: Arc<Executor> = Arc::new(executor);
+            // `DEVNET_EXEC_LANE=1`: run the async execution worker —
+            // `finalize_block` hands each committed block to a
+            // per-validator thread and returns, overlapping block
+            // h's execution with view h+1's consensus. Off by
+            // default so benchmarks can A/B the synchronous path.
+            if std::env::var_os("DEVNET_EXEC_LANE").is_some() {
+                app.spawn_exec_lane();
+            }
             let app_dyn: Arc<dyn AppInterface> = app.clone();
 
             // Build the peer list (all peers except self).
@@ -1550,6 +1558,7 @@ impl TcpMultiNodeDevnet {
                         engine.epoch(),
                     );
                     let sig = secret_key.sign(crypto::hash::Domain::Vote, &msg);
+                    let (attestation, attestation_sig) = engine.vote_attestation();
                     let _ = engine.collect_vote(
                         u16::from(idx),
                         types::Vote {
@@ -1557,6 +1566,8 @@ impl TcpMultiNodeDevnet {
                             phase: types::VotePhase::Prepare,
                             block_hash,
                             signature: sig,
+                            attestation,
+                            attestation_sig,
                         },
                     );
                     voted_views.insert(view);
@@ -2051,11 +2062,14 @@ impl TcpMultiNodeDevnet {
                         engine.epoch(),
                     );
                     let sig = self.secret_keys[i].sign(crypto::hash::Domain::Vote, &msg);
+                    let (attestation, attestation_sig) = engine.vote_attestation();
                     let leader_vote = types::Vote {
                         view: header.view,
                         phase: types::VotePhase::Prepare,
                         block_hash,
                         signature: sig,
+                        attestation,
+                        attestation_sig,
                     };
                     let _ = engine.collect_vote(u16::try_from(i).unwrap(), leader_vote);
                     state.voted.insert((i, view));
@@ -2237,11 +2251,14 @@ impl TcpMultiNodeDevnet {
             self.engines[leader_idx].epoch(),
         );
         let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
+        let (attestation, attestation_sig) = self.engines[leader_idx].vote_attestation();
         let leader_vote = types::Vote {
             view: header.view,
             phase: types::VotePhase::Prepare,
             block_hash,
             signature: leader_sig,
+            attestation,
+            attestation_sig,
         };
         self.engines[leader_idx]
             .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)

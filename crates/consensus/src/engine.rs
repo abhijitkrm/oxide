@@ -52,8 +52,8 @@ use crypto::hash::{Domain, Hasher};
 use ports::{AppInterface, ConsensusEngine};
 use primitives::{Address, Epoch, Hash, Height, View};
 use types::{
-    BlockBudget, BlockHeader, FinalizedBlock, MempoolAck, Proposal, QuorumCertificate,
-    TimeoutCertificate, TxBytes, Verdict, Vote, VotePhase,
+    BlockBudget, BlockHeader, ExecCertificate, FinalizedBlock, MempoolAck, Proposal,
+    QuorumCertificate, StateAttestation, TimeoutCertificate, TxBytes, Verdict, Vote, VotePhase,
 };
 
 use crate::validator::{ValidatorIndex, ValidatorSet};
@@ -375,6 +375,43 @@ pub struct OxideBft {
     votes: Vec<Option<Vote>>,
     /// Number of votes collected in the current view.
     vote_count: usize,
+    /// Execution attestations harvested from collected votes, grouped
+    /// by `(height, state_root)`. A bucket reaching quorum is
+    /// aggregated into an [`ExecCertificate`] in `exec_certs`.
+    ///
+    /// Unlike `votes` (cleared every view), attestations persist
+    /// across views — a validator may attest the same execution
+    /// result in several consecutive votes, and the certificate
+    /// forms whenever quorum is reached regardless of view.
+    ///
+    /// Safety: a bucket counts each voter at most once (checked on
+    /// insert), so ≥2f+1 entries requires 2f+1 distinct validators —
+    /// no quorum can be fabricated from equivocating attestations.
+    /// Only signature-verified attestations are admitted
+    /// (`verify_signatures` mode); in conformance mode the pool
+    /// stays empty and `exec_cert` is never embedded.
+    exec_attest_pool: std::collections::BTreeMap<
+        u64,
+        std::collections::HashMap<Hash, Vec<(ValidatorIndex, Signature)>>,
+    >,
+    /// Formed execution certificates, keyed by certified height.
+    /// `propose()` embeds the newest entry whose height is at most
+    /// `proposed_height - 2`: voters only refuse-vote on a cert they
+    /// cannot verify locally, and at vote time a follower's executed
+    /// tip trails the proposed height by one full 2-chain lag.
+    /// Entries at or below the committed height are pruned — the
+    /// committed prefix no longer needs certification.
+    exec_certs: std::collections::BTreeMap<u64, ExecCertificate>,
+    /// The last attestation this validator signed, cached by
+    /// `(height, state_root)`. Execution attestations only change
+    /// when the app's executed tip advances, but votes are cast
+    /// once per view — under steady-state pipelining the same
+    /// watermark is attested several times. Re-signing an
+    /// identical `(height, root)` would produce an identical BLS
+    /// signature (BLS is deterministic), so the cached signature is
+    /// reused verbatim — one `sign` per executed height instead of
+    /// one per vote (~0.5ms saved per vote on the critical path).
+    last_attestation: Option<(StateAttestation, Signature)>,
     /// The timeout certificate that justified entry into the current
     /// view, when the view was reached via the timeout path. `None`
     /// when the view was entered via QC progress (the happy path),
@@ -470,6 +507,9 @@ impl OxideBft {
             epoch,
             votes: vec![None; n],
             vote_count: 0,
+            exec_attest_pool: std::collections::BTreeMap::new(),
+            exec_certs: std::collections::BTreeMap::new(),
+            last_attestation: None,
             last_tc: None,
             timeout_signatures: vec![None; n],
             verify_signatures: true,
@@ -1346,7 +1386,19 @@ impl OxideBft {
             proposer: proposer_hash(self.validator_set.leader(self.current_view)),
             timestamp: 0,             // deterministic: no real clock in the test model
             proposer_signature: None, // set below after signing
-            exec_cert: None,          // Wired after exec-cert aggregation
+            // Embed the newest execution certificate that every voter
+            // can verify locally. The bound is `cert.height <= h - 2`:
+            // a voter's executed tip at vote(h) time is h-2 — block
+            // h-1 commits only *after* QC(h) forms (the 2-chain lag),
+            // so a cert for h-1 would hit `attest_state(h-1) ==
+            // Hash::ZERO` on every honest voter and freeze quorum.
+            // Anything older is safely verifiable and still proves
+            // execution agreement for the committed prefix.
+            exec_cert: self
+                .exec_certs
+                .range(..height.value().saturating_sub(1))
+                .next_back()
+                .map(|(_, cert)| cert.clone()),
         };
         // C3 fix: sign the header with the leader's BLS secret key.
         // The signature authenticates that the claimed proposer
@@ -1686,11 +1738,28 @@ impl OxideBft {
         // (conformance mode) since the app may not have real state.
         if self.verify_signatures {
             if let Some(cert) = &header.exec_cert {
+                // The local root alone decides this vote: we vote iff
+                // the certified root matches what WE executed. The
+                // aggregate signature is deliberately NOT verified on
+                // the happy path — it can never change the outcome.
+                // A forged cert carrying the correct root is harmless
+                // (the vote is identical); a forged cert carrying a
+                // wrong root only withholds our vote — a bounded DoS
+                // in the same class as any malformed proposal, limited
+                // to the forger's own leader turns. Skipping the ~4ms
+                // aggregate_verify here keeps certified execution free
+                // on the vote critical path.
                 let local = self.app.attest_state(cert.height);
                 if local.root != cert.state_root {
-                    // Log the divergence and refuse to vote. The
-                    // operator should be alerted — this is a critical
-                    // condition that requires investigation.
+                    // Verify only now, off the happy path, purely for
+                    // evidence: a VALID signature means ≥2f+1 really
+                    // attested a root we did not compute — confirmed
+                    // divergence, refuse and alert the operator. An
+                    // INVALID signature means the leader fabricated
+                    // the claim — the proposal is ignored. Both
+                    // withhold this vote; the distinction is logged
+                    // for forensics rather than acted on.
+                    let _confirmed_divergence = self.verify_exec_cert(cert).is_ok();
                     return None;
                 }
             }
@@ -1720,7 +1789,17 @@ impl OxideBft {
         self.append_wal();
         // Sign the vote (stage 5: real BLS if key is set).
         let signature = self.sign_vote(header.view, block_hash);
-        Some(Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature })
+        // Attach the newest execution attestation — the divergence-
+        // detection input leaders aggregate into `ExecCertificate`s.
+        let (attestation, attestation_sig) = self.build_attestation();
+        Some(Vote {
+            view: header.view,
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature,
+            attestation,
+            attestation_sig,
+        })
     }
 
     /// Supply a reconstructed body for a header-verified block — the
@@ -1841,6 +1920,105 @@ impl OxideBft {
         }
     }
 
+    /// The message a validator signs for an execution attestation:
+    /// `(height, state_root, epoch)` — 48 bytes. The epoch binding
+    /// prevents attestation replay across epoch boundaries (same
+    /// defense as the vote signing message, C3).
+    fn attestation_signing_message(&self, height: Height, root: &Hash) -> [u8; 48] {
+        let mut msg = [0u8; 48];
+        msg[..8].copy_from_slice(&height.value().to_le_bytes());
+        msg[8..40].copy_from_slice(root.as_bytes());
+        msg[40..48].copy_from_slice(&self.epoch.value().to_le_bytes());
+        msg
+    }
+
+    /// Build this validator's execution attestation for an outgoing
+    /// vote: the newest *executed* state root from the app, signed
+    /// under `Domain::ExecAttest`. Returns `(None, None)` when
+    /// nothing has executed yet — attestations are only ever claims
+    /// about real execution, never placeholders.
+    ///
+    /// `attest_latest` is non-blocking by contract: with the async
+    /// execution lane the attestation may lag the committed height
+    /// by a block or more. That is safe — the height travels inside
+    /// the attestation, so it certifies whatever it certifies.
+    /// Public form used by harnesses that construct a leader
+    /// self-vote manually (the engine only returns votes from
+    /// `vote`/`vote_header`, which leaders never call on their own
+    /// proposals). Returns the same `(attestation, attestation_sig)`
+    /// those methods embed.
+    pub fn vote_attestation(&mut self) -> (Option<StateAttestation>, Option<Signature>) {
+        self.build_attestation()
+    }
+
+    fn build_attestation(&mut self) -> (Option<StateAttestation>, Option<Signature>) {
+        let att = self.app.attest_latest();
+        if att.root == Hash::ZERO {
+            return (None, None);
+        }
+        // BLS signing is deterministic: an unchanged `(height,
+        // root)` yields an identical signature, so the cached one
+        // is byte-for-byte valid. Saves one sign per vote once the
+        // executed watermark stalls behind consensus.
+        if let Some((cached_att, cached_sig)) = &self.last_attestation {
+            if cached_att.height == att.height && cached_att.root == att.root {
+                return (Some(*cached_att), Some(*cached_sig));
+            }
+        }
+        let sig = match &self.secret_key {
+            Some(sk) => {
+                let msg = self.attestation_signing_message(att.height, &att.root);
+                sk.sign(crypto::hash::Domain::ExecAttest, &msg)
+            }
+            None => Signature::ZERO,
+        };
+        self.last_attestation = Some((att, sig));
+        (Some(att), Some(sig))
+    }
+
+    /// Verify an [`ExecCertificate`]'s aggregate signature against
+    /// the validator set — the same pattern as
+    /// [`verify_qc_signature`](Self::verify_qc_signature): the bitmap
+    /// names the signers, `aggregate_verify` checks the BLS
+    /// aggregate over `(height, state_root, epoch)` under
+    /// `Domain::ExecAttest`.
+    ///
+    /// This check matters for liveness, not just authenticity: the
+    /// voter-side divergence check refuses to vote on a cert whose
+    /// root disagrees with local state, so a leader embedding a
+    /// *fabricated* root could freeze quorum. Verifying the
+    /// aggregate proves ≥2f+1 validators actually attested the root —
+    /// a fabricated cert fails here and the proposal is ignored
+    /// before the root comparison ever runs.
+    fn verify_exec_cert(&self, cert: &ExecCertificate) -> Result<(), ConsensusError> {
+        let mut signer_pks: Vec<crypto::bls::PublicKey> =
+            Vec::with_capacity(self.validator_set.quorum());
+        for (i, byte) in cert.signer_bitmap.iter().enumerate() {
+            for bit in 0..8 {
+                if (byte >> bit) & 1 == 1 {
+                    let idx = u16::try_from(i * 8 + bit)
+                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                    let pk = self
+                        .validator_set
+                        .validator(idx)
+                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                    signer_pks.push(*pk);
+                }
+            }
+        }
+        if signer_pks.len() < self.validator_set.quorum() {
+            return Err(ConsensusError::InvalidQcSignature);
+        }
+        let msg = self.attestation_signing_message(cert.height, &cert.state_root);
+        crypto::aggregate_verify(
+            &cert.aggregate_signature,
+            crypto::hash::Domain::ExecAttest,
+            &msg,
+            &signer_pks,
+        )
+        .map_err(|_| ConsensusError::InvalidQcSignature)
+    }
+
     /// Leader: collect a vote from validator `voter`. Stores the vote
     /// for later QC formation. The `voter` index identifies which
     /// slot in the signer bitmap to set.
@@ -1934,6 +2112,70 @@ impl OxideBft {
                     expected_block: first.block_hash,
                     actual_block: vote.block_hash,
                 });
+            }
+        }
+
+        // Harvest the execution attestation (if any) for exec-cert
+        // aggregation. Only signature-verified attestations count —
+        // a forged attestation that slipped into an aggregate would
+        // make the resulting cert fail verification at proposal
+        // time, letting one byzantine voter poison a whole block's
+        // embedded cert. The vote itself is unaffected either way:
+        // attestations ride along as best-effort signals and are
+        // dropped individually when invalid.
+        if self.verify_signatures {
+            if let (Some(att), Some(sig)) = (&vote.attestation, &vote.attestation_sig) {
+                // Skip the BLS verify (~1.5ms) when a cert already
+                // exists for this height — quorum is proven, so
+                // further attestations are redundant. Attestations
+                // for the committed tip are NOT redundant: the
+                // normal steady state is voters attesting their
+                // newest executed (= committed) block, and that is
+                // precisely the root the next proposals certify.
+                let valid = !self.exec_certs.contains_key(&att.height.value())
+                    && self.validator_set.validator(voter).is_ok_and(|pk| {
+                        let msg = self.attestation_signing_message(att.height, &att.root);
+                        crypto::verify(sig, crypto::hash::Domain::ExecAttest, &msg, pk).is_ok()
+                    });
+                if valid {
+                    let bucket = self
+                        .exec_attest_pool
+                        .entry(att.height.value())
+                        .or_default()
+                        .entry(att.root)
+                        .or_default();
+                    if !bucket.iter().any(|(v, _)| *v == voter) {
+                        bucket.push((voter, *sig));
+                        if bucket.len() == self.validator_set.quorum() {
+                            // Quorum of identical attestations:
+                            // aggregate into an ExecCertificate for
+                            // `propose()` to embed. Equality (`==`)
+                            // not `>=` — aggregate once, when the
+                            // bucket first crosses the threshold;
+                            // additional attestations are redundant
+                            // (the cert already proves quorum).
+                            let sigs: Vec<Signature> = bucket.iter().map(|(_, s)| *s).collect();
+                            if let Ok(aggregate_signature) = crypto::aggregate(&sigs) {
+                                let bitmap_len = self.validator_set.n().div_ceil(8);
+                                let mut signer_bitmap = vec![0u8; bitmap_len];
+                                for (v, _) in bucket.iter() {
+                                    let i = usize::from(*v);
+                                    signer_bitmap[i / 8] |= 1u8 << (i % 8);
+                                }
+                                self.exec_certs.insert(
+                                    att.height.value(),
+                                    ExecCertificate {
+                                        height: att.height,
+                                        state_root: att.root,
+                                        epoch: self.epoch,
+                                        signer_bitmap,
+                                        aggregate_signature,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2320,6 +2562,20 @@ impl OxideBft {
         // is no longer needed. Keeps the map bounded by the number
         // of in-flight (uncommitted) heights.
         self.voted_at_height.retain(|h, _| *h > header.height.value());
+        // Prune attestation state at-or-below the committed height:
+        // the committed prefix is final and needs no certification.
+        // `exec_certs` keeps a generous retention window — a cert is
+        // formed by whichever leader collected the attesting votes,
+        // and that leader only gets to embed it on its *next* turn,
+        // up to a full committee rotation (~n views) plus the
+        // attestation lag (~2 views) later. Two rotations of margin
+        // covers both without unbounded growth: certs are ~200 B and
+        // only the newest embeddable one is ever chosen anyway.
+        let committed_height = header.height.value();
+        self.exec_attest_pool.retain(|h, _| *h > committed_height);
+        let cert_floor = committed_height
+            .saturating_sub(2 * u64::try_from(self.validator_set.n()).unwrap_or(u64::MAX));
+        self.exec_certs.retain(|h, _| *h >= cert_floor);
         // Prune the block store of stale proposals: a block at or
         // below the just-committed height can never be needed again
         // (the 2-chain rule only walks ancestors of the pending
@@ -2649,8 +2905,15 @@ impl OxideBft {
 
         // Self-vote (stage 5: real BLS if key is set).
         let signature = self.sign_vote(self.current_view, block_hash);
-        let vote =
-            Vote { view: self.current_view, phase: VotePhase::Prepare, block_hash, signature };
+        let (attestation, attestation_sig) = self.build_attestation();
+        let vote = Vote {
+            view: self.current_view,
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature,
+            attestation,
+            attestation_sig,
+        };
         self.last_voted_view = Some(self.current_view);
         // Record the per-height lock for the self-vote as well.
         self.voted_at_height.insert(header.height.value(), block_hash);
@@ -2882,6 +3145,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         leader.collect_vote(leader_idx, leader_vote).expect("conformance: no verification");
 
@@ -2942,6 +3207,8 @@ mod tests {
                     phase: VotePhase::Prepare,
                     block_hash,
                     signature: Signature::ZERO,
+                    attestation: None,
+                    attestation_sig: None,
                 },
             )
             .expect("conformance: no verification");
@@ -3266,6 +3533,8 @@ mod tests {
                 phase: VotePhase::Prepare,
                 block_hash: d_hash,
                 signature: Signature::ZERO,
+                attestation: None,
+                attestation_sig: None,
             },
         )
         .expect("conformance mode");
@@ -3322,6 +3591,8 @@ mod tests {
                 phase: VotePhase::Prepare,
                 block_hash: hash_a,
                 signature: Signature::ZERO,
+                attestation: None,
+                attestation_sig: None,
             },
         )
         .expect("conformance mode");
@@ -3398,6 +3669,7 @@ mod tests {
     /// height-1 fork against e1, which commits b through QC(d)'s
     /// justify edge. Post-fix every vote must be rejected.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn prev_justify_divergence_cannot_fork_commits() {
         let mut e0 = make_multi_engine(0);
         let mut e1 = make_multi_engine(1);
@@ -3416,6 +3688,8 @@ mod tests {
                 phase: VotePhase::Prepare,
                 block_hash: hash_a,
                 signature: Signature::ZERO,
+                attestation: None,
+                attestation_sig: None,
             },
         )
         .expect("conformance mode");
@@ -3444,6 +3718,8 @@ mod tests {
                 phase: VotePhase::Prepare,
                 block_hash: hash_b,
                 signature: Signature::ZERO,
+                attestation: None,
+                attestation_sig: None,
             },
         )
         .expect("conformance mode");
@@ -3650,6 +3926,8 @@ mod tests {
                         phase: VotePhase::Prepare,
                         block_hash: hash_a,
                         signature: *sig,
+                        attestation: None,
+                        attestation_sig: None,
                     },
                 )
                 .expect("real votes");
@@ -3802,6 +4080,8 @@ mod tests {
                     phase: VotePhase::Prepare,
                     block_hash,
                     signature: leader_sig,
+                    attestation: None,
+                    attestation_sig: None,
                 },
             )
             .expect("valid self-vote must verify");
@@ -3993,6 +4273,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash,
             signature: forged_sig,
+            attestation: None,
+            attestation_sig: None,
         };
 
         // collect_vote must reject the forged vote.
@@ -4016,6 +4298,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
 
         // Voter index 99 is out of bounds (n=4).
@@ -4140,8 +4424,14 @@ mod tests {
         vote_msg.extend_from_slice(block_hash.as_bytes());
         vote_msg.extend_from_slice(&leader.epoch.value().to_le_bytes());
         let valid_sig = keys[1].sign(crypto::hash::Domain::Vote, &vote_msg);
-        let valid_vote =
-            Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature: valid_sig };
+        let valid_vote = Vote {
+            view: header.view,
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature: valid_sig,
+            attestation: None,
+            attestation_sig: None,
+        };
 
         leader.collect_vote(1, valid_vote).expect("valid vote must be accepted");
     }
@@ -4656,12 +4946,18 @@ mod tests {
         let mock_root = Hash([0x00; 32]);
         let divergent_root = Hash([0xDE; 32]); // != mock_root
 
+        // A real, correctly-signed cert over the *wrong* root —
+        // the reject must come from the root comparison, not from
+        // signature verification (a fabricated cert would fail
+        // verify_exec_cert earlier and for a different reason).
+        let att_msg = engine.attestation_signing_message(Height::new(0), &divergent_root);
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
         let exec_cert = ExecCertificate {
             height: Height::new(0),
             state_root: divergent_root,
             epoch: Epoch::new(0),
             signer_bitmap: vec![0b0000_0001],
-            aggregate_signature: AggregateSignature::ZERO,
+            aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
         };
 
         let proposal = Proposal {
@@ -4712,12 +5008,14 @@ mod tests {
         // MockApp returns Hash([0x00; 32]) for height 0.
         let matching_root = Hash([0x00; 32]);
 
+        let att_msg = engine.attestation_signing_message(Height::new(0), &matching_root);
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
         let exec_cert = ExecCertificate {
             height: Height::new(0),
             state_root: matching_root,
             epoch: Epoch::new(0),
             signer_bitmap: vec![0b0000_0001],
-            aggregate_signature: AggregateSignature::ZERO,
+            aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
         };
 
         let proposal = Proposal {
@@ -4750,6 +5048,305 @@ mod tests {
             Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
         let vote = engine.vote(&header, &proposal);
         assert!(vote.is_some(), "proposal with matching exec_cert must be accepted");
+    }
+
+    // ---- Execution attestation / exec-cert aggregation tests ----
+    //
+    // Votes carry `StateAttestation`s (BLS-signed under
+    // `Domain::ExecAttest`); leaders aggregate quorum-identical
+    // attestations into `ExecCertificate`s embedded in later
+    // proposals — the chain's divergence-detection substrate.
+
+    /// Build a signed-mode 4-validator committee: engines with real
+    /// keys and signature verification on (production path).
+    fn signed_committee() -> (Vec<OxideBft>, Vec<crypto::BlsSecretKey>) {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+        let engines = (0..4u16)
+            .map(|i| {
+                OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), i)
+                    .with_secret_key(keys[usize::from(i)].clone())
+            })
+            .collect();
+        (engines, keys)
+    }
+
+    #[test]
+    fn vote_carries_execution_attestation() {
+        // After the app has executed a block, the engine's vote must
+        // carry an attestation for that height+root — the raw input
+        // leaders aggregate into exec certs.
+        let (mut engines, _keys) = signed_committee();
+        let engine = &mut engines[1];
+        // Height 1, not 0: the mock's height-derived root for height 0
+        // is `Hash::ZERO` — the same value `attest_latest` uses as the
+        // "nothing executed" sentinel — so an attestation for height 0
+        // could never be observed. Height 1 attests cleanly.
+        engine.app.finalize_block(&FinalizedBlock {
+            height: Height::new(1),
+            txs: vec![],
+            signers: vec![],
+        });
+
+        // A genesis-style proposal (height 0, no highQC needed).
+        let proposal = Proposal { height: Height::new(0), txs: vec![], attestation: None };
+        let mut body = Vec::new();
+        proposal.encode(&mut body);
+        let mut header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            body_commitment: types::shard::commitment(&body, 4),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: proposer_hash(0),
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+        };
+        // Sign with the real leader key so proposer auth passes.
+        let sk = bls_key(1);
+        let signing_hash = OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+
+        let vote = engine.vote(&header, &proposal).expect("vote must be produced");
+        let att = vote.attestation.expect("vote must carry an attestation");
+        assert_eq!(att.height, Height::new(1), "attestation covers executed height");
+        assert_eq!(
+            att.root,
+            engine.app.attest_state(Height::new(1)).root,
+            "attestation root matches local execution"
+        );
+        // The attestation signature must verify under ExecAttest.
+        let msg = engine.attestation_signing_message(att.height, &att.root);
+        let pk = &bls_key(2).public_key();
+        crypto::verify(
+            &vote.attestation_sig.expect("attestation must be signed"),
+            crypto::hash::Domain::ExecAttest,
+            &msg,
+            pk,
+        )
+        .expect("attestation signature must verify");
+    }
+
+    #[test]
+    fn exec_cert_forms_from_quorum_attestations() {
+        // Three (of four) identical, correctly-signed attestations
+        // for the same (height, root) must aggregate into an
+        // ExecCertificate on the collecting leader.
+        let (mut engines, keys) = signed_committee();
+        let leader = &mut engines[0];
+        let height = Height::new(7);
+        let root = Hash([0x77; 32]);
+        let block_hash = Hash([0xAB; 32]);
+
+        for i in 1u16..=3 {
+            let att = StateAttestation { height, root };
+            let msg = leader.attestation_signing_message(height, &root);
+            let att_sig = keys[usize::from(i)].sign(crypto::hash::Domain::ExecAttest, &msg);
+            let vote_msg = leader.vote_signing_message(View::new(0), 0, &block_hash);
+            let vote_sig = keys[usize::from(i)].sign(crypto::hash::Domain::Vote, &vote_msg);
+            leader
+                .collect_vote(
+                    i,
+                    Vote {
+                        view: View::new(0),
+                        phase: VotePhase::Prepare,
+                        block_hash,
+                        signature: vote_sig,
+                        attestation: Some(att),
+                        attestation_sig: Some(att_sig),
+                    },
+                )
+                .expect("vote accepted");
+        }
+
+        let cert = leader.exec_certs.get(&7).expect("exec cert must form at quorum");
+        assert_eq!(cert.state_root, root);
+        assert_eq!(cert.height, height);
+        // The cert must verify: aggregate sig + bitmap ≥ quorum.
+        leader.verify_exec_cert(cert).expect("formed cert must verify");
+    }
+
+    #[test]
+    fn forged_attestation_signature_is_dropped_not_fatal() {
+        // An attestation signed by the wrong key must be ignored —
+        // but the vote carrying it still counts for the QC (an
+        // attestation is a best-effort signal, not a vote defect).
+        let (mut engines, keys) = signed_committee();
+        let leader = &mut engines[0];
+        let block_hash = Hash([0xCD; 32]);
+
+        // Attestation for (7, root) signed by validator 0's key but
+        // claimed as validator 1's — fails verification.
+        let root = Hash([0x77; 32]);
+        let msg = leader.attestation_signing_message(Height::new(7), &root);
+        let bad_sig = keys[0].sign(crypto::hash::Domain::ExecAttest, &msg);
+        let vote_msg = leader.vote_signing_message(View::new(0), 0, &block_hash);
+        let vote_sig = keys[1].sign(crypto::hash::Domain::Vote, &vote_msg);
+        leader
+            .collect_vote(
+                1,
+                Vote {
+                    view: View::new(0),
+                    phase: VotePhase::Prepare,
+                    block_hash,
+                    signature: vote_sig,
+                    attestation: Some(StateAttestation { height: Height::new(7), root }),
+                    attestation_sig: Some(bad_sig),
+                },
+            )
+            .expect("vote itself must still be accepted");
+        assert!(leader.exec_attest_pool.is_empty(), "forged attestation must be dropped");
+        assert_eq!(leader.vote_count, 1, "the vote still counts toward the QC");
+    }
+
+    #[test]
+    fn forged_exec_cert_is_rejected_on_root_mismatch() {
+        // A proposal carrying a cert whose aggregate signature does
+        // not verify AND whose root the voter never computed must be
+        // refused — the leader can withhold a vote this way but never
+        // redirect it. (A forged cert claiming the root we DID compute
+        // is harmless: the vote outcome is unchanged, so the signature
+        // is not even checked — the aggregate verify only runs on the
+        // mismatch path.)
+        let (mut engines, keys) = signed_committee();
+        let engine = &mut engines[1];
+
+        // Cert over a root the engine never produced (local attest is
+        // Hash::ZERO at every unexecuted height), with an aggregate
+        // built from a Vote-domain signature — fails verify_exec_cert.
+        let root = Hash([0xab; 32]);
+        let msg = engine.attestation_signing_message(Height::new(0), &root);
+        let wrong_domain_sig = keys[0].sign(crypto::hash::Domain::Vote, &msg);
+        let exec_cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[wrong_domain_sig]).expect("aggregate"),
+        };
+
+        let proposal = Proposal { height: Height::new(0), txs: vec![], attestation: None };
+        let mut body = Vec::new();
+        proposal.encode(&mut body);
+        let mut header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            body_commitment: types::shard::commitment(&body, 4),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: proposer_hash(0),
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: Some(exec_cert),
+        };
+        let sk = bls_key(1);
+        let signing_hash = OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+        assert!(
+            engine.vote(&header, &proposal).is_none(),
+            "proposal with a forged exec cert must be rejected"
+        );
+    }
+
+    #[test]
+    fn propose_embeds_exec_cert_only_for_proven_heights() {
+        // The embed rule: block h may carry a cert only for heights
+        // <= h-2 — voters have only executed through h-2 at vote
+        // time (2-chain lag), so a newer cert would freeze quorum.
+        let (mut engines, _keys) = signed_committee();
+        let leader = &mut engines[0];
+        leader.submit_tx(TxBytes::new(vec![1]));
+
+        // Seed a cert at height 3 and one at height 4 (not yet
+        // provable when proposing height 5).
+        for h in [3u64, 4] {
+            leader.exec_certs.insert(
+                h,
+                ExecCertificate {
+                    height: Height::new(h),
+                    state_root: Hash([0x55; 32]),
+                    epoch: Epoch::new(0),
+                    signer_bitmap: vec![0xFF],
+                    aggregate_signature: AggregateSignature::ZERO,
+                },
+            );
+        }
+        // Committed tip = 4 → next proposal is height 5; embeddable
+        // certs are those <= 3.
+        leader.last_committed = Some((Hash([0x01; 32]), Height::new(4)));
+        let (header, _proposal) = leader.propose().expect("must propose");
+        assert_eq!(header.height, Height::new(5));
+        let cert = header.exec_cert.expect("cert(3) must be embedded");
+        assert_eq!(cert.height, Height::new(3), "the *newest embeddable* cert wins");
+    }
+
+    #[test]
+    fn exec_cert_flows_through_signed_pipeline() {
+        // End-to-end: 4 signed engines drive rounds; attestations
+        // ride every vote, certs form, and later proposals embed
+        // them — with finality unaffected.
+        let (mut engines, keys) = signed_committee();
+        let mut saw_cert = false;
+        for round in 0..8usize {
+            let leader_idx = round % 4;
+            // Keep the mempool non-empty: `propose()` returns None
+            // when no work is outstanding (liveness gate), which
+            // would stall the driver.
+            engines[leader_idx]
+                .submit_tx(TxBytes::new(vec![u8::try_from(round).unwrap_or(u8::MAX)]));
+            let mut followers: Vec<&mut OxideBft> = Vec::new();
+            // Split borrow: leader at leader_idx, followers elsewhere.
+            let (before, rest) = engines.split_at_mut(leader_idx);
+            let (leader, after) = rest.split_at_mut(1);
+            followers.extend(before.iter_mut());
+            followers.extend(after.iter_mut());
+            let (header, proposal) = leader[0].propose().expect("propose");
+            if header.exec_cert.is_some() {
+                saw_cert = true;
+            }
+            let block_hash = OxideBft::block_hash(&header);
+            let leader_vi = leader[0].validator_index;
+            let msg = leader[0].vote_signing_message(header.view, 0, &block_hash);
+            let sig = keys[usize::from(leader_vi)].sign(crypto::hash::Domain::Vote, &msg);
+            let (attestation, attestation_sig) = leader[0].vote_attestation();
+            leader[0]
+                .collect_vote(
+                    leader_vi,
+                    Vote {
+                        view: header.view,
+                        phase: VotePhase::Prepare,
+                        block_hash,
+                        signature: sig,
+                        attestation,
+                        attestation_sig,
+                    },
+                )
+                .expect("self vote");
+            for f in &mut followers {
+                if let Some(vote) = f.vote(&header, &proposal) {
+                    leader[0].collect_vote(f.validator_index, vote).expect("vote");
+                }
+            }
+            let qc = leader[0].try_form_qc().expect("qc");
+            leader[0].deliver_qc(qc.clone()).expect("deliver");
+            for f in &mut followers {
+                f.deliver_qc(qc.clone()).expect("deliver");
+                f.advance_view();
+            }
+            leader[0].advance_view();
+        }
+        assert!(saw_cert, "exec certs must flow through proposals once quorum attests");
     }
 
     // ---- View-change tests (multi-validator) ----
@@ -4885,6 +5482,8 @@ mod tests {
                 phase: VotePhase::Prepare,
                 block_hash,
                 signature: Signature::ZERO,
+                attestation: None,
+                attestation_sig: None,
             };
             engines[leader_idx]
                 .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
@@ -4945,6 +5544,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         engines[leader_idx]
             .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
@@ -5057,6 +5658,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: Hash([0xAA; 32]),
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         leader.collect_vote(1, vote_a).expect("first vote accepted");
 
@@ -5066,6 +5669,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: Hash([0xBB; 32]),
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         let err = leader.collect_vote(2, vote_b).expect_err("conflicting vote must be rejected");
         assert!(
@@ -5089,6 +5694,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: Hash::ZERO,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         leader.collect_vote(1, vote_v0).expect("first vote accepted");
 
@@ -5097,6 +5704,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: Hash::ZERO,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         // C2: future-view vote is silently dropped, not an error.
         leader.collect_vote(2, vote_v1).expect("future-view vote silently dropped (C2)");
@@ -5119,6 +5728,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: Hash::ZERO,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         leader.collect_vote(1, future_vote).expect("future-view vote silently dropped");
 
@@ -5128,6 +5739,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: Hash::ZERO,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         leader
             .collect_vote(2, real_vote)
@@ -5416,6 +6029,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: Hash::ZERO,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         engine.collect_vote(1, vote).expect("conformance: no verification");
         assert!(engine.vote_count > 0, "engine should have collected a vote");
@@ -5572,6 +6187,8 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: Hash::ZERO,
             signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
         };
         engine.collect_vote(1, vote).expect("conformance: no verification");
         engine.timeout_signatures[2] = Some(Signature::ZERO);

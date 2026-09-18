@@ -60,6 +60,7 @@ fn dst(domain: Domain) -> &'static [u8] {
         Domain::StateSyncChunk => b"oxide/statesync-chunk",
         Domain::BodyShardLeaf => b"oxide/body-shard-leaf",
         Domain::BodyShardNode => b"oxide/body-shard-node",
+        Domain::ExecAttest => b"oxide/exec-attest",
     }
 }
 

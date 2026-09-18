@@ -14737,3 +14737,118 @@ common prefix** (`finalized[0][min_blocks - 1]`), which every
 validator provably committed. Re-run: all 8 validators agree on the
 state root at height 199 — deterministic execution confirmed on the
 dispersed path.
+
+## Session — execution certificates + real async execution lane
+
+Two upgrades approved after the "vote on state changes" discussion:
+certified post-state roots in headers (the spec'd `ExecCertificate`
+mechanism, never wired) and execution that actually overlaps consensus
+(the `async_execution` flag existed but was a same-thread lazy flush).
+
+### Exec-cert aggregation (oxidebft-spec.md §6, now live)
+
+`Vote` grew `attestation: Option<StateAttestation>` +
+`attestation_sig: Option<Signature>`; every vote carries the voter's
+newest executed `(height, state_root)` BLS-signed under the new
+`Domain::ExecAttest` (`oxide/exec-attest`, appended as discriminant 14
+— existing domains unrenumbered). Leaders bucket verified attestations
+by `(height, root)` in `exec_attest_pool`; a quorum of identical
+attestations aggregates into an `ExecCertificate` stored in
+`exec_certs`. `propose()` embeds the newest cert at height
+`<= proposed - 2` — the 2-chain lag means voters at vote time have
+executed through `h-2`, so a newer cert would freeze quorum on the
+root-compare. Voters refuse any proposal whose cert root disagrees
+with `app.attest_state(cert_height)` — divergence becomes a
+consensus-visible event instead of a test artifact.
+
+Why attestations ride *votes* rather than a separate message: they
+need the same authentication + dedup machinery (per-validator BLS
+identity, one-per-view semantics) and must not gate QC formation — a
+validator with divergent or lagging execution still has a valid
+consensus vote. Attestations are best-effort sidecar data: invalid
+ones are dropped individually, the vote still counts.
+
+Dead end worth recording: an early-out skipping attestations at
+`height <= committed` starved the pool — the steady-state common case
+is the voter's executed tip *equaling* the committed tip, so nearly
+all attestations were dropped and certs never formed. Reverted; the
+correct early-out is "cert already exists for this height" (quorum
+proven → further attestations redundant).
+
+### The happy path costs zero cert crypto
+
+The initial voter-side check ran `verify_exec_cert` (aggregate BLS
+verify, ~4ms) *before* comparing roots — ~45% trading-TPS regression
+on light blocks. Reordering revealed the verify is **redundant on
+the vote path**: the local root alone decides the vote. A forged cert
+carrying the *correct* root is harmless (vote identical); a forged
+cert with a *wrong* root only withholds a vote — bounded DoS, same
+class as any malformed proposal, limited to the forger's leader
+turns. Now: compare roots first; only on mismatch run the aggregate
+verify, purely to distinguish confirmed divergence (valid cert → we
+diverged from quorum) from forgery (invalid sig → malformed
+proposal). Both withhold the vote; the distinction is forensic.
+
+Two more cheap wins: `last_attestation` caches the signed
+attestation by `(height, root)` — BLS is deterministic so the cached
+signature is byte-identical, saving ~0.5ms per vote once the
+watermark stalls; and the cert-exists early-out above skips most
+attestation verifies (~1.5ms each) after quorum forms.
+
+### Real execution lane
+
+`Executor::spawn_exec_lane` (on `Arc<Executor>`) starts a worker
+thread fed by an mpsc channel of `FinalizedBlock`s; `finalize_block`
+enqueues and returns — execution of h overlaps consensus for h+1.
+`ExecSync { enqueued, executed }` + condvar publishes watermarks:
+`attest_latest` reads the newest completed root non-blocking (a stale
+attestation certifies an older height — never a wrong one);
+`attest_state(h)` waits only while `h <= enqueued && h > executed` —
+a height never enqueued returns `Hash::ZERO` immediately rather than
+blocking forever. Old `pending_block`/`flush_pending` lazy path
+removed.
+
+Caught a real consistency bug: `export_snapshot` read live module
+state while the worker could be mid-block — cross-module torn
+snapshots (module A post-h, module B pre-h). `wait_exec_idle` now
+drains the lane (`executed == enqueued`) before snapshot state is
+read; two node snapshot tests caught it immediately.
+
+### Results (8v threaded, wire-max 64×2×65,536 fills)
+
+| Config | fills/s | vs 901–955K baseline |
+|---|---|---|
+| certs on, lane off | 826K | ~-10% |
+| certs on, **lane on** | **827–957K** (4 runs) | ≈ baseline, certs free |
+
+The lane absorbs the cert cost entirely on heavy blocks — commit
+phase 2.7s → ~2.1s as execution overlaps the next view.
+
+Trading path (4v threaded, 200K order txs — light blocks):
+
+| Config | tx/s | vs 110K baseline |
+|---|---|---|
+| certs on, lane off | 83.5K | -24% |
+| certs on, lane on | 66K | lane hurts here |
+
+Light-block residual cost is the ~3 attestation verifies per new
+height needed to form each cert — irreducible without batching, and
+the lane's worker wakeups cost more than microsecond-scale execution
+saves. Lane is opt-in (`DEVNET_EXEC_LANE=1`; `Node::assemble` enables
+it) precisely because the tradeoff is workload-dependent.
+
+### Tests
+
+- `exec_cert_flows_through_signed_pipeline`: attestation → quorum →
+  cert → embed → voter verify, end-to-end across rotating leaders.
+- `forged_attestation_does_not_reach_pool` (renamed semantics: forged
+  sidecar dropped, vote still counts),
+  `forged_exec_cert_is_rejected_on_root_mismatch` (updated for the
+  root-compare-first order — a forged cert claiming the true local
+  root is now votable, by design),
+  `propose_embeds_exec_cert_only_for_proven_heights`.
+- Executor lane: executes + attests, roots identical to sync path
+  over 5 blocks, `attest_state` on an unenqueued height returns
+  rather than hanging (5s watchdog).
+- Gates: 125 consensus + 70 executor + 18 node + full workspace green;
+  clippy `-D warnings` clean; fmt clean.

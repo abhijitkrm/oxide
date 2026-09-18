@@ -112,6 +112,17 @@ pub trait AppInterface: Send + Sync {
     /// to the engine — it embeds these bytes verbatim and never parses
     /// them (oai-spec.md §3, rule 5).
     fn attest_state(&self, height: Height) -> StateAttestation;
+
+    /// The newest *executed* state root, without blocking. Returns
+    /// `root = Hash::ZERO` when nothing has executed yet.
+    ///
+    /// Consensus attaches this to outgoing votes as the validator's
+    /// execution attestation (the input to [`types::ExecCertificate`]
+    /// aggregation). It must never wait on in-flight execution — the
+    /// vote path cannot afford to stall behind the execution lane,
+    /// and a stale attestation is never wrong (its height is carried
+    /// inside, so it simply certifies an older block).
+    fn attest_latest(&self) -> StateAttestation;
 }
 
 /// Implemented by consensus engines (oxideBFT is the default;

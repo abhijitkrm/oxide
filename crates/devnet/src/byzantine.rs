@@ -196,8 +196,14 @@ impl ByzantineTcpDevnet {
         msg.extend_from_slice(bad_block_hash.as_bytes());
         msg.extend_from_slice(&epoch.value().to_le_bytes());
         let sig = self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, &msg);
-        let vote =
-            Vote { view, phase: VotePhase::Prepare, block_hash: bad_block_hash, signature: sig };
+        let vote = Vote {
+            view,
+            phase: VotePhase::Prepare,
+            block_hash: bad_block_hash,
+            signature: sig,
+            attestation: None,
+            attestation_sig: None,
+        };
         let mut buf = Vec::with_capacity(1 + 137);
         buf.push(MSG_VOTE);
         vote.encode(&mut buf);
@@ -221,7 +227,14 @@ impl ByzantineTcpDevnet {
         let view = self.inner.engines()[target_idx].current_view();
         let block_hash = primitives::Hash([0x42; 32]);
         let fake_sig = crypto::bls::Signature::from_slice(&[0xAA; 96]).expect("sig len");
-        let vote = Vote { view, phase: VotePhase::Prepare, block_hash, signature: fake_sig };
+        let vote = Vote {
+            view,
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature: fake_sig,
+            attestation: None,
+            attestation_sig: None,
+        };
         let mut buf = Vec::with_capacity(1 + 137);
         buf.push(MSG_VOTE);
         vote.encode(&mut buf);
@@ -294,10 +307,22 @@ impl ByzantineTcpDevnet {
         msg2.extend_from_slice(&epoch.value().to_le_bytes());
         let sig_1 = self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, &msg1);
         let sig_2 = self.inner.secret_keys()[byzantine_idx].sign(Domain::Vote, &msg2);
-        let vote_1 =
-            Vote { view, phase: VotePhase::Prepare, block_hash: block_hash_1, signature: sig_1 };
-        let vote_2 =
-            Vote { view, phase: VotePhase::Prepare, block_hash: block_hash_2, signature: sig_2 };
+        let vote_1 = Vote {
+            view,
+            phase: VotePhase::Prepare,
+            block_hash: block_hash_1,
+            signature: sig_1,
+            attestation: None,
+            attestation_sig: None,
+        };
+        let vote_2 = Vote {
+            view,
+            phase: VotePhase::Prepare,
+            block_hash: block_hash_2,
+            signature: sig_2,
+            attestation: None,
+            attestation_sig: None,
+        };
         let mut buf1 = Vec::with_capacity(1 + 137);
         buf1.push(MSG_VOTE);
         vote_1.encode(&mut buf1);

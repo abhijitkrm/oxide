@@ -943,6 +943,19 @@ pub const DEFAULT_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 /// Minimum tx size: sender (20) + nonce (8) + fee (8) = 36 bytes.
 const TX_MIN_SIZE: usize = 20 + 8 + 8;
 
+/// Shared execution-lane progress: the worker publishes `executed`
+/// (highest height whose state root is recorded); `finalize_block`
+/// publishes `enqueued` (highest height handed to the lane).
+/// `attest_state` waits on the paired condvar while the height it
+/// needs is owed to the lane.
+struct ExecSync {
+    /// Highest block height handed to the worker (`None`: none yet).
+    enqueued: Option<u64>,
+    /// Highest block height whose execution completed. Always
+    /// `<= enqueued`; equal while the lane is idle.
+    executed: Option<u64>,
+}
+
 /// The executor: a sequential block executor with a module router.
 ///
 /// Owns the registered modules and drives them through the block
@@ -968,22 +981,18 @@ pub struct Executor {
     state_roots: Mutex<BTreeMap<u64, Hash>>,
     /// The next proposal height.
     next_proposal_height: Mutex<u64>,
-    /// Phase D: the most recently finalized block that hasn't been
-    /// executed yet. Execution is deferred until `attest_state` or
-    /// the next `finalize_block` flushes it.
-    ///
-    /// This is the "async execution lane": the consensus engine can
-    /// commit block h and immediately proceed to propose/vote/commit
-    /// block h+1 while block h's execution is deferred. When the
-    /// state root for h is needed (via `attest_state`), or when h+1
-    /// is committed (the next `finalize_block`), the pending block
-    /// is executed synchronously.
-    ///
-    /// This overlaps execution with consensus without spawning
-    /// threads — the execution happens lazily when the state root
-    /// is actually needed. Blocks are still executed in order (the
-    /// next `finalize_block` flushes the pending block first).
-    pending_block: Mutex<Option<FinalizedBlock>>,
+    /// Phase D: the execution-lane channel. `Some` once
+    /// [`Executor::spawn_exec_lane`] has installed the worker
+    /// thread; `None` means synchronous finalize (the default).
+    /// `OnceLock` so spawning races are refused loudly rather than
+    /// silently splitting the commit stream between two workers.
+    exec_lane_tx: std::sync::OnceLock<std::sync::mpsc::Sender<FinalizedBlock>>,
+    /// Execution progress shared with the worker. `attest_state`
+    /// waits on the condvar only while the requested height is
+    /// enqueued-but-not-yet-executed — preserving the synchronous
+    /// contract that an attested height's root exists, without
+    /// blocking callers that attest a height the lane never saw.
+    exec_sync: std::sync::Arc<(Mutex<ExecSync>, std::sync::Condvar)>,
     /// Pending events from the current block (cleared each block).
     events: Mutex<Vec<Event>>,
     /// Pre-recovered senders, keyed by tx hash. Populated at
@@ -1006,16 +1015,6 @@ pub struct Executor {
     /// because the per-group `CacheDB` init is O(1) (Arc clone) and
     /// rayon task overhead (~10 µs) amortizes at 32+ txs.
     parallel_threshold: usize,
-    /// Phase D: enable the async execution lane. When `true`,
-    /// `finalize_block` defers execution to overlap with consensus.
-    /// When `false` (default), execution is synchronous.
-    ///
-    /// The async lane trades a small per-block overhead (extra lock
-    /// acquisitions for pending block tracking) for the ability to
-    /// overlap execution of block h-1 with consensus for block h.
-    /// For single-block benchmarks, the overhead is a net loss;
-    /// for the full consensus pipeline, it's a net win.
-    async_execution: bool,
     /// Optional latency recorder for the block pipeline. When set,
     /// `prepare_proposal`, `finalize_block`, and `attest_state`
     /// record their durations. This is the "measure everything"
@@ -1115,11 +1114,14 @@ impl Executor {
             finalized: Mutex::new(BTreeMap::new()),
             state_roots: Mutex::new(BTreeMap::new()),
             next_proposal_height: Mutex::new(0),
-            pending_block: Mutex::new(None),
+            exec_lane_tx: std::sync::OnceLock::new(),
+            exec_sync: std::sync::Arc::new((
+                Mutex::new(ExecSync { enqueued: None, executed: None }),
+                std::sync::Condvar::new(),
+            )),
             events: Mutex::new(Vec::new()),
             preverify_cache: Mutex::new(HashMap::new()),
             parallel_threshold,
-            async_execution: false,
             recorder: None,
             mempool_intake_tx: intake_tx,
             mempool_intake_rx: Mutex::new(intake_rx),
@@ -1237,8 +1239,59 @@ impl Executor {
     /// overlap execution of block h-1 with consensus for block h.
     /// For the full consensus pipeline (2-chain), this can hide
     /// execution latency behind consensus latency.
-    pub fn enable_async_execution(&mut self) {
-        self.async_execution = true;
+    /// Spawn the async execution worker. `finalize_block` then
+    /// hands each committed block to the worker and returns
+    /// immediately; the worker executes it and records the state
+    /// root — overlapping execution of block h with consensus for
+    /// block h+1, instead of serializing both on the consensus
+    /// thread.
+    ///
+    /// # Correctness
+    ///
+    /// Blocks arrive strictly in commit order (the engine's commit
+    /// walk is contiguous and oldest-first), so the worker's serial
+    /// execution matches the synchronous path's ordering exactly.
+    /// `attest_state(h)` waits on the watermark while h is
+    /// enqueued-but-not-executed — the same root the synchronous
+    /// path would have produced, just computed off-thread.
+    ///
+    /// The worker holds a `Weak` back-reference: dropping the
+    /// `Executor` disconnects the channel and the thread exits —
+    /// no reference cycle leaks the executor through its own
+    /// worker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called twice — a second lane would split the
+    /// commit stream.
+    pub fn spawn_exec_lane(self: &std::sync::Arc<Self>) {
+        let (tx, rx) = std::sync::mpsc::channel::<FinalizedBlock>();
+        self.exec_lane_tx.set(tx).expect("exec lane already spawned");
+        let weak = std::sync::Arc::downgrade(self);
+        let sync = self.exec_sync.clone();
+        std::thread::Builder::new()
+            .name("exec-lane".to_string())
+            .spawn(move || {
+                while let Ok(block) = rx.recv() {
+                    // If the executor is gone there is no one left
+                    // to serve — exit rather than resurrect it.
+                    let Some(executor) = weak.upgrade() else { return };
+                    let height = block.height.value();
+                    let root = executor.execute_block(&block);
+                    executor
+                        .state_roots
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert_retained(height, root, executor.history_retention);
+                    // Blocks arrive in commit order, so the newest
+                    // height is always the watermark.
+                    let (lock, cv) = &*sync;
+                    lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).executed =
+                        Some(height);
+                    cv.notify_all();
+                }
+            })
+            .expect("spawn exec lane thread");
     }
 
     /// The current chain height (the highest finalized block).
@@ -1385,6 +1438,22 @@ impl Executor {
         }
     }
 
+    /// Block until the execution lane has fully drained — every
+    /// enqueued block executed. Callers that must observe a
+    /// consistent cross-module state (snapshot export, state sync)
+    /// wait here rather than reading module state while the worker
+    /// is mid-block. No-op when the lane is not installed or is
+    /// already idle.
+    fn wait_exec_idle(&self) {
+        if self.exec_lane_tx.get().is_some() {
+            let (lock, cv) = &*self.exec_sync;
+            let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while s.enqueued != s.executed {
+                s = cv.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+
     /// Export a snapshot of the executor's state at the current
     /// chain height.
     ///
@@ -1397,9 +1466,19 @@ impl Executor {
     /// snapshot to skip replaying the entire chain from genesis.
     /// The snapshot is deterministic: two executors with the same
     /// state produce byte-identical snapshots.
+    ///
+    /// Drains the execution lane before reading module state so the
+    /// snapshot captures a quiesced height boundary, never a
+    /// mid-block mix of pre- and post-execution module roots.
     #[must_use]
     pub fn export_snapshot(&self) -> ExecutorSnapshot {
         use crypto::hash::{Domain, Hasher};
+        // Drain the execution lane first: module state is mutated by
+        // the worker thread block-by-block, so a snapshot taken
+        // mid-block could mix pre- and post-execution module roots.
+        // Waiting for `executed == enqueued` captures a quiesced
+        // height boundary.
+        self.wait_exec_idle();
         let height = self.current_height();
         let state_root = self.state_root_at(height);
         let module_roots: Vec<(String, Hash)> =
@@ -1617,29 +1696,6 @@ impl Executor {
             snapshot.executed_nonces.iter().copied().collect();
 
         Ok(())
-    }
-
-    /// Phase D: flush any pending block — execute it and store its
-    /// state root.
-    ///
-    /// This is the "drain" side of the async execution lane. When
-    /// `finalize_block` defers execution, the block is stored as
-    /// pending. This method executes the pending block (if any) and
-    /// stores its state root.
-    ///
-    /// Called by `finalize_block` (before storing a new pending
-    /// block) and by `attest_state` (before returning the state
-    /// root).
-    fn flush_pending(&self) {
-        let pending =
-            self.pending_block.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        if let Some(block) = pending {
-            let root = self.execute_block(&block);
-            self.state_roots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(block.height.value(), root);
-        }
     }
 
     /// Check the envelope authentication of a tx routed to `module`.
@@ -2409,22 +2465,33 @@ impl AppInterface for Executor {
 
     fn finalize_block(&self, block: &FinalizedBlock) -> CommitAck {
         let start = std::time::Instant::now();
-        if self.async_execution {
-            // Phase D: async execution lane — defer execution.
-            //
-            // Flush any previously pending block (execute it and
-            // store its state root) before storing the new block as
-            // pending. This ensures blocks are executed in order and
-            // the state is consistent when the new block is
-            // eventually executed.
-            self.flush_pending();
-
-            // Store the new block as pending and advance the proposal
-            // height immediately. The consensus engine can proceed to
-            // propose/vote/commit the next block while this block's
-            // execution is deferred.
-            *self.pending_block.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(block.clone());
+        if let Some(tx) = self.exec_lane_tx.get() {
+            // Async execution lane: hand the block to the worker.
+            // Ordering is the engine's commit order (FIFO channel),
+            // so serial worker execution is identical to the
+            // synchronous path. `finalized` and the proposal height
+            // advance now — they record *ordering* finality, which
+            // consensus already settled — while `state_roots` is
+            // written by the worker when execution lands.
+            {
+                let (lock, cv) = &*self.exec_sync;
+                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).enqueued =
+                    Some(block.height.value());
+                cv.notify_all();
+            }
+            if tx.send(block.clone()).is_err() {
+                // Worker dead (executor teardown mid-shutdown):
+                // execute inline so the commit still lands.
+                let root = self.execute_block(block);
+                self.state_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert_retained(block.height.value(), root, self.history_retention);
+                let (lock, cv) = &*self.exec_sync;
+                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).executed =
+                    Some(block.height.value());
+                cv.notify_all();
+            }
             self.finalized
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2454,12 +2521,19 @@ impl AppInterface for Executor {
 
     fn attest_state(&self, height: Height) -> StateAttestation {
         let start = std::time::Instant::now();
-        // Phase D: flush any pending block before attesting state.
-        // This ensures the state root for the requested height is
-        // available (if it was deferred). When async execution is
-        // disabled, flush_pending is a no-op (pending_block is
-        // always None).
-        self.flush_pending();
+        // Async lane: wait only while the height is owed to the
+        // worker. A height never enqueued has no execution coming —
+        // return the absent-root sentinel (`Hash::ZERO`) rather than
+        // blocking forever.
+        if self.exec_lane_tx.get().is_some() {
+            let (lock, cv) = &*self.exec_sync;
+            let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while s.enqueued.is_some_and(|e| height.value() <= e)
+                && s.executed.is_none_or(|x| x < height.value())
+            {
+                s = cv.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
         let root = self
             .state_roots
             .lock()
@@ -2471,6 +2545,23 @@ impl AppInterface for Executor {
             recorder.record("attest_state", start.elapsed());
         }
         StateAttestation { height, root }
+    }
+
+    fn attest_latest(&self) -> StateAttestation {
+        // Deliberately does NOT flush pending execution: the vote
+        // path calls this on every vote and cannot afford to wait
+        // on the execution lane. A stale attestation certifies an
+        // older height — never a wrong one.
+        match self
+            .state_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .next_back()
+        {
+            Some((h, root)) => StateAttestation { height: Height::new(*h), root: *root },
+            None => StateAttestation { height: Height::new(0), root: Hash::ZERO },
+        }
     }
 }
 
@@ -3796,5 +3887,98 @@ mod tests {
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
         assert!(proposal.txs.is_empty(), "no txs may be proposed past the halt");
+    }
+
+    // ---- Async execution lane tests ----
+    //
+    // `spawn_exec_lane` moves block execution onto a worker thread:
+    // `finalize_block` returns immediately, `attest_state` waits on
+    // the watermark only for heights the lane actually owes.
+
+    #[test]
+    fn exec_lane_executes_and_attests() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let executor = Arc::new(executor);
+        executor.spawn_exec_lane();
+
+        // A real tx so the counter module's root is non-zero
+        // (count=0 → Hash::ZERO, the same sentinel attest_state
+        // returns for unexecuted heights — a zero-root block would
+        // make this test vacuous).
+        let block = FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![make_tx_with_nonce(1, &[7], 0)],
+            signers: vec![],
+        };
+        executor.finalize_block(&block);
+
+        // attest_state waits on the worker watermark and returns
+        // the worker-computed root.
+        let att = executor.attest_state(Height::new(0));
+        assert_eq!(att.height, Height::new(0));
+        assert_ne!(att.root, Hash::ZERO, "worker must have executed the block");
+        // attest_latest reads the watermark without blocking.
+        let latest = executor.attest_latest();
+        assert_eq!(latest.height, Height::new(0));
+        assert_eq!(latest.root, att.root);
+    }
+
+    #[test]
+    fn exec_lane_matches_sync_roots() {
+        // The lane must produce byte-identical state roots to the
+        // synchronous path — same blocks, same order.
+        let mut sync_exec = Executor::new(100);
+        sync_exec.register_module(Arc::new(CounterModule::new()));
+        let mut async_exec = Executor::new(100);
+        async_exec.register_module(Arc::new(CounterModule::new()));
+        let async_exec = Arc::new(async_exec);
+        async_exec.spawn_exec_lane();
+
+        for h in 0..5u64 {
+            let block = FinalizedBlock {
+                height: Height::new(h),
+                txs: vec![make_tx_with_nonce(1, &[u8::try_from(h).unwrap_or(0)], h)],
+                signers: vec![],
+            };
+            sync_exec.finalize_block(&block);
+            async_exec.finalize_block(&block);
+        }
+        for h in 0..5u64 {
+            let sync_root = sync_exec.attest_state(Height::new(h)).root;
+            let async_root = async_exec.attest_state(Height::new(h)).root;
+            assert_eq!(sync_root, async_root, "height {h} root mismatch");
+            assert_ne!(sync_root, Hash::ZERO);
+        }
+    }
+
+    #[test]
+    fn attest_beyond_enqueued_does_not_block() {
+        // attest_state for a height the lane never saw must return
+        // the absent sentinel immediately — never wait on execution
+        // that isn't coming.
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let executor = Arc::new(executor);
+        executor.spawn_exec_lane();
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![make_tx_with_nonce(1, &[1], 0)],
+            signers: vec![],
+        });
+        executor.attest_state(Height::new(0)); // drain the lane
+
+        // Run the attest on a helper thread with a hard deadline —
+        // if the wait logic ever blocks on an unknown height this
+        // test fails by timeout rather than hanging CI forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app = executor.clone();
+        std::thread::spawn(move || {
+            tx.send(app.attest_state(Height::new(99))).expect("send");
+        });
+        let att = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("attest_state must not block on an unenqueued height");
+        assert_eq!(att.root, Hash::ZERO);
     }
 }

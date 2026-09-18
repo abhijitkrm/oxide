@@ -1241,11 +1241,14 @@ fn run_consensus_loop(
                     engine.epoch(),
                 );
                 let sig = our_key.sign(crypto::hash::Domain::Vote, &msg);
+                let (attestation, attestation_sig) = engine.vote_attestation();
                 let leader_vote = types::Vote {
                     view: header.view,
                     phase: types::VotePhase::Prepare,
                     block_hash,
                     signature: sig,
+                    attestation,
+                    attestation_sig,
                 };
                 let _ = engine.collect_vote(u16::try_from(node_index).unwrap(), leader_vote);
                 voted_views.insert(proposal_view);

@@ -217,10 +217,6 @@ impl Node {
         if let Some(n) = config.history_retention {
             executor = executor.with_history_retention(n);
         }
-        // Enable the async execution lane (plan.md §13 Phase D):
-        // defer block execution to `attest_state`, overlapping
-        // execution of block h-1 with consensus for block h.
-        executor.enable_async_execution();
         executor.register_module(Arc::new(oxide_core::CoreModule::new()));
 
         // The EVM module is built FIRST: it is the chain's balance
@@ -326,6 +322,11 @@ impl Node {
         evm_module.set_native_modules(Some(exchange), Some(perps));
         executor.register_module(evm_module.clone());
         let app: Arc<Executor> = Arc::new(executor);
+        // Spawn the async execution lane (plan.md §13 Phase D):
+        // `finalize_block` hands each committed block to a worker
+        // thread, overlapping execution of block h with consensus
+        // for block h+1.
+        app.spawn_exec_lane();
         let app_dyn: Arc<dyn AppInterface> = app.clone();
 
         // Select the consensus engine.
