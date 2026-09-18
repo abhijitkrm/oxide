@@ -68,6 +68,7 @@ use types::CHAIN_BLOCK_GAS_LIMIT;
 // turns that into 88%/N_cores.
 use rayon::prelude::*;
 
+pub mod coinbase_read;
 pub mod deadline;
 pub mod fee;
 pub mod history;
@@ -809,7 +810,66 @@ impl EvmModule {
     where
         DB: revm::database_interface::Database,
     {
-        self.build_evm_with_mode(db, coinbase, block_number, block_timestamp, false)
+        self.build_evm_with_mode(db, coinbase, block_number, block_timestamp, false, false)
+    }
+
+    /// Speculative EVM builder for the parallel executor: identical
+    /// to [`build_evm`](Self::build_evm) but with two speculative-only
+    /// guards — read-only native precompiles (a speculative frame can
+    /// never write shared native state outside its own `CacheDB`
+    /// clone; suppressed mutations surface via
+    /// `blocked_native_mutation`)
+    /// and a [`CoinbaseReadDetector`](coinbase_read) flagging
+    /// `BALANCE(coinbase)` observations so the commit phase can
+    /// validate them against the canonical running tip total.
+    #[allow(clippy::type_complexity)]
+    fn build_spec_evm<'db, DB>(
+        &self,
+        db: &'db mut DB,
+        coinbase: revm::primitives::Address,
+        block_number: u64,
+        block_timestamp: u64,
+    ) -> revm::context::Evm<
+        revm::context::Context<
+            revm::context::BlockEnv,
+            TxEnv,
+            revm::context::CfgEnv,
+            &'db mut DB,
+            revm::context::Journal<&'db mut DB>,
+            (),
+        >,
+        (
+            native_journal::NativeJournalInspector,
+            (trace::CallRecorder, coinbase_read::CoinbaseReadDetector),
+        ),
+        revm::handler::instructions::EthInstructions<
+            revm::interpreter::interpreter::EthInterpreter,
+            revm::context::Context<
+                revm::context::BlockEnv,
+                TxEnv,
+                revm::context::CfgEnv,
+                &'db mut DB,
+                revm::context::Journal<&'db mut DB>,
+                (),
+            >,
+        >,
+        precompiles::NativePrecompiles,
+        revm::handler::EthFrame<revm::interpreter::interpreter::EthInterpreter>,
+    >
+    where
+        DB: revm::database_interface::Database,
+    {
+        let (ctx, instruction, precompiles, journal) =
+            self.evm_parts(db, coinbase, block_number, block_timestamp, false, true);
+        revm::context::Evm::new_with_inspector(
+            ctx,
+            (
+                native_journal::NativeJournalInspector::new(journal),
+                (trace::CallRecorder::new(), coinbase_read::CoinbaseReadDetector::new(coinbase)),
+            ),
+            instruction,
+            precompiles,
+        )
     }
 
     /// Assemble the pieces both EVM builders share: the context
@@ -821,6 +881,13 @@ impl EvmModule {
     /// and the simulation builder identical except for the inspector
     /// — the sim path adds the wall-clock deadline, which must never
     /// exist on a committed path.
+    ///
+    /// `spec_ro` (speculative read-only) makes mutating native
+    /// precompiles revert — used by the parallel executor so a
+    /// speculative frame can never write shared native state outside
+    /// its own `CacheDB` clone. The suppressed mutation is flagged in
+    /// the native journal (`blocked_mutation`) so the tx is known to
+    /// need canonical re-execution.
     #[allow(clippy::type_complexity)]
     fn evm_parts<'db, DB>(
         &self,
@@ -829,6 +896,7 @@ impl EvmModule {
         block_number: u64,
         block_timestamp: u64,
         sim: bool,
+        spec_ro: bool,
     ) -> (
         revm::context::Context<
             revm::context::BlockEnv,
@@ -906,7 +974,7 @@ impl EvmModule {
         {
             precompiles = precompiles.with_staking(staking);
         }
-        if sim {
+        if sim || spec_ro {
             precompiles = precompiles.read_only();
         }
         (ctx, instruction, precompiles, journal)
@@ -956,7 +1024,7 @@ impl EvmModule {
         DB: revm::database_interface::Database,
     {
         let (ctx, instruction, precompiles, journal) =
-            self.evm_parts(db, coinbase, block_number, block_timestamp, true);
+            self.evm_parts(db, coinbase, block_number, block_timestamp, true, false);
         revm::context::Evm::new_with_inspector(
             ctx,
             (
@@ -976,6 +1044,7 @@ impl EvmModule {
         block_number: u64,
         block_timestamp: u64,
         sim: bool,
+        spec_ro: bool,
     ) -> revm::context::Evm<
         revm::context::Context<
             revm::context::BlockEnv,
@@ -1004,7 +1073,7 @@ impl EvmModule {
         DB: revm::database_interface::Database,
     {
         let (ctx, instruction, precompiles, journal) =
-            self.evm_parts(db, coinbase, block_number, block_timestamp, sim);
+            self.evm_parts(db, coinbase, block_number, block_timestamp, sim, spec_ro);
         revm::context::Evm::new_with_inspector(
             ctx,
             (
@@ -1651,6 +1720,82 @@ impl EvmModule {
         }
     }
 
+    /// Build the [`SpecTx`] record for a transaction that ran on a
+    /// native fast path (`try_native_transfer` or
+    /// `try_empty_code_call`).
+    ///
+    /// The fast paths touch exactly three accounts — caller (nonce +
+    /// balance), recipient (balance), and the coinbase (tip). The
+    /// coinbase is tracked through `coinbase_delta` instead of the
+    /// write set because every transaction writes it and the change
+    /// is strictly additive. When the caller *is* the coinbase the
+    /// nonce bump lands on the fee-recipient account — a
+    /// non-additive change the delta cannot represent — so the tx is
+    /// flagged `coinbase_nontrivial` and re-executes canonically.
+    ///
+    /// `coinbase_before` is the coinbase balance the group cache
+    /// showed just before this tx ran — what any `BALANCE(coinbase)`
+    /// would have observed (fast paths never execute opcodes, so
+    /// `coinbase.read` only matters for the caller == coinbase case,
+    /// which is already `must_reexec`).
+    #[allow(clippy::too_many_arguments)]
+    fn spec_fast_path<DB: DatabaseRef>(
+        db: &CacheDB<DB>,
+        idx: usize,
+        caller: revm::primitives::Address,
+        signed: &tx::SignedTx,
+        coinbase: revm::primitives::Address,
+        coinbase_before: revm::primitives::U256,
+        result: ExecutionResult,
+    ) -> SpecTx {
+        let recipient = match signed.to() {
+            tx::TxKind::Call(addr) => revm::primitives::Address::from(addr.0),
+            // Both fast paths reject Create before reaching here.
+            tx::TxKind::Create => revm::primitives::Address::ZERO,
+        };
+        let caller_is_coinbase = caller == coinbase;
+
+        let mut reads: std::collections::HashSet<revm::primitives::Address> =
+            std::collections::HashSet::with_capacity(2);
+        reads.insert(caller);
+        reads.insert(recipient);
+
+        let mut writes: std::collections::HashSet<revm::primitives::Address> =
+            std::collections::HashSet::with_capacity(2);
+        let mut write_accounts = Vec::with_capacity(2);
+        for addr in [caller, recipient] {
+            if addr == coinbase || !writes.insert(addr) {
+                continue;
+            }
+            if let Some(dba) = db.cache.accounts.get(&addr) {
+                write_accounts.push((addr, dba.clone()));
+            }
+        }
+
+        let coinbase_after =
+            db.cache.accounts.get(&coinbase).map_or(coinbase_before, |a| a.info.balance);
+        let frame = Self::fast_path_frame(signed, caller, &result);
+        SpecTx {
+            idx,
+            sender: caller,
+            result: Ok((result, Some(frame))),
+            reads,
+            writes,
+            write_accounts,
+            new_contracts: Vec::new(),
+            coinbase_before,
+            coinbase_delta: coinbase_after - coinbase_before,
+            coinbase: CoinbaseObs {
+                // The caller's balance-sufficiency check reads the
+                // coinbase balance when caller == coinbase.
+                read: caller_is_coinbase,
+                accessed: caller_is_coinbase || recipient == coinbase,
+                nontrivial: caller_is_coinbase,
+            },
+            must_reexec: caller_is_coinbase,
+        }
+    }
+
     ///
     /// # Errors
     ///
@@ -2157,23 +2302,37 @@ impl EvmModule {
     ///    Within a group, transactions execute sequentially (nonce
     ///    dependency). Across groups, transactions are independent
     ///    (different senders).
-    /// 3. **Parallel execution**: Each group executes on its own clone
-    ///    of the main `CacheDB`. Groups execute in parallel via `rayon`.
-    ///    Each transaction uses `transact` (non-commit) to obtain the
-    ///    `EvmState` diff, then commits it to the group's local clone so
-    ///    the next transaction in the group sees the updated state.
-    /// 4. **Conflict detection**: After parallel execution, groups are
-    ///    committed in canonical order (by minimum original tx index).
-    ///    If a group's touched accounts overlap with a previously
-    ///    committed group — **excluding the coinbase**, which is handled
-    ///    additively — the group is re-executed sequentially against the
-    ///    main DB. This preserves Ethereum semantics: any read-write
-    ///    conflict between groups falls back to the serial path.
-    /// 5. **Coinbase handling**: The coinbase (fee recipient) is touched
-    ///    by every transaction. Each group's tip contribution is
-    ///    computed as a balance delta and applied additively to the main
-    ///    DB's coinbase. This is correct because tips are strictly
-    ///    additive (the coinbase only receives balance, never spends).
+    /// 3. **Parallel execution**: Each group executes on its own
+    ///    copy-on-write `CacheDB` over a shared snapshot. Groups
+    ///    execute in parallel via `rayon`. Each transaction uses
+    ///    `transact` (non-commit) to obtain the `EvmState` diff —
+    ///    its exact read and write sets — then commits it to the
+    ///    group's local clone so the next transaction in the group
+    ///    sees the updated state. Speculative EVMs run with
+    ///    read-only native precompiles (a suppressed native
+    ///    mutation flags the tx for re-execution) and a
+    ///    `BALANCE(coinbase)` detector.
+    /// 4. **Canonical-order commit**: Transactions are committed in
+    ///    original batch order — *not* group order — so an
+    ///    interleaving like `A0, B0, A1` can never commit as
+    ///    `A0, A1, B0`. At each tx's position, its speculative
+    ///    read/write sets are validated against the writes of all
+    ///    canonically-earlier txs from other senders: a tx whose
+    ///    speculation saw only same-sender writes and untouched
+    ///    accounts merges directly; anything else re-executes
+    ///    against the main DB, which by then holds exactly the
+    ///    canonical pre-state. Once a tx re-executes, its
+    ///    same-sender successors re-execute too (they speculated
+    ///    on its speculative outcome).
+    /// 5. **Coinbase handling**: The coinbase (fee recipient) is
+    ///    written by every transaction via tips, so it is tracked
+    ///    outside the read/write sets: each tx's net coinbase
+    ///    delta merges additively in canonical order, keeping the
+    ///    running balance canonical. A tx that observed the
+    ///    coinbase balance (`BALANCE`) re-executes unless the
+    ///    balance it saw matches the canonical total; a tx that
+    ///    changed the coinbase non-additively (nonce/storage)
+    ///    always re-executes.
     ///
     /// # When to use this vs `handle_batch`
     ///
@@ -2186,13 +2345,12 @@ impl EvmModule {
     ///
     /// # Limitations
     ///
-    /// - Clones the entire `CacheDB` per group. For large state (many
-    ///   accounts), the clone cost may dominate. A future optimization
-    ///   will use copy-on-write or account-level snapshots.
-    /// - Conflict detection is conservative: any shared touched
-    ///   account (excluding coinbase) triggers sequential
-    ///   re-execution of the later group. Finer-grained conflict
-    ///   detection (per-storage-slot) is future work.
+    /// - Conflict detection is account-granular: two txs touching
+    ///   different storage slots of the same account are treated as
+    ///   conflicting. Per-storage-slot tracking is future work.
+    /// - Re-execution cascades within a sender: one invalid
+    ///   speculative tx re-executes all its same-sender successors
+    ///   (their speculation depended on its outcome).
     ///
     /// # Arguments
     ///
@@ -2421,10 +2579,23 @@ impl EvmModule {
             *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Phase 4: execute each group in parallel on its own COW
-        // nested cache. Each group's txs execute sequentially via
-        // `transact_commit` (no per-tx EvmState clone). After
-        // execution, the nested cache's touched accounts are
-        // extracted directly as the group's state diff.
+        // nested cache. Within a group txs run sequentially (nonce
+        // dependency); across groups they speculate independently.
+        // Every tx produces a `SpecTx` recording its exact per-tx
+        // read/write sets, coinbase observation, and native-mutation
+        // flags — the commit phase (Phase 5) validates each tx in
+        // canonical index order, so speculation order cannot leak
+        // into the committed result.
+        //
+        // Speculative EVMs run with read-only native precompiles:
+        // a mutating staking call reverts instead of touching the
+        // shared `StakingModule`, and the suppressed mutation sets
+        // `native_blocked` so the tx re-executes canonically.
+        let parent_coinbase = snapshot
+            .cache
+            .accounts
+            .get(&coinbase)
+            .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
         let group_results: Vec<GroupExecResult> = group_order
             .par_iter()
             .map(|sender| {
@@ -2463,38 +2634,24 @@ impl EvmModule {
                     let _ = db.load_account(*addr);
                 }
 
-                // Build the EVM context lazily — only needed for
-                // non-native txs (contract calls, creations, txs
-                // with calldata). For groups where all txs are
-                // simple transfers, the EVM is never built.
-                // Context rebuild is ~100 ns; negligible vs the
-                // ~3.7 µs EVM execution cost for non-native txs.
-
-                let mut tx_results: Vec<(usize, TracedResult)> = Vec::with_capacity(txs.len());
-                // Ceiling 2: per-tx accessed account sets. For each
-                // tx, we record the set of accounts it accessed
-                // (read OR written). This enables tx-granular
-                // conflict detection: when a group conflicts, only
-                // the specific txs that accessed conflicting accounts
-                // are re-executed, not the entire group.
-                let mut per_tx_accessed: Vec<(
-                    usize,
-                    std::collections::HashSet<revm::primitives::Address>,
-                )> = Vec::with_capacity(txs.len());
+                let mut spec_txs: Vec<SpecTx> = Vec::with_capacity(txs.len());
 
                 for (idx, signed) in txs {
                     let caller = *sender;
+                    let idx = *idx;
 
-                    // Snapshot the cache's account keys before this
-                    // tx. After the tx, the union of before-keys and
-                    // after-keys is the set of accounts this tx
-                    // accessed (read accounts are loaded into the
-                    // cache; written accounts are modified in the
-                    // cache). This is O(n_cache) per tx, but n_cache
-                    // is typically small (10-50 accounts for a
-                    // contract call).
-                    let cache_keys_before: std::collections::HashSet<revm::primitives::Address> =
-                        db.cache.accounts.keys().copied().collect();
+                    // The coinbase state this tx speculates against:
+                    // pre-block balance plus own-group tips so far.
+                    // `nonce_before` detects non-additive coinbase
+                    // writes (only possible when the sender *is* the
+                    // coinbase — tips never bump a nonce).
+                    let coinbase_before = db
+                        .cache
+                        .accounts
+                        .get(&coinbase)
+                        .map_or(parent_coinbase, |a| a.info.balance);
+                    let coinbase_nonce_before =
+                        db.cache.accounts.get(&coinbase).map_or(0, |a| a.info.nonce);
 
                     // Try the native transfer fast path first. For
                     // simple ETH transfers (empty calldata, EOA
@@ -2502,16 +2659,15 @@ impl EvmModule {
                     if let Some(result) =
                         Self::try_native_transfer(signed, caller, &mut db, coinbase, self.base_fee)
                     {
-                        // Native transfer accesses: caller, recipient, coinbase.
-                        let mut accessed = std::collections::HashSet::new();
-                        accessed.insert(caller);
-                        if let tx::TxKind::Call(addr) = signed.to() {
-                            accessed.insert(revm::primitives::Address::from(addr.0));
-                        }
-                        accessed.insert(coinbase);
-                        per_tx_accessed.push((*idx, accessed));
-                        let frame = Self::fast_path_frame(signed, caller, &result);
-                        tx_results.push((*idx, Ok((result, Some(frame)))));
+                        spec_txs.push(Self::spec_fast_path(
+                            &db,
+                            idx,
+                            caller,
+                            signed,
+                            coinbase,
+                            coinbase_before,
+                            result,
+                        ));
                         continue;
                     }
 
@@ -2522,16 +2678,15 @@ impl EvmModule {
                     if let Some(result) =
                         Self::try_empty_code_call(signed, caller, &mut db, coinbase, self.base_fee)
                     {
-                        // Empty-code call accesses: caller, recipient, coinbase.
-                        let mut accessed = std::collections::HashSet::new();
-                        accessed.insert(caller);
-                        if let tx::TxKind::Call(addr) = signed.to() {
-                            accessed.insert(revm::primitives::Address::from(addr.0));
-                        }
-                        accessed.insert(coinbase);
-                        per_tx_accessed.push((*idx, accessed));
-                        let frame = Self::fast_path_frame(signed, caller, &result);
-                        tx_results.push((*idx, Ok((result, Some(frame)))));
+                        spec_txs.push(Self::spec_fast_path(
+                            &db,
+                            idx,
+                            caller,
+                            signed,
+                            coinbase,
+                            coinbase_before,
+                            result,
+                        ));
                         continue;
                     }
 
@@ -2539,133 +2694,238 @@ impl EvmModule {
                     let tx_env = match Self::build_tx_env(signed, caller, self.spec) {
                         Ok(t) => t,
                         Err(e) => {
-                            per_tx_accessed.push((*idx, std::collections::HashSet::new()));
-                            tx_results.push((*idx, Err(e)));
+                            // Build failures are tx-intrinsic (malformed
+                            // fields) — no state was read, so the result
+                            // cannot depend on ordering.
+                            spec_txs.push(SpecTx::intrinsic_error(idx, caller, e));
                             continue;
                         }
                     };
 
-                    // Ceiling 2: use `transact` (not `transact_commit`)
-                    // to get the per-tx `EvmState`, which contains
-                    // the exact set of modified accounts. This lets
-                    // us track per-tx write sets for tx-granular
-                    // conflict detection.
-                    let result = {
+                    // Snapshot contract-code keys before the tx so the
+                    // per-tx `new_contracts` diff is exact (CREATE is
+                    // the only way code enters the cache).
+                    let contracts_before: std::collections::HashSet<revm::primitives::B256> =
+                        db.cache.contracts.keys().copied().collect();
+
+                    // Speculative run: read-only native precompiles
+                    // + coinbase-read detection. `transact` (not
+                    // `transact_commit`) returns the per-tx `EvmState`
+                    // — the exact set of accounts the tx loaded
+                    // (reads) and modified (writes). The state diff is
+                    // committed into the group cache before the EVM is
+                    // dropped so `db` is free for the write-set scan.
+                    let (result, native_blocked, coinbase_read, call_trace, loaded) = {
                         let mut evm =
-                            self.build_evm(&mut db, coinbase, block_number, block_timestamp);
+                            self.build_spec_evm(&mut db, coinbase, block_number, block_timestamp);
                         let rs = evm.inspect_tx(tx_env);
+                        let blocked = evm.precompiles.blocked_native_mutation();
                         evm.precompiles.clear_native_journal();
-                        let call_trace = evm.inspector.1.take_root();
-                        if let Ok(ref rs) = rs {
-                            evm.commit(rs.state.clone());
+                        let cb_read = evm.inspector.1.1.observed();
+                        let call_trace = evm.inspector.1.0.take_root();
+                        match rs {
+                            Ok(rs) => {
+                                // `rs.state` holds every account the
+                                // journal loaded — the exact read set.
+                                let accessed_coinbase = rs.state.contains_key(&coinbase);
+                                // A non-additive coinbase change cannot
+                                // be merged via the balance delta:
+                                // nonce bumps (sender == coinbase, or a
+                                // CREATE/CREATE2 deployed at the fee
+                                // recipient), storage writes into a
+                                // contract living at that address, or
+                                // destruction — `SELFDESTRUCT` or an
+                                // EIP-161 empty-touch delete, which
+                                // leaves balance, nonce, and storage
+                                // map untouched in the journal entry
+                                // but must still drop the account.
+                                let coinbase_nontrivial =
+                                    rs.state.get(&coinbase).is_some_and(|a| {
+                                        a.is_touched()
+                                            && (a.is_selfdestructed()
+                                                || a.is_created_locally()
+                                                || !a.storage.is_empty()
+                                                || a.info.nonce != coinbase_nonce_before)
+                                    });
+                                let mut addrs: std::collections::HashSet<
+                                    revm::primitives::Address,
+                                > = std::collections::HashSet::with_capacity(rs.state.len());
+                                for addr in rs.state.keys() {
+                                    addrs.insert(*addr);
+                                }
+                                evm.commit(rs.state);
+                                (
+                                    Ok(rs.result),
+                                    blocked,
+                                    cb_read,
+                                    call_trace,
+                                    Some((addrs, accessed_coinbase, coinbase_nontrivial)),
+                                )
+                            }
+                            Err(e) => (Err(e), blocked, cb_read, call_trace, None),
                         }
-                        (rs, call_trace)
                     };
 
                     match result {
-                        (Ok(rs), call_trace) => {
-                            // Per-tx accessed accounts: the union of
-                            // cache keys before and after the tx, plus
-                            // the accounts in the EvmState (which may
-                            // include accounts not yet in the cache).
-                            let mut accessed = cache_keys_before;
-                            accessed.extend(rs.state.keys().copied());
-                            accessed.extend(db.cache.accounts.keys().copied());
-                            per_tx_accessed.push((*idx, accessed));
-                            tx_results.push((*idx, Ok((rs.result, call_trace))));
+                        Ok(exec_result) => {
+                            let (loaded_addrs, accessed_coinbase, coinbase_nontrivial) =
+                                loaded.expect("Ok carries the loaded state");
+
+                            // The coinbase delta captures the tx's
+                            // net balance effect on the fee recipient
+                            // (tips, plus transfers/selfdestructs to
+                            // it — all strictly additive).
+                            let coinbase_after = db
+                                .cache
+                                .accounts
+                                .get(&coinbase)
+                                .map_or(parent_coinbase, |a| a.info.balance);
+
+                            // `loaded_addrs` holds every account the
+                            // journal touched — the exact read set.
+                            // Writes are the subset the commit marked
+                            // modified (`account_state != None`),
+                            // matching sequential `commit_account`
+                            // semantics.
+                            let mut reads: std::collections::HashSet<revm::primitives::Address> =
+                                std::collections::HashSet::with_capacity(loaded_addrs.len());
+                            for addr in &loaded_addrs {
+                                if *addr != coinbase {
+                                    reads.insert(*addr);
+                                }
+                            }
+
+                            let mut writes: std::collections::HashSet<revm::primitives::Address> =
+                                std::collections::HashSet::new();
+                            let mut write_accounts: Vec<(
+                                revm::primitives::Address,
+                                revm::database::DbAccount,
+                            )> = Vec::new();
+                            for addr in &reads {
+                                if let Some(dba) = db.cache.accounts.get(addr) {
+                                    if dba.account_state != revm::database::AccountState::None {
+                                        writes.insert(*addr);
+                                        write_accounts.push((*addr, dba.clone()));
+                                    }
+                                }
+                            }
+
+                            let new_contracts: Vec<(
+                                revm::primitives::B256,
+                                revm::bytecode::Bytecode,
+                            )> = db
+                                .cache
+                                .contracts
+                                .iter()
+                                .filter(|(hash, _)| !contracts_before.contains(*hash))
+                                .map(|(hash, code)| (*hash, code.clone()))
+                                .collect();
+
+                            spec_txs.push(SpecTx {
+                                idx,
+                                sender: caller,
+                                result: Ok((exec_result, call_trace)),
+                                reads,
+                                writes,
+                                write_accounts,
+                                new_contracts,
+                                coinbase_before,
+                                coinbase_delta: coinbase_after - coinbase_before,
+                                coinbase: CoinbaseObs {
+                                    read: coinbase_read,
+                                    accessed: accessed_coinbase,
+                                    nontrivial: coinbase_nontrivial,
+                                },
+                                must_reexec: native_blocked || coinbase_nontrivial,
+                            });
                         }
-                        (Err(e), _) => {
-                            per_tx_accessed.push((*idx, cache_keys_before));
-                            tx_results.push((
-                                *idx,
-                                Err(ExecError::ModuleRejected(format!(
+                        Err(e) => {
+                            // revm validation failure — the only state
+                            // consulted is the sender's account (nonce,
+                            // balance, gas affordability), so the
+                            // sender alone forms the read set.
+                            let mut reads = std::collections::HashSet::new();
+                            reads.insert(caller);
+                            spec_txs.push(SpecTx {
+                                idx,
+                                sender: caller,
+                                result: Err(ExecError::ModuleRejected(format!(
                                     "evm transact failed: {e:?}"
                                 ))),
-                            ));
+                                reads,
+                                writes: std::collections::HashSet::new(),
+                                write_accounts: Vec::new(),
+                                new_contracts: Vec::new(),
+                                coinbase_before,
+                                coinbase_delta: revm::primitives::U256::ZERO,
+                                coinbase: CoinbaseObs {
+                                    read: false,
+                                    accessed: false,
+                                    nontrivial: false,
+                                },
+                                must_reexec: native_blocked,
+                            });
                         }
                     }
                 }
 
-                // Extract the nested cache's touched accounts and
-                // new contracts as the group's state diff. Only
-                // accounts with `account_state != None` were
-                // actually modified (touched, created, or
-                // selfdestructed) — accounts that were only loaded
-                // (read) have `account_state = None` and are
-                // excluded.
-                //
-                // We clone the touched accounts and new contracts
-                // because the local cache is still needed for the
-                // `accessed_accounts` extraction below. Attempting
-                // to drain/move caused a significant throughput
-                // regression (likely due to HashMap internal
-                // reallocation behavior during drain on the
-                // CacheDB's concurrent access patterns).
-                let touched_accounts: revm::primitives::AddressMap<revm::database::DbAccount> = db
-                    .cache
-                    .accounts
-                    .iter()
-                    .filter(|(_, a)| a.account_state != revm::database::AccountState::None)
-                    .map(|(addr, a)| (*addr, a.clone()))
-                    .collect();
-
-                // Read-set tracking (hardening): collect ALL accounts
-                // accessed by this group (read OR written). This
-                // includes accounts with `account_state == None`
-                // (read-only) and `account_state != None` (written).
-                // Used for read-write conflict detection in the
-                // commit phase: a group conflicts if its accessed
-                // set overlaps with any previously committed group's
-                // write set. Without this, a group that reads an
-                // account modified by an earlier group would not be
-                // detected as conflicting and would commit stale
-                // state.
-                let accessed_accounts: std::collections::HashSet<revm::primitives::Address> =
-                    db.cache.accounts.keys().copied().collect();
-
-                let new_contracts = db.cache.contracts.clone();
-
-                // Compute the coinbase balance delta for this group.
-                // The nested cache's coinbase balance = parent's
-                // coinbase balance + tips received by this group.
-                // The delta is strictly additive (the coinbase only
-                // receives tips).
-                let coinbase_after = touched_accounts
-                    .get(&coinbase)
-                    .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
-                let coinbase_before = snapshot
-                    .cache
-                    .accounts
-                    .get(&coinbase)
-                    .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
-                let coinbase_delta = coinbase_after - coinbase_before;
-
-                GroupExecResult {
-                    sender: *sender,
-                    tx_results,
-                    touched_accounts,
-                    accessed_accounts,
-                    per_tx_accessed,
-                    new_contracts,
-                    coinbase_delta,
-                }
+                GroupExecResult { spec_txs }
             })
             .collect();
 
-        // Phase 5: commit groups in canonical order with conflict
-        // detection. Groups are already ordered by first appearance
-        // (group_order), which matches canonical tx order.
+        // Phase 5: commit in canonical transaction order.
         //
-        // We maintain a set of accounts touched by previously
-        // committed groups. If a new group touches any of those
-        // accounts (excluding the coinbase, which is handled
-        // additively), we re-execute the group sequentially against
-        // the main DB to preserve Ethereum semantics.
+        // Speculation ran per-sender groups — for `A0, B0, A1` the
+        // speculative execution order was effectively `A0, A1, B0`.
+        // Merging in group order would let `A1` commit a result
+        // computed without `B0`'s writes. Instead every tx is
+        // validated at its canonical index position: it keeps its
+        // speculative result iff no canonically-earlier tx from a
+        // *different* sender wrote anything it read or wrote —
+        // otherwise it is re-executed against the main DB, which at
+        // that point holds exactly the canonical pre-state.
+        //
+        // `writers` maps each written account to its first writer's
+        // sender plus a "multiple senders" flag; a tx conflicts when
+        // any account in `reads ∪ writes` was written by a different
+        // sender. Same-sender writes are excluded because the group's
+        // sequential speculation already observed them — but only up
+        // to the first re-execution: once a tx re-executes, its
+        // same-group successors speculated on its speculative
+        // outcome, so they re-execute too (`broken`).
         let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let db = Arc::make_mut(&mut *db_guard);
-        let mut committed_touched: std::collections::HashSet<revm::primitives::Address> =
+
+        // Flatten speculative records and signed txs into index
+        // order — the commit loop below walks positions 0..n_txs.
+        let mut flat: Vec<Option<SpecTx>> = Vec::with_capacity(n_txs);
+        flat.resize_with(n_txs, || None);
+        for gr in group_results {
+            for st in gr.spec_txs {
+                let idx = st.idx;
+                flat[idx] = Some(st);
+            }
+        }
+        let mut signed_by_idx: Vec<Option<&tx::SignedTx>> = Vec::with_capacity(n_txs);
+        signed_by_idx.resize_with(n_txs, || None);
+        for txs in groups.values() {
+            for (idx, signed) in txs {
+                signed_by_idx[*idx] = Some(signed);
+            }
+        }
+
+        let mut writers: std::collections::HashMap<
+            revm::primitives::Address,
+            (revm::primitives::Address, bool),
+        > = std::collections::HashMap::new();
+        let mut broken: std::collections::HashSet<revm::primitives::Address> =
             std::collections::HashSet::new();
-        let mut total_coinbase_delta = revm::primitives::U256::ZERO;
+        // Set once any tx changed the coinbase beyond an additive
+        // balance delta (nonce/storage — e.g. sender == coinbase, or
+        // a contract deployed at the fee recipient). Later txs that
+        // accessed the coinbase at all can no longer trust their
+        // speculative view of it.
+        let mut coinbase_dirty = false;
         let mut all_touched: std::collections::HashSet<revm::primitives::Address> =
             std::collections::HashSet::new();
         // Inverse-diff accumulator for the parallel path — captures
@@ -2673,232 +2933,245 @@ impl EvmModule {
         // re-execution and non-conflict merges), never the
         // speculative scratch caches.
         let mut committed_undo = versioned::BlockUndo::default();
-        // Results from sequential re-execution of conflicting groups.
-        // Keyed by original tx index. Takes precedence over the
-        // speculative results in `group_results`.
-        let mut reexec_results: std::collections::HashMap<
-            usize,
-            Result<(revm::context::result::ExecutionResult, Option<trace::CallFrame>), ExecError>,
-        > = std::collections::HashMap::new();
+        // The committed result for each tx position — speculative or
+        // re-executed, whichever the validation chose.
+        let mut final_results: Vec<Option<TracedResult>> = Vec::with_capacity(n_txs);
+        final_results.resize_with(n_txs, || None);
 
-        for gr in &group_results {
-            // Read-write conflict detection (hardening):
-            //
-            // A group conflicts if any account it *accessed* (read OR
-            // wrote) was *written* by a previously committed group.
-            // The prior implementation only checked write-write
-            // conflicts (group's write set vs committed write set),
-            // missing read-write conflicts where a group reads an
-            // account that was modified by an earlier group. This
-            // caused the group to commit stale state silently.
-            //
-            // The `accessed_accounts` set includes all accounts in
-            // the group's cache (read + written). The
-            // `committed_touched` set includes all accounts written
-            // by previously committed groups. The coinbase is
-            // excluded from both sides (it is handled additively).
-            //
-            // **Read-only group fast path**: if the group's only
-            // writes are to its own sender account (nonce/balance)
-            // and the coinbase (tips), it cannot conflict with any
-            // other group — the sender is unique per group (groups
-            // are by sender), and the coinbase is handled
-            // additively. This skips the conflict check and the
-            // `accessed_accounts` set intersection, which is O(n_groups)
-            // per group and O(n_groups²) total. For workloads with
-            // many read-only contract calls (e.g. 10% reads in the
-            // standard mix), this eliminates unnecessary conflict
-            // detection and potential false-positive re-execution.
-            let group_touched: std::collections::HashSet<revm::primitives::Address> =
-                gr.touched_accounts.keys().filter(|addr| **addr != coinbase).copied().collect();
-
-            // A group is "read-only" (with respect to other groups)
-            // if its only write outside the coinbase is its own
-            // sender account. The sender is unique per group, so it
-            // can never conflict with another group's writes.
-            let is_read_only = group_touched.iter().all(|addr| *addr == gr.sender);
-
-            let has_conflict = if is_read_only {
-                // Read-only group: skip conflict check entirely.
-                false
-            } else {
-                // Read-write group: check if any accessed account was
-                // written by a previously committed group.
-                let group_accessed: std::collections::HashSet<revm::primitives::Address> = gr
-                    .accessed_accounts
-                    .iter()
-                    .filter(|addr| **addr != coinbase)
-                    .copied()
-                    .collect();
-                group_accessed.iter().any(|addr| committed_touched.contains(addr))
+        for i in 0..n_txs {
+            let Some(st) = flat[i].take() else {
+                continue;
             };
 
-            if has_conflict {
-                // Conflict resolution: re-execute the ENTIRE group
-                // sequentially against the main DB.
-                //
-                // We previously tried tx-granular re-execution (only
-                // re-executing the specific txs that accessed
-                // conflicting accounts, keeping speculative results
-                // for non-conflicting txs). This was incorrect:
-                // non-conflicting txs' state changes (nonce increments,
-                // balance deductions) were never applied to the main
-                // DB, so when a later tx in the same group was
-                // re-executed, the main DB had a stale nonce — causing
-                // `NonceTooHigh` failures.
-                //
-                // All txs from the same sender have a strict nonce
-                // dependency: tx N+1 cannot execute until tx N's
-                // nonce increment is committed. Partial re-execution
-                // breaks this dependency. Full-group re-execution
-                // preserves it: the entire group runs sequentially
-                // against the main DB, which sees each tx's nonce
-                // increment before the next tx executes.
-                let group_txs = groups.get(&gr.sender).expect("group exists");
-                for (idx, signed) in group_txs {
-                    let caller = gr.sender;
-                    let idx = *idx;
+            // Canonical coinbase balance before tx i — the main DB
+            // receives merged deltas and re-executed tips in index
+            // order, so this equals the sequential value.
+            let canonical_coinbase = db
+                .cache
+                .accounts
+                .get(&coinbase)
+                .map_or(revm::primitives::U256::ZERO, |a| a.info.balance);
 
-                    // Try native fast path first.
-                    Self::undo_capture_fast_path(&mut committed_undo, db, signed, caller, coinbase);
-                    if let Some(result) =
-                        Self::try_native_transfer(signed, caller, &mut *db, coinbase, self.base_fee)
-                    {
-                        all_touched.insert(caller);
-                        if let tx::TxKind::Call(addr) = signed.to() {
-                            all_touched.insert(revm::primitives::Address::from(addr.0));
-                        }
-                        all_touched.insert(coinbase);
-                        committed_touched.insert(caller);
-                        if let tx::TxKind::Call(addr) = signed.to() {
-                            committed_touched.insert(revm::primitives::Address::from(addr.0));
-                        }
-                        committed_touched.insert(coinbase);
-                        let frame = Self::fast_path_frame(signed, caller, &result);
-                        reexec_results.insert(idx, Ok((result, Some(frame))));
-                        continue;
-                    }
+            let account_conflict =
+                st.reads.iter().chain(st.writes.iter()).any(|addr| match writers.get(addr) {
+                    Some(&(writer, multi)) => writer != st.sender || multi,
+                    None => false,
+                });
+            // The speculative coinbase observation is only valid if
+            // the balance it saw equals the canonical running total.
+            let stale_coinbase = (st.coinbase.read && st.coinbase_before != canonical_coinbase)
+                || (coinbase_dirty && st.coinbase.accessed);
 
-                    // Try empty-code call fast path — must use the
-                    // same fast paths as the speculative execution to
-                    // ensure identical state roots.
-                    if let Some(result) =
-                        Self::try_empty_code_call(signed, caller, &mut *db, coinbase, self.base_fee)
-                    {
-                        all_touched.insert(caller);
-                        if let tx::TxKind::Call(addr) = signed.to() {
-                            all_touched.insert(revm::primitives::Address::from(addr.0));
-                        }
-                        all_touched.insert(coinbase);
-                        committed_touched.insert(caller);
-                        if let tx::TxKind::Call(addr) = signed.to() {
-                            committed_touched.insert(revm::primitives::Address::from(addr.0));
-                        }
-                        committed_touched.insert(coinbase);
-                        let frame = Self::fast_path_frame(signed, caller, &result);
-                        reexec_results.insert(idx, Ok((result, Some(frame))));
-                        continue;
-                    }
+            if st.must_reexec || broken.contains(&st.sender) || account_conflict || stale_coinbase {
+                // Re-execute this tx against the canonical DB.
+                broken.insert(st.sender);
+                coinbase_dirty |= st.coinbase.nontrivial;
+                let caller = st.sender;
+                let signed = signed_by_idx[i].expect("speculative tx has signed bytes");
+                let cb_nonce_pre = db.cache.accounts.get(&coinbase).map_or(0, |a| a.info.nonce);
 
-                    // Fall through to revm.
-                    let tx_env = match Self::build_tx_env(signed, caller, self.spec) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            reexec_results.insert(idx, Err(e));
-                            continue;
-                        }
-                    };
-                    {
-                        let mut evm =
-                            self.build_evm(&mut *db, coinbase, block_number, block_timestamp);
-                        match evm.inspect_tx(tx_env) {
-                            Ok(rs) => {
-                                let r = rs.result;
-                                for addr in rs.state.keys() {
-                                    all_touched.insert(*addr);
-                                    committed_touched.insert(*addr);
-                                    committed_undo.capture(
-                                        *addr,
-                                        evm.ctx.journaled_state.database.cache.accounts.get(addr),
-                                    );
+                // Try native fast path first.
+                Self::undo_capture_fast_path(&mut committed_undo, db, signed, caller, coinbase);
+                if let Some(result) =
+                    Self::try_native_transfer(signed, caller, &mut *db, coinbase, self.base_fee)
+                {
+                    coinbase_dirty |= caller == coinbase;
+                    all_touched.insert(caller);
+                    all_touched.insert(coinbase);
+                    for addr in [caller] {
+                        match writers.entry(addr) {
+                            Entry::Occupied(mut o) => {
+                                if o.get().0 != caller {
+                                    o.get_mut().1 = true;
                                 }
-                                evm.precompiles.clear_native_journal();
-                                let call_trace = evm.inspector.1.take_root();
-                                evm.commit(rs.state);
-                                reexec_results.insert(idx, Ok((r, call_trace)));
                             }
-                            Err(e) => {
-                                reexec_results.insert(
-                                    idx,
-                                    Err(ExecError::ModuleRejected(format!(
-                                        "evm transact failed: {e:?}"
-                                    ))),
+                            Entry::Vacant(v) => {
+                                v.insert((caller, false));
+                            }
+                        }
+                    }
+                    if let tx::TxKind::Call(addr) = signed.to() {
+                        let rcp = revm::primitives::Address::from(addr.0);
+                        all_touched.insert(rcp);
+                        match writers.entry(rcp) {
+                            Entry::Occupied(mut o) => {
+                                if o.get().0 != caller {
+                                    o.get_mut().1 = true;
+                                }
+                            }
+                            Entry::Vacant(v) => {
+                                v.insert((caller, false));
+                            }
+                        }
+                    }
+                    let frame = Self::fast_path_frame(signed, caller, &result);
+                    final_results[i] = Some(Ok((result, Some(frame))));
+                    continue;
+                }
+
+                // Try empty-code call fast path — must use the
+                // same fast paths as the speculative execution to
+                // ensure identical state roots.
+                if let Some(result) =
+                    Self::try_empty_code_call(signed, caller, &mut *db, coinbase, self.base_fee)
+                {
+                    coinbase_dirty |= caller == coinbase;
+                    all_touched.insert(caller);
+                    all_touched.insert(coinbase);
+                    match writers.entry(caller) {
+                        Entry::Occupied(mut o) => {
+                            if o.get().0 != caller {
+                                o.get_mut().1 = true;
+                            }
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert((caller, false));
+                        }
+                    }
+                    if let tx::TxKind::Call(addr) = signed.to() {
+                        let rcp = revm::primitives::Address::from(addr.0);
+                        all_touched.insert(rcp);
+                        match writers.entry(rcp) {
+                            Entry::Occupied(mut o) => {
+                                if o.get().0 != caller {
+                                    o.get_mut().1 = true;
+                                }
+                            }
+                            Entry::Vacant(v) => {
+                                v.insert((caller, false));
+                            }
+                        }
+                    }
+                    let frame = Self::fast_path_frame(signed, caller, &result);
+                    final_results[i] = Some(Ok((result, Some(frame))));
+                    continue;
+                }
+
+                // Fall through to revm — the committed-path EVM
+                // (mutating native precompiles enabled: this is the
+                // canonical execution).
+                let tx_env = match Self::build_tx_env(signed, caller, self.spec) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        final_results[i] = Some(Err(e));
+                        continue;
+                    }
+                };
+                {
+                    let mut evm = self.build_evm(&mut *db, coinbase, block_number, block_timestamp);
+                    match evm.inspect_tx(tx_env) {
+                        Ok(rs) => {
+                            let r = rs.result;
+                            if let Some(cb) = rs.state.get(&coinbase) {
+                                // Same non-additive predicate as the
+                                // speculative scan: nonce, storage,
+                                // creation, or destruction — anything a
+                                // balance-delta merge cannot represent.
+                                coinbase_dirty |= cb.is_touched()
+                                    && (cb.is_selfdestructed()
+                                        || cb.is_created_locally()
+                                        || !cb.storage.is_empty()
+                                        || cb.info.nonce != cb_nonce_pre);
+                            }
+                            let state_keys: Vec<revm::primitives::Address> =
+                                rs.state.keys().copied().collect();
+                            for addr in &state_keys {
+                                all_touched.insert(*addr);
+                                committed_undo.capture(
+                                    *addr,
+                                    evm.ctx.journaled_state.database.cache.accounts.get(addr),
                                 );
                             }
+                            evm.precompiles.clear_native_journal();
+                            let call_trace = evm.inspector.1.take_root();
+                            evm.commit(rs.state);
+                            // Mark the tx's actual write set — accounts
+                            // the commit marked modified — as written
+                            // by this sender.
+                            for addr in &state_keys {
+                                if *addr == coinbase {
+                                    continue;
+                                }
+                                if db.cache.accounts.get(addr).is_some_and(|a| {
+                                    a.account_state != revm::database::AccountState::None
+                                }) {
+                                    match writers.entry(*addr) {
+                                        Entry::Occupied(mut o) => {
+                                            if o.get().0 != caller {
+                                                o.get_mut().1 = true;
+                                            }
+                                        }
+                                        Entry::Vacant(v) => {
+                                            v.insert((caller, false));
+                                        }
+                                    }
+                                }
+                            }
+                            final_results[i] = Some(Ok((r, call_trace)));
+                        }
+                        Err(e) => {
+                            final_results[i] = Some(Err(ExecError::ModuleRejected(format!(
+                                "evm transact failed: {e:?}"
+                            ))));
                         }
                     }
                 }
-            } else {
-                // No conflict: directly merge the group's touched
-                // accounts and new contracts into the main DB. This
-                // avoids the `EvmState` → `commit_account` conversion
-                // — we insert `DbAccount`s directly, which is what
-                // `commit_account` would produce anyway.
-                //
-                // Exclude the coinbase from the merge — it is
-                // handled additively via `coinbase_delta` at the
-                // end. Including it here would double-count the
-                // tips (once from the merge, once from the delta).
-                for (addr, account) in &gr.touched_accounts {
-                    if *addr != coinbase {
-                        committed_undo.capture(*addr, db.cache.accounts.get(addr));
-                        db.cache.accounts.insert(*addr, account.clone());
+                continue;
+            }
+
+            // Speculation validated: merge the tx's write set into
+            // the main DB and keep its speculative result.
+            for (addr, account) in &st.write_accounts {
+                committed_undo.capture(*addr, db.cache.accounts.get(addr));
+                db.cache.accounts.insert(*addr, account.clone());
+            }
+            for (hash, bytecode) in &st.new_contracts {
+                db.cache.contracts.entry(*hash).or_insert_with(|| bytecode.clone());
+            }
+            // Apply the coinbase delta now — keeping the running
+            // balance canonical for every later validation check.
+            if st.coinbase_delta != revm::primitives::U256::ZERO {
+                committed_undo.capture(coinbase, db.cache.accounts.get(&coinbase));
+                let coinbase_account = db.cache.accounts.entry(coinbase).or_insert_with(|| {
+                    revm::database::DbAccount {
+                        info: revm::database::state::AccountInfo {
+                            balance: revm::primitives::U256::ZERO,
+                            nonce: 0,
+                            // `KECCAK_EMPTY` matches what revm's
+                            // `insert_contract` sets for an empty-code
+                            // account. Using `B256::ZERO` here would
+                            // produce a different state root from the
+                            // serial path.
+                            code_hash: revm::primitives::KECCAK_EMPTY,
+                            account_id: None,
+                            code: Some(revm::bytecode::Bytecode::new_raw(
+                                revm::primitives::Bytes::new(),
+                            )),
+                        },
+                        // `Touched` matches what revm's `commit_account`
+                        // sets for a modified account.
+                        account_state: revm::database::AccountState::Touched,
+                        storage: revm::primitives::HashMap::default(),
+                    }
+                });
+                coinbase_account.info.balance += st.coinbase_delta;
+                coinbase_account.account_state = revm::database::AccountState::Touched;
+                all_touched.insert(coinbase);
+            }
+            for w in &st.writes {
+                match writers.entry(*w) {
+                    Entry::Occupied(mut o) => {
+                        if o.get().0 != st.sender {
+                            o.get_mut().1 = true;
+                        }
+                    }
+                    Entry::Vacant(v) => {
+                        v.insert((st.sender, false));
                     }
                 }
-                for (hash, bytecode) in &gr.new_contracts {
-                    db.cache.contracts.entry(*hash).or_insert_with(|| bytecode.clone());
-                }
-                committed_touched.extend(group_touched.iter().copied());
-                all_touched.extend(group_touched.iter().copied());
-
-                // Coinbase delta is only added for non-conflicting
-                // groups. For conflicting groups, the sequential
-                // re-execution via `transact_commit` already pays
-                // tips to the coinbase — adding the delta here would
-                // double-count.
-                total_coinbase_delta += gr.coinbase_delta;
+                all_touched.insert(*w);
             }
-        }
-
-        // Apply the total coinbase balance delta.
-        if total_coinbase_delta != revm::primitives::U256::ZERO {
-            // Capture coinbase's pre-block value before the delta
-            // lands (first-write-wins — the delta may not be its
-            // first write this block).
-            committed_undo.capture(coinbase, db.cache.accounts.get(&coinbase));
-            let coinbase_account =
-                db.cache.accounts.entry(coinbase).or_insert_with(|| revm::database::DbAccount {
-                    info: revm::database::state::AccountInfo {
-                        balance: revm::primitives::U256::ZERO,
-                        nonce: 0,
-                        // `KECCAK_EMPTY` matches what revm's
-                        // `insert_contract` sets for an empty-code
-                        // account. Using `B256::ZERO` here would
-                        // produce a different state root from the
-                        // serial path.
-                        code_hash: revm::primitives::KECCAK_EMPTY,
-                        account_id: None,
-                        code: Some(revm::bytecode::Bytecode::new_raw(
-                            revm::primitives::Bytes::new(),
-                        )),
-                    },
-                    // `Touched` matches what revm's `commit_account`
-                    // sets for a modified account.
-                    account_state: revm::database::AccountState::Touched,
-                    storage: revm::primitives::HashMap::default(),
-                });
-            coinbase_account.info.balance += total_coinbase_delta;
-            all_touched.insert(coinbase);
+            final_results[i] = Some(st.result);
         }
 
         // Merge touched accounts into the module-level set.
@@ -2915,23 +3188,9 @@ impl EvmModule {
             }
         }
 
-        // Phase 6: assemble results in original order.
-        // Re-executed results (from conflict fallback) take
-        // precedence over speculative results.
-        //
-        // Build a flat index map from tx index -> speculative
-        // result, so we can look up results in O(1) instead of
-        // O(groups * txs).
-        let mut spec_index: std::collections::HashMap<
-            usize,
-            &Result<(revm::context::result::ExecutionResult, Option<trace::CallFrame>), ExecError>,
-        > = std::collections::HashMap::with_capacity(n_txs);
-        for gr in &group_results {
-            for (idx, result) in &gr.tx_results {
-                spec_index.insert(*idx, result);
-            }
-        }
-
+        // Phase 6: assemble results in original order. `final_results`
+        // already carries whichever execution won — the validated
+        // speculative result or the canonical re-execution.
         let mut results: Vec<Result<Vec<Event>, ExecError>> = Vec::with_capacity(n_txs);
         for (i, err) in errors.iter().enumerate() {
             if let Some(e) = err {
@@ -2942,28 +3201,13 @@ impl EvmModule {
             // the trace into `metas[i]` — `exec_result_to_events`
             // takes the 3-tuple so the trace lands in history beside
             // the receipt.
-            let attach = |r: Result<
-                (revm::context::result::ExecutionResult, Option<trace::CallFrame>),
-                ExecError,
-            >,
-                          meta: Option<(history::StoredTx, Vec<u8>)>| {
-                let (res, call_trace) = match r {
-                    Ok((res, t)) => (Ok(res), t),
-                    Err(e) => (Err(e), None),
-                };
-                let meta = meta.map(|(s, raw)| (s, raw, call_trace));
-                (res, meta)
-            };
-            // Check re-executed results first (conflict fallback).
-            if let Some(r) = reexec_results.remove(&i) {
-                let (res, meta) = attach(r, metas[i].take());
-                results.push(self.exec_result_to_events(res, meta));
-                continue;
-            }
-            // Fall back to speculative results.
-            match spec_index.get(&i) {
-                Some(result) => {
-                    let (res, meta) = attach((*result).clone(), metas[i].take());
+            match final_results[i].take() {
+                Some(r) => {
+                    let (res, call_trace) = match r {
+                        Ok((res, t)) => (Ok(res), t),
+                        Err(e) => (Err(e), None),
+                    };
+                    let meta = metas[i].take().map(|(s, raw)| (s, raw, call_trace));
                     results.push(self.exec_result_to_events(res, meta));
                 }
                 None => {
@@ -3091,52 +3335,104 @@ impl DatabaseRef for SharedCacheDB {
     }
 }
 
-/// The result of executing a single sender group in parallel.
+/// The speculative outcome of a single transaction, captured for
+/// canonical-order validation and merge.
 ///
-/// Each group executes on its own COW nested cache. After
-/// execution, the nested cache's touched accounts and new
-/// contracts are extracted as the group's state diff — no
-/// per-tx `EvmState` cloning needed. The `coinbase_delta` is the
-/// group's tip contribution (additive, applied once at the end).
-struct GroupExecResult {
-    /// The sender address for this group.
+/// The parallel executor speculates per-sender groups, then commits
+/// each tx at its canonical index position. A `SpecTx` carries
+/// everything needed for both paths: the read/write sets that prove
+/// (or disprove) the speculation, the merge payload
+/// (`write_accounts`, `new_contracts`, `coinbase_delta`) for the
+/// fast path, and the flags that force canonical re-execution.
+struct SpecTx {
+    /// Original position of the tx in the batch.
+    idx: usize,
+    /// The tx sender (its group's key) — used to exclude same-sender
+    /// predecessor writes, which sequential in-group speculation
+    /// already observed.
     sender: revm::primitives::Address,
-    /// Per-tx results, indexed by original position in the batch.
-    /// The `Ok` payload carries the trace recorded beside the
-    /// execution result — for conflict-reexecuted txs the reexec
-    /// map's trace wins (it's the committed execution).
-    tx_results: Vec<(usize, TracedResult)>,
-    /// Touched accounts from the nested cache (final state of all
-    /// accounts modified by this group). Extracted directly from
-    /// `CacheDB::cache::accounts`, filtered to only touched
-    /// accounts (`account_state != None`).
-    touched_accounts: revm::primitives::AddressMap<revm::database::DbAccount>,
-    /// All accounts accessed by this group (read OR written),
-    /// extracted from `CacheDB::cache::accounts`. This includes
-    /// accounts with `account_state == None` (read-only) and
-    /// `account_state != None` (written). Used for read-write
-    /// conflict detection: a group conflicts if its accessed set
-    /// overlaps with any previously committed group's write set.
-    accessed_accounts: std::collections::HashSet<revm::primitives::Address>,
-    /// Per-tx accessed account sets. Each entry is the set of
-    /// accounts accessed (read OR written) by the tx at the
-    /// corresponding position in `tx_results`.
-    ///
-    /// Currently unused: tx-granular conflict re-execution was
-    /// removed because it broke nonce continuity within a group
-    /// (non-conflicting txs' nonce increments were not applied to
-    /// the main DB before conflicting txs were re-executed).
-    /// Retained as infrastructure for a future tx-granular
-    /// optimization that properly handles nonce dependencies by
-    /// committing non-conflicting txs' state before re-executing
-    /// conflicting txs.
-    #[allow(dead_code)]
-    per_tx_accessed: Vec<(usize, std::collections::HashSet<revm::primitives::Address>)>,
-    /// New contracts created by this group, extracted from
-    /// `CacheDB::cache::contracts`.
-    new_contracts: revm::primitives::B256Map<revm::bytecode::Bytecode>,
-    /// The coinbase balance delta for this group (tips received).
+    /// The speculative execution result and call trace.
+    result: TracedResult,
+    /// Accounts the tx loaded during execution (read or wrote),
+    /// excluding the coinbase — tracked separately because every tx
+    /// writes it via tips. For the revm path this is `rs.state`'s
+    /// keys; for fast paths `{caller, recipient}`.
+    reads: std::collections::HashSet<revm::primitives::Address>,
+    /// Accounts the tx modified, excluding the coinbase.
+    writes: std::collections::HashSet<revm::primitives::Address>,
+    /// Post-execution snapshots of `writes` — the merge payload for
+    /// a validated tx.
+    write_accounts: Vec<(revm::primitives::Address, revm::database::DbAccount)>,
+    /// Code entries the tx deployed (CREATE is the only source).
+    new_contracts: Vec<(revm::primitives::B256, revm::bytecode::Bytecode)>,
+    /// The coinbase balance the tx speculated against — pre-block
+    /// balance plus own-group tips. Compared against the canonical
+    /// running balance at commit when `coinbase.read` is set.
+    coinbase_before: revm::primitives::U256,
+    /// Net coinbase balance change the tx produced. Strictly
+    /// additive (tips, plus any transfers to the fee recipient), so
+    /// it merges correctly regardless of position.
     coinbase_delta: revm::primitives::U256,
+    /// How the tx interacted with the block's fee recipient beyond
+    /// the strictly additive tip credit — see [`CoinbaseObs`].
+    coinbase: CoinbaseObs,
+    /// Speculation cannot represent this tx: a mutating native
+    /// precompile was suppressed (read-only provider) or a
+    /// non-additive coinbase write occurred. The tx must re-execute
+    /// against the canonical DB regardless of conflict sets.
+    must_reexec: bool,
+}
+
+/// How a speculative transaction interacted with the block's fee
+/// recipient beyond the strictly additive tip credit.
+///
+/// Grouped because the three flags describe one concept — the
+/// coinbase is special-cased in conflict detection precisely because
+/// every tx writes it, so only *non-additive* interaction can
+/// invalidate a speculation.
+struct CoinbaseObs {
+    /// `BALANCE(coinbase)` executed during speculation — the result
+    /// may depend on the canonical running tip total.
+    read: bool,
+    /// The coinbase account was loaded at all — cheap superset of
+    /// `read`, used to gate re-execution once the coinbase has been
+    /// non-additively modified (`coinbase_dirty`).
+    accessed: bool,
+    /// The tx changed the coinbase beyond an additive balance delta
+    /// (nonce, storage, creation, or destruction — e.g. sender ==
+    /// coinbase, or a contract at the fee-recipient address). Such a
+    /// change cannot be merged and dirties the coinbase for every
+    /// later accessor.
+    nontrivial: bool,
+}
+
+impl SpecTx {
+    /// A record for a tx that failed before touching state
+    /// (`build_tx_env` rejection — intrinsic to the tx bytes, so no
+    /// ordering dependency exists).
+    fn intrinsic_error(idx: usize, sender: revm::primitives::Address, e: ExecError) -> Self {
+        Self {
+            idx,
+            sender,
+            result: Err(e),
+            reads: std::collections::HashSet::new(),
+            writes: std::collections::HashSet::new(),
+            write_accounts: Vec::new(),
+            new_contracts: Vec::new(),
+            coinbase_before: revm::primitives::U256::ZERO,
+            coinbase_delta: revm::primitives::U256::ZERO,
+            coinbase: CoinbaseObs { read: false, accessed: false, nontrivial: false },
+            must_reexec: false,
+        }
+    }
+}
+
+/// The result of executing a single sender group in parallel:
+/// one [`SpecTx`] per transaction, in group (nonce) order.
+struct GroupExecResult {
+    /// Per-tx speculative records, in the order the txs ran
+    /// (ascending nonce within the sender).
+    spec_txs: Vec<SpecTx>,
 }
 
 impl Module for EvmModule {
@@ -7086,6 +7382,146 @@ mod tests {
             serial_root, parallel_root,
             "read-write conflict: parallel state root must match serial"
         );
+    }
+
+    /// Interleaved sender ordering — the `A0, B0, A1` case the audit
+    /// flagged: sender-grouped speculation effectively ran `A0, A1,
+    /// B0`, and group-order commit merged `A1`'s result — computed
+    /// without `B0`'s writes — before `B` ever ran. Canonical-order
+    /// commit validates `A1` at its true position (index 2), detects
+    /// that `B0` wrote the account `A1` reads, and re-executes `A1`
+    /// against the canonical state.
+    ///
+    /// Contract D reads `BALANCE(R)` into its storage slot 0, so the
+    /// stale-vs-canonical divergence is directly observable in state.
+    #[test]
+    fn handle_batch_parallel_interleaved_senders_matches_serial() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let (pk_deploy, addr_deploy) = test_keypair();
+
+        // R is an EOA that B0 funds; D stores R's balance in slot 0.
+        let recipient_r = revm::primitives::Address::from_slice(&[0x99; 20]);
+        // A0's recipient — deliberately disjoint from R so the only
+        // cross-group dependency is B0 → A1.
+        let other = revm::primitives::Address::from_slice(&[0x77; 20]);
+
+        // Contract D runtime: CALLDATALOAD(0) → BALANCE → SSTORE(0)
+        // — identical to the read-write conflict test above.
+        let d_init_code: Vec<u8> = vec![
+            0x60, 0x08, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x08, 0x60, 0x00, 0xf3, 0x60, 0x00,
+            0x35, 0x31, 0x60, 0x00, 0x55, 0x00,
+        ];
+        let d_address = revm::primitives::Address::from_slice(&addr_deploy.0).create(0);
+        let oxide_d = primitives::Address(d_address.0.into());
+
+        let deploy_tx = signed_tx(&pk_deploy, 0, tx::TxKind::Create, &d_init_code);
+        // A0: touches only `other` — no dependency on B0 or R.
+        let tx_a0 = signed_transfer_tx(&pk_a, 0, other, 5);
+        // B0: funds R — canonically precedes A1.
+        let tx_b0 = signed_transfer_tx(&pk_b, 0, recipient_r, 1_000_000_000);
+        // A1: reads R's balance into D's slot 0. Canonical order says
+        // it must observe B0's transfer; group-order commit merged
+        // the pre-B0 read.
+        let mut calldata = [0u8; 32];
+        calldata[12..].copy_from_slice(recipient_r.as_slice());
+        let tx_a1 = signed_tx(&pk_a, 1, tx::TxKind::Call(d_address), &calldata);
+
+        // --- Serial execution ---
+        let m_serial = make_module();
+        fund(&m_serial, &addr_a);
+        fund(&m_serial, &addr_b);
+        fund(&m_serial, &addr_deploy);
+        m_serial.begin_block(Height::new(1));
+        m_serial.handle(&dummy_ctx(), &deploy_tx).expect("deploy D (serial)");
+        m_serial.handle(&dummy_ctx(), &tx_a0).expect("serial A0");
+        m_serial.handle(&dummy_ctx(), &tx_b0).expect("serial B0");
+        m_serial.handle(&dummy_ctx(), &tx_a1).expect("serial A1");
+        m_serial.end_block(Height::new(1));
+        let serial_root = m_serial.state_root();
+        let serial_slot0 = m_serial.storage_at(&oxide_d, &revm::primitives::U256::ZERO);
+
+        // --- Parallel execution ---
+        let m_par = make_module();
+        fund(&m_par, &addr_a);
+        fund(&m_par, &addr_b);
+        fund(&m_par, &addr_deploy);
+        m_par.begin_block(Height::new(1));
+        m_par.handle(&dummy_ctx(), &deploy_tx).expect("deploy D (parallel)");
+        // Canonical order A0, B0, A1 — A0 and A1 share a sender, so
+        // speculation groups them together.
+        let txs = vec![tx_a0, tx_b0, tx_a1];
+        let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+        m_par.end_block(Height::new(1));
+        let parallel_root = m_par.state_root();
+        let parallel_slot0 = m_par.storage_at(&oxide_d, &revm::primitives::U256::ZERO);
+
+        assert!(results.iter().all(std::result::Result::is_ok), "all txs must succeed");
+        assert_eq!(
+            serial_slot0, parallel_slot0,
+            "A1 must observe R's post-B0 balance, not the pre-block balance"
+        );
+        assert_eq!(serial_root, parallel_root, "interleaved state roots must match");
+    }
+
+    /// Speculative native-precompile safety: a mutating staking
+    /// precompile inside a speculative run must never touch the
+    /// shared `StakingModule`, and the suppressed call must force
+    /// canonical re-execution — not a committed stale revert.
+    ///
+    /// The batch `A0(delegate call), B0(transfer), A1(transfer)`
+    /// interleaves three positions: `A0` re-executes because its
+    /// delegate precompile was suppressed (`native_blocked`), `A1`
+    /// re-executes on the same-sender cascade, and `B0` merges
+    /// speculatively. Final delegation must be exactly the one the
+    /// canonical `A0` applied: `0` would mean the speculative revert
+    /// was committed; `2_000` would mean speculation leaked into
+    /// shared state on top of the canonical application.
+    #[test]
+    fn handle_batch_parallel_native_precompile_no_speculative_mutation() {
+        let (pk_a, addr_a) = test_keypair();
+        let (pk_b, addr_b) = test_keypair();
+        let contract = Address([0xC0; 20]);
+        let validator = Address([0xAA; 20]);
+        let (m, staking_mod) = staking_wired_module(
+            contract,
+            10_000,
+            delegate_then_revert_runtime(validator.0, 1_000, false),
+        );
+        staking_mod.register_validator(validator);
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+
+        let contract_evm = revm::primitives::Address::from_slice(&contract.0);
+        let other = revm::primitives::Address::from_slice(&[0x77; 20]);
+        // A0: call the contract → delegate precompile (suppressed in
+        // speculation, applied for real in canonical re-execution).
+        let tx_a0 = signed_tx(&pk_a, 0, tx::TxKind::Call(contract_evm), &[]);
+        // B0: independent transfer — merges speculatively.
+        let tx_b0 = signed_transfer_tx(&pk_b, 0, other, 7);
+        // A1: same-sender successor — re-executes on the cascade.
+        let tx_a1 = signed_transfer_tx(&pk_a, 1, other, 3);
+
+        m.begin_block(Height::new(1));
+        let txs = vec![tx_a0, tx_b0, tx_a1];
+        let results = m.handle_batch_parallel(&dummy_ctx(), &txs);
+        m.end_block(Height::new(1));
+
+        assert!(results.iter().all(std::result::Result::is_ok), "all txs must succeed");
+        assert_eq!(
+            staking_mod.delegation(&contract, &validator),
+            1_000,
+            "canonical re-execution must apply the delegation exactly once"
+        );
+        assert_eq!(staking_mod.stake(&validator), 1_000);
+        assert_eq!(
+            Balances::balance(m.as_ref(), &contract),
+            9_000,
+            "the canonical bond must debit the delegator"
+        );
+        assert_eq!(Balances::balance(m.as_ref(), &staking::BONDED_POOL), 1_000);
+        assert_eq!(m.nonce(&addr_a), 2, "A0 and A1 both committed");
+        assert_eq!(m.nonce(&addr_b), 1, "B0 committed");
     }
 
     /// Regression test: a byzantine proposer supplying a wrong

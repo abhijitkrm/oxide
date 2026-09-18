@@ -15310,3 +15310,98 @@ now exercise the real PoP-bearing wire format end-to-end.
 
 Gates: 134 consensus + 57 staking + crypto + devnet suites green;
 full workspace suite green; fmt + clippy `-D warnings` clean.
+
+## Session — audit fix C4: parallel EVM execution is canonical-order equivalent
+
+C4 from the audit: `handle_batch_parallel` (and the preverified
+variant) grouped transactions by sender, ran each group on a
+copy-on-write `CacheDB` clone, and merged *group diffs* in
+group-appearance order. That is not sequential semantics.
+
+Two root causes, both breaking block-order equivalence:
+
+1. **Group-order commit lost intra-block position.** For the batch
+   `A0, B0, A1` speculation effectively ran `A0, A1, B0`: `A1`'s
+   result — computed without `B0`'s writes — was merged before `B`
+   ever ran. Any read/write or write/write interaction across
+   sender groups committed stale state: different balances,
+   different storage, different state root than sequential
+   execution. Sender grouping is a *parallelization* strategy, not
+   an execution-order strategy.
+2. **Native precompiles escaped the speculative `CacheDB`.**
+   `evm_parts` wired `precompiles.with_staking(staking)` — a clone
+   of the module's shared `Arc<StakingModule>` pointing at the real
+   module. A speculative `delegate`/`undelegate` call mutated
+   shared native state outside its COW cache and outside the EVM
+   journal: unjournaled across groups, invisible to the state diff,
+   and irreversible by conflict fallback.
+
+Fix shape — speculation stays per-sender, but *commit* moved to
+canonical transaction order:
+
+- Speculation records a `SpecTx` per transaction, not a merged
+  group diff: exact read set (`rs.state` keys — every account the
+  journal loaded), write set (the subset `commit` marked
+  modified), post-execution `DbAccount` clones, deployed code,
+  coinbase observation flags, and a `must_reexec` flag.
+- Speculative EVMs (`build_spec_evm`) run read-only native
+  precompiles: mutating staking calls revert inside the frame
+  instead of touching shared state, and `NativeJournal` gained a
+  `blocked_mutation` flag the provider sets on suppression. A
+  flagged tx can never keep its speculative result — it re-executes
+  on the committed path where the real precompiles apply the
+  mutation exactly once. Read-only exchange/perps getters still
+  answer in speculation: native module state is frozen for the
+  duration of the EVM batch.
+- Commit walks positions `0..n` in canonical order. A tx keeps its
+  speculative result iff no canonically-earlier tx from a
+  *different* sender wrote anything in `reads ∪ writes`
+  (same-sender writes are safe — in-group sequential speculation
+  already observed them). Otherwise it re-executes against the
+  main DB, which at that point holds exactly the canonical
+  pre-state, through the *same* fast paths + `build_evm` the
+  serial executor uses. Once a sender's tx re-executes, its
+  same-group successors re-execute too (`broken` cascade) — they
+  speculated on the broken tx's speculative outcome.
+- The coinbase is special-cased: every tx writes it via tips, so
+  tracking it as a normal write would serialize the whole batch.
+  Tips commute, so merges apply a per-tx `coinbase_delta` to a
+  canonical running balance. Non-additive interaction forces
+  canonical re-execution instead: a new `CoinbaseReadDetector`
+  inspector flags `BALANCE(coinbase)` (the only opcode that can
+  observe the running tip total — stale if the speculated balance
+  differs from canonical), and `coinbase_nontrivial` catches
+  nonce/storage/creation/destruction writes a delta cannot
+  represent (sender == coinbase, a contract at the fee recipient,
+  `SELFDESTRUCT` or EIP-161 empty-touch deletes — found in review;
+  the first cut missed destruction). `coinbase_dirty` then
+  re-executes every later tx that touched the account at all.
+- Validation failures are handled per-class: `build_tx_env`
+  rejections are tx-intrinsic (no state read) and merge directly;
+  revm validation failures read only the caller account, so
+  `{caller}` is the conflict set — an earlier cross-sender funding
+  transfer correctly forces re-execution into a success.
+- Undo (`BlockUndo`) and `touched` accumulate only writes that land
+  in the main DB — first-write-wins capture preserves the
+  end-of-previous-block inverse diff, matching the serial path.
+
+Regression tests (all prove serial ≡ parallel):
+
+- `handle_batch_parallel_interleaved_senders_matches_serial` —
+  the audit's `A0, B0, A1` case: `A1` reads an account `B0` funds;
+  a `BALANCE→SSTORE` contract makes the stale read directly
+  observable in storage. Parallel commits the canonical value.
+- `handle_batch_parallel_native_precompile_no_speculative_mutation` —
+  a `delegate` call inside speculation must apply *exactly once*:
+  0 would mean the suppressed revert was committed; 2× would mean
+  speculation leaked into shared `StakingModule` state on top of
+  the canonical application. Interleaved with an independent
+  transfer and a same-sender successor to exercise the broken
+  cascade alongside speculative merges.
+- Existing conflict suite continues to pass: same-recipient
+  write/write, read/write `BALANCE` conflicts, multi-nonce sender
+  groups, mixed deploy/transfer batches, and the serial-vs-parallel
+  state-root equality tests.
+
+Gates: 235 evm tests + full workspace suite green; fmt + clippy
+`-D warnings` clean.

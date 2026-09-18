@@ -75,6 +75,14 @@ pub struct NativeJournal {
     depth: usize,
     /// `(depth_at_application, undo)` pairs.
     ops: Vec<(usize, UndoFn)>,
+    /// Set when a read-only precompile provider suppressed a mutation
+    /// a committed path would have applied (the mutating staking
+    /// precompiles revert under `call.read_only`). The parallel
+    /// executor reads this after each speculative transaction: a
+    /// suppressed mutation means the speculative result is *not* the
+    /// committed-path result, so the tx is flagged for canonical
+    /// re-execution rather than merged.
+    blocked_mutation: bool,
 }
 
 impl Default for NativeJournal {
@@ -87,7 +95,21 @@ impl NativeJournal {
     /// An empty journal for a new transaction.
     #[must_use]
     pub fn new() -> Self {
-        Self { depth: 0, ops: Vec::new() }
+        Self { depth: 0, ops: Vec::new(), blocked_mutation: false }
+    }
+
+    /// Mark that a read-only provider suppressed a native mutation
+    /// (called by the mutating precompiles' shared guard). See the
+    /// field docs for why the parallel executor depends on it.
+    pub fn mark_blocked_mutation(&mut self) {
+        self.blocked_mutation = true;
+    }
+
+    /// Whether a read-only provider suppressed a mutation during this
+    /// transaction.
+    #[must_use]
+    pub fn blocked_mutation(&self) -> bool {
+        self.blocked_mutation
     }
 
     /// The depth subsequent mutations are tagged with — the frame the
@@ -127,9 +149,12 @@ impl NativeJournal {
 
     /// Drop all bookkeeping — called after each transaction. Applied
     /// ops are either committed (depth-0 survivors) or already undone.
+    /// The blocked flag is reset here too — it is read after the tx
+    /// ends, before the next one starts.
     pub fn clear(&mut self) {
         self.ops.clear();
         self.depth = 0;
+        self.blocked_mutation = false;
     }
 }
 

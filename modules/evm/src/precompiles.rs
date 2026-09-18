@@ -413,11 +413,25 @@ fn parse_staking_args(input: &[u8], gas_cost: u64) -> Result<(Address, u64), Pre
 /// Guard shared by mutating staking precompiles: static/read-only
 /// calls, stranded value transfers, and an unwired staking module all
 /// revert; otherwise returns the wired module handle.
+///
+/// A `read_only` rejection is *not* equivalent to the committed path
+/// when staking is wired: the committed path would have applied the
+/// mutation. The parallel executor runs speculation with read-only
+/// providers precisely so suppressed mutations never leak into
+/// shared native state; it marks the journal here so the tx can be
+/// flagged for canonical re-execution. `is_static` and `has_value`
+/// revert identically on every path, so they need no flag.
 fn require_staking_mutability(
     call: &NativeCallCtx,
     gas_cost: u64,
 ) -> Result<&staking::StakingModule, PrecompileResult> {
-    if call.is_static || call.read_only || call.has_value {
+    if call.is_static || call.has_value {
+        return Err(PrecompileResult::revert(gas_cost));
+    }
+    if call.read_only {
+        if call.staking.is_some() {
+            call.journal.borrow_mut().mark_blocked_mutation();
+        }
         return Err(PrecompileResult::revert(gas_cost));
     }
     call.staking.as_deref().ok_or_else(|| PrecompileResult::revert(gas_cost))
@@ -811,6 +825,15 @@ impl NativePrecompiles {
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self
+    }
+
+    /// Whether a read-only provider suppressed a native mutation in
+    /// the transaction that just ran. The parallel executor checks
+    /// this after each speculative `inspect_tx`: a `true` result
+    /// means the speculative output is not the committed-path output
+    /// and the tx must be re-executed canonically.
+    pub fn blocked_native_mutation(&self) -> bool {
+        self.journal.borrow().blocked_mutation()
     }
 
     /// Drain the per-transaction native journal. Called after every

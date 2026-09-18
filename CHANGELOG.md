@@ -1004,6 +1004,44 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Parallel EVM execution could commit results that sequential
+  execution would never produce** (`modules/evm`)
+  - `handle_batch_parallel` speculated per-sender groups on
+    copy-on-write state snapshots, then merged whole *group* diffs
+    in group-appearance order. For a block like `A0, B0, A1`, the
+    effective run order was `A0, A1, B0`: `A1`'s result — computed
+    without `B0`'s writes — merged before `B` ran, committing stale
+    balances, storage, and state roots whenever sender groups
+    interacted through shared accounts.
+  - Worse, staking precompiles were wired to the shared
+    `StakingModule`: a speculative `delegate` call mutated real
+    native state outside its snapshot, invisible to the state diff
+    and impossible to roll back on conflict.
+  - Speculation still runs per-sender, but commit now walks the
+    block in canonical transaction order: each transaction keeps
+    its speculative result only if no earlier transaction from a
+    different sender wrote anything it read or wrote — otherwise it
+    re-executes against the true canonical pre-state. Same-sender
+    successors of a re-executed transaction re-execute too.
+  - Speculative frames run read-only native precompiles: a
+    mutating staking call reverts instead of touching shared state
+    and flags the transaction for canonical re-execution, where the
+    real mutation applies exactly once.
+  - The fee recipient is handled exactly: tips still merge as
+    additive deltas, but a transaction that runs `BALANCE` on the
+    fee recipient — or one that changes it non-additively
+    (sender-is-coinbase, a contract at that address, `SELFDESTRUCT`,
+    deployment) — is validated against the canonical running
+    balance or re-executed.
+  - **In plain words:** the chain's "run transactions in parallel"
+    speed path could produce different results — different
+    balances, different contract storage — than running the same
+    transactions one by one in order. Two validators could compute
+    different state roots for the same block and fork. Parallel
+    execution now guarantees byte-for-byte the same outcome as
+    sequential execution; it only skips work that provably cannot
+    change the answer.
+
 - **Consensus keys were admitted without proof-of-possession, and
   validator sets accepted duplicate keys and addresses**
   (`crates/crypto`, `crates/consensus`, `modules/staking`,
