@@ -167,9 +167,9 @@ ancestors commit with the chain that certifies them.
   a prepare vote can never be confused with a pre-commit vote).
 - **Quorum certificate (QC).** An aggregate BLS signature over the
   votes for a single `(height, view, phase)`, plus the bitmap of
-  signers. Forms when ≥2f+1 of total stake signed (f = maximum
-  Byzantine validators). Stake-weighted: a validator with 10% stake
-  contributes 10% to the quorum, not 1/N.
+  signers. Forms when signers holding >2/3 of total voting power —
+  `⌊2·total_stake/3⌋ + 1` — signed. Stake-weighted: a validator
+  with 10% stake contributes 10% to the quorum, not 1/N.
 - **Aggregate verification.** A QC verifies in one BLS aggregate
   check, not N individual checks — this is the throughput lever.
   Batch verification of many QCs at once is a further optimization
@@ -196,7 +196,8 @@ a height; views advance on timeout or on a timeout certificate.
   not wait for a leader to self-report failure. This is the
   Jolteon/AptosBFT design: proactive view sync keeps finality moving
   under a faulty leader.
-- **Timeout certificate (TC).** Once ≥2f+1 validators sign a timeout
+- **Timeout certificate (TC).** Once validators holding >2/3 of
+  total voting power sign a timeout
   for view *v*, the next leader (view *v+1*) embeds the TC in its
   proposal (`header.timeout_cert`), proving it is the legitimate
   successor. The embedded TC has a second, load-bearing role: it is
@@ -249,18 +250,19 @@ post-execution roots in later proposals.
 ## 7. Safety and liveness arguments (sketch)
 
 **Safety.** Two honest validators cannot commit different blocks at
-the same height: a commit QC requires ≥2f+1 votes, and ≥f+1 of those
-voters are honest (f Byzantine ≤ total − 2f−1). An honest validator
+the same height: a commit QC requires signers holding >2/3 of
+voting power, and >1/3 of the power behind those voters is honest
+(Byzantine power ≤ T/3 < 2·(2T/3) − T). An honest validator
 signs at most one prepare per (height, view), so two conflicting
-commit QCs would require ≥f+1 honest validators to have signed
+commit QCs would require honest validators to have signed
 conflicting prepares — impossible, because the pre-commit lock
 prevents a honest validator from preparing a block that conflicts
 with its locked block.
 
 **Liveness.** Under partial synchrony (GST after some finite time),
 the pacemaker eventually advances views until a honest leader is
-chosen; that leader's proposal gathers ≥2f+1 votes within the
-network's eventual delay bound, forming a QC and advancing the
+chosen; that leader's proposal gathers a voting-power quorum within
+the network's eventual delay bound, forming a QC and advancing the
 pipeline. Tail-fork resistance (TC-forced view change) ensures a
 perpetually faulty leader cannot stall finality indefinitely.
 

@@ -2548,10 +2548,17 @@ mod tests {
         devnet.apps[0].ingest_tx(make_staking_tx(&delegate_msg, 0));
         devnet.run_batch(2, 0);
 
-        // Submit a validator_add for a new validator.
+        // Submit a validator_add for a new validator. Stake is 1 —
+        // the devnet does not spawn an engine for the added validator,
+        // so its voting power must stay below the quorum the existing
+        // 4 engines can reach on their own: with [1,1,1,1,1] the
+        // power quorum is 4 and progress continues with the new
+        // validator offline. A large stake here would (correctly)
+        // halt the chain — the dominant validator would be required
+        // for every quorum.
         let new_key = bls_key(0xAA).public_key();
         let new_addr = primitives::Address([0xAA; 20]);
-        let add_msg = staking::msg::validator_add(new_addr, new_key.as_bytes(), 1000);
+        let add_msg = staking::msg::validator_add(new_addr, new_key.as_bytes(), 1);
         devnet.apps[0].ingest_tx(make_staking_tx(&add_msg, 1));
         devnet.run_batch(3, 0);
 

@@ -386,15 +386,16 @@ impl<'a> Decode<'a> for StateAttestation {
     }
 }
 
-/// Execution certificate: ≥2f+1 validators attest to the state root
-/// of a finalized block (docs/oxidebft-spec.md §6).
+/// Execution certificate: validators holding a strict two-thirds
+/// supermajority of voting power (`⌊2·total_stake/3⌋+1`) attest to
+/// the state root of a finalized block (docs/oxidebft-spec.md §6).
 ///
 /// This is the consensus-level execution attestation — a quorum
-/// certificate proving that a supermajority of validators executed
-/// the block at `height` and agree on `state_root`. It is embedded in
-/// the *next* block's header as `exec_cert`, so every block carries
-/// proof that the previous block's execution was verified by the
-/// network.
+/// certificate proving that a stake-supermajority of validators
+/// executed the block at `height` and agree on `state_root`. It is
+/// embedded in the *next* block's header as `exec_cert`, so every
+/// block carries proof that the previous block's execution was
+/// verified by the network.
 ///
 /// This is distinct from [`StateAttestation`] (a single validator's
 /// attestation) and from [`QuorumCertificate`] (which certifies a
@@ -615,8 +616,10 @@ impl<'a> Decode<'a> for Vote {
     }
 }
 
-/// A quorum certificate: the aggregate of ≥2f+1 votes for a single
-/// `(view, phase, block_hash)` (docs/oxidebft-spec.md §3).
+/// A quorum certificate: the aggregate of votes for a single
+/// `(view, phase, block_hash)` whose signers hold a strict
+/// two-thirds supermajority of voting power
+/// (`⌊2·total_stake/3⌋+1`, docs/oxidebft-spec.md §3).
 ///
 /// The QC carries the aggregate BLS signature (one group element,
 /// regardless of validator count) and a bitmap identifying which
@@ -673,8 +676,10 @@ impl<'a> Decode<'a> for QuorumCertificate {
     }
 }
 
-/// A timeout certificate: ≥2f+1 validators signed a timeout for view
-/// `v`, proving the view should advance (docs/oxidebft-spec.md §4).
+/// A timeout certificate: validators holding a strict two-thirds
+/// supermajority of voting power (`⌊2·total_stake/3⌋+1`) signed a
+/// timeout for view `v`, proving the view should advance
+/// (docs/oxidebft-spec.md §4).
 ///
 /// The TC is the "force a view change without the leader" mechanism —
 /// tail-fork resistance. The next leader (view *v+1*) embeds the TC in
@@ -764,8 +769,8 @@ pub struct BlockHeader {
     /// from fabricating a proposal in another validator's name.
     /// `None` in conformance mode (no real signing).
     pub proposer_signature: Option<Signature>,
-    /// Execution certificate for the previous block: ≥2f+1 validators
-    /// attested to the state root of the block at `height - 1`. This
+    /// Execution certificate for the previous block: validators holding a
+    /// strict two-thirds supermajority of voting power attested to the state root of the block at `height - 1`. This
     /// proves the previous block's execution was verified by the
     /// network and enables divergence detection — if two honest
     /// validators disagree on the state root, the `exec_cert` will

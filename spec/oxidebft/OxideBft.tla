@@ -48,7 +48,12 @@ EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS
     N,              \* validator count; engine tolerates f = (N-1)/3
-    Quorum,         \* QC/TC threshold = 2f+1
+    Quorum,         \* QC/TC threshold in VOTING-POWER units. The engine
+                    \* requires signers holding >2/3 of total stake
+                    \* (ValidatorSet::quorum_stake). Under this model's
+                    \* equal-stake assumption (Leader(v) == v % N) each
+                    \* validator carries identical power, so a signer
+                    \* count is the power sum and Quorum = floor(2N/3)+1.
     Byzantine,      \* subset of Validators that may deviate arbitrarily
     MaxView,        \* view bound (model-checking finitization)
     MaxHeight,      \* stamped-height bound

@@ -37,7 +37,8 @@
 //! ## View changes
 //!
 //! When a validator's local timer expires, it produces a timeout
-//! signature. When ≥2f+1 validators timeout, a TC forms and the view
+//! signature. When validators holding >2/3 of voting power timeout,
+//! a TC forms and the view
 //! advances. The new leader must extend the highest QC (tail-fork
 //! resistance). The pacemaker (stage 2) drives the view advancement;
 //! the engine wires it in here.
@@ -197,15 +198,15 @@ pub enum ConsensusError {
         /// The block hash the conflicting vote was for.
         actual_block: Hash,
     },
-    /// A QC was formed or received whose signer count is below the
-    /// quorum threshold. The aggregate signature may verify, but the
-    /// QC does not represent ≥2f+1 validators — it cannot be trusted
-    /// as a commitment certificate.
+    /// A QC was formed or received whose signer voting power is below
+    /// the quorum threshold. The aggregate signature may verify, but
+    /// the QC does not represent >2/3 of total stake — it cannot be
+    /// trusted as a commitment certificate.
     InsufficientQuorum {
-        /// The number of signers in the QC's bitmap.
-        signers: usize,
-        /// The quorum threshold for the current validator set.
-        threshold: usize,
+        /// The total stake of the signers in the QC's bitmap.
+        voting_power: u64,
+        /// The voting-power quorum for the current validator set.
+        required: u64,
     },
     /// A QC was received whose view is not greater than the engine's
     /// current `high_qc` view. A byzantine leader could replay an old
@@ -263,8 +264,8 @@ impl std::fmt::Display for ConsensusError {
                     view.value()
                 )
             }
-            Self::InsufficientQuorum { signers, threshold } => {
-                write!(f, "insufficient quorum: {signers} signers < {threshold} threshold")
+            Self::InsufficientQuorum { voting_power, required } => {
+                write!(f, "insufficient quorum: {voting_power} stake < {required} threshold")
             }
             Self::StaleQc { qc_view, high_qc_view } => {
                 write!(
@@ -373,8 +374,15 @@ pub struct OxideBft {
     /// Collected votes for the current view (leader only). `None` =
     /// no vote from that validator. Indexed by `ValidatorIndex`.
     votes: Vec<Option<Vote>>,
-    /// Number of votes collected in the current view.
+    /// Number of votes collected in the current view (diagnostics).
+    /// The quorum decision uses `vote_stake` — signer *count* is not
+    /// voting *power* under unequal stake.
     vote_count: usize,
+    /// Total stake of the validators whose votes have been collected
+    /// in the current view. Compared against
+    /// [`ValidatorSet::quorum_stake`] in `try_form_qc` — a quorum is
+    /// >2/3 of voting power, not >2/3 of validator count.
+    vote_stake: u64,
     /// Execution attestations harvested from collected votes, grouped
     /// by `(height, state_root)`. A bucket reaching quorum is
     /// aggregated into an [`ExecCertificate`] in `exec_certs`.
@@ -385,8 +393,9 @@ pub struct OxideBft {
     /// forms whenever quorum is reached regardless of view.
     ///
     /// Safety: a bucket counts each voter at most once (checked on
-    /// insert), so ≥2f+1 entries requires 2f+1 distinct validators —
-    /// no quorum can be fabricated from equivocating attestations.
+    /// insert), so reaching `quorum_stake` requires distinct
+    /// validators contributing distinct stake — equivocating
+    /// attestations cannot double-count a validator's power.
     /// Only signature-verified attestations are admitted
     /// (`verify_signatures` mode); in conformance mode the pool
     /// stays empty and `exec_cert` is never embedded.
@@ -507,6 +516,7 @@ impl OxideBft {
             epoch,
             votes: vec![None; n],
             vote_count: 0,
+            vote_stake: 0,
             exec_attest_pool: std::collections::BTreeMap::new(),
             exec_certs: std::collections::BTreeMap::new(),
             last_attestation: None,
@@ -691,10 +701,21 @@ impl OxideBft {
         self.vote_count
     }
 
-    /// Quorum size for the current validator set (diagnostic).
+    /// Equal-stake quorum size for the current validator set
+    /// (diagnostic). The authoritative quorum threshold under unequal
+    /// stake is [`quorum_stake`](Self::quorum_stake) — certificate
+    /// validation uses voting power, not signer count.
     #[must_use]
     pub fn quorum(&self) -> usize {
         self.validator_set.quorum()
+    }
+
+    /// Voting-power quorum for the current validator set —
+    /// `⌊2·total_stake/3⌋ + 1` (diagnostic). This is the threshold
+    /// every QC, TC, and execution certificate is checked against.
+    #[must_use]
+    pub fn quorum_stake(&self) -> u64 {
+        self.validator_set.quorum_stake()
     }
 
     /// The active validator set for the current epoch.
@@ -771,6 +792,7 @@ impl OxideBft {
         self.last_tc = None;
         self.votes = vec![None; self.validator_set.n()];
         self.vote_count = 0;
+        self.vote_stake = 0;
         self.timeout_signatures = vec![None; self.validator_set.n()];
         // Persist the cleared locks: a crash between rotation and the
         // next vote would otherwise restore the old epoch's locks
@@ -1213,12 +1235,55 @@ impl OxideBft {
         Self::block_hash(&unsigned)
     }
 
-    /// Count the number of set bits in a signer bitmap. This is the
-    /// number of validators who signed the certificate (QC or TC).
-    /// Used for quorum enforcement — a structural property checked
-    /// regardless of whether BLS signature verification is enabled.
-    fn count_signers(bitmap: &[u8]) -> usize {
-        bitmap.iter().map(|b| b.count_ones() as usize).sum()
+    /// Resolve a certificate's signer bitmap into the signers' public
+    /// keys plus their combined voting power.
+    ///
+    /// Quorum is a stake threshold (oxideBFT spec §3), so every
+    /// certificate check needs both halves: the keys for aggregate
+    /// signature verification and the summed stake for the
+    /// `> 2/3 of total` power check. Returning them together keeps
+    /// the two readings of one bitmap from drifting apart across the
+    /// QC/TC/exec-cert call sites.
+    ///
+    /// # Errors
+    /// [`ConsensusError::SignerOutOfBounds`] if a set bit references
+    /// a validator past the end of the set — an out-of-range bit must
+    /// neither pass verification nor contribute phantom stake.
+    fn signer_keys_and_power(
+        &self,
+        bitmap: &[u8],
+    ) -> Result<(Vec<crypto::bls::PublicKey>, u64), ConsensusError> {
+        let mut signer_pks: Vec<crypto::bls::PublicKey> =
+            Vec::with_capacity(self.validator_set.n());
+        let mut voting_power = 0u64;
+        for (i, byte) in bitmap.iter().enumerate() {
+            for bit in 0..8 {
+                if (byte >> bit) & 1 == 1 {
+                    let idx = u16::try_from(i * 8 + bit)
+                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                    let pk = self
+                        .validator_set
+                        .validator(idx)
+                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
+                    voting_power = voting_power.saturating_add(
+                        self.validator_set
+                            .stake(idx)
+                            .map_err(|_| ConsensusError::SignerOutOfBounds)?,
+                    );
+                    signer_pks.push(*pk);
+                }
+            }
+        }
+        Ok((signer_pks, voting_power))
+    }
+
+    /// Voting power behind a certificate bitmap, checked against the
+    /// stake quorum. A convenience for structural (pre-signature)
+    /// checks that need the power without the keys — equivalent to
+    /// [`signer_keys_and_power`](Self::signer_keys_and_power) minus
+    /// the allocation.
+    fn bitmap_meets_quorum(&self, bitmap: &[u8]) -> bool {
+        self.validator_set.signer_stake(bitmap) >= self.validator_set.quorum_stake()
     }
 
     /// Leader: propose a block. Calls `app.prepare_proposal`, wraps
@@ -1719,11 +1784,23 @@ impl OxideBft {
         // fabricated justify must never gather votes at all. Same
         // cost class as the standalone QC verify in `deliver_qc` —
         // one aggregate verify per accepted-position proposal.
-        if self.verify_signatures {
-            if let Some(hqc) = &header.high_qc {
-                if self.verify_qc_signature(hqc).is_err() {
-                    return None;
-                }
+        if let Some(hqc) = &header.high_qc {
+            // Quorum is a structural property, not a cryptographic
+            // one — a sub-quorum bitmap is not a certificate even
+            // when its aggregate signature verifies (a QC with a
+            // single honest signer's vote verifies as a valid
+            // aggregate yet carries no quorum). Enforced
+            // unconditionally, matching `deliver_qc`: without it a
+            // Byzantine leader could embed a self-signed "QC" and
+            // have honest voters notarize a chain whose parent never
+            // achieved real consensus. The threshold is voting
+            // *power* — a majority of low-stake signers is not a
+            // quorum under unequal stake.
+            if !self.bitmap_meets_quorum(&hqc.signer_bitmap) {
+                return None;
+            }
+            if self.verify_signatures && self.verify_qc_signature(hqc).is_err() {
+                return None;
             }
         }
         // Divergence detection (docs/oxidebft-spec.md §6): if the
@@ -1752,8 +1829,9 @@ impl OxideBft {
                 let local = self.app.attest_state(cert.height);
                 if local.root != cert.state_root {
                     // Verify only now, off the happy path, purely for
-                    // evidence: a VALID signature means ≥2f+1 really
-                    // attested a root we did not compute — confirmed
+                    // evidence: a VALID signature means a stake
+                    // supermajority really attested a root we did not
+                    // compute — confirmed
                     // divergence, refuse and alert the operator. An
                     // INVALID signature means the leader fabricated
                     // the claim — the proposal is ignored. Both
@@ -1987,27 +2065,25 @@ impl OxideBft {
     /// voter-side divergence check refuses to vote on a cert whose
     /// root disagrees with local state, so a leader embedding a
     /// *fabricated* root could freeze quorum. Verifying the
-    /// aggregate proves ≥2f+1 validators actually attested the root —
+    /// aggregate proves signers holding >2/3 of voting power actually
+    /// attested the root —
     /// a fabricated cert fails here and the proposal is ignored
     /// before the root comparison ever runs.
+    ///
+    /// # Errors
+    /// [`ConsensusError::SignerOutOfBounds`] if the bitmap references
+    /// an out-of-range validator,
+    /// [`ConsensusError::InsufficientQuorum`] if the signers' voting
+    /// power is below quorum, or
+    /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
+    /// not verify.
     fn verify_exec_cert(&self, cert: &ExecCertificate) -> Result<(), ConsensusError> {
-        let mut signer_pks: Vec<crypto::bls::PublicKey> =
-            Vec::with_capacity(self.validator_set.quorum());
-        for (i, byte) in cert.signer_bitmap.iter().enumerate() {
-            for bit in 0..8 {
-                if (byte >> bit) & 1 == 1 {
-                    let idx = u16::try_from(i * 8 + bit)
-                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-                    let pk = self
-                        .validator_set
-                        .validator(idx)
-                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-                    signer_pks.push(*pk);
-                }
-            }
-        }
-        if signer_pks.len() < self.validator_set.quorum() {
-            return Err(ConsensusError::InvalidQcSignature);
+        let (signer_pks, voting_power) = self.signer_keys_and_power(&cert.signer_bitmap)?;
+        if voting_power < self.validator_set.quorum_stake() {
+            return Err(ConsensusError::InsufficientQuorum {
+                voting_power,
+                required: self.validator_set.quorum_stake(),
+            });
         }
         let msg = self.attestation_signing_message(cert.height, &cert.state_root);
         crypto::aggregate_verify(
@@ -2146,14 +2222,19 @@ impl OxideBft {
                         .or_default();
                     if !bucket.iter().any(|(v, _)| *v == voter) {
                         bucket.push((voter, *sig));
-                        if bucket.len() == self.validator_set.quorum() {
-                            // Quorum of identical attestations:
-                            // aggregate into an ExecCertificate for
-                            // `propose()` to embed. Equality (`==`)
-                            // not `>=` — aggregate once, when the
-                            // bucket first crosses the threshold;
-                            // additional attestations are redundant
-                            // (the cert already proves quorum).
+                        // Quorum of identical attestations measured
+                        // in voting power — the same stake-weighted
+                        // threshold the cert will be validated
+                        // against downstream. Checked on every
+                        // insert; the `exec_certs.contains_key` gate
+                        // above makes a formed cert stop absorbing
+                        // further attestations, so this aggregates
+                        // exactly once.
+                        let bucket_power: u64 = bucket
+                            .iter()
+                            .map(|(v, _)| self.validator_set.stake(*v).unwrap_or(0))
+                            .sum();
+                        if bucket_power >= self.validator_set.quorum_stake() {
                             let sigs: Vec<Signature> = bucket.iter().map(|(_, s)| *s).collect();
                             if let Ok(aggregate_signature) = crypto::aggregate(&sigs) {
                                 let bitmap_len = self.validator_set.n().div_ceil(8);
@@ -2181,16 +2262,20 @@ impl OxideBft {
 
         self.votes[idx] = Some(vote);
         self.vote_count += 1;
+        // `voter` is in-range (checked against `votes.len()` above),
+        // so the stake lookup cannot fail.
+        self.vote_stake =
+            self.vote_stake.saturating_add(self.validator_set.stake(voter).unwrap_or(0));
         Ok(())
     }
 
     /// Leader: try to form a QC from collected votes. Returns the QC
-    /// if quorum (≥2f+1) is reached, `None` otherwise.
+    /// if quorum (>2/3 of voting power) is reached, `None` otherwise.
     ///
     /// After forming a QC, the vote buffer is cleared for the next
     /// view.
     pub fn try_form_qc(&mut self) -> Option<QuorumCertificate> {
-        if self.vote_count < self.validator_set.quorum() {
+        if self.vote_stake < self.validator_set.quorum_stake() {
             return None;
         }
 
@@ -2232,6 +2317,7 @@ impl OxideBft {
         // Clear the vote buffer for the next view.
         self.votes.fill(None);
         self.vote_count = 0;
+        self.vote_stake = 0;
 
         Some(qc)
     }
@@ -2269,8 +2355,8 @@ impl OxideBft {
     /// aggregate signature does not verify,
     /// [`ConsensusError::SignerOutOfBounds`] if the bitmap references
     /// a validator past the end of the set,
-    /// [`ConsensusError::InsufficientQuorum`] if the signer count is
-    /// below the quorum threshold, or
+    /// [`ConsensusError::InsufficientQuorum`] if the signers' voting
+    /// power is below the quorum threshold, or
     /// [`ConsensusError::StaleQc`] if the QC's view is not greater
     /// than the current `high_qc`'s view.
     pub fn deliver_qc(&mut self, qc: QuorumCertificate) -> Result<(), ConsensusError> {
@@ -2289,14 +2375,15 @@ impl OxideBft {
         }
 
         // Hardening: enforce quorum threshold regardless of whether
-        // signature verification is enabled. A QC with fewer than
-        // quorum signers is not a valid commitment certificate, even
-        // in conformance mode — the signer count is a structural
-        // property of the QC, not a cryptographic one.
-        let signer_count = Self::count_signers(&qc.signer_bitmap);
-        let threshold = self.validator_set.quorum();
-        if signer_count < threshold {
-            return Err(ConsensusError::InsufficientQuorum { signers: signer_count, threshold });
+        // signature verification is enabled. A QC backed by less
+        // than quorum voting power is not a valid commitment
+        // certificate, even in conformance mode — the signer stake
+        // is a structural property of the QC, not a cryptographic
+        // one.
+        let voting_power = self.validator_set.signer_stake(&qc.signer_bitmap);
+        let required = self.validator_set.quorum_stake();
+        if voting_power < required {
+            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
         }
 
         // C1 fix: verify the QC's aggregate signature against the
@@ -2453,38 +2540,35 @@ impl OxideBft {
     /// calls `crypto::aggregate_verify` with the QC's aggregate
     /// signature, the block hash as the message, and `Domain::Vote`.
     ///
-    /// The quorum threshold check is performed by the caller
-    /// ([`deliver_qc`](Self::deliver_qc)) via [`count_signers`](Self::count_signers),
-    /// so it is enforced regardless of whether signature verification
-    /// is enabled.
+    /// The quorum threshold is enforced both by callers
+    /// ([`deliver_qc`](Self::deliver_qc), the embedded-justify check —
+    /// which must hold even when `verify_signatures` is off) and again
+    /// here, so this function alone is a complete certificate
+    /// validator for any call site.
     ///
     /// # Errors
     /// Returns [`ConsensusError::SignerOutOfBounds`] if the bitmap
-    /// references a validator past the end of the set, or
+    /// references a validator past the end of the set,
+    /// [`ConsensusError::InsufficientQuorum`] if the signers' voting
+    /// power is below the stake quorum, or
     /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
     /// not verify.
     fn verify_qc_signature(&self, qc: &QuorumCertificate) -> Result<(), ConsensusError> {
-        // Extract the signer public keys from the bitmap.
-        // Perf: pre-size to the quorum threshold — the number of
-        // signers is at most the validator set size, and typically
-        // close to the quorum threshold (2f+1).
-        let mut signer_pks: Vec<crypto::bls::PublicKey> =
-            Vec::with_capacity(self.validator_set.quorum());
-        for (i, byte) in qc.signer_bitmap.iter().enumerate() {
-            for bit in 0..8 {
-                if (byte >> bit) & 1 == 1 {
-                    let idx = u16::try_from(i * 8 + bit)
-                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-                    let pk = self
-                        .validator_set
-                        .validator(idx)
-                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-                    signer_pks.push(*pk);
-                }
-            }
-        }
+        // Resolve the bitmap into signer keys + voting power.
+        let (signer_pks, voting_power) = self.signer_keys_and_power(&qc.signer_bitmap)?;
         if signer_pks.is_empty() {
             return Err(ConsensusError::InvalidQcSignature);
+        }
+        // A certificate is only a certificate at quorum. Callers
+        // (deliver_qc, the embedded-justify check) enforce this too,
+        // but the check lives here as well so no future call site can
+        // accept a validly-signed but sub-quorum bitmap — a single
+        // signer's aggregate verifies fine yet proves nothing. The
+        // threshold is voting power: enough low-stake signers to
+        // outnumber the honest set still cannot form a QC.
+        let required = self.validator_set.quorum_stake();
+        if voting_power < required {
+            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
         }
         // C3 fix: verify against the full (view, phase, block_hash,
         // epoch) message, not just the block hash.
@@ -2609,6 +2693,7 @@ impl OxideBft {
     fn clear_per_view_state(&mut self) {
         self.votes.fill(None);
         self.vote_count = 0;
+        self.vote_stake = 0;
         self.timeout_signatures.fill(None);
     }
 
@@ -2787,12 +2872,13 @@ impl OxideBft {
         tc: &TimeoutCertificate,
     ) -> Result<(), ConsensusError> {
         // Hardening: enforce quorum threshold regardless of whether
-        // signature verification is enabled. A TC with fewer than
-        // quorum signers is not a valid view-change certificate.
-        let signer_count = Self::count_signers(&tc.signer_bitmap);
-        let threshold = self.validator_set.quorum();
-        if signer_count < threshold {
-            return Err(ConsensusError::InsufficientQuorum { signers: signer_count, threshold });
+        // signature verification is enabled. A TC backed by less
+        // than quorum voting power is not a valid view-change
+        // certificate.
+        let voting_power = self.validator_set.signer_stake(&tc.signer_bitmap);
+        let required = self.validator_set.quorum_stake();
+        if voting_power < required {
+            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
         }
 
         // Verify the TC's aggregate signature (TC safety).
@@ -2839,7 +2925,7 @@ impl OxideBft {
         if tc.epoch != self.epoch || tc.view.saturating_next() != header.view {
             return false;
         }
-        if Self::count_signers(&tc.signer_bitmap) < self.validator_set.quorum() {
+        if !self.bitmap_meets_quorum(&tc.signer_bitmap) {
             return false;
         }
         !self.verify_signatures || self.verify_tc_signature(tc).is_ok()
@@ -2852,34 +2938,28 @@ impl OxideBft {
     ///
     /// The quorum threshold check is performed by the caller
     /// ([`on_timeout_certificate`](Self::on_timeout_certificate)) via
-    /// [`count_signers`](Self::count_signers), so it is enforced
-    /// regardless of whether signature verification is enabled.
+    /// [`ValidatorSet::signer_stake`], so it is enforced regardless
+    /// of whether signature verification is enabled.
     ///
     /// # Errors
     ///
     /// Returns [`ConsensusError::SignerOutOfBounds`] if the bitmap
-    /// references an out-of-bounds validator, or
-    /// [`ConsensusError::InvalidTcSignature`] if the aggregate does
-    /// not verify.
+    /// references an out-of-bounds validator,
+    /// [`ConsensusError::InsufficientQuorum`] if the signers' voting
+    /// power is below quorum, or [`ConsensusError::InvalidTcSignature`]
+    /// if the aggregate does not verify.
     fn verify_tc_signature(&self, tc: &TimeoutCertificate) -> Result<(), ConsensusError> {
-        // Perf: pre-size to the quorum threshold.
-        let mut signer_pks: Vec<crypto::bls::PublicKey> =
-            Vec::with_capacity(self.validator_set.quorum());
-        for (i, byte) in tc.signer_bitmap.iter().enumerate() {
-            for bit in 0..8 {
-                if (byte >> bit) & 1 == 1 {
-                    let idx = u16::try_from(i * 8 + bit)
-                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-                    let pk = self
-                        .validator_set
-                        .validator(idx)
-                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-                    signer_pks.push(*pk);
-                }
-            }
-        }
+        let (signer_pks, voting_power) = self.signer_keys_and_power(&tc.signer_bitmap)?;
         if signer_pks.is_empty() {
             return Err(ConsensusError::InvalidTcSignature);
+        }
+        // Same defense-in-depth as `verify_qc_signature`: a TC is
+        // only a certificate at quorum (voting power), enforced here
+        // too so no call site can accept a validly-signed sub-quorum
+        // bitmap.
+        let required = self.validator_set.quorum_stake();
+        if voting_power < required {
+            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
         }
         // M1 fix: verify against (view, epoch), not just view.
         let mut msg = Vec::with_capacity(16);
@@ -3408,7 +3488,11 @@ mod tests {
             phase: VotePhase::Prepare,
             block_hash: OxideBft::block_hash(&header_a),
             epoch: Epoch::new(0),
-            signer_bitmap: vec![0x01],
+            // A QC's bitmap must carry quorum signers — the count is
+            // a structural property enforced even without signature
+            // verification (conformance mode): a fabricated
+            // single-signer "QC" is not a certificate.
+            signer_bitmap: vec![0x07],
             aggregate_signature: AggregateSignature::ZERO,
         };
         let mut header_c = header_a.clone();
@@ -4520,6 +4604,14 @@ mod tests {
         ValidatorSet::new(vec![pk(5), pk(6)], vec![1, 1]).expect("2 validators")
     }
 
+    /// A different single-validator set — used by the rotation
+    /// continuation test. A lone engine inside a multi-validator set
+    /// legitimately cannot reach quorum (`n − f` signers), so driving
+    /// post-rotation consensus requires a set it can quorum in alone.
+    fn replacement_single_validator_set() -> ValidatorSet {
+        ValidatorSet::new(vec![pk(9)], vec![1]).expect("1 validator")
+    }
+
     #[test]
     fn schedule_rotation_sets_pending() {
         let mut engine = make_engine();
@@ -4590,8 +4682,13 @@ mod tests {
         engine.submit_tx(TxBytes::new(vec![1]));
         engine.run_until_idle();
 
-        // Rotate to a new epoch.
-        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        // Rotate to a new epoch — a single-validator set, because a
+        // lone engine inside a multi-validator set cannot reach the
+        // `n − f` quorum alone (a self-signed single-signer "QC" is
+        // not a certificate). Under the previous `2f + 1` formula a
+        // 2-validator set had quorum 1 and this engine could commit
+        // unilaterally — exactly the unsafe threshold this fix removes.
+        engine.schedule_rotation(replacement_single_validator_set()).expect("schedule");
         engine.rotate_epoch().expect("rotate");
         assert_eq!(engine.epoch(), Epoch::new(1));
 
@@ -5349,6 +5446,72 @@ mod tests {
         assert!(saw_cert, "exec certs must flow through proposals once quorum attests");
     }
 
+    /// Regression test for the embedded-justify hole: a proposal's
+    /// `high_qc` used to be checked only for a *verifying* aggregate
+    /// signature — never for quorum. A QC with one real signer's vote
+    /// verifies as a valid aggregate yet certifies nothing: a
+    /// Byzantine leader could embed a self-signed "QC" and have
+    /// honest validators notarize a chain whose parent never reached
+    /// consensus. The signer count must be enforced unconditionally.
+    #[test]
+    fn subquorum_embedded_qc_is_rejected() {
+        let (mut engines, keys) = signed_committee();
+        let engine = &mut engines[1];
+
+        // Anchor the chain at (H, 0): the vote path accepts a
+        // proposal whose `prev_block`/`height` continue the committed
+        // tip when no highQC is known locally.
+        let parent_hash = Hash([0x42; 32]);
+        engine.last_committed = Some((parent_hash, Height::new(0)));
+
+        // A structurally valid QC for the parent — but with only
+        // validator 0's signature (1 < quorum 3). The aggregate is a
+        // real BLS signature and verifies fine: the signature is not
+        // the problem, the missing quorum is.
+        let vote_msg = engine.vote_signing_message(View::new(0), 0, &parent_hash);
+        let one_sig = keys[0].sign(crypto::hash::Domain::Vote, &vote_msg);
+        let thin_qc = QuorumCertificate {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: parent_hash,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[one_sig]).expect("aggregate"),
+        };
+        // Sanity: the signature itself is sound — only the count fails.
+        assert!(
+            engine.verify_qc_signature(&thin_qc).is_err(),
+            "sub-quorum QC must fail complete certificate validation"
+        );
+
+        let proposal = Proposal { height: Height::new(1), txs: vec![], attestation: None };
+        let mut body = Vec::new();
+        proposal.encode(&mut body);
+        let mut header = BlockHeader {
+            height: Height::new(1),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: parent_hash,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            body_commitment: types::shard::commitment(&body, 4),
+            high_qc: Some(thin_qc),
+            timeout_cert: None,
+            proposer: proposer_hash(0),
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+        };
+        let sk = bls_key(1);
+        let signing_hash = OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+
+        assert!(
+            engine.vote(&header, &proposal).is_none(),
+            "a proposal whose embedded QC lacks quorum must not be voted"
+        );
+    }
+
     // ---- View-change tests (multi-validator) ----
     //
     // docs/oxidebft-spec.md §4: a faulty leader is bypassed after one
@@ -5769,9 +5932,57 @@ mod tests {
             .deliver_qc(insufficient_qc)
             .expect_err("QC with insufficient quorum must be rejected");
         assert!(
-            matches!(err, ConsensusError::InsufficientQuorum { signers, threshold } if signers == 2 && threshold == 3),
+            matches!(err, ConsensusError::InsufficientQuorum { voting_power, required } if voting_power == 2 && required == 3),
             "expected InsufficientQuorum (2 < 3), got {err:?}"
         );
+    }
+
+    /// Stake-weighted quorum (spec §3): a committee with stakes
+    /// [100, 1, 1, 1] has `quorum_stake = 69` of `T = 103`. The three
+    /// low-stake validators outnumber the honest quorum by *count*
+    /// (3 ≥ 3) but hold only 3 stake — a count-based check would
+    /// accept a certificate that commits nothing. The dominant
+    /// validator alone carries enough power to form a QC.
+    #[test]
+    fn deliver_qc_enforces_stake_weighted_quorum() {
+        let weighted_set = ValidatorSet::new(vec![pk(1), pk(2), pk(3), pk(4)], vec![100, 1, 1, 1])
+            .expect("4 validators, 100:1:1:1 stake");
+        let app = Arc::new(MockApp::new());
+        let mut engine =
+            OxideBft::with_index(app, weighted_set, 0).without_signature_verification();
+        assert_eq!(engine.validator_set().quorum_stake(), 69);
+
+        // QC signed by the three 1-stake validators: count says 3/4
+        // signers (≥ count-quorum 3), power says 3/103 (< 69). This
+        // certificate must be rejected — the exact failure mode the
+        // count-based quorum admitted.
+        let small_signers_qc = QuorumCertificate {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1110],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        let err = engine
+            .deliver_qc(small_signers_qc)
+            .expect_err("low-stake signers must not form a quorum");
+        assert!(
+            matches!(err, ConsensusError::InsufficientQuorum { voting_power, required } if voting_power == 3 && required == 69),
+            "expected InsufficientQuorum (3 < 69), got {err:?}"
+        );
+
+        // The 100-stake validator alone exceeds the power quorum —
+        // fewer signers, more weight.
+        let dominant_qc = QuorumCertificate {
+            view: View::new(0),
+            phase: VotePhase::Prepare,
+            block_hash: Hash::ZERO,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.deliver_qc(dominant_qc).expect("dominant-stake signer alone must form a quorum");
     }
 
     #[test]
@@ -5856,7 +6067,7 @@ mod tests {
             .on_timeout_certificate(&insufficient_tc)
             .expect_err("TC with insufficient quorum must be rejected");
         assert!(
-            matches!(err, ConsensusError::InsufficientQuorum { signers, threshold } if signers == 2 && threshold == 3),
+            matches!(err, ConsensusError::InsufficientQuorum { voting_power, required } if voting_power == 2 && required == 3),
             "expected InsufficientQuorum (2 < 3), got {err:?}"
         );
     }

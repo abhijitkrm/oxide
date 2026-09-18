@@ -15166,3 +15166,81 @@ shape of a real preverify impl).
 
 Gates: 71 executor + 178 evm lib tests green; workspace builds;
 fmt + clippy `-D warnings` clean.
+
+## Session — audit fix C2: quorum is voting power, not validator count
+
+Second fix from the audit list (critical finding C2). Two layers of
+the same defect, fixed together because the first fix alone still
+violated the published spec:
+
+1. **Wrong count formula.** `quorum()` was `2f + 1` with
+   `f = ⌊(n−1)/3⌋` — only safe for `n = 3f + 1`. At `n = 8` it
+   produced quorum 5, and two quorums of 5 can intersect in just 2
+   validators — possibly *all* Byzantine, voiding the
+   honest-intersection argument every BFT safety proof rests on.
+   `n = 2`/`n = 3` were worse: quorum **1**, a single signer counted
+   as consensus. Now `n − f = ⌊2n/3⌋ + 1` — the strict two-thirds
+   supermajority, honest-intersection-correct for all `n`.
+2. **Count, not stake.** `docs/oxidebft-spec.md` §3 has always said
+   quorum is *stake-weighted* ("a validator with 10% stake
+   contributes 10% to the quorum, not 1/N"), but every check summed
+   signer *bits*, not stake. With stakes [100, 1, 1, 1], the three
+   low-stake validators meet the count quorum (3 ≥ 3) while holding
+   <3% of voting power — a small-stake minority could certify blocks
+   the dominant validator never saw, or force view changes at will.
+
+Fix shape:
+
+- `ValidatorSet::quorum_stake()` — `⌊2·total_stake/3⌋ + 1`,
+  overflow-free (`T − ⌊T/3⌋` +1 exactly when `T ≡ 0 mod 3`). The
+  honest-intersection argument transfers directly to power: two
+  quorums share > T/3 of stake, strictly more than the ≤ T/3 a
+  Byzantine minority can hold.
+- `ValidatorSet::signer_stake(bitmap)` — voting power behind a
+  certificate bitmap; out-of-range bits contribute nothing (a corrupt
+  bitmap can't inflate power; sig verification rejects it anyway).
+- `quorum()` kept as the **equal-stake** count — now clearly
+  documented as diagnostic/sizing only; it equals `quorum_stake()`
+  in units of one stake each.
+- Engine: `vote_stake` accumulates each collected voter's stake
+  (reset everywhere `vote_count` resets — view advance, QC form,
+  epoch rotation); `try_form_qc` gates on it. `count_signers`
+  replaced by `signer_keys_and_power` (bitmap → keys + power in one
+  pass, shared by `verify_qc_signature`/`verify_tc_signature`/
+  `verify_exec_cert`) plus `bitmap_meets_quorum` for the structural
+  checks (embedded QC, TC lock-release). `deliver_qc` and
+  `on_timeout_certificate` compare `signer_stake` against
+  `quorum_stake`. `InsufficientQuorum` now carries
+  `{voting_power, required}` in stake units.
+- Exec-attestation buckets form an `ExecCertificate` when their
+  signers' stake reaches `quorum_stake` — the same threshold the
+  cert is later validated against.
+- Pacemaker `has_timeout_quorum` is stake-weighted; a small-stake
+  minority can no longer force view changes.
+- Spec/docs/code all agree: spec §3/§4/§7 reworded to ">2/3 of
+  voting power"; TLA model header notes its count `Quorum` equals
+  the power sum only under its stated equal-stake abstraction;
+  protocol type docs updated.
+
+Tests (regression first): `deliver_qc_enforces_stake_weighted_quorum`
+— [100,1,1,1] committee, 3 small signers (count quorum met, power 3
+of 103 < 69) rejected; dominant signer alone accepted.
+`timeout_tc_requires_voting_power_not_signer_count` — same shape in
+the pacemaker. `quorum_stake_is_strict_supermajority` +
+`signer_stake_unequal_power` — arithmetic across every mod-3 residue
+class and corrupt-bitmap zero-power. Existing test fallout:
+`engine_continues_after_rotation` rotates to a 1-validator set (a
+lone engine in a 2-validator set legitimately can't reach quorum 2);
+`tcp_multinode_validator_add_remove` adds the validator at stake 1 —
+the devnet spawns no engine for it, so 1000 stake would (correctly)
+halt the chain by making the absent validator quorum-mandatory.
+
+Gates: 130 consensus + 31 devnet-lib tests green; full workspace
+suite green; fmt + clippy `-D warnings` clean.
+
+**Rebaseline note:** every prior devnet TPS number was measured under
+unsafe quorum thresholds (n=8 quorums of 5 where a Byzantine pair
+could sit in the intersection). Throughput figures must be
+rebaselined once the remaining audit fixes land — the correct
+thresholds are stricter and certificate validation does strictly
+more work per QC/TC.

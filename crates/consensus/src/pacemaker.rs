@@ -19,7 +19,7 @@
 //!   │ (view) │                 │ (view)   │
 //!   └────────┘                 └──────────┘
 //!      ▲ │                        │  │
-//!      │ │ progress               │  │ ≥2f+1 timeout sigs
+//!      │ │ progress               │  │ >2/3 stake timeout sigs
 //!      │ │ (reset timer)          │  ▼
 //!      │ │                        │ TC formed
 //!      │ │     ┌──────────────┐   │
@@ -31,8 +31,8 @@
 //! - `Active(view)`: timer running, waiting for a proposal or votes.
 //!   On progress (a valid proposal arrives), the timer resets.
 //! - `TimedOut(view)`: local timer expired; collecting timeout
-//!   signatures from other replicas. On ≥2f+1 sigs, a TC forms and
-//!   the view advances.
+//!   signatures from other replicas. When the collected signers hold
+//!   >2/3 of voting power, a TC forms and the view advances.
 //! - A TC received from another replica (for the current view) also
 //!   advances the view — a replica does not need to collect its own
 //!   quorum if a peer already did.
@@ -92,8 +92,9 @@ pub enum PacemakerEvent {
         /// The epoch the timeout belongs to.
         epoch: Epoch,
     },
-    /// A timeout certificate was formed (≥2f+1 timeout signatures
-    /// collected). The consensus loop should include this TC in the
+    /// A timeout certificate was formed (signers holding >2/3 of
+    /// voting power collected). The consensus loop should include
+    /// this TC in the
     /// next proposal if this replica is the next leader, or use it
     /// to validate the next leader's proposal.
     TimeoutCertificateFormed(TimeoutCertificate),
@@ -131,7 +132,9 @@ pub struct Pacemaker {
     /// validator. A `1` bit means that validator signed a timeout.
     /// Stored as a bitmap matching the QC's `signer_bitmap` format.
     timeout_signers: Vec<u8>,
-    /// Count of set bits in `timeout_signers` (quorum check).
+    /// Count of set bits in `timeout_signers` (diagnostic accessor
+    /// only — the quorum decision uses [`has_timeout_quorum`]'s
+    /// stake-weighted check, not this count).
     timeout_signer_count: usize,
     /// Whether this replica has already broadcast its own timeout
     /// for the current view (avoid duplicate broadcasts).
@@ -255,9 +258,14 @@ impl Pacemaker {
     }
 
     /// Whether a quorum of timeout signatures has been collected.
+    ///
+    /// Measured in voting power: the collected signers' combined
+    /// stake must reach `⌊2·total_stake/3⌋ + 1` (oxideBFT spec §4).
+    /// Signer *count* is only a quorum under equal stake — a swarm
+    /// of low-stake validators cannot force a view change.
     #[must_use]
     pub fn has_timeout_quorum(&self) -> bool {
-        self.timeout_signer_count >= self.validator_set.quorum()
+        self.validator_set.signer_stake(&self.timeout_signers) >= self.validator_set.quorum_stake()
     }
 
     /// Local timer expired — broadcast a timeout and start collecting.
@@ -282,8 +290,8 @@ impl Pacemaker {
     }
 
     /// Received a timeout signature from `validator` for the current
-    /// view. If this brings the count to a quorum, form a TC and
-    /// advance the view.
+    /// view. If this brings the collected voting power to quorum,
+    /// form a TC and advance the view.
     ///
     /// Stage 2: signatures are collected but not verified (stage 5
     /// adds BLS verification). The caller is responsible for verifying
@@ -505,6 +513,34 @@ mod tests {
         }
         assert_eq!(pm.current_view(), View::new(1));
         assert_eq!(pm.state(), PacemakerState::Active);
+    }
+
+    /// Stake-weighted timeout quorum: with stakes [100, 1, 1, 1]
+    /// (`quorum_stake = 69` of `T = 103`), the three low-stake
+    /// validators meeting the *count* quorum must not force a view
+    /// change — a Byzantine small-stake minority could otherwise
+    /// stall the chain by endlessly cycling views.
+    #[test]
+    fn timeout_tc_requires_voting_power_not_signer_count() {
+        let weighted = ValidatorSet::new(vec![pk(1), pk(2), pk(3), pk(4)], vec![100, 1, 1, 1])
+            .expect("4 validators, 100:1:1:1 stake");
+        let mut pm = Pacemaker::new(weighted, View::new(0), Epoch::new(0));
+        let _ = pm.on_local_timeout();
+
+        // All three small validators sign: count quorum (3) met,
+        // power quorum (3 of 103 < 69) not. No TC, no advance.
+        for v in 1..4u16 {
+            let events = pm.on_timeout_signature(v, sig(u8::try_from(v).unwrap_or(0) + 1));
+            assert!(events.is_empty(), "low-stake signer {v} must not complete a TC");
+        }
+        assert!(!pm.has_timeout_quorum());
+        assert_eq!(pm.current_view(), View::new(0), "must not advance on count alone");
+
+        // The dominant validator's signature tips the power over 2/3.
+        let events = pm.on_timeout_signature(0, sig(9));
+        assert_eq!(events.len(), 2, "dominant stake completes the TC");
+        assert!(matches!(events[0], PacemakerEvent::TimeoutCertificateFormed(_)));
+        assert_eq!(pm.current_view(), View::new(1));
     }
 
     #[test]

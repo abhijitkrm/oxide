@@ -1004,6 +1004,36 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Quorum was counted in validators, not stake — and under-counted
+  even as a count** (`crates/consensus`, `crates/types`,
+  `crates/devnet`, `docs/oxidebft-spec.md`)
+  - `ValidatorSet::quorum()` used `2f + 1` — safe only for
+    `n = 3f + 1`. At `n = 8` it yielded 5, letting two quorums
+    intersect in just 2 validators (possibly all Byzantine); at
+    `n = 2`/`n = 3` a single signer counted as consensus. The count
+    threshold is now `n − f = ⌊2n/3⌋ + 1`, the strict two-thirds
+    supermajority that guarantees an honest member in every quorum
+    intersection for all committee sizes.
+  - More fundamentally, every certificate check counted signer
+    *bits* instead of *stake*, while the spec promises stake-weighted
+    quorum. With stakes [100, 1, 1, 1], the three low-stake
+    validators met the count quorum holding <3% of voting power — a
+    small-stake minority could certify blocks or force view changes.
+    All QC, TC, embedded-QC, and execution-certificate checks now
+    compare `signer_stake(bitmap)` against
+    `quorum_stake() = ⌊2·total_stake/3⌋ + 1`; vote collection and
+    the pacemaker accumulate voting power the same way.
+    `ConsensusError::InsufficientQuorum` reports
+    `{voting_power, required}` in stake units.
+  - `quorum()` remains as the equal-stake count (diagnostic only);
+    `quorum_stake()` is the authoritative threshold.
+  - **In plain words:** consensus was trusting "how many validators
+    signed" instead of "how much stake signed". A handful of
+    low-stake validators could out-vote the network's real economic
+    weight — or stall it by forcing view changes. Now a certificate
+    only counts if the signers actually control more than two-thirds
+    of the stake, which is what the spec always claimed.
+
 - **Cached execution ran every cached transaction under the first
   transaction's identity** (`crates/executor`, `modules/evm`)
   - `execute_block` passed the group leader's `TxContext` (sender,

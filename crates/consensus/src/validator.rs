@@ -8,9 +8,14 @@
 //!
 //! # Fault tolerance
 //!
-//! With `n = 3f + 1` validators, the protocol tolerates `f` Byzantine
-//! faults. A quorum is `2f + 1` (supermajority). These two constants
-//! are derived from the validator set size, never stored separately.
+//! The protocol tolerates up to `f = ⌊(n−1)/3⌋` Byzantine faults — the
+//! most any `n`-validator committee can sustain while guaranteeing a
+//! quorum of honest progress. A quorum is `n − f` (equivalently
+//! `⌊2n/3⌋ + 1`, a strict two-thirds supermajority): two quorums
+//! always intersect in at least `2(n−f) − n = n − 2f ≥ f + 1`
+//! validators, so at least one honest signer sits in every QC
+//! intersection. These constants are derived from the validator set
+//! size, never stored separately.
 
 use crypto::bls::{PublicKey, validator_address};
 use primitives::{Address, View};
@@ -220,19 +225,98 @@ impl ValidatorSet {
         self.validators.len()
     }
 
-    /// Maximum Byzantine faults tolerated (`f = (n - 1) / 3`).
+    /// Maximum Byzantine faults tolerated (`f = ⌊(n − 1) / 3⌋`).
     ///
-    /// With `n = 3f + 1`, this is exactly `f`. The formula works for
-    /// any `n >= 1`: for `n = 1` (single validator), `f = 0`.
+    /// This is the largest `f` for which `n ≥ 3f + 1` — the BFT
+    /// bound. For `n = 3f + 1` it is exactly `f`; for larger
+    /// committees it rounds *down*, so e.g. `n = 8` still tolerates
+    /// only `f = 2` (the third spare validator adds liveness headroom,
+    /// not fault tolerance). For `n = 1` (single validator), `f = 0`.
     #[must_use]
     pub fn f(&self) -> usize {
         (self.n() - 1) / 3
     }
 
-    /// Quorum size (`2f + 1`) — the supermajority needed for a QC or TC.
+    /// Quorum size (`n − f`, equivalently `⌊2n/3⌋ + 1`) — the strict
+    /// two-thirds supermajority needed for a QC or TC.
+    ///
+    /// The threshold must satisfy two properties:
+    ///
+    /// - **Safety (honest intersection):** any two quorums intersect
+    ///   in at least `2q − n ≥ f + 1` validators — more than every
+    ///   possible Byzantine — so two conflicting certificates can
+    ///   never both form. `n − f` gives `2(n−f) − n = n − 2f ≥ f + 1`
+    ///   because `n ≥ 3f + 1`.
+    /// - **Liveness:** the `n − f` honest validators alone can form
+    ///   a quorum even with all `f` Byzantine offline.
+    ///
+    /// The earlier `2f + 1` formula satisfies both only for
+    /// `n = 3f + 1`. At `n = 8` it yields 5, and two quorums of 5 can
+    /// intersect in just 2 validators — possibly *all* Byzantine —
+    /// which voids the safety argument for every non-`3f+1` committee.
+    /// `n − f` is the standard `>2/3` rule and reduces to `2f + 1`
+    /// exactly when `n = 3f + 1`.
+    ///
+    /// **Use [`quorum_stake`](Self::quorum_stake) for all certificate
+    /// validation.** This count is only the quorum when every
+    /// validator's stake is equal; under unequal stake the
+    /// authoritative threshold is voting *power*, not signer count.
+    /// `quorum()` remains for sizing hints and equal-stake tests.
     #[must_use]
     pub fn quorum(&self) -> usize {
-        2 * self.f() + 1
+        self.n() - self.f()
+    }
+
+    /// Voting-power quorum: strictly more than two-thirds of
+    /// `total_stake` — `⌊2·total_stake/3⌋ + 1`.
+    ///
+    /// A QC, TC, or execution certificate is valid only when the
+    /// *stake* behind its signers reaches this threshold
+    /// (docs/oxidebft-spec.md §3: "a validator with 10% stake
+    /// contributes 10% to the quorum, not 1/N"). Under equal stake
+    /// this equals `quorum()` in stake units; under unequal stake it
+    /// is the authoritative threshold — a count of low-stake signers
+    /// must not form a certificate, and one large-stake signer may
+    /// carry more weight than several small ones.
+    ///
+    /// The honest-intersection argument transfers directly: any two
+    /// quorums hold a combined `> 4T/3` of the `T` total stake, so
+    /// they share `> T/3` — strictly more than the `≤ T/3` of stake
+    /// a Byzantine minority can hold (the committee builder enforces
+    /// `f < n/3`, and stake shares define the same bound in power).
+    ///
+    /// Overflow-free: `T − ⌊T/3⌋` equals `⌊2T/3⌋` whenever
+    /// `T ≢ 0 (mod 3)` and is one short when `T ≡ 0 (mod 3)`, so the
+    /// `+ 1` is added exactly in the divisible case.
+    #[must_use]
+    pub fn quorum_stake(&self) -> u64 {
+        let t = self.total_stake;
+        t - t / 3 + u64::from(t % 3 == 0)
+    }
+
+    /// Voting power carried by `bitmap`: the sum of the stakes of the
+    /// validators whose bits are set.
+    ///
+    /// Bits beyond the validator set contribute nothing — an
+    /// out-of-range bit cannot inflate a certificate's apparent
+    /// power (signature verification rejects such bitmaps anyway).
+    /// Saturating add: total stake cannot exceed `u64::MAX`, but a
+    /// corrupt bitmap must never panic or wrap.
+    #[must_use]
+    pub fn signer_stake(&self, bitmap: &[u8]) -> u64 {
+        let mut power = 0u64;
+        for (i, byte) in bitmap.iter().enumerate() {
+            for bit in 0..8 {
+                if (byte >> bit) & 1 == 1 {
+                    let contribution = u16::try_from(i * 8 + bit)
+                        .ok()
+                        .and_then(|idx| self.stake(idx).ok())
+                        .unwrap_or(0);
+                    power = power.saturating_add(contribution);
+                }
+            }
+        }
+        power
     }
 
     /// Total stake across all validators.
@@ -360,28 +444,115 @@ mod tests {
         PublicKey([byte; PublicKey::LEN])
     }
 
+    /// Quorum threshold across committee sizes — including every
+    /// residue class mod 3, because `n − f` only coincides with the
+    /// old `2f + 1` for `n = 3f + 1`. Sizes `≡ 2` and `≡ 0 (mod 3)`
+    /// were under-threshold before: at `n = 8` two quorums of 5 could
+    /// intersect in just 2 validators (possibly all Byzantine), and at
+    /// `n = 2`/`n = 3` a single signer counted as a quorum.
     #[test]
     fn fault_tolerance_and_quorum() {
-        // n = 4 → f = 1, quorum = 3
-        let vs = ValidatorSet::new(vec![pk(1), pk(2), pk(3), pk(4)], vec![1, 1, 1, 1])
-            .expect("4 validators");
-        assert_eq!(vs.n(), 4);
-        assert_eq!(vs.f(), 1);
-        assert_eq!(vs.quorum(), 3);
+        // (n, f, quorum) — quorum = n − f = ⌊2n/3⌋ + 1.
+        for (n, f, q) in [
+            (1usize, 0usize, 1usize),
+            (2, 0, 2),
+            (3, 0, 3),
+            (4, 1, 3),
+            (5, 1, 4),
+            (6, 1, 5),
+            (7, 2, 5),
+            (8, 2, 6),
+            (9, 2, 7),
+            (10, 3, 7),
+        ] {
+            let vs = ValidatorSet::new(
+                (0u8..u8::try_from(n).unwrap_or(u8::MAX)).map(pk).collect(),
+                vec![1; n],
+            )
+            .expect("validator set");
+            assert_eq!(vs.n(), n);
+            assert_eq!(vs.f(), f, "f for n={n}");
+            assert_eq!(vs.quorum(), q, "quorum for n={n}");
+            // Honest-intersection invariant: two quorums must
+            // intersect in strictly more than f validators.
+            assert!(2 * q - n > f, "quorums at n={n} must intersect in >f validators");
+            // Liveness: the honest majority alone can reach quorum.
+            assert!(n - f >= q, "honest validators at n={n} must reach quorum");
+        }
+    }
 
-        // n = 7 → f = 2, quorum = 5
-        let vs = ValidatorSet::new(
-            vec![pk(1), pk(2), pk(3), pk(4), pk(5), pk(6), pk(7)],
-            vec![1, 1, 1, 1, 1, 1, 1],
-        )
-        .expect("7 validators");
-        assert_eq!(vs.f(), 2);
-        assert_eq!(vs.quorum(), 5);
+    /// Voting-power quorum across total-stake values — every residue
+    /// class mod 3, because `⌊2T/3⌋ + 1` rounds differently for each.
+    /// With all-equal stakes the power quorum must equal `quorum()`
+    /// in stake units (each validator contributes its own stake).
+    #[test]
+    fn quorum_stake_is_strict_supermajority() {
+        // (per-validator stake, n, expected quorum_stake)
+        for (s, n, expected) in [
+            (1u64, 1usize, 1u64), // T=1:  ⌊2/3⌋+1  = 1
+            (1, 2, 2),            // T=2:  ⌊4/3⌋+1  = 2
+            (1, 3, 3),            // T=3:  ⌊6/3⌋+1  = 3
+            (1, 4, 3),            // T=4:  ⌊8/3⌋+1  = 3
+            (1, 8, 6),            // T=8:  ⌊16/3⌋+1 = 6
+            (1, 9, 7),            // T=9:  ⌊18/3⌋+1 = 7
+            (1, 10, 7),           // T=10: ⌊20/3⌋+1 = 7
+            (7, 4, 19),           // T=28: ⌊56/3⌋+1 = 19
+        ] {
+            let vs = ValidatorSet::new(
+                (0u8..u8::try_from(n).unwrap_or(u8::MAX)).map(pk).collect(),
+                vec![s; n],
+            )
+            .expect("validator set");
+            assert_eq!(
+                vs.quorum_stake(),
+                expected,
+                "quorum_stake for stake={s}, n={n} (T={})",
+                s * n as u64
+            );
+            // The invariant: strictly more than two-thirds of T.
+            let t = u64::try_from(n).unwrap_or(u64::MAX) * s;
+            assert!(3 * vs.quorum_stake() > 2 * t, "must exceed 2T/3");
+            // Equal-stake equivalence: the power held by quorum()
+            // validators must meet the power quorum. (Not equal in
+            // general — ⌊2n/3⌋+1 signers × s can overshoot ⌊2ns/3⌋+1
+            // by up to s−1; for s=1 they coincide exactly.)
+            assert!(
+                vs.quorum() as u64 * s >= vs.quorum_stake(),
+                "a count quorum of equal-stake validators must reach the power quorum"
+            );
+            if s == 1 {
+                assert_eq!(vs.quorum_stake(), vs.quorum() as u64, "unit stake: power == count");
+            }
+        }
+    }
 
-        // n = 1 → f = 0, quorum = 1 (single-validator devnet)
-        let vs = ValidatorSet::new(vec![pk(1)], vec![1]).expect("1 validator");
-        assert_eq!(vs.f(), 0);
-        assert_eq!(vs.quorum(), 1);
+    /// `signer_stake` sums only in-range bitmap bits — the power a
+    /// certificate actually carries under unequal stake. This is the
+    /// scenario count-based quorum got wrong: n=4 with stakes
+    /// [100, 1, 1, 1] — the three small validators meet the count
+    /// quorum (3 ≥ ⌊2·4/3⌋+1 = 3) but hold <3% of the voting power
+    /// and must not form a certificate.
+    #[test]
+    fn signer_stake_unequal_power() {
+        let vs = ValidatorSet::new(vec![pk(1), pk(2), pk(3), pk(4)], vec![100, 1, 1, 1])
+            .expect("validator set");
+        // T = 103 → quorum_stake = ⌊206/3⌋+1 = 68+1 = 69.
+        assert_eq!(vs.quorum_stake(), 69);
+
+        // Three low-stake signers: count quorum met, power quorum not.
+        let small = [0b0000_1110u8];
+        assert_eq!(vs.signer_stake(&small), 3);
+        assert!(vs.signer_stake(&small) < vs.quorum_stake());
+
+        // The dominant signer alone exceeds the power quorum.
+        let big = [0b0000_0001u8];
+        assert_eq!(vs.signer_stake(&big), 100);
+        assert!(vs.signer_stake(&big) >= vs.quorum_stake());
+
+        // Bits beyond the validator set contribute nothing — a
+        // corrupt bitmap cannot inflate apparent power.
+        let corrupt = [0b1111_0000u8];
+        assert_eq!(vs.signer_stake(&corrupt), 0);
     }
 
     #[test]
