@@ -15,6 +15,8 @@
 //! pinned by unit tests in this crate and round-tripped by the codec
 //! property tests.
 
+pub mod shard;
+
 use codec::{Decode, DecodeError, Encode, Reader, write};
 use crypto::bls::{AggregateSignature, Signature};
 use primitives::{Address, Epoch, Hash, Height, View};
@@ -728,6 +730,14 @@ pub struct BlockHeader {
     /// validators disagree on the state root, the `exec_cert` will
     /// not form. `None` at genesis or before the first exec cert.
     pub exec_cert: Option<ExecCertificate>,
+    /// Commitment over the dispersed body shards (Merkle-style root
+    /// from [`crate::shard::disperse_body`]). Every validator verifies
+    /// its own shard's inclusion proof against this root and votes on
+    /// the block commitment *before* reconstructing the full body —
+    /// the `DispersedSimplex` broadcast pattern: notarize on partial
+    /// information, certify (reconstruct + verify) before finalize.
+    /// `Hash::ZERO` only for synthetic headers in tests.
+    pub body_commitment: Hash,
 }
 
 impl Encode for BlockHeader {
@@ -767,6 +777,9 @@ impl Encode for BlockHeader {
             }
             None => write::bool(buf, false),
         }
+        // Appended last so earlier protocol revisions' encodings are a
+        // strict prefix — decoders that stop here see the old format.
+        self.body_commitment.encode(buf);
     }
 }
 
@@ -787,6 +800,7 @@ impl<'a> Decode<'a> for BlockHeader {
             if reader.read_bool()? { Some(Signature::decode(reader)?) } else { None };
         let exec_cert =
             if reader.read_bool()? { Some(ExecCertificate::decode(reader)?) } else { None };
+        let body_commitment = Hash::decode(reader)?;
         Ok(Self {
             height,
             view,
@@ -799,6 +813,7 @@ impl<'a> Decode<'a> for BlockHeader {
             timestamp,
             proposer_signature,
             exec_cert,
+            body_commitment,
         })
     }
 }
@@ -1074,6 +1089,7 @@ mod tests {
             timestamp: 1000,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let mut expected = Vec::new();
         expected.extend_from_slice(&0u64.to_le_bytes()); // height
@@ -1087,6 +1103,7 @@ mod tests {
         expected.extend_from_slice(&1000u64.to_le_bytes()); // timestamp
         expected.push(0); // no proposer_signature
         expected.push(0); // no exec_cert
+        expected.extend_from_slice(&[0; 32]); // body_commitment
         roundtrip(&header, &expected);
     }
 
@@ -1113,6 +1130,7 @@ mod tests {
             timestamp: 2000,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         // Encode + round-trip (the QC makes the full wire form long;
         // roundtrip checks both encode-match and decode-match).
@@ -1145,6 +1163,7 @@ mod tests {
             timestamp: 3000,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let mut buf = Vec::new();
         header.encode(&mut buf);

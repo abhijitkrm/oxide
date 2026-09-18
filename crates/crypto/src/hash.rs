@@ -57,6 +57,10 @@ use primitives::Hash;
 /// | `StateRoot` | 7 | execution state root (Phase 2) |
 /// | `MmrRoot` | 8 | MMR root finalization (storage) |
 /// | `Proposal` | 9 | block proposal signing (C3 fix) |
+/// | `ValidatorAddress` | 10 | staking address derivation |
+/// | `StateSyncChunk` | 11 | state-sync snapshot chunks |
+/// | `BodyShardLeaf` | 12 | dispersed-block shard leaf (Phase 5) |
+/// | `BodyShardNode` | 13 | dispersed-block shard tree node (Phase 5) |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -90,6 +94,15 @@ pub enum Domain {
     /// manifest's `chunk_hashes`). Appended after
     /// `ValidatorAddress` — never renumber.
     StateSyncChunk = 11,
+    /// A dispersed-block shard leaf: `H(tag ‖ index ‖ total ‖ bytes)`.
+    /// Appended after `StateSyncChunk` — never renumber. Leaf and
+    /// node domains differ so a leaf hash can never collide with an
+    /// internal node in the shard commitment tree.
+    BodyShardLeaf = 12,
+    /// A dispersed-block shard-tree internal node:
+    /// `H(tag ‖ left ‖ right)`. Appended after `BodyShardLeaf` —
+    /// never renumber.
+    BodyShardNode = 13,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

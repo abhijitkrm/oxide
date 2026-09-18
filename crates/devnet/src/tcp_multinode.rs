@@ -31,7 +31,7 @@
 //! `authenticated = false`, `encrypted = false`. This is for local
 //! devnet only — do not use across untrusted networks.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -71,12 +71,38 @@ const MSG_QC: u8 = 0x02;
 /// the first harness to pay the real distribution cost.
 const MSG_PROPOSAL: u8 = 0x03;
 
+/// Message type tag: body shard (header + one committed chunk).
+///
+/// The threaded driver's dispersed-broadcast path: the leader sends
+/// each peer its assigned shard only (~body/n), and validators relay
+/// their own shard so every peer reassembles the body off the vote
+/// critical path. Votes attest the `body_commitment`; bodies certify
+/// at `supply_body` before finalization — the `DispersedSimplex`
+/// split used by `Commonware` `marshal::coding` and `LayerZero` `Zero`.
+const MSG_SHARD: u8 = 0x04;
+
 /// Per-receiver reliable fallback queue: `(sender_index, frame)`.
 /// The threaded driver drops frames here when a peer's TCP writer
 /// channel reports `ChannelFull`, preserving the harness's "no
 /// message loss" invariant without blocking the sender's hot loop —
 /// the receiving validator drains its inbox each iteration.
 type Inboxes = Vec<Arc<std::sync::Mutex<VecDeque<(u8, Vec<u8>)>>>>;
+
+/// Mutable per-validator state the inbound dispatcher needs beyond
+/// the engine: future-view headers awaiting vote retry, reassembling
+/// body shards keyed by block hash, the relay out-queue (our
+/// assigned shard for peers), and our own index for the
+/// relay-ownership rule.
+struct DispatchState<'a> {
+    /// Future-view headers queued for `vote_header` retry.
+    pending: &'a mut BTreeMap<u64, types::BlockHeader>,
+    /// Reassembling bodies: `(shard set, block height)`.
+    shard_sets: &'a mut HashMap<primitives::Hash, (types::shard::ShardSet, u64)>,
+    /// Shard frames to forward to every peer this pass.
+    relays: &'a mut Vec<Vec<u8>>,
+    /// This validator's index — the relay-ownership check.
+    me: u8,
+}
 
 /// Build the BLS vote signing message: `(view, phase, block_hash,
 /// epoch)`. This must match the format used by
@@ -1338,10 +1364,23 @@ impl TcpMultiNodeDevnet {
         target_txs: u64,
     ) -> (OxideBft, p2p::tcp::TcpTransport) {
         let me = usize::from(idx);
+        let me_u8 = u8::try_from(me).unwrap_or(0);
         // Pending proposals by view — filled by `MSG_PROPOSAL`
         // frames, voted on in view order (BTreeMap keeps the oldest
         // first so a burst of views resolves FIFO).
-        let mut pending: BTreeMap<u64, (types::BlockHeader, types::Proposal)> = BTreeMap::new();
+        // Future-view headers queued for vote retry — keyed by view.
+        // Header-only: `vote_header` resolves the body from engine
+        // state (already stored `Complete` on the full-proposal path,
+        // or `Awaiting` on the shard path — vote eligibility is
+        // identical either way).
+        let mut pending: BTreeMap<u64, types::BlockHeader> = BTreeMap::new();
+        // Reassembling block bodies, keyed by block hash. A set is
+        // inserted on the first valid shard seen for a block and
+        // removed when it completes (supply_body) or is pruned below
+        // the committed height. The `u64` is the block height, kept
+        // solely for pruning.
+        let mut shard_sets: HashMap<primitives::Hash, (types::shard::ShardSet, u64)> =
+            HashMap::new();
         let mut proposed_views: HashSet<u64> = HashSet::new();
         let mut voted_views: HashSet<u64> = HashSet::new();
         let mut marked_done = false;
@@ -1371,15 +1410,18 @@ impl TcpMultiNodeDevnet {
         loop {
             // ── inbound: TCP first, then the reliable fallback ──
             let t0 = std::time::Instant::now();
+            let mut relays: Vec<Vec<u8>> = Vec::new();
             while let Some(msg) = transport.recv() {
                 let from = msg.from.first().copied().unwrap_or(0);
-                if let Some((v, vote)) = Self::dispatch_inbound(
-                    &mut engine,
-                    &mut pending,
-                    from,
-                    &msg.bytes,
-                    &mut t_commit,
-                ) {
+                let mut state = DispatchState {
+                    pending: &mut pending,
+                    shard_sets: &mut shard_sets,
+                    relays: &mut relays,
+                    me: me_u8,
+                };
+                if let Some((v, vote)) =
+                    Self::dispatch_inbound(&mut engine, &mut state, from, &msg.bytes, &mut t_commit)
+                {
                     voted_views.insert(v);
                     Self::send_vote(
                         &mut engine,
@@ -1398,8 +1440,14 @@ impl TcpMultiNodeDevnet {
                 std::mem::take(&mut *guard)
             };
             for (from, bytes) in drained {
+                let mut state = DispatchState {
+                    pending: &mut pending,
+                    shard_sets: &mut shard_sets,
+                    relays: &mut relays,
+                    me: me_u8,
+                };
                 if let Some((v, vote)) =
-                    Self::dispatch_inbound(&mut engine, &mut pending, from, &bytes, &mut t_commit)
+                    Self::dispatch_inbound(&mut engine, &mut state, from, &bytes, &mut t_commit)
                 {
                     voted_views.insert(v);
                     Self::send_vote(
@@ -1413,6 +1461,22 @@ impl TcpMultiNodeDevnet {
                     );
                 }
             }
+            // Shard relays collected this pass — our assigned shard
+            // goes to every peer once (it arrives back at us only via
+            // no path: peers relay their own index only).
+            for frame in relays {
+                for peer in 0..n {
+                    if peer != me {
+                        Self::wire_send(
+                            &mut transport,
+                            &inboxes,
+                            idx,
+                            u8::try_from(peer).unwrap_or(0),
+                            &frame,
+                        );
+                    }
+                }
+            }
             t_inbound += t0.elapsed();
 
             // ── propose: leader only, gated on high_qc like the sim ──
@@ -1424,10 +1488,48 @@ impl TcpMultiNodeDevnet {
             {
                 if let Some((header, proposal)) = engine.propose() {
                     proposed_views.insert(view);
-                    let mut frame = Vec::with_capacity(64);
-                    frame.push(MSG_PROPOSAL);
-                    header.encode(&mut frame);
-                    proposal.encode(&mut frame);
+                    // Dispersed broadcast (DispersedSimplex): encode
+                    // the body once, chunk it into n shards committed
+                    // by `header.body_commitment`, and send each peer
+                    // only its assigned shard + the header. Leader
+                    // egress is O(S) instead of O(n·S); validators
+                    // relay their own shard so everyone reassembles
+                    // the body off the vote critical path.
+                    let mut body = Vec::new();
+                    proposal.encode(&mut body);
+                    let (root, shards) = types::shard::disperse_body(&body, n);
+                    debug_assert_eq!(
+                        root, header.body_commitment,
+                        "engine and harness must compute the same body commitment"
+                    );
+                    for (peer, shard) in shards.iter().enumerate() {
+                        if peer != me {
+                            let mut frame = Vec::with_capacity(64 + shard.bytes.len());
+                            frame.push(MSG_SHARD);
+                            header.encode(&mut frame);
+                            shard.encode(&mut frame);
+                            Self::wire_send(
+                                &mut transport,
+                                &inboxes,
+                                idx,
+                                u8::try_from(peer).unwrap_or(0),
+                                &frame,
+                            );
+                        }
+                    }
+                    // The leader is also shard `me`'s owner: every
+                    // peer needs all n chunks to reconstruct, and
+                    // only the leader ever holds this one — it must
+                    // broadcast it exactly like peers relay theirs.
+                    // Skipping it leaves every peer's set at n-1
+                    // shards forever — notarization still races
+                    // ahead on commitments while nothing can ever
+                    // finalize (observed: commits=0 with unbounded
+                    // shard-set growth).
+                    let mut own = Vec::with_capacity(64 + shards[me].bytes.len());
+                    own.push(MSG_SHARD);
+                    header.encode(&mut own);
+                    shards[me].encode(&mut own);
                     for peer in 0..n {
                         if peer != me {
                             Self::wire_send(
@@ -1435,7 +1537,7 @@ impl TcpMultiNodeDevnet {
                                 &inboxes,
                                 idx,
                                 u8::try_from(peer).unwrap_or(0),
-                                &frame,
+                                &own,
                             );
                         }
                     }
@@ -1464,12 +1566,14 @@ impl TcpMultiNodeDevnet {
 
             // ── vote on pending proposals ──
             let t0 = std::time::Instant::now();
-            // Entries here are future-view proposals (queued on
-            // arrival because we weren't at their view yet — their
-            // bodies are already stored in the engine). A retry
-            // fires only once our view catches up; stale entries
-            // (view passed while they waited) are dropped — the
-            // stored body still serves the QC commit walk.
+            // Entries here are future-view headers (queued on arrival
+            // because we weren't at their view yet). `vote_header`
+            // resolves whatever body state the engine already stored —
+            // `Complete` from a full proposal or `Awaiting` from the
+            // shard path — and emits the commitment vote when our
+            // view has caught up. Stale entries (view passed while
+            // they waited) are dropped; the stored state still serves
+            // the commit walk.
             let current = engine.current_view().value();
             let pending_views: Vec<u64> = pending.keys().copied().collect();
             for v in pending_views {
@@ -1481,8 +1585,8 @@ impl TcpMultiNodeDevnet {
                 if v > current {
                     continue;
                 }
-                let Some((header, proposal)) = pending.get(&v) else { continue };
-                if let Some(vote) = engine.vote(header, proposal) {
+                let Some(header) = pending.get(&v) else { continue };
+                if let Some(vote) = engine.vote_header(header) {
                     voted_views.insert(v);
                     Self::send_vote(
                         &mut engine,
@@ -1537,10 +1641,11 @@ impl TcpMultiNodeDevnet {
             if debug && last_debug.elapsed() >= std::time::Duration::from_secs(1) {
                 last_debug = std::time::Instant::now();
                 eprintln!(
-                    "  [v{idx}] view={} highqc={:?} pending={} proposed={} voted={} commits={}",
+                    "  [v{idx}] view={} highqc={:?} pending={} shards={} proposed={} voted={} commits={}",
                     engine.current_view().value(),
                     engine.high_qc().map(|q| q.view.value()),
                     pending.len(),
+                    shard_sets.len(),
                     proposed_views.len(),
                     voted_views.len(),
                     committed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
@@ -1569,6 +1674,12 @@ impl TcpMultiNodeDevnet {
                         .sum();
                     counted_blocks = guard.len();
                     finalized_txs += new_txs;
+                    // Committed blocks can never need their bodies
+                    // again — drop any straggling incomplete shard
+                    // sets at/below the commit tip.
+                    if let Some(tip) = guard.last().map(|b| b.height.value()) {
+                        shard_sets.retain(|_, (_, h)| *h > tip);
+                    }
                     drop(guard);
                     last_commit_seq = seq_now;
                     if finalized_txs >= target_txs {
@@ -1628,7 +1739,7 @@ impl TcpMultiNodeDevnet {
     /// a devnet harness, not the hardened production ingress path.
     fn dispatch_inbound(
         engine: &mut OxideBft,
-        pending: &mut BTreeMap<u64, (types::BlockHeader, types::Proposal)>,
+        state: &mut DispatchState<'_>,
         from: u8,
         bytes: &[u8],
         t_commit: &mut std::time::Duration,
@@ -1646,12 +1757,82 @@ impl TcpMultiNodeDevnet {
                     // body is stored, only the vote waits for our
                     // view to catch up.
                     None if v >= engine.current_view().value() => {
-                        pending.entry(v).or_insert((header, proposal));
+                        state.pending.entry(v).or_insert(header);
                         None
                     }
                     // Stale: body stored, no vote possible or needed.
                     None => None,
                 }
+            }
+            // Dispersed broadcast: one body shard + the signed header.
+            // The validator (a) verifies its own shard's inclusion
+            // proof against `header.body_commitment`, (b) notarizes
+            // the commitment immediately — the full body is *not*
+            // required to vote, and (c) relays the shard to peers iff
+            // it is our leader-assigned shard (index == me). Bodies
+            // reconstruct incrementally as peer relays arrive; once a
+            // set is complete it is certified by `supply_body` and can
+            // finalize — the DispersedSimplex certify gate.
+            MSG_SHARD => {
+                let header = types::BlockHeader::decode(&mut reader).ok()?;
+                let shard = types::shard::Shard::decode(&mut reader).ok()?;
+                // Commitment check first — cheap (~4 hashes) and does
+                // not depend on header authenticity; garbage shards
+                // are dropped before any BLS work.
+                if !types::shard::verify_shard(&header.body_commitment, &shard) {
+                    return None;
+                }
+                let block_hash = OxideBft::block_hash(&header);
+                let is_mine = shard.index == u32::from(state.me);
+                // On the first shard seen for a block, authenticate
+                // and vote on the commitment — `vote_header` also
+                // stores the header as `Awaiting`, which `supply_body`
+                // requires later regardless of whether a vote emits.
+                // Subsequent shards skip the BLS work.
+                let vote_out = if state.shard_sets.contains_key(&block_hash) {
+                    None
+                } else {
+                    let v = header.view.value();
+                    match engine.vote_header(&header) {
+                        Some(vote) => Some((v, vote)),
+                        None if v >= engine.current_view().value() => {
+                            state.pending.entry(v).or_insert(header.clone());
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                // Accumulate the shard — even for views we can't vote
+                // on yet: the body must exist before this block can
+                // ever commit.
+                let entry = state.shard_sets.entry(block_hash).or_insert_with(|| {
+                    (
+                        types::shard::ShardSet::new(usize::try_from(shard.total).unwrap_or(0)),
+                        header.height.value(),
+                    )
+                });
+                // `insert` returns true exactly once — when this
+                // shard completes the set.
+                if entry.0.insert(shard) {
+                    if let Some((set, _)) = state.shard_sets.remove(&block_hash) {
+                        if let Some(body) = set.reconstruct() {
+                            if let Ok(proposal) =
+                                types::Proposal::decode(&mut codec::Reader::new(&body))
+                            {
+                                let t0 = std::time::Instant::now();
+                                let _ = engine.supply_body(block_hash, &proposal);
+                                *t_commit += t0.elapsed();
+                            }
+                        }
+                    }
+                }
+                // Relay our leader-assigned shard — each validator
+                // forwards only the shard the leader sent *it*, so
+                // every shard traverses exactly one extra hop.
+                if is_mine {
+                    state.relays.push(bytes.to_vec());
+                }
+                vote_out
             }
             MSG_VOTE => {
                 if let Ok(vote) = types::Vote::decode(&mut reader) {

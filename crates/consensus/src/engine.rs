@@ -141,6 +141,27 @@ impl std::error::Error for KeyChangeError {}
 /// These are distinct from operational errors (io, codec): they
 /// indicate byzantine behavior — a peer sent a vote or QC with an
 /// invalid signature, conflicting metadata, or insufficient quorum.
+/// Stored state of a block's body in `OxideBft::blocks`.
+///
+/// With dispersed broadcast (`types::shard`), a validator votes on the
+/// block *commitment* as soon as it holds a verified own-shard +
+/// header — the full body is reconstructed lazily and is required
+/// only at commit time, not vote time (the `DispersedSimplex` split:
+/// notarize on partial information, certify before finalize).
+/// `Awaiting` blocks participate in every header-level rule
+/// (parentage, height, QC chain) but can never be committed until
+/// `OxideBft::supply_body` upgrades them to `Complete` — the
+/// commit walk treats them exactly like a body that hasn't arrived
+/// yet and defers.
+#[derive(Debug, Clone)]
+enum BlockBody {
+    /// The full proposal — known-valid bytes, executable at commit.
+    Complete(Proposal),
+    /// Header verified and notarization-eligible; the body is still
+    /// propagating as shards (or, adversarially, may never arrive).
+    Awaiting,
+}
+
 /// The caller should penalize the peer, not retry the operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsensusError {
@@ -209,6 +230,16 @@ pub enum ConsensusError {
         /// The state root the local validator computed.
         actual_root: Hash,
     },
+    /// A reconstructed block body failed certification: either its
+    /// shard-commitment does not match the `body_commitment` in the
+    /// notarized header (the leader dispersed inconsistent bodies —
+    /// a provable equivocation) or the app's static
+    /// `process_proposal` check rejected it. A notarized-but-uncertified
+    /// block must never finalize (`DispersedSimplex` certify gate).
+    BodyRejected {
+        /// The block whose body failed certification.
+        block_hash: Hash,
+    },
     /// The persisted consensus state could not be restored — the
     /// byte buffer is malformed, truncated, or corrupted (C9 fix).
     InvalidState,
@@ -249,6 +280,9 @@ impl std::fmt::Display for ConsensusError {
                     "state divergence at height {}: network root {expected_root}, local root {actual_root}",
                     height.value()
                 )
+            }
+            Self::BodyRejected { block_hash } => {
+                write!(f, "block body failed certification: {block_hash}")
             }
             Self::InvalidState => write!(f, "invalid persisted consensus state"),
         }
@@ -300,9 +334,9 @@ pub struct OxideBft {
     /// the SAME block hash. Entries are pruned on commit (a
     /// finalized prefix cannot conflict).
     voted_at_height: BTreeMap<u64, Hash>,
-    /// Block store: block hash → (header, proposal). Used to look up
-    /// blocks at commit time.
-    blocks: HashMap<Hash, (BlockHeader, Proposal)>,
+    /// Block store: block hash → (header, body state). Used to look
+    /// up blocks at commit time.
+    blocks: HashMap<Hash, (BlockHeader, BlockBody)>,
     /// Finalized blocks keyed by height. `BTreeMap` for ordered
     /// iteration (the conformance suite checks the height sequence).
     /// Bounded to `MAX_RETAINED_FINALIZED` — old blocks are pruned.
@@ -1204,7 +1238,13 @@ impl OxideBft {
         // txs froze the conveyor, and "tip uncommitted" is perpetual
         // (the newest QC'd block only ever commits via the NEXT QC),
         // so it never let `run_until_idle` terminate.
-        let uncommitted_has_txs = self.blocks.values().any(|(_, p)| !p.txs.is_empty());
+        // An `Awaiting` body counts as work regardless of contents —
+        // it is uncommitted consensus state that only a longer chain
+        // can finalize.
+        let uncommitted_has_txs = self.blocks.values().any(|(_, b)| match b {
+            BlockBody::Complete(p) => !p.txs.is_empty(),
+            BlockBody::Awaiting => true,
+        });
         let work_outstanding = self.app.has_queued_txs() || uncommitted_has_txs;
 
         // No work: nothing queued and nothing left to flush. The
@@ -1274,12 +1314,23 @@ impl OxideBft {
                 None => (Height::new(0), Hash::ZERO),
             },
         };
+        // Bind the proposal body for dispersed broadcast: validators
+        // verify their assigned shard's inclusion proof against this
+        // root and vote on the commitment before reconstructing the
+        // full body (the DispersedSimplex split — notarize on partial
+        // information, certify before finalize). Computed over the
+        // canonical `Proposal` encoding; receivers recompute it
+        // identically in `supply_body`.
+        let mut body_bytes = Vec::new();
+        proposal.encode(&mut body_bytes);
+        let body_commitment = types::shard::commitment(&body_bytes, self.validator_set.n());
         let mut header = BlockHeader {
             height,
             view: self.current_view,
             epoch: self.epoch,
             prev_block,
             tx_root,
+            body_commitment,
             high_qc: self.high_qc.clone(),
             // Embed the TC that brought us into this view, if any
             // (spec §view-changes: "the next leader embeds the TC in
@@ -1309,7 +1360,7 @@ impl OxideBft {
             header.proposer_signature = Some(sig);
         }
         let block_hash = Self::block_hash(&header);
-        self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
+        self.blocks.insert(block_hash, (header.clone(), BlockBody::Complete(proposal.clone())));
         // Keep the observed-height watermark at least one past the
         // stamp we just used. `next_height` no longer drives stamps
         // (they are derived from the parent block) — it remains a
@@ -1326,6 +1377,67 @@ impl OxideBft {
     /// BLS secret key is set (stage 5), the vote is signed with real
     /// BLS; otherwise `Signature::ZERO` is used (conformance mode).
     pub fn vote(&mut self, header: &BlockHeader, proposal: &Proposal) -> Option<Vote> {
+        let block_hash = self.authenticate_proposal(header)?;
+        // Body↔commitment binding: the leader signed a shard
+        // commitment into the header — the body it shipped must hash
+        // to it. Without this check a byzantine leader could attach
+        // an arbitrary body to a commitment that honest validators
+        // attested (notarize-on-commitment means the *commitment* is
+        // what the QC actually certifies). Gated on
+        // `verify_signatures`: unauthenticated conformance headers
+        // carry no meaningful commitment (same precedent as the
+        // signature checks); the shard path enforces the binding
+        // unconditionally at `supply_body`.
+        if self.verify_signatures {
+            let mut buf = Vec::new();
+            proposal.encode(&mut buf);
+            if types::shard::commitment(&buf, self.validator_set.n()) != header.body_commitment {
+                return None;
+            }
+        }
+        // Store the authenticated block body BEFORE the vote-
+        // eligibility checks. The QC commit walk in `deliver_qc`
+        // can only run while the QC'd block is in `self.blocks`, and
+        // real networks reorder: a QC frequently reaches a validator
+        // before the proposal it certifies (different peers, different
+        // paths). If the proposal then arrives while its view is
+        // already past, the vote path below rejects it as stale — but
+        // the body is still required for the commit walk that the
+        // early QC could not complete. Storing here (after proposer-
+        // signature verification, so only the genuine leader's blocks
+        // land) keeps block availability independent of vote
+        // eligibility — the deciding factor for *commit* order is the
+        // QC chain, not local vote timing.
+        self.blocks.insert(block_hash, (header.clone(), BlockBody::Complete(proposal.clone())));
+        self.vote_if_eligible(header, block_hash, Some(proposal))
+    }
+
+    /// Validator: vote on a block *header* alone — the dispersed-
+    /// broadcast path. The voter has verified its assigned body
+    /// shard against `header.body_commitment` (harness-side) and
+    /// notarizes the commitment immediately; the full body is
+    /// reconstructed lazily and certified at `supply_body` before
+    /// it can ever finalize (`DispersedSimplex`: notarize on partial
+    /// information, certify before finalize).
+    ///
+    /// The block is stored `Awaiting` so header-level rules
+    /// (parentage, QC-chain walk) work exactly as with a complete
+    /// body — commit still defers until the body lands.
+    pub fn vote_header(&mut self, header: &BlockHeader) -> Option<Vote> {
+        let block_hash = self.authenticate_proposal(header)?;
+        // Insert only when vacant: a `Complete` body already stored
+        // must never be downgraded to `Awaiting`.
+        self.blocks.entry(block_hash).or_insert_with(|| (header.clone(), BlockBody::Awaiting));
+        self.vote_if_eligible(header, block_hash, None)
+    }
+
+    /// Shared proposal authentication for both vote paths: sanity
+    /// bounds, expected-leader + signature verification, and the
+    /// observed-height watermark update. Returns the block hash when
+    /// the header is genuine; `None` means the caller must not vote
+    /// AND must not store anything — an unauthenticated header is
+    /// worthless for both voting and the commit walk.
+    fn authenticate_proposal(&mut self, header: &BlockHeader) -> Option<Hash> {
         // Sanity bound (C1 fix): reject proposals with height near
         // u64::MAX before learning it. Such a height is never
         // legitimate (at 10 blk/s, u64::MAX is ~58 billion years),
@@ -1370,23 +1482,21 @@ impl OxideBft {
         // about the chain's progression. If we later become the
         // leader, we must propose at a height above any we've seen.
         self.observe_block_height(header.height);
+        Some(Self::block_hash(header))
+    }
 
-        // Store the authenticated block body BEFORE the vote-
-        // eligibility checks. The QC commit walk in `deliver_qc`
-        // can only run while the QC'd block is in `self.blocks`, and
-        // real networks reorder: a QC frequently reaches a validator
-        // before the proposal it certifies (different peers, different
-        // paths). If the proposal then arrives while its view is
-        // already past, the vote path below rejects it as stale — but
-        // the body is still required for the commit walk that the
-        // early QC could not complete. Storing here (after proposer-
-        // signature verification, so only the genuine leader's blocks
-        // land) keeps block availability independent of vote
-        // eligibility — the deciding factor for *commit* order is the
-        // QC chain, not local vote timing.
-        let block_hash = Self::block_hash(header);
-        self.blocks.insert(block_hash, (header.clone(), proposal.clone()));
-
+    /// Shared vote-eligibility chain for both vote paths. `body` is
+    /// `Some` for the complete-proposal path (`vote`) and `None` for
+    /// the commitment path (`vote_header`): the app's static
+    /// `process_proposal` check needs body bytes, so the commitment
+    /// path defers it to `supply_body`'s certification — a notarized
+    /// block whose body fails certification can never finalize.
+    fn vote_if_eligible(
+        &mut self,
+        header: &BlockHeader,
+        block_hash: Hash,
+        body: Option<&Proposal>,
+    ) -> Option<Vote> {
         // HIGH fix: require the proposal's view to match our current
         // view. A proposal for a different view is either stale
         // (already finalized) or premature (future round). Voting
@@ -1586,9 +1696,14 @@ impl OxideBft {
             }
         }
         // Process the proposal through the app (static validity).
-        match self.app.process_proposal(proposal) {
-            Verdict::Accept => {}
-            Verdict::Reject { .. } => return None,
+        // The commitment path (`vote_header`) has no body yet — its
+        // `process_proposal` runs at `supply_body` certification, so
+        // a notarized block carrying invalid txs can never finalize.
+        if let Some(proposal) = body {
+            match self.app.process_proposal(proposal) {
+                Verdict::Accept => {}
+                Verdict::Reject { .. } => return None,
+            }
         }
         // The block body was already stored above (before the
         // eligibility checks) — commit-walk completeness must not
@@ -1606,6 +1721,68 @@ impl OxideBft {
         // Sign the vote (stage 5: real BLS if key is set).
         let signature = self.sign_vote(header.view, block_hash);
         Some(Vote { view: header.view, phase: VotePhase::Prepare, block_hash, signature })
+    }
+
+    /// Supply a reconstructed body for a header-verified block — the
+    /// certification step of dispersed broadcast. The harness calls
+    /// this once it has gathered every shard of `block_hash` and
+    /// reassembled the proposal.
+    ///
+    /// Two checks, exactly mirroring what the complete-proposal path
+    /// does up front:
+    ///
+    /// 1. **Commitment:** the canonical `Proposal` encoding must hash
+    ///    to the `body_commitment` the leader signed into the header.
+    ///    A mismatch means the leader dispersed inconsistent bodies
+    ///    across validators — provable equivocation; the body is
+    ///    rejected and never stored.
+    /// 2. **Static validity:** `app.process_proposal` — the same
+    ///    check `vote` runs eagerly on the complete path, deferred
+    ///    here for the commitment path.
+    ///
+    /// On success the stored state upgrades `Awaiting` → `Complete`
+    /// and the commit walk retries from `high_qc`: the QC certifying
+    /// this block may well have arrived while its body was still
+    /// propagating — deferral, not loss. Idempotent: re-supplying an
+    /// already-complete body is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsensusError::BodyRejected`] when the block is
+    /// unknown/pruned, when the body's shard commitment does not
+    /// match the signed header's `body_commitment`, or when the app
+    /// rejects the body's static validity — none of which mutate the
+    /// stored `Awaiting` slot.
+    pub fn supply_body(
+        &mut self,
+        block_hash: Hash,
+        proposal: &Proposal,
+    ) -> Result<(), ConsensusError> {
+        let n = self.validator_set.n();
+        let Some((header, body)) = self.blocks.get_mut(&block_hash) else {
+            // The header never arrived or the block was already
+            // pruned — nothing to certify; the caller drops the body.
+            return Err(ConsensusError::BodyRejected { block_hash });
+        };
+        if matches!(body, BlockBody::Complete(_)) {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        proposal.encode(&mut buf);
+        if types::shard::commitment(&buf, n) != header.body_commitment {
+            return Err(ConsensusError::BodyRejected { block_hash });
+        }
+        match self.app.process_proposal(proposal) {
+            Verdict::Accept => {}
+            Verdict::Reject { .. } => return Err(ConsensusError::BodyRejected { block_hash }),
+        }
+        *body = BlockBody::Complete(proposal.clone());
+        if let Some(qc) = self.high_qc.clone() {
+            if let Some((tip, _)) = self.blocks.get(&qc.block_hash).cloned() {
+                self.commit_walk(&tip);
+            }
+        }
+        Ok(())
     }
 
     /// Build the BLS signing message for a vote. Binds `(view,
@@ -1947,61 +2124,84 @@ impl OxideBft {
         // height order (oldest first) — the app requires in-order
         // finalization.
         if let Some((header, _)) = self.blocks.get(&qc.block_hash).cloned() {
-            // Collect the uncommitted ancestor chain, newest→oldest:
-            // (block hash, bitmap of the QC certifying it). The
-            // certifying QC for a block X is the embedded `high_qc`
-            // of X's child — for the tip that is `header.high_qc`.
-            // The walk stops at genesis (prev ZERO / no stored
-            // parent), at a committed block (evicted from `blocks`
-            // by `commit_block`'s retain — a missing ancestor is
-            // always already finalized, since vote-time storage is
-            // prefix-closed: a block can only be stored after its
-            // parent was), or when the embedded-QC chain ends.
-            // The walk only applies when the stored block's parent IS
-            // its certified block — `prev == justify`, enforced at
-            // vote time. A divergent stored block (impossible via the
-            // vote path; only a future import seam could create one)
-            // would otherwise commit an *uncertified* parent: the
-            // embedded QC certifies `justify`, not `prev`.
-            let mut chain: Vec<(Hash, Vec<u8>, u64)> = Vec::new();
-            if header.high_qc.as_ref().is_some_and(|qc| qc.block_hash == header.prev_block) {
-                let mut cursor_hash = header.prev_block;
-                let mut certifying = header.high_qc.clone();
-                while let Some(bitmap) = certifying.as_ref().map(|qc| qc.signer_bitmap.clone()) {
-                    let Some((cursor_header, _)) = self.blocks.get(&cursor_hash) else {
-                        break;
-                    };
-                    if self.finalized.contains_key(&cursor_header.height.value()) {
-                        break;
-                    }
-                    chain.push((cursor_hash, bitmap, cursor_header.height.value()));
-                    certifying.clone_from(&cursor_header.high_qc);
-                    cursor_hash = cursor_header.prev_block;
-                }
-            }
-            // Contiguity guard: commit only when the collected chain's
-            // oldest block is the direct child of the commit tip.
-            // A gap means an ancestor proposal is still in flight —
-            // the QC that certifies this chain arrived before the
-            // block body did (real networks reorder). Committing
-            // anyway would finalize out of order AND permanently
-            // orphan the missing height: later walks stop at the
-            // finalized sibling and never reach back. Deferring is
-            // safe — the walk re-runs on the next delivered QC, by
-            // which time the body has landed via the vote path.
-            let expected_next =
-                self.last_committed.map_or(0, |(_, committed_height)| committed_height.value() + 1);
-            let contiguous =
-                chain.last().is_none_or(|(_, _, oldest_height)| *oldest_height == expected_next);
-            // Commit oldest-first so `finalize_block` sees a
-            // contiguous ascending prefix.
-            if contiguous {
-                for (hash, bitmap, _) in chain.iter().rev() {
-                    self.commit_block(*hash, bitmap);
-                }
-            }
+            self.commit_walk(&header);
         }
         Ok(())
+    }
+
+    /// Walk the certified ancestor chain under a QC'd tip and commit
+    /// the contiguous uncommitted prefix, oldest-first.
+    ///
+    /// A block joins the collected chain only while its stored body
+    /// is `Complete`: an `Awaiting` ancestor (dispersed body still
+    /// propagating as shards) breaks the walk exactly like a missing
+    /// block — the contiguity guard below then defers the whole
+    /// commit rather than finalizing over an unexecutable body. The
+    /// walk re-runs when `supply_body` completes the body or when a
+    /// later QC arrives.
+    ///
+    /// The tip itself is never committed here — it commits only when
+    /// a QC for its *child* arrives — so the tip's own body state is
+    /// irrelevant to this walk.
+    fn commit_walk(&mut self, header: &BlockHeader) {
+        // Collect the uncommitted ancestor chain, newest→oldest:
+        // (block hash, bitmap of the QC certifying it). The
+        // certifying QC for a block X is the embedded `high_qc`
+        // of X's child — for the tip that is `header.high_qc`.
+        // The walk stops at genesis (prev ZERO / no stored
+        // parent), at a committed block (evicted from `blocks`
+        // by `commit_block`'s retain — a missing ancestor is
+        // always already finalized, since vote-time storage is
+        // prefix-closed: a block can only be stored after its
+        // parent was), at an `Awaiting` body (dispersed body not
+        // yet reconstructed — never commit unexecutable state),
+        // or when the embedded-QC chain ends.
+        // The walk only applies when the stored block's parent IS
+        // its certified block — `prev == justify`, enforced at
+        // vote time. A divergent stored block (impossible via the
+        // vote path; only a future import seam could create one)
+        // would otherwise commit an *uncertified* parent: the
+        // embedded QC certifies `justify`, not `prev`.
+        let mut chain: Vec<(Hash, Vec<u8>, u64)> = Vec::new();
+        if header.high_qc.as_ref().is_some_and(|qc| qc.block_hash == header.prev_block) {
+            let mut cursor_hash = header.prev_block;
+            let mut certifying = header.high_qc.clone();
+            while let Some(bitmap) = certifying.as_ref().map(|qc| qc.signer_bitmap.clone()) {
+                let Some((cursor_header, cursor_body)) = self.blocks.get(&cursor_hash) else {
+                    break;
+                };
+                if !matches!(cursor_body, BlockBody::Complete(_)) {
+                    break;
+                }
+                if self.finalized.contains_key(&cursor_header.height.value()) {
+                    break;
+                }
+                chain.push((cursor_hash, bitmap, cursor_header.height.value()));
+                certifying.clone_from(&cursor_header.high_qc);
+                cursor_hash = cursor_header.prev_block;
+            }
+        }
+        // Contiguity guard: commit only when the collected chain's
+        // oldest block is the direct child of the commit tip.
+        // A gap means an ancestor proposal is still in flight —
+        // the QC that certifies this chain arrived before the
+        // block body did (real networks reorder). Committing
+        // anyway would finalize out of order AND permanently
+        // orphan the missing height: later walks stop at the
+        // finalized sibling and never reach back. Deferring is
+        // safe — the walk re-runs on the next delivered QC, by
+        // which time the body has landed via the vote path.
+        let expected_next =
+            self.last_committed.map_or(0, |(_, committed_height)| committed_height.value() + 1);
+        let contiguous =
+            chain.last().is_none_or(|(_, _, oldest_height)| *oldest_height == expected_next);
+        // Commit oldest-first so `finalize_block` sees a
+        // contiguous ascending prefix.
+        if contiguous {
+            for (hash, bitmap, _) in chain.iter().rev() {
+                self.commit_block(*hash, bitmap);
+            }
+        }
     }
 
     /// Verify a QC's aggregate signature against the signer bitmap
@@ -2069,8 +2269,17 @@ impl OxideBft {
     /// proposes before committing). The app's `next_proposal_height`
     /// advances here (via `finalize_block`).
     fn commit_block(&mut self, block_hash: Hash, signer_bitmap: &[u8]) {
-        let Some((header, proposal)) = self.blocks.remove(&block_hash) else {
+        let Some((header, body)) = self.blocks.remove(&block_hash) else {
             return; // already committed or unknown
+        };
+        // Certify gate (dispersed broadcast): a block whose body is
+        // still `Awaiting` reconstruction must never finalize —
+        // the commit walk already skips it, this is the last-line
+        // guard if a future path ever reaches here directly. Put
+        // the entry back so a later `supply_body` can complete it.
+        let BlockBody::Complete(proposal) = body else {
+            self.blocks.insert(block_hash, (header, body));
+            return;
         };
         let addresses = self.validator_set.validator_addresses();
         let signers: Vec<Address> = signer_bitmap
@@ -2703,6 +2912,169 @@ mod tests {
         qc
     }
 
+    /// Drive one round over the dispersed-broadcast path
+    /// (DispersedSimplex): followers vote on the *header only* —
+    /// the shard-commitment vote — while the body is still
+    /// propagating; the QC forms and delivers before any follower
+    /// holds the body. `supply_body` then certifies the body and
+    /// triggers the deferred commit walk.
+    ///
+    /// Returns `(header, proposal, qc)` — callers inspect the QC
+    /// and choose whether/when to supply bodies.
+    fn drive_round_sharded(
+        leader: &mut OxideBft,
+        followers: &mut [&mut OxideBft],
+        tx: Option<TxBytes>,
+        supply_bodies: bool,
+    ) -> (BlockHeader, Proposal, QuorumCertificate) {
+        if let Some(t) = tx {
+            leader.submit_tx(t);
+        }
+        let (header, proposal) = leader.propose().expect("leader should propose");
+        let block_hash = OxideBft::block_hash(&header);
+        // Leader self-vote — it produced the body (complete path).
+        let leader_idx = leader.validator_index;
+        leader
+            .collect_vote(
+                leader_idx,
+                Vote {
+                    view: header.view,
+                    phase: VotePhase::Prepare,
+                    block_hash,
+                    signature: Signature::ZERO,
+                },
+            )
+            .expect("conformance: no verification");
+        // Followers notarize the commitment — body not required.
+        for (i, follower) in followers.iter_mut().enumerate() {
+            if let Some(vote) = follower.vote_header(&header) {
+                let voter_idx = u16::try_from(i + 1).expect("validator index fits u16");
+                leader.collect_vote(voter_idx, vote).expect("conformance: no verification");
+            }
+        }
+        let qc = leader.try_form_qc().expect("quorum should be reached");
+        leader.deliver_qc(qc.clone()).expect("conformance: no verification");
+        for follower in followers.iter_mut() {
+            follower.deliver_qc(qc.clone()).expect("conformance: no verification");
+        }
+        // The body lands *after* the QC — the dispersed order.
+        if supply_bodies {
+            for follower in followers.iter_mut() {
+                follower
+                    .supply_body(block_hash, &proposal)
+                    .expect("certified body must be accepted");
+            }
+        }
+        leader.advance_view();
+        for follower in followers.iter_mut() {
+            follower.advance_view();
+        }
+        (header, proposal, qc)
+    }
+
+    /// A follower must vote on a block's commitment without ever
+    /// having seen its body — notarization attests availability of
+    /// the *commitment*, execution waits for certification.
+    #[test]
+    fn vote_header_notarizes_without_body() {
+        let mut leader = make_multi_engine(0);
+        let mut follower = make_multi_engine(1);
+        leader.submit_tx(TxBytes::new(vec![9]));
+        let (header, _proposal) = leader.propose().expect("leader proposes");
+        assert!(follower.vote_header(&header).is_some(), "commitment vote must not need the body");
+        // One vote per view — a second header-vote in the same view
+        // is a no-op, same as the full path.
+        assert!(follower.vote_header(&header).is_none());
+    }
+
+    /// The certify gate: a QC'd block whose body is still `Awaiting`
+    /// must defer the commit walk, and `supply_body` must trigger
+    /// the deferred walk — finalization only after the body is
+    /// verified and complete.
+    #[test]
+    fn commit_defers_until_body_certified() {
+        let mut leader = make_multi_engine(0);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        let mut followers = [&mut f1, &mut f2, &mut f3];
+
+        // Round 1: block h0 — followers never receive its body.
+        let (h0, p0, _qc0) =
+            drive_round_sharded(&mut leader, &mut followers, Some(TxBytes::new(vec![42])), false);
+        // Round 2: block h1 — QC(h1) is what would commit h0.
+        drive_round_sharded(&mut leader, &mut followers, None, false);
+
+        // On every follower, h0 is notarized but NOT committed: its
+        // body is still Awaiting, so the commit walk broke on it.
+        for (name, e) in [("f1", &f1), ("f2", &f2), ("f3", &f3)] {
+            assert!(
+                e.finalized_block(Height::new(0)).is_none(),
+                "{name}: uncommitted body must defer finalization"
+            );
+        }
+
+        // The body arrives — certification completes it and the
+        // deferred walk fires: h0 commits under the already-stored
+        // QC(h1) (2-chain rule satisfied since h1's header is known).
+        let h0_hash = OxideBft::block_hash(&h0);
+        for (i, e) in [&mut f1, &mut f2, &mut f3].iter_mut().enumerate() {
+            e.supply_body(h0_hash, &p0)
+                .unwrap_or_else(|e| panic!("f{}: certified body accepted: {e:?}", i + 1));
+            let block = e.finalized_block(Height::new(0));
+            assert!(block.is_some(), "f{}: certified body must unblock commit", i + 1);
+            assert_eq!(block.map(|b| b.txs.len()), Some(1));
+        }
+    }
+
+    /// `supply_body` must reject a body whose canonical encoding
+    /// does not hash to the header's signed `body_commitment` —
+    /// equivocating bodies can never be certified, and the stored
+    /// `Awaiting` slot must not be poisoned (the genuine body is
+    /// still accepted afterwards).
+    #[test]
+    fn supply_body_rejects_commitment_mismatch() {
+        let mut leader = make_multi_engine(0);
+        let mut follower = make_multi_engine(1);
+        leader.submit_tx(TxBytes::new(vec![7]));
+        let (header, proposal) = leader.propose().expect("leader proposes");
+        let hash = OxideBft::block_hash(&header);
+        assert!(follower.vote_header(&header).is_some());
+
+        let mut wrong = proposal.clone();
+        wrong.txs = vec![TxBytes::new(vec![8])];
+        assert!(matches!(
+            follower.supply_body(hash, &wrong),
+            Err(ConsensusError::BodyRejected { .. })
+        ));
+        // Genuine body still accepted — the failed supply did not
+        // poison the slot. Duplicate supply is idempotent.
+        follower.supply_body(hash, &proposal).expect("genuine body accepted");
+        follower.supply_body(hash, &proposal).expect("duplicate supply is a no-op");
+    }
+
+    /// A notarized header keeps the block eligible for all
+    /// header-level rules while its body propagates: with bodies
+    /// supplied every round, the dispersed path commits identically
+    /// to the full-proposal path.
+    #[test]
+    fn sharded_round_trip_commits_identically() {
+        let mut leader = make_multi_engine(0);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        let mut followers = [&mut f1, &mut f2, &mut f3];
+
+        drive_round_sharded(&mut leader, &mut followers, Some(TxBytes::new(vec![42])), true);
+        drive_round_sharded(&mut leader, &mut followers, None, true);
+
+        for (name, e) in [("leader", &leader), ("f1", &f1), ("f2", &f2), ("f3", &f3)] {
+            let block = e.finalized_block(Height::new(0)).expect("block 0 committed");
+            assert_eq!(block.txs.len(), 1, "{name}: block 0 should have 1 tx");
+            assert_eq!(block.txs[0].as_bytes(), [42], "{name}: block 0 tx mismatch");
+        }
+    }
+
     #[test]
     fn multi_validator_two_chain_commits() {
         // 4 validators, 1 leader (index 0), 3 followers.
@@ -2879,7 +3251,7 @@ mod tests {
         assert_eq!(d_header.height, Height::new(3), "honest stamp would be 3");
         d_header.height = Height::new(5); // the attack: a height the chain hasn't reached
         let d_hash = OxideBft::block_hash(&d_header);
-        e3.blocks.insert(d_hash, (d_header.clone(), d_proposal.clone()));
+        e3.blocks.insert(d_hash, (d_header.clone(), BlockBody::Complete(d_proposal.clone())));
 
         // e0 and e1 vote for d: nobody holds a height-5 lock, the
         // parent is the real highQC, and the view matches.
@@ -3204,6 +3576,7 @@ mod tests {
                 timestamp: 0,
                 proposer_signature: None,
                 exec_cert: None,
+                body_commitment: Hash::ZERO,
             };
             let proposal = Proposal {
                 height: header.height,
@@ -3211,7 +3584,7 @@ mod tests {
                 attestation: None,
             };
             let hash = OxideBft::block_hash(&header);
-            e.blocks.insert(hash, (header, proposal.clone()));
+            e.blocks.insert(hash, (header, BlockBody::Complete(proposal.clone())));
             (hash, proposal)
         };
 
@@ -3503,6 +3876,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         // Even with a valid signature from key 2, the proposer field
         // doesn't match the expected leader (0), so vote() rejects.
@@ -3543,6 +3917,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None, // missing
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         assert!(
             follower.vote(&header, &proposal).is_none(),
@@ -3576,6 +3951,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let forged_sk = bls_key(3);
         let signing_hash = OxideBft::proposal_signing_hash(&header);
@@ -4002,6 +4378,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(vote.is_none(), "fork proposal without high_qc must be rejected");
@@ -4043,6 +4420,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(
@@ -4090,6 +4468,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(vote.is_some(), "proposal extending high_qc must be accepted");
@@ -4143,8 +4522,11 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
-        engine.blocks.insert(newer_qc.block_hash, (parent_header, parent_proposal));
+        engine
+            .blocks
+            .insert(newer_qc.block_hash, (parent_header, BlockBody::Complete(parent_proposal)));
 
         let stamped_height = parent_height.saturating_next();
         let proposal_view = View::new(our_high_qc.view.value() + 2);
@@ -4167,6 +4549,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(
@@ -4214,6 +4597,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(
@@ -4243,6 +4627,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: None,
+            body_commitment: Hash::ZERO,
         };
         let vote = engine.vote(&header, &proposal);
         assert!(vote.is_some(), "genesis proposal must be accepted");
@@ -4298,6 +4683,7 @@ mod tests {
             timestamp: 0,
             proposer_signature: None,
             exec_cert: Some(exec_cert),
+            body_commitment: Hash::ZERO,
         };
         let signing_hash = OxideBft::proposal_signing_hash(&header);
         header.proposer_signature =
@@ -4340,12 +4726,18 @@ mod tests {
             attestation: None,
         };
         // C3: sign the header so the proposer-auth check passes.
+        // The signed header must also carry the real body
+        // commitment — `vote` verifies the binding in production
+        // mode (this engine verifies signatures).
+        let mut body = Vec::new();
+        proposal.encode(&mut body);
         let mut header = BlockHeader {
             height: Height::new(0),
             view: View::new(0),
             epoch: Epoch::new(0),
             prev_block: Hash::ZERO,
             tx_root: OxideBft::tx_root(&proposal.txs),
+            body_commitment: types::shard::commitment(&body, 1),
             high_qc: None,
             timeout_cert: None,
             proposer: proposer_hash(0),

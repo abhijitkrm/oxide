@@ -14603,3 +14603,102 @@ off the consensus path (also the real-network answer: 460 MiB of
 consensus payload per 64-round run does not survive real latency).
 Cheaper interim wins: hash-once at decode (currently re-hashed per
 phase), dedupe proposal-body copies, batch or skip WAL in benches.
+
+## Session — dispersed block broadcast (DispersedSimplex) in oxideBFT
+
+Following the "payload bytes are the ceiling" conclusion, this session
+implements the Commonware `marshal::coding` / LayerZero Zero pattern
+inside the engine instead of shipping whole bodies in proposals:
+leaders erasure-chunk bodies, validators notarize the *commitment*,
+and blocks finalize only after the body is reconstructed and
+certified locally.
+
+### Design mapping
+
+| Commonware | oxideBFT |
+|---|---|
+| shard dispersal | `MSG_SHARD` — leader sends each peer its assigned chunk only |
+| shard relay | each validator forwards its own leader-assigned shard to all peers |
+| vote on partial info | `OxideBft::vote_header(header)` — verifies proposer auth + notarizes `body_commitment` before any body bytes arrive |
+| certify gate | `OxideBft::supply_body(hash, proposal)` — verifies the canonical encoding hashes to the signed `body_commitment`, runs `process_proposal`, then upgrades stored state and retries the deferred commit walk |
+
+### Engine changes (`crates/consensus/src/engine.rs`)
+
+- `BlockHeader.body_commitment` (types crate): Merkle root over the
+  canonical `Proposal` encoding's shard leaves — binds the body into
+  the signed header so a QC certifies a *specific* body, not just a
+  view. `propose()` computes it zero-copy; `vote()` verifies the
+  shipped body matches it whenever signature verification is on
+  (closes a leader-equivocation hole on the full-proposal path too).
+- `blocks` values became `(BlockHeader, BlockBody)` where
+  `BlockBody = Complete(Proposal) | Awaiting`. `Awaiting` blocks take
+  part in every header-level rule (parentage, QC chain, liveness
+  gate counts them as work) but the commit walk requires `Complete`
+  cursors — a missing body defers the whole commit exactly like a
+  missing ancestor (the reorder fix's contiguity guard carries it).
+- `vote()` was split into `authenticate_proposal` (shared preamble)
+  + `vote_if_eligible` (shared tail) so `vote_header` reuses the
+  identical safety chain; `process_proposal` runs eagerly on the
+  complete path and is deferred to `supply_body` on the shard path —
+  an invalid body can never finalize because certification precedes
+  commit, not notarization.
+- `commit_block` keeps a last-line `Awaiting` guard (re-inserts and
+  returns) so no future caller can finalize an unexecutable block.
+
+### Harness (`crates/devnet/src/tcp_multinode.rs`)
+
+- `MSG_SHARD` wire: `[tag][header][Shard{index,total,proof,bytes}]`.
+- Leader: `disperse_body` → per-peer assigned shard **plus its own
+  shard broadcast** — see the bug below.
+- Follower: verify shard proof against `header.body_commitment`
+  (cheap, pre-BLS), store into a `ShardSet`, `vote_header` once per
+  block, relay iff `shard.index == me`, `supply_body` on completion.
+- Future-view headers queue as headers only — `vote_header` retries
+  resolve whichever body state the engine already stored.
+- Incomplete sets prune below the commit tip (commit-seq gated).
+
+### Bug found + fixed during bring-up
+
+First threaded run: views raced (notarization fine — commitments
+don't need bodies) but **commits=0 everywhere, shard sets growing
+unboundedly**. Root cause: the leader assigned shards to peers but
+nobody owned `shard_leader` — every peer's set waited at n−1 shards
+forever, so nothing could ever certify. Fix: the leader broadcasts
+its own shard exactly like peers relay theirs (leader egress ≈ 2·S,
+still ~4× under the old n·S fan-out). This is the real protocol
+lesson: **every shard needs an owner who pushes it to all peers.**
+
+### Measured (8v threaded, TCP loopback, wire-max 64×2×65,536 fills)
+
+| Run | fills/s | orders/s | vs 682K threaded baseline |
+|---|---|---|---|
+| dispersal #1 | **955,209** | 1.91M | +40% |
+| dispersal #2 | **901,602** | 1.80M | +32% |
+
+Also beats the 885K single-threaded pipelined record. Per-validator
+profile (~8.9s): inbound ~5.1s, commit ~2.6s, idle ~1.8s,
+propose+vote+qc ~1.5s.
+
+**Honest read:** the win is real but smaller than hoped because the
+wall moved, not shrank — follower *ingress* is still ~S bytes/view
+(all n shards must arrive for certification), so on loopback the
+aggregate transport cost (~460 MiB × 8 receivers, per-frame copies
+and allocs) dominates. What dispersal bought: leader egress n·S →
+2·S, and votes decoupled from body arrival (QC forms on ~S/n bytes).
+On real multi-machine links — where the leader's single writer is
+the wall — this is the win that matters; on loopback the remaining
+levers are transport-level: fewer/larger frames, hash-once-at-decode,
+reassembly without extra copies, WAL batching in the commit path.
+
+### Tests
+
+- New engine tests: `vote_header_notarizes_without_body`,
+  `commit_defers_until_body_certified` (QC arrives before body →
+  defer → `supply_body` fires the deferred walk),
+  `supply_body_rejects_commitment_mismatch` (wrong body rejected,
+  slot unpoisoned, duplicate idempotent),
+  `sharded_round_trip_commits_identically`.
+- `types::shard`: encode round-trip, proof verify, incomplete
+  reconstruction, disperse/verify/reconstruct.
+- Gates: 119 consensus + 26 types + 31 devnet tests green; workspace
+  clippy and fmt clean.

@@ -921,6 +921,34 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     next big speedup isn't more per-fill work, it's stopping 460MiB
     of fill bodies from riding inside consensus messages.
 
+- **Dispersed block broadcast: notarize commitments, certify bodies**
+  (`crates/types`, `crates/consensus`, `crates/devnet`)
+  - Block headers now carry a `body_commitment` — a Merkle root over
+    the proposal body's shard chunks (`types::shard`). Leaders send
+    each validator only its assigned chunk plus a proof; validators
+    relay their own chunk so everyone reassembles the body in
+    parallel (`MSG_SHARD` wire in the threaded devnet).
+  - New engine seam: `vote_header` notarizes the commitment before
+    any body bytes arrive; `supply_body` certifies the reconstructed
+    body (commitment match + app validity) and only then may the
+    block finalize — the `DispersedSimplex` split used by Commonware
+    `marshal::coding` and LayerZero `Zero`. `vote()` also verifies
+    the body↔commitment binding on the full-proposal path whenever
+    signature verification is on.
+  - Commit safety: `blocks` now distinguish `Awaiting` bodies from
+    `Complete` ones; the commit walk requires complete ancestors and
+    `commit_block` guards as a last line, so a notarized block with
+    a missing body defers — never finalizes.
+  - Measured (8 validators, threaded, TCP loopback, wire maximum):
+    **955K / 901K fills/s (1.8–1.9M orders/s)** across two runs —
+    +32–40% over the 682K fills/s whole-proposal threaded baseline.
+  - **In plain words:** instead of every validator waiting for a
+    3.8MiB block before it can vote, validators now vote on a
+    fingerprint of the block while the pieces arrive in parallel —
+    and no block can ever finalize until its real contents have been
+    received and checked. Throughput rose by about a third; the next
+    wall is now raw bytes through the network links themselves.
+
 ### Fixed
 
 - **Consensus liveness under message reorder: QC before proposal**

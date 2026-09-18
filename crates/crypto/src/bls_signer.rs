@@ -58,6 +58,8 @@ fn dst(domain: Domain) -> &'static [u8] {
         Domain::Proposal => b"oxide/proposal",
         Domain::ValidatorAddress => b"oxide/validator-address",
         Domain::StateSyncChunk => b"oxide/statesync-chunk",
+        Domain::BodyShardLeaf => b"oxide/body-shard-leaf",
+        Domain::BodyShardNode => b"oxide/body-shard-node",
     }
 }
 
