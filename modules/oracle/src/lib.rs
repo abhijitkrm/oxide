@@ -155,6 +155,12 @@ pub struct OracleModule {
     last_update: Mutex<BTreeMap<u8, u64>>,
     /// Registered external (non-validator) feed addresses.
     feeds: Mutex<BTreeSet<Address>>,
+    /// C9: committee endorsements for feed-registry changes —
+    /// registering a feed grants it a vote in every market's
+    /// median, so admission/removal takes the same two-thirds
+    /// committee quorum as any other governance action. A single
+    /// validator's signature is a vote, never a command.
+    endorsements: framework::Endorsements,
 }
 
 impl OracleModule {
@@ -171,6 +177,7 @@ impl OracleModule {
             marks: Mutex::new(BTreeMap::new()),
             last_update: Mutex::new(BTreeMap::new()),
             feeds: Mutex::new(BTreeSet::new()),
+            endorsements: framework::Endorsements::new(),
         }
     }
 
@@ -431,35 +438,52 @@ impl Module for OracleModule {
                 if body.len() != 20 {
                     return Err(ExecError::Malformed);
                 }
-                if !self.committee.as_ref().is_some_and(|c| c.is_active_validator(&ctx.sender)) {
+                // C9: the feed registry is committee governance —
+                // a registered feed holds a vote in every market's
+                // median, so one validator must not grant or strip
+                // that power alone. The tx endorses the exact
+                // (tag, feed) action; it applies only once
+                // endorsing power strictly exceeds two-thirds of
+                // the committee. Without a wired committee the path
+                // is closed entirely.
+                let Some(committee) = self.committee.clone() else {
                     return Err(ExecError::ModuleRejected(
-                        "feed registry: sender is not an active validator".to_string(),
+                        "feed registry: no committee wired".to_string(),
                     ));
-                }
-                let mut feed = [0u8; 20];
-                feed.copy_from_slice(body);
-                let feed_addr = Address(feed);
-                let mut feeds =
-                    self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut store =
-                    self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let key = [b"feed/".as_slice(), &feed].concat();
-                if tag == TAG_REGISTER_FEED {
-                    feeds.insert(feed_addr);
-                    store.insert(key, vec![1]);
-                    Ok(vec![Event {
+                };
+                match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
+                    framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
                         module: "oracle",
-                        kind: "feed_registered",
-                        data: feed.to_vec(),
-                    }])
-                } else {
-                    feeds.remove(&feed_addr);
-                    store.remove(&key);
-                    Ok(vec![Event {
-                        module: "oracle",
-                        kind: "feed_unregistered",
-                        data: feed.to_vec(),
-                    }])
+                        kind: "feed_registry_endorse",
+                        data: body.to_vec(),
+                    }]),
+                    framework::EndorsementOutcome::Quorum => {
+                        let mut feed = [0u8; 20];
+                        feed.copy_from_slice(body);
+                        let feed_addr = Address(feed);
+                        let mut feeds =
+                            self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut store =
+                            self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let key = [b"feed/".as_slice(), &feed].concat();
+                        if tag == TAG_REGISTER_FEED {
+                            feeds.insert(feed_addr);
+                            store.insert(key, vec![1]);
+                            Ok(vec![Event {
+                                module: "oracle",
+                                kind: "feed_registered",
+                                data: feed.to_vec(),
+                            }])
+                        } else {
+                            feeds.remove(&feed_addr);
+                            store.remove(&key);
+                            Ok(vec![Event {
+                                module: "oracle",
+                                kind: "feed_unregistered",
+                                data: feed.to_vec(),
+                            }])
+                        }
+                    }
                 }
             }
             _ => Err(ExecError::Malformed),
@@ -506,6 +530,9 @@ impl Module for OracleModule {
                 }
             }
         }
+        // C9: pending feed-registry endorsements decide whether a
+        // registry change applies — future-affecting state.
+        self.endorsements.write_canonical(&mut w);
         w.root()
     }
 }
@@ -560,6 +587,12 @@ mod tests {
         }
         fn active_validator_count(&self) -> usize {
             self.members.len()
+        }
+        fn power(&self, addr: &Address) -> u64 {
+            u64::from(self.is_active_validator(addr))
+        }
+        fn total_power(&self) -> u64 {
+            self.members.len() as u64
         }
     }
 
@@ -735,8 +768,12 @@ mod tests {
         // Non-validator registers a feed — rejected (not committee).
         let err = oracle.handle(&ctx(50), &msg::register_feed(addr(77))).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
-        // Validator registers it — accepted.
-        oracle.handle(&ctx(0), &msg::register_feed(addr(77))).unwrap();
+        // A committee quorum registers it (C9: one signature is an
+        // endorsement; three of four equal-power validators reach
+        // the two-thirds threshold).
+        for v in 0..3u8 {
+            oracle.handle(&ctx(v), &msg::register_feed(addr(77))).unwrap();
+        }
         // Now 5 eligible feeders (4 validators + 1 external) → quorum
         // still 3. External feed's submission counts.
         oracle.handle(&ctx(0), &msg::submit_price(0, 1_000)).unwrap();
@@ -749,10 +786,53 @@ mod tests {
     #[test]
     fn unregistered_feed_stops_counting() {
         let oracle = setup(4, None);
-        oracle.handle(&ctx(0), &msg::register_feed(addr(77))).unwrap();
-        oracle.handle(&ctx(0), &msg::unregister_feed(addr(77))).unwrap();
+        for v in 0..3u8 {
+            oracle.handle(&ctx(v), &msg::register_feed(addr(77))).unwrap();
+            oracle.handle(&ctx(v), &msg::unregister_feed(addr(77))).unwrap();
+        }
         let err = oracle.handle(&ctx(77), &msg::submit_price(0, 1_000)).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// C9: registering a price feed grants it a vote in every
+    /// market's median — one validator must not grant that power
+    /// alone. Feed registry changes are committee-quorum actions.
+    #[test]
+    fn register_feed_requires_committee_quorum() {
+        let oracle = setup(4, None);
+        let feed = addr(77);
+        let err = oracle.handle(&ctx(77), &msg::submit_price(0, 1_000)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+
+        // Two of four endorsements — below quorum, the feed is not
+        // registered and its submissions stay rejected.
+        oracle.handle(&ctx(0), &msg::register_feed(feed)).unwrap();
+        oracle.handle(&ctx(1), &msg::register_feed(feed)).unwrap();
+        let err = oracle.handle(&ctx(77), &msg::submit_price(0, 1_000)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "below quorum the feed stays out");
+
+        // The third endorsement crosses two-thirds — the feed is in.
+        oracle.handle(&ctx(2), &msg::register_feed(feed)).unwrap();
+        oracle.handle(&ctx(77), &msg::submit_price(0, 1_000)).unwrap();
+    }
+
+    /// Kicking a feed out of the registry is the same quorum-gated
+    /// action — a single validator must not silence a feeder.
+    #[test]
+    fn unregister_feed_requires_committee_quorum() {
+        let oracle = setup(4, None);
+        let feed = addr(77);
+        for v in 0..3u8 {
+            oracle.handle(&ctx(v), &msg::register_feed(feed)).unwrap();
+        }
+
+        oracle.handle(&ctx(0), &msg::unregister_feed(feed)).unwrap();
+        oracle.handle(&ctx(1), &msg::unregister_feed(feed)).unwrap();
+        oracle.handle(&ctx(77), &msg::submit_price(0, 1_000)).unwrap();
+
+        oracle.handle(&ctx(2), &msg::unregister_feed(feed)).unwrap();
+        let err = oracle.handle(&ctx(77), &msg::submit_price(0, 1_000)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "quorum removes the feed");
     }
 
     #[test]

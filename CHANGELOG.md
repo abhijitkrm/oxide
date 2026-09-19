@@ -1004,6 +1004,39 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Privileged actions required only one validator's signature:
+  any single member could add/remove validators, slash, schedule
+  a halt, force perps marks and funding, and rewrite the oracle
+  feed registry — and `validator_add` minted declared stake with
+  no bonded collateral** (`modules/framework`, `modules/staking`,
+  `modules/perps`, `modules/oracle`, `crates/devnet`)
+  - Every committee-gated tx is now an *endorsement* of an exact
+    action payload (`framework::Endorsements`): it accumulates the
+    endorsing members' current voting power — from the new
+    `Committee::power`/`total_power` seam — and the action applies
+    only once endorsing power strictly exceeds two-thirds of the
+    committee, the same threshold a consensus QC requires. One
+    signature is a vote, never a command; with no committee wired
+    the paths fail closed.
+  - `validator_add` drops its declared-stake field — the wire is
+    `[0x06][addr][bls_key][pop]`. A quorum-admitted candidate
+    registers with zero stake and seats at the epoch rotation only
+    if real collateral was bonded through `delegate` (an actual
+    EVM-ledger debit). Unbonded candidates lapse at the rotation.
+    Cancelling a pending admission now moves every delegation into
+    unbonding instead of stranding the collateral.
+  - Duplicate BLS keys are rejected on add and on `key_change`,
+    and pending endorsements are committed in each module's
+    canonical state root so replicas can't diverge on in-flight
+    votes. A dead-action sweep keeps the bounded pending set free
+    of actions that can never apply.
+  - **In plain words:** the validator set, slashes, halts,
+    emergency prices, and price feeds used to answer to any single
+    validator's key — losing one key meant losing the chain. Now
+    every such action needs the same two-thirds of bonded stake
+    that finalizes a block, and a new validator must put up real
+    collateral before it ever gets a vote.
+
 - **State roots did not authenticate the complete state machine:
   live order books, positions, margin, marks, reward accumulators,
   and pending validator changes were all invisible to the block

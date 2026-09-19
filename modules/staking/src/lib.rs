@@ -85,16 +85,18 @@ mod msg_type {
     /// Key change: update a validator's BLS consensus public key.
     /// The new key takes effect at the next epoch rotation.
     pub const KEY_CHANGE: u8 = 0x05;
-    /// Validator add: register a new validator in the set. Takes
-    /// effect at the next epoch rotation — the new validator joins
-    /// the validator set, participates in consensus, and receives
-    /// block rewards.
+    /// Validator add: endorse admitting a new validator. The
+    /// admission applies only once cumulative endorsing power
+    /// strictly exceeds two-thirds of the committee (C9), registers
+    /// the candidate with zero stake, and seats it at the next
+    /// epoch rotation only if collateral has been bonded via
+    /// `delegate` — declared stake was never real collateral.
     pub const VALIDATOR_ADD: u8 = 0x06;
-    /// Validator remove: remove a validator from the set. Takes
-    /// effect at the next epoch rotation — the validator is removed
-    /// from consensus and stops receiving block rewards. Their
-    /// stake enters unbonding (reclaimable after the unbonding
-    /// period).
+    /// Validator remove: endorse removing a validator from the
+    /// set. Applies at committee quorum; the validator is removed
+    /// from consensus at the next epoch rotation and stops
+    /// receiving block rewards. Their stake enters unbonding
+    /// (reclaimable after the unbonding period).
     pub const VALIDATOR_REMOVE: u8 = 0x07;
     /// Evidence: submit cryptographic proof of a consensus fault
     /// (double-sign). Permissionless — the proof itself
@@ -104,8 +106,9 @@ mod msg_type {
     /// Unjail: a jailed validator rejoins the set after the jail
     /// period. Sender must be the validator itself.
     pub const UNJAIL: u8 = 0x09;
-    /// Schedule halt: set (or clear) the coordinated halt height.
-    /// Committee-gated — sender must be a current validator.
+    /// Schedule halt: endorse setting (or clearing) the
+    /// coordinated halt height. Applies at committee quorum —
+    /// a lone validator must never hold the freeze trigger.
     /// Height 0 clears the schedule.
     pub const SCHEDULE_HALT: u8 = 0x0A;
 }
@@ -314,15 +317,25 @@ pub struct StakingModule {
     /// engine reads these via `take_key_changes` at the epoch
     /// boundary.
     pending_key_changes: Mutex<BTreeMap<Address, Vec<u8>>>,
-    /// Pending validator additions: `(address, bls_public_key,
-    /// stake)`. The new validator joins the set at the next epoch
-    /// rotation. The consensus engine reads these via
-    /// `take_validator_changes`.
-    pending_validator_adds: Mutex<Vec<(Address, Vec<u8>, u64)>>,
+    /// Pending validator additions: `(address, bls_public_key)`.
+    /// The new validator joins the set at the next epoch rotation —
+    /// and only if it has *bonded* stake by then (delegations to the
+    /// registered candidate): admission authorizes membership, the
+    /// ledger debit proves collateral. The consensus engine reads
+    /// these via `take_validator_changes`.
+    pending_validator_adds: Mutex<Vec<(Address, Vec<u8>)>>,
     /// Pending validator removals: addresses to remove at the next
     /// epoch rotation. The consensus engine reads these via
     /// `take_validator_changes`.
     pending_validator_removes: Mutex<Vec<Address>>,
+    /// Committee endorsements for governance-gated actions —
+    /// validator adds/removes, slashes, and scheduled halts. Each
+    /// gated tx records the sender's endorsement of the exact
+    /// action payload; the action applies only when cumulative
+    /// endorsing power strictly exceeds two-thirds of the
+    /// committee's total bonded power (C9: one validator's
+    /// signature is a vote, never a command).
+    endorsements: framework::Endorsements,
     /// The *current* BLS consensus key per validator — 48-byte
     /// BLS12-381 compressed public key. Unlike
     /// `pending_key_changes` (drained each rotation), this map
@@ -393,6 +406,7 @@ impl StakingModule {
             pending_key_changes: Mutex::new(BTreeMap::new()),
             pending_validator_adds: Mutex::new(Vec::new()),
             pending_validator_removes: Mutex::new(Vec::new()),
+            endorsements: framework::Endorsements::new(),
             bls_keys: Mutex::new(BTreeMap::new()),
             jailed: Mutex::new(BTreeMap::new()),
             pending_jails: Mutex::new(Vec::new()),
@@ -496,17 +510,20 @@ impl StakingModule {
         self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(addr)
     }
 
-    /// `true` if `addr` is in the current validator set and not
-    /// jailed — i.e. eligible to perform committee-privileged
-    /// actions (oracle price feeds, governance overrides) right
-    /// now.
+    /// `true` if `addr` is in the current validator set, not
+    /// jailed, and not a quorum-admitted candidate still waiting
+    /// for the epoch rotation — i.e. eligible to perform
+    /// committee-privileged actions (oracle price feeds,
+    /// governance endorsements) right now.
     ///
     /// Jailed validators keep their stake (so `is_jailed` alone is
     /// not the check) but are excluded from committee duties until
     /// they unjail: a jailed validator is by definition suspected
     /// of misbehavior, and letting it keep feeding prices or voting
     /// on slashes would let the fault continue during the jail
-    /// period.
+    /// period. Pending candidates are registered so delegations can
+    /// bond to them, but committee membership begins at the
+    /// rotation that seats them.
     ///
     /// # Panics
     ///
@@ -518,12 +535,75 @@ impl StakingModule {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(addr);
-        in_set && !self.is_jailed(addr)
+        if !in_set || self.is_jailed(addr) {
+            return false;
+        }
+        !self
+            .pending_validator_adds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(a, _)| a == addr)
+    }
+
+    /// `true` if `addr` is registered as a validator — an active
+    /// committee member *or* a quorum-admitted candidate awaiting
+    /// the epoch rotation (candidates are registered so
+    /// delegations can bond collateral to them).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    #[must_use]
+    pub fn is_registered(&self, addr: &Address) -> bool {
+        self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(addr)
+    }
+
+    /// `addr`'s current voting power: bonded stake if the address
+    /// is an active committee member, `0` otherwise. Governance
+    /// endorsements weigh power, not membership — a jailed,
+    /// pending, or unbonded member holds no vote.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    #[must_use]
+    pub fn power(&self, addr: &Address) -> u64 {
+        if !self.is_active_validator(addr) {
+            return 0;
+        }
+        self.validators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(addr)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Total voting power across the active committee — the
+    /// denominator for the two-thirds governance quorum. Jailed
+    /// and pending-add members are excluded (their stake exists but
+    /// holds no vote).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    #[must_use]
+    pub fn total_power(&self) -> u64 {
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending =
+            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        validators
+            .iter()
+            .filter(|(a, _)| !jailed.contains_key(*a) && !pending.iter().any(|(p, _)| p == *a))
+            .map(|(_, s)| *s)
+            .sum()
     }
 
     /// Number of validators eligible for committee duties right now
-    /// (in set, not jailed). Used by the oracle to size its
-    /// submission quorum.
+    /// (in set, not jailed, not pending activation). Used by the
+    /// oracle to size its submission quorum.
     ///
     /// # Panics
     ///
@@ -532,7 +612,12 @@ impl StakingModule {
     pub fn active_validator_count(&self) -> usize {
         let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        validators.keys().filter(|v| !jailed.contains_key(*v)).count()
+        let pending =
+            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        validators
+            .keys()
+            .filter(|v| !jailed.contains_key(*v) && !pending.iter().any(|(p, _)| p == *v))
+            .count()
     }
 }
 
@@ -543,6 +628,14 @@ impl framework::Committee for StakingModule {
 
     fn active_validator_count(&self) -> usize {
         Self::active_validator_count(self)
+    }
+
+    fn power(&self, addr: &Address) -> u64 {
+        Self::power(self, addr)
+    }
+
+    fn total_power(&self) -> u64 {
+        Self::total_power(self)
     }
 }
 
@@ -708,12 +801,36 @@ impl StakingModule {
             &mut *self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         ))
         .collect();
-        let mut adds = std::mem::take(
+        let pending_adds = std::mem::take(
             &mut *self
                 .pending_validator_adds
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let mut adds = Vec::with_capacity(pending_adds.len());
+        {
+            let mut validators =
+                self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut bls_keys =
+                self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (addr, key) in pending_adds {
+                let bonded = validators.get(&addr).copied().unwrap_or(0);
+                if bonded == 0 {
+                    // Admission authorized membership, not stake —
+                    // a candidate that reaches the rotation with no
+                    // bonded collateral never proved it has skin in
+                    // the game. The admission lapses: unwind the
+                    // registration so a fresh endorsement round can
+                    // admit them once funded. (Keeping the pending
+                    // add would let an unfunded address hold a queue
+                    // slot forever.)
+                    validators.remove(&addr);
+                    bls_keys.remove(&addr);
+                    continue;
+                }
+                adds.push((addr, key, bonded));
+            }
+        }
         let unjails = std::mem::take(
             &mut *self.pending_unjails.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         );
@@ -817,6 +934,12 @@ pub mod msg {
     /// The `amount` is the slash amount (not the slash fraction).
     /// The caller (consensus engine or governance) computes the
     /// actual slash amount based on the offense type.
+    ///
+    /// The tx is a committee *endorsement* of the exact
+    /// `(validator, amount)` action — it applies only once
+    /// endorsing power strictly exceeds two-thirds (C9). The
+    /// permissionless alternative is [`msg::evidence`], which
+    /// authenticates itself with the proof it carries.
     pub fn slash(validator: primitives::Address, amount: u64) -> Vec<u8> {
         let mut msg = Vec::with_capacity(29);
         msg.push(super::msg_type::SLASH);
@@ -867,31 +990,32 @@ pub mod msg {
         msg
     }
 
-    /// A validator-add message:
-    /// `[type: 0x06][new_validator: 20B][bls_key: 48B][stake: 8B LE][pop: 96B]`.
+    /// A validator-add endorsement:
+    /// `[type: 0x06][new_validator: 20B][bls_key: 48B][pop: 96B]`.
     ///
-    /// Registers a new validator in the set. Only a current validator
-    /// can submit this (governance-by-committee — the validator set
-    /// admits new members). The new validator joins at the next epoch
-    /// rotation.
+    /// Records the sender's endorsement of admitting `new_validator`
+    /// with consensus key `bls_key`. The admission applies only once
+    /// cumulative endorsing power strictly exceeds two-thirds of the
+    /// committee (C9) — one validator's tx is a vote, not a command.
+    /// The admitted candidate joins at the next epoch rotation, and
+    /// only if real balance has been bonded to it via `delegate`:
+    /// the message carries no stake field because declared stake was
+    /// never collateral.
     ///
     /// `new_validator` is the staking address. `bls_key` is the
-    /// 48-byte BLS12-381 compressed public key. `stake` is the
-    /// initial stake in atomic units. `pop` is the 96-byte
+    /// 48-byte BLS12-381 compressed public key. `pop` is the 96-byte
     /// proof-of-possession for `bls_key` (`BlsSecretKey::pop_prove`),
     /// required so `fast_aggregate_verify` QC checks are safe from
     /// rogue-key forgery.
     pub fn validator_add(
         new_validator: primitives::Address,
         bls_key: &[u8],
-        stake: u64,
         pop: &[u8],
     ) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(173);
+        let mut msg = Vec::with_capacity(165);
         msg.push(super::msg_type::VALIDATOR_ADD);
         msg.extend_from_slice(&new_validator.0);
         msg.extend_from_slice(bls_key);
-        msg.extend_from_slice(&stake.to_le_bytes());
         msg.extend_from_slice(pop);
         msg
     }
@@ -958,8 +1082,15 @@ pub mod msg {
     /// Sets the coordinated halt height — the chain freezes state
     /// for heights above it so operators can snapshot and swap
     /// binaries. `halt_height` must be in the future; `0` clears
-    /// the schedule. Committee-gated: the sender must be a current
-    /// validator (the `validator` field identifies the sender).
+    /// the schedule.
+    ///
+    /// The tx is a committee *endorsement* of the exact
+    /// `(SCHEDULE_HALT, halt_height)` action — a lone validator
+    /// must never hold the freeze trigger, so the schedule applies
+    /// only once endorsing power strictly exceeds two-thirds (C9).
+    /// The `validator` field is part of the wire format but not
+    /// the action identity — the height alone decides what the
+    /// vote means.
     pub fn schedule_halt(validator: primitives::Address, halt_height: u64) -> Vec<u8> {
         let mut msg = Vec::with_capacity(29);
         msg.push(super::msg_type::SCHEDULE_HALT);
@@ -1273,8 +1404,8 @@ impl StakingModule {
         let adds =
             self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         w.put_count(adds.len());
-        for (a, k, stake) in adds.iter() {
-            w.put_addr(a).put_bytes(k).put_u64(*stake);
+        for (a, k) in adds.iter() {
+            w.put_addr(a).put_bytes(k);
         }
         let removes = self
             .pending_validator_removes
@@ -1306,6 +1437,11 @@ impl StakingModule {
         for a in pending_unjails.iter() {
             w.put_addr(a);
         }
+        // C9: pending governance endorsements — an action that has
+        // accumulated votes but not yet reached quorum is
+        // future-affecting state: two replicas must diverge if one
+        // has recorded an endorsement the other has not.
+        self.endorsements.write_canonical(w);
     }
 
     /// Commit consensus-adjacent state (C8): the scheduled halt,
@@ -1699,12 +1835,13 @@ impl StakingModule {
 
     /// Handle a slash message: reduce `validator`'s stake by `amount`.
     ///
-    /// Arbitrary-amount slashing is a governance action — the sender
-    /// must be a current validator (same committee model as
-    /// `validator_add`/`validator_remove`). The permissionless path
-    /// is [`msg_type::EVIDENCE`], which authenticates itself with the
-    /// proof it carries. Before this check, any account could slash
-    /// any validator to zero — an open confiscation hole.
+    /// Arbitrary-amount slashing is a governance action — the tx
+    /// endorses the exact `(validator, amount)` action, which
+    /// applies only once endorsing power strictly exceeds
+    /// two-thirds of the committee (C9: a single signer's command
+    /// is not committee authorization). The permissionless path is
+    /// [`msg_type::EVIDENCE`], which authenticates itself with the
+    /// proof it carries.
     fn handle_slash(
         &self,
         ctx: &TxContext,
@@ -1712,17 +1849,30 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let is_committee = self
+        // The action must name a live validator before it can
+        // collect endorsements — slashing an unknown address is
+        // never meaningful.
+        if !self
             .validators
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&ctx.sender);
-        if !is_committee {
-            return Err(ExecError::ModuleRejected(
-                "slash: sender is not a current validator".to_string(),
-            ));
+            .contains_key(&validator)
+        {
+            return Err(ExecError::ModuleRejected("slash: validator not found".to_string()));
         }
-        self.apply_slash(validator, amount, msg)
+        match self.endorsements.record(msg, &ctx.sender, self)? {
+            framework::EndorsementOutcome::Pending { .. } => {
+                Ok(vec![Event { module: "staking", kind: "slash_endorse", data: msg.to_vec() }])
+            }
+            framework::EndorsementOutcome::Quorum => {
+                let events = self.apply_slash(validator, amount, msg)?;
+                // A slash that zeroed the target's stake can kill
+                // pending removes whose "last powered member" guard
+                // now fails — reclaim dead endorsement slots.
+                self.sweep_dead_actions();
+                Ok(events)
+            }
+        }
     }
 
     /// Reduce `validator`'s stake by `amount`, burning the same
@@ -2023,8 +2173,12 @@ impl StakingModule {
     /// Handle a schedule-halt message:
     /// `[type: 0x0A][validator: 20B][halt_height: 8B LE]`.
     ///
-    /// Committee-gated (same model as `validator_add`/`slash`) —
-    /// coordinating an upgrade halt is a validator-set decision.
+    /// Committee-quorum endorsement — coordinating an upgrade halt
+    /// is a validator-set decision no single member may take. The
+    /// endorsed action is `(SCHEDULE_HALT, halt_height)`: the
+    /// `validator` field is only the message header's uniform
+    /// address slot (the real sender is `ctx.sender`), so it does
+    /// not participate in the action's identity.
     /// `halt_height` must be in the future (a past/present halt
     /// freezes immediately, which governance cannot intend
     /// mid-block); `0` clears the schedule.
@@ -2035,16 +2189,6 @@ impl StakingModule {
         halt_height: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let is_committee = self
-            .validators
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&ctx.sender);
-        if !is_committee {
-            return Err(ExecError::ModuleRejected(
-                "schedule_halt: sender is not a current validator".to_string(),
-            ));
-        }
         let current =
             *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if halt_height != 0 && halt_height <= current {
@@ -2052,9 +2196,42 @@ impl StakingModule {
                 "schedule_halt: height {halt_height} is not in the future (current {current})"
             )));
         }
-        *self.scheduled_halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            if halt_height == 0 { None } else { Some(halt_height) };
-        Ok(vec![Event { module: "staking", kind: "schedule_halt", data: msg.to_vec() }])
+        // Action identity = the type tag + the target height. A
+        // stale-height action can still reach quorum after the tip
+        // passes it, so the future check is re-evaluated at apply
+        // time below.
+        let mut action = Vec::with_capacity(9);
+        action.push(msg_type::SCHEDULE_HALT);
+        action.extend_from_slice(&halt_height.to_le_bytes());
+        match self.endorsements.record(&action, &ctx.sender, self)? {
+            framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
+                module: "staking",
+                kind: "schedule_halt_endorse",
+                data: msg.to_vec(),
+            }]),
+            framework::EndorsementOutcome::Quorum => {
+                let now =
+                    *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let events = if halt_height != 0 && halt_height <= now {
+                    vec![Event {
+                        module: "staking",
+                        kind: "schedule_halt_stale",
+                        data: msg.to_vec(),
+                    }]
+                } else {
+                    *self
+                        .scheduled_halt
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        if halt_height == 0 { None } else { Some(halt_height) };
+                    vec![Event { module: "staking", kind: "schedule_halt", data: msg.to_vec() }]
+                };
+                // Applying (or passing) a halt height kills pending
+                // halt entries for heights the tip has passed.
+                self.sweep_dead_actions();
+                Ok(events)
+            }
+        }
     }
 
     /// Handle a claim-reward message: withdraw accumulated rewards.
@@ -2163,6 +2340,21 @@ impl StakingModule {
         }
         let new_key = msg[21..69].to_vec();
         Self::verify_key_pop(&new_key, &msg[69..165], "key_change")?;
+        // A consensus key identifies exactly one staking address —
+        // rotating to a key another member already holds would
+        // collide identities at the rotation's duplicate check
+        // (same gate `validator_add` applies at admission).
+        if self
+            .bls_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(a, k)| *a != validator && *k == new_key)
+        {
+            return Err(ExecError::ModuleRejected(
+                "key_change: consensus key already in use".to_string(),
+            ));
+        }
         drop(validators); // release lock before acquiring pending_key_changes
 
         self.pending_key_changes
@@ -2200,171 +2392,382 @@ impl StakingModule {
     }
 
     /// Handle a validator-add message:
-    /// `[type: 0x06][new_validator: 20B][bls_key: 48B][stake: 8B LE][pop: 96B]`.
+    /// `[type: 0x06][new_validator: 20B][bls_key: 48B][pop: 96B]`.
     ///
-    /// The sender must be a current validator — only the validator
-    /// set itself can admit new members (governance-by-committee).
-    /// The new validator joins at the next epoch rotation.
+    /// The message is a committee *endorsement* of the exact
+    /// `(new_validator, bls_key)` action: the sender must carry
+    /// committee voting power, and the admission applies only once
+    /// cumulative endorsing power strictly exceeds two-thirds of
+    /// the committee — the same quorum a consensus QC requires
+    /// (C9: consensus on inclusion is not governance
+    /// authorization).
     ///
-    /// `validator` is the new validator's staking address. The
-    /// `bls_key` is the 48-byte BLS12-381 compressed public key.
-    /// `stake` is the initial stake in atomic units. `pop` is the
-    /// 96-byte proof-of-possession for `bls_key` — the rogue-key
-    /// admission gate that `fast_aggregate_verify` QC verification
-    /// relies on.
+    /// Admission registers the candidate with **zero** stake — it
+    /// declares membership, not collateral. Delegations bond real
+    /// balance to the candidate, and the rotation seats it only if
+    /// bonded stake exists at the epoch boundary; the activation
+    /// stake is whatever the ledger proves, never anything the add
+    /// message claimed.
     ///
     /// # Errors
     ///
-    /// - `ModuleRejected` if the sender is not a current validator.
-    /// - `ModuleRejected` if the new validator is already in the set
-    ///   or has a pending add.
-    /// - `ModuleRejected` if the BLS key is not exactly 48 bytes or
-    ///   the `PoP` does not verify.
-    /// - `ModuleRejected` if the stake is 0.
+    /// - `ModuleRejected` if the sender has no committee voting
+    ///   power (not a member, jailed, pending, or unbonded).
+    /// - `ModuleRejected` if the candidate is already registered,
+    ///   already pending, or its BLS key is already in use.
+    /// - `ModuleRejected` if the message is malformed or the `PoP`
+    ///   does not verify.
     fn handle_validator_add(
         &self,
         ctx: &TxContext,
         new_validator: Address,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        // Governance check: only a current validator can propose
-        // adding a new validator. This prevents an arbitrary account
-        // from flooding the set with sybil validators.
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !validators.contains_key(&ctx.sender) {
-            return Err(ExecError::ModuleRejected(
-                "validator_add: sender is not a current validator".to_string(),
-            ));
-        }
-        // The new validator must not already exist.
-        if validators.contains_key(&new_validator) {
-            return Err(ExecError::ModuleRejected(
-                "validator_add: validator already exists".to_string(),
-            ));
-        }
-        // The new validator must not already be pending.
-        let pending_adds =
-            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending_adds.iter().any(|(a, _, _)| *a == new_validator) {
-            return Err(ExecError::ModuleRejected(
-                "validator_add: validator already pending".to_string(),
-            ));
-        }
-        // Parse [bls_key: 48B][stake: 8B LE][pop: 96B] after the
-        // validator field. The PoP is mandatory — a consensus key
-        // that cannot prove possession must never reach the
-        // ValidatorSet (rogue-key aggregate-forgery defense).
-        if msg.len() != 21 + 48 + 8 + 96 {
+        // Parse [bls_key: 48B][pop: 96B] after the validator field.
+        // The PoP is verified BEFORE an endorsement is recorded —
+        // endorsements only accumulate for actions that could
+        // apply, and a consensus key that cannot prove possession
+        // must never reach the ValidatorSet (rogue-key
+        // aggregate-forgery defense).
+        if msg.len() != 21 + 48 + 96 {
             return Err(ExecError::ModuleRejected(format!(
-                "validator_add: expected 173-byte message, got {} bytes",
+                "validator_add: expected 165-byte message, got {} bytes",
                 msg.len()
             )));
         }
         let bls_key = msg[21..69].to_vec();
-        let stake = u64::from_le_bytes(msg[69..77].try_into().map_err(|_| ExecError::Malformed)?);
-        if stake == 0 {
-            return Err(ExecError::ModuleRejected("validator_add: zero stake".to_string()));
+        Self::verify_key_pop(&bls_key, &msg[69..165], "validator_add")?;
+
+        // Validate the action before recording: the candidate must
+        // not already be registered or pending, and its consensus
+        // key must not duplicate another member's (a BLS key
+        // identifies exactly one staking address — the same
+        // duplicate-identity check `ValidatorSet` enforces at
+        // rotation, applied early so doomed actions never collect
+        // endorsements).
+        self.validate_add_action(&new_validator, &bls_key)?;
+
+        // The endorsement binds the action payload — type +
+        // address + key (the PoP is a proof, not part of the
+        // action's identity: two different proofs for the same key
+        // endorse the same action).
+        match self.endorsements.record(&msg[..69], &ctx.sender, self)? {
+            framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
+                module: "staking",
+                kind: "validator_add_endorse",
+                data: msg.to_vec(),
+            }]),
+            framework::EndorsementOutcome::Quorum => {
+                // Re-validate at apply time — the set may have
+                // changed since the first endorsement (a different
+                // action may have registered the address or key).
+                let events = if self.validate_add_action(&new_validator, &bls_key).is_err() {
+                    vec![Event {
+                        module: "staking",
+                        kind: "validator_add_stale",
+                        data: msg.to_vec(),
+                    }]
+                } else {
+                    self.validators
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(new_validator, 0);
+                    // Record the consensus key immediately — evidence
+                    // submitted before the rotation still needs it
+                    // for verification.
+                    self.bls_keys
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(new_validator, bls_key.clone());
+                    self.pending_validator_adds
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((new_validator, bls_key));
+                    vec![Event { module: "staking", kind: "validator_add", data: msg.to_vec() }]
+                };
+                // Registering the candidate killed every other
+                // pending "admit this address" variant — reclaim
+                // their endorsement slots before they leak.
+                self.sweep_dead_actions();
+                Ok(events)
+            }
         }
-        Self::verify_key_pop(&bls_key, &msg[77..173], "validator_add")?;
-        drop(pending_adds);
+    }
 
-        // Register the validator in the staking map immediately —
-        // they can receive delegations and be removed before the
-        // epoch rotation. They only join consensus at the rotation.
-        validators.insert(new_validator, stake);
-        drop(validators);
-
-        // Record the consensus key immediately — evidence submitted
-        // before the rotation still needs it for verification.
-        self.bls_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(new_validator, bls_key.clone());
-
-        self.pending_validator_adds
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((new_validator, bls_key, stake));
-
-        Ok(vec![Event { module: "staking", kind: "validator_add", data: msg.to_vec() }])
+    /// Check that `(candidate, key)` may be admitted: not already
+    /// registered, not already pending, and the key not in use by
+    /// another address. Runs both before an endorsement is
+    /// recorded and again when the action reaches quorum — the
+    /// committee may have changed in between.
+    fn validate_add_action(&self, candidate: &Address, key: &[u8]) -> Result<(), ExecError> {
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if validators.contains_key(candidate) {
+            return Err(ExecError::ModuleRejected(
+                "validator_add: validator already exists".to_string(),
+            ));
+        }
+        let pending_adds =
+            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending_adds.iter().any(|(a, _)| a == candidate) {
+            return Err(ExecError::ModuleRejected(
+                "validator_add: validator already pending".to_string(),
+            ));
+        }
+        let bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bls_keys.iter().any(|(a, k)| a != candidate && k == key) {
+            return Err(ExecError::ModuleRejected(
+                "validator_add: consensus key already in use".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Handle a validator-remove message: `[type: 0x07][validator: 20B]`.
     ///
-    /// The sender must be a current validator — only the validator
-    /// set itself can remove members. The validator is removed at
-    /// the next epoch rotation; their stake enters unbonding.
+    /// Committee-quorum endorsement, same model as
+    /// `validator_add`: the remove applies only once endorsing
+    /// power strictly exceeds two-thirds. Removing a
+    /// quorum-admitted candidate that has not seated yet cancels
+    /// its admission outright; removing an active member queues it
+    /// for the next epoch rotation, where its stake enters
+    /// unbonding.
     ///
     /// # Errors
     ///
-    /// - `ModuleRejected` if the sender is not a current validator.
-    /// - `ModuleRejected` if the validator is not in the set.
-    /// - `ModuleRejected` if the validator is already pending removal.
-    /// - `ModuleRejected` if removing this validator would leave the
-    ///   set empty.
+    /// - `ModuleRejected` if the sender has no committee voting
+    ///   power.
+    /// - `ModuleRejected` if the validator is not registered or is
+    ///   already pending removal.
+    /// - `ModuleRejected` if removing this validator would leave
+    ///   the set without powered members.
     fn handle_validator_remove(
         &self,
         ctx: &TxContext,
         validator: Address,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !validators.contains_key(&ctx.sender) {
-            return Err(ExecError::ModuleRejected(
-                "validator_remove: sender is not a current validator".to_string(),
-            ));
+        self.validate_remove_action(&validator)?;
+
+        match self.endorsements.record(msg, &ctx.sender, self)? {
+            framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
+                module: "staking",
+                kind: "validator_remove_endorse",
+                data: msg.to_vec(),
+            }]),
+            framework::EndorsementOutcome::Quorum => {
+                let events = if self.validate_remove_action(&validator).is_err() {
+                    vec![Event {
+                        module: "staking",
+                        kind: "validator_remove_stale",
+                        data: msg.to_vec(),
+                    }]
+                } else {
+                    self.apply_validator_remove(&validator);
+                    vec![Event { module: "staking", kind: "validator_remove", data: msg.to_vec() }]
+                };
+                // Removing the target killed pending actions aimed
+                // at it (e.g. a queued slash or remove variant) —
+                // reclaim their endorsement slots.
+                self.sweep_dead_actions();
+                Ok(events)
+            }
         }
-        if !validators.contains_key(&validator) {
+    }
+
+    /// Check that `validator` may be removed right now — run before
+    /// an endorsement is recorded and again at quorum.
+    fn validate_remove_action(&self, validator: &Address) -> Result<(), ExecError> {
+        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !validators.contains_key(validator) {
             return Err(ExecError::ModuleRejected(
                 "validator_remove: validator not found".to_string(),
             ));
         }
-
-        // If the validator is pending add, cancel the add instead of
-        // adding a remove — the validator never joins the set.
-        let mut pending_adds =
-            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pos) = pending_adds.iter().position(|(a, _, _)| *a == validator) {
-            pending_adds.remove(pos);
-            validators.remove(&validator);
-            drop(pending_adds);
-            drop(validators);
-            return Ok(vec![Event {
-                module: "staking",
-                kind: "validator_remove",
-                data: msg.to_vec(),
-            }]);
-        }
-        drop(pending_adds);
-
         let pending_removes = self
             .pending_validator_removes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending_removes.contains(&validator) {
+        if pending_removes.contains(validator) {
             return Err(ExecError::ModuleRejected(
                 "validator_remove: validator already pending removal".to_string(),
             ));
         }
-        // Cannot remove the last validator — a chain must have at
-        // least one validator.
-        let active_count = validators.values().filter(|&&s| s > 0).count();
-        if active_count <= 1 {
+        // A pending-add candidate is removable — the remove cancels
+        // the admission — so the "last validator" guard only applies
+        // to powered members. Count powered members not already
+        // queued for removal: removing the last one would leave the
+        // chain with no committee.
+        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staying_powered = validators
+            .iter()
+            .filter(|(a, s)| **s > 0 && !pending_removes.contains(*a) && !jailed.contains_key(*a))
+            .count();
+        if staying_powered <= 1
+            && self
+                .pending_validator_adds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(|(a, _)| a != validator)
+        {
             return Err(ExecError::ModuleRejected(
-                "validator_remove: cannot remove last validator".to_string(),
+                "validator_remove: cannot remove last powered validator".to_string(),
             ));
         }
-        drop(pending_removes);
-        drop(validators);
+        Ok(())
+    }
 
+    /// Apply a quorum-authorized removal: cancel a pending
+    /// admission outright, or queue an active member for the next
+    /// epoch rotation.
+    fn apply_validator_remove(&self, validator: &Address) {
+        let mut pending_adds =
+            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pos) = pending_adds.iter().position(|(a, _)| a == validator) {
+            pending_adds.remove(pos);
+            drop(pending_adds);
+            self.cancel_pending_add(validator);
+            return;
+        }
+        drop(pending_adds);
         self.pending_validator_removes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(validator);
+            .push(*validator);
+    }
 
-        Ok(vec![Event { module: "staking", kind: "validator_remove", data: msg.to_vec() }])
+    /// Unwind a pending-add candidate that never seated: drop the
+    /// registration and key, and move every delegation into
+    /// unbonding so delegators recover their collateral after the
+    /// period — the bonded pool pays out at `end_block` exactly as
+    /// for a normal undelegation. Bonded admission (C9) lets real
+    /// collateral accumulate while a candidate waits to seat, so
+    /// cancelling is NOT the no-op it was when adds carried only a
+    /// declared amount. Reward settlement is unnecessary: a pending
+    /// candidate never entered the consensus set, so it accrued
+    /// nothing.
+    fn cancel_pending_add(&self, validator: &Address) {
+        let current =
+            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let completion = current.saturating_add(self.unbonding_period);
+        let mut delegations =
+            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let affected: Vec<(Address, u64)> = delegations
+            .iter()
+            .filter(|((_, v), _)| v == validator)
+            .map(|((d, _), amount)| (*d, *amount))
+            .collect();
+        {
+            let mut unbonding =
+                self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut delegator_index =
+                self.delegator_index.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (delegator, amount) in &affected {
+                delegations.remove(&(*delegator, *validator));
+                if let Some(set) = delegator_index.get_mut(delegator) {
+                    set.remove(validator);
+                }
+                unbonding.push(UnbondingEntry {
+                    delegator: *delegator,
+                    validator: *validator,
+                    amount: *amount,
+                    completion_height: completion,
+                });
+            }
+        }
+        self.delegated_total
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(validator);
+        self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(validator);
+        self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(validator);
+        // Clear the store mirror so queries cannot report a phantom
+        // stake or delegation for the cancelled candidate.
+        {
+            let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.remove(&validator.0.to_vec());
+            for (delegator, _) in &affected {
+                let mut key = Vec::with_capacity(4 + 40);
+                key.extend_from_slice(b"del/");
+                key.extend_from_slice(&delegator.0);
+                key.extend_from_slice(&validator.0);
+                store.remove(&key);
+            }
+        }
+    }
+
+    /// Drop pending endorsements for actions that can never apply.
+    ///
+    /// Called after every quorum — the authorized state change can
+    /// kill sibling actions: admitting validator X makes every
+    /// other pending "admit X" variant permanently invalid, and a
+    /// scheduled halt whose height the tip passes can never fire.
+    /// Record-time validation already rejects *new* endorsements
+    /// of dead actions, but the frozen entry would otherwise occupy
+    /// the bounded [`framework::MAX_PENDING_ACTIONS`] set forever:
+    /// unable to collect another endorsement, it can never reach
+    /// quorum and be consumed. Governance txs are rare, so the
+    /// O(pending) sweep is cheap insurance against cap exhaustion.
+    fn sweep_dead_actions(&self) {
+        self.endorsements.retain(|action| self.is_action_live(action));
+    }
+
+    /// `true` while `action` could still apply — the same checks the
+    /// handlers run before recording an endorsement, reused so the
+    /// sweep drops exactly the actions the record path would reject
+    /// forever.
+    fn is_action_live(&self, action: &[u8]) -> bool {
+        match action.first() {
+            // [type][validator: 20B][bls_key: 48B] — dead once the
+            // address is registered/pending or the key is taken.
+            Some(&msg_type::VALIDATOR_ADD) => {
+                if action.len() != 1 + 20 + 48 {
+                    return false;
+                }
+                let Ok(addr) = <[u8; 20]>::try_from(&action[1..21]) else { return false };
+                self.validate_add_action(&Address(addr), &action[21..69]).is_ok()
+            }
+            // [type][validator: 20B] — dead once the target is
+            // unremovable (gone, already queued, or last powered
+            // member). "Last member" is transient — a later add
+            // could re-enable removal — but dropping a dead entry
+            // only forces re-endorsement, never a wrong apply.
+            Some(&msg_type::VALIDATOR_REMOVE) => {
+                if action.len() != 1 + 20 {
+                    return false;
+                }
+                let Ok(addr) = <[u8; 20]>::try_from(&action[1..21]) else { return false };
+                self.validate_remove_action(&Address(addr)).is_ok()
+            }
+            // [type][validator: 20B][amount: 8B] — dead once the
+            // target is no longer registered.
+            Some(&msg_type::SLASH) => {
+                if action.len() != 1 + 20 + 8 {
+                    return false;
+                }
+                let Ok(addr) = <[u8; 20]>::try_from(&action[1..21]) else { return false };
+                self.validators
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&Address(addr))
+            }
+            // [type][height: 8B] — dead once the tip passes the
+            // target height (height 0 = "cancel halt" never dies).
+            Some(&msg_type::SCHEDULE_HALT) => {
+                if action.len() != 1 + 8 {
+                    return false;
+                }
+                let Ok(bits) = <[u8; 8]>::try_from(&action[1..9]) else { return false };
+                let halt = u64::from_le_bytes(bits);
+                let current =
+                    *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                halt == 0 || halt > current
+            }
+            // Unknown payloads are kept — conservatively assume a
+            // future action type rather than silently dropping
+            // state a replica expects to reach quorum.
+            _ => true,
+        }
     }
 
     /// The validator's self-share: bonded stake not attributable to
@@ -2583,6 +2986,22 @@ mod tests {
 
     fn ctx_with_sender(sender: u8) -> TxContext {
         TxContext { sender: addr(sender), nonce: 0, fee: 0 }
+    }
+
+    /// A committee with real voting power: each listed validator is
+    /// registered and self-bonds `power` base units. Governance
+    /// actions are weighed by bonded stake, so a registered but
+    /// unbonded "validator" carries no authority — committee-gated
+    /// tests must use this fixture, not bare `setup`.
+    fn setup_powered(validators: &[u8], power: u64) -> StakingModule {
+        let staking = setup(validators);
+        for v in validators {
+            let a = addr(*v);
+            staking
+                .handle(&ctx_with_sender(*v), &msg::delegate(a, power))
+                .expect("self-bond for committee power");
+        }
+        staking
     }
 
     #[test]
@@ -3360,21 +3779,26 @@ mod tests {
 
     // ── Validator add / remove (committee-gated set changes) ────
 
-    /// A committee member can admit a new validator whose key carries
-    /// a valid proof-of-possession — the add lands in the pending
-    /// set changes for the next epoch rotation.
+    /// A committee quorum can admit a new validator whose key
+    /// carries a valid proof-of-possession — the add lands in the
+    /// pending set changes for the next epoch rotation. Activation
+    /// requires bonded collateral, so the test delegates to the
+    /// admitted candidate before draining the rotation.
     #[test]
     fn validator_add_with_valid_pop_succeeds() {
-        let staking = setup(&[1]);
+        let staking = setup_powered(&[1], 100);
         let new_addr = addr(9);
         let new_sk = bls_key(0xAA);
         let pop = new_sk.pop_prove();
         staking
             .handle(
                 &ctx_with_sender(1),
-                &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), 500, pop.as_bytes()),
+                &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), pop.as_bytes()),
             )
             .unwrap();
+        // The candidate bonds 500 (any delegator can bond to a
+        // registered candidate — the ledger debit is the collateral).
+        staking.handle(&ctx_with_sender(0), &msg::delegate(new_addr, 500)).unwrap();
         let changes = staking.take_validator_changes();
         assert_eq!(changes.adds.len(), 1, "one pending add");
         assert_eq!(changes.adds[0].0, new_addr);
@@ -3389,92 +3813,70 @@ mod tests {
     /// `fast_aggregate_verify` quorum checks.
     #[test]
     fn validator_add_rejects_invalid_pop() {
-        let staking = setup(&[1]);
+        let staking = setup_powered(&[1], 100);
         let new_addr = addr(9);
         let new_sk = bls_key(0xAA);
         // PoP for a different key.
         let wrong_pop = bls_key(0xBB).pop_prove();
         let result = staking.handle(
             &ctx_with_sender(1),
-            &msg::validator_add(
-                new_addr,
-                new_sk.public_key().as_bytes(),
-                500,
-                wrong_pop.as_bytes(),
-            ),
+            &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), wrong_pop.as_bytes()),
         );
         assert!(result.is_err(), "PoP for a different key must be rejected");
         // Garbage bytes.
         let result = staking.handle(
             &ctx_with_sender(1),
-            &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), 500, &[0xCC; 96]),
+            &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), &[0xCC; 96]),
         );
         assert!(result.is_err(), "garbage PoP must be rejected");
-        // Nothing pending.
+        // Nothing registered or pending.
+        assert!(!staking.is_registered(&new_addr));
         assert!(staking.take_validator_changes().adds.is_empty());
     }
 
-    /// Only a current validator can propose set membership — an
-    /// arbitrary account must not sybil the committee.
+    /// Only a powered committee member can endorse set membership —
+    /// an arbitrary account must not sybil the committee.
     #[test]
     fn validator_add_rejects_non_committee_sender() {
-        let staking = setup(&[1]);
+        let staking = setup_powered(&[1], 100);
         let new_sk = bls_key(0xAA);
         let pop = new_sk.pop_prove();
         let result = staking.handle(
             &ctx_with_sender(8), // addr(8) is funded but not a validator
-            &msg::validator_add(addr(9), new_sk.public_key().as_bytes(), 500, pop.as_bytes()),
+            &msg::validator_add(addr(9), new_sk.public_key().as_bytes(), pop.as_bytes()),
         );
         assert!(result.is_err(), "non-validator sender must be rejected");
     }
 
-    /// Zero-stake validators carry no voting power and must not be
-    /// admitted — `ValidatorSet` rejects them too, so refuse early.
-    #[test]
-    fn validator_add_rejects_zero_stake() {
-        let staking = setup(&[1]);
-        let new_sk = bls_key(0xAA);
-        let pop = new_sk.pop_prove();
-        let result = staking.handle(
-            &ctx_with_sender(1),
-            &msg::validator_add(addr(9), new_sk.public_key().as_bytes(), 0, pop.as_bytes()),
-        );
-        assert!(result.is_err(), "zero stake must be rejected");
-    }
-
     /// The staking address is the validator's identity — an existing
-    /// member (or a pending add) cannot be re-added under a new key.
+    /// member (or a quorum-admitted pending candidate) cannot be
+    /// re-added under a new key.
     #[test]
     fn validator_add_rejects_duplicate_address() {
-        let staking = setup(&[1]);
+        let staking = setup_powered(&[1], 100);
         let sk = bls_key(0xAA);
         let pop = sk.pop_prove();
         // addr(1) is already a validator.
         let result = staking.handle(
             &ctx_with_sender(1),
-            &msg::validator_add(addr(1), sk.public_key().as_bytes(), 500, pop.as_bytes()),
+            &msg::validator_add(addr(1), sk.public_key().as_bytes(), pop.as_bytes()),
         );
         assert!(result.is_err(), "existing validator address must be rejected");
-        // Two pending adds of the same address.
+        // A quorum-admitted candidate cannot be re-added either.
         let new_addr = addr(9);
         staking
             .handle(
                 &ctx_with_sender(1),
-                &msg::validator_add(new_addr, sk.public_key().as_bytes(), 500, pop.as_bytes()),
+                &msg::validator_add(new_addr, sk.public_key().as_bytes(), pop.as_bytes()),
             )
             .unwrap();
         let other_sk = bls_key(0xBB);
         let other_pop = other_sk.pop_prove();
         let result = staking.handle(
             &ctx_with_sender(1),
-            &msg::validator_add(
-                new_addr,
-                other_sk.public_key().as_bytes(),
-                500,
-                other_pop.as_bytes(),
-            ),
+            &msg::validator_add(new_addr, other_sk.public_key().as_bytes(), other_pop.as_bytes()),
         );
-        assert!(result.is_err(), "pending duplicate address must be rejected");
+        assert!(result.is_err(), "registered candidate address must be rejected");
     }
 
     /// A malformed BLS public key (48 bytes that do not encode a
@@ -3483,14 +3885,12 @@ mod tests {
     /// never lands.
     #[test]
     fn validator_add_rejects_malformed_key() {
-        let staking = setup(&[1]);
+        let staking = setup_powered(&[1], 100);
         // 48 bytes that do not encode a valid BLS12-381 G1 point.
         let bogus_key = vec![0xFF; 48];
         let pop = bls_key(0xAA).pop_prove();
-        let result = staking.handle(
-            &ctx_with_sender(1),
-            &msg::validator_add(addr(9), &bogus_key, 500, pop.as_bytes()),
-        );
+        let result = staking
+            .handle(&ctx_with_sender(1), &msg::validator_add(addr(9), &bogus_key, pop.as_bytes()));
         assert!(result.is_err(), "malformed public key must be rejected");
     }
 
@@ -3498,7 +3898,7 @@ mod tests {
 
     #[test]
     fn schedule_halt_committee_only_and_future_only() {
-        let staking = setup(&[1]);
+        let staking = setup_powered(&[1], 100);
         staking.begin_block(Height::new(10));
 
         // Non-validator sender is refused.
@@ -3509,14 +3909,15 @@ mod tests {
         assert!(staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 5)).is_err());
         assert_eq!(staking.scheduled_halt_height(), None);
 
-        // A validator schedules a future halt.
+        // A powered validator schedules a future halt (a
+        // single-validator committee is its own quorum).
         staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 100)).unwrap();
         assert_eq!(staking.scheduled_halt_height(), Some(100));
     }
 
     #[test]
     fn schedule_halt_reschedule_and_cancel() {
-        let staking = setup(&[1]);
+        let staking = setup_powered(&[1], 100);
         staking.begin_block(Height::new(10));
 
         staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 100)).unwrap();
@@ -3529,5 +3930,279 @@ mod tests {
         // Height 0 cancels the schedule.
         staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 0)).unwrap();
         assert_eq!(staking.scheduled_halt_height(), None);
+    }
+
+    // ── C9: committee-quorum governance ──────────────────────────
+    //
+    // Privileged actions are *endorsements*: each gated tx records
+    // the sender's endorsement of the exact action payload and the
+    // action applies only once cumulative endorser power strictly
+    // exceeds two-thirds of the committee's total bonded power —
+    // the same quorum a consensus QC requires. One validator's
+    // signature is a vote, never a command.
+
+    /// One validator must not admit a peer on its own signature:
+    /// two endorsements out of four equal-power validators are
+    /// still below quorum; the third crosses it.
+    #[test]
+    fn validator_add_requires_committee_quorum() {
+        let staking = setup_powered(&[1, 2, 3, 4], 100);
+        let new_addr = addr(9);
+        let new_sk = bls_key(0xAA);
+        let pop = new_sk.pop_prove();
+        let add = msg::validator_add(new_addr, new_sk.public_key().as_bytes(), pop.as_bytes());
+
+        staking.handle(&ctx_with_sender(1), &add).unwrap();
+        assert!(!staking.is_registered(&new_addr), "one endorsement must not admit");
+        staking.handle(&ctx_with_sender(2), &add).unwrap();
+        assert!(!staking.is_registered(&new_addr), "two of four is below quorum");
+
+        staking.handle(&ctx_with_sender(3), &add).unwrap();
+        assert!(staking.is_registered(&new_addr), "quorum admits the candidate");
+    }
+
+    /// Admission itself bonds nothing — the audit's original hole
+    /// let the add message *declare* stake with no collateral behind
+    /// it. The endorsed registration carries zero stake; the
+    /// candidate activates at the rotation only if real balance was
+    /// bonded to it (by itself or any delegator), and the activation
+    /// stake is the bonded amount, not anything the add claimed.
+    #[test]
+    fn validator_add_activation_requires_bonded_stake() {
+        // Unbonded candidate: the quorum-approved admission lapses
+        // at the epoch boundary and the registration unwinds.
+        let staking = setup_powered(&[1], 100);
+        let new_addr = addr(9);
+        let new_sk = bls_key(0xAA);
+        let pop = new_sk.pop_prove();
+        staking
+            .handle(
+                &ctx_with_sender(1),
+                &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), pop.as_bytes()),
+            )
+            .unwrap();
+        assert!(staking.is_registered(&new_addr));
+        assert_eq!(staking.stake(&new_addr), 0, "admission itself bonds nothing");
+        let changes = staking.take_validator_changes();
+        assert!(changes.adds.is_empty(), "unbonded candidate must not activate");
+        assert!(!staking.is_registered(&new_addr), "lapsed admission unwinds");
+
+        // Bonded candidate: activates with the bonded collateral —
+        // delegation by any account counts, the ledger debit is the
+        // collateral proof.
+        let staking = setup_powered(&[1], 100);
+        let pop = new_sk.pop_prove();
+        staking
+            .handle(
+                &ctx_with_sender(1),
+                &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), pop.as_bytes()),
+            )
+            .unwrap();
+        staking.handle(&ctx_with_sender(0), &msg::delegate(new_addr, 500)).unwrap();
+        let changes = staking.take_validator_changes();
+        assert_eq!(changes.adds.len(), 1);
+        assert_eq!(changes.adds[0].0, new_addr);
+        assert_eq!(changes.adds[0].2, 500, "activation stake is the bonded collateral");
+    }
+
+    /// A lone validator must not evict a peer: removal is the same
+    /// quorum-gated endorsement as admission.
+    #[test]
+    fn validator_remove_requires_committee_quorum() {
+        let staking = setup_powered(&[1, 2, 3, 4], 100);
+        let rm = msg::validator_remove(addr(4));
+
+        staking.handle(&ctx_with_sender(1), &rm).unwrap();
+        staking.handle(&ctx_with_sender(2), &rm).unwrap();
+        assert!(
+            staking.take_validator_changes().removes.is_empty(),
+            "two endorsements must not remove"
+        );
+
+        staking.handle(&ctx_with_sender(3), &rm).unwrap();
+        let changes = staking.take_validator_changes();
+        assert_eq!(changes.removes, vec![addr(4)], "quorum removes");
+    }
+
+    /// Confiscating a validator's stake is a governance action —
+    /// one signer must not slash. (The permissionless path is
+    /// `EVIDENCE`, which authenticates itself with the proof.)
+    #[test]
+    fn slash_requires_committee_quorum() {
+        let staking = setup_powered(&[1, 2, 3, 4], 100);
+        let slash = msg::slash(addr(4), 10);
+
+        staking.handle(&ctx_with_sender(1), &slash).unwrap();
+        staking.handle(&ctx_with_sender(2), &slash).unwrap();
+        assert_eq!(staking.stake(&addr(4)), 100, "below quorum, no slash");
+
+        staking.handle(&ctx_with_sender(3), &slash).unwrap();
+        assert_eq!(staking.stake(&addr(4)), 90, "quorum slashes");
+    }
+
+    /// Scheduling a coordinated halt freezes the chain — a single
+    /// validator must never hold that trigger alone.
+    #[test]
+    fn schedule_halt_requires_committee_quorum() {
+        let staking = setup_powered(&[1, 2, 3, 4], 100);
+        staking.begin_block(Height::new(10));
+        let halt = msg::schedule_halt(addr(1), 100);
+
+        staking.handle(&ctx_with_sender(1), &halt).unwrap();
+        staking.handle(&ctx_with_sender(2), &halt).unwrap();
+        assert_eq!(staking.scheduled_halt_height(), None, "below quorum, no halt");
+
+        staking.handle(&ctx_with_sender(3), &halt).unwrap();
+        assert_eq!(staking.scheduled_halt_height(), Some(100), "quorum schedules");
+    }
+
+    /// A registered-but-unbonded validator has zero voting power —
+    /// its endorsement is not even recorded. Registration is not
+    /// authority; bonded stake is.
+    #[test]
+    fn powerless_validator_cannot_endorse() {
+        let staking = setup(&[1]);
+        let new_sk = bls_key(0xAA);
+        let pop = new_sk.pop_prove();
+        let result = staking.handle(
+            &ctx_with_sender(1),
+            &msg::validator_add(addr(9), new_sk.public_key().as_bytes(), pop.as_bytes()),
+        );
+        assert!(result.is_err(), "a powerless member holds no governance vote");
+        assert!(!staking.is_registered(&addr(9)));
+    }
+
+    /// A jailed validator is by definition suspected of misbehavior
+    /// — it must not keep voting on set changes during its jail
+    /// period even though its stake is still bonded.
+    #[test]
+    fn jailed_validator_cannot_endorse() {
+        let staking = setup_powered(&[1, 2, 3, 4], 100);
+        staking.jailed.lock().unwrap().insert(addr(4), 1);
+        let result = staking.handle(&ctx_with_sender(4), &msg::validator_remove(addr(3)));
+        assert!(result.is_err(), "jailed validators hold no committee vote");
+    }
+
+    /// A quorum-admitted candidate is registered for delegation but
+    /// is not committee until the rotation seats it — it must not
+    /// endorse actions in the gap.
+    #[test]
+    fn pending_candidate_cannot_endorse() {
+        let staking = setup_powered(&[1], 100);
+        let new_addr = addr(9);
+        let new_sk = bls_key(0xAA);
+        let pop = new_sk.pop_prove();
+        staking
+            .handle(
+                &ctx_with_sender(1),
+                &msg::validator_add(new_addr, new_sk.public_key().as_bytes(), pop.as_bytes()),
+            )
+            .unwrap();
+        staking.handle(&ctx_with_sender(0), &msg::delegate(new_addr, 100)).unwrap();
+        let result = staking.handle(&ctx_with_sender(9), &msg::validator_remove(addr(1)));
+        assert!(result.is_err(), "a pending candidate is not yet committee");
+    }
+
+    /// Endorsements bind to the exact action payload: "admit X with
+    /// key K1" and "admit X with key K2" are different actions and
+    /// accumulate separately. Whichever reaches quorum first wins;
+    /// the loser's later quorum is consumed as stale — it must not
+    /// rotate the already-admitted validator's key.
+    #[test]
+    fn endorsements_are_per_action() {
+        let staking = setup_powered(&[1, 2, 3, 4], 100);
+        let new_addr = addr(9);
+        let (sk1, sk2) = (bls_key(0xAA), bls_key(0xBB));
+        let add1 =
+            msg::validator_add(new_addr, sk1.public_key().as_bytes(), sk1.pop_prove().as_bytes());
+        let add2 =
+            msg::validator_add(new_addr, sk2.public_key().as_bytes(), sk2.pop_prove().as_bytes());
+
+        // Two endorsements on each action — neither quorums.
+        for sender in [1u8, 2] {
+            staking.handle(&ctx_with_sender(sender), &add1).unwrap();
+            staking.handle(&ctx_with_sender(sender), &add2).unwrap();
+        }
+        assert!(!staking.is_registered(&new_addr), "split endorsements reach no quorum");
+        assert_eq!(staking.endorsements.pending_count(), 2, "both variants accumulate");
+
+        // K1 wins the race to quorum — and registering new_addr
+        // killed the K2 variant, which can never apply now: its
+        // frozen entry is swept out of the bounded pending set.
+        staking.handle(&ctx_with_sender(3), &add1).unwrap();
+        assert!(staking.is_registered(&new_addr));
+        assert_eq!(
+            staking.endorsements.pending_count(),
+            0,
+            "losing variant must be swept, not leaked",
+        );
+        staking.handle(&ctx_with_sender(0), &msg::delegate(new_addr, 50)).unwrap();
+
+        // A late endorsement for K2 is rejected outright — the
+        // address is registered, so the action is permanently dead.
+        let err = staking.handle(&ctx_with_sender(4), &add2).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+
+        let changes = staking.take_validator_changes();
+        assert_eq!(changes.adds.len(), 1);
+        assert_eq!(changes.adds[0].1, sk1.public_key().as_bytes().to_vec(), "K1 won admission");
+    }
+
+    /// Removing a quorum-admitted candidate before it seats cancels
+    /// the pending add outright — it never occupied consensus, so
+    /// there is nothing to unbond and nothing reaches the rotation.
+    #[test]
+    fn validator_remove_cancels_pending_add_at_quorum() {
+        let staking = setup_powered(&[1, 2], 100);
+        let new_addr = addr(9);
+        let new_sk = bls_key(0xAA);
+        let pop = new_sk.pop_prove();
+        let add = msg::validator_add(new_addr, new_sk.public_key().as_bytes(), pop.as_bytes());
+        staking.handle(&ctx_with_sender(1), &add).unwrap();
+        staking.handle(&ctx_with_sender(2), &add).unwrap();
+        assert!(staking.is_registered(&new_addr));
+
+        let rm = msg::validator_remove(new_addr);
+        staking.handle(&ctx_with_sender(1), &rm).unwrap();
+        staking.handle(&ctx_with_sender(2), &rm).unwrap();
+        assert!(!staking.is_registered(&new_addr), "quorum remove cancels the admission");
+        let changes = staking.take_validator_changes();
+        assert!(changes.adds.is_empty() && changes.removes.is_empty());
+    }
+
+    /// The endorsement map is bounded state: beyond
+    /// `MAX_PENDING_ACTIONS` distinct pending actions new ones are
+    /// refused, while already-tracked actions still accept
+    /// endorsements (a cap must not deadlock governance).
+    #[test]
+    fn endorsement_cap_rejects_new_actions() {
+        let staking = setup_powered(&[1, 2], 100);
+        staking.begin_block(Height::new(1));
+        // One endorsement per distinct halt height — with power 100
+        // of 200 a single endorsement never quorums, so each stays
+        // pending and fills the tracker.
+        for h in 2..(2 + framework::MAX_PENDING_ACTIONS as u64) {
+            staking
+                .handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), h))
+                .expect("tracked actions accepted up to the cap");
+        }
+        let result = staking.handle(&ctx_with_sender(1), &msg::schedule_halt(addr(1), 10_000));
+        assert!(result.is_err(), "the cap rejects new actions");
+
+        // An already-tracked action still takes endorsements — the
+        // second validator completes its quorum and it applies.
+        staking.handle(&ctx_with_sender(2), &msg::schedule_halt(addr(1), 2)).unwrap();
+        assert_eq!(staking.scheduled_halt_height(), Some(2));
+    }
+
+    /// C8 for C9: pending endorsements are future-affecting state —
+    /// two replicas must diverge if one has recorded an endorsement
+    /// the other has not, so the tally is committed in the root.
+    #[test]
+    fn state_root_changes_after_endorsement() {
+        let staking = setup_powered(&[1, 2], 100);
+        let root0 = staking.state_root();
+        staking.handle(&ctx_with_sender(1), &msg::validator_remove(addr(2))).unwrap();
+        assert_ne!(staking.state_root(), root0, "a pending endorsement is committed state");
     }
 }

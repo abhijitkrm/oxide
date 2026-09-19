@@ -401,6 +401,13 @@ pub struct PerpsModule {
     /// primitive, so production wiring must attach the staking
     /// committee before these txs are accepted.
     committee: Option<Arc<dyn framework::Committee + Send + Sync>>,
+    /// C9: committee endorsements for the emergency override
+    /// actions — `(market, mark)` and `(market, rate)` payloads
+    /// accumulate powered-validator votes and apply only once
+    /// endorsing power strictly exceeds two-thirds of the
+    /// committee. A single validator's signature is a vote, never
+    /// a command.
+    endorsements: framework::Endorsements,
 }
 
 struct Inner {
@@ -444,6 +451,7 @@ impl PerpsModule {
             store: Mutex::new(BTreeMap::new()),
             ledger: None,
             committee: None,
+            endorsements: framework::Endorsements::new(),
         }
     }
 
@@ -473,13 +481,6 @@ impl PerpsModule {
     ) -> Self {
         self.committee = Some(committee);
         self
-    }
-
-    /// `true` if `sender` may submit `TAG_SET_MARK` /
-    /// `TAG_APPLY_FUNDING` transactions: an active (non-jailed)
-    /// validator when a committee is wired, nobody otherwise.
-    fn is_committee(&self, sender: &Address) -> bool {
-        self.committee.as_ref().is_some_and(|c| c.is_active_validator(sender))
     }
 
     /// List a new perps market with the given configuration. Returns
@@ -1263,39 +1264,94 @@ impl Module for PerpsModule {
             }
             TAG_SET_MARK => {
                 let (market, mark) = Self::parse_set_mark(body).ok_or(ExecError::Malformed)?;
-                drop(inner);
-                // Committee-gated emergency override. The normal mark
-                // pipeline is the oracle module pushing the aggregated
-                // median through `MarkSink`; this tx path exists so the
-                // validator set can still force a mark if the oracle
-                // feed stalls entirely. Without a wired committee the
-                // path is closed — an unauthenticated mark update is a
-                // free manipulation primitive.
-                if !self.is_committee(&ctx.sender) {
-                    return Err(ExecError::ModuleRejected(
-                        "set_mark: sender is not an active validator".to_string(),
-                    ));
+                // Reject a nonexistent market before recording an
+                // endorsement — pending actions are a bounded set,
+                // so junk targets must never occupy a slot. Markets
+                // are only ever listed, never removed, so the
+                // check cannot go stale mid-endorsement.
+                if !inner.configs.contains_key(&market) {
+                    return Err(ExecError::ModuleRejected("market does not exist".to_string()));
                 }
-                // `set_mark_price` enforces both the per-update
-                // deviation check (MAX_MARK_CHANGE_BPS) and the
-                // per-block rate limit (MAX_ORACLE_UPDATES_PER_BLOCK).
-                self.set_mark_price(market, mark)?;
-                Ok(vec![Event { module: "perps", kind: "mark_updated", data: vec![market] }])
+                drop(inner);
+                // C9: committee-quorum emergency override. The
+                // normal mark pipeline is the oracle module pushing
+                // the aggregated median through `MarkSink`; this tx
+                // path exists so the validator set can still force
+                // a mark if the oracle feed stalls entirely. Each
+                // tx endorses the exact (market, mark) payload —
+                // the mark applies only once endorsing power
+                // strictly exceeds two-thirds of the committee, so
+                // one validator's signature is a vote, never a
+                // command. Without a wired committee the path is
+                // closed entirely.
+                let Some(committee) = self.committee.clone() else {
+                    return Err(ExecError::ModuleRejected(
+                        "set_mark: no committee wired".to_string(),
+                    ));
+                };
+                match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
+                    framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
+                        module: "perps",
+                        kind: "set_mark_endorse",
+                        data: vec![market],
+                    }]),
+                    framework::EndorsementOutcome::Quorum => {
+                        // `set_mark_price` keeps the per-update
+                        // deviation cap and per-block rate limit —
+                        // a quorum-authorized mark that violates
+                        // them is consumed as stale, not forced.
+                        match self.set_mark_price(market, mark) {
+                            Ok(()) => Ok(vec![Event {
+                                module: "perps",
+                                kind: "mark_updated",
+                                data: vec![market],
+                            }]),
+                            Err(_) => Ok(vec![Event {
+                                module: "perps",
+                                kind: "set_mark_stale",
+                                data: vec![market],
+                            }]),
+                        }
+                    }
+                }
             }
             TAG_APPLY_FUNDING => {
                 let (market, rate_bits) = Self::parse_funding(body).ok_or(ExecError::Malformed)?;
                 let rate = i64::from_le_bytes(rate_bits);
-                drop(inner);
-                // Same committee gate as `TAG_SET_MARK` — an
-                // unauthenticated funding rate is an unauthenticated
-                // balance transfer between every long and short on
-                // the market.
-                if !self.is_committee(&ctx.sender) {
-                    return Err(ExecError::ModuleRejected(
-                        "apply_funding: sender is not an active validator".to_string(),
-                    ));
+                // Same pre-endorsement existence check as
+                // `TAG_SET_MARK` — the bounded pending set must
+                // never carry an action that cannot apply.
+                if !inner.marks.contains_key(&market) {
+                    return Err(ExecError::ModuleRejected("market does not exist".to_string()));
                 }
-                self.apply_funding(market, rate)
+                drop(inner);
+                // Same quorum gate as `TAG_SET_MARK` — an
+                // unauthenticated funding rate is an
+                // unauthenticated balance transfer between every
+                // long and short on the market, so it takes the
+                // same two-thirds endorsement to apply.
+                let Some(committee) = self.committee.clone() else {
+                    return Err(ExecError::ModuleRejected(
+                        "apply_funding: no committee wired".to_string(),
+                    ));
+                };
+                match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
+                    framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
+                        module: "perps",
+                        kind: "apply_funding_endorse",
+                        data: vec![market],
+                    }]),
+                    framework::EndorsementOutcome::Quorum => {
+                        match self.apply_funding(market, rate) {
+                            Ok(events) => Ok(events),
+                            Err(_) => Ok(vec![Event {
+                                module: "perps",
+                                kind: "apply_funding_stale",
+                                data: vec![market],
+                            }]),
+                        }
+                    }
+                }
             }
             _ => Err(ExecError::Malformed),
         }
@@ -1379,6 +1435,11 @@ impl Module for PerpsModule {
             w.put_u8(*market);
             w.put_u8(*n);
         }
+        drop(inner);
+        // C9: pending governance endorsements decide whether an
+        // override applies — future-affecting state, committed like
+        // everything else.
+        self.endorsements.write_canonical(&mut w);
         w.root()
     }
 }
@@ -2194,8 +2255,9 @@ fn encode_perps_config(cfg: &PerpsMarketConfig) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MarketConfig, NewOrder, OrderId, OrderType, PRICE_SCALE, PerpsMarketConfig, PerpsModule,
-        Position, Side, StpMode, TimeInForce, encode_reject_reason, mark_price_deviation_bps, msg,
+        CROSS_MARGIN_MARKET, MarketConfig, NewOrder, OrderId, OrderType, PRICE_SCALE,
+        PerpsMarketConfig, PerpsModule, Position, Side, StpMode, TimeInForce, encode_reject_reason,
+        mark_price_deviation_bps, msg,
     };
     use executor::{ExecError, Module, TxContext};
     use framework::{Balances, module_id};
@@ -2308,6 +2370,32 @@ mod tests {
         fn active_validator_count(&self) -> usize {
             1
         }
+        fn power(&self, a: &Address) -> u64 {
+            u64::from(self.is_active_validator(a))
+        }
+        fn total_power(&self) -> u64 {
+            1
+        }
+    }
+
+    /// A two-member committee stub — `addr(1)` and `addr(2)` each
+    /// carry one unit of power, so neither can reach the
+    /// two-thirds quorum alone: endorsement-gated paths need both.
+    struct TwoValidatorCommittee;
+
+    impl framework::Committee for TwoValidatorCommittee {
+        fn is_active_validator(&self, a: &Address) -> bool {
+            *a == addr(1) || *a == addr(2)
+        }
+        fn active_validator_count(&self) -> usize {
+            2
+        }
+        fn power(&self, a: &Address) -> u64 {
+            u64::from(self.is_active_validator(a))
+        }
+        fn total_power(&self) -> u64 {
+            2
+        }
     }
 
     #[test]
@@ -2316,6 +2404,55 @@ mod tests {
         let mid = perps.list_market(test_cfg()).unwrap();
         perps.handle(&ctx(1), &msg::set_mark(mid, 1_600_000_000)).unwrap();
         assert_eq!(perps.mark_price(mid), Some(1_600_000_000));
+    }
+
+    /// C9: an emergency mark override is a governance action — one
+    /// validator's signature endorses the exact (market, mark)
+    /// payload; it applies only once endorsing power exceeds
+    /// two-thirds of the committee. A single signer must not move
+    /// the mark: that is a free liquidation-manipulation primitive.
+    #[test]
+    fn set_mark_requires_committee_quorum() {
+        let perps = PerpsModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        let mid = perps.list_market(test_cfg()).unwrap();
+        let before = perps.mark_price(mid);
+
+        perps.handle(&ctx(1), &msg::set_mark(mid, 1_600_000_000)).unwrap();
+        assert_eq!(perps.mark_price(mid), before, "one endorsement must not move the mark");
+
+        perps.handle(&ctx(2), &msg::set_mark(mid, 1_600_000_000)).unwrap();
+        assert_eq!(perps.mark_price(mid), Some(1_600_000_000), "quorum applies");
+    }
+
+    /// Same quorum gate for the funding override — an
+    /// unauthenticated rate is an unauthenticated transfer between
+    /// every long and short on the market.
+    #[test]
+    fn apply_funding_requires_committee_quorum() {
+        let perps = PerpsModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Trader 3 holds a long so funding has an observable
+        // effect — the `funding` event is emitted per payer, so a
+        // bare deposit with no open position would produce no
+        // events at quorum.
+        perps.handle(&ctx(3), &msg::deposit(CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(3));
+            acct.positions.insert(
+                mid,
+                Position { size: 1_000_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+        }
+
+        let events = perps.handle(&ctx(1), &msg::apply_funding(mid, 1)).unwrap();
+        assert_eq!(
+            events[0].kind, "apply_funding_endorse",
+            "one endorsement records but does not apply"
+        );
+
+        let events = perps.handle(&ctx(2), &msg::apply_funding(mid, 1)).unwrap();
+        assert_eq!(events[0].kind, "funding", "quorum applies the rate");
     }
 
     /// The emergency mark/funding tx path must reject non-committee

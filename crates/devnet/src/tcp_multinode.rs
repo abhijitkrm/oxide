@@ -768,9 +768,14 @@ impl TcpMultiNodeDevnet {
         let start = std::time::Instant::now();
         for round in 0..rounds {
             let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
-            for tx_i in 0..txs_per_round {
-                let tx = make_batch_tx(round, tx_i);
-                self.engines[leader_idx].submit_tx(tx);
+            // A phantom member (validator_add without a spawned
+            // engine) can't take mempool submissions — skip the
+            // submit; its leader slot times out in `run_round_tcp`.
+            if let Some(engine) = self.engines.get_mut(leader_idx) {
+                for tx_i in 0..txs_per_round {
+                    let tx = make_batch_tx(round, tx_i);
+                    engine.submit_tx(tx);
+                }
             }
             self.run_round_tcp();
         }
@@ -831,9 +836,14 @@ impl TcpMultiNodeDevnet {
         for round in 0..rounds {
             let view = primitives::View::new(round as u64);
             let leader_idx = usize::from(self.validator_set.leader(view));
-            for tx_i in 0..txs_per_round {
-                let tx = make_batch_tx(round, tx_i);
-                self.engines[leader_idx].submit_tx(tx);
+            // Phantom member (validator_add without a spawned
+            // engine): its round's txs can never be proposed —
+            // skip them as a crashed leader's would be lost.
+            if let Some(engine) = self.engines.get_mut(leader_idx) {
+                for tx_i in 0..txs_per_round {
+                    let tx = make_batch_tx(round, tx_i);
+                    engine.submit_tx(tx);
+                }
             }
         }
 
@@ -1226,6 +1236,15 @@ impl TcpMultiNodeDevnet {
             let view = primitives::View::new(next_submit_round as u64);
             let leader_idx = usize::from(self.validator_set.leader(view));
             let round_end = (next_submit_round + 1) * txs_per_round;
+            // A phantom member (validator_add without a spawned
+            // engine) has no app to ingest into — consume the
+            // round's txs without submitting, the same outcome as
+            // a crashed leader losing its round.
+            if leader_idx >= self.apps.len() {
+                tx_idx = round_end;
+                next_submit_round += 1;
+                continue;
+            }
             while tx_idx < round_end {
                 match self.apps[leader_idx].ingest_tx(all_txs[tx_idx].clone()) {
                     types::MempoolAck::Accepted => tx_idx += 1,
@@ -1294,6 +1313,13 @@ impl TcpMultiNodeDevnet {
                 let view = primitives::View::new(next_submit_round as u64);
                 let leader_idx = usize::from(self.validator_set.leader(view));
                 let round_end = (next_submit_round + 1) * txs_per_round;
+                // Phantom member — no app to ingest into; consume
+                // the round's txs as if the leader were crashed.
+                if leader_idx >= self.apps.len() {
+                    tx_idx = round_end;
+                    next_submit_round += 1;
+                    continue;
+                }
                 while tx_idx < round_end {
                     match self.apps[leader_idx].ingest_tx(all_txs[tx_idx].clone()) {
                         types::MempoolAck::Accepted => tx_idx += 1,
@@ -1884,6 +1910,12 @@ impl TcpMultiNodeDevnet {
             let _ = engine.collect_vote(u16::from(idx), vote);
             return;
         }
+        // A phantom member (validator_add without a spawned engine)
+        // has no inbox or transport — its votes are dropped, the
+        // same outcome as a crashed validator's peers.
+        if leader_idx >= inboxes.len() {
+            return;
+        }
         let mut frame = Vec::with_capacity(1 + 137);
         frame.push(MSG_VOTE);
         vote.encode(&mut frame);
@@ -1950,6 +1982,14 @@ impl TcpMultiNodeDevnet {
         deadline: std::time::Instant,
     ) -> usize {
         let mut tx_idx = 0;
+        // A phantom member (validator_add without a spawned engine)
+        // has no mempool — its round's txs simply never land, which
+        // is the same outcome as a crashed leader. (Indexed per call
+        // rather than a held `get_mut` borrow: the retry loop below
+        // needs `self` mutable again for `pipelined_tick`.)
+        if leader_idx >= self.engines.len() {
+            return txs_per_round;
+        }
         while tx_idx < txs_per_round {
             let ack = self.engines[leader_idx].submit_tx(txs[tx_idx].clone());
             match ack {
@@ -2090,9 +2130,14 @@ impl TcpMultiNodeDevnet {
         }
 
         // In-process vote delivery: collect all votes formed this
-        // tick on their respective leader engines.
+        // tick on their respective leader engines. A phantom member
+        // (validator_add without a spawned engine) has no engine to
+        // collect with — its votes are simply lost, which is the
+        // same outcome as a crashed validator.
         for (leader_idx, voter_idx, vote) in votes_to_collect {
-            let _ = self.engines[leader_idx].collect_vote(voter_idx, vote);
+            if let Some(engine) = self.engines.get_mut(leader_idx) {
+                let _ = engine.collect_vote(voter_idx, vote);
+            }
         }
     }
 
@@ -2237,7 +2282,15 @@ impl TcpMultiNodeDevnet {
 
         // Leader proposes (direct — proposal broadcast is a separate
         // layer). If the leader can't propose, the view times out.
-        let Some((header, proposal)) = self.engines[leader_idx].propose() else {
+        // A `None` engine slot means the ValidatorSet grew via
+        // validator_add while no engine was spawned for the new
+        // member — the phantom leader can't propose, so the view
+        // times out and advances to a live one.
+        let Some(engine) = self.engines.get_mut(leader_idx) else {
+            self.timeout_advance_all();
+            return;
+        };
+        let Some((header, proposal)) = engine.propose() else {
             self.timeout_advance_all();
             return;
         };
@@ -2466,7 +2519,15 @@ fn make_batch_tx(round: usize, tx_i: usize) -> TxBytes {
 /// balance for fee payment).
 #[cfg(test)]
 fn make_staking_tx(module_payload: &[u8], nonce: u64) -> TxBytes {
-    let sender = primitives::Address([0u8; 20]);
+    make_staking_tx_from(primitives::Address([0u8; 20]), module_payload, nonce)
+}
+
+/// Build a staking-module tx from an explicit sender. Committee
+/// endorsement tests need txs from *different* validators — the
+/// sender must carry a genesis balance for fee payment (the
+/// devnet prefunds `Address([b; 20])` for `b < 32`).
+#[cfg(test)]
+fn make_staking_tx_from(sender: primitives::Address, module_payload: &[u8], nonce: u64) -> TxBytes {
     let fee = 100u64;
     let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
     bytes.extend_from_slice(&sender.0);
@@ -2548,25 +2609,42 @@ mod tests {
         let initial_n = devnet.validator_set().n();
 
         // Address::ZERO must be a validator (have stake) to submit
-        // governance txs — delegate first.
+        // governance txs — delegate first. With ZERO the only
+        // powered committee member, its endorsement alone is the
+        // two-thirds quorum (1·3 > 1·2).
         let delegate_msg = staking::msg::delegate(primitives::Address::ZERO, 1);
         devnet.apps[0].ingest_tx(make_staking_tx(&delegate_msg, 0));
         devnet.run_batch(2, 0);
 
-        // Submit a validator_add for a new validator. Stake is 1 —
-        // the devnet does not spawn an engine for the added validator,
-        // so its voting power must stay below the quorum the existing
-        // 4 engines can reach on their own: with [1,1,1,1,1] the
-        // power quorum is 4 and progress continues with the new
-        // validator offline. A large stake here would (correctly)
-        // halt the chain — the dominant validator would be required
-        // for every quorum.
+        // Submit a validator_add endorsement for a new validator.
+        // The candidate's address must be (a) one of the 32
+        // prefunded senders so it can pay fees and cast its own
+        // endorsement later, and (b) OUTSIDE the engine identity
+        // range — engine i already holds `Address([i; 20])` in the
+        // ValidatorSet, so 0..n would collide at apply time.
+        // `Address([9; 20])` satisfies both.
+        // Bonded stake stays at 1 — the devnet does not
+        // spawn an engine for the added validator, so its voting
+        // power must stay below the quorum the existing 4 engines
+        // can reach on their own: with [1,1,1,1,1] the power quorum
+        // is 4 and progress continues with the new validator
+        // offline. A large stake here would (correctly) halt the
+        // chain — the dominant validator would be required for
+        // every quorum.
         let new_sk = bls_key(0xAA);
         let new_key = new_sk.public_key();
         let pop = new_sk.pop_prove();
-        let new_addr = primitives::Address([0xAA; 20]);
-        let add_msg = staking::msg::validator_add(new_addr, new_key.as_bytes(), 1, pop.as_bytes());
+        let new_addr = primitives::Address([9u8; 20]);
+        let add_msg = staking::msg::validator_add(new_addr, new_key.as_bytes(), pop.as_bytes());
         devnet.apps[0].ingest_tx(make_staking_tx(&add_msg, 1));
+        devnet.run_batch(3, 0);
+
+        // C9 bonded admission: the quorum-admitted candidate
+        // carries no stake until collateral is bonded to it — the
+        // delegate debits a funded account, which is the collateral
+        // proof the rotation requires.
+        let bond_msg = staking::msg::delegate(new_addr, 1);
+        devnet.apps[0].ingest_tx(make_staking_tx(&bond_msg, 2));
         devnet.run_batch(3, 0);
 
         // Apply the pending validator change — should add 1 validator.
@@ -2583,10 +2661,23 @@ mod tests {
             "new validator's BLS key must match",
         );
 
-        // Now remove the new validator.
+        // Now remove the new validator — committee quorum is two
+        // endorsements once the candidate is powered (power 1 of
+        // total 2 each). ZERO's endorsement alone is below quorum.
+        // With a 5-member set apps[0] leads every fifth view, so
+        // the batch runs five rounds to guarantee its mempool txs
+        // are proposed.
         let remove_msg = staking::msg::validator_remove(new_addr);
-        devnet.apps[0].ingest_tx(make_staking_tx(&remove_msg, 2));
-        devnet.run_batch(3, 0);
+        devnet.apps[0].ingest_tx(make_staking_tx(&remove_msg, 3));
+        devnet.run_batch(5, 0);
+        assert_eq!(
+            devnet.apps[0].take_pending_validator_changes().removes.len(),
+            0,
+            "one endorsement must not remove — no quorum yet",
+        );
+        // The seated member casts the second endorsement → quorum.
+        devnet.apps[0].ingest_tx(make_staking_tx_from(new_addr, &remove_msg, 0));
+        devnet.run_batch(5, 0);
 
         let applied = devnet.rotate_epoch_with_validator_changes();
         assert_eq!(applied, 1, "one validator remove should be applied");

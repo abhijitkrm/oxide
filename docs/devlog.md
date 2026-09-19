@@ -15685,3 +15685,104 @@ failed before the fix, passes now). The old
 the gap (asserting roots did NOT change on a resting order)
 was inverted. Gates: full workspace suite green (106 binaries);
 fmt + clippy `-D warnings` clean.
+
+### Session 5 (cont.) — Audit C9: committee-quorum governance replaces single-validator administration
+
+**The bug.** Every privileged path was gated by
+`validators.contains_key(&ctx.sender)` — membership, not
+authorization. Any one validator could unilaterally add or remove
+committee members, slash arbitrary amounts, schedule (or clear) a
+coordinated halt, force a perps mark or funding rate, and rewrite
+the oracle feed registry. A single compromised validator key was a
+full administrative takeover — the exact power the audit flagged
+under "single-validator governance." Worse, `validator_add`
+carried a *declared* stake field that was written straight into
+`validators` — voting power minted from nothing, never backed by
+the EVM-backed ledger.
+
+**The fix — endorsements, not commands.** Governance txs are now
+votes on an exact action payload, weighted by bonded voting power,
+activated only past the same strict two-thirds quorum a consensus
+QC requires:
+
+- `framework::Committee` gains `power(addr)` / `total_power()`
+  (the oracle/perps seam now weighs stake, not count — the C2
+  model extended to governance).
+- `framework::Endorsements` tracks `BTreeMap<action_bytes,
+  BTreeSet<endorser>>`: rejects zero-power endorsers (jailed,
+  pending, unbonded, unknown), dedupes per sender, tallies *live*
+  power on every call (a member jailed mid-flight contributes
+  nothing from then on), removes the action and returns `Quorum`
+  when `3·endorsing > 2·total`. Pending actions are capped at
+  `MAX_PENDING_ACTIONS = 64` (attacker-writable memory is
+  bounded); already-tracked actions always keep collecting
+  endorsements so the cap can't deadlock an in-flight decision.
+  `retain(pred)` drops actions that can never apply again — the
+  dead-entry sweep below.
+- Staking `validator_add`/`validator_remove`/`slash`/
+  `schedule_halt`, perps `TAG_SET_MARK`/`TAG_APPLY_FUNDING`, and
+  oracle feed register/unregister all record the exact message
+  bytes as the action identity — a vote for "admit X with key K1"
+  never transfers to "admit X with key K2" or "set mark to P2".
+- Record-time validation rejects malformed or permanently-
+  inapplicable actions BEFORE an endorsement lands (bad PoP,
+  duplicate address/key, nonexistent market/feed); quorum-time
+  re-validation consumes actions that went stale mid-flight
+  (`*_stale` events) rather than forcing them.
+
+**Bonded admission.** `validator_add` drops the declared-stake
+field — the wire is now `[0x06][addr:20][bls_key:48][pop:96]`.
+A quorum-admitted candidate registers with **zero** stake and
+seats at the epoch rotation only if real collateral exists
+(`validators[addr] > 0` via `delegate` — an actual EVM-ledger
+debit into `BONDED_POOL`). Unbonded candidates lapse at the
+rotation: registration + key unwind so a fresh round can admit
+them later. PoP stays mandatory (rogue-key defense) and is bound
+out of the action identity — two proofs for the same key endorse
+the same action. Duplicate BLS keys are rejected on add AND on
+`key_change` (a key identifies exactly one staking address — the
+same check `ValidatorSet` enforces at rotation, applied at
+admission).
+
+**Cancel refunds delegations.** Removing a quorum-admitted but
+unseated candidate must no longer be a silent no-op: bonded
+admission lets real collateral accumulate while pending, so
+`cancel_pending_add` moves every delegation into unbonding
+(delegators recover collateral after the period — the bonded pool
+pays out at `end_block` exactly as for a normal undelegation),
+clears `delegated_total`/store mirrors, and drops the
+registration.
+
+**Dead-action sweep.** A quorum'd state change can kill sibling
+actions — admitting X invalidates every other pending "admit X"
+variant, a passed halt height can never fire. Dead entries could
+otherwise occupy the bounded pending set forever: record-time
+validation rejects new endorsements of them, so they could never
+quorum and be consumed. `sweep_dead_actions()` re-validates every
+pending action after each quorum (`is_action_live` mirrors the
+record-time checks per type). Perps/oracle need no sweep: their
+actions have one canonical form per target and never go
+permanently stale (markets/feeds only ever exist or not).
+
+**Devnet harness: phantom members.** The e2e test adds a real
+fifth validator to the set without spawning an engine — every
+`engines[leader_idx]`/`apps[leader_idx]`/`inboxes[to]` site now
+treats a member with no engine as a crashed validator (skip
+submit, drop votes, timeout the view) instead of indexing out of
+bounds.
+
+State roots (C8 rule): pending endorsements are future-affecting
+state — committed via `Endorsements::write_canonical` in staking,
+perps, and oracle roots.
+
+Regressions: staking — single member can't add/remove/slash/
+halt, quorum activates, exact-action separation + losing-variant
+sweep, duplicate endorsement rejection, cap behavior, bonded
+activation, pending-add cancel refunds, powerless endorser
+rejected, state-root moves on endorsement. Perps — set_mark/
+apply_funding pending-then-quorum, non-committee and no-committee
+rejection, nonexistent market rejected before endorsement. Oracle
+— feed register/unregister quorum with power-aware stubs.
+Devnet — full add/bond/seat/remove cycle over TCP.
+
+Gates: 106 test binaries green, fmt + clippy `-D warnings` clean.

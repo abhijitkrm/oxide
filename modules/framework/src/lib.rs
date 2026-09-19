@@ -14,7 +14,7 @@
 //! simple in-memory `BTreeMap` (the real storage backend arrives with
 //! the `storage` crate integration).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use executor::{ExecError, Module};
@@ -142,6 +142,174 @@ pub trait Committee {
     /// Number of currently active validators — the denominator the
     /// oracle uses to size its submission quorum.
     fn active_validator_count(&self) -> usize;
+    /// `addr`'s current voting power — bonded stake for an active
+    /// validator, `0` for anything else (jailed, pending-add,
+    /// unbonded, unknown). Governance endorsements weigh power, not
+    /// membership: a zero-power member cannot move an action.
+    fn power(&self, addr: &Address) -> u64;
+    /// Total voting power across the active committee — the
+    /// denominator for the two-thirds governance quorum.
+    fn total_power(&self) -> u64;
+}
+
+/// The result of recording one endorsement for a governance action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndorsementOutcome {
+    /// The endorsement was recorded; cumulative endorsing power is
+    /// still at or below two-thirds of the committee.
+    Pending {
+        /// Sum of current committee power held by endorsers of this
+        /// action — tallied live at each call.
+        endorsing: u64,
+        /// The smallest endorsing power that would cross the
+        /// threshold (`floor(2·total/3) + 1`).
+        required: u64,
+    },
+    /// This endorsement pushed cumulative endorsing power strictly
+    /// past two-thirds of total committee power — the action is
+    /// authorized and its endorsement record has been consumed.
+    Quorum,
+}
+
+/// The maximum number of distinct pending governance actions a
+/// module tracks endorsements for at once.
+///
+/// Endorsement state is unbounded attacker-writable memory without
+/// a cap: every distinct action payload allocates a fresh entry.
+/// 64 pending actions is generous for committee governance (set
+/// changes, halts, parameter overrides are rare and deliberate)
+/// while bounding the state an adversary can grow for free. New
+/// actions beyond the cap are rejected; endorsements for
+/// already-tracked actions always land, so the cap cannot deadlock
+/// an in-flight decision.
+pub const MAX_PENDING_ACTIONS: usize = 64;
+
+/// Tracks committee endorsements for governance-gated actions.
+///
+/// Each privileged tx names an exact action — encoded bytes such as
+/// "admit validator X with key K", "halt at height H", "set mark M
+/// to price P". Identical payloads accumulate endorsers; once
+/// cumulative endorsing power strictly exceeds two-thirds of the
+/// committee's total bonded power the action is authorized — the
+/// same quorum a consensus QC requires, so no coalition under the
+/// Byzantine threshold can push a governance action through on its
+/// own. One validator's signature is a vote, never a command.
+///
+/// Endorsing power is tallied against the *current* committee on
+/// every call: a member jailed or slashed to zero after endorsing
+/// contributes nothing from then on, and endorsements never carry
+/// over between different payloads — "admit X with K1" and "admit X
+/// with K2" are different actions that race independently.
+///
+/// The tally is future-affecting state and is committed in each
+/// module's canonical state root via [`Self::write_canonical`].
+#[derive(Default)]
+pub struct Endorsements {
+    inner: Mutex<BTreeMap<Vec<u8>, BTreeSet<Address>>>,
+}
+
+impl Endorsements {
+    /// A fresh, empty endorsement tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `endorser`'s endorsement for `action`.
+    ///
+    /// The endorser must carry nonzero committee power *right now* —
+    /// a jailed, pending-add, or unbonded member holds no vote, so
+    /// their tx is rejected rather than silently recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::ModuleRejected`] if the endorser has no voting
+    /// power, or if `action` is new and the tracker already holds
+    /// [`MAX_PENDING_ACTIONS`] pending actions.
+    pub fn record(
+        &self,
+        action: &[u8],
+        endorser: &Address,
+        committee: &dyn Committee,
+    ) -> Result<EndorsementOutcome, ExecError> {
+        if committee.power(endorser) == 0 {
+            return Err(ExecError::ModuleRejected(
+                "governance: sender has no committee voting power".to_string(),
+            ));
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !inner.contains_key(action) && inner.len() >= MAX_PENDING_ACTIONS {
+            return Err(ExecError::ModuleRejected(format!(
+                "governance: {MAX_PENDING_ACTIONS} pending actions already tracked"
+            )));
+        }
+        let endorsers = inner.entry(action.to_vec()).or_default();
+        endorsers.insert(*endorser);
+        // Tally live power on every call: endorsements by members
+        // who have since been jailed, removed, or slashed to zero
+        // contribute nothing — the quorum reflects the committee as
+        // it is now, not as it was when each vote was cast.
+        let endorsing: u64 = endorsers.iter().map(|a| committee.power(a)).sum();
+        let total = committee.total_power();
+        if u128::from(endorsing) * 3 > u128::from(total) * 2 {
+            inner.remove(action);
+            return Ok(EndorsementOutcome::Quorum);
+        }
+        // `endorsing ≥ floor(2·total/3) + 1` ⟺ `3·endorsing >
+        // 2·total` — the strict BFT two-thirds threshold. The u128
+        // intermediate keeps `total * 2` overflow-free for supplies
+        // above u64::MAX/2; the result is ≤ total so it fits u64.
+        let required = u64::try_from(u128::from(total) * 2 / 3 + 1).unwrap_or(u64::MAX);
+        Ok(EndorsementOutcome::Pending { endorsing, required })
+    }
+
+    /// The number of distinct actions currently accumulating
+    /// endorsements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+    }
+
+    /// Drop every pending action for which `keep` returns `false`.
+    ///
+    /// Modules call this after a quorum-authorized action applies:
+    /// the state change can render sibling actions permanently
+    /// inapplicable — admitting validator X kills every other
+    /// pending "admit X" variant, and a scheduled halt whose
+    /// height the tip has passed can never fire. Record-time
+    /// validation already rejects *new* endorsements of dead
+    /// actions, but the frozen entry itself would otherwise occupy
+    /// the bounded [`MAX_PENDING_ACTIONS`] set forever: it can
+    /// never collect another endorsement, so it can never reach
+    /// quorum and be consumed. Re-running the module's liveness
+    /// predicate over the pending set reclaims those slots
+    /// deterministically. Keep semantics are conservative — a
+    /// module must only drop actions that can *never* apply again,
+    /// never merely ones that fail a transient precondition.
+    pub fn retain(&self, keep: impl Fn(&[u8]) -> bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.retain(|action, _| keep(action));
+    }
+
+    /// Serialize the full tally into `w` — pending endorsements are
+    /// future-affecting state (they decide whether an action
+    /// applies), so two replicas must diverge on different tallies.
+    /// Deterministic order comes free from `BTreeMap`/`BTreeSet`.
+    pub fn write_canonical(&self, w: &mut CanonicalState) {
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(inner.len());
+        for (action, endorsers) in inner.iter() {
+            w.put_bytes(action);
+            w.put_count(endorsers.len());
+            for endorser in endorsers {
+                w.put_addr(endorser);
+            }
+        }
+    }
 }
 
 /// The mark-price sink seam — where the oracle's aggregated price
