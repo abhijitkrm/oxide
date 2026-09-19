@@ -33,7 +33,7 @@
 //!
 //! | Tag | Operation | Body |
 //! |-----|-----------|------|
-//! | 0   | Place order | `[market:1][side:1][type:1][tif:1][stp:1][price:8][qty:8]` |
+//! | 0   | Place order | `[market:1][side:1][type:1][tif:1][stp:1][price:8][qty:8][flags:1]` |
 //! | 1   | Cancel order | `[market:1][order_id:8]` |
 //! | 2   | List market | `[tick:8][lot:8][min:8][max:8][max_resting:4][max_leverage:2][mmr_base:8]` |
 //! | 3   | Deposit margin | `[market:1][amount:8]` (isolated) or `[market:0xFF][amount:8]` (cross) |
@@ -67,8 +67,14 @@ const TAG_APPLY_FUNDING: u8 = 6;
 
 // ── Message sizes (body, excluding the 1-byte tag) ───────────────────
 
-/// `[market:1][side:1][type:1][tif:1][stp:1][price:8][qty:8]` = 21.
-const PLACE_BODY_LEN: usize = 21;
+/// `[market:1][side:1][type:1][tif:1][stp:1][price:8][qty:8][flags:1]`
+/// = 22. `flags` bit 0 = reduce-only (C7): the order may only close
+/// existing exposure — an order whose qty exceeds the reducible
+/// position is rejected at admission, and a resting remainder is
+/// canceled if it outlives its cover.
+const PLACE_BODY_LEN: usize = 22;
+/// `flags` bit 0: reduce-only order (C7).
+const FLAG_REDUCE_ONLY: u8 = 0x01;
 /// `[market:1][order_id:8]` = 9.
 const CANCEL_BODY_LEN: usize = 9;
 /// `[tick:8][lot:8][min:8][max:8][max_resting:4][max_leverage:2][mmr_base:2]` = 40.
@@ -227,6 +233,34 @@ impl Position {
 
 // ── Account state ────────────────────────────────────────────────────
 
+/// A resting order's margin-reservation record (C7).
+///
+/// An unfilled resting order is *potential* exposure: it can fill at
+/// any time and must be margined as if it already had. The
+/// reservation is computed lazily from `qty`/`side`/`price` against
+/// the CURRENT position — the portion of the order covered by an
+/// opposite-side position is a reduce (no margin), the tail is new
+/// exposure charged at `price × qty / leverage`. Recomputing against
+/// the live position keeps the reservation exact even when the
+/// position changes through other paths after the order rests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOrderResv {
+    /// Remaining resting quantity (scale-6), decremented on each
+    /// maker fill. Zero means the order is gone and the entry is
+    /// removed.
+    pub qty: u64,
+    /// The order's resting price (scale-8). A maker fills at its own
+    /// resting price, so this is the exact notional rate — not a
+    /// worst-case bound.
+    pub price: u64,
+    /// Which side the resting order sits on.
+    pub side: Side,
+    /// Reduce-only marker: if the position moves so the remaining
+    /// qty exceeds what it could still reduce, the remainder is
+    /// canceled at the next maker fill (see `apply_fill_to_position`).
+    pub reduce_only: bool,
+}
+
 /// Per-account perps state: cross-margin pool + per-market positions.
 #[derive(Debug, Clone, Default)]
 pub struct AccountState {
@@ -234,6 +268,10 @@ pub struct AccountState {
     pub cross_margin: u64,
     /// Positions indexed by market ID.
     pub positions: BTreeMap<u8, Position>,
+    /// Resting-order reservations keyed by `(market, order_id)`.
+    /// Maintained by place/fill/cancel; released when the order
+    /// leaves the book by any path.
+    pub open_orders: BTreeMap<(u8, u64), OpenOrderResv>,
 }
 
 impl AccountState {
@@ -306,6 +344,39 @@ impl AccountState {
                 // notional is scale-14; convert to scale-6.
                 total += pos.notional(mark) / leverage / PRICE_SCALE;
             }
+        }
+        total
+    }
+
+    /// Initial margin reserved by resting orders (C7), scale-6.
+    ///
+    /// For each resting order, the portion covered by an opposite-
+    /// side position of the same account is a reduce and reserves
+    /// nothing; the tail beyond the current position is potential
+    /// new exposure charged `qty × price / leverage`. Evaluating the
+    /// cover against the live position means the reservation
+    /// tightens automatically if the position shrinks — a resting
+    /// "reduce" that outlives its position is charged as an opener.
+    fn total_open_order_im(&self, configs: &BTreeMap<u8, PerpsMarketConfig>) -> u128 {
+        let mut total: u128 = 0;
+        for ((market, _oid), resv) in &self.open_orders {
+            let Some(cfg) = configs.get(market) else {
+                continue;
+            };
+            let covered = match self.positions.get(market) {
+                Some(p)
+                    if (p.size > 0 && resv.side == Side::Sell)
+                        || (p.size < 0 && resv.side == Side::Buy) =>
+                {
+                    u128::from(p.size.unsigned_abs().min(resv.qty))
+                }
+                _ => 0,
+            };
+            let exposed = u128::from(resv.qty).saturating_sub(covered);
+            let leverage = u128::from(cfg.max_leverage.max(1));
+            // notional is scale-14 (qty scale-6 × price scale-8);
+            // divide by PRICE_SCALE to land on scale-6.
+            total += exposed * u128::from(resv.price) / leverage / PRICE_SCALE;
         }
         total
     }
@@ -764,12 +835,46 @@ impl PerpsModule {
             return Ok(vec![]); // not under-margined
         }
 
-        // Phase 2 — liquidate: close all positions at mark and
+        // Phase 2a — cancel every resting order the account owns
+        // (C7). A liquidated account's orders are unbacked: if they
+        // stayed on the book they could keep matching against
+        // solvent takers with no margin behind them. Cancelling also
+        // releases the margin reservations — `open_orders` is
+        // cleared wholesale below since the account is done trading.
+        let mut events = Vec::new();
+        {
+            let Inner { markets, accounts, .. } = &mut *inner;
+            let mut scratch: Vec<trading::RestingEntry> = Vec::new();
+            for (mid_u, slot) in markets.iter_mut().enumerate() {
+                let Some(engine) = slot.as_mut() else {
+                    continue;
+                };
+                engine.resting_entries(&mut scratch);
+                // Collect first — `cancel` mutates the book while
+                // `scratch` holds the snapshot.
+                let owned: Vec<u64> =
+                    scratch.iter().filter(|e| e.owner == *account).map(|e| e.id.0).collect();
+                for oid in owned {
+                    if engine.cancel(trading::OrderId(oid)).is_ok() {
+                        #[allow(clippy::cast_possible_truncation)]
+                        events.push(Event {
+                            module: "perps",
+                            kind: "liquidation_cancel",
+                            data: vec![mid_u as u8],
+                        });
+                    }
+                }
+            }
+            if let Some(acct_mut) = accounts.get_mut(account) {
+                acct_mut.open_orders.clear();
+            }
+        }
+
+        // Phase 2b — liquidate: close all positions at mark and
         // realize losses, mutating the real positions in place.
         // `marks`/`accounts` are destructured so the mark lookup
         // (shared) and the position mutation (mutable) borrow
         // disjoint fields — no clone, no materialized positions.
-        let mut events = Vec::new();
         let mut total_loss_scale14: i128 = 0;
         let mut total_margin_recovered: u64 = 0;
         let cross_margin;
@@ -1018,6 +1123,20 @@ pub mod msg {
 
     /// Build a place-order message.
     pub fn place(market: u8, order: NewOrder) -> Vec<u8> {
+        place_with_flags(market, order, 0)
+    }
+
+    /// Build a reduce-only place-order message (C7): the order may
+    /// only close existing exposure — oversized requests are
+    /// rejected at admission and resting remainders are canceled if
+    /// they outlive their cover.
+    pub fn place_reduce_only(market: u8, order: NewOrder) -> Vec<u8> {
+        place_with_flags(market, order, super::FLAG_REDUCE_ONLY)
+    }
+
+    /// Shared place-order encoder: `[tag][market][side][type][tif]
+    /// [stp][price][qty][flags]`.
+    fn place_with_flags(market: u8, order: NewOrder, flags: u8) -> Vec<u8> {
         let mut msg = Vec::with_capacity(1 + PLACE_BODY_LEN);
         msg.push(super::TAG_PLACE);
         msg.push(market);
@@ -1027,6 +1146,7 @@ pub mod msg {
         msg.push(encode_stp(order.stp));
         msg.extend_from_slice(&order.price.0.to_le_bytes());
         msg.extend_from_slice(&order.qty.0.to_le_bytes());
+        msg.push(flags);
         msg
     }
 
@@ -1206,22 +1326,26 @@ impl PerpsModule {
     /// Handle a place-order message (extracted from `handle` to keep
     /// the dispatch function under the clippy line-count gate).
     fn handle_place(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
-        let (market, mut order, _) = Self::parse_place(body).ok_or(ExecError::Malformed)?;
+        let (market, mut order, flags) = Self::parse_place(body).ok_or(ExecError::Malformed)?;
         order.owner = ctx.sender;
+        let reduce_only = flags & FLAG_REDUCE_ONLY != 0;
 
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // ── Initial-margin gate (plan.md §9.3) ──
-        // An order that increases the account's absolute exposure
-        // must leave `equity >= total initial margin` after the
-        // fill — otherwise anyone could open unbacked positions and
-        // socialize losses to the insurance fund / counterparties.
+        // ── Initial-margin gate (plan.md §9.3, C7) ──
+        // An order must leave `equity >= total initial margin` after
+        // accounting for the exposure it could ADD. The reducible
+        // portion — the part of an opposite-side order that closes
+        // existing size — is free; only the tail beyond it is new
+        // exposure. A reduce-then-flip order is therefore charged on
+        // its flipped remainder, not skipped wholesale (the old
+        // `increases` test let a flip order through with no margin
+        // at all) and not over-charged on its covered part.
         //
-        // `increases` is a conservative test: the order adds exposure
-        // when it is on the same side as the current position (or
-        // when there is no position). Reduce-only orders skip the
-        // check; a reduce-then-flip order is charged the full new
-        // notional (over-estimate is the safe direction).
+        // `existing` now includes `total_open_order_im`: resting
+        // orders are potential exposure and must be margined as if
+        // filled — otherwise an account could stack unbacked orders
+        // that all later fill (C7).
         let cfg =
             inner.configs.get(&market).copied().ok_or_else(|| {
                 ExecError::ModuleRejected(format!("market {market} does not exist"))
@@ -1229,14 +1353,25 @@ impl PerpsModule {
         {
             let acct = inner.accounts.get(&ctx.sender);
             let pos = acct.and_then(|a| a.positions.get(&market));
-            let increases = match pos {
-                Some(p) => {
-                    (p.size >= 0 && order.side == Side::Buy)
-                        || (p.size <= 0 && order.side == Side::Sell)
+            let reducible = match pos {
+                Some(p)
+                    if (p.size > 0 && order.side == Side::Sell)
+                        || (p.size < 0 && order.side == Side::Buy) =>
+                {
+                    p.size.unsigned_abs()
                 }
-                None => true,
+                _ => 0,
             };
-            if increases {
+            // Reduce-only may only close: a request larger than the
+            // reducible size would add exposure, which the flag
+            // forbids — reject at admission.
+            if reduce_only && order.qty.0 > reducible {
+                return Err(ExecError::ModuleRejected(
+                    "reduce-only order exceeds reducible position".to_string(),
+                ));
+            }
+            let exposure_qty = order.qty.0.saturating_sub(reducible);
+            if exposure_qty > 0 {
                 // Reference price for the notional: the limit price
                 // for priced orders, the current mark for market
                 // orders (no limit to bound the fill price).
@@ -1245,13 +1380,14 @@ impl PerpsModule {
                     _ => order.price.0,
                 };
                 // Scale-14 notional → scale-6 quote.
-                let notional = u128::from(order.qty.0) * u128::from(ref_price) / PRICE_SCALE;
+                let notional = u128::from(exposure_qty) * u128::from(ref_price) / PRICE_SCALE;
                 let leverage = u128::from(cfg.max_leverage.max(1));
                 let new_im = notional / leverage;
                 let equity = acct.map_or(0i128, |a| a.equity(&inner.marks, &inner.configs));
                 let existing_im =
                     acct.map_or(0u128, |a| a.total_initial_margin(&inner.marks, &inner.configs));
-                let required = existing_im.saturating_add(new_im);
+                let open_order_im = acct.map_or(0u128, |a| a.total_open_order_im(&inner.configs));
+                let required = existing_im.saturating_add(open_order_im).saturating_add(new_im);
                 if equity < i128::try_from(required).unwrap_or(i128::MAX) {
                     return Err(ExecError::ModuleRejected(
                         "insufficient initial margin".to_string(),
@@ -1277,6 +1413,19 @@ impl PerpsModule {
         // then apply fills to positions. `mem::take` moves the Vec's
         // contents out in O(1), leaving an empty Vec behind.
         let fills_owned: Vec<FillEvent> = std::mem::take(fills);
+
+        // A resting remainder joins the reservation ledger (C7): the
+        // uncovered tail is charged initial margin until the order
+        // fills or is canceled. Reduce-only orders record the flag so
+        // a remainder that outlives its cover is canceled at the next
+        // maker fill.
+        if let OrderOutcome::Resting { order_id, price, resting_qty } = outcome {
+            let acct = Self::account_mut(&mut inner, &ctx.sender);
+            acct.open_orders.insert(
+                (market, order_id.0),
+                OpenOrderResv { qty: resting_qty.0, price: price.0, side: order.side, reduce_only },
+            );
+        }
         let mut events = Vec::with_capacity(fills_owned.len() + 1);
         for f in &fills_owned {
             events.push(fill_event(*f));
@@ -1284,11 +1433,23 @@ impl PerpsModule {
 
         // Apply fills to positions (needs exclusive `&mut inner`).
         for f in &fills_owned {
-            Self::apply_fill_to_position(&mut inner, market, f);
+            Self::apply_fill_to_position(&mut inner, market, f, &mut events);
         }
 
-        // Post-trade margin check.
+        // Post-trade margin check — the taker AND every maker whose
+        // position the fills changed. A maker fill can push the
+        // maker under water (realized loss, or a flip into exposure
+        // it cannot cover); the check is uniform for every account
+        // the trade touched.
         Self::margin_check(&mut inner, &ctx.sender, market, &mut events);
+        let mut checked: Vec<Address> = Vec::with_capacity(fills_owned.len());
+        for f in &fills_owned {
+            let maker = f.maker_owner;
+            if maker != ctx.sender && !checked.contains(&maker) {
+                checked.push(maker);
+                Self::margin_check(&mut inner, &maker, market, &mut events);
+            }
+        }
 
         events.push(outcome_event(market, outcome));
         Ok(events)
@@ -1307,10 +1468,25 @@ impl PerpsModule {
                 return Err(ExecError::ModuleRejected("cancel: not the order owner".to_string()));
             }
         } else {
+            // Order not on the book: if a reservation entry survives
+            // (e.g. an STP-cancelled order the module was never told
+            // about), drop it now — the reservation ledger heals
+            // itself on contact.
+            if let Some(acct) = inner.accounts.get_mut(&ctx.sender) {
+                acct.open_orders.remove(&(market, order_id.0));
+            }
             return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
         }
         match engine.cancel(order_id) {
-            Ok(canceled) => Ok(vec![cancel_event(market, canceled)]),
+            Ok(canceled) => {
+                // Release the margin reservation — removing the entry
+                // IS the release; `total_open_order_im` recomputes
+                // from live entries.
+                if let Some(acct) = inner.accounts.get_mut(&ctx.sender) {
+                    acct.open_orders.remove(&(market, order_id.0));
+                }
+                Ok(vec![cancel_event(market, canceled)])
+            }
             Err(TradingError::OrderNotFound) => {
                 Err(ExecError::ModuleRejected("cancel: order not found".to_string()))
             }
@@ -1364,22 +1540,72 @@ impl PerpsModule {
     fn handle_withdraw(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (market, amount) = Self::parse_margin(body).ok_or(ExecError::Malformed)?;
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let acct = Self::account_mut(&mut inner, &ctx.sender);
-        let balance = if market == CROSS_MARGIN_MARKET {
-            &mut acct.cross_margin
+
+        // ── Solvency gate (C7): the check is required-margin-AFTER,
+        // not stored-balance-before. The old code let an account
+        // withdraw the margin backing its open exposure and become
+        // instantly under-margined.
+        //
+        // Cross withdrawal: `equity − amount` must still cover the
+        // whole book's initial margin — open positions AND resting
+        // orders (which are potential exposure, C7). Isolated
+        // withdrawal: the position's own `isolated_margin − amount +
+        // uPnL` must still cover that position's initial margin —
+        // isolated margin may not be pulled below what its position
+        // requires.
+        if market == CROSS_MARGIN_MARKET {
+            let Some(acct) = inner.accounts.get(&ctx.sender) else {
+                return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
+            };
+            if acct.cross_margin < amount {
+                return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
+            }
+            let equity_after = acct.equity(&inner.marks, &inner.configs) - i128::from(amount);
+            let required = acct
+                .total_initial_margin(&inner.marks, &inner.configs)
+                .saturating_add(acct.total_open_order_im(&inner.configs));
+            if equity_after < i128::try_from(required).unwrap_or(i128::MAX) {
+                return Err(ExecError::ModuleRejected(
+                    "withdrawal would breach initial margin".to_string(),
+                ));
+            }
         } else {
-            &mut acct.positions.entry(market).or_default().isolated_margin
-        };
-        if *balance < amount {
-            return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
+            let acct = inner.accounts.get(&ctx.sender);
+            let pos = acct.and_then(|a| a.positions.get(&market));
+            let iso = pos.map_or(0u64, |p| p.isolated_margin);
+            if iso < amount {
+                return Err(ExecError::ModuleRejected("insufficient margin".to_string()));
+            }
+            if let Some(p) = pos.filter(|p| p.is_open()) {
+                let mark = inner.marks.get(&market).copied().unwrap_or(p.entry_price);
+                let cfg = inner.configs.get(&market);
+                if let Some(cfg) = cfg {
+                    let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
+                    let upnl_scale6 = p.unrealized_pnl(mark) / price_scale;
+                    let equity_after = i128::from(iso - amount) + upnl_scale6;
+                    let leverage = u128::from(cfg.max_leverage.max(1));
+                    let pos_im = p.notional(mark) / leverage / PRICE_SCALE;
+                    if equity_after < i128::try_from(pos_im).unwrap_or(i128::MAX) {
+                        return Err(ExecError::ModuleRejected(
+                            "withdrawal would breach position margin".to_string(),
+                        ));
+                    }
+                }
+            }
         }
+
         // Ledger credit first (margin lock held): on failure the
         // margin is untouched. The margin debit below cannot fail —
         // sufficiency was just checked.
         if let Some(ledger) = &self.ledger {
             ledger.credit(&ctx.sender, amount)?;
         }
-        *balance -= amount;
+        let acct = Self::account_mut(&mut inner, &ctx.sender);
+        if market == CROSS_MARGIN_MARKET {
+            acct.cross_margin -= amount;
+        } else {
+            acct.positions.entry(market).or_default().isolated_margin -= amount;
+        }
         drop(inner);
         Ok(vec![Event { module: "perps", kind: "withdraw", data: vec![market] }])
     }
@@ -1407,10 +1633,16 @@ impl PerpsModule {
 }
 
 impl PerpsModule {
-    /// Apply a fill to the taker's and maker's positions. A buy
-    /// increases the position; a sell decreases it. Entry price is
-    /// volume-weighted.
-    fn apply_fill_to_position(inner: &mut Inner, market: u8, fill: &FillEvent) {
+    /// Apply a fill to the taker's and maker's positions, release
+    /// the maker's order reservation for the filled quantity, and
+    /// enforce reduce-only on the maker's remainder. Emits
+    /// `realized_pnl` / `bad_debt` / `reduce_only_cancel` events.
+    fn apply_fill_to_position(
+        inner: &mut Inner,
+        market: u8,
+        fill: &FillEvent,
+        events: &mut Vec<Event>,
+    ) {
         // Taker side determines who is buying vs selling.
         let (buyer, seller) = if fill.taker_side == Side::Buy {
             (fill.taker_owner, fill.maker_owner)
@@ -1426,52 +1658,222 @@ impl PerpsModule {
         let fill_qty = i64::try_from(fill.qty.0).unwrap_or(i64::MAX);
 
         // Buyer's position increases (or shorts decrease).
-        Self::adjust_position(inner, &buyer, market, fill.price.0, fill_qty);
+        Self::adjust_position(inner, &buyer, market, fill.price.0, fill_qty, events);
         // Seller's position decreases (or shorts increase).
-        Self::adjust_position(inner, &seller, market, fill.price.0, -fill_qty);
+        Self::adjust_position(inner, &seller, market, fill.price.0, -fill_qty, events);
+
+        // Release the maker's reservation for the filled portion.
+        // The maker is the resting side: its reservation tracks the
+        // order's remaining qty, which every fill consumes. The
+        // uncovered tail is recomputed lazily at margin-evaluation
+        // time, so only `qty` is updated here.
+        let maker_resv_done = {
+            let acct = Self::account_mut(inner, &fill.maker_owner);
+            match acct.open_orders.get_mut(&(market, fill.maker_order_id.0)) {
+                Some(resv) => {
+                    resv.qty = resv.qty.saturating_sub(fill.qty.0);
+                    resv.qty == 0 || resv.reduce_only
+                }
+                None => false,
+            }
+        };
+        if maker_resv_done {
+            let (cancel_remainder, keep) = {
+                let acct = Self::account_mut(inner, &fill.maker_owner);
+                let key = (market, fill.maker_order_id.0);
+                match acct.open_orders.get(&key) {
+                    // Reduce-only enforcement: if the remaining qty
+                    // now exceeds what the live position can still
+                    // reduce, the remainder could add exposure —
+                    // cancel it (standard reduce-only semantics).
+                    Some(resv) if resv.reduce_only && resv.qty > 0 => {
+                        let covered = match acct.positions.get(&market) {
+                            Some(p)
+                                if (p.size > 0 && resv.side == Side::Sell)
+                                    || (p.size < 0 && resv.side == Side::Buy) =>
+                            {
+                                p.size.unsigned_abs().min(resv.qty)
+                            }
+                            _ => 0,
+                        };
+                        (resv.qty > covered, resv.qty <= covered)
+                    }
+                    Some(resv) => (false, resv.qty > 0),
+                    None => (false, false),
+                }
+            };
+            if cancel_remainder {
+                if let Some(engine) =
+                    inner.markets.get_mut(usize::from(market)).and_then(Option::as_mut)
+                {
+                    let _ = engine.cancel(fill.maker_order_id);
+                    events.push(Event {
+                        module: "perps",
+                        kind: "reduce_only_cancel",
+                        data: vec![market],
+                    });
+                }
+            }
+            if !keep || cancel_remainder {
+                let acct = Self::account_mut(inner, &fill.maker_owner);
+                acct.open_orders.remove(&(market, fill.maker_order_id.0));
+            }
+        }
     }
 
     /// Adjust a position by `delta` (signed qty) at `fill_price`.
-    /// Updates the volume-weighted entry price.
+    ///
+    /// C7: a delta that opposes the position realizes `PnL` on the
+    /// closed portion — `closed × (fill − entry)` for longs,
+    /// `closed × (entry − fill)` for shorts — settled into the
+    /// backing margin bucket via [`Self::settle_realized`]. A delta
+    /// larger than the position closes it (realizing the full
+    /// unrealized `PnL`) and opens the remainder on the other side at
+    /// the fill price. Same-side deltas update the volume-weighted
+    /// entry as before.
     fn adjust_position(
         inner: &mut Inner,
         account: &Address,
         market: u8,
         fill_price: u64,
         delta: i64,
+        events: &mut Vec<Event>,
     ) {
-        let acct = Self::account_mut(inner, account);
-        let pos = acct.positions.entry(market).or_default();
-        let new_size = pos.size.saturating_add(delta);
+        let mut realized_scale6: i128 = 0;
+        {
+            let acct = Self::account_mut(inner, account);
+            let pos = acct.positions.entry(market).or_default();
+            let old_size = pos.size;
+            let new_size = old_size.saturating_add(delta);
 
-        // Update entry price (volume-weighted) when increasing the
-        // position. When decreasing, entry price stays the same.
-        if delta != 0 && (pos.size.signum() == delta.signum() || pos.size == 0) {
-            // Increasing position: weighted average.
-            let old_cost = i128::from(pos.size.unsigned_abs()) * i128::from(pos.entry_price);
-            let add_cost = i128::from(delta.unsigned_abs()) * i128::from(fill_price);
-            let new_size_abs = i128::from(new_size.unsigned_abs());
-            if new_size_abs > 0 {
-                let new_entry = (old_cost + add_cost) / new_size_abs;
-                pos.entry_price = u64::try_from(new_entry).unwrap_or(u64::MAX);
+            // Realized PnL on the closed portion (scale-14 → scale-6
+            // at settle time). Only a delta opposing a live position
+            // closes anything.
+            if old_size != 0 && delta != 0 && old_size.signum() != delta.signum() {
+                let closed = i128::from(old_size.unsigned_abs().min(delta.unsigned_abs()));
+                let pnl_per_unit = if old_size > 0 {
+                    i128::from(fill_price) - i128::from(pos.entry_price)
+                } else {
+                    i128::from(pos.entry_price) - i128::from(fill_price)
+                };
+                let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
+                realized_scale6 = closed * pnl_per_unit / price_scale;
+            }
+
+            // Update entry price (volume-weighted) when increasing the
+            // position. When decreasing, entry price stays the same.
+            if delta != 0 && (old_size.signum() == delta.signum() || old_size == 0) {
+                // Increasing position: weighted average.
+                let old_cost = i128::from(old_size.unsigned_abs()) * i128::from(pos.entry_price);
+                let add_cost = i128::from(delta.unsigned_abs()) * i128::from(fill_price);
+                let new_size_abs = i128::from(new_size.unsigned_abs());
+                if new_size_abs > 0 {
+                    let new_entry = (old_cost + add_cost) / new_size_abs;
+                    pos.entry_price = u64::try_from(new_entry).unwrap_or(u64::MAX);
+                }
+            }
+            // If the position flipped sign (e.g. long → short), reset
+            // entry to the fill price.
+            if old_size != 0 && old_size.signum() != new_size.signum() {
+                pos.entry_price = fill_price;
+            }
+            pos.size = new_size;
+            if new_size == 0 {
+                pos.entry_price = 0;
             }
         }
-        // If the position flipped sign (e.g. long → short), reset
-        // entry to the fill price.
-        if pos.size != 0 && pos.size.signum() != new_size.signum() {
-            pos.entry_price = fill_price;
+
+        // Settle realized PnL into the backing margin bucket — a
+        // separate pass because settlement may touch the insurance
+        // fund, which lives on `Inner`, not the account.
+        if realized_scale6 != 0 {
+            Self::settle_realized(inner, account, market, realized_scale6, events);
         }
-        pos.size = new_size;
-        if new_size == 0 {
-            pos.entry_price = 0;
+    }
+
+    /// Settle realized `PnL` into an account's margin (C7).
+    ///
+    /// A gain is credited to the bucket backing the position —
+    /// `isolated_margin` when nonzero (isolated mode) else
+    /// `cross_margin`. A loss drains the same bucket; an isolated
+    /// position's loss is capped at its isolated bucket (that is the
+    /// point of isolation — the cross pool is NOT tapped), while a
+    /// cross-backed position drains the cross pool. Any remainder is
+    /// bad debt covered by the insurance fund, and a shortfall
+    /// beyond the fund is reported as a `bad_debt` event — value is
+    /// never silently invented or destroyed.
+    fn settle_realized(
+        inner: &mut Inner,
+        account: &Address,
+        market: u8,
+        realized_scale6: i128,
+        events: &mut Vec<Event>,
+    ) {
+        let mut bad_debt: u64 = 0;
+        {
+            let acct = Self::account_mut(inner, account);
+            let iso_backed = acct.positions.get(&market).is_some_and(|p| p.isolated_margin > 0);
+            if realized_scale6 > 0 {
+                let gain = u64::try_from(realized_scale6).unwrap_or(u64::MAX);
+                if iso_backed {
+                    let pos = acct.positions.entry(market).or_default();
+                    if let Some(v) = pos.isolated_margin.checked_add(gain) {
+                        pos.isolated_margin = v;
+                    } else {
+                        // Bucket overflow: hold the max and spill the
+                        // excess to cross rather than destroy value.
+                        let spill = gain - (u64::MAX - pos.isolated_margin);
+                        pos.isolated_margin = u64::MAX;
+                        acct.cross_margin = acct.cross_margin.saturating_add(spill);
+                    }
+                } else {
+                    acct.cross_margin = acct.cross_margin.saturating_add(gain);
+                }
+            } else {
+                let mut loss = u64::try_from(realized_scale6.unsigned_abs()).unwrap_or(u64::MAX);
+                if iso_backed {
+                    let pos = acct.positions.entry(market).or_default();
+                    let from = pos.isolated_margin.min(loss);
+                    pos.isolated_margin -= from;
+                    loss -= from;
+                } else {
+                    let from = acct.cross_margin.min(loss);
+                    acct.cross_margin -= from;
+                    loss -= from;
+                }
+                bad_debt = loss;
+            }
         }
+        if bad_debt > 0 {
+            // The account's collateral is exhausted — the insurance
+            // fund is the designated backstop for uncovered losses.
+            let cover = inner.insurance_fund.min(bad_debt);
+            inner.insurance_fund -= cover;
+            let residual = bad_debt - cover;
+            let mut data = Vec::with_capacity(1 + 8);
+            data.push(market);
+            data.extend_from_slice(&residual.to_le_bytes());
+            events.push(Event { module: "perps", kind: "bad_debt", data });
+        }
+        // Emit the realized amount (scale-6, signed) for the audit
+        // trail — clamped to i64 range; a larger realized amount is
+        // already reflected in the margin fields.
+        let amt = i64::try_from(realized_scale6).unwrap_or(if realized_scale6 > 0 {
+            i64::MAX
+        } else {
+            i64::MIN
+        });
+        let mut data = Vec::with_capacity(1 + 8);
+        data.push(market);
+        data.extend_from_slice(&amt.to_le_bytes());
+        events.push(Event { module: "perps", kind: "realized_pnl", data });
     }
 }
 
 // ── Parsing helpers ─────────────────────────────────────────────────
 
 impl PerpsModule {
-    fn parse_place(msg: &[u8]) -> Option<(u8, NewOrder, Address)> {
+    fn parse_place(msg: &[u8]) -> Option<(u8, NewOrder, u8)> {
         if msg.len() != PLACE_BODY_LEN {
             return None;
         }
@@ -1482,6 +1884,13 @@ impl PerpsModule {
         let stp = decode_stp(msg[4])?;
         let price = u64::from_le_bytes(msg[5..13].try_into().ok()?);
         let qty = u64::from_le_bytes(msg[13..21].try_into().ok()?);
+        let flags = msg[21];
+        // Unknown flag bits are rejected, not ignored — a client
+        // setting a bit the module doesn't understand is asking for
+        // semantics it won't get (fail closed).
+        if flags & !FLAG_REDUCE_ONLY != 0 {
+            return None;
+        }
         Some((
             market,
             NewOrder {
@@ -1493,7 +1902,7 @@ impl PerpsModule {
                 owner: Address([0; 20]),
                 stp,
             },
-            Address([0; 20]),
+            flags,
         ))
     }
 
@@ -1710,8 +2119,8 @@ fn encode_perps_config(cfg: &PerpsMarketConfig) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MarketConfig, NewOrder, OrderType, PRICE_SCALE, PerpsMarketConfig, PerpsModule, Position,
-        Side, StpMode, TimeInForce, encode_reject_reason, mark_price_deviation_bps, msg,
+        MarketConfig, NewOrder, OrderId, OrderType, PRICE_SCALE, PerpsMarketConfig, PerpsModule,
+        Position, Side, StpMode, TimeInForce, encode_reject_reason, mark_price_deviation_bps, msg,
     };
     use executor::{ExecError, Module, TxContext};
     use framework::{Balances, module_id};
@@ -2576,5 +2985,257 @@ mod tests {
         let events = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
         assert!(events.iter().any(|e| e.kind == "fill"));
         assert_eq!(perps.position(&addr(1), mid).size, 1_000);
+    }
+
+    // ── C7: core financial invariants ──────────────────────────────
+
+    /// A cross-margin withdrawal may not take account equity below
+    /// the initial-margin requirement of the open book. The old code
+    /// checked only the stored bucket balance — an account could
+    /// withdraw the margin backing an open position and become
+    /// instantly under-margined.
+    #[test]
+    fn withdraw_cross_cannot_break_initial_margin() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        perps.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        // Buyer deposits exactly 2_000 — free collateral after a
+        // 1-lot position (IM 1_500) is 500.
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 2_000)).unwrap();
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 1_000);
+
+        // Withdraw 1_000: equity_after = 1_000 < IM 1_500 → reject.
+        let err =
+            perps.handle(&ctx(1), &msg::withdraw(super::CROSS_MARGIN_MARKET, 1_000)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        // Margin and ledger both untouched.
+        assert_eq!(perps.cross_margin(&addr(1)), 2_000);
+
+        // Withdraw exactly the free collateral (500): equity_after
+        // = 1_500 = IM → allowed.
+        perps.handle(&ctx(1), &msg::withdraw(super::CROSS_MARGIN_MARKET, 500)).unwrap();
+        assert_eq!(perps.cross_margin(&addr(1)), 1_500);
+    }
+
+    /// An isolated-margin withdrawal may not pull the position's
+    /// own margin below its initial-margin requirement.
+    #[test]
+    fn withdraw_isolated_cannot_break_position_margin() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        perps.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        // Isolated deposit of 2_000 backing a 1-lot position.
+        perps.handle(&ctx(1), &msg::deposit(mid, 2_000)).unwrap();
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+
+        // Withdraw 1_000 → isolated margin 1_000 < IM 1_500 → reject.
+        let err = perps.handle(&ctx(1), &msg::withdraw(mid, 1_000)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        // The free excess (500) withdraws fine.
+        perps.handle(&ctx(1), &msg::withdraw(mid, 500)).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).isolated_margin, 1_500);
+    }
+
+    /// Closing part of a position must realize `PnL` into collateral.
+    /// The old code shrank `size` and kept the entry price but the
+    /// realized gain vanished — margin was never credited.
+    #[test]
+    fn partial_close_realizes_pnl_into_margin() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        perps.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 100_000)).unwrap();
+
+        // Open a 2-lot long at 1.5e9 (tick 500).
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 2, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 2, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 2_000);
+
+        // Maker bid at tick 600 (1.6e9); close 1 lot into it.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Buy, 600, 1, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Sell, 600, 1, 1))).unwrap();
+
+        let pos = perps.position(&addr(1), mid);
+        assert_eq!(pos.size, 1_000, "one lot remains");
+        assert_eq!(pos.entry_price, 1_500_000_000, "entry unchanged on reduce");
+        // Realized: 1_000 qty × (1.6e9 − 1.5e9) / 1e8 = 1_000.
+        assert_eq!(
+            perps.cross_margin(&addr(1)),
+            100_000 + 1_000,
+            "realized PnL must settle into margin"
+        );
+    }
+
+    /// A sell larger than the long flips the position: the closed
+    /// portion realizes `PnL` and the remainder opens a short at the
+    /// fill price. The old code classified the whole order as a
+    /// reduce (skipping the IM gate AND the realized `PnL`).
+    #[test]
+    fn flip_close_realizes_pnl_and_reopens() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        perps.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 100_000)).unwrap();
+
+        // Open a 1-lot long at 1.5e9.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+
+        // Sell 3 lots into a 3-lot bid at 1.6e9 — flips to −2_000.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Buy, 600, 3, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Sell, 600, 3, 1))).unwrap();
+
+        let pos = perps.position(&addr(1), mid);
+        assert_eq!(pos.size, -2_000, "flipped remainder opens short");
+        assert_eq!(pos.entry_price, 1_600_000_000, "new side enters at fill price");
+        // Realized on the closed lot: 1_000 × (1.6e9 − 1.5e9) / 1e8 = 1_000.
+        assert_eq!(perps.cross_margin(&addr(1)), 100_000 + 1_000);
+    }
+
+    /// Resting orders must reserve initial margin: two orders that
+    /// each fit inside equity must not both pass when their
+    /// combined requirement exceeds it. The old gate counted only
+    /// open positions — resting orders were free, so an account
+    /// could stack unbacked exposure that all later fills.
+    #[test]
+    fn resting_order_reserves_initial_margin() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        // Equity 2_000 covers one lot's IM (1_500) but not two.
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 2_000)).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+
+        let err = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap_err();
+        assert!(
+            matches!(err, ExecError::ModuleRejected(_)),
+            "second resting order must exceed reserved initial margin"
+        );
+    }
+
+    /// Cancelling a resting order releases its margin reservation:
+    /// the same order becomes placeable again.
+    #[test]
+    fn cancel_releases_order_reservation() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 2_000)).unwrap();
+        let events = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        let resting = events.iter().find(|e| e.kind == "resting").expect("order rests");
+        let order_id = OrderId(u64::from_le_bytes(resting.data[1..9].try_into().unwrap()));
+
+        // Cancel → reservation released → an identical order fits again.
+        perps.handle(&ctx(1), &msg::cancel(mid, order_id)).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+    }
+
+    /// Liquidation must also cancel the account's resting orders —
+    /// otherwise unbacked orders of a bankrupt account keep
+    /// matching against the book.
+    #[test]
+    fn liquidation_cancels_resting_orders() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 2_000)).unwrap();
+        let events = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        let resting = events.iter().find(|e| e.kind == "resting").expect("order rests");
+        let order_id = OrderId(u64::from_le_bytes(resting.data[1..9].try_into().unwrap()));
+
+        // Inject a deeply underwater position and crash the mark:
+        // 100 lots long from entry 2.0e9, mark at 1.0e9 → equity
+        // far below maintenance → liquidation must fire.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(1));
+            acct.positions.insert(
+                mid,
+                Position { size: 100_000, entry_price: 2_000_000_000, isolated_margin: 0 },
+            );
+        }
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
+        let events = perps.liquidation_check(&addr(1)).unwrap();
+        assert!(!events.is_empty(), "account must liquidate");
+
+        // The resting order must be gone: cancel now reports
+        // not-found rather than silently succeeding.
+        let err = perps.handle(&ctx(1), &msg::cancel(mid, order_id)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// Reduce-only may only close: an order whose qty exceeds the
+    /// reducible position is rejected at admission, while an
+    /// in-cover close executes normally.
+    #[test]
+    fn reduce_only_rejects_oversized_close() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        ledger.mint(&addr(9), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        perps.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+
+        // Open a 1-lot long.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 1_000);
+
+        // Reduce-only sell of 2 lots > 1 reducible → rejected.
+        let err = perps
+            .handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 500, 2, 1)))
+            .unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+
+        // Reduce-only sell of 1 lot — exactly the position — closes.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Buy, 500, 1, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 500, 1, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 0);
+    }
+
+    /// A reduce-only order on the WRONG side of the book (no
+    /// reducible position) is rejected outright — there is nothing
+    /// it could reduce.
+    #[test]
+    fn reduce_only_without_position_rejected() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        // No position at all: any reduce-only order exceeds
+        // reducible (0).
+        let err = perps
+            .handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 500, 1, 1)))
+            .unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
     }
 }

@@ -1004,6 +1004,48 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Perpetuals lacked core financial invariants: realized PnL
+  vanished, withdrawals ignored margin requirements, resting
+  orders were unreserved, and liquidated accounts kept trading**
+  (`modules/perps`)
+  - Closing or flipping a position never realized PnL — a partial
+    close at a profit credited nothing and at a loss debited
+    nothing. Opposing fill deltas now settle `closed ×
+    (fill − entry)` into the margin bucket backing the position
+    (isolated margin stays isolated — its losses are capped at its
+    own bucket, with the insurance fund absorbing any bad debt),
+    and a `realized_pnl`/`bad_debt` event trail records every
+    movement.
+  - Withdrawals checked only the bucket balance, so an account
+    could pull out the margin backing open positions and become
+    instantly under-margined. Cross withdrawal now requires
+    post-withdrawal equity to cover the whole book's initial
+    margin; isolated withdrawal requires the position's own
+    margin to cover its requirement.
+  - Resting orders were invisible to the margin gate — an account
+    could stack unbacked orders that all later fill. Resting
+    remainders now reserve initial margin, computed against the
+    live position so an order that outlives its cover is charged
+    as an opener, and released on fill, cancel, or liquidation.
+  - Reduce-then-flip orders skipped the margin gate entirely
+    (classified as reduces); the gate now charges exactly the
+    flipped remainder, and an explicit `reduce-only` order flag
+    (new `[flags]` wire byte) rejects oversized closes at
+    admission and cancels resting remainders that outlive their
+    cover.
+  - Liquidation zeroed positions but left the account's resting
+    orders on the book — unbacked orders that could keep
+    matching. Liquidation now cancels all of the account's orders
+    first, and post-trade margin checks run for every maker a
+    fill touched, not just the taker.
+  - **In plain words:** the perpetuals module was keeping score
+    wrong in ways that lose or print money — closing a winning
+    trade didn't pay out, you could withdraw the collateral
+    backing your open bets, orders waiting on the book didn't
+    count against your margin, and a busted account's orders
+    could keep trading. All of those are fixed; margin is
+    accounted for at every step.
+
 - **Buy-order reservations could be refunded twice, market buys
   were unreserved, and on-chain settlement could consume book
   orders without payment** (`crates/matcher`,

@@ -15535,3 +15535,70 @@ IOC dead remainder, price improvement.
 
 Gates: 103 matcher + 32 exchange + full workspace suite green;
 fmt + clippy `-D warnings` clean.
+
+### Session 5 (cont.) — Audit C7: perps financial invariants (PnL reconciliation, margin solvency, order reservation, reduce-only, liquidation order-cancel)
+
+The audit flagged five violations in `modules/perps`; inspection
+found a sixth (liquidated accounts' resting orders stayed live).
+
+**Realized PnL reconciliation.** `adjust_position` shrank `size`
+on a reduce and reset `entry_price` on a flip — and the realized
+PnL simply vanished. A partial close at a profit credited nothing;
+a partial close at a loss debited nothing. Now an opposing delta
+computes `closed_qty × (fill − entry)` (sign-correct per side) and
+`settle_realized` moves it into the bucket backing the position:
+isolated margin when nonzero (isolation means the cross pool is
+NOT tapped for its losses — the remainder is insurance-fund bad
+debt, surfaced as a `bad_debt` event), else the cross pool. Gains
+credit the same bucket; isolated-bucket overflow spills to cross.
+A `realized_pnl` event records every settlement.
+
+**Flip handling.** The IM gate's `increases` test classified any
+opposite-side order as a reduce — a sell larger than the long
+skipped the gate entirely while flipping into an unbacked short.
+The gate now computes `reducible` (the covered portion) and
+charges IM on `qty − reducible` only: pure reduces stay free,
+flips pay margin on exactly the new exposure. `adjust_position`
+realizes PnL on the closed portion and re-enters the remainder at
+the fill price.
+
+**Open-order margin reservation.** Resting orders were invisible
+to the margin gate — `existing_im` counted positions only, so an
+account could stack unbacked orders that all later fill.
+`AccountState.open_orders` now records `(market, order_id) →
+qty/price/side/reduce_only` for every resting remainder, and
+`total_open_order_im` charges `exposed_qty × price / leverage`
+where `exposed` is the tail beyond what the LIVE position can
+still cover — recomputed lazily so a "reduce" order that outlives
+its position is automatically charged as an opener. Released on
+fill (maker decrement), cancel (entry drop), liquidation
+(wholesale clear), and self-heals on an OrderNotFound cancel
+touch (STP-cancelled orders emit no event).
+
+**Withdrawal solvency.** `handle_withdraw` checked the bucket
+balance only — an account could withdraw the margin backing open
+exposure and go instantly under-margined. Cross withdrawal now
+requires `equity − amount ≥ total_initial_margin +
+total_open_order_im`; isolated withdrawal requires the position's
+own `margin − amount + uPnL ≥ its initial margin`.
+
+**Explicit reduce-only.** Place-order wire bodies grow a `[flags]`
+byte (bit0 = reduce-only; unknown bits rejected — fail closed).
+`msg::place_reduce_only` builds it; `qty > reducible` is rejected
+at admission, and a resting reduce-only remainder is
+engine-cancelled if the live position shrinks below what it could
+still reduce (`reduce_only_cancel` event).
+
+**Liquidation order-cancel.** `liquidation_check` zeroed positions
+but left the account's resting orders on the book — unbacked
+orders that could keep matching. Phase 2a now scans
+`resting_entries` per market, cancels every order the account
+owns (`liquidation_cancel` events), and clears its reservations.
+Post-trade `margin_check` now also runs for every maker whose
+position a fill changed, not just the taker.
+
+New regressions (9): cross/isolated withdrawal solvency, partial
+-close realized PnL, flip realize-and-reopen, resting-order IM
+reservation, cancel-release, reduce-only oversized + no-position
+rejections, liquidation order-cancel. Gates: 50 perps tests +
+full workspace suite green; fmt + clippy `-D warnings` clean.
