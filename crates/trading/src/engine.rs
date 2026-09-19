@@ -364,6 +364,41 @@ impl<B: BookBackend> MatchingEngine<B> {
         }
     }
 
+    /// Append the engine's canonical state encoding to `out` (C8).
+    ///
+    /// Commits every field that can affect future matching: the
+    /// market config, `next_id` (order-id assignment is consensus-
+    /// relevant — two replicas assigning different ids to the same
+    /// fill sequence are divergent), and every resting order in
+    /// canonical order — price level ascending, FIFO within a level
+    /// — as `(id, side, price, qty, owner)`. Encoding is little-
+    /// endian fixed-width throughout; `entries` is caller-owned
+    /// scratch reused across markets so a module's per-block
+    /// state-root pass stays allocation-light.
+    ///
+    /// Cold path only: O(resting) per call, once per block per
+    /// market. The match path never runs it.
+    pub fn write_canonical_state(&self, out: &mut Vec<u8>, entries: &mut Vec<RestingEntry>) {
+        out.extend_from_slice(&self.cfg.market_id.to_le_bytes());
+        out.extend_from_slice(&self.cfg.tick_size.to_le_bytes());
+        out.extend_from_slice(&self.cfg.lot_size.to_le_bytes());
+        out.extend_from_slice(&self.cfg.min_price.to_le_bytes());
+        out.extend_from_slice(&self.cfg.max_price.to_le_bytes());
+        out.extend_from_slice(&self.cfg.max_resting.to_le_bytes());
+        out.extend_from_slice(&self.next_id.to_le_bytes());
+        out.extend_from_slice(&self.resting.to_le_bytes());
+        self.resting_entries(entries);
+        #[allow(clippy::cast_possible_truncation)]
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for e in entries.iter() {
+            out.extend_from_slice(&e.id.0.to_le_bytes());
+            out.push(e.side as u8);
+            out.extend_from_slice(&e.price.0.to_le_bytes());
+            out.extend_from_slice(&e.qty.0.to_le_bytes());
+            out.extend_from_slice(&e.owner.0);
+        }
+    }
+
     /// The entry sweep: match the incoming order against resting
     /// liquidity, best price first, FIFO within each level.
     ///

@@ -15602,3 +15602,86 @@ New regressions (9): cross/isolated withdrawal solvency, partial
 reservation, cancel-release, reduce-only oversized + no-position
 rejections, liquidation order-cancel. Gates: 50 perps tests +
 full workspace suite green; fmt + clippy `-D warnings` clean.
+
+### Session 5 (cont.) — Audit C8: canonical state roots over the complete state machine
+
+**The bug.** `Module::state_root` was `subtree_root(&store)` on
+almost every module — but most authoritative state lives in
+memory, not the KV store. Exchange hashed market configs while
+the live order books decided future fills; perps hashed configs
+while positions, margin, marks, open-order reservations, and the
+insurance fund decided future liquidations; staking hashed a
+partial stake/delegation mirror while ~15 maps (unbonding,
+reward accumulators, pending validator changes, jails,
+attendance rings, the scheduled halt) decided consensus set
+membership and payouts; governance hashed raw messages while
+tallies and `finalized`/`passed` flags decided which param
+changes apply. Identical roots across validators therefore
+proved nothing about trading or staking state. Separately,
+`execute_block` hashed module roots alone while
+`export_snapshot` appended the nonce root — two different root
+definitions for the same state.
+
+**The fix — one canonical commitment.** New
+`framework::CanonicalState`: a length-prefixed, fixed-order
+serializer hashed once under `Domain::Block` per module. The
+rule for every module now: commit every field that can affect
+future execution — authoritative maps, queues, counters —
+excluding only derived caches, pure scratch buffers (the
+per-call `fills` vec), construction-time config, and assembly
+wiring (`ledger`/`committee`/`sink` handles). `MatchingEngine`
+gains `write_canonical_state` — cfg + `next_order_id` +
+`resting_count` + every resting order in canonical order
+(price-level ascending, FIFO within level) — so a book's
+commitment covers order priority itself, not just membership.
+
+- **exchange**: store root + per-market engine encodings.
+- **perps**: store root + engines + configs + marks + accounts
+  (cross margin, positions, C7 open-order reservations) +
+  insurance fund + the intra-block oracle-update counter.
+- **staking**: all 18 mutex'd fields in struct-declaration
+  order, one lock at a time (no lock-order interaction with
+  handlers), split into `commit_stake_state` /
+  `commit_reward_state` / `commit_set_state` /
+  `commit_consensus_state` section helpers. `delegator_index`
+  is committed even though derivable — it is maintained as
+  replicated state, so a drift bug SHOULD diverge the root.
+- **governance**: `next_id` + every proposal field.
+- **oracle**: store already mirrored everything (the model this
+  follows); the live maps are committed anyway so a future
+  field can't silently escape the root.
+- **core**: `current_epoch` + height + store.
+- **evm**: already complete — the MPT root covers every
+  account's nonce/balance/storage/code; remaining fields are
+  caches, undo history, and wiring.
+
+**Executor**: `canonical_state_root(module_roots, nonce_root)`
+is now THE aggregate — used by `execute_block`,
+`export_snapshot`, and `import_snapshot` — so the block root
+stored at `state_root_at(h)` is byte-identical to the snapshot
+root at the same height. `SNAPSHOT_FORMAT_VERSION` bumps to 3:
+v2 roots were computed under the KV-only scheme and must not
+be mistaken for canonical commitments (the forward gate still
+tolerant-decodes v1/v2 layouts; post-import nodes compute v3
+roots going forward — same as the pre-existing state-restore
+fidelity gap, now made VISIBLE by the stronger root).
+
+**Honest cost note (perf):** module roots are now O(committed
+state) per block — a full book serializes its resting orders
+once per block. `state_root` is a cold path (once per block
+per module, off the match hot path) and the encoding reuses a
+caller-owned scratch buffer per market; the incremental/
+accumulator root (QMDB-style) remains a follow-up if profiling
+shows the per-block serialization matters at production book
+depths.
+
+New regressions (14): exchange rest/fill/cancel roots; perps
+deposit/mark/rest/position/insurance roots; staking
+attendance/schedule-halt/key-change/reward-accrual roots;
+governance finalize root; executor
+`snapshot_root_matches_block_root` (the two-definitions bug —
+failed before the fix, passes now). The old
+`state_root_changes_after_order_rests` test that DOCUMENTED
+the gap (asserting roots did NOT change on a resting order)
+was inverted. Gates: full workspace suite green (106 binaries);
+fmt + clippy `-D warnings` clean.

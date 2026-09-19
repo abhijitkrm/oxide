@@ -319,6 +319,142 @@ pub fn subtree_root(store: &KVStore) -> Hash {
     Hasher::hash_one(Domain::Block, &data)
 }
 
+/// Canonical module-state serializer for state roots (C8).
+///
+/// A module's [`Module::state_root`] must commit **every field that
+/// can affect future execution** — not just the KV store. Modules
+/// keep live state in memory (matching engines, positions, margin,
+/// reward accumulators, pending queues); two replicas with
+/// identical KV stores can hold divergent books or margin and must
+/// NOT produce identical roots.
+///
+/// `CanonicalState` accumulates a module's authoritative state in a
+/// fixed schema order into one byte buffer, then `root()` hashes it
+/// once under `Domain::Block` — the same domain [`subtree_root`]
+/// uses, so a module root remains a single `Domain::Block` digest.
+///
+/// Encoding rules (consensus-critical — change = new root format):
+/// - Integers are little-endian fixed-width; `bool` is one byte.
+/// - `put_bytes` is `u64`-length-prefixed, and every collection
+///   must be preceded by `put_count` so section boundaries are
+///   unambiguous.
+/// - `BTreeMap`/`BTreeSet` iterate sorted — feed them directly.
+///   `Vec`/`VecDeque` order is itself committed.
+/// - Commit authoritative state; skip derived caches (anything
+///   rebuildable from committed state), pure scratch buffers,
+///   construction-time config that never changes via txs, and
+///   wiring handles (`Arc` seams). Intra-block counters reset by
+///   `begin_block`/`end_block` are committed anyway when cheap —
+///   they hold the *current* block's deterministic values at
+///   commit time.
+///
+/// `state_root` is a cold path (once per block per module): a
+/// single allocation for the buffer is acceptable; the matching
+/// hot path never runs it.
+#[derive(Default)]
+pub struct CanonicalState {
+    /// The accumulated canonical encoding.
+    buf: Vec<u8>,
+}
+
+impl CanonicalState {
+    /// A fresh, empty serializer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A section discriminator byte. Use distinct tags per logical
+    /// section so two different schemas can never collide.
+    pub fn put_tag(&mut self, tag: u8) -> &mut Self {
+        self.buf.push(tag);
+        self
+    }
+
+    /// A `u8`.
+    pub fn put_u8(&mut self, v: u8) -> &mut Self {
+        self.buf.push(v);
+        self
+    }
+
+    /// A `u16` little-endian.
+    pub fn put_u16(&mut self, v: u16) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    /// A `u32` little-endian.
+    pub fn put_u32(&mut self, v: u32) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    /// A `u64` little-endian.
+    pub fn put_u64(&mut self, v: u64) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    /// A `u128` little-endian.
+    pub fn put_u128(&mut self, v: u128) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    /// An `i64` little-endian (positions are signed).
+    pub fn put_i64(&mut self, v: i64) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    /// A `bool` as one byte (`0`/`1`).
+    pub fn put_bool(&mut self, v: bool) -> &mut Self {
+        self.buf.push(u8::from(v));
+        self
+    }
+
+    /// An `Address` as its raw 20 bytes.
+    pub fn put_addr(&mut self, a: &Address) -> &mut Self {
+        self.buf.extend_from_slice(&a.0);
+        self
+    }
+
+    /// A collection element count as `u64` — must precede the
+    /// elements so section boundaries are unambiguous.
+    pub fn put_count(&mut self, n: usize) -> &mut Self {
+        #[allow(clippy::cast_possible_truncation)]
+        self.buf.extend_from_slice(&(n as u64).to_le_bytes());
+        self
+    }
+
+    /// A length-prefixed byte string (`u64` length + raw bytes).
+    pub fn put_bytes(&mut self, v: &[u8]) -> &mut Self {
+        #[allow(clippy::cast_possible_truncation)]
+        self.buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        self.buf.extend_from_slice(v);
+        self
+    }
+
+    /// A `Hash` as its raw 32 bytes (fixed-width, unambiguous).
+    pub fn put_root(&mut self, h: &Hash) -> &mut Self {
+        self.buf.extend_from_slice(h.as_bytes());
+        self
+    }
+
+    /// The canonical encoding accumulated so far.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Hash the canonical encoding into the module's state root.
+    #[must_use]
+    pub fn root(&self) -> Hash {
+        use crypto::hash::{Domain, Hasher};
+        Hasher::hash_one(Domain::Block, &self.buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

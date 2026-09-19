@@ -1124,7 +1124,26 @@ impl Module for StakingModule {
     }
 
     fn state_root(&self) -> Hash {
-        subtree_root(&self.store)
+        // C8: commit EVERY field that can affect future execution.
+        // The KV store mirrors only stake/delegation pairs — the
+        // unbonding queue, reward accumulators, pending validator
+        // changes, jails, attendance rings, and the scheduled halt
+        // all decide future consensus set membership and payouts,
+        // so identical roots across validators must prove identical
+        // staking state. Field order is fixed and consensus-
+        // critical (struct-declaration order).
+        //
+        // Excluded: `ledger` (assembly wiring), `unbonding_period` /
+        // `block_reward` (construction config, never tx-mutated).
+        // Locks are taken one at a time and released before the
+        // next — no lock-order interaction with handlers.
+        let mut w = framework::CanonicalState::new();
+        w.put_root(&subtree_root(&self.store));
+        self.commit_stake_state(&mut w);
+        self.commit_reward_state(&mut w);
+        self.commit_set_state(&mut w);
+        self.commit_consensus_state(&mut w);
+        w.root()
     }
 
     fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
@@ -1152,6 +1171,172 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     pub fn set_ledger(&self, ledger: std::sync::Arc<dyn Balances + Send + Sync>) {
         *self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ledger);
+    }
+
+    /// Commit `validators`, `delegations`, and the `unbonding` queue
+    /// to the canonical state encoding (C8). These decide consensus
+    /// voting power and future unbond payouts.
+    fn commit_stake_state(&self, w: &mut framework::CanonicalState) {
+        {
+            let validators =
+                self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(validators.len());
+            for (a, s) in validators.iter() {
+                w.put_addr(a).put_u64(*s);
+            }
+        }
+        {
+            let delegations =
+                self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(delegations.len());
+            for ((d, v), amt) in delegations.iter() {
+                w.put_addr(d).put_addr(v).put_u64(*amt);
+            }
+        }
+        {
+            let unbonding =
+                self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(unbonding.len());
+            for e in unbonding.iter() {
+                w.put_addr(&e.delegator)
+                    .put_addr(&e.validator)
+                    .put_u64(e.amount)
+                    .put_u64(e.completion_height);
+            }
+        }
+    }
+
+    /// Commit the reward accrual state (C8): `pending_rewards`,
+    /// `reward_per_token`, `reward_debt`, `self_debt`,
+    /// `delegator_index`, and `delegated_total` — the lazy-accrual
+    /// bookkeeping that decides future payouts. `delegator_index`
+    /// is technically derivable from `delegations`, but it is
+    /// maintained as replicated state and committed alongside: a
+    /// drift bug would produce divergent claims and SHOULD diverge
+    /// the root.
+    fn commit_reward_state(&self, w: &mut framework::CanonicalState) {
+        {
+            let pending =
+                self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(pending.len());
+            for (a, r) in pending.iter() {
+                w.put_addr(a).put_u64(*r);
+            }
+        }
+        {
+            let rpt =
+                self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(rpt.len());
+            for (a, r) in rpt.iter() {
+                w.put_addr(a).put_u128(*r);
+            }
+            let debt = self.reward_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(debt.len());
+            for ((d, v), r) in debt.iter() {
+                w.put_addr(d).put_addr(v).put_u128(*r);
+            }
+            let self_debt =
+                self.self_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(self_debt.len());
+            for (a, r) in self_debt.iter() {
+                w.put_addr(a).put_u128(*r);
+            }
+            let index =
+                self.delegator_index.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(index.len());
+            for (d, validators) in index.iter() {
+                w.put_addr(d).put_count(validators.len());
+                for v in validators {
+                    w.put_addr(v);
+                }
+            }
+            let totals =
+                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(totals.len());
+            for (a, t) in totals.iter() {
+                w.put_addr(a).put_u64(*t);
+            }
+        }
+    }
+
+    /// Commit the validator-set transition state (C8): pending key
+    /// changes, pending adds/removes, live BLS keys, jails, and the
+    /// pending jail/unjail queues — everything the next epoch
+    /// rotation will act on.
+    fn commit_set_state(&self, w: &mut framework::CanonicalState) {
+        let pending_keys =
+            self.pending_key_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(pending_keys.len());
+        for (a, k) in pending_keys.iter() {
+            w.put_addr(a).put_bytes(k);
+        }
+        let adds =
+            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(adds.len());
+        for (a, k, stake) in adds.iter() {
+            w.put_addr(a).put_bytes(k).put_u64(*stake);
+        }
+        let removes = self
+            .pending_validator_removes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(removes.len());
+        for a in removes.iter() {
+            w.put_addr(a);
+        }
+        let keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(keys.len());
+        for (a, k) in keys.iter() {
+            w.put_addr(a).put_bytes(k);
+        }
+        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(jailed.len());
+        for (a, h) in jailed.iter() {
+            w.put_addr(a).put_u64(*h);
+        }
+        let pending_jails =
+            self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(pending_jails.len());
+        for a in pending_jails.iter() {
+            w.put_addr(a);
+        }
+        let pending_unjails =
+            self.pending_unjails.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(pending_unjails.len());
+        for a in pending_unjails.iter() {
+            w.put_addr(a);
+        }
+    }
+
+    /// Commit consensus-adjacent state (C8): the scheduled halt,
+    /// seen-evidence replay set, per-validator attendance rings,
+    /// and the current height marker.
+    fn commit_consensus_state(&self, w: &mut framework::CanonicalState) {
+        match *self.scheduled_halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            Some(h) => {
+                w.put_u8(1).put_u64(h);
+            }
+            None => {
+                w.put_u8(0);
+            }
+        }
+        {
+            let seen = self.seen_evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(seen.len());
+            for h in seen.iter() {
+                w.put_root(h);
+            }
+            let attendance =
+                self.attendance.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(attendance.len());
+            for (a, ring) in attendance.iter() {
+                w.put_addr(a).put_count(ring.len());
+                for present in ring {
+                    w.put_bool(*present);
+                }
+            }
+        }
+        w.put_u64(*self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     }
 
     /// The delegator's bonded amount with a validator.
@@ -3022,6 +3207,66 @@ mod tests {
         staking.handle(&ctx_with_sender(1), &msg::slash(v, 100)).unwrap();
         let root1 = staking.state_root();
         assert_ne!(root0, root1, "state root must change after slash");
+    }
+
+    // ── C8 canonical state-root completeness ─────────────────────
+    //
+    // Most staking state (unbonding queues, reward accumulators,
+    // pending validator changes, jails, attendance rings, the
+    // scheduled halt) lives in memory, not the KV store. The state
+    // root must commit all of it — identical roots across
+    // validators must prove identical staking state.
+
+    #[test]
+    fn state_root_changes_after_attendance() {
+        let staking = setup(&[1, 2]);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let root0 = staking.state_root();
+        // v2 signed, v1 absent — the attendance ring is consensus
+        // state: it decides future downtime jailing.
+        staking.record_block_attendance(Height::new(1), &[addr(2)]);
+        let root1 = staking.state_root();
+        assert_ne!(root0, root1, "attendance must be committed");
+    }
+
+    #[test]
+    fn state_root_changes_after_schedule_halt() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        staking.begin_block(Height::new(5));
+        let root0 = staking.state_root();
+        staking.handle(&ctx_with_sender(1), &msg::schedule_halt(v, 100)).unwrap();
+        let root1 = staking.state_root();
+        assert_ne!(root0, root1, "the scheduled halt must be committed");
+    }
+
+    #[test]
+    fn state_root_changes_after_key_change() {
+        let staking = setup(&[0]);
+        let v = addr(0);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let root0 = staking.state_root();
+        let new_sk = bls_key(0xAA);
+        let new_key = new_sk.public_key().as_bytes().to_vec();
+        let pop = new_sk.pop_prove();
+        staking.handle(&ctx(), &msg::key_change(v, &new_key, pop.as_bytes())).unwrap();
+        let root1 = staking.state_root();
+        assert_ne!(root0, root1, "pending key changes must be committed");
+    }
+
+    #[test]
+    fn state_root_changes_after_rewards_accrue() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let root0 = staking.state_root();
+        // end_block accrues `reward_per_token` — an in-memory
+        // accumulator that decides future payouts.
+        staking.end_block(Height::new(1));
+        let root1 = staking.state_root();
+        assert_ne!(root0, root1, "reward accrual must be committed");
     }
 
     #[test]

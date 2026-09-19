@@ -1304,7 +1304,82 @@ impl Module for PerpsModule {
     fn end_block(&self, _height: Height) {}
 
     fn state_root(&self) -> Hash {
-        subtree_root(&self.store)
+        // C8: commit EVERY field that can affect future execution —
+        // the KV store only mirrors market configs, while positions,
+        // margin, marks, the insurance fund, open-order reservations,
+        // and the live books decide future fills, liquidations, and
+        // funding. Identical roots across validators must prove
+        // identical trading state. Section order is fixed and
+        // consensus-critical.
+        //
+        // Excluded: `fills` (per-call scratch), `ledger` /
+        // `committee` (assembly wiring, not tx-mutated state).
+        let mut w = framework::CanonicalState::new();
+        w.put_root(&subtree_root(&self.store));
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Live books: market config + order-id sequence + every
+        // resting order (canonical order inside the engine encoding).
+        let mut entries = Vec::new();
+        let mut book_bytes = Vec::new();
+        w.put_count(inner.markets.len());
+        for engine in &inner.markets {
+            match engine {
+                Some(e) => {
+                    w.put_u8(1);
+                    book_bytes.clear();
+                    e.write_canonical_state(&mut book_bytes, &mut entries);
+                    w.put_bytes(&book_bytes);
+                }
+                None => {
+                    w.put_u8(0);
+                }
+            }
+        }
+        // Perps market configs (leverage / mmr — margin math).
+        w.put_count(inner.configs.len());
+        for (market, cfg) in &inner.configs {
+            w.put_u8(*market);
+            w.put_u16(cfg.max_leverage);
+            w.put_u16(cfg.mmr_base_bps);
+        }
+        // Mark prices drive funding, liquidations, and margin checks.
+        w.put_count(inner.marks.len());
+        for (market, mark) in &inner.marks {
+            w.put_u8(*market);
+            w.put_u64(*mark);
+        }
+        // Accounts: cross margin, per-market positions, and the C7
+        // open-order reservations (potential exposure).
+        w.put_count(inner.accounts.len());
+        for (addr, acct) in &inner.accounts {
+            w.put_addr(addr);
+            w.put_u64(acct.cross_margin);
+            w.put_count(acct.positions.len());
+            for (market, pos) in &acct.positions {
+                w.put_u8(*market);
+                w.put_i64(pos.size);
+                w.put_u64(pos.entry_price);
+                w.put_u64(pos.isolated_margin);
+            }
+            w.put_count(acct.open_orders.len());
+            for ((market, oid), resv) in &acct.open_orders {
+                w.put_u8(*market);
+                w.put_u64(*oid);
+                w.put_u64(resv.qty);
+                w.put_u64(resv.price);
+                w.put_u8(resv.side as u8);
+                w.put_bool(resv.reduce_only);
+            }
+        }
+        w.put_u64(inner.insurance_fund);
+        // Intra-block oracle-update counter: deterministic (same
+        // block → same count) and cheap, so it is committed too.
+        w.put_count(inner.oracle_updates_this_block.len());
+        for (market, n) in &inner.oracle_updates_this_block {
+            w.put_u8(*market);
+            w.put_u8(*n);
+        }
+        w.root()
     }
 }
 
@@ -2432,6 +2507,70 @@ mod tests {
         perps.list_market(test_cfg()).unwrap();
         let root1 = perps.state_root();
         assert_ne!(root0, root1);
+    }
+
+    // ── C8 canonical state-root completeness ─────────────────────
+    //
+    // A perps `state_root` must commit every field that can affect
+    // future execution — positions, margin, marks, insurance, and
+    // the live book — not just the KV store (which only mirrors
+    // market configs). Identical roots across validators must prove
+    // identical trading state.
+
+    #[test]
+    fn state_root_changes_after_margin_deposit() {
+        let perps = PerpsModule::new();
+        perps.list_market(test_cfg()).unwrap();
+        let root0 = perps.state_root();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        let root1 = perps.state_root();
+        assert_ne!(root0, root1, "a margin deposit must change the state root");
+    }
+
+    #[test]
+    fn state_root_changes_after_mark_set() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        let root0 = perps.state_root();
+        perps.set_mark_price_unchecked(mid, 1_600_000_000).unwrap();
+        let root1 = perps.state_root();
+        assert_ne!(root0, root1, "a mark update must change the state root");
+    }
+
+    #[test]
+    fn state_root_changes_after_order_rests() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
+        let root0 = perps.state_root();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 400, 3, 1))).unwrap();
+        let root1 = perps.state_root();
+        assert_ne!(root0, root1, "a resting order must change the state root");
+    }
+
+    #[test]
+    fn state_root_changes_after_position_opens() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
+        perps.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
+        // Maker sell rests; taker buy fills it — both positions change.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 5, 9))).unwrap();
+        let root0 = perps.state_root();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 5, 1))).unwrap();
+        let root1 = perps.state_root();
+        assert_ne!(root0, root1, "a position change must change the state root");
+    }
+
+    #[test]
+    fn state_root_changes_after_insurance_fund_moves() {
+        let perps = PerpsModule::new();
+        perps.list_market(test_cfg()).unwrap();
+        let root0 = perps.state_root();
+        perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insurance_fund =
+            1_000;
+        let root1 = perps.state_root();
+        assert_ne!(root0, root1, "the insurance fund must be committed");
     }
 
     // ── Property tests ───────────────────────────────────────────────

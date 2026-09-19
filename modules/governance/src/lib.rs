@@ -256,7 +256,26 @@ impl Module for GovernanceModule {
     }
 
     fn state_root(&self) -> Hash {
-        subtree_root(&self.store)
+        // C8: commit every future-affecting field — the store only
+        // mirrors proposal bytes and per-voter records; the tallies,
+        // `finalized`/`passed` flags, and `next_id` live in memory
+        // and decide which param changes apply.
+        let mut w = framework::CanonicalState::new();
+        w.put_root(&subtree_root(&self.store));
+        w.put_u64(*self.next_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let proposals = self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(proposals.len());
+        for (id, p) in proposals.iter() {
+            w.put_u64(*id);
+            w.put_addr(&p.proposer);
+            w.put_bytes(&p.param_key);
+            w.put_bytes(&p.param_val);
+            w.put_u64(p.yes_votes);
+            w.put_u64(p.no_votes);
+            w.put_bool(p.finalized);
+            w.put_bool(p.passed);
+        }
+        w.root()
     }
 }
 
@@ -381,6 +400,20 @@ mod tests {
         let mut msg = msg;
         msg.push(2); // not 0 or 1
         assert_eq!(gov.handle(&ctx(1), &msg), Err(ExecError::Malformed));
+    }
+
+    #[test]
+    fn state_root_changes_after_finalize() {
+        // C8: `finalized`/`passed` live only in the in-memory
+        // proposals map — they decide whether a proposal's param
+        // change applies, so they are future-affecting state and
+        // must move the root even though they never touch the store.
+        let gov = GovernanceModule::new();
+        gov.handle(&ctx(1), &msg::propose(b"key", b"val")).unwrap();
+        let root0 = gov.state_root();
+        gov.end_block(Height::new(1));
+        let root1 = gov.state_root();
+        assert_ne!(root0, root1, "finalizing a proposal must change the state root");
     }
 
     #[test]

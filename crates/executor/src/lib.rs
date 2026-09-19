@@ -98,10 +98,17 @@ pub enum ExecError {
 ///
 /// The current `ExecutorSnapshot` *format* version. v1 is the
 /// pre-versioning layout (implicit — decoded snapshots that end at
-/// `nonce_root` read as 1); v2 adds `version` + `module_versions`.
+/// `nonce_root` read as 1); v2 adds `version` + `module_versions`;
+/// v3 changes the state-root semantics (C8): module roots now
+/// commit each module's complete canonical state — not just its
+/// KV store — and the block/snapshot/replay paths share one
+/// aggregate definition (`H(module_roots || nonce_root)`). A v2
+/// snapshot's roots were computed under the old KV-only scheme and
+/// would verify against stale-definition roots, so they must be
+/// refused outright.
 /// Bumped whenever the snapshot layout or semantics change so an
 /// importer can reject bytes written by a newer binary.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// A point-in-time snapshot of the executor's state — see the
 /// header comment above [`SNAPSHOT_FORMAT_VERSION`] for the full
@@ -353,6 +360,23 @@ fn compute_nonce_root(nonces: &[(primitives::Address, u64)]) -> Hash {
         data.extend_from_slice(&addr.0);
         data.extend_from_slice(&nonce.to_le_bytes());
     }
+    Hasher::hash_one(Domain::Block, &data)
+}
+
+/// C8: THE canonical aggregate state root — the single definition
+/// shared by block execution, snapshot export, snapshot import, and
+/// journal replay. It commits every module's canonical root plus
+/// the executed-nonce root: replay protection is consensus state
+/// (it decides which future txs are admissible), so it must move
+/// the root like any other state. Before this, `execute_block`
+/// hashed module roots alone while `export_snapshot` appended the
+/// nonce root — two different commitments for the same state.
+fn canonical_state_root(module_roots: impl IntoIterator<Item = Hash>, nonce_root: Hash) -> Hash {
+    let mut data = Vec::new();
+    for root in module_roots {
+        data.extend_from_slice(root.as_bytes());
+    }
+    data.extend_from_slice(nonce_root.as_bytes());
     Hasher::hash_one(Domain::Block, &data)
 }
 
@@ -1488,7 +1512,6 @@ impl Executor {
     /// mid-block mix of pre- and post-execution module roots.
     #[must_use]
     pub fn export_snapshot(&self) -> ExecutorSnapshot {
-        use crypto::hash::{Domain, Hasher};
         // Drain the execution lane first: module state is mutated by
         // the worker thread block-by-block, so a snapshot taken
         // mid-block could mix pre- and post-execution module roots.
@@ -1502,17 +1525,12 @@ impl Executor {
         // Export full KV state for each module that supports it.
         let module_state: Vec<Option<storage::Snapshot>> =
             self.modules.iter().flatten().map(|m| m.export_state()).collect();
-        // Debug: verify the state root matches the recomputed aggregate.
-        // This is a sanity check for the snapshot's internal consistency.
-        let mut root_data = Vec::new();
-        for (_, root) in &module_roots {
-            root_data.extend_from_slice(root.as_bytes());
-        }
-        // Recompute the state root from the module roots and the
-        // nonce root. We always recompute (rather than using the
-        // stored root) because the stored root may be stale if the
-        // block hasn't been executed yet (async execution), and
-        // the HIGH fix binds the nonce root into the state root.
+        // C8: recompute the canonical aggregate — module roots +
+        // nonce root, the same definition `execute_block` uses. We
+        // always recompute (rather than using the stored root)
+        // because the stored root may be stale if the block hasn't
+        // been executed yet (async execution), and the nonce root
+        // binds `executed_nonces` into the commitment.
         let _ = state_root; // stored root may be stale; we recompute below
         let executed_nonces: Vec<(primitives::Address, u64)> = self
             .executed_nonce
@@ -1521,11 +1539,9 @@ impl Executor {
             .iter()
             .map(|(addr, nonce)| (*addr, *nonce))
             .collect();
-        // HIGH fix: compute the nonce root and bind it into the
-        // state root so `executed_nonces` are authenticated.
         let nonce_root = compute_nonce_root(&executed_nonces);
-        root_data.extend_from_slice(nonce_root.as_bytes());
-        let state_root = Hasher::hash_one(Domain::Block, &root_data);
+        let state_root =
+            canonical_state_root(module_roots.iter().map(|(_, root)| *root), nonce_root);
         ExecutorSnapshot {
             height,
             state_root,
@@ -1578,19 +1594,12 @@ impl Executor {
         }
 
         // Verify the snapshot's internal consistency: the state root
-        // must match the recomputed aggregate of the snapshot's own
-        // per-module state roots AND the nonce root. This catches
-        // corrupted or tampered snapshots without requiring the local
-        // modules to have the same state (the snapshot is from a
-        // peer, not local).
-        let mut root_data = Vec::new();
-        for (_, root) in &snapshot.module_roots {
-            root_data.extend_from_slice(root.as_bytes());
-        }
-        // HIGH fix: bind the nonce root into the state root so
-        // `executed_nonces` are authenticated. Without this, a
-        // crafted snapshot could zero or corrupt replay-protection
-        // nonces without detection.
+        // must match the recomputed canonical aggregate of the
+        // snapshot's own per-module state roots AND the nonce root
+        // (C8 — the same definition `execute_block` uses). This
+        // catches corrupted or tampered snapshots without requiring
+        // the local modules to have the same state (the snapshot is
+        // from a peer, not local).
         let recomputed_nonce_root = compute_nonce_root(&snapshot.executed_nonces);
         if recomputed_nonce_root != snapshot.nonce_root {
             return Err(SnapshotImportError::NonceRootMismatch {
@@ -1598,8 +1607,10 @@ impl Executor {
                 actual: recomputed_nonce_root,
             });
         }
-        root_data.extend_from_slice(recomputed_nonce_root.as_bytes());
-        let recomputed = Hasher::hash_one(Domain::Block, &root_data);
+        let recomputed = canonical_state_root(
+            snapshot.module_roots.iter().map(|(_, root)| *root),
+            recomputed_nonce_root,
+        );
         if recomputed != snapshot.state_root {
             return Err(SnapshotImportError::StateRootMismatch {
                 expected: snapshot.state_root,
@@ -2053,11 +2064,18 @@ impl Executor {
             module.record_block_attendance(block.height, &block.signers);
         }
 
-        // Compute the state root: hash all module state roots.
-        let mut root_data = Vec::new();
+        // Compute the state root: ONE canonical commitment (C8) over
+        // every module's canonical root plus the executed-nonce
+        // root — the same definition `export_snapshot` /
+        // `import_snapshot` use, so block, snapshot, and replay
+        // roots always agree. `local_nonce` already holds the
+        // post-block map (advanced as each tx passed continuity).
+        let post_block_nonces: Vec<(primitives::Address, u64)> =
+            local_nonce.iter().map(|(a, n)| (*a, *n)).collect();
+        let nonce_root = compute_nonce_root(&post_block_nonces);
+        let mut module_roots = Vec::new();
         for module in self.modules.iter().flatten() {
-            let mr = module.state_root();
-            root_data.extend_from_slice(mr.as_bytes());
+            module_roots.push(module.state_root());
         }
 
         // H4/H5: persist the updated nonce map. `local_nonce` was
@@ -2068,7 +2086,7 @@ impl Executor {
         *self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             local_nonce;
 
-        Hasher::hash_one(Domain::Block, &root_data)
+        canonical_state_root(module_roots, nonce_root)
     }
 }
 
@@ -2709,6 +2727,30 @@ mod tests {
         // The state root should be non-zero (the counter incremented).
         let attestation = executor.attest_state(Height::new(0));
         assert_ne!(attestation.root, Hash::ZERO);
+    }
+
+    #[test]
+    fn snapshot_root_matches_block_root() {
+        // C8: ONE canonical state-root definition. The root stored
+        // at finalize must equal the snapshot's recomputed root —
+        // both are `H(module_roots || nonce_root)`. Before the fix
+        // `execute_block` hashed module roots alone while
+        // `export_snapshot` appended the nonce root: two different
+        // commitments for the same state.
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        executor.ingest_tx(make_tx(1, &[42]));
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        let block =
+            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        executor.finalize_block(&block);
+        let block_root = executor.state_root_at(0);
+        let snapshot = executor.export_snapshot();
+        assert_eq!(
+            snapshot.state_root, block_root,
+            "snapshot and block must share one canonical root definition"
+        );
     }
 
     #[test]

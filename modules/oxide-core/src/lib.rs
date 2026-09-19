@@ -85,7 +85,13 @@ impl Module for CoreModule {
     }
 
     fn state_root(&self) -> Hash {
-        subtree_root(&self.store)
+        // C8: commit every field — the store only holds `height`;
+        // `current_epoch` lives in memory and must move the root.
+        let mut w = framework::CanonicalState::new();
+        w.put_root(&subtree_root(&self.store));
+        w.put_u64(*self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        w.put_u64(*self.current_epoch.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        w.root()
     }
 }
 

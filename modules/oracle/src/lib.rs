@@ -471,7 +471,42 @@ impl Module for OracleModule {
     }
 
     fn state_root(&self) -> Hash {
-        subtree_root(&self.store)
+        // C8: commit every future-affecting field. The store already
+        // mirrors marks/last_update/feeds, but committing the live
+        // maps directly keeps the invariant true even if a future
+        // field is added without a store mirror. `submissions` is
+        // intra-block state (cleared at `end_block`, so empty at
+        // commit time); it is committed anyway for uniformity.
+        // Excluded: `committee`/`sink` (assembly wiring).
+        let mut w = framework::CanonicalState::new();
+        w.put_root(&subtree_root(&self.store));
+        {
+            let marks = self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(marks.len());
+            for (m, p) in marks.iter() {
+                w.put_u8(*m).put_u64(*p);
+            }
+            let updates =
+                self.last_update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(updates.len());
+            for (m, h) in updates.iter() {
+                w.put_u8(*m).put_u64(*h);
+            }
+            let feeds = self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(feeds.len());
+            for f in feeds.iter() {
+                w.put_addr(f);
+            }
+            let subs = self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(subs.len());
+            for (m, feeders) in subs.iter() {
+                w.put_u8(*m).put_count(feeders.len());
+                for (f, p) in feeders {
+                    w.put_addr(f).put_u64(*p);
+                }
+            }
+        }
+        w.root()
     }
 }
 

@@ -524,7 +524,36 @@ impl Module for ExchangeModule {
     fn end_block(&self, _height: Height) {}
 
     fn state_root(&self) -> Hash {
-        subtree_root(&self.store)
+        // C8: commit EVERY field that can affect future execution.
+        // The KV store (market configs) is only part of it — the
+        // live order books decide future fills, cancels, and
+        // settlement, so identical roots across validators must
+        // prove identical books. Section order is fixed and
+        // consensus-critical.
+        //
+        // Excluded: `fills` (per-call scratch), `ledger` /
+        // `settlement_operator` (assembly wiring, not tx-mutated
+        // state).
+        let mut w = framework::CanonicalState::new();
+        w.put_root(&subtree_root(&self.store));
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries = Vec::new();
+        let mut book_bytes = Vec::new();
+        w.put_count(inner.markets.len());
+        for engine in &inner.markets {
+            match engine {
+                Some(e) => {
+                    w.put_u8(1);
+                    book_bytes.clear();
+                    e.write_canonical_state(&mut book_bytes, &mut entries);
+                    w.put_bytes(&book_bytes);
+                }
+                None => {
+                    w.put_u8(0);
+                }
+            }
+        }
+        w.root()
     }
 }
 
@@ -1295,21 +1324,43 @@ mod tests {
         let mid = ex.list_market(test_cfg()).unwrap();
         let root0 = ex.state_root();
 
-        // Rest an order — the engine is in-memory, but the module
-        // persists market configs. The state root does not change
-        // from order placement (only from market listing), because
-        // the live book is in RAM. This is by design until the
-        // journal/replay layer materializes the book.
+        // C8: a resting order is future-affecting state — it can
+        // match, be canceled, or settle — so it MUST move the state
+        // root even though the book lives in memory rather than the
+        // KV store. Identical roots across validators must prove
+        // identical books.
         let order = limit(Side::Buy, 400, 3, 1);
         ex.handle(&ctx(1), &msg::place(mid, order)).unwrap();
         let root1 = ex.state_root();
-        // The state root is the same because only market configs are
-        // persisted, not live orders. This will change when the
-        // journal integrates.
-        assert_eq!(
-            root0, root1,
-            "order placement does not change the persisted state root (journal integration pending)"
-        );
+        assert_ne!(root0, root1, "a resting order must change the state root");
+    }
+
+    #[test]
+    fn state_root_changes_after_cancel() {
+        let ex = ExchangeModule::new();
+        let mid = ex.list_market(test_cfg()).unwrap();
+        let order = limit(Side::Buy, 400, 3, 1);
+        let events = ex.handle(&ctx(1), &msg::place(mid, order)).unwrap();
+        let order_id = OrderId(u64::from_le_bytes(events[0].data[1..9].try_into().unwrap()));
+        let root0 = ex.state_root();
+        ex.handle(&ctx(1), &msg::cancel(mid, order_id)).unwrap();
+        let root1 = ex.state_root();
+        assert_ne!(root0, root1, "canceling a resting order must change the state root");
+    }
+
+    #[test]
+    fn state_root_changes_after_fill() {
+        let ex = ExchangeModule::new();
+        let mid = ex.list_market(test_cfg()).unwrap();
+        // Rest a 5-lot sell; a 3-lot taker buy partially consumes it
+        // — the surviving resting qty is different book state.
+        let maker = limit(Side::Sell, 500, 5, 9);
+        ex.handle(&ctx(9), &msg::place(mid, maker)).unwrap();
+        let root0 = ex.state_root();
+        let taker = limit(Side::Buy, 500, 3, 1);
+        ex.handle(&ctx(1), &msg::place(mid, taker)).unwrap();
+        let root1 = ex.state_root();
+        assert_ne!(root0, root1, "a fill must change the state root");
     }
 
     #[test]

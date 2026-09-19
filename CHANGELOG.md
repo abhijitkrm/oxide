@@ -1004,6 +1004,46 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **State roots did not authenticate the complete state machine:
+  live order books, positions, margin, marks, reward accumulators,
+  and pending validator changes were all invisible to the block
+  root — and the block and snapshot paths used two different root
+  definitions** (`modules/*`, `crates/executor`, `crates/trading`,
+  `modules/framework`)
+  - Almost every module's `state_root` hashed only its KV store,
+    while the state that decides future execution lived in memory:
+    exchange order books, perps positions/margin/marks/insurance/
+    order reservations, staking's ~15 maps (unbonding, reward
+    accumulators, pending validator changes, jails, attendance,
+    the scheduled halt), and governance tallies/finalized flags.
+    Identical roots across validators proved nothing about trading
+    or staking state.
+  - New `framework::CanonicalState` serializer: every module now
+    commits every future-affecting field in a fixed schema order
+    (derived caches, scratch buffers, construction config, and
+    wiring handles excluded). `MatchingEngine` gained
+    `write_canonical_state` — market config, order-id sequence,
+    and every resting order in canonical order (price-level
+    ascending, FIFO within level) — so book commitments cover
+    order priority itself.
+  - `execute_block` hashed module roots alone while
+    `export_snapshot` appended the nonce root — two different
+    commitments for the same state. A single
+    `canonical_state_root(module_roots, nonce_root)` now serves
+    block execution, snapshot export/import, and replay; the
+    block root stored at a height is byte-identical to the
+    snapshot root at that height. `SNAPSHOT_FORMAT_VERSION` bumps
+    to 3 (v2 roots were computed under the KV-only scheme).
+  - **In plain words:** the state root is the chain's fingerprint
+    that lets validators detect any divergence in what the chain
+    actually did. Previously it only fingerprinted a small slice
+    of state — two validators could hold completely different
+    order books or validator sets and still produce matching
+    fingerprints. Now the fingerprint covers everything that
+    affects what happens next: if any piece of trading, staking,
+    or governance state diverges anywhere, the roots diverge and
+    the disagreement is caught.
+
 - **Perpetuals lacked core financial invariants: realized PnL
   vanished, withdrawals ignored margin requirements, resting
   orders were unreserved, and liquidated accounts kept trading**
