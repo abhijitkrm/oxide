@@ -92,6 +92,52 @@ use trading::{
 /// Matches `modules/exchange/src/lib.rs`.
 const PRICE_SCALE: u128 = 100_000_000;
 
+/// Settlement arithmetic for a buy order's reservation (C6).
+///
+/// `reservation` was debited at admission: `limit_price × qty` for
+/// limit buys, the ask-ladder sweep bound for market buys — always
+/// the WORST CASE the taker could owe. This returns how much of it
+/// comes back:
+///
+/// - Fills cost their ACTUAL execution price (`fill.price`), not the
+///   limit — the difference is taker price improvement, refunded
+///   here. Each fill's quote is truncated at `/PRICE_SCALE` exactly
+///   the way the seller credits are computed, so buyer-out equals
+///   seller-in to the unit (no rounding drift).
+/// - A `Resting` outcome keeps `limit_price × resting_qty` held —
+///   precisely the amount `cancel_order` refunds later, exactly once.
+///   The resting remainder IS the reservation; the book is the
+///   reservation ledger.
+/// - Every other terminal outcome (`Filled`, `Killed`,
+///   `CanceledRemainder`, `Rejected`, engine `Err`) holds nothing —
+///   an IOC/FOK remainder is dead, not resting, so its reservation
+///   comes back in full.
+///
+/// `saturating_sub` guards the refund against arithmetic drift: a
+/// refund can never exceed what was actually debited.
+fn buy_reservation_refund(
+    reservation: u64,
+    limit_price: u64,
+    outcome: &OrderOutcome,
+    fills: &[FillEvent],
+) -> u64 {
+    let fill_cost: u64 = fills
+        .iter()
+        .map(|f| {
+            u64::try_from(u128::from(f.price.0) * u128::from(f.qty.0) / PRICE_SCALE)
+                .unwrap_or(u64::MAX)
+        })
+        .sum();
+    let held = match outcome {
+        OrderOutcome::Resting { resting_qty, .. } => {
+            u64::try_from(u128::from(limit_price) * u128::from(resting_qty.0) / PRICE_SCALE)
+                .unwrap_or(u64::MAX)
+        }
+        _ => 0,
+    };
+    reservation.saturating_sub(fill_cost.saturating_add(held))
+}
+
 /// A matched fill with settlement attribution.
 #[derive(Debug, Clone, Copy)]
 pub struct SettledFill {
@@ -351,21 +397,32 @@ impl MatchingServer {
             return OrderResponse::rejected(reason);
         }
 
-        // ── Balance check (buy orders only) ─────────────────────
-        // Buy orders pay `price * qty / PRICE_SCALE` in quote.
-        // This is the anti-spam gate: without sufficient balance,
-        // the order is rejected before it reaches the engine.
-        if req.side == Side::Buy && req.order_type != OrderType::Market {
-            let notional = u128::from(req.price.0) * u128::from(req.qty.0);
+        // ── Reservation (buy orders only) ───────────────────────
+        // Every buy debits its WORST-CASE quote cost up front:
+        // limit buys reserve `price × qty` (fills can only cost
+        // less — price improvement is refunded at settlement), and
+        // market buys reserve the ask-ladder sweep bound from
+        // `sweep_cost` (a market order pays whatever the book
+        // charges — skipping this reservation let unfunded takers
+        // drain makers, C6). The reservation is released piecewise
+        // at settlement via `buy_reservation_refund`: fills pay
+        // their actual price, a surviving resting remainder keeps
+        // `price × resting_qty` held (exactly what cancel refunds
+        // later — once), and dead remainders come back in full.
+        let mut reservation = 0u64;
+        if req.side == Side::Buy {
+            let notional = match req.order_type {
+                OrderType::Market => self.engine.sweep_cost(Side::Buy, req.qty.0, None),
+                _ => u128::from(req.price.0) * u128::from(req.qty.0),
+            };
             let quote_needed = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
             let available = self.balances.get(&req.owner);
             if available < quote_needed {
                 self.balance_rejections += 1;
                 return OrderResponse::rejected(RejectReason::InsufficientBalance);
             }
-            // Reserve the balance immediately (debit now; if the
-            // order is rejected by the engine, we credit back).
             self.balances.debit(&req.owner, quote_needed);
+            reservation = quote_needed;
         }
 
         // ── Build the order ─────────────────────────────────────
@@ -383,20 +440,20 @@ impl MatchingServer {
         self.fills.clear();
         let Ok(outcome) = self.engine.place(order, &mut self.fills) else {
             self.engine_rejections += 1;
-            // Credit back the reserved balance (buy orders only).
-            if req.side == Side::Buy && req.order_type != OrderType::Market {
-                let notional = u128::from(req.price.0) * u128::from(req.qty.0);
-                let quote_needed = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
-                self.balances.credit(&req.owner, quote_needed);
+            // Engine-level error: nothing matched, nothing rests —
+            // the whole reservation comes back.
+            if reservation > 0 {
+                self.balances.credit(&req.owner, reservation);
             }
             return OrderResponse::rejected(RejectReason::EngineError);
         };
 
         // ── Settle fills ─────────────────────────────────────────
-        // For each fill: credit the seller (sell orders receive
-        // quote). The buyer was already debited in the pre-check;
-        // if the fill is partial, we credit back the unfilled
-        // portion.
+        // For each fill: credit the seller. The buyer's side of the
+        // payment comes out of the reservation debited at admission
+        // (buy orders) — see `buy_reservation_refund` below. Sell
+        // takers simply receive quote; their fills' buyers are
+        // resting makers whose own reservations paid at rest.
         for f in &self.fills {
             self.fills_produced += 1;
             let notional = u128::from(f.price.0) * u128::from(f.qty.0);
@@ -419,15 +476,14 @@ impl MatchingServer {
             });
         }
 
-        // If the buy order was partially filled or rejected (e.g.
-        // FOK killed), credit back the unfilled portion.
-        if req.side == Side::Buy && req.order_type != OrderType::Market {
-            let filled_qty: u64 = self.fills.iter().map(|f| f.qty.0).sum();
-            let unfilled_qty = req.qty.0.saturating_sub(filled_qty);
-            if unfilled_qty > 0 {
-                let refund =
-                    u64::try_from(u128::from(req.price.0) * u128::from(unfilled_qty) / PRICE_SCALE)
-                        .unwrap_or(0);
+        // ── Release the reservation (buys) ──────────────────────
+        // Everything not consumed by fills (at their actual price)
+        // or held for a surviving resting remainder comes back —
+        // exactly once. A resting buy keeps `price × resting_qty`
+        // locked, which is what `cancel_order` refunds.
+        if reservation > 0 {
+            let refund = buy_reservation_refund(reservation, req.price.0, &outcome, &self.fills);
+            if refund > 0 {
                 self.balances.credit(&req.owner, refund);
             }
         }
@@ -443,14 +499,16 @@ impl MatchingServer {
                 OrderResponse::resting(order_id, fills_count)
             }
             OrderOutcome::Killed => {
-                // FOK killed — already credited back above.
+                // FOK killed — full reservation already refunded.
                 OrderResponse::rejected(RejectReason::Killed)
             }
-            OrderOutcome::CanceledRemainder { order_id, .. } => {
-                // Partial fill + resting remainder: the remainder
-                // is a new resting order.
-                self.risk.inc_resting(&req.owner);
-                OrderResponse::resting(order_id, fills_count)
+            OrderOutcome::CanceledRemainder { .. } => {
+                // IOC/FOK entry or an STP self-touch: the remainder
+                // is DEAD, not resting — no resting counter, and the
+                // response must not claim a live order id. Report it
+                // as a terminal fill result (partial fills are
+                // visible in `fills_count`).
+                OrderResponse::filled(fills_count)
             }
             OrderOutcome::Rejected(_) => {
                 self.engine_rejections += 1;
@@ -1695,16 +1753,24 @@ impl MarketWorker {
             return OrderResponse::rejected(reason);
         }
 
-        // ── Balance check (buy orders only) ─────────────────────
-        // Atomic check-and-debit under the shard lock — no TOCTOU
-        // race even if another market trades this account.
-        if req.side == Side::Buy && req.order_type != OrderType::Market {
-            let notional = u128::from(req.price.0) * u128::from(req.qty.0);
+        // ── Reservation (buy orders only) ───────────────────────
+        // Same accounting as `MatchingServer::execute_order`: limit
+        // buys reserve `price × qty`, market buys reserve the
+        // ask-ladder sweep bound (`sweep_cost`). Atomic
+        // check-and-debit under the shard lock — no TOCTOU race
+        // even if another market trades this account.
+        let mut reservation = 0u64;
+        if req.side == Side::Buy {
+            let notional = match req.order_type {
+                OrderType::Market => self.engine.sweep_cost(Side::Buy, req.qty.0, None),
+                _ => u128::from(req.price.0) * u128::from(req.qty.0),
+            };
             let quote_needed = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
             if !self.balances.check_and_debit(&req.owner, quote_needed) {
                 self.balance_rejections += 1;
                 return OrderResponse::rejected(RejectReason::InsufficientBalance);
             }
+            reservation = quote_needed;
         }
 
         // ── Build the order ─────────────────────────────────────
@@ -1722,18 +1788,19 @@ impl MarketWorker {
         self.fills.clear();
         let Ok(outcome) = self.engine.place(order, &mut self.fills) else {
             self.engine_rejections += 1;
-            // Credit back the reserved balance (buy orders only).
-            if req.side == Side::Buy && req.order_type != OrderType::Market {
-                let notional = u128::from(req.price.0) * u128::from(req.qty.0);
-                let quote_needed = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
-                self.balances.credit(&req.owner, quote_needed);
+            // Engine-level error: nothing matched, nothing rests —
+            // the whole reservation comes back.
+            if reservation > 0 {
+                self.balances.credit(&req.owner, reservation);
             }
             return OrderResponse::rejected(RejectReason::EngineError);
         };
 
         // ── Settle fills ─────────────────────────────────────────
-        // Credit the seller for each fill. The buyer was already
-        // debited in the pre-check; partial fills get a refund.
+        // Credit the seller for each fill (cross-shard if needed).
+        // The buyer's payment comes out of the reservation debited
+        // at admission — released piecewise below via
+        // `buy_reservation_refund`.
         for f in &self.fills {
             self.fills_produced += 1;
             let notional = u128::from(f.price.0) * u128::from(f.qty.0);
@@ -1743,7 +1810,6 @@ impl MarketWorker {
             } else {
                 (f.maker_owner, f.taker_owner)
             };
-            // Credit the seller (cross-shard if needed).
             self.balances.credit(&seller, quote_amount);
             // Accumulate for batch settlement.
             self.settlement_batch.push(SettledFill {
@@ -1756,14 +1822,14 @@ impl MarketWorker {
             });
         }
 
-        // Refund unfilled portion of buy orders.
-        if req.side == Side::Buy && req.order_type != OrderType::Market {
-            let filled_qty: u64 = self.fills.iter().map(|f| f.qty.0).sum();
-            let unfilled_qty = req.qty.0.saturating_sub(filled_qty);
-            if unfilled_qty > 0 {
-                let refund =
-                    u64::try_from(u128::from(req.price.0) * u128::from(unfilled_qty) / PRICE_SCALE)
-                        .unwrap_or(0);
+        // ── Release the reservation (buys) ──────────────────────
+        // Fills pay their actual price (improvement refunded), a
+        // surviving resting remainder keeps `price × resting_qty`
+        // held (exactly what cancel refunds — once), dead
+        // remainders come back in full.
+        if reservation > 0 {
+            let refund = buy_reservation_refund(reservation, req.price.0, &outcome, &self.fills);
+            if refund > 0 {
                 self.balances.credit(&req.owner, refund);
             }
         }
@@ -1772,13 +1838,17 @@ impl MarketWorker {
         let fills_count = u32::try_from(self.fills.len()).unwrap_or(u32::MAX);
         match outcome {
             OrderOutcome::Filled => OrderResponse::filled(fills_count),
-            OrderOutcome::Resting { order_id, .. }
-            | OrderOutcome::CanceledRemainder { order_id, .. } => {
-                // Both outcomes leave a resting remainder on the
-                // book — the account's resting-order risk counter
-                // tracks either.
+            OrderOutcome::Resting { order_id, .. } => {
+                // Track the new resting order for the resting-cap
+                // risk check.
                 self.risk.inc_resting(&req.owner);
                 OrderResponse::resting(order_id, fills_count)
+            }
+            OrderOutcome::CanceledRemainder { .. } => {
+                // IOC/FOK entry or STP self-touch: the remainder is
+                // DEAD, not resting — no resting counter, and the
+                // response must not claim a live order id.
+                OrderResponse::filled(fills_count)
             }
             OrderOutcome::Killed => OrderResponse::rejected(RejectReason::Killed),
             OrderOutcome::Rejected(_) => {
@@ -2404,6 +2474,201 @@ mod tests {
             responses[2].fills_count, 1,
             "index 2 (good buy) fills against the resting sell"
         );
+    }
+
+    // ── C6 regression tests: reservation accounting ─────────────
+
+    /// Regression (C6): a resting buy's reservation must STAY debited
+    /// while the order rests. The old code refunded `price * unfilled`
+    /// immediately — including the resting quantity — then `cancel`
+    /// refunded it again, minting balance out of nothing (buy at
+    /// `15_000`, cancel, end with `15_000` MORE than started).
+    #[test]
+    fn resting_buy_reservation_released_exactly_once() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&buyer, 100_000);
+
+        // GTC limit buy, nothing to match against — rests.
+        let req = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+        let resp = server.submit_order(&req);
+        assert!(!resp.rejected, "buy should rest");
+
+        // Reservation = 1.5e9 * 1_000 / 1e8 = 15_000. The balance
+        // must show the reservation is STILL held — if this shows
+        // 100_000, the cancel below will refund a second time.
+        let after_rest = server.balances.get(&buyer);
+        assert_eq!(
+            after_rest,
+            100_000 - 15_000,
+            "resting reservation must remain debited (got {after_rest})"
+        );
+
+        // Cancel via a signed action (nonce 1).
+        let cancel = signed_action(&buyer_sk, ActionType::Cancel, resp.order_id, 1);
+        let resp2 = server.submit_action(&cancel);
+        assert!(!resp2.rejected, "cancel should succeed");
+
+        // Conservation: started with 100_000, traded nothing —
+        // must end with exactly 100_000. The double-refund bug
+        // leaves 115_000.
+        assert_eq!(
+            server.balances.get(&buyer),
+            100_000,
+            "cancel must refund the reservation exactly once"
+        );
+    }
+
+    /// Regression (C6): price improvement must be refunded. A taker
+    /// limit buy debited at its LIMIT price but filled at a BETTER
+    /// maker price keeps the difference today — the reservation
+    /// silently overcharges the taker.
+    #[test]
+    fn price_improvement_is_refunded_to_taker() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&seller, 1_000_000_000);
+        server.fund_account(&buyer, 100_000);
+
+        // Maker rests a sell at 1.5e9.
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        server.submit_order(&maker);
+
+        // Taker buys with a 1.6e9 limit — fills at the maker's 1.5e9.
+        // Reservation debits 16_000; actual cost 15_000.
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_600_000_000, 1_000);
+        let resp = server.submit_order(&taker);
+        assert_eq!(resp.fills_count, 1, "taker should fill at maker price");
+
+        // The 1_000 improvement must come back.
+        assert_eq!(
+            server.balances.get(&buyer),
+            100_000 - 15_000,
+            "taker pays the fill price, not the limit price"
+        );
+        assert_eq!(
+            server.balances.get(&seller),
+            1_000_000_000 + 15_000,
+            "seller receives the fill price"
+        );
+    }
+
+    /// Regression (C6): market buys were never reserved — the
+    /// `!= Market` guard skipped the debit while fills still
+    /// credited sellers, minting quote on every market sweep.
+    /// An unfunded market buy must reject BEFORE touching the book;
+    /// a funded one must pay the actual sweep cost.
+    #[test]
+    fn market_buy_reserves_sweep_cost_and_settles() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (seller_sk, seller) = test_account(9);
+        let (poor_sk, poor) = test_account(2);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&seller, 1_000_000_000);
+        server.fund_account(&poor, 0);
+        server.fund_account(&buyer, 100_000);
+
+        // Maker rests a sell at 1.5e9.
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        server.submit_order(&maker);
+
+        // Unfunded market buy: must reject WITHOUT consuming the
+        // resting order.
+        let mut poor_req = signed_req(&poor_sk, 0, Side::Buy, 0, 0, 1_000);
+        poor_req.order_type = OrderType::Market;
+        poor_req.tif = TimeInForce::Ioc; // Market requires Ioc.
+        poor_req.price = Price(0);
+        // Re-sign after mutation (signature covers price/type).
+        crate::protocol::sign_order(&mut poor_req, &poor_sk);
+        let resp = server.submit_order(&poor_req);
+        assert!(resp.rejected, "unfunded market buy must reject");
+        assert_eq!(resp.reject_reason, Some(RejectReason::InsufficientBalance));
+        assert_eq!(server.resting_count(), 1, "the resting maker must survive a rejected sweep");
+
+        // Funded market buy: pays the actual sweep cost (15_000).
+        let mut mkt = signed_req(&buyer_sk, 0, Side::Buy, 0, 0, 1_000);
+        mkt.order_type = OrderType::Market;
+        mkt.tif = TimeInForce::Ioc;
+        mkt.price = Price(0);
+        crate::protocol::sign_order(&mut mkt, &buyer_sk);
+        let resp = server.submit_order(&mkt);
+        assert_eq!(resp.fills_count, 1, "market buy should sweep the ask");
+        assert_eq!(
+            server.balances.get(&buyer),
+            100_000 - 15_000,
+            "market taker pays the real fill cost"
+        );
+        assert_eq!(server.balances.get(&seller), 1_000_000_000 + 15_000);
+    }
+
+    /// Regression (C6): an IOC/FOK remainder is DEAD — it must not be
+    /// counted or reported as resting. `CanceledRemainder` was
+    /// mapped to `OrderResponse::resting` + `inc_resting`, inflating
+    /// the resting cap and telling the client a dead order is live.
+    #[test]
+    fn ioc_remainder_does_not_rest() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&seller, 1_000_000_000);
+        server.fund_account(&buyer, 100_000);
+
+        // Maker sells 1_000 (one lot); taker IOC buys 2_000 — fills
+        // 1_000, the remaining 1_000 must die, not rest.
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        server.submit_order(&maker);
+
+        let mut ioc = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 2_000);
+        ioc.tif = TimeInForce::Ioc;
+        crate::protocol::sign_order(&mut ioc, &buyer_sk);
+        let resp = server.submit_order(&ioc);
+        assert!(!resp.rejected);
+        assert_eq!(resp.fills_count, 1, "IOC fills the 1_000 available");
+
+        // The book must be empty and the resting counter at zero —
+        // the remainder was canceled by IOC semantics.
+        assert_eq!(server.resting_count(), 0, "IOC remainder must not rest");
+
+        // Reservation: debited 30_000, paid 15_000, remainder dead
+        // → 15_000 refunded (nothing stays reserved).
+        assert_eq!(
+            server.balances.get(&buyer),
+            100_000 - 15_000,
+            "dead remainder's reservation is fully refunded"
+        );
+    }
+
+    /// Regression (C6): a partially-filled buy that then rests holds
+    /// reservation ONLY for the resting remainder — and cancel
+    /// refunds exactly that, once.
+    #[test]
+    fn partial_fill_buy_holds_only_remainder_reservation() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&seller, 1_000_000_000);
+        server.fund_account(&buyer, 100_000);
+
+        // Maker sells 1_000; taker GTC buys 2_000 — fills 1_000,
+        // rests 1_000.
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        server.submit_order(&maker);
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 2_000);
+        let resp = server.submit_order(&taker);
+        assert_eq!(resp.fills_count, 1);
+
+        // Paid 1_000×15 = 15_000; still holds 1_000×15 = 15_000 reserved.
+        assert_eq!(
+            server.balances.get(&buyer),
+            100_000 - 15_000 - 15_000,
+            "paid fills + held remainder reservation"
+        );
+
+        // Cancel the remainder: 15_000 comes back exactly once.
+        let cancel = signed_action(&buyer_sk, ActionType::Cancel, resp.order_id, 1);
+        server.submit_action(&cancel);
+        assert_eq!(server.balances.get(&buyer), 100_000 - 15_000);
     }
 
     /// Regression (C5): `submit_batch` must route each verified order

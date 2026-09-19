@@ -15469,3 +15469,69 @@ Gates: 98 matcher tests + full workspace suite green; fmt + clippy
 `-D warnings` clean. New regressions: unsigned order/action,
 foreign-owner signature, replayed order/action, mixed batch
 position alignment, per-market batch routing.
+
+### Session 5 (cont.) — Audit C6: reservation accounting + atomic book/settlement on both matching surfaces
+
+The audit finding covered two surfaces with the same class of bug:
+the off-chain `matcher` crate and the on-chain `exchange` module.
+
+**Matcher (`crates/matcher`).** The reservation flow debited a buy's
+worst-case quote correctly but released it wrong:
+
+1. A resting (or partially filled) buy was refunded
+   `price × unfilled_qty` immediately — including the resting
+   quantity — and `cancel` then refunded it a second time. Balance
+   minted from nothing.
+2. Market buys skipped the debit entirely (`!= Market`), yet fills
+   still credited sellers — quote minted on every market buy.
+3. Price improvement was kept by the house: debited at limit,
+   settled at the maker's better price, difference never returned.
+4. `OrderOutcome::CanceledRemainder` (IOC dead remainder) was
+   counted as a live resting order — risk counters inflated, a dead
+   order id returned as if it rested.
+
+The fix rewrites `execute_order` (both `MatchingServer` and
+`MarketWorker` copies, sharing one `buy_reservation_refund` helper
+so they cannot diverge): limit buys reserve `price × qty`; market
+buys reserve `engine.sweep_cost` and are rejected unfunded before
+the book is touched. Post-match the release is
+`reservation − Σ fill notional − price × resting_qty` — fills pay
+their actual price, a GTC remainder keeps exactly its own
+reservation (which is precisely what `cancel` refunds, once), and
+IOC/FOK/Killed/Rejected remainders come back in full. Engine-`Err`
+paths refund the entire reservation. `CanceledRemainder` is a
+terminal outcome: no resting counter, no live order id.
+
+**Exchange (`modules/exchange`).** The same economic bug, plus a
+worse structural one: `handle_place` checked the taker's balance,
+called `engine.place` (mutating the in-memory book), then ran
+`ledger.transfer` per fill. The old comment claimed executor
+rollback would undo the book mutation on failure — it cannot:
+`Inner` lives behind a `Mutex` in module memory, invisible to the
+executor's state journal. A resting maker buy whose balance moved
+after resting was the concrete insolvency vector — a taker sell
+consumed the bid, the transfer failed, the maker's order vanished
+unpaid.
+
+The module now runs the same reservation discipline: a buy DEBITS
+its worst-case cost at admission (limit bound or sweep cost), a
+surviving remainder keeps `price × resting_qty` held, and cancel
+releases exactly that held amount, once. After `engine.place`
+nothing may fail — every post-place operation is a `credit`
+(seller proceeds, price improvement, dead-remainder refund) whose
+payer was already debited. The `map_err`s that remain guard
+invariants that are unreachable while they hold (fill notional ≤
+reservation → u64 range; credit overflow needs an account near
+u64::MAX while supply stays below it). `engine.place`'s `Err` arm
+refunds the full reservation before propagating.
+
+New regressions — matcher: reservation released exactly once,
+price improvement refunded, market-buy sweep reservation, IOC
+remainder non-resting, partial fill holds only remainder.
+Exchange: resting reservation held, cancel refunds once, maker
+fill pays from held reservation (funded with exactly the
+reservation — the old code's insolvency case), partial fill,
+IOC dead remainder, price improvement.
+
+Gates: 103 matcher + 32 exchange + full workspace suite green;
+fmt + clippy `-D warnings` clean.

@@ -1004,6 +1004,49 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Buy-order reservations could be refunded twice, market buys
+  were unreserved, and on-chain settlement could consume book
+  orders without payment** (`crates/matcher`,
+  `modules/exchange`)
+  - The matcher debited a buy's worst-case cost correctly but
+    released it wrong: a resting buy was refunded
+    `price × unfilled_qty` at placement *including the resting
+    quantity* — then `cancel` refunded the same reservation again.
+    Market buys skipped the debit entirely while their fills still
+    credited sellers. Both paths minted balance from nothing, and
+    price improvement (limit debited, maker price paid) was never
+    returned to the buyer.
+  - Matching now reserves before touching the book — limit buys at
+    `price × qty`, market buys at the actual sweep cost — and
+    releases `reservation − Σ fill notional − price × resting_qty`:
+    fills pay their real price, a surviving GTC remainder keeps
+    exactly its own reservation (which cancel refunds, once), and
+    dead remainders come back in full. IOC `CanceledRemainder`
+    outcomes are terminal: no resting counter, no phantom order id.
+  - The on-chain `exchange` module had the same economics plus a
+    structural hole: `engine.place` mutated the in-memory book, then
+    `ledger.transfer` ran per fill — and the module comment claimed
+    executor rollback would undo the book on failure. It cannot:
+    the engine lives behind a `Mutex`, outside the state journal. A
+    resting maker buy whose balance moved after resting could be
+    consumed by a fill whose transfer then failed.
+  - Exchange orders now follow the same reservation discipline: a
+    buy is debited its worst-case cost at admission, the resting
+    remainder holds `price × resting_qty`, and cancel releases
+    exactly that. After `engine.place` nothing may fail — every
+    post-place step is a `credit` whose payer was already debited,
+    and an engine-rejected order is refunded in full before the
+    error propagates.
+  - **In plain words:** two bugs let the exchange print money —
+    placing a buy and cancelling it could return more than was
+    deposited, and market buys spent nothing while sellers were
+    still paid. On-chain there was a worse version: a resting buy
+    could be filled *after* its owner's balance was spent
+    elsewhere, consuming the order with no payment. Both surfaces
+    now hold the money from the moment the order is accepted until
+    it is filled, cancelled, or killed — every reserved unit is
+    accounted for exactly once.
+
 - **Matcher admission now requires a valid Ed25519 signature bound
   to the account owner on every ingress path** (`crates/matcher`,
   `crates/crypto`, `bin/oxide-loadgen`)

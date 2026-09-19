@@ -467,7 +467,37 @@ impl Module for ExchangeModule {
                 }
 
                 match engine.cancel(order_id) {
-                    Ok(canceled) => Ok(vec![cancel_event(market, canceled)]),
+                    Ok(canceled) => {
+                        // Release the resting reservation (C6): a
+                        // resting buy holds `price × remaining_qty`
+                        // of quote debited since the order rested.
+                        // Cancel releases it — exactly once. A sell
+                        // rest unreserved (no base-asset tracking in
+                        // v0), so there is nothing to refund. The
+                        // credit cannot overflow: the refund returns
+                        // funds that were debited from this account.
+                        if canceled.side == Side::Buy {
+                            if let Some(ledger) = &self.ledger {
+                                let refund = u64::try_from(
+                                    u128::from(canceled.price.0) * u128::from(canceled.qty.0)
+                                        / PRICE_SCALE,
+                                )
+                                .map_err(|_| {
+                                    ExecError::ModuleRejected(
+                                        "cancel refund exceeds u64 quote range".to_string(),
+                                    )
+                                })?;
+                                if refund > 0 {
+                                    ledger.credit(&canceled.owner, refund).map_err(|_| {
+                                        ExecError::ModuleRejected(
+                                            "cancel refund failed".to_string(),
+                                        )
+                                    })?;
+                                }
+                            }
+                        }
+                        Ok(vec![cancel_event(market, canceled)])
+                    }
                     Err(TradingError::OrderNotFound) => {
                         Err(ExecError::ModuleRejected("cancel: order not found".to_string()))
                     }
@@ -524,47 +554,64 @@ impl ExchangeModule {
             return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
         };
 
-        // Pre-trade risk check (plan.md §9.2): if the ledger
-        // is wired, verify the buyer has enough quote balance for
-        // the worst-case fill. Buy orders pay `price * qty`;
-        // sell orders receive quote (no pre-check needed for v0
-        // — base-asset tracking is deferred).
+        // Reservation (C6): if the ledger is wired, a buy order
+        // DEBITS its worst-case quote cost up front — this is a
+        // reservation, not a check. Limit buys reserve
+        // `price × qty` (fills can only cost less); market buys
+        // reserve the real sweep cost of `qty` through the ask
+        // ladder (`engine.sweep_cost`) — a market order has no
+        // limit, so `price × qty` would be meaningless. Without a
+        // reservation an unfunded taker could sweep the book and
+        // leave every fill unsettled.
         //
-        // Market buys have no limit price, so `price * qty` is
-        // meaningless — the worst case is the actual sweep
-        // cost of `qty` through the ask ladder, computed by
-        // `engine.sweep_cost`. Without this check an unfunded
-        // taker could sweep the book and leave every fill
-        // unsettled (makers' orders consumed, no payment).
+        // The reservation is released piecewise at settlement:
+        // fills pay their actual price, a surviving resting
+        // remainder keeps `price × resting_qty` held — which is
+        // exactly what `TAG_CANCEL` refunds later, exactly once.
+        // Resting buy orders ARE the reservation ledger: a maker
+        // fill pays from quote already debited at rest time, so
+        // settlement below cannot fail on insolvency.
+        let mut reservation = 0u64;
         if let Some(ledger) = &self.ledger {
             if order.side == Side::Buy {
-                // Scale-14 notional: limit buys use the
-                // worst-case `price × qty` bound (fills can
-                // only cost less); market buys use the real
-                // sweep cost.
+                // Scale-14 notional → scale-6 quote. Reject rather
+                // than cap on u64 overflow — saturating would
+                // silently change what the buyer pays.
                 let notional = match order.order_type {
                     OrderType::Market => engine.sweep_cost(Side::Buy, order.qty.0, None),
                     _ => u128::from(order.price.0) * u128::from(order.qty.0),
                 };
-                // Reject rather than cap when the quote amount
-                // exceeds u64 — a saturating conversion would
-                // silently change what the buyer pays.
                 let quote_needed = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
                     ExecError::ModuleRejected("buy notional exceeds u64 quote range".to_string())
                 })?;
-                if ledger.balance(&ctx.sender) < quote_needed {
-                    return Err(ExecError::ModuleRejected(
-                        "insufficient balance for buy order".to_string(),
-                    ));
-                }
+                // Debit up front — fails here, BEFORE the book is
+                // touched, on insufficient funds.
+                ledger.debit(&ctx.sender, quote_needed).map_err(|_| {
+                    ExecError::ModuleRejected("insufficient balance for buy order".to_string())
+                })?;
+                reservation = quote_needed;
             }
         }
 
         // Reuse the fill buffer across calls — zero alloc.
         fills.clear();
-        let outcome = engine
-            .place(order, fills)
-            .map_err(|e| ExecError::ModuleRejected(format!("engine: {e}")))?;
+        let outcome = match engine.place(order, fills) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Engine rejected the order — nothing matched and
+                // nothing rests, so the full reservation comes back.
+                // Crediting the account we just debited cannot
+                // overflow; the map_err is defensive.
+                if reservation > 0 {
+                    if let Some(ledger) = &self.ledger {
+                        ledger.credit(&ctx.sender, reservation).map_err(|_| {
+                            ExecError::ModuleRejected("engine-reject refund failed".to_string())
+                        })?;
+                    }
+                }
+                return Err(ExecError::ModuleRejected(format!("engine: {e}")));
+            }
+        };
 
         // Emit one event per fill + one for the outcome.
         let mut events = Vec::with_capacity(fills.len() + 1);
@@ -572,39 +619,62 @@ impl ExchangeModule {
             events.push(fill_event(*f));
         }
 
-        // Settlement (plan.md §9.2): for each fill, debit the
-        // buyer and credit the seller. The quote amount is
-        // `notional / PRICE_SCALE` (scale-14 → scale-6).
-        //
-        // C8 fix: if any settlement transfer fails, return `Err`
-        // immediately. The executor's per-transaction state cache
-        // will roll back the order-book mutation from `engine.place`,
-        // preventing a "free fill" where the buyer gets the fill
-        // but no funds move. Before the fix, a failed transfer
-        // emitted a `settlement_failed` event but the fill stood —
-        // the maker lost their resting order without receiving
-        // payment, and the buyer kept their balance.
+        // Settlement (plan.md §9.2, C6): the payer's side of every
+        // fill was ALREADY debited — the taker via the reservation
+        // above, a resting maker buy via the reservation it has held
+        // since it rested. So each fill only needs `credit(seller)`:
+        // no debit can fail here, which is the point — the book
+        // mutation above is NOT rolled back on a post-`place` error
+        // (the engine lives in module memory, invisible to the
+        // executor's state journal), so nothing after `place` may
+        // fail. The remaining `map_err`s guard invariants that are
+        // unreachable while they hold: per-fill notional ≤ the
+        // debited reservation (u64 range), and credit overflow only
+        // if an account approaches u64::MAX — impossible while total
+        // supply stays below it (enforced at mint/genesis).
         if let Some(ledger) = &self.ledger {
             for f in fills.iter() {
                 let notional = u128::from(f.price.0) * u128::from(f.qty.0);
-                // An over-u64 quote cannot transfer — reject the
-                // entire transaction rather than silently capping
-                // the amount moved.
-                let Ok(quote_amount) = u64::try_from(notional / PRICE_SCALE) else {
-                    return Err(ExecError::ModuleRejected(format!(
-                        "fill notional exceeds u64 quote range (market {market})"
-                    )));
-                };
-                let (buyer, seller) = if f.taker_side == Side::Buy {
-                    (f.taker_owner, f.maker_owner)
-                } else {
-                    (f.maker_owner, f.taker_owner)
-                };
-                ledger.transfer(&buyer, &seller, quote_amount).map_err(|_| {
+                let quote_amount = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
                     ExecError::ModuleRejected(format!(
-                        "settlement transfer failed (market {market})"
+                        "fill notional exceeds u64 quote range (market {market})"
                     ))
                 })?;
+                // The seller is whichever party did NOT pay the
+                // quote: the maker when the taker bought, the taker
+                // when the taker sold.
+                let seller = if f.taker_side == Side::Buy { f.maker_owner } else { f.taker_owner };
+                ledger.credit(&seller, quote_amount).map_err(|_| {
+                    ExecError::ModuleRejected(format!("settlement credit failed (market {market})"))
+                })?;
+            }
+
+            // Release the taker's reservation: fills the taker BOUGHT
+            // cost their actual fill price (improvement refunded), a
+            // surviving GTC remainder keeps `price × resting_qty`
+            // held for the cancel path, and dead remainders
+            // (IOC/FOK/Killed/Rejected) come back in full.
+            if reservation > 0 {
+                let taker_paid: u64 = fills
+                    .iter()
+                    .map(|f| {
+                        u64::try_from(u128::from(f.price.0) * u128::from(f.qty.0) / PRICE_SCALE)
+                            .unwrap_or(u64::MAX)
+                    })
+                    .sum();
+                let held = match outcome {
+                    OrderOutcome::Resting { resting_qty, .. } => u64::try_from(
+                        u128::from(order.price.0) * u128::from(resting_qty.0) / PRICE_SCALE,
+                    )
+                    .unwrap_or(u64::MAX),
+                    _ => 0,
+                };
+                let refund = reservation.saturating_sub(taker_paid.saturating_add(held));
+                if refund > 0 {
+                    ledger.credit(&ctx.sender, refund).map_err(|_| {
+                        ExecError::ModuleRejected("reservation refund failed".to_string())
+                    })?;
+                }
             }
         }
 
@@ -1765,5 +1835,142 @@ mod tests {
         // Nothing matched — both makers still rest, no funds moved.
         assert_eq!(ex.resting_count(mid), 2);
         assert_eq!(ledger.balance(&addr(1)), 20_000);
+    }
+
+    // ── Reservation accounting (C6) ────────────────────────────────
+
+    /// A resting buy locks its worst-case quote cost at admission:
+    /// `price × qty` leaves the account the moment the order rests,
+    /// not when a later taker arrives.
+    #[test]
+    fn resting_buy_holds_reservation() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+
+        // Rest a buy: tick 500 ($15.00), 1 lot → reserve 15_000.
+        let events = ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        assert_eq!(events[0].kind, "resting");
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 15_000);
+    }
+
+    /// Cancelling a resting buy releases exactly the held
+    /// reservation, exactly once — a second cancel is not found, so
+    /// the refund cannot be collected twice.
+    #[test]
+    fn cancel_resting_buy_refunds_reservation_once() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+
+        let events = ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 2, 1))).unwrap();
+        let order_id = OrderId(u64::from_le_bytes(events[0].data[1..9].try_into().unwrap()));
+        // Reservation = 2 lots × 15_000 = 30_000.
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 30_000);
+
+        ex.handle(&ctx(1), &msg::cancel(mid, order_id)).unwrap();
+        assert_eq!(
+            ledger.balance(&addr(1)),
+            1_000_000_000_000,
+            "cancel must return the held reservation"
+        );
+
+        // Second cancel: the order is gone — no double refund.
+        let err = ex.handle(&ctx(1), &msg::cancel(mid, order_id)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000);
+    }
+
+    /// The core C6 invariant: a maker buy pays from the reservation
+    /// it held since resting. Fund the maker with EXACTLY the
+    /// reservation — under the old settle-by-transfer design this is
+    /// where insolvency surfaced post-place (book consumed, transfer
+    /// failed). Now settlement is credit-only and cannot fail.
+    #[test]
+    fn maker_buy_fill_pays_from_held_reservation() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        // Maker has EXACTLY the reservation: 1 lot @ $15 = 15_000.
+        ledger.mint(&addr(5), 15_000);
+        ledger.mint(&addr(9), 1_000_000_000_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.list_market(test_cfg()).unwrap();
+        let mid = 0;
+
+        // Maker rests the buy — balance drops to zero (fully reserved).
+        ex.handle(&ctx(5), &msg::place(mid, limit(Side::Buy, 500, 1, 5))).unwrap();
+        assert_eq!(ledger.balance(&addr(5)), 0);
+
+        // Taker sell fills the maker's bid. The seller must receive
+        // 15_000 even though the buyer's free balance is 0 — the
+        // money comes from the held reservation.
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000);
+        assert_eq!(ledger.balance(&addr(5)), 0, "buyer paid at rest, not at fill");
+        assert_eq!(ex.resting_count(mid), 0);
+    }
+
+    /// A partially filled buy releases the filled portion's
+    /// reservation and keeps only `price × resting_qty` held. The
+    /// held remainder is what a later cancel refunds.
+    #[test]
+    fn partial_fill_buy_holds_only_remainder_reservation() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+
+        // Maker sell: 1 lot @ tick 500 ($15.00).
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+
+        // Taker GTC buy 2 lots @ 500: fills 1 (15_000), rests 1
+        // (15_000 held). Reservation was 30_000; refund 0.
+        let events = ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 2, 1))).unwrap();
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 30_000);
+        let resting_ev = events.iter().find(|e| e.kind == "resting").expect("remainder rests");
+        let order_id = OrderId(u64::from_le_bytes(resting_ev.data[1..9].try_into().unwrap()));
+
+        // Cancel the resting remainder — releases the held 15_000.
+        ex.handle(&ctx(1), &msg::cancel(mid, order_id)).unwrap();
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 15_000);
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000);
+    }
+
+    /// An IOC buy's dead remainder is released in full — nothing is
+    /// held for an order that cannot rest.
+    #[test]
+    fn ioc_buy_refunds_dead_remainder() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+
+        // Maker sell: 1 lot @ tick 500.
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+
+        // IOC buy 2 lots @ 500: fills 1 (15_000), remainder dies.
+        // Reserved 30_000, paid 15_000, held 0 → refund 15_000.
+        let ioc = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Ioc,
+            price: Price(1_500_000_000),
+            qty: Qty(2_000),
+            owner: addr(1),
+            stp: StpMode::None,
+        };
+        ex.handle(&ctx(1), &msg::place(mid, ioc)).unwrap();
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 15_000);
+        assert_eq!(ex.resting_count(mid), 0);
+    }
+
+    /// Price improvement is refunded: a limit buy pays the maker's
+    /// (better) price, not its own limit.
+    #[test]
+    fn limit_buy_price_improvement_refunded() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+
+        // Maker sell @ tick 500 ($15.00); taker bids tick 600
+        // ($16.00) — fills at $15.00, not $16.00.
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 600, 1, 1))).unwrap();
+
+        // Reserved 16_000, paid 15_000 → net 15_000 gone.
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 15_000);
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000);
     }
 }
