@@ -1004,6 +1004,26 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **A validator could emit consensus signatures whose
+  anti-equivocation state was never durably recorded: the WAL
+  append ignored write/fsync errors, and leader self-votes were
+  hand-built outside the engine's signing path** (`crates/consensus`,
+  `bin/oxide-validator`, `crates/devnet`, `sim`)
+  - A failed WAL append now latches `wal_failed` and takes the
+    validator fully silent — no vote, timeout, attestation, or
+    proposal signature leaves the engine until it is restarted on
+    healthy storage (the new `OxideBft::signing_healthy()` reports
+    the latch).
+  - Single-validator mode (`step`) previously signed *before*
+    updating its vote locks and never appended the WAL for the
+    self-vote; it now records locks, persists, then signs.
+  - Every honest leader self-vote now goes through
+    `engine.vote()` — the single signing authority — so the
+    per-height lock and WAL entry are always durable before the
+    signature exists.
+  - In plain words: if a validator's disk can't record that it
+    voted, the validator now refuses to vote instead of risking a
+    double-vote after a restart.
 - **Privileged actions required only one validator's signature:
   any single member could add/remove validators, slash, schedule
   a halt, force perps marks and funding, and rewrite the oracle

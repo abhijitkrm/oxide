@@ -248,6 +248,12 @@ pub struct Wal {
     /// buffering, each `append` would issue a `write` syscall per
     /// entry).
     writer: BufWriter<File>,
+    /// Fault-injection latch for tests: when set, `append` fails
+    /// without touching the file. Engine tests use it to exercise
+    /// the C10 fail-closed signing path on platforms where no
+    /// always-failing device (`/dev/full`) is reachable from the
+    /// sandbox.
+    poisoned: bool,
 }
 
 impl Wal {
@@ -266,7 +272,16 @@ impl Wal {
             .read(true)
             .open(&path)
             .map_err(WalError::Open)?;
-        Ok(Self { path, writer: BufWriter::new(file) })
+        Ok(Self { path, writer: BufWriter::new(file), poisoned: false })
+    }
+
+    /// Fault-injection hook for tests: after `poison`, every
+    /// `append` fails with an I/O error. Permanent for the life of
+    /// this `Wal` — matching how a real disk failure presents to
+    /// the engine.
+    #[doc(hidden)]
+    pub fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     /// Append a WAL entry and fsync it to disk.
@@ -279,6 +294,11 @@ impl Wal {
     ///
     /// Returns [`WalError::Io`] if the write or fsync fails.
     pub fn append(&mut self, entry: &WalEntry) -> Result<(), WalError> {
+        // Fault-injection latch (tests only): fail before touching
+        // the file, the same outcome an ENOSPC write produces.
+        if self.poisoned {
+            return Err(WalError::Io(std::io::Error::other("WAL poisoned")));
+        }
         // Encode the entry payload.
         let mut payload = Vec::with_capacity(256);
         entry.encode(&mut payload);

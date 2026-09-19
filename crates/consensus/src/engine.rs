@@ -471,6 +471,14 @@ pub struct OxideBft {
     /// the network. On restart, call [`OxideBft::recover_from_wal`]
     /// to restore safety-critical state.
     wal: Option<crate::wal::Wal>,
+    /// C10 fix: fail-closed signing latch. Set the first time a WAL
+    /// append reports an error and never cleared in-process: a
+    /// signature emitted while its anti-equivocation state might not
+    /// be durable can equivocate after a restart, so a WAL-failed
+    /// engine refuses to sign — vote, timeout, attestation, and
+    /// proposal signatures are all withheld until the operator
+    /// restarts the validator on healthy storage.
+    wal_failed: bool,
 }
 
 impl OxideBft {
@@ -530,6 +538,7 @@ impl OxideBft {
             // — the aggregate verification catches any forged votes.
             verify_per_vote: false,
             wal: None,
+            wal_failed: false,
         }
     }
 
@@ -649,27 +658,64 @@ impl OxideBft {
     }
 
     /// Append the current state to the WAL (if attached).
-    /// Called after every vote and QC delivery.
-    fn append_wal(&mut self) {
-        if let Some(ref mut wal) = self.wal {
-            // Build the entry first to avoid borrowing self while
-            // the WAL is mutably borrowed.
-            let entry = crate::wal::WalEntry {
-                last_voted_view: self.last_voted_view,
-                voted_at_height: self.voted_at_height.clone(),
-                high_qc: self.high_qc.clone(),
-                current_view: self.current_view,
-                next_height: self.next_height,
-                epoch: self.epoch,
-                last_committed: self.last_committed,
-            };
-            // If the WAL append fails, the engine continues —
-            // the vote is already in memory. A WAL failure means
-            // restart safety is compromised, but the current
-            // round should not stall. The operator should monitor
-            // WAL errors and restart the node if they persist.
-            let _ = wal.append(&entry);
+    ///
+    /// Called after every vote-lock update, QC adoption, commit, and
+    /// epoch rotation — always BEFORE any signature that depends on
+    /// the new state is emitted.
+    ///
+    /// C10 fix: a failed append latches [`Self::wal_failed`] and
+    /// alerts on stderr. From then on no signature leaves this
+    /// engine — a vote, timeout, attestation, or proposal signed
+    /// while its anti-equivocation state is undurable can equivocate
+    /// after a restart. The latch is permanent for the process:
+    /// WAL failures indicate failing storage, and the safe remedy is
+    /// an operator restart on healthy media, not silent retry.
+    ///
+    /// # Errors
+    /// Returns [`crate::wal::WalError`] when the append (or its
+    /// fsync) fails. With no WAL attached this is a no-op `Ok(())`
+    /// — WAL-less engines (tests, sims, conformance runs) keep
+    /// their previous best-effort semantics.
+    fn append_wal(&mut self) -> Result<(), crate::wal::WalError> {
+        let Some(ref mut wal) = self.wal else {
+            return Ok(());
+        };
+        // Build the entry first to avoid borrowing self while
+        // the WAL is mutably borrowed.
+        let entry = crate::wal::WalEntry {
+            last_voted_view: self.last_voted_view,
+            voted_at_height: self.voted_at_height.clone(),
+            high_qc: self.high_qc.clone(),
+            current_view: self.current_view,
+            next_height: self.next_height,
+            epoch: self.epoch,
+            last_committed: self.last_committed,
+        };
+        match wal.append(&entry) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Latch + alert once: repeated failures of a dead
+                // disk would otherwise spam stderr every view.
+                if !self.wal_failed {
+                    self.wal_failed = true;
+                    eprintln!(
+                        "oxideBFT: WAL append failed ({err}) — validator signing disabled; \
+                         restart on healthy storage"
+                    );
+                }
+                Err(err)
+            }
         }
+    }
+
+    /// Whether this engine may still emit signatures. `false` once a
+    /// WAL append has failed (C10): durable signing must not fail
+    /// open, so a WAL-failed validator goes silent and stays silent
+    /// until restarted on healthy storage. Always `true` for engines
+    /// with no WAL attached — they never promised durability.
+    #[must_use]
+    pub fn signing_healthy(&self) -> bool {
+        !self.wal_failed
     }
 
     /// The budget the engine uses when assembling proposals. Ceiling 1:
@@ -798,8 +844,9 @@ impl OxideBft {
         // next vote would otherwise restore the old epoch's locks
         // from the WAL and wedge the new epoch's first heights (the
         // new chain continues from `last_committed`, so those stale
-        // entries can never be released by a commit).
-        self.append_wal();
+        // entries can never be released by a commit). A failure here
+        // latches `wal_failed` — signing stays disabled from now on.
+        let _ = self.append_wal();
         // Reset the pacemaker for the new epoch.
         self.pacemaker =
             crate::pacemaker::Pacemaker::new(self.validator_set.clone(), View::new(0), self.epoch);
@@ -1316,6 +1363,13 @@ impl OxideBft {
     /// implementation could trigger this, so panicking would give an
     /// attacker a trivial network-kill vector.
     pub fn propose(&mut self) -> Option<(BlockHeader, Proposal)> {
+        // C10: a proposal carries the leader's `proposer_signature` —
+        // it is a signature, so a WAL-failed validator must not
+        // produce one. Going silent lets the view time out and a
+        // healthy leader take over.
+        if self.wal_failed {
+            return None;
+        }
         let proposal = self.app.prepare_proposal(&Self::BUDGET);
         let has_pending_txs = !proposal.txs.is_empty();
         // Liveness gate: the leader stays silent only when no work
@@ -1864,9 +1918,19 @@ impl OxideBft {
         // sent but before the WAL is written, a restart could
         // double-vote or vote for a conflicting block. The WAL
         // append fsyncs before returning, ensuring durability.
-        self.append_wal();
-        // Sign the vote (stage 5: real BLS if key is set).
-        let signature = self.sign_vote(header.view, block_hash);
+        //
+        // C10 fix: the append must succeed for the vote to exist at
+        // all. A signature emitted while its locks might be
+        // undurable can equivocate after a restart, so a failed
+        // append withholds the vote entirely (and latches
+        // `wal_failed` for everything that follows).
+        if self.append_wal().is_err() {
+            return None;
+        }
+        // Sign the vote (stage 5: real BLS if key is set). The
+        // `wal_failed` latch gates inside `sign_vote` too, so no
+        // path can emit a signature after a durability failure.
+        let signature = self.sign_vote(header.view, block_hash)?;
         // Attach the newest execution attestation — the divergence-
         // detection input leaders aggregate into `ExecCertificate`s.
         let (attestation, attestation_sig) = self.build_attestation();
@@ -1980,6 +2044,11 @@ impl OxideBft {
     /// Sign a vote with this engine's BLS secret key. If no key is set
     /// (conformance mode), returns `Signature::ZERO`.
     ///
+    /// Returns `None` when `wal_failed` is latched (C10): the engine
+    /// is the single signing authority for every vote it emits, and
+    /// no signature may leave while the durability of its
+    /// anti-equivocation state is in doubt.
+    ///
     /// # Signed message (C3 fix)
     ///
     /// The signed message binds `(view, phase, block_hash, epoch)` to
@@ -1987,15 +2056,18 @@ impl OxideBft {
     /// signature cannot be reused as a `PreCommit` or `Commit` vote because
     /// the phase byte differs. A vote from epoch 0 cannot be replayed
     /// in epoch 1 because the epoch bytes differ.
-    fn sign_vote(&self, view: View, block_hash: Hash) -> Signature {
-        match &self.secret_key {
+    fn sign_vote(&self, view: View, block_hash: Hash) -> Option<Signature> {
+        if self.wal_failed {
+            return None;
+        }
+        Some(match &self.secret_key {
             Some(sk) => {
                 let phase_byte = Self::current_phase_byte();
                 let msg = self.vote_signing_message(view, phase_byte, &block_hash);
                 sk.sign(crypto::hash::Domain::Vote, &msg)
             }
             None => Signature::ZERO,
-        }
+        })
     }
 
     /// The message a validator signs for an execution attestation:
@@ -2030,6 +2102,12 @@ impl OxideBft {
     }
 
     fn build_attestation(&mut self) -> (Option<StateAttestation>, Option<Signature>) {
+        // C10: an attestation is a signature too — a WAL-failed
+        // validator goes fully silent rather than emitting any
+        // signature whose surrounding safety state is undurable.
+        if self.wal_failed {
+            return (None, None);
+        }
         let att = self.app.attest_latest();
         if att.root == Hash::ZERO {
             return (None, None);
@@ -2399,8 +2477,9 @@ impl OxideBft {
         // C9 fix: persist the updated high_qc to the WAL. A
         // restarted validator must propose from the correct
         // high_qc; without persistence, it could propose a stale
-        // fork.
-        self.append_wal();
+        // fork. A failure latches `wal_failed` (C10) — this engine
+        // must not sign again until restarted on healthy storage.
+        let _ = self.append_wal();
 
         // Catch-up: if the QC's view is higher than our current view,
         // advance our view to qc.view + 1. This lets a restarted or
@@ -2640,7 +2719,10 @@ impl OxideBft {
         // collide with it (or worse, a `None` restore would accept
         // a forged genesis chain in a later epoch).
         self.last_committed = Some((block_hash, header.height));
-        self.append_wal();
+        // A failed append latches `wal_failed` (C10): the commit is
+        // already real in memory and cannot be undone, but signing
+        // must stop — durable state may now trail emitted signatures.
+        let _ = self.append_wal();
         // Prune per-height vote locks at-or-below the committed
         // height: a finalized prefix cannot be forked, so the lock
         // is no longer needed. Keeps the map bounded by the number
@@ -2757,6 +2839,13 @@ impl OxideBft {
     /// The signed message binds `(view, epoch)` to prevent replay
     /// across epochs (M1 fix). The domain is `Timeout`.
     pub fn on_timeout(&mut self) -> Option<Signature> {
+        // C10: refuse to sign while the WAL latch is set. Timeout
+        // signatures are deterministic per (view, epoch) — a re-sign
+        // can never equivocate — but a validator that cannot trust
+        // its durability layer must not participate at all.
+        if self.wal_failed {
+            return None;
+        }
         let _ = self.pacemaker.on_local_timeout();
         match &self.secret_key {
             Some(sk) => {
@@ -2983,8 +3072,22 @@ impl OxideBft {
         };
         let block_hash = Self::block_hash(&header);
 
-        // Self-vote (stage 5: real BLS if key is set).
-        let signature = self.sign_vote(self.current_view, block_hash);
+        // Self-vote — same durable order as `vote_if_eligible`
+        // (C10): record the locks, persist them, and only then sign.
+        // The old order signed first and never appended the WAL, so
+        // a crash after the signature left restart state unaware the
+        // vote was ever cast.
+        self.last_voted_view = Some(self.current_view);
+        // Record the per-height lock for the self-vote as well.
+        self.voted_at_height.insert(header.height.value(), block_hash);
+        if self.append_wal().is_err() {
+            // Durability failed: withhold the vote entirely — no
+            // signature may leave while its locks are undurable.
+            return false;
+        }
+        let Some(signature) = self.sign_vote(self.current_view, block_hash) else {
+            return false;
+        };
         let (attestation, attestation_sig) = self.build_attestation();
         let vote = Vote {
             view: self.current_view,
@@ -2994,9 +3097,6 @@ impl OxideBft {
             attestation,
             attestation_sig,
         };
-        self.last_voted_view = Some(self.current_view);
-        // Record the per-height lock for the self-vote as well.
-        self.voted_at_height.insert(header.height.value(), block_hash);
 
         // Form QC (single validator: quorum = 1). Stage 5: aggregate
         // the real signature(s) if a key is set.
@@ -3216,19 +3316,14 @@ mod tests {
 
         // 1. Leader proposes.
         let (header, proposal) = leader.propose().expect("leader should propose");
-        let block_hash = OxideBft::block_hash(&header);
 
-        // 2. Leader self-votes.
+        // 2. Leader self-votes through `vote()` — the single signing
+        // authority (C10): locks + WAL update precede the signature,
+        // same as for followers.
         let leader_idx = leader.validator_index;
-        let leader_vote = Vote {
-            view: header.view,
-            phase: VotePhase::Prepare,
-            block_hash,
-            signature: Signature::ZERO,
-            attestation: None,
-            attestation_sig: None,
-        };
-        leader.collect_vote(leader_idx, leader_vote).expect("conformance: no verification");
+        if let Some(leader_vote) = leader.vote(&header, &proposal) {
+            leader.collect_vote(leader_idx, leader_vote).expect("conformance: no verification");
+        }
 
         // 3. Followers vote.
         for (i, follower) in followers.iter_mut().enumerate() {
@@ -3277,21 +3372,13 @@ mod tests {
         }
         let (header, proposal) = leader.propose().expect("leader should propose");
         let block_hash = OxideBft::block_hash(&header);
-        // Leader self-vote — it produced the body (complete path).
+        // Leader self-vote through `vote()` — the single signing
+        // authority (C10): locks + WAL update precede the signature.
+        // It produced the body, so the complete path applies.
         let leader_idx = leader.validator_index;
-        leader
-            .collect_vote(
-                leader_idx,
-                Vote {
-                    view: header.view,
-                    phase: VotePhase::Prepare,
-                    block_hash,
-                    signature: Signature::ZERO,
-                    attestation: None,
-                    attestation_sig: None,
-                },
-            )
-            .expect("conformance: no verification");
+        if let Some(leader_vote) = leader.vote(&header, &proposal) {
+            leader.collect_vote(leader_idx, leader_vote).expect("conformance: no verification");
+        }
         // Followers notarize the commitment — body not required.
         for (i, follower) in followers.iter_mut().enumerate() {
             if let Some(vote) = follower.vote_header(&header) {
@@ -6534,7 +6621,7 @@ mod tests {
             engine.current_view = View::new(6);
             engine.next_height = Height::new(4);
             engine.last_committed = Some((Hash([0xBB; 32]), Height::new(2)));
-            engine.append_wal();
+            engine.append_wal().expect("tempdir WAL append must succeed");
         }
 
         // Phase 2: simulate a restart — create a new engine with
@@ -6576,10 +6663,231 @@ mod tests {
         let mut engine = make_engine();
 
         // append_wal with no WAL should be a no-op.
-        engine.append_wal();
+        engine.append_wal().expect("no-WAL append is a no-op Ok");
 
         // recover_from_wal with no WAL should return Ok(()).
         engine.recover_from_wal().expect("recover with no WAL should be Ok");
+    }
+
+    // ---- C10: durable signing fails closed ----
+
+    /// C10 test: a WAL append failure must withhold the vote — a
+    /// signature emitted while its anti-equivocation state is not
+    /// durable can equivocate after a restart. `Wal::poison` makes
+    /// every append fail without touching the file — the same
+    /// outcome an ENOSPC write produces.
+    #[test]
+    fn c10_wal_failure_disables_vote_signing() {
+        use crate::wal::Wal;
+        use tempfile::tempdir;
+
+        // Follower engine (index 1) with a WAL that fails on append.
+        let dir = tempdir().expect("tempdir");
+        let mut wal = Wal::open(dir.path().join("consensus.wal")).expect("open WAL");
+        wal.poison();
+        let mut follower = make_multi_engine(1).with_wal(wal);
+
+        // A valid proposal from leader 0 at view 0.
+        let mut leader = make_multi_engine(0);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, proposal) = leader.propose().expect("leader proposes");
+
+        // The vote must be withheld: the vote-lock update cannot be
+        // made durable, so no signature may leave.
+        assert!(
+            follower.vote(&header, &proposal).is_none(),
+            "vote must be withheld when the WAL append fails"
+        );
+        assert!(follower.wal_failed, "WAL failure must latch");
+        assert!(!follower.signing_healthy(), "signing_healthy must report the latched failure");
+    }
+
+    /// C10 test: the WAL-failure latch is sticky — a validator with
+    /// a failed WAL must go silent for every signature kind until
+    /// the operator restarts it on healthy storage.
+    #[test]
+    fn c10_wal_failure_latches_all_signing() {
+        use crate::wal::Wal;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let mut wal = Wal::open(dir.path().join("consensus.wal")).expect("open WAL");
+        wal.poison();
+        let mut follower = make_multi_engine(1).with_wal(wal);
+        let mut leader = make_multi_engine(0);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, proposal) = leader.propose().expect("leader proposes");
+
+        // First vote attempt fails and latches.
+        assert!(follower.vote(&header, &proposal).is_none());
+        assert!(follower.wal_failed);
+
+        // Timeout signatures must also be refused.
+        assert!(
+            follower.on_timeout().is_none(),
+            "timeout signature must be withheld while the WAL is failed"
+        );
+        // A second vote attempt must still refuse even though the
+        // locks are already updated in memory.
+        assert!(follower.vote(&header, &proposal).is_none());
+    }
+
+    /// C10 test: an attestation signature is still a signature — a
+    /// WAL-failed validator must not emit one either.
+    #[test]
+    fn c10_wal_failure_disables_attestation() {
+        use crate::wal::Wal;
+        use tempfile::tempdir;
+
+        // Two committed rounds so `attest_latest` reports a nonzero
+        // executed root (the height-0 mock root is `Hash::ZERO`).
+        let dir = tempdir().expect("tempdir");
+        let wal = Wal::open(dir.path().join("consensus.wal")).expect("open WAL");
+        let mut engine = OxideBft::new(Arc::new(MockApp::new()), single_validator_set())
+            .without_signature_verification()
+            .with_wal(wal);
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        engine.submit_tx(TxBytes::new(vec![2]));
+        engine.run_until_idle();
+        assert!(
+            engine.vote_attestation().0.is_some(),
+            "committed blocks give a non-empty attestation"
+        );
+
+        // Poison the WAL: the next step's vote append fails and
+        // latches — the self-vote must be withheld, nothing new
+        // can finalize, and attestations go silent too.
+        engine.wal.as_mut().expect("wal attached").poison();
+        engine.submit_tx(TxBytes::new(vec![3]));
+        engine.run_until_idle();
+        assert!(engine.wal_failed, "failed append must latch wal_failed");
+
+        assert_eq!(
+            engine.vote_attestation(),
+            (None, None),
+            "attestation signatures must be withheld while the WAL is failed"
+        );
+    }
+
+    /// C10 test: `step()` (single-validator mode) must refuse to
+    /// cast its self-vote when the WAL append fails — previously it
+    /// signed first, updated the locks after, and never appended at
+    /// all, so a crash left restart state unaware the vote was cast.
+    #[test]
+    fn c10_step_refuses_when_wal_fails() {
+        use crate::wal::Wal;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let mut wal = Wal::open(dir.path().join("consensus.wal")).expect("open WAL");
+        wal.poison();
+        let mut engine = OxideBft::new(Arc::new(MockApp::new()), single_validator_set())
+            .without_signature_verification()
+            .with_wal(wal);
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+
+        assert!(engine.wal_failed, "failed append must latch wal_failed");
+        assert!(
+            engine.finalized_height().is_none(),
+            "a WAL-failed engine must not vote, so nothing can finalize"
+        );
+    }
+
+    /// C10 test: `step()`'s self-vote is durable — a restart
+    /// recovering the WAL must see exactly the lock state the
+    /// engine holds (committed-height pruning included).
+    #[test]
+    fn c10_step_persists_locks_before_signing() {
+        use crate::wal::Wal;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("consensus.wal");
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(Arc::new(MockApp::new()), single_validator_set())
+            .without_signature_verification()
+            .with_wal(wal);
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        assert!(engine.last_voted_view.is_some(), "run_until_idle must have voted at least once");
+
+        // The WAL's latest entry must cover the engine's live
+        // safety state — every lock the engine relies on is durable.
+        // (The WAL may hold MORE locks than the live map: commit
+        // appends run before `voted_at_height` pruning, so the
+        // durable set is the safe, strictly-conservative superset.)
+        let entry = Wal::open(&wal_path)
+            .expect("reopen WAL")
+            .recover()
+            .expect("recover")
+            .expect("WAL must contain at least one entry");
+        assert_eq!(entry.last_voted_view, engine.last_voted_view);
+        assert!(
+            engine.voted_at_height.iter().all(|(h, b)| entry.voted_at_height.get(h) == Some(b)),
+            "every live vote lock must be durable in the WAL"
+        );
+    }
+
+    /// C10 test: the leader's self-vote must go through `vote()` —
+    /// the single signing authority — which updates the vote locks
+    /// and appends the WAL before the signature exists. Harnesses
+    /// that hand-built a `Vote` and called `collect_vote` skipped
+    /// both.
+    #[test]
+    fn c10_leader_self_vote_via_vote_is_durable() {
+        use crate::wal::Wal;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("consensus.wal");
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut leader = make_multi_engine(0).with_wal(wal);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, proposal) = leader.propose().expect("leader proposes");
+        let block_hash = OxideBft::block_hash(&header);
+
+        // The engine's own proposal passes every eligibility rule —
+        // vote() is the canonical path for leader and follower alike.
+        let vote = leader.vote(&header, &proposal);
+        assert!(vote.is_some(), "leader self-vote through vote() must succeed");
+
+        // The lock must be recorded in memory AND durable in the WAL.
+        assert_eq!(
+            leader.voted_at_height.get(&header.height.value()),
+            Some(&block_hash),
+            "leader vote must take the per-height lock"
+        );
+        let entry = Wal::open(&wal_path)
+            .expect("reopen WAL")
+            .recover()
+            .expect("recover")
+            .expect("WAL entry must exist");
+        assert_eq!(
+            entry.voted_at_height.get(&header.height.value()),
+            Some(&block_hash),
+            "leader vote lock must be durable before the vote ships"
+        );
+    }
+
+    /// C10 test: a healthy WAL keeps signing enabled — the
+    /// fail-closed gate must not break the normal path.
+    #[test]
+    fn c10_healthy_wal_signs() {
+        use crate::wal::Wal;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let wal = Wal::open(dir.path().join("consensus.wal")).expect("open WAL");
+        let mut follower = make_multi_engine(1).with_wal(wal);
+        let mut leader = make_multi_engine(0);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, proposal) = leader.propose().expect("leader proposes");
+
+        assert!(follower.vote(&header, &proposal).is_some());
+        assert!(follower.signing_healthy());
+        assert!(follower.on_timeout().is_some());
     }
 
     // ---- Validator key rotation (staking KEY_CHANGE) ----

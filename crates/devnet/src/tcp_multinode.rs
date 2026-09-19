@@ -104,23 +104,6 @@ struct DispatchState<'a> {
     me: u8,
 }
 
-/// Build the BLS vote signing message: `(view, phase, block_hash,
-/// epoch)`. This must match the format used by
-/// `OxideBft::vote_signing_message` (C3 fix).
-fn vote_signing_message(
-    view: primitives::View,
-    phase: types::VotePhase,
-    block_hash: &primitives::Hash,
-    epoch: primitives::Epoch,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(49);
-    msg.extend_from_slice(&view.value().to_le_bytes());
-    msg.push(phase as u8);
-    msg.extend_from_slice(block_hash.as_bytes());
-    msg.extend_from_slice(&epoch.value().to_le_bytes());
-    msg
-}
-
 /// A TCP-based multi-node devnet: N validators running oxideBFT with
 /// real TCP transport.
 pub struct TcpMultiNodeDevnet {
@@ -1264,7 +1247,6 @@ impl TcpMultiNodeDevnet {
         let mut handles = Vec::with_capacity(n);
         for (i, (engine, transport)) in engines.into_iter().zip(transports).enumerate() {
             let vs = self.validator_set.clone();
-            let key = self.secret_keys[i].clone();
             let inboxes = inboxes.clone();
             let committed = self.committed_blocks[i].clone();
             let commit_seq = self.commit_seqs[i].clone();
@@ -1275,7 +1257,6 @@ impl TcpMultiNodeDevnet {
                 Self::validator_loop(
                     engine,
                     transport,
-                    key,
                     u8::try_from(i).unwrap_or(0),
                     n,
                     vs,
@@ -1385,7 +1366,6 @@ impl TcpMultiNodeDevnet {
     fn validator_loop(
         mut engine: OxideBft,
         mut transport: p2p::tcp::TcpTransport,
-        secret_key: crypto::BlsSecretKey,
         idx: u8,
         n: usize,
         validator_set: ValidatorSet,
@@ -1575,28 +1555,15 @@ impl TcpMultiNodeDevnet {
                             );
                         }
                     }
-                    // Leader self-vote (same construction as the sim).
-                    let block_hash = OxideBft::block_hash(&header);
-                    let msg = vote_signing_message(
-                        header.view,
-                        types::VotePhase::Prepare,
-                        &block_hash,
-                        engine.epoch(),
-                    );
-                    let sig = secret_key.sign(crypto::hash::Domain::Vote, &msg);
-                    let (attestation, attestation_sig) = engine.vote_attestation();
-                    let _ = engine.collect_vote(
-                        u16::from(idx),
-                        types::Vote {
-                            view: header.view,
-                            phase: types::VotePhase::Prepare,
-                            block_hash,
-                            signature: sig,
-                            attestation,
-                            attestation_sig,
-                        },
-                    );
-                    voted_views.insert(view);
+                    // Leader self-vote through the engine's single
+                    // signing path (C10): `vote()` records the locks
+                    // and appends the WAL before the signature
+                    // exists — the hand-built Vote + collect_vote it
+                    // replaces skipped durability entirely.
+                    if let Some(leader_vote) = engine.vote(&header, &proposal) {
+                        let _ = engine.collect_vote(u16::from(idx), leader_vote);
+                        voted_views.insert(view);
+                    }
                 }
             }
             t_propose += t0.elapsed();
@@ -2093,26 +2060,14 @@ impl TcpMultiNodeDevnet {
                 }
                 let leader_idx = usize::from(self.validator_set.leader(header.view));
                 if i == leader_idx {
-                    // Leader self-votes directly (no network).
-                    let block_hash = OxideBft::block_hash(header);
-                    let msg = vote_signing_message(
-                        header.view,
-                        types::VotePhase::Prepare,
-                        &block_hash,
-                        engine.epoch(),
-                    );
-                    let sig = self.secret_keys[i].sign(crypto::hash::Domain::Vote, &msg);
-                    let (attestation, attestation_sig) = engine.vote_attestation();
-                    let leader_vote = types::Vote {
-                        view: header.view,
-                        phase: types::VotePhase::Prepare,
-                        block_hash,
-                        signature: sig,
-                        attestation,
-                        attestation_sig,
-                    };
-                    let _ = engine.collect_vote(u16::try_from(i).unwrap(), leader_vote);
-                    state.voted.insert((i, view));
+                    // Leader self-votes through `engine.vote()` —
+                    // the single signing authority (C10): the vote
+                    // locks and WAL append precede the signature,
+                    // exactly as for followers.
+                    if let Some(leader_vote) = engine.vote(header, proposal) {
+                        let _ = engine.collect_vote(u16::try_from(i).unwrap(), leader_vote);
+                        state.voted.insert((i, view));
+                    }
                 } else if let Some(vote) = engine.vote(header, proposal) {
                     let mut buf = Vec::with_capacity(1 + 137);
                     buf.push(MSG_VOTE);
@@ -2294,28 +2249,16 @@ impl TcpMultiNodeDevnet {
             self.timeout_advance_all();
             return;
         };
-        let block_hash = OxideBft::block_hash(&header);
-
-        // Leader self-votes (direct — no network self-send).
-        let leader_msg = vote_signing_message(
-            header.view,
-            types::VotePhase::Prepare,
-            &block_hash,
-            self.engines[leader_idx].epoch(),
-        );
-        let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
-        let (attestation, attestation_sig) = self.engines[leader_idx].vote_attestation();
-        let leader_vote = types::Vote {
-            view: header.view,
-            phase: types::VotePhase::Prepare,
-            block_hash,
-            signature: leader_sig,
-            attestation,
-            attestation_sig,
-        };
-        self.engines[leader_idx]
-            .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
-            .expect("leader self-vote must verify");
+        // Leader self-votes through the engine's single signing
+        // path (C10): `vote()` records the locks and appends the
+        // WAL before the signature exists. If the engine withholds
+        // (e.g. WAL failure), the view simply times out — the same
+        // outcome as a crashed leader.
+        if let Some(leader_vote) = engine.vote(&header, &proposal) {
+            engine
+                .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
+                .expect("leader self-vote must verify");
+        }
 
         // Followers vote via TCP: each follower encodes its vote and
         // sends it to the leader.

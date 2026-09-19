@@ -55,22 +55,6 @@ const MSG_TIMEOUT: u8 = 0x03; // timeout signature (view-change init)
 const MSG_TC: u8 = 0x04; // timeout certificate (view-change proof)
 const MSG_TX: u8 = 0x05; // raw tx envelope gossip (mempool propagation)
 
-/// Build the BLS vote signing message: `view` || `phase` || `block_hash` || `epoch`.
-/// This must match the consensus engine's `vote_signing_message`.
-fn vote_signing_message(
-    view: primitives::View,
-    phase: types::VotePhase,
-    block_hash: &primitives::Hash,
-    epoch: primitives::Epoch,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(49);
-    msg.extend_from_slice(&view.value().to_le_bytes());
-    msg.push(phase as u8);
-    msg.extend_from_slice(block_hash.as_bytes());
-    msg.extend_from_slice(&epoch.value().to_le_bytes());
-    msg
-}
-
 mod driver;
 
 /// Adapter that lets the RPC server submit transactions into the
@@ -732,7 +716,6 @@ fn run_devnet_node(node_index_str: &str) {
         &mut engine,
         &mut transport,
         &validator_set_clone,
-        &our_key,
         node_index,
         num_nodes,
         shutdown.as_ref(),
@@ -1166,7 +1149,6 @@ fn run_consensus_loop(
     engine: &mut consensus::OxideBft,
     transport: &mut p2p::tcp::TcpTransport,
     validator_set: &consensus::ValidatorSet,
-    our_key: &crypto::BlsSecretKey,
     node_index: usize,
     num_nodes: usize,
     shutdown: &AtomicBool,
@@ -1240,29 +1222,19 @@ fn run_consensus_loop(
             if view > 0 && engine.high_qc().is_none() {
                 // Need the previous QC before proposing.
             } else if let Some((header, proposal)) = engine.propose() {
-                let block_hash = consensus::OxideBft::block_hash(&header);
                 let proposal_view = header.view.value();
                 proposed_views.insert(proposal_view);
                 pending_proposals.push((header.clone(), proposal.clone()));
-                // Leader self-votes directly (no network).
-                let msg = vote_signing_message(
-                    header.view,
-                    types::VotePhase::Prepare,
-                    &block_hash,
-                    engine.epoch(),
-                );
-                let sig = our_key.sign(crypto::hash::Domain::Vote, &msg);
-                let (attestation, attestation_sig) = engine.vote_attestation();
-                let leader_vote = types::Vote {
-                    view: header.view,
-                    phase: types::VotePhase::Prepare,
-                    block_hash,
-                    signature: sig,
-                    attestation,
-                    attestation_sig,
-                };
-                let _ = engine.collect_vote(u16::try_from(node_index).unwrap(), leader_vote);
-                voted_views.insert(proposal_view);
+                // C10: the leader self-votes through `engine.vote()` —
+                // the single signing authority — which records the
+                // vote locks and appends the WAL BEFORE signing. The
+                // manual sign-then-collect this replaces emitted a
+                // signature whose anti-equivocation state was never
+                // durable: a restart could then double-vote.
+                if let Some(leader_vote) = engine.vote(&header, &proposal) {
+                    let _ = engine.collect_vote(u16::try_from(node_index).unwrap(), leader_vote);
+                    voted_views.insert(proposal_view);
+                }
                 // Broadcast proposal to followers.
                 let mut buf = Vec::with_capacity(1 + 512);
                 buf.push(MSG_PROPOSAL);

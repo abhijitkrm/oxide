@@ -15786,3 +15786,57 @@ rejection, nonexistent market rejected before endorsement. Oracle
 Devnet — full add/bond/seat/remove cycle over TCP.
 
 Gates: 106 test binaries green, fmt + clippy `-D warnings` clean.
+
+## 2026-09-19 — Audit remediation: C10 — durable signing fails closed
+
+**Finding** (audit round 2): `append_wal` discarded append/fsync
+errors and the engine signed anyway; and every harness
+(`oxide-validator`, both devnets, the chaos sim's honest leader
+self-vote) built the leader's self-vote by hand — signing with the
+raw secret key and feeding `collect_vote` directly — bypassing the
+vote-lock update and the WAL append entirely. A validator could
+emit a signature whose anti-equivocation state was never durable,
+then restart with stale voting knowledge and double-vote.
+
+**Fix** — fail closed, one signing authority:
+
+- `wal_failed` latch on `OxideBft`: the first failed `append_wal`
+  (now `Result`-returning) latches it and alerts on stderr. While
+  latched, `propose` returns `None`, `sign_vote`/`on_timeout`/
+  `build_attestation` refuse — a WAL-failed validator goes fully
+  silent until restarted on healthy storage. New
+  `OxideBft::signing_healthy()` exposes the latch for operators.
+- `vote_if_eligible` now treats a failed append as fatal to the
+  vote: locks update in memory, but no `Vote` is produced.
+- `step()` (single-validator mode) had the worst ordering: it
+  signed BEFORE updating `last_voted_view`/`voted_at_height` and
+  never appended the WAL for the self-vote. It now records locks
+  → appends → signs, and returns `false` on failure.
+- Single signing authority: every honest leader self-vote now goes
+  through `engine.vote(&header, &proposal)` — authentication, lock
+  update, WAL append, and signature in that order. Replaced the
+  hand-built `Vote` + `collect_vote` at six sites
+  (oxide-validator Phase 1, tcp_multinode dispersed/vote_phase/
+  run_round_tcp, multinode run_round/run_round_transport,
+  chaos-sim honest path) and in the `drive_round` test helpers.
+  Byzantine sims keep raw signing — forging is their job. Dead
+  `vote_signing_message` helpers and the unused `our_key`/
+  `secret_key` params removed.
+- `Wal::poison()` fault-injection seam (hidden, tests only) so the
+  fail-closed path is testable without `/dev/full` (sandboxed on
+  this platform).
+
+Note (follow-up, not fixed here): `WalEntry` does not record
+"proposed at view" — a restarted validator still eligible as
+leader of an un-advanced view could re-propose a different block
+(same-view proposal equivocation). Vote-consistency rules make it
+a liveness-only wound; tracked as a WAL-format follow-up.
+
+Regressions: poisoned WAL → `vote()`/`on_timeout()`/attestation
+all withheld, latch sticky, `step()` refuses and nothing
+finalizes; healthy-WAL path unaffected; leader self-vote via
+`vote()` persists the per-height lock; `step()`'s durable state
+covers all live locks.
+
+Gates: 106 test binaries green, fmt + clippy `-D warnings` clean;
+threaded + pipelined devnet drivers smoke-verified end-to-end.

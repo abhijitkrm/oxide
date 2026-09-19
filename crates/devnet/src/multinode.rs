@@ -43,22 +43,6 @@ use types::{FinalizedBlock, TxBytes};
 /// Source: plan.md §13 (Phase 1 gate: 200k tx/s sim).
 const GENESIS_BALANCE: u64 = 1_000_000_000_000; // 10^12
 
-/// Build the BLS vote signing message: `(view, phase, block_hash,
-/// epoch)`. Must match `OxideBft::vote_signing_message` (C3 fix).
-fn vote_signing_message(
-    view: primitives::View,
-    phase: types::VotePhase,
-    block_hash: &primitives::Hash,
-    epoch: primitives::Epoch,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(49);
-    msg.extend_from_slice(&view.value().to_le_bytes());
-    msg.push(phase as u8);
-    msg.extend_from_slice(block_hash.as_bytes());
-    msg.extend_from_slice(&epoch.value().to_le_bytes());
-    msg
-}
-
 /// A multi-node devnet: N validators running oxideBFT with the real
 /// app stack.
 ///
@@ -548,30 +532,17 @@ impl MultiNodeDevnet {
         let (header, proposal) = self.engines[leader_idx]
             .propose()
             .unwrap_or_else(|| panic!("leader {leader_idx} should propose"));
-        let block_hash = OxideBft::block_hash(&header);
 
-        // Leader self-votes. The leader signs its own block with its
-        // real BLS key (C1 fix: all votes carry real signatures).
-        // C3 fix: sign with (view, phase, block_hash, epoch).
-        let leader_msg = vote_signing_message(
-            header.view,
-            types::VotePhase::Prepare,
-            &block_hash,
-            self.engines[leader_idx].epoch(),
-        );
-        let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
-        let (attestation, attestation_sig) = self.engines[leader_idx].vote_attestation();
-        let leader_vote = types::Vote {
-            view: header.view,
-            phase: types::VotePhase::Prepare,
-            block_hash,
-            signature: leader_sig,
-            attestation,
-            attestation_sig,
-        };
-        self.engines[leader_idx]
-            .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
-            .expect("leader self-vote must verify");
+        // Leader self-votes through the engine's single signing
+        // path (C10): `vote()` records the vote locks and appends
+        // the WAL before the signature exists — the hand-built Vote
+        // it replaces skipped both, so a leader's own vote was never
+        // durable.
+        if let Some(leader_vote) = self.engines[leader_idx].vote(&header, &proposal) {
+            self.engines[leader_idx]
+                .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
+                .expect("leader self-vote must verify");
+        }
 
         // Followers vote in index order (deterministic).
         let mut follower_votes = Vec::new();
@@ -648,29 +619,15 @@ impl MultiNodeDevnet {
             self.timeout_advance_all();
             return;
         };
-        let block_hash = OxideBft::block_hash(&header);
 
-        // Leader self-votes (direct — no network self-send).
-        // C3 fix: sign with (view, phase, block_hash, epoch).
-        let leader_msg = vote_signing_message(
-            header.view,
-            types::VotePhase::Prepare,
-            &block_hash,
-            self.engines[leader_idx].epoch(),
-        );
-        let leader_sig = self.secret_keys[leader_idx].sign(crypto::hash::Domain::Vote, &leader_msg);
-        let (attestation, attestation_sig) = self.engines[leader_idx].vote_attestation();
-        let leader_vote = types::Vote {
-            view: header.view,
-            phase: types::VotePhase::Prepare,
-            block_hash,
-            signature: leader_sig,
-            attestation,
-            attestation_sig,
-        };
-        self.engines[leader_idx]
-            .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
-            .expect("leader self-vote must verify");
+        // Leader self-votes through the engine's single signing
+        // path (C10): `vote()` records the vote locks and appends
+        // the WAL before the signature exists.
+        if let Some(leader_vote) = self.engines[leader_idx].vote(&header, &proposal) {
+            self.engines[leader_idx]
+                .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
+                .expect("leader self-vote must verify");
+        }
 
         // Followers vote via transport: each follower encodes its
         // vote and sends it to the leader.

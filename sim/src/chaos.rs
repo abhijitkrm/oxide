@@ -324,24 +324,15 @@ fn run_chaos_round(
             None
         };
 
-    // Leader self-votes for its real proposal (same as the harness —
-    // the leader doesn't send to itself over the transport).
-    let leader_sig = {
-        let eng = &devnet.engines()[leader_idx];
-        let msg = eng.vote_signing_message(header.view, VotePhase::Prepare as u8, &hash_a);
-        devnet.secret_key(leader_idx).sign(Domain::Vote, &msg)
-    };
-    let leader_vote = Vote {
-        view: header.view,
-        phase: VotePhase::Prepare,
-        block_hash: hash_a,
-        signature: leader_sig,
-        attestation: None,
-        attestation_sig: None,
-    };
-    devnet.engines_mut()[leader_idx]
-        .collect_vote(u16::try_from(leader_idx).unwrap_or(0), leader_vote)
-        .expect("leader self-vote must verify");
+    // Leader self-votes for its real proposal through the engine's
+    // single signing path (C10): `vote()` records the locks and
+    // appends the WAL before the signature exists — the same path
+    // honest followers use.
+    if let Some(leader_vote) = devnet.engines_mut()[leader_idx].vote(&header, &proposal) {
+        devnet.engines_mut()[leader_idx]
+            .collect_vote(u16::try_from(leader_idx).unwrap_or(0), leader_vote)
+            .expect("leader self-vote must verify");
+    }
 
     // Followers vote. Under leader equivocation, the first half of
     // the follower set sees header A and the second half sees B —
