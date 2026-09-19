@@ -113,10 +113,63 @@ pub struct SettledFill {
     pub quote_amount: u64,
 }
 
+/// Per-owner nonce tracker — the replay gate at the admission
+/// boundary.
+///
+/// Each admitted order/action carries a nonce strictly greater than
+/// the last seen for its owner; anything at-or-below is a replay and
+/// is rejected with `StaleNonce`. The nonce is consumed BEFORE any
+/// later check fails (same semantics as Ethereum account nonces: a
+/// transaction consumes its nonce even if it reverts), so a captured
+/// request can never be replayed, including a rejected one.
+///
+/// `MatchingServer` owns one directly (single writer); the
+/// multi-market workers share one `Arc<Mutex<NonceTracker>>` because
+/// nonces are per-ACCOUNT, not per-market — an owner trading on
+/// market A must not be able to replay the same nonce on market B.
+struct NonceTracker {
+    /// owner → last consumed nonce.
+    last_seen: HashMap<primitives::Address, u64>,
+}
+
+impl NonceTracker {
+    /// Create an empty tracker.
+    fn new() -> Self {
+        Self { last_seen: HashMap::new() }
+    }
+
+    /// Returns `true` and consumes `nonce` iff it is strictly
+    /// greater than the last seen for `owner`; `false` on replay
+    /// (the map is not modified). The first request from a new
+    /// owner is always accepted.
+    fn check_and_consume(&mut self, owner: &primitives::Address, nonce: u64) -> bool {
+        if let Some(&last) = self.last_seen.get(owner) {
+            if nonce <= last {
+                return false;
+            }
+        }
+        self.last_seen.insert(*owner, nonce);
+        true
+    }
+}
+
 /// The core matching server — owns the matching engine, balance
 /// cache, and fill buffer. Single-threaded by design (the matching
 /// engine takes `&mut self`); protocol adapters feed orders via a
 /// channel or call `submit_order` directly.
+///
+/// # The admission boundary
+///
+/// `submit_order` / `submit_verified` / `submit_action` are THE
+/// mandatory admission points — every wire path (TCP single/batch,
+/// JSON-RPC, FIX, WS, ring, multi-market) and every direct caller
+/// funnels through them. The sequence is always:
+/// `authenticate → replay-check → risk → reserve → match`. There is
+/// no public path that skips authentication: [`protocol::VerifiedOrder`]
+/// is constructible only by passing [`protocol::verify_order`], and
+/// internal resubmits (amend/replace) use the private
+/// `execute_order` — safe only because the enclosing signed action
+/// was already authenticated.
 pub struct MatchingServer {
     /// The matching engine (one market in v0).
     engine: MatchingEngine,
@@ -136,13 +189,13 @@ pub struct MatchingServer {
     engine_rejections: u64,
     /// Total orders rejected by the risk engine.
     risk_rejections: u64,
+    /// Total requests rejected by authentication (bad signature or
+    /// owner not derived from the request's public key).
+    auth_rejections: u64,
     /// The pending settlement batch.
     settlement_batch: Vec<SettledFill>,
-    /// Per-owner last-seen nonce (C7 fix). Each new order/action must
-    /// carry a nonce strictly greater than the last seen for that
-    /// owner. Prevents replay of signed orders — a captured order
-    /// cannot be resubmitted because its nonce is now stale.
-    last_seen_nonce: HashMap<primitives::Address, u64>,
+    /// Per-owner replay gate (see [`NonceTracker`]).
+    nonces: NonceTracker,
 }
 
 impl MatchingServer {
@@ -162,12 +215,13 @@ impl MatchingServer {
             risk: RiskEngine::with_defaults(),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
-            last_seen_nonce: HashMap::new(),
+            nonces: NonceTracker::new(),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
             engine_rejections: 0,
             risk_rejections: 0,
+            auth_rejections: 0,
         }
     }
 
@@ -192,12 +246,13 @@ impl MatchingServer {
             risk: RiskEngine::new(risk_config),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
-            last_seen_nonce: HashMap::new(),
+            nonces: NonceTracker::new(),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
             engine_rejections: 0,
             risk_rejections: 0,
+            auth_rejections: 0,
         }
     }
 
@@ -212,36 +267,72 @@ impl MatchingServer {
         self.balances.get(addr)
     }
 
-    /// Submit an order for matching. Performs:
-    /// 1. Risk-engine checks (rate limit, size cap, price band, resting cap).
-    /// 2. Balance check (buy orders only).
-    /// 3. Matching via `MatchingEngine::place`.
-    /// 4. Settlement (update balance cache, accumulate fills).
+    /// Submit an order for matching — THE admission boundary for new
+    /// orders.
+    ///
+    /// The pipeline is `authenticate → replay-check → risk → reserve
+    /// → match → settle`:
+    /// 1. Authentication ([`protocol::verify_order`]): the Ed25519
+    ///    signature must verify AND the claimed `owner` must equal
+    ///    the address derived from the request's public key.
+    /// 2. Replay check: the nonce must be strictly greater than the
+    ///    owner's last consumed nonce.
+    /// 3. Risk-engine checks (rate limit, size cap, price band,
+    ///    resting cap).
+    /// 4. Balance reservation (buy orders only).
+    /// 5. Matching via `MatchingEngine::place`.
+    /// 6. Settlement (update balance cache, accumulate fills).
+    ///
+    /// Every wire path funnels through here or through
+    /// [`Self::submit_verified`] (which only accepts a
+    /// [`protocol::VerifiedOrder`] — constructible solely by passing
+    /// the same authentication). There is no public path that skips
+    /// authentication.
     ///
     /// Returns the order response (filled, resting, or rejected).
     pub fn submit_order(&mut self, req: &OrderRequest) -> OrderResponse {
-        self.orders_processed += 1;
-
-        // C7 fix: enforce per-owner nonce monotonicity. Each order
-        // must carry a nonce strictly greater than the last seen
-        // for this owner. A replayed order (same or lower nonce)
-        // is rejected with `StaleNonce` before any balance
-        // reservation or engine state change. This prevents a
-        // captured signed order from being resubmitted.
-        // The first order from a new owner is always accepted
-        // (no prior nonce to compare against).
-        if let Some(&last) = self.last_seen_nonce.get(&req.owner) {
-            if req.nonce <= last {
-                return OrderResponse::rejected(RejectReason::StaleNonce);
-            }
+        if let Some(verified) = protocol::VerifiedOrder::new(*req) {
+            self.submit_verified(&verified)
+        } else {
+            self.auth_rejections += 1;
+            OrderResponse::rejected(RejectReason::BadSignature)
         }
-        // Consume the nonce immediately — even if the order is later
-        // rejected by risk/balance/engine, the nonce is spent. This
-        // prevents an attacker from replaying a rejected order (the
-        // nonce is now stale). Same semantics as Ethereum account
-        // nonces: a transaction consumes its nonce even if it reverts.
-        self.last_seen_nonce.insert(req.owner, req.nonce);
+    }
 
+    /// Submit an already-authenticated order — the entry point for
+    /// ring channels and internal call sites that hold a
+    /// [`protocol::VerifiedOrder`] (which can only be constructed by
+    /// passing [`protocol::verify_order`], so this path cannot be
+    /// reached with a forged order).
+    ///
+    /// The transport threads authenticate in parallel; this function
+    /// performs the remaining boundary steps (replay-check → risk →
+    /// reserve → match → settle) on the single matcher thread.
+    pub fn submit_verified(&mut self, req: &protocol::VerifiedOrder) -> OrderResponse {
+        self.orders_processed += 1;
+        let req = req.request();
+
+        // Replay check: each order must carry a nonce strictly
+        // greater than the last seen for this owner. A replayed
+        // order (same or lower nonce) is rejected with `StaleNonce`
+        // before any balance reservation or engine state change.
+        // This prevents a captured signed order from being
+        // resubmitted. The nonce is consumed even if a later check
+        // rejects — a spent nonce can never be replayed (same
+        // semantics as Ethereum account nonces).
+        if !self.nonces.check_and_consume(&req.owner, req.nonce) {
+            return OrderResponse::rejected(RejectReason::StaleNonce);
+        }
+
+        self.execute_order(req)
+    }
+
+    /// Execute an authenticated, nonce-consumed order: risk →
+    /// reserve → match → settle. Private — called by
+    /// `submit_verified` and by the internal amend/replace resubmits
+    /// (which are authenticated by their enclosing signed action and
+    /// must NOT consume a second nonce).
+    fn execute_order(&mut self, req: &OrderRequest) -> OrderResponse {
         // ── Risk-engine checks ───────────────────────────────────
         // Run before the balance check so we reject spam and
         // fat-finger orders without reserving any balance. The
@@ -396,8 +487,38 @@ impl MatchingServer {
     /// atomically. If the cancel fails, the new order is not
     /// submitted. Returns the new order's response (or the cancel
     /// rejection).
-    pub fn submit_action(&mut self, action: &OrderAction) -> OrderResponse {
+    ///
+    /// # The admission boundary (C5)
+    ///
+    /// `submit_action` is THE entry point for cancel/amend/replace —
+    /// it takes the wire [`ActionRequest`] directly so authentication
+    /// can never be skipped: `verify_action` (signature + owner
+    /// binding) runs first, then the per-owner nonce check, then
+    /// dispatch. The signed action's nonce is consumed here, which
+    /// fixes the previous gap where a captured action could be
+    /// replayed forever.
+    pub fn submit_action(&mut self, req: &ActionRequest) -> OrderResponse {
         self.orders_processed += 1;
+        // Authentication gate — identical policy to `submit_order`.
+        if !protocol::verify_action(req) {
+            self.auth_rejections += 1;
+            return OrderResponse::rejected(RejectReason::BadSignature);
+        }
+        // Replay check on the signed action's nonce — this is the
+        // nonce the "cancel/amend drops the signed action nonce"
+        // finding referred to: it is now consumed here, before any
+        // book mutation.
+        if !self.nonces.check_and_consume(&req.owner, req.nonce) {
+            return OrderResponse::rejected(RejectReason::StaleNonce);
+        }
+        let action = protocol::action_request_to_order_action(req);
+        self.execute_action(&action)
+    }
+
+    /// Dispatch an authenticated, nonce-consumed action to the
+    /// matching engine. Private — reachable only via
+    /// `submit_action`.
+    fn execute_action(&mut self, action: &OrderAction) -> OrderResponse {
         match action {
             OrderAction::Cancel { order_id, owner } => self.cancel_order(*order_id, *owner),
             OrderAction::Amend { order_id, owner, new_price, new_qty } => {
@@ -472,6 +593,13 @@ impl MatchingServer {
         // side. Resting orders are always GTC; use Limit/GTC for the
         // re-submission (a PostOnly order that would cross is rejected
         // by the engine, which is acceptable amend behavior).
+        //
+        // This is an INTERNAL resubmit: the enclosing signed action
+        // was already authenticated and its nonce already consumed
+        // by `submit_action`, so `execute_order` (which skips
+        // authentication and the nonce check) is the correct entry —
+        // not `submit_order`, which would (correctly) reject this
+        // unsigned synthetic request.
         let req = OrderRequest {
             market: 0,
             side: canceled.side,
@@ -484,10 +612,7 @@ impl MatchingServer {
             pubkey: [0u8; 32],
             signature: [0u8; 64],
         };
-        // Decrement orders_processed to avoid double-counting (the
-        // re-submit via submit_order increments it again).
-        self.orders_processed -= 1;
-        self.submit_order(&req)
+        self.execute_order(&req)
     }
 
     /// Replace a resting order: cancel + submit a new order atomically.
@@ -518,10 +643,12 @@ impl MatchingServer {
             let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
             self.balances.credit(&canceled.owner, refund);
         }
-        // Submit the new order. Decrement orders_processed to avoid
-        // double-counting (submit_order increments it again).
-        self.orders_processed -= 1;
-        self.submit_order(new_order)
+        // Submit the new order via the internal path: the enclosing
+        // signed action was already authenticated and its nonce
+        // consumed — the replacement must not re-verify (its
+        // signature is the ACTION signature, not an order signature)
+        // nor consume a second nonce.
+        self.execute_order(new_order)
     }
 
     /// Seal the current settlement batch and return it. The caller
@@ -556,6 +683,12 @@ impl MatchingServer {
         self.risk_rejections
     }
 
+    /// Total requests rejected by authentication — bad signature or
+    /// an `owner` not derived from the request's public key.
+    pub fn auth_rejections(&self) -> u64 {
+        self.auth_rejections
+    }
+
     /// Number of resting orders in the book.
     pub fn resting_count(&self) -> u32 {
         self.engine.resting_count()
@@ -578,6 +711,7 @@ impl MatchingServer {
             balance_rejections: self.balance_rejections,
             engine_rejections: self.engine_rejections,
             risk_rejections: self.risk_rejections,
+            auth_rejections: self.auth_rejections,
             resting_count: self.engine.resting_count(),
             pending_settlements: self.settlement_batch.len(),
         }
@@ -607,7 +741,9 @@ impl SharedMatcher {
         Self { inner: Arc::new(std::sync::Mutex::new(server)) }
     }
 
-    /// Submit an order (called by protocol adapters).
+    /// Submit an order (called by protocol adapters). Authentication
+    /// runs inside `MatchingServer::submit_order` — this path can
+    /// never admit a forged order.
     ///
     /// Returns an `EngineError` rejection if the internal mutex is
     /// poisoned (a thread panicked while holding the lock). A poisoned
@@ -621,13 +757,15 @@ impl SharedMatcher {
     }
 
     /// Submit an order action (cancel/amend/replace) (called by
-    /// protocol adapters).
+    /// protocol adapters). Takes the wire `ActionRequest` so
+    /// authentication runs inside the server — this path can never
+    /// admit a forged action.
     ///
     /// Returns an `EngineError` rejection if the internal mutex is
     /// poisoned.
-    pub fn submit_action(&self, action: &OrderAction) -> OrderResponse {
+    pub fn submit_action(&self, req: &ActionRequest) -> OrderResponse {
         match self.inner.lock() {
-            Ok(mut guard) => guard.submit_action(action),
+            Ok(mut guard) => guard.submit_action(req),
             Err(_) => OrderResponse::rejected(crate::protocol::RejectReason::EngineError),
         }
     }
@@ -643,6 +781,7 @@ impl SharedMatcher {
                 balance_rejections: s.balance_rejections(),
                 engine_rejections: s.engine_rejections(),
                 risk_rejections: s.risk_rejections(),
+                auth_rejections: s.auth_rejections(),
                 resting_count: s.resting_count(),
                 pending_settlements: s.pending_settlements(),
             },
@@ -685,9 +824,11 @@ enum ControlCommand {
     /// channel. Used by monitoring.
     Stats(std::sync::mpsc::Sender<MatcherStats>),
     /// Process an order action (cancel/amend/replace) and send the
-    /// response back via the oneshot channel. Used by protocol
-    /// adapters that route through the ring matcher.
-    Action(OrderAction, std::sync::mpsc::Sender<OrderResponse>),
+    /// response back via the oneshot channel. The wire
+    /// `ActionRequest` travels to the matcher thread so
+    /// authentication runs inside `MatchingServer::submit_action` —
+    /// the control path can never admit a forged action.
+    Action(ActionRequest, std::sync::mpsc::Sender<OrderResponse>),
 }
 
 /// A lock-free matching server using SPSC rings (LMAX Disruptor
@@ -729,9 +870,16 @@ enum ControlCommand {
 pub struct RingMatcher {
     /// The order rings (one per connection). Producer = connection,
     /// consumer = matcher thread. Each item is a WHOLE BATCH of
-    /// orders (`Vec<OrderRequest>`) — one mpsc send per batch, not
+    /// orders (`Vec<VerifiedOrder>`) — one mpsc send per batch, not
     /// per order. This keeps the per-order overhead near zero.
-    order_rings: Vec<ring::SpscSender<Vec<OrderRequest>>>,
+    ///
+    /// The ring carries `VerifiedOrder` (proof-of-authentication),
+    /// not raw requests: the producer's transport thread runs the
+    /// expensive signature check in parallel with other connections,
+    /// while the matcher thread trusts the type — a forged order
+    /// can never be placed on the ring because `VerifiedOrder` is
+    /// constructible only by passing `verify_order`.
+    order_rings: Vec<ring::SpscSender<Vec<protocol::VerifiedOrder>>>,
     /// The response rings (one per connection). Producer = matcher,
     /// consumer = connection. Each item is a WHOLE BATCH of
     /// responses.
@@ -767,9 +915,9 @@ impl RingMatcher {
         // CPU core at 100% when the matcher was idle.
         let shared_wakeup = Arc::new(ring::Wakeup::new());
         // Create ring pairs: (order_tx, order_rx) and (resp_tx, resp_rx).
-        let mut order_senders: Vec<ring::SpscSender<Vec<OrderRequest>>> =
+        let mut order_senders: Vec<ring::SpscSender<Vec<protocol::VerifiedOrder>>> =
             Vec::with_capacity(num_rings);
-        let mut order_receivers: Vec<ring::SpscReceiver<Vec<OrderRequest>>> =
+        let mut order_receivers: Vec<ring::SpscReceiver<Vec<protocol::VerifiedOrder>>> =
             Vec::with_capacity(num_rings);
         let mut response_senders: Vec<ring::SpscSender<Vec<OrderResponse>>> =
             Vec::with_capacity(num_rings);
@@ -798,7 +946,7 @@ impl RingMatcher {
                         // back-to-back (no interleaving from other
                         // rings — the batch is atomic).
                         let responses: Vec<OrderResponse> =
-                            batch.iter().map(|req| server.submit_order(req)).collect();
+                            batch.iter().map(|req| server.submit_verified(req)).collect();
                         // Push the batch response to this connection's
                         // ring. If the ring is full, spin until the
                         // client drains it. If the client disconnected
@@ -837,6 +985,7 @@ impl RingMatcher {
                                 balance_rejections: server.balance_rejections(),
                                 engine_rejections: server.engine_rejections(),
                                 risk_rejections: server.risk_rejections(),
+                                auth_rejections: server.auth_rejections(),
                                 resting_count: server.resting_count(),
                                 pending_settlements: server.pending_settlements(),
                             };
@@ -897,13 +1046,14 @@ impl RingMatcher {
     }
 
     /// Submit an order action (cancel/amend/replace) via a
-    /// control-channel command to the matcher thread. This reaches
-    /// THE SAME order book the rings write to — there is exactly one
-    /// book.
+    /// control-channel command to the matcher thread. Takes the wire
+    /// `ActionRequest` so authentication runs inside the server's
+    /// `submit_action` — this reaches THE SAME order book the rings
+    /// write to, and can never admit a forged action.
     ///
     /// Returns an `EngineError` rejection if the control channel is
     /// disconnected (matcher thread died) or the reply fails.
-    pub fn submit_action(&self, action: OrderAction) -> OrderResponse {
+    pub fn submit_action(&self, action: ActionRequest) -> OrderResponse {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self.control_tx.send(ControlCommand::Action(action, reply_tx)).is_err() {
             return OrderResponse::rejected(crate::protocol::RejectReason::EngineError);
@@ -914,9 +1064,11 @@ impl RingMatcher {
     }
 
     /// Get a connection's order sender (producer side of the order
-    /// ring). The caller pushes WHOLE BATCHES (`Vec<OrderRequest>`)
-    /// to this ring — one push per batch, not per order.
-    pub fn order_sender(&self, ring_idx: usize) -> &ring::SpscSender<Vec<OrderRequest>> {
+    /// ring). The caller pushes WHOLE BATCHES of authenticated orders
+    /// (`Vec<VerifiedOrder>`) to this ring — one push per batch, not
+    /// per order. Only `VerifiedOrder`s can enter the ring, so the
+    /// matcher thread never sees an unauthenticated order.
+    pub fn order_sender(&self, ring_idx: usize) -> &ring::SpscSender<Vec<protocol::VerifiedOrder>> {
         &self.order_rings[ring_idx]
     }
 
@@ -953,6 +1105,9 @@ pub struct MatcherStats {
     pub orders_processed: u64,
     pub fills_produced: u64,
     pub balance_rejections: u64,
+    /// Requests rejected by authentication (bad signature or owner
+    /// not derived from the request's public key).
+    pub auth_rejections: u64,
     pub engine_rejections: u64,
     /// Orders rejected by the risk engine (rate limit, fat-finger,
     /// size cap, resting cap).
@@ -981,18 +1136,28 @@ enum MarketMessage {
 /// A work item sent from a protocol handler to a market worker
 /// thread. The worker processes the orders, sends the responses back
 /// via `response_tx`, and accumulates fills for batch settlement.
+///
+/// Orders arrive PRE-AUTHENTICATED: `MultiMarketMatcher::submit_batch`
+/// verifies each request on the calling (transport) thread and packs
+/// the survivors as [`protocol::VerifiedOrder`] — proof tokens that
+/// can only be built by passing `verify_order`. The worker therefore
+/// never executes an unauthenticated order AND never pays a second
+/// signature verification (signature checks parallelize across the
+/// submitting threads).
 struct MarketWork {
-    /// The batch of orders (all for this market).
-    orders: Vec<OrderRequest>,
+    /// The authenticated orders (all for this market).
+    orders: Vec<protocol::VerifiedOrder>,
     /// One-shot channel for the worker to return the responses.
     response_tx: std::sync::mpsc::Sender<Vec<OrderResponse>>,
 }
 
 /// An action work item: a single order action (cancel/amend/replace)
-/// routed to the correct market worker.
+/// routed to the correct market worker. Carries the wire
+/// `ActionRequest` so the worker authenticates it inside
+/// `MarketWorker::submit_action` — the same boundary as orders.
 struct ActionWork {
-    /// The order action to process.
-    action: OrderAction,
+    /// The wire action request to process.
+    action: ActionRequest,
     /// One-shot channel for the worker to return the response.
     response_tx: std::sync::mpsc::Sender<OrderResponse>,
 }
@@ -1005,6 +1170,7 @@ struct WorkerStats {
     balance_rejections: u64,
     engine_rejections: u64,
     risk_rejections: u64,
+    auth_rejections: u64,
     resting_count: u32,
     pending_settlements: usize,
 }
@@ -1048,9 +1214,12 @@ struct WorkerStats {
 /// # Determinism
 ///
 /// Within each market, the worker processes orders in FIFO order
-/// (MPSC channel preserves order). Across markets, ordering is
-/// non-deterministic (threads run independently), but that's
-/// correct — different markets are independent state machines.
+/// (MPSC channel preserves order). Across markets, execution order is
+/// non-deterministic (threads run independently), but that's correct
+/// — different markets are independent state machines. The one
+/// cross-market invariant — per-account nonce ordering — IS
+/// deterministic: `submit_batch` consumes nonces in batch order on
+/// the calling thread before dispatch (see the `nonces` field).
 ///
 /// # Settlement
 ///
@@ -1068,6 +1237,17 @@ pub struct MultiMarketMatcher {
     _threads: Vec<std::thread::JoinHandle<()>>,
     /// Number of markets.
     num_markets: usize,
+    /// Shared per-account replay gate — the SAME tracker the workers
+    /// hold. `submit_batch` consumes nonces HERE (in batch order, on
+    /// the calling thread) rather than in the workers: a batch mixing
+    /// markets for one account would otherwise have its nonces
+    /// consumed by different workers in parallel, making admission
+    /// order — and therefore `StaleNonce` vs accept — nondeterministic
+    /// within a single call. Consuming at dispatch defines the batch's
+    /// submission order as the admission order. (Races ACROSS
+    /// concurrent `submit_batch` calls remain, which is correct —
+    /// concurrent submissions have no defined order.)
+    nonces: Arc<std::sync::Mutex<NonceTracker>>,
 }
 
 impl MultiMarketMatcher {
@@ -1089,47 +1269,174 @@ impl MultiMarketMatcher {
         let num_markets = configs.len();
         let mut market_senders = Vec::with_capacity(num_markets);
         let mut threads = Vec::with_capacity(num_markets);
+        // The nonce tracker is SHARED across workers: nonces are
+        // per-account, not per-market, so a replayed nonce must be
+        // rejected no matter which market it lands on. A short Mutex
+        // is acceptable — the check runs once per admission and the
+        // work already crosses an MPSC hop.
+        let nonces = Arc::new(std::sync::Mutex::new(NonceTracker::new()));
 
         for cfg in configs {
             let (tx, rx) = std::sync::mpsc::channel::<MarketMessage>();
             let balances = Arc::clone(&balances);
+            let nonces = Arc::clone(&nonces);
             let thread = std::thread::spawn(move || {
-                MarketWorker::run(cfg, balances, rx);
+                MarketWorker::run(cfg, balances, nonces, rx);
             });
             market_senders.push(tx);
             threads.push(thread);
         }
 
-        Self { market_senders, _threads: threads, num_markets }
+        Self { market_senders, _threads: threads, num_markets, nonces }
     }
 
-    /// Submit a batch of orders. All orders in the batch MUST be for
-    /// the same market (the caller is responsible for grouping by
-    /// market). Returns the responses in the same order as the
-    /// requests.
+    /// Submit a batch of orders. Orders may span markets — each order
+    /// is routed to the worker for its own `market` field. Returns
+    /// the responses in the same order as the requests.
+    ///
+    /// Authentication runs HERE — on the calling (transport) thread —
+    /// so signature verification parallelizes across submitters.
+    /// Each request becomes a [`protocol::VerifiedOrder`] proof token
+    /// (unforgeable outside `verify_order`); failed entries get an
+    /// aligned `BadSignature` response at their original position and
+    /// never reach the worker.
+    ///
+    /// Routing is by EACH order's market, not the batch head's:
+    /// routing every order to `orders[0].market` would silently match
+    /// mixed-market batches on the wrong book (the engine does not
+    /// re-check the market field — the worker's engine IS the market).
     ///
     /// # Panics
     ///
-    /// Panics if the market worker thread has died (channel
-    /// disconnected) or the response channel fails.
+    /// Panics if `orders` is empty, if any order's `market` is out of
+    /// range, or if a market worker thread has died mid-batch.
     pub fn submit_batch(&self, orders: Vec<OrderRequest>) -> Vec<OrderResponse> {
         assert!(!orders.is_empty(), "batch must not be empty");
-        let market = orders[0].market as usize;
-        assert!(
-            market < self.num_markets,
-            "market {market} out of range (have {} markets)",
-            self.num_markets
-        );
-        let (response_tx, response_rx) = std::sync::mpsc::channel();
-        if self.market_senders[market]
-            .send(MarketMessage::Work(MarketWork { orders, response_tx }))
-            .is_err()
-        {
-            return vec![OrderResponse::rejected(RejectReason::EngineError); 1];
+        // Authenticate + replay-check every order on this thread, IN
+        // BATCH ORDER. `positions[i]` records the original index of
+        // admitted order i so its response lands in the right slot.
+        //
+        // The nonce is consumed HERE — before dispatch — because the
+        // workers run in parallel: if two same-account orders went to
+        // different markets and each worker consumed its nonce on
+        // arrival, whichever worker ran first would set the watermark
+        // and the other order's result (StaleNonce vs accept) would
+        // be nondeterministic within a single call. Consuming in
+        // batch order makes the batch's submission order the
+        // admission order. Order matters within the sequence:
+        // signature verification runs BEFORE the nonce is consumed —
+        // a forged request must never burn the victim's next nonce.
+        let mut positions: Vec<usize> = Vec::with_capacity(orders.len());
+        let mut verified: Vec<protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
+        let mut responses: Vec<Option<OrderResponse>> = Vec::with_capacity(orders.len());
+        for (i, req) in orders.into_iter().enumerate() {
+            match protocol::VerifiedOrder::new(req) {
+                Some(vo) => {
+                    let ok = match self.nonces.lock() {
+                        Ok(mut tracker) => {
+                            tracker.check_and_consume(&vo.request().owner, vo.request().nonce)
+                        }
+                        // A poisoned nonce mutex means a worker panicked
+                        // mid-check — fail closed rather than admit a
+                        // possible replay.
+                        Err(_) => false,
+                    };
+                    if ok {
+                        positions.push(i);
+                        verified.push(vo);
+                        responses.push(None);
+                    } else {
+                        responses.push(Some(OrderResponse::rejected(RejectReason::StaleNonce)));
+                    }
+                }
+                None => {
+                    responses.push(Some(OrderResponse::rejected(RejectReason::BadSignature)));
+                }
+            }
         }
-        response_rx
-            .recv()
-            .unwrap_or_else(|_| vec![OrderResponse::rejected(RejectReason::EngineError); 1])
+        if verified.is_empty() {
+            return responses
+                .into_iter()
+                .map(|r| r.unwrap_or_else(|| OrderResponse::rejected(RejectReason::EngineError)))
+                .collect();
+        }
+
+        let first_market = usize::from(verified[0].request().market);
+        if verified.iter().all(|v| usize::from(v.request().market) == first_market) {
+            // Fast path: single market — one send, one recv, no
+            // per-market grouping allocation.
+            assert!(
+                first_market < self.num_markets,
+                "market {first_market} out of range (have {} markets)",
+                self.num_markets
+            );
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            if self.market_senders[first_market]
+                .send(MarketMessage::Work(MarketWork { orders: verified, response_tx }))
+                .is_err()
+            {
+                return vec![OrderResponse::rejected(RejectReason::EngineError); 1];
+            }
+            let worker_responses = response_rx
+                .recv()
+                .unwrap_or_else(|_| vec![OrderResponse::rejected(RejectReason::EngineError); 1]);
+            for (pos, resp) in positions.into_iter().zip(worker_responses) {
+                responses[pos] = Some(resp);
+            }
+        } else {
+            // Slow path: mixed markets — split verified orders by
+            // market, dispatch every group BEFORE blocking on any
+            // response channel so the workers run in parallel, then
+            // merge each worker's responses by original batch index.
+            // `by_market[m]` holds (orig_pos, order) pairs. Indexed by
+            // market rather than a HashMap: `num_markets` is bounded
+            // (u8) and the mixed path is already the rare path.
+            let mut by_market: Vec<Vec<(usize, protocol::VerifiedOrder)>> =
+                (0..self.num_markets).map(|_| Vec::new()).collect();
+            for (pos, vo) in positions.iter().copied().zip(verified) {
+                let m = usize::from(vo.request().market);
+                assert!(
+                    m < self.num_markets,
+                    "market {m} out of range (have {} markets)",
+                    self.num_markets
+                );
+                by_market[m].push((pos, vo));
+            }
+            let mut receivers = Vec::new();
+            for (m, group) in by_market.into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                let (idxs, group_orders): (Vec<usize>, Vec<protocol::VerifiedOrder>) =
+                    group.into_iter().unzip();
+                let (response_tx, response_rx) = std::sync::mpsc::channel();
+                if self.market_senders[m]
+                    .send(MarketMessage::Work(MarketWork { orders: group_orders, response_tx }))
+                    .is_err()
+                {
+                    for pos in idxs {
+                        responses[pos] = Some(OrderResponse::rejected(RejectReason::EngineError));
+                    }
+                    continue;
+                }
+                receivers.push((idxs, response_rx));
+            }
+            for (idxs, rx) in receivers {
+                let n = idxs.len();
+                let worker_responses = rx.recv().unwrap_or_else(|_| {
+                    vec![OrderResponse::rejected(RejectReason::EngineError); n]
+                });
+                for (pos, resp) in idxs.into_iter().zip(worker_responses) {
+                    responses[pos] = Some(resp);
+                }
+            }
+        }
+        // Every slot is Some: verified entries got worker responses,
+        // unverified got BadSignature at submit time.
+        responses
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| OrderResponse::rejected(RejectReason::EngineError)))
+            .collect()
     }
 
     /// Submit a single order. Routes to the correct market worker.
@@ -1141,26 +1448,24 @@ impl MultiMarketMatcher {
         responses.pop().unwrap_or_else(|| OrderResponse::rejected(RejectReason::EngineError))
     }
 
-    /// Submit an order action (cancel/amend/replace). Routes to the
-    /// market worker that owns the order (determined by the market
-    /// field in the action's new order for Replace, or market 0 for
-    /// Cancel/Amend in v0).
+    /// Submit an order action (cancel/amend/replace). Takes the wire
+    /// `ActionRequest` so the worker authenticates it inside
+    /// `MarketWorker::submit_action` — the same mandatory boundary as
+    /// order admission. Routes to market 0 (the v0 action protocol
+    /// is single-market; the wire format carries no market field).
     ///
     /// Returns an `EngineError` rejection if the market worker thread
     /// has died.
-    pub fn submit_action(&self, action: OrderAction) -> OrderResponse {
-        // Cancel/Amend are single-market (v0: market 0). Replace
-        // carries a full OrderRequest with its own market field.
-        let market = match &action {
-            OrderAction::Replace { new_order, .. } => new_order.market as usize,
-            _ => 0,
-        };
+    pub fn submit_action(&self, action: &ActionRequest) -> OrderResponse {
+        // v0: all actions route to market 0 — the wire `ActionRequest`
+        // has no market field (multi-market routing is future work).
+        let market = 0;
         if market >= self.num_markets {
             return OrderResponse::rejected(RejectReason::EngineError);
         }
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         if self.market_senders[market]
-            .send(MarketMessage::Action(ActionWork { action, response_tx }))
+            .send(MarketMessage::Action(ActionWork { action: *action, response_tx }))
             .is_err()
         {
             return OrderResponse::rejected(RejectReason::EngineError);
@@ -1206,6 +1511,7 @@ impl MultiMarketMatcher {
                 total.balance_rejections += s.balance_rejections;
                 total.engine_rejections += s.engine_rejections;
                 total.risk_rejections += s.risk_rejections;
+                total.auth_rejections += s.auth_rejections;
                 total.resting_count += s.resting_count;
                 total.pending_settlements += s.pending_settlements;
             }
@@ -1235,11 +1541,27 @@ impl BatchSealer for MultiMarketMatcher {
 /// processes orders from its MPSC channel. Settlement fills are
 /// accumulated locally (no shared lock); the batch settler collects
 /// them via the control channel.
+///
+/// The worker enforces the SAME admission boundary as
+/// `MatchingServer`: orders arrive pre-authenticated as
+/// [`protocol::VerifiedOrder`] (signature + owner binding already
+/// checked on the submitting thread), then the worker runs the
+/// remaining steps — replay-check → risk → reserve → match — using
+/// the SHARED nonce tracker (nonces are per-account across all
+/// markets) and a per-market risk engine. Actions arrive as wire
+/// `ActionRequest`s and are authenticated inside `submit_action`.
 struct MarketWorker {
     /// The matching engine for this market (single-writer).
     engine: MatchingEngine,
     /// Shared sharded balance cache (cross-market).
     balances: Arc<AtomicBalanceCache>,
+    /// Shared per-account replay gate — one sequence per owner
+    /// across ALL markets (see `NonceTracker`).
+    nonces: Arc<std::sync::Mutex<NonceTracker>>,
+    /// Per-market risk engine (rate limits, fat-finger, size caps).
+    /// Per-market rather than shared: an account's rate/resting
+    /// budget is scoped to this market's book.
+    risk: RiskEngine,
     /// Reusable fill buffer — zero alloc after the first order.
     fills: Vec<FillEvent>,
     /// The pending settlement batch (local to this worker).
@@ -1252,6 +1574,10 @@ struct MarketWorker {
     balance_rejections: u64,
     /// Total orders rejected by the engine.
     engine_rejections: u64,
+    /// Total orders rejected by the risk engine.
+    risk_rejections: u64,
+    /// Total requests rejected by authentication.
+    auth_rejections: u64,
 }
 
 impl MarketWorker {
@@ -1261,6 +1587,7 @@ impl MarketWorker {
     fn run(
         cfg: MarketConfig,
         balances: Arc<AtomicBalanceCache>,
+        nonces: Arc<std::sync::Mutex<NonceTracker>>,
         rx: std::sync::mpsc::Receiver<MarketMessage>,
     ) {
         let engine = MatchingEngine::new(cfg, DenseBook::new(cfg).expect("book creation"))
@@ -1268,12 +1595,16 @@ impl MarketWorker {
         let mut worker = MarketWorker {
             engine,
             balances,
+            nonces,
+            risk: RiskEngine::with_defaults(),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
             engine_rejections: 0,
+            risk_rejections: 0,
+            auth_rejections: 0,
         };
 
         loop {
@@ -1296,7 +1627,8 @@ impl MarketWorker {
                         fills_produced: worker.fills_produced,
                         balance_rejections: worker.balance_rejections,
                         engine_rejections: worker.engine_rejections,
-                        risk_rejections: 0, // TODO: wire risk engine into multi-market workers
+                        risk_rejections: worker.risk_rejections,
+                        auth_rejections: worker.auth_rejections,
                         resting_count: worker.engine.resting_count(),
                         pending_settlements: worker.settlement_batch.len(),
                     };
@@ -1307,21 +1639,61 @@ impl MarketWorker {
         }
     }
 
-    /// Process a batch of orders for this market. Returns responses
-    /// in the same order as the requests.
-    fn process_batch(&mut self, orders: &[OrderRequest]) -> Vec<OrderResponse> {
+    /// Process a batch of authenticated orders for this market.
+    /// Returns responses in the same order as the requests.
+    fn process_batch(&mut self, orders: &[protocol::VerifiedOrder]) -> Vec<OrderResponse> {
         let mut responses = Vec::with_capacity(orders.len());
         for req in orders {
-            responses.push(self.submit_order(req));
+            responses.push(self.submit_verified(req));
         }
         responses
     }
 
-    /// Submit one order: balance check, match, settle. Mirrors
-    /// `MatchingServer::submit_order` but uses the shared
-    /// `AtomicBalanceCache` instead of a local `BalanceCache`.
-    fn submit_order(&mut self, req: &OrderRequest) -> OrderResponse {
+    /// Check the shared nonce for `owner`/`nonce` — returns `false`
+    /// on replay. One lock acquisition per admission.
+    fn check_nonce(&self, owner: &primitives::Address, nonce: u64) -> bool {
+        match self.nonces.lock() {
+            Ok(mut tracker) => tracker.check_and_consume(owner, nonce),
+            // A poisoned nonce mutex means a worker panicked
+            // mid-check — the tracker may be inconsistent. Fail
+            // closed: reject rather than admit a possible replay.
+            Err(_) => false,
+        }
+    }
+
+    /// Submit one authenticated, nonce-consumed order: risk →
+    /// reserve → match → settle. The replay check already ran on the
+    /// dispatching thread inside `MultiMarketMatcher::submit_batch`
+    /// (in batch order — see that function's comment for why the
+    /// consume cannot happen here: parallel workers would make
+    /// cross-market admission order nondeterministic). `VerifiedOrder`
+    /// can only arrive via `MarketWork`, which `submit_batch` builds
+    /// exclusively — the worker boundary cannot be reached without
+    /// passing authentication AND nonce consumption.
+    fn submit_verified(&mut self, req: &protocol::VerifiedOrder) -> OrderResponse {
         self.orders_processed += 1;
+        self.execute_order(req.request())
+    }
+
+    /// Execute an authenticated, nonce-consumed order: risk →
+    /// reserve → match → settle. Private — also used by the internal
+    /// amend/replace resubmits (authenticated by their enclosing
+    /// signed action).
+    fn execute_order(&mut self, req: &OrderRequest) -> OrderResponse {
+        // ── Risk-engine checks ───────────────────────────────────
+        // Per-market risk engine: rate limit, size cap, price band,
+        // resting cap. Mirrors `MatchingServer::execute_order`.
+        let mid = match (self.engine.best_bid(), self.engine.best_ask()) {
+            (Some((bid, _)), Some((ask, _))) => u64::midpoint(bid.0, ask.0),
+            _ => 0,
+        };
+        let now_ms = self.orders_processed; // deterministic stand-in
+        if let RiskDecision::Reject(reason) =
+            self.risk.check(&req.owner, now_ms, req.price.0, req.qty.0, mid)
+        {
+            self.risk_rejections += 1;
+            return OrderResponse::rejected(reason);
+        }
 
         // ── Balance check (buy orders only) ─────────────────────
         // Atomic check-and-debit under the shard lock — no TOCTOU
@@ -1400,11 +1772,15 @@ impl MarketWorker {
         let fills_count = u32::try_from(self.fills.len()).unwrap_or(u32::MAX);
         match outcome {
             OrderOutcome::Filled => OrderResponse::filled(fills_count),
-            OrderOutcome::Resting { order_id, .. } => OrderResponse::resting(order_id, fills_count),
-            OrderOutcome::Killed => OrderResponse::rejected(RejectReason::Killed),
-            OrderOutcome::CanceledRemainder { order_id, .. } => {
+            OrderOutcome::Resting { order_id, .. }
+            | OrderOutcome::CanceledRemainder { order_id, .. } => {
+                // Both outcomes leave a resting remainder on the
+                // book — the account's resting-order risk counter
+                // tracks either.
+                self.risk.inc_resting(&req.owner);
                 OrderResponse::resting(order_id, fills_count)
             }
+            OrderOutcome::Killed => OrderResponse::rejected(RejectReason::Killed),
             OrderOutcome::Rejected(_) => {
                 self.engine_rejections += 1;
                 OrderResponse::rejected(RejectReason::EngineRejected)
@@ -1412,11 +1788,26 @@ impl MarketWorker {
         }
     }
 
-    /// Submit an order action (cancel/amend/replace). Mirrors
-    /// `MatchingServer::submit_action` but uses the shared
-    /// `AtomicBalanceCache` (aliased `ShardedBalanceCache`).
-    fn submit_action(&mut self, action: &OrderAction) -> OrderResponse {
+    /// Submit an order action (cancel/amend/replace). Takes the wire
+    /// `ActionRequest` — the SAME mandatory boundary as
+    /// `MatchingServer::submit_action`: `verify_action` (signature +
+    /// owner binding) → shared nonce check → dispatch.
+    fn submit_action(&mut self, req: &ActionRequest) -> OrderResponse {
         self.orders_processed += 1;
+        if !protocol::verify_action(req) {
+            self.auth_rejections += 1;
+            return OrderResponse::rejected(RejectReason::BadSignature);
+        }
+        if !self.check_nonce(&req.owner, req.nonce) {
+            return OrderResponse::rejected(RejectReason::StaleNonce);
+        }
+        let action = protocol::action_request_to_order_action(req);
+        self.execute_action(&action)
+    }
+
+    /// Dispatch an authenticated, nonce-consumed action. Private —
+    /// reachable only via `submit_action`.
+    fn execute_action(&mut self, action: &OrderAction) -> OrderResponse {
         match action {
             OrderAction::Cancel { order_id, owner } => self.cancel_order(*order_id, *owner),
             OrderAction::Amend { order_id, owner, new_price, new_qty } => {
@@ -1441,6 +1832,7 @@ impl MarketWorker {
             self.engine_rejections += 1;
             return OrderResponse::rejected(RejectReason::OrderNotFound);
         };
+        self.risk.dec_resting(&canceled.owner);
         if canceled.side == Side::Buy {
             let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
             let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
@@ -1468,6 +1860,7 @@ impl MarketWorker {
             self.engine_rejections += 1;
             return OrderResponse::rejected(RejectReason::OrderNotFound);
         };
+        self.risk.dec_resting(&canceled.owner);
         if canceled.side == Side::Buy {
             let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
             let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
@@ -1485,8 +1878,8 @@ impl MarketWorker {
             pubkey: [0u8; 32],
             signature: [0u8; 64],
         };
-        self.orders_processed -= 1;
-        self.submit_order(&req)
+        // Internal resubmit — authenticated by the enclosing action.
+        self.execute_order(&req)
     }
 
     /// Replace a resting order (multi-market path).
@@ -1507,13 +1900,14 @@ impl MarketWorker {
             self.engine_rejections += 1;
             return OrderResponse::rejected(RejectReason::OrderNotFound);
         };
+        self.risk.dec_resting(&canceled.owner);
         if canceled.side == Side::Buy {
             let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
             let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
             self.balances.credit(&canceled.owner, refund);
         }
-        self.orders_processed -= 1;
-        self.submit_order(new_order)
+        // Internal resubmit — authenticated by the enclosing action.
+        self.execute_order(new_order)
     }
 }
 
@@ -1538,78 +1932,73 @@ mod tests {
         primitives::Address([byte; 20])
     }
 
-    #[test]
-    fn buy_order_rejected_with_insufficient_balance() {
-        let mut server = MatchingServer::new(cfg(), 100);
-        server.fund_account(&addr(1), 1_000); // Not enough for 5 lots at $15.
+    /// A deterministic test account: `seed` derives the Ed25519
+    /// signing key; the account address is the key's derived owner.
+    fn test_account(seed: u8) -> (crypto::ed25519::Ed25519SecretKey, primitives::Address) {
+        let secret = crypto::ed25519::Ed25519SecretKey::from_bytes(&[seed; 32]);
+        let owner = crypto::ed25519::owner_address(&secret.verifying_key());
+        (secret, owner)
+    }
 
-        let req = OrderRequest {
-            market: 0,
+    /// Build a signed order for `secret`'s account.
+    fn signed_req(
+        secret: &crypto::ed25519::Ed25519SecretKey,
+        market: u8,
+        side: Side,
+        nonce: u64,
+        price: u64,
+        qty: u64,
+    ) -> OrderRequest {
+        let mut req = OrderRequest {
+            market,
+            side,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price(price),
+            qty: Qty(qty),
+            nonce,
+            owner: addr(0),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        crate::protocol::sign_order(&mut req, secret);
+        req
+    }
+
+    /// Build a signed action for `secret`'s account.
+    fn signed_action(
+        secret: &crypto::ed25519::Ed25519SecretKey,
+        action_type: ActionType,
+        order_id: u64,
+        nonce: u64,
+    ) -> ActionRequest {
+        let mut req = ActionRequest {
+            action_type,
+            order_id,
+            new_price: Price(0),
+            new_qty: Qty(0),
             side: Side::Buy,
             order_type: OrderType::Limit,
             tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(5_000),
-            owner: addr(1),
-            nonce: 0,
+            nonce,
+            owner: addr(0),
             pubkey: [0u8; 32],
             signature: [0u8; 64],
         };
-
-        let resp = server.submit_order(&req);
-        assert!(resp.rejected, "should reject insufficient balance");
-        assert_eq!(resp.reject_reason, Some(RejectReason::InsufficientBalance));
-        assert_eq!(server.balance(&addr(1)), 1_000, "balance unchanged");
+        crate::protocol::sign_action(&mut req, secret);
+        req
     }
 
+    // ── C5 regression tests: the mandatory admission boundary ──────
+
+    /// Regression (C5): `submit_order` used to execute orders with
+    /// no signature verification at all — the binary-TCP single
+    /// order path, JSON-RPC, FIX, and WS all submitted unverified
+    /// requests. An unsigned (zero-signature) order must be rejected
+    /// with `BadSignature` before any nonce/balance/book state
+    /// changes.
     #[test]
-    fn buy_order_accepted_with_sufficient_balance() {
-        let mut server = MatchingServer::new(cfg(), 100);
-        server.fund_account(&addr(9), 1_000_000_000); // Seller.
-        server.fund_account(&addr(1), 1_000_000_000); // Buyer.
-
-        // Rest a maker sell.
-        let maker = OrderRequest {
-            market: 0,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(9),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        server.submit_order(&maker);
-
-        // Taker buy — should match the maker.
-        let taker = OrderRequest {
-            market: 0,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(1),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        let resp = server.submit_order(&taker);
-        assert!(!resp.rejected, "should accept sufficient balance");
-        assert_eq!(resp.fills_count, 1, "should have one fill");
-        // Notional = 1_500_000_000 * 1_000 / 100_000_000 = 15_000.
-        assert_eq!(server.balance(&addr(1)), 1_000_000_000 - 15_000);
-        assert_eq!(server.balance(&addr(9)), 1_000_000_000 + 15_000);
-    }
-
-    /// Regression test (C7): a replayed order (same nonce from the
-    /// same owner) must be rejected with `StaleNonce`. Before the
-    /// fix, the matcher ignored the protocol nonce field — signed
-    /// orders could be replayed indefinitely.
-    #[test]
-    fn replayed_order_rejected_with_stale_nonce() {
+    fn unsigned_order_rejected_with_bad_signature() {
         let mut server = MatchingServer::new(cfg(), 100);
         server.fund_account(&addr(1), 1_000_000_000);
 
@@ -1621,10 +2010,164 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             owner: addr(1),
-            nonce: 42,
+            nonce: 0,
             pubkey: [0u8; 32],
             signature: [0u8; 64],
         };
+        let resp = server.submit_order(&req);
+        assert!(resp.rejected, "unsigned order must be rejected");
+        assert_eq!(resp.reject_reason, Some(RejectReason::BadSignature));
+        assert_eq!(server.resting_count(), 0, "no order may reach the book");
+    }
+
+    /// Regression (C5): a validly-signed order whose `owner` is NOT
+    /// derived from the signing key must be rejected — the signature
+    /// alone does not prove the key controls the claimed account.
+    #[test]
+    fn signed_order_with_foreign_owner_rejected() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (secret, _) = test_account(1);
+        server.fund_account(&addr(0x77), 1_000_000_000); // the victim
+
+        // Attacker signs a real order but claims the victim's owner.
+        let mut req = signed_req(&secret, 0, Side::Buy, 1, 1_500_000_000, 1_000);
+        req.owner = addr(0x77);
+        // Re-sign so the signature covers the claimed owner verbatim —
+        // this is the attack the owner-binding check exists to stop.
+        let msg = crate::protocol::signing_message(&req);
+        req.signature = crypto::ed25519::sign_message(&secret, &msg).to_bytes();
+
+        let resp = server.submit_order(&req);
+        assert!(resp.rejected);
+        assert_eq!(resp.reject_reason, Some(RejectReason::BadSignature));
+        assert_eq!(server.balance(&addr(0x77)), 1_000_000_000, "victim balance untouched");
+    }
+
+    /// A properly signed order (owner derived from the key) passes
+    /// the boundary and matches.
+    #[test]
+    fn signed_order_accepted_and_matched() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (seller_sk, _seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&buyer, 1_000_000_000);
+
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        server.submit_order(&maker);
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+        let resp = server.submit_order(&taker);
+        assert!(!resp.rejected, "authentic order must be admitted");
+        assert_eq!(resp.fills_count, 1);
+        assert_eq!(server.balance(&buyer), 1_000_000_000 - 15_000);
+    }
+
+    /// Regression (C5): actions (cancel/amend/replace) were admitted
+    /// without any nonce check — a captured signed action replayed
+    /// forever. The same action nonce must be rejected as stale.
+    #[test]
+    fn replayed_action_nonce_rejected() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (seller_sk, seller) = test_account(9);
+        server.fund_account(&seller, 0);
+
+        // Rest a sell order so there is something to cancel.
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        let resp = server.submit_order(&maker);
+        assert!(!resp.rejected);
+        let order_id = resp.order_id;
+        assert_eq!(server.resting_count(), 1);
+
+        // Cancel with nonce 1 — accepted.
+        let cancel = signed_action(&seller_sk, ActionType::Cancel, order_id, 1);
+        let resp = server.submit_action(&cancel);
+        assert!(!resp.rejected, "first cancel must be admitted");
+
+        // Rest a second order; replay the same cancel request
+        // (same nonce) — must be rejected as stale, and the second
+        // order must NOT be canceled.
+        let maker2 = signed_req(&seller_sk, 0, Side::Sell, 2, 1_500_000_000, 1_000);
+        let resp2 = server.submit_order(&maker2);
+        assert!(!resp2.rejected);
+
+        let replay = signed_action(&seller_sk, ActionType::Cancel, resp2.order_id, 1);
+        let replay_resp = server.submit_action(&replay);
+        assert!(replay_resp.rejected, "replayed action nonce must be rejected");
+        assert_eq!(replay_resp.reject_reason, Some(RejectReason::StaleNonce));
+        assert_eq!(server.resting_count(), 1, "second order must still be resting");
+    }
+
+    /// Regression (C5): an action with a bad signature must be
+    /// rejected at the boundary — today `submit_action` took an
+    /// `OrderAction` (already stripped of signature) so forged
+    /// cancels could reach the engine directly.
+    #[test]
+    fn unsigned_action_rejected_with_bad_signature() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let req = ActionRequest {
+            action_type: ActionType::Cancel,
+            order_id: 1,
+            new_price: Price(0),
+            new_qty: Qty(0),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            nonce: 0,
+            owner: addr(1),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        let resp = server.submit_action(&req);
+        assert!(resp.rejected);
+        assert_eq!(resp.reject_reason, Some(RejectReason::BadSignature));
+    }
+
+    #[test]
+    fn buy_order_rejected_with_insufficient_balance() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&buyer, 1_000); // Not enough for 5 lots at $15.
+
+        let req = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 5_000);
+
+        let resp = server.submit_order(&req);
+        assert!(resp.rejected, "should reject insufficient balance");
+        assert_eq!(resp.reject_reason, Some(RejectReason::InsufficientBalance));
+        assert_eq!(server.balance(&buyer), 1_000, "balance unchanged");
+    }
+
+    #[test]
+    fn buy_order_accepted_with_sufficient_balance() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&seller, 1_000_000_000);
+        server.fund_account(&buyer, 1_000_000_000);
+
+        // Rest a maker sell.
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        server.submit_order(&maker);
+
+        // Taker buy — should match the maker.
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+        let resp = server.submit_order(&taker);
+        assert!(!resp.rejected, "should accept sufficient balance");
+        assert_eq!(resp.fills_count, 1, "should have one fill");
+        // Notional = 1_500_000_000 * 1_000 / 100_000_000 = 15_000.
+        assert_eq!(server.balance(&buyer), 1_000_000_000 - 15_000);
+        assert_eq!(server.balance(&seller), 1_000_000_000 + 15_000);
+    }
+
+    /// Regression test (C7): a replayed order (same nonce from the
+    /// same owner) must be rejected with `StaleNonce`. Before the
+    /// fix, the matcher ignored the protocol nonce field — signed
+    /// orders could be replayed indefinitely.
+    #[test]
+    fn replayed_order_rejected_with_stale_nonce() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&buyer, 1_000_000_000);
+
+        let req = signed_req(&buyer_sk, 0, Side::Buy, 42, 1_500_000_000, 1_000);
 
         // First submission: accepted (nonce 42 is new).
         let resp = server.submit_order(&req);
@@ -1640,8 +2183,7 @@ mod tests {
         );
 
         // Higher nonce: accepted.
-        let mut req2 = req;
-        req2.nonce = 43;
+        let req2 = signed_req(&buyer_sk, 0, Side::Buy, 43, 1_500_000_000, 1_000);
         let resp2 = server.submit_order(&req2);
         assert!(!resp2.rejected, "order with higher nonce must be accepted");
     }
@@ -1655,21 +2197,13 @@ mod tests {
             max_resting_per_account: 0,
         };
         let mut server = MatchingServer::with_risk_config(cfg(), 100, risk_cfg);
+        let (buyer_sk, _buyer) = test_account(1);
 
-        // Submit 1000 buy orders with zero balance — all should be rejected.
+        // Submit 1000 signed buy orders with zero balance — all
+        // should be rejected at the balance check (they pass
+        // authentication and the nonce gate, then fail reservation).
         for i in 0..1000u64 {
-            let req = OrderRequest {
-                market: 0,
-                side: Side::Buy,
-                order_type: OrderType::Limit,
-                tif: TimeInForce::Gtc,
-                price: Price(1_500_000_000),
-                qty: Qty(1_000),
-                owner: addr(1),
-                nonce: i,
-                pubkey: [0u8; 32],
-                signature: [0u8; 64],
-            };
+            let req = signed_req(&buyer_sk, 0, Side::Buy, i, 1_500_000_000, 1_000);
             let resp = server.submit_order(&req);
             assert!(resp.rejected, "spam order should be rejected");
         }
@@ -1684,39 +2218,26 @@ mod tests {
         // orders through the ring, then seal via the control channel
         // — the seal must return the SAME fills the protocols
         // produced (one book, never two).
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
         let mut server = MatchingServer::new(cfg(), 100);
-        server.fund_account(&addr(9), 1_000_000_000); // Seller.
-        server.fund_account(&addr(1), 1_000_000_000); // Buyer.
+        server.fund_account(&seller, 1_000_000_000);
+        server.fund_account(&buyer, 1_000_000_000);
         let ring = RingMatcher::new(server, 4, 1024);
 
         // Push a maker sell + taker buy as one batch through ring 0.
-        let maker = OrderRequest {
-            market: 0,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(9),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        let taker = OrderRequest {
-            market: 0,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(1),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
+        // The ring only accepts `VerifiedOrder` proofs — transport
+        // threads authenticate, the matcher thread never sees a raw
+        // unauthenticated request.
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+        let verified: Vec<crate::protocol::VerifiedOrder> = [maker, taker]
+            .into_iter()
+            .map(|req| crate::protocol::VerifiedOrder::new(req).expect("signed orders must verify"))
+            .collect();
         let sender = ring.order_sender(0);
         let receiver = ring.response_receiver(0);
-        let mut batch = vec![maker, taker];
+        let mut batch = verified;
         while let Err(crate::ring::PushError::Full(returned)) = sender.push(batch) {
             batch = returned;
             std::hint::spin_loop();
@@ -1734,8 +2255,8 @@ mod tests {
         let fills = ring.seal_batch();
         assert_eq!(fills.len(), 1, "seal returns the fill produced via the ring");
         assert_eq!(fills[0].qty, Qty(1_000));
-        assert_eq!(fills[0].buyer, addr(1));
-        assert_eq!(fills[0].seller, addr(9));
+        assert_eq!(fills[0].buyer, buyer);
+        assert_eq!(fills[0].seller, seller);
 
         // Stats via the control channel.
         let stats = ring.stats();
@@ -1760,67 +2281,28 @@ mod tests {
     fn multi_market_two_markets_match_independently() {
         // Two markets, each with its own book. The same seller and
         // buyer trade on both — balances are shared (sharded), books
-        // are independent.
+        // are independent. Nonces are also shared (per-ACCOUNT, not
+        // per-market): each account's nonces must increase across
+        // markets.
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
         let balances = Arc::new(AtomicBalanceCache::new(8));
-        balances.set(&addr(9), 1_000_000_000); // Seller.
-        balances.set(&addr(1), 1_000_000_000); // Buyer.
+        balances.set(&seller, 1_000_000_000);
+        balances.set(&buyer, 1_000_000_000);
         let configs = vec![cfg_for(0), cfg_for(1)];
         let matcher = MultiMarketMatcher::new(configs, balances);
 
         // Market 0: rest a maker sell, then a taker buy fills it.
-        let maker0 = OrderRequest {
-            market: 0,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(9),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        let taker0 = OrderRequest {
-            market: 0,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(1),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
+        let maker0 = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        let taker0 = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
         let responses = matcher.submit_batch(vec![maker0, taker0]);
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[1].fills_count, 1, "market 0 taker should fill");
 
         // Market 1: same pair, independent book — should also fill.
-        let maker1 = OrderRequest {
-            market: 1,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_600_000_000),
-            qty: Qty(1_000),
-            owner: addr(9),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        let taker1 = OrderRequest {
-            market: 1,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_600_000_000),
-            qty: Qty(1_000),
-            owner: addr(1),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
+        // Nonces continue per account (seller 1, buyer 1).
+        let maker1 = signed_req(&seller_sk, 1, Side::Sell, 1, 1_600_000_000, 1_000);
+        let taker1 = signed_req(&buyer_sk, 1, Side::Buy, 1, 1_600_000_000, 1_000);
         let responses = matcher.submit_batch(vec![maker1, taker1]);
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[1].fills_count, 1, "market 1 taker should fill");
@@ -1837,68 +2319,28 @@ mod tests {
 
     #[test]
     fn multi_market_balance_check_is_atomic_across_markets() {
-        // Account 1 has exactly 15_000 quote (enough for ONE fill at
+        // The buyer has exactly 15_000 quote (enough for ONE fill at
         // $15 × 1000 qty). Two markets try to debit simultaneously —
         // only one should succeed.
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
         let balances = Arc::new(AtomicBalanceCache::new(8));
-        balances.set(&addr(9), 1_000_000_000); // Seller (funded).
-        balances.set(&addr(1), 15_000); // Buyer: exactly one fill's worth.
+        balances.set(&seller, 1_000_000_000); // Seller (funded).
+        balances.set(&buyer, 15_000); // Buyer: exactly one fill's worth.
         let configs = vec![cfg_for(0), cfg_for(1)];
         let matcher = MultiMarketMatcher::new(configs, balances);
 
-        // Rest maker sells on both markets.
-        let maker0 = OrderRequest {
-            market: 0,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(9),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        let maker1 = OrderRequest {
-            market: 1,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(9),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
+        // Rest maker sells on both markets (seller nonces 0, 1 —
+        // shared per-account nonce tracker across markets).
+        let maker0 = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        let maker1 = signed_req(&seller_sk, 1, Side::Sell, 1, 1_500_000_000, 1_000);
         matcher.submit_batch(vec![maker0]);
         matcher.submit_batch(vec![maker1]);
 
-        // Submit taker buys on both markets (same buyer, same balance).
-        let taker0 = OrderRequest {
-            market: 0,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(1),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        let taker1 = OrderRequest {
-            market: 1,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(1),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
+        // Submit taker buys on both markets (same buyer, same
+        // balance; buyer nonces 0, 1).
+        let taker0 = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+        let taker1 = signed_req(&buyer_sk, 1, Side::Buy, 1, 1_500_000_000, 1_000);
         let resp0 = matcher.submit_one(taker0);
         let resp1 = matcher.submit_one(taker1);
 
@@ -1913,5 +2355,115 @@ mod tests {
             resp0.rejected,
             resp1.rejected
         );
+    }
+
+    /// Regression (C5): a batch with a bad-signature order between
+    /// two valid orders must produce aligned responses —
+    /// `[good, bad, good]` → `[result0, BadSignature, result1]`.
+    /// The pre-fix transport filtered valid requests and prepended
+    /// rejections, yielding `[BadSignature, result0, result1]` and
+    /// misattributing every response after the bad entry.
+    #[test]
+    fn multi_market_batch_preserves_positions_with_bad_signature() {
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        let balances = Arc::new(AtomicBalanceCache::new(8));
+        balances.set(&seller, 1_000_000_000);
+        balances.set(&buyer, 1_000_000_000);
+        let configs = vec![cfg_for(0), cfg_for(1)];
+        let matcher = MultiMarketMatcher::new(configs, balances);
+
+        let good0 = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        // A forged order: zero signature/pubkey — fails verify_order
+        // outright regardless of the claimed owner.
+        let bad = OrderRequest {
+            market: 0,
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price(1_500_000_000),
+            qty: Qty(1_000),
+            nonce: 0,
+            owner: seller,
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        let good1 = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+
+        // The interleaved case: [good sell, forged, good buy].
+        let responses = matcher.submit_batch(vec![good0, bad, good1]);
+        assert_eq!(responses.len(), 3);
+        assert!(!responses[0].rejected, "index 0 (good sell) must rest");
+        assert!(responses[1].rejected, "index 1 (forged) must be rejected");
+        assert_eq!(
+            responses[1].reject_reason,
+            Some(RejectReason::BadSignature),
+            "the middle slot gets BadSignature at its own position"
+        );
+        assert_eq!(
+            responses[2].fills_count, 1,
+            "index 2 (good buy) fills against the resting sell"
+        );
+    }
+
+    /// Regression (C5): `submit_batch` must route each verified order
+    /// by ITS OWN `market` field — not `orders[0].market`. The pre-fix
+    /// code sent the whole batch to the head order's worker, silently
+    /// matching mixed-market batches on the wrong book. Distinct
+    /// price bands make misrouting observable: market 1's price is
+    /// out of band on market 0's engine, so a misrouted order would
+    /// be rejected instead of filling.
+    #[test]
+    fn multi_market_batch_routes_by_each_orders_market() {
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        let balances = Arc::new(AtomicBalanceCache::new(8));
+        balances.set(&seller, 1_000_000_000);
+        balances.set(&buyer, 1_000_000_000);
+        // Market 0 band: [1e9, 2e9]. Market 1 band: [3e9, 4e9] — no
+        // overlap, so a market-1 order landing on market 0's engine
+        // is rejected by price-band validation.
+        let mut cfg0 = cfg_for(0);
+        cfg0.min_price = 1_000_000_000;
+        cfg0.max_price = 2_000_000_000;
+        let mut cfg1 = cfg_for(1);
+        cfg1.min_price = 3_000_000_000;
+        cfg1.max_price = 4_000_000_000;
+        let matcher = MultiMarketMatcher::new(vec![cfg0, cfg1], balances);
+
+        // One mixed batch: market-1 orders INTERLEAVED after the
+        // market-0 head. If routed by orders[0].market, both market-1
+        // orders hit the [1e9,2e9] engine and are rejected.
+        let orders = vec![
+            signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000),
+            signed_req(&seller_sk, 1, Side::Sell, 1, 3_500_000_000, 1_000),
+            signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000),
+            signed_req(&buyer_sk, 1, Side::Buy, 1, 3_500_000_000, 1_000),
+        ];
+        let responses = matcher.submit_batch(orders);
+        assert_eq!(responses.len(), 4);
+        assert!(
+            !responses[0].rejected,
+            "market-0 maker rests, got {:?}",
+            responses[0].reject_reason
+        );
+        assert!(
+            !responses[1].rejected,
+            "market-1 maker must reach market 1's engine (its 3.5e9 \
+             price is out of band on market 0 — a misroute would reject)"
+        );
+        assert_eq!(
+            responses[2].fills_count, 1,
+            "market-0 taker fills (rejected={} reason={:?})",
+            responses[2].rejected, responses[2].reject_reason
+        );
+        assert_eq!(
+            responses[3].fills_count, 1,
+            "market-1 taker fills (rejected={} reason={:?})",
+            responses[3].rejected, responses[3].reject_reason
+        );
+
+        let fills = matcher.seal_batch();
+        assert_eq!(fills.len(), 2, "one fill per market");
     }
 }

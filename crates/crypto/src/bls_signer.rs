@@ -62,6 +62,10 @@ fn dst(domain: Domain) -> &'static [u8] {
         Domain::BodyShardNode => b"oxide/body-shard-node",
         Domain::ExecAttest => b"oxide/exec-attest",
         Domain::BlsPop => b"oxide/bls-pop",
+        // Never used for BLS signing (Ed25519 owner derivation hashes
+        // via BLAKE3, not this DST) — the arm exists only because the
+        // match is exhaustive over `Domain`.
+        Domain::Ed25519Owner => b"oxide/ed25519-owner",
     }
 }
 

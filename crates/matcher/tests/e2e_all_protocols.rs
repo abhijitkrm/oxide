@@ -24,7 +24,8 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_possible_wrap)]
 
-use matcher::protocol::{OrderRequest, decode_response, encode_request};
+use crypto::ed25519::{Ed25519SecretKey, owner_address};
+use matcher::protocol::{OrderRequest, decode_response, encode_request, sign_order};
 use matcher::{MatchingServer, SharedMatcher};
 use primitives::fixed::{Price, Qty};
 use std::sync::Arc;
@@ -54,8 +55,20 @@ fn addr_from_index(i: u32) -> primitives::Address {
     primitives::Address(addr)
 }
 
-fn make_order(side: Side, owner_idx: u32, nonce: u64) -> OrderRequest {
-    OrderRequest {
+/// Deterministic per-account signing key — account `i` is an Ed25519
+/// key whose funded address is the key's derived owner. Every order
+/// must authenticate at the admission boundary (signature + owner
+/// binding), so benchmarks sign like real clients.
+fn account_key(i: u32) -> Ed25519SecretKey {
+    let mut seed = [0u8; 32];
+    seed[..4].copy_from_slice(&i.to_le_bytes());
+    Ed25519SecretKey::from_bytes(&seed)
+}
+
+/// Build a signed order for `key`'s account. `sign_order` fills in
+/// `owner` (derived from the key), `pubkey`, and `signature`.
+fn make_order(key: &Ed25519SecretKey, side: Side, nonce: u64) -> OrderRequest {
+    let mut req = OrderRequest {
         market: 0,
         side,
         order_type: OrderType::Limit,
@@ -63,14 +76,16 @@ fn make_order(side: Side, owner_idx: u32, nonce: u64) -> OrderRequest {
         price: Price(1_500_000_000),
         qty: Qty(1_000),
         nonce,
-        owner: addr_from_index(owner_idx),
+        owner: addr_from_index(0),
         pubkey: [0u8; 32],
         signature: [0u8; 64],
-    }
+    };
+    sign_order(&mut req, key);
+    req
 }
 
 /// Per-owner nonce counter. `MatchingServer::submit` enforces
-/// strictly-increasing nonces per owner (C7 replay protection):
+/// strictly-increasing nonces per owner (C5 replay protection):
 /// a benchmark that reuses `nonce: 0` gets every order after the
 /// first per account rejected as `StaleNonce`, which measures
 /// reject throughput, not matching.
@@ -80,25 +95,24 @@ fn next_nonce(nonces: &mut std::collections::HashMap<u32, u64>, owner_idx: u32) 
     *n
 }
 
-/// 32-byte zero public key as hex (parse-required; the submit path
-/// does not verify signatures — only actions do).
-const DUMMY_PUBKEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// 64-byte zero signature as hex.
-const DUMMY_SIG_HEX: &str = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-
-/// Build a shared matcher with funded accounts.
-fn build_matcher(n_accounts: usize, initial_balance: u64) -> Arc<SharedMatcher> {
+/// Build a shared matcher with funded accounts plus the account
+/// keys needed to sign for them.
+fn build_matcher(
+    n_accounts: usize,
+    initial_balance: u64,
+) -> (Arc<SharedMatcher>, Vec<Ed25519SecretKey>) {
+    let keys: Vec<Ed25519SecretKey> =
+        (0..u32::try_from(n_accounts).unwrap_or(u32::MAX)).map(account_key).collect();
     let mut server = MatchingServer::new(cfg(), n_accounts);
-    for i in 0..u32::try_from(n_accounts).unwrap_or(u32::MAX) {
-        server.fund_account(&addr_from_index(i), initial_balance);
+    for key in &keys {
+        server.fund_account(&owner_address(&key.verifying_key()), initial_balance);
     }
-    Arc::new(SharedMatcher::new(server))
+    (Arc::new(SharedMatcher::new(server)), keys)
 }
 
 /// Run the binary TCP protocol benchmark.
 async fn bench_binary_tcp(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let tcp_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_binary_tcp_server(tcp_matcher, port).await;
@@ -116,11 +130,11 @@ async fn bench_binary_tcp(n_orders: usize, n_accounts: usize, port: u16) -> f64 
     for i in 0..n_pairs {
         let seller = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32;
         let buyer = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32;
-        let maker = make_order(Side::Sell, seller, next_nonce(&mut nonces, seller));
+        let maker = make_order(&keys[seller as usize], Side::Sell, next_nonce(&mut nonces, seller));
         sock.write_all(&encode_request(&maker)).await.expect("w");
         sock.read_exact(&mut buf).await.expect("r");
         fills += u64::from(decode_response(&buf).expect("d").fills_count);
-        let taker = make_order(Side::Buy, buyer, next_nonce(&mut nonces, buyer));
+        let taker = make_order(&keys[buyer as usize], Side::Buy, next_nonce(&mut nonces, buyer));
         sock.write_all(&encode_request(&taker)).await.expect("w");
         sock.read_exact(&mut buf).await.expect("r");
         fills += u64::from(decode_response(&buf).expect("d").fills_count);
@@ -136,7 +150,7 @@ async fn bench_binary_tcp(n_orders: usize, n_accounts: usize, port: u16) -> f64 
 
 /// Run the JSON-RPC protocol benchmark.
 async fn bench_jsonrpc(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let rpc_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_jsonrpc_tcp_server(rpc_matcher, port).await;
@@ -155,7 +169,7 @@ async fn bench_jsonrpc(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
         let seller = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32;
         let buyer = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32;
         // Maker sell.
-        let maker = make_order(Side::Sell, seller, next_nonce(&mut nonces, seller));
+        let maker = make_order(&keys[seller as usize], Side::Sell, next_nonce(&mut nonces, seller));
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "oxide_placeOrder",
@@ -168,8 +182,8 @@ async fn bench_jsonrpc(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
                 "qty": maker.qty.0,
                 "nonce": maker.nonce,
                 "owner": format!("0x{}", hex::encode(maker.owner.0)),
-                "pubkey": DUMMY_PUBKEY_HEX,
-                "signature": DUMMY_SIG_HEX,
+                "pubkey": hex::encode(maker.pubkey),
+                "signature": hex::encode(maker.signature),
             },
             "id": i * 2,
         });
@@ -186,7 +200,7 @@ async fn bench_jsonrpc(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         // Taker buy.
-        let taker = make_order(Side::Buy, buyer, next_nonce(&mut nonces, buyer));
+        let taker = make_order(&keys[buyer as usize], Side::Buy, next_nonce(&mut nonces, buyer));
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "oxide_placeOrder",
@@ -199,8 +213,8 @@ async fn bench_jsonrpc(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
                 "qty": taker.qty.0,
                 "nonce": taker.nonce,
                 "owner": format!("0x{}", hex::encode(taker.owner.0)),
-                "pubkey": DUMMY_PUBKEY_HEX,
-                "signature": DUMMY_SIG_HEX,
+                "pubkey": hex::encode(taker.pubkey),
+                "signature": hex::encode(taker.signature),
             },
             "id": i * 2 + 1,
         });
@@ -227,7 +241,7 @@ async fn bench_jsonrpc(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
 
 /// Run the FIX 4.4 protocol benchmark.
 async fn bench_fix(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let fix_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_fix_server(fix_matcher, port).await;
@@ -246,25 +260,25 @@ async fn bench_fix(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
         let seller = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32;
         let buyer = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32;
         // Maker sell (FIX NewOrderSingle). Tags 9666/9700/9701
-        // (nonce/pubkey/signature) are mandatory post-C7 — the
-        // parser rejects messages without them, and the server
+        // (nonce/pubkey/signature) are mandatory — the parser
+        // rejects messages without them, and the server
         // answers a parse failure with a rejected ExecutionReport.
-        let maker = make_order(Side::Sell, seller, next_nonce(&mut nonces, seller));
+        let maker = make_order(&keys[seller as usize], Side::Sell, next_nonce(&mut nonces, seller));
         let fix_msg = format!(
             "8=FIX.4.4\x0135=D\x0149=CLIENT\x0156=MATCHER\x0134={i}\x0111=M{i}\x01\
              54=2\x0140=2\x0159=0\x0144=15.00\x0138=0.001\x01\
              1=0x{}\x0155=OXIDE\x019666={}\x019700={}\x019701={}\x0110=000\x01",
             hex::encode(maker.owner.0),
             maker.nonce,
-            DUMMY_PUBKEY_HEX,
-            DUMMY_SIG_HEX,
+            hex::encode(maker.pubkey),
+            hex::encode(maker.signature),
         );
         sock.write_all(fix_msg.as_bytes()).await.expect("w");
         resp_buf.fill(0);
         let _ = sock.read(&mut resp_buf).await.expect("r");
         // We don't parse the FIX response for fills — just count orders.
         // Taker buy.
-        let taker = make_order(Side::Buy, buyer, next_nonce(&mut nonces, buyer));
+        let taker = make_order(&keys[buyer as usize], Side::Buy, next_nonce(&mut nonces, buyer));
         let fix_msg = format!(
             "8=FIX.4.4\x0135=D\x0149=CLIENT\x0156=MATCHER\x0134={}\x0111=T{i}\x01\
              54=1\x0140=2\x0159=0\x0144=15.00\x0138=0.001\x01\
@@ -272,8 +286,8 @@ async fn bench_fix(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
             i + 1,
             hex::encode(taker.owner.0),
             taker.nonce,
-            DUMMY_PUBKEY_HEX,
-            DUMMY_SIG_HEX,
+            hex::encode(taker.pubkey),
+            hex::encode(taker.signature),
         );
         sock.write_all(fix_msg.as_bytes()).await.expect("w");
         resp_buf.fill(0);
@@ -291,7 +305,7 @@ async fn bench_fix(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
 
 /// Run the WebSocket protocol benchmark.
 async fn bench_websocket(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let ws_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_websocket_server(ws_matcher, port).await;
@@ -327,28 +341,28 @@ async fn bench_websocket(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
         let seller = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32;
         let buyer = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32;
         // Maker sell (JSON).
-        let maker = make_order(Side::Sell, seller, next_nonce(&mut nonces, seller));
+        let maker = make_order(&keys[seller as usize], Side::Sell, next_nonce(&mut nonces, seller));
         let json = format!(
             r#"{{"market":0,"side":"sell","type":"limit","tif":"gtc","price":{},"qty":{},"nonce":{},"owner":"0x{}","pubkey":"0x{}","signature":"0x{}"}}"#,
             maker.price.0,
             maker.qty.0,
             maker.nonce,
             hex::encode(maker.owner.0),
-            DUMMY_PUBKEY_HEX,
-            DUMMY_SIG_HEX,
+            hex::encode(maker.pubkey),
+            hex::encode(maker.signature),
         );
         write_ws_frame(&mut sock, json.as_bytes()).await.expect("w");
         read_ws_frame(&mut sock).await.expect("r");
         // Taker buy.
-        let taker = make_order(Side::Buy, buyer, next_nonce(&mut nonces, buyer));
+        let taker = make_order(&keys[buyer as usize], Side::Buy, next_nonce(&mut nonces, buyer));
         let json = format!(
             r#"{{"market":0,"side":"buy","type":"limit","tif":"gtc","price":{},"qty":{},"nonce":{},"owner":"0x{}","pubkey":"0x{}","signature":"0x{}"}}"#,
             taker.price.0,
             taker.qty.0,
             taker.nonce,
             hex::encode(taker.owner.0),
-            DUMMY_PUBKEY_HEX,
-            DUMMY_SIG_HEX,
+            hex::encode(taker.pubkey),
+            hex::encode(taker.signature),
         );
         write_ws_frame(&mut sock, json.as_bytes()).await.expect("w");
         let resp = read_ws_frame(&mut sock).await.expect("r");

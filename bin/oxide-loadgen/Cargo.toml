@@ -15,6 +15,7 @@ name = "oxide-loadgen"
 path = "src/main.rs"
 
 [dependencies]
+crypto = { workspace = true }
 matcher = { workspace = true }
 primitives = { workspace = true }
 trading = { workspace = true }

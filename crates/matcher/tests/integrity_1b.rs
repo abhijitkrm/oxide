@@ -26,6 +26,8 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_possible_wrap)]
 
+use crypto::ed25519::{Ed25519SecretKey, owner_address};
+use matcher::protocol::sign_order;
 use matcher::{MatchingServer, OrderRequest};
 use primitives::fixed::{Price, Qty};
 use std::time::Instant;
@@ -55,6 +57,34 @@ fn addr_from_index(i: u32) -> primitives::Address {
     primitives::Address(addr)
 }
 
+/// Deterministic per-account signing key — account `i` is an Ed25519
+/// key whose funded address is the key's derived owner. The admission
+/// boundary verifies every order's signature, so the integrity test
+/// signs like a real client.
+fn account_key(i: u32) -> Ed25519SecretKey {
+    let mut seed = [0u8; 32];
+    seed[..4].copy_from_slice(&i.to_le_bytes());
+    Ed25519SecretKey::from_bytes(&seed)
+}
+
+/// Build a signed order for `key`'s account at `nonce`.
+fn signed_order(key: &Ed25519SecretKey, side: Side, nonce: u64) -> OrderRequest {
+    let mut req = OrderRequest {
+        market: 0,
+        side,
+        order_type: OrderType::Limit,
+        tif: TimeInForce::Gtc,
+        price: Price(1_500_000_000),
+        qty: Qty(1_000),
+        nonce,
+        owner: addr_from_index(0),
+        pubkey: [0u8; 32],
+        signature: [0u8; 64],
+    };
+    sign_order(&mut req, key);
+    req
+}
+
 /// 1B-order integrity test with 1M active accounts.
 #[test]
 #[ignore = "long-running 1B-order test; run with --release --ignored --nocapture"]
@@ -67,12 +97,18 @@ fn integrity_1b_orders_1m_accounts() {
         "integrity: {n_orders} orders, {n_accounts} accounts, {initial_balance} quote/account"
     );
 
-    // Setup: create server, fund accounts.
+    // Setup: create server, fund accounts. Each account is an
+    // Ed25519 key — the funded address is the key's derived owner,
+    // and every order is signed by that key.
     eprintln!("integrity: funding {n_accounts} accounts...");
     let setup_start = Instant::now();
+    let account_keys: Vec<Ed25519SecretKey> =
+        (0..u32::try_from(n_accounts).unwrap_or(u32::MAX)).map(account_key).collect();
+    let owners: Vec<primitives::Address> =
+        account_keys.iter().map(|k| owner_address(&k.verifying_key())).collect();
     let mut server = MatchingServer::new(cfg(), n_accounts);
-    for i in 0..u32::try_from(n_accounts).unwrap_or(u32::MAX) {
-        server.fund_account(&addr_from_index(i), initial_balance);
+    for owner in &owners {
+        server.fund_account(owner, initial_balance);
     }
     let total_initial = u64::try_from(n_accounts).unwrap_or(u64::MAX) * initial_balance;
     eprintln!(
@@ -92,33 +128,16 @@ fn integrity_1b_orders_1m_accounts() {
 
     let n_pairs = n_orders / 2;
     let n_accounts_u32 = u32::try_from(n_accounts).unwrap_or(u32::MAX);
+    // Per-account nonce counters — nonces must strictly increase
+    // per account or the replay gate rejects the order.
+    let mut nonces = vec![0u64; n_accounts];
     for i in 0..n_pairs {
-        let seller_idx = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_accounts_u32;
-        let buyer_idx = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_accounts_u32;
-        let maker = OrderRequest {
-            market: 0,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            nonce: 0,
-            owner: addr_from_index(seller_idx),
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        let taker = OrderRequest {
-            market: 0,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            nonce: 0,
-            owner: addr_from_index(buyer_idx),
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
+        let seller_idx = (u32::try_from(2 * i).unwrap_or(u32::MAX) % n_accounts_u32) as usize;
+        let buyer_idx = (u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_accounts_u32) as usize;
+        let maker = signed_order(&account_keys[seller_idx], Side::Sell, nonces[seller_idx]);
+        nonces[seller_idx] += 1;
+        let taker = signed_order(&account_keys[buyer_idx], Side::Buy, nonces[buyer_idx]);
+        nonces[buyer_idx] += 1;
         let _ = server.submit_order(&maker);
         let _ = server.submit_order(&taker);
     }
@@ -179,8 +198,8 @@ fn integrity_1b_orders_1m_accounts() {
 
     // Sum all account balances and verify conservation.
     let mut total_balance: u128 = 0;
-    for i in 0..n_accounts as u32 {
-        total_balance += u128::from(server.balance(&addr_from_index(i)));
+    for owner in &owners {
+        total_balance += u128::from(server.balance(owner));
     }
     let expected_total = u128::from(n_accounts as u64) * u128::from(initial_balance);
     eprintln!("integrity: total balance = {total_balance}, expected = {expected_total}");
@@ -195,7 +214,7 @@ fn integrity_1b_orders_1m_accounts() {
     // With 1B orders / 1M accounts = 1000 fills per account, each
     // costing 15_000 quote. Starting with 1T, no account should
     // be near zero.
-    let min_balance = server.balance(&addr_from_index(0));
+    let min_balance = server.balance(&owners[0]);
     assert!(min_balance > 0, "all accounts must have positive balance");
 
     eprintln!("integrity: all checks passed ✓");
@@ -209,41 +228,25 @@ fn integrity_smoke() {
     let n_accounts = env_usize("INTEGRITY_ACCOUNTS", 1000);
     let initial_balance = 1_000_000_000_000u64;
 
+    let account_keys: Vec<Ed25519SecretKey> = (0..n_accounts as u32).map(account_key).collect();
+    let owners: Vec<primitives::Address> =
+        account_keys.iter().map(|k| owner_address(&k.verifying_key())).collect();
     let mut server = MatchingServer::new(cfg(), n_accounts);
-    for i in 0..n_accounts as u32 {
-        server.fund_account(&addr_from_index(i), initial_balance);
+    for owner in &owners {
+        server.fund_account(owner, initial_balance);
     }
 
     let start = Instant::now();
     let n_pairs = n_orders / 2;
     let n_accounts_u32 = u32::try_from(n_accounts).unwrap_or(u32::MAX);
+    let mut nonces = vec![0u64; n_accounts];
     for i in 0..n_pairs {
-        let seller_idx = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_accounts_u32;
-        let buyer_idx = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_accounts_u32;
-        let maker = OrderRequest {
-            market: 0,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            nonce: 0,
-            owner: addr_from_index(seller_idx),
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        let taker = OrderRequest {
-            market: 0,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            nonce: 0,
-            owner: addr_from_index(buyer_idx),
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
+        let seller_idx = (u32::try_from(2 * i).unwrap_or(u32::MAX) % n_accounts_u32) as usize;
+        let buyer_idx = (u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_accounts_u32) as usize;
+        let maker = signed_order(&account_keys[seller_idx], Side::Sell, nonces[seller_idx]);
+        nonces[seller_idx] += 1;
+        let taker = signed_order(&account_keys[buyer_idx], Side::Buy, nonces[buyer_idx]);
+        nonces[buyer_idx] += 1;
         let _ = server.submit_order(&maker);
         let _ = server.submit_order(&taker);
     }

@@ -15405,3 +15405,67 @@ Regression tests (all prove serial ≡ parallel):
 
 Gates: 235 evm tests + full workspace suite green; fmt + clippy
 `-D warnings` clean.
+
+### Session 5 (cont.) — Audit C5: mandatory matcher authentication at every admission path
+
+C5 finding: order/action authentication was optional or absent on most
+matcher ingress paths — binary-TCP single orders, JSON-RPC, FIX, and
+WebSocket all reached the engine unverified, and the claimed
+"key ↔ owner registration" did not exist anywhere.
+
+**Owner binding (C5a/b).** `crypto::ed25519::owner_address` derives the
+account address from the Ed25519 verifying key under a new
+`Domain::Ed25519Owner` tag — the key IS the account, no registry
+needed. `verify_order`/`verify_action` now check signature AND
+`owner == owner_address(pubkey)`; `sign_order`/`sign_action` derive
+and fill `owner`. `VerifiedOrder` is an unforgeable proof token
+(`Option::new` runs `verify_order`) — ring channels and worker
+queues carry it, not raw requests.
+
+**Boundary (C5c).** `MatchingServer::submit_order` → authenticate →
+`NonceTracker` (strictly-increasing per-account, consumed even when
+execution later fails — Ethereum semantics) → risk → reserve → match.
+`submit_action` takes the wire `ActionRequest` (not a stripped
+`OrderAction`) so forged cancels cannot bypass auth. Internal
+amend/replace resubmits call private `execute_order` — already
+authorized by the enclosing signed action, must not consume a second
+nonce. `MatcherStats.auth_rejections` aggregates everywhere.
+
+**Transports (C5d).** All adapters pass `ActionRequest` through to
+the matcher boundary. Two real bugs found and fixed:
+
+1. Batch responses were misaligned: the TCP batch path filtered bad
+   orders then *prepended* rejections, so `[good, bad, good]` came
+   back `[BadSignature, r0, r1]` — every response after a bad entry
+   misattributed. Now an aligned slot merge (`positions[]` →
+   `Vec<Option<OrderResponse>>`) in `MultiMarketMatcher::submit_batch`
+   and `submit_batch_ring`.
+2. `submit_batch` routed the whole batch by `orders[0].market` —
+   a mixed-market batch silently matched on the wrong book (the
+   e2e test could not tell: identical price bands meant the orders
+   still crossed). Now each verified order routes by its own
+   `market` (fast path when uniform), and a new regression gives
+   markets disjoint price bands so misrouting is observable.
+
+**Nonce-order race (found while testing).** Per-account nonces are
+consumed by market workers under a shared `NonceTracker` — but a
+same-account, cross-market batch feeds DIFFERENT workers in
+parallel, so whichever worker ran first set the watermark and the
+other order's `StaleNonce`-vs-accept verdict was nondeterministic
+(failed 2 of 3 runs). Fixed by consuming nonces at dispatch in
+batch order on the calling thread — the batch's submission order IS
+the admission order; only concurrent calls race, which is correct.
+15/15 deterministic passes after.
+
+**Fixtures (C5e).** Every success-path fixture now signs:
+deterministic `Ed25519SecretKey` per account, derived owners,
+strictly-increasing per-account nonces across markets. Benches
+pre-sign in setup (client-side work excluded from the measured
+server path); `oxide-loadgen` signs with partitioned account
+ranges per connection so one account's nonce sequence never
+arrives out of order.
+
+Gates: 98 matcher tests + full workspace suite green; fmt + clippy
+`-D warnings` clean. New regressions: unsigned order/action,
+foreign-owner signature, replayed order/action, mixed batch
+position alignment, per-market batch routing.

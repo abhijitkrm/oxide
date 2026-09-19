@@ -25,8 +25,10 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crypto::ed25519::Ed25519SecretKey;
 use matcher::protocol::{
     OrderRequest, decode_batch_response, decode_response, encode_batch_request, encode_request,
+    sign_order,
 };
 use primitives::fixed::{Price, Qty};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -112,36 +114,52 @@ fn addr_from_index(i: u32) -> primitives::Address {
     primitives::Address(addr)
 }
 
-fn make_order(side: Side, owner_idx: u32, market: u8) -> OrderRequest {
-    OrderRequest {
+/// Deterministic per-account signing key — the server authenticates
+/// every order (signature + derived-owner binding), so loadgen
+/// signs exactly like a real client. Accounts are assumed to be
+/// pre-funded on the server side at each key's derived owner.
+fn account_key(i: u32) -> Ed25519SecretKey {
+    let mut seed = [0u8; 32];
+    seed[..4].copy_from_slice(&i.to_le_bytes());
+    Ed25519SecretKey::from_bytes(&seed)
+}
+
+/// Build a signed order for `key`'s account at `nonce` on `market`.
+fn make_order(key: &Ed25519SecretKey, side: Side, nonce: u64, market: u8) -> OrderRequest {
+    let mut req = OrderRequest {
         market,
         side,
         order_type: OrderType::Limit,
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
-        owner: addr_from_index(owner_idx),
-        nonce: 0,
+        owner: addr_from_index(0),
+        nonce,
         pubkey: [0u8; 32],
         signature: [0u8; 64],
-    }
+    };
+    sign_order(&mut req, key);
+    req
 }
 
-fn generate_orders(n_orders: usize, n_accounts: usize, n_markets: u8) -> Vec<OrderRequest> {
+fn generate_orders(n_orders: usize, keys: &[Ed25519SecretKey], n_markets: u8) -> Vec<OrderRequest> {
+    let mut nonces = vec![0u64; keys.len()];
     let n_pairs = n_orders / 2;
-    let n_u32 = u32::try_from(n_accounts).unwrap_or(u32::MAX);
+    let n_u32 = u32::try_from(keys.len()).unwrap_or(u32::MAX);
     let mut orders = Vec::with_capacity(n_orders);
     for i in 0..n_pairs {
-        let seller = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32;
-        let buyer = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32;
+        let seller = (u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32) as usize;
+        let buyer = (u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32) as usize;
         // Round-robin market assignment: each order pair goes to
         // market (i % n_markets). This spreads load evenly across
         // all markets so the multi-market parallel matcher can
         // exercise all worker threads.
         let market =
             if n_markets == 1 { 0 } else { u8::try_from(i % usize::from(n_markets)).unwrap_or(0) };
-        orders.push(make_order(Side::Sell, seller, market));
-        orders.push(make_order(Side::Buy, buyer, market));
+        orders.push(make_order(&keys[seller], Side::Sell, nonces[seller], market));
+        nonces[seller] += 1;
+        orders.push(make_order(&keys[buyer], Side::Buy, nonces[buyer], market));
+        nonces[buyer] += 1;
     }
     orders
 }
@@ -153,17 +171,18 @@ fn generate_orders(n_orders: usize, n_accounts: usize, n_markets: u8) -> Vec<Ord
 /// not 128).
 fn generate_orders_grouped(
     n_orders: usize,
-    n_accounts: usize,
+    keys: &[Ed25519SecretKey],
     n_markets: u8,
     batch_size: usize,
 ) -> Vec<OrderRequest> {
+    let mut nonces = vec![0u64; keys.len()];
     let n_pairs = n_orders / 2;
-    let n_u32 = u32::try_from(n_accounts).unwrap_or(u32::MAX);
+    let n_u32 = u32::try_from(keys.len()).unwrap_or(u32::MAX);
     let pairs_per_batch = (batch_size / 2).max(1);
     let mut orders = Vec::with_capacity(n_orders);
     for i in 0..n_pairs {
-        let seller = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32;
-        let buyer = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32;
+        let seller = (u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32) as usize;
+        let buyer = (u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32) as usize;
         // Group by batch: pairs 0..(pairs_per_batch-1) → market 0,
         // pairs pairs_per_batch..(2*pairs_per_batch-1) → market 1, etc.
         let market = if n_markets == 1 {
@@ -172,8 +191,10 @@ fn generate_orders_grouped(
             let batch_idx = i / pairs_per_batch;
             u8::try_from(batch_idx % usize::from(n_markets)).unwrap_or(0)
         };
-        orders.push(make_order(Side::Sell, seller, market));
-        orders.push(make_order(Side::Buy, buyer, market));
+        orders.push(make_order(&keys[seller], Side::Sell, nonces[seller], market));
+        nonces[seller] += 1;
+        orders.push(make_order(&keys[buyer], Side::Buy, nonces[buyer], market));
+        nonces[buyer] += 1;
     }
     orders
 }
@@ -186,7 +207,9 @@ async fn run_sync(
     accounts: usize,
     markets: u8,
 ) -> BenchResult {
-    let all_orders = generate_orders(orders, accounts, markets);
+    let keys: Vec<Ed25519SecretKey> =
+        (0..u32::try_from(accounts).unwrap_or(u32::MAX)).map(account_key).collect();
+    let all_orders = generate_orders(orders, &keys, markets);
     let mut sock = TcpStream::connect((host, port)).await.expect("connect");
     let mut buf = [0u8; matcher::protocol::RESPONSE_SIZE];
     let mut fills = 0u64;
@@ -211,7 +234,9 @@ async fn run_pipelined(
     pipe: usize,
     markets: u8,
 ) -> BenchResult {
-    let all_orders = generate_orders(orders, accounts, markets);
+    let keys: Vec<Ed25519SecretKey> =
+        (0..u32::try_from(accounts).unwrap_or(u32::MAX)).map(account_key).collect();
+    let all_orders = generate_orders(orders, &keys, markets);
     let mut sock = TcpStream::connect((host, port)).await.expect("connect");
     let mut resp_buf = vec![0u8; pipe * matcher::protocol::RESPONSE_SIZE];
     let mut fills = 0u64;
@@ -238,6 +263,14 @@ async fn run_pipelined(
 }
 
 /// Batch mode: M connections, each sending batch requests.
+///
+/// Each connection gets a DISJOINT partition of the account space:
+/// nonces are per-account and strictly increasing, so the same
+/// account's orders must flow through one connection in sequence
+/// (each batch's response is read before the next is sent, which
+/// keeps that connection's stream totally ordered). Splitting one
+/// account across connections could deliver a higher nonce before
+/// a lower one and get it rejected as `StaleNonce`.
 async fn run_batch(
     host: &str,
     port: u16,
@@ -247,16 +280,22 @@ async fn run_batch(
     batch_size: usize,
     markets: u8,
 ) -> BenchResult {
-    let all_orders = Arc::new(generate_orders_grouped(orders, accounts, markets, batch_size));
     let orders_per_conn = orders / connections;
+    // Floor partition — leftover accounts (accounts % connections)
+    // simply go unused; every connection's account set is disjoint.
+    let accounts_per_conn = (accounts / connections).max(1);
     let host = Arc::new(host.to_string());
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(connections);
     for conn_idx in 0..connections {
-        let off = conn_idx * orders_per_conn;
-        let end = if conn_idx == connections - 1 { orders } else { off + orders_per_conn };
-        let chunk = all_orders[off..end].to_vec();
+        let lo = conn_idx * accounts_per_conn;
+        let hi = lo + accounts_per_conn;
+        let keys: Vec<Ed25519SecretKey> = (u32::try_from(lo).unwrap_or(u32::MAX)
+            ..u32::try_from(hi).unwrap_or(u32::MAX))
+            .map(account_key)
+            .collect();
+        let chunk = generate_orders_grouped(orders_per_conn, &keys, markets, batch_size);
         let host = Arc::clone(&host);
         handles.push(tokio::spawn(async move {
             let mut sock = TcpStream::connect((host.as_str(), port)).await.expect("connect");

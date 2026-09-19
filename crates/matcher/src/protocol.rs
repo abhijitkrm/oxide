@@ -34,10 +34,17 @@
 //!
 //! Every order carries an Ed25519 signature over the signing domain
 //! (see `SIGNING_DOMAIN`), the chain ID, the order fields, and the
-//! nonce. The matcher verifies the signature before any balance or
-//! risk check, binding the `owner` address to the signing key. This
-//! prevents spoofing: an attacker cannot submit orders as another
-//! account without that account's secret key.
+//! nonce. The `owner` address is not merely claimed — it must equal
+//! the address derived from the included public key
+//! (`crypto::ed25519::owner_address`), so the signing key
+//! cryptographically controls the account it trades for. The
+//! mandatory admission boundary — authenticate → replay-check →
+//! risk → reserve → match — runs inside `MatchingServer` /
+//! `MarketWorker` so no transport or direct caller can skip it.
+//! Transports construct [`VerifiedOrder`] (the proof token) before
+//! pushing to the rings; this prevents spoofing: an attacker cannot
+//! submit orders as another account without that account's secret
+//! key.
 //!
 //! # Replay protection
 //!
@@ -93,7 +100,8 @@ pub struct OrderRequest {
     pub qty: Qty,
     /// Per-account nonce for replay protection.
     pub nonce: u64,
-    /// Owner address (20 bytes).
+    /// Owner address (20 bytes) — must equal the address derived
+    /// from `pubkey` via `crypto::ed25519::owner_address`.
     pub owner: primitives::Address,
     /// Ed25519 public key (32 bytes) that signed this order.
     pub pubkey: [u8; 32],
@@ -172,7 +180,8 @@ impl OrderResponse {
 /// - `CHAIN_ID` (cross-chain replay protection)
 /// - All order fields except `signature` and `pubkey` (the pubkey is
 ///   verified separately — the signature proves the signer owns the
-///   pubkey, and the owner is bound to the pubkey via registration)
+///   pubkey, and the owner must equal the address derived from that
+///   pubkey via [`crypto::ed25519::owner_address`])
 ///
 /// # Arguments
 ///
@@ -206,18 +215,29 @@ pub fn signing_message(req: &OrderRequest) -> Vec<u8> {
 
 /// Verify the Ed25519 signature on an order request.
 ///
-/// Returns `true` if the signature is valid for the included public
-/// key and the signing message. Returns `false` if the signature is
-/// invalid, the public key is malformed, or any crypto error occurs.
+/// Returns `true` only if ALL of:
+/// - the public key is well-formed,
+/// - the claimed `owner` equals [`crypto::ed25519::owner_address`]
+///   of the included pubkey — the key must CONTROL the account it
+///   trades for (C5: previously any key could claim any owner), and
+/// - the signature verifies against that pubkey and message.
 ///
-/// This is the authentication gate: the matcher calls this before
-/// any balance or risk check. A `false` result means the order is
-/// not authentic and must be rejected with `BadSignature`.
+/// This is the authentication gate: every admission path calls this
+/// (directly, or by constructing a [`VerifiedOrder`]) before any
+/// nonce, balance, or risk check. A `false` result means the order
+/// is not authentic and must be rejected with `BadSignature`.
 #[must_use]
 pub fn verify_order(req: &OrderRequest) -> bool {
     let Ok(pubkey) = crypto::ed25519::Ed25519PublicKey::from_bytes(&req.pubkey) else {
         return false;
     };
+    // Owner binding: the Ed25519 key IS the account. Without this
+    // check, a signer could claim any victim's `owner` — the
+    // signature verifies over the claimed field verbatim. Deriving
+    // the address from the key makes the binding cryptographic.
+    if crypto::ed25519::owner_address(&pubkey) != req.owner {
+        return false;
+    }
     let Ok(signature) = crypto::ed25519::Ed25519Signature::from_slice(&req.signature) else {
         return false;
     };
@@ -226,15 +246,51 @@ pub fn verify_order(req: &OrderRequest) -> bool {
 }
 
 /// Sign an order request with an Ed25519 secret key. Fills in the
-/// `pubkey` and `signature` fields.
+/// `owner`, `pubkey`, and `signature` fields.
+///
+/// The `owner` is overwritten with the key's derived address — an
+/// order can only ever trade for the account its key controls.
 ///
 /// This is used by clients (and test helpers) to produce authentic
 /// orders. The matcher never calls this — it only verifies.
 pub fn sign_order(req: &mut OrderRequest, secret: &crypto::ed25519::Ed25519SecretKey) {
-    req.pubkey = secret.verifying_key().to_bytes();
+    let verifying = secret.verifying_key();
+    req.pubkey = verifying.to_bytes();
+    req.owner = crypto::ed25519::owner_address(&verifying);
     let msg = signing_message(req);
     let sig = crypto::ed25519::sign_message(secret, &msg);
     req.signature = sig.to_bytes();
+}
+
+/// An [`OrderRequest`] that has passed authentication — the
+/// signature verifies AND the `owner` equals the address derived
+/// from the request's public key.
+///
+/// Constructible ONLY via [`VerifiedOrder::new`] (which runs
+/// [`verify_order`]); the field is private so the type IS the proof.
+/// Ring channels carry `VerifiedOrder` rather than raw requests: the
+/// transport thread authenticates (signature verification is the
+/// expensive step and parallelizes across connections), while the
+/// matcher thread never executes an unauthenticated order and never
+/// pays a second verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedOrder(OrderRequest);
+
+impl VerifiedOrder {
+    /// Authenticate an order request. Returns `Some` only if
+    /// [`verify_order`] passes (signature valid AND owner derived
+    /// from pubkey); `None` otherwise — the caller must reject with
+    /// `BadSignature`.
+    #[must_use]
+    pub fn new(req: OrderRequest) -> Option<Self> {
+        if verify_order(&req) { Some(Self(req)) } else { None }
+    }
+
+    /// The authenticated request.
+    #[must_use]
+    pub fn request(&self) -> &OrderRequest {
+        &self.0
+    }
 }
 
 /// Encode an order request to `REQUEST_SIZE` bytes.
@@ -670,7 +726,8 @@ pub struct ActionRequest {
     pub tif: TimeInForce,
     /// Per-account nonce for replay protection.
     pub nonce: u64,
-    /// Owner address (20 bytes) — must match the resting order's owner.
+    /// Owner address (20 bytes) — must equal the address derived
+    /// from `pubkey`, AND match the resting order's owner.
     pub owner: primitives::Address,
     /// Ed25519 public key (32 bytes) that signed this action.
     pub pubkey: [u8; 32],
@@ -725,8 +782,10 @@ pub fn signing_message_action(req: &ActionRequest) -> Vec<u8> {
 
 /// Verify the Ed25519 signature on an action request.
 ///
-/// Returns `true` if the signature is valid for the included public
-/// key and the signing message. This is the authentication gate for
+/// Returns `true` only if the public key is well-formed, the claimed
+/// `owner` equals [`crypto::ed25519::owner_address`] of the pubkey
+/// (same owner binding as [`verify_order`] — C5), and the signature
+/// verifies. This is the authentication gate for
 /// cancel/amend/replace — a `false` result means the action is not
 /// authentic and must be rejected with `BadSignature`.
 #[must_use]
@@ -734,6 +793,11 @@ pub fn verify_action(req: &ActionRequest) -> bool {
     let Ok(pubkey) = crypto::ed25519::Ed25519PublicKey::from_bytes(&req.pubkey) else {
         return false;
     };
+    // Owner binding — identical to `verify_order`: the key must
+    // control the account it acts on.
+    if crypto::ed25519::owner_address(&pubkey) != req.owner {
+        return false;
+    }
     let Ok(signature) = crypto::ed25519::Ed25519Signature::from_slice(&req.signature) else {
         return false;
     };
@@ -742,9 +806,13 @@ pub fn verify_action(req: &ActionRequest) -> bool {
 }
 
 /// Sign an action request with an Ed25519 secret key. Fills in the
-/// `pubkey` and `signature` fields. Used by clients and test helpers.
+/// `owner`, `pubkey`, and `signature` fields (`owner` is overwritten
+/// with the key's derived address — an action can only target the
+/// account its key controls). Used by clients and test helpers.
 pub fn sign_action(req: &mut ActionRequest, secret: &crypto::ed25519::Ed25519SecretKey) {
-    req.pubkey = secret.verifying_key().to_bytes();
+    let verifying = secret.verifying_key();
+    req.pubkey = verifying.to_bytes();
+    req.owner = crypto::ed25519::owner_address(&verifying);
     let msg = signing_message_action(req);
     let sig = crypto::ed25519::sign_message(secret, &msg);
     req.signature = sig.to_bytes();
@@ -891,9 +959,11 @@ mod tests {
         primitives::Address([byte; 20])
     }
 
-    /// Build a signed order for testing.
-    fn signed_order(nonce: u64, owner_byte: u8) -> OrderRequest {
-        let (secret, _) = crypto::ed25519::generate_keypair_for_test();
+    /// Build a signed order for testing. `seed` derives the signing
+    /// key — different seeds give different accounts (the owner is
+    /// derived from the key by `sign_order`).
+    fn signed_order(nonce: u64, seed: u8) -> OrderRequest {
+        let secret = crypto::ed25519::Ed25519SecretKey::from_bytes(&[seed; 32]);
         let mut req = OrderRequest {
             market: 0,
             side: Side::Buy,
@@ -902,7 +972,7 @@ mod tests {
             price: Price(1_500_000_000),
             qty: Qty(1_000),
             nonce,
-            owner: addr(owner_byte),
+            owner: addr(0),
             pubkey: [0u8; 32],
             signature: [0u8; 64],
         };
@@ -976,6 +1046,92 @@ mod tests {
         assert!(!verify_order(&req), "tampered nonce must not verify");
     }
 
+    /// Regression test (C5): `verify_order` used to check the
+    /// signature against the request-supplied pubkey with NO binding
+    /// that the key controls the claimed `owner`. An attacker could
+    /// sign a perfectly valid order with their own key while setting
+    /// `owner` to a victim's address — the signature verifies (it
+    /// covers the owner field verbatim) but the key does not control
+    /// the claimed account. The owner MUST equal the address derived
+    /// from the pubkey (`owner_address`), or the order is forged.
+    #[test]
+    fn verify_rejects_owner_not_derived_from_key() {
+        let (secret, _) = crypto::ed25519::generate_keypair_for_test();
+        let mut req = OrderRequest {
+            market: 0,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price(1_500_000_000),
+            qty: Qty(1_000),
+            nonce: 1,
+            // The attacker's chosen claim: a victim's address.
+            owner: addr(0x77),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        // Sign manually so the attacker-chosen owner stays in place
+        // (`sign_order` would correct it to the derived address).
+        req.pubkey = secret.verifying_key().to_bytes();
+        let msg = signing_message(&req);
+        req.signature = crypto::ed25519::sign_message(&secret, &msg).to_bytes();
+        assert!(
+            !verify_order(&req),
+            "a valid signature claiming an owner the key does not derive \
+             to must be rejected — the key does not control that account"
+        );
+    }
+
+    /// Regression test (C5): the same owner-binding gap existed for
+    /// cancel/amend/replace actions — a signed action could target
+    /// any owner.
+    #[test]
+    fn action_verify_rejects_owner_not_derived_from_key() {
+        let (secret, _) = crypto::ed25519::generate_keypair_for_test();
+        let mut req = ActionRequest {
+            action_type: ActionType::Cancel,
+            order_id: 7,
+            new_price: Price(0),
+            new_qty: Qty(0),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            nonce: 1,
+            owner: addr(0x77),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        req.pubkey = secret.verifying_key().to_bytes();
+        let msg = signing_message_action(&req);
+        req.signature = crypto::ed25519::sign_message(&secret, &msg).to_bytes();
+        assert!(
+            !verify_action(&req),
+            "a valid action signature claiming a foreign owner must be rejected"
+        );
+    }
+
+    /// `sign_order` binds the request's `owner` to the signing key's
+    /// derived address — the signed request is self-consistent.
+    #[test]
+    fn sign_order_derives_owner_from_key() {
+        let (secret, public) = crypto::ed25519::generate_keypair_for_test();
+        let mut req = OrderRequest {
+            market: 0,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price(1_500_000_000),
+            qty: Qty(1_000),
+            nonce: 1,
+            owner: addr(0), // ignored — overwritten by sign_order
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        sign_order(&mut req, &secret);
+        assert_eq!(req.owner, crypto::ed25519::owner_address(&public));
+        assert!(verify_order(&req));
+    }
+
     #[test]
     fn batch_roundtrip() {
         let orders = vec![signed_order(1, 0x10), signed_order(2, 0x20)];
@@ -986,8 +1142,8 @@ mod tests {
 
     // ── Action protocol tests ─────────────────────────────────────
 
-    fn signed_cancel(nonce: u64, owner_byte: u8, order_id: u64) -> ActionRequest {
-        let (secret, _) = crypto::ed25519::generate_keypair_for_test();
+    fn signed_cancel(nonce: u64, seed: u8, order_id: u64) -> ActionRequest {
+        let secret = crypto::ed25519::Ed25519SecretKey::from_bytes(&[seed; 32]);
         let mut req = ActionRequest {
             action_type: ActionType::Cancel,
             order_id,
@@ -997,7 +1153,7 @@ mod tests {
             order_type: OrderType::Limit,
             tif: TimeInForce::Gtc,
             nonce,
-            owner: addr(owner_byte),
+            owner: addr(0),
             pubkey: [0u8; 32],
             signature: [0u8; 64],
         };
@@ -1007,12 +1163,12 @@ mod tests {
 
     fn signed_amend(
         nonce: u64,
-        owner_byte: u8,
+        seed: u8,
         order_id: u64,
         new_price: u64,
         new_qty: u64,
     ) -> ActionRequest {
-        let (secret, _) = crypto::ed25519::generate_keypair_for_test();
+        let secret = crypto::ed25519::Ed25519SecretKey::from_bytes(&[seed; 32]);
         let mut req = ActionRequest {
             action_type: ActionType::Amend,
             order_id,
@@ -1022,7 +1178,7 @@ mod tests {
             order_type: OrderType::Limit,
             tif: TimeInForce::Gtc,
             nonce,
-            owner: addr(owner_byte),
+            owner: addr(0),
             pubkey: [0u8; 32],
             signature: [0u8; 64],
         };
@@ -1073,7 +1229,9 @@ mod tests {
         match action {
             OrderAction::Cancel { order_id, owner } => {
                 assert_eq!(order_id, 7);
-                assert_eq!(owner, addr(0x42));
+                // The owner is derived from the signing key (not the
+                // literal the test helper was called with).
+                assert_eq!(owner, req.owner);
             }
             _ => panic!("expected Cancel"),
         }
@@ -1086,7 +1244,7 @@ mod tests {
         match action {
             OrderAction::Amend { order_id, owner, new_price, new_qty } => {
                 assert_eq!(order_id, 3);
-                assert_eq!(owner, addr(0x42));
+                assert_eq!(owner, req.owner);
                 assert_eq!(new_price.0, 1_600_000_000);
                 assert_eq!(new_qty.0, 2_000);
             }

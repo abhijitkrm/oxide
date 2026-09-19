@@ -129,6 +129,30 @@ pub fn derive_public(secret: &Ed25519SecretKey) -> Ed25519PublicKey {
     secret.verifying_key()
 }
 
+/// Derive the 20-byte trading-account address an Ed25519 key controls:
+/// `BLAKE3(Domain::Ed25519Owner ‖ pk_bytes)[..20]`.
+///
+/// The Ed25519 key IS the account — the matcher's `owner` field must
+/// equal this derivation. This binds the signing key to the account
+/// cryptographically, with no registration table: a signature proves
+/// "I control the key", and the derivation proves "the key controls
+/// this account". An attacker cannot sign with their own key while
+/// claiming a victim's `owner`, because `owner_address(attacker_pk)
+/// != victim_owner` fails the check before the signature is even
+/// verified.
+///
+/// Mirrors [`crate::bls::validator_address`] — same construction,
+/// different domain so a validator identity can never alias a
+/// trading account.
+#[must_use]
+pub fn owner_address(public: &Ed25519PublicKey) -> primitives::Address {
+    let hash = crate::hash::Hasher::hash_one(crate::hash::Domain::Ed25519Owner, public.as_bytes());
+    // `Hash` is always 32 bytes; the first 20 always fit an `Address`.
+    let mut bytes = [0u8; 20];
+    bytes.copy_from_slice(&hash.0[..20]);
+    primitives::Address(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +222,35 @@ mod tests {
         let sig1 = sign_message(&secret, message);
         let sig2 = sign_message(&secret, message);
         assert_eq!(sig1, sig2, "same key + message must produce same signature");
+    }
+
+    #[test]
+    fn owner_address_is_deterministic() {
+        let (_, public) = generate_keypair_for_test();
+        assert_eq!(owner_address(&public), owner_address(&public));
+    }
+
+    #[test]
+    fn owner_address_differs_per_key() {
+        let (_, pk1) = generate_keypair_for_test();
+        let (_, pk2) = generate_keypair_for_test();
+        assert_ne!(
+            owner_address(&pk1),
+            owner_address(&pk2),
+            "different keys must control different accounts — this is the \
+             property that stops a signer from claiming a victim's owner",
+        );
+    }
+
+    #[test]
+    fn owner_address_differs_from_validator_address_domain() {
+        // The Ed25519Owner domain must not alias the ValidatorAddress
+        // domain — a consensus identity is not a trading account.
+        // Hash the same 32 bytes under both domains and confirm the
+        // derived addresses differ.
+        let bytes = [0xABu8; 32];
+        let ed = crate::hash::Hasher::hash_one(crate::hash::Domain::Ed25519Owner, &bytes);
+        let bls = crate::hash::Hasher::hash_one(crate::hash::Domain::ValidatorAddress, &bytes);
+        assert_ne!(&ed.0[..20], &bls.0[..20]);
     }
 }

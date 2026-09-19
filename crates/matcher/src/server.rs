@@ -22,7 +22,7 @@ use crate::protocol::{
     OrderRequest, OrderResponse, RejectReason, decode_action_request, decode_request,
     encode_response, is_action_request, verify_action,
 };
-use crate::{MatchingServer, OrderAction, SharedMatcher};
+use crate::{MatchingServer, SharedMatcher};
 use exchange::BatchFillEntry;
 use futures_util::{SinkExt, StreamExt};
 use primitives::fixed::{Price, Qty};
@@ -51,33 +51,71 @@ async fn submit_batch_ring(
     ring_counter: &std::sync::atomic::AtomicUsize,
     orders: Vec<OrderRequest>,
 ) -> Vec<OrderResponse> {
-    let ring_idx =
-        ring_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % ring.num_rings();
-    let order_sender = ring.order_sender(ring_idx).clone();
-    let response_receiver = ring.response_receiver(ring_idx).clone();
-    let mut pending = orders;
-    loop {
-        match order_sender.push(pending) {
-            Ok(()) => break,
-            Err(crate::ring::PushError::Disconnected(_)) => {
-                // Worker thread died — no point retrying.
-                return vec![
-                    OrderResponse::rejected(crate::protocol::RejectReason::EngineError,);
-                    1
-                ];
+    // Authenticate on THIS transport thread: Ed25519 verification
+    // parallelizes across connections, and the ring only accepts
+    // `VerifiedOrder` proof tokens (unforgeable outside
+    // `VerifiedOrder::new`), so the matcher thread can never execute
+    // an unauthenticated order. `positions[i]` is the original batch
+    // index of verified order i; failed entries keep an aligned
+    // `BadSignature` response and never touch the ring.
+    let mut positions: Vec<usize> = Vec::with_capacity(orders.len());
+    let mut verified: Vec<crate::protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
+    let mut responses: Vec<Option<OrderResponse>> = Vec::with_capacity(orders.len());
+    for (i, req) in orders.into_iter().enumerate() {
+        match crate::protocol::VerifiedOrder::new(req) {
+            Some(vo) => {
+                positions.push(i);
+                verified.push(vo);
+                responses.push(None);
             }
-            Err(crate::ring::PushError::Full(returned)) => {
-                pending = returned;
+            None => {
+                responses.push(Some(OrderResponse::rejected(
+                    crate::protocol::RejectReason::BadSignature,
+                )));
+            }
+        }
+    }
+    if !verified.is_empty() {
+        let ring_idx =
+            ring_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % ring.num_rings();
+        let order_sender = ring.order_sender(ring_idx).clone();
+        let response_receiver = ring.response_receiver(ring_idx).clone();
+        let mut pending = verified;
+        let sent = loop {
+            match order_sender.push(pending) {
+                Ok(()) => break true,
+                Err(crate::ring::PushError::Disconnected(_)) => {
+                    // Worker thread died — verified slots fall through
+                    // to EngineError below.
+                    break false;
+                }
+                Err(crate::ring::PushError::Full(returned)) => {
+                    pending = returned;
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        if sent {
+            let worker_responses = loop {
+                if let Some(r) = response_receiver.pop() {
+                    break r;
+                }
                 tokio::task::yield_now().await;
+            };
+            for (pos, resp) in positions.into_iter().zip(worker_responses) {
+                responses[pos] = Some(resp);
             }
         }
     }
-    loop {
-        if let Some(responses) = response_receiver.pop() {
-            return responses;
-        }
-        tokio::task::yield_now().await;
-    }
+    // Every slot is Some: verified entries got worker responses,
+    // unverified got BadSignature, dead-worker entries get
+    // EngineError — all at their original batch positions.
+    responses
+        .into_iter()
+        .map(|r| {
+            r.unwrap_or_else(|| OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
+        })
+        .collect()
 }
 
 /// Submit a single order through the ring matcher (batch of one).
@@ -95,13 +133,20 @@ async fn submit_one_ring(
 /// orders, so the control-channel path (serviced between ring polls)
 /// is the right seam — it reaches THE SAME order book the rings
 /// write to, with no second book.
-fn submit_action_ring(ring: &crate::RingMatcher, action: OrderAction) -> OrderResponse {
+fn submit_action_ring(
+    ring: &crate::RingMatcher,
+    req: crate::protocol::ActionRequest,
+) -> OrderResponse {
     // The control channel is synchronous (std::sync::mpsc); the
     // matcher thread services it between ring polls. We send and
     // recv — the recv blocks the tokio task, but actions are rare
     // (cancel/amend/replace), so this is acceptable. For a hot-path
     // action stream, a dedicated ring would be added.
-    ring.submit_action(action)
+    //
+    // The wire `ActionRequest` crosses the channel intact — the
+    // matching server authenticates it (signature + owner binding +
+    // nonce) inside `submit_action` before dispatching.
+    ring.submit_action(req)
 }
 
 // ── TxSubmitter trait ────────────────────────────────────────────────
@@ -478,35 +523,26 @@ async fn handle_connection(
                 let _ = socket.write_all(&encode_response(&resp)).await;
                 continue;
             };
-            // Process all orders. If the ring matcher is
-            // available, route through the per-connection
-            // SPSC ring (no locks); otherwise use the mutex
-            // path (single lock for the whole batch).
-            //
-            // Signature verification happens BEFORE submission —
-            // unauthenticated orders are rejected with BadSignature
-            // without touching the matching engine or balances.
-            let verified: Vec<OrderRequest> =
-                orders.iter().filter(|req| crate::protocol::verify_order(req)).copied().collect();
-            let bad_sig_count = orders.len() - verified.len();
-            let mut responses: Vec<OrderResponse> = if let Some(rm) = &ring_matcher {
-                submit_batch_ring(rm, &ring_counter, verified).await
+            // Submit the whole batch. The ring path authenticates
+            // each order on this thread and pushes only
+            // `VerifiedOrder` proofs; the mutex path authenticates
+            // inside `submit_order`. Both produce one response per
+            // request — failed authentication yields an aligned
+            // `BadSignature` in place, never a dropped or reordered
+            // response.
+            let responses: Vec<OrderResponse> = if let Some(rm) = &ring_matcher {
+                submit_batch_ring(rm, &ring_counter, orders).await
             } else {
                 match matcher.inner.lock() {
-                    Ok(mut server) => verified.iter().map(|req| server.submit_order(req)).collect(),
-                    Err(_) => {
-                        vec![OrderResponse::rejected(crate::protocol::RejectReason::EngineError)]
-                    }
+                    Ok(mut server) => orders.iter().map(|req| server.submit_order(req)).collect(),
+                    Err(_) => orders
+                        .iter()
+                        .map(|_| {
+                            OrderResponse::rejected(crate::protocol::RejectReason::EngineError)
+                        })
+                        .collect(),
                 }
             };
-            // Prepend rejections for orders that failed signature
-            // verification. This preserves the response count == request count.
-            for _ in 0..bad_sig_count {
-                responses.insert(
-                    0,
-                    OrderResponse::rejected(crate::protocol::RejectReason::BadSignature),
-                );
-            }
             // Encode and send the batch response.
             let batch_resp = crate::protocol::encode_batch_response(&responses);
             if socket.write_all(&batch_resp).await.is_err() {
@@ -534,11 +570,14 @@ async fn handle_connection(
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
             }
-            let action = crate::protocol::action_request_to_order_action(&action_req);
+            // The wire `ActionRequest` is submitted intact — the
+            // matching server re-authenticates it (signature + owner
+            // binding + nonce) as the mandatory boundary before
+            // dispatching. The verify above is only an early reject.
             let action_resp = if let Some(rm) = &ring_matcher {
-                submit_action_ring(rm, action)
+                submit_action_ring(rm, action_req)
             } else {
-                matcher.submit_action(&action)
+                matcher.submit_action(&action_req)
             };
             if socket.write_all(&encode_response(&action_resp)).await.is_err() {
                 break;
@@ -667,11 +706,12 @@ async fn run_jsonrpc_tcp_server_impl(
                             .await;
                         continue;
                     }
-                    let action = crate::protocol::action_request_to_order_action(&action_req);
+                    // Submit the wire `ActionRequest` intact — the
+                    // core re-authenticates before dispatch.
                     let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action)
+                        submit_action_ring(rm, action_req)
                     } else {
-                        matcher.submit_action(&action)
+                        matcher.submit_action(&action_req)
                     };
                     let result = crate::jsonrpc::format_jsonrpc_response(&resp);
                     let response = serde_json::json!({
@@ -829,11 +869,12 @@ async fn run_fix_server_impl(
                         let _ = socket.write_all(report.as_bytes()).await;
                         continue;
                     }
-                    let action = crate::protocol::action_request_to_order_action(&action_req);
+                    // Submit the wire `ActionRequest` intact — the
+                    // core re-authenticates before dispatch.
                     let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action)
+                        submit_action_ring(rm, action_req)
                     } else {
-                        matcher.submit_action(&action)
+                        matcher.submit_action(&action_req)
                     };
                     let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
                     let _ = socket.write_all(report.as_bytes()).await;
@@ -952,11 +993,12 @@ async fn run_websocket_server_impl(
                         let _ = ws_sender.send(Message::Text(response.into())).await;
                         continue;
                     }
-                    let action = crate::protocol::action_request_to_order_action(&action_req);
+                    // Submit the wire `ActionRequest` intact — the
+                    // core re-authenticates before dispatch.
                     let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action)
+                        submit_action_ring(rm, action_req)
                     } else {
-                        matcher.submit_action(&action)
+                        matcher.submit_action(&action_req)
                     };
                     let response = crate::ws::format_ws_response(&resp, 0);
                     if ws_sender.send(Message::Text(response.into())).await.is_err() {
@@ -1211,35 +1253,14 @@ fn submit_batch_multi(
     matcher: &crate::MultiMarketMatcher,
     orders: Vec<OrderRequest>,
 ) -> Vec<OrderResponse> {
-    use std::collections::HashMap;
     if orders.is_empty() {
         return Vec::new();
     }
-    // Fast path: all orders for the same market — one send, one recv.
-    let first_market = orders[0].market;
-    if orders.iter().all(|o| o.market == first_market) {
-        return matcher.submit_batch(orders);
-    }
-    // Slow path: mixed markets — split by market, send in parallel,
-    // collect and re-sort by original index.
-    let mut by_market: HashMap<u8, Vec<(usize, OrderRequest)>> = HashMap::new();
-    for (i, order) in orders.into_iter().enumerate() {
-        by_market.entry(order.market).or_default().push((i, order));
-    }
-    // Send to each market worker and collect responses.
-    let mut indexed_responses: Vec<(usize, OrderResponse)> =
-        Vec::with_capacity(by_market.values().map(Vec::len).sum());
-    for (_market, market_orders) in by_market {
-        let indices: Vec<usize> = market_orders.iter().map(|(i, _)| *i).collect();
-        let bare_orders: Vec<OrderRequest> = market_orders.into_iter().map(|(_, o)| o).collect();
-        let responses = matcher.submit_batch(bare_orders);
-        for (idx, resp) in indices.into_iter().zip(responses) {
-            indexed_responses.push((idx, resp));
-        }
-    }
-    // Re-sort by original index.
-    indexed_responses.sort_by_key(|(i, _)| *i);
-    indexed_responses.into_iter().map(|(_, r)| r).collect()
+    // `submit_batch` authenticates every request on this thread,
+    // routes each verified order by its own `market` field (single-
+    // and mixed-market batches both), and merges responses at their
+    // original positions — no transport-side grouping needed.
+    matcher.submit_batch(orders)
 }
 
 /// Submit a single order through the multi-market parallel matcher.
@@ -1327,8 +1348,9 @@ async fn handle_connection_multi(
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
             }
-            let action = crate::protocol::action_request_to_order_action(&action_req);
-            let action_resp = matcher.submit_action(action);
+            // The wire `ActionRequest` is routed intact — the market
+            // worker authenticates it before dispatching.
+            let action_resp = matcher.submit_action(&action_req);
             if socket.write_all(&encode_response(&action_resp)).await.is_err() {
                 break;
             }
@@ -1394,8 +1416,9 @@ pub async fn run_jsonrpc_tcp_server_multi(
 "#).await;
                         continue;
                     }
-                    let action = crate::protocol::action_request_to_order_action(&action_req);
-                    let resp = matcher.submit_action(action);
+                    // The wire `ActionRequest` is routed intact — the
+                    // market worker authenticates it before dispatch.
+                    let resp = matcher.submit_action(&action_req);
                     let result = crate::jsonrpc::format_jsonrpc_response(&resp);
                     let response =
                         serde_json::json!({ "jsonrpc": "2.0", "result": result, "id": id });
@@ -1482,8 +1505,9 @@ pub async fn run_fix_server_multi(
                         let _ = socket.write_all(report.as_bytes()).await;
                         continue;
                     }
-                    let action = crate::protocol::action_request_to_order_action(&action_req);
-                    let resp = matcher.submit_action(action);
+                    // The wire `ActionRequest` is routed intact — the
+                    // market worker authenticates it before dispatch.
+                    let resp = matcher.submit_action(&action_req);
                     let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
                     let _ = socket.write_all(report.as_bytes()).await;
                     continue;
@@ -1647,6 +1671,37 @@ mod tests {
         primitives::Address([byte; 20])
     }
 
+    /// A deterministic test account: `seed` derives the Ed25519
+    /// signing key; the account address is the key's derived owner.
+    fn test_account(seed: u8) -> (crypto::ed25519::Ed25519SecretKey, primitives::Address) {
+        let secret = crypto::ed25519::Ed25519SecretKey::from_bytes(&[seed; 32]);
+        let owner = crypto::ed25519::owner_address(&secret.verifying_key());
+        (secret, owner)
+    }
+
+    /// Build a signed order for `secret`'s account — every request
+    /// reaching `submit_order` must now authenticate.
+    fn signed_req(
+        secret: &crypto::ed25519::Ed25519SecretKey,
+        side: Side,
+        nonce: u64,
+    ) -> OrderRequest {
+        let mut req = OrderRequest {
+            market: 0,
+            side,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price(1_500_000_000),
+            qty: Qty(1_000),
+            nonce,
+            owner: addr(0),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        crate::protocol::sign_order(&mut req, secret);
+        req
+    }
+
     /// A mock tx submitter that records submissions.
     struct MockSubmitter {
         submissions: std::sync::Mutex<Vec<TxBytes>>,
@@ -1671,39 +1726,15 @@ mod tests {
 
     #[test]
     fn batch_settler_seals_and_submits() {
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
         let mut server = MatchingServer::new(cfg(), 100);
-        server.fund_account(&addr(9), 1_000_000_000_000);
-        server.fund_account(&addr(1), 1_000_000_000_000);
+        server.fund_account(&seller, 1_000_000_000_000);
+        server.fund_account(&buyer, 1_000_000_000_000);
 
-        // Rest a maker sell.
-        let maker = OrderRequest {
-            market: 0,
-            side: Side::Sell,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(9),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        server.submit_order(&maker);
-
-        // Taker buy — should match.
-        let taker = OrderRequest {
-            market: 0,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            tif: TimeInForce::Gtc,
-            price: Price(1_500_000_000),
-            qty: Qty(1_000),
-            owner: addr(1),
-            nonce: 0,
-            pubkey: [0u8; 32],
-            signature: [0u8; 64],
-        };
-        server.submit_order(&taker);
+        // Rest a maker sell, then a taker buy — should match.
+        server.submit_order(&signed_req(&seller_sk, Side::Sell, 0));
+        server.submit_order(&signed_req(&buyer_sk, Side::Buy, 0));
 
         // There should be 1 fill in the batch.
         assert_eq!(server.pending_settlements(), 1);
@@ -1712,9 +1743,9 @@ mod tests {
         let shared = Arc::new(SharedMatcher::new(server));
         let counter = Arc::new(MockSubmitter::new());
         let submitter: Arc<dyn TxSubmitter> = Arc::clone(&counter) as Arc<dyn TxSubmitter>;
-        let sealer: Arc<dyn crate::BatchSealer> =
+        let batch_sealer: Arc<dyn crate::BatchSealer> =
             Arc::clone(&shared) as Arc<dyn crate::BatchSealer>;
-        let settler = BatchSettler::new(sealer, Arc::clone(&submitter), 100, addr(0), 0);
+        let settler = BatchSettler::new(batch_sealer, Arc::clone(&submitter), 100, addr(0), 0);
 
         // Settle now.
         let settled = settler.settle_now().expect("settle");
@@ -1760,23 +1791,13 @@ mod tests {
     /// every subsequent settlement was nonce-skipped forever.
     #[test]
     fn batch_settler_retries_failed_batch_same_envelope() {
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
         let mut server = MatchingServer::new(cfg(), 100);
-        server.fund_account(&addr(9), 1_000_000_000_000);
-        server.fund_account(&addr(1), 1_000_000_000_000);
-        for (owner, side) in [(addr(9), Side::Sell), (addr(1), Side::Buy)] {
-            server.submit_order(&OrderRequest {
-                market: 0,
-                side,
-                order_type: OrderType::Limit,
-                tif: TimeInForce::Gtc,
-                price: Price(1_500_000_000),
-                qty: Qty(1_000),
-                owner,
-                nonce: 0,
-                pubkey: [0u8; 32],
-                signature: [0u8; 64],
-            });
-        }
+        server.fund_account(&seller, 1_000_000_000_000);
+        server.fund_account(&buyer, 1_000_000_000_000);
+        server.submit_order(&signed_req(&seller_sk, Side::Sell, 0));
+        server.submit_order(&signed_req(&buyer_sk, Side::Buy, 0));
         assert_eq!(server.pending_settlements(), 1);
 
         let shared = Arc::new(SharedMatcher::new(server));
@@ -1821,21 +1842,13 @@ mod tests {
     }
 
     /// Submit another matched pair so `seal_batch` returns a fill.
+    /// Each account's second order uses nonce 1 (nonce 0 was the
+    /// first fill's pair).
     fn server_refill(shared: &SharedMatcher) {
-        for (owner, side) in [(addr(9), Side::Sell), (addr(1), Side::Buy)] {
-            shared.submit(&OrderRequest {
-                market: 0,
-                side,
-                order_type: OrderType::Limit,
-                tif: TimeInForce::Gtc,
-                price: Price(1_500_000_000),
-                qty: Qty(1_000),
-                owner,
-                nonce: 1,
-                pubkey: [0u8; 32],
-                signature: [0u8; 64],
-            });
-        }
+        let (seller_sk, _) = test_account(9);
+        let (buyer_sk, _) = test_account(1);
+        shared.submit(&signed_req(&seller_sk, Side::Sell, 1));
+        shared.submit(&signed_req(&buyer_sk, Side::Buy, 1));
     }
 
     /// Regression test: a permanently-rejected envelope must NOT be
@@ -1847,23 +1860,13 @@ mod tests {
     /// recovers. The nonce is NOT advanced (the tx never executed).
     #[test]
     fn batch_settler_keeps_pending_after_max_retries() {
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
         let mut server = MatchingServer::new(cfg(), 100);
-        server.fund_account(&addr(9), 1_000_000_000_000);
-        server.fund_account(&addr(1), 1_000_000_000_000);
-        for (owner, side) in [(addr(9), Side::Sell), (addr(1), Side::Buy)] {
-            server.submit_order(&OrderRequest {
-                market: 0,
-                side,
-                order_type: OrderType::Limit,
-                tif: TimeInForce::Gtc,
-                price: Price(1_500_000_000),
-                qty: Qty(1_000),
-                owner,
-                nonce: 0,
-                pubkey: [0u8; 32],
-                signature: [0u8; 64],
-            });
-        }
+        server.fund_account(&seller, 1_000_000_000_000);
+        server.fund_account(&buyer, 1_000_000_000_000);
+        server.submit_order(&signed_req(&seller_sk, Side::Sell, 0));
+        server.submit_order(&signed_req(&buyer_sk, Side::Buy, 0));
 
         let shared = Arc::new(SharedMatcher::new(server));
         // Fail forever — the batch is retried but NOT dropped.

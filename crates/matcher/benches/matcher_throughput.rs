@@ -34,6 +34,8 @@
 #![allow(clippy::cast_possible_wrap)]
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use crypto::ed25519::{Ed25519SecretKey, owner_address};
+use matcher::protocol::sign_order;
 use matcher::{MatchingServer, OrderRequest};
 use primitives::fixed::{Price, Qty};
 use std::hint::black_box;
@@ -63,42 +65,45 @@ fn addr_from_index(i: u32) -> primitives::Address {
     primitives::Address(addr)
 }
 
-/// Build a maker sell order for account `i`.
-fn maker_sell(i: u32) -> OrderRequest {
-    OrderRequest {
+/// Deterministic per-account signing key — every order must
+/// authenticate at the admission boundary (signature + derived-owner
+/// binding), so the benchmark signs like a real client.
+fn account_key(i: u32) -> Ed25519SecretKey {
+    let mut seed = [0u8; 32];
+    seed[..4].copy_from_slice(&i.to_le_bytes());
+    Ed25519SecretKey::from_bytes(&seed)
+}
+
+/// Build a signed order for `key`'s account at `nonce`.
+fn signed_order(key: &Ed25519SecretKey, side: Side, nonce: u64) -> OrderRequest {
+    let mut req = OrderRequest {
         market: 0,
-        side: Side::Sell,
+        side,
         order_type: OrderType::Limit,
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
-        nonce: 0,
-        owner: addr_from_index(i),
+        nonce,
+        owner: addr_from_index(0),
         pubkey: [0u8; 32],
         signature: [0u8; 64],
-    }
+    };
+    sign_order(&mut req, key);
+    req
 }
 
-/// Build a taker buy order for account `i`.
-fn taker_buy(i: u32) -> OrderRequest {
-    OrderRequest {
-        market: 0,
-        side: Side::Buy,
-        order_type: OrderType::Limit,
-        tif: TimeInForce::Gtc,
-        price: Price(1_500_000_000),
-        qty: Qty(1_000),
-        nonce: 0,
-        owner: addr_from_index(i),
-        pubkey: [0u8; 32],
-        signature: [0u8; 64],
-    }
-}
-
-/// Benchmark the full order entry path: decode → balance check →
-/// match → settle → encode response.
+/// Benchmark the full order entry path: decode → verify → nonce →
+/// balance check → match → settle → encode response.
+///
+/// Orders are pre-signed in setup — Ed25519 signing is client-side
+/// work, so the measured region isolates the server path (which now
+/// includes `verify_order` on every submission). Each order carries
+/// a unique per-account nonce or the replay gate would reject it.
 fn bench_order_entry(c: &mut Criterion) {
-    let n_orders = env_usize("BENCH_ORDERS", 1_000_000_000);
+    // Default 100k orders: the pre-signed pool is materialized in
+    // memory (~200 B/order) and each pool costs a signing pass in
+    // setup — scale with BENCH_ORDERS as RAM/time allow.
+    let n_orders = env_usize("BENCH_ORDERS", 100_000);
     let n_accounts = env_usize("BENCH_ACCOUNTS", 1_000_000);
 
     let mut group = c.benchmark_group("order_entry");
@@ -106,33 +111,43 @@ fn bench_order_entry(c: &mut Criterion) {
     group.sample_size(10); // Fewer samples for large runs.
     group.measurement_time(std::time::Duration::from_secs(30));
 
-    group.bench_function("1b_orders_1m_accounts", |bencher| {
+    group.bench_function("authenticated_order_entry", |bencher| {
         bencher.iter_with_setup(
             || {
-                // Setup: create server, fund 1M accounts.
+                // Setup: two trading accounts (maker + taker) plus
+                // the 1M-account balance map for lookup realism.
+                let seller_key = account_key(0);
+                let buyer_key = account_key(1);
+                let seller = owner_address(&seller_key.verifying_key());
+                let buyer = owner_address(&buyer_key.verifying_key());
                 let mut server = MatchingServer::new(cfg(), n_accounts);
                 for i in 0..u32::try_from(n_accounts).unwrap_or(u32::MAX) {
                     server.fund_account(&addr_from_index(i), 1_000_000_000_000);
                 }
-                server
+                server.fund_account(&seller, u64::MAX / 4);
+                server.fund_account(&buyer, u64::MAX / 4);
+                // Pre-sign the workload: alternating maker sells and
+                // taker buys, per-account nonces 0..n/2. Each maker
+                // rests, the next taker matches it (book stays at
+                // 0–1 resting orders).
+                let orders: Vec<OrderRequest> = (0..n_orders)
+                    .map(|i| {
+                        if i % 2 == 0 {
+                            signed_order(&seller_key, Side::Sell, (i / 2) as u64)
+                        } else {
+                            signed_order(&buyer_key, Side::Buy, (i / 2) as u64)
+                        }
+                    })
+                    .collect();
+                (server, orders)
             },
-            |mut server| {
-                // Measured: submit n_orders orders, alternating
-                // maker sells and taker buys. Each maker rests, then
-                // the next taker matches it. This keeps the book at
-                // 0–1 resting orders (avoids max_resting cap) and
-                // exercises the balance check on every buy order.
-                //
-                // Use two accounts: account 0 (maker/seller) and
-                // account 1 (taker/buyer). Alternate between them.
-                let maker = maker_sell(0);
-                let taker = taker_buy(1);
-
-                for _ in 0..n_orders / 2 {
-                    let _ = server.submit_order(black_box(&maker));
-                    let _ = server.submit_order(black_box(&taker));
+            |(mut server, orders)| {
+                // Measured: submit each pre-signed order through the
+                // full admission boundary (verify → nonce → risk →
+                // balance → match → settle).
+                for req in &orders {
+                    let _ = server.submit_order(black_box(req));
                 }
-
                 black_box(server.orders_processed());
             },
         );

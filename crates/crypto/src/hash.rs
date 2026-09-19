@@ -63,6 +63,7 @@ use primitives::Hash;
 /// | `BodyShardNode` | 13 | dispersed-block shard tree node (Phase 5) |
 /// | `ExecAttest` | 14 | execution attestation signing (Phase 5) |
 /// | `BlsPop` | 15 | BLS proof-of-possession (validator key admission) |
+/// | `Ed25519Owner` | 16 | matcher account derivation from Ed25519 key |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -118,6 +119,14 @@ pub enum Domain {
     /// Its own domain so a `PoP` can never be reinterpreted as a
     /// vote, timeout, or attestation signature over the same bytes.
     BlsPop = 15,
+    /// A matcher account address derived from an Ed25519 public key:
+    /// `H(tag ‖ pk_bytes)[..20]`. Appended after `BlsPop` — never
+    /// renumber. The Ed25519 key IS the trading account: the
+    /// matcher's `owner` field must equal this derivation, which
+    /// binds the signing key to the account with no registry.
+    /// Distinct from `ValidatorAddress` so a consensus identity can
+    /// never alias a trading account (and vice versa).
+    Ed25519Owner = 16,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

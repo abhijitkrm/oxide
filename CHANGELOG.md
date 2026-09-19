@@ -1004,6 +1004,35 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Matcher admission now requires a valid Ed25519 signature bound
+  to the account owner on every ingress path** (`crates/matcher`,
+  `crates/crypto`, `bin/oxide-loadgen`)
+  - Binary-TCP single orders, JSON-RPC, FIX, and WebSocket orders
+    previously reached the matching engine with no signature check
+    at all, and order actions (cancel/amend/replace) were dispatched
+    after being stripped of their authentication fields — a forged
+    cancel needed no key at all.
+  - Owner identity is now cryptographic: `crypto::ed25519::
+    owner_address` derives the account address from the verifying
+    key under a new domain tag, so a signature over someone else's
+    account is rejected — no registration table to get out of sync.
+  - Replay protection is a strictly-increasing per-account nonce,
+    consumed even when the order is later rejected (Ethereum
+    semantics) and shared across all markets.
+  - Fixed two latent correctness bugs along the way: batch responses
+    were misaligned after a bad entry (`[good, bad, good]` answered
+    `[BadSignature, r0, r1]`), and `submit_batch` routed a
+    mixed-market batch entirely by the first order's market.
+  - Nonces are now consumed at dispatch in batch order: same-account
+    orders on different markets previously raced on the shared
+    tracker, making accept-vs-`StaleNonce` nondeterministic within
+    one call.
+  - **In plain words:** anyone who could reach the matcher could
+    place orders as any account or cancel any resting order without
+    keys. Every order and action now needs a signature from the key
+    that owns the account, and replays are rejected — while signed
+    clients see no API change beyond providing their key.
+
 - **Parallel EVM execution could commit results that sequential
   execution would never produce** (`modules/evm`)
   - `handle_batch_parallel` speculated per-sender groups on

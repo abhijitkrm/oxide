@@ -27,8 +27,10 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_possible_wrap)]
 
+use crypto::ed25519::{Ed25519SecretKey, owner_address};
 use matcher::protocol::{
     OrderRequest, decode_batch_response, decode_response, encode_batch_request, encode_request,
+    sign_order,
 };
 use matcher::{MatchingServer, SharedMatcher};
 use primitives::fixed::{Price, Qty};
@@ -59,53 +61,80 @@ fn addr_from_index(i: u32) -> primitives::Address {
     primitives::Address(addr)
 }
 
-fn make_order(side: Side, owner_idx: u32) -> OrderRequest {
-    OrderRequest {
+/// Deterministic per-account signing key — every order must
+/// authenticate (signature + derived-owner binding), so the
+/// benchmark signs like a real client.
+fn account_key(i: u32) -> Ed25519SecretKey {
+    let mut seed = [0u8; 32];
+    seed[..4].copy_from_slice(&i.to_le_bytes());
+    Ed25519SecretKey::from_bytes(&seed)
+}
+
+/// Build a signed order for `key`'s account (`sign_order` fills in
+/// the derived owner, pubkey, and signature).
+fn make_order(key: &Ed25519SecretKey, side: Side, nonce: u64) -> OrderRequest {
+    let mut req = OrderRequest {
         market: 0,
         side,
         order_type: OrderType::Limit,
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
-        nonce: 0,
-        owner: addr_from_index(owner_idx),
+        nonce,
+        owner: addr_from_index(0),
         pubkey: [0u8; 32],
         signature: [0u8; 64],
-    }
+    };
+    sign_order(&mut req, key);
+    req
 }
 
-fn build_matcher(n_accounts: usize, initial_balance: u64) -> Arc<SharedMatcher> {
+/// Build a shared matcher with funded accounts plus the account
+/// keys needed to sign for them.
+fn build_matcher(
+    n_accounts: usize,
+    initial_balance: u64,
+) -> (Arc<SharedMatcher>, Vec<Ed25519SecretKey>) {
+    let keys: Vec<Ed25519SecretKey> =
+        (0..u32::try_from(n_accounts).unwrap_or(u32::MAX)).map(account_key).collect();
     let mut server = MatchingServer::new(cfg(), n_accounts);
-    for i in 0..u32::try_from(n_accounts).unwrap_or(u32::MAX) {
-        server.fund_account(&addr_from_index(i), initial_balance);
+    for key in &keys {
+        server.fund_account(&owner_address(&key.verifying_key()), initial_balance);
     }
-    Arc::new(SharedMatcher::new(server))
+    (Arc::new(SharedMatcher::new(server)), keys)
 }
 
-/// Generate order pairs (maker sell + taker buy) for the benchmark.
-fn generate_orders(n_orders: usize, n_accounts: usize) -> Vec<OrderRequest> {
+/// Generate signed order pairs (maker sell + taker buy) for the
+/// benchmark. Each account's nonces increase strictly across every
+/// order it signs (the admission boundary replays-check nonces).
+fn generate_orders(n_orders: usize, keys: &[Ed25519SecretKey]) -> Vec<OrderRequest> {
     let n_pairs = n_orders / 2;
-    let n_u32 = u32::try_from(n_accounts).unwrap_or(u32::MAX);
+    let n_u32 = u32::try_from(keys.len()).unwrap_or(u32::MAX);
     let mut orders = Vec::with_capacity(n_orders);
+    let mut nonces = vec![0u64; keys.len()];
     for i in 0..n_pairs {
-        let seller = u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32;
-        let buyer = u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32;
-        orders.push(make_order(Side::Sell, seller));
-        orders.push(make_order(Side::Buy, buyer));
+        let seller = (u32::try_from(2 * i).unwrap_or(u32::MAX) % n_u32) as usize;
+        let buyer = (u32::try_from(2 * i + 1).unwrap_or(u32::MAX) % n_u32) as usize;
+        let seller_nonce = nonces[seller];
+        nonces[seller] += 1;
+        orders.push(make_order(&keys[seller], Side::Sell, seller_nonce));
+        let buyer_nonce = nonces[buyer];
+        nonces[buyer] += 1;
+        orders.push(make_order(&keys[buyer], Side::Buy, buyer_nonce));
     }
     orders
 }
 
 /// Baseline: synchronous request-response (one round-trip per order).
 async fn bench_sync(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let tcp_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_binary_tcp_server(tcp_matcher, port).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let orders = generate_orders(n_orders, n_accounts);
+    let orders = generate_orders(n_orders, &keys);
     let mut sock = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
     let mut buf = [0u8; matcher::protocol::RESPONSE_SIZE];
     let mut fills = 0u64;
@@ -128,14 +157,14 @@ async fn bench_sync(n_orders: usize, n_accounts: usize, port: u16) -> f64 {
 /// Pipelining: send N requests in a burst, then read N responses.
 /// Amortizes TCP round-trip latency.
 async fn bench_pipelined(n_orders: usize, n_accounts: usize, port: u16, pipe_size: usize) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let tcp_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_binary_tcp_server(tcp_matcher, port).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let orders = generate_orders(n_orders, n_accounts);
+    let orders = generate_orders(n_orders, &keys);
     let mut sock = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
     let mut resp_buf = vec![0u8; pipe_size * matcher::protocol::RESPONSE_SIZE];
     let mut fills = 0u64;
@@ -176,14 +205,14 @@ async fn bench_pooled(
     n_connections: usize,
     pipe_size: usize,
 ) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let tcp_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_binary_tcp_server(tcp_matcher, port).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let orders = generate_orders(n_orders, n_accounts);
+    let orders = generate_orders(n_orders, &keys);
     let orders_per_conn = n_orders / n_connections;
 
     let start = Instant::now();
@@ -232,14 +261,14 @@ async fn bench_pooled(
 /// N responses in a single batch reply. Minimizes syscalls and lock
 /// acquisitions.
 async fn bench_batch(n_orders: usize, n_accounts: usize, port: u16, batch_size: usize) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let tcp_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_binary_tcp_server(tcp_matcher, port).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let orders = generate_orders(n_orders, n_accounts);
+    let orders = generate_orders(n_orders, &keys);
     let mut sock = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
     let mut fills = 0u64;
 
@@ -284,14 +313,14 @@ async fn bench_combined(
     n_connections: usize,
     batch_size: usize,
 ) -> f64 {
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let tcp_matcher = Arc::clone(&matcher);
     tokio::spawn(async move {
         let _ = matcher::server::run_binary_tcp_server(tcp_matcher, port).await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let orders = generate_orders(n_orders, n_accounts);
+    let orders = generate_orders(n_orders, &keys);
     let orders_per_conn = n_orders / n_connections;
 
     let start = Instant::now();
@@ -344,15 +373,16 @@ async fn bench_combined(
 /// Ring matcher benchmark: batch orders routed through the lock-free
 /// SPSC ring (no mutex on the order path).
 async fn bench_ring_batch(n_orders: usize, n_accounts: usize, port: u16, batch_size: usize) -> f64 {
-    // Build a funded server for the ring matcher's thread.
+    // Build the account keys first — the ring matcher's server AND
+    // the mutex-fallback server must fund the same derived owners.
+    let (matcher, keys) = build_matcher(n_accounts, 1_000_000_000_000);
     let mut funded = MatchingServer::new(cfg(), n_accounts);
-    for i in 0..u32::try_from(n_accounts).unwrap_or(u32::MAX) {
-        funded.fund_account(&addr_from_index(i), 1_000_000_000_000);
+    for key in &keys {
+        funded.fund_account(&owner_address(&key.verifying_key()), 1_000_000_000_000);
     }
     let ring_matcher = Arc::new(matcher::RingMatcher::new(funded, 8, 8192));
     // The SharedMatcher is only used for the mutex path fallback in
     // the server (settlement isn't measured here).
-    let matcher = build_matcher(n_accounts, 1_000_000_000_000);
     let tcp_matcher = Arc::clone(&matcher);
     let ring = Arc::clone(&ring_matcher);
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -361,7 +391,7 @@ async fn bench_ring_batch(n_orders: usize, n_accounts: usize, port: u16, batch_s
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let orders = generate_orders(n_orders, n_accounts);
+    let orders = generate_orders(n_orders, &keys);
     let mut sock = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
     let mut fills = 0u64;
 
