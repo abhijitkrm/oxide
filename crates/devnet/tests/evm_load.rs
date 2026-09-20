@@ -169,7 +169,13 @@ fn run_evm_load_test(n_validators: usize, total_txs: usize, base_port: u16) {
     // differ. We check the last finalized block's state root.
     let max_height = n_blocks - 1;
     let state_roots: Vec<primitives::Hash> = (0..n_validators)
-        .map(|i| devnet.app(i).attest_state(primitives::Height::new(max_height as u64)).root)
+        .map(|i| {
+            devnet
+                .app(i)
+                .attest_state(primitives::Height::new(max_height as u64))
+                .expect("executed")
+                .root
+        })
         .collect();
     let first_root = state_roots[0];
     for (i, &root) in state_roots.iter().enumerate() {

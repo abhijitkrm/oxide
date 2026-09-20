@@ -2597,12 +2597,11 @@ impl AppInterface for Executor {
         CommitAck { height: block.height }
     }
 
-    fn attest_state(&self, height: Height) -> StateAttestation {
+    fn attest_state(&self, height: Height) -> Option<StateAttestation> {
         let start = std::time::Instant::now();
         // Async lane: wait only while the height is owed to the
         // worker. A height never enqueued has no execution coming —
-        // return the absent-root sentinel (`Hash::ZERO`) rather than
-        // blocking forever.
+        // return `None` ("not executed") rather than blocking forever.
         if self.exec_lane_tx.get().is_some() {
             let (lock, cv) = &*self.exec_sync;
             let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2617,29 +2616,25 @@ impl AppInterface for Executor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&height.value())
-            .copied()
-            .unwrap_or(Hash::ZERO);
+            .copied();
         if let Some(recorder) = &self.recorder {
             recorder.record("attest_state", start.elapsed());
         }
-        StateAttestation { height, root }
+        root.map(|root| StateAttestation { height, root })
     }
 
-    fn attest_latest(&self) -> StateAttestation {
+    fn attest_latest(&self) -> Option<StateAttestation> {
         // Deliberately does NOT flush pending execution: the vote
         // path calls this on every vote and cannot afford to wait
         // on the execution lane. A stale attestation certifies an
-        // older height — never a wrong one.
-        match self
-            .state_roots
+        // older height — never a wrong one. `None` before the first
+        // execution: there is no attestation to make.
+        self.state_roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .next_back()
-        {
-            Some((h, root)) => StateAttestation { height: Height::new(*h), root: *root },
-            None => StateAttestation { height: Height::new(0), root: Hash::ZERO },
-        }
+            .map(|(h, root)| StateAttestation { height: Height::new(*h), root: *root })
     }
 }
 
@@ -2725,7 +2720,7 @@ mod tests {
         assert_eq!(ack.height, Height::new(0));
 
         // The state root should be non-zero (the counter incremented).
-        let attestation = executor.attest_state(Height::new(0));
+        let attestation = executor.attest_state(Height::new(0)).expect("executed");
         assert_ne!(attestation.root, Hash::ZERO);
     }
 
@@ -2774,7 +2769,7 @@ mod tests {
 
         // The state root should be non-zero.
         let app = engine.app();
-        let attestation = app.attest_state(Height::new(0));
+        let attestation = app.attest_state(Height::new(0)).expect("executed");
         assert_ne!(attestation.root, Hash::ZERO, "state root should be non-zero after execution");
     }
 
@@ -2795,7 +2790,7 @@ mod tests {
 
         // The unknown module's tx should be silently skipped.
         // The counter module should not have been called.
-        let attestation = executor.attest_state(Height::new(0));
+        let attestation = executor.attest_state(Height::new(0)).expect("executed");
         // State root is the hash of the counter's state root (0).
         assert_ne!(attestation.root, Hash::ZERO, "state root should reflect counter=0");
     }
@@ -2825,9 +2820,9 @@ mod tests {
         assert_eq!(count, 3, "counter should have been incremented 3 times");
 
         // Each block should have a different state root.
-        let root0 = executor.attest_state(Height::new(0)).root;
-        let root1 = executor.attest_state(Height::new(1)).root;
-        let root2 = executor.attest_state(Height::new(2)).root;
+        let root0 = executor.attest_state(Height::new(0)).expect("executed").root;
+        let root1 = executor.attest_state(Height::new(1)).expect("executed").root;
+        let root2 = executor.attest_state(Height::new(2)).expect("executed").root;
         assert_ne!(root0, root1, "state roots should differ across blocks");
         assert_ne!(root1, root2, "state roots should differ across blocks");
     }
@@ -4109,11 +4104,11 @@ mod tests {
 
         // attest_state waits on the worker watermark and returns
         // the worker-computed root.
-        let att = executor.attest_state(Height::new(0));
+        let att = executor.attest_state(Height::new(0)).expect("executed");
         assert_eq!(att.height, Height::new(0));
         assert_ne!(att.root, Hash::ZERO, "worker must have executed the block");
         // attest_latest reads the watermark without blocking.
-        let latest = executor.attest_latest();
+        let latest = executor.attest_latest().expect("executed");
         assert_eq!(latest.height, Height::new(0));
         assert_eq!(latest.root, att.root);
     }
@@ -4139,8 +4134,8 @@ mod tests {
             async_exec.finalize_block(&block);
         }
         for h in 0..5u64 {
-            let sync_root = sync_exec.attest_state(Height::new(h)).root;
-            let async_root = async_exec.attest_state(Height::new(h)).root;
+            let sync_root = sync_exec.attest_state(Height::new(h)).expect("executed").root;
+            let async_root = async_exec.attest_state(Height::new(h)).expect("executed").root;
             assert_eq!(sync_root, async_root, "height {h} root mismatch");
             assert_ne!(sync_root, Hash::ZERO);
         }
@@ -4149,8 +4144,8 @@ mod tests {
     #[test]
     fn attest_beyond_enqueued_does_not_block() {
         // attest_state for a height the lane never saw must return
-        // the absent sentinel immediately — never wait on execution
-        // that isn't coming.
+        // `None` immediately — never wait on execution that isn't
+        // coming.
         let mut executor = Executor::new(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let executor = Arc::new(executor);
@@ -4173,6 +4168,8 @@ mod tests {
         let att = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("attest_state must not block on an unenqueued height");
-        assert_eq!(att.root, Hash::ZERO);
+        // An unenqueued height has no execution coming — `None`,
+        // the explicit "not executed" signal.
+        assert!(att.is_none());
     }
 }

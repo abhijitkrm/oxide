@@ -226,9 +226,9 @@ fn run_settle_tps(
 
     // 4. State root equality at the finalized height.
     let final_height = result.finalized[0].last().map_or(primitives::Height::new(0), |b| b.height);
-    let root_0 = devnet.app(0).attest_state(final_height).root;
+    let root_0 = devnet.app(0).attest_state(final_height).expect("executed").root;
     for i in 1..n_validators {
-        let root_i = devnet.app(i).attest_state(final_height).root;
+        let root_i = devnet.app(i).attest_state(final_height).expect("executed").root;
         assert_eq!(root_0, root_i, "validator {i} state root != validator 0");
     }
 

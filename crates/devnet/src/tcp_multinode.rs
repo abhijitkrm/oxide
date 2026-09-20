@@ -2677,7 +2677,7 @@ mod tests {
     fn tcp_multinode_evm_ledger_executes() {
         let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21200);
         devnet.run_batch(3, 10);
-        let root = devnet.app(0).attest_state(primitives::Height::new(0));
+        let root = devnet.app(0).attest_state(primitives::Height::new(0)).expect("executed");
         assert_ne!(root.root, primitives::Hash::ZERO, "state root should be non-zero");
     }
 

@@ -44,6 +44,6 @@ fn smoke_spammer_batch_100_txs() {
     let height = node.engine().finalized_height();
     assert!(height.is_some(), "at least one block should finalize");
 
-    let attestation = node.app().attest_state(height.unwrap());
+    let attestation = node.app().attest_state(height.unwrap()).expect("executed");
     assert_ne!(attestation.root, primitives::Hash::ZERO, "state root must be non-zero");
 }

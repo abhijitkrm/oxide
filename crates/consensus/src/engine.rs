@@ -231,6 +231,18 @@ pub enum ConsensusError {
         /// The state root the local validator computed.
         actual_root: Hash,
     },
+    /// An execution certificate's epoch differs from the engine's
+    /// current epoch. Attestation signatures commit to
+    /// `(height, root, epoch)` and the signer bitmap indexes the
+    /// *current* validator set, so a certificate from any other
+    /// epoch is unverifiable here — refused rather than silently
+    /// trusted.
+    CertEpochMismatch {
+        /// The epoch the certificate claims to belong to.
+        cert_epoch: Epoch,
+        /// The engine's current epoch.
+        epoch: Epoch,
+    },
     /// A reconstructed block body failed certification: either its
     /// shard-commitment does not match the `body_commitment` in the
     /// notarized header (the leader dispersed inconsistent bodies —
@@ -280,6 +292,14 @@ impl std::fmt::Display for ConsensusError {
                     f,
                     "state divergence at height {}: network root {expected_root}, local root {actual_root}",
                     height.value()
+                )
+            }
+            Self::CertEpochMismatch { cert_epoch, epoch } => {
+                write!(
+                    f,
+                    "exec cert epoch {} does not match current epoch {}",
+                    cert_epoch.value(),
+                    epoch.value()
                 )
             }
             Self::BodyRejected { block_hash } => {
@@ -411,8 +431,19 @@ pub struct OxideBft {
     /// Entries at or below the committed height are pruned — the
     /// committed prefix no longer needs certification.
     exec_certs: std::collections::BTreeMap<u64, ExecCertificate>,
+    /// Certificates that have passed [`verify_exec_cert`]
+    /// (`Self::verify_exec_cert`) under the *current* validator set,
+    /// keyed by certified height. The vote path consults this before
+    /// paying the ~4ms aggregate verify: a certificate is validated
+    /// once and the result is bound to its complete identity — the
+    /// cached value must equal the presented cert, so a different
+    /// cert at the same height re-validates rather than inheriting
+    /// the earlier verdict. Cleared at epoch rotation: verification
+    /// is only defined against the epoch's validator set.
+    verified_exec_certs: std::collections::BTreeMap<u64, ExecCertificate>,
     /// The last attestation this validator signed, cached by
-    /// `(height, state_root)`. Execution attestations only change
+    /// `(height, state_root, epoch)`. Execution attestations only
+    /// change
     /// when the app's executed tip advances, but votes are cast
     /// once per view — under steady-state pipelining the same
     /// watermark is attested several times. Re-signing an
@@ -420,7 +451,11 @@ pub struct OxideBft {
     /// signature (BLS is deterministic), so the cached signature is
     /// reused verbatim — one `sign` per executed height instead of
     /// one per vote (~0.5ms saved per vote on the critical path).
-    last_attestation: Option<(StateAttestation, Signature)>,
+    /// The epoch is part of the key: the signed message binds
+    /// `(height, root, epoch)`, so a signature minted in epoch N
+    /// is invalid under epoch N+1 and must never be replayed from
+    /// this cache.
+    last_attestation: Option<(StateAttestation, Epoch, Signature)>,
     /// The timeout certificate that justified entry into the current
     /// view, when the view was reached via the timeout path. `None`
     /// when the view was entered via QC progress (the happy path),
@@ -527,6 +562,7 @@ impl OxideBft {
             vote_stake: 0,
             exec_attest_pool: std::collections::BTreeMap::new(),
             exec_certs: std::collections::BTreeMap::new(),
+            verified_exec_certs: std::collections::BTreeMap::new(),
             last_attestation: None,
             last_tc: None,
             timeout_signatures: vec![None; n],
@@ -840,6 +876,19 @@ impl OxideBft {
         self.vote_count = 0;
         self.vote_stake = 0;
         self.timeout_signatures = vec![None; self.validator_set.n()];
+        // Execution certificates, pooled attestations, and cached
+        // cert verifications are all epoch-bound: the signatures
+        // commit to `(height, root, epoch)` and verify against the
+        // signing epoch's validator set, which is gone after this
+        // swap. Stale certs are unverifiable, stale pool entries
+        // could only aggregate into certs that fail verification
+        // (a leader embedding one would withhold every honest
+        // vote), and cached verdicts were computed against the old
+        // set. Drop all of it — the new epoch's attestations
+        // rebuild the pool from scratch.
+        self.exec_attest_pool.clear();
+        self.exec_certs.clear();
+        self.verified_exec_certs.clear();
         // Persist the cleared locks: a crash between rotation and the
         // next vote would otherwise restore the old epoch's locks
         // from the WAL and wedge the new epoch's first heights (the
@@ -1517,7 +1566,16 @@ impl OxideBft {
                 .exec_certs
                 .range(..height.value().saturating_sub(1))
                 .next_back()
-                .map(|(_, cert)| cert.clone()),
+                .map(|(_, cert)| cert.clone())
+                // Only a same-epoch cert is verifiable: the signed
+                // message binds `(height, root, epoch)` and the
+                // bitmap indexes the current validator set. Certs
+                // are cleared at rotation so the map should only
+                // ever hold same-epoch entries — this filter is
+                // defense in depth: embedding an out-of-epoch cert
+                // would withhold every honest vote and burn the
+                // view.
+                .filter(|cert| cert.epoch == self.epoch),
         };
         // C3 fix: sign the header with the leader's BLS secret key.
         // The signature authenticates that the claimed proposer
@@ -1869,29 +1927,30 @@ impl OxideBft {
         // (conformance mode) since the app may not have real state.
         if self.verify_signatures {
             if let Some(cert) = &header.exec_cert {
-                // The local root alone decides this vote: we vote iff
-                // the certified root matches what WE executed. The
-                // aggregate signature is deliberately NOT verified on
-                // the happy path — it can never change the outcome.
-                // A forged cert carrying the correct root is harmless
-                // (the vote is identical); a forged cert carrying a
-                // wrong root only withholds our vote — a bounded DoS
-                // in the same class as any malformed proposal, limited
-                // to the forger's own leader turns. Skipping the ~4ms
-                // aggregate_verify here keeps certified execution free
-                // on the vote critical path.
-                let local = self.app.attest_state(cert.height);
+                // Full validation once per unique certificate
+                // (cached in `verified_exec_certs`): epoch match,
+                // bitmap bounds, quorum power, aggregate signature.
+                // A forged cert — even one carrying a
+                // locally-matching root — is unproven execution
+                // agreement and must never ride into a committed
+                // block as if it were evidence. The old code skipped
+                // verification whenever the root matched, letting a
+                // fabricated cert be committed unquestioned.
+                if !self.exec_cert_verified(cert) {
+                    return None;
+                }
+                // The now-verified cert's root must equal what WE
+                // executed at that height. `None` means the height
+                // has not executed locally — we cannot confirm the
+                // certificate, so the vote is withheld. (The old
+                // `Hash::ZERO` sentinel here let a forged cert
+                // claiming a zero root "match" an unexecuted
+                // height.) A mismatch on a *verified* cert means a
+                // stake supermajority really attested a root we did
+                // not compute — confirmed divergence; refuse to
+                // extend it.
+                let local = self.app.attest_state(cert.height)?;
                 if local.root != cert.state_root {
-                    // Verify only now, off the happy path, purely for
-                    // evidence: a VALID signature means a stake
-                    // supermajority really attested a root we did not
-                    // compute — confirmed
-                    // divergence, refuse and alert the operator. An
-                    // INVALID signature means the leader fabricated
-                    // the claim — the proposal is ignored. Both
-                    // withhold this vote; the distinction is logged
-                    // for forensics rather than acted on.
-                    let _confirmed_divergence = self.verify_exec_cert(cert).is_ok();
                     return None;
                 }
             }
@@ -2108,16 +2167,29 @@ impl OxideBft {
         if self.wal_failed {
             return (None, None);
         }
-        let att = self.app.attest_latest();
+        // `None` = nothing executed yet — attestations are only
+        // ever claims about real execution, never placeholders. A
+        // `Hash::ZERO` root gets the same treatment: no real state
+        // root is the zero hash, so an app reporting one has not
+        // actually executed anything.
+        let Some(att) = self.app.attest_latest() else {
+            return (None, None);
+        };
         if att.root == Hash::ZERO {
             return (None, None);
         }
         // BLS signing is deterministic: an unchanged `(height,
-        // root)` yields an identical signature, so the cached one
-        // is byte-for-byte valid. Saves one sign per vote once the
-        // executed watermark stalls behind consensus.
-        if let Some((cached_att, cached_sig)) = &self.last_attestation {
-            if cached_att.height == att.height && cached_att.root == att.root {
+        // root, epoch)` yields an identical signature, so the
+        // cached one is byte-for-byte valid. Saves one sign per
+        // vote once the executed watermark stalls behind consensus.
+        // The epoch must match — the signed message binds it, so a
+        // signature minted before a rotation verifies against
+        // nothing in the new epoch.
+        if let Some((cached_att, cached_epoch, cached_sig)) = &self.last_attestation {
+            if cached_att.height == att.height
+                && cached_att.root == att.root
+                && *cached_epoch == self.epoch
+            {
                 return (Some(*cached_att), Some(*cached_sig));
             }
         }
@@ -2128,7 +2200,7 @@ impl OxideBft {
             }
             None => Signature::ZERO,
         };
-        self.last_attestation = Some((att, sig));
+        self.last_attestation = Some((att, self.epoch, sig));
         (Some(att), Some(sig))
     }
 
@@ -2156,6 +2228,19 @@ impl OxideBft {
     /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
     /// not verify.
     fn verify_exec_cert(&self, cert: &ExecCertificate) -> Result<(), ConsensusError> {
+        // The certificate's epoch must equal this engine's epoch:
+        // the signed message binds `(height, root, epoch)` and the
+        // bitmap indexes the *current* validator set — a cert from
+        // any other epoch is unverifiable here (its signers index a
+        // different set and its signatures commit to a different
+        // epoch), not merely stale. Checked before the bitmap walk
+        // so an out-of-epoch bitmap can never index the wrong set.
+        if cert.epoch != self.epoch {
+            return Err(ConsensusError::CertEpochMismatch {
+                cert_epoch: cert.epoch,
+                epoch: self.epoch,
+            });
+        }
         let (signer_pks, voting_power) = self.signer_keys_and_power(&cert.signer_bitmap)?;
         if voting_power < self.validator_set.quorum_stake() {
             return Err(ConsensusError::InsufficientQuorum {
@@ -2171,6 +2256,29 @@ impl OxideBft {
             &signer_pks,
         )
         .map_err(|_| ConsensusError::InvalidQcSignature)
+    }
+
+    /// Validate an embedded [`ExecCertificate`] at most once per
+    /// complete identity. The vote path calls this on every proposal
+    /// carrying a cert; the first sight pays the full check (epoch,
+    /// bitmap bounds, quorum power, aggregate signature — one
+    /// `aggregate_verify`, ~4ms) and the certificate is then cached
+    /// in `verified_exec_certs` keyed by certified height with the
+    /// cert itself as the value. A different cert at the same height
+    /// fails the equality check and re-validates, so the cache can
+    /// never launder an unverified certificate under a previously
+    /// verified height. Entries are cleared at epoch rotation:
+    /// verification is only defined against the epoch's validator
+    /// set, so cached verdicts must not outlive it.
+    fn exec_cert_verified(&mut self, cert: &ExecCertificate) -> bool {
+        if self.verified_exec_certs.get(&cert.height.value()) == Some(cert) {
+            return true;
+        }
+        if self.verify_exec_cert(cert).is_err() {
+            return false;
+        }
+        self.verified_exec_certs.insert(cert.height.value(), cert.clone());
+        true
     }
 
     /// Leader: collect a vote from validator `voter`. Stores the vote
@@ -2742,6 +2850,7 @@ impl OxideBft {
         let cert_floor = committed_height
             .saturating_sub(2 * u64::try_from(self.validator_set.n()).unwrap_or(u64::MAX));
         self.exec_certs.retain(|h, _| *h >= cert_floor);
+        self.verified_exec_certs.retain(|h, _| *h >= cert_floor);
         // Prune the block store of stale proposals: a block at or
         // below the just-committed height can never be needed again
         // (the 2-chain rule only walks ancestors of the pending
@@ -5234,6 +5343,340 @@ mod tests {
         assert!(vote.is_some(), "proposal with matching exec_cert must be accepted");
     }
 
+    // ---- Exec-cert validation hardening ----
+    //
+    // Audit: a matching `state_root` used to skip *all* certificate
+    // validation — signature, signer bitmap, quorum, and epoch — so a
+    // leader could embed a fabricated cert and have it committed as
+    // unproven "proof" of execution agreement. Attestations were also
+    // cached by `(height, root)` without the epoch they sign, and an
+    // unexecuted height reported `Hash::ZERO`, matching a forged cert
+    // that claimed a zero root. These tests pin the hardened
+    // behavior: full validation once per cert identity, epoch-bound
+    // certificates, and an explicit "not executed" signal.
+
+    /// Build a correctly-signed single-validator proposal at genesis
+    /// carrying `cert` as its `exec_cert`. Mirrors the header shape
+    /// `divergence_detection_accepts_matching_exec_cert` proves is
+    /// accepted when the cert is valid.
+    fn genesis_proposal_with_cert(
+        sk: &crypto::BlsSecretKey,
+        cert: ExecCertificate,
+    ) -> (BlockHeader, Proposal) {
+        let proposal = Proposal {
+            height: Height::new(0),
+            txs: vec![TxBytes::new(vec![1])],
+            attestation: None,
+        };
+        let mut body = Vec::new();
+        proposal.encode(&mut body);
+        let mut header = BlockHeader {
+            height: Height::new(0),
+            view: View::new(0),
+            epoch: Epoch::new(0),
+            prev_block: Hash::ZERO,
+            tx_root: OxideBft::tx_root(&proposal.txs),
+            body_commitment: types::shard::commitment(&body, 1),
+            high_qc: None,
+            timeout_cert: None,
+            proposer: proposer_hash(0),
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: Some(cert),
+        };
+        let signing_hash = OxideBft::proposal_signing_hash(&header);
+        header.proposer_signature =
+            Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+        (header, proposal)
+    }
+
+    #[test]
+    fn forged_exec_cert_with_matching_root_rejected() {
+        // The cert's root matches local execution, but its aggregate
+        // signature is over a different message — a fabrication. The
+        // old code voted anyway (root match bypassed verification);
+        // a forged cert must withhold the vote regardless of the
+        // root it carries.
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+        let matching_root = Hash([0x00; 32]); // mock_state_root(0)
+        let wrong_msg = engine.attestation_signing_message(Height::new(0), &Hash([0xAA; 32]));
+        let forged_sig = sk.sign(crypto::hash::Domain::ExecAttest, &wrong_msg);
+        let cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: matching_root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[forged_sig]).expect("aggregate"),
+        };
+        let (header, proposal) = genesis_proposal_with_cert(&sk, cert);
+        let vote = engine.vote(&header, &proposal);
+        assert!(
+            vote.is_none(),
+            "a forged exec_cert must withhold the vote even when its root matches local state"
+        );
+    }
+
+    #[test]
+    fn exec_cert_with_wrong_epoch_rejected() {
+        // Attestations sign `(height, root, epoch)` and the bitmap
+        // indexes the *current* validator set — a cert claiming any
+        // other epoch is unverifiable even when its signature
+        // happens to match this epoch's message.
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+        let matching_root = Hash([0x00; 32]);
+        let att_msg = engine.attestation_signing_message(Height::new(0), &matching_root);
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+        let cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: matching_root,
+            // One epoch ahead of the engine — same signature bytes,
+            // wrong claimed epoch.
+            epoch: Epoch::new(1),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+        };
+        assert!(
+            engine.verify_exec_cert(&cert).is_err(),
+            "a cert whose epoch differs from the engine's must fail verification"
+        );
+        let (header, proposal) = genesis_proposal_with_cert(&sk, cert);
+        assert!(
+            engine.vote(&header, &proposal).is_none(),
+            "a proposal embedding a stale-epoch cert must be refused"
+        );
+    }
+
+    #[test]
+    fn propose_never_embeds_stale_epoch_cert() {
+        // `propose()` selects the newest embeddable cert; a cert from
+        // another epoch can never be verified by voters, so the
+        // leader must not embed it — doing so would withhold every
+        // honest vote and waste the view.
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+        // A cert for height 0 stamped with a foreign epoch, and a
+        // committed anchor at height 1 so the leader proposes
+        // height 2 (the embed bound is `cert.height <= h - 2`).
+        let att_msg = engine.attestation_signing_message(Height::new(0), &Hash([0x00; 32]));
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+        engine.exec_certs.insert(
+            0,
+            ExecCertificate {
+                height: Height::new(0),
+                state_root: Hash([0x00; 32]),
+                epoch: Epoch::new(99),
+                signer_bitmap: vec![0b0000_0001],
+                aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+            },
+        );
+        engine.last_committed = Some((Hash([9; 32]), Height::new(1)));
+
+        let (header, _proposal) = engine.propose().expect("genesis chain must propose");
+        assert_eq!(header.height, Height::new(2));
+        assert!(
+            header.exec_cert.is_none(),
+            "a stale-epoch cert must never be embedded in a proposal"
+        );
+    }
+
+    #[test]
+    fn attestation_cache_binds_epoch() {
+        // The attestation signature cache must key on the epoch the
+        // signature commits to. Reusing a signature minted in epoch N
+        // under epoch N+1 attaches an attestation that fails every
+        // verify — the cached sig must not survive an epoch change.
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(app.clone(), vs).with_secret_key(sk.clone());
+
+        // Give the app an executed tip with a non-zero root (height 1;
+        // height 0's mock root is Hash::ZERO, the never-attested
+        // sentinel).
+        app.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![],
+            signers: vec![],
+        });
+        app.finalize_block(&FinalizedBlock {
+            height: Height::new(1),
+            txs: vec![],
+            signers: vec![],
+        });
+
+        let (att0, sig0) = engine.vote_attestation();
+        assert!(att0.is_some() && sig0.is_some(), "executed tip must produce an attestation");
+        // Same epoch: the deterministic BLS signature is cached —
+        // byte-identical on repeat.
+        let (_, sig0_again) = engine.vote_attestation();
+        assert_eq!(sig0, sig0_again, "same-epoch attestation must reuse the cached signature");
+
+        // Simulate the epoch boundary: the same `(height, root)` now
+        // signs a different message, so the cached signature is
+        // invalid and must be re-minted.
+        engine.epoch = Epoch::new(1);
+        let (att1, sig1) = engine.vote_attestation();
+        assert_eq!(att0, att1, "the attested tip is unchanged across the boundary");
+        assert_ne!(sig0, sig1, "an epoch change must invalidate the cached attestation signature");
+    }
+
+    /// An app whose execution lane never runs: `attest_state`
+    /// returns `None` for every height — the explicit "not
+    /// executed" signal a `Hash::ZERO` sentinel used to hide.
+    /// Exercises the vote path's cannot-confirm branch, which
+    /// `MockApp`'s fabricating `attest_state` cannot reach.
+    struct NeverExecutedApp;
+
+    impl AppInterface for NeverExecutedApp {
+        fn ingest_tx(&self, _tx: TxBytes) -> MempoolAck {
+            MempoolAck::Accepted
+        }
+        fn prepare_proposal(&self, _budget: &BlockBudget) -> Proposal {
+            Proposal { height: Height::new(0), txs: Vec::new(), attestation: None }
+        }
+        fn has_queued_txs(&self) -> bool {
+            false
+        }
+        fn process_proposal(&self, _proposal: &Proposal) -> Verdict {
+            Verdict::Accept
+        }
+        fn finalize_block(&self, block: &FinalizedBlock) -> types::CommitAck {
+            types::CommitAck { height: block.height }
+        }
+        fn attest_state(&self, _height: Height) -> Option<StateAttestation> {
+            None
+        }
+        fn attest_latest(&self) -> Option<StateAttestation> {
+            None
+        }
+    }
+
+    #[test]
+    fn exec_cert_for_unexecuted_height_withheld() {
+        // A *validly signed* cert claiming a state root for a height
+        // the app never executed must still withhold the vote: there
+        // is no local execution to confirm it against. Before
+        // `attest_state` returned `Option`, the `Hash::ZERO` sentinel
+        // made a cert claiming a zero root "match" an unexecuted
+        // height and the vote went through.
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(Arc::new(NeverExecutedApp), vs).with_secret_key(sk.clone());
+
+        // Claim a ZERO root at height 0 — the exact value the old
+        // sentinel produced for unexecuted heights. The cert itself
+        // verifies (real signature, in-bounds bitmap, right epoch);
+        // only local confirmation is missing.
+        let att_msg = engine.attestation_signing_message(Height::new(0), &Hash::ZERO);
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+        let cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: Hash::ZERO,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+        };
+        let (header, proposal) = genesis_proposal_with_cert(&sk, cert);
+        assert!(
+            engine.vote(&header, &proposal).is_none(),
+            "a cert for a height with no local execution must withhold the vote"
+        );
+    }
+
+    #[test]
+    fn verified_exec_cert_is_cached_per_identity() {
+        // A cert that passes full validation is cached under its
+        // complete identity; a *different* cert at the same height
+        // must re-validate (and fail, here) rather than inheriting
+        // the cached verdict.
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+        let matching_root = Hash([0x00; 32]);
+        let att_msg = engine.attestation_signing_message(Height::new(0), &matching_root);
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+        let cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: matching_root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+        };
+        let (header, proposal) = genesis_proposal_with_cert(&sk, cert.clone());
+        assert!(engine.vote(&header, &proposal).is_some(), "a valid cert must be accepted");
+        assert_eq!(
+            engine.verified_exec_certs.get(&0),
+            Some(&cert),
+            "the verified cert must be cached under its complete identity"
+        );
+
+        // A forged cert at the SAME height: the cached entry must
+        // not launder it — it re-validates and fails.
+        let wrong_msg = engine.attestation_signing_message(Height::new(0), &Hash([0xBB; 32]));
+        let forged_sig = sk.sign(crypto::hash::Domain::ExecAttest, &wrong_msg);
+        let forged = ExecCertificate {
+            aggregate_signature: crypto::aggregate(&[forged_sig]).expect("aggregate"),
+            ..cert
+        };
+        let (header, proposal) = genesis_proposal_with_cert(&sk, forged);
+        assert!(
+            engine.vote(&header, &proposal).is_none(),
+            "a forged cert must re-validate even when a valid cert is cached at its height"
+        );
+    }
+
+    #[test]
+    fn rotation_clears_exec_cert_state() {
+        // Certs, pooled attestations, and cached verifications are
+        // bound to the signing epoch's validator set — none may
+        // outlive the epoch they were formed in.
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+        let att_msg = engine.attestation_signing_message(Height::new(0), &Hash([7; 32]));
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+        let cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: Hash([7; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+        };
+        engine
+            .exec_attest_pool
+            .entry(0)
+            .or_default()
+            .entry(Hash([7; 32]))
+            .or_default()
+            .push((0u16, Signature::ZERO));
+        engine.exec_certs.insert(0, cert.clone());
+        engine.verified_exec_certs.insert(0, cert);
+
+        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        engine.rotate_epoch().expect("rotate");
+        assert!(engine.exec_attest_pool.is_empty(), "stale attestations must not survive rotation");
+        assert!(engine.exec_certs.is_empty(), "stale certs must not survive rotation");
+        assert!(
+            engine.verified_exec_certs.is_empty(),
+            "cached verifications must not survive rotation"
+        );
+    }
+
     // ---- Execution attestation / exec-cert aggregation tests ----
     //
     // Votes carry `StateAttestation`s (BLS-signed under
@@ -5303,7 +5746,7 @@ mod tests {
         assert_eq!(att.height, Height::new(1), "attestation covers executed height");
         assert_eq!(
             att.root,
-            engine.app.attest_state(Height::new(1)).root,
+            engine.app.attest_state(Height::new(1)).expect("executed").root,
             "attestation root matches local execution"
         );
         // The attestation signature must verify under ExecAttest.

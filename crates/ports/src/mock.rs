@@ -133,7 +133,12 @@ impl AppInterface for MockApp {
         CommitAck { height: block.height }
     }
 
-    fn attest_state(&self, height: Height) -> StateAttestation {
+    fn attest_state(&self, height: Height) -> Option<StateAttestation> {
+        // The mock reports a deterministic root for *every* height —
+        // finalized or not — so tests can attest arbitrary heights
+        // without driving finalization first. A real app returns
+        // `None` for unexecuted heights; engine tests that need the
+        // `None` path use a dedicated stub.
         let root = self
             .state_roots
             .lock()
@@ -141,18 +146,20 @@ impl AppInterface for MockApp {
             .get(&height.value())
             .copied()
             .unwrap_or_else(|| mock_state_root(height));
-        StateAttestation { height, root }
+        Some(StateAttestation { height, root })
     }
 
-    fn attest_latest(&self) -> StateAttestation {
+    fn attest_latest(&self) -> Option<StateAttestation> {
         // Newest executed height: the mock records one root per
         // finalized block, so the max key is the execution tip.
-        // `Hash::ZERO` before the first block, matching the real
-        // executor's "nothing executed" sentinel.
-        match self.state_roots.lock().unwrap().iter().next_back() {
-            Some((h, root)) => StateAttestation { height: Height::new(*h), root: *root },
-            None => StateAttestation { height: Height::new(0), root: Hash::ZERO },
-        }
+        // `None` before the first block, matching the real
+        // executor's "nothing executed" signal.
+        self.state_roots
+            .lock()
+            .unwrap()
+            .iter()
+            .next_back()
+            .map(|(h, root)| StateAttestation { height: Height::new(*h), root: *root })
     }
 }
 

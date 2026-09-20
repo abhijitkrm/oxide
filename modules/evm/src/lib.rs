@@ -7190,7 +7190,7 @@ mod tests {
         // The state root must be non-zero — the EVM executed the txs
         // and changed the state (sender balance decreased, recipient
         // balance increased, nonce advanced).
-        let attestation = executor.attest_state(Height::new(0));
+        let attestation = executor.attest_state(Height::new(0)).expect("executed");
         assert_ne!(
             attestation.root,
             primitives::Hash::ZERO,
@@ -7230,7 +7230,7 @@ mod tests {
 
         // The state root must be non-zero.
         let app = engine.app();
-        let attestation = app.attest_state(Height::new(0));
+        let attestation = app.attest_state(Height::new(0)).expect("executed");
         assert_ne!(
             attestation.root,
             primitives::Hash::ZERO,
@@ -7270,7 +7270,7 @@ mod tests {
             signers: Vec::new(),
         };
         executor.finalize_block(&block);
-        let tx_root = executor.attest_state(Height::new(1)).root;
+        let tx_root = executor.attest_state(Height::new(1)).expect("executed").root;
 
         // Path 2: executor with an empty block (same EVM module, same
         // funding, but no txs).
@@ -7281,7 +7281,7 @@ mod tests {
         let empty_block =
             types::FinalizedBlock { height: Height::new(1), txs: vec![], signers: Vec::new() };
         exec_empty.finalize_block(&empty_block);
-        let empty_root = exec_empty.attest_state(Height::new(1)).root;
+        let empty_root = exec_empty.attest_state(Height::new(1)).expect("executed").root;
 
         assert_ne!(tx_root, empty_root, "pipeline with 5 EVM txs must differ from empty block");
     }

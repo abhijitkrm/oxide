@@ -108,13 +108,17 @@ pub trait AppInterface: Send + Sync {
     /// the ack asserts reception, not execution.
     fn finalize_block(&self, block: &FinalizedBlock) -> CommitAck;
 
-    /// Post-execution roots for embedding in the next proposal. Opaque
-    /// to the engine — it embeds these bytes verbatim and never parses
-    /// them (oai-spec.md §3, rule 5).
-    fn attest_state(&self, height: Height) -> StateAttestation;
+    /// Post-execution root for `height`, or `None` when the block at
+    /// `height` has not executed locally. `None` is explicit: a caller
+    /// must never mistake "not yet executed" for an attested root —
+    /// a `Hash::ZERO` sentinel here once let a forged execution
+    /// certificate claiming a zero root "match" a height that had
+    /// never run. Opaque to the engine — it embeds these bytes
+    /// verbatim and never parses them (oai-spec.md §3, rule 5).
+    fn attest_state(&self, height: Height) -> Option<StateAttestation>;
 
     /// The newest *executed* state root, without blocking. Returns
-    /// `root = Hash::ZERO` when nothing has executed yet.
+    /// `None` when nothing has executed yet.
     ///
     /// Consensus attaches this to outgoing votes as the validator's
     /// execution attestation (the input to [`types::ExecCertificate`]
@@ -122,7 +126,7 @@ pub trait AppInterface: Send + Sync {
     /// vote path cannot afford to stall behind the execution lane,
     /// and a stale attestation is never wrong (its height is carried
     /// inside, so it simply certifies an older block).
-    fn attest_latest(&self) -> StateAttestation;
+    fn attest_latest(&self) -> Option<StateAttestation>;
 }
 
 /// Implemented by consensus engines (oxideBFT is the default;

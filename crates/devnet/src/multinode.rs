@@ -898,7 +898,7 @@ mod tests {
         let mut devnet = MultiNodeDevnet::new(4, 10_000);
         devnet.run(3);
         // Check that the executor has a non-zero state root at height 0.
-        let root = devnet.app(0).attest_state(primitives::Height::new(0));
+        let root = devnet.app(0).attest_state(primitives::Height::new(0)).expect("executed");
         assert_ne!(root.root, primitives::Hash::ZERO, "state root should be non-zero");
     }
 

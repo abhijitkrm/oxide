@@ -90,8 +90,11 @@ fn main() {
 
     // State root at the final height.
     if let Some(h) = height {
-        let attestation = node.app().attest_state(h);
-        println!("oxide-spammer: state root at height {} = {}", h.value(), attestation.root);
+        if let Some(attestation) = node.app().attest_state(h) {
+            println!("oxide-spammer: state root at height {} = {}", h.value(), attestation.root);
+        } else {
+            println!("oxide-spammer: height {} not executed", h.value());
+        }
     }
     println!("oxide-spammer: load test complete");
 }

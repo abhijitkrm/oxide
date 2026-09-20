@@ -534,7 +534,7 @@ pub fn run_node_smoke_test() {
     }
 
     // Verify the state transition executed.
-    let balance = node.app().attest_state(primitives::Height::new(0));
+    let balance = node.app().attest_state(primitives::Height::new(0)).expect("executed");
     assert_ne!(balance.root, primitives::Hash::ZERO, "state root should be non-zero");
 
     // Verify metrics were recorded.

@@ -79,8 +79,8 @@ fn oai_attestation_is_stable_and_matches_finalization() {
     let height = Height::new(0);
     // finalize_block already ran inside run_until_idle and recorded the
     // root; attest_state must return that same root.
-    let att1 = engine.app().attest_state(height);
-    let att2 = engine.app().attest_state(height);
+    let att1 = engine.app().attest_state(height).expect("height 0 executed");
+    let att2 = engine.app().attest_state(height).expect("height 0 executed");
     assert_eq!(att1.height, height);
     assert_eq!(att1, att2, "attest_state must be stable across calls");
     // The mock root is height-derived; confirm the contract holds so a

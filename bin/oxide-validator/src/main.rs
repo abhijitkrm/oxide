@@ -247,12 +247,15 @@ fn run_single_node() {
     tracing::info!(?height, "oxide-validator: finalized height");
 
     if let Some(h) = height {
-        let attestation = node.app().attest_state(h);
-        tracing::info!(
-            height = h.value(),
-            state_root = %attestation.root,
-            "oxide-validator: state root"
-        );
+        if let Some(attestation) = node.app().attest_state(h) {
+            tracing::info!(
+                height = h.value(),
+                state_root = %attestation.root,
+                "oxide-validator: state root"
+            );
+        } else {
+            tracing::info!(height = h.value(), "oxide-validator: height not executed");
+        }
     }
 
     tracing::info!("oxide-validator: smoke test complete");

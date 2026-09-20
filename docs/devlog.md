@@ -15840,3 +15840,65 @@ covers all live locks.
 
 Gates: 106 test binaries green, fmt + clippy `-D warnings` clean;
 threaded + pipelined devnet drivers smoke-verified end-to-end.
+
+## 2026-09-20 — Audit remediation H1: exec-cert validation hardening
+
+**Finding** — the vote path's embedded-`exec_cert` check trusted a
+matching root and skipped every other check. If the certified root
+equalled the local one, the vote proceeded with **no** aggregate
+verification, **no** bitmap/quorum check, and **no** epoch check —
+a leader could commit a fabricated certificate inside a block as
+unproven "proof" of execution agreement. Two compounding defects:
+`attest_state` reported unexecuted heights as `root = Hash::ZERO`,
+so a forged cert claiming a zero root at a never-executed height
+*matched* and the vote went through; and `verify_exec_cert` built
+the verify message from `self.epoch` while ignoring `cert.epoch`,
+so the cert's claimed epoch was dead weight. Separately, the
+attestation-signature cache keyed on `(height, root)` without the
+epoch the signature binds — after a rotation it would replay a
+signature minted under the old epoch's message, attaching an
+attestation that fails every verify.
+
+**Fix** — full validation once, explicit "not executed":
+
+- `verify_exec_cert` now rejects `cert.epoch != self.epoch` first
+  (new `ConsensusError::CertEpochMismatch`): attestation signatures
+  commit to `(height, root, epoch)` and the bitmap indexes the
+  *current* validator set, so a cert from another epoch is
+  unverifiable, not merely stale. Checked before the bitmap walk so
+  an out-of-epoch bitmap can never index the wrong set.
+- New `verified_exec_certs` map caches validated certs keyed by
+  certified height *with the cert itself as the value* — a
+  different cert at the same height fails equality and re-validates,
+  so the cache can never launder an unverified cert. The vote path
+  now runs: full validation (cached) → `attest_state` → root
+  compare. A forged cert withholds the vote regardless of the root
+  it carries.
+- `AppInterface::attest_state` / `attest_latest` now return
+  `Option<StateAttestation>` — `None` is the explicit "not
+  executed" signal. The voter withholds on `None` (cannot confirm),
+  same outcome class as a mismatch today but no longer forgeable.
+  `MockApp` keeps fabricating deterministic roots (test stability,
+  documented); a `NeverExecutedApp` stub covers the `None` path.
+- `last_attestation` cache now keys `(height, root, epoch)` — a
+  signature minted in epoch N is never replayed in epoch N+1.
+- Epoch lifecycle: `complete_rotation` clears `exec_attest_pool`,
+  `exec_certs`, and `verified_exec_certs` — all are bound to the
+  signing epoch's validator set; stale pool entries could only
+  aggregate into certs that fail verification and burn a leader's
+  view. `propose()` additionally filters embedded certs to
+  `cert.epoch == self.epoch` (defense in depth). `verified_exec_certs`
+  prunes alongside `exec_certs` at the committed-height floor.
+
+Regressions: forged-cert-with-matching-root → withheld (was
+accepted); wrong-epoch cert → `CertEpochMismatch` + withheld;
+stale-epoch cert never embedded by `propose()`; valid cert at an
+unexecuted height claiming `Hash::ZERO` → withheld (was accepted —
+the sentinel collision); attestation cache re-signs across an epoch
+boundary, reuses within an epoch; cached verdict can't launder a
+different cert at the same height; rotation clears all cert state.
+
+Gates: 106 test binaries green, fmt + clippy `-D warnings` clean.
+Ripple: ~20 call sites updated for the `Option` attestation API
+(executor, storage/devnet/evm tests, node, oxide-validator,
+oxide-spammer — production callers handle `None` explicitly).

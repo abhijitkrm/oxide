@@ -52,7 +52,7 @@ fn smoke_submit_finalize_state_root_sequencer() {
     let height = node.engine().finalized_height();
     assert!(height.is_some(), "a block should be finalized");
 
-    let attestation = node.app().attest_state(height.unwrap());
+    let attestation = node.app().attest_state(height.unwrap()).expect("executed");
     assert_ne!(attestation.root, primitives::Hash::ZERO, "state root must be non-zero");
 }
 
@@ -74,6 +74,6 @@ fn smoke_submit_finalize_state_root_oxidebft() {
     let height = node.engine().finalized_height();
     assert!(height.is_some(), "oxideBFT should finalize a block");
 
-    let attestation = node.app().attest_state(height.unwrap());
+    let attestation = node.app().attest_state(height.unwrap()).expect("executed");
     assert_ne!(attestation.root, primitives::Hash::ZERO, "state root must be non-zero");
 }

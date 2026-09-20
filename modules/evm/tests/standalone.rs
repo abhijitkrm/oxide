@@ -112,7 +112,7 @@ fn standalone_evm_only_50_blocks() {
             FinalizedBlock { height: Height::new(block), txs: proposal.txs, signers: Vec::new() };
         executor.finalize_block(&finalized);
 
-        let attestation = executor.attest_state(Height::new(block));
+        let attestation = executor.attest_state(Height::new(block)).expect("executed");
         roots.push(attestation.root);
     }
 

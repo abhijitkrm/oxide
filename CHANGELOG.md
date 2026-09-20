@@ -1004,6 +1004,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Embedded execution certificates were trusted on a matching
+  state root alone — signature, signer bitmap, quorum, and epoch
+  were never checked — and an unexecuted height reported a
+  `Hash::ZERO` root that a forged certificate could "match"**
+  (`crates/consensus`, `crates/ports`, `crates/executor`)
+  - Every embedded certificate is now fully validated once — epoch
+    match, bitmap bounds, quorum voting power, aggregate signature —
+    and cached under its complete identity, so a different cert at
+    the same height can never inherit a prior verdict. A forged
+    cert withholds the vote regardless of the root it carries.
+  - Certificates are epoch-bound: a cert from another epoch is
+    unverifiable (`CertEpochMismatch`), stale certs and pooled
+    attestations are dropped at rotation, and leaders never embed
+    an out-of-epoch cert.
+  - `attest_state`/`attest_latest` now report "not executed" as
+    `None` instead of a zero root, so a certificate claiming a zero
+    root at a never-executed height can no longer pass as matching.
+  - The attestation-signature cache now keys on the epoch the
+    signature commits to — a pre-rotation signature is never
+    replayed into the new epoch.
+  - In plain words: a block's embedded proof that "the network
+    executed the previous block identically" is now actually
+    verified before anyone votes for it, and it can no longer be
+    forged with a lucky or vacuous state root.
+
 - **A validator could emit consensus signatures whose
   anti-equivocation state was never durably recorded: the WAL
   append ignored write/fsync errors, and leader self-votes were

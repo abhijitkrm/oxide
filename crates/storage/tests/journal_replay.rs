@@ -107,7 +107,7 @@ fn journal_replay_reproduces_state_root_bit_exact() {
 
         // Execute the block (produces and records the state root).
         executor.finalize_block(&block);
-        let root = executor.attest_state(block.height).root;
+        let root = executor.attest_state(block.height).expect("executed").root;
         original_roots.push(root);
 
         // Append the encoded block to the journal.
@@ -132,7 +132,7 @@ fn journal_replay_reproduces_state_root_bit_exact() {
 
         // Re-execute the block through the fresh executor.
         replayed_executor.finalize_block(&block);
-        let replayed_root = replayed_executor.attest_state(block.height).root;
+        let replayed_root = replayed_executor.attest_state(block.height).expect("executed").root;
 
         // The acceptance gate: state root must match bit-exact.
         assert_eq!(
@@ -336,7 +336,8 @@ fn journal_replay_deterministic_state_roots() {
         writer1.append(&encode_block(&block)).expect("append should succeed");
     }
     writer1.sync().expect("sync should succeed");
-    let roots1: Vec<_> = (0..5).map(|h| exec1.attest_state(Height::new(h)).root).collect();
+    let roots1: Vec<_> =
+        (0..5).map(|h| exec1.attest_state(Height::new(h)).expect("executed").root).collect();
 
     // Run 2: write and execute (identical sequence).
     let dir2 = std::env::temp_dir().join(format!(
@@ -360,7 +361,8 @@ fn journal_replay_deterministic_state_roots() {
         writer2.append(&encode_block(&block)).expect("append should succeed");
     }
     writer2.sync().expect("sync should succeed");
-    let roots2: Vec<_> = (0..5).map(|h| exec2.attest_state(Height::new(h)).root).collect();
+    let roots2: Vec<_> =
+        (0..5).map(|h| exec2.attest_state(Height::new(h)).expect("executed").root).collect();
 
     // The two runs must produce identical state roots.
     assert_eq!(roots1, roots2, "identical write sequences must produce identical state roots");
@@ -372,7 +374,8 @@ fn journal_replay_deterministic_state_roots() {
         let block = decode_block(&record.payload);
         exec3.finalize_block(&block);
     }
-    let roots3: Vec<_> = (0..5).map(|h| exec3.attest_state(Height::new(h)).root).collect();
+    let roots3: Vec<_> =
+        (0..5).map(|h| exec3.attest_state(Height::new(h)).expect("executed").root).collect();
     assert_eq!(roots1, roots3, "replayed state roots must match original");
 
     let _ = std::fs::remove_dir_all(&dir1);

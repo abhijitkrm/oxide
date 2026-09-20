@@ -275,9 +275,9 @@ fn run_trading_tps(
     // attesting there yields `Hash::ZERO` on validators that never
     // reached that height, a false divergence.
     let final_height = result.finalized[0][min_blocks - 1].height;
-    let root_0 = devnet.app(0).attest_state(final_height).root;
+    let root_0 = devnet.app(0).attest_state(final_height).expect("executed").root;
     for i in 1..n_validators {
-        let root_i = devnet.app(i).attest_state(final_height).root;
+        let root_i = devnet.app(i).attest_state(final_height).expect("executed").root;
         assert_eq!(root_0, root_i, "validator {i} state root {root_i} != validator 0 {root_0}");
     }
     eprintln!(
