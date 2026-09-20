@@ -1640,7 +1640,17 @@ impl Executor {
     /// or after each block commit to ensure nonces survive restart.
     /// Without this, a restart resets all executed nonces to zero,
     /// allowing replay of already-executed native transactions.
-    pub fn save_executed_nonces(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`storage::ApplyError`] when the backend rejects the
+    /// batch — the nonce map was NOT persisted and a restart would
+    /// reopen the replay window; the caller must not treat the
+    /// shutdown/commit as complete.
+    pub fn save_executed_nonces(
+        &self,
+        backend: &mut (dyn storage::StorageBackend + Send),
+    ) -> Result<(), storage::ApplyError> {
         /// Key prefix: `exec_nonce` padded to 32 bytes. Each entry
         /// is keyed by `prefix || addr` and valued by the nonce as
         /// 8-byte LE.
@@ -1656,7 +1666,7 @@ impl Executor {
                 value: nonce.to_le_bytes().to_vec(),
             });
         }
-        backend.apply_batch(&ops);
+        backend.apply_batch(&ops)
     }
 
     /// Load executed nonces from a storage backend (C10 fix).

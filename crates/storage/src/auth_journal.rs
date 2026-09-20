@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-use crate::backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend};
+use crate::backend::{ApplyError, Caps, Op, Snapshot, SnapshotError, StorageBackend};
 use crate::journal::{JournalConfig, JournalError, JournalWriter, Replay, replay};
 use crate::mmr::{Mmr, hash_leaf};
 use primitives::Hash;
@@ -489,7 +489,7 @@ impl StorageBackend for JournalBackend {
         iter.map(|(k, v)| (*k, v.clone())).collect()
     }
 
-    fn apply_batch(&mut self, ops: &[Op]) {
+    fn apply_batch(&mut self, ops: &[Op]) -> Result<(), ApplyError> {
         // Save the old state root and the old values of affected
         // keys so we can roll back if the journal append fails.
         // Without this, a failed append (e.g., disk full) would
@@ -509,11 +509,14 @@ impl StorageBackend for JournalBackend {
         self.recompute_state_root();
         // Serialize the batch + state root and append to the journal.
         let record = encode_batch_record(ops, self.state_root);
-        if self.journal.append(&record).is_err() {
+        if let Err(e) = self.journal.append(&record) {
             // Append failed — roll back the in-memory state to
             // keep it consistent with the journal. Restore each
             // affected key to its old value (or remove it if it
-            // didn't exist before).
+            // didn't exist before). The error is then returned:
+            // swallowing it would let the caller commit a block
+            // the journal can never replay — silent state/disk
+            // divergence.
             for (key, old_value) in &old_values {
                 match old_value {
                     Some(v) => {
@@ -525,7 +528,13 @@ impl StorageBackend for JournalBackend {
                 }
             }
             self.state_root = old_state_root;
+            return Err(ApplyError(format!("journal append failed: {e}")));
         }
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), ApplyError> {
+        self.journal.sync().map_err(|e| ApplyError(format!("journal sync failed: {e}")))
     }
 
     fn snapshot_export(&self) -> Snapshot {
@@ -889,12 +898,14 @@ mod tests {
         let key2 = Hash([0x02; 32]);
 
         // Set and get.
-        backend.apply_batch(&[Op::Set { key, value: vec![0xAA, 0xBB] }]);
+        backend
+            .apply_batch(&[Op::Set { key, value: vec![0xAA, 0xBB] }])
+            .expect("apply_batch must succeed");
         assert_eq!(backend.get(&key), Some(vec![0xAA, 0xBB]));
         assert_eq!(backend.get(&key2), None);
 
         // Delete.
-        backend.apply_batch(&[Op::Delete { key }]);
+        backend.apply_batch(&[Op::Delete { key }]).expect("apply_batch must succeed");
         assert_eq!(backend.get(&key), None);
     }
 
@@ -906,11 +917,15 @@ mod tests {
         assert_eq!(root0, Hash::ZERO, "empty state root must be zero");
 
         let key = Hash([0x01; 32]);
-        backend.apply_batch(&[Op::Set { key, value: vec![0xAA] }]);
+        backend
+            .apply_batch(&[Op::Set { key, value: vec![0xAA] }])
+            .expect("apply_batch must succeed");
         let root1 = backend.state_root();
         assert_ne!(root0, root1, "state root must change after set");
 
-        backend.apply_batch(&[Op::Set { key, value: vec![0xBB] }]);
+        backend
+            .apply_batch(&[Op::Set { key, value: vec![0xBB] }])
+            .expect("apply_batch must succeed");
         let root2 = backend.state_root();
         assert_ne!(root1, root2, "state root must change after update");
     }
@@ -936,11 +951,13 @@ mod tests {
             a
         });
 
-        backend.apply_batch(&[
-            Op::Set { key: key_a, value: vec![1] },
-            Op::Set { key: key_b, value: vec![2] },
-            Op::Set { key: key_c, value: vec![3] },
-        ]);
+        backend
+            .apply_batch(&[
+                Op::Set { key: key_a, value: vec![1] },
+                Op::Set { key: key_b, value: vec![2] },
+                Op::Set { key: key_c, value: vec![3] },
+            ])
+            .expect("apply_batch must succeed");
 
         // Prefix [0x01] matches key_a and key_b.
         let results = backend.range(&[0x01]);
@@ -961,10 +978,12 @@ mod tests {
         let key1 = Hash([0x01; 32]);
         let key2 = Hash([0x02; 32]);
 
-        backend.apply_batch(&[
-            Op::Set { key: key1, value: vec![0xAA, 0xBB] },
-            Op::Set { key: key2, value: vec![0xCC] },
-        ]);
+        backend
+            .apply_batch(&[
+                Op::Set { key: key1, value: vec![0xAA, 0xBB] },
+                Op::Set { key: key2, value: vec![0xCC] },
+            ])
+            .expect("apply_batch must succeed");
 
         // Export snapshot.
         let snapshot = backend.snapshot_export();
@@ -988,7 +1007,9 @@ mod tests {
         let root0 = backend.log_root();
 
         let key = Hash([0x01; 32]);
-        backend.apply_batch(&[Op::Set { key, value: vec![0xAA] }]);
+        backend
+            .apply_batch(&[Op::Set { key, value: vec![0xAA] }])
+            .expect("apply_batch must succeed");
         let root1 = backend.log_root();
         assert_ne!(root0, root1, "log root must advance after batch");
     }
@@ -1006,8 +1027,12 @@ mod tests {
         let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
         let key1 = Hash([0x01; 32]);
         let key2 = Hash([0x02; 32]);
-        backend.apply_batch(&[Op::Set { key: key1, value: vec![0xAA, 0xBB] }]);
-        backend.apply_batch(&[Op::Set { key: key2, value: vec![0xCC] }]);
+        backend
+            .apply_batch(&[Op::Set { key: key1, value: vec![0xAA, 0xBB] }])
+            .expect("apply_batch must succeed");
+        backend
+            .apply_batch(&[Op::Set { key: key2, value: vec![0xCC] }])
+            .expect("apply_batch must succeed");
         // Flush the journal to disk before opening a new backend.
         backend.sync().unwrap();
         let expected_state_root = backend.state_root();
@@ -1036,8 +1061,12 @@ mod tests {
     fn journal_backend_open_verifies_expected_root_and_continues_mmr() {
         let dir = TempDir::new("backend-trusted-open");
         let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
-        backend.apply_batch(&[Op::Set { key: Hash([0x01; 32]), value: vec![0xAA] }]);
-        backend.apply_batch(&[Op::Set { key: Hash([0x02; 32]), value: vec![0xBB] }]);
+        backend
+            .apply_batch(&[Op::Set { key: Hash([0x01; 32]), value: vec![0xAA] }])
+            .expect("apply_batch must succeed");
+        backend
+            .apply_batch(&[Op::Set { key: Hash([0x02; 32]), value: vec![0xBB] }])
+            .expect("apply_batch must succeed");
         backend.sync().unwrap();
         let trusted_root = backend.log_root();
 
@@ -1057,7 +1086,9 @@ mod tests {
 
         // New appends extend the *same* MMR — the root changes as a
         // continuation, not a fork from empty.
-        reopened.apply_batch(&[Op::Set { key: Hash([0x03; 32]), value: vec![0xCC] }]);
+        reopened
+            .apply_batch(&[Op::Set { key: Hash([0x03; 32]), value: vec![0xCC] }])
+            .expect("apply_batch must succeed");
         reopened.sync().unwrap();
         let continued_root = reopened.log_root();
         assert_ne!(continued_root, trusted_root, "new appends must advance the root");
@@ -1079,7 +1110,9 @@ mod tests {
         let dir = TempDir::new("backend-snapshot-durability");
         let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
         // Pre-existing state that the import must replace.
-        backend.apply_batch(&[Op::Set { key: Hash([0xAA; 32]), value: vec![1] }]);
+        backend
+            .apply_batch(&[Op::Set { key: Hash([0xAA; 32]), value: vec![1] }])
+            .expect("apply_batch must succeed");
         backend.sync().unwrap();
 
         // Import a snapshot: two entries, sorted.
@@ -1107,14 +1140,16 @@ mod tests {
     }
 
     /// Regression test: `apply_batch` must roll back the in-memory
-    /// state if the journal append fails. Before the fix, the
-    /// append error was silently ignored (`let _ = ...`), leaving
-    /// the in-memory state inconsistent with the journal.
+    /// state AND report the failure when the journal append fails.
+    /// Before the fallible contract, the append error was silently
+    /// ignored — the in-memory state rolled back but the caller was
+    /// told nothing, so the EVM could commit a block the journal
+    /// could never replay.
     ///
     /// We simulate an append failure by creating a backend with a
     /// very large value that exceeds `MAX_RECORD_BYTES`. The append
-    /// returns `RecordTooLarge`, and the in-memory state must be
-    /// rolled back.
+    /// returns `RecordTooLarge`; the batch must report `Err` and the
+    /// in-memory state must be rolled back.
     #[test]
     fn journal_backend_apply_batch_rolls_back_on_append_failure() {
         let dir = TempDir::new("backend-rollback");
@@ -1122,13 +1157,19 @@ mod tests {
 
         // Set an initial value.
         let key = Hash([0x01; 32]);
-        backend.apply_batch(&[Op::Set { key, value: vec![0xAA] }]);
+        backend
+            .apply_batch(&[Op::Set { key, value: vec![0xAA] }])
+            .expect("apply_batch must succeed");
         let state_root_before = backend.state_root();
 
         // Try to set a value that's too large to append. The
         // encoded batch record will exceed MAX_RECORD_BYTES (16 MiB).
+        // The append must fail AND the error must reach the caller —
+        // previously it was swallowed, letting the EVM commit state
+        // the journal could never replay.
         let huge_value = vec![0xBB; 17 * 1024 * 1024]; // 17 MiB > 16 MiB max
-        backend.apply_batch(&[Op::Set { key, value: huge_value }]);
+        let result = backend.apply_batch(&[Op::Set { key, value: huge_value }]);
+        assert!(result.is_err(), "oversized append must return Err, not be swallowed");
 
         // The in-memory state must be rolled back — the key must
         // still have its old value, and the state root must be
@@ -1143,6 +1184,53 @@ mod tests {
             state_root_before,
             "state root must be unchanged after append failure"
         );
+
+        // A subsequent well-formed batch must still apply — a
+        // transient append failure poisons only its own batch, not
+        // the backend.
+        backend
+            .apply_batch(&[Op::Set { key, value: vec![0xCC] }])
+            .expect("post-failure batch must apply");
+        assert_eq!(backend.get(&key), Some(vec![0xCC]));
+    }
+
+    /// Rotation keeps sealed records readable on reopen: replay
+    /// must see every record a rotated-away segment carried.
+    ///
+    /// Note this guards the rotate→seal→replay contract (records
+    /// survive handle-swap intact), not fsync itself — a process-
+    /// level reopen still reads page-cache data, so only a power
+    /// loss distinguishes a synced seal from an unsynced one. That
+    /// needs fault injection this test level cannot provide; the
+    /// seal-time `sync_data` in `rotate()` is the durability fix.
+    #[test]
+    fn journal_backend_rotation_durable_without_explicit_sync() {
+        let dir = TempDir::new("backend-rotate-sync");
+        // Small segments force rotation every couple of records.
+        let config = JournalConfig { max_segment_bytes: 128 };
+        let mut backend = JournalBackend::create(&dir.0, config).unwrap();
+        for i in 0..6u8 {
+            backend
+                .apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i] }])
+                .expect("apply_batch must succeed");
+            // Deliberately NO `sync` — rotation's seal-time fsync is
+            // what must carry the sealed segment's tail writes.
+        }
+        // Reopen from disk: replay must see every record a SEALED
+        // segment carried — rotation must not strand or tear data.
+        // The last record is NOT asserted: it sits in the active
+        // segment's write buffer (never flushed — buffered is not
+        // "written", let alone durable), so replay legitimately
+        // misses it. Sealed-segment records are the contract.
+        let reopened = JournalBackend::open(&dir.0, JournalConfig::default(), None)
+            .unwrap_or_else(|_| panic!("reopen must succeed"));
+        for i in 0..5u8 {
+            assert_eq!(
+                reopened.get(&Hash([i; 32])),
+                Some(vec![i]),
+                "sealed record {i} must survive rotation+reopen"
+            );
+        }
     }
 
     // ─── Checkpoint + pruning tests ────────────────────────────
@@ -1160,7 +1248,9 @@ mod tests {
         let config = JournalConfig { max_segment_bytes: 128 };
         let mut backend = JournalBackend::create(&dir.0, config).unwrap();
         for i in 0..8u8 {
-            backend.apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i, i, i] }]);
+            backend
+                .apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i, i, i] }])
+                .expect("apply_batch must succeed");
             backend.sync().unwrap();
         }
         // Snapshot BEFORE checkpointing — the caller's contract.
@@ -1172,7 +1262,9 @@ mod tests {
         assert!(deleted > 0, "sealed segments below the checkpoint are deleted");
 
         // A later batch lands in the surviving tail.
-        backend.apply_batch(&[Op::Set { key: Hash([0xF0; 32]), value: vec![9] }]);
+        backend
+            .apply_batch(&[Op::Set { key: Hash([0xF0; 32]), value: vec![9] }])
+            .expect("apply_batch must succeed");
         backend.sync().unwrap();
         let post_batch_log_root = backend.log_root();
 
@@ -1199,7 +1291,9 @@ mod tests {
         let config = JournalConfig { max_segment_bytes: 128 };
         let mut backend = JournalBackend::create(&dir.0, config).unwrap();
         for i in 0..6u8 {
-            backend.apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i] }]);
+            backend
+                .apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i] }])
+                .expect("apply_batch must succeed");
             backend.sync().unwrap();
         }
         let ckpt_seg = backend.checkpoint().unwrap();
@@ -1221,7 +1315,9 @@ mod tests {
         let config = JournalConfig { max_segment_bytes: 128 };
         let mut backend = JournalBackend::create(&dir.0, config).unwrap();
         for i in 0..6u8 {
-            backend.apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i] }]);
+            backend
+                .apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i] }])
+                .expect("apply_batch must succeed");
             backend.sync().unwrap();
         }
         let ckpt_seg = backend.checkpoint().unwrap();
@@ -1244,7 +1340,9 @@ mod tests {
         let dir = TempDir::new("backend-active-safe");
         let config = JournalConfig { max_segment_bytes: 128 };
         let mut backend = JournalBackend::create(&dir.0, config).unwrap();
-        backend.apply_batch(&[Op::Set { key: Hash([0x01; 32]), value: vec![1] }]);
+        backend
+            .apply_batch(&[Op::Set { key: Hash([0x01; 32]), value: vec![1] }])
+            .expect("apply_batch must succeed");
         backend.sync().unwrap();
 
         // Watermark beyond the active segment — only sealed

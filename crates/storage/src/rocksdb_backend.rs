@@ -31,7 +31,7 @@ use std::path::Path;
 
 use rocksdb::{DB, Options, WriteBatch};
 
-use crate::backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend};
+use crate::backend::{ApplyError, Caps, Op, Snapshot, SnapshotError, StorageBackend};
 use primitives::Hash;
 
 /// A `RocksDB`-backed `StorageBackend`.
@@ -116,7 +116,7 @@ impl StorageBackend for RocksDbBackend {
         out
     }
 
-    fn apply_batch(&mut self, ops: &[Op]) {
+    fn apply_batch(&mut self, ops: &[Op]) -> Result<(), ApplyError> {
         // Single WriteBatch = atomic batch (StorageBackend contract).
         let mut batch = WriteBatch::default();
         for op in ops {
@@ -129,8 +129,18 @@ impl StorageBackend for RocksDbBackend {
                 }
             }
         }
-        // Write with WAL for durability.
-        self.db.write(batch).expect("rocksdb write");
+        // Write with WAL for durability. A rejected write applies
+        // nothing — the WriteBatch was never committed — and the
+        // error propagates instead of panicking (the caller decides
+        // whether this commit failure is retryable or fatal).
+        self.db.write(batch).map_err(|e| ApplyError(format!("rocksdb write failed: {e}")))
+    }
+
+    fn sync(&mut self) -> Result<(), ApplyError> {
+        // Flush the WAL to stable storage — `apply_batch` writes go
+        // through the WAL, so this is the durability boundary between
+        // "written" and "survives a crash".
+        self.db.flush_wal(true).map_err(|e| ApplyError(format!("rocksdb WAL flush failed: {e}")))
     }
 
     fn snapshot_export(&self) -> Snapshot {
@@ -226,7 +236,9 @@ mod tests {
     fn rocksdb_set_get_round_trip() {
         let mut store = make_backend();
         let k = Hash([0x42; 32]);
-        store.apply_batch(&[Op::Set { key: k, value: b"hello".to_vec() }]);
+        store
+            .apply_batch(&[Op::Set { key: k, value: b"hello".to_vec() }])
+            .expect("apply_batch must succeed");
         assert_eq!(store.get(&k), Some(b"hello".to_vec()));
     }
 
@@ -234,10 +246,12 @@ mod tests {
     fn rocksdb_batch_atomicity_last_op_wins() {
         let mut store = make_backend();
         let k = Hash([0x01; 32]);
-        store.apply_batch(&[
-            Op::Set { key: k, value: b"first".to_vec() },
-            Op::Set { key: k, value: b"second".to_vec() },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: k, value: b"first".to_vec() },
+                Op::Set { key: k, value: b"second".to_vec() },
+            ])
+            .expect("apply_batch must succeed");
         assert_eq!(store.get(&k), Some(b"second".to_vec()));
     }
 
@@ -245,9 +259,11 @@ mod tests {
     fn rocksdb_delete_removes_key() {
         let mut store = make_backend();
         let k = Hash([0x02; 32]);
-        store.apply_batch(&[Op::Set { key: k, value: b"v".to_vec() }]);
+        store
+            .apply_batch(&[Op::Set { key: k, value: b"v".to_vec() }])
+            .expect("apply_batch must succeed");
         assert!(store.get(&k).is_some());
-        store.apply_batch(&[Op::Delete { key: k }]);
+        store.apply_batch(&[Op::Delete { key: k }]).expect("apply_batch must succeed");
         assert!(store.get(&k).is_none());
     }
 
@@ -259,12 +275,14 @@ mod tests {
             k[31] = last;
             Hash(k)
         };
-        store.apply_batch(&[
-            Op::Set { key: make_key(1), value: vec![1] },
-            Op::Set { key: make_key(3), value: vec![3] },
-            Op::Set { key: make_key(2), value: vec![2] },
-            Op::Set { key: Hash([0x99; 32]), value: vec![9] },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: make_key(1), value: vec![1] },
+                Op::Set { key: make_key(3), value: vec![3] },
+                Op::Set { key: make_key(2), value: vec![2] },
+                Op::Set { key: Hash([0x99; 32]), value: vec![9] },
+            ])
+            .expect("apply_batch must succeed");
         let hits = store.range(&[0x42]);
         assert_eq!(hits.len(), 3);
         let lasts: Vec<u8> = hits.iter().map(|(k, _)| k.as_bytes()[31]).collect();
@@ -281,7 +299,9 @@ mod tests {
         let k = Hash([0x77; 32]);
         {
             let mut store = RocksDbBackend::open(&path).expect("open");
-            store.apply_batch(&[Op::Set { key: k, value: b"persistent".to_vec() }]);
+            store
+                .apply_batch(&[Op::Set { key: k, value: b"persistent".to_vec() }])
+                .expect("apply_batch must succeed");
         }
         // Reopen and verify the data survived.
         let store = RocksDbBackend::open(&path).expect("reopen");
@@ -293,11 +313,13 @@ mod tests {
     #[test]
     fn rocksdb_snapshot_round_trip() {
         let mut store = make_backend();
-        store.apply_batch(&[
-            Op::Set { key: Hash([0x01; 32]), value: b"alpha".to_vec() },
-            Op::Set { key: Hash([0x02; 32]), value: b"beta".to_vec() },
-            Op::Delete { key: Hash([0x02; 32]) },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: Hash([0x01; 32]), value: b"alpha".to_vec() },
+                Op::Set { key: Hash([0x02; 32]), value: b"beta".to_vec() },
+                Op::Delete { key: Hash([0x02; 32]) },
+            ])
+            .expect("apply_batch must succeed");
         let snapshot = store.snapshot_export();
         assert_eq!(snapshot.entries.len(), 1);
 

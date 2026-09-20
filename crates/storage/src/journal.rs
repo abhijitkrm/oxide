@@ -270,6 +270,13 @@ impl JournalWriter {
     /// Finish the active segment and start the next one.
     fn rotate(&mut self) -> Result<(), JournalError> {
         self.flush()?;
+        // Sync the segment being sealed BEFORE swapping handles —
+        // once `self.file` points at the new segment, a later `sync()`
+        // only covers the new file and the sealed segment's tail
+        // writes could sit in the page cache indefinitely. "Sealed"
+        // must mean durable, or a crash can drop records the caller
+        // believes the journal committed.
+        self.file.sync_data().map_err(JournalError::Io)?;
         // Seal the height index FIRST: the entry
         // `[sealed_seq → max_height]` must exist before the new
         // segment file does, or a concurrent height-prune could

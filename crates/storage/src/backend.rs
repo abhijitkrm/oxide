@@ -101,7 +101,40 @@ pub trait StorageBackend {
 
     /// Apply one atomic batch (block commit). Order within the batch is
     /// the write order; the last op for a key wins.
-    fn apply_batch(&mut self, ops: &[Op]);
+    ///
+    /// The three durability stages are explicit: `Ok` means the batch is
+    /// *applied in memory* and *written* to the backend's durability
+    /// layer (journal buffer, engine transaction); it is *durable* only
+    /// after [`sync`](Self::sync). `Err` means the batch was NOT applied
+    /// — in-memory state is left untouched (the backend rolls back any
+    /// partial work) — so callers must treat failure as "this commit did
+    /// not happen" and decide: retry, halt, or degrade. Silently
+    /// continuing past an `Err` is a state/disk divergence bug.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError`] when the durability layer rejects the
+    /// batch (journal append failure, engine write/commit error).
+    fn apply_batch(&mut self, ops: &[Op]) -> Result<(), ApplyError>;
+
+    /// Make everything `apply_batch` has accepted durable — the
+    /// explicit commit boundary between "written" and "survives a
+    /// crash". Callers invoke this at their commit cadence (once per
+    /// finalized block) — it is deliberately a separate call so
+    /// per-op fsync cost is never paid implicitly.
+    ///
+    /// The default is a no-op: a backend with no durability layer
+    /// (`Volatile`, or a transactional engine whose commits are
+    /// already durable) has nothing to sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError`] when the sync fails. The data was
+    /// written but may not survive a crash — the same "did not
+    /// happen" contract as `apply_batch` applies.
+    fn sync(&mut self) -> Result<(), ApplyError> {
+        Ok(())
+    }
 
     /// Export the entire current state as a snapshot (plan.md §8).
     ///
@@ -148,6 +181,24 @@ pub struct Snapshot {
     /// The (key, value) pairs, sorted by key.
     pub entries: Vec<(Hash, Vec<u8>)>,
 }
+
+/// Why an `apply_batch`/`sync` call failed.
+///
+/// The failure is durability-layer-specific — journal append, engine
+/// transaction, fsync — so the message carries the backend's own
+/// error text rather than re-modelling every engine's error type.
+/// The contract that matters is uniform: on `Err` the operation did
+/// not commit and in-memory state was left untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyError(pub String);
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "storage apply failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for ApplyError {}
 
 /// A snapshot import/export error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,7 +340,7 @@ impl StorageBackend for Volatile {
         out
     }
 
-    fn apply_batch(&mut self, ops: &[Op]) {
+    fn apply_batch(&mut self, ops: &[Op]) -> Result<(), ApplyError> {
         for op in ops {
             match op {
                 Op::Set { key, value } => {
@@ -300,6 +351,7 @@ impl StorageBackend for Volatile {
                 }
             }
         }
+        Ok(())
     }
 
     fn snapshot_export(&self) -> Snapshot {
@@ -346,15 +398,19 @@ mod tests {
         let mut store = Volatile::new();
         let k = key(1);
         assert_eq!(store.get(&k), None);
-        store.apply_batch(&[Op::Set { key: k, value: b"v1".to_vec() }]);
+        store
+            .apply_batch(&[Op::Set { key: k, value: b"v1".to_vec() }])
+            .expect("apply_batch must succeed");
         assert_eq!(store.get(&k), Some(b"v1".to_vec()));
         // Upsert semantics: a second Set overwrites.
-        store.apply_batch(&[Op::Set { key: k, value: b"v2".to_vec() }]);
+        store
+            .apply_batch(&[Op::Set { key: k, value: b"v2".to_vec() }])
+            .expect("apply_batch must succeed");
         assert_eq!(store.get(&k), Some(b"v2".to_vec()));
-        store.apply_batch(&[Op::Delete { key: k }]);
+        store.apply_batch(&[Op::Delete { key: k }]).expect("apply_batch must succeed");
         assert_eq!(store.get(&k), None);
         // Delete of an absent key is a tombstone no-op, not an error.
-        store.apply_batch(&[Op::Delete { key: k }]);
+        store.apply_batch(&[Op::Delete { key: k }]).expect("apply_batch must succeed");
         assert_eq!(store.get(&k), None);
     }
 
@@ -364,11 +420,13 @@ mod tests {
     fn test_batch_order_last_op_wins() {
         let mut store = Volatile::new();
         let k = key(7);
-        store.apply_batch(&[
-            Op::Set { key: k, value: b"first".to_vec() },
-            Op::Set { key: k, value: b"second".to_vec() },
-            Op::Delete { key: key(8) },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: k, value: b"first".to_vec() },
+                Op::Set { key: k, value: b"second".to_vec() },
+                Op::Delete { key: key(8) },
+            ])
+            .expect("apply_batch must succeed");
         assert_eq!(store.get(&k), Some(b"second".to_vec()));
     }
 
@@ -382,12 +440,14 @@ mod tests {
             k[31] = last;
             Hash(k)
         };
-        store.apply_batch(&[
-            Op::Set { key: with_prefix(1), value: vec![1] },
-            Op::Set { key: with_prefix(3), value: vec![3] },
-            Op::Set { key: with_prefix(2), value: vec![2] },
-            Op::Set { key: key(9), value: vec![9] }, // different first byte
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: with_prefix(1), value: vec![1] },
+                Op::Set { key: with_prefix(3), value: vec![3] },
+                Op::Set { key: with_prefix(2), value: vec![2] },
+                Op::Set { key: key(9), value: vec![9] }, // different first byte
+            ])
+            .expect("apply_batch must succeed");
         // 1-byte namespace prefix: matches all three 0x42… keys.
         let hits = store.range(&[0x42]);
         assert_eq!(hits.len(), 3, "non-matching keys excluded");

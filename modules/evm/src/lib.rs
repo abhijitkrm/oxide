@@ -429,6 +429,24 @@ pub struct EvmModule {
     /// and loaded on construction. When `None`, the module is
     /// purely in-memory (useful for tests and single-block sims).
     backend: Mutex<Option<Box<dyn storage::StorageBackend + Send>>>,
+    /// Storage ops that have been built but not yet durably applied
+    /// to `backend`. `end_block` appends each block's flush batch
+    /// here and attempts one `apply_batch` over the whole buffer:
+    /// on `Ok` the buffer clears; on `Err` the ops stay queued and
+    /// the next block's flush retries them. Without this, a failed
+    /// batch silently dropped that block's account updates AND its
+    /// sealed-history/undo records — the backend's rollback meant
+    /// nothing was written, so retrying is the only way the data
+    /// survives.
+    pending_flush: Mutex<Vec<storage::Op>>,
+    /// The last storage-layer failure observed by `end_block` or a
+    /// maintenance flush — the module's health signal. `Some` while
+    /// persistence is failing (every block retries the pending
+    /// buffer); cleared by the first successful `apply_batch`. Node
+    /// wiring should treat `Some` as "commit durability degraded":
+    /// keep executing (the in-memory state is correct) but do not
+    /// trust restart recovery until it clears.
+    storage_error: Mutex<Option<storage::ApplyError>>,
     /// The coinbase / fee recipient for the current block.
     /// The priority fee (tip) is paid to this address by revm's
     /// internal gas accounting. Set via `begin_block`.
@@ -589,6 +607,8 @@ impl EvmModule {
             base_fee,
             spec: SpecId::PRAGUE,
             backend: Mutex::new(None),
+            pending_flush: Mutex::new(Vec::new()),
+            storage_error: Mutex::new(None),
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
@@ -620,6 +640,8 @@ impl EvmModule {
             base_fee,
             spec,
             backend: Mutex::new(None),
+            pending_flush: Mutex::new(Vec::new()),
+            storage_error: Mutex::new(None),
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
@@ -678,6 +700,8 @@ impl EvmModule {
             base_fee,
             spec: SpecId::PRAGUE,
             backend: Mutex::new(None),
+            pending_flush: Mutex::new(Vec::new()),
+            storage_error: Mutex::new(None),
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
@@ -709,6 +733,21 @@ impl EvmModule {
     #[must_use]
     pub fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    /// The last storage-layer failure, if any — the module's
+    /// persistence-health signal.
+    ///
+    /// `Some` means at least one `apply_batch`/`sync` has failed and
+    /// the pending buffer still holds ops not yet written (every
+    /// `end_block` retries them). `None` means everything built so
+    /// far is durable. Node wiring should treat `Some` as "restart
+    /// recovery is degraded": in-memory state keeps serving
+    /// correctly, but a crash before the next successful flush loses
+    /// the buffered blocks' writes.
+    #[must_use]
+    pub fn storage_error(&self) -> Option<storage::ApplyError> {
+        self.storage_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// Wire native exchange and perps modules for read-only EVM
@@ -4061,7 +4100,13 @@ impl Module for EvmModule {
             for h in pruned_undo {
                 ops.push(storage::Op::Delete { key: persist::undo_key(h) });
             }
-            backend.apply_batch(&ops);
+            // `end_block` cannot return an error (the `Module` trait
+            // is infallible), so the flush goes through the pending
+            // buffer: a failed batch keeps its ops queued for the
+            // next block's retry instead of silently dropping the
+            // block's state + history writes. The failure is latched
+            // into `storage_error` for node health checks.
+            let _ = self.flush_pending(backend.as_mut(), ops);
         }
         drop(backend_guard);
 
@@ -4426,7 +4471,8 @@ impl Module for EvmModule {
             let mut backend =
                 self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(ref mut b) = *backend {
-                self.flush_to_storage(b.as_mut());
+                self.flush_to_storage(b.as_mut())
+                    .map_err(|_| storage::SnapshotError::BackendError)?;
                 b.snapshot_import(snapshot.clone())?;
             } else {
                 return Err(storage::SnapshotError::BackendError);
@@ -5752,10 +5798,60 @@ impl EvmModule {
     /// # Panics
     ///
     /// Panics if the DB mutex is poisoned.
-    fn flush_to_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
+    fn flush_to_storage(
+        &self,
+        backend: &mut (dyn storage::StorageBackend + Send),
+    ) -> Result<(), storage::ApplyError> {
         let ops = self.account_flush_ops();
-        if !ops.is_empty() {
-            backend.apply_batch(&ops);
+        self.flush_pending(backend, ops)
+    }
+
+    /// Attempt `apply_batch` over `pending_flush + extra` as ONE
+    /// batch — a failed earlier flush retries inside the next one,
+    /// so no account update, sealed-block record, or undo blob is
+    /// ever dropped on a transient storage failure.
+    ///
+    /// On `Ok`: the buffer clears, the error latch resets, and the
+    /// batch is synced (the per-block durability point — `Ok` from
+    /// `apply_batch` is "written", `sync` is "durable"). On `Err`:
+    /// the ops stay in `pending_flush` and the error is latched into
+    /// `storage_error` — the in-memory state remains correct, but
+    /// callers can observe degraded persistence via
+    /// [`Self::storage_error`].
+    fn flush_pending(
+        &self,
+        backend: &mut (dyn storage::StorageBackend + Send),
+        extra: Vec<storage::Op>,
+    ) -> Result<(), storage::ApplyError> {
+        let mut pending =
+            self.pending_flush.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.extend(extra);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        match backend.apply_batch(&pending) {
+            Ok(()) => {
+                pending.clear();
+                drop(pending);
+                // Per-block durability point: `apply_batch` is
+                // "written", `sync` is "durable". A sync failure is
+                // latched but not buffered — the ops ARE written, and
+                // the next successful sync covers them (same file).
+                if let Err(e) = backend.sync() {
+                    *self.storage_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(e.clone());
+                    return Err(e);
+                }
+                *self.storage_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    None;
+                Ok(())
+            }
+            Err(e) => {
+                drop(pending);
+                *self.storage_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(e.clone());
+                Err(e)
+            }
         }
     }
 
@@ -5972,11 +6068,15 @@ impl EvmModule {
         }
 
         // One cleanup batch for stale records discovered during
-        // restore (over-capacity or below-floor entries).
+        // restore (over-capacity or below-floor entries). Routed
+        // through the pending buffer: a failure latches into
+        // `storage_error` and retries inside the next block's flush
+        // — the records are housekeeping, so a delayed cleanup is
+        // harmless, but a silently dropped write is not.
         if !stale.is_empty() {
             let ops: Vec<storage::Op> =
                 stale.into_iter().map(|key| storage::Op::Delete { key }).collect();
-            backend.apply_batch(&ops);
+            let _ = self.flush_pending(backend, ops);
         }
 
         // Schema version check: the backend records the layout
@@ -5993,10 +6093,16 @@ impl EvmModule {
         if stored_version < self.state_version()
             && let Ok(new_version) = self.migrate(stored_version)
         {
-            backend.apply_batch(&[storage::Op::Set {
-                key: persist::state_version_key(),
-                value: new_version.to_le_bytes().to_vec(),
-            }]);
+            // Schema-version write through the pending buffer — a
+            // failure latches and retries rather than leaving the
+            // recorded version silently behind the migrated state.
+            let _ = self.flush_pending(
+                backend,
+                vec![storage::Op::Set {
+                    key: persist::state_version_key(),
+                    value: new_version.to_le_bytes().to_vec(),
+                }],
+            );
         }
     }
 }

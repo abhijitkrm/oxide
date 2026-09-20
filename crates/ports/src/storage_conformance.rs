@@ -81,19 +81,20 @@ fn batch_atomicity<B: StorageBackend>(make_backend: &impl Fn() -> B) {
     let k2 = key1(2);
 
     // Batch with two Sets to the same key — last wins.
-    store.apply_batch(&[
-        Op::Set { key: k1, value: b"first".to_vec() },
-        Op::Set { key: k1, value: b"second".to_vec() },
-        Op::Set { key: k2, value: b"v2".to_vec() },
-    ]);
+    store
+        .apply_batch(&[
+            Op::Set { key: k1, value: b"first".to_vec() },
+            Op::Set { key: k1, value: b"second".to_vec() },
+            Op::Set { key: k2, value: b"v2".to_vec() },
+        ])
+        .expect("apply_batch must succeed");
     assert_eq!(store.get(&k1), Some(b"second".to_vec()));
     assert_eq!(store.get(&k2), Some(b"v2".to_vec()));
 
     // Batch with a Delete then re-Set — the re-Set wins (applied in order).
-    store.apply_batch(&[
-        Op::Delete { key: k1 },
-        Op::Set { key: k1, value: b"resurrected".to_vec() },
-    ]);
+    store
+        .apply_batch(&[Op::Delete { key: k1 }, Op::Set { key: k1, value: b"resurrected".to_vec() }])
+        .expect("apply_batch must succeed");
     assert_eq!(store.get(&k1), Some(b"resurrected".to_vec()));
 }
 
@@ -103,12 +104,14 @@ fn deterministic_iteration_order<B: StorageBackend>(make_backend: &impl Fn() -> 
     let mut store = make_backend();
     // Insert in reverse order to prove range sorts, not insertion-order.
     let prefix = [0x42u8; 2];
-    store.apply_batch(&[
-        Op::Set { key: key2(prefix, 3), value: vec![3] },
-        Op::Set { key: key2(prefix, 1), value: vec![1] },
-        Op::Set { key: key2(prefix, 2), value: vec![2] },
-        Op::Set { key: key1(9), value: vec![9] }, // different prefix
-    ]);
+    store
+        .apply_batch(&[
+            Op::Set { key: key2(prefix, 3), value: vec![3] },
+            Op::Set { key: key2(prefix, 1), value: vec![1] },
+            Op::Set { key: key2(prefix, 2), value: vec![2] },
+            Op::Set { key: key1(9), value: vec![9] }, // different prefix
+        ])
+        .expect("apply_batch must succeed");
 
     let hits = store.range(&prefix);
     assert_eq!(hits.len(), 3, "non-matching keys excluded");
@@ -133,12 +136,12 @@ fn crash_replay_determinism<B: StorageBackend>(make_backend: &impl Fn() -> B) {
 
     let mut first = make_backend();
     for batch in &batches {
-        first.apply_batch(batch);
+        first.apply_batch(batch).expect("apply_batch must succeed");
     }
 
     let mut second = make_backend();
     for batch in &batches {
-        second.apply_batch(batch);
+        second.apply_batch(batch).expect("apply_batch must succeed");
     }
 
     // Both backends must have identical state.
@@ -156,11 +159,13 @@ fn crash_replay_determinism<B: StorageBackend>(make_backend: &impl Fn() -> B) {
 /// than the key width (matches nothing).
 fn prefix_exactness<B: StorageBackend>(make_backend: &impl Fn() -> B) {
     let mut store = make_backend();
-    store.apply_batch(&[
-        Op::Set { key: key1(0x42), value: vec![1] },
-        Op::Set { key: key1(0x43), value: vec![2] },
-        Op::Set { key: key1(0x44), value: vec![3] },
-    ]);
+    store
+        .apply_batch(&[
+            Op::Set { key: key1(0x42), value: vec![1] },
+            Op::Set { key: key1(0x43), value: vec![2] },
+            Op::Set { key: key1(0x44), value: vec![3] },
+        ])
+        .expect("apply_batch must succeed");
 
     // 1-byte prefix matches exactly one key.
     assert_eq!(store.range(&[0x42]).len(), 1);
@@ -183,14 +188,16 @@ fn delete_idempotence<B: StorageBackend>(make_backend: &impl Fn() -> B) {
     let k = key1(5);
 
     // Delete of absent key is a no-op.
-    store.apply_batch(&[Op::Delete { key: k }]);
+    store.apply_batch(&[Op::Delete { key: k }]).expect("apply_batch must succeed");
     assert!(store.get(&k).is_none());
 
     // Set then delete twice — same as delete once.
-    store.apply_batch(&[Op::Set { key: k, value: b"v".to_vec() }]);
-    store.apply_batch(&[Op::Delete { key: k }]);
+    store
+        .apply_batch(&[Op::Set { key: k, value: b"v".to_vec() }])
+        .expect("apply_batch must succeed");
+    store.apply_batch(&[Op::Delete { key: k }]).expect("apply_batch must succeed");
     let state_after_one_delete = store.range(&[]);
-    store.apply_batch(&[Op::Delete { key: k }]);
+    store.apply_batch(&[Op::Delete { key: k }]).expect("apply_batch must succeed");
     let state_after_two_deletes = store.range(&[]);
     assert_eq!(state_after_one_delete, state_after_two_deletes, "double delete must be idempotent");
 }
@@ -206,12 +213,14 @@ fn delete_idempotence<B: StorageBackend>(make_backend: &impl Fn() -> B) {
 fn snapshot_round_trip<B: StorageBackend>(make_backend: &impl Fn() -> B) {
     // Populate a backend with some state.
     let mut store = make_backend();
-    store.apply_batch(&[
-        Op::Set { key: key1(1), value: b"alpha".to_vec() },
-        Op::Set { key: key1(2), value: b"beta".to_vec() },
-        Op::Set { key: key1(3), value: b"gamma".to_vec() },
-        Op::Delete { key: key1(2) }, // delete one to test non-trivial state
-    ]);
+    store
+        .apply_batch(&[
+            Op::Set { key: key1(1), value: b"alpha".to_vec() },
+            Op::Set { key: key1(2), value: b"beta".to_vec() },
+            Op::Set { key: key1(3), value: b"gamma".to_vec() },
+            Op::Delete { key: key1(2) }, // delete one to test non-trivial state
+        ])
+        .expect("apply_batch must succeed");
 
     // Export the snapshot.
     let snapshot: Snapshot = store.snapshot_export();

@@ -16455,3 +16455,56 @@ consumed nonce stays consumed across a simulated restart via
 `set_nonce_store`; a corrupt checkpoint panics instead of resetting
 the gate. 113 matcher tests + 6 e2e multi-market green; fmt +
 clippy clean.
+
+## Storage commits are fallible — and "written" is not "durable"
+
+The finding: `JournalBackend::apply_batch` rolled its in-memory state
+back when the journal append failed but returned `()`, so the EVM
+committed blocks the journal could never replay — silent state/disk
+divergence. Meanwhile the disk backends `expect`ed their writes
+(panic, not error), and journal rotation flushed the sealed segment
+without syncing it: a later `sync()` covered only the NEW active
+file, so a sealed segment's tail could sit in page cache
+indefinitely.
+
+### Fix
+
+`StorageBackend::apply_batch` now returns `Result<(), ApplyError>`.
+The trait documents the three-stage contract explicitly: `Ok` =
+applied in memory AND written to the durability layer; *durable*
+only after the new `sync()` method (a default no-op for backends
+with nothing to flush — `Volatile`, or engines whose commits are
+already transactional). `Err` = the batch did not happen; in-memory
+state is untouched.
+
+- `JournalBackend` keeps its rollback and now returns the error.
+- `RocksDbBackend`/`RedbBackend`/`MdbxBackend` propagate every
+  fallible step instead of `expect`ing — an engine error no longer
+  kills the process mid-commit.
+- `RocksDbBackend::sync` flushes the WAL; `JournalBackend::sync`
+  folds into the trait impl.
+- `JournalWriter::rotate` `sync_data`s the segment it seals BEFORE
+  swapping handles — "sealed" now means durable at seal time, not
+  "written to a file we can no longer reach".
+
+Caller policy where the signature could not carry the error:
+`Module::end_block` is infallible, so the EVM module buffers every
+block's flush ops in `pending_flush` and attempts one
+`apply_batch` over the whole buffer per block. A failed batch keeps
+its ops queued — account updates, sealed-block records, and undo
+blobs retry inside the next block's flush instead of silently
+dropping — and the failure latches into `storage_error()`, the
+health signal node wiring can check before trusting restart
+recovery. `executor::save_executed_nonces` now returns the error.
+
+### Verification
+
+The oversized-record test now asserts `Err` AND rollback AND that a
+follow-on batch still applies (a transient failure poisons only its
+own batch). A rotation test proves sealed-segment records survive
+reopen without an explicit sync — honestly documented as guarding
+the seal/replay contract, since process-level reopen still reads
+page cache (only power loss distinguishes a synced seal; that needs
+fault injection this level cannot provide). 55 storage / 185 evm /
+31 conformance / 17 exploit / 5 multiblock tests green; fmt +
+clippy clean.

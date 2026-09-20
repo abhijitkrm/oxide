@@ -186,7 +186,7 @@ proptest! {
                 }
             })
             .collect();
-        store.apply_batch(&batch);
+        store.apply_batch(&batch).expect("apply_batch must succeed");
         // Model: fold the same ops over a HashMap.
         let mut model = std::collections::BTreeMap::new();
         for op in &batch {

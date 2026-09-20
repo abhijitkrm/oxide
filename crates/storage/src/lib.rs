@@ -54,7 +54,7 @@ pub mod mdbx_backend;
 pub use auth_journal::{
     AuthenticatedJournal, AuthenticatedReplay, JournalBackend, OpenError, replay_verified,
 };
-pub use backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend, Volatile};
+pub use backend::{ApplyError, Caps, Op, Snapshot, SnapshotError, StorageBackend, Volatile};
 pub use journal::{JournalConfig, JournalWriter, Location, Replay, ReplayRecord, replay};
 pub use mmr::{Mmr, MmrProof, PathStep};
 

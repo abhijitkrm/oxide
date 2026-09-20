@@ -1956,6 +1956,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     every network, and restarting the server let old orders
     replay. All four now behave the way the docs always claimed.
 
+- **Storage commits could fail silently** (`crates/storage`,
+  `modules/evm`, `crates/executor`)
+  - `StorageBackend::apply_batch` now returns
+    `Result<(), ApplyError>` — `Ok` means applied and written;
+    `Err` means the batch did not happen and in-memory state is
+    untouched. The journal backend previously rolled back quietly,
+    letting the EVM commit blocks the journal could never replay;
+    the disk backends panicked instead of reporting.
+  - A new `sync()` method on the trait makes the durability
+    boundary explicit: written is not durable until `sync`
+    succeeds. Journal rotation now fsyncs the segment it seals —
+    previously a sealed segment's tail could sit in page cache
+    forever while `sync()` covered only the newer file.
+  - The EVM module queues every block's flush into a pending
+    buffer: a failed batch retries inside the next block's flush
+    instead of silently dropping account, history, and undo writes,
+    and `storage_error()` reports degraded persistence for node
+    health checks.
+  - **In plain words:** if the disk write failed, the chain used to
+    keep going as if the data was saved — after a restart it would
+    come back missing blocks. Now a failed write is reported, the
+    unsaved data is retried automatically, and nothing counts as
+    "saved" until the disk actually confirms it.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

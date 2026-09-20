@@ -32,7 +32,7 @@ use std::path::Path;
 
 use libmdbx::{Database, NoWriteMap};
 
-use crate::backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend};
+use crate::backend::{ApplyError, Caps, Op, Snapshot, SnapshotError, StorageBackend};
 use primitives::Hash;
 
 /// An `MDBX`-backed `StorageBackend`.
@@ -116,22 +116,30 @@ impl StorageBackend for MdbxBackend {
         out
     }
 
-    fn apply_batch(&mut self, ops: &[Op]) {
-        // Single read-write transaction = atomic batch.
-        let txn = self.db.begin_rw_txn().expect("mdbx begin write txn");
-        let table = txn.open_table(None).expect("mdbx open table");
+    fn apply_batch(&mut self, ops: &[Op]) -> Result<(), ApplyError> {
+        // Single read-write transaction = atomic batch. Every
+        // fallible step propagates: an uncommitted txn applies
+        // nothing on drop, and the caller learns the batch did not
+        // happen instead of the process dying mid-commit.
+        let txn = self
+            .db
+            .begin_rw_txn()
+            .map_err(|e| ApplyError(format!("mdbx begin write failed: {e}")))?;
+        let table =
+            txn.open_table(None).map_err(|e| ApplyError(format!("mdbx open table failed: {e}")))?;
         for op in ops {
             match op {
                 Op::Set { key, value } => {
                     txn.put(&table, key.as_bytes(), value, libmdbx::WriteFlags::default())
-                        .expect("mdbx put");
+                        .map_err(|e| ApplyError(format!("mdbx put failed: {e}")))?;
                 }
                 Op::Delete { key } => {
-                    txn.del(&table, key.as_bytes(), None).expect("mdbx del");
+                    txn.del(&table, key.as_bytes(), None)
+                        .map_err(|e| ApplyError(format!("mdbx delete failed: {e}")))?;
                 }
             }
         }
-        txn.commit().expect("mdbx commit");
+        txn.commit().map_err(|e| ApplyError(format!("mdbx commit failed: {e}"))).map(|_| ())
     }
 
     fn snapshot_export(&self) -> Snapshot {
@@ -200,7 +208,9 @@ mod tests {
     fn mdbx_set_get_round_trip() {
         let mut store = make_backend();
         let k = Hash([0x42; 32]);
-        store.apply_batch(&[Op::Set { key: k, value: b"hello".to_vec() }]);
+        store
+            .apply_batch(&[Op::Set { key: k, value: b"hello".to_vec() }])
+            .expect("apply_batch must succeed");
         assert_eq!(store.get(&k), Some(b"hello".to_vec()));
     }
 
@@ -208,10 +218,12 @@ mod tests {
     fn mdbx_batch_atomicity_last_op_wins() {
         let mut store = make_backend();
         let k = Hash([0x01; 32]);
-        store.apply_batch(&[
-            Op::Set { key: k, value: b"first".to_vec() },
-            Op::Set { key: k, value: b"second".to_vec() },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: k, value: b"first".to_vec() },
+                Op::Set { key: k, value: b"second".to_vec() },
+            ])
+            .expect("apply_batch must succeed");
         assert_eq!(store.get(&k), Some(b"second".to_vec()));
     }
 
@@ -219,9 +231,11 @@ mod tests {
     fn mdbx_delete_removes_key() {
         let mut store = make_backend();
         let k = Hash([0x02; 32]);
-        store.apply_batch(&[Op::Set { key: k, value: b"v".to_vec() }]);
+        store
+            .apply_batch(&[Op::Set { key: k, value: b"v".to_vec() }])
+            .expect("apply_batch must succeed");
         assert!(store.get(&k).is_some());
-        store.apply_batch(&[Op::Delete { key: k }]);
+        store.apply_batch(&[Op::Delete { key: k }]).expect("apply_batch must succeed");
         assert!(store.get(&k).is_none());
     }
 
@@ -233,12 +247,14 @@ mod tests {
             k[31] = last;
             Hash(k)
         };
-        store.apply_batch(&[
-            Op::Set { key: make_key(1), value: vec![1] },
-            Op::Set { key: make_key(3), value: vec![3] },
-            Op::Set { key: make_key(2), value: vec![2] },
-            Op::Set { key: Hash([0x99; 32]), value: vec![9] },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: make_key(1), value: vec![1] },
+                Op::Set { key: make_key(3), value: vec![3] },
+                Op::Set { key: make_key(2), value: vec![2] },
+                Op::Set { key: Hash([0x99; 32]), value: vec![9] },
+            ])
+            .expect("apply_batch must succeed");
         let hits = store.range(&[0x42]);
         assert_eq!(hits.len(), 3);
         let lasts: Vec<u8> = hits.iter().map(|(k, _)| k.as_bytes()[31]).collect();
@@ -248,11 +264,13 @@ mod tests {
     #[test]
     fn mdbx_snapshot_round_trip() {
         let mut store = make_backend();
-        store.apply_batch(&[
-            Op::Set { key: Hash([0x01; 32]), value: b"alpha".to_vec() },
-            Op::Set { key: Hash([0x02; 32]), value: b"beta".to_vec() },
-            Op::Delete { key: Hash([0x02; 32]) },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: Hash([0x01; 32]), value: b"alpha".to_vec() },
+                Op::Set { key: Hash([0x02; 32]), value: b"beta".to_vec() },
+                Op::Delete { key: Hash([0x02; 32]) },
+            ])
+            .expect("apply_batch must succeed");
         let snapshot = store.snapshot_export();
         assert_eq!(snapshot.entries.len(), 1);
 

@@ -33,7 +33,7 @@ use std::path::Path;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::backend::{Caps, Op, Snapshot, SnapshotError, StorageBackend};
+use crate::backend::{ApplyError, Caps, Op, Snapshot, SnapshotError, StorageBackend};
 use primitives::Hash;
 
 /// The redb table definition: byte-slice keys → byte-slice values.
@@ -152,23 +152,36 @@ impl StorageBackend for RedbBackend {
         out
     }
 
-    fn apply_batch(&mut self, ops: &[Op]) {
-        // Single write transaction = atomic batch (StorageBackend contract).
-        let txn = self.db.begin_write().expect("redb write txn");
+    fn apply_batch(&mut self, ops: &[Op]) -> Result<(), ApplyError> {
+        // Single write transaction = atomic batch (StorageBackend
+        // contract). Every fallible step propagates: an uncommitted
+        // txn applies nothing on drop, and the caller learns the
+        // batch did not happen instead of the process dying mid-
+        // commit on a recoverable engine error.
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| ApplyError(format!("redb begin write failed: {e}")))?;
         {
-            let mut table = txn.open_table(TABLE).expect("redb open table");
+            let mut table = txn
+                .open_table(TABLE)
+                .map_err(|e| ApplyError(format!("redb open table failed: {e}")))?;
             for op in ops {
                 match op {
                     Op::Set { key, value } => {
-                        table.insert(key.as_bytes(), value.as_slice()).expect("redb insert");
+                        table
+                            .insert(key.as_bytes(), value.as_slice())
+                            .map_err(|e| ApplyError(format!("redb insert failed: {e}")))?;
                     }
                     Op::Delete { key } => {
-                        table.remove(key.as_bytes()).expect("redb delete");
+                        table
+                            .remove(key.as_bytes())
+                            .map_err(|e| ApplyError(format!("redb delete failed: {e}")))?;
                     }
                 }
             }
         }
-        txn.commit().expect("redb commit");
+        txn.commit().map_err(|e| ApplyError(format!("redb commit failed: {e}")))
     }
 
     fn snapshot_export(&self) -> Snapshot {
@@ -271,7 +284,9 @@ mod tests {
     fn redb_set_get_round_trip() {
         let mut store = make_backend();
         let k = Hash([0x42; 32]);
-        store.apply_batch(&[Op::Set { key: k, value: b"hello".to_vec() }]);
+        store
+            .apply_batch(&[Op::Set { key: k, value: b"hello".to_vec() }])
+            .expect("apply_batch must succeed");
         assert_eq!(store.get(&k), Some(b"hello".to_vec()));
         // Verify via range too.
         let hits = store.range(&[0x42]);
@@ -283,10 +298,12 @@ mod tests {
     fn redb_batch_atomicity_last_op_wins() {
         let mut store = make_backend();
         let k = Hash([0x01; 32]);
-        store.apply_batch(&[
-            Op::Set { key: k, value: b"first".to_vec() },
-            Op::Set { key: k, value: b"second".to_vec() },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: k, value: b"first".to_vec() },
+                Op::Set { key: k, value: b"second".to_vec() },
+            ])
+            .expect("apply_batch must succeed");
         let hits = store.range(&[0x01]);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1, b"second");
@@ -296,9 +313,11 @@ mod tests {
     fn redb_delete_removes_key() {
         let mut store = make_backend();
         let k = Hash([0x02; 32]);
-        store.apply_batch(&[Op::Set { key: k, value: b"v".to_vec() }]);
+        store
+            .apply_batch(&[Op::Set { key: k, value: b"v".to_vec() }])
+            .expect("apply_batch must succeed");
         assert_eq!(store.range(&[0x02]).len(), 1);
-        store.apply_batch(&[Op::Delete { key: k }]);
+        store.apply_batch(&[Op::Delete { key: k }]).expect("apply_batch must succeed");
         assert_eq!(store.range(&[0x02]).len(), 0);
     }
 
@@ -310,12 +329,14 @@ mod tests {
             k[31] = last;
             Hash(k)
         };
-        store.apply_batch(&[
-            Op::Set { key: make_key(1), value: vec![1] },
-            Op::Set { key: make_key(3), value: vec![3] },
-            Op::Set { key: make_key(2), value: vec![2] },
-            Op::Set { key: Hash([0x99; 32]), value: vec![9] },
-        ]);
+        store
+            .apply_batch(&[
+                Op::Set { key: make_key(1), value: vec![1] },
+                Op::Set { key: make_key(3), value: vec![3] },
+                Op::Set { key: make_key(2), value: vec![2] },
+                Op::Set { key: Hash([0x99; 32]), value: vec![9] },
+            ])
+            .expect("apply_batch must succeed");
         let hits = store.range(&[0x42]);
         assert_eq!(hits.len(), 3);
         let lasts: Vec<u8> = hits.iter().map(|(k, _)| k.as_bytes()[31]).collect();
@@ -332,7 +353,9 @@ mod tests {
         let k = Hash([0x77; 32]);
         {
             let mut store = RedbBackend::open(&path).expect("open");
-            store.apply_batch(&[Op::Set { key: k, value: b"persistent".to_vec() }]);
+            store
+                .apply_batch(&[Op::Set { key: k, value: b"persistent".to_vec() }])
+                .expect("apply_batch must succeed");
         }
         // Reopen and verify the data survived.
         let store = RedbBackend::open(&path).expect("reopen");

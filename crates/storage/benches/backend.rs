@@ -63,7 +63,7 @@ fn bench_apply_batch(c: &mut Criterion) {
     // Volatile (in-memory reference).
     group.bench_with_input(BenchmarkId::new("apply_batch", "Volatile"), &batch, |b, batch| {
         b.iter_with_setup(Volatile::new, |mut store| {
-            store.apply_batch(std::hint::black_box(batch));
+            store.apply_batch(std::hint::black_box(batch)).expect("apply_batch must succeed");
             store
         });
     });
@@ -84,7 +84,7 @@ fn bench_apply_batch(c: &mut Criterion) {
                 RedbBackend::open(&path).expect("open redb")
             },
             |mut store| {
-                store.apply_batch(std::hint::black_box(batch));
+                store.apply_batch(std::hint::black_box(batch)).expect("apply_batch must succeed");
                 store
             },
         );
@@ -109,7 +109,9 @@ fn bench_apply_batch(c: &mut Criterion) {
                     RocksDbBackend::open(&path).expect("open rocksdb")
                 },
                 |mut store| {
-                    store.apply_batch(std::hint::black_box(batch));
+                    store
+                        .apply_batch(std::hint::black_box(batch))
+                        .expect("apply_batch must succeed");
                     store
                 },
             );
@@ -132,7 +134,7 @@ fn bench_apply_batch(c: &mut Criterion) {
                 MdbxBackend::open(&path).expect("open mdbx")
             },
             |mut store| {
-                store.apply_batch(std::hint::black_box(batch));
+                store.apply_batch(std::hint::black_box(batch)).expect("apply_batch must succeed");
                 store
             },
         );
@@ -151,7 +153,7 @@ fn bench_get(c: &mut Criterion) {
     // Volatile (in-memory reference).
     group.bench_with_input(BenchmarkId::new("get", "Volatile"), &batch, |b, batch| {
         let mut store = Volatile::new();
-        store.apply_batch(batch);
+        store.apply_batch(batch).expect("apply_batch must succeed");
         b.iter(|| std::hint::black_box(store.get(std::hint::black_box(&key))));
     });
 
@@ -164,7 +166,7 @@ fn bench_get(c: &mut Criterion) {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let mut store = RedbBackend::open(&path).expect("open redb");
-        store.apply_batch(batch);
+        store.apply_batch(batch).expect("apply_batch must succeed");
         b.iter(|| std::hint::black_box(store.get(std::hint::black_box(&key))));
     });
 
@@ -177,7 +179,7 @@ fn bench_get(c: &mut Criterion) {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let mut store = RocksDbBackend::open(&path).expect("open rocksdb");
-        store.apply_batch(batch);
+        store.apply_batch(batch).expect("apply_batch must succeed");
         b.iter(|| std::hint::black_box(store.get(std::hint::black_box(&key))));
     });
 
@@ -190,7 +192,7 @@ fn bench_get(c: &mut Criterion) {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let mut store = MdbxBackend::open(&path).expect("open mdbx");
-        store.apply_batch(batch);
+        store.apply_batch(batch).expect("apply_batch must succeed");
         b.iter(|| std::hint::black_box(store.get(std::hint::black_box(&key))));
     });
 
