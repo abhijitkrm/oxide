@@ -1857,6 +1857,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     possibly close it. Now the position can only cover one order's
     worth, and the rest must be backed by real margin.
 
+- **Reduce-only orders could flip a trader into new exposure
+  before their remainders were canceled** (`crates/trading`,
+  `modules/perps`)
+  - Reduce-only enforcement ran after the fill had already mutated
+    positions: a resting reduce-only order that outlived its
+    position filled past its closing capacity and opened exposure
+    it was explicitly forbidden from opening — the cleanup only
+    canceled what was left over.
+  - The matching engine now consults a per-maker `MakerCap` gate
+    inside the sweep, before each fill is booked. Perps' cap is
+    the closing capacity the maker's position still offers,
+    allocated once across that owner's fills in the sweep — so an
+    ordinary fill that exhausts the position leaves a reduce-only
+    order behind it dead rather than short. Makers with no legal
+    fill left are removed at the match decision and reported as
+    `reduce_only_cancel`; the default `place` path compiles the
+    gate away entirely (zero added work for uncapped venues).
+  - FOK orders against a capped book now kill instead of
+    partially filling: the all-or-nothing pre-scan replays the
+    sweep's cap decisions read-only.
+  - **In plain words:** a "close-only" sell order used to be able
+    to turn your +10 position into a −10 short if your position
+    shrank while the order sat on the book — the check ran after
+    the trade, not before. Now the matcher itself refuses to fill
+    such an order past what it can still close.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

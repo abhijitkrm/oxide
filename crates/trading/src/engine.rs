@@ -69,6 +69,53 @@ pub struct FillEvent {
     pub taker_side: Side,
 }
 
+/// Per-maker fill gate consulted inside the sweep, before each fill
+/// is booked — caller policy enforced at the match decision, not as
+/// post-trade repair.
+///
+/// [`MatchingEngine::place_with_cap`] calls [`MakerCap::cap`] once
+/// per maker the sweep reaches (after self-trade handling, before
+/// the fill). The return value is the quantity the maker may fill
+/// now:
+///
+/// - `0` — the maker cannot legally fill: it is removed from the
+///   book as dead liquidity (e.g. a reduce-only order whose position
+///   no longer exists) and matching continues to the next order.
+/// - `1..book_qty` — the maker fills exactly that much, then its
+///   remainder is removed: it can never legally execute further.
+/// - `>= book_qty` — uncapped; the ordinary fill path.
+///
+/// [`MakerCap::reset`] is invoked between a FOK pre-scan (which
+/// consults `cap` in simulation, so a capped book still honours
+/// all-or-nothing) and the real sweep, giving implementations a
+/// point to clear sweep-local accounting.
+///
+/// `UNCAPPED` marks the trivial implementation; the generic code
+/// resolves the fast paths at compile time, so [`NoCap`] monomorphizes
+/// to a literal no-op on the hot `place` path.
+pub trait MakerCap {
+    /// `true` for implementations that never restrict a fill.
+    const UNCAPPED: bool = false;
+
+    /// Maximum quantity this maker may fill in the current sweep.
+    fn cap(&mut self, id: OrderId, owner: Address, book_qty: u64) -> u64;
+
+    /// Clear state accumulated for the simulated pre-scan sweep.
+    fn reset(&mut self) {}
+}
+
+/// Every maker fills its full book quantity — the default
+/// [`MatchingEngine::place`] gate.
+pub struct NoCap;
+
+impl MakerCap for NoCap {
+    const UNCAPPED: bool = true;
+
+    fn cap(&mut self, _id: OrderId, _owner: Address, book_qty: u64) -> u64 {
+        book_qty
+    }
+}
+
 /// Terminal state of a submitted order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderOutcome {
@@ -227,6 +274,22 @@ impl<B: BookBackend> MatchingEngine<B> {
         req: NewOrder,
         fills: &mut Vec<FillEvent>,
     ) -> Result<OrderOutcome, TradingError> {
+        self.place_with_cap(req, fills, &mut NoCap)
+    }
+
+    /// `place` with a [`MakerCap`] gate consulted per maker fill —
+    /// the caller enforces policy (e.g. reduce-only cover) at the
+    /// match decision, before the fill is booked, instead of
+    /// repairing positions afterward.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::place`].
+    pub fn place_with_cap<C: MakerCap>(
+        &mut self,
+        req: NewOrder,
+        fills: &mut Vec<FillEvent>,
+        cap: &mut C,
+    ) -> Result<OrderOutcome, TradingError> {
         // ── Validation: entirely before the match loop (plan §9.1) ──
         if let Err(reason) = req.validate(
             self.cfg.tick_size,
@@ -262,11 +325,23 @@ impl<B: BookBackend> MatchingEngine<B> {
         // sweep; that documented corner yields CanceledRemainder,
         // never a silent partial fill of a "kill".)
         if req.tif == TimeInForce::Fok {
-            let fillable = if matches!(req.stp, StpMode::None) {
-                self.book.fillable_qty(req.side, limit_raw)
+            let fillable = if C::UNCAPPED {
+                if matches!(req.stp, StpMode::None) {
+                    self.book.fillable_qty(req.side, limit_raw)
+                } else {
+                    self.book
+                        .fillable_qty_excluding_owner(req.side, limit_raw, req.owner, &self.pool)
+                }
             } else {
-                self.book.fillable_qty_excluding_owner(req.side, limit_raw, req.owner, &self.pool)
+                // A cap can shrink or kill a maker fill — the
+                // optimized book scans know nothing about it, so the
+                // pre-scan must replay the sweep's decisions
+                // read-only (same order, same STP rules, same caps).
+                self.capped_fillable(&req, limit_raw, cap)
             };
+            // The pre-scan fed `cap` a simulated sweep; reset its
+            // sweep-local state before the real one.
+            cap.reset();
             if fillable < req.qty.0 {
                 return Ok(OrderOutcome::Killed);
             }
@@ -274,7 +349,7 @@ impl<B: BookBackend> MatchingEngine<B> {
 
         // ── Match loop: zero validation, zero allocation below ──────
         let mut rem = req.qty.0;
-        let taker_canceled = self.sweep(&req, taker_id, limit_raw, &mut rem, fills);
+        let taker_canceled = self.sweep(&req, taker_id, limit_raw, &mut rem, fills, cap);
         if taker_canceled {
             // STP canceled the taker mid-sweep; fills stand.
             return Ok(OrderOutcome::CanceledRemainder {
@@ -505,13 +580,14 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// mid-sweep (fills booked so far stand); `false` when the sweep
     /// ended normally — book empty, price bound reached, or the order
     /// fully filled.
-    fn sweep(
+    fn sweep<C: MakerCap>(
         &mut self,
         req: &NewOrder,
         taker_id: OrderId,
         limit_raw: Option<u64>,
         rem: &mut u64,
         fills: &mut Vec<FillEvent>,
+        cap: &mut C,
     ) -> bool {
         'sweep: loop {
             let opp = match req.side {
@@ -578,8 +654,19 @@ impl<B: BookBackend> MatchingEngine<B> {
                     }
                 }
 
+                // The maker-cap gate decides, at the match decision,
+                // how much of this maker may legally fill: `0`
+                // removes it as dead (e.g. reduce-only with no cover
+                // left), a partial cap fills that much then removes
+                // the now-unfillable remainder, `>= m_qty` is the
+                // ordinary path.
+                let cap_qty = cap.cap(m_id, m_owner, m_qty);
+                if cap_qty == 0 {
+                    self.remove_maker(head, m_id);
+                    continue;
+                }
                 // Fill against the FIFO head maker.
-                let fill = (*rem).min(m_qty);
+                let fill = (*rem).min(m_qty).min(cap_qty);
                 fills.push(FillEvent {
                     price: Price(opp),
                     qty: Qty(fill),
@@ -593,8 +680,10 @@ impl<B: BookBackend> MatchingEngine<B> {
                 self.book.reduce_total(opp, fill);
                 *rem -= fill;
 
-                if fill == m_qty {
-                    // Maker exhausted: detach, unmap, recycle.
+                if fill == m_qty || fill == cap_qty {
+                    // Maker exhausted — or it hit its cap, meaning
+                    // the remainder can never legally fill: detach,
+                    // unmap, recycle either way.
                     self.remove_maker(head, m_id);
                 }
                 if *rem == 0 {
@@ -631,6 +720,103 @@ impl<B: BookBackend> MatchingEngine<B> {
         }
         self.pool.release(slot);
         self.resting = self.resting.saturating_sub(1);
+    }
+
+    /// Read-only fillable-quantity probe for the FOK pre-scan when a
+    /// [`MakerCap`] gate is active. The optimized book scans know
+    /// nothing about caps, so this replays the sweep's decisions in
+    /// order — opposing levels best-first, FIFO within a level, the
+    /// same self-trade rules, and the same `cap` calls — so the
+    /// fillable total is exactly what the real sweep would book.
+    ///
+    /// Cold path (FOK + caps only): O(levels touched). Levels are
+    /// homogeneous by construction — a price that would host both
+    /// sides has already crossed — so a level's head side decides
+    /// whether it is opposing at all.
+    fn capped_fillable<C: MakerCap>(
+        &self,
+        req: &NewOrder,
+        limit_raw: Option<u64>,
+        cap: &mut C,
+    ) -> u64 {
+        let mut fillable = 0u64;
+        let mut rem = req.qty.0;
+        // Cold path: usize→u32 is bounded by MAX_DENSE_LEVELS per
+        // MarketConfig::validate (same bound `resting_entries` uses).
+        #[allow(clippy::cast_possible_truncation)]
+        let level_count = self.book.level_count() as u32;
+        // Sweep direction: a buy consumes asks ascending, a sell
+        // consumes bids descending — best price first.
+        let opposing = match req.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        let (mut idx, step): (i64, i64) = match req.side {
+            Side::Buy => (0, 1),
+            Side::Sell => (i64::from(level_count) - 1, -1),
+        };
+        while idx >= 0 && idx < i64::from(level_count) {
+            // The loop guard keeps idx inside 0..level_count — the
+            // cast can neither truncate nor go negative.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let price = self.book.level_price(idx as u32);
+            if let Some(lim) = limit_raw {
+                let marketable = match req.side {
+                    Side::Buy => price <= lim,
+                    Side::Sell => price >= lim,
+                };
+                // Levels are visited in match order: once the bound
+                // is passed, nothing beyond can fill.
+                if !marketable {
+                    break;
+                }
+            }
+            let mut slot = self.book.level_head(price);
+            while slot != crate::pool::NIL {
+                let node = &self.pool[slot];
+                let (m_id, m_qty, m_owner) = (node.id, node.qty.0, node.owner);
+                slot = node.next;
+                // Levels are homogeneous: a wrong-side level never
+                // matches this taker.
+                if node.side != opposing {
+                    continue;
+                }
+                // Self-trade handling mirrors the sweep exactly —
+                // STP-skipped makers never reach the cap gate.
+                if m_owner == req.owner {
+                    match req.stp {
+                        // The sweep cancels the taker here — fills
+                        // booked so far stand, nothing further counts.
+                        StpMode::CancelNewest => return fillable,
+                        StpMode::CancelOldest => continue,
+                        StpMode::DecrementAndCancel => {
+                            if m_qty <= rem {
+                                rem -= m_qty;
+                            } else {
+                                rem = 0;
+                            }
+                            if rem == 0 {
+                                return fillable;
+                            }
+                            continue;
+                        }
+                        StpMode::None => {}
+                    }
+                }
+                let c = cap.cap(m_id, m_owner, m_qty);
+                if c == 0 {
+                    continue;
+                }
+                let f = rem.min(m_qty).min(c);
+                fillable += f;
+                rem -= f;
+                if rem == 0 {
+                    return fillable;
+                }
+            }
+            idx += step;
+        }
+        fillable
     }
 
     /// Would a `side` order at `price_raw` cross the book?

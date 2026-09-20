@@ -480,6 +480,79 @@ struct Inner {
     oracle_updates_this_block: BTreeMap<u8, u8>,
 }
 
+/// [`MakerCap`] gate enforcing reduce-only at the match decision:
+/// a resting reduce-only order may fill only up to the closing
+/// capacity its owner's position still offers — allocated once
+/// across that owner's fills in the sweep (`spent`), the same
+/// once-only rule the margin reservation uses. A maker with no
+/// cover left returns `0` and is removed as dead liquidity; a
+/// partially covered one fills its cover and is then removed (the
+/// remainder could only open exposure). This replaces enforcement
+/// that used to run after the fill had already flipped positions.
+struct ReduceOnlyCap<'a> {
+    /// Account states (read-only: positions + reservations).
+    accounts: &'a BTreeMap<Address, AccountState>,
+    /// The market this engine serves.
+    market: u8,
+    /// Cover already consumed per owner in this sweep. Every
+    /// opposing maker — reduce-only or not — burns the same pool:
+    /// a normal sell can exhaust the cover a reduce-only sell
+    /// behind it would have needed.
+    spent: BTreeMap<Address, u64>,
+    /// `(order_id, owner)` pairs the gate removed as dead: the
+    /// module drops their reservations and reports
+    /// `reduce_only_cancel` after the sweep.
+    dead: Vec<(OrderId, Address)>,
+}
+
+impl trading::MakerCap for ReduceOnlyCap<'_> {
+    fn cap(&mut self, id: OrderId, owner: Address, book_qty: u64) -> u64 {
+        let Some(acct) = self.accounts.get(&owner) else {
+            return book_qty;
+        };
+        let Some(resv) = acct.open_orders.get(&(self.market, id.0)) else {
+            // A resting order with no reservation cannot be
+            // reduce-only — treat as ordinary liquidity.
+            return book_qty;
+        };
+        let pos_size = acct.positions.get(&self.market).map_or(0, |p| p.size);
+        let opposing =
+            (pos_size > 0 && resv.side == Side::Sell) || (pos_size < 0 && resv.side == Side::Buy);
+        if !opposing {
+            if resv.reduce_only {
+                // No reducible position on this side — the order can
+                // only open exposure, which its flag forbids.
+                self.dead.push((id, owner));
+                return 0;
+            }
+            return book_qty;
+        }
+        if resv.reduce_only {
+            let used = self.spent.get(&owner).copied().unwrap_or(0);
+            let remaining = pos_size.unsigned_abs().saturating_sub(used);
+            let cap = remaining.min(book_qty);
+            *self.spent.entry(owner).or_insert(0) += cap;
+            if cap < book_qty {
+                self.dead.push((id, owner));
+            }
+            cap
+        } else {
+            // A normal opposing maker burns cover its reduce-only
+            // siblings would need. The full book qty is charged even
+            // though the actual fill may be smaller — but a smaller
+            // fill means the taker is done, so no later maker ever
+            // consults the over-estimate.
+            *self.spent.entry(owner).or_insert(0) += book_qty;
+            book_qty
+        }
+    }
+
+    fn reset(&mut self) {
+        self.spent.clear();
+        self.dead.clear();
+    }
+}
+
 impl PerpsModule {
     /// Construct a fresh perps module with no markets and no ledger
     /// settlement.
@@ -1910,15 +1983,17 @@ impl PerpsModule {
             }
         }
 
-        let Inner { markets, fills, .. } = &mut *inner;
+        let Inner { markets, fills, accounts, .. } = &mut *inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
             return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
         };
 
         fills.clear();
+        let mut cap = ReduceOnlyCap { accounts, market, spent: BTreeMap::new(), dead: Vec::new() };
         let outcome = engine
-            .place(order, fills)
+            .place_with_cap(order, fills, &mut cap)
             .map_err(|e| ExecError::ModuleRejected(format!("engine: {e}")))?;
+        let ReduceOnlyCap { dead, .. } = cap;
 
         // Move fills out of the scratch buffer (no clone). The
         // buffer is left empty for the next use. This avoids a
@@ -1927,6 +2002,15 @@ impl PerpsModule {
         // then apply fills to positions. `mem::take` moves the Vec's
         // contents out in O(1), leaving an empty Vec behind.
         let fills_owned: Vec<FillEvent> = std::mem::take(fills);
+
+        // Makers the cap gate removed as dead are already off the
+        // book — release their reservations now so fill application
+        // doesn't see stale entries, and report the cancel below.
+        for (oid, owner) in &dead {
+            if let Some(acct) = inner.accounts.get_mut(owner) {
+                acct.open_orders.remove(&(market, oid.0));
+            }
+        }
 
         // A resting remainder joins the reservation ledger (C7): the
         // uncovered tail is charged initial margin until the order
@@ -1966,6 +2050,12 @@ impl PerpsModule {
         }
 
         events.push(outcome_event(market, outcome));
+        // Report makers the reduce-only cap removed mid-sweep —
+        // their orders died at the match decision, so the cancel is
+        // reported once here rather than as post-trade repair.
+        for _ in &dead {
+            events.push(Event { module: "perps", kind: "reduce_only_cancel", data: vec![market] });
+        }
         Ok(events)
     }
 
@@ -3891,6 +3981,142 @@ mod tests {
             .handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 500, 1, 1)))
             .unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// A reduce-only order admitted at full cover can outlive its
+    /// position: the position shrinks under it via other fills.
+    /// Enforcement must cap the fill at the match decision — the
+    /// maker may only reduce what remains — not let the fill flip
+    /// the maker into new exposure and cancel the remainder after.
+    ///
+    /// Owner 1: +10 long, reduce-only sell of 10 resting. A normal
+    /// sell of 5 fills first, shrinking the position to +5 — the
+    /// resting reduce-only now has only 5 cover. A taker buying 10
+    /// must fill just 5 and kill the remainder.
+    #[test]
+    fn reduce_only_maker_capped_at_match_decision() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        for b in [1u8, 8, 9] {
+            ledger.mint(&addr(b), 1_000_000);
+        }
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        for b in [1u8, 8, 9] {
+            perps.handle(&ctx(b), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        }
+
+        // Owner 1 opens +10 long against owner 9.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 10, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 10, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 10_000);
+
+        // Reduce-only sell of 10 rests (admitted at full cover).
+        let events = perps
+            .handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 700, 10, 1)))
+            .unwrap();
+        let resting = events.iter().find(|e| e.kind == "resting").expect("RO order rests");
+        let ro_id = OrderId(u64::from_le_bytes(resting.data[1..9].try_into().unwrap()));
+
+        // An ordinary sell of 5 fills first → position shrinks to
+        // +5; the resting reduce-only now has only 5 cover.
+        perps.handle(&ctx(8), &msg::place(mid, limit(Side::Buy, 500, 5, 8))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Sell, 500, 5, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 5_000);
+
+        // A taker buying 10 hits the reduce-only maker: it may only
+        // fill the 5 cover that remains, and the uncovered remainder
+        // must die at the match — never flip the maker to −5.
+        let events = perps.handle(&ctx(8), &msg::place(mid, limit(Side::Buy, 700, 10, 8))).unwrap();
+        assert_eq!(
+            perps.position(&addr(1), mid).size,
+            0,
+            "reduce-only fill must stop at the closing capacity, not flip"
+        );
+        assert!(
+            events.iter().any(|e| e.kind == "reduce_only_cancel"),
+            "the uncovered remainder must be reported canceled"
+        );
+        // The dead remainder is off the book: cancel reports not-found.
+        let err = perps.handle(&ctx(1), &msg::cancel(mid, ro_id)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// Cover is allocated once per owner per sweep, across makers
+    /// of every kind: an ordinary opposing fill that exhausts the
+    /// position leaves zero cover for a reduce-only maker behind
+    /// it — the reduce-only must die unfilled, not open a short.
+    #[test]
+    fn reduce_only_behind_ordinary_fill_gets_no_cover() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        for b in [1u8, 8, 9] {
+            ledger.mint(&addr(b), 1_000_000);
+        }
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        for b in [1u8, 8, 9] {
+            perps.handle(&ctx(b), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        }
+
+        // Owner 1: +10 long.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 10, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 10, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 10_000);
+
+        // Resting reduce-only sell of 10 @1.7e9, then an ordinary
+        // sell of 10 @1.6e9 (admitted — the uncovered tail pays IM).
+        perps.handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 700, 10, 1))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Sell, 600, 10, 1))).unwrap();
+
+        // Taker buys 20 @1.7e9: sweeps the ordinary sell first (10
+        // cover consumed → position flat), then the reduce-only
+        // finds 0 cover and must die without filling.
+        perps.handle(&ctx(8), &msg::place(mid, limit(Side::Buy, 700, 20, 8))).unwrap();
+        assert_eq!(
+            perps.position(&addr(1), mid).size,
+            0,
+            "reduce-only must not open a short behind the ordinary fill"
+        );
+        // Owner 8 holds the 10 it bought from the ordinary sell.
+        assert_eq!(perps.position(&addr(8), mid).size, 10_000);
+    }
+
+    /// FOK all-or-nothing must count capped fills: a reduce-only
+    /// book that only covers 5 cannot satisfy a FOK buy of 10 —
+    /// the order must be killed, not partially filled.
+    #[test]
+    fn fok_counts_capped_fillable() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        for b in [1u8, 8, 9] {
+            ledger.mint(&addr(b), 1_000_000);
+        }
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        for b in [1u8, 8, 9] {
+            perps.handle(&ctx(b), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        }
+
+        // Same setup: +10 long, RO sell 10 resting, shrink to +5.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 10, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 10, 1))).unwrap();
+        perps.handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 700, 10, 1))).unwrap();
+        perps.handle(&ctx(8), &msg::place(mid, limit(Side::Buy, 500, 5, 8))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Sell, 500, 5, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 5_000);
+
+        // FOK buy of 10 @1.7e9 — only 5 is legally fillable.
+        let mut fok = limit(Side::Buy, 700, 10, 8);
+        fok.tif = TimeInForce::Fok;
+        let events = perps.handle(&ctx(8), &msg::place(mid, fok)).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "killed"),
+            "FOK must kill when capped fillable < requested"
+        );
+        assert_eq!(
+            perps.position(&addr(1), mid).size,
+            5_000,
+            "a killed FOK must leave positions untouched"
+        );
+        assert_eq!(perps.position(&addr(8), mid).size, 5_000);
     }
 
     /// A position's closing capacity can only be spent once. With a

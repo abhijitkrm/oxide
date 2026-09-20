@@ -16241,3 +16241,54 @@ two covered-looking sells; now charges the expensive residual), and an
 end-to-end place-order test showing the second opposing order is
 margin-gated once the first books the cover. All 61 perps tests green;
 fmt + clippy clean.
+
+## Session — perps: reduce-only enforced at the match decision
+
+Audit finding: reduce-only enforcement ran *after* the fill mutated
+positions — `apply_fill_to_position` adjusted buyer/seller positions
+first, then looked at the maker's reduce-only reservation and canceled
+an invalid remainder. A resting reduce-only order that had outlived its
+position could already open or flip exposure before cleanup ran
+(observed directly: makers flipped to −5_000/−10_000 in the red tests).
+
+### Fix
+
+New `trading::MakerCap` gate consulted inside the engine's sweep once
+per maker fill (after STP handling, before the fill is booked):
+
+- `0` → the maker cannot legally fill; it is removed as dead liquidity.
+- `1..book_qty` → the maker fills that much, then its remainder is
+  removed (it can never legally execute further).
+- `>= book_qty` → uncapped; the ordinary path.
+
+`NoCap` is the default `place` gate — an `UNCAPPED` const resolves the
+old fast paths at compile time, so the hot path monomorphizes to a
+literal no-op (identical semantics, zero added work). `place_with_cap`
+is the public entry for capped venues.
+
+Perps supplies `ReduceOnlyCap`: a maker's cap is the closing capacity
+its owner's position still offers, allocated once across that owner's
+fills in the sweep (`spent`) — every opposing maker, reduce-only or
+not, burns the same pool, so a normal sell can exhaust the cover a
+reduce-only sell behind it would have needed. A reduce-only maker with
+no reducible position (none, or same-side) is dead by definition and
+removed. Removed makers get a `reduce_only_cancel` event and their
+margin reservations are released. The post-fill check stays as a
+safety net for stale reservations.
+
+FOK interaction handled: the optimized `fillable_qty` scans know
+nothing about caps, so `place_with_cap` runs `capped_fillable` — a
+read-only replay of the sweep in match order (same STP rules, same cap
+calls) — and `MakerCap::reset` clears sweep-local state between the
+pre-scan and the real sweep. A FOK order against a capped book now
+kills instead of partially filling.
+
+### Verification
+
+Three regression tests, all confirmed red against a neutered cap
+(maker flipped to −5_000/−10_000, FOK partially filled): fill capped
+at remaining cover + dead remainder removed + `reduce_only_cancel`
+emitted; an ordinary fill exhausting cover leaves a reduce-only maker
+behind it dead and unfilled; FOK kills when capped fillable <
+requested. 64 perps / 56 trading / 36 exchange tests + the matching
+property oracle all green; fmt + clippy clean.
