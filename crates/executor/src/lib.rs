@@ -45,6 +45,25 @@ use crypto::hash::{Domain, Hasher};
 /// long-lived node doesn't grow memory without limit.
 const MAX_RETAINED_HISTORY: usize = 4096;
 
+/// Maximum committed-but-unreceived blocks the execution lane
+/// buffers — the bound on how far consensus may outrun execution.
+///
+/// Unit: committed blocks. The worker holds at most one additional
+/// in-flight block, so the total execution lag is at most
+/// `EXEC_LANE_DEPTH + 1` heights — far inside the default
+/// [`MAX_RETAINED_HISTORY`] window, which keeps every unexecuted
+/// block reachable by the inline backlog drain. Origin: the audit
+/// requires "one block behind" to be *enforced* — an unbounded
+/// queue let consensus run arbitrarily ahead while `finalized`
+/// pruned to a fixed window, so a dead lane could leave committed
+/// heights already evicted and unexecutable. Tradeoff: a deeper
+/// queue absorbs commit bursts without stalling `finalize_block`;
+/// a shallower one tightens the lag bound and shrinks worst-case
+/// queued tx bytes. 64 keeps the stall rare (attestations already
+/// wait on execution, so deeper buffering buys nothing) while
+/// bounded enough that a stalled lane cannot hide.
+const EXEC_LANE_DEPTH: usize = 64;
+
 /// Insert-then-prune for height-keyed history maps: keeps the
 /// newest [`MAX_RETAINED_HISTORY`] entries by dropping the oldest.
 trait InsertRetained<K: Ord, V> {
@@ -1165,7 +1184,7 @@ pub struct Executor {
     /// thread; `None` means synchronous finalize (the default).
     /// `OnceLock` so spawning races are refused loudly rather than
     /// silently splitting the commit stream between two workers.
-    exec_lane_tx: std::sync::OnceLock<std::sync::mpsc::Sender<FinalizedBlock>>,
+    exec_lane_tx: std::sync::OnceLock<std::sync::mpsc::SyncSender<FinalizedBlock>>,
     /// Execution progress shared with the worker. `attest_state`
     /// waits on the condvar only while the requested height is
     /// enqueued-but-not-yet-executed — preserving the synchronous
@@ -1449,7 +1468,16 @@ impl Executor {
     /// Panics if called twice — a second lane would split the
     /// commit stream.
     pub fn spawn_exec_lane(self: &std::sync::Arc<Self>) {
-        let (tx, rx) = std::sync::mpsc::channel::<FinalizedBlock>();
+        // Bound the lane's queue: at most `depth` committed blocks
+        // may sit unreceived. `finalize_block`'s blocking send then
+        // *enforces* bounded execution lag — a worker that falls
+        // behind stalls the commit path rather than silently
+        // accumulating a backlog the drain could never replay.
+        // Capping at `retention - 1` keeps the maximum possible
+        // backlog (queue + one in-flight) inside the retained
+        // history window even for tiny custom retentions.
+        let depth = EXEC_LANE_DEPTH.min(self.history_retention.saturating_sub(1)).max(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FinalizedBlock>(depth);
         self.exec_lane_tx.set(tx).expect("exec lane already spawned");
         let weak = std::sync::Arc::downgrade(self);
         let sync = self.exec_sync.clone();
@@ -1526,6 +1554,36 @@ impl Executor {
     /// state (journal/snapshot/backend) at process restart. Heights
     /// the lane never started are unaffected — replaying an
     /// unstarted block mutates nothing twice.
+    /// Insert a committed block into `finalized` and prune to the
+    /// retention window — but never evict a height that has not
+    /// been executed. Unexecuted committed blocks are the backlog
+    /// the inline drain replays on lane failure; pruning one would
+    /// strand that height permanently rootless. Execution is in
+    /// height order, so every height at or below the `executed`
+    /// watermark already has a root and is safe to drop; the pin
+    /// simply refuses to evict above it.
+    ///
+    /// The watermark is read before the map lock — two short,
+    /// non-nested critical sections keep the lock graph flat. A
+    /// stale read only makes eviction more conservative, never
+    /// wrong.
+    fn insert_finalized(&self, height: u64, block: FinalizedBlock) {
+        let executed = {
+            let (lock, _cv) = &*self.exec_sync;
+            lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).executed
+        };
+        let mut f = self.finalized.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f.insert(height, block);
+        while f.len() > self.history_retention {
+            let evictable =
+                f.keys().next().is_some_and(|first| executed.is_some_and(|e| *first <= e));
+            if !evictable {
+                break;
+            }
+            f.pop_first();
+        }
+    }
+
     fn execute_committed_backlog(&self) {
         // Fail closed on a partially applied block before replaying
         // anything. `in_flight` is set by the worker around
@@ -2939,10 +2997,7 @@ impl AppInterface for Executor {
             // below) when execution lands. `finalized` is inserted
             // BEFORE the send so the backlog drain can see this
             // block too.
-            self.finalized
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert_retained(block.height.value(), block.clone(), self.history_retention);
+            self.insert_finalized(block.height.value(), block.clone());
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 block.height.value().saturating_add(1); // M2 fix
             let lane_dead = {
@@ -2969,10 +3024,16 @@ impl AppInterface for Executor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert_retained(block.height.value(), root, self.history_retention);
-            self.finalized
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert_retained(block.height.value(), block.clone(), self.history_retention);
+            // Keep the watermark honest in synchronous mode too:
+            // the block was just executed, and `insert_finalized`
+            // evicts only at-or-below it.
+            {
+                let (lock, _cv) = &*self.exec_sync;
+                let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.enqueued = Some(block.height.value());
+                s.executed = Some(block.height.value());
+            }
+            self.insert_finalized(block.height.value(), block.clone());
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 block.height.value().saturating_add(1); // M2 fix
         }
@@ -5100,6 +5161,131 @@ mod tests {
             *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             1,
             "a refused replay must not run the mutation a second time"
+        );
+    }
+
+    /// A module whose `handle` blocks until the test opens a gate —
+    /// models a slow worker so the lane's queue can be filled
+    /// deterministically. Spins on an atomic rather than a channel
+    /// so a single flag release unblocks every later call too.
+    struct GatedModule {
+        /// Open when the test releases execution.
+        gate: std::sync::atomic::AtomicBool,
+        /// Invocation count, for post-drain assertions.
+        calls: Mutex<u64>,
+    }
+
+    impl Module for GatedModule {
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+        fn id(&self) -> u8 {
+            4
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            while !self.gate.load(std::sync::atomic::Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            Ok(vec![Event { module: "gated", kind: "call", data: vec![] }])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            Hash([u8::try_from(c.max(1)).unwrap_or(0xff); 32])
+        }
+    }
+
+    fn finalized_block(height: u64, module: u8, nonce: u64) -> FinalizedBlock {
+        FinalizedBlock {
+            height: Height::new(height),
+            txs: vec![make_tx_with_nonce(module, &[u8::try_from(height).unwrap_or(0xff)], nonce)],
+            signers: vec![],
+        }
+    }
+
+    #[test]
+    fn finalized_pruning_pins_unexecuted_heights() {
+        // Retention bounds only the executed prefix: a committed
+        // height without a state root is the drain's backlog and
+        // must survive pruning no matter how far behind execution
+        // falls.
+        let executor = Executor::new(100).with_history_retention(2);
+
+        // Nothing executed: every committed height is unexecuted —
+        // the pin holds all of them even past the window.
+        for h in 0..4 {
+            executor.insert_finalized(h, finalized_block(h, 1, h));
+        }
+        assert_eq!(
+            executor.finalized.lock().unwrap().len(),
+            4,
+            "unexecuted heights must never be evicted"
+        );
+
+        // Mark 0–2 executed (in-order execution ⇒ rooted): they
+        // become evictable; 3 and the new 4 stay pinned.
+        {
+            let (lock, _cv) = &*executor.exec_sync;
+            lock.lock().unwrap().executed = Some(2);
+        }
+        executor.insert_finalized(4, finalized_block(4, 1, 4));
+        let kept: Vec<u64> = executor.finalized.lock().unwrap().keys().copied().collect();
+        assert_eq!(kept, vec![3, 4], "only executed heights may be evicted");
+    }
+
+    #[test]
+    fn exec_lane_queue_is_bounded() {
+        // The lane queue must bound how far consensus can outrun
+        // execution: once the channel holds `depth` unreceived
+        // blocks, `finalize_block` blocks until the worker drains —
+        // backpressure, not an unbounded backlog that outlives the
+        // retained history.
+        let mut executor = Executor::new(100).with_history_retention(5);
+        // lane depth = min(EXEC_LANE_DEPTH, retention - 1) = 4.
+        let module = Arc::new(GatedModule {
+            gate: std::sync::atomic::AtomicBool::new(false),
+            calls: Mutex::new(0),
+        });
+        executor.register_module(module.clone() as Arc<dyn Module>);
+        let executor = Arc::new(executor);
+        executor.spawn_exec_lane();
+
+        // h0 reaches the worker and parks inside the gate.
+        executor.finalize_block(&finalized_block(0, 4, 0));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // h1..h4 fill the bounded queue (depth 4).
+        for h in 1..=4u64 {
+            executor.finalize_block(&finalized_block(h, 4, h));
+        }
+
+        // h5 cannot be queued until the worker drains — its
+        // finalize must block.
+        let done = std::sync::mpsc::channel::<()>();
+        let exec2 = executor.clone();
+        let join = std::thread::spawn(move || {
+            exec2.finalize_block(&finalized_block(5, 4, 5));
+            let _ = done.0.send(());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            done.1.try_recv().is_err(),
+            "a full lane queue must apply backpressure to the commit path"
+        );
+
+        // Release the worker: the backlog drains and h5 completes.
+        module.gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        done.1
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("h5 finalize must complete once the worker drains");
+        join.join().expect("finalize thread must not panic");
+        executor.wait_exec_idle();
+        assert_eq!(
+            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            6,
+            "every committed block executed exactly once"
         );
     }
 }

@@ -2000,6 +2000,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     requires a restart that rebuilds state from disk, the only place
     a consistent pre-block state exists.
 
+- **Consensus could outrun execution without bound**
+  (`crates/executor`)
+  - The execution lane's queue is now bounded (`EXEC_LANE_DEPTH` =
+    64): when the worker falls that far behind, the commit path
+    blocks until it drains — backpressure instead of an
+    ever-growing backlog.
+  - Committed-but-unexecuted blocks can no longer be pruned from
+    the in-memory history window: eviction only drops heights the
+    worker has already executed, so the recovery path always keeps
+    every block it might need.
+  - **In plain words:** the chain used to be able to finalize
+    blocks far faster than it executed them, quietly piling up work
+    until some blocks were forgotten entirely — a crash at the
+    wrong moment could then never recover them. Now a slow
+    execution lane simply slows consensus down, and nothing that
+    still needs executing is ever thrown away.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

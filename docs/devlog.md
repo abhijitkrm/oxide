@@ -16540,3 +16540,40 @@ its mutation first, then panics — the test asserts the drain
 refuses AND that `calls` stays at exactly 1 (a blind replay would
 have run the mutation twice). 85 executor unit + 5 signed-tx
 integration tests green; fmt + clippy clean.
+
+## Execution lag is bounded — and unexecuted history is pinned (audit 3.5)
+
+The exec-lane channel was unbounded while `finalized` pruned to a
+fixed 4096-height window: consensus could commit arbitrarily ahead
+of execution, and the blocks the lane owed could age out of the
+very map the backlog drain reads. A dead lane could then leave
+committed heights simultaneously rootless and unrecoverable.
+
+Two layers now make the bound real:
+
+- The lane queue is a `sync_channel` of `EXEC_LANE_DEPTH` (64,
+  capped at `retention − 1`). `finalize_block`'s send blocks when
+  the queue is full — consensus *cannot* outrun execution by more
+  than depth+1 heights. Backpressure is the enforcement the audit
+  asked for; a dead lane still errors the send and falls into the
+  fail-closed drain.
+- `insert_finalized` replaces raw `insert_retained` on the
+  `finalized` map: eviction is permitted only at-or-below the
+  `executed` watermark, so a committed-but-unexecuted height is
+  never pruned — the drain's backlog is pinned in memory. The
+  watermark is read before the map lock (no nested critical
+  sections), and synchronous mode now advances `executed` too so
+  the pin is uniform.
+
+The persisted-backlog half of the finding stays deliberately
+out of scope: durable recovery after a partial-application halt
+belongs to the journal/snapshot/backend at restart (the 3.4
+contract), not to a second in-memory copy of the commit log.
+
+Tests: `finalized_pruning_pins_unexecuted_heights` drives the map
+past its window with an empty `executed` watermark and proves
+nothing is evicted, then that executed heights evict normally.
+`exec_lane_queue_is_bounded` parks the worker behind a gated
+module, fills the queue, and proves the next `finalize_block`
+blocks until the worker drains. 87 executor unit + 5 signed-tx
+integration tests green; fmt + clippy clean.
