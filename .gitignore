@@ -38,6 +38,7 @@ fuzz/artifacts/
 fuzz/target/
 fuzz/coverage/
 fuzz/soak_logs/
+fuzz/corpus/
 
 plan.md
 
