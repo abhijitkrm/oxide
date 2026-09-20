@@ -58,6 +58,14 @@ pub enum TradingError {
     /// should make it impossible); it is rejected loudly rather than
     /// saturating, because saturation would fork validators.
     Overflow,
+    /// Snapshot/canonical state bytes were malformed or internally
+    /// inconsistent.
+    ///
+    /// Only produced by the cold-path restore API
+    /// (`decode_canonical_state`, `from_canonical_state`,
+    /// `restore_resting`) — the match path can never emit it. A
+    /// corrupt snapshot is rejected, never partially restored.
+    CorruptState(&'static str),
 }
 
 impl fmt::Display for TradingError {
@@ -74,6 +82,9 @@ impl fmt::Display for TradingError {
             }
             TradingError::Overflow => {
                 write!(f, "fixed-point overflow in order math")
+            }
+            TradingError::CorruptState(what) => {
+                write!(f, "corrupt canonical book state: {what}")
             }
         }
     }

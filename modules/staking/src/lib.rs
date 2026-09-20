@@ -1269,12 +1269,84 @@ impl Module for StakingModule {
         // Locks are taken one at a time and released before the
         // next — no lock-order interaction with handlers.
         let mut w = framework::CanonicalState::new();
-        w.put_root(&subtree_root(&self.store));
-        self.commit_stake_state(&mut w);
-        self.commit_reward_state(&mut w);
-        self.commit_set_state(&mut w);
-        self.commit_consensus_state(&mut w);
+        self.write_committed(&mut w);
         w.root()
+    }
+
+    /// Export the committed state as one canonical blob —
+    /// `canon ‖ store`. The canon section is the `state_root`
+    /// preimage, so a peer can verify the claimed root before
+    /// installing anything (audit 3.2).
+    fn export_state(&self) -> Option<storage::Snapshot> {
+        let mut w = framework::CanonicalState::new();
+        self.write_committed(&mut w);
+        Some(storage::Snapshot {
+            height: 0,
+            entries: vec![(
+                framework::state_blob_key(),
+                framework::encode_state_blob(w.as_bytes(), &self.store),
+            )],
+        })
+    }
+
+    /// Verify a staged snapshot's claimed root without mutating:
+    /// decode the blob, check the store section hashes to the
+    /// committed subtree root, fully decode every field with all
+    /// internal invariants enforced, then hash the canonical
+    /// preimage.
+    fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
+        let (canon, _staged, _store) =
+            framework::stage_blob_snapshot(snapshot, |r, store| Self::decode_committed(r, store))?;
+        Ok(framework::canon_root(canon))
+    }
+
+    /// Install staged state after `inspect_state` has proven it —
+    /// the same staged decode runs again, then every field swaps in
+    /// (decode first, mutate second).
+    fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+        let (_canon, staged, store) =
+            framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s))?;
+        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        *self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.validators;
+        *self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.delegations;
+        *self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.unbonding;
+        *self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.pending_rewards;
+        *self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.reward_per_token;
+        *self.reward_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.reward_debt;
+        *self.self_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.self_debt;
+        *self.delegator_index.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.delegator_index;
+        *self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.delegated_total;
+        *self.pending_key_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.pending_key_changes;
+        *self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.pending_validator_adds;
+        *self.pending_validator_removes.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.pending_validator_removes;
+        *self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = staged.bls_keys;
+        *self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = staged.jailed;
+        *self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.pending_jails;
+        *self.pending_unjails.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.pending_unjails;
+        *self.scheduled_halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.scheduled_halt;
+        *self.seen_evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.seen_evidence;
+        *self.attendance.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.attendance;
+        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.current_height;
+        self.endorsements.replace_with(staged.endorsements);
+        Ok(())
     }
 
     fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
@@ -1284,6 +1356,59 @@ impl Module for StakingModule {
     fn take_validator_changes(&self) -> executor::ValidatorChanges {
         StakingModule::take_validator_changes(self)
     }
+}
+
+/// Staged staking state — the decoded form of a snapshot blob's
+/// canonical section, produced by [`StakingModule::decode_committed`]
+/// and installed by `import_state` only after the executor has
+/// verified the blob's claimed root.
+///
+/// The `ledger` handle is not part of it — assembly wiring reattached
+/// by the node harness, not chain state.
+#[derive(Default)]
+struct StagedStaking {
+    /// Validator stake: address → total bonded.
+    validators: BTreeMap<Address, u64>,
+    /// `(delegator, validator) → bonded amount`.
+    delegations: BTreeMap<(Address, Address), u64>,
+    /// FIFO unbonding queue.
+    unbonding: Vec<UnbondingEntry>,
+    /// Claimable rewards per delegator.
+    pending_rewards: BTreeMap<Address, u64>,
+    /// Lazy-accrual accumulator per validator.
+    reward_per_token: BTreeMap<Address, u128>,
+    /// Reward debt per `(delegator, validator)`.
+    reward_debt: BTreeMap<(Address, Address), u128>,
+    /// Self-share reward debt per validator.
+    self_debt: BTreeMap<Address, u128>,
+    /// Delegator → set of validators mirrored from `delegations`.
+    delegator_index: BTreeMap<Address, std::collections::BTreeSet<Address>>,
+    /// Total delegated into each validator.
+    delegated_total: BTreeMap<Address, u64>,
+    /// Pending consensus-key rotations.
+    pending_key_changes: BTreeMap<Address, Vec<u8>>,
+    /// Endorsed validator admissions awaiting the epoch rotation.
+    pending_validator_adds: Vec<(Address, Vec<u8>)>,
+    /// Endorsed removals awaiting the epoch rotation.
+    pending_validator_removes: Vec<Address>,
+    /// Pending governance endorsements (C9).
+    endorsements: framework::Endorsements,
+    /// Live BLS consensus keys.
+    bls_keys: BTreeMap<Address, Vec<u8>>,
+    /// Jailed validators: address → height jailed.
+    jailed: BTreeMap<Address, u64>,
+    /// Jail events awaiting the next validator-set broadcast.
+    pending_jails: Vec<Address>,
+    /// Unjail events awaiting the next validator-set broadcast.
+    pending_unjails: Vec<Address>,
+    /// Governance-scheduled halt height.
+    scheduled_halt: Option<u64>,
+    /// Evidence hashes already acted on (replay guard).
+    seen_evidence: std::collections::BTreeSet<Hash>,
+    /// Per-validator attendance rings for downtime tracking.
+    attendance: BTreeMap<Address, std::collections::VecDeque<bool>>,
+    /// Last processed block height.
+    current_height: u64,
 }
 
 impl StakingModule {
@@ -1473,6 +1598,354 @@ impl StakingModule {
             }
         }
         w.put_u64(*self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
+
+    /// Write the module's committed state into `w` — shared by
+    /// `state_root` and `export_state` so the snapshot blob's
+    /// canonical section is provably the same bytes `state_root`
+    /// hashes.
+    fn write_committed(&self, w: &mut framework::CanonicalState) {
+        w.put_root(&subtree_root(&self.store));
+        self.commit_stake_state(w);
+        self.commit_reward_state(w);
+        self.commit_set_state(w);
+        self.commit_consensus_state(w);
+    }
+
+    /// Decode the canonical fields following the leading store root —
+    /// shared by `inspect_state` and `import_state` so verification
+    /// and installation can never disagree about the schema. Field
+    /// order mirrors `commit_stake_state` → `commit_consensus_state`
+    /// exactly.
+    ///
+    /// Beyond structural validity this enforces the *internal*
+    /// invariants every live code path maintains (store mirror,
+    /// index/total mirrors, pending-action membership). Those matter
+    /// because the root check alone only proves the blob hashes to
+    /// the claimed root — a crafted blob with a matching claimed root
+    /// could otherwise install state no honest execution could
+    /// produce.
+    fn decode_committed(
+        r: &mut framework::CanonicalReader<'_>,
+        store: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Option<StagedStaking> {
+        let mut staged = StagedStaking::default();
+        Self::decode_stake_state(r, &mut staged)?;
+        Self::decode_reward_state(r, &mut staged)?;
+        Self::decode_set_state(r, &mut staged)?;
+        Self::decode_consensus_state(r, &mut staged)?;
+        Self::check_replica_mirrors(&staged)?;
+        Self::check_store_binding(&staged, store)?;
+        Some(staged)
+    }
+
+    /// Decode `validators`, `delegations`, and the `unbonding` queue —
+    /// the mirror of [`Self::commit_stake_state`].
+    fn decode_stake_state(
+        r: &mut framework::CanonicalReader<'_>,
+        out: &mut StagedStaking,
+    ) -> Option<()> {
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            let stake = r.get_u64()?;
+            if out.validators.insert(a, stake).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let d = r.get_addr()?;
+            let v = r.get_addr()?;
+            let amt = r.get_u64()?;
+            // A delegation can only target a registered validator —
+            // `delegate` requires membership and validator removal
+            // drains every delegation into the unbonding queue.
+            if !out.validators.contains_key(&v) {
+                return None;
+            }
+            if out.delegations.insert((d, v), amt).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        // Order-preserving: the queue is FIFO by completion height;
+        // `n.min(remaining/56)` bounds the allocation to what the
+        // bytes could actually encode (each entry costs 56 bytes).
+        out.unbonding.reserve(n.min(r.remaining() / 56));
+        for _ in 0..n {
+            out.unbonding.push(UnbondingEntry {
+                delegator: r.get_addr()?,
+                validator: r.get_addr()?,
+                amount: r.get_u64()?,
+                completion_height: r.get_u64()?,
+            });
+        }
+        Some(())
+    }
+
+    /// Decode the reward-accrual bookkeeping — the mirror of
+    /// [`Self::commit_reward_state`].
+    fn decode_reward_state(
+        r: &mut framework::CanonicalReader<'_>,
+        out: &mut StagedStaking,
+    ) -> Option<()> {
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            if out.pending_rewards.insert(a, r.get_u64()?).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            if out.reward_per_token.insert(a, r.get_u128()?).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let d = r.get_addr()?;
+            let v = r.get_addr()?;
+            if out.reward_debt.insert((d, v), r.get_u128()?).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            if out.self_debt.insert(a, r.get_u128()?).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let d = r.get_addr()?;
+            let vn = r.get_count()?;
+            let mut set = std::collections::BTreeSet::new();
+            for _ in 0..vn {
+                if !set.insert(r.get_addr()?) {
+                    return None;
+                }
+            }
+            if out.delegator_index.insert(d, set).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            if out.delegated_total.insert(a, r.get_u64()?).is_some() {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    /// Decode the validator-set transition state — the mirror of
+    /// [`Self::commit_set_state`]. Membership in `out.validators` is
+    /// enforced where the live paths require it.
+    fn decode_set_state(
+        r: &mut framework::CanonicalReader<'_>,
+        out: &mut StagedStaking,
+    ) -> Option<()> {
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            // `handle_key_change` requires the validator to exist.
+            if !out.validators.contains_key(&a) {
+                return None;
+            }
+            if out.pending_key_changes.insert(a, r.get_bytes()?.to_vec()).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        out.pending_validator_adds.reserve(n.min(r.remaining() / 20));
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            let key = r.get_bytes()?.to_vec();
+            // `validate_add_action` seats the candidate in
+            // `validators` (0 stake) and records its key in
+            // `bls_keys` at quorum time — both must hold.
+            if !out.validators.contains_key(&a) {
+                return None;
+            }
+            out.pending_validator_adds.push((a, key));
+        }
+        let n = r.get_count()?;
+        out.pending_validator_removes.reserve(n.min(r.remaining() / 20));
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            // Removal is only ever queued for a live member.
+            if !out.validators.contains_key(&a) {
+                return None;
+            }
+            out.pending_validator_removes.push(a);
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            let key = r.get_bytes()?.to_vec();
+            // Consensus keys are fixed-size BLS12-381 compressed
+            // public keys — every writer enforces 48 bytes.
+            if key.len() != crypto::bls::PublicKey::LEN {
+                return None;
+            }
+            if out.bls_keys.insert(a, key).is_some() {
+                return None;
+            }
+        }
+        for (a, key) in &out.pending_validator_adds {
+            match out.bls_keys.get(a) {
+                Some(k) if *k == *key => {}
+                _ => return None,
+            }
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            if out.jailed.insert(a, r.get_u64()?).is_some() {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        out.pending_jails.reserve(n.min(r.remaining() / 20));
+        for _ in 0..n {
+            out.pending_jails.push(r.get_addr()?);
+        }
+        let n = r.get_count()?;
+        out.pending_unjails.reserve(n.min(r.remaining() / 20));
+        for _ in 0..n {
+            out.pending_unjails.push(r.get_addr()?);
+        }
+        out.endorsements = framework::Endorsements::read_canonical(r)?;
+        Some(())
+    }
+
+    /// Decode consensus-adjacent state — the mirror of
+    /// [`Self::commit_consensus_state`].
+    fn decode_consensus_state(
+        r: &mut framework::CanonicalReader<'_>,
+        out: &mut StagedStaking,
+    ) -> Option<()> {
+        out.scheduled_halt = match r.get_u8()? {
+            0 => None,
+            1 => Some(r.get_u64()?),
+            _ => return None,
+        };
+        let n = r.get_count()?;
+        for _ in 0..n {
+            if !out.seen_evidence.insert(r.get_root()?) {
+                return None;
+            }
+        }
+        let n = r.get_count()?;
+        for _ in 0..n {
+            let a = r.get_addr()?;
+            let ring_len = r.get_count()?;
+            let mut ring = std::collections::VecDeque::with_capacity(ring_len.min(r.remaining()));
+            for _ in 0..ring_len {
+                ring.push_back(r.get_bool()?);
+            }
+            if out.attendance.insert(a, ring).is_some() {
+                return None;
+            }
+        }
+        out.current_height = r.get_u64()?;
+        Some(())
+    }
+
+    /// Enforce the replicated-state mirrors: `delegator_index` and
+    /// `delegated_total` are maintained alongside `delegations` and
+    /// must agree exactly — drift corrupts reward/delegation walks.
+    fn check_replica_mirrors(staged: &StagedStaking) -> Option<()> {
+        for (d, v) in staged.delegations.keys() {
+            match staged.delegator_index.get(d) {
+                Some(set) if set.contains(v) => {}
+                _ => return None,
+            }
+        }
+        for (d, set) in &staged.delegator_index {
+            for v in set {
+                if !staged.delegations.contains_key(&(*d, *v)) {
+                    return None;
+                }
+            }
+        }
+        // `delegated_total[v]` is the sum of all delegations into
+        // `v` — maintained on every delegate/undelegate/slash and
+        // never re-derived, so it must match exactly.
+        let mut totals = BTreeMap::<Address, u128>::new();
+        for ((_, v), amt) in &staged.delegations {
+            *totals.entry(*v).or_default() += u128::from(*amt);
+        }
+        for (v, expected) in &totals {
+            if staged.delegated_total.get(v).copied().unwrap_or(0)
+                != u64::try_from(*expected).ok()?
+            {
+                return None;
+            }
+        }
+        for (v, total) in &staged.delegated_total {
+            // Entries are removed with the validator; a total for an
+            // unregistered address is dead state.
+            if !staged.validators.contains_key(v) {
+                return None;
+            }
+            if u128::from(*total) != *totals.get(v).unwrap_or(&0) {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    /// Enforce the KV-store mirror. The binding is intentionally
+    /// asymmetric: `genesis_register_validator` never mirrors a
+    /// validator's stake into the store, so a bare 20-byte store key
+    /// must resolve to a live validator with the same stake, but a
+    /// validator WITHOUT a store entry is legitimate (genesis-only,
+    /// never delegated). `del/` entries are mirrored in both
+    /// directions because every delegation mutation goes through
+    /// `store_delegation_state`.
+    fn check_store_binding(
+        staged: &StagedStaking,
+        store: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Option<()> {
+        for ((d, v), amt) in &staged.delegations {
+            let mut key = Vec::with_capacity(4 + 40);
+            key.extend_from_slice(b"del/");
+            key.extend_from_slice(&d.0);
+            key.extend_from_slice(&v.0);
+            match store.get(&key) {
+                Some(val) if *val == amt.to_le_bytes() => {}
+                _ => return None,
+            }
+        }
+        for (key, val) in store {
+            if let Some(rest) = key.strip_prefix(b"del/") {
+                if rest.len() != 40 {
+                    return None;
+                }
+                let d = Address(rest[..20].try_into().ok()?);
+                let v = Address(rest[20..].try_into().ok()?);
+                match staged.delegations.get(&(d, v)) {
+                    Some(amt) if *val == amt.to_le_bytes() => {}
+                    _ => return None,
+                }
+            } else {
+                if key.len() != Address::LEN {
+                    return None;
+                }
+                let v = Address(key.as_slice().try_into().ok()?);
+                match staged.validators.get(&v) {
+                    Some(stake) if *val == stake.to_le_bytes() => {}
+                    _ => return None,
+                }
+            }
+        }
+        Some(())
     }
 
     /// The delegator's bonded amount with a validator.
@@ -4204,5 +4677,41 @@ mod tests {
         let root0 = staking.state_root();
         staking.handle(&ctx_with_sender(1), &msg::validator_remove(addr(2))).unwrap();
         assert_ne!(staking.state_root(), root0, "a pending endorsement is committed state");
+    }
+
+    /// Snapshot round-trip: validators, delegations, an unbonding
+    /// entry, and the reward/set bookkeeping must export, verify,
+    /// and re-import byte-identically — the imported module's root
+    /// must equal the source's (audit 3.2).
+    #[test]
+    fn state_snapshot_round_trips() {
+        let src = setup(&[1, 2]);
+        src.handle(&ctx_with_sender(1), &msg::delegate(addr(1), 100)).unwrap();
+        src.handle(&ctx_with_sender(3), &msg::delegate(addr(2), 250)).unwrap();
+        // An unbonding entry exercises the FIFO queue section.
+        src.handle(&ctx_with_sender(3), &msg::undelegate(addr(2), 50)).unwrap();
+        src.begin_block(Height::new(10));
+        src.end_block(Height::new(10));
+
+        let snapshot = src.export_state().expect("staking exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+        let dst = StakingModule::new();
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        assert_eq!(dst.delegation(&addr(1), &addr(1)), 100);
+        assert_eq!(dst.delegation(&addr(3), &addr(2)), 200);
+    }
+
+    /// A truncated blob must fail inspection and import — the
+    /// claimed root is never trusted over the bytes.
+    #[test]
+    fn state_snapshot_rejects_corruption() {
+        let src = setup(&[1]);
+        src.handle(&ctx_with_sender(1), &msg::delegate(addr(1), 100)).unwrap();
+        let mut snapshot = src.export_state().unwrap();
+        snapshot.entries[0].1.truncate(12);
+        assert!(src.inspect_state(&snapshot).is_err());
+        assert!(StakingModule::new().import_state(&snapshot).is_err());
     }
 }

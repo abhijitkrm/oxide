@@ -310,6 +310,53 @@ impl Endorsements {
             }
         }
     }
+
+    /// Decode the tally written by [`Self::write_canonical`] —
+    /// snapshot restore must rebuild the same (action → endorsers)
+    /// map so the two-thirds tally resumes identically.
+    ///
+    /// `None` on truncation or a non-canonical stream: duplicate
+    /// action keys or duplicate endorsers within an action are
+    /// rejected (a `BTreeMap`/`BTreeSet` insert would otherwise
+    /// silently absorb them). The claimed counts only pace the
+    /// loops — every element read bounds-checks, so a forged count
+    /// cannot over-allocate.
+    #[must_use]
+    pub fn read_canonical(r: &mut CanonicalReader<'_>) -> Option<Self> {
+        let count = r.get_count()?;
+        let mut inner = BTreeMap::new();
+        for _ in 0..count {
+            let action = r.get_bytes()?.to_vec();
+            let n = r.get_count()?;
+            let mut endorsers = BTreeSet::new();
+            for _ in 0..n {
+                if !endorsers.insert(r.get_addr()?) {
+                    return None; // Duplicate endorser — non-canonical.
+                }
+            }
+            if inner.insert(action, endorsers).is_some() {
+                return None; // Duplicate action — non-canonical.
+            }
+        }
+        Some(Self { inner: Mutex::new(inner) })
+    }
+
+    /// Replace the tally's contents with `other` — snapshot restore.
+    ///
+    /// Modules hold `Endorsements` by value inside `&self`-shared
+    /// module state, so import cannot move-assign the field; this
+    /// swaps the inner map instead. `other` must come from
+    /// [`Self::read_canonical`] (or an equivalently verified decode)
+    /// so the canonical structure is preserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a mutex is poisoned.
+    pub fn replace_with(&self, other: Endorsements) {
+        let mut dst = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let src = other.inner.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *dst = src;
+    }
 }
 
 /// The mark-price sink seam — where the oracle's aggregated price
@@ -430,6 +477,10 @@ impl Balances for MemoryBalances {
 /// requires `Sync`).
 pub type KVStore = Mutex<BTreeMap<Vec<u8>, Vec<u8>>>;
 
+/// The unlocked form of a module's KV subtree — the decoded store
+/// section of a canonical state blob (see [`decode_state_blob`]).
+pub type StoreMap = BTreeMap<Vec<u8>, Vec<u8>>;
+
 /// A module router: registers modules and provides lookup.
 pub struct ModuleRouter {
     modules: BTreeMap<u8, Arc<dyn Module>>,
@@ -476,10 +527,23 @@ impl Default for ModuleRouter {
 /// Panics if the `KVStore` mutex is poisoned (a thread panicked while
 /// holding the lock).
 pub fn subtree_root(store: &KVStore) -> Hash {
+    let locked = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    subtree_root_map(&locked)
+}
+
+/// Compute a subtree root over a plain map — the pure form of
+/// [`subtree_root`].
+///
+/// Snapshot staging needs the subtree root of a store that is still
+/// being decoded — before it is committed into a `KVStore` — so the
+/// hashing loop is exposed over the map itself. The encoding is the
+/// same (`key ‖ u64-le vlen ‖ value` in `BTreeMap` order, hashed
+/// under `Domain::Block`); both functions MUST stay byte-identical.
+#[must_use]
+pub fn subtree_root_map(store: &StoreMap) -> Hash {
     use crypto::hash::{Domain, Hasher};
     let mut data = Vec::new();
-    let locked = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    for (k, v) in locked.iter() {
+    for (k, v) in store {
         data.extend_from_slice(k);
         data.extend_from_slice(&(v.len() as u64).to_le_bytes());
         data.extend_from_slice(v);
@@ -623,6 +687,257 @@ impl CanonicalState {
     }
 }
 
+/// Bounds-checked decode mirror of [`CanonicalState`].
+///
+/// Snapshot import is untrusted input: every read bounds-checks
+/// against the buffer and returns `None` on truncation or a
+/// non-canonical value (e.g. a `bool` byte other than `0`/`1`) —
+/// never a panic. Callers MUST check [`Self::at_end`] after
+/// decoding: a stream with trailing garbage is malformed, not
+/// silently consumed.
+///
+/// [`Self::get_count`] returns a *claimed* element count. Do NOT
+/// pre-allocate by it — a forged `u64::MAX` count would be an
+/// allocation bomb. Instead let each element's own read bound the
+/// loop: a stream of `n` bytes can encode at most `n` elements.
+pub struct CanonicalReader<'a> {
+    /// The buffer being decoded.
+    buf: &'a [u8],
+    /// Read cursor — next unread byte offset.
+    pos: usize,
+}
+
+impl<'a> CanonicalReader<'a> {
+    /// A reader over `buf` positioned at the start.
+    #[must_use]
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    /// `true` when the buffer is exactly consumed — check after
+    /// decoding so trailing garbage marks the input malformed.
+    #[must_use]
+    pub fn at_end(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+
+    /// Bytes remaining unread.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    /// Consume `n` raw bytes, or `None` if fewer remain.
+    pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
+        Some(out)
+    }
+
+    /// A `u8` (mirror of [`CanonicalState::put_u8`]/`put_tag`).
+    pub fn get_u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    /// A `u16` little-endian.
+    pub fn get_u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    /// A `u32` little-endian.
+    pub fn get_u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    /// A `u64` little-endian.
+    pub fn get_u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// A `u128` little-endian.
+    pub fn get_u128(&mut self) -> Option<u128> {
+        Some(u128::from_le_bytes(self.take(16)?.try_into().ok()?))
+    }
+
+    /// An `i64` little-endian.
+    pub fn get_i64(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// A `bool` — canonical form only: `0`/`1`; any other byte is
+    /// malformed (a permissive `!= 0` read would accept multiple
+    /// encodings of the same value, breaking byte-exactness).
+    pub fn get_bool(&mut self) -> Option<bool> {
+        match self.get_u8()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// An `Address` — 20 raw bytes.
+    pub fn get_addr(&mut self) -> Option<Address> {
+        let mut a = [0u8; Address::LEN];
+        a.copy_from_slice(self.take(Address::LEN)?);
+        Some(Address(a))
+    }
+
+    /// A `Hash` — 32 raw bytes (mirror of `put_root`).
+    pub fn get_root(&mut self) -> Option<Hash> {
+        let mut h = [0u8; Hash::LEN];
+        h.copy_from_slice(self.take(Hash::LEN)?);
+        Some(Hash(h))
+    }
+
+    /// An element count (mirror of `put_count`). See the struct
+    /// docs: treat it as a claim, not an allocation size.
+    pub fn get_count(&mut self) -> Option<usize> {
+        usize::try_from(self.get_u64()?).ok()
+    }
+
+    /// A `u64`-length-prefixed byte string (mirror of `put_bytes`).
+    pub fn get_bytes(&mut self) -> Option<&'a [u8]> {
+        let len = self.get_count()?;
+        self.take(len)
+    }
+}
+
+/// Hash a canonical preimage — the state root it claims.
+///
+/// Shared by `Module::inspect_state` impls so the domain separation
+/// matches [`CanonicalState::root`] exactly (`Domain::Block`).
+#[must_use]
+pub fn canon_root(canon: &[u8]) -> Hash {
+    use crypto::hash::{Domain, Hasher};
+    Hasher::hash_one(Domain::Block, canon)
+}
+
+/// The snapshot-entry key a module's canonical state blob lives under.
+///
+/// A canonical module snapshot carries exactly ONE entry: the whole
+/// committed state as an opaque blob under this fixed key. Deriving
+/// the key from a fixed tag keeps it self-describing, and the single
+/// entry makes multi-entry or mis-keyed snapshots trivially
+/// malformed — there is nothing else a canonical blob legitimately
+/// contains.
+#[must_use]
+pub fn state_blob_key() -> Hash {
+    use crypto::hash::{Domain, Hasher};
+    Hasher::hash_one(Domain::Block, b"oxide/module-state-blob")
+}
+
+/// Pack committed state into a module's single snapshot value:
+/// `u64(canon_len) ‖ canon ‖ store`.
+///
+/// `canon` is the module's [`CanonicalState`] preimage — the bytes
+/// `state_root` hashes — and `store` serializes the module's KV
+/// subtree as `u64(count) ‖ (u64 klen ‖ key ‖ u64 vlen ‖ val)*` in
+/// `BTreeMap` (sorted) key order. The two sections stay separate
+/// because `canon` commits `subtree_root(store)` — a 32-byte digest,
+/// not the entries — so `canon_root(canon)` still equals the
+/// module's `state_root` while the blob carries enough information
+/// to rebuild the store on a peer.
+///
+/// # Panics
+///
+/// Panics if the `KVStore` mutex is poisoned.
+#[must_use]
+pub fn encode_state_blob(canon: &[u8], store: &KVStore) -> Vec<u8> {
+    let locked = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[allow(clippy::cast_possible_truncation)]
+    let mut out = Vec::with_capacity(8 + canon.len() + 8 + locked.len() * 16);
+    out.extend_from_slice(&(canon.len() as u64).to_le_bytes());
+    out.extend_from_slice(canon);
+    out.extend_from_slice(&(locked.len() as u64).to_le_bytes());
+    for (k, v) in locked.iter() {
+        out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+        out.extend_from_slice(k);
+        out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+/// Inverse of [`encode_state_blob`] — splits a blob into the
+/// canonical preimage and the rebuilt store map.
+///
+/// Structural validation only: the length prefix must be consistent,
+/// keys must be strictly increasing (canonical order — a sorted map
+/// would silently absorb a duplicate key otherwise), and the buffer
+/// must be consumed exactly. Semantic checks — the subtree root
+/// committed inside `canon`, field decoding — happen in
+/// [`stage_blob_snapshot`].
+#[must_use]
+pub fn decode_state_blob(blob: &[u8]) -> Option<(&[u8], StoreMap)> {
+    let mut r = CanonicalReader::new(blob);
+    let canon_len = r.get_count()?;
+    let canon = r.take(canon_len)?;
+    let n = r.get_count()?;
+    let mut store = BTreeMap::new();
+    let mut prev: Option<&[u8]> = None;
+    for _ in 0..n {
+        let k = r.get_bytes()?;
+        let v = r.get_bytes()?.to_vec();
+        if prev.is_some_and(|p| p >= k) {
+            return None; // Unsorted or duplicate key — not canonical.
+        }
+        prev = Some(k);
+        store.insert(k.to_vec(), v);
+    }
+    if !r.at_end() {
+        return None;
+    }
+    Some((canon, store))
+}
+
+/// Decode and verify a canonical-blob module snapshot WITHOUT
+/// mutating anything — the shared staging step for
+/// `Module::inspect_state` and `Module::import_state`.
+///
+/// Checks, in order:
+/// 1. The snapshot is exactly one entry under [`state_blob_key`].
+/// 2. The blob splits cleanly via [`decode_state_blob`].
+/// 3. The rebuilt store's [`subtree_root_map`] equals the root the
+///    canonical stream commits as its first field (`put_root`) —
+///    the store section cannot disagree with the canonical section.
+/// 4. `parse` fully decodes the remaining canonical fields (and may
+///    cross-check against the store) and consumes the stream exactly.
+///
+/// Returns `(canon, staged, store)`: `canon` is the root preimage —
+/// [`canon_root`]`(canon)` is the state root this snapshot claims —
+/// `staged` is the module's decoded field set, and `store` is the
+/// rebuilt KV subtree. A module's `import_state` should install both
+/// only after this returns `Ok`.
+///
+/// # Errors
+///
+/// [`storage::SnapshotError::Malformed`] on any structural,
+/// consistency, or field-decode failure.
+pub fn stage_blob_snapshot<'a, S>(
+    snapshot: &'a storage::Snapshot,
+    parse: impl FnOnce(&mut CanonicalReader<'a>, &StoreMap) -> Option<S>,
+) -> Result<(&'a [u8], S, StoreMap), storage::SnapshotError> {
+    if snapshot.entries.len() != 1 || snapshot.entries[0].0 != state_blob_key() {
+        return Err(storage::SnapshotError::Malformed);
+    }
+    let (canon, store) =
+        decode_state_blob(&snapshot.entries[0].1).ok_or(storage::SnapshotError::Malformed)?;
+    let mut r = CanonicalReader::new(canon);
+    let committed_root = r.get_root().ok_or(storage::SnapshotError::Malformed)?;
+    if subtree_root_map(&store) != committed_root {
+        return Err(storage::SnapshotError::Malformed);
+    }
+    let staged = parse(&mut r, &store).ok_or(storage::SnapshotError::Malformed)?;
+    if !r.at_end() {
+        return Err(storage::SnapshotError::Malformed);
+    }
+    Ok((canon, staged, store))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,5 +988,219 @@ mod tests {
             .insert(b"k".to_vec(), b"v".to_vec());
         let root1 = subtree_root(&store);
         assert_ne!(root0, root1, "state root must change when state changes");
+    }
+
+    /// `subtree_root` and `subtree_root_map` must agree byte-for-byte —
+    /// snapshot staging verifies a rebuilt map against the committed
+    /// root, so the two encodings can never diverge.
+    #[test]
+    fn subtree_root_map_matches_locked_store() {
+        let store: KVStore = Mutex::new(BTreeMap::new());
+        {
+            let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.insert(b"alpha".to_vec(), vec![1, 2, 3]);
+            s.insert(b"beta".to_vec(), vec![]);
+        }
+        let map = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        assert_eq!(subtree_root(&store), subtree_root_map(&map));
+    }
+
+    /// `CanonicalState` → `CanonicalReader` must round-trip every field
+    /// kind and end exactly at the stream's end.
+    #[test]
+    fn canonical_reader_round_trips_all_fields() {
+        let mut w = CanonicalState::new();
+        w.put_tag(0xA5)
+            .put_u8(7)
+            .put_u16(0xBEEF)
+            .put_u32(0xDEAD_BEEF)
+            .put_u64(u64::MAX)
+            .put_u128(u128::from(u64::MAX) + 1)
+            .put_i64(-42)
+            .put_bool(true)
+            .put_bool(false)
+            .put_addr(&Address([0xAB; 20]))
+            .put_count(3)
+            .put_bytes(b"payload")
+            .put_root(&Hash([0x11; 32]));
+
+        let mut r = CanonicalReader::new(w.as_bytes());
+        assert_eq!(r.get_u8(), Some(0xA5));
+        assert_eq!(r.get_u8(), Some(7));
+        assert_eq!(r.get_u16(), Some(0xBEEF));
+        assert_eq!(r.get_u32(), Some(0xDEAD_BEEF));
+        assert_eq!(r.get_u64(), Some(u64::MAX));
+        assert_eq!(r.get_u128(), Some(u128::from(u64::MAX) + 1));
+        assert_eq!(r.get_i64(), Some(-42));
+        assert_eq!(r.get_bool(), Some(true));
+        assert_eq!(r.get_bool(), Some(false));
+        assert_eq!(r.get_addr(), Some(Address([0xAB; 20])));
+        assert_eq!(r.get_count(), Some(3));
+        assert_eq!(r.get_bytes(), Some(b"payload".as_slice()));
+        assert_eq!(r.get_root(), Some(Hash([0x11; 32])));
+        assert!(r.at_end(), "a well-formed stream must be consumed exactly");
+    }
+
+    /// Every malformed input must yield `None`, never a panic:
+    /// truncation, trailing garbage, a non-canonical bool, and a
+    /// length prefix that overruns the buffer.
+    #[test]
+    fn canonical_reader_rejects_malformed() {
+        // Truncated u64.
+        assert_eq!(CanonicalReader::new(&[1, 2, 3]).get_u64(), None);
+        // Trailing garbage after a valid field.
+        let mut r = CanonicalReader::new(&[0, 9]);
+        assert_eq!(r.get_bool(), Some(false));
+        assert!(!r.at_end());
+        // Non-canonical bool bytes.
+        assert_eq!(CanonicalReader::new(&[2]).get_bool(), None);
+        assert_eq!(CanonicalReader::new(&[0xFF]).get_bool(), None);
+        // Length prefix exceeding remaining bytes.
+        let big = u64::MAX.to_le_bytes();
+        let mut r = CanonicalReader::new(&big);
+        assert_eq!(r.get_bytes(), None, "claimed length must not wrap or overrun");
+        // u64 count that cannot fit usize is still rejected cleanly
+        // on the element reads — not at the count read itself.
+        let mut r = CanonicalReader::new(&big);
+        assert_eq!(r.get_count(), Some(usize::MAX));
+        assert_eq!(r.get_u8(), None);
+    }
+
+    /// A blob round-trips: canon + store rebuild the same subtree
+    /// root, and `canon_root` of the preimage equals `CanonicalState`'s
+    /// root — the invariant `inspect_state` depends on.
+    #[test]
+    fn state_blob_round_trip() {
+        let store: KVStore = Mutex::new(BTreeMap::new());
+        {
+            let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.insert(b"m/1".to_vec(), vec![9; 4]);
+            s.insert(b"m/2".to_vec(), b"x".to_vec());
+        }
+        let mut w = CanonicalState::new();
+        w.put_root(&subtree_root(&store));
+        w.put_u64(42);
+        let canon = w.as_bytes().to_vec();
+        let claimed = w.root();
+
+        let blob = encode_state_blob(&canon, &store);
+        let snapshot = storage::Snapshot { height: 0, entries: vec![(state_blob_key(), blob)] };
+
+        let (canon_back, fields, store_back) = stage_blob_snapshot(&snapshot, |r, _store| {
+            r.get_u64() // the single committed field after the root
+        })
+        .expect("well-formed blob must stage");
+        assert_eq!(fields, 42);
+        assert_eq!(canon_back, canon.as_slice());
+        assert_eq!(canon_root(canon_back), claimed, "canon hash must equal state_root");
+        assert_eq!(
+            subtree_root_map(&store_back),
+            subtree_root(&store),
+            "rebuilt store must hash to the same subtree root"
+        );
+    }
+
+    /// Malformed blob inputs must all be rejected: wrong entry count,
+    /// wrong key, unsorted store keys, tampered subtree root, and a
+    /// parse that leaves bytes unread.
+    #[test]
+    fn state_blob_rejects_malformed() {
+        let store: KVStore = Mutex::new(BTreeMap::new());
+        let mut w = CanonicalState::new();
+        w.put_root(&subtree_root(&store));
+        let canon = w.as_bytes().to_vec();
+        let blob = encode_state_blob(&canon, &store);
+
+        let key = state_blob_key();
+        let ok = |entries: Vec<(Hash, Vec<u8>)>| storage::Snapshot { height: 0, entries };
+
+        // Zero and two entries are both malformed.
+        assert!(stage_blob_snapshot(&ok(vec![]), |_, _| Some(())).is_err());
+        assert!(
+            stage_blob_snapshot(
+                &ok(vec![(key, blob.clone()), (Hash([1; 32]), vec![]),]),
+                |_, _| Some(())
+            )
+            .is_err()
+        );
+        // Wrong key.
+        assert!(
+            stage_blob_snapshot(&ok(vec![(Hash([0; 32]), blob.clone())]), |_, _| Some(())).is_err()
+        );
+        // Truncated blob.
+        assert!(
+            stage_blob_snapshot(&ok(vec![(key, blob[..blob.len() - 1].to_vec())]), |_, _| Some(()))
+                .is_err()
+        );
+        // Store content that doesn't match the committed subtree root:
+        // rebuild a blob whose store section holds an extra entry.
+        let tampered_store: KVStore = Mutex::new(BTreeMap::from([(b"x".to_vec(), vec![1])]));
+        let bad = encode_state_blob(&canon, &tampered_store);
+        assert!(
+            stage_blob_snapshot(&ok(vec![(key, bad)]), |_, _| Some(())).is_err(),
+            "store disagreeing with the committed subtree root must be rejected"
+        );
+        // A parse that leaves canonical bytes unread must fail:
+        // append a stray field to the canon (rebuilt against the same
+        // store so the subtree check still passes).
+        let mut w2 = CanonicalState::new();
+        w2.put_root(&subtree_root(&store));
+        w2.put_u8(0xEE); // stray trailing field the parse won't read
+        let stray = encode_state_blob(w2.as_bytes(), &store);
+        assert!(
+            stage_blob_snapshot(&ok(vec![(key, stray)]), |_, _| Some(())).is_err(),
+            "trailing canonical bytes are malformed"
+        );
+        // A parse reading past the stream's end must fail.
+        assert!(
+            stage_blob_snapshot(&ok(vec![(key, blob)]), |r, _| r.get_u8().map(|_| ())).is_err(),
+            "canon ends after the store root — a field read must fail"
+        );
+    }
+
+    /// Store keys out of canonical order must be rejected by the blob
+    /// decoder even though a `BTreeMap` would silently sort them.
+    #[test]
+    fn state_blob_rejects_unsorted_store() {
+        let mut blob = Vec::new();
+        // canon_len=32 + canon(dummy root bytes) + 2 unsorted entries.
+        blob.extend_from_slice(&32u64.to_le_bytes());
+        blob.extend_from_slice(&[0u8; 32]);
+        blob.extend_from_slice(&2u64.to_le_bytes());
+        for (k, v) in [(b"b".as_slice(), &[1u8][..]), (b"a", &[2u8][..])] {
+            blob.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            blob.extend_from_slice(k);
+            blob.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            blob.extend_from_slice(v);
+        }
+        assert!(decode_state_blob(&blob).is_none(), "unsorted keys are not the canonical encoding");
+    }
+
+    /// Endorsements must round-trip through the canonical stream:
+    /// identical tallies after decode, and duplicate keys rejected.
+    #[test]
+    fn endorsements_canonical_round_trip() {
+        let e = Endorsements::new();
+        {
+            let mut inner = e.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner
+                .insert(b"halt@100".to_vec(), BTreeSet::from([Address([1; 20]), Address([2; 20])]));
+            inner.insert(b"admit-x".to_vec(), BTreeSet::from([Address([3; 20])]));
+        }
+        let mut w = CanonicalState::new();
+        e.write_canonical(&mut w);
+
+        let mut r = CanonicalReader::new(w.as_bytes());
+        let back = Endorsements::read_canonical(&mut r).expect("must decode");
+        assert!(r.at_end());
+        assert_eq!(back.pending_count(), 2);
+
+        // A stream claiming 2 actions but containing 1 must fail.
+        let mut w2 = CanonicalState::new();
+        w2.put_count(2);
+        w2.put_bytes(b"a");
+        w2.put_count(0);
+        let mut r2 = CanonicalReader::new(w2.as_bytes());
+        assert!(Endorsements::read_canonical(&mut r2).is_none());
     }
 }

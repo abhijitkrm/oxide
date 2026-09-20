@@ -217,6 +217,39 @@ pub enum SnapshotImportError {
         /// The schema version the imported state was written at.
         from: u32,
     },
+    /// The snapshot's module name at position `i` does not match
+    /// the registered module's name — the snapshot was written by a
+    /// chain with a different module ordering, or the name list was
+    /// forged to slide a foreign blob into a module's slot.
+    ModuleNameMismatch {
+        /// Position in the module list.
+        index: usize,
+        /// The name the snapshot claims.
+        snapshot: String,
+        /// The registered module's name.
+        registered: String,
+    },
+    /// A module that declares committed state (`export_state`
+    /// returns `Some`) has no state payload in the snapshot — the
+    /// snapshot cannot be a complete image of that module.
+    MissingModuleState {
+        /// The module's name.
+        module: String,
+    },
+    /// A module that declares itself stateless (`export_state`
+    /// returns `None`) has a state payload in the snapshot — bytes
+    /// it cannot interpret must not be silently trusted.
+    UnexpectedModuleState {
+        /// The module's name.
+        module: String,
+    },
+    /// A module's `inspect_state` rejected its staged snapshot —
+    /// the bytes are malformed or internally inconsistent. Raised
+    /// during the verify phase, before any module state mutates.
+    MalformedModuleState {
+        /// The module's name.
+        module: String,
+    },
 }
 
 impl std::fmt::Display for SnapshotImportError {
@@ -244,6 +277,21 @@ impl std::fmt::Display for SnapshotImportError {
             }
             Self::MigrationFailed { module, from } => {
                 write!(f, "module {module} failed migrating state from schema v{from}")
+            }
+            Self::ModuleNameMismatch { index, snapshot, registered } => {
+                write!(
+                    f,
+                    "module name mismatch at position {index}: snapshot says '{snapshot}', registered is '{registered}'"
+                )
+            }
+            Self::MissingModuleState { module } => {
+                write!(f, "snapshot is missing state for stateful module '{module}'")
+            }
+            Self::UnexpectedModuleState { module } => {
+                write!(f, "snapshot carries state for stateless module '{module}'")
+            }
+            Self::MalformedModuleState { module } => {
+                write!(f, "module '{module}' rejected its snapshot state as malformed")
             }
         }
     }
@@ -732,41 +780,83 @@ pub trait Module: Send + Sync {
     /// Compute the module's state root (over its storage subtree).
     fn state_root(&self) -> Hash;
 
-    /// Export the module's full key-value state for snapshot sync.
+    /// Export the module's full committed state for snapshot sync.
     ///
-    /// Returns `None` if the module does not support KV export (e.g.
-    /// in-memory modules without a `StorageBackend`). Modules with a
-    /// `StorageBackend` override this to return the backend's
-    /// `snapshot_export()`.
+    /// Returns `None` if — and only if — the module carries no
+    /// committed state beyond what its constructor fixed (the
+    /// `state_root` a fresh instance reports is then the complete
+    /// commitment). `None` is a *declaration*: under strict snapshot
+    /// import the executor rejects a snapshot that supplies state
+    /// for a `None`-exporting module, and requires a `Some` snapshot
+    /// whose [`Self::inspect_state`] verifies for every module whose
+    /// `export_state` returns `Some`.
     ///
     /// This is used for full state sync: a new node imports the
     /// snapshot to skip replaying the entire chain from genesis.
-    /// The snapshot includes all key-value pairs, not just the
-    /// state root.
+    /// The snapshot must encode **every field that contributes to
+    /// [`Self::state_root`]** — not merely a KV backend — or the
+    /// importer restores a state whose root it cannot prove.
     ///
     /// # Default
     ///
-    /// Returns `None` — modules without a `StorageBackend` cannot
-    /// export KV state.
+    /// Returns `None` — declares the module stateless past
+    /// construction.
     fn export_state(&self) -> Option<storage::Snapshot> {
         None
     }
 
-    /// Import a key-value snapshot, restoring the module's state.
+    /// Compute the state root a staged snapshot claims — WITHOUT
+    /// mutating the module.
     ///
-    /// This is the import side of snapshot sync. The module restores
-    /// its `StorageBackend` from the snapshot, then reloads its
-    /// in-memory cache from the backend.
+    /// The executor calls this during the verification phase of a
+    /// strict snapshot import, before any module state is written:
+    /// it must decode and fully validate `snapshot` and return the
+    /// state root the snapshot's contents produce. The result is
+    /// compared against the snapshot's claimed per-module root; only
+    /// after **every** module passes does the executor call
+    /// [`Self::import_state`] to apply.
+    ///
+    /// "Fully validate" means byte-exact decoding of the module's own
+    /// encoding — malformed fields, trailing bytes, and internally
+    /// inconsistent sections are all `Err`, never silently skipped.
     ///
     /// # Default
     ///
-    /// Returns `Ok(())` — modules without a `StorageBackend` silently
-    /// ignore the import (their state is in-memory only).
+    /// Fails closed: returns `Err(Malformed)`. A module whose
+    /// `export_state` yields `Some` must override this — a stateful
+    /// module that cannot inspect its snapshot cannot prove the
+    /// root it would restore.
     ///
     /// # Errors
     ///
-    /// Returns [`storage::SnapshotError`] if the backend import
-    /// fails (malformed snapshot, backend I/O error).
+    /// [`storage::SnapshotError::Malformed`] on any decode or
+    /// consistency failure.
+    fn inspect_state(&self, _snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
+        Err(storage::SnapshotError::Malformed)
+    }
+
+    /// Import a snapshot, restoring the module's committed state.
+    ///
+    /// The executor calls this in the apply phase of a strict import
+    /// — after [`Self::inspect_state`] has already verified this
+    /// snapshot produces the claimed root — so `snapshot` here is
+    /// authenticated input. The module must still decode defensively
+    /// (it is a public entry point), then install the staged state
+    /// atomically: fields are swapped in only after the whole
+    /// payload decodes.
+    ///
+    /// # Default
+    ///
+    /// Returns `Ok(())` — reachable only for modules whose
+    /// `export_state` is `None` (the executor never calls it with
+    /// state then), so silently ignoring is correct: there is no
+    /// state to install.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`storage::SnapshotError`] if the payload fails to
+    /// decode (should not happen post-inspection) or a backend I/O
+    /// error occurs mid-apply.
     fn import_state(&self, _snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         Ok(())
     }
@@ -1687,17 +1777,19 @@ impl Executor {
     ///
     /// # Panics
     ///
-    /// Does not panic. Import is atomic: if verification fails, the
-    /// executor's state is unchanged.
+    /// Does not panic. Verification is atomic: no module state
+    /// mutates until every module's staged payload has passed
+    /// `inspect_state` against its claimed root.
     ///
     /// # Safety
     ///
-    /// This method does NOT restore individual module key-value
-    /// state — it only restores the chain height and state root
-    /// metadata. Full state restoration requires each module to
-    /// implement its own snapshot import. When `module_state` is
-    /// populated in the snapshot, this method calls each module's
-    /// `import_state` to restore the full key-value state.
+    /// Every module's committed state is restored: modules that
+    /// declare state (`export_state` → `Some`) must carry a payload
+    /// whose `inspect_state` reproduces the claimed module root;
+    /// stateless-declaring modules must match their construction
+    /// root and carry no payload. Anything else — missing, extra,
+    /// malformed, or mislabeled module state — fails the import
+    /// before any mutation.
     pub fn import_snapshot(&self, snapshot: &ExecutorSnapshot) -> Result<(), SnapshotImportError> {
         // A snapshot at height 0 is valid — it represents the genesis
         // state after the first (empty) block. We only reject if there
@@ -1751,70 +1843,9 @@ impl Executor {
             });
         }
 
-        // If the snapshot includes full KV state, import it into
-        // each module that supports `import_state`. This restores
-        // the complete key-value state, not just the roots.
-        //
-        // M3 fix: after importing KV state, recompute each module's
-        // state root from the imported data and verify it matches
-        // the snapshot's claimed module root. Without this, a
-        // crafted snapshot with arbitrary KV + matching aggregate
-        // root is accepted — the KV data doesn't actually produce
-        // the claimed per-module roots.
-        if !snapshot.module_state.is_empty() {
-            for (i, (module, state)) in
-                self.modules.iter().flatten().zip(&snapshot.module_state).enumerate()
-            {
-                if let Some(state) = state {
-                    module
-                        .import_state(state)
-                        .map_err(|_| SnapshotImportError::StateImportFailed)?;
-                    // Schema upgrade: the snapshot records the module
-                    // version its state was written at. Older than
-                    // declared → run the module's `migrate` hook on
-                    // the freshly imported bytes. Empty
-                    // `module_versions` (v1 snapshots) means "all
-                    // current" — v1 state predates the hook entirely.
-                    let from =
-                        snapshot.module_versions.get(i).copied().unwrap_or(module.state_version());
-                    if from < module.state_version() {
-                        module.migrate(from).map_err(|_| SnapshotImportError::MigrationFailed {
-                            module: module.name().to_string(),
-                            from,
-                        })?;
-                    }
-                }
-            }
-
-            // M3: recompute each module's state root from the
-            // imported KV data and verify it matches the snapshot's
-            // claimed root. This catches a crafted snapshot where
-            // the KV data doesn't match the claimed roots.
-            //
-            // Only verify modules that actually have KV state in
-            // the snapshot (`module_state[i].is_some()`). Modules
-            // without KV state (in-memory or no export support)
-            // cannot be verified from KV — we trust their claimed
-            // root.
-            for ((module, state), (name, claimed_root)) in self
-                .modules
-                .iter()
-                .flatten()
-                .zip(&snapshot.module_state)
-                .zip(&snapshot.module_roots)
-            {
-                if state.is_some() {
-                    let actual_root = module.state_root();
-                    if actual_root != *claimed_root {
-                        return Err(SnapshotImportError::ModuleRootMismatch {
-                            module: name.clone(),
-                            expected: *claimed_root,
-                            actual: actual_root,
-                        });
-                    }
-                }
-            }
-        }
+        // Verify + restore every module's committed state — staged,
+        // name-bound, and proven before a single byte is installed.
+        self.restore_module_state(snapshot)?;
 
         // Import: set the chain height and state root. The local
         // modules' key-value state is restored above (if the snapshot
@@ -1835,6 +1866,140 @@ impl Executor {
         *self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             snapshot.executed_nonces.iter().copied().collect();
 
+        Ok(())
+    }
+
+    /// Strict, staged module-state restore for [`import_snapshot`].
+    ///
+    /// A snapshot is untrusted until every module's claimed state has
+    /// been proven from the staged bytes. Two passes:
+    ///
+    ///   1. VERIFY — bind names, check completeness, and run each
+    ///      module's [`Module::inspect_state`] over the staged
+    ///      payload so the claimed root is derived from the data, not
+    ///      trusted. No module state is mutated in this pass.
+    ///   2. APPLY — only after every module verifies, call
+    ///      `import_state` + `migrate`.
+    ///
+    /// Binding: `module_state[i]` belongs to the module registered at
+    /// position i only because `module_roots[i].0` equals its
+    /// `name()` — position alone is not binding (a forged name list
+    /// would slide a foreign blob into the wrong module).
+    ///
+    /// Completeness: `export_state` returning `Some` declares the
+    /// module stateful — the snapshot must carry a payload whose
+    /// `inspect_state` reproduces the claimed root. Returning `None`
+    /// declares it stateless — its committed state is fixed at
+    /// construction, so the claimed root must equal a fresh module's
+    /// root, and any supplied payload is rejected as uninterpretable.
+    ///
+    /// # Errors
+    ///
+    /// `ModuleNameMismatch` when the claimed name doesn't match the
+    /// registered module; `ModuleCountMismatch` when the state vector
+    /// length disagrees with `module_roots`; `MissingModuleState` /
+    /// `UnexpectedModuleState` on the stateful/stateless declaration
+    /// boundary; `MalformedModuleState` when `inspect_state` rejects
+    /// the payload; `ModuleRootMismatch` when the staged bytes don't
+    /// hash to the claimed root; `StateImportFailed` / `MigrationFailed`
+    /// during the apply pass.
+    fn restore_module_state(&self, snapshot: &ExecutorSnapshot) -> Result<(), SnapshotImportError> {
+        let modules: Vec<&Arc<dyn Module>> = self.modules.iter().flatten().collect();
+        for (i, (module, (name, claimed_root))) in
+            modules.iter().zip(&snapshot.module_roots).enumerate()
+        {
+            if module.name() != name.as_str() {
+                return Err(SnapshotImportError::ModuleNameMismatch {
+                    index: i,
+                    snapshot: name.clone(),
+                    registered: module.name().to_string(),
+                });
+            }
+            if module.export_state().is_none() && module.state_root() != *claimed_root {
+                // Stateless module claiming a root no fresh instance
+                // produces — either the snapshot lies or the configs
+                // differ.
+                return Err(SnapshotImportError::ModuleRootMismatch {
+                    module: name.clone(),
+                    expected: *claimed_root,
+                    actual: module.state_root(),
+                });
+            }
+        }
+
+        if snapshot.module_state.is_empty() {
+            // Metadata-only snapshot: complete only when no module
+            // declares committed state — anything else is missing
+            // data, not a sparse encoding.
+            for module in &modules {
+                if module.export_state().is_some() {
+                    return Err(SnapshotImportError::MissingModuleState {
+                        module: module.name().to_string(),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
+        if snapshot.module_state.len() != snapshot.module_roots.len() {
+            return Err(SnapshotImportError::ModuleCountMismatch {
+                snapshot: snapshot.module_state.len(),
+                registered: modules.len(),
+            });
+        }
+        // VERIFY pass — inspect every payload before mutating.
+        let mut staged: Vec<(usize, &storage::Snapshot)> = Vec::new();
+        for (i, module) in modules.iter().enumerate() {
+            let (name, claimed_root) = &snapshot.module_roots[i];
+            match &snapshot.module_state[i] {
+                Some(state) => {
+                    if module.export_state().is_none() {
+                        return Err(SnapshotImportError::UnexpectedModuleState {
+                            module: name.clone(),
+                        });
+                    }
+                    let actual = module.inspect_state(state).map_err(|_| {
+                        SnapshotImportError::MalformedModuleState { module: name.clone() }
+                    })?;
+                    if actual != *claimed_root {
+                        return Err(SnapshotImportError::ModuleRootMismatch {
+                            module: name.clone(),
+                            expected: *claimed_root,
+                            actual,
+                        });
+                    }
+                    staged.push((i, state));
+                }
+                None => {
+                    if module.export_state().is_some() {
+                        return Err(SnapshotImportError::MissingModuleState {
+                            module: name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // APPLY pass — every module verified. `import_state`
+        // re-decodes and installs atomically; `migrate` upgrades
+        // the freshly imported bytes when the snapshot's recorded
+        // schema trails the binary's declared version (empty
+        // `module_versions` — v1 snapshots — means "all current",
+        // as v1 predates the hook entirely). A backend I/O error
+        // or failed migration can still leave an earlier module
+        // applied: mutation-after-verification is inherent to
+        // apply, but NO malformed input ever reaches this point.
+        for (i, state) in staged {
+            let module = modules[i];
+            module.import_state(state).map_err(|_| SnapshotImportError::StateImportFailed)?;
+            let from = snapshot.module_versions.get(i).copied().unwrap_or(module.state_version());
+            if from < module.state_version() {
+                module.migrate(from).map_err(|_| SnapshotImportError::MigrationFailed {
+                    module: module.name().to_string(),
+                    from,
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -2777,12 +2942,23 @@ mod tests {
 
     /// A trivial test module that counts messages.
     struct CounterModule {
+        /// Dispatch id — parametrized so snapshot tests can register
+        /// two independent counters.
+        id: u8,
+        /// The snapshot-entry key this counter's blob lives under.
+        key: Hash,
         count: Mutex<u64>,
     }
 
     impl CounterModule {
         fn new() -> Self {
-            Self { count: Mutex::new(0) }
+            Self { id: 1, key: Hash([0xEE; 32]), count: Mutex::new(0) }
+        }
+
+        /// A second counter for multi-module strict-import tests —
+        /// distinct dispatch id and snapshot key.
+        fn other() -> Self {
+            Self { id: 2, key: Hash([0xEF; 32]), count: Mutex::new(0) }
         }
     }
 
@@ -2791,7 +2967,7 @@ mod tests {
             "counter"
         }
         fn id(&self) -> u8 {
-            1
+            self.id
         }
 
         fn begin_block(&self, _height: Height) {}
@@ -2808,6 +2984,50 @@ mod tests {
             let c = *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let byte = u8::try_from(c).unwrap_or(0xff);
             Hash([byte; 32])
+        }
+
+        // The counter is committed state: export/import/inspect it
+        // so strict snapshot verification exercises the real path.
+        fn export_state(&self) -> Option<storage::Snapshot> {
+            let c = *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            Some(storage::Snapshot {
+                height: 0,
+                entries: vec![(self.key, c.to_le_bytes().to_vec())],
+            })
+        }
+
+        fn inspect_state(
+            &self,
+            snapshot: &storage::Snapshot,
+        ) -> Result<Hash, storage::SnapshotError> {
+            let c = self.decode_count(snapshot)?;
+            let byte = u8::try_from(c).unwrap_or(0xff);
+            Ok(Hash([byte; 32]))
+        }
+
+        fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+            let c = self.decode_count(snapshot)?;
+            *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = c;
+            Ok(())
+        }
+    }
+
+    impl CounterModule {
+        /// The snapshot payload is exactly one entry under our key:
+        /// the counter as `u64` LE.
+        fn decode_count(
+            &self,
+            snapshot: &storage::Snapshot,
+        ) -> Result<u64, storage::SnapshotError> {
+            if snapshot.entries.len() != 1 || snapshot.entries[0].0 != self.key {
+                return Err(storage::SnapshotError::Malformed);
+            }
+            let bytes: [u8; 8] = snapshot.entries[0]
+                .1
+                .as_slice()
+                .try_into()
+                .map_err(|_| storage::SnapshotError::Malformed)?;
+            Ok(u64::from_le_bytes(bytes))
         }
     }
 
@@ -4100,6 +4320,21 @@ mod tests {
                 entries: self.kv.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
             })
         }
+        fn inspect_state(
+            &self,
+            snapshot: &storage::Snapshot,
+        ) -> Result<Hash, storage::SnapshotError> {
+            // `kv` is test scratch that `state_root` does not commit —
+            // the claimed root is the constant. Still validate the
+            // payload is well-formed (sorted, unique keys) so the
+            // strict path exercises real checks.
+            for w in snapshot.entries.windows(2) {
+                if w[0].0 >= w[1].0 {
+                    return Err(storage::SnapshotError::Malformed);
+                }
+            }
+            Ok(self.state_root())
+        }
         fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
             *self.kv.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 snapshot.entries.clone();
@@ -4206,6 +4441,218 @@ mod tests {
             }
             other => panic!("expected MigrationFailed, got {other:?}"),
         }
+    }
+
+    // ── Strict snapshot import (audit 3.2) ─────────────────────────
+    //
+    // A snapshot is untrusted input: every structural defect and every
+    // unproven claim must reject BEFORE any module mutates. These
+    // tests build the failing variants from a *valid* exported
+    // snapshot so the only difference is the defect under test.
+
+    /// Run one counter tx so the source module has non-fresh
+    /// committed state to carry across.
+    fn exec_one_tx(executor: &Executor) {
+        let tx = make_tx(1, &[0xAA]);
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![tx],
+            signers: vec![],
+        });
+    }
+
+    /// The name in `module_roots` binds the payload to the module —
+    /// a forged name (a different chain's ordering) must reject.
+    #[test]
+    fn snapshot_import_rejects_module_name_mismatch() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        exec_one_tx(&executor);
+        let mut snapshot = executor.export_snapshot();
+        // The root aggregate commits only the root values, not names,
+        // so a name swap does not disturb `state_root`.
+        snapshot.module_roots[0].0 = "not-counter".to_string();
+
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(CounterModule::new()));
+        match executor2.import_snapshot(&snapshot) {
+            Err(SnapshotImportError::ModuleNameMismatch { index, snapshot, registered }) => {
+                assert_eq!(index, 0);
+                assert_eq!(snapshot, "not-counter");
+                assert_eq!(registered, "counter");
+            }
+            other => panic!("expected ModuleNameMismatch, got {other:?}"),
+        }
+    }
+
+    /// A `module_state` shorter than the module list is malformed —
+    /// the tail modules' state was never committed.
+    #[test]
+    fn snapshot_import_rejects_module_state_count_mismatch() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        exec_one_tx(&executor);
+        let mut snapshot = executor.export_snapshot();
+        snapshot.module_state.clear(); // module claims state, none carried
+
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(CounterModule::new()));
+        match executor2.import_snapshot(&snapshot) {
+            Err(SnapshotImportError::MissingModuleState { module }) => {
+                assert_eq!(module, "counter");
+            }
+            other => panic!("expected MissingModuleState, got {other:?}"),
+        }
+    }
+
+    /// A `None` payload for a stateful module is incomplete state,
+    /// not a sparse encoding.
+    #[test]
+    fn snapshot_import_rejects_dropped_module_state() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        exec_one_tx(&executor);
+        let mut snapshot = executor.export_snapshot();
+        snapshot.module_state[0] = None;
+
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(CounterModule::new()));
+        match executor2.import_snapshot(&snapshot) {
+            Err(SnapshotImportError::MissingModuleState { module }) => {
+                assert_eq!(module, "counter");
+            }
+            other => panic!("expected MissingModuleState, got {other:?}"),
+        }
+    }
+
+    /// A payload supplied for a stateless module is uninterpretable —
+    /// it must be rejected, not silently ignored.
+    #[test]
+    fn snapshot_import_rejects_unexpected_module_state() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(SelfAuthModule));
+        let mut snapshot = executor.export_snapshot();
+        assert!(snapshot.module_state[0].is_none());
+        snapshot.module_state[0] =
+            Some(storage::Snapshot { height: 0, entries: vec![(Hash([0; 32]), vec![1])] });
+
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(SelfAuthModule));
+        match executor2.import_snapshot(&snapshot) {
+            Err(SnapshotImportError::UnexpectedModuleState { module }) => {
+                assert_eq!(module, "selfauth");
+            }
+            other => panic!("expected UnexpectedModuleState, got {other:?}"),
+        }
+    }
+
+    /// A payload that fails the module's own decode must surface as
+    /// malformed during the verify pass.
+    #[test]
+    fn snapshot_import_rejects_malformed_module_state() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        exec_one_tx(&executor);
+        let mut snapshot = executor.export_snapshot();
+        // Corrupt the counter's blob: wrong length value.
+        snapshot.module_state[0] =
+            Some(storage::Snapshot { height: 0, entries: vec![(Hash([0xEE; 32]), vec![1, 2, 3])] });
+
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(CounterModule::new()));
+        match executor2.import_snapshot(&snapshot) {
+            Err(SnapshotImportError::MalformedModuleState { module }) => {
+                assert_eq!(module, "counter");
+            }
+            other => panic!("expected MalformedModuleState, got {other:?}"),
+        }
+    }
+
+    /// A claimed module root that doesn't match the staged payload's
+    /// decoded root must reject — the claim is never trusted over
+    /// the data.
+    #[test]
+    fn snapshot_import_rejects_forged_module_root() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        exec_one_tx(&executor);
+        let mut snapshot = executor.export_snapshot();
+        // Forge the claimed root, then re-fix the aggregate so only
+        // the per-module claim is wrong.
+        snapshot.module_roots[0].1 = Hash([0x99; 32]);
+        snapshot.state_root = canonical_state_root(
+            snapshot.module_roots.iter().map(|(_, r)| *r),
+            snapshot.nonce_root,
+        );
+
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(CounterModule::new()));
+        match executor2.import_snapshot(&snapshot) {
+            Err(SnapshotImportError::ModuleRootMismatch { module, expected, actual }) => {
+                assert_eq!(module, "counter");
+                assert_eq!(expected, Hash([0x99; 32]));
+                assert_eq!(actual, Hash([1; 32]), "the staged count is 1");
+            }
+            other => panic!("expected ModuleRootMismatch, got {other:?}"),
+        }
+    }
+
+    /// Verify-before-mutate: a corrupt payload for the SECOND module
+    /// must leave the FIRST module untouched — no module state may be
+    /// installed until every module's payload verifies.
+    #[test]
+    fn snapshot_import_verifies_all_modules_before_mutating() {
+        let mut executor = Executor::new(100);
+        let c1 = Arc::new(CounterModule::new());
+        let c2 = Arc::new(CounterModule::other());
+        executor.register_module(c1.clone());
+        executor.register_module(c2.clone());
+        exec_one_tx(&executor);
+        let mut snapshot = executor.export_snapshot();
+        // Corrupt only the second module's payload.
+        snapshot.module_state[1] = Some(storage::Snapshot {
+            height: 0,
+            entries: vec![(Hash([0xEF; 32]), vec![0xDE, 0xAD])],
+        });
+
+        let d1 = Arc::new(CounterModule::new());
+        let d2 = Arc::new(CounterModule::other());
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(d1.clone());
+        executor2.register_module(d2.clone());
+        assert!(
+            executor2.import_snapshot(&snapshot).is_err(),
+            "a malformed payload must fail the import"
+        );
+        assert_eq!(
+            *d1.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "module 0 must not be mutated while module 1's payload is unproven"
+        );
+        assert_eq!(
+            *d2.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "module 1 must not be mutated by a malformed payload"
+        );
+    }
+
+    /// Metadata-only import is complete only for an executor whose
+    /// modules are all stateless — then it applies cleanly.
+    #[test]
+    fn snapshot_import_metadata_only_with_stateless_modules() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(SelfAuthModule));
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![],
+            signers: vec![],
+        });
+        let mut snapshot = executor.export_snapshot();
+        snapshot.module_state.clear();
+
+        let mut executor2 = Executor::new(100);
+        executor2.register_module(Arc::new(SelfAuthModule));
+        executor2.import_snapshot(&snapshot).expect("stateless modules need no payloads");
     }
 
     /// Past the scheduled halt, `execute_block` must return the

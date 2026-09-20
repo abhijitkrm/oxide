@@ -334,6 +334,84 @@ impl ExchangeModule {
         let max_resting = u32::from_le_bytes(msg[32..36].try_into().ok()?);
         Some(MarketConfig { market_id: 0, tick_size, lot_size, min_price, max_price, max_resting })
     }
+
+    /// Write the module's committed state into `w` — shared by
+    /// `state_root` and `export_state` so the snapshot blob's
+    /// canonical section is provably the same bytes `state_root`
+    /// hashes.
+    fn write_committed(&self, w: &mut framework::CanonicalState) {
+        w.put_root(&subtree_root(&self.store));
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries = Vec::new();
+        let mut book_bytes = Vec::new();
+        w.put_count(inner.markets.len());
+        for engine in &inner.markets {
+            match engine {
+                Some(e) => {
+                    w.put_u8(1);
+                    book_bytes.clear();
+                    e.write_canonical_state(&mut book_bytes, &mut entries);
+                    w.put_bytes(&book_bytes);
+                }
+                None => {
+                    w.put_u8(0);
+                }
+            }
+        }
+    }
+
+    /// Decode the canonical fields following the leading store root —
+    /// shared by `inspect_state` and `import_state` so verification
+    /// and installation can never disagree about the schema.
+    ///
+    /// `slots` is the destination's fixed market-slot count: a blob
+    /// claiming a different array length cannot represent this
+    /// module's state.
+    fn decode_committed(
+        r: &mut framework::CanonicalReader<'_>,
+        store: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        slots: usize,
+    ) -> Option<Vec<Option<MatchingEngine>>> {
+        let n = r.get_count()?;
+        if n != slots {
+            return None;
+        }
+        let mut markets = Vec::with_capacity(n);
+        for i in 0..n {
+            match r.get_u8()? {
+                0 => markets.push(None),
+                1 => {
+                    let bytes = r.get_bytes()?;
+                    let engine =
+                        MatchingEngine::from_canonical_state(bytes, |c| DenseBook::new(*c)).ok()?;
+                    // Store↔engine binding: a listed market must carry
+                    // its byte-identical config under `m/{id}`. Without
+                    // this check a crafted blob could pair engines with
+                    // mismatched store entries and still hash to a
+                    // self-consistent root.
+                    let key = market_config_key(u8::try_from(i).ok()?);
+                    match store.get(&key) {
+                        Some(v) if *v == encode_market_config(engine.config()) => {}
+                        _ => return None,
+                    }
+                    markets.push(Some(engine));
+                }
+                _ => return None,
+            }
+        }
+        // Reverse direction: every `m/{id}` store key must name a
+        // listed market — a config without an engine is dead state
+        // no live code path produces.
+        for key in store.keys() {
+            if let [b'm', id] = key.as_slice() {
+                match markets.get(usize::from(*id)) {
+                    Some(Some(_)) => {}
+                    _ => return None,
+                }
+            }
+        }
+        Some(markets)
+    }
 }
 
 impl Default for ExchangeModule {
@@ -535,25 +613,54 @@ impl Module for ExchangeModule {
         // `settlement_operator` (assembly wiring, not tx-mutated
         // state).
         let mut w = framework::CanonicalState::new();
-        w.put_root(&subtree_root(&self.store));
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut entries = Vec::new();
-        let mut book_bytes = Vec::new();
-        w.put_count(inner.markets.len());
-        for engine in &inner.markets {
-            match engine {
-                Some(e) => {
-                    w.put_u8(1);
-                    book_bytes.clear();
-                    e.write_canonical_state(&mut book_bytes, &mut entries);
-                    w.put_bytes(&book_bytes);
-                }
-                None => {
-                    w.put_u8(0);
-                }
-            }
-        }
+        self.write_committed(&mut w);
         w.root()
+    }
+
+    /// Export the committed state as one canonical blob —
+    /// `canon ‖ store`. The canon section is the `state_root`
+    /// preimage, so a peer can verify the claimed root before
+    /// installing anything (audit 3.2).
+    fn export_state(&self) -> Option<storage::Snapshot> {
+        let mut w = framework::CanonicalState::new();
+        self.write_committed(&mut w);
+        Some(storage::Snapshot {
+            height: 0,
+            entries: vec![(
+                framework::state_blob_key(),
+                framework::encode_state_blob(w.as_bytes(), &self.store),
+            )],
+        })
+    }
+
+    /// Verify a staged snapshot's claimed root without mutating:
+    /// decode the blob, check the store section hashes to the
+    /// committed subtree root, fully decode the fields, then hash
+    /// the canonical preimage.
+    fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
+        let slots =
+            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
+        let (canon, _markets, _store) = framework::stage_blob_snapshot(snapshot, |r, store| {
+            Self::decode_committed(r, store, slots)
+        })?;
+        Ok(framework::canon_root(canon))
+    }
+
+    /// Install staged state after `inspect_state` has proven it —
+    /// the same staged decode runs again, then the fields swap in
+    /// atomically (decode first, mutate second).
+    fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+        let slots =
+            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
+        let (_canon, markets, store) =
+            framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
+        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.markets = markets;
+        // `fills` is per-call scratch — clear it so a buffer left
+        // mid-transaction cannot leak across the import boundary.
+        inner.fills.clear();
+        Ok(())
     }
 }
 
@@ -2023,5 +2130,39 @@ mod tests {
         // Reserved 16_000, paid 15_000 → net 15_000 gone.
         assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 15_000);
         assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000);
+    }
+
+    /// Snapshot round-trip: a market with resting orders on both
+    /// sides must export, verify, and re-import byte-identically —
+    /// the imported module's root must equal the source's (audit
+    /// 3.2).
+    #[test]
+    fn state_snapshot_round_trips() {
+        let src = ExchangeModule::new();
+        let mid = src.list_market(test_cfg()).unwrap();
+        src.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 5, 9))).unwrap();
+        src.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 300, 2, 1))).unwrap();
+        src.handle(&ctx(2), &msg::place(mid, limit(Side::Buy, 300, 3, 2))).unwrap();
+
+        let snapshot = src.export_state().expect("exchange exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+        let dst = ExchangeModule::new();
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        assert_eq!(dst.resting_count(mid), 3);
+        assert_eq!(dst.l1(mid), src.l1(mid));
+    }
+
+    /// A truncated blob and a non-canonical stream must both fail
+    /// inspection — the claimed root is never trusted over the bytes.
+    #[test]
+    fn state_snapshot_rejects_corruption() {
+        let src = ExchangeModule::new();
+        src.list_market(test_cfg()).unwrap();
+        let mut snapshot = src.export_state().unwrap();
+        snapshot.entries[0].1.truncate(12);
+        assert!(src.inspect_state(&snapshot).is_err());
+        assert!(ExchangeModule::new().import_state(&snapshot).is_err());
     }
 }

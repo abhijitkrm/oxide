@@ -18,6 +18,7 @@ types = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
 trading = { workspace = true }
+storage = { workspace = true }
 
 [dev-dependencies]
 # Benchmark harness (criterion gates: plan.md §13 Phase 3 acceptance).

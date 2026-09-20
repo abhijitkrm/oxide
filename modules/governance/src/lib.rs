@@ -105,6 +105,81 @@ impl GovernanceModule {
         self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id).cloned()
     }
 
+    /// Write the module's committed state into `w` — shared by
+    /// `state_root` and `export_state` so the snapshot blob's
+    /// canonical section is provably the same bytes `state_root`
+    /// hashes.
+    fn write_committed(&self, w: &mut framework::CanonicalState) {
+        w.put_root(&subtree_root(&self.store));
+        w.put_u64(*self.next_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let proposals = self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(proposals.len());
+        for (id, p) in proposals.iter() {
+            w.put_u64(*id);
+            w.put_addr(&p.proposer);
+            w.put_bytes(&p.param_key);
+            w.put_bytes(&p.param_val);
+            w.put_u64(p.yes_votes);
+            w.put_u64(p.no_votes);
+            w.put_bool(p.finalized);
+            w.put_bool(p.passed);
+        }
+    }
+
+    /// Decode the canonical fields following the leading store root —
+    /// shared by `inspect_state` and `import_state` so verification
+    /// and installation can never disagree about the schema.
+    ///
+    /// Beyond shape, the decode enforces the module's live
+    /// invariants a snapshot can't fake: map keys are unique (the
+    /// stream's `id` IS the key), `id < next_id` (ids are issued
+    /// sequentially), `passed` implies `finalized`, and a finalized
+    /// proposal's `passed` must equal `yes_votes > no_votes` — the
+    /// tally is computed once at finalize and votes cannot change
+    /// afterwards.
+    fn decode_committed(
+        r: &mut framework::CanonicalReader<'_>,
+    ) -> Option<(u64, BTreeMap<u64, Proposal>)> {
+        let next_id = r.get_u64()?;
+        let n = r.get_count()?;
+        let mut proposals = BTreeMap::new();
+        for _ in 0..n {
+            let id = r.get_u64()?;
+            let proposer = r.get_addr()?;
+            let param_key = r.get_bytes()?.to_vec();
+            let param_val = r.get_bytes()?.to_vec();
+            let yes_votes = r.get_u64()?;
+            let no_votes = r.get_u64()?;
+            let finalized = r.get_bool()?;
+            let passed = r.get_bool()?;
+            if id >= next_id || (passed && !finalized) {
+                return None;
+            }
+            if finalized && passed != (yes_votes > no_votes) {
+                return None;
+            }
+            if proposals
+                .insert(
+                    id,
+                    Proposal {
+                        id,
+                        proposer,
+                        param_key,
+                        param_val,
+                        yes_votes,
+                        no_votes,
+                        finalized,
+                        passed,
+                    },
+                )
+                .is_some()
+            {
+                return None; // Duplicate proposal id — non-canonical.
+            }
+        }
+        Some((next_id, proposals))
+    }
+
     /// Get the number of proposals.
     ///
     /// # Panics
@@ -261,21 +336,45 @@ impl Module for GovernanceModule {
         // `finalized`/`passed` flags, and `next_id` live in memory
         // and decide which param changes apply.
         let mut w = framework::CanonicalState::new();
-        w.put_root(&subtree_root(&self.store));
-        w.put_u64(*self.next_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-        let proposals = self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        w.put_count(proposals.len());
-        for (id, p) in proposals.iter() {
-            w.put_u64(*id);
-            w.put_addr(&p.proposer);
-            w.put_bytes(&p.param_key);
-            w.put_bytes(&p.param_val);
-            w.put_u64(p.yes_votes);
-            w.put_u64(p.no_votes);
-            w.put_bool(p.finalized);
-            w.put_bool(p.passed);
-        }
+        self.write_committed(&mut w);
         w.root()
+    }
+
+    /// Export the committed state as one canonical blob —
+    /// `canon ‖ store` (audit 3.2). The canon section is the
+    /// `state_root` preimage, so a peer verifies the claimed root
+    /// before installing anything.
+    fn export_state(&self) -> Option<storage::Snapshot> {
+        let mut w = framework::CanonicalState::new();
+        self.write_committed(&mut w);
+        Some(storage::Snapshot {
+            height: 0,
+            entries: vec![(
+                framework::state_blob_key(),
+                framework::encode_state_blob(w.as_bytes(), &self.store),
+            )],
+        })
+    }
+
+    /// Verify a staged snapshot's claimed root without mutating:
+    /// blob decode → store-subtree-root consistency → full field
+    /// decode (with proposal invariants) → hash the canonical
+    /// preimage.
+    fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
+        let (canon, _staged, _store) =
+            framework::stage_blob_snapshot(snapshot, |r, _store| Self::decode_committed(r))?;
+        Ok(framework::canon_root(canon))
+    }
+
+    /// Install staged state after inspection proved it — decode
+    /// first, then swap the store and in-memory fields in one step.
+    fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+        let (_canon, (next_id, proposals), store) =
+            framework::stage_blob_snapshot(snapshot, |r, _store| Self::decode_committed(r))?;
+        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        *self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = proposals;
+        *self.next_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next_id;
+        Ok(())
     }
 }
 
@@ -447,5 +546,37 @@ mod tests {
         let p1 = gov.proposal(1).unwrap();
         assert_eq!(p0.yes_votes, 1);
         assert_eq!(p1.no_votes, 1);
+    }
+
+    /// Export → inspect → import must reproduce the exact committed
+    /// state: proposals, tallies, and `next_id` survive a snapshot
+    /// round-trip with the state root intact (audit 3.2).
+    #[test]
+    fn state_snapshot_round_trips() {
+        let src = GovernanceModule::new();
+        src.handle(&ctx(1), &msg::propose(b"k1", b"v1")).unwrap();
+        src.handle(&ctx(1), &msg::propose(b"k2", b"v2")).unwrap();
+        src.handle(&ctx(2), &msg::vote(0, Vote::Yes)).unwrap();
+        src.end_block(Height::new(1)); // finalize proposal 0
+        let snapshot = src.export_state().expect("governance exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+        let dst = GovernanceModule::new();
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        assert_eq!(dst.num_proposals(), 2);
+        assert!(dst.proposal(0).unwrap().finalized);
+    }
+
+    /// Corrupt canonical bytes and a violated proposal invariant
+    /// must both fail inspection — never import.
+    #[test]
+    fn state_snapshot_rejects_corruption() {
+        let src = GovernanceModule::new();
+        src.handle(&ctx(1), &msg::propose(b"k", b"v")).unwrap();
+        let mut snapshot = src.export_state().unwrap();
+        snapshot.entries[0].1.truncate(20);
+        assert!(src.inspect_state(&snapshot).is_err());
+        assert!(GovernanceModule::new().import_state(&snapshot).is_err());
     }
 }

@@ -16086,3 +16086,127 @@ gas, so the test uses empty calldata, which has nothing to hide behind.
 evm 182 tests green. Six fixes, each with a red-green regression except
 the two new-capability checks (helper + differential), which are
 red-green as a pair.
+
+## Session — audit 3.2: complete, verify-then-mutate snapshots
+
+Audit finding: `export_state`/`import_state` shipped only the EVM's KV
+backend, so a snapshot carried no module state for the other seven
+modules — and even for the EVM the executor installed the bytes without
+recomputing the root they claim. A restarted node trusted roots it never
+reconstructed; a malicious or corrupted peer could install arbitrary
+state under a forged root.
+
+### Design
+
+Every module's `state_root` is already `H(canonical preimage)` after
+C8, so the snapshot payload is *that preimage*: `state_blob` =
+`u64(canon_len) ‖ canon ‖ store` where `canon` is the exact bytes the
+module commits and `store` is the deterministically-encoded KV map the
+canon commits *to*. Inspection decodes `canon`, rebuilds the store
+subtree root, and checks equality — all before touching live state.
+`framework::CanonicalReader` is the strict inverse of `CanonicalState`:
+it rejects truncation, trailing bytes, invalid bools, duplicate keys,
+and unbounded counts (counts never pre-allocate — a `u64::MAX` count on
+a short blob must not become an allocation-amplification DoS).
+
+`Module::inspect_state` is new trait surface: verify without mutating.
+`Executor::import_snapshot` now (1) verifies the nonce root and
+aggregate root, (2) binds snapshot module names to registered modules
+positionally, (3) rejects missing state for stateful modules and
+unexpected state for stateless ones, (4) `inspect_state`s every payload
+and compares against the claimed `module_roots`, and only then
+(5) `import_state`s — verify-then-mutate, so a bad snapshot cannot
+half-apply.
+
+Module coverage: oxide-core (chain config), governance (proposals +
+votes + tallies), oracle (feeds + rounds + endorsements), exchange
+(store + market configs + `MatchingEngine::from_canonical_state`
+restoring books without matching), perps (engines + configs + marks +
+accounts/positions/C7 reservations + insurance fund + oracle counters +
+endorsements — with the reservation↔resting-order bijection enforced),
+staking (validators, delegations, unbonding, reward debt/index/total
+mirrors, pending set changes, BLS keys, jail queues, evidence,
+attendance — plus the one-directional store binding, since
+`genesis_register_validator` never mirrors to KV), and the EVM.
+
+### The EVM was the hard part — three real bugs found
+
+The strict checker surfaced two latent divergences the audit's
+"restarted node trusts roots it never reconstructed" was pointing at,
+plus one persistence hole:
+
+1. **Genesis state never flushed.** `fund_account_for_test` (used by
+   `Node::assemble` for the genesis faucet — not actually test-only)
+   never marked `touched`, and `begin_block` cleared `touched` *before*
+   it could flush: genesis funding was committed to `state_root` but
+   could never reach the backend. The old round-trip tests passed
+   anyway because the destination node re-inserted the same genesis
+   accounts at assembly, masking the hole — the two sides diverged
+   identically. Fixed by marking touched on fund, and moving the
+   per-block `touched` bound wholly to `end_block`'s post-flush clear
+   (`begin_block` no longer discards pre-block marks).
+
+2. **`NotExisting` tombstones committed as leaves.** `state_root`'s
+   full-build iterated every `cache.accounts` entry — including
+   `AccountState::NotExisting` entries (selfdestructs, or revm
+   `basic()` misses cached as absent). The flush correctly emits
+   `Delete` for them, so the committed root covered state the backend
+   could never reproduce — and worse, a node that merely *read* a
+   missing account on a different path would compute a different root
+   from identical state. Both build paths now skip tombstones (and the
+   stale `storage_root_cache` entry is dropped).
+
+3. **Persisted code didn't hash to its committed `code_hash`.**
+   `account_flush_ops` serialized `bytes_slice()`, which for an
+   *analyzed* `Bytecode` returns the padded jump-table buffer — while
+   `code_hash` commits `keccak(original_byte_slice())`. After any
+   contract's first execution, the durable bytes no longer hashed to
+   the committed hash: a restart would reinstall padded bytecode
+   (`extcodesize`/`extcodecopy` observe the padding). Strict import
+   now requires `code_hash == keccak(code)` (or `KECCAK_EMPTY` for
+   empty code) — which caught it — and the shared
+   `serialize_committed_account` helper writes
+   `original_byte_slice()`. Also fixed the sibling hole: a
+   balance-touched contract whose `info.code` was never loaded fell
+   back to `code_len=0` under a real hash — now resolves from
+   `cache.contracts` first.
+
+`EvmModule::export_state` serializes the committed cache account set
+directly (not just flushed backend state) merged with the backend's
+non-account namespaces, sorted — so export reproduces the committed
+root at any height, independent of flush timing. `import_state`
+re-runs the strict parse before touching the backend and resets the
+trie caches *and* `touched` afterward (the leaf map previously kept
+ghost leaves for accounts absent from the imported snapshot — another
+root-poisoning path).
+
+`trading::MatchingEngine` gained `from_canonical_state` +
+`restore_resting`/`set_next_id` so books rebuild byte-exactly without
+matching; `TradingError::CorruptState` covers decode failures.
+
+### Verification
+
+`cargo fmt --check`, `clippy --workspace --all-targets -D warnings`,
+and `cargo test --workspace` (106 suites) all clean. New coverage:
+framework reader/blob strictness, trading restore round-trips,
+per-module round-trip + corruption tests (each module: tampered canon,
+tampered store, truncated, missing/extra state), executor strictness
+(module-count mismatch, name binding, missing/unexpected state,
+root mismatch, verify-before-mutate ordering), EVM strict account
+deserialization + scratch-trie root verification, and the four
+pre-existing node-level snapshot tests that now pass *because* the
+underlying bugs are fixed rather than masked.
+
+Benched nothing new — snapshot export/import is a cold path (state
+sync / backup), not a per-block hot path; no acceptance gate applies.
+The `state_root` edits only remove work (tombstone skip), and the
+`trie_root` bench confirms no regression: incremental
+10k-accts/10-touched ~43 ms, full rebuild 10k ~21 ms, in line with the
+existing sparse-walk design.
+
+Fuzz: the `codec-decode` target doesn't reach these decoders (they live
+in `framework`/`evm`, not `crates/codec`); a 5-minute libFuzzer soak on
+it ran clean under nightly 1.100.0 + ASan (installed for this gate).
+A dedicated `canonical-state` fuzz target would be a worthwhile
+follow-up — the strict reader is exactly the kind of boundary it
+exists for.

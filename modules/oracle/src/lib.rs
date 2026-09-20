@@ -163,6 +163,22 @@ pub struct OracleModule {
     endorsements: framework::Endorsements,
 }
 
+/// The oracle's committed state decoded from a snapshot blob —
+/// every field `state_root` commits, minus the store subtree
+/// (carried separately in the blob's store section).
+struct StagedOracle {
+    /// Published EMA mark per market.
+    marks: BTreeMap<u8, u64>,
+    /// Last height each market's mark was published.
+    last_update: BTreeMap<u8, u64>,
+    /// Registered external feed addresses.
+    feeds: BTreeSet<Address>,
+    /// This block's `market → feeder → price` observations.
+    submissions: BTreeMap<u8, BTreeMap<Address, u64>>,
+    /// Pending feed-registry endorsements.
+    endorsements: framework::Endorsements,
+}
+
 impl OracleModule {
     /// Construct a bare oracle with no committee and no sink: all
     /// submissions are rejected and nothing is pushed. Use
@@ -266,6 +282,82 @@ impl OracleModule {
     /// a single-validator devnet still works.
     fn quorum(&self) -> usize {
         self.eligible_feeders() / 2 + 1
+    }
+
+    /// Write the module's committed state into `w` — shared by
+    /// `state_root` and `export_state` so the snapshot blob's
+    /// canonical section is provably the same bytes `state_root`
+    /// hashes.
+    fn write_committed(&self, w: &mut framework::CanonicalState) {
+        w.put_root(&subtree_root(&self.store));
+        {
+            let marks = self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(marks.len());
+            for (m, p) in marks.iter() {
+                w.put_u8(*m).put_u64(*p);
+            }
+            let updates =
+                self.last_update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(updates.len());
+            for (m, h) in updates.iter() {
+                w.put_u8(*m).put_u64(*h);
+            }
+            let feeds = self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(feeds.len());
+            for f in feeds.iter() {
+                w.put_addr(f);
+            }
+            let subs = self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(subs.len());
+            for (m, feeders) in subs.iter() {
+                w.put_u8(*m).put_count(feeders.len());
+                for (f, p) in feeders {
+                    w.put_addr(f).put_u64(*p);
+                }
+            }
+        }
+        self.endorsements.write_canonical(w);
+    }
+
+    /// Decode the canonical fields following the leading store root —
+    /// shared by `inspect_state` and `import_state` so verification
+    /// and installation can never disagree about the schema. Map/set
+    /// insertions enforce uniqueness: a duplicated key is
+    /// non-canonical, not absorbed.
+    fn decode_committed(r: &mut framework::CanonicalReader<'_>) -> Option<StagedOracle> {
+        let mut marks = BTreeMap::new();
+        for _ in 0..r.get_count()? {
+            if marks.insert(r.get_u8()?, r.get_u64()?).is_some() {
+                return None;
+            }
+        }
+        let mut last_update = BTreeMap::new();
+        for _ in 0..r.get_count()? {
+            if last_update.insert(r.get_u8()?, r.get_u64()?).is_some() {
+                return None;
+            }
+        }
+        let mut feeds = BTreeSet::new();
+        for _ in 0..r.get_count()? {
+            if !feeds.insert(r.get_addr()?) {
+                return None;
+            }
+        }
+        let mut submissions = BTreeMap::new();
+        for _ in 0..r.get_count()? {
+            let market = r.get_u8()?;
+            let mut feeders = BTreeMap::new();
+            for _ in 0..r.get_count()? {
+                if feeders.insert(r.get_addr()?, r.get_u64()?).is_some() {
+                    return None;
+                }
+            }
+            if submissions.insert(market, feeders).is_some() {
+                return None;
+            }
+        }
+        let endorsements = framework::Endorsements::read_canonical(r)?;
+        Some(StagedOracle { marks, last_update, feeds, submissions, endorsements })
     }
 
     /// The lower median of `prices` (element at index `(n−1)/2`
@@ -503,37 +595,50 @@ impl Module for OracleModule {
         // commit time); it is committed anyway for uniformity.
         // Excluded: `committee`/`sink` (assembly wiring).
         let mut w = framework::CanonicalState::new();
-        w.put_root(&subtree_root(&self.store));
-        {
-            let marks = self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            w.put_count(marks.len());
-            for (m, p) in marks.iter() {
-                w.put_u8(*m).put_u64(*p);
-            }
-            let updates =
-                self.last_update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            w.put_count(updates.len());
-            for (m, h) in updates.iter() {
-                w.put_u8(*m).put_u64(*h);
-            }
-            let feeds = self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            w.put_count(feeds.len());
-            for f in feeds.iter() {
-                w.put_addr(f);
-            }
-            let subs = self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            w.put_count(subs.len());
-            for (m, feeders) in subs.iter() {
-                w.put_u8(*m).put_count(feeders.len());
-                for (f, p) in feeders {
-                    w.put_addr(f).put_u64(*p);
-                }
-            }
-        }
-        // C9: pending feed-registry endorsements decide whether a
-        // registry change applies — future-affecting state.
-        self.endorsements.write_canonical(&mut w);
+        self.write_committed(&mut w);
         w.root()
+    }
+
+    /// Export the committed state as one canonical blob —
+    /// `canon ‖ store` (audit 3.2). The canon section is the
+    /// `state_root` preimage, so a peer verifies the claimed root
+    /// before installing anything.
+    fn export_state(&self) -> Option<storage::Snapshot> {
+        let mut w = framework::CanonicalState::new();
+        self.write_committed(&mut w);
+        Some(storage::Snapshot {
+            height: 0,
+            entries: vec![(
+                framework::state_blob_key(),
+                framework::encode_state_blob(w.as_bytes(), &self.store),
+            )],
+        })
+    }
+
+    /// Verify a staged snapshot's claimed root without mutating —
+    /// full field decode included, so a payload that can't rebuild
+    /// the oracle's state can't pass.
+    fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
+        let (canon, _staged, _store) =
+            framework::stage_blob_snapshot(snapshot, |r, _store| Self::decode_committed(r))?;
+        Ok(framework::canon_root(canon))
+    }
+
+    /// Install staged state after inspection proved it — decode
+    /// first, then swap the store and in-memory fields in one step.
+    /// `committee`/`sink` are assembly wiring and are NOT touched.
+    fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+        let (_canon, staged, store) =
+            framework::stage_blob_snapshot(snapshot, |r, _store| Self::decode_committed(r))?;
+        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        *self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = staged.marks;
+        *self.last_update.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.last_update;
+        *self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = staged.feeds;
+        *self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.submissions;
+        self.endorsements.replace_with(staged.endorsements);
+        Ok(())
     }
 }
 
@@ -866,5 +971,40 @@ mod tests {
         oracle.end_block(Height::new(1));
         let root_after = oracle.state_root();
         assert_ne!(root_empty, root_after);
+    }
+
+    /// Export → inspect → import must reproduce the exact committed
+    /// state: published marks, heartbeat heights, and feeds survive a
+    /// snapshot round-trip with the state root intact (audit 3.2).
+    /// `committee`/`sink` are assembly wiring — the destination
+    /// supplies its own.
+    #[test]
+    fn state_snapshot_round_trips() {
+        let src = setup(4, None);
+        for v in 0..3u8 {
+            src.handle(&ctx(v), &msg::submit_price(0, 1_000)).unwrap();
+        }
+        src.handle(&ctx(0), &msg::submit_price(1, 9_999)).unwrap();
+        src.end_block(Height::new(1));
+        let snapshot = src.export_state().expect("oracle exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+        let dst = setup(4, None); // wiring reattached by the harness
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        assert_eq!(dst.mark(0), src.mark(0));
+        assert_eq!(dst.last_update_height(0), src.last_update_height(0));
+    }
+
+    /// A truncated blob and a non-canonical stream must both fail
+    /// inspection — the claimed root is never trusted over the bytes.
+    #[test]
+    fn state_snapshot_rejects_corruption() {
+        let src = setup(4, None);
+        src.end_block(Height::new(1));
+        let mut snapshot = src.export_state().unwrap();
+        snapshot.entries[0].1.truncate(12);
+        assert!(src.inspect_state(&snapshot).is_err());
+        assert!(setup(4, None).import_state(&snapshot).is_err());
     }
 }

@@ -3529,12 +3529,15 @@ impl Module for EvmModule {
         *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             h.saturating_mul(BLOCK_TIME_SECS);
 
-        // Clear the touched set from the previous block. The set was
-        // consumed by `state_root` (for incremental storage root
-        // updates) and by `flush_to_storage` (for dirty-only writes).
-        // Clearing here (not in `end_block`) lets `state_root` see
-        // which accounts were touched in this block.
-        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        // `touched` is deliberately NOT cleared here: marks made
+        // before the first block (genesis `alloc`, preinstalls,
+        // assembly-time funding) must survive into block 1's
+        // `end_block` flush or genesis state would be committed to
+        // the state root yet never persisted — a restart would serve
+        // a different account set than the committed root covers.
+        // `end_block` clears the set after flushing, so `touched`
+        // still means exactly "accounts written since the last
+        // durable commit" and stays block-bounded.
 
         // Start a fresh undo accumulator — any residue here means a
         // previous block never sealed, which is a bug, but dropping
@@ -4122,36 +4125,48 @@ impl Module for EvmModule {
             // from the cache were removed from state.
             for addr in touched.iter() {
                 let hashed = alloy_primitives::keccak256(addr);
-                match db.cache.accounts.get(addr) {
-                    Some(account) => {
-                        let storage_root = if account.storage.is_empty() {
-                            trie::EMPTY_ROOT
-                        } else {
-                            // Touched → always recompute the
-                            // storage root (its slots changed).
-                            let storage_iter = account.storage.iter().map(|(slot, value)| {
-                                (
-                                    alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()),
-                                    *value,
-                                )
-                            });
-                            let root = trie::storage_root(storage_iter);
-                            storage_root_cache.insert(*addr, root);
-                            root
-                        };
-                        leaves.insert(hashed, encode_trie_leaf(account, storage_root));
-                    }
-                    None => {
-                        leaves.remove(&hashed);
-                    }
+                // `NotExisting` tombstones (selfdestruct, or a revm
+                // `basic()` miss cached as absent) are NOT part of the
+                // state trie — committing them as leaves would put the
+                // root ahead of persisted state, which never carries
+                // them (flush emits `Delete`). Two nodes that read a
+                // missing account on different paths would then
+                // compute different roots from identical state.
+                if let Some(account) = db
+                    .cache
+                    .accounts
+                    .get(addr)
+                    .filter(|a| a.account_state != revm::database::AccountState::NotExisting)
+                {
+                    let storage_root = if account.storage.is_empty() {
+                        trie::EMPTY_ROOT
+                    } else {
+                        // Touched → always recompute the
+                        // storage root (its slots changed).
+                        let storage_iter = account.storage.iter().map(|(slot, value)| {
+                            (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
+                        });
+                        let root = trie::storage_root(storage_iter);
+                        storage_root_cache.insert(*addr, root);
+                        root
+                    };
+                    leaves.insert(hashed, encode_trie_leaf(account, storage_root));
+                } else {
+                    leaves.remove(&hashed);
+                    storage_root_cache.remove(addr);
                 }
             }
         } else {
             // Full build — first call after construction or
             // `import_state`. Hashes and encodes every account once
             // (same cost as the old path); subsequent calls patch
-            // only `touched` accounts.
+            // only `touched` accounts. `NotExisting` tombstones are
+            // skipped — they are not part of the committed trie (see
+            // the incremental path above).
             for (addr, account) in &db.cache.accounts {
+                if account.account_state == revm::database::AccountState::NotExisting {
+                    continue;
+                }
                 let storage_root = if account.storage.is_empty() {
                     trie::EMPTY_ROOT
                 } else if touched.contains(addr) {
@@ -4313,29 +4328,96 @@ impl Module for EvmModule {
         Hash(root.0)
     }
 
-    /// Export the EVM's full key-value state for snapshot sync.
+    /// Export the EVM's committed state for snapshot sync.
     ///
     /// Returns `Some(snapshot)` if a `StorageBackend` is attached,
-    /// `None` otherwise. The snapshot includes all key-value pairs
-    /// in the backend — the complete EVM state (accounts, code,
-    /// storage).
+    /// `None` otherwise.
     ///
-    /// This is used for full state sync: a new node imports the
-    /// snapshot to skip replaying the entire chain from genesis.
+    /// The committed `state_root` covers the whole `CacheDB` account
+    /// set — which can run ahead of the backend (genesis-funded and
+    /// preinstalled accounts, for example, sit in the cache until the
+    /// first `end_block` flush). A snapshot built from the backend
+    /// alone would then be unable to reproduce the claimed root
+    /// (audit 3.2). So the `0x01` account entries are serialized from
+    /// the authoritative cache via the same
+    /// [`Self::serialize_committed_account`] the flush uses, while the
+    /// `0x02`/`0x03`/`0x04` namespaces (sealed history, undo window,
+    /// schema meta — RPC data, not committed to the trie) are copied
+    /// from the backend verbatim.
     fn export_state(&self) -> Option<storage::Snapshot> {
         let backend = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        backend.as_ref().map(|b| b.snapshot_export())
+        let mut snap = backend.as_ref()?.snapshot_export();
+        // Drop the backend's account entries — the cache is
+        // authoritative for committed state and may hold accounts
+        // the backend has not seen yet.
+        snap.entries.retain(|(k, _)| k.0[0] != persist::NS_ACCOUNT);
+        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        snap.entries.reserve(db.cache.accounts.len());
+        for evm_addr in db.cache.accounts.keys() {
+            if let Some(value) = Self::serialize_committed_account(evm_addr, &db) {
+                let key = persist::account_key(&Address(evm_addr.0.into()));
+                snap.entries.push((key, value));
+            }
+        }
+        drop(db);
+        drop(backend);
+        // The cache merge broke the backend's ascending key order —
+        // `Snapshot` requires strictly sorted entries (verified by
+        // `snapshot_import` and `parse_snapshot_entries`).
+        snap.entries.sort_unstable_by_key(|e| e.0);
+        Some(snap)
+    }
+
+    /// Verify a staged snapshot without mutating: strictly parse
+    /// every entry by namespace, rebuild the account set in a
+    /// scratch map, and recompute the Ethereum MPT root the same way
+    /// `state_root`'s full-build path does. The returned root is
+    /// checked against the snapshot's claimed module root — bytes
+    /// that don't reproduce it never reach the backend (audit 3.2).
+    ///
+    /// The `0x02`/`0x03`/`0x04` namespaces (sealed blocks, undo
+    /// blobs, schema meta) are RPC-window data — not committed to
+    /// the account trie — but they are still schema-validated so a
+    /// malformed record can't be installed silently.
+    fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
+        let accounts = Self::parse_snapshot_entries(snapshot)?;
+        // Rebuild the state trie from the staged accounts — the
+        // same keying (keccak256(addr)) and leaf RLP as the live
+        // `state_root` full-build path.
+        let iter = accounts.iter().map(|(addr, acct)| {
+            let storage_root = if acct.storage.is_empty() {
+                trie::EMPTY_ROOT
+            } else {
+                trie::storage_root(acct.storage.iter().map(|(slot, value)| {
+                    (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
+                }))
+            };
+            (
+                alloy_primitives_address(addr.0),
+                trie::build_trie_account(acct.nonce, acct.balance, storage_root, acct.code_hash),
+            )
+        });
+        Ok(Hash(trie::state_root(iter).0))
     }
 
     /// Import a key-value snapshot, restoring the EVM's state.
     ///
-    /// Flushes the current in-memory state to the backend, then
+    /// The snapshot is strictly re-validated before the backend is
+    /// touched — `import_state` must never trust a prior inspection
+    /// to have happened.
+    ///
+    /// Flushes the current in-memory state to the backend first, then
     /// replaces the backend's state with the snapshot, then reloads
     /// the in-memory cache from the backend.
     ///
     /// Returns `Ok(())` on success, or an error if the backend is
     /// not attached or the import fails.
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+        // Strict structural validation before any mutation — the
+        // executor's verify-then-mutate contract depends on
+        // `inspect_state`, but `import_state` must not blindly trust
+        // it ran (same pattern as the blob modules' re-staging).
+        Self::parse_snapshot_entries(snapshot)?;
         // Flush the current state to the backend first (so we don't
         // lose any pending changes — though in practice, import
         // happens before consensus starts, so there are no pending
@@ -4356,16 +4438,90 @@ impl Module for EvmModule {
             self.load_from_storage(b.as_mut());
         }
         // The account set was wholesale replaced — the incremental
-        // leaf map and retained branches are stale. The next
-        // `state_root` rebuilds from scratch.
+        // leaf map, retained branches, root cache, and any pending
+        // `touched` marks all describe pre-import state. Reset them:
+        // the next `state_root` rebuilds from scratch and the next
+        // `end_block` flush must not re-emit ops for accounts the
+        // snapshot already installed.
         *self.trie_leaves_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.trie_leaves.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         self.retained_branches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         Ok(())
     }
 }
 
 impl EvmModule {
+    /// Strictly parse a snapshot's entries, returning the staged
+    /// account set keyed by address.
+    ///
+    /// Enforces, before any state is touched:
+    ///
+    /// - `Snapshot.entries` sorted ascending with no duplicate keys
+    ///   (the `Snapshot` contract — verified, not assumed).
+    /// - `0x01` account keys in canonical form
+    ///   (`[0x01][addr:20][0x00:11]` — the zero padding matters: a
+    ///   key with non-zero tail bytes would alias the same address
+    ///   under a second encoding) and values that satisfy
+    ///   [`persist::deserialize_account_strict`].
+    /// - `0x02` block records / `0x03` undo blobs: canonical key
+    ///   padding and a fully-parsing value (RPC-window data — not
+    ///   committed to the trie, but malformed records must not be
+    ///   installed).
+    /// - `0x04`: exactly the schema-version slot with a 4-byte value.
+    /// - Any other namespace byte is rejected outright.
+    fn parse_snapshot_entries(
+        snapshot: &storage::Snapshot,
+    ) -> Result<
+        std::collections::BTreeMap<Address, persist::DeserializedAccount>,
+        storage::SnapshotError,
+    > {
+        if snapshot.entries.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err(storage::SnapshotError::Malformed);
+        }
+        let mut accounts = std::collections::BTreeMap::new();
+        for (key, value) in &snapshot.entries {
+            match key.0[0] {
+                persist::NS_ACCOUNT => {
+                    if key.0[21..].iter().any(|b| *b != 0) {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                    let addr =
+                        persist::key_to_address(key).ok_or(storage::SnapshotError::Malformed)?;
+                    let acct = persist::deserialize_account_strict(value)
+                        .ok_or(storage::SnapshotError::Malformed)?;
+                    if accounts.insert(addr, acct).is_some() {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                }
+                persist::NS_BLOCK => {
+                    if key.0[9..].iter().any(|b| *b != 0)
+                        || persist::key_to_height(key).is_none()
+                        || persist::deserialize_block(value).is_none()
+                    {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                }
+                persist::NS_UNDO => {
+                    if key.0[9..].iter().any(|b| *b != 0)
+                        || persist::key_to_height(key).is_none()
+                        || persist::deserialize_undo(value).is_none()
+                    {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                }
+                persist::NS_META => {
+                    if *key != persist::state_version_key() || value.len() != 4 {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                }
+                _ => return Err(storage::SnapshotError::Malformed),
+            }
+        }
+        Ok(accounts)
+    }
+
     /// Get an account's balance from the EVM state.
     ///
     /// Returns 0 for accounts not in the state (EVM convention).
@@ -5436,6 +5592,14 @@ impl EvmModule {
                 storage: revm::primitives::HashMap::default(),
             });
         account.info.balance = revm::primitives::U256::from(balance);
+        // Funding is a state write — mark the account touched so the
+        // next `end_block` flush persists it. Without the mark the
+        // balance is committed to `state_root` but never reaches the
+        // backend: a restart (or a snapshot built from flushed state)
+        // would lose the account. `Node::assemble` uses this path for
+        // genesis faucet funding, so the hole is not test-only.
+        drop(db_guard);
+        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(evm_addr);
     }
 
     /// Insert an account with full state — the genesis `alloc` path.
@@ -5614,44 +5778,13 @@ impl EvmModule {
             // Delete op so the stale entry is removed from storage.
             // Without this, a self-destructed account reappears on
             // reload because the old persisted value is still there.
-            let Some(account) = db.cache.accounts.get(evm_addr) else {
-                ops.push(storage::Op::Delete { key });
-                continue;
-            };
-            if account.account_state == revm::database::AccountState::NotExisting {
-                ops.push(storage::Op::Delete { key });
-                continue;
+            // `serialize_committed_account` returns `None` for both
+            // cases (missing entry or `NotExisting` tombstone) —
+            // exactly the accounts absent from committed state.
+            match Self::serialize_committed_account(evm_addr, &db) {
+                Some(value) => ops.push(storage::Op::Set { key, value }),
+                None => ops.push(storage::Op::Delete { key }),
             }
-
-            // Extract code bytes if present. Accounts with
-            // `KECCAK_EMPTY` code hash are EOAs — their `code` field
-            // is `Some(Bytecode::default())` which contains a single
-            // STOP opcode, but they have no real code. Skip the code
-            // bytes for these accounts so they reload as true EOAs
-            // (revm's EIP-3607 check rejects callers with any code).
-            let code_bytes: Vec<u8> = if account.info.code_hash == revm::primitives::KECCAK_EMPTY {
-                Vec::new()
-            } else {
-                account.info.code.as_ref().map_or(Vec::new(), |bc| bc.bytes_slice().to_vec())
-            };
-
-            // Extract storage slots and sort by slot key for
-            // deterministic serialization. `DbAccount.storage` is a
-            // `U256Map<U256>` (HashMap) — iteration order is
-            // non-deterministic. Sorting ensures every validator
-            // produces the same byte blob for the same logical state.
-            let mut storage_slots: Vec<(revm::primitives::U256, revm::primitives::U256)> =
-                account.storage.iter().map(|(slot, val)| (*slot, *val)).collect();
-            storage_slots.sort_by_key(|a| a.0);
-
-            let value = persist::serialize_account(
-                account.info.balance,
-                account.info.nonce,
-                account.info.code_hash,
-                &code_bytes,
-                &storage_slots,
-            );
-            ops.push(storage::Op::Set { key, value });
         }
         // The schema version rides every flush batch: one extra op
         // per block keeps the `0x04` meta slot in lockstep with the
@@ -5663,6 +5796,69 @@ impl EvmModule {
             value: self.state_version().to_le_bytes().to_vec(),
         });
         ops
+    }
+
+    /// Serialize one committed cache account into its canonical
+    /// value blob — the single encoding shared by the incremental
+    /// flush ([`Self::account_flush_ops`]) and the snapshot export
+    /// ([`Module::export_state`]). Keeping both on one serializer is
+    /// the audit-3.2 invariant: the bytes that reach durable storage
+    /// and the bytes a snapshot carries can never drift apart.
+    ///
+    /// Returns `None` when the address is absent from committed
+    /// state — no cache entry, or an `AccountState::NotExisting`
+    /// tombstone (self-destructed this block, or a `basic()` miss
+    /// revm cached). Tombstones are not part of the state trie, so
+    /// they must never serialize as live accounts.
+    ///
+    /// The blob layout is `persist::serialize_account`'s: balance,
+    /// nonce, `code_hash`, code bytes, then storage slots sorted
+    /// ascending by slot key. `DbAccount.storage` is a `U256Map`
+    /// (hash map) — sorting makes the blob deterministic across
+    /// validators with the same logical state.
+    fn serialize_committed_account(
+        evm_addr: &revm::primitives::Address,
+        db: &CacheDB<EmptyDB>,
+    ) -> Option<Vec<u8>> {
+        let account = db.cache.accounts.get(evm_addr)?;
+        if account.account_state == revm::database::AccountState::NotExisting {
+            return None;
+        }
+        let code_bytes: Vec<u8> = if account.info.code_hash == revm::primitives::KECCAK_EMPTY {
+            Vec::new()
+        } else {
+            // `original_byte_slice`, not `bytes_slice`: once revm has
+            // analyzed a contract (first execution) `bytes_slice`
+            // returns the padded buffer, whose keccak no longer
+            // matches the committed `code_hash` — persisting it
+            // would reinstall divergent bytecode on restart
+            // (`extcodesize`/`extcodecopy` observe the padding).
+            match &account.info.code {
+                Some(bc) => bc.original_byte_slice().to_vec(),
+                // A balance/nonce-touched contract may never have
+                // loaded bytecode into `info.code` (e.g. a contract
+                // coinbase receiving fees — `basic()` doesn't
+                // populate `code`). Fall back to the contracts map:
+                // writing `code_len=0` under a real `code_hash`
+                // would silently strip the contract's code on
+                // reload/snapshot.
+                None => db
+                    .cache
+                    .contracts
+                    .get(&account.info.code_hash)
+                    .map_or_else(Vec::new, |bc| bc.original_byte_slice().to_vec()),
+            }
+        };
+        let mut storage_slots: Vec<(revm::primitives::U256, revm::primitives::U256)> =
+            account.storage.iter().map(|(slot, val)| (*slot, *val)).collect();
+        storage_slots.sort_by_key(|a| a.0);
+        Some(persist::serialize_account(
+            account.info.balance,
+            account.info.nonce,
+            account.info.code_hash,
+            &code_bytes,
+            &storage_slots,
+        ))
     }
 
     /// Load EVM state from the `StorageBackend` into the `CacheDB`.
@@ -9215,5 +9411,122 @@ mod tests {
         drive_block(&m, 1, &[]);
         drive_block(&m, 2, &[]);
         assert_eq!(m.storage_at(&hist_addr, &U256::from(1)), U256::ZERO);
+    }
+
+    /// Audit 3.2 round-trip: a snapshot's accounts must rebuild the
+    /// same Ethereum MPT root on a scratch verification BEFORE the
+    /// backend is touched, and re-import must land byte-identical
+    /// state.
+    #[test]
+    fn state_snapshot_round_trips() {
+        use storage::Volatile;
+
+        let (pk, addr) = test_keypair();
+        let src = EvmModule::with_storage(1, 7, Box::new(Volatile::new()));
+        fund(&src, &addr);
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let tx = signed_transfer_tx(&pk, 0, recipient, 1_000_000_000);
+        src.begin_block(Height::new(1));
+        let results = src.handle_batch(&dummy_ctx(), &[tx]);
+        assert!(results.iter().all(Result::is_ok), "tx must succeed: {results:?}");
+        src.end_block(Height::new(1));
+
+        let snapshot = Module::export_state(&src).expect("evm exports state");
+        // The staged account set must reproduce the module's root.
+        assert_eq!(Module::inspect_state(&src, &snapshot).unwrap(), src.state_root());
+
+        let dst = EvmModule::with_storage(1, 7, Box::new(Volatile::new()));
+        Module::import_state(&dst, &snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        let oxide_recipient = primitives::Address(recipient.0.into());
+        assert_eq!(dst.balance(&oxide_recipient), 1_000_000_000);
+    }
+
+    /// A tampered account balance still parses — inspection must
+    /// return a DIFFERENT root (the executor compares against the
+    /// claimed root), while truncated or unsorted entries fail
+    /// outright.
+    #[test]
+    fn state_snapshot_verifies_root_and_rejects_malformed() {
+        use storage::Volatile;
+
+        let (pk, addr) = test_keypair();
+        let src = EvmModule::with_storage(1, 7, Box::new(Volatile::new()));
+        fund(&src, &addr);
+        let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+        let tx = signed_transfer_tx(&pk, 0, recipient, 1_000_000_000);
+        src.begin_block(Height::new(1));
+        let results = src.handle_batch(&dummy_ctx(), &[tx]);
+        assert!(results.iter().all(Result::is_ok), "tx must succeed: {results:?}");
+        src.end_block(Height::new(1)); // flush touched accounts to backend
+
+        let snapshot = Module::export_state(&src).unwrap();
+        assert!(snapshot.entries.iter().any(|(k, _)| k.0[0] == 0x01), "an account exists");
+
+        // Bit-flip a balance byte: structurally valid, wrong root.
+        let mut tampered = snapshot.clone();
+        let entry =
+            tampered.entries.iter_mut().find(|(k, _)| k.0[0] == 0x01).expect("account entry");
+        entry.1[0] ^= 0xFF;
+        let inspected = Module::inspect_state(&src, &tampered).unwrap();
+        assert_ne!(inspected, src.state_root(), "tampered state must change the root");
+
+        // Truncated value: structural rejection.
+        let mut truncated = snapshot.clone();
+        let entry =
+            truncated.entries.iter_mut().find(|(k, _)| k.0[0] == 0x01).expect("account entry");
+        entry.1.truncate(40);
+        assert!(Module::inspect_state(&src, &truncated).is_err());
+        assert!(
+            Module::import_state(
+                &EvmModule::with_storage(1, 7, Box::new(Volatile::new())),
+                &truncated
+            )
+            .is_err()
+        );
+
+        // Unsorted entry list violates the Snapshot contract.
+        let mut unsorted = snapshot.clone();
+        unsorted.entries.reverse();
+        assert!(Module::inspect_state(&src, &unsorted).is_err());
+    }
+
+    /// `deserialize_account_strict` rejects what the lenient decoder
+    /// accepts: trailing bytes, unsorted/duplicate storage slots,
+    /// and a `code_hash` that doesn't bind its code bytes.
+    #[test]
+    fn account_deserialize_strict_rejects_noncanonical() {
+        let slot_a = U256::from(1);
+        let slot_b = U256::from(2);
+        // Slots out of order — the lenient decoder accepts, strict rejects.
+        let out_of_order = persist::serialize_account(
+            U256::ZERO,
+            0,
+            revm::primitives::KECCAK_EMPTY,
+            &[],
+            &[(slot_b, U256::from(9)), (slot_a, U256::from(9))],
+        );
+        assert!(persist::deserialize_account(&out_of_order).is_some());
+        assert!(persist::deserialize_account_strict(&out_of_order).is_none());
+
+        // Trailing bytes after the last slot.
+        let mut trailing =
+            persist::serialize_account(U256::ZERO, 0, revm::primitives::KECCAK_EMPTY, &[], &[]);
+        trailing.push(0);
+        assert!(persist::deserialize_account(&trailing).is_some());
+        assert!(persist::deserialize_account_strict(&trailing).is_none());
+
+        // A code_hash that doesn't match the code bytes — the MPT
+        // commits the hash, so mismatched code would diverge while
+        // verifying clean.
+        let code = vec![0x60, 0x00];
+        let mismatched =
+            persist::serialize_account(U256::ZERO, 0, revm::primitives::B256::ZERO, &code, &[]);
+        assert!(persist::deserialize_account_strict(&mismatched).is_none());
+
+        // Empty code with a non-empty hash — unverifiable.
+        let no_body =
+            persist::serialize_account(U256::ZERO, 0, revm::primitives::B256::ZERO, &[], &[]);
+        assert!(persist::deserialize_account_strict(&no_body).is_none());
     }
 }

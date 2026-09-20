@@ -17,6 +17,7 @@ crypto = { workspace = true }
 types = { workspace = true }
 executor = { workspace = true }
 framework = { workspace = true }
+storage = { workspace = true }
 # ledger: bond/unbond settlement — delegate debits the delegator
 # into BONDED_POOL, completed unbonding pays out of it. The EVM
 # precompile shares this path so invariants are identical.

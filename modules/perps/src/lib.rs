@@ -1106,6 +1106,343 @@ impl PerpsModule {
     }
 }
 
+/// Staged perps state — the decoded form of a snapshot blob's
+/// canonical section, produced by [`PerpsModule::decode_committed`]
+/// and installed by `import_state` only after the executor has
+/// verified the blob's claimed root.
+///
+/// Wiring handles (`ledger`, `committee`) are not part of it — they
+/// are assembly-time dependencies reattached by the node harness,
+/// not chain state.
+struct StagedPerps {
+    /// Matching engines per market slot (fixed `u8`-indexed array).
+    markets: Vec<Option<MatchingEngine>>,
+    /// Perps-specific configs per listed market.
+    configs: BTreeMap<u8, PerpsMarketConfig>,
+    /// Mark prices per market (scale-8).
+    marks: BTreeMap<u8, u64>,
+    /// Account states, keyed by address.
+    accounts: BTreeMap<Address, AccountState>,
+    /// Insurance fund balance (scale-6 quote).
+    insurance_fund: u64,
+    /// Per-market oracle-update counter for the current block.
+    oracle_updates_this_block: BTreeMap<u8, u8>,
+    /// Pending governance endorsements (C9).
+    endorsements: framework::Endorsements,
+}
+
+impl PerpsModule {
+    /// Write the module's committed state into `w` — shared by
+    /// `state_root` and `export_state` so the snapshot blob's
+    /// canonical section is provably the same bytes `state_root`
+    /// hashes.
+    fn write_committed(&self, w: &mut framework::CanonicalState) {
+        w.put_root(&subtree_root(&self.store));
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Live books: market config + order-id sequence + every
+        // resting order (canonical order inside the engine encoding).
+        let mut entries = Vec::new();
+        let mut book_bytes = Vec::new();
+        w.put_count(inner.markets.len());
+        for engine in &inner.markets {
+            match engine {
+                Some(e) => {
+                    w.put_u8(1);
+                    book_bytes.clear();
+                    e.write_canonical_state(&mut book_bytes, &mut entries);
+                    w.put_bytes(&book_bytes);
+                }
+                None => {
+                    w.put_u8(0);
+                }
+            }
+        }
+        // Perps market configs (leverage / mmr — margin math).
+        w.put_count(inner.configs.len());
+        for (market, cfg) in &inner.configs {
+            w.put_u8(*market);
+            w.put_u16(cfg.max_leverage);
+            w.put_u16(cfg.mmr_base_bps);
+        }
+        // Mark prices drive funding, liquidations, and margin checks.
+        w.put_count(inner.marks.len());
+        for (market, mark) in &inner.marks {
+            w.put_u8(*market);
+            w.put_u64(*mark);
+        }
+        // Accounts: cross margin, per-market positions, and the C7
+        // open-order reservations (potential exposure).
+        w.put_count(inner.accounts.len());
+        for (addr, acct) in &inner.accounts {
+            w.put_addr(addr);
+            w.put_u64(acct.cross_margin);
+            w.put_count(acct.positions.len());
+            for (market, pos) in &acct.positions {
+                w.put_u8(*market);
+                w.put_i64(pos.size);
+                w.put_u64(pos.entry_price);
+                w.put_u64(pos.isolated_margin);
+            }
+            w.put_count(acct.open_orders.len());
+            for ((market, oid), resv) in &acct.open_orders {
+                w.put_u8(*market);
+                w.put_u64(*oid);
+                w.put_u64(resv.qty);
+                w.put_u64(resv.price);
+                w.put_u8(resv.side as u8);
+                w.put_bool(resv.reduce_only);
+            }
+        }
+        w.put_u64(inner.insurance_fund);
+        // Intra-block oracle-update counter: deterministic (same
+        // block → same count) and cheap, so it is committed too.
+        w.put_count(inner.oracle_updates_this_block.len());
+        for (market, n) in &inner.oracle_updates_this_block {
+            w.put_u8(*market);
+            w.put_u8(*n);
+        }
+        drop(inner);
+        // C9: pending governance endorsements decide whether an
+        // override applies — future-affecting state, committed like
+        // everything else.
+        self.endorsements.write_canonical(w);
+    }
+
+    /// Decode the canonical fields following the leading store root —
+    /// shared by `inspect_state` and `import_state` so verification
+    /// and installation can never disagree about the schema.
+    ///
+    /// `slots` is the destination's fixed market-slot count: a blob
+    /// claiming a different array length cannot represent this
+    /// module's state.
+    ///
+    /// Beyond structural validity this enforces the *internal*
+    /// invariants every live code path maintains (store↔config
+    /// binding, marks ⟺ listed markets, reservations ⟺ resting
+    /// orders). Those matter because the root check alone only proves
+    /// the blob hashes to the claimed root — a crafted blob with a
+    /// matching claimed root could otherwise install state no honest
+    /// execution could produce, corrupting margin accounting on the
+    /// next fill.
+    fn decode_committed(
+        r: &mut framework::CanonicalReader<'_>,
+        store: &BTreeMap<Vec<u8>, Vec<u8>>,
+        slots: usize,
+    ) -> Option<StagedPerps> {
+        let markets = Self::decode_engines(r, slots)?;
+        let configs = Self::decode_configs(r, &markets, store)?;
+        let marks = Self::decode_marks(r, &configs)?;
+        let accounts = Self::decode_accounts(r, &configs)?;
+        Self::check_reservation_binding(&markets, &accounts)?;
+        let insurance_fund = r.get_u64()?;
+        // Intra-block oracle-update counter — a count for an
+        // unlisted market is dead state no live path produces.
+        let n = r.get_count()?;
+        let mut oracle_updates_this_block = BTreeMap::new();
+        for _ in 0..n {
+            let market = r.get_u8()?;
+            let count = r.get_u8()?;
+            if !configs.contains_key(&market) {
+                return None;
+            }
+            if oracle_updates_this_block.insert(market, count).is_some() {
+                return None;
+            }
+        }
+        let endorsements = framework::Endorsements::read_canonical(r)?;
+        Some(StagedPerps {
+            markets,
+            configs,
+            marks,
+            accounts,
+            insurance_fund,
+            oracle_updates_this_block,
+            endorsements,
+        })
+    }
+
+    /// Decode the fixed-size market array — one canonical engine blob
+    /// per listed slot.
+    fn decode_engines(
+        r: &mut framework::CanonicalReader<'_>,
+        slots: usize,
+    ) -> Option<Vec<Option<MatchingEngine>>> {
+        let n = r.get_count()?;
+        if n != slots {
+            return None;
+        }
+        let mut markets = Vec::with_capacity(n);
+        for _ in 0..n {
+            match r.get_u8()? {
+                0 => markets.push(None),
+                1 => {
+                    let bytes = r.get_bytes()?;
+                    markets.push(Some(
+                        MatchingEngine::from_canonical_state(bytes, |c| DenseBook::new(*c)).ok()?,
+                    ));
+                }
+                _ => return None,
+            }
+        }
+        Some(markets)
+    }
+
+    /// Decode the perps market configs. `base` is recovered from the
+    /// engine's own canonical config so the two encodings cannot
+    /// disagree, and the KV store must carry the byte-identical
+    /// `m/{id}` entry — without that binding a crafted blob could
+    /// pair engines with mismatched store entries and still hash to
+    /// a self-consistent root.
+    fn decode_configs(
+        r: &mut framework::CanonicalReader<'_>,
+        markets: &[Option<MatchingEngine>],
+        store: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Option<BTreeMap<u8, PerpsMarketConfig>> {
+        let n = r.get_count()?;
+        let mut configs = BTreeMap::new();
+        for _ in 0..n {
+            let market = r.get_u8()?;
+            let max_leverage = r.get_u16()?;
+            let mmr_base_bps = r.get_u16()?;
+            let engine = markets.get(usize::from(market)).and_then(Option::as_ref)?;
+            let cfg = PerpsMarketConfig { base: *engine.config(), max_leverage, mmr_base_bps };
+            match store.get(&market_config_key(market)) {
+                Some(v) if *v == encode_perps_config(&cfg) => {}
+                _ => return None,
+            }
+            if configs.insert(market, cfg).is_some() {
+                return None; // Duplicate market key — non-canonical.
+            }
+        }
+        Some(configs)
+    }
+
+    /// Decode mark prices. `set_mark_price` rejects unknown markets
+    /// and `list_market` seeds an initial mark, so the live invariant
+    /// is marks ⟺ configs exactly.
+    fn decode_marks(
+        r: &mut framework::CanonicalReader<'_>,
+        configs: &BTreeMap<u8, PerpsMarketConfig>,
+    ) -> Option<BTreeMap<u8, u64>> {
+        let n = r.get_count()?;
+        let mut marks = BTreeMap::new();
+        for _ in 0..n {
+            let market = r.get_u8()?;
+            let mark = r.get_u64()?;
+            if !configs.contains_key(&market) {
+                return None;
+            }
+            if marks.insert(market, mark).is_some() {
+                return None;
+            }
+        }
+        if marks.len() != configs.len() {
+            return None;
+        }
+        Some(marks)
+    }
+
+    /// Decode accounts — cross margin, positions (only on listed
+    /// markets: a position can only exist where fills can happen),
+    /// and C7 open-order reservations.
+    fn decode_accounts(
+        r: &mut framework::CanonicalReader<'_>,
+        configs: &BTreeMap<u8, PerpsMarketConfig>,
+    ) -> Option<BTreeMap<Address, AccountState>> {
+        let n = r.get_count()?;
+        let mut accounts = BTreeMap::new();
+        for _ in 0..n {
+            let addr = r.get_addr()?;
+            let cross_margin = r.get_u64()?;
+            let pn = r.get_count()?;
+            let mut positions = BTreeMap::new();
+            for _ in 0..pn {
+                let market = r.get_u8()?;
+                if !configs.contains_key(&market) {
+                    return None;
+                }
+                let size = r.get_i64()?;
+                let entry_price = r.get_u64()?;
+                let isolated_margin = r.get_u64()?;
+                if positions
+                    .insert(market, Position { size, entry_price, isolated_margin })
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            let on = r.get_count()?;
+            let mut open_orders = BTreeMap::new();
+            for _ in 0..on {
+                let market = r.get_u8()?;
+                let oid = r.get_u64()?;
+                let qty = r.get_u64()?;
+                let price = r.get_u64()?;
+                let side = match r.get_u8()? {
+                    0 => Side::Buy,
+                    1 => Side::Sell,
+                    _ => return None,
+                };
+                let reduce_only = r.get_bool()?;
+                if open_orders
+                    .insert((market, oid), OpenOrderResv { qty, price, side, reduce_only })
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            if accounts
+                .insert(addr, AccountState { cross_margin, positions, open_orders })
+                .is_some()
+            {
+                return None;
+            }
+        }
+        Some(accounts)
+    }
+
+    /// Enforce the reservation↔book binding: collect every resting
+    /// order and require a bijection with the accounts' reservations
+    /// — same owner, side, price, and remaining qty. A crafted blob
+    /// that splits the two would leak or double-charge margin on the
+    /// next fill/cancel.
+    fn check_reservation_binding(
+        markets: &[Option<MatchingEngine>],
+        accounts: &BTreeMap<Address, AccountState>,
+    ) -> Option<()> {
+        let mut resting = BTreeMap::new();
+        let mut scratch = Vec::new();
+        for (i, engine) in markets.iter().enumerate() {
+            let Some(e) = engine else { continue };
+            e.resting_entries(&mut scratch);
+            let market = u8::try_from(i).ok()?;
+            for entry in scratch.drain(..) {
+                if resting.insert((market, entry.id.0), entry).is_some() {
+                    return None; // Duplicate resting id — impossible from a live engine.
+                }
+            }
+        }
+        for (addr, acct) in accounts {
+            for ((market, oid), resv) in &acct.open_orders {
+                let entry = resting.get(&(*market, *oid))?;
+                if entry.owner != *addr
+                    || entry.qty.0 != resv.qty
+                    || entry.price.0 != resv.price
+                    || entry.side != resv.side
+                {
+                    return None;
+                }
+            }
+        }
+        for ((market, oid), entry) in &resting {
+            // Field equality was proven by the forward pass; the
+            // reverse only needs existence.
+            accounts.get(&entry.owner).and_then(|a| a.open_orders.get(&(*market, *oid)))?;
+        }
+        Some(())
+    }
+}
+
 impl Default for PerpsModule {
     fn default() -> Self {
         Self::new()
@@ -1371,76 +1708,62 @@ impl Module for PerpsModule {
         // Excluded: `fills` (per-call scratch), `ledger` /
         // `committee` (assembly wiring, not tx-mutated state).
         let mut w = framework::CanonicalState::new();
-        w.put_root(&subtree_root(&self.store));
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Live books: market config + order-id sequence + every
-        // resting order (canonical order inside the engine encoding).
-        let mut entries = Vec::new();
-        let mut book_bytes = Vec::new();
-        w.put_count(inner.markets.len());
-        for engine in &inner.markets {
-            match engine {
-                Some(e) => {
-                    w.put_u8(1);
-                    book_bytes.clear();
-                    e.write_canonical_state(&mut book_bytes, &mut entries);
-                    w.put_bytes(&book_bytes);
-                }
-                None => {
-                    w.put_u8(0);
-                }
-            }
-        }
-        // Perps market configs (leverage / mmr — margin math).
-        w.put_count(inner.configs.len());
-        for (market, cfg) in &inner.configs {
-            w.put_u8(*market);
-            w.put_u16(cfg.max_leverage);
-            w.put_u16(cfg.mmr_base_bps);
-        }
-        // Mark prices drive funding, liquidations, and margin checks.
-        w.put_count(inner.marks.len());
-        for (market, mark) in &inner.marks {
-            w.put_u8(*market);
-            w.put_u64(*mark);
-        }
-        // Accounts: cross margin, per-market positions, and the C7
-        // open-order reservations (potential exposure).
-        w.put_count(inner.accounts.len());
-        for (addr, acct) in &inner.accounts {
-            w.put_addr(addr);
-            w.put_u64(acct.cross_margin);
-            w.put_count(acct.positions.len());
-            for (market, pos) in &acct.positions {
-                w.put_u8(*market);
-                w.put_i64(pos.size);
-                w.put_u64(pos.entry_price);
-                w.put_u64(pos.isolated_margin);
-            }
-            w.put_count(acct.open_orders.len());
-            for ((market, oid), resv) in &acct.open_orders {
-                w.put_u8(*market);
-                w.put_u64(*oid);
-                w.put_u64(resv.qty);
-                w.put_u64(resv.price);
-                w.put_u8(resv.side as u8);
-                w.put_bool(resv.reduce_only);
-            }
-        }
-        w.put_u64(inner.insurance_fund);
-        // Intra-block oracle-update counter: deterministic (same
-        // block → same count) and cheap, so it is committed too.
-        w.put_count(inner.oracle_updates_this_block.len());
-        for (market, n) in &inner.oracle_updates_this_block {
-            w.put_u8(*market);
-            w.put_u8(*n);
-        }
-        drop(inner);
-        // C9: pending governance endorsements decide whether an
-        // override applies — future-affecting state, committed like
-        // everything else.
-        self.endorsements.write_canonical(&mut w);
+        self.write_committed(&mut w);
         w.root()
+    }
+
+    /// Export the committed state as one canonical blob —
+    /// `canon ‖ store`. The canon section is the `state_root`
+    /// preimage, so a peer can verify the claimed root before
+    /// installing anything (audit 3.2).
+    fn export_state(&self) -> Option<storage::Snapshot> {
+        let mut w = framework::CanonicalState::new();
+        self.write_committed(&mut w);
+        Some(storage::Snapshot {
+            height: 0,
+            entries: vec![(
+                framework::state_blob_key(),
+                framework::encode_state_blob(w.as_bytes(), &self.store),
+            )],
+        })
+    }
+
+    /// Verify a staged snapshot's claimed root without mutating:
+    /// decode the blob, check the store section hashes to the
+    /// committed subtree root, fully decode the fields with all
+    /// internal invariants enforced, then hash the canonical
+    /// preimage.
+    fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
+        let slots =
+            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
+        let (canon, _staged, _store) = framework::stage_blob_snapshot(snapshot, |r, store| {
+            Self::decode_committed(r, store, slots)
+        })?;
+        Ok(framework::canon_root(canon))
+    }
+
+    /// Install staged state after `inspect_state` has proven it —
+    /// the same staged decode runs again, then the fields swap in
+    /// atomically (decode first, mutate second).
+    fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
+        let slots =
+            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
+        let (_canon, staged, store) =
+            framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
+        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.markets = staged.markets;
+        inner.configs = staged.configs;
+        inner.marks = staged.marks;
+        inner.accounts = staged.accounts;
+        inner.insurance_fund = staged.insurance_fund;
+        inner.oracle_updates_this_block = staged.oracle_updates_this_block;
+        // `fills` is per-call scratch — clear it so a buffer left
+        // mid-transaction cannot leak across the import boundary.
+        inner.fills.clear();
+        drop(inner);
+        self.endorsements.replace_with(staged.endorsements);
+        Ok(())
     }
 }
 
@@ -3513,5 +3836,44 @@ mod tests {
             .handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 500, 1, 1)))
             .unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// Snapshot round-trip: a listed market, funded accounts,
+    /// positions, and resting orders on both sides must export,
+    /// verify, and re-import byte-identically — the imported
+    /// module's root must equal the source's (audit 3.2).
+    #[test]
+    fn state_snapshot_round_trips() {
+        let src = PerpsModule::new();
+        let mid = src.list_market(test_cfg()).unwrap();
+        src.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 1_000_000)).unwrap();
+        src.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 1_000_000)).unwrap();
+        // A crossed pair opens positions for both sides…
+        src.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        src.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        // …and a second resting sell stays on the book.
+        src.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 700, 2, 9))).unwrap();
+
+        let snapshot = src.export_state().expect("perps exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+        let dst = PerpsModule::new();
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        assert_eq!(dst.mark_price(mid), src.mark_price(mid));
+        assert_eq!(dst.cross_margin(&addr(1)), src.cross_margin(&addr(1)));
+        assert_eq!(dst.position(&addr(1), mid).size, src.position(&addr(1), mid).size);
+    }
+
+    /// A truncated blob must fail inspection and import — the
+    /// claimed root is never trusted over the bytes.
+    #[test]
+    fn state_snapshot_rejects_corruption() {
+        let src = PerpsModule::new();
+        src.list_market(test_cfg()).unwrap();
+        let mut snapshot = src.export_state().unwrap();
+        snapshot.entries[0].1.truncate(12);
+        assert!(src.inspect_state(&snapshot).is_err());
+        assert!(PerpsModule::new().import_state(&snapshot).is_err());
     }
 }

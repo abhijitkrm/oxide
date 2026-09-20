@@ -399,6 +399,102 @@ impl<B: BookBackend> MatchingEngine<B> {
         }
     }
 
+    /// Rebuild an engine from `write_canonical_state` bytes —
+    /// snapshot restore.
+    ///
+    /// The decoded config is re-validated (`MarketConfig::validate`
+    /// via [`Self::new`]), each resting entry is re-inserted through
+    /// [`Self::restore_resting`] in committed order, and the restored
+    /// engine is re-encoded and compared byte-for-byte against the
+    /// input: if the bytes disagree, the input was never a faithful
+    /// canonical encoding (or a field was dropped on restore) and the
+    /// whole decode is rejected.
+    ///
+    /// `make_book` builds the fresh [`BookBackend`] for the decoded
+    /// config (e.g. `DenseBook::new`) — the engine cannot construct
+    /// `B` itself because backend construction is backend-specific.
+    ///
+    /// # Errors
+    /// [`TradingError::CorruptState`] on malformed bytes, a config or
+    /// entry the live engine could never have produced, a duplicate
+    /// order id, or a re-encode mismatch; [`TradingError::BookFull`]
+    /// if the entry count exceeds `max_resting`.
+    pub fn from_canonical_state(
+        data: &[u8],
+        make_book: impl FnOnce(&MarketConfig) -> Result<B, TradingError>,
+    ) -> Result<Self, TradingError> {
+        let decoded = decode_canonical_state(data).ok_or(TradingError::CorruptState("decode"))?;
+        let mut engine = Self::new(decoded.cfg, make_book(&decoded.cfg)?)?;
+        for e in &decoded.entries {
+            engine.restore_resting(e)?;
+        }
+        engine.set_next_id(decoded.next_id);
+        // Byte-exactness self-check: the restored engine must
+        // re-encode to the input. Cold path (snapshot import only) —
+        // the extra O(resting) pass is acceptable and turns every
+        // subtle restore bug into a loud rejection.
+        let mut re_encoded = Vec::with_capacity(data.len());
+        let mut scratch = Vec::with_capacity(decoded.entries.len());
+        engine.write_canonical_state(&mut re_encoded, &mut scratch);
+        if re_encoded != data {
+            return Err(TradingError::CorruptState("re-encode mismatch"));
+        }
+        Ok(engine)
+    }
+
+    /// Reinsert a resting order WITHOUT matching — snapshot restore
+    /// only.
+    ///
+    /// The caller replays entries in committed order (price level
+    /// ascending, FIFO within a level), which `book.append` preserves.
+    /// `e.id` is kept verbatim — the caller must call
+    /// [`Self::set_next_id`] afterwards so live orders cannot be
+    /// assigned an id that is already resting.
+    ///
+    /// # Errors
+    /// [`TradingError::CorruptState`] if the entry's fields violate
+    /// the market's tick/lot/band rules (a state the live engine
+    /// could never have produced); [`TradingError::BookFull`] at
+    /// capacity; [`TradingError::OrderNotFound`] on a duplicate id
+    /// (the `IdMap`'s existing invariant check).
+    pub fn restore_resting(&mut self, e: &RestingEntry) -> Result<(), TradingError> {
+        // Reuse `NewOrder`'s field validation: a restored resting
+        // order is a GTC limit remainder — the exact shape `place`
+        // books. If it would have been rejected on the wire, the
+        // snapshot is corrupt.
+        let probe = NewOrder {
+            side: e.side,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: e.price,
+            qty: e.qty,
+            owner: e.owner,
+            stp: StpMode::None,
+        };
+        probe
+            .validate(self.cfg.tick_size, self.cfg.lot_size, self.cfg.min_price, self.cfg.max_price)
+            .map_err(|_| TradingError::CorruptState("entry fails market rules"))?;
+        if self.resting >= self.cfg.max_resting {
+            return Err(TradingError::BookFull);
+        }
+        let slot =
+            self.pool.alloc(fresh_node(e.id, e.side, e.price, e.qty, e.owner, TimeInForce::Gtc));
+        self.book.append(slot, &mut self.pool);
+        self.ids.insert(e.id.0, slot)?;
+        self.resting += 1;
+        Ok(())
+    }
+
+    /// Set the order-id counter — snapshot restore only.
+    ///
+    /// `next` must exceed every restored id or a later `place` would
+    /// assign a live order an id already in `ids`, cross-wiring
+    /// cancel/owner lookups. [`decode_canonical_state`] enforces
+    /// `max(id) < next_id` for blobs it produced.
+    pub fn set_next_id(&mut self, next: u64) {
+        self.next_id = next;
+    }
+
     /// The entry sweep: match the incoming order against resting
     /// liquidity, best price first, FIFO within each level.
     ///
@@ -545,6 +641,125 @@ impl<B: BookBackend> MatchingEngine<B> {
             Side::Sell => self.book.best_bid_price().is_some_and(|b| b >= price_raw),
         }
     }
+}
+
+/// The fields decoded from a `write_canonical_state` blob.
+///
+/// Not a live engine — `from_canonical_state` consumes this and
+/// rebuilds the pool/book/`ids` structures from `entries`.
+#[derive(Debug)]
+pub struct DecodedBook {
+    /// Market configuration committed by the blob.
+    pub cfg: MarketConfig,
+    /// The order-id counter at commit time.
+    pub next_id: u64,
+    /// The committed resting-order count — must equal
+    /// `entries.len()` (redundant fields are cross-checked).
+    pub resting: u32,
+    /// Resting orders in committed order (level ascending, FIFO
+    /// within a level).
+    pub entries: Vec<RestingEntry>,
+}
+
+/// Bounds-checked little-endian cursor for [`decode_canonical_state`]
+/// — mirrors `write_canonical_state`'s field order exactly. Snapshot
+/// bytes are untrusted input: every read bounds-checks and yields
+/// `None`, never a panic.
+struct CanonReader<'a> {
+    /// The buffer being decoded.
+    b: &'a [u8],
+    /// Read cursor — next unread byte offset.
+    p: usize,
+}
+
+impl<'a> CanonReader<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, p: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.p.checked_add(n)?;
+        if end > self.b.len() {
+            return None;
+        }
+        let out = &self.b[self.p..end];
+        self.p = end;
+        Some(out)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn at_end(&self) -> bool {
+        self.p == self.b.len()
+    }
+}
+
+/// Decode a `write_canonical_state` blob into its committed fields.
+///
+/// Checks beyond shape: `resting == entries.len()` (the two counts
+/// are committed redundantly and must agree), every entry id is
+/// strictly below `next_id` (else a live order could later be
+/// assigned an id that is already resting), the entry count fits
+/// `cfg.max_resting`, and the stream ends exactly — trailing garbage
+/// is malformed, not ignored. Config self-consistency is enforced
+/// downstream by `MarketConfig::validate` in `MatchingEngine::new`.
+///
+/// `None` on any malformation; never panics on untrusted input.
+#[must_use]
+pub fn decode_canonical_state(data: &[u8]) -> Option<DecodedBook> {
+    let mut r = CanonReader::new(data);
+    let cfg = MarketConfig {
+        market_id: r.u16()?,
+        tick_size: r.u64()?,
+        lot_size: r.u64()?,
+        min_price: r.u64()?,
+        max_price: r.u64()?,
+        max_resting: r.u32()?,
+    };
+    let next_id = r.u64()?;
+    let resting = r.u32()?;
+    let count = usize::try_from(r.u64()?).ok()?;
+    if count != usize::try_from(resting).ok()? {
+        return None; // The redundant counts must agree.
+    }
+    if resting > cfg.max_resting {
+        return None; // More entries than the book can ever hold.
+    }
+    let mut entries = Vec::with_capacity(count.min(r.b.len() - r.p));
+    for _ in 0..count {
+        let id = OrderId(r.u64()?);
+        let side = match r.u8()? {
+            0 => Side::Buy,
+            1 => Side::Sell,
+            _ => return None, // Unknown side tag — non-canonical.
+        };
+        let price = Price(r.u64()?);
+        let qty = Qty(r.u64()?);
+        let mut owner = [0u8; Address::LEN];
+        owner.copy_from_slice(r.take(Address::LEN)?);
+        if id.0 >= next_id {
+            return None; // A resting id must be strictly below next_id.
+        }
+        entries.push(RestingEntry { id, side, price, qty, owner: Address(owner) });
+    }
+    if !r.at_end() {
+        return None;
+    }
+    Some(DecodedBook { cfg, next_id, resting, entries })
 }
 
 #[cfg(test)]
@@ -1104,5 +1319,98 @@ mod tests {
         // With STP None, the self-trade executes and the order fills.
         assert_eq!(out, OrderOutcome::Filled, "FOK without STP must fill against own order");
         assert!(!fills.is_empty(), "FOK without STP must produce fills");
+    }
+
+    /// Snapshot restore: an engine rebuilt from `write_canonical_state`
+    /// bytes must re-encode to byte-identical output and keep trading
+    /// correctly (next id continues, resting orders are cancellable).
+    #[test]
+    fn canonical_state_round_trip_restores_book() {
+        let mut e = engine();
+        let mut fills = Vec::new();
+
+        // Two resting sells at different prices, one partially filled,
+        // plus a resting bid — a non-trivial book shape.
+        e.place(
+            order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 5_000, 1),
+            &mut fills,
+        )
+        .unwrap();
+        e.place(
+            order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_051_000_000, 2_000, 2),
+            &mut fills,
+        )
+        .unwrap();
+        e.place(
+            order(Side::Buy, OrderType::Limit, TimeInForce::Gtc, 1_010_000_000, 7_000, 3),
+            &mut fills,
+        )
+        .unwrap();
+        e.place(
+            order(Side::Buy, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 1_000, 4),
+            &mut fills,
+        )
+        .unwrap(); // partially fills the first sell
+        assert_eq!(e.resting_count(), 3);
+        assert_eq!(e.next_order_id(), 4);
+
+        let mut bytes = Vec::new();
+        let mut scratch = Vec::new();
+        e.write_canonical_state(&mut bytes, &mut scratch);
+
+        let mut restored =
+            MatchingEngine::from_canonical_state(&bytes, |c| DenseBook::new(*c)).unwrap();
+        let mut bytes2 = Vec::new();
+        restored.write_canonical_state(&mut bytes2, &mut scratch);
+        assert_eq!(bytes, bytes2, "restored engine must re-encode byte-identically");
+
+        // Live operation continues correctly: next id is 4, and a
+        // restored order cancels by id.
+        assert_eq!(restored.next_order_id(), 4);
+        let canceled = restored.cancel(OrderId(2)).expect("restored order must cancel");
+        assert_eq!(canceled.price, Price(1_010_000_000));
+        assert_eq!(restored.resting_count(), 2);
+    }
+
+    /// `decode_canonical_state` must reject truncated, inconsistent,
+    /// or non-canonical input — never panic, never restore silently.
+    #[test]
+    fn canonical_state_decode_rejects_malformed() {
+        let mut e = engine();
+        let mut fills = Vec::new();
+        e.place(
+            order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 5_000, 1),
+            &mut fills,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut scratch = Vec::new();
+        e.write_canonical_state(&mut bytes, &mut scratch);
+
+        // Truncation at every prefix length.
+        for cut in 0..bytes.len() {
+            assert!(
+                decode_canonical_state(&bytes[..cut]).is_none(),
+                "prefix of len {cut} must not decode"
+            );
+        }
+        // Trailing garbage.
+        let mut padded = bytes.clone();
+        padded.push(0);
+        assert!(decode_canonical_state(&padded).is_none());
+
+        // resting field ≠ entries count. Layout: cfg(38B = u16 +
+        // 4×u64 + u32) next_id(8) resting(4) count(8) entries —
+        // flip the resting field.
+        let mut bad = bytes.clone();
+        bad[38 + 8] ^= 0xFF;
+        assert!(decode_canonical_state(&bad).is_none(), "resting must equal entries count");
+
+        // An entry id ≥ next_id is impossible in a live book.
+        let mut bad = bytes.clone();
+        // Entry 0's id (offset 38+8+4+8 = 58) — set it to next_id.
+        let nid = u64::from_le_bytes(bytes[38..46].try_into().unwrap());
+        bad[58..66].copy_from_slice(&nid.to_le_bytes());
+        assert!(decode_canonical_state(&bad).is_none(), "id ≥ next_id must be rejected");
     }
 }

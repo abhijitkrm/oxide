@@ -55,7 +55,7 @@ use crate::tx::TxAuthorization;
 use crate::versioned::{BlockUndo, UndoAccount};
 
 /// Namespace prefix for EVM account keys.
-const NS_ACCOUNT: u8 = 0x01;
+pub(crate) const NS_ACCOUNT: u8 = 0x01;
 
 /// Namespace prefix for sealed `ExecutedBlock` records.
 ///
@@ -63,7 +63,7 @@ const NS_ACCOUNT: u8 = 0x01;
 /// bytes, height-major so `range([0x02])` returns blocks in
 /// ascending order. The `hash_index`/`tx_index` maps are *not*
 /// persisted; they are rebuilt from the records on load.
-const NS_BLOCK: u8 = 0x02;
+pub(crate) const NS_BLOCK: u8 = 0x02;
 
 /// Namespace prefix for per-height undo blobs.
 ///
@@ -73,13 +73,13 @@ const NS_BLOCK: u8 = 0x02;
 /// index so historical reads survive restart. Every executed
 /// height writes a blob (possibly empty) so the retention floor
 /// is preserved exactly.
-const NS_UNDO: u8 = 0x03;
+pub(crate) const NS_UNDO: u8 = 0x03;
 
 /// Namespace prefix for module metadata — the schema version the
 /// stored state was written at. Read on load so `migrate` knows
 /// what it's migrating *from*; rewritten on flush so the stored
 /// version always matches the binary that last wrote state.
-const NS_META: u8 = 0x04;
+pub(crate) const NS_META: u8 = 0x04;
 
 /// The fixed key for the stored schema version:
 /// `[0x04][0x00: 31B]` — a single slot, value is `u32 LE`.
@@ -190,6 +190,46 @@ pub(crate) fn deserialize_account(data: &[u8]) -> Option<DeserializedAccount> {
         off += 64;
     }
     Some(DeserializedAccount { balance, nonce, code_hash, code, storage })
+}
+
+/// Deserialize an EVM account with snapshot-strictness — the checks
+/// [`deserialize_account`] skips because a local storage corruption
+/// is a skip-and-continue bug, but a *snapshot* is consensus state:
+/// bytes that don't decode to exactly the encoder's output must be
+/// rejected, not papered over.
+///
+/// Additional invariants over the lenient decoder:
+///
+/// - **Exact length**: no trailing bytes after the last slot pair.
+/// - **Sorted, unique storage slots**: `account_flush_ops` sorts
+///   slots ascending; any other order (or a duplicate) is not the
+///   encoder's output.
+/// - **`code_hash` binds the code bytes**: the MPT commits the hash,
+///   not the code — a snapshot whose code doesn't match its hash
+///   would install bytecode that diverges from the committed root
+///   while verifying clean. Empty code must carry `KECCAK_EMPTY`
+///   (the EOA convention); non-empty code must hash to `code_hash`.
+pub(crate) fn deserialize_account_strict(data: &[u8]) -> Option<DeserializedAccount> {
+    let account = deserialize_account(data)?;
+    // Recompute the expected total length: 76 header bytes + code +
+    // 4 count bytes + 64 bytes per slot. Trailing bytes are rejected.
+    let expected = 76 + account.code.len() + 4 + account.storage.len() * 64;
+    if data.len() != expected {
+        return None;
+    }
+    // Slots are written in ascending order — enforce it so a
+    // reordered or duplicated slot can't alias into the trie.
+    if account.storage.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return None;
+    }
+    if account.code.is_empty() {
+        if account.code_hash != crate::trie::KECCAK_EMPTY {
+            return None;
+        }
+    } else if account.code_hash != alloy_primitives::keccak256(&account.code) {
+        return None;
+    }
+    Some(account)
 }
 
 /// Build the 32-byte storage key for a sealed block record.

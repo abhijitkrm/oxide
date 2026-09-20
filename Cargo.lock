@@ -1754,6 +1754,7 @@ dependencies = [
  "executor",
  "framework",
  "primitives",
+ "storage",
  "trading",
  "types",
 ]
@@ -1895,6 +1896,7 @@ dependencies = [
  "crypto",
  "executor",
  "primitives",
+ "storage",
  "types",
 ]
 
@@ -2022,6 +2024,7 @@ dependencies = [
  "executor",
  "framework",
  "primitives",
+ "storage",
  "types",
 ]
 
@@ -2785,6 +2788,7 @@ dependencies = [
  "executor",
  "framework",
  "primitives",
+ "storage",
 ]
 
 [[package]]
@@ -2800,6 +2804,7 @@ dependencies = [
  "executor",
  "framework",
  "primitives",
+ "storage",
  "types",
 ]
 
@@ -3026,6 +3031,7 @@ dependencies = [
  "framework",
  "primitives",
  "proptest",
+ "storage",
  "trading",
  "types",
 ]
@@ -4246,6 +4252,7 @@ dependencies = [
  "executor",
  "framework",
  "primitives",
+ "storage",
  "types",
 ]
 

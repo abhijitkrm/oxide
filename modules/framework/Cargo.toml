@@ -16,6 +16,7 @@ codec = { workspace = true }
 crypto = { workspace = true }
 types = { workspace = true }
 executor = { workspace = true }
+storage = { workspace = true }
 
 [lints]
 workspace = true

@@ -1793,6 +1793,47 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     previously heard nothing back and would wait forever; the
     server now always answers, even if the answer is "rejected".
 
+- **Snapshots carried only EVM state and were installed unverified**
+  (`modules/framework`, `crates/executor`, `crates/trading`,
+  `modules/*`)
+  - `export_state`/`import_state` shipped just the EVM KV backend, so
+    a state-sync snapshot dropped every other module's state — and
+    even the EVM's bytes were installed without recomputing the root
+    they claimed to be. A peer could serve arbitrary module state
+    under a forged root and the importing node could not tell.
+  - Every stateful module now exports a single canonical state blob
+    — `u64(canon_len) ‖ canon ‖ store`, where `canon` is the exact
+    byte preimage the module's `state_root` commits and `store` is
+    the deterministically-encoded KV map it commits to. The new
+    `framework::CanonicalReader` decodes it strictly: truncation,
+    trailing bytes, non-canonical integers, invalid bools, duplicate
+    keys, and length/count mismatches are all rejected.
+  - `Module::inspect_state` is new: each module verifies a staged
+    snapshot and returns the root it would install *without
+    mutating*. The executor now binds module names to registered
+    modules, rejects missing/extra/malformed state, inspects every
+    payload against its claimed root, and only then applies —
+    verify-then-mutate, so a bad snapshot can never half-apply.
+  - The strict pass surfaced three latent bugs that the incomplete
+    snapshot path had been masking: genesis-funded accounts (and
+    preinstalls) were committed to `state_root` but could never be
+    flushed because `begin_block` discarded pre-block `touched`
+    marks; `state_root` encoded `NotExisting` tombstones as leaves
+    the backend never carries; and persisted contract bytecode was
+    the *padded analyzed* buffer, whose keccak no longer matched
+    the committed `code_hash` after a contract's first execution.
+    All three are fixed — genesis writes persist, tombstones are
+    absent from the root, and the shared serializer writes the
+    original bytecode.
+  - **In plain words:** restoring a node from a snapshot used to
+    mean trusting it on faith — most of the chain's state wasn't
+    even in the file, and the parts that were never got checked.
+    Now a snapshot carries every module's complete state and a node
+    proves each piece reproduces its promised fingerprint before
+    installing anything. Checking that fingerprint also exposed —
+    and fixed — three real ways a restarted node could have come
+    back with different state than the chain agreed on.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).
