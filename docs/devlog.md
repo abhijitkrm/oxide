@@ -16210,3 +16210,34 @@ it ran clean under nightly 1.100.0 + ASan (installed for this gate).
 A dedicated `canonical-state` fuzz target would be a worthwhile
 follow-up — the strict reader is exactly the kind of boundary it
 exists for.
+
+## Session — perps: position cover allocated once across resting orders
+
+Audit finding: `AccountState::total_open_order_im` scored every opposing
+resting order against the account's *full* position independently, and
+the admission gate did the same for each new order. A +10-lot long made
+N resting sells of 10 each look fully covered — collectively they could
+open unbacked short exposure far beyond what margin reserved.
+
+### Fix
+
+`total_open_order_im` now groups reservations per market and allocates
+the position's closing capacity once across the opposing set —
+cheapest-price orders consume it first, leaving the most expensive tail
+exposed, which is the conservative (maximum-margin) allocation.
+Same-side orders remain pure exposure. The new `open_order_im_with`
+folds a hypothetical order into its market's set so the admission gate
+can charge the *marginal* IM: `required = position_IM + set_IM(with
+new)` instead of `position_IM + set_IM + new_order_vs_raw_position`.
+Reduce-only admission likewise checks the *leftover* closing capacity
+(position size minus what resting opposing orders already claimed), not
+the raw position size.
+
+### Verification
+
+Two regression tests, both confirmed red against the old code: a unit
+test asserting the uncovered tail reserves IM (old code returned 0 for
+two covered-looking sells; now charges the expensive residual), and an
+end-to-end place-order test showing the second opposing order is
+margin-gated once the first books the cover. All 61 perps tests green;
+fmt + clippy clean.

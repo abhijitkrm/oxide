@@ -350,33 +350,79 @@ impl AccountState {
 
     /// Initial margin reserved by resting orders (C7), scale-6.
     ///
-    /// For each resting order, the portion covered by an opposite-
-    /// side position of the same account is a reduce and reserves
-    /// nothing; the tail beyond the current position is potential
-    /// new exposure charged `qty × price / leverage`. Evaluating the
-    /// cover against the live position means the reservation
-    /// tightens automatically if the position shrinks — a resting
-    /// "reduce" that outlives its position is charged as an opener.
+    /// For each market, the position's closing capacity — its
+    /// absolute size — is allocated ONCE across the whole set of
+    /// opposing resting orders: the cheapest opposing orders consume
+    /// it first, leaving the most expensive residual exposed.
+    /// Same-side orders are pure exposure. An order's uncovered
+    /// tail is potential new exposure charged `qty × price /
+    /// leverage`.
+    ///
+    /// Allocating the cover once is the point of the computation:
+    /// scoring each order against the full position independently
+    /// lets a +10 long make N sells of 10 each look fully covered,
+    /// stacking unbacked short exposure that all fills. Covering
+    /// the cheapest opposing orders first is the conservative
+    /// choice — it maximizes exposed notional and therefore the
+    /// reservation. Evaluating the cover against the live position
+    /// means the reservation still tightens automatically if the
+    /// position shrinks — a resting "reduce" that outlives its
+    /// position is charged as an opener.
     fn total_open_order_im(&self, configs: &BTreeMap<u8, PerpsMarketConfig>) -> u128 {
-        let mut total: u128 = 0;
+        self.open_order_im_with(configs, None)
+    }
+
+    /// `total_open_order_im` with a hypothetical extra order folded
+    /// into its market's reservation set. The admission gate uses
+    /// the delta over `total_open_order_im` as the order's marginal
+    /// initial margin — which automatically charges same-side
+    /// exposure in full and gives an opposing order only the
+    /// closing capacity the resting book has not already claimed.
+    fn open_order_im_with(
+        &self,
+        configs: &BTreeMap<u8, PerpsMarketConfig>,
+        extra: Option<(u8, &OpenOrderResv)>,
+    ) -> u128 {
+        // Group reservations by market so each position's closing
+        // capacity is allocated once across the whole opposing set.
+        let mut by_market: BTreeMap<u8, Vec<&OpenOrderResv>> = BTreeMap::new();
         for ((market, _oid), resv) in &self.open_orders {
+            by_market.entry(*market).or_default().push(resv);
+        }
+        if let Some((market, resv)) = extra {
+            by_market.entry(market).or_default().push(resv);
+        }
+        let mut total: u128 = 0;
+        for (market, orders) in &by_market {
             let Some(cfg) = configs.get(market) else {
                 continue;
             };
-            let covered = match self.positions.get(market) {
-                Some(p)
-                    if (p.size > 0 && resv.side == Side::Sell)
-                        || (p.size < 0 && resv.side == Side::Buy) =>
-                {
-                    u128::from(p.size.unsigned_abs().min(resv.qty))
-                }
-                _ => 0,
-            };
-            let exposed = u128::from(resv.qty).saturating_sub(covered);
             let leverage = u128::from(cfg.max_leverage.max(1));
-            // notional is scale-14 (qty scale-6 × price scale-8);
-            // divide by PRICE_SCALE to land on scale-6.
-            total += exposed * u128::from(resv.price) / leverage / PRICE_SCALE;
+            let (closing_side, mut cover) = match self.positions.get(market) {
+                Some(p) if p.size > 0 => (Side::Sell, p.size.unsigned_abs()),
+                Some(p) if p.size < 0 => (Side::Buy, p.size.unsigned_abs()),
+                // No position: every order is pure exposure. The
+                // closing side is irrelevant with cover 0 — pick
+                // either; both branches below charge full qty.
+                _ => (Side::Buy, 0),
+            };
+            // Opposing orders cheapest-first: the cover pool retires
+            // low-price orders and leaves the expensive tail
+            // exposed — the conservative (max-margin) allocation.
+            let mut opposing: Vec<&OpenOrderResv> =
+                orders.iter().copied().filter(|r| r.side == closing_side).collect();
+            opposing.sort_by_key(|r| r.price);
+            for r in opposing {
+                let covered = cover.min(r.qty);
+                cover -= covered;
+                // notional is scale-14 (qty scale-6 × price scale-8);
+                // divide by PRICE_SCALE to land on scale-6.
+                let exposed = u128::from(r.qty - covered);
+                total += exposed * u128::from(r.price) / leverage / PRICE_SCALE;
+            }
+            for r in orders.iter().filter(|r| r.side != closing_side) {
+                total += u128::from(r.qty) * u128::from(r.price) / leverage / PRICE_SCALE;
+            }
         }
         total
     }
@@ -1805,48 +1851,57 @@ impl PerpsModule {
         // orders are potential exposure and must be margined as if
         // filled — otherwise an account could stack unbacked orders
         // that all later fill (C7).
-        let cfg =
-            inner.configs.get(&market).copied().ok_or_else(|| {
-                ExecError::ModuleRejected(format!("market {market} does not exist"))
-            })?;
+        if !inner.configs.contains_key(&market) {
+            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+        }
         {
             let acct = inner.accounts.get(&ctx.sender);
             let pos = acct.and_then(|a| a.positions.get(&market));
-            let reducible = match pos {
-                Some(p)
-                    if (p.size > 0 && order.side == Side::Sell)
-                        || (p.size < 0 && order.side == Side::Buy) =>
-                {
-                    p.size.unsigned_abs()
-                }
-                _ => 0,
-            };
+            let pos_size = pos.map_or(0, |p| p.size);
+            // The position can only close once: closing capacity the
+            // account's resting opposing orders in this market have
+            // already claimed is not available to this order.
+            let cover_booked: u128 = acct.map_or(0, |a| {
+                a.open_orders
+                    .iter()
+                    .filter(|((m, _), r)| {
+                        *m == market
+                            && ((pos_size > 0 && r.side == Side::Sell)
+                                || (pos_size < 0 && r.side == Side::Buy))
+                    })
+                    .map(|(_, r)| u128::from(r.qty))
+                    .sum()
+            });
+            let reducible = u128::from(pos_size.unsigned_abs()).saturating_sub(cover_booked);
             // Reduce-only may only close: a request larger than the
             // reducible size would add exposure, which the flag
             // forbids — reject at admission.
-            if reduce_only && order.qty.0 > reducible {
+            if reduce_only && u128::from(order.qty.0) > reducible {
                 return Err(ExecError::ModuleRejected(
                     "reduce-only order exceeds reducible position".to_string(),
                 ));
             }
-            let exposure_qty = order.qty.0.saturating_sub(reducible);
-            if exposure_qty > 0 {
-                // Reference price for the notional: the limit price
-                // for priced orders, the current mark for market
-                // orders (no limit to bound the fill price).
-                let ref_price = match order.order_type {
-                    OrderType::Market => inner.marks.get(&market).copied().unwrap_or(order.price.0),
-                    _ => order.price.0,
-                };
-                // Scale-14 notional → scale-6 quote.
-                let notional = u128::from(exposure_qty) * u128::from(ref_price) / PRICE_SCALE;
-                let leverage = u128::from(cfg.max_leverage.max(1));
-                let new_im = notional / leverage;
-                let equity = acct.map_or(0i128, |a| a.equity(&inner.marks, &inner.configs));
-                let existing_im =
-                    acct.map_or(0u128, |a| a.total_initial_margin(&inner.marks, &inner.configs));
-                let open_order_im = acct.map_or(0u128, |a| a.total_open_order_im(&inner.configs));
-                let required = existing_im.saturating_add(open_order_im).saturating_add(new_im);
+            // Marginal IM of this order = the reservation-set IM
+            // with it folded in, minus the set without it. Folding
+            // the order into the set charges same-side exposure in
+            // full and gives an opposing order only the closing
+            // capacity the resting book has not already claimed —
+            // scoring it against the raw position would let every
+            // successive order spend the same cover.
+            let ref_price = match order.order_type {
+                OrderType::Market => inner.marks.get(&market).copied().unwrap_or(order.price.0),
+                _ => order.price.0,
+            };
+            let extra =
+                OpenOrderResv { qty: order.qty.0, price: ref_price, side: order.side, reduce_only };
+            let empty = AccountState::default();
+            let a = acct.unwrap_or(&empty);
+            let order_set_im = a.open_order_im_with(&inner.configs, Some((market, &extra)));
+            let new_im = order_set_im.saturating_sub(a.total_open_order_im(&inner.configs));
+            if new_im > 0 {
+                let equity = a.equity(&inner.marks, &inner.configs);
+                let existing_im = a.total_initial_margin(&inner.marks, &inner.configs);
+                let required = existing_im.saturating_add(order_set_im);
                 if equity < i128::try_from(required).unwrap_or(i128::MAX) {
                     return Err(ExecError::ModuleRejected(
                         "insufficient initial margin".to_string(),
@@ -3836,6 +3891,79 @@ mod tests {
             .handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 500, 1, 1)))
             .unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// A position's closing capacity can only be spent once. With a
+    /// +10-lot long, one resting sell of 10 consumes all of it; a
+    /// second sell of 10 is new short exposure and must reserve
+    /// initial margin. The old gate scored each order against the
+    /// full position independently — N sells of 10 each looked
+    /// covered, stacking unbacked short exposure that all fills.
+    #[test]
+    fn position_cover_is_allocated_once_across_opposing_orders() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+
+        // +10-lot long at the mark — no PnL, isolated margin 0.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(1));
+            acct.positions.insert(
+                mid,
+                Position { size: 10_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+        }
+        // Equity covers the position IM (15_000) with headroom, but
+        // not position IM + a fresh 10-lot exposure (≈11_000+).
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 20_000)).unwrap();
+
+        // First opposing order: fully covered by the long → free.
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Sell, 100, 10, 1))).unwrap();
+
+        // Second opposing order: cover exhausted → charged IM →
+        // must exceed the remaining equity.
+        let err =
+            perps.handle(&ctx(1), &msg::place(mid, limit(Side::Sell, 200, 10, 1))).unwrap_err();
+        assert!(
+            matches!(err, ExecError::ModuleRejected(_)),
+            "cover allocated to the first order must not be spent twice"
+        );
+    }
+
+    /// The unit-level view of the same invariant: `total_open_order_im`
+    /// charges the uncovered tail once the position's cover is spent,
+    /// and conservatively covers the CHEAPEST opposing orders first,
+    /// leaving the most expensive residual exposed.
+    #[test]
+    fn open_order_im_allocates_cover_once() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        let im = {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let configs = inner.configs.clone();
+            let acct = PerpsModule::account_mut(&mut inner, &addr(1));
+            acct.positions.insert(
+                mid,
+                Position { size: 10_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+            for (oid, ticks) in [(1u64, 100u64), (2, 200)] {
+                acct.open_orders.insert(
+                    (mid, oid),
+                    super::OpenOrderResv {
+                        qty: 10_000,
+                        price: 1_000_000_000 + ticks * 1_000_000,
+                        side: Side::Sell,
+                        reduce_only: false,
+                    },
+                );
+            }
+            acct.total_open_order_im(&configs)
+        };
+        // Cover pool = 10_000 → retires the cheaper sell (1.1e9);
+        // exposed tail = 10_000 × 1.2e9 / lev(10) / 1e8 = 12_000.
+        assert_eq!(im, 12_000, "the uncovered sell must reserve initial margin");
     }
 
     /// Snapshot round-trip: a listed market, funded accounts,

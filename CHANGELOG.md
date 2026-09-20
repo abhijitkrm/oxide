@@ -1834,6 +1834,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     and fixed — three real ways a restarted node could have come
     back with different state than the chain agreed on.
 
+- **Perps margin let the same position "cover" many opposing
+  orders at once** (`modules/perps`)
+  - Resting-order initial margin scored every opposing order
+    against the account's *full* position independently, and the
+    admission gate did the same for each new order. A +10-lot long
+    made N resting sells of 10 each look fully covered — so an
+    account could stack unbacked short exposure that all fills
+    after the long is exhausted.
+  - `total_open_order_im` now allocates the position's closing
+    capacity once per market across the opposing order set —
+    cheapest orders consume it first, leaving the most expensive
+    tail exposed (the conservative maximum-margin allocation).
+    Admission charges each new order its *marginal* IM — the delta
+    of the reservation set with the order folded in — and
+    reduce-only checks the leftover closing capacity, not the raw
+    position size.
+  - **In plain words:** if you held 10 contracts and placed five
+    separate sell orders of 10, the system used to believe each one
+    individually just "closed your position" and asked for no
+    deposit on any of them — even though only the first could
+    possibly close it. Now the position can only cover one order's
+    worth, and the rest must be backed by real margin.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).
