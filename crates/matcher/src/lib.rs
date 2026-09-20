@@ -138,6 +138,42 @@ fn buy_reservation_refund(
     reservation.saturating_sub(fill_cost.saturating_add(held))
 }
 
+/// Owners whose resting orders left the book during a sweep —
+/// deduplicated so each releases its resting-count slot exactly
+/// once. Two sources:
+///
+/// - Reported removals with nothing left (`remaining == 0`): STP
+///   and cap removals. A removal with `remaining > 0` is only a
+///   decrement — the order still rests and keeps its slot.
+/// - Fill-exhausted makers: a fill event reports the trade but
+///   nothing says "the order ended", so a maker absent from the
+///   engine's id map after the sweep is gone. Without this, every
+///   fully filled maker leaked its slot and active traders hit the
+///   per-account resting cap on phantom counts.
+///
+/// A maker can appear in both sources (a capped fill followed by a
+/// cap removal of the dead remainder) — the order-id dedup makes
+/// the release exactly-once.
+fn gone_makers(
+    engine: &MatchingEngine,
+    removed: &[trading::MakerRemoval],
+    fills: &[FillEvent],
+) -> Vec<primitives::Address> {
+    let mut gone: Vec<(u64, primitives::Address)> = Vec::with_capacity(removed.len() + fills.len());
+    for r in removed {
+        if r.remaining == 0 {
+            gone.push((r.order_id.0, r.owner));
+        }
+    }
+    for f in fills {
+        let exhausted = engine.order_owner(f.maker_order_id).is_none();
+        if exhausted && !gone.iter().any(|(id, _)| *id == f.maker_order_id.0) {
+            gone.push((f.maker_order_id.0, f.maker_owner));
+        }
+    }
+    gone.into_iter().map(|(_, owner)| owner).collect()
+}
+
 /// A matched fill with settlement attribution.
 #[derive(Debug, Clone, Copy)]
 pub struct SettledFill {
@@ -176,12 +212,48 @@ pub struct SettledFill {
 struct NonceTracker {
     /// owner → last consumed nonce.
     last_seen: HashMap<primitives::Address, u64>,
+    /// Optional durable checkpoint. Without it, every restart resets
+    /// the replay gate to empty — ANY captured signed request is
+    /// then replayable once (the first request from an owner is
+    /// always accepted). With a store attached, the replay window
+    /// shrinks to the entries consumed since the last flush.
+    store: Option<NonceStore>,
+    /// Mutations since the last successful flush.
+    dirty: u32,
 }
+
+/// Consumed-nonce mutations between durable checkpoints. Chosen to
+/// bound crash loss to ~64 admissions while keeping writes rare —
+/// `seal_batch` (the settler cadence) also flushes, so a graceful
+/// run checkpoints far more often than this bound.
+const NONCE_FLUSH_EVERY: u32 = 64;
 
 impl NonceTracker {
     /// Create an empty tracker.
     fn new() -> Self {
-        Self { last_seen: HashMap::new() }
+        Self { last_seen: HashMap::new(), store: None, dirty: 0 }
+    }
+
+    /// Attach a durable checkpoint file, loading any previously
+    /// persisted nonces. Must be called before serving traffic —
+    /// entries already consumed are NOT loaded again.
+    ///
+    /// # Errors / panics
+    ///
+    /// Panics if the file exists but does not decode — a corrupt
+    /// replay DB must fail closed (refuse to start) rather than
+    /// silently reopen the replay window for every account.
+    fn attach_store(&mut self, path: std::path::PathBuf) {
+        let loaded = NonceStore::load(&path)
+            .unwrap_or_else(|e| panic!("nonce store at {} is corrupt: {e}", path.display()));
+        // Max-merge, never overwrite downward: a checkpoint is a
+        // LOWER bound of consumed nonces. Regressing a watermark
+        // would let already-consumed requests replay.
+        for (owner, nonce) in loaded {
+            self.last_seen.entry(owner).and_modify(|e| *e = (*e).max(nonce)).or_insert(nonce);
+        }
+        self.store = Some(NonceStore { path });
+        self.dirty = 0;
     }
 
     /// Returns `true` and consumes `nonce` iff it is strictly
@@ -195,7 +267,106 @@ impl NonceTracker {
             }
         }
         self.last_seen.insert(*owner, nonce);
+        self.dirty += 1;
+        if self.dirty >= NONCE_FLUSH_EVERY {
+            self.flush();
+        }
         true
+    }
+
+    /// Persist consumed nonces if a store is attached. Best-effort:
+    /// a failed write is ignored (the in-memory gate keeps working;
+    /// only the restart boundary widens).
+    fn flush(&mut self) {
+        let Some(store) = &self.store else { return };
+        if store.save(&self.last_seen).is_ok() {
+            self.dirty = 0;
+        }
+    }
+}
+
+/// A file-backed checkpoint of consumed nonces — bounds the
+/// restart replay window to the flush interval instead of forever.
+///
+/// Format (little-endian, strict):
+/// `[magic "OXNC"][version u32=1][count u32][entry × count]` where
+/// `entry = owner[20] ‖ nonce u64` (28 bytes). Writes go to a temp
+/// file then `rename` for atomicity — a crash mid-write can never
+/// leave a torn checkpoint.
+struct NonceStore {
+    /// Checkpoint file path (`<path>.tmp` is the write scratch).
+    path: std::path::PathBuf,
+}
+
+impl NonceStore {
+    /// Checkpoint format magic + version for strict decode.
+    const MAGIC: &'static [u8; 4] = b"OXNC";
+    /// Current format version.
+    const VERSION: u32 = 1;
+    /// Hard bound on stored accounts — a larger count means the file
+    /// is corrupt or hostile; the decode allocates nothing up front.
+    const MAX_ENTRIES: usize = 8_000_000;
+    /// Header size: magic(4) + version(4) + count(4).
+    const HEADER: usize = 12;
+    /// Entry size: owner(20) + nonce(8).
+    const ENTRY: usize = 28;
+
+    /// Read the checkpoint. Missing file = empty state (first run).
+    /// Returns `Err` on ANY structural violation — the caller fails
+    /// closed rather than resetting the replay gate.
+    fn load(path: &std::path::Path) -> Result<Vec<(primitives::Address, u64)>, String> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("read failed: {e}")),
+        };
+        if bytes.len() < Self::HEADER {
+            return Err(format!("truncated header ({} bytes)", bytes.len()));
+        }
+        if &bytes[0..4] != Self::MAGIC {
+            return Err("bad magic".to_string());
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or_default());
+        if version != Self::VERSION {
+            return Err(format!("unsupported version {version}"));
+        }
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap_or_default()) as usize;
+        if count > Self::MAX_ENTRIES {
+            return Err(format!("count {count} exceeds bound"));
+        }
+        if bytes.len() != Self::HEADER + count * Self::ENTRY {
+            return Err(format!("size mismatch: {} bytes for {count} entries", bytes.len()));
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = Self::HEADER + i * Self::ENTRY;
+            let mut owner = [0u8; 20];
+            owner.copy_from_slice(&bytes[off..off + 20]);
+            let nonce =
+                u64::from_le_bytes(bytes[off + 20..off + 28].try_into().unwrap_or_default());
+            out.push((primitives::Address(owner), nonce));
+        }
+        Ok(out)
+    }
+
+    /// Serialize and atomically replace the checkpoint.
+    fn save(&self, last_seen: &HashMap<primitives::Address, u64>) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(12 + last_seen.len() * 28);
+        buf.extend_from_slice(Self::MAGIC);
+        buf.extend_from_slice(&Self::VERSION.to_le_bytes());
+        buf.extend_from_slice(&u32::try_from(last_seen.len()).unwrap_or(u32::MAX).to_le_bytes());
+        for (owner, nonce) in last_seen {
+            buf.extend_from_slice(&owner.0);
+            buf.extend_from_slice(&nonce.to_le_bytes());
+        }
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, &buf)?;
+        // Fsync the temp file before the rename so the checkpoint is
+        // durable, not just renamed.
+        if let Ok(f) = std::fs::File::open(&tmp) {
+            let _ = f.sync_all();
+        }
+        std::fs::rename(&tmp, &self.path)
     }
 }
 
@@ -242,6 +413,28 @@ pub struct MatchingServer {
     settlement_batch: Vec<SettledFill>,
     /// Per-owner replay gate (see [`NonceTracker`]).
     nonces: NonceTracker,
+    /// Millisecond time source for the rate limiter — the limiter's
+    /// sliding window only has meaning against real elapsed time.
+    /// Injectable so tests control the window deterministically and
+    /// deployments can swap in a monotonic clock.
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The chain ID order/action signatures are verified against —
+    /// configured per deployment so a signature produced for one
+    /// chain can never replay on another. Defaults to the devnet
+    /// [`protocol::CHAIN_ID`].
+    chain_id: u64,
+    /// Scratch for non-fill book removals the sweep reports —
+    /// reused across orders like `fills` (zero alloc steady-state).
+    removed: Vec<trading::MakerRemoval>,
+}
+
+/// Wall-clock milliseconds since the Unix epoch — the production
+/// time source for risk controls. `map_or(0, …)` only if the system
+/// clock predates the epoch (already handled as "no elapsed time").
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 impl MatchingServer {
@@ -262,6 +455,9 @@ impl MatchingServer {
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
             nonces: NonceTracker::new(),
+            clock: Arc::new(wall_clock_ms),
+            chain_id: protocol::CHAIN_ID,
+            removed: Vec::with_capacity(64),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
@@ -293,6 +489,9 @@ impl MatchingServer {
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
             nonces: NonceTracker::new(),
+            clock: Arc::new(wall_clock_ms),
+            chain_id: protocol::CHAIN_ID,
+            removed: Vec::with_capacity(64),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
@@ -300,6 +499,44 @@ impl MatchingServer {
             risk_rejections: 0,
             auth_rejections: 0,
         }
+    }
+
+    /// Swap in a different millisecond time source for the rate
+    /// limiter — tests inject a controllable clock; deployments can
+    /// supply a monotonic source.
+    pub fn set_clock(&mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.clock = clock;
+    }
+
+    /// The chain ID order and action signatures are verified
+    /// against.
+    #[must_use]
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Configure the chain ID signatures verify against. Call this
+    /// before serving traffic — signatures made under a different
+    /// chain ID verify as forgeries (rejected `BadSignature`), which
+    /// is exactly the cross-chain replay boundary.
+    pub fn set_chain_id(&mut self, chain_id: u64) {
+        self.chain_id = chain_id;
+    }
+
+    /// Attach a durable checkpoint file for consumed nonces. Without
+    /// it the replay gate is memory-only: every restart forgets all
+    /// consumed nonces, so ANY captured signed request becomes
+    /// replayable once. With a store attached, the replay window
+    /// shrinks to the entries consumed since the last checkpoint —
+    /// flushed every [`NONCE_FLUSH_EVERY`] admissions and on every
+    /// [`Self::seal_batch`]. Call before serving traffic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the file exists but is corrupt — a replay DB that
+    /// can't be verified must fail closed, not silently reset.
+    pub fn set_nonce_store(&mut self, path: std::path::PathBuf) {
+        self.nonces.attach_store(path);
     }
 
     /// Fund an account with the given quote balance. Called during
@@ -337,7 +574,7 @@ impl MatchingServer {
     ///
     /// Returns the order response (filled, resting, or rejected).
     pub fn submit_order(&mut self, req: &OrderRequest) -> OrderResponse {
-        if let Some(verified) = protocol::VerifiedOrder::new(*req) {
+        if let Some(verified) = protocol::VerifiedOrder::with_chain_id(*req, self.chain_id) {
             self.submit_verified(&verified)
         } else {
             self.auth_rejections += 1;
@@ -382,15 +619,16 @@ impl MatchingServer {
         // ── Risk-engine checks ───────────────────────────────────
         // Run before the balance check so we reject spam and
         // fat-finger orders without reserving any balance. The
-        // timestamp is derived from the order count (deterministic
-        // for testing); in production, the caller would pass a
-        // real timestamp. The mid-price comes from the engine's
-        // best bid/ask.
+        // timestamp comes from the injected clock — the rate
+        // limiter's sliding window measures ELAPSED time; feeding it
+        // the order counter would make an account's allowance depend
+        // on how fast the whole venue trades, not on real seconds.
+        // The mid-price comes from the engine's best bid/ask.
         let mid = match (self.engine.best_bid(), self.engine.best_ask()) {
             (Some((bid, _)), Some((ask, _))) => u64::midpoint(bid.0, ask.0),
             _ => 0, // no mid available — skip price-band check
         };
-        let now_ms = self.orders_processed; // deterministic stand-in
+        let now_ms = (self.clock)();
         let decision = self.risk.check(&req.owner, now_ms, req.price.0, req.qty.0, mid);
         if let RiskDecision::Reject(reason) = decision {
             self.risk_rejections += 1;
@@ -437,8 +675,17 @@ impl MatchingServer {
         };
 
         // ── Match ───────────────────────────────────────────────
+        // `ObserveRemovals` never restricts a fill — it reports the
+        // non-fill removals the resting-count bookkeeping below must
+        // consume, so a maker deleted without a fill still releases
+        // its resting slot.
         self.fills.clear();
-        let Ok(outcome) = self.engine.place(order, &mut self.fills) else {
+        self.removed.clear();
+        let Ok(outcome) = self.engine.place_with_cap(
+            order,
+            &mut self.fills,
+            &mut trading::ObserveRemovals { removed: &mut self.removed },
+        ) else {
             self.engine_rejections += 1;
             // Engine-level error: nothing matched, nothing rests —
             // the whole reservation comes back.
@@ -474,6 +721,14 @@ impl MatchingServer {
                 seller,
                 quote_amount,
             });
+        }
+
+        // ── Release resting slots for makers that left the book ──
+        // Fills and reported removals both retire resting orders;
+        // `gone_makers` attributes each departure to its owner,
+        // exactly once (see the helper for the accounting rules).
+        for owner in gone_makers(&self.engine, &self.removed, &self.fills) {
+            self.risk.dec_resting(&owner);
         }
 
         // ── Release the reservation (buys) ──────────────────────
@@ -557,8 +812,9 @@ impl MatchingServer {
     /// replayed forever.
     pub fn submit_action(&mut self, req: &ActionRequest) -> OrderResponse {
         self.orders_processed += 1;
-        // Authentication gate — identical policy to `submit_order`.
-        if !protocol::verify_action(req) {
+        // Authentication gate — identical policy to `submit_order`,
+        // including the configured chain ID.
+        if !protocol::verify_action_with_chain_id(req, self.chain_id) {
             self.auth_rejections += 1;
             return OrderResponse::rejected(RejectReason::BadSignature);
         }
@@ -711,7 +967,12 @@ impl MatchingServer {
 
     /// Seal the current settlement batch and return it. The caller
     /// submits this batch to consensus for on-chain finalization.
+    ///
+    /// Also checkpoints consumed nonces — the settler's seal cadence
+    /// is a natural, off-hot-path durability point for the replay
+    /// gate.
     pub fn seal_batch(&mut self) -> Vec<SettledFill> {
+        self.nonces.flush();
         std::mem::take(&mut self.settlement_batch)
     }
 
@@ -825,6 +1086,18 @@ impl SharedMatcher {
         match self.inner.lock() {
             Ok(mut guard) => guard.submit_action(req),
             Err(_) => OrderResponse::rejected(crate::protocol::RejectReason::EngineError),
+        }
+    }
+
+    /// The chain ID the inner server verifies signatures against —
+    /// transports use it for their early (pre-dispatch) signature
+    /// check so early-reject and the mandatory in-server re-verify
+    /// can never disagree. Falls back to the devnet default if the
+    /// mutex is poisoned.
+    pub fn chain_id(&self) -> u64 {
+        match self.inner.lock() {
+            Ok(guard) => guard.chain_id(),
+            Err(_) => crate::protocol::CHAIN_ID,
         }
     }
 
@@ -946,6 +1219,11 @@ pub struct RingMatcher {
     /// polls the receiver between ring polls and services seal/stats
     /// commands without touching the order rings.
     control_tx: std::sync::mpsc::Sender<ControlCommand>,
+    /// The chain ID the embedded server verifies signatures
+    /// against — copied at construction (the server moves to the
+    /// matcher thread, so this can never diverge). Transport threads
+    /// verify `VerifiedOrder` proofs with the same value.
+    chain_id: u64,
     /// The matcher thread handle (kept for shutdown).
     _thread: std::thread::JoinHandle<()>,
 }
@@ -993,6 +1271,7 @@ impl RingMatcher {
         }
 
         let mut server = server;
+        let chain_id = server.chain_id();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<ControlCommand>();
         let thread = std::thread::spawn(move || {
             loop {
@@ -1073,8 +1352,17 @@ impl RingMatcher {
             order_rings: order_senders,
             response_rings: response_receivers,
             control_tx,
+            chain_id,
             _thread: thread,
         }
+    }
+
+    /// The chain ID signatures are verified against — transports
+    /// read this to produce `VerifiedOrder` proofs the embedded
+    /// server will accept.
+    #[must_use]
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     /// Seal the settlement batch via a control-channel command to the
@@ -1306,6 +1594,10 @@ pub struct MultiMarketMatcher {
     /// concurrent `submit_batch` calls remain, which is correct —
     /// concurrent submissions have no defined order.)
     nonces: Arc<std::sync::Mutex<NonceTracker>>,
+    /// The chain ID order signatures are verified against — shared
+    /// with every worker so transport-side and worker-side
+    /// authentication can never disagree.
+    chain_id: u64,
 }
 
 impl MultiMarketMatcher {
@@ -1323,6 +1615,48 @@ impl MultiMarketMatcher {
     /// create from the given config.
     #[must_use]
     pub fn new(configs: Vec<MarketConfig>, balances: Arc<AtomicBalanceCache>) -> Self {
+        Self::with_options(configs, balances, Arc::new(wall_clock_ms), protocol::CHAIN_ID, None)
+    }
+
+    /// Create a multi-market matcher with a custom millisecond time
+    /// source — production deployments can supply a monotonic clock;
+    /// tests inject a deterministic one so rate-limit windows are
+    /// controllable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `configs` is empty or if any engine/book fails to
+    /// create from the given config.
+    #[must_use]
+    pub fn with_clock(
+        configs: Vec<MarketConfig>,
+        balances: Arc<AtomicBalanceCache>,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self::with_options(configs, balances, clock, protocol::CHAIN_ID, None)
+    }
+
+    /// Create a multi-market matcher with a custom clock and chain
+    /// ID. `chain_id` is the signature-verification domain — set it
+    /// to the deployment's real chain ID or foreign-chain signatures
+    /// replay here (the devnet default is [`protocol::CHAIN_ID`]).
+    /// `nonce_store_path` attaches the durable replay-gate checkpoint
+    /// (see [`MatchingServer::set_nonce_store`]) — the SHARED tracker
+    /// it guards covers all workers/markets.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `configs` is empty, if any engine/book fails to
+    /// create from the given config, or if `nonce_store_path` exists
+    /// but is corrupt.
+    #[must_use]
+    pub fn with_options(
+        configs: Vec<MarketConfig>,
+        balances: Arc<AtomicBalanceCache>,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+        chain_id: u64,
+        nonce_store_path: Option<std::path::PathBuf>,
+    ) -> Self {
         assert!(!configs.is_empty(), "must have at least one market");
         let num_markets = configs.len();
         let mut market_senders = Vec::with_capacity(num_markets);
@@ -1333,19 +1667,34 @@ impl MultiMarketMatcher {
         // is acceptable — the check runs once per admission and the
         // work already crosses an MPSC hop.
         let nonces = Arc::new(std::sync::Mutex::new(NonceTracker::new()));
+        if let Some(path) = nonce_store_path {
+            nonces
+                .lock()
+                .expect("nonce tracker mutex poisoned during construction")
+                .attach_store(path);
+        }
 
         for cfg in configs {
             let (tx, rx) = std::sync::mpsc::channel::<MarketMessage>();
             let balances = Arc::clone(&balances);
             let nonces = Arc::clone(&nonces);
+            let clock = Arc::clone(&clock);
             let thread = std::thread::spawn(move || {
-                MarketWorker::run(cfg, balances, nonces, rx);
+                MarketWorker::run(cfg, balances, nonces, clock, chain_id, rx);
             });
             market_senders.push(tx);
             threads.push(thread);
         }
 
-        Self { market_senders, _threads: threads, num_markets, nonces }
+        Self { market_senders, _threads: threads, num_markets, nonces, chain_id }
+    }
+
+    /// The chain ID order signatures are verified against —
+    /// transports read this so transport-side and worker-side
+    /// authentication always agree.
+    #[must_use]
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     /// Submit a batch of orders. Orders may span markets — each order
@@ -1388,7 +1737,7 @@ impl MultiMarketMatcher {
         let mut verified: Vec<protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
         let mut responses: Vec<Option<OrderResponse>> = Vec::with_capacity(orders.len());
         for (i, req) in orders.into_iter().enumerate() {
-            match protocol::VerifiedOrder::new(req) {
+            match protocol::VerifiedOrder::with_chain_id(req, self.chain_id) {
                 Some(vo) => {
                     let ok = match self.nonces.lock() {
                         Ok(mut tracker) => {
@@ -1538,7 +1887,13 @@ impl MultiMarketMatcher {
     ///
     /// Returns fills only from live workers; dead workers contribute
     /// nothing.
+    ///
+    /// Also checkpoints the shared consumed-nonce state — the same
+    /// settler-cadence durability point the single-market path uses.
     pub fn seal_batch(&self) -> Vec<SettledFill> {
+        if let Ok(mut tracker) = self.nonces.lock() {
+            tracker.flush();
+        }
         let mut all_fills = Vec::new();
         for tx in &self.market_senders {
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -1636,6 +1991,16 @@ struct MarketWorker {
     risk_rejections: u64,
     /// Total requests rejected by authentication.
     auth_rejections: u64,
+    /// Millisecond time source for the rate limiter — same injection
+    /// point as `MatchingServer`; threaded from the matcher that
+    /// spawned this worker.
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The chain ID action signatures are verified against —
+    /// identical to the dispatching matcher's so a verified order
+    /// can never be rejected downstream (and vice versa).
+    chain_id: u64,
+    /// Scratch for non-fill book removals the sweep reports.
+    removed: Vec<trading::MakerRemoval>,
 }
 
 impl MarketWorker {
@@ -1646,6 +2011,8 @@ impl MarketWorker {
         cfg: MarketConfig,
         balances: Arc<AtomicBalanceCache>,
         nonces: Arc<std::sync::Mutex<NonceTracker>>,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+        chain_id: u64,
         rx: std::sync::mpsc::Receiver<MarketMessage>,
     ) {
         let engine = MatchingEngine::new(cfg, DenseBook::new(cfg).expect("book creation"))
@@ -1657,6 +2024,9 @@ impl MarketWorker {
             risk: RiskEngine::with_defaults(),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
+            clock,
+            chain_id,
+            removed: Vec::with_capacity(64),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
@@ -1740,12 +2110,14 @@ impl MarketWorker {
     fn execute_order(&mut self, req: &OrderRequest) -> OrderResponse {
         // ── Risk-engine checks ───────────────────────────────────
         // Per-market risk engine: rate limit, size cap, price band,
-        // resting cap. Mirrors `MatchingServer::execute_order`.
+        // resting cap. Mirrors `MatchingServer::execute_order` —
+        // including the real-time source: the limiter measures
+        // elapsed milliseconds, not the order counter.
         let mid = match (self.engine.best_bid(), self.engine.best_ask()) {
             (Some((bid, _)), Some((ask, _))) => u64::midpoint(bid.0, ask.0),
             _ => 0,
         };
-        let now_ms = self.orders_processed; // deterministic stand-in
+        let now_ms = (self.clock)();
         if let RiskDecision::Reject(reason) =
             self.risk.check(&req.owner, now_ms, req.price.0, req.qty.0, mid)
         {
@@ -1785,8 +2157,16 @@ impl MarketWorker {
         };
 
         // ── Match ───────────────────────────────────────────────
+        // `ObserveRemovals` reports non-fill removals for the
+        // resting-count bookkeeping below — same as the
+        // single-market server.
         self.fills.clear();
-        let Ok(outcome) = self.engine.place(order, &mut self.fills) else {
+        self.removed.clear();
+        let Ok(outcome) = self.engine.place_with_cap(
+            order,
+            &mut self.fills,
+            &mut trading::ObserveRemovals { removed: &mut self.removed },
+        ) else {
             self.engine_rejections += 1;
             // Engine-level error: nothing matched, nothing rests —
             // the whole reservation comes back.
@@ -1820,6 +2200,13 @@ impl MarketWorker {
                 seller,
                 quote_amount,
             });
+        }
+
+        // ── Release resting slots for makers that left the book ──
+        // Same accounting as `MatchingServer::execute_order` — see
+        // `gone_makers` for the rules.
+        for owner in gone_makers(&self.engine, &self.removed, &self.fills) {
+            self.risk.dec_resting(&owner);
         }
 
         // ── Release the reservation (buys) ──────────────────────
@@ -1864,7 +2251,7 @@ impl MarketWorker {
     /// owner binding) → shared nonce check → dispatch.
     fn submit_action(&mut self, req: &ActionRequest) -> OrderResponse {
         self.orders_processed += 1;
-        if !protocol::verify_action(req) {
+        if !protocol::verify_action_with_chain_id(req, self.chain_id) {
             self.auth_rejections += 1;
             return OrderResponse::rejected(RejectReason::BadSignature);
         }
@@ -2730,5 +3117,317 @@ mod tests {
 
         let fills = matcher.seal_batch();
         assert_eq!(fills.len(), 2, "one fill per market");
+    }
+
+    // ── Risk-control accounting: time source + resting counts ────
+
+    /// A test clock the caller advances explicitly — the rate
+    /// limiter must measure THESE milliseconds, never the server's
+    /// order counter.
+    fn test_clock() -> (Arc<std::sync::atomic::AtomicU64>, Arc<dyn Fn() -> u64 + Send + Sync>) {
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reader = Arc::clone(&now);
+        let clock: Arc<dyn Fn() -> u64 + Send + Sync> =
+            Arc::new(move || reader.load(std::sync::atomic::Ordering::Relaxed));
+        (now, clock)
+    }
+
+    /// Regression: `execute_order` fed `orders_processed` — a
+    /// GLOBAL counter — to the rate limiter as its millisecond
+    /// timestamp. Every order submitted anywhere advanced every
+    /// account's "time", so unrelated traffic could slide a
+    /// rate-limited trader's window open while zero real time had
+    /// passed, and real elapsed time had no effect on the limit.
+    #[test]
+    fn rate_limiter_uses_clock_not_order_counter() {
+        let mut server = MatchingServer::with_risk_config(
+            cfg(),
+            100,
+            RiskConfig {
+                max_orders_per_second: 2,
+                max_order_qty: 0,
+                max_price_deviation_bps: 0,
+                max_resting_per_account: 0,
+            },
+        );
+        let (now, clock) = test_clock();
+        server.set_clock(clock);
+
+        let (trader_sk, trader) = test_account(3);
+        let (other_sk, other) = test_account(4);
+        server.fund_account(&trader, 1_000_000_000_000);
+        server.fund_account(&other, 1_000_000_000_000);
+
+        // Two orders at t=0 pass; the third is rate-limited.
+        for nonce in 0..2 {
+            let req = signed_req(&trader_sk, 0, Side::Buy, nonce, 1_500_000_000, 1_000);
+            assert!(!server.submit_order(&req).rejected);
+        }
+        let req = signed_req(&trader_sk, 0, Side::Buy, 2, 1_500_000_000, 1_000);
+        let resp = server.submit_order(&req);
+        assert_eq!(resp.reject_reason, Some(RejectReason::RateLimited));
+
+        // 1_500 orders from ANOTHER account. With the counter fed
+        // as milliseconds this pushed "now" ~1.5s forward and slid
+        // the trader's window open — even though the clock has not
+        // moved at all. (Each flood order is itself rejected after
+        // the second one, but `orders_processed` counted them all.)
+        for nonce in 0..1_500 {
+            let req = signed_req(&other_sk, 0, Side::Sell, nonce, 1_500_000_000, 1_000);
+            server.submit_order(&req);
+        }
+        let req = signed_req(&trader_sk, 0, Side::Buy, 3, 1_500_000_000, 1_000);
+        let resp = server.submit_order(&req);
+        assert_eq!(
+            resp.reject_reason,
+            Some(RejectReason::RateLimited),
+            "other accounts' order flow must not slide the window"
+        );
+
+        // Real elapsed time does slide it: +1001ms exceeds the
+        // one-second window and the next order passes.
+        now.store(1_001, std::sync::atomic::Ordering::Relaxed);
+        let req = signed_req(&trader_sk, 0, Side::Buy, 4, 1_500_000_000, 1_000);
+        assert!(!server.submit_order(&req).rejected, "order after the window slid must be allowed");
+    }
+
+    /// Regression: a maker filled to zero left the book but kept
+    /// its resting-order slot — active market makers accumulated
+    /// phantom counts until the per-account cap rejected them.
+    #[test]
+    fn filled_maker_releases_resting_count() {
+        let mut server = MatchingServer::with_risk_config(
+            cfg(),
+            100,
+            RiskConfig {
+                max_orders_per_second: 0,
+                max_order_qty: 0,
+                max_price_deviation_bps: 0,
+                max_resting_per_account: 1,
+            },
+        );
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&seller, 1_000_000_000);
+        server.fund_account(&buyer, 1_000_000_000_000);
+
+        // Maker rests — its slot is taken (a second resting order
+        // would exceed the cap of 1).
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        assert!(!server.submit_order(&maker).rejected);
+        assert_eq!(server.risk.resting_count(&seller), 1);
+        let blocked = signed_req(&seller_sk, 0, Side::Sell, 1, 1_500_000_000, 1_000);
+        assert_eq!(server.submit_order(&blocked).reject_reason, Some(RejectReason::TooManyResting));
+
+        // A taker fills the maker completely — the slot frees and
+        // the account can rest again.
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+        assert_eq!(server.submit_order(&taker).fills_count, 1);
+        assert_eq!(
+            server.risk.resting_count(&seller),
+            0,
+            "a fully filled maker must release its resting slot"
+        );
+        let again = signed_req(&seller_sk, 0, Side::Sell, 2, 1_500_000_000, 1_000);
+        assert!(!server.submit_order(&again).rejected);
+    }
+
+    /// A partially filled maker still rests — it must keep its
+    /// slot. Only orders that leave the book release one.
+    #[test]
+    fn partially_filled_maker_keeps_resting_count() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        server.fund_account(&seller, 1_000_000_000);
+        server.fund_account(&buyer, 1_000_000_000_000);
+
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 2_000);
+        assert!(!server.submit_order(&maker).rejected);
+        assert_eq!(server.risk.resting_count(&seller), 1);
+
+        // Fill half — the other half still rests at 1.5e9.
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+        assert_eq!(server.submit_order(&taker).fills_count, 1);
+        assert_eq!(
+            server.risk.resting_count(&seller),
+            1,
+            "a surviving maker remainder keeps its slot"
+        );
+    }
+
+    /// The worker path shares the accounting: a maker filled away
+    /// on a `MultiMarketMatcher` must be able to rest again. The
+    /// maker floods the book to the default 1000-order cap; a
+    /// single sweep fills them all; the next order must not see
+    /// `TooManyResting`. The injected clock advances 1001ms between
+    /// bursts so the 100/sec limiter never engages — this also
+    /// exercises `MultiMarketMatcher::with_clock`.
+    #[test]
+    fn worker_releases_filled_maker_resting_count() {
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        let balances = Arc::new(AtomicBalanceCache::new(8));
+        balances.set(&seller, 1_000_000_000);
+        balances.set(&buyer, u64::MAX / 2);
+        let (now, clock) = test_clock();
+        let matcher = MultiMarketMatcher::with_clock(vec![cfg_for(0)], balances, clock);
+
+        // 1_000 resting sells = the default per-account cap. Ten
+        // batches of 100 with a full window slide between them stay
+        // under the 100/sec rate limit.
+        let mut nonce = 0u64;
+        for _ in 0..10 {
+            let batch: Vec<OrderRequest> = (0..100)
+                .map(|_| {
+                    let req = signed_req(&seller_sk, 0, Side::Sell, nonce, 1_500_000_000, 1_000);
+                    nonce += 1;
+                    req
+                })
+                .collect();
+            for resp in matcher.submit_batch(batch) {
+                assert!(!resp.rejected, "maker order rejected: {:?}", resp.reject_reason);
+            }
+            now.fetch_add(1_001, std::sync::atomic::Ordering::Relaxed);
+        }
+        // The cap is real: one more resting order is rejected.
+        now.fetch_add(1_001, std::sync::atomic::Ordering::Relaxed);
+        let extra = signed_req(&seller_sk, 0, Side::Sell, nonce, 1_500_000_000, 1_000);
+        nonce += 1;
+        let resp = matcher.submit_batch(vec![extra]);
+        assert_eq!(resp[0].reject_reason, Some(RejectReason::TooManyResting));
+
+        // One taker sweeps all 1_000 makers (1_000 × 1_000 qty).
+        now.fetch_add(1_001, std::sync::atomic::Ordering::Relaxed);
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000_000);
+        let resp = matcher.submit_batch(vec![taker]);
+        assert_eq!(resp[0].fills_count, 1_000);
+
+        // Every slot released: the maker rests again instead of
+        // hitting the phantom cap.
+        now.fetch_add(1_001, std::sync::atomic::Ordering::Relaxed);
+        let again = signed_req(&seller_sk, 0, Side::Sell, nonce, 1_500_000_000, 1_000);
+        let resp = matcher.submit_batch(vec![again]);
+        assert!(
+            !resp[0].rejected,
+            "maker must rest again after the sweep freed its slots, got {:?}",
+            resp[0].reject_reason
+        );
+    }
+
+    /// Regression: the chain ID is the signature domain — an order
+    /// signed for chain A must not replay on chain B. The server
+    /// verifies against its CONFIGURED chain ID, not a hardcoded
+    /// constant.
+    #[test]
+    fn order_signed_for_other_chain_rejected() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        server.set_chain_id(42);
+        let (trader_sk, trader) = test_account(5);
+        server.fund_account(&trader, 1_000_000_000);
+
+        // Signed under the devnet default (1): verifies as a forgery
+        // on chain 42 — exactly the cross-chain replay boundary.
+        let req = signed_req(&trader_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        let resp = server.submit_order(&req);
+        assert_eq!(resp.reject_reason, Some(RejectReason::BadSignature));
+
+        // The same request re-signed for chain 42 verifies and rests.
+        // (The BadSignature rejection never consumed the nonce.)
+        let mut req2 = signed_req(&trader_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        crate::protocol::sign_order_with_chain_id(&mut req2, &trader_sk, 42);
+        let resp2 = server.submit_order(&req2);
+        assert!(
+            !resp2.rejected,
+            "order signed for the server's chain must verify, got {:?}",
+            resp2.reject_reason
+        );
+    }
+
+    /// The worker path shares the domain: a `MultiMarketMatcher`
+    /// configured for chain 42 must reject devnet-signed orders and
+    /// accept chain-42 signatures.
+    #[test]
+    fn worker_verifies_configured_chain_id() {
+        let (trader_sk, trader) = test_account(5);
+        let balances = Arc::new(AtomicBalanceCache::new(8));
+        balances.set(&trader, 1_000_000_000);
+        let matcher = MultiMarketMatcher::with_options(
+            vec![cfg_for(0)],
+            balances,
+            Arc::new(wall_clock_ms),
+            42,
+            None,
+        );
+
+        let bad = signed_req(&trader_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        let resp = matcher.submit_batch(vec![bad]);
+        assert_eq!(resp[0].reject_reason, Some(RejectReason::BadSignature));
+
+        let mut good = signed_req(&trader_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        crate::protocol::sign_order_with_chain_id(&mut good, &trader_sk, 42);
+        let resp = matcher.submit_batch(vec![good]);
+        assert!(
+            !resp[0].rejected,
+            "chain-42 order must verify on the chain-42 worker, got {:?}",
+            resp[0].reject_reason
+        );
+    }
+
+    /// Regression: without a durable checkpoint, every restart
+    /// forgot all consumed nonces — a captured signed order became
+    /// replayable once per restart, forever. `set_nonce_store`
+    /// bounds the window to the checkpoint interval.
+    #[test]
+    fn nonce_store_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("oxnc-test-{}", std::process::id()));
+        let path = dir.join("nonces.oxnc");
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let (trader_sk, trader) = test_account(6);
+        {
+            let mut server = MatchingServer::new(cfg(), 100);
+            server.set_nonce_store(path.clone());
+            server.fund_account(&trader, 1_000_000_000);
+            let req = signed_req(&trader_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+            assert!(!server.submit_order(&req).rejected);
+            // Checkpoint via the seal-cadence flush (the 64-mutation
+            // amortized flush has not been reached).
+            server.seal_batch();
+        }
+
+        // "Restart": a fresh server over the same checkpoint must
+        // still reject the replayed nonce — before the store, this
+        // was accepted because the gate restarted empty.
+        let mut server2 = MatchingServer::new(cfg(), 100);
+        server2.set_nonce_store(path.clone());
+        server2.fund_account(&trader, 1_000_000_000);
+        let replay = signed_req(&trader_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
+        let resp = server2.submit_order(&replay);
+        assert_eq!(
+            resp.reject_reason,
+            Some(RejectReason::StaleNonce),
+            "consumed nonce must stay consumed across restart"
+        );
+        // And a genuinely new nonce still works.
+        let fresh = signed_req(&trader_sk, 0, Side::Sell, 1, 1_500_000_000, 1_000);
+        assert!(!server2.submit_order(&fresh).rejected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt checkpoint must fail closed at startup — the
+    /// alternative (silently resetting the gate) reopens the replay
+    /// window for every captured signature.
+    #[test]
+    fn corrupt_nonce_store_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("oxnc-bad-{}", std::process::id()));
+        let path = dir.join("bad.oxnc");
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        std::fs::write(&path, b"definitely-not-a-checkpoint").unwrap_or_default();
+        let result = std::panic::catch_unwind(|| {
+            let mut tracker = NonceTracker::new();
+            tracker.attach_store(path.clone());
+        });
+        assert!(result.is_err(), "corrupt nonce store must panic, not reset the gate");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

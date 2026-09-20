@@ -1930,6 +1930,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     exactly what would trade, and the order is killed outright
     when it can't fully fill.
 
+- **Matcher risk controls were fed the wrong inputs or never wired
+  back** (`crates/matcher`, `bin/oxide-matcher`)
+  - The rate limiter received the global order counter as its
+    "milliseconds": ~1000 orders of unrelated traffic slid a
+    rate-limited trader's window open while no real time passed.
+    Both execution paths now take an injectable wall clock.
+  - A maker filled to zero left the book with its resting-order
+    slot still counted — active market makers accumulated phantom
+    counts until the per-account cap rejected them. Exhausted and
+    fully-removed makers now release their slot exactly once.
+  - The signing chain ID was a hardcoded `1`, so signatures replayed
+    across deployments. It is now configurable end-to-end
+    (`--chain-id`), and transport pre-verification always uses the
+    same chain ID as the mandatory in-server re-verify.
+  - Consumed nonces lived only in memory — a restart reopened the
+    replay gate. Nonce checkpoints now persist to a versioned,
+    atomically-renamed file (`--nonce-state`), flushed every 64
+    admissions and on every settlement-batch seal; a corrupt
+    checkpoint fails closed at startup instead of resetting.
+  - **In plain words:** the risk limits looked right but ran on
+    bogus numbers — "per second" meant "per thousand orders
+    anywhere", filled orders kept occupying your resting-order
+    budget forever, signatures meant for one network worked on
+    every network, and restarting the server let old orders
+    replay. All four now behave the way the docs always claimed.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

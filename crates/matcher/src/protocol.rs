@@ -51,7 +51,32 @@
 //! The `nonce` is a monotonically increasing per-account counter. The
 //! matcher rejects orders with a nonce lower than or equal to the
 //! last-seen nonce for that account. This prevents replaying a
-//! captured order.
+//! captured order. Consumed nonces can be checkpointed to disk
+//! (`MatchingServer::set_nonce_store` /
+//! `MultiMarketMatcher::with_options`) — without a checkpoint every
+//! restart re-opens the replay window for every captured signature.
+//!
+//! # Identity model (Ed25519 trading key vs. secp256k1 ledger key)
+//!
+//! Two separate credentials exist over the SAME 20-byte address
+//! namespace:
+//!
+//! - **Ed25519 trading credential** — the key in `pubkey`; its
+//!   `owner_address`-derived 20-byte address IS the trading account:
+//!   balance-cache entries, risk limits, nonce watermarks, and fill
+//!   attribution all key on it.
+//! - **secp256k1 ledger credential** — the EVM EOA key. An
+//!   Ed25519-derived address is a valid EVM address byte-wise, but
+//!   NO secp256k1 key controls it (different curve): the two
+//!   credentials can never sign for each other.
+//!
+//! Consequence: on-chain settlement crediting the trading `owner`
+//! address maps outcomes into the ledger namespace, but fund custody
+//! on-chain belongs to the secp256k1 identity. Any path that must
+//! bind the two (settlement authorization, withdrawals) needs an
+//! explicit linkage mechanism — e.g. a ledger-key-signed attestation
+//! of the trading key — which does not exist yet and is tracked as
+//! a settlement-authorization gap, not a matcher concern.
 
 use primitives::fixed::{Price, Qty};
 use trading::{OrderType, Side, TimeInForce};
@@ -62,8 +87,12 @@ pub const MAGIC: u16 = 0x4F58;
 /// Protocol version 2: adds Ed25519 signature, nonce, and `chain_id`.
 pub const VERSION: u8 = 2;
 
-/// Chain ID for the devnet. Used in the signing domain to prevent
-/// cross-chain replay. In production this comes from genesis config.
+/// Chain ID for the devnet — the DEFAULT used by the bare
+/// `signing_message`/`verify_*`/`sign_*` helpers. Production
+/// deployments MUST NOT rely on it: the matcher and every transport
+/// take a configured chain ID (see `*_with_chain_id` variants and
+/// `MatchingServer::set_chain_id`) so signatures made for one chain
+/// can never replay on another.
 pub const CHAIN_ID: u64 = 1;
 
 /// Signing domain separator: prevents signature reuse across
@@ -177,7 +206,7 @@ impl OrderResponse {
 ///
 /// The message includes:
 /// - `SIGNING_DOMAIN` (domain separation)
-/// - `CHAIN_ID` (cross-chain replay protection)
+/// - `chain_id` (cross-chain replay protection)
 /// - All order fields except `signature` and `pubkey` (the pubkey is
 ///   verified separately — the signature proves the signer owns the
 ///   pubkey, and the owner must equal the address derived from that
@@ -188,9 +217,17 @@ impl OrderResponse {
 /// - `req`: the order request (signature field is ignored)
 #[must_use]
 pub fn signing_message(req: &OrderRequest) -> Vec<u8> {
+    signing_message_with_chain_id(req, CHAIN_ID)
+}
+
+/// [`signing_message`] with an explicit chain ID — the production
+/// form. The devnet default [`CHAIN_ID`] is only for tests and
+/// local tooling.
+#[must_use]
+pub fn signing_message_with_chain_id(req: &OrderRequest, chain_id: u64) -> Vec<u8> {
     let mut msg = Vec::with_capacity(SIGNING_DOMAIN.len() + 8 + 1 + 1 + 1 + 1 + 8 + 8 + 8 + 20);
     msg.extend_from_slice(SIGNING_DOMAIN);
-    msg.extend_from_slice(&CHAIN_ID.to_le_bytes());
+    msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.push(req.market);
     msg.push(match req.side {
         Side::Buy => 0,
@@ -226,8 +263,19 @@ pub fn signing_message(req: &OrderRequest) -> Vec<u8> {
 /// (directly, or by constructing a [`VerifiedOrder`]) before any
 /// nonce, balance, or risk check. A `false` result means the order
 /// is not authentic and must be rejected with `BadSignature`.
+///
+/// Verifies against the devnet-default [`CHAIN_ID`] — production
+/// paths must call [`verify_order_with_chain_id`] with the
+/// configured chain ID instead.
 #[must_use]
 pub fn verify_order(req: &OrderRequest) -> bool {
+    verify_order_with_chain_id(req, CHAIN_ID)
+}
+
+/// [`verify_order`] with an explicit chain ID — the signature is
+/// only valid for the chain it was produced on.
+#[must_use]
+pub fn verify_order_with_chain_id(req: &OrderRequest, chain_id: u64) -> bool {
     let Ok(pubkey) = crypto::ed25519::Ed25519PublicKey::from_bytes(&req.pubkey) else {
         return false;
     };
@@ -241,7 +289,7 @@ pub fn verify_order(req: &OrderRequest) -> bool {
     let Ok(signature) = crypto::ed25519::Ed25519Signature::from_slice(&req.signature) else {
         return false;
     };
-    let msg = signing_message(req);
+    let msg = signing_message_with_chain_id(req, chain_id);
     crypto::ed25519::verify_message(&pubkey, &msg, &signature).is_ok()
 }
 
@@ -253,11 +301,23 @@ pub fn verify_order(req: &OrderRequest) -> bool {
 ///
 /// This is used by clients (and test helpers) to produce authentic
 /// orders. The matcher never calls this — it only verifies.
+///
+/// Signs for the devnet-default [`CHAIN_ID`]; production clients
+/// call [`sign_order_with_chain_id`].
 pub fn sign_order(req: &mut OrderRequest, secret: &crypto::ed25519::Ed25519SecretKey) {
+    sign_order_with_chain_id(req, secret, CHAIN_ID);
+}
+
+/// [`sign_order`] with an explicit chain ID.
+pub fn sign_order_with_chain_id(
+    req: &mut OrderRequest,
+    secret: &crypto::ed25519::Ed25519SecretKey,
+    chain_id: u64,
+) {
     let verifying = secret.verifying_key();
     req.pubkey = verifying.to_bytes();
     req.owner = crypto::ed25519::owner_address(&verifying);
-    let msg = signing_message(req);
+    let msg = signing_message_with_chain_id(req, chain_id);
     let sig = crypto::ed25519::sign_message(secret, &msg);
     req.signature = sig.to_bytes();
 }
@@ -281,9 +341,18 @@ impl VerifiedOrder {
     /// [`verify_order`] passes (signature valid AND owner derived
     /// from pubkey); `None` otherwise — the caller must reject with
     /// `BadSignature`.
+    ///
+    /// Verifies against the devnet-default [`CHAIN_ID`]; production
+    /// transports call [`Self::with_chain_id`].
     #[must_use]
     pub fn new(req: OrderRequest) -> Option<Self> {
-        if verify_order(&req) { Some(Self(req)) } else { None }
+        Self::with_chain_id(req, CHAIN_ID)
+    }
+
+    /// [`Self::new`] with an explicit chain ID.
+    #[must_use]
+    pub fn with_chain_id(req: OrderRequest, chain_id: u64) -> Option<Self> {
+        if verify_order_with_chain_id(&req, chain_id) { Some(Self(req)) } else { None }
     }
 
     /// The authenticated request.
@@ -753,10 +822,17 @@ pub const ACTION_SIGNING_DOMAIN: &[u8] = b"oxide-action-v1";
 /// except `signature` and `pubkey`.
 #[must_use]
 pub fn signing_message_action(req: &ActionRequest) -> Vec<u8> {
+    signing_message_action_with_chain_id(req, CHAIN_ID)
+}
+
+/// [`signing_message_action`] with an explicit chain ID — the
+/// production form.
+#[must_use]
+pub fn signing_message_action_with_chain_id(req: &ActionRequest, chain_id: u64) -> Vec<u8> {
     let mut msg =
         Vec::with_capacity(ACTION_SIGNING_DOMAIN.len() + 8 + 1 + 8 + 8 + 8 + 1 + 1 + 1 + 8 + 20);
     msg.extend_from_slice(ACTION_SIGNING_DOMAIN);
-    msg.extend_from_slice(&CHAIN_ID.to_le_bytes());
+    msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.push(req.action_type as u8);
     msg.extend_from_slice(&req.order_id.to_le_bytes());
     msg.extend_from_slice(&req.new_price.0.to_le_bytes());
@@ -788,8 +864,17 @@ pub fn signing_message_action(req: &ActionRequest) -> Vec<u8> {
 /// verifies. This is the authentication gate for
 /// cancel/amend/replace — a `false` result means the action is not
 /// authentic and must be rejected with `BadSignature`.
+///
+/// Verifies against the devnet-default [`CHAIN_ID`]; production
+/// paths call [`verify_action_with_chain_id`].
 #[must_use]
 pub fn verify_action(req: &ActionRequest) -> bool {
+    verify_action_with_chain_id(req, CHAIN_ID)
+}
+
+/// [`verify_action`] with an explicit chain ID.
+#[must_use]
+pub fn verify_action_with_chain_id(req: &ActionRequest, chain_id: u64) -> bool {
     let Ok(pubkey) = crypto::ed25519::Ed25519PublicKey::from_bytes(&req.pubkey) else {
         return false;
     };
@@ -801,7 +886,7 @@ pub fn verify_action(req: &ActionRequest) -> bool {
     let Ok(signature) = crypto::ed25519::Ed25519Signature::from_slice(&req.signature) else {
         return false;
     };
-    let msg = signing_message_action(req);
+    let msg = signing_message_action_with_chain_id(req, chain_id);
     crypto::ed25519::verify_message(&pubkey, &msg, &signature).is_ok()
 }
 
@@ -809,11 +894,23 @@ pub fn verify_action(req: &ActionRequest) -> bool {
 /// `owner`, `pubkey`, and `signature` fields (`owner` is overwritten
 /// with the key's derived address — an action can only target the
 /// account its key controls). Used by clients and test helpers.
+///
+/// Signs for the devnet-default [`CHAIN_ID`]; production clients
+/// call [`sign_action_with_chain_id`].
 pub fn sign_action(req: &mut ActionRequest, secret: &crypto::ed25519::Ed25519SecretKey) {
+    sign_action_with_chain_id(req, secret, CHAIN_ID);
+}
+
+/// [`sign_action`] with an explicit chain ID.
+pub fn sign_action_with_chain_id(
+    req: &mut ActionRequest,
+    secret: &crypto::ed25519::Ed25519SecretKey,
+    chain_id: u64,
+) {
     let verifying = secret.verifying_key();
     req.pubkey = verifying.to_bytes();
     req.owner = crypto::ed25519::owner_address(&verifying);
-    let msg = signing_message_action(req);
+    let msg = signing_message_action_with_chain_id(req, chain_id);
     let sig = crypto::ed25519::sign_message(secret, &msg);
     req.signature = sig.to_bytes();
 }

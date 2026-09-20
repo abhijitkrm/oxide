@@ -16373,3 +16373,85 @@ external liquidity kills instead of partially filling; a self
 decrement no longer counts toward FOK fillable. The property oracle
 (512 random op sequences) now agrees with the engine including all
 four STP modes. 58 trading tests green; fmt + clippy clean.
+
+## Matcher risk controls now match their advertised behavior
+
+Four independent risk-control defects in the matcher, all the same
+class: the code looked like it implemented the control, but the
+plumbing fed it the wrong inputs or never wired the output back.
+
+### Rate limiter fed the order counter as "milliseconds"
+
+`execute_order` passed `orders_processed` — a global counter that
+increments on EVERY submission including rejected ones — to the
+rate limiter as its `now_ms`. Every order anywhere advanced every
+account's "time": ~1000 orders of unrelated traffic slid a
+rate-limited trader's window open while zero real time passed, and
+real elapsed time had no effect on the limit. Both execution paths
+(server and per-market worker) now take an injectable clock —
+`wall_clock_ms` in production, an `AtomicU64` in tests —
+`MatchingServer::set_clock` / `MultiMarketMatcher::with_clock`.
+
+### Filled makers never released their resting-order slot
+
+`inc_resting` ran on rest and `dec_resting` on cancel/amend — but a
+maker filled to zero left the book with its slot still counted, so
+active market makers accumulated phantom counts until the
+per-account cap rejected them. A new `gone_makers` helper collects
+the departures after every sweep — reported removals with
+`remaining == 0` (STP/cap kills, a `remaining > 0` report is only a
+decrement) plus fill-exhausted makers (absent from the id map) —
+deduplicated so a maker appearing in several fills or in both
+sources releases exactly once. Same code runs in `MatchingServer`
+and `MarketWorker` via the shared helper; the engine's
+`ObserveRemovals` channel (added for the STP obligation fix)
+supplies the reported half.
+
+### Signing chain ID was hardcoded to 1
+
+`protocol::CHAIN_ID` was a compile-time constant baked into every
+signing message — signatures for one deployment replayed on any
+other. Every sign/verify entry point now has a `_with_chain_id`
+form; `MatchingServer`, `MarketWorker`, `MultiMarketMatcher`, and
+`RingMatcher` carry a configured `chain_id` (defaults stay devnet),
+transports read it off the matcher they submit to (so early-verify
+and the mandatory in-server re-verify can never disagree), and
+`oxide-matcher` exposes `--chain-id`. The devnet-default wrappers
+remain for tests/loadgen/benches.
+
+### Replay state was memory-only
+
+`NonceTracker` kept consumed nonces in a `HashMap` — restart reset
+the gate, so any captured signed request replayed once per restart
+forever. `NonceStore` is a durable checkpoint: a versioned,
+strictly-decoded binary file (bounded count, exact-size check —
+corruption fails closed at startup, never silently resets), written
+to a temp file then renamed (no torn checkpoint). Flushes are
+amortized every 64 consumed nonces plus on every `seal_batch` —
+the settler's existing cadence keeps the write off the order hot
+path. Loaded watermarks max-merge, never regress. `oxide-matcher`
+exposes `--nonce-state <path>`; `ServerConfig` carries
+`nonce_state_path` for the internally-built multi matcher.
+
+### Identity linkage documented
+
+The protocol docs now state the two-credential model explicitly:
+the Ed25519 key IS the trading account (owner = derived address,
+shared 20-byte namespace with the ledger), the secp256k1 EVM key is
+a separate credential, and binding them requires an explicit
+attestation mechanism — tracked under the settlement-authorization
+work, not assumed to "naturally coincide".
+
+### Verification
+
+Seven new regressions: unrelated order flow cannot slide a frozen
+rate-limit window (the old counter-as-ms path did), real elapsed
+time does; a filled maker's resting slot releases (cap blocks then
+frees); a partial fill keeps its slot; the same release through a
+live `MultiMarketMatcher` worker (1000 resting → swept → rests
+again, also exercising `with_clock`); devnet-signed order rejected
+on a chain-42 server AND worker, chain-42-signed accepted; a
+consumed nonce stays consumed across a simulated restart via
+`set_nonce_store`; a corrupt checkpoint panics instead of resetting
+the gate. 113 matcher tests + 6 e2e multi-market green; fmt +
+clippy clean.

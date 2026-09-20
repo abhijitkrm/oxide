@@ -20,7 +20,7 @@
 
 use crate::protocol::{
     OrderRequest, OrderResponse, RejectReason, decode_action_request, decode_request,
-    encode_response, is_action_request, verify_action,
+    encode_response, is_action_request,
 };
 use crate::{MatchingServer, SharedMatcher};
 use exchange::BatchFillEntry;
@@ -61,8 +61,13 @@ async fn submit_batch_ring(
     let mut positions: Vec<usize> = Vec::with_capacity(orders.len());
     let mut verified: Vec<crate::protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
     let mut responses: Vec<Option<OrderResponse>> = Vec::with_capacity(orders.len());
+    // Verify against the ring's configured chain ID — the embedded
+    // server re-checks nothing for `VerifiedOrder`, so the transport
+    // MUST use the same domain or valid orders die here as
+    // `BadSignature`.
+    let chain_id = ring.chain_id();
     for (i, req) in orders.into_iter().enumerate() {
-        match crate::protocol::VerifiedOrder::new(req) {
+        match crate::protocol::VerifiedOrder::with_chain_id(req, chain_id) {
             Some(vo) => {
                 positions.push(i);
                 verified.push(vo);
@@ -116,6 +121,17 @@ async fn submit_batch_ring(
             r.unwrap_or_else(|| OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
         })
         .collect()
+}
+
+/// The chain ID the target matcher verifies signatures against —
+/// ring mode reads it off the `RingMatcher`, mutex mode off the
+/// `SharedMatcher`. Early transport verifies MUST use the same
+/// domain as the mandatory in-server re-verify.
+fn transport_chain_id(
+    matcher: &SharedMatcher,
+    ring_matcher: Option<&Arc<crate::RingMatcher>>,
+) -> u64 {
+    ring_matcher.map_or_else(|| matcher.chain_id(), |rm| rm.chain_id())
 }
 
 /// Submit a single order through the ring matcher (batch of one).
@@ -564,8 +580,11 @@ async fn handle_connection(
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
             };
-            // Signature verification before processing.
-            if !verify_action(&action_req) {
+            // Signature verification before processing — with the
+            // SAME chain ID the matcher will re-verify against.
+            let action_chain_id =
+                ring_matcher.as_ref().map_or_else(|| matcher.chain_id(), |rm| rm.chain_id());
+            if !crate::protocol::verify_action_with_chain_id(&action_req, action_chain_id) {
                 let rej = OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
@@ -697,7 +716,8 @@ async fn run_jsonrpc_tcp_server_impl(
                             .await;
                         continue;
                     };
-                    if !crate::protocol::verify_action(&action_req) {
+                    let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
+                    if !crate::protocol::verify_action_with_chain_id(&action_req, action_chain_id) {
                         let _ = writer
                             .write_all(
                                 br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad signature"},"id":null}
@@ -863,7 +883,8 @@ async fn run_fix_server_impl(
                         let _ = socket.write_all(report.as_bytes()).await;
                         continue;
                     };
-                    if !crate::protocol::verify_action(&action_req) {
+                    let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
+                    if !crate::protocol::verify_action_with_chain_id(&action_req, action_chain_id) {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
                         let _ = socket.write_all(report.as_bytes()).await;
@@ -987,7 +1008,8 @@ async fn run_websocket_server_impl(
                             .await;
                         continue;
                     };
-                    if !crate::protocol::verify_action(&action_req) {
+                    let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
+                    if !crate::protocol::verify_action_with_chain_id(&action_req, action_chain_id) {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         let response = crate::ws::format_ws_response(&resp, 0);
                         let _ = ws_sender.send(Message::Text(response.into())).await;
@@ -1045,6 +1067,19 @@ pub struct ServerConfig {
     pub websocket_port: u16,
     /// Batch settlement interval in milliseconds.
     pub batch_interval_ms: u64,
+    /// The chain ID order/action signatures are verified against.
+    /// Used only where this module constructs the matcher itself
+    /// (`run_server_multi`) — otherwise the chain ID lives on the
+    /// matcher object the caller built (`MatchingServer::set_chain_id`).
+    /// Defaults to the devnet [`crate::protocol::CHAIN_ID`]; set it
+    /// to the deployment's real chain ID.
+    pub chain_id: u64,
+    /// Durable checkpoint file for consumed nonces — bounds the
+    /// restart replay window to the flush interval instead of
+    /// "any captured request replays once after every restart".
+    /// Same scope note as `chain_id`: used where this module builds
+    /// the matcher (`run_server_multi`); `None` = memory-only gate.
+    pub nonce_state_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -1055,6 +1090,8 @@ impl Default for ServerConfig {
             fix_port: 36002,
             websocket_port: 36003,
             batch_interval_ms: 100,
+            chain_id: crate::protocol::CHAIN_ID,
+            nonce_state_path: None,
         }
     }
 }
@@ -1343,7 +1380,7 @@ async fn handle_connection_multi(
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
             };
-            if !verify_action(&action_req) {
+            if !crate::protocol::verify_action_with_chain_id(&action_req, matcher.chain_id()) {
                 let rej = OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
@@ -1411,7 +1448,10 @@ pub async fn run_jsonrpc_tcp_server_multi(
 "#).await;
                         continue;
                     };
-                    if !crate::protocol::verify_action(&action_req) {
+                    if !crate::protocol::verify_action_with_chain_id(
+                        &action_req,
+                        matcher.chain_id(),
+                    ) {
                         let _ = writer.write_all(br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad signature"},"id":null}
 "#).await;
                         continue;
@@ -1499,7 +1539,10 @@ pub async fn run_fix_server_multi(
                         let _ = socket.write_all(report.as_bytes()).await;
                         continue;
                     };
-                    if !crate::protocol::verify_action(&action_req) {
+                    if !crate::protocol::verify_action_with_chain_id(
+                        &action_req,
+                        matcher.chain_id(),
+                    ) {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
                         let _ = socket.write_all(report.as_bytes()).await;
@@ -1598,7 +1641,13 @@ pub async fn run_server_multi(
     config: ServerConfig,
     sender: primitives::Address,
 ) {
-    let matcher = Arc::new(crate::MultiMarketMatcher::new(configs, balances));
+    let matcher = Arc::new(crate::MultiMarketMatcher::with_options(
+        configs,
+        balances,
+        Arc::new(crate::wall_clock_ms),
+        config.chain_id,
+        config.nonce_state_path.clone(),
+    ));
 
     // Batch settler seals from ALL markets via the control channel.
     let sealer: Arc<dyn crate::BatchSealer> = Arc::clone(&matcher) as Arc<dyn crate::BatchSealer>;

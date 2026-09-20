@@ -74,6 +74,8 @@ struct CliConfig {
     mode: String,
     markets: usize,
     accounts_cap: usize,
+    chain_id: u64,
+    nonce_state: Option<std::path::PathBuf>,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -88,6 +90,13 @@ fn parse_cli() -> CliConfig {
         mode: parse_flag("--mode", "multi".to_string()),
         markets: parse_flag("--markets", DEFAULT_MARKETS),
         accounts_cap: parse_flag("--accounts-cap", DEFAULT_ACCOUNTS_CAP),
+        // Signature domain: signatures produced under another chain
+        // ID must not verify here. Default = the devnet chain ID;
+        // production passes the real chain ID.
+        chain_id: parse_flag("--chain-id", matcher::protocol::CHAIN_ID),
+        // Durable replay-gate checkpoint — without it, every restart
+        // lets any captured signed request replay once.
+        nonce_state: parse_flag_opt::<String>("--nonce-state").map(std::path::PathBuf::from),
     }
 }
 
@@ -99,6 +108,8 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
         fix_port: cli.fix_port,
         websocket_port: cli.ws_port,
         batch_interval_ms: cli.batch_interval,
+        chain_id: cli.chain_id,
+        nonce_state_path: cli.nonce_state.clone(),
     }
 }
 
@@ -161,6 +172,12 @@ fn main() {
     println!("  FIX 4.4:         127.0.0.1:{}", cli.fix_port);
     println!("  WebSocket:       127.0.0.1:{}", cli.ws_port);
     println!("  batch interval:  {}ms", cli.batch_interval);
+    println!("  chain ID:        {}", cli.chain_id);
+    if let Some(p) = &cli.nonce_state {
+        println!("  nonce state:     {}", p.display());
+    } else {
+        println!("  nonce state:     memory-only (restart replays possible)");
+    }
 
     // Assemble the Oxide node (single-node devnet with executor + modules).
     let node_config = NodeConfig {
@@ -205,6 +222,10 @@ fn main() {
         "ring" => {
             println!("oxide-matcher: funding {} accounts (single-market ring)...", cli.accounts);
             let mut server = MatchingServer::new(single_market_config(), cli.accounts);
+            server.set_chain_id(cli.chain_id);
+            if let Some(p) = &cli.nonce_state {
+                server.set_nonce_store(p.clone());
+            }
             fund_server(&mut server, cli.accounts);
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             runtime.block_on(run_server_ring(server, submitter, config, sender));
@@ -212,6 +233,10 @@ fn main() {
         "mutex" => {
             println!("oxide-matcher: funding {} accounts (single-market mutex)...", cli.accounts);
             let mut server = MatchingServer::new(single_market_config(), cli.accounts);
+            server.set_chain_id(cli.chain_id);
+            if let Some(p) = &cli.nonce_state {
+                server.set_nonce_store(p.clone());
+            }
             fund_server(&mut server, cli.accounts);
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             let shared = Arc::new(matcher::SharedMatcher::new(server));
@@ -238,4 +263,16 @@ fn parse_flag<T: std::str::FromStr>(name: &str, default: T) -> T {
         }
     }
     default
+}
+
+/// Parse an optional CLI flag of the form `--name value`. Returns
+/// `None` if the flag is absent or its value fails to parse.
+fn parse_flag_opt<T: std::str::FromStr>(name: &str) -> Option<T> {
+    let args: Vec<String> = env::args().collect();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == name {
+            return args.get(i + 1).and_then(|v| v.parse().ok());
+        }
+    }
+    None
 }
