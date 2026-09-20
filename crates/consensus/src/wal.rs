@@ -52,6 +52,17 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+/// Upper bound on one WAL entry's payload.
+///
+/// Unit: bytes. Origin: a `WalEntry` is the whole consensus safety state
+/// (`last_voted_view`, `voted_at_height`, `high_qc`, `current_view`,
+/// `next_height`, `epoch`, `last_committed`) — roughly 200 bytes even
+/// with a large vote-lock map. 1 MiB is ~5000× headroom. Tradeoff: a
+/// corrupt length field beyond this is treated as a torn tail rather
+/// than allocated, so a damaged file cannot drive a multi-gigabyte
+/// allocation on the recovery path.
+const MAX_WAL_ENTRY_BYTES: usize = 1 << 20;
+
 /// The safety-critical consensus state persisted to the WAL.
 ///
 /// This is a snapshot of the engine's safety-critical fields at the
@@ -260,10 +271,15 @@ impl Wal {
     /// Open or create the WAL at `path`. If the file exists,
     /// recovery entries are preserved; new entries are appended.
     ///
+    /// A torn or corrupt suffix left by a crash is **truncated** before
+    /// the first append — see [`repair_tail`](Self::repair_tail) for why
+    /// appending past it would silently strand later records.
+    ///
     /// # Errors
     ///
     /// Returns [`WalError::Open`] if the file cannot be created
-    /// or opened for read+write+create.
+    /// or opened for read+write+create, or [`WalError::Io`] if a torn
+    /// tail cannot be repaired.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WalError> {
         let path = path.into();
         let file = OpenOptions::new()
@@ -272,7 +288,77 @@ impl Wal {
             .read(true)
             .open(&path)
             .map_err(WalError::Open)?;
-        Ok(Self { path, writer: BufWriter::new(file), poisoned: false })
+        let mut wal = Self { path, writer: BufWriter::new(file), poisoned: false };
+        // Repair before any append can land after the damaged bytes.
+        wal.repair_tail()?;
+        Ok(wal)
+    }
+
+    /// Byte offset just past the last complete, CRC-valid record.
+    ///
+    /// Scans with the same rules [`recover`](Self::recover) uses (short
+    /// read, oversized length, or CRC mismatch ends the scan), so the
+    /// returned offset is exactly the boundary between replayable and
+    /// unreplayable bytes.
+    fn valid_prefix_len(&self) -> Result<u64, WalError> {
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+        let mut valid_end = 0u64;
+        loop {
+            let mut len_buf = [0u8; 4];
+            match reader.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(WalError::Io(e)),
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len > MAX_WAL_ENTRY_BYTES {
+                break; // corrupt length field — treat as torn tail
+            }
+            let mut crc_buf = [0u8; 4];
+            if reader.read_exact(&mut crc_buf).is_err() {
+                break;
+            }
+            let expected_crc = u32::from_le_bytes(crc_buf);
+            let mut payload = vec![0u8; len];
+            if reader.read_exact(&mut payload).is_err() {
+                break;
+            }
+            if crc32(&payload) != expected_crc {
+                break;
+            }
+            valid_end += 8 + u64::try_from(len).unwrap_or(u64::MAX);
+        }
+        Ok(valid_end)
+    }
+
+    /// Truncate any torn or corrupt suffix so the file ends at a
+    /// replayable record boundary. Returns `true` if bytes were removed.
+    ///
+    /// Replay stops at the first incomplete or CRC-mismatched record. If
+    /// that suffix is left in place, appends land *after* the
+    /// unreplayable bytes — and the next restart stops at the same
+    /// damaged point, silently discarding every record written since.
+    /// The vote those records describe was already fsynced and sent, so
+    /// forgetting it is exactly the double-vote hazard this WAL exists
+    /// to prevent. Repairing at open time keeps the append position
+    /// always at a durable, replayable boundary.
+    ///
+    /// # Errors
+    ///
+    /// [`WalError::Io`] if the file cannot be read or truncated.
+    pub fn repair_tail(&mut self) -> Result<bool, WalError> {
+        let valid_end = self.valid_prefix_len()?;
+        let file_len = std::fs::metadata(&self.path).map_err(WalError::Io)?.len();
+        if valid_end >= file_len {
+            return Ok(false);
+        }
+        // `set_len` truncates in place; sync so the shortened file is
+        // durable before the first append reuses that space.
+        let file = OpenOptions::new().write(true).open(&self.path).map_err(WalError::Open)?;
+        file.set_len(valid_end).map_err(WalError::Io)?;
+        file.sync_all().map_err(WalError::Io)?;
+        Ok(true)
     }
 
     /// Fault-injection hook for tests: after `poison`, every
@@ -348,6 +434,13 @@ impl Wal {
                 Err(e) => return Err(WalError::Io(e)),
             }
             let len = u32::from_le_bytes(len_buf) as usize;
+
+            // A corrupt length field must not drive a huge allocation.
+            // Real entries are ~200 B; anything past the bound is a torn
+            // tail, not a record (same rule `valid_prefix_len` applies).
+            if len > MAX_WAL_ENTRY_BYTES {
+                break;
+            }
 
             // Read the 4-byte CRC32.
             let mut crc_buf = [0u8; 4];
@@ -554,6 +647,80 @@ mod tests {
 
         let recovered = wal.recover().unwrap();
         assert!(recovered.is_none());
+    }
+
+    /// Regression: appending after a torn tail must not strand later
+    /// records.
+    ///
+    /// Previously `open` left the damaged suffix in place, so the append
+    /// cursor sat *after* unreplayable bytes. The next restart stopped
+    /// at those same bytes and silently discarded every record written
+    /// since — including votes that had already been fsynced and sent,
+    /// which is precisely the double-vote hazard the WAL exists to
+    /// prevent.
+    #[test]
+    fn wal_repairs_torn_tail_so_later_entries_survive_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+
+        // Session 1: one valid entry, then a crash leaves a torn tail.
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&genesis_entry()).unwrap();
+            wal.writer.flush().unwrap();
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&1000u32.to_le_bytes()).unwrap(); // claims 1000 B
+            file.write_all(&0u32.to_le_bytes()).unwrap(); // CRC
+            file.write_all(&[0u8; 10]).unwrap(); // partial payload
+            file.sync_data().unwrap();
+        }
+
+        // Session 2: restart, recover the valid prefix, then vote.
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            let recovered = wal.recover().unwrap();
+            assert_eq!(
+                recovered,
+                Some(genesis_entry()),
+                "the torn tail must not hide the valid entry before it"
+            );
+            wal.append(&voted_entry()).unwrap();
+        }
+
+        // Session 3: the vote fsynced in session 2 must still be there.
+        let wal = Wal::open(&path).unwrap();
+        let recovered = wal.recover().unwrap();
+        assert_eq!(
+            recovered,
+            Some(voted_entry()),
+            "a vote written after a repaired torn tail must survive the next restart"
+        );
+    }
+
+    /// `repair_tail` is a no-op on an intact file and reports whether it
+    /// actually removed anything.
+    #[test]
+    fn wal_repair_tail_reports_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&genesis_entry()).unwrap();
+        }
+        // Intact file: nothing to repair.
+        let mut wal = Wal::open(&path).unwrap();
+        assert!(!wal.repair_tail().unwrap(), "an intact WAL needs no repair");
+
+        // Damaged tail: repaired once, then idempotent.
+        {
+            wal.writer.flush().unwrap();
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&[0xFFu8; 6]).unwrap(); // partial length prefix
+            file.sync_data().unwrap();
+        }
+        assert!(wal.repair_tail().unwrap(), "a torn tail must be removed");
+        assert!(!wal.repair_tail().unwrap(), "repair must be idempotent");
+        assert_eq!(wal.recover().unwrap(), Some(genesis_entry()));
     }
 
     /// C9 test: CRC32 produces the expected value for a known input.

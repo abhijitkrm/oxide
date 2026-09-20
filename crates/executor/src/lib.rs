@@ -1974,6 +1974,24 @@ impl Executor {
             let Some(ctx) = parse_tx_context(bytes) else {
                 continue; // skip malformed txs
             };
+            let Some(module_id) = parse_module_id(bytes) else {
+                continue; // skip malformed txs
+            };
+            let Some(module) = self.modules[module_id as usize].as_ref() else {
+                continue; // unknown module — skip
+            };
+            // A self-authenticating module (the EVM) recovers its real
+            // sender and nonce from its own payload, so the envelope's
+            // declared pair is a mempool ordering hint and nothing more.
+            // Driving the executor's account-indexed nonce state from it
+            // would let anyone advance *another* account's counter: wrap
+            // your own valid signed payload in a victim's envelope and
+            // the victim's `executed_nonce` moves while their balance and
+            // their EVM account nonce never do. The executor's nonce gate
+            // therefore applies only to modules that authenticate from
+            // the envelope; a self-authenticating module enforces its own
+            // nonce during execution.
+            let self_authenticating = module.authenticates_sender();
             // H5: each tx's nonce must equal the next expected nonce
             // for its sender; txs that fail are skipped and do not
             // advance the counter. u64::MAX is reserved — skipping it
@@ -1981,15 +1999,9 @@ impl Executor {
             // nonce would wrap the counter to 0 and reopen the
             // sender's whole nonce range to replay).
             let expected = local_nonce.get(&ctx.sender).copied().unwrap_or(0);
-            if ctx.nonce != expected || ctx.nonce == u64::MAX {
+            if !self_authenticating && (ctx.nonce != expected || ctx.nonce == u64::MAX) {
                 continue; // stale, out-of-order, or reserved nonce — skip
             }
-            let Some(module_id) = parse_module_id(bytes) else {
-                continue; // skip malformed txs
-            };
-            let Some(module) = self.modules[module_id as usize].as_ref() else {
-                continue; // unknown module — skip
-            };
             if self
                 .check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), Some(preverify_cache))
                 .is_err()
@@ -2024,8 +2036,12 @@ impl Executor {
             // after the fee charge succeeds; a tx that can't pay its
             // fee doesn't get its nonce advanced. `expected + 1`
             // cannot overflow: the reserved-nonce skip above keeps
-            // `expected ≤ u64::MAX - 1`.
-            local_nonce.insert(ctx.sender, expected + 1);
+            // `expected ≤ u64::MAX - 1`. Self-authenticating modules
+            // keep their own account nonce (enforced inside the module),
+            // so the executor tracks nothing for them.
+            if !self_authenticating {
+                local_nonce.insert(ctx.sender, expected + 1);
+            }
             cumulative_gas = cumulative_gas.saturating_add(gas);
             // Zero-copy: the payload is borrowed from the block tx
             // bytes; the full-tx hash is the same key `ingest_tx`
@@ -3553,6 +3569,64 @@ mod tests {
 
     /// H4/H5: snapshot export/import must preserve the executed-nonce
     /// map so replay protection survives restarts.
+    /// An EVM transaction must not be able to advance *another*
+    /// account's executor nonce.
+    ///
+    /// The EVM recovers its sender and nonce from the signed RLP, so a
+    /// caller can wrap their own valid payload in any envelope. Before
+    /// this fix the executor drove `executed_nonce` from the envelope's
+    /// declared `(sender, nonce)`, so such an envelope advanced the
+    /// victim's counter without the victim's authorization —
+    /// desynchronizing ordinary Ethereum submissions from the real EVM
+    /// account nonce. The envelope must not touch account-indexed nonce
+    /// state for a module that authenticates itself.
+    #[test]
+    fn self_authenticating_module_cannot_advance_another_accounts_nonce() {
+        const VICTIM: u8 = 0x11;
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(SelfAuthModule));
+
+        // The attacker's payload, wrapped in the victim's envelope at
+        // the victim's nonce. Module 3 is `SelfAuthModule` (see the
+        // signed-transaction section below), which reports
+        // `authenticates_sender() == true` exactly like the EVM.
+        let tx = make_tx_with_fee_and_sender(3, &[0xAA], 0, 0, VICTIM);
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![tx],
+            signers: vec![],
+        });
+
+        let snap = executor.export_snapshot();
+        assert!(
+            !snap.executed_nonces.iter().any(|(a, _)| *a == Address([VICTIM; 20])),
+            "a self-authenticating module must not advance the envelope sender's nonce"
+        );
+    }
+
+    /// Control: a module that authenticates from the envelope *does* own
+    /// the nonce gate, so its counter still advances normally.
+    #[test]
+    fn envelope_authenticating_module_still_advances_nonce() {
+        const SENDER: u8 = 0x22;
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let tx = make_tx_with_fee_and_sender(1, &[0xAA], 0, 0, SENDER);
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![tx],
+            signers: vec![],
+        });
+
+        let snap = executor.export_snapshot();
+        assert_eq!(
+            snap.executed_nonces.iter().find(|(a, _)| *a == Address([SENDER; 20])).map(|(_, n)| *n),
+            Some(1),
+            "an envelope-authenticating module must advance its sender's nonce"
+        );
+    }
+
     #[test]
     fn h4h5_snapshot_preserves_executed_nonce() {
         let mut executor = Executor::new(100);

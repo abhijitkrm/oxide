@@ -48,3 +48,5 @@ docs/evidence/*
 spec/**/states/
 spec/**/*_TTrace_*
 states/
+
+docs/audit*

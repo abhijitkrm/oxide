@@ -1337,12 +1337,39 @@ impl EvmModule {
     ///
     /// Panics if the database mutex is poisoned (internal to
     /// `load_account`).
+    /// Whether `recipient` is executed as a precompile rather than as an
+    /// ordinary account.
+    ///
+    /// Precompiles have no account code, so the fast paths' "no code ⇒
+    /// plain transfer" rule would otherwise treat them as EOAs and skip
+    /// their execution entirely — returning empty output and charging
+    /// calldata gas instead of the precompile's own gas and result. That
+    /// is a consensus-visible divergence: `sha256` (0x02) called with
+    /// empty input must return the 32-byte digest of empty input, and a
+    /// call to `identity` must echo its calldata, whereas the shortcut
+    /// would report success with no output at all.
+    ///
+    /// Both sets are checked: Ethereum's (fork-dependent, taken from
+    /// revm so a future EIP precompile is covered automatically) and
+    /// Oxide's native precompiles, which live in their own address space
+    /// (`0x0000…OOXX`) and are unknown to revm.
+    fn recipient_is_precompile(recipient: &revm::primitives::Address, spec: SpecId) -> bool {
+        use revm::precompile::{PrecompileSpecId, Precompiles};
+        if Precompiles::new(PrecompileSpecId::from(spec)).contains(recipient) {
+            return true;
+        }
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(recipient.as_slice());
+        crate::precompiles::is_precompile(&Address(bytes))
+    }
+
     fn try_native_transfer<DB: DatabaseRef>(
         signed: &tx::SignedTx,
         caller: revm::primitives::Address,
         db: &mut CacheDB<DB>,
         coinbase: revm::primitives::Address,
         base_fee: u64,
+        spec: SpecId,
     ) -> Option<ExecutionResult> {
         // ── Qualification checks ──────────────────────────────
 
@@ -1351,6 +1378,12 @@ impl EvmModule {
             tx::TxKind::Create => return None,
             tx::TxKind::Call(addr) => addr,
         };
+
+        // 2. A precompile executes even though it has no account code,
+        //    so it must never take the plain-transfer shortcut.
+        if Self::recipient_is_precompile(&recipient, spec) {
+            return None;
+        }
 
         // 2. Empty calldata.
         if !signed.data().is_empty() {
@@ -1534,12 +1567,21 @@ impl EvmModule {
         db: &mut CacheDB<DB>,
         coinbase: revm::primitives::Address,
         base_fee: u64,
+        spec: SpecId,
     ) -> Option<ExecutionResult> {
         // 1. Must be a Call (not Create).
         let recipient = match signed.to() {
             tx::TxKind::Create => return None,
             tx::TxKind::Call(addr) => addr,
         };
+
+        // 1b. A precompile has no account code but is not an EOA — its
+        //     execution is the whole point of the call, so it must fall
+        //     through to revm rather than being answered as an empty
+        //     call with no output.
+        if Self::recipient_is_precompile(&recipient, spec) {
+            return None;
+        }
 
         // 2. Must have non-empty calldata (empty → try_native_transfer).
         let data = signed.data();
@@ -2115,6 +2157,9 @@ impl EvmModule {
     ///
     /// Panics if the `DB`, `coinbase`, `block_height`,
     /// `block_timestamp`, or touched mutex is poisoned.
+    // One long linear loop: fast path, empty-code path, then revm — the
+    // sequencing is the point, so splitting it would obscure the order.
+    #[allow(clippy::too_many_lines)]
     fn execute_decoded(
         &self,
         ctx: &TxContext,
@@ -2174,9 +2219,14 @@ impl EvmModule {
             // the correct pre-block values and the later capture is
             // a no-op (first-write-wins).
             Self::undo_capture_fast_path(&mut local_undo, db, &signed, caller, coinbase);
-            if let Some(result) =
-                Self::try_native_transfer(&signed, caller, &mut *db, coinbase, self.base_fee)
-            {
+            if let Some(result) = Self::try_native_transfer(
+                &signed,
+                caller,
+                &mut *db,
+                coinbase,
+                self.base_fee,
+                self.spec,
+            ) {
                 local_touched.insert(caller);
                 if let tx::TxKind::Call(addr) = signed.to() {
                     local_touched.insert(revm::primitives::Address::from(addr.0));
@@ -2198,9 +2248,14 @@ impl EvmModule {
             // Try the empty-code call fast path. For calls to
             // contracts with no runtime code (EOA or constructor-only
             // deployment), this bypasses revm's call-frame setup.
-            if let Some(result) =
-                Self::try_empty_code_call(&signed, caller, &mut *db, coinbase, self.base_fee)
-            {
+            if let Some(result) = Self::try_empty_code_call(
+                &signed,
+                caller,
+                &mut *db,
+                coinbase,
+                self.base_fee,
+                self.spec,
+            ) {
                 local_touched.insert(caller);
                 if let tx::TxKind::Call(addr) = signed.to() {
                     local_touched.insert(revm::primitives::Address::from(addr.0));
@@ -2656,9 +2711,14 @@ impl EvmModule {
                     // Try the native transfer fast path first. For
                     // simple ETH transfers (empty calldata, EOA
                     // recipient), this bypasses revm entirely.
-                    if let Some(result) =
-                        Self::try_native_transfer(signed, caller, &mut db, coinbase, self.base_fee)
-                    {
+                    if let Some(result) = Self::try_native_transfer(
+                        signed,
+                        caller,
+                        &mut db,
+                        coinbase,
+                        self.base_fee,
+                        self.spec,
+                    ) {
                         spec_txs.push(Self::spec_fast_path(
                             &db,
                             idx,
@@ -2675,9 +2735,14 @@ impl EvmModule {
                     // to contracts with no runtime code (EOA or
                     // constructor-only deployment), this bypasses
                     // revm's call-frame setup and gas accounting.
-                    if let Some(result) =
-                        Self::try_empty_code_call(signed, caller, &mut db, coinbase, self.base_fee)
-                    {
+                    if let Some(result) = Self::try_empty_code_call(
+                        signed,
+                        caller,
+                        &mut db,
+                        coinbase,
+                        self.base_fee,
+                        self.spec,
+                    ) {
                         spec_txs.push(Self::spec_fast_path(
                             &db,
                             idx,
@@ -2972,9 +3037,14 @@ impl EvmModule {
 
                 // Try native fast path first.
                 Self::undo_capture_fast_path(&mut committed_undo, db, signed, caller, coinbase);
-                if let Some(result) =
-                    Self::try_native_transfer(signed, caller, &mut *db, coinbase, self.base_fee)
-                {
+                if let Some(result) = Self::try_native_transfer(
+                    signed,
+                    caller,
+                    &mut *db,
+                    coinbase,
+                    self.base_fee,
+                    self.spec,
+                ) {
                     coinbase_dirty |= caller == coinbase;
                     all_touched.insert(caller);
                     all_touched.insert(coinbase);
@@ -3012,9 +3082,14 @@ impl EvmModule {
                 // Try empty-code call fast path — must use the
                 // same fast paths as the speculative execution to
                 // ensure identical state roots.
-                if let Some(result) =
-                    Self::try_empty_code_call(signed, caller, &mut *db, coinbase, self.base_fee)
-                {
+                if let Some(result) = Self::try_empty_code_call(
+                    signed,
+                    caller,
+                    &mut *db,
+                    coinbase,
+                    self.base_fee,
+                    self.spec,
+                ) {
                     coinbase_dirty |= caller == coinbase;
                     all_touched.insert(caller);
                     all_touched.insert(coinbase);
@@ -6649,6 +6724,100 @@ mod tests {
 
     /// Native fast path should NOT activate for contract calls
     /// (non-empty calldata). The tx must fall through to revm.
+    /// The fast paths must never answer a precompile call.
+    ///
+    /// A precompile has no account code, so the "no code ⇒ plain
+    /// transfer / empty call" shortcuts previously treated it as an EOA:
+    /// the call reported success with no output, skipping the
+    /// precompile's execution and charging calldata gas instead of
+    /// precompile gas. `sha256` (0x02) called with empty input must
+    /// return the 32-byte digest of empty input — the shortcut returned
+    /// nothing, which is a consensus-visible divergence from every other
+    /// EVM.
+    #[test]
+    fn precompile_recipients_are_excluded_from_fast_paths() {
+        // Ethereum's set, taken from revm so a future EIP precompile is
+        // covered without editing this list.
+        for byte in 1u8..=0x0a {
+            let mut addr = [0u8; 20];
+            addr[19] = byte;
+            assert!(
+                EvmModule::recipient_is_precompile(
+                    &revm::primitives::Address::from(addr),
+                    SpecId::PRAGUE
+                ),
+                "0x{byte:02x} is an Ethereum precompile and must not take a fast path"
+            );
+        }
+        // Oxide's native precompiles live in their own address space, so
+        // revm's set does not know about them.
+        let native = crate::precompiles::precompile_address(0x0C, 0x01);
+        assert!(
+            EvmModule::recipient_is_precompile(
+                &revm::primitives::Address::from(native.0),
+                SpecId::PRAGUE
+            ),
+            "the native staking precompile must be excluded from fast paths"
+        );
+        // An ordinary account is not a precompile.
+        assert!(
+            !EvmModule::recipient_is_precompile(
+                &revm::primitives::Address::from([0x42u8; 20]),
+                SpecId::PRAGUE
+            ),
+            "a plain EOA must keep taking the fast path"
+        );
+    }
+
+    /// Differential test for the same fix: a call to a precompile must
+    /// produce the same state root whether it executes through revm
+    /// (`handle`) or through the batch fast paths (`handle_batch`).
+    ///
+    /// A precompile has no account code, so before this fix the "no code
+    /// ⇒ plain transfer" shortcut answered the call itself: the
+    /// precompile never ran, so `sha256` returned nothing instead of the
+    /// 32-byte digest, and the sender was charged the flat 21 000
+    /// transfer gas instead of the precompile's own schedule. Both the
+    /// output and the sender's balance differ, and the balance lands in
+    /// the state root — a consensus-visible divergence from every other
+    /// EVM.
+    ///
+    /// Empty calldata is the case that exposes it: with calldata, Prague's
+    /// EIP-7623 floor dominates the intrinsic cost and can mask the
+    /// precompile's gas, but a bare call to `sha256` has nothing to hide
+    /// behind.
+    #[test]
+    fn precompile_call_matches_revm_state_root() {
+        let (pk, addr) = test_keypair();
+        let precompile = revm::primitives::Address::from_slice(&{
+            let mut a = [0u8; 20];
+            a[19] = 0x02; // sha256 precompile
+            a
+        });
+        let tx = signed_tx(&pk, 0, tx::TxKind::Call(precompile), &[]);
+
+        // Path 1: handle() — executes the call through revm.
+        let m1 = make_module();
+        fund(&m1, &addr);
+        m1.begin_block(Height::new(1));
+        m1.handle(&dummy_ctx(), &tx).expect("revm tx must succeed");
+        m1.end_block(Height::new(1));
+        let root1 = m1.state_root();
+
+        // Path 2: handle_batch() — tries the fast paths first.
+        let m2 = make_module();
+        fund(&m2, &addr);
+        m2.begin_block(Height::new(1));
+        m2.handle_batch(&dummy_ctx(), std::slice::from_ref(&tx));
+        m2.end_block(Height::new(1));
+        let root2 = m2.state_root();
+
+        assert_eq!(
+            root1, root2,
+            "a precompile call must not be answered by the empty-code fast path"
+        );
+    }
+
     #[test]
     fn native_transfer_skipped_for_calldata() {
         let (pk, addr) = test_keypair();

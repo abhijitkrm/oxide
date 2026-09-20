@@ -1345,6 +1345,28 @@ fn run_consensus_loop(
                             if let Ok(sig_epoch) = reader.read_u64() {
                                 if let Ok(sig) = crypto::Signature::decode(&mut reader) {
                                     let voter_idx = u16::from(voter_idx_byte);
+                                    // Authenticate the evidence BEFORE acting
+                                    // on it. Everything below mutates
+                                    // consensus state — `sync_to_view` moves
+                                    // the view, resets the pacemaker timer,
+                                    // and clears the vote buffer — so a peer
+                                    // claiming a high view with a garbage
+                                    // signature must be rejected here rather
+                                    // than after the damage is done. The
+                                    // signature is checked against the
+                                    // (view, epoch) the sender actually signed,
+                                    // never against our own current view.
+                                    if engine
+                                        .verify_timeout_signature_for(
+                                            voter_idx,
+                                            primitives::View::new(sig_view),
+                                            primitives::Epoch::new(sig_epoch),
+                                            &sig,
+                                        )
+                                        .is_err()
+                                    {
+                                        continue;
+                                    }
                                     let my_epoch = engine.epoch().value();
                                     // Ignore timeout sigs from a different
                                     // epoch — they are not valid for this epoch.

@@ -50,11 +50,76 @@ pub struct ValidatorSet {
     /// `ValidatorIndex`. Derived from `validators` by default;
     /// `with_addresses` accepts explicit values.
     validator_addresses: Vec<Address>,
-    /// Cumulative stake for binary-search leader election. Computed
-    /// once at construction; `leader(v)` is O(log n) thereafter.
-    cumulative_stakes: Vec<u64>,
+    /// One full leader-rotation cycle, precomputed at construction by
+    /// [`build_leader_schedule`]. `leader(v)` indexes it at
+    /// `v mod len`, so leader selection is O(1) and needs no state.
+    leader_schedule: Vec<ValidatorIndex>,
     /// Total stake across all validators.
     total_stake: u64,
+}
+
+/// Maximum number of views in one leader-rotation cycle.
+///
+/// Unit: views. Origin: bounds the precomputed schedule to
+/// `MAX_LEADER_CYCLE × 2 B = 8 KiB` per validator set while keeping each
+/// validator's share accurate to within one cycle slot (≤ 1/4096 ≈
+/// 0.024%). Tradeoff: raising it sharpens stake proportionality for
+/// very large committees; lowering it shortens the schedule but coarsens
+/// rounding for low-stake validators.
+const MAX_LEADER_CYCLE: u64 = 4096;
+
+/// Build one full leader-rotation cycle: a stake-weighted round-robin
+/// schedule that spreads each validator's turns evenly.
+///
+/// Why not `view % total_stake` (the previous rule): consecutive views
+/// map to the same validator for as many views as its *raw* stake. Stake
+/// is denominated in token units, so a validator holding `1_000_000`
+/// units led a million consecutive views — a failed leader stayed
+/// scheduled for a million timeouts, and the rotation's shape depended
+/// on the unit stake happened to be denominated in. This schedule fixes
+/// both: stake is normalized to small integer weights (scale-invariant)
+/// and those weights are interleaved smoothly.
+///
+/// The interleave is smooth weighted round-robin (the nginx algorithm):
+/// each step every validator's running counter advances by its weight,
+/// the largest counter wins the slot, and the winner's counter is
+/// reduced by the cycle total. Per-cycle shares are exact and
+/// consecutive runs stay short; equal weights degrade to plain
+/// round-robin (`[0, 1, 2, …]`).
+fn build_leader_schedule(stakes: &[u64], total_stake: u64) -> Vec<ValidatorIndex> {
+    let n = stakes.len();
+    let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
+    // Committee larger than the cycle budget: one slot each (plain
+    // round-robin). Stake weighting is meaningless once every validator
+    // would receive less than a single slot per cycle.
+    if n == 0 || n_u64 > MAX_LEADER_CYCLE {
+        return (0..n).map(|i| ValidatorIndex::try_from(i).unwrap_or(0)).collect();
+    }
+    // Normalize stake to integer weights whose *sum* fits the cycle.
+    // `scale` derives from the total (not the maximum) because the sum,
+    // not any single weight, is what the budget bounds. Every validator
+    // keeps at least one slot: a weight of zero would silently drop it
+    // from the rotation entirely.
+    let scale = total_stake.div_ceil(MAX_LEADER_CYCLE).max(1);
+    let weights: Vec<u64> = stakes.iter().map(|s| (s / scale).max(1)).collect();
+    let cycle: u64 = weights.iter().sum();
+    // `cycle ≤ MAX_LEADER_CYCLE` by construction, so this narrowing
+    // cannot truncate on any supported target.
+    let cap = usize::try_from(cycle).unwrap_or(4096);
+    let mut counters = vec![0i128; n];
+    let mut schedule = Vec::with_capacity(cap);
+    for _ in 0..cycle {
+        let mut best = 0usize;
+        for (i, w) in weights.iter().enumerate() {
+            counters[i] += i128::from(*w);
+            if counters[i] > counters[best] {
+                best = i;
+            }
+        }
+        counters[best] -= i128::from(cycle);
+        schedule.push(ValidatorIndex::try_from(best).unwrap_or(0));
+    }
+    schedule
 }
 
 impl ValidatorSet {
@@ -124,14 +189,13 @@ impl ValidatorSet {
                 return Err(ValidatorSetError::DuplicateAddress { index: i });
             }
         }
-        let mut cumulative_stakes = Vec::with_capacity(stakes.len());
         let mut acc = 0u64;
         for &s in &stakes {
             acc = acc.checked_add(s).ok_or(ValidatorSetError::StakeOverflow)?;
-            cumulative_stakes.push(acc);
         }
         let total_stake = acc;
-        Ok(Self { validators, stakes, validator_addresses, cumulative_stakes, total_stake })
+        let leader_schedule = build_leader_schedule(&stakes, total_stake);
+        Ok(Self { validators, stakes, validator_addresses, leader_schedule, total_stake })
     }
 
     /// The public keys in this set, indexed by `ValidatorIndex`.
@@ -367,17 +431,18 @@ impl ValidatorSet {
     /// The leader for `view` — stake-weighted round-robin
     /// (docs/oxidebft-spec.md §5).
     ///
-    /// Maps the view to a point in `[0, total_stake)` via `view %
-    /// total_stake`, then binary-searches the cumulative-stake array
-    /// to find which validator owns that point. This is a
-    /// deterministic function of the view and the validator set — no
-    /// VRF, no randomness (determinism contract).
+    /// Indexes the precomputed [`leader_schedule`](Self::leader_schedule)
+    /// cycle at `view mod cycle_len`. This is a deterministic function
+    /// of the view and the validator set — no VRF, no randomness, no
+    /// mutable state (determinism contract, oai-spec.md §3 rule 3).
     ///
-    /// For equal stakes (the common Phase 1 case), this reduces to
-    /// `view mod n` — pure round-robin. For unequal stakes, a
-    /// high-stake validator leads proportionally more often: a
-    /// validator with 90% of the stake owns 90% of the points in
-    /// `[0, total_stake)`, so it leads ~90% of views.
+    /// For equal stakes (the common Phase 1 case) the schedule is plain
+    /// round-robin: `view mod n`. For unequal stakes a high-stake
+    /// validator leads proportionally more often, with its turns
+    /// *interleaved* rather than clustered — a validator holding 90% of
+    /// the stake leads 90% of views without ever leading more than a few
+    /// consecutive ones. See [`build_leader_schedule`] for why the
+    /// previous raw-stake modulo rule was a liveness hazard.
     ///
     /// # Panics
     /// Never; returns validator index 0 for the degenerate case.
@@ -386,15 +451,18 @@ impl ValidatorSet {
         if self.n() == 1 {
             return 0;
         }
-        // Stake-weighted selection: pick a point in [0, total_stake)
-        // deterministically from the view. `view % total_stake` cycles
-        // through every point in the range, so each validator gets
-        // selected proportionally to its stake.
-        let point = view.value() % self.total_stake.max(1);
-        // Binary search: find the first validator whose cumulative
-        // stake exceeds `point`. This is O(log n).
-        let idx = self.cumulative_stakes.partition_point(|&c| c <= point).min(self.n() - 1);
-        u16::try_from(idx).unwrap_or(0)
+        // Cycle length is ≥ 1 for any valid set (every validator keeps
+        // at least one slot), so the modulo cannot divide by zero.
+        let len = u64::try_from(self.leader_schedule.len()).unwrap_or(1).max(1);
+        let idx = usize::try_from(view.value() % len).unwrap_or(0);
+        self.leader_schedule.get(idx).copied().unwrap_or(0)
+    }
+
+    /// Number of views in one leader-rotation cycle (cold path: tests
+    /// and diagnostics).
+    #[must_use]
+    pub fn leader_cycle_len(&self) -> usize {
+        self.leader_schedule.len()
     }
 }
 
@@ -727,6 +795,93 @@ mod tests {
             (0.85..=0.95).contains(&ratio),
             "high-stake validator should lead ~90%, got {ratio:.3}",
         );
+    }
+
+    /// The rotation must not cluster a validator's turns. Stake is
+    /// denominated in token units, so the previous `view % total_stake`
+    /// rule scheduled validator 0 for a full `stake`-long run of views
+    /// — at stake `1_000_000`, a failed leader stayed scheduled for a
+    /// million timeouts instead of being bypassed after one.
+    #[test]
+    fn leader_turns_are_interleaved_not_clustered() {
+        let vs = ValidatorSet::new(
+            vec![pk(1), pk(2), pk(3), pk(4)],
+            vec![1_000_000, 1_000_000, 1_000_000, 1_000_000],
+        )
+        .expect("4 equal-stake validators");
+        let mut max_run = 0u32;
+        let mut run = 0u32;
+        let mut prev = None;
+        for v in 0..4096u64 {
+            let l = vs.leader(View::new(v));
+            if Some(l) == prev {
+                run += 1;
+            } else {
+                run = 1;
+                prev = Some(l);
+            }
+            max_run = max_run.max(run);
+        }
+        assert_eq!(max_run, 1, "equal stakes must stay pure round-robin");
+    }
+
+    /// Even under a lopsided split the dominant validator's turns stay
+    /// interleaved: a run is bounded by roughly its weight ratio, never
+    /// by its raw stake.
+    #[test]
+    fn leader_runs_stay_short_under_lopsided_stake() {
+        let vs = ValidatorSet::new(vec![pk(1), pk(2)], vec![9_000_000, 1_000_000])
+            .expect("9:1 stake split");
+        let cycle = vs.leader_cycle_len() as u64;
+        let mut max_run = 0u64;
+        let mut run = 0u64;
+        let mut prev = None;
+        for v in 0..cycle * 2 {
+            let l = vs.leader(View::new(v));
+            if Some(l) == prev {
+                run += 1;
+            } else {
+                run = 1;
+                prev = Some(l);
+            }
+            max_run = max_run.max(run);
+        }
+        assert!(max_run <= 16, "dominant leader must not cluster: max run {max_run}");
+    }
+
+    /// Per-cycle leader shares track stake to within one cycle slot.
+    #[test]
+    fn leader_share_tracks_stake() {
+        let vs =
+            ValidatorSet::new(vec![pk(1), pk(2), pk(3)], vec![2_000_000, 3_000_000, 5_000_000])
+                .expect("3 unequal validators");
+        let cycle = vs.leader_cycle_len() as u64;
+        let mut counts = [0u64; 3];
+        for v in 0..cycle {
+            counts[usize::from(vs.leader(View::new(v)))] += 1;
+        }
+        for (i, expected_pct) in [(0usize, 20u64), (1, 30), (2, 50)] {
+            let pct = counts[i] * 100 / cycle;
+            assert!(
+                pct.abs_diff(expected_pct) <= 1,
+                "validator {i}: expected ~{expected_pct}% of views, got {pct}%"
+            );
+        }
+    }
+
+    /// Every staked validator appears in the rotation. A normalized
+    /// weight of zero would silently drop a validator from leadership
+    /// entirely, which is a liveness fault for that validator.
+    #[test]
+    fn leader_schedule_includes_every_validator() {
+        let vs = ValidatorSet::new(vec![pk(1), pk(2), pk(3)], vec![1_000_000, 1_000_000, 1])
+            .expect("one tiny validator");
+        let cycle = vs.leader_cycle_len() as u64;
+        let mut seen = std::collections::BTreeSet::new();
+        for v in 0..cycle {
+            seen.insert(vs.leader(View::new(v)));
+        }
+        assert_eq!(seen.len(), 3, "a staked validator must appear in the rotation");
     }
 
     #[test]

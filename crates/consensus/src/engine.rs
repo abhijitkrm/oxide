@@ -2455,6 +2455,109 @@ impl OxideBft {
         Ok(())
     }
 
+    /// Whether `aggregate` verifies against the public keys of the
+    /// validators whose votes are currently buffered, over the buffered
+    /// vote message.
+    ///
+    /// All buffered votes are for one `(view, phase, block_hash)` — the
+    /// `ConflictingVote` rule in `collect_vote` guarantees it — so a
+    /// single message reconstructs what the aggregate must cover.
+    fn buffered_aggregate_verifies(&self, aggregate: &AggregateSignature) -> bool {
+        let Some(first) = self.votes.iter().find_map(Option::as_ref) else {
+            return false;
+        };
+        let mut signer_pks: Vec<crypto::bls::PublicKey> = Vec::with_capacity(self.votes.len());
+        for (i, vote) in self.votes.iter().enumerate() {
+            if vote.is_none() {
+                continue;
+            }
+            let Ok(voter) = u16::try_from(i) else {
+                return false;
+            };
+            let Ok(pk) = self.validator_set.validator(voter) else {
+                return false;
+            };
+            signer_pks.push(*pk);
+        }
+        if signer_pks.is_empty() {
+            return false;
+        }
+        let msg = self.vote_signing_message(first.view, first.phase as u8, &first.block_hash);
+        crypto::aggregate_verify(aggregate, crypto::hash::Domain::Vote, &msg, &signer_pks).is_ok()
+    }
+
+    /// Aggregate the buffered votes and prove the result verifies
+    /// against its signers *before* it can be broadcast.
+    ///
+    /// `collect_vote` stores the first vote per validator **without**
+    /// verifying it: per-vote BLS verification costs ~1 ms, so at n
+    /// validators it would dominate the view budget (the documented
+    /// reason `verify_per_vote` defaults off). Delegating the check to
+    /// receivers is not equivalent, though. A QC whose aggregate fails
+    /// verification is rejected by every peer, so the view stalls until
+    /// its timeout — and because the offending vote stays buffered, the
+    /// same forged vote poisons every retry. One Byzantine participant
+    /// gets one permanently stalled view: a liveness `DoS`, not a safety
+    /// break, but a cheap and total one.
+    ///
+    /// So the leader verifies its own aggregate here — one pairing check
+    /// per QC rather than per vote — and on failure takes a quarantine
+    /// pass: each buffered vote is verified individually (a slow path
+    /// reached only when something is already wrong), invalid
+    /// contributions are dropped from both the buffer and the stake
+    /// accounting, and the aggregate is rebuilt. Honest votes are never
+    /// discarded, so a faulty participant cannot stall the view.
+    ///
+    /// Returns `None` when no honest quorum remains — the caller must
+    /// not emit a QC it cannot prove.
+    fn aggregate_collected_votes(&mut self) -> Option<AggregateSignature> {
+        let sigs: Vec<Signature> =
+            self.votes.iter().filter_map(|v| v.as_ref().map(|v| v.signature)).collect();
+        let aggregate = crypto::aggregate(&sigs).ok()?;
+        // Conformance mode has no real keys, and per-vote mode already
+        // screened every contribution at collect time.
+        if !self.verify_signatures || self.verify_per_vote {
+            return Some(aggregate);
+        }
+        if self.buffered_aggregate_verifies(&aggregate) {
+            return Some(aggregate);
+        }
+
+        // Quarantine pass: drop the invalid contributions, keep the rest.
+        let mut dropped = false;
+        for idx in 0..self.votes.len() {
+            let Some(vote) = self.votes[idx].as_ref() else {
+                continue;
+            };
+            let msg = self.vote_signing_message(vote.view, vote.phase as u8, &vote.block_hash);
+            let Ok(voter) = u16::try_from(idx) else {
+                continue;
+            };
+            let valid = self.validator_set.validator(voter).is_ok_and(|pk| {
+                crypto::verify(&vote.signature, crypto::hash::Domain::Vote, &msg, pk).is_ok()
+            });
+            if !valid {
+                let stake = self.validator_set.stake(voter).unwrap_or(0);
+                self.vote_stake = self.vote_stake.saturating_sub(stake);
+                self.vote_count = self.vote_count.saturating_sub(1);
+                self.votes[idx] = None;
+                dropped = true;
+            }
+        }
+        // Nothing was individually invalid, yet the aggregate failed:
+        // the aggregate bytes themselves are malformed. Emitting it
+        // would be pointless — no receiver could verify it.
+        if !dropped {
+            return None;
+        }
+        if self.vote_stake < self.validator_set.quorum_stake() {
+            return None; // quarantining the bad votes cost us the quorum
+        }
+        let sigs: Vec<Signature> =
+            self.votes.iter().filter_map(|v| v.as_ref().map(|v| v.signature)).collect();
+        crypto::aggregate(&sigs).ok()
+    }
+
     /// Leader: try to form a QC from collected votes. Returns the QC
     /// if quorum (>2/3 of voting power) is reached, `None` otherwise.
     ///
@@ -2468,6 +2571,22 @@ impl OxideBft {
         // Form the QC from the first valid vote (all votes are for
         // the same block in the happy path).
         let first_vote = self.votes.iter().find_map(Option::clone)?;
+
+        // Stage 5: aggregate the collected signatures via blst.
+        // If no secret key is set (conformance mode), use ZERO.
+        // H6 fix: propagate aggregation errors instead of silently
+        // replacing with ZERO (which would produce an invalid QC).
+        let aggregate_signature = if self.secret_key.is_some() {
+            self.aggregate_collected_votes()?
+        } else {
+            AggregateSignature::ZERO
+        };
+
+        // Build the signer bitmap AFTER aggregation: the quarantine
+        // pass inside `aggregate_collected_votes` may have dropped
+        // invalid votes, and the bitmap must describe exactly the
+        // signers whose signatures the aggregate covers — a stale bit
+        // would make the QC unverifiable at every receiver.
         let bitmap_len = self.validator_set.n().div_ceil(8);
         let mut signer_bitmap = vec![0u8; bitmap_len];
         for (i, v) in self.votes.iter().enumerate() {
@@ -2475,21 +2594,6 @@ impl OxideBft {
                 signer_bitmap[i / 8] |= 1u8 << (i % 8);
             }
         }
-
-        // Stage 5: aggregate the collected signatures via blst.
-        // If no secret key is set (conformance mode), use ZERO.
-        // H6 fix: propagate aggregation errors instead of silently
-        // replacing with ZERO (which would produce an invalid QC).
-        let aggregate_signature = if self.secret_key.is_some() {
-            let sigs: Vec<Signature> =
-                self.votes.iter().filter_map(|v| v.as_ref().map(|v| v.signature)).collect();
-            match crypto::aggregate(&sigs) {
-                Ok(agg) => agg,
-                Err(_) => return None, // aggregation failed — can't form QC
-            }
-        } else {
-            AggregateSignature::ZERO
-        };
 
         let qc = QuorumCertificate {
             view: first_vote.view,
@@ -2968,6 +3072,49 @@ impl OxideBft {
             }
             None => Some(Signature::ZERO),
         }
+    }
+
+    /// Verify a peer's timeout signature for an explicit `(view, epoch)`
+    /// **without mutating any state**.
+    ///
+    /// The node's message pump needs to authenticate timeout evidence
+    /// *before* acting on it. `collect_timeout_signature` verifies
+    /// against the engine's *current* view, so the pump previously had
+    /// to call `sync_to_view(sig_view)` first — which meant an
+    /// unauthenticated peer could move the view, reset the pacemaker
+    /// timer, and clear the vote buffer simply by claiming a high view
+    /// and attaching garbage. A forged timeout must change nothing.
+    ///
+    /// This entry point breaks that ordering: authenticate here, then
+    /// (only if it verifies) let the caller sync and collect. The
+    /// signature binds `(view, epoch)` under [`Domain::Timeout`], so a
+    /// signature is only ever valid for the view it was cast for.
+    ///
+    /// # Errors
+    ///
+    /// [`ConsensusError::SignerOutOfBounds`] if `voter` is past the end
+    /// of the set, or [`ConsensusError::InvalidVoteSignature`] if the
+    /// signature does not verify for this `(view, epoch)`.
+    pub fn verify_timeout_signature_for(
+        &self,
+        voter: ValidatorIndex,
+        view: View,
+        epoch: Epoch,
+        signature: &Signature,
+    ) -> Result<(), ConsensusError> {
+        // Conformance mode carries no real keys, so there is nothing to
+        // authenticate (the same precedent as every other check gated on
+        // `verify_signatures`).
+        if !self.verify_signatures {
+            return Ok(());
+        }
+        let pk =
+            self.validator_set.validator(voter).map_err(|_| ConsensusError::SignerOutOfBounds)?;
+        let mut msg = Vec::with_capacity(16);
+        msg.extend_from_slice(&view.value().to_le_bytes());
+        msg.extend_from_slice(&epoch.value().to_le_bytes());
+        crypto::bls_signer::verify(signature, crypto::hash::Domain::Timeout, &msg, pk)
+            .map_err(|_| ConsensusError::InvalidVoteSignature { voter })
     }
 
     /// Validator: collect a timeout signature from `voter` for the
@@ -4521,6 +4668,136 @@ mod tests {
             follower.vote(&header, &proposal).is_none(),
             "proposal with forged proposer signature must be rejected"
         );
+    }
+
+    /// A single forged vote must not stall the view.
+    ///
+    /// `collect_vote` stores the first vote per validator *without*
+    /// verifying it (per-vote BLS verification is opt-in for cost
+    /// reasons), so a Byzantine validator can slip a bad signature into
+    /// the leader's buffer. Before this fix the resulting aggregate
+    /// failed verification at every receiver, so the view stalled until
+    /// its timeout — and because the bad vote stayed buffered, it
+    /// poisoned every retry: one participant, one permanently stalled
+    /// view. The leader must now detect its own bad aggregate,
+    /// quarantine the invalid contribution, and still form a QC from
+    /// the honest quorum.
+    #[test]
+    fn forged_vote_is_quarantined_and_quorum_still_forms() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut leader =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        leader.submit_tx(TxBytes::new(vec![42]));
+        let (header, _proposal) = leader.propose().expect("propose");
+        let block_hash = OxideBft::block_hash(&header);
+
+        let mut msg = Vec::with_capacity(49);
+        msg.extend_from_slice(&header.view.value().to_le_bytes());
+        msg.push(VotePhase::Prepare as u8);
+        msg.extend_from_slice(block_hash.as_bytes());
+        msg.extend_from_slice(&leader.epoch.value().to_le_bytes());
+
+        // Three honest votes — quorum at n=4 is 3.
+        for voter in [0u16, 2, 3] {
+            let vote = Vote {
+                view: header.view,
+                phase: VotePhase::Prepare,
+                block_hash,
+                signature: keys[usize::from(voter)].sign(crypto::hash::Domain::Vote, &msg),
+                attestation: None,
+                attestation_sig: None,
+            };
+            leader.collect_vote(voter, vote).expect("honest vote accepted");
+        }
+
+        // Validator 1 equivocates by signing with validator 3's key:
+        // well-formed bytes, wrong signer for the claimed slot.
+        let forged = Vote {
+            view: header.view,
+            phase: VotePhase::Prepare,
+            block_hash,
+            signature: keys[3].sign(crypto::hash::Domain::Vote, &msg),
+            attestation: None,
+            attestation_sig: None,
+        };
+        leader
+            .collect_vote(1, forged)
+            .expect("the default path stores without per-vote verification");
+
+        // Nominal quorum is reached, but one contribution is forged.
+        let qc =
+            leader.try_form_qc().expect("the honest quorum must still form a QC after quarantine");
+
+        // The QC must describe exactly the three honest signers.
+        assert_eq!(qc.signer_bitmap, vec![0b0000_1101], "voter 1 must be quarantined");
+
+        let honest_pks: Vec<crypto::bls::PublicKey> =
+            [0usize, 2, 3].iter().map(|i| keys[*i].public_key()).collect();
+        crypto::aggregate_verify(
+            &qc.aggregate_signature,
+            crypto::hash::Domain::Vote,
+            &msg,
+            &honest_pks,
+        )
+        .expect("the emitted QC must verify against exactly its signers");
+    }
+
+    /// If quarantine leaves less than a quorum, no QC may be emitted.
+    /// Broadcasting a certificate no peer can verify is worse than
+    /// stalling, and the honest votes must stay buffered for the retry.
+    #[test]
+    fn quarantine_below_quorum_emits_no_qc() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+        let mut leader =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        leader.submit_tx(TxBytes::new(vec![42]));
+        let (header, _proposal) = leader.propose().expect("propose");
+        let block_hash = OxideBft::block_hash(&header);
+
+        let mut msg = Vec::with_capacity(49);
+        msg.extend_from_slice(&header.view.value().to_le_bytes());
+        msg.push(VotePhase::Prepare as u8);
+        msg.extend_from_slice(block_hash.as_bytes());
+        msg.extend_from_slice(&leader.epoch.value().to_le_bytes());
+
+        // Two honest votes plus one forged: nominally 3, honestly 2.
+        for voter in [0u16, 2] {
+            let vote = Vote {
+                view: header.view,
+                phase: VotePhase::Prepare,
+                block_hash,
+                signature: keys[usize::from(voter)].sign(crypto::hash::Domain::Vote, &msg),
+                attestation: None,
+                attestation_sig: None,
+            };
+            leader.collect_vote(voter, vote).expect("honest vote accepted");
+        }
+        leader
+            .collect_vote(
+                1,
+                Vote {
+                    view: header.view,
+                    phase: VotePhase::Prepare,
+                    block_hash,
+                    signature: keys[3].sign(crypto::hash::Domain::Vote, &msg),
+                    attestation: None,
+                    attestation_sig: None,
+                },
+            )
+            .expect("default path stores without per-vote verification");
+
+        assert!(leader.try_form_qc().is_none(), "must not emit a QC it cannot prove");
+        assert_eq!(leader.vote_count(), 2, "honest votes must be preserved for the retry");
     }
 
     #[test]

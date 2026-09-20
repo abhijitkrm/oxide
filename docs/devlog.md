@@ -15948,3 +15948,141 @@ BOTH the block that killed the worker and the new block (was:
 permanent root hole at the lost height).
 
 Gates: 106 test binaries green, fmt + clippy `-D warnings` clean.
+
+## 2026-09-20 — audit001 remediation: WAL tail repair, leader rotation,
+## timeout authentication, vote quarantine, EVM nonce binding, precompiles
+
+A static audit (`docs/audit001.md`) produced a prioritised finding list.
+This session fixes the six highest-value *code-level* findings; the
+remaining ones (financial conservation, snapshot completeness, consensus
+safety proof) are tracked in the audit file itself.
+
+### 3.1 — a torn WAL tail stranded every record written after it
+
+`Wal::open` appended past whatever suffix recovery had stopped at.
+Sequence: crash leaves a torn tail → restart recovers the last *valid*
+entry → the node votes and fsyncs → crash → restart stops at the same
+damaged bytes and returns the *pre-crash* state. The vote that was
+already signed and sent is forgotten — exactly the double-vote hazard
+the WAL exists to prevent.
+
+Fix: `Wal::open` now calls `repair_tail()`, which truncates the file at
+the end of the last complete, CRC-valid record (and fsyncs the shortened
+file) before any append can land. `valid_prefix_len()` shares
+`recover`'s scan rules so the boundary is exactly "replayable vs not".
+Both paths also bound a record length at `MAX_WAL_ENTRY_BYTES` (1 MiB),
+so a corrupt length field can no longer drive a multi-gigabyte
+allocation on the recovery path.
+
+Regressions: `wal_repairs_torn_tail_so_later_entries_survive_restart`
+(3-session crash/recover/append/crash cycle — verified red before the
+fix: recovered the stale genesis entry instead of the vote) and
+`wal_repair_tail_reports_and_is_idempotent`.
+
+### 2.4 — stake-weighted leader rotation clustered turns by raw stake
+
+`leader(v)` was `v % total_stake` over cumulative-stake intervals. With
+equal stakes of `1_000_000`, validator 0 led the first *million* views:
+a failed leader stayed scheduled for a million timeouts, and the
+rotation's shape depended on the unit stake was denominated in.
+
+Fix: `ValidatorSet` precomputes one rotation cycle of smooth weighted
+round-robin (nginx SWRR) over GCD-free normalized weights whose sum is
+bounded by `MAX_LEADER_CYCLE` (4096 views ≈ 8 KiB of `u16`). Equal
+weights degrade to plain round-robin; `leader(v)` is now O(1) indexing
+into that cycle. Every staked validator keeps ≥ 1 slot per cycle, so a
+tiny validator cannot be dropped from leadership entirely.
+
+Regressions: `leader_turns_are_interleaved_not_clustered` (equal stakes
+→ max run 1), `leader_runs_stay_short_under_lopsided_stake`,
+`leader_share_tracks_stake` (±1% of stake), and
+`leader_schedule_includes_every_validator`. All prior leader tests
+(`leader_round_robin_equal_stakes`, `leader_high_stake_leads_more`)
+still pass unchanged.
+
+### 2.2 — the node moved its view on an *unverified* timeout signature
+
+The message pump called `sync_to_view(sig_view)` and reset its timer
+*before* `collect_timeout_signature` verified the signature — because
+that method verifies against the engine's *current* view, the pump had
+to move the view first for verification to succeed. So an admitted peer
+could move the view, reset the pacemaker timer, and clear the vote
+buffer with a claimed view and garbage bytes.
+
+Fix: new `OxideBft::verify_timeout_signature_for(voter, view, epoch,
+sig)` authenticates an explicit `(view, epoch)` under `Domain::Timeout`
+without touching state. The pump now authenticates first and only then
+applies epoch/staleness policy and the catch-up sync.
+
+Note: a *validly signed* timeout for a far-future view still triggers a
+catch-up. Bounding that needs the DiemBFT v4 rule (timeout messages must
+carry the previous view's TC as proof of legitimate entry); recorded in
+the audit as a follow-up, not silently changed here.
+
+### 2.3 — one forged vote could stall a view permanently
+
+`collect_vote` stores the first vote per validator *without* verifying
+it (per-vote BLS verification is opt-in for cost reasons). A forged
+contribution therefore poisoned the aggregate: every receiver rejected
+the QC, the view stalled until its timeout, and the same buffered vote
+poisoned every retry — one participant, one permanently stalled view.
+
+Fix: the leader now verifies its *own* aggregate before it can leave
+(`aggregate_collected_votes`) — one pairing check per QC, not per vote,
+so the fast path is unchanged. On failure it takes a quarantine pass:
+each buffered vote is verified individually, invalid contributions are
+dropped from the buffer *and* the stake accounting, and the aggregate is
+rebuilt. Honest votes are never discarded; if quarantine leaves less
+than a quorum, no QC is emitted (broadcasting an unprovable certificate
+would be worse than stalling). The signer bitmap is now built *after*
+aggregation so it describes exactly the signers the aggregate covers.
+
+Regressions: `forged_vote_is_quarantined_and_quorum_still_forms` (3
+honest + 1 forged → QC forms over exactly the honest signers and
+verifies) and `quarantine_below_quorum_emits_no_qc`.
+
+### 1.2 — an EVM transaction could advance another account's nonce
+
+The EVM recovers its real sender and nonce from the signed RLP, so the
+envelope's declared pair is only an ordering hint. The executor
+nevertheless drove `executed_nonce` from it: wrapping your own valid
+payload in a victim's envelope advanced the victim's counter while their
+balance and EVM account nonce never moved — desynchronising ordinary
+Ethereum submissions from the real account nonce.
+
+Fix: `group_block_txs` resolves the module before the nonce gate and
+applies that gate only to modules that authenticate from the envelope.
+A self-authenticating module enforces its own nonce during execution, so
+the executor tracks nothing for it.
+
+Regressions: `self_authenticating_module_cannot_advance_another_accounts_nonce`
+(verified red before the fix) and the control
+`envelope_authenticating_module_still_advances_nonce`.
+
+### 1.4 — EVM fast paths answered precompile calls as empty EOAs
+
+Both shortcuts qualify a recipient by "has no code", but a precompile
+has no code *and still executes*. A bare call to `sha256` (0x02) was
+answered as a plain transfer: no digest returned, and the flat 21 000
+transfer gas charged instead of the precompile's schedule — a
+consensus-visible divergence (different sender balance ⇒ different state
+root).
+
+Fix: `recipient_is_precompile` checks revm's fork-dependent
+`Precompiles` set (so future EIP precompiles are covered automatically)
+plus Oxide's native `0x0000…OOXX` space, and both shortcuts decline.
+
+Regressions: `precompile_recipients_are_excluded_from_fast_paths` and
+the differential `precompile_call_matches_revm_state_root` — revm vs
+`handle_batch` roots must agree (verified red before the fix: roots
+differed). Note the calldata case is *not* a reliable probe: Prague's
+EIP-7623 floor dominates the intrinsic cost and masks the precompile's
+gas, so the test uses empty calldata, which has nothing to hide behind.
+
+### Gates
+
+`cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets
+-- -D warnings` clean on every touched crate; consensus 156, executor 81,
+evm 182 tests green. Six fixes, each with a red-green regression except
+the two new-capability checks (helper + differential), which are
+red-green as a pair.

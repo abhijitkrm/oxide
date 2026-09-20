@@ -1004,6 +1004,107 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **A torn consensus-WAL tail silently discarded every vote written
+  after it** (`crates/consensus`)
+  - `Wal::open` appended past whatever suffix recovery had stopped at.
+    After a crash mid-write, the node recovered the last *valid* entry,
+    voted, fsynced — and the next restart stopped at the same damaged
+    bytes and returned the *pre-crash* state. A vote that had already
+    been signed and sent was forgotten, which is exactly the double-vote
+    hazard the WAL exists to prevent.
+  - `open` now repairs the tail first: it truncates the file at the end
+    of the last complete, CRC-valid record and fsyncs the shortened file
+    before any append can land. A corrupt length field is also bounded
+    (1 MiB) so it can no longer drive a huge allocation during recovery.
+  - **In plain words:** after a crash, the validator's safety notebook
+    used to keep its old torn page. Everything written on the following
+    pages was invisible on the next restart — including a promise not to
+    vote twice. Now the torn page is removed before writing resumes, so
+    every later entry stays readable.
+  - Regression: a three-session crash → recover → vote → crash cycle
+    (`wal_repairs_torn_tail_so_later_entries_survive_restart`).
+
+- **Stake-weighted leader rotation scheduled one validator for as many
+  consecutive views as it held stake units** (`crates/consensus`)
+  - Leader selection was `view % total_stake` over cumulative-stake
+    intervals, so with equal stakes of `1_000_000` validator 0 led the
+    first million views: a failed leader stayed scheduled for a million
+    timeouts, and the rotation depended on the *unit* stake was
+    denominated in.
+  - The validator set now precomputes one rotation cycle of smooth
+    weighted round-robin over normalized weights, so turns are
+    interleaved: equal stakes give plain round-robin, unequal stakes keep
+    proportional frequency with short runs. Every staked validator keeps
+    at least one turn per cycle.
+  - **In plain words:** the queue of who leads next used to be built
+    from raw stake numbers, so a validator with a million tokens led a
+    million blocks in a row. Now the turns are shuffled evenly — the big
+    validator still leads most of the time, but never monopolises the
+    line, so a broken leader is skipped after one timeout instead of a
+    million.
+
+- **The node moved its consensus view on an unverified timeout
+  signature** (`bin/oxide-validator`, `crates/consensus`)
+  - The message pump advanced the view, reset the pacemaker timer, and
+    cleared the vote buffer *before* the timeout signature was checked.
+    Any admitted peer could therefore disturb consensus state just by
+    claiming a high view and attaching garbage.
+  - The engine gained `verify_timeout_signature_for`, which authenticates
+    an explicit `(view, epoch)` without mutating state; the pump now
+    authenticates first and only then applies its epoch/staleness policy
+    and catch-up.
+  - **In plain words:** a stranger could previously shove the validator
+    into a far-future round just by asking, with no proof attached. Now
+    the proof is checked before anything moves.
+
+- **One forged vote could stall a view permanently** (`crates/consensus`)
+  - Votes are buffered without individual signature checks (per-vote BLS
+    verification is opt-in for cost reasons), so a single forged
+    contribution poisoned the aggregate QC: every peer rejected it, the
+    view stalled until its timeout, and the same buffered vote poisoned
+    every retry.
+  - The leader now verifies its own aggregate before broadcasting it —
+    one pairing check per QC rather than per vote, so the fast path is
+    unchanged — and on failure quarantines the invalid contributions and
+    rebuilds the certificate from the honest votes. If no honest quorum
+    remains, no QC is emitted.
+  - **In plain words:** one bad signature used to be enough to freeze a
+    round forever, because the bad vote was never removed. Now the leader
+    spots the bad apple, throws it out, and carries on with everyone
+    else's votes.
+
+- **An EVM transaction could advance another account's nonce**
+  (`crates/executor`)
+  - The EVM recovers its sender and nonce from the signed transaction
+    body, so the envelope's declared sender/nonce is only an ordering
+    hint. The executor nonetheless drove its per-account nonce state from
+    that hint, so wrapping your own valid transaction in someone else's
+    envelope moved *their* counter while their balance and real EVM nonce
+    never changed.
+  - The executor's nonce gate now applies only to modules that
+    authenticate from the envelope; a self-authenticating module enforces
+    its own nonce during execution.
+  - **In plain words:** you could previously push a stranger's "next
+    transaction number" forward without their permission, which would
+    make their normal wallet transactions look out of order. Only your
+    own transactions can move your own counter now.
+
+- **EVM fast paths answered precompile calls as if they were empty
+  accounts** (`modules/evm`)
+  - Both shortcuts qualified a recipient by "has no code" — but a
+    precompile has no code and still executes. A bare call to `sha256`
+    was answered as a plain transfer: no digest returned, and flat
+    transfer gas charged instead of the precompile's schedule. That
+    changes the sender's balance and therefore the state root, so
+    validators could disagree with every other EVM.
+  - The shortcuts now decline any recipient that revm's fork-dependent
+    precompile set recognises, plus Oxide's native `0x0000…OOXX`
+    precompiles, so the call falls through and the precompile runs.
+  - **In plain words:** asking the chain to hash something returned
+    nothing and charged the wrong fee, because the shortcut mistook the
+    hashing contract for an ordinary wallet. Those calls now really
+    execute — and all validators agree on the result.
+
 - **A panic in the async execution-lane worker killed the thread
   silently — `attest_state` then waited forever on a watermark that
   could never advance, and the height the worker died on stayed
