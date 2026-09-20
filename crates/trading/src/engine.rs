@@ -390,22 +390,33 @@ impl<B: BookBackend> MatchingEngine<B> {
         // current book; insufficient → kill without executing.
         //
         // When STP is active, the taker's own resting orders on the
-        // opposite side will be skipped or canceled during the sweep,
-        // so they must not count toward the fillable quantity. Using
-        // the non-STP fillable_qty here would accept a FOK that STP
-        // then partially cancels — violating the FOK guarantee.
-        //
-        // (Self-trade prevention can still interrupt a FOK mid-sweep
-        // if a new self-match appears between the pre-scan and the
-        // sweep; that documented corner yields CanceledRemainder,
-        // never a silent partial fill of a "kill".)
+        // opposite side change what can fill: skipped or canceled
+        // makers never trade, `CancelNewest` makes everything past
+        // the first self order unreachable, and `DecrementAndCancel`
+        // spends taker quantity on self makers without a fill. The
+        // pre-scan therefore evaluates the exact STP behavior — a
+        // scan that counted only non-self liquidity would accept a
+        // FOK the sweep then partially cancels, violating the
+        // all-or-nothing guarantee.
         if req.tif == TimeInForce::Fok {
             let fillable = if C::UNCAPPED {
-                if matches!(req.stp, StpMode::None) {
-                    self.book.fillable_qty(req.side, limit_raw)
-                } else {
-                    self.book
-                        .fillable_qty_excluding_owner(req.side, limit_raw, req.owner, &self.pool)
+                match req.stp {
+                    StpMode::None => self.book.fillable_qty(req.side, limit_raw),
+                    // Self orders are removed and the sweep keeps
+                    // matching — every external order in range is
+                    // reachable, so the level-total scan is exact.
+                    StpMode::CancelOldest => self
+                        .book
+                        .fillable_qty_excluding_owner(req.side, limit_raw, req.owner, &self.pool),
+                    // `CancelNewest` stops the sweep at the first
+                    // self maker and `DecrementAndCancel` spends
+                    // taker quantity on self makers without a fill —
+                    // level totals cannot express either, so replay
+                    // the sweep read-only (the cap probe with a
+                    // no-op cap).
+                    StpMode::CancelNewest | StpMode::DecrementAndCancel => {
+                        self.capped_fillable(&req, limit_raw, cap)
+                    }
                 }
             } else {
                 // A cap can shrink or kill a maker fill — the
@@ -1663,6 +1674,88 @@ mod tests {
         // With STP None, the self-trade executes and the order fills.
         assert_eq!(out, OrderOutcome::Filled, "FOK without STP must fill against own order");
         assert!(!fills.is_empty(), "FOK without STP must produce fills");
+    }
+
+    /// Regression: `CancelNewest` stops the sweep at the FIRST
+    /// self-owned maker — liquidity beyond it is unreachable. A
+    /// book of external, then self, then external liquidity must
+    /// not pass the pre-scan on the beyond-self quantity.
+    #[test]
+    fn fok_pre_scan_stops_at_self_order_under_cancel_newest() {
+        let mut e = engine();
+        let mut fills = Vec::new();
+
+        // External sell 5 @10.50, self sell 5 @10.51, external sell
+        // 10 @10.52 — 15 non-self in range, but only 5 reachable.
+        e.place(
+            order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 5_000, 2),
+            &mut fills,
+        )
+        .unwrap();
+        e.place(
+            order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_051_000_000, 5_000, 1),
+            &mut fills,
+        )
+        .unwrap();
+        e.place(
+            order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_052_000_000, 10_000, 2),
+            &mut fills,
+        )
+        .unwrap();
+
+        // FOK buy 15 @10.52, owner 1, CancelNewest: the sweep fills
+        // 5 then cancels at the self order — fillable is 5, not 15.
+        let fok_req = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Fok,
+            price: Price(1_052_000_000),
+            qty: Qty(15_000),
+            owner: Address([1; 20]),
+            stp: StpMode::CancelNewest,
+        };
+        let out = e.place(fok_req, &mut fills).unwrap();
+        assert_eq!(out, OrderOutcome::Killed, "liquidity past the self order is unreachable");
+        assert!(fills.is_empty(), "a killed FOK books nothing");
+        assert_eq!(e.resting_count(), 3, "a killed FOK leaves the book untouched");
+    }
+
+    /// Regression: `DecrementAndCancel` spends taker quantity on
+    /// self makers without a fill — the pre-scan must count only
+    /// real fills, so a self decrement cannot hide a shortfall.
+    #[test]
+    fn fok_pre_scan_counts_fills_not_self_decrement() {
+        let mut e = engine();
+        let mut fills = Vec::new();
+
+        // Self sell 4 @10.50 at the level head, external sell 10
+        // @10.51: 10 non-self, but the self decrement burns 4 of the
+        // taker's qty — only 6 can actually fill.
+        e.place(
+            order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 4_000, 1),
+            &mut fills,
+        )
+        .unwrap();
+        e.place(
+            order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_051_000_000, 10_000, 2),
+            &mut fills,
+        )
+        .unwrap();
+
+        let fok_req = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Fok,
+            price: Price(1_051_000_000),
+            qty: Qty(10_000),
+            owner: Address([1; 20]),
+            stp: StpMode::DecrementAndCancel,
+        };
+        let out = e.place(fok_req, &mut fills).unwrap();
+        assert_eq!(out, OrderOutcome::Killed, "self decrement must not count toward FOK fillable");
+        assert!(fills.is_empty());
+        // The self order is untouched too — a kill mutates nothing.
+        assert_eq!(e.resting_count(), 2);
     }
 
     /// Snapshot restore: an engine rebuilt from `write_canonical_state`

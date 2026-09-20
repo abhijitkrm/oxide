@@ -226,33 +226,53 @@ impl ModelBook {
         }
 
         // FOK pre-scan (STP-aware, matching the engine's behavior).
-        // When STP is active, the taker's own resting orders on the
-        // opposite side will be skipped or canceled during the sweep,
-        // so they must not count toward the fillable quantity.
+        // Replay the sweep read-only — best-first levels, FIFO
+        // within a level, same self-trade rules — because order
+        // *within* a level decides reachability: `CancelNewest`
+        // stops at the first self order, `DecrementAndCancel` spends
+        // taker quantity on self makers, and only `CancelOldest`
+        // lets all non-self liquidity through.
         if req.tif == TimeInForce::Fok {
             let mut fillable = 0u64;
+            let mut sim_rem = rem;
             let prices: Vec<u64> = self.map(opposite).keys().copied().collect();
             // Best-first iteration.
             let ordered: Vec<u64> = match opposite {
                 Side::Buy => prices.into_iter().rev().collect(),
                 Side::Sell => prices,
             };
-            for price in ordered {
+            'scan: for price in ordered {
                 if !Self::marketable(req.side, price, limit) {
                     break;
                 }
-                fillable += self.map(opposite).get(&price).map_or(0, |d| {
-                    d.iter()
-                        .filter(|o| {
-                            // STP-aware: exclude the taker's own
-                            // orders when STP is active.
-                            matches!(req.stp, StpMode::None) || o.owner != req.owner
-                        })
-                        .map(|o| o.qty)
-                        .sum::<u64>()
-                });
-                if fillable >= rem {
-                    break;
+                if let Some(deque) = self.map(opposite).get(&price) {
+                    for o in deque {
+                        if o.owner == req.owner {
+                            match req.stp {
+                                // The sweep cancels the taker here —
+                                // nothing further is reachable.
+                                StpMode::CancelNewest => break 'scan,
+                                // Self order removed; keep matching.
+                                StpMode::CancelOldest => continue,
+                                // The decrement consumes taker qty
+                                // without a fill.
+                                StpMode::DecrementAndCancel => {
+                                    sim_rem = sim_rem.saturating_sub(o.qty);
+                                    if sim_rem == 0 {
+                                        break 'scan;
+                                    }
+                                    continue;
+                                }
+                                StpMode::None => {}
+                            }
+                        }
+                        let f = sim_rem.min(o.qty);
+                        fillable += f;
+                        sim_rem -= f;
+                        if sim_rem == 0 {
+                            break 'scan;
+                        }
+                    }
                 }
             }
             if fillable < rem {

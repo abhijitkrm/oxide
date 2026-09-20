@@ -16337,3 +16337,39 @@ cancel — no double-release); a perps STP removal frees the whole margin
 reservation (full withdraw succeeds). 38 exchange / 65 perps / 56
 trading tests + the matching property oracle all green; fmt + clippy
 clean.
+
+## FOK pre-scan now evaluates the exact STP behavior (audit 4.6)
+
+The finding: the FOK pre-scan counted *all* non-self liquidity in
+range, but `CancelNewest` stops the real sweep at the first
+self-owned maker (liquidity past it is unreachable) and
+`DecrementAndCancel` spends taker quantity on self makers without a
+fill. A book of external, then self, then external liquidity passed
+the pre-scan and still produced a partial FOK fill — or a `Filled`
+outcome whose fills summed less than the order.
+
+### Fix
+
+The pre-scan now dispatches per STP mode:
+
+- `None` → `fillable_qty` (unchanged, exact)
+- `CancelOldest` → `fillable_qty_excluding_owner` (unchanged —
+  provably exact: self orders are removed, every external order in
+  range is reachable)
+- `CancelNewest` / `DecrementAndCancel` → `capped_fillable`, the
+  read-only sweep replay already built for maker caps — it walks
+  levels best-first and orders FIFO *within* a level, which is
+  exactly what level totals cannot express.
+
+The property-test oracle modeled the same naive exclusion — its
+pre-scan now replays the sweep read-only too (this is the 8.1
+class of oracle-mirrors-the-bug; the fix makes the oracle verify
+the *correct* semantics rather than the convenient approximation).
+
+### Verification
+
+Two red-first regressions: `CancelNewest` behind external+self+
+external liquidity kills instead of partially filling; a self
+decrement no longer counts toward FOK fillable. The property oracle
+(512 random op sequences) now agrees with the engine including all
+four STP modes. 58 trading tests green; fmt + clippy clean.

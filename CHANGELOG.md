@@ -1908,6 +1908,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     is released — including partial decrements, which refund only
     the consumed slice.
 
+- **Fill-or-kill orders could partially fill when self-trade
+  prevention was active** (`crates/trading`)
+  - The FOK pre-scan counted *all* non-self liquidity in range, but
+    `CancelNewest` stops the sweep at the first self-owned order
+    (liquidity past it is unreachable) and `DecrementAndCancel`
+    spends taker quantity on self orders without a fill. A FOK
+    could therefore pass the all-or-nothing check and still book a
+    partial fill — or report `Filled` with fewer fills than the
+    order quantity.
+  - The pre-scan now evaluates the exact STP behavior per mode:
+    `CancelNewest` and `DecrementAndCancel` replay the sweep
+    read-only (best-first levels, FIFO *within* a level — the part
+    level totals cannot express), so the fillable total equals what
+    the sweep would actually book. `CancelOldest` keeps the fast
+    level scan, which is provably exact for it.
+  - **In plain words:** a fill-or-kill order could get half-filled
+    when your own resting order stood in the way — the check
+    assumed liquidity behind your own order was reachable, but the
+    self-trade rule stops the match there. Now the check simulates
+    exactly what would trade, and the order is killed outright
+    when it can't fully fill.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).
