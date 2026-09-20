@@ -994,6 +994,42 @@ struct ExecSync {
     /// Highest block height whose execution completed. Always
     /// `<= enqueued`; equal while the lane is idle.
     executed: Option<u64>,
+    /// Set when the worker thread exits for ANY reason — panic or
+    /// clean disconnect. A dead lane can never advance `executed`,
+    /// so `attest_state` waiters must stop waiting on it and
+    /// `finalize_block` must drive the committed backlog inline
+    /// instead of sending into a void. Terminal: the lane is never
+    /// respawned (a second spawn is already a panic).
+    lane_dead: bool,
+}
+
+/// RAII marker that flags the execution lane dead when the worker
+/// thread exits — normal return AND panic unwind both run `Drop`.
+/// The worker installs it before entering the receive loop so no
+/// exit path can skip it. A panic prints its own message via the
+/// panic runtime; the guard adds the lane-death notice so operators
+/// can correlate the later withheld attestations with the cause.
+struct LaneDeath {
+    /// The progress channel shared with `attest_state` waiters and
+    /// `finalize_block`.
+    sync: std::sync::Arc<(Mutex<ExecSync>, std::sync::Condvar)>,
+}
+
+impl Drop for LaneDeath {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.sync;
+        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lane_dead = true;
+        // Wake every waiter: heights the dead lane still owes will
+        // never execute — `attest_state` must stop waiting now, not
+        // at the next commit.
+        cv.notify_all();
+        if std::thread::panicking() {
+            eprintln!(
+                "executor: exec lane worker panicked — lane marked dead; \
+                 committed backlog will execute inline at finalize"
+            );
+        }
+    }
 }
 
 /// The executor: a sequential block executor with a module router.
@@ -1156,7 +1192,7 @@ impl Executor {
             next_proposal_height: Mutex::new(0),
             exec_lane_tx: std::sync::OnceLock::new(),
             exec_sync: std::sync::Arc::new((
-                Mutex::new(ExecSync { enqueued: None, executed: None }),
+                Mutex::new(ExecSync { enqueued: None, executed: None, lane_dead: false }),
                 std::sync::Condvar::new(),
             )),
             events: Mutex::new(Vec::new()),
@@ -1312,6 +1348,13 @@ impl Executor {
         std::thread::Builder::new()
             .name("exec-lane".to_string())
             .spawn(move || {
+                // RAII: ANY worker exit — panic unwind or clean
+                // channel disconnect — marks the lane dead and wakes
+                // every waiter. Without this, a panic mid-`execute_block`
+                // left `attest_state` waiting forever on a watermark
+                // that could never advance, and the death surfaced
+                // only as unexplained withheld votes.
+                let _death = LaneDeath { sync: sync.clone() };
                 while let Ok(block) = rx.recv() {
                     // If the executor is gone there is no one left
                     // to serve — exit rather than resurrect it.
@@ -1332,6 +1375,76 @@ impl Executor {
                 }
             })
             .expect("spawn exec lane thread");
+    }
+
+    /// Drive every committed-but-unexecuted height through block
+    /// execution inline, in commit order. Called when the async
+    /// lane is dead or unreachable: `finalized` already holds the
+    /// committed blocks, so nothing is lost — the lane is only an
+    /// offload, never the owner of correctness. Roots land in
+    /// `state_roots` exactly as the worker would have written them,
+    /// and the `executed` watermark advances to the newest root so
+    /// `attest_state` waiters see the lane's debt as settled.
+    ///
+    /// A deterministic panic in `execute_block` propagates to the
+    /// caller: a committed block that cannot execute is a fatal,
+    /// chain-level fault. Crashing on the committing thread with
+    /// the real panic is honest failure propagation — masking it
+    /// would convert a loud crash into a silent liveness stall.
+    fn execute_committed_backlog(&self) {
+        loop {
+            // Oldest committed height still lacking a state root —
+            // height order preserves the worker's serial ordering
+            // exactly. Two short critical sections, never nested:
+            // no lock-order contract between the block log and the
+            // root map.
+            let next = {
+                let heights: Vec<u64> = self
+                    .finalized
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .keys()
+                    .copied()
+                    .collect();
+                let roots =
+                    self.state_roots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                heights.into_iter().find(|h| !roots.contains_key(h))
+            };
+            let Some(height) = next else { break };
+            let Some(block) = self
+                .finalized
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&height)
+                .cloned()
+            else {
+                // The entry was found moments ago and this thread is
+                // the only pruner — unreachable, but bail rather
+                // than spin if invariants ever change.
+                break;
+            };
+            let root = self.execute_block(&block);
+            self.state_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_retained(height, root, self.history_retention);
+        }
+        // Advance the executed watermark to the newest recorded
+        // root: heights the dead lane owed have now been executed
+        // inline, and `attest_state` waiters must observe that.
+        let newest = self
+            .state_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .next_back()
+            .map(|(h, _)| *h);
+        if let Some(h) = newest {
+            let (lock, cv) = &*self.exec_sync;
+            let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.executed = Some(s.executed.map_or(h, |e| e.max(h)));
+            cv.notify_all();
+        }
     }
 
     /// The current chain height (the highest finalized block).
@@ -2544,38 +2657,35 @@ impl AppInterface for Executor {
     fn finalize_block(&self, block: &FinalizedBlock) -> CommitAck {
         let start = std::time::Instant::now();
         if let Some(tx) = self.exec_lane_tx.get() {
-            // Async execution lane: hand the block to the worker.
-            // Ordering is the engine's commit order (FIFO channel),
-            // so serial worker execution is identical to the
-            // synchronous path. `finalized` and the proposal height
-            // advance now — they record *ordering* finality, which
-            // consensus already settled — while `state_roots` is
-            // written by the worker when execution lands.
-            {
-                let (lock, cv) = &*self.exec_sync;
-                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).enqueued =
-                    Some(block.height.value());
-                cv.notify_all();
-            }
-            if tx.send(block.clone()).is_err() {
-                // Worker dead (executor teardown mid-shutdown):
-                // execute inline so the commit still lands.
-                let root = self.execute_block(block);
-                self.state_roots
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert_retained(block.height.value(), root, self.history_retention);
-                let (lock, cv) = &*self.exec_sync;
-                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).executed =
-                    Some(block.height.value());
-                cv.notify_all();
-            }
+            // Async execution lane: `finalized` and the proposal
+            // height advance now — they record *ordering* finality,
+            // which consensus already settled — while `state_roots`
+            // is written by the worker (or the inline backlog drain
+            // below) when execution lands. `finalized` is inserted
+            // BEFORE the send so the backlog drain can see this
+            // block too.
             self.finalized
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert_retained(block.height.value(), block.clone(), self.history_retention);
             *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 block.height.value().saturating_add(1); // M2 fix
+            let lane_dead = {
+                let (lock, cv) = &*self.exec_sync;
+                let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.enqueued = Some(block.height.value());
+                cv.notify_all();
+                s.lane_dead
+            };
+            if lane_dead || tx.send(block.clone()).is_err() {
+                // The lane can never execute this block — drive
+                // every committed-but-unexecuted height inline.
+                // Executing only THIS block (the old behavior) left
+                // the height the worker died on permanently
+                // rootless: a hole no later commit can fill,
+                // stalling every exec-cert that references it.
+                self.execute_committed_backlog();
+            }
         } else {
             // Synchronous execution (default): execute the block
             // immediately and store the state root.
@@ -2599,13 +2709,17 @@ impl AppInterface for Executor {
 
     fn attest_state(&self, height: Height) -> Option<StateAttestation> {
         let start = std::time::Instant::now();
-        // Async lane: wait only while the height is owed to the
-        // worker. A height never enqueued has no execution coming —
-        // return `None` ("not executed") rather than blocking forever.
+        // Async lane: wait only while the height is owed to a LIVE
+        // worker. A height never enqueued has no execution coming,
+        // and a dead lane can never advance `executed` — both return
+        // `None` ("not executed") rather than blocking forever. The
+        // `lane_dead` check is what makes a worker panic propagate
+        // instead of hanging every attester.
         if self.exec_lane_tx.get().is_some() {
             let (lock, cv) = &*self.exec_sync;
             let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            while s.enqueued.is_some_and(|e| height.value() <= e)
+            while !s.lane_dead
+                && s.enqueued.is_some_and(|e| height.value() <= e)
                 && s.executed.is_none_or(|x| x < height.value())
             {
                 s = cv.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4171,5 +4285,121 @@ mod tests {
         // An unenqueued height has no execution coming — `None`,
         // the explicit "not executed" signal.
         assert!(att.is_none());
+    }
+
+    /// A module that panics inside `handle` exactly once — models a
+    /// worker-killing execution fault that replays cleanly when the
+    /// same committed block is re-executed later.
+    struct PanicOnceModule {
+        /// Set until the first `handle` call detonates it.
+        armed: std::sync::atomic::AtomicBool,
+        /// Invocation count, for the post-recovery state root.
+        calls: Mutex<u64>,
+    }
+
+    impl PanicOnceModule {
+        fn new() -> Self {
+            Self { armed: std::sync::atomic::AtomicBool::new(true), calls: Mutex::new(0) }
+        }
+    }
+
+    impl Module for PanicOnceModule {
+        fn name(&self) -> &'static str {
+            "panic-once"
+        }
+        fn id(&self) -> u8 {
+            2
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            assert!(
+                !self.armed.swap(false, std::sync::atomic::Ordering::SeqCst),
+                "panic-once: injected execution fault"
+            );
+            *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            Ok(vec![Event { module: "panic-once", kind: "call", data: vec![] }])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            // Non-zero once any call has landed (count 1 → byte 1).
+            let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            Hash([u8::try_from(c.max(1)).unwrap_or(0xff); 32])
+        }
+    }
+
+    #[test]
+    fn exec_lane_death_unblocks_attest() {
+        // A worker that dies mid-block must not leave `attest_state`
+        // waiting forever: the lane's death is terminal, so the
+        // attest for the lost height returns `None` (no root landed)
+        // instead of blocking on a watermark that can never advance.
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(PanicOnceModule::new()));
+        let executor = Arc::new(executor);
+        executor.spawn_exec_lane();
+
+        // The panic tx kills the worker during block 0's execution.
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![make_tx_with_nonce(2, &[1], 0)],
+            signers: vec![],
+        });
+        // Give the worker a beat to receive, panic, and unwind —
+        // execution is microseconds; this margin only needs to
+        // outlive thread scheduling.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // attest_state on the dead lane's lost height must return —
+        // on a helper thread with a hard deadline so a hang fails
+        // by timeout rather than hanging CI forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app = executor.clone();
+        std::thread::spawn(move || {
+            tx.send(app.attest_state(Height::new(0))).expect("send");
+        });
+        let att = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("attest_state must not hang on a dead execution lane");
+        // The panicked block's root never landed — nothing executed.
+        assert!(att.is_none(), "a height lost to a dead lane has no root to attest");
+    }
+
+    #[test]
+    fn exec_lane_death_backfills_committed_blocks() {
+        // When the lane dies, the next `finalize_block` must drive
+        // every committed-but-unexecuted height inline — not just
+        // the new block — so no committed height is left permanently
+        // rootless. The panic-once module succeeds on re-execution,
+        // so the backlog completes.
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(PanicOnceModule::new()));
+        let executor = Arc::new(executor);
+        executor.spawn_exec_lane();
+
+        // Block 0 kills the worker mid-execution.
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: vec![make_tx_with_nonce(2, &[1], 0)],
+            signers: vec![],
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Block 1: the send fails on the dead lane — the backlog
+        // path must execute BOTH committed heights inline (block 0
+        // replays cleanly now that the fault has fired).
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(1),
+            txs: vec![make_tx_with_nonce(2, &[2], 1)],
+            signers: vec![],
+        });
+
+        assert!(
+            executor.attest_state(Height::new(0)).is_some(),
+            "the backlog must execute the block that killed the worker"
+        );
+        assert!(
+            executor.attest_state(Height::new(1)).is_some(),
+            "the backlog must execute the newly committed block"
+        );
     }
 }

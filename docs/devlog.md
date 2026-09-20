@@ -15902,3 +15902,49 @@ Gates: 106 test binaries green, fmt + clippy `-D warnings` clean.
 Ripple: ~20 call sites updated for the `Option` attestation API
 (executor, storage/devnet/evm tests, node, oxide-validator,
 oxide-spammer — production callers handle `None` explicitly).
+
+## 2026-09-20 — Audit remediation H2: async exec-lane death propagation
+
+**Finding** — the async execution lane could die silently and take
+consensus liveness with it. `execute_block` runs on the `exec-lane`
+worker thread; a panic there killed the thread with three failures:
+
+- `attest_state(h)` waited on the `executed` watermark forever for
+  a height whose worker could never write it — the consensus vote
+  path hangs on a dead lane (demonstrated: recv_timeout at 5s).
+- The send-failure fallback in `finalize_block` executed only the
+  NEW block inline — the height the worker died on stayed
+  permanently rootless: a committed-height hole no later commit
+  could fill, stalling every exec-cert that referenced it.
+- Nothing recorded or reported the death — it surfaced only as
+  unexplained withheld votes.
+
+**Fix** — death is terminal, visible, and covered:
+
+- `ExecSync.lane_dead`, set by an RAII `LaneDeath` guard the worker
+  installs before its receive loop — Drop runs on panic unwind AND
+  clean exit, sets the flag, wakes every waiter, and eprints a
+  lane-death notice when unwinding (the panic runtime prints the
+  cause itself).
+- `attest_state` adds `!s.lane_dead` to the wait condition: a dead
+  lane returns `None` promptly instead of hanging.
+- `finalize_block` now inserts `finalized` BEFORE the send attempt
+  and checks `lane_dead` alongside `send().is_err()`; either way it
+  calls `execute_committed_backlog`, which drains EVERY
+  committed-but-unexecuted height inline in commit order and
+  advances the `executed` watermark to the newest root. The lane is
+  an offload, never the owner of correctness — `finalized` is the
+  committed log it drains from.
+- A deterministic `execute_block` panic on the backlog path
+  propagates to the committing thread: a committed block that
+  cannot execute is a fatal chain-level fault — a loud crash beats
+  a silent stall, and this exposure already existed in the old
+  send-failure path.
+
+Regressions: `PanicOnceModule` (detonates once, replays cleanly) —
+worker panic → `attest_state(lost_height)` returns `None` inside a
+5s deadline (was: infinite hang); next finalize → backlog executes
+BOTH the block that killed the worker and the new block (was:
+permanent root hole at the lost height).
+
+Gates: 106 test binaries green, fmt + clippy `-D warnings` clean.

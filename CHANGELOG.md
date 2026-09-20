@@ -1004,6 +1004,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **A panic in the async execution-lane worker killed the thread
+  silently — `attest_state` then waited forever on a watermark that
+  could never advance, and the height the worker died on stayed
+  permanently rootless** (`crates/executor`)
+  - The worker now installs a `LaneDeath` guard that marks the lane
+    dead on ANY exit (panic or clean), wakes all waiters, and
+    reports the death; `attest_state` returns `None` promptly on a
+    dead lane instead of hanging.
+  - `finalize_block` now detects the dead lane and drives EVERY
+    committed-but-unexecuted height inline in commit order
+    (`execute_committed_backlog`) — the old send-failure path
+    executed only the new block, leaving a permanent root hole that
+    stalled every certificate referencing the lost height.
+  - In plain words: if the background execution thread ever
+    crashes, the validator now notices immediately, executes the
+    backlog itself, and keeps producing state roots — previously it
+    would quietly stop being able to attest blocks.
+
 - **Embedded execution certificates were trusted on a matching
   state root alone — signature, signer bitmap, quorum, and epoch
   were never checked — and an unexecuted height reported a
