@@ -16292,3 +16292,48 @@ emitted; an ordinary fill exhausting cover leaves a reduce-only maker
 behind it dead and unfilled; FOK kills when capped fillable <
 requested. 64 perps / 56 trading / 36 exchange tests + the matching
 property oracle all green; fmt + clippy clean.
+
+## STP removals now report every non-fill book change (audit 4.5)
+
+The finding: the sweep's self-trade-prevention paths could remove or
+decrement a resting maker without emitting a fill, and venue accounting
+only reacted to fills and explicit cancels — so an STP-cancelled resting
+buy disappeared while its reserved quote stayed debited, with no live
+order left to recover it through. Same hole existed for perps margin
+reservations.
+
+### Fix
+
+`MakerCap` grew a second callback: `on_removed(MakerRemoval)`. The sweep
+now reports *every* book mutation that is not a fill — the complement of
+`FillEvent` — through one audited channel:
+
+- `CancelOldest` removal → `Removed { SelfTrade }`
+- `DecrementAndCancel` full-consume → `Removed { SelfTrade }`; partial
+  consume → `Decremented { remaining }` (the order stays, shrunk)
+- cap-0 kill and capped-remainder removal → `Removed { Cap }`
+- fill exhaustion → no report (the fill event already covers it)
+
+`MakerRemoval` carries id/owner/side/price/removed_qty/remaining/reason —
+`removed_qty` is the obligation-release basis (`price × removed_qty`).
+`ObserveRemovals` is a `UNCAPPED` cap impl that just records, so callers
+that never restrict fills still get the report; `NoCap` stays a literal
+no-op on the default `place` path.
+
+Venues consume the report: the exchange refunds `price × removed_qty`
+to removed/decremented resting buys (resting buys ARE the reservation
+ledger — sells hold nothing until base-asset custody lands) and emits
+`stp_cancel`/`stp_decrement` events; perps drops the reservation
+(`remaining == 0`) or re-syncs `resv.qty` to the book-authoritative
+remainder, with `reduce_only_cancel` kept for cap kills. The perps cap's
+ad-hoc `dead` list is gone — the engine reports all removals uniformly.
+
+### Verification
+
+Three regression tests: exchange `CancelOldest` refunds the maker's
+full hold and emits `stp_cancel`; `DecrementAndCancel` refunds only the
+consumed slice (book-authoritative remainder verified by a follow-on
+cancel — no double-release); a perps STP removal frees the whole margin
+reservation (full withdraw succeeds). 38 exchange / 65 perps / 56
+trading tests + the matching property oracle all green; fmt + clippy
+clean.

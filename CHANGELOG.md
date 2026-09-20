@@ -1883,6 +1883,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     the trade, not before. Now the matcher itself refuses to fill
     such an order past what it can still close.
 
+- **Self-trade-prevention removals could strand the money locked
+  behind a resting order** (`crates/trading`, `modules/exchange`,
+  `modules/perps`)
+  - The sweep's STP paths (`CancelOldest`, `DecrementAndCancel`)
+    could remove or shrink a resting order without emitting a
+    fill — and venue accounting only reacted to fills and explicit
+    cancels. An STP-cancelled resting buy vanished while its held
+    quote stayed debited, with no live order left to recover it;
+    perps margin reservations stranded the same way.
+  - The engine now reports every book mutation that is not a fill
+    through `MakerCap::on_removed` — the exact complement of
+    `FillEvent`: removals, decrements, and cap kills each carry the
+    released quantity and what remains on the book. The exchange
+    refunds `price × removed_qty` to affected resting buys and
+    emits `stp_cancel`/`stp_decrement` events; perps releases or
+    re-syncs the margin reservation to the book-authoritative
+    remainder. The default `place` path still compiles the gate
+    away — reporting is opt-in via `ObserveRemovals`/venue caps.
+  - **In plain words:** if your own sell order cancelled your own
+    resting buy (self-trade prevention), the money the buy had
+    locked used to stay locked forever because nobody was told the
+    order disappeared. Now every deletion is reported and the hold
+    is released — including partial decrements, which refund only
+    the consumed slice.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

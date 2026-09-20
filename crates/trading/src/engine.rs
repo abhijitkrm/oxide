@@ -100,8 +100,62 @@ pub trait MakerCap {
     /// Maximum quantity this maker may fill in the current sweep.
     fn cap(&mut self, id: OrderId, owner: Address, book_qty: u64) -> u64;
 
+    /// Called for every maker the sweep shrank or removed *without*
+    /// a fill — fills are reported separately via `FillEvent`, so
+    /// this is the channel through which every other book mutation
+    /// reaches the caller. Obligations held against resting orders
+    /// (quote holds, margin reservations) must be released here:
+    /// an order that vanishes unreported strands whatever it had
+    /// locked.
+    fn on_removed(&mut self, _removal: MakerRemoval) {}
+
     /// Clear state accumulated for the simulated pre-scan sweep.
     fn reset(&mut self) {}
+}
+
+/// Why the sweep shrank or removed a resting maker without filling it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalReason {
+    /// Self-trade prevention: the taker's own resting order was in
+    /// the way (`CancelOldest` removal, or a `DecrementAndCancel` that
+    /// consumed quantity without a trade).
+    SelfTrade,
+    /// The `MakerCap` gate killed the order — dead liquidity, or a
+    /// remainder that can never legally fill.
+    Cap,
+}
+
+/// How an STP interaction between the taker and its own resting
+/// order resolved — internal control flow for `sweep`/`stp_maker`.
+enum StpAction {
+    /// The maker was removed or decremented; the taker keeps matching.
+    MakerResolved,
+    /// The taker's remaining qty was consumed — the sweep is done,
+    /// not self-canceled (outcome reports the fills).
+    TakerConsumed,
+    /// `CancelNewest`: the taker's remainder is canceled mid-sweep.
+    TakerCanceled,
+}
+
+/// A resting order the sweep decremented or removed *without* a
+/// fill — the complement of `FillEvent` for book mutations.
+#[derive(Debug, Clone, Copy)]
+pub struct MakerRemoval {
+    /// The resting order affected.
+    pub order_id: OrderId,
+    /// Its owner (obligation attribution).
+    pub owner: Address,
+    /// Side it was resting on.
+    pub side: Side,
+    /// Its resting price.
+    pub price: u64,
+    /// Quantity released without a fill — the refund basis for any
+    /// obligation held against the order.
+    pub removed_qty: u64,
+    /// Quantity still resting (0 = the order is gone entirely).
+    pub remaining: u64,
+    /// Why the sweep did it.
+    pub reason: RemovalReason,
 }
 
 /// Every maker fills its full book quantity — the default
@@ -113,6 +167,27 @@ impl MakerCap for NoCap {
 
     fn cap(&mut self, _id: OrderId, _owner: Address, book_qty: u64) -> u64 {
         book_qty
+    }
+}
+
+/// A [`MakerCap`] that never restricts fills but records every
+/// maker the sweep shrank or removed — for callers that hold
+/// obligations against resting orders and must release them when
+/// the book changes without a fill (self-trade prevention).
+pub struct ObserveRemovals<'a> {
+    /// Removals in match order.
+    pub removed: &'a mut Vec<MakerRemoval>,
+}
+
+impl MakerCap for ObserveRemovals<'_> {
+    const UNCAPPED: bool = true;
+
+    fn cap(&mut self, _id: OrderId, _owner: Address, book_qty: u64) -> u64 {
+        book_qty
+    }
+
+    fn on_removed(&mut self, removal: MakerRemoval) {
+        self.removed.push(removal);
     }
 }
 
@@ -612,45 +687,18 @@ impl<B: BookBackend> MatchingEngine<B> {
                     // to the next best level.
                     break;
                 }
-                let (m_id, m_qty, m_owner) = {
+                let (m_id, m_qty, m_side, m_owner) = {
                     let node = &self.pool[head];
-                    (node.id, node.qty.0, node.owner)
+                    (node.id, node.qty.0, node.side, node.owner)
                 };
 
                 // Self-trade prevention: only when owners match and a
                 // mode is selected.
-                if m_owner == req.owner {
-                    match req.stp {
-                        StpMode::CancelNewest => {
-                            // The taker's remainder is canceled; fills
-                            // booked so far stand.
-                            return true;
-                        }
-                        StpMode::CancelOldest => {
-                            // Remove the resting maker, keep matching.
-                            self.remove_maker(head, m_id);
-                            continue;
-                        }
-                        StpMode::DecrementAndCancel => {
-                            if m_qty <= *rem {
-                                // Maker is smaller: remove it whole,
-                                // taker continues with reduced rem.
-                                self.remove_maker(head, m_id);
-                                *rem -= m_qty;
-                            } else {
-                                // Taker is smaller: consume it by
-                                // decrementing the maker. No fill is
-                                // booked for the consumed quantity.
-                                self.pool[head].qty = Qty(m_qty - *rem);
-                                self.book.reduce_total(opp, *rem);
-                                *rem = 0;
-                            }
-                            if *rem == 0 {
-                                break 'sweep;
-                            }
-                            continue;
-                        }
-                        StpMode::None => {}
+                if m_owner == req.owner && req.stp != StpMode::None {
+                    match self.stp_maker(req, head, opp, rem, cap) {
+                        StpAction::MakerResolved => continue,
+                        StpAction::TakerConsumed => break 'sweep,
+                        StpAction::TakerCanceled => return true,
                     }
                 }
 
@@ -662,6 +710,18 @@ impl<B: BookBackend> MatchingEngine<B> {
                 // ordinary path.
                 let cap_qty = cap.cap(m_id, m_owner, m_qty);
                 if cap_qty == 0 {
+                    // The gate declares the whole order dead (e.g. a
+                    // reduce-only with no cover left). Report it so
+                    // obligations held against it are released.
+                    cap.on_removed(MakerRemoval {
+                        order_id: m_id,
+                        owner: m_owner,
+                        side: m_side,
+                        price: opp,
+                        removed_qty: m_qty,
+                        remaining: 0,
+                        reason: RemovalReason::Cap,
+                    });
                     self.remove_maker(head, m_id);
                     continue;
                 }
@@ -680,10 +740,23 @@ impl<B: BookBackend> MatchingEngine<B> {
                 self.book.reduce_total(opp, fill);
                 *rem -= fill;
 
-                if fill == m_qty || fill == cap_qty {
-                    // Maker exhausted — or it hit its cap, meaning
-                    // the remainder can never legally fill: detach,
-                    // unmap, recycle either way.
+                if fill == m_qty {
+                    // Maker exhausted — the fill event above covers
+                    // the whole order, so no removal report.
+                    self.remove_maker(head, m_id);
+                } else if fill == cap_qty {
+                    // The maker hit its cap with book quantity left:
+                    // the remainder can never legally fill — dead
+                    // liquidity, removed and reported.
+                    cap.on_removed(MakerRemoval {
+                        order_id: m_id,
+                        owner: m_owner,
+                        side: m_side,
+                        price: opp,
+                        removed_qty: m_qty - fill,
+                        remaining: 0,
+                        reason: RemovalReason::Cap,
+                    });
                     self.remove_maker(head, m_id);
                 }
                 if *rem == 0 {
@@ -692,6 +765,91 @@ impl<B: BookBackend> MatchingEngine<B> {
             }
         }
         false
+    }
+
+    /// Apply self-trade prevention for a head maker owned by the
+    /// taker, reporting every removal/decrement through `cap`.
+    ///
+    /// Separated from `sweep` for readability — and so the
+    /// reporting contract (every non-fill mutation emits
+    /// `on_removed` exactly once) lives in one audited place.
+    fn stp_maker<C: MakerCap>(
+        &mut self,
+        req: &NewOrder,
+        head: u32,
+        opp: u64,
+        rem: &mut u64,
+        cap: &mut C,
+    ) -> StpAction {
+        let (m_id, m_qty, m_side, m_owner) = {
+            let node = &self.pool[head];
+            (node.id, node.qty.0, node.side, node.owner)
+        };
+        match req.stp {
+            StpMode::CancelNewest => {
+                // The taker's remainder is canceled; fills booked so
+                // far stand.
+                StpAction::TakerCanceled
+            }
+            StpMode::CancelOldest => {
+                // Remove the resting maker, keep matching. No fill
+                // books for this quantity — report the removal so
+                // obligations held against the order release once.
+                cap.on_removed(MakerRemoval {
+                    order_id: m_id,
+                    owner: m_owner,
+                    side: m_side,
+                    price: opp,
+                    removed_qty: m_qty,
+                    remaining: 0,
+                    reason: RemovalReason::SelfTrade,
+                });
+                self.remove_maker(head, m_id);
+                StpAction::MakerResolved
+            }
+            StpMode::DecrementAndCancel => {
+                if m_qty <= *rem {
+                    // Maker is smaller: remove it whole, taker
+                    // continues with reduced rem.
+                    cap.on_removed(MakerRemoval {
+                        order_id: m_id,
+                        owner: m_owner,
+                        side: m_side,
+                        price: opp,
+                        removed_qty: m_qty,
+                        remaining: 0,
+                        reason: RemovalReason::SelfTrade,
+                    });
+                    self.remove_maker(head, m_id);
+                    *rem -= m_qty;
+                    if *rem == 0 { StpAction::TakerConsumed } else { StpAction::MakerResolved }
+                } else {
+                    // Taker is smaller: consume it by decrementing
+                    // the maker. No fill books for the consumed
+                    // quantity — report the decrement so the maker's
+                    // obligation tracks the live qty.
+                    let new_qty = m_qty - *rem;
+                    cap.on_removed(MakerRemoval {
+                        order_id: m_id,
+                        owner: m_owner,
+                        side: m_side,
+                        price: opp,
+                        removed_qty: *rem,
+                        remaining: new_qty,
+                        reason: RemovalReason::SelfTrade,
+                    });
+                    self.pool[head].qty = Qty(new_qty);
+                    self.book.reduce_total(opp, *rem);
+                    *rem = 0;
+                    StpAction::TakerConsumed
+                }
+            }
+            StpMode::None => {
+                // The caller only invokes this for a mode other than
+                // `None`; a defensive fallthrough keeps matching.
+                StpAction::MakerResolved
+            }
+        }
     }
 
     /// Detach an exhausted or STP-canceled maker from the book and

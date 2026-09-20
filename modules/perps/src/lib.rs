@@ -499,10 +499,12 @@ struct ReduceOnlyCap<'a> {
     /// a normal sell can exhaust the cover a reduce-only sell
     /// behind it would have needed.
     spent: BTreeMap<Address, u64>,
-    /// `(order_id, owner)` pairs the gate removed as dead: the
-    /// module drops their reservations and reports
-    /// `reduce_only_cancel` after the sweep.
-    dead: Vec<(OrderId, Address)>,
+    /// Every maker the sweep shrank or removed without a fill —
+    /// cap kills, but also self-trade-prevention removals and
+    /// decrements, whose reservations need the same release. The
+    /// engine reports each via `on_removed`; the module consumes
+    /// them after the sweep.
+    removed: Vec<trading::MakerRemoval>,
 }
 
 impl trading::MakerCap for ReduceOnlyCap<'_> {
@@ -519,22 +521,16 @@ impl trading::MakerCap for ReduceOnlyCap<'_> {
         let opposing =
             (pos_size > 0 && resv.side == Side::Sell) || (pos_size < 0 && resv.side == Side::Buy);
         if !opposing {
-            if resv.reduce_only {
-                // No reducible position on this side — the order can
-                // only open exposure, which its flag forbids.
-                self.dead.push((id, owner));
-                return 0;
-            }
-            return book_qty;
+            // A reduce-only order with no reducible position can
+            // only open exposure — cap it at zero; the engine then
+            // reports the removal via `on_removed`.
+            return if resv.reduce_only { 0 } else { book_qty };
         }
         if resv.reduce_only {
             let used = self.spent.get(&owner).copied().unwrap_or(0);
             let remaining = pos_size.unsigned_abs().saturating_sub(used);
             let cap = remaining.min(book_qty);
             *self.spent.entry(owner).or_insert(0) += cap;
-            if cap < book_qty {
-                self.dead.push((id, owner));
-            }
             cap
         } else {
             // A normal opposing maker burns cover its reduce-only
@@ -547,9 +543,13 @@ impl trading::MakerCap for ReduceOnlyCap<'_> {
         }
     }
 
+    fn on_removed(&mut self, removal: trading::MakerRemoval) {
+        self.removed.push(removal);
+    }
+
     fn reset(&mut self) {
         self.spent.clear();
-        self.dead.clear();
+        self.removed.clear();
     }
 }
 
@@ -1989,11 +1989,12 @@ impl PerpsModule {
         };
 
         fills.clear();
-        let mut cap = ReduceOnlyCap { accounts, market, spent: BTreeMap::new(), dead: Vec::new() };
+        let mut cap =
+            ReduceOnlyCap { accounts, market, spent: BTreeMap::new(), removed: Vec::new() };
         let outcome = engine
             .place_with_cap(order, fills, &mut cap)
             .map_err(|e| ExecError::ModuleRejected(format!("engine: {e}")))?;
-        let ReduceOnlyCap { dead, .. } = cap;
+        let ReduceOnlyCap { removed, .. } = cap;
 
         // Move fills out of the scratch buffer (no clone). The
         // buffer is left empty for the next use. This avoids a
@@ -2003,14 +2004,11 @@ impl PerpsModule {
         // contents out in O(1), leaving an empty Vec behind.
         let fills_owned: Vec<FillEvent> = std::mem::take(fills);
 
-        // Makers the cap gate removed as dead are already off the
-        // book — release their reservations now so fill application
-        // doesn't see stale entries, and report the cancel below.
-        for (oid, owner) in &dead {
-            if let Some(acct) = inner.accounts.get_mut(owner) {
-                acct.open_orders.remove(&(market, oid.0));
-            }
-        }
+        // Makers the sweep removed or decremented without a fill —
+        // cap kills and self-trade-prevention removals alike — are
+        // already off the book. Release their reservations now so
+        // fill application doesn't see stale entries.
+        Self::release_removal_reservations(&mut inner, market, &removed);
 
         // A resting remainder joins the reservation ledger (C7): the
         // uncovered tail is charged initial margin until the order
@@ -2050,13 +2048,47 @@ impl PerpsModule {
         }
 
         events.push(outcome_event(market, outcome));
-        // Report makers the reduce-only cap removed mid-sweep —
-        // their orders died at the match decision, so the cancel is
-        // reported once here rather than as post-trade repair.
-        for _ in &dead {
-            events.push(Event { module: "perps", kind: "reduce_only_cancel", data: vec![market] });
-        }
+        Self::emit_removal_events(market, &removed, &mut events);
         Ok(events)
+    }
+
+    /// Release reservations for makers the sweep removed or
+    /// decremented without a fill — call before applying fills so
+    /// stale entries don't linger. The book is authoritative for
+    /// decremented quantities.
+    fn release_removal_reservations(
+        inner: &mut Inner,
+        market: u8,
+        removed: &[trading::MakerRemoval],
+    ) {
+        for r in removed {
+            if let Some(acct) = inner.accounts.get_mut(&r.owner) {
+                if r.remaining == 0 {
+                    acct.open_orders.remove(&(market, r.order_id.0));
+                } else if let Some(resv) = acct.open_orders.get_mut(&(market, r.order_id.0)) {
+                    resv.qty = r.remaining;
+                }
+            }
+        }
+    }
+
+    /// Emit one event per non-fill book change the sweep applied:
+    /// cap kills are reduce-only cancels; self-trade removals and
+    /// decrements get their own kinds so downstream accounting sees
+    /// every obligation the book released.
+    fn emit_removal_events(market: u8, removed: &[trading::MakerRemoval], events: &mut Vec<Event>) {
+        for r in removed {
+            let kind = match r.reason {
+                trading::RemovalReason::Cap => "reduce_only_cancel",
+                trading::RemovalReason::SelfTrade if r.remaining == 0 => "stp_cancel",
+                trading::RemovalReason::SelfTrade => "stp_decrement",
+            };
+            let mut data = Vec::with_capacity(1 + 8 + 8);
+            data.push(market);
+            data.extend_from_slice(&r.order_id.0.to_le_bytes());
+            data.extend_from_slice(&r.remaining.to_le_bytes());
+            events.push(Event { module: "perps", kind, data });
+        }
     }
 
     /// Handle a cancel-order message (extracted from `handle`).
@@ -4039,6 +4071,36 @@ mod tests {
         // The dead remainder is off the book: cancel reports not-found.
         let err = perps.handle(&ctx(1), &msg::cancel(mid, ro_id)).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
+    }
+
+    /// A resting order removed by self-trade prevention releases
+    /// its margin reservation — the sweep reports the removal
+    /// through `on_removed` so nothing is stranded.
+    #[test]
+    fn stp_removal_releases_margin_reservation() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+
+        // Rest a buy at tick 400 — margin reserved against it.
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 400, 10, 1))).unwrap();
+
+        // The same owner fires an IOC sell with CancelOldest: the
+        // resting buy is removed without a fill and the IOC
+        // remainder dies, leaving no orders behind.
+        let taker = NewOrder {
+            tif: TimeInForce::Ioc,
+            stp: StpMode::CancelOldest,
+            ..limit(Side::Sell, 400, 10, 1)
+        };
+        let events = perps.handle(&ctx(1), &msg::place(mid, taker)).unwrap();
+        assert!(events.iter().any(|e| e.kind == "stp_cancel"));
+
+        // Every reservation is gone: the full deposit withdraws.
+        perps.handle(&ctx(1), &msg::withdraw(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        assert_eq!(perps.cross_margin(&addr(1)), 0);
     }
 
     /// Cover is allocated once per owner per sweep, across makers

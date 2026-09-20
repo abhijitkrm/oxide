@@ -731,7 +731,18 @@ impl ExchangeModule {
 
         // Reuse the fill buffer across calls — zero alloc.
         fills.clear();
-        let outcome = match engine.place(order, fills) {
+        // `ObserveRemovals` never restricts a fill — it records
+        // every maker the sweep shrank or removed without one (STP
+        // prevention), so the quote those orders held at rest can be
+        // released below. A resting buy IS its reservation; a maker
+        // the engine deletes unreported would strand that quote
+        // forever.
+        let mut removed: Vec<trading::MakerRemoval> = Vec::new();
+        let outcome = match engine.place_with_cap(
+            order,
+            fills,
+            &mut trading::ObserveRemovals { removed: &mut removed },
+        ) {
             Ok(outcome) => outcome,
             Err(e) => {
                 // Engine rejected the order — nothing matched and
@@ -815,7 +826,49 @@ impl ExchangeModule {
         }
 
         events.push(outcome_event(market, outcome));
+        // Release maker holds + report every non-fill book change
+        // the sweep applied, so downstream accounting sees each
+        // obligation the book released — a maker the engine deleted
+        // silently would be invisible to settlement reconciliation.
+        self.release_maker_holds(market, &removed, &mut events)?;
         Ok(events)
+    }
+
+    /// Release quote the sweep freed without a fill and emit one
+    /// event per removal/decrement: a removed resting buy held
+    /// `price × removed_qty` since it rested; a decremented one
+    /// holds `price × remaining` now, so the released slice is
+    /// `price × removed_qty` in both cases. Resting sells hold no
+    /// quote reservation (base-asset custody is a separate build) —
+    /// nothing to refund there. The credit cannot overflow: it
+    /// returns funds debited from this same account at rest time.
+    fn release_maker_holds(
+        &self,
+        market: u8,
+        removed: &[trading::MakerRemoval],
+        events: &mut Vec<Event>,
+    ) -> Result<(), ExecError> {
+        if let Some(ledger) = &self.ledger {
+            for r in removed {
+                if r.side == Side::Buy && r.removed_qty > 0 {
+                    let refund = u64::try_from(
+                        u128::from(r.price) * u128::from(r.removed_qty) / PRICE_SCALE,
+                    )
+                    .map_err(|_| {
+                        ExecError::ModuleRejected("STP release exceeds u64 quote range".to_string())
+                    })?;
+                    if refund > 0 {
+                        ledger.credit(&r.owner, refund).map_err(|_| {
+                            ExecError::ModuleRejected("STP release refund failed".to_string())
+                        })?;
+                    }
+                }
+            }
+        }
+        for r in removed {
+            events.push(removal_event(market, *r));
+        }
+        Ok(())
     }
 
     /// Handle a batch-settle message: apply pre-matched fills from
@@ -1152,6 +1205,23 @@ fn outcome_event(market: u8, outcome: OrderOutcome) -> Event {
         OrderOutcome::Killed => ("killed", vec![]),
         OrderOutcome::Rejected(reason) => ("rejected", vec![encode_reject_reason(reason)]),
     };
+    Event { module: "exchange", kind, data }
+}
+
+/// Encode a non-fill book change (STP removal or decrement) as an
+/// event: `[market][order_id][side][price][removed_qty][remaining][owner]`.
+/// `remaining == 0` means the order is gone (`stp_cancel`), `> 0` a
+/// decrement (`stp_decrement`).
+fn removal_event(market: u8, r: trading::MakerRemoval) -> Event {
+    let mut data = Vec::with_capacity(1 + 8 + 1 + 8 + 8 + 8 + 20);
+    data.push(market);
+    data.extend_from_slice(&r.order_id.0.to_le_bytes());
+    data.push(encode_side(r.side));
+    data.extend_from_slice(&r.price.to_le_bytes());
+    data.extend_from_slice(&r.removed_qty.to_le_bytes());
+    data.extend_from_slice(&r.remaining.to_le_bytes());
+    data.extend_from_slice(&r.owner.0);
+    let kind = if r.remaining == 0 { "stp_cancel" } else { "stp_decrement" };
     Event { module: "exchange", kind, data }
 }
 
@@ -2130,6 +2200,59 @@ mod tests {
         // Reserved 16_000, paid 15_000 → net 15_000 gone.
         assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 15_000);
         assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000);
+    }
+
+    /// An STP-removed resting buy releases its held quote — a
+    /// resting buy IS its reservation, so deleting the order
+    /// without reporting the removal would strand `price × qty`
+    /// forever.
+    #[test]
+    fn stp_cancel_oldest_releases_maker_reservation() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+
+        // Owner 1 rests a buy: 10 lots @ tick 500 → holds 150_000.
+        let maker = limit(Side::Buy, 500, 10, 1);
+        ex.handle(&ctx(1), &msg::place(mid, maker)).unwrap();
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 150_000);
+
+        // The same owner sells with CancelOldest: the resting buy is
+        // removed with no fill — its reservation must come back.
+        let taker = NewOrder { stp: StpMode::CancelOldest, ..limit(Side::Sell, 500, 10, 1) };
+        let events = ex.handle(&ctx(1), &msg::place(mid, taker)).unwrap();
+
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000);
+        assert!(events.iter().any(|e| e.kind == "stp_cancel"));
+        // The resting buy is gone; the taker's sell rests instead.
+        assert_eq!(ex.resting_count(mid), 1);
+    }
+
+    /// A partial STP decrement releases only the consumed slice —
+    /// the maker's remaining reservation tracks the live book qty.
+    #[test]
+    fn stp_decrement_releases_consumed_slice() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+
+        let maker = limit(Side::Buy, 500, 10, 1);
+        ex.handle(&ctx(1), &msg::place(mid, maker)).unwrap();
+
+        // Same owner sells 4 lots with DecrementAndCancel: the
+        // maker shrinks 10 → 6 with no fill; refund 4 lots = 60_000.
+        let taker = NewOrder { stp: StpMode::DecrementAndCancel, ..limit(Side::Sell, 500, 4, 1) };
+        let events = ex.handle(&ctx(1), &msg::place(mid, taker)).unwrap();
+
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 90_000);
+        let dec = events.iter().find(|e| e.kind == "stp_decrement").expect("decrement event");
+        // Data tail: [removed_qty:8][remaining:8][owner:20].
+        let remaining = u64::from_le_bytes(dec.data[26..34].try_into().unwrap());
+        assert_eq!(remaining, 6_000);
+
+        // A later cancel refunds only what the book still holds:
+        // price × 6 lots = 90_000 — no double-release of the
+        // consumed slice.
+        ex.handle(&ctx(1), &msg::cancel(mid, OrderId(0))).unwrap();
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000);
     }
 
     /// Snapshot round-trip: a market with resting orders on both

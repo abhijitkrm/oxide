@@ -57,7 +57,8 @@ pub mod pool;
 
 pub use book::{BookBackend, DenseBook, MarketConfig, PriceLevel};
 pub use engine::{
-    CanceledOrder, FillEvent, MakerCap, MatchingEngine, NoCap, OrderOutcome, RestingEntry,
+    CanceledOrder, FillEvent, MakerCap, MakerRemoval, MatchingEngine, NoCap, ObserveRemovals,
+    OrderOutcome, RemovalReason, RestingEntry,
 };
 pub use error::{RejectReason, TradingError};
 pub use idmap::IdMap;
