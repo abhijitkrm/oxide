@@ -1091,6 +1091,15 @@ struct ExecSync {
     /// instead of sending into a void. Terminal: the lane is never
     /// respawned (a second spawn is already a panic).
     lane_dead: bool,
+    /// The height currently inside `execute_block` on the worker —
+    /// `Some` only while module state is mid-mutation. When the
+    /// lane dies with this set AND the height has no recorded root,
+    /// the block was PARTIALLY APPLIED: fees charged, nonces
+    /// advanced, and module state mutated for some prefix of its
+    /// txs. Replaying such a block re-runs those mutations on
+    /// already-mutated state and can produce a silently wrong root
+    /// — the backlog drain must refuse rather than re-execute.
+    in_flight: Option<u64>,
 }
 
 /// RAII marker that flags the execution lane dead when the worker
@@ -1108,15 +1117,19 @@ struct LaneDeath {
 impl Drop for LaneDeath {
     fn drop(&mut self) {
         let (lock, cv) = &*self.sync;
-        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lane_dead = true;
+        let in_flight = {
+            let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.lane_dead = true;
+            s.in_flight
+        };
         // Wake every waiter: heights the dead lane still owes will
         // never execute — `attest_state` must stop waiting now, not
         // at the next commit.
         cv.notify_all();
         if std::thread::panicking() {
             eprintln!(
-                "executor: exec lane worker panicked — lane marked dead; \
-                 committed backlog will execute inline at finalize"
+                "executor: exec lane worker panicked — lane marked dead \
+                 (in-flight height: {in_flight:?})"
             );
         }
     }
@@ -1282,7 +1295,12 @@ impl Executor {
             next_proposal_height: Mutex::new(0),
             exec_lane_tx: std::sync::OnceLock::new(),
             exec_sync: std::sync::Arc::new((
-                Mutex::new(ExecSync { enqueued: None, executed: None, lane_dead: false }),
+                Mutex::new(ExecSync {
+                    enqueued: None,
+                    executed: None,
+                    lane_dead: false,
+                    in_flight: None,
+                }),
                 std::sync::Condvar::new(),
             )),
             events: Mutex::new(Vec::new()),
@@ -1450,6 +1468,16 @@ impl Executor {
                     // to serve — exit rather than resurrect it.
                     let Some(executor) = weak.upgrade() else { return };
                     let height = block.height.value();
+                    // Mark the block in-flight BEFORE executing: if
+                    // `execute_block` panics below, `LaneDeath` fires
+                    // with this set and no root recorded — the state
+                    // the recovery path must treat as partially
+                    // applied, never blindly replayed.
+                    {
+                        let (lock, _cv) = &*sync;
+                        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight =
+                            Some(height);
+                    }
                     let root = executor.execute_block(&block);
                     executor
                         .state_roots
@@ -1459,8 +1487,11 @@ impl Executor {
                     // Blocks arrive in commit order, so the newest
                     // height is always the watermark.
                     let (lock, cv) = &*sync;
-                    lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).executed =
-                        Some(height);
+                    {
+                        let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        s.in_flight = None;
+                        s.executed = Some(height);
+                    }
                     cv.notify_all();
                 }
             })
@@ -1481,7 +1512,45 @@ impl Executor {
     /// chain-level fault. Crashing on the committing thread with
     /// the real panic is honest failure propagation — masking it
     /// would convert a loud crash into a silent liveness stall.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the dead lane was mid-`execute_block` on a height
+    /// that never recorded a root: that block was PARTIALLY APPLIED
+    /// (fees charged, nonces advanced, module state mutated for some
+    /// prefix of its txs), and re-executing it would replay those
+    /// mutations on already-mutated state — potentially producing a
+    /// silently wrong root rather than a second panic. There is no
+    /// whole-block rollback to restore the pre-block state, so the
+    /// only safe course is to halt: recovery must come from durable
+    /// state (journal/snapshot/backend) at process restart. Heights
+    /// the lane never started are unaffected — replaying an
+    /// unstarted block mutates nothing twice.
     fn execute_committed_backlog(&self) {
+        // Fail closed on a partially applied block before replaying
+        // anything. `in_flight` is set by the worker around
+        // `execute_block` and cleared only after the root lands, so
+        // `Some(h)` + no root = the worker died mid-mutation.
+        let poisoned = {
+            let (lock, _cv) = &*self.exec_sync;
+            let in_flight =
+                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight;
+            in_flight.filter(|h| {
+                !self
+                    .state_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(h)
+            })
+        };
+        if let Some(h) = poisoned {
+            panic!(
+                "executor: execution lane died mid-execution of committed block {h}; \
+                 the block may be partially applied (fees/nonces/module state already \
+                 mutated) and cannot be safely replayed in-process — halting; restart \
+                 to recover from durable state"
+            );
+        }
         loop {
             // Oldest committed height still lacking a state root —
             // height order preserves the worker's serial ordering
@@ -1513,11 +1582,26 @@ impl Executor {
                 // than spin if invariants ever change.
                 break;
             };
+            // Mark the height in-flight around the inline execution
+            // exactly as the worker does: if `execute_block` panics
+            // here, the panic propagates to the committer AND the
+            // marker stays set — so a later `finalize_block` meets
+            // the same fail-closed check above instead of silently
+            // retrying a block this drain partially applied.
+            {
+                let (lock, _cv) = &*self.exec_sync;
+                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight =
+                    Some(height);
+            }
             let root = self.execute_block(&block);
             self.state_roots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert_retained(height, root, self.history_retention);
+            {
+                let (lock, _cv) = &*self.exec_sync;
+                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight = None;
+            }
         }
         // Advance the executed watermark to the newest recorded
         // root: heights the dead lane owed have now been executed
@@ -4895,13 +4979,53 @@ mod tests {
         assert!(att.is_none(), "a height lost to a dead lane has no root to attest");
     }
 
+    /// A module that mutates observable state BEFORE panicking —
+    /// the partial-application case the old `PanicOnceModule`
+    /// fixture could not express (it detonated before mutating, so
+    /// its replay was benign by construction). Here the mutation
+    /// lands first, so the block is provably half-applied when the
+    /// worker dies.
+    struct MutateThenPanicModule {
+        /// Invocation count — the observable mutation proving
+        /// execution began before the fault.
+        calls: Mutex<u64>,
+        /// Set until the first `handle` detonates it.
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl Module for MutateThenPanicModule {
+        fn name(&self) -> &'static str {
+            "mutate-then-panic"
+        }
+        fn id(&self) -> u8 {
+            3
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            // Mutation FIRST — the moment this lands the block is
+            // partially applied, and replaying it would repeat it.
+            *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            assert!(
+                !self.armed.swap(false, std::sync::atomic::Ordering::SeqCst),
+                "mutate-then-panic: injected mid-mutation fault"
+            );
+            Ok(vec![Event { module: "mutate-then-panic", kind: "call", data: vec![] }])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            Hash([u8::try_from(c.max(1)).unwrap_or(0xff); 32])
+        }
+    }
+
     #[test]
     fn exec_lane_death_backfills_committed_blocks() {
-        // When the lane dies, the next `finalize_block` must drive
-        // every committed-but-unexecuted height inline — not just
-        // the new block — so no committed height is left permanently
-        // rootless. The panic-once module succeeds on re-execution,
-        // so the backlog completes.
+        // A lane that dies mid-`execute_block` leaves a PARTIALLY
+        // APPLIED block — replaying it would re-run fees, nonces,
+        // and module mutations on already-mutated state. The backlog
+        // drain must fail closed (panic) instead of re-executing:
+        // recovery belongs to durable state at restart, not to a
+        // blind in-process replay.
         let mut executor = Executor::new(100);
         executor.register_module(Arc::new(PanicOnceModule::new()));
         let executor = Arc::new(executor);
@@ -4915,22 +5039,67 @@ mod tests {
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        // Block 1: the send fails on the dead lane — the backlog
-        // path must execute BOTH committed heights inline (block 0
-        // replays cleanly now that the fault has fired).
+        // Block 1's finalize drives the backlog drain — which must
+        // refuse to replay the partially applied block 0.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.finalize_block(&FinalizedBlock {
+                height: Height::new(1),
+                txs: vec![make_tx_with_nonce(2, &[2], 1)],
+                signers: vec![],
+            });
+        }));
+        let payload = result.expect_err("the drain must fail closed on a partially applied block");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("partially applied"), "halt message must name the cause, got: {msg}");
+    }
+
+    #[test]
+    fn exec_lane_death_mid_mutation_is_not_replayed() {
+        // The `MutateThenPanicModule` lands its mutation BEFORE the
+        // fault — block 0 is provably half-applied. The drain's
+        // refusal must ALSO leave the mutation unreplayed: `calls`
+        // stays at exactly 1 — a blind replay would have run the
+        // same mutation a second time.
+        let mut executor = Executor::new(100);
+        let module = Arc::new(MutateThenPanicModule {
+            calls: Mutex::new(0),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+        executor.register_module(module.clone() as Arc<dyn Module>);
+        let executor = Arc::new(executor);
+        executor.spawn_exec_lane();
+
         executor.finalize_block(&FinalizedBlock {
-            height: Height::new(1),
-            txs: vec![make_tx_with_nonce(2, &[2], 1)],
+            height: Height::new(0),
+            txs: vec![make_tx_with_nonce(3, &[1], 0)],
             signers: vec![],
         });
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
-        assert!(
-            executor.attest_state(Height::new(0)).is_some(),
-            "the backlog must execute the block that killed the worker"
+        // The mutation landed before the panic — the block WAS
+        // partially applied.
+        assert_eq!(
+            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "the pre-panic mutation must have landed exactly once"
         );
-        assert!(
-            executor.attest_state(Height::new(1)).is_some(),
-            "the backlog must execute the newly committed block"
+
+        // The drain refuses; the mutation is never replayed.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.finalize_block(&FinalizedBlock {
+                height: Height::new(1),
+                txs: vec![make_tx_with_nonce(3, &[2], 1)],
+                signers: vec![],
+            });
+        }));
+        assert_eq!(
+            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "a refused replay must not run the mutation a second time"
         );
     }
 }

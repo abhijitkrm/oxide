@@ -1980,6 +1980,26 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     unsaved data is retried automatically, and nothing counts as
     "saved" until the disk actually confirms it.
 
+- **Execution-lane recovery could replay a half-applied block**
+  (`crates/executor`)
+  - The async execution worker marks which committed height it is
+    mid-execution on. If the worker dies, the backlog-drain path now
+    checks that marker before replaying: a block that was partially
+    applied (fees charged, nonces advanced, module state mutated for
+    some prefix of its transactions) and never produced a state root
+    cannot be safely re-executed from the mutated in-memory state —
+    the node now halts instead, and recovery must come from durable
+    state at restart.
+  - Blocks the dead worker never started still replay safely
+    inline, and a worker that dies between blocks (no in-flight
+    height) leaves the drain fully functional.
+  - **In plain words:** previously, if the execution thread crashed
+    halfway through applying a block, the node would silently re-run
+    that block on top of its own partial effects — potentially
+    charging fees or advancing nonces twice. Now the node stops and
+    requires a restart that rebuilds state from disk, the only place
+    a consistent pre-block state exists.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

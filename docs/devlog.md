@@ -16508,3 +16508,35 @@ page cache (only power loss distinguishes a synced seal; that needs
 fault injection this level cannot provide). 55 storage / 185 evm /
 31 conformance / 17 exploit / 5 multiblock tests green; fmt +
 clippy clean.
+
+## Execution-lane recovery fails closed on partial application (audit 3.4)
+
+The async execution lane detected worker death and replayed every
+committed-but-rootless block inline — correct only if the block the
+worker died on had never started mutating. `execute_block` applies
+fees, nonces, and module state incrementally with no whole-block
+rollback, so replaying a mid-mutation block would re-run those
+effects on already-mutated state and could produce a silently wrong
+state root rather than a second panic.
+
+The lane now tracks the in-flight height in `ExecSync`: the worker
+sets it before `execute_block` and clears it only after the root is
+recorded, so `Some(h)` + missing root at `LaneDeath` time means
+"partially applied." `execute_committed_backlog` checks the marker
+first and panics — halt is the only safe response since the
+pre-block state no longer exists in memory; recovery is the
+journal/snapshot/backend's job at restart. The drain marks its own
+inline executions in-flight too, so a drain-side panic poisons
+later drains identically instead of retrying blind.
+
+Blocks the worker never started remain safe to replay — the
+marker-and-root check distinguishes "never touched" from
+"half-applied" exactly, and a worker that dies after clearing the
+marker (root already recorded) leaves the drain fully functional.
+
+The old `PanicOnceModule` fixture detonated before mutating, so it
+only proved a benign replay. The new `MutateThenPanicModule` lands
+its mutation first, then panics — the test asserts the drain
+refuses AND that `calls` stays at exactly 1 (a blind replay would
+have run the mutation twice). 85 executor unit + 5 signed-tx
+integration tests green; fmt + clippy clean.
