@@ -1095,7 +1095,7 @@ pub fn validate_effective_config(
 /// keys, operator addresses).
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex".to_string());
     }
     (0..s.len())
@@ -2065,11 +2065,21 @@ mod tests {
         submit(&mut node, gov, &governance::msg::vote(0, governance::Vote::Yes));
         // The sequencer only mints non-empty blocks — drive the
         // voting window (1000) + timelock (100) with junk txs that
-        // reject at execution but still carry a block each.
+        // reject at execution but still carry a block each. Each junk
+        // tx comes from a FRESH sender at nonce 0: mempool `select`
+        // anchors a sender's chain at its last-executed nonce + 1,
+        // which the async exec lane updates a block behind commits —
+        // under CPU contention a same-sender nonce chain queues behind
+        // that lagging anchor and `run_until_idle` produces no block,
+        // silently under-producing heights (observed flake: the loop
+        // finished in 0.14s with the proposal still in Voting). A
+        // first-seen sender's nonce-0 tx is always pending, so exactly
+        // 1_150 heights are produced regardless of lane lag.
         let junk = governance::msg::vote(999_999, governance::Vote::Yes);
-        for _ in 0..1_150 {
-            node.engine().submit_tx(build_tx_as(validator, nonce, gov, &junk));
-            nonce += 1;
+        for i in 0..1_150u64 {
+            let mut a = [0xAAu8; 20];
+            a[..8].copy_from_slice(&i.to_le_bytes());
+            node.engine().submit_tx(build_tx_as(primitives::Address(a), 0, gov, &junk));
             node.engine().run_until_idle();
         }
         // Execution rides the exec lane — wait for the watermark,
