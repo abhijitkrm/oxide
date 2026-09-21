@@ -1171,6 +1171,67 @@ impl Module for ExchangeModule {
     }
 }
 
+/// Governance-enacted parameter application — the module's half of
+/// the deposit → quorum → veto → timelock → apply lifecycle. The
+/// exchange registers under the `"exchange"` prefix and owns exactly
+/// one key:
+///
+/// `exchange.fee_vault.withdraw` — value `[market:1B][dest:20B]
+/// [amount:8B LE]` (29 bytes): pays `amount` of the market's accrued
+/// fee vault out of module custody directly to `dest`'s ledger
+/// balance. The vault is a sink by design — the ONLY exit is this
+/// governance-gated path, so fee spending carries a deposited,
+/// quorum-decided, timelocked mandate rather than any single key.
+///
+/// Rejects foreign keys (the sink owns its keyspace, not governance's
+/// routing guesses), malformed values, zero amounts, and a vault that
+/// does not cover the amount — an `Err` lands the proposal in
+/// `ApplyFailed`, terminal, never retried.
+impl framework::ParameterSink for ExchangeModule {
+    fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError> {
+        if key != b"exchange.fee_vault.withdraw" {
+            return Err(ExecError::ModuleRejected(
+                "exchange: unknown governed parameter".to_string(),
+            ));
+        }
+        if value.len() != 29 {
+            return Err(ExecError::Malformed);
+        }
+        let market = value[0];
+        let Ok(dest_bytes) = <[u8; 20]>::try_from(&value[1..21]) else {
+            return Err(ExecError::Malformed);
+        };
+        let Ok(amount_bytes) = <[u8; 8]>::try_from(&value[21..29]) else {
+            return Err(ExecError::Malformed);
+        };
+        let dest = Address(dest_bytes);
+        let amount = u64::from_le_bytes(amount_bytes);
+        if amount == 0 {
+            return Err(ExecError::ModuleRejected("fee_vault.withdraw: zero amount".to_string()));
+        }
+        let ledger = self.ledger.as_ref().ok_or_else(|| {
+            ExecError::ModuleRejected("fee_vault.withdraw: no ledger wired".to_string())
+        })?;
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vault = inner.fee_vault.get(&market).copied().unwrap_or(0);
+        if vault < amount {
+            return Err(ExecError::ModuleRejected(
+                "fee_vault.withdraw: insufficient vault balance".to_string(),
+            ));
+        }
+        // Credit before decrementing custody — same ordering as
+        // `handle_withdraw_base`: a credit failure leaves the vault
+        // untouched (the proposal then records ApplyFailed rather
+        // than silently losing the funds).
+        ledger.credit(&dest, amount).map_err(|_| {
+            ExecError::ModuleRejected("fee_vault.withdraw: credit failed".to_string())
+        })?;
+        // `vault >= amount` was just proven — cannot underflow.
+        *inner.fee_vault.get_mut(&market).ok_or(ExecError::Malformed)? -= amount;
+        Ok(())
+    }
+}
+
 impl ExchangeModule {
     /// Handle a cancel-order message (extracted from `handle`):
     /// remove the resting order and release its reservation — quote
@@ -4869,5 +4930,120 @@ mod tests {
                 prop_assert_eq!(total_base_custody(&ex), custodied);
             }
         }
+    }
+
+    // ── Governance parameter sink ────────────────────────────────
+    // The fee vault's only exit is the governance apply path: a
+    // deposited, quorum-decided, timelocked proposal delivers
+    // `exchange.fee_vault.withdraw` → `[market][dest][amount]`.
+
+    /// Encode a `fee_vault.withdraw` value: `[market:1B][dest:20B]
+    /// [amount:8B LE]`.
+    fn withdraw_value(market: u8, dest: u8, amount: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(29);
+        v.push(market);
+        v.extend_from_slice(&addr(dest).0);
+        v.extend_from_slice(&amount.to_le_bytes());
+        v
+    }
+
+    /// A passed governance withdrawal pays the vault's accrued fees
+    /// out of custody to the mandated destination — and the vault
+    /// decrements exactly, so the committed accounting stays closed.
+    #[test]
+    fn fee_vault_withdrawal_pays_out_via_governance() {
+        let (ledger, ex) = ledger_and_exchange();
+        // Accrue 75 in fees with a real fill (sell 5 lots @500 vs
+        // buy 5 lots @500 — fee = FEE_BPS of the 75_000 quote leg).
+        ex.handle(&ctx(9), &msg::place(0, limit(Side::Sell, 500, 5, 9))).unwrap();
+        ex.handle(&ctx(1), &msg::place(0, limit(Side::Buy, 500, 5, 1))).unwrap();
+        assert_eq!(ex.fee_vault(0), 75);
+
+        let dest = addr(0x42);
+        let before = ledger.balance(&dest);
+        framework::ParameterSink::apply_param(
+            &ex,
+            b"exchange.fee_vault.withdraw",
+            &withdraw_value(0, 0x42, 50),
+        )
+        .unwrap();
+        assert_eq!(ledger.balance(&dest), before + 50);
+        assert_eq!(ex.fee_vault(0), 25, "vault decremented by the paid amount");
+
+        // Drain the rest — the vault goes to zero, never negative.
+        framework::ParameterSink::apply_param(
+            &ex,
+            b"exchange.fee_vault.withdraw",
+            &withdraw_value(0, 0x42, 25),
+        )
+        .unwrap();
+        assert_eq!(ex.fee_vault(0), 0);
+        assert!(
+            framework::ParameterSink::apply_param(
+                &ex,
+                b"exchange.fee_vault.withdraw",
+                &withdraw_value(0, 0x42, 1),
+            )
+            .is_err()
+        );
+        assert_eq!(ex.fee_vault(0), 0, "failed withdrawal left the vault untouched");
+    }
+
+    /// The sink owns its keyspace: foreign keys, malformed values,
+    /// zero amounts, and vault overdrafts all reject — governance
+    /// records `ApplyFailed`, never a partial or silent effect.
+    #[test]
+    fn fee_vault_sink_rejects_bad_applies() {
+        let (ledger, ex) = ledger_and_exchange();
+        ex.handle(&ctx(9), &msg::place(0, limit(Side::Sell, 500, 5, 9))).unwrap();
+        ex.handle(&ctx(1), &msg::place(0, limit(Side::Buy, 500, 5, 1))).unwrap();
+        assert_eq!(ex.fee_vault(0), 75);
+        let dest = addr(0x42);
+        let before = ledger.balance(&dest);
+
+        // A key the exchange does not own — the prefix routed here
+        // but the path is foreign.
+        assert!(
+            framework::ParameterSink::apply_param(
+                &ex,
+                b"exchange.orderbook.steal",
+                &withdraw_value(0, 0x42, 1),
+            )
+            .is_err()
+        );
+        // Malformed value lengths.
+        assert!(
+            framework::ParameterSink::apply_param(&ex, b"exchange.fee_vault.withdraw", &[1, 2, 3],)
+                .is_err()
+        );
+        // Zero amount — a no-op withdrawal is meaningless.
+        assert!(
+            framework::ParameterSink::apply_param(
+                &ex,
+                b"exchange.fee_vault.withdraw",
+                &withdraw_value(0, 0x42, 0),
+            )
+            .is_err()
+        );
+        // Overdraft — the vault holds 75.
+        assert!(
+            framework::ParameterSink::apply_param(
+                &ex,
+                b"exchange.fee_vault.withdraw",
+                &withdraw_value(0, 0x42, 76),
+            )
+            .is_err()
+        );
+        // An unlisted market has no vault — implicitly insufficient.
+        assert!(
+            framework::ParameterSink::apply_param(
+                &ex,
+                b"exchange.fee_vault.withdraw",
+                &withdraw_value(9, 0x42, 1),
+            )
+            .is_err()
+        );
+        assert_eq!(ex.fee_vault(0), 75);
+        assert_eq!(ledger.balance(&dest), before, "rejections moved nothing");
     }
 }

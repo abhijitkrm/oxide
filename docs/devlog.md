@@ -18045,3 +18045,24 @@ crossing, expiry/quorum/veto burns, per-depositor refunds, the
 depositor cap, fail-closed paths, timelock delay, apply/noop/failed
 terminals, and a snapshot round-trip that keeps mid-deposit,
 mid-vote, and mid-timelock proposals settling correctly.
+
+### Exchange: the fee vault's only exit is a governance mandate
+
+`fee_vault` accrued protocol fees with no withdrawal path — a sink
+by design until governance could meaningfully authorize a spend.
+With the lifecycle landed, `ExchangeModule` implements
+`framework::ParameterSink`: `exchange.fee_vault.withdraw` with value
+`[market:1B][dest:20B][amount:8B LE]` pays the vault out of module
+custody to the destination's ledger balance — credit-before-debit
+(same ordering as `withdraw_base`), exact-amount only, overdraft
+and foreign keys rejected so a bad proposal lands `ApplyFailed`,
+terminal. Node wiring registers the exchange under the `"exchange"`
+prefix.
+
+The proof is end-to-end, not unit-only: a node-level test delegates
+stake for voting power, runs a real fill to accrue 75 units of
+fees, submits propose → deposit → vote envelopes, drives ~1150 real
+sequenced blocks through the voting window and timelock, waits for
+the exec lane, and finds the 50-unit payout on the destination's
+EVM balance. Unit tests pin the sink contract: exact payout,
+overdraft/malformed/zero/foreign-key rejections move nothing.

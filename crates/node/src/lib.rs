@@ -520,6 +520,10 @@ pub struct AssembledExecutor {
 /// genesis validator has zero stake, or if a genesis BLS key is not
 /// 48 bytes.
 #[must_use]
+// Module assembly is inherently linear: one register call per
+// module, in dependency order — the function's length tracks the
+// module count, not its complexity.
+#[allow(clippy::too_many_lines)]
 pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     // Build the executor with standard modules. Use `with_config`
     // so the parallel threshold is configurable (default: 32 txs,
@@ -669,9 +673,14 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     oracle.with_sink(perps.clone());
     executor.register_module(oracle);
     // Governance: stake-weighted parameter lifecycle — deposits
-    // escrow on the EVM ledger, staking supplies the voting power.
-    let gov = governance::GovernanceModule::new().with_committee(staking_module.clone());
-    executor.register_module(Arc::new(gov.with_ledger(evm_module.clone())));
+    // escrow on the EVM ledger, staking supplies the voting power,
+    // and "exchange.*" keys route to the exchange's parameter sink
+    // (fee-vault withdrawals carry a governance mandate).
+    let gov = governance::GovernanceModule::new()
+        .with_committee(staking_module.clone())
+        .with_ledger(evm_module.clone())
+        .with_sink("exchange", exchange.clone());
+    executor.register_module(Arc::new(gov));
     // Wire the exchange and perps modules into the EVM for
     // read-only precompiles (plan.md §10), then register the EVM.
     evm_module.set_native_modules(Some(exchange), Some(perps));
@@ -1944,5 +1953,131 @@ mod tests {
         let key = crypto::BlsSecretKey::from_ikm(&[1u8; 32]).expect("BLS key");
         let expected_beneficiary = crypto::bls::validator_address(&key.public_key());
         assert_eq!(sealed.coinbase.0, expected_beneficiary.0);
+    }
+
+    /// An unsigned envelope with an explicit sender and nonce — the
+    /// default-genesis validator `[0u8;20]` is the funded proposer/
+    /// depositor/voter; trader senders get their own addresses and
+    /// nonces must stay monotonic per sender.
+    fn build_tx_as(
+        sender: primitives::Address,
+        nonce: u64,
+        module_id: u8,
+        module_payload: &[u8],
+    ) -> types::TxBytes {
+        let fee = 100u64;
+        let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
+        bytes.extend_from_slice(&sender.0);
+        bytes.extend_from_slice(&nonce.to_le_bytes());
+        bytes.extend_from_slice(&fee.to_le_bytes());
+        bytes.push(module_id);
+        bytes.extend_from_slice(module_payload);
+        types::TxBytes::new(bytes)
+    }
+
+    /// The whole governance lifecycle driving a real exchange state
+    /// change: a fill accrues `fee_vault`, a funded proposal passes
+    /// quorum, waits out the timelock, and the exchange's
+    /// `ParameterSink` pays the withdrawal to the mandated address —
+    /// all through real engine-produced blocks.
+    #[test]
+    fn governance_applies_fee_vault_withdrawal_end_to_end() {
+        let config = NodeConfig {
+            consensus: ConsensusConfig::Sequencer,
+            max_mempool_entries: 10_000,
+            parallel_threshold: 32,
+            evm_persistence: false,
+            storage_path: None,
+            settlement_operator: None,
+            min_fee: 0,
+            chain_id: 1,
+            require_signed_txs: false,
+            history_retention: None,
+            ..Default::default()
+        };
+        let mut node = Node::assemble(&config);
+        let validator = primitives::Address([0u8; 20]);
+        let gov = framework::module_id::GOVERNANCE;
+        let exch = framework::module_id::EXCHANGE;
+        let staking_id = framework::module_id::STAKING;
+        // Nonces are per-sender monotonic — validator txs take 0..,
+        // traders take their own senders.
+        let mut nonce = 0u64;
+        let mut submit = |node: &mut Node, module_id: u8, payload: &[u8]| {
+            node.engine().submit_tx(build_tx_as(validator, nonce, module_id, payload));
+            nonce += 1;
+            node.engine().run_until_idle();
+        };
+
+        // Give the validator bonded voting power — genesis registers
+        // it with zero stake; delegation supplies the power.
+        submit(&mut node, staking_id, &staking::msg::delegate(validator, 1_000_000));
+
+        // Accrue a real fee into the vault: fund two traders, move
+        // base into custody, then cross a 5-lot fill at tick 500 —
+        // quote leg 75_000 units, FEE_BPS=10 → vault gets 75.
+        let buyer = primitives::Address([0xB0; 20]);
+        let seller = primitives::Address([0x50; 20]);
+        node.fund_evm_account(&buyer, 10u128.pow(21));
+        node.fund_evm_account(&seller, 10u128.pow(21));
+        let dep = exchange::msg::deposit_base(0, 1_000_000);
+        node.engine().submit_tx(build_tx_as(buyer, 0, exch, &dep));
+        node.engine().submit_tx(build_tx_as(seller, 0, exch, &dep));
+        let sell = exchange::msg::place(
+            0,
+            trading::NewOrder {
+                side: trading::Side::Sell,
+                order_type: trading::OrderType::Limit,
+                tif: trading::TimeInForce::Gtc,
+                price: primitives::fixed::Price(1_000_000_000 + 500 * 1_000_000),
+                qty: primitives::fixed::Qty(5_000),
+                owner: seller,
+                stp: trading::StpMode::None,
+            },
+        );
+        node.engine().submit_tx(build_tx_as(seller, 1, exch, &sell));
+        let buy = exchange::msg::place(
+            0,
+            trading::NewOrder {
+                side: trading::Side::Buy,
+                order_type: trading::OrderType::Limit,
+                tif: trading::TimeInForce::Gtc,
+                price: primitives::fixed::Price(1_000_000_000 + 500 * 1_000_000),
+                qty: primitives::fixed::Qty(5_000),
+                owner: buyer,
+                stp: trading::StpMode::None,
+            },
+        );
+        node.engine().submit_tx(build_tx_as(buyer, 1, exch, &buy));
+        node.engine().run_until_idle();
+
+        // Propose the withdrawal: value `[market][dest][amount]`.
+        let dest = primitives::Address([0xDE; 20]);
+        let mut value = Vec::with_capacity(29);
+        value.push(0u8);
+        value.extend_from_slice(&dest.0);
+        value.extend_from_slice(&50u64.to_le_bytes());
+        submit(&mut node, gov, &governance::msg::propose(b"exchange.fee_vault.withdraw", &value));
+        // Fund it past MIN_DEPOSIT (1_000_000 units) → Voting opens.
+        submit(&mut node, gov, &governance::msg::deposit(0, 1_000_000));
+        // The validator's 1M power is the whole live committee —
+        // quorum and majority in one ballot.
+        submit(&mut node, gov, &governance::msg::vote(0, governance::Vote::Yes));
+        // The sequencer only mints non-empty blocks — drive the
+        // voting window (1000) + timelock (100) with junk txs that
+        // reject at execution but still carry a block each.
+        let junk = governance::msg::vote(999_999, governance::Vote::Yes);
+        for _ in 0..1_150 {
+            node.engine().submit_tx(build_tx_as(validator, nonce, gov, &junk));
+            nonce += 1;
+            node.engine().run_until_idle();
+        }
+        // Execution rides the exec lane — wait for the watermark,
+        // then the vault's 50 units must sit on `dest` in wei.
+        let height = node.engine().finalized_height().expect("blocks finalized");
+        node.app().attest_state(height).expect("exec lane reached the tip");
+        let evm = node.evm_module().expect("evm module registered");
+        let got = framework::Balances::balance(evm, &dest);
+        assert_eq!(got, 50, "governance-enacted withdrawal paid dest 50 units");
     }
 }

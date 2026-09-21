@@ -1138,6 +1138,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     fail-closed deposit path, timelock delay, sink apply/noop/
     failed terminals, lifecycle snapshot round-trip.
 
+- **Accrued exchange fees can be spent through governance**
+  (`modules/exchange`, `crates/node`)
+  - The per-market `fee_vault` was a permanent sink — now the
+    exchange implements `framework::ParameterSink` and answers
+    `exchange.fee_vault.withdraw` (`[market][dest][amount]`): a
+    passed, timelocked governance proposal pays vault funds out of
+    module custody directly to the destination's balance.
+  - Exact amounts only — overdrafts, malformed values, zero
+    amounts, and foreign keys reject as `ApplyFailed` (terminal,
+    never retried). Credit precedes the custody decrement, so a
+    failed payout can never strand funds.
+  - **In plain words:** trading fees collected by the exchange used
+    to pile up in a vault with no door. Now the only way to spend
+    them is a funded, quorum-approved governance vote that survives
+    a review window — no single key can touch the money.
+  - Proven end-to-end: a node-level test drives deposit → fill →
+    propose → deposit → vote → ~1150 real blocks → the mandated
+    payout lands on the destination's balance.
+
 ### Fixed
 
 - **The perps backstop could not exit inventory once the book
