@@ -17844,3 +17844,44 @@ survives drop+reopen byte-identical, an unsynced batch is all-or-
 nothing across the crash (write-through or buffered — never torn),
 and a reopened backend keeps accumulating state. `JournalBackend`,
 MDBX, redb, and RocksDB all pass it.
+
+## Trading: declarative spec properties — a second oracle that can't share the engine's bugs
+
+The matching oracle (`ModelBook`) verifies behavior by re-running the
+sweep on different data structures — it catches indexing and
+bookkeeping errors, but a *policy* bug implemented identically in
+both (a wrong FOK or STP rule) passes silently. Added a second,
+independent property layer that asserts the specification's
+accounting rules directly from observable transitions:
+`resting_entries` snapshots before/after each op, the returned
+outcome, and the fill list — no control flow is re-derived.
+
+The rules asserted per `place`:
+
+- **Quantity conservation on the taker side** — fills + self-STP
+  decrements + rested remainder + canceled remainder always equal
+  the request. `DecrementAndCancel` shrinkage on self makers counts
+  as consumption (the taker spends its remainder decrementing);
+  `CancelOldest` shrinkage does not; unexplained shrinkage under
+  `None`/`CancelNewest` is a leak.
+- **Fill discipline** — every fill pays a price that was actually
+  resting on the opposite side, at the maker's own price, inside the
+  taker's limit, booked to the right counterparties.
+- **Outcome discipline** — FOK is `Filled` or `Killed` (never
+  partial); IOC/market never rest; post-only rests its full qty or
+  rejects; only post-only may be matching-rejected; a GTC remainder
+  dies only to `CancelNewest`; `Killed`/`Rejected` leave the book
+  byte-identical (a killed FOK never partially decrements).
+- **Maker-side conservation** — a maker loses qty only through fills
+  plus (self-orders only) STP decrement/cancel; same-side makers are
+  untouchable; resting side/price/owner are immutable; no order
+  appears except the taker's rest.
+- **Cancel releases exactly the reservation** — `cancel` Ok returns
+  the order's own rested qty and removes only that id; Err leaves
+  the book untouched.
+
+Writing it caught two of my own misreadings of the spec in draft
+assertions (DaC decrements count toward `filled_qty` in
+`CanceledRemainder`, and `Filled` can legitimately consume qty via
+decrement) — exactly the correlated-semantics trap the finding
+describes, demonstrated in miniature.

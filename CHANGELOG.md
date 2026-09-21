@@ -339,6 +339,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     batch, and tampered or truncated history is rejected outright
     instead of quietly continuing.
 
+- **Matching engine: declarative spec properties alongside the
+  oracle** (`crates/trading`)
+  - The `ModelBook` oracle verifies the engine by re-running the
+    sweep on different data structures — it catches bookkeeping
+    bugs, but a *policy* bug implemented identically in both would
+    pass silently. `declarative_spec_properties_hold` adds a second
+    layer that asserts the matching spec's accounting rules from
+    observable transitions alone: resting-book snapshots before and
+    after every op, the returned outcome, and the fill list.
+  - Enforced per placement: fills + self-trade decrements + rested
+    + canceled quantity always conserve the request; every fill
+    pays a price that was actually offered inside the taker's
+    limit; FOK is all-or-nothing; IOC and market orders never rest;
+    post-only rests in full or rejects; killed/rejected orders
+    leave the book byte-identical; non-self makers lose quantity
+    only through fills; cancellations release exactly the
+    reservation they held.
+  - **In plain words:** the matching engine now answers to an
+    independent auditor that only reads its books — it can't copy
+    the engine's homework, so a misunderstanding shared by the
+    original checker gets caught here instead of passing twice.
+
 - **Fuzz campaign: soaks, committed corpus, coverage, nightly CI**
   (`fuzz/`, `.github/workflows/nightly.yml`, `.gitignore`)
   - All 9 targets ran 10-minute libFuzzer soaks — zero crashes,

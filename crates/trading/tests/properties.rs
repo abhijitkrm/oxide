@@ -484,3 +484,269 @@ proptest! {
         }
     }
 }
+
+// ─── Declarative spec properties ──────────────────────────────────
+//
+// The oracle above mirrors the engine's sweep control flow on
+// different data structures — correlated *policy* bugs (a wrong FOK
+// or STP rule implemented identically in both) would pass it. The
+// layer below asserts the specification's accounting rules directly
+// from observable state transitions: `resting_entries` snapshots
+// before and after each op, plus the returned outcome and fills.
+// No control flow is re-derived — a correct engine under a buggy
+// oracle copy still fails these if the rule itself is violated.
+
+/// One resting order's observable state: (side, price, qty, owner).
+type Resting = (Side, u64, u64, Address);
+
+/// Snapshot of resting state keyed by order id — built ONLY from the
+/// engine's observable `resting_entries`, never simulated.
+fn resting_map(e: &MatchingEngine) -> std::collections::BTreeMap<u64, Resting> {
+    let mut v = Vec::new();
+    e.resting_entries(&mut v);
+    v.into_iter().map(|r| (r.id.0, (r.side, r.price.0, r.qty.0, r.owner))).collect()
+}
+
+/// Assert the declarative spec rules for one `place` transition.
+/// Every predicate here is an accounting fact the spec states
+/// outright — none re-implements the sweep.
+// The rules form one predicate per spec bullet; splitting them into
+// fns would scatter a single logical transition's accounting.
+#[allow(clippy::too_many_lines)]
+fn check_place_transition(
+    before: &std::collections::BTreeMap<u64, Resting>,
+    req: &NewOrder,
+    taker_id: u64,
+    out: OrderOutcome,
+    fills: &[FillEvent],
+    after: &std::collections::BTreeMap<u64, Resting>,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let filled: u64 = fills.iter().map(|f| f.qty.0).sum();
+    prop_assert!(filled <= req.qty.0, "fills exceed the requested qty");
+
+    // Fill discipline: every fill pays a price the book actually
+    // offered, at the maker's own resting price, within the taker's
+    // limit, and is booked to the right counterparties.
+    for f in fills {
+        let Some(&(m_side, m_price, _, m_owner)) = before.get(&f.maker_order_id.0) else {
+            return Err(proptest::test_runner::TestCaseError::fail(
+                "fill against a maker that was not resting",
+            ));
+        };
+        prop_assert_eq!(f.price.0, m_price, "fill price differs from maker's resting price");
+        prop_assert_eq!(f.maker_owner, m_owner);
+        prop_assert_eq!(m_side, req.side.opposite(), "fill came from the wrong side");
+        prop_assert_eq!(f.taker_order_id.0, taker_id);
+        prop_assert_eq!(f.taker_owner, req.owner);
+        prop_assert_eq!(f.taker_side, req.side);
+        if req.order_type != OrderType::Market {
+            match req.side {
+                Side::Buy => prop_assert!(f.price.0 <= req.price.0, "buy fill above limit"),
+                Side::Sell => prop_assert!(f.price.0 >= req.price.0, "sell fill below limit"),
+            }
+        }
+    }
+
+    // Maker-side quantity lost beyond fills, on the taker's own
+    // opposite-side orders. Under `DecrementAndCancel` that shrink
+    // *consumes* taker quantity (the decrement is the taker paying
+    // its remainder into the self order); under `CancelOldest` it is
+    // pure maker removal (the taker's remainder is untouched); under
+    // the other modes it must not happen at all.
+    let mut fill_by_maker: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    for f in fills {
+        *fill_by_maker.entry(f.maker_order_id.0).or_default() += f.qty.0;
+    }
+    let self_shrink: u64 = before
+        .iter()
+        .filter(|(_, r)| r.3 == req.owner && r.0 == req.side.opposite())
+        .map(|(id, r)| {
+            r.2 - after.get(id).map_or(0, |a| a.2) - fill_by_maker.get(id).copied().unwrap_or(0)
+        })
+        .sum();
+    if !matches!(req.stp, StpMode::CancelOldest | StpMode::DecrementAndCancel) {
+        prop_assert_eq!(self_shrink, 0, "STP-free shrinkage on self makers is a leak");
+    }
+    // Quantity consumed on the taker side: fills always, self-
+    // decrement only when the STP mode spends the remainder that way.
+    let consumed =
+        if req.stp == StpMode::DecrementAndCancel { filled + self_shrink } else { filled };
+
+    // Outcome ↔ quantity conservation: filled (+decremented) + rested
+    // + canceled always sums to the request — quantity is never
+    // created or lost.
+    match out {
+        OrderOutcome::Filled => {
+            prop_assert_eq!(consumed, req.qty.0, "Filled without full quantity consumed");
+            prop_assert!(!after.contains_key(&taker_id), "filled taker must not rest");
+        }
+        OrderOutcome::Resting { order_id, price, resting_qty } => {
+            prop_assert_eq!(order_id.0, taker_id);
+            prop_assert_eq!(
+                consumed + resting_qty.0,
+                req.qty.0,
+                "consumed + resting must conserve the request"
+            );
+            prop_assert_eq!(
+                after.get(&taker_id).copied(),
+                Some((req.side, price.0, resting_qty.0, req.owner)),
+                "rested remainder missing or mutated"
+            );
+            prop_assert_eq!(price.0, req.price.0, "taker rested at a price it did not ask");
+        }
+        OrderOutcome::CanceledRemainder { order_id, filled_qty } => {
+            prop_assert_eq!(order_id.0, taker_id);
+            prop_assert_eq!(
+                consumed,
+                filled_qty.0,
+                "canceled-remainder report must count consumed (fills + decrements)"
+            );
+            prop_assert!(!after.contains_key(&taker_id), "canceled taker must not rest");
+            // A GTC remainder only dies to self-trade prevention —
+            // an unsolicited cancel of a live remainder is a bug.
+            if req.tif == TimeInForce::Gtc {
+                prop_assert_eq!(
+                    req.stp,
+                    StpMode::CancelNewest,
+                    "GTC remainder canceled without CancelNewest STP"
+                );
+            }
+        }
+        OrderOutcome::Killed => {
+            prop_assert!(fills.is_empty(), "killed order produced fills");
+            prop_assert_eq!(after, before, "a killed FOK must leave the book untouched");
+        }
+        OrderOutcome::Rejected(_) => {
+            prop_assert!(fills.is_empty(), "rejected order produced fills");
+            prop_assert_eq!(after, before, "a rejected order must leave the book untouched");
+        }
+    }
+
+    // TIF/type → outcome discipline (the rules the audit names):
+    // FOK is all-or-nothing; IOC and market never rest; only a
+    // post-only may be rejected by matching.
+    if req.tif == TimeInForce::Fok {
+        prop_assert!(
+            matches!(out, OrderOutcome::Filled | OrderOutcome::Killed),
+            "FOK must fill completely or not at all"
+        );
+    }
+    if req.tif == TimeInForce::Ioc || req.order_type == OrderType::Market {
+        prop_assert!(
+            matches!(out, OrderOutcome::Filled | OrderOutcome::CanceledRemainder { .. }),
+            "IOC/market order must never rest"
+        );
+    }
+    if req.order_type == OrderType::PostOnly {
+        prop_assert!(
+            matches!(out, OrderOutcome::Resting { .. } | OrderOutcome::Rejected(_)),
+            "post-only must rest in full or reject"
+        );
+        if let OrderOutcome::Resting { resting_qty, .. } = out {
+            prop_assert_eq!(resting_qty.0, req.qty.0, "post-only must rest its full qty");
+        }
+    }
+    if let OrderOutcome::Rejected(_) = out {
+        prop_assert_eq!(
+            req.order_type,
+            OrderType::PostOnly,
+            "only a post-only may be matching-rejected"
+        );
+    }
+
+    // Maker-side conservation — the book-mutation/accounting
+    // counterpart rule: a maker loses quantity only through fills
+    // against it, PLUS (self orders only) the STP decrement/cancel
+    // path. Unexplained shrinkage on a stranger's order is a leak;
+    // growth or phantom orders are fabrication.
+    for (id, &(m_side, m_price, m_qty, m_owner)) in before {
+        let after_qty = after.get(id).map_or(0, |a| a.2);
+        let lost = m_qty - after_qty;
+        let via_fills = fill_by_maker.get(id).copied().unwrap_or(0);
+        prop_assert!(via_fills <= lost, "fills took more than the maker lost");
+        if lost > via_fills {
+            prop_assert_eq!(
+                m_owner,
+                req.owner,
+                "quantity vanished from a non-self maker without a fill"
+            );
+        }
+        if m_side == req.side {
+            prop_assert_eq!(lost, 0, "a sweep may never touch same-side makers");
+        }
+        if let Some(&(a_side, a_price, _, a_owner)) = after.get(id) {
+            prop_assert_eq!(
+                (a_side, a_price, a_owner),
+                (m_side, m_price, m_owner),
+                "a resting order's side/price/owner mutated in place"
+            );
+        }
+    }
+    for id in after.keys() {
+        if !before.contains_key(id) {
+            prop_assert_eq!(*id, taker_id, "an order that was never placed appeared");
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Declarative spec properties over arbitrary op sequences —
+    /// independent of the model oracle, so an oracle bug that copies
+    /// the engine's mistake still fails here (audit: the oracle
+    /// "deliberately mirrors the engine's sweep control flow").
+    #[test]
+    fn declarative_spec_properties_hold(ops in prop::collection::vec(op_strategy(), 1..120)) {
+        let mut e = engine();
+        let mut fills = Vec::new();
+
+        for op in &ops {
+            let before = resting_map(&e);
+            match op {
+                Op::Place(req) => {
+                    if req.validate(cfg().tick_size, cfg().lot_size, cfg().min_price, cfg().max_price).is_err() {
+                        continue;
+                    }
+                    let taker_id = e.next_order_id();
+                    fills.clear();
+                    let out = e.place(*req, &mut fills).unwrap();
+                    let after = resting_map(&e);
+                    check_place_transition(&before, req, taker_id, out, &fills, &after)?;
+                }
+                Op::Cancel(id) => {
+                    let res = e.cancel(OrderId(*id));
+                    let after = resting_map(&e);
+                    match res {
+                        Ok(canceled) => {
+                            // Cancellation releases exactly the
+                            // remaining reservation — the canceled
+                            // order's own qty, and nothing else moves.
+                            let Some(&(_, _, rested, _)) = before.get(id) else {
+                                return Err(proptest::test_runner::TestCaseError::fail(
+                                    "cancel Ok'd an order that was not resting",
+                                ));
+                            };
+                            prop_assert_eq!(canceled.qty.0, rested,
+                                "cancel released more/less than the reservation");
+                            prop_assert_eq!(canceled.order_id.0, *id);
+                            let mut want = before.clone();
+                            want.remove(id);
+                            prop_assert_eq!(after, want, "cancel must touch only its own order");
+                        }
+                        Err(_) => {
+                            prop_assert_eq!(after, before,
+                                "a failed cancel must not mutate the book");
+                        }
+                    }
+                }
+            }
+
+            // Never crossed, after every op.
+            if let (Some((b, _)), Some((a, _))) = (e.best_bid(), e.best_ask()) {
+                prop_assert!(b.0 < a.0, "crossed book: bid {b:?} >= ask {a:?}");
+            }
+        }
+    }
+}
