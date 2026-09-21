@@ -16934,3 +16934,69 @@ fall under underutilization, rehydrated fee across a storage
 reload (EVM); real `Node::assemble` → oxideBFT → executor →
 sealed-block e2e proving header timestamp/beneficiary/gas limit
 reach EVM history. Workspace suite, fmt, and clippy all green.
+
+## Epoch lifecycle — durable committee transitions (epoch audit remediation)
+
+The engine already had the rotation machinery (`schedule_rotation`,
+`complete_rotation`, `apply_key_changes`) but two production gaps
+remained: nothing in the validator loop ever *drove* a transition,
+and a restart recovered the epoch without the committee or a
+pacemaker rebuild — a node that rotated then crashed would come
+back signing under its construction index, stamping timeouts with
+the wrong epoch, and counting quorum against the genesis set.
+
+**Durable set.** `WalEntry` carries an optional validator set; an
+epoch transition appends a set-bearing record *before* the new
+committee can sign, so the WAL — not the staking module's pending
+queues — is the authority for "which committee is active" across a
+restart. Ordinary vote/QC entries stay compact (no trailer), and a
+record without the tail still decodes: recovery carries the last
+set-bearing entry forward. The trailer encodes keys, stakes, and
+addresses so the recovered set preserves the *rotation's* order —
+rebuilding from staking's `BTreeMap` would produce a different
+leader schedule than peers that never restarted.
+
+**Recovery is a lifecycle restore.** `recover_from_wal` now
+resizes the per-set vote/timeout buffers, clears epoch-bound
+caches, re-seats `validator_index` by matching the local BLS key
+against the recovered committee, and rebuilds the pacemaker with
+the recovered set, view, epoch, and the configured timeout values.
+The old code called only `sync_to_view` — the pacemaker kept the
+genesis epoch and membership.
+
+**One combined transition.** `apply_key_changes` and
+`apply_validator_changes` each scheduled their own rotation, so a
+block that enacted both kinds of delta could not apply through
+either (the second schedule hit `RotationAlreadyPending`). The
+executor's queues now drain as one `EpochChanges` record through
+`AppInterface::take_epoch_changes`; `drive_epoch_changes` folds
+it via `build_next_set` — key replacements first (against the
+original indices), removals descending, additions at the tail —
+so every replica derives the same candidate, then schedules and
+completes the rotation in one step.
+
+**Replay dedup.** Module queues persist their deltas, so a crash
+between a rotation and the drain re-pends the same transition
+after recovery. `build_next_set` is idempotent: an add whose
+address already sits in the post-removal set folds to a no-op,
+and a duplicated remove index can no longer eat a second member.
+A replayed record therefore produces the *current* set — equality
+with the active committee returns `Ok(0)` instead of scheduling a
+spurious extra epoch that would diverge the node from every peer
+that stayed up.
+
+**Production loop.** `run_consensus_loop` stops consulting the
+startup `ValidatorSet`/index after rotation: leader routing uses
+`engine.validator_set().leader(view)`, self-vote and timeout
+attribution use `engine.validator_index()`, and the loop calls
+`drive_epoch_changes()` after finalized-block execution (the point
+where staking deltas have just been queued) and refreshes the
+shared RPC validator-set view when the epoch moved. A fresh start
+still requires the local key at its configured index — a key
+found at a different slot is a misconfiguration, not a rotation.
+
+Tests: WAL set roundtrip + legacy-decode + carry-forward (wal);
+drive-rotation, combined key+add+remove in one transition, replay
+dedup, index re-seat by BLS key, full recovery restoring
+set/epoch/pacemaker, post-recovery re-seat (engine); staged
+`EpochChanges` queue on `MockApp` exercising the drain seam.

@@ -2213,6 +2213,43 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   and the EIP-1559 base fee actually breathes with demand —
   surviving restarts so every node computes the same fee.
 
+- **Epoch transitions are a durable, recovery-complete lifecycle**
+  (`crates/consensus`, `crates/types`, `crates/executor`,
+  `crates/ports`, `bin/oxide-validator`)
+  - The engine had rotation machinery but the production loop never
+    drove it, and WAL recovery restored the epoch without the
+    committee — a validator that rotated then crashed restarted
+    signing under its construction index, stamping timeouts with the
+    wrong epoch, and counting quorum against the genesis set.
+  - `WalEntry` carries an optional validator set: a rotation appends
+    a set-bearing record before the new committee signs, and
+    recovery carries the last such record forward — preserving the
+    rotated member order that a rebuild from staking's queues would
+    lose. Old records without the tail still decode.
+  - Recovery now rebuilds the pacemaker with the recovered set,
+    view, epoch, and configured timeouts, and re-seats the local
+    `validator_index` by BLS key — as does `complete_rotation`, so a
+    moved validator signs under the right slot without a restart.
+  - Staking's pending key/validator deltas drain as one
+    `EpochChanges` record through `AppInterface` and fold into a
+    single scheduled+completed rotation; the fold is idempotent, so
+    a queue replay after a mid-transition crash dedups to a no-op
+    instead of bumping the epoch a second time.
+  - The validator loop routes leaders and attributes signatures
+    through the engine's *live* committee and index, and refreshes
+    the RPC-visible validator set when the epoch moves.
+  - **In plain words:** when the validator committee changed, a
+    node used to forget the change on restart and kept signing as
+    whoever it was at first boot — while the block timer still
+    believed the old committee was in charge. Now the committee
+    change is written into the same crash-proof notebook as the
+    votes, and waking up restores the whole picture: who's in,
+    which epoch, which slot is ours, and a timer that agrees.
+  - Regression: WAL set roundtrip/carry-forward/legacy decode;
+    drive-rotation, combined-transition, replay-dedup, index
+    re-seat, and full-recovery engine tests; staged `EpochChanges`
+    on `MockApp`.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

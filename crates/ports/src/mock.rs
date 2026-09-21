@@ -46,6 +46,11 @@ pub struct MockApp {
     /// The next height `prepare_proposal` will assemble for. Incremented
     /// once per proposal so the engine and app stay in lockstep.
     next_proposal_height: Mutex<u64>,
+    /// Staged validator-set transitions, drained one per
+    /// `take_epoch_changes` call — the mock half of the epoch
+    /// protocol: a real app produces these from executed staking
+    /// transactions; the mock lets a test script them.
+    pending_epoch_changes: Mutex<Vec<types::EpochChanges>>,
 }
 
 impl MockApp {
@@ -55,7 +60,19 @@ impl MockApp {
             mempool: Mutex::new(Vec::new()),
             state_roots: Mutex::new(BTreeMap::new()),
             next_proposal_height: Mutex::new(0),
+            pending_epoch_changes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Stage a validator-set transition for the next
+    /// `take_epoch_changes` drain — tests use this to drive the
+    /// engine's epoch lifecycle the way a staking module would.
+    ///
+    /// # Panics
+    /// When the staging queue's mutex is poisoned — the same
+    /// fail-loud policy as every other `MockApp` lock.
+    pub fn queue_epoch_changes(&self, changes: types::EpochChanges) {
+        self.pending_epoch_changes.lock().unwrap().push(changes);
     }
 }
 
@@ -147,6 +164,12 @@ impl AppInterface for MockApp {
             .copied()
             .unwrap_or_else(|| mock_state_root(height));
         Some(StateAttestation { height, root })
+    }
+
+    /// One staged transition per call — mirroring a real app's
+    /// destructive drain: once consumed, a record is gone.
+    fn take_epoch_changes(&self) -> types::EpochChanges {
+        self.pending_epoch_changes.lock().unwrap().pop().unwrap_or_default()
     }
 
     fn attest_latest(&self) -> Option<StateAttestation> {

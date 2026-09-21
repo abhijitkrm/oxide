@@ -349,6 +349,45 @@ pub fn system_time_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// The validator-set transition a finalized block's execution
+/// produced — the staking module's pending queues, drained by the
+/// consensus engine at the epoch boundary.
+///
+/// Every field is a *delta* against the engine's current
+/// `ValidatorSet`, applied in a fixed order — key replacements
+/// first, then removals (descending index, so positions don't
+/// shift), then additions appended — so every replica that
+/// executes the same block derives the same next-epoch set.
+///
+/// `adds` is a list of `(staking_address, bls_public_key, stake)`
+/// tuples for new validators. `removes` is a list of staking
+/// addresses to drop.
+///
+/// The record is the consensus-facing half of the transition:
+/// modules record the deltas when the block executes; the engine
+/// folds them into a candidate `ValidatorSet`, certifies the swap
+/// through the epoch rotation, and persists the resulting set in
+/// its WAL so a restart re-derives the same committee.
+#[derive(Debug, Clone, Default)]
+pub struct EpochChanges {
+    /// Consensus-key replacements for existing validators:
+    /// `(staking_address, new_bls_public_key)`.
+    pub key_changes: Vec<(Address, Vec<u8>)>,
+    /// Validators to add: `(staking_address, bls_public_key, stake)`.
+    pub adds: Vec<(Address, Vec<u8>, u64)>,
+    /// Validator staking addresses to remove.
+    pub removes: Vec<Address>,
+}
+
+impl EpochChanges {
+    /// Whether there is no pending transition — the common case on
+    /// every block that enacted no staking changes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.key_changes.is_empty() && self.adds.is_empty() && self.removes.is_empty()
+    }
+}
+
 /// The engine's whole output: a finalized, reorg-free ordering of
 /// transactions at a height. After this is emitted the engine never
 /// re-emits this height and never finalizes a different block here

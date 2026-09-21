@@ -3221,6 +3221,23 @@ impl AppInterface for Executor {
             .next_back()
             .map(|(h, root)| StateAttestation { height: Height::new(*h), root: *root })
     }
+
+    /// Drain both pending-transition queues as one atomic
+    /// [`EpochChanges`] record — the consensus-facing half of the
+    /// epoch protocol. The engine polls this each epoch-boundary
+    /// pass; draining and rotating in the same pass keeps the
+    /// module queues from re-reporting an enacted transition.
+    fn take_epoch_changes(&self) -> types::EpochChanges {
+        // One drain per queue — `take_pending_validator_changes`
+        // clears the module queues, so a second call would report
+        // empty and the removes would be lost.
+        let val = self.take_pending_validator_changes();
+        types::EpochChanges {
+            key_changes: self.take_pending_key_changes(),
+            adds: val.adds,
+            removes: val.removes,
+        }
+    }
 }
 
 #[cfg(test)]

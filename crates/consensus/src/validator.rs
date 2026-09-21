@@ -39,7 +39,7 @@ pub type ValidatorIndex = crypto::bls::ValidatorIndex;
 /// is independent of the consensus key (e.g. a cold wallet). The
 /// address survives key rotation — `apply_key_change` replaces the
 /// key but preserves the address.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorSet {
     /// Public keys, indexed by `ValidatorIndex`.
     validators: Vec<PublicKey>,
@@ -226,6 +226,21 @@ impl ValidatorSet {
     #[must_use]
     pub fn index_of(&self, addr: &Address) -> Option<ValidatorIndex> {
         self.validator_addresses.iter().position(|a| a == addr).and_then(|i| u16::try_from(i).ok())
+    }
+
+    /// Find the validator index for a consensus public key.
+    ///
+    /// This is the restart/rekey half of membership lookup: after a
+    /// rotation the local node re-derives *which* index it holds by
+    /// matching its BLS key against the committed set — the staking
+    /// address alone cannot locate it (a key-change rotation keeps
+    /// the address while the index may have moved, and a fresh
+    /// binary only knows its key file, not its committee slot).
+    ///
+    /// Linear scan — same scale argument as [`index_of`](Self::index_of).
+    #[must_use]
+    pub fn index_of_key(&self, key: &PublicKey) -> Option<ValidatorIndex> {
+        self.validators.iter().position(|k| k == key).and_then(|i| u16::try_from(i).ok())
     }
 
     /// Apply a key change: return a new `ValidatorSet` with the

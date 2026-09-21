@@ -231,6 +231,15 @@ impl Pacemaker {
         self.current_epoch
     }
 
+    /// The validator set this pacemaker computes quorum and the
+    /// leader schedule over — after a recovery or rotation rebuild
+    /// it must equal the engine's active committee, or timeout
+    /// certificates would be counted against a stale membership.
+    #[must_use]
+    pub fn validator_set(&self) -> &ValidatorSet {
+        &self.validator_set
+    }
+
     /// Current state (`Active` or `TimedOut`).
     #[must_use]
     pub fn state(&self) -> PacemakerState {

@@ -102,6 +102,24 @@ pub struct WalEntry {
     /// Encoded as an optional trailer (1-byte flag + height + hash)
     /// so entries written by older binaries still decode.
     pub last_committed: Option<(Hash, Height)>,
+    /// The committed validator set at this entry's epoch — present
+    /// only on entries written by an epoch rotation (or an explicit
+    /// set swap); ordinary vote/QC entries leave it `None` so the
+    /// per-vote record stays ~200 bytes.
+    ///
+    /// Durability: the engine's in-memory set is rebuilt from
+    /// genesis on every restart; without this field a post-rotation
+    /// restart would resurrect the *genesis* committee under the
+    /// recovered (later) epoch — a divergent leader schedule and
+    /// quorum vs. every peer that stayed up. Recording the set in
+    /// the same fsync'd entry that persists the epoch makes the
+    /// transition atomic: recovery sees either both halves or the
+    /// pre-rotation state, never a mix.
+    ///
+    /// `recover()` carries the most recent set-bearing entry
+    /// forward, so the returned entry always reflects the set that
+    /// was committed when the last record was written.
+    pub validator_set: Option<crate::validator::ValidatorSet>,
 }
 
 impl Encode for WalEntry {
@@ -144,6 +162,23 @@ impl Encode for WalEntry {
             }
             None => buf.push(0),
         }
+        // Optional trailer #2: the committed validator set
+        // (1-byte flag + varint count + per-validator
+        // [48B key][8B stake][20B address]). Written only on
+        // rotation/set-swap entries — absent on old files and on
+        // ordinary entries, decoded as `None`.
+        match &self.validator_set {
+            Some(vs) => {
+                buf.push(1);
+                codec::write::varint(buf, vs.n() as u64);
+                for i in 0..vs.n() {
+                    buf.extend_from_slice(vs.public_keys()[i].as_bytes());
+                    codec::write::u64(buf, vs.stakes()[i]);
+                    buf.extend_from_slice(&vs.validator_addresses()[i].0);
+                }
+            }
+            None => buf.push(0),
+        }
     }
 }
 
@@ -177,6 +212,46 @@ impl<'a> Decode<'a> for WalEntry {
         } else {
             None
         };
+        // Optional trailer #2: validator set. Entries written before
+        // it existed (and ordinary entries that leave it `None`)
+        // end at the flag byte or earlier — decode `None`.
+        let validator_set = if reader.remaining() > 0 && reader.read_u8()? == 1 {
+            let count = u32::try_from(reader.read_varint()?).map_err(|_| {
+                DecodeError::LengthPrefixTooLarge {
+                    claimed: u64::MAX,
+                    remaining: reader.remaining() as u64,
+                }
+            })?;
+            // Every member encodes 48 key + 8 stake + 20 address
+            // bytes — a count beyond what the remaining bytes could
+            // hold is malformed, and bounding it here keeps the
+            // `with_capacity` below from trusting the wire.
+            if u64::from(count) > reader.remaining() as u64 / 76 {
+                return Err(DecodeError::LengthPrefixTooLarge {
+                    claimed: u64::from(count),
+                    remaining: reader.remaining() as u64,
+                });
+            }
+            let mut keys = Vec::with_capacity(count as usize);
+            let mut stakes = Vec::with_capacity(count as usize);
+            let mut addrs = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let key_bytes = reader.read_fixed::<48>()?;
+                keys.push(crypto::bls::PublicKey::from_slice(&key_bytes).map_err(|_| {
+                    DecodeError::WrongSliceLength { expected: 48, got: key_bytes.len() }
+                })?);
+                stakes.push(reader.read_u64()?);
+                addrs.push(primitives::Address(reader.read_fixed::<20>()?));
+            }
+            Some(crate::validator::ValidatorSet::with_addresses(keys, stakes, addrs).map_err(
+                |_| DecodeError::LengthPrefixTooLarge {
+                    claimed: u64::MAX,
+                    remaining: reader.remaining() as u64,
+                },
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             last_voted_view,
             voted_at_height,
@@ -185,6 +260,7 @@ impl<'a> Decode<'a> for WalEntry {
             next_height,
             epoch,
             last_committed,
+            validator_set,
         })
     }
 }
@@ -424,6 +500,7 @@ impl Wal {
         let file = File::open(&self.path)?;
         let mut reader = BufReader::new(file);
         let mut last_valid: Option<WalEntry> = None;
+        let mut last_set: Option<crate::validator::ValidatorSet> = None;
 
         loop {
             // Read the 4-byte length prefix.
@@ -468,9 +545,25 @@ impl Wal {
             // Decode the entry.
             let mut reader = Reader::new(&payload);
             let entry = WalEntry::decode(&mut reader)?;
+            // Track the most recent set-bearing record: only
+            // rotation entries carry `validator_set`, so the set
+            // that governed the final entry is the last one
+            // recorded — possibly many entries back.
+            if entry.validator_set.is_some() {
+                last_set.clone_from(&entry.validator_set);
+            }
             last_valid = Some(entry);
         }
 
+        // Merge the effective committee into the returned entry so
+        // the caller restores epoch *and* membership atomically —
+        // a tail of plain vote entries after a rotation still
+        // resolves to the rotated set.
+        if let Some(ref mut entry) = last_valid {
+            if entry.validator_set.is_none() {
+                entry.validator_set = last_set;
+            }
+        }
         Ok(last_valid)
     }
 
@@ -518,6 +611,7 @@ mod tests {
             next_height: Height::new(0),
             epoch: Epoch::new(0),
             last_committed: None,
+            validator_set: None,
         }
     }
 
@@ -533,6 +627,7 @@ mod tests {
             next_height: Height::new(4),
             epoch: Epoch::new(0),
             last_committed: Some((Hash([0xBB; 32]), Height::new(2))),
+            validator_set: None,
         }
     }
 
@@ -755,5 +850,90 @@ mod tests {
         // The recovered state must have the correct view and height.
         assert_eq!(recovered.current_view, View::new(6));
         assert_eq!(recovered.next_height, Height::new(4));
+    }
+
+    /// Build a two-validator set for set-trailer tests.
+    fn test_set() -> crate::validator::ValidatorSet {
+        let keys: Vec<crypto::BlsSecretKey> =
+            (1u8..=2).map(|i| crypto::BlsSecretKey::from_ikm(&[i; 32]).expect("BLS key")).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        crate::validator::ValidatorSet::with_addresses(
+            pks,
+            vec![1, 1],
+            vec![primitives::Address([0x01; 20]), primitives::Address([0x02; 20])],
+        )
+        .expect("test validator set")
+    }
+
+    /// A set-bearing entry round-trips through the wire — the
+    /// rotation record that recovery relies on.
+    #[test]
+    fn wal_entry_with_validator_set_roundtrips() {
+        let mut entry = voted_entry();
+        entry.epoch = Epoch::new(1);
+        entry.validator_set = Some(test_set());
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
+        let mut reader = Reader::new(&buf);
+        let decoded = WalEntry::decode(&mut reader).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.validator_set, Some(test_set()));
+    }
+
+    /// Entries written before the set trailer existed must still
+    /// decode — the field is an optional tail, not a schema break.
+    #[test]
+    fn wal_entry_without_set_decodes_legacy() {
+        // Encode the pre-set shape by hand: everything through
+        // `last_committed`, no set trailer.
+        let mut buf = Vec::new();
+        buf.push(0u8); // last_voted_view: None
+        codec::write::varint(&mut buf, 0); // 0 voted_at_height
+        buf.push(0u8); // high_qc: None
+        View::new(2).encode(&mut buf);
+        Height::new(1).encode(&mut buf);
+        Epoch::new(3).encode(&mut buf);
+        buf.push(0u8); // last_committed: None — stream ends here
+        let mut reader = Reader::new(&buf);
+        let decoded = WalEntry::decode(&mut reader).expect("legacy tail decodes");
+        assert_eq!(decoded.validator_set, None);
+        assert_eq!(decoded.epoch, Epoch::new(3));
+    }
+
+    /// The epoch-transition durability contract: a rotation entry
+    /// carries the new committee, and recovery must resolve THAT
+    /// set even when plain vote entries were appended afterward —
+    /// the last record does not hold the set, the last *set-bearing*
+    /// record does.
+    #[test]
+    fn wal_recover_carries_forward_last_validator_set() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        let rotated = test_set();
+
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&genesis_entry()).unwrap();
+            // Rotation entry: epoch 1 with the new committee.
+            let mut rotation = voted_entry();
+            rotation.epoch = Epoch::new(1);
+            rotation.validator_set = Some(rotated.clone());
+            wal.append(&rotation).unwrap();
+            // Ordinary vote entries after the rotation — no set
+            // trailer, epoch 1 (the committee now in force).
+            let mut post = voted_entry();
+            post.epoch = Epoch::new(1);
+            wal.append(&post).unwrap();
+        }
+
+        let wal = Wal::open(&path).unwrap();
+        let recovered = wal.recover().unwrap().expect("recovers");
+        assert_eq!(recovered.epoch, Epoch::new(1), "last entry's own epoch");
+        assert_eq!(
+            recovered.validator_set,
+            Some(rotated),
+            "recovery resolves the most recent set-bearing entry"
+        );
     }
 }

@@ -127,6 +127,25 @@ pub trait AppInterface: Send + Sync {
     /// and a stale attestation is never wrong (its height is carried
     /// inside, so it simply certifies an older block).
     fn attest_latest(&self) -> Option<StateAttestation>;
+
+    /// Drain the validator-set transition pending in the app's
+    /// executed state — the staking module's recorded key changes,
+    /// validator additions, and removals from finalized blocks.
+    ///
+    /// This is the consensus-facing half of the epoch protocol: a
+    /// `KEY_CHANGE`/`VALIDATOR_ADD`/`VALIDATOR_REMOVE` transaction
+    /// lands in the module's pending queue when its block executes;
+    /// the engine polls here each epoch-boundary pass and folds the
+    /// deltas into the next `ValidatorSet`. Draining is destructive
+    /// by design — the engine's rotation (and its WAL record of the
+    /// resulting set) is the acknowledgment, so the queues must not
+    /// re-report an enacted transition.
+    ///
+    /// The default returns an empty record for apps with no
+    /// validator-set lifecycle (mocks, single-module executors).
+    fn take_epoch_changes(&self) -> types::EpochChanges {
+        types::EpochChanges::default()
+    }
 }
 
 /// Implemented by consensus engines (oxideBFT is the default;

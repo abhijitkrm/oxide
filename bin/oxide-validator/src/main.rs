@@ -629,12 +629,47 @@ fn run_devnet_node(node_index_str: &str) {
     .with_pacemaker_timeouts(node_config.base_timeout_ms, node_config.max_timeout_ms)
     .with_block_budget(node_config.block_budget);
 
-    // WAL persistence: --wal-file.
-    if let Some(wal_path) = parse_cli_flag("--wal-file") {
+    // WAL persistence: --wal-file. Recovery may return a *rotated*
+    // validator set — the WAL records the committed committee, not
+    // just the epoch — and `recover_from_wal` re-seats our index by
+    // matching our BLS key against it.
+    let recovered = if let Some(wal_path) = parse_cli_flag("--wal-file") {
         let wal = consensus::wal::Wal::open(&wal_path).expect("wal open");
         engine = engine.with_wal(wal);
         engine.recover_from_wal().expect("wal recover");
         println!("oxide-validator[{node_index}]: WAL loaded from {wal_path}");
+        true
+    } else {
+        false
+    };
+
+    // Membership gate: our BLS key must resolve to a slot in the
+    // committee the engine is actually running (post-recovery, not
+    // necessarily the genesis set). `None` means we were rotated
+    // out (or the key file doesn't match this node's config) — a
+    // validator that cannot produce verifiable votes must not run:
+    // its signatures would only ever be rejected noise.
+    let our_index = engine.validator_set().index_of_key(&our_key.public_key());
+    if our_index.is_none() {
+        eprintln!(
+            "oxide-validator[{node_index}]: our BLS key is not in the active validator set \
+             (epoch {}) — exiting; this node is no longer a committee member",
+            engine.epoch().value()
+        );
+        std::process::exit(1);
+    }
+    // Fresh start (no recovery): the engine was constructed as
+    // validator `node_index`, so our key must occupy that exact
+    // slot — landing elsewhere means the key file belongs to a
+    // different validator, and signing under `node_index` would
+    // emit only invalid votes.
+    if !recovered && our_index != Some(u16::try_from(node_index).unwrap_or(u16::MAX)) {
+        eprintln!(
+            "oxide-validator[{node_index}]: our BLS key resolves to validator index \
+             {our_index:?}, not {node_index} — the key file does not match this node's \
+             identity; exiting",
+        );
+        std::process::exit(1);
     }
 
     // Data directory: `--data-dir` or `[storage] data_dir` enables
@@ -740,7 +775,6 @@ fn run_devnet_node(node_index_str: &str) {
     run_consensus_loop(
         &mut engine,
         &mut transport,
-        &validator_set_clone,
         node_index,
         num_nodes,
         shutdown.as_ref(),
@@ -999,7 +1033,6 @@ fn start_devnet_rpc(
 fn run_consensus_loop(
     engine: &mut consensus::OxideBft,
     transport: &mut p2p::tcp::TcpTransport,
-    validator_set: &consensus::ValidatorSet,
     node_index: usize,
     num_nodes: usize,
     shutdown: &AtomicBool,
@@ -1067,9 +1100,12 @@ fn run_consensus_loop(
         }
 
         // Phase 1: propose (if leader and haven't proposed this view).
+        // Leader decisions consult the engine's LIVE committee —
+        // `is_leader` reads the current validator set AND our
+        // re-seated index, so a rotated epoch can't strand us on the
+        // startup set's schedule (or our startup slot).
         let view = engine.current_view().value();
-        let leader_idx = usize::from(validator_set.leader(engine.current_view()));
-        if node_index == leader_idx && !proposed_views.contains(&view) {
+        if engine.is_leader() && !proposed_views.contains(&view) {
             if view > 0 && engine.high_qc().is_none() {
                 // Need the previous QC before proposing.
             } else if let Some((header, proposal)) = engine.propose() {
@@ -1083,7 +1119,7 @@ fn run_consensus_loop(
                 // signature whose anti-equivocation state was never
                 // durable: a restart could then double-vote.
                 if let Some(leader_vote) = engine.vote(&header, &proposal) {
-                    let _ = engine.collect_vote(u16::try_from(node_index).unwrap(), leader_vote);
+                    let _ = engine.collect_vote(engine.validator_index(), leader_vote);
                     voted_views.insert(proposal_view);
                 }
                 // Broadcast proposal to followers.
@@ -1105,8 +1141,8 @@ fn run_consensus_loop(
             if voted_views.contains(&proposal_view) {
                 continue;
             }
-            let leader = usize::from(validator_set.leader(header.view));
-            if node_index == leader {
+            let leader = usize::from(engine.validator_set().leader(header.view));
+            if usize::from(engine.validator_index()) == leader {
                 continue; // Leader already self-voted.
             }
             if let Some(vote) = engine.vote(header, proposal) {
@@ -1371,7 +1407,21 @@ fn run_consensus_loop(
                 // verify the signature against the correct view and
                 // ignore stale sigs from a different view (e.g., after
                 // a partition when validators may be at different views).
-                buf.push(u8::try_from(node_index).unwrap());
+                // Our voter index comes from the engine — rotation
+                // may have re-seated it, while `node_index` is the
+                // frozen startup slot. The wire field is one byte:
+                // an index that cannot fit must skip the broadcast —
+                // emitting slot 0's number under our signature would
+                // misattribute the timeout.
+                let Ok(voter_byte) = u8::try_from(engine.validator_index()) else {
+                    eprintln!(
+                        "oxide-validator[{node_index}]: validator index {} exceeds the \
+                         1-byte voter encoding — timeout signature not broadcast",
+                        engine.validator_index()
+                    );
+                    continue;
+                };
+                buf.push(voter_byte);
                 buf.extend_from_slice(&current_view_now.to_le_bytes());
                 buf.extend_from_slice(&engine.epoch().value().to_le_bytes());
                 sig.encode(&mut buf);
@@ -1383,7 +1433,7 @@ fn run_consensus_loop(
                 // Self-collect: feed our own timeout signature to the
                 // engine so it counts toward the quorum.
                 if let Ok(Some(tc)) =
-                    engine.collect_timeout_signature(u16::try_from(node_index).unwrap(), sig)
+                    engine.collect_timeout_signature(engine.validator_index(), sig)
                 {
                     // TC formed immediately (unlikely with 1/4, but
                     // handle it). Broadcast the TC to all peers.
@@ -1443,6 +1493,43 @@ fn run_consensus_loop(
             last_epoch = engine.epoch().value();
             if let Ok(mut shared) = shared_validator_set.write() {
                 *shared = engine.validator_set().clone();
+            }
+        }
+
+        // Epoch lifecycle: drain the validator-set transition the
+        // executor's finalized blocks recorded (staking key changes,
+        // validator adds/removes) and rotate the engine into the new
+        // committee. This is the production half of the epoch
+        // protocol — the queues only fill when a block *executes*,
+        // so polling each pass is the deferred, deterministic
+        // trigger: every node folds the same committed deltas at the
+        // same height boundary.
+        match engine.drive_epoch_changes() {
+            Ok(0) => {}
+            Ok(applied) => {
+                eprintln!(
+                    "oxide-validator[{node_index}]: epoch rotation applied {applied} \
+                     validator-set change(s) — now epoch {} ({} validators)",
+                    engine.epoch().value(),
+                    engine.validator_set().n()
+                );
+                // Reflect the new committee immediately — the
+                // `last_epoch` check above only runs once per pass.
+                last_epoch = engine.epoch().value();
+                if let Ok(mut shared) = shared_validator_set.write() {
+                    *shared = engine.validator_set().clone();
+                }
+            }
+            Err(e) => {
+                // Deterministic rejection — every replica folds the
+                // same deltas through `build_next_set` and reaches
+                // the same verdict, so this is consistent cluster
+                // state, not a fork: the transition is dropped and
+                // must be re-submitted.
+                eprintln!(
+                    "oxide-validator[{node_index}]: epoch transition rejected: {e} — \
+                     pending change dropped (re-submit a valid set)"
+                );
             }
         }
 

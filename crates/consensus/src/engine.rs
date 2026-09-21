@@ -773,16 +773,70 @@ impl OxideBft {
             self.next_height = entry.next_height;
             self.epoch = entry.epoch;
             self.last_committed = entry.last_committed;
-            // Sync the pacemaker to the recovered view.
-            self.pacemaker.sync_to_view(self.current_view);
+            // Membership is part of the recovered state too: rotation
+            // entries carry the committed set, and `Wal::recover`
+            // forwards the most recent one. Without this a
+            // post-rotation restart would resurrect the genesis
+            // committee under a later epoch — wrong leader schedule,
+            // wrong quorum, divergent from every peer that stayed up.
+            // `None` means the WAL predates set persistence (or no
+            // rotation ever committed): the construction set stands.
+            if let Some(set) = entry.validator_set {
+                if set != self.validator_set {
+                    self.validator_set = set;
+                    // Per-set state is sized/keyed to membership:
+                    // vote buffers index by `ValidatorIndex`, timeout
+                    // sigs likewise, and exec-cert artifacts verify
+                    // against the signing epoch's set. All are
+                    // view/epoch-scoped — a restart drops in-flight
+                    // collections regardless — so resize fresh rather
+                    // than carry stale shape or stale verdicts.
+                    self.votes = vec![None; self.validator_set.n()];
+                    self.vote_count = 0;
+                    self.vote_stake = 0;
+                    self.timeout_signatures = vec![None; self.validator_set.n()];
+                    self.exec_attest_pool.clear();
+                    self.exec_certs.clear();
+                    self.verified_exec_certs.clear();
+                    // Re-seat our own index: the committed set may
+                    // have moved us (removals shift positions, our
+                    // key may be at a different index than genesis).
+                    // The BLS key is the identity the operator
+                    // actually holds — `index_of_key` is the honest
+                    // remap. `None` means we are no longer in the
+                    // committee: leave the stale index — our
+                    // signatures will fail verification against the
+                    // new set anyway, which is fail-closed.
+                    if let Some(ref key) = self.secret_key {
+                        if let Some(idx) = self.validator_set.index_of_key(&key.public_key()) {
+                            self.validator_index = idx;
+                        }
+                    }
+                }
+            }
+            // Rebuild the pacemaker with the recovered epoch AND the
+            // recovered set — a bare `sync_to_view` used to leave it
+            // running the construction-time epoch/membership, so a
+            // post-rotation restart stamped and rejected timeout
+            // certificates on the wrong epoch. Configured timeouts
+            // carry over (same rule rotation applies).
+            self.pacemaker = crate::pacemaker::Pacemaker::with_config(
+                self.validator_set.clone(),
+                self.current_view,
+                self.epoch,
+                self.pacemaker_base_timeout_ms,
+                self.pacemaker_max_timeout_ms,
+            );
         }
         Ok(())
     }
 
     /// Build a `WalEntry` snapshot of the engine's current
-    /// safety-critical state.
+    /// safety-critical state. `include_set` attaches the committed
+    /// validator set — used only by epoch transitions, so ordinary
+    /// per-vote entries stay ~200 bytes.
     #[allow(dead_code)]
-    fn wal_entry(&self) -> crate::wal::WalEntry {
+    fn wal_entry(&self, include_set: bool) -> crate::wal::WalEntry {
         crate::wal::WalEntry {
             last_voted_view: self.last_voted_view,
             voted_at_height: self.voted_at_height.clone(),
@@ -791,6 +845,7 @@ impl OxideBft {
             next_height: self.next_height,
             epoch: self.epoch,
             last_committed: self.last_committed,
+            validator_set: include_set.then(|| self.validator_set.clone()),
         }
     }
 
@@ -814,6 +869,17 @@ impl OxideBft {
     /// — WAL-less engines (tests, sims, conformance runs) keep
     /// their previous best-effort semantics.
     fn append_wal(&mut self) -> Result<(), crate::wal::WalError> {
+        self.append_wal_full(false)
+    }
+
+    /// [`append_wal`](Self::append_wal) with control over the
+    /// validator-set trailer: `include_set` records the committed
+    /// set in this entry. Epoch transitions pass `true` so recovery
+    /// restores membership and epoch atomically from the same
+    /// fsync'd record; ordinary per-vote appends pass `false` — the
+    /// set is unchanged and ~n×76 bytes of redundancy per entry
+    /// buys nothing.
+    fn append_wal_full(&mut self, include_set: bool) -> Result<(), crate::wal::WalError> {
         let Some(ref mut wal) = self.wal else {
             return Ok(());
         };
@@ -827,6 +893,7 @@ impl OxideBft {
             next_height: self.next_height,
             epoch: self.epoch,
             last_committed: self.last_committed,
+            validator_set: include_set.then(|| self.validator_set.clone()),
         };
         match wal.append(&entry) {
             Ok(()) => Ok(()),
@@ -965,6 +1032,18 @@ impl OxideBft {
             return Err(EpochRotationError::NoPendingRotation);
         };
         self.validator_set = new_set;
+        // Re-seat our own index under the new committee — removals
+        // shift positions and the genesis index may now name a
+        // different validator. Matching by BLS key is the honest
+        // remap (it is the identity we can actually sign with).
+        // `None` means we were removed: keep the stale index — our
+        // signatures fail verification against the new set, which
+        // is fail-closed silence, not authority.
+        if let Some(ref key) = self.secret_key {
+            if let Some(idx) = self.validator_set.index_of_key(&key.public_key()) {
+                self.validator_index = idx;
+            }
+        }
         // Saturating: epoch = u64::MAX would wrap to 0, confusing
         // the epoch boundary. Saturation is safe — the chain is
         // already dead at epoch u64::MAX.
@@ -1001,7 +1080,11 @@ impl OxideBft {
         // new chain continues from `last_committed`, so those stale
         // entries can never be released by a commit). A failure here
         // latches `wal_failed` — signing stays disabled from now on.
-        let _ = self.append_wal();
+        // The entry carries the *new* validator set: a restart past
+        // this point must recover the rotated committee, not the
+        // genesis set the engine was constructed with — membership
+        // and epoch become durable in the same fsync.
+        let _ = self.append_wal_full(true);
         // Reset the pacemaker for the new epoch — carrying the
         // configured timeouts, not the compiled defaults: a rebuild
         // through `Pacemaker::new` here would silently revert the
@@ -1053,29 +1136,7 @@ impl OxideBft {
         &mut self,
         changes: &[(primitives::Address, Vec<u8>)],
     ) -> Result<usize, KeyChangeError> {
-        if changes.is_empty() {
-            return Ok(0);
-        }
-        let mut keys = self.validator_set.public_keys().to_vec();
-        let mut applied = 0usize;
-        for (addr, key_bytes) in changes {
-            let new_key = crypto::bls::PublicKey::from_slice(key_bytes)
-                .map_err(|_| KeyChangeError::InvalidKeyLength)?;
-            if let Some(idx) = self.validator_set.index_of(addr) {
-                keys[usize::from(idx)] = new_key;
-                applied += 1;
-            }
-        }
-        if applied > 0 {
-            let new_set = ValidatorSet::with_addresses(
-                keys,
-                self.validator_set.stakes().to_vec(),
-                self.validator_set.validator_addresses().to_vec(),
-            )
-            .map_err(|_| KeyChangeError::InvalidSet)?;
-            self.schedule_rotation(new_set).map_err(|_| KeyChangeError::RotationAlreadyPending)?;
-        }
-        Ok(applied)
+        self.apply_epoch_changes(changes, &[], &[])
     }
 
     /// Apply pending validator set changes to the validator set and
@@ -1109,16 +1170,46 @@ impl OxideBft {
         adds: &[(primitives::Address, Vec<u8>, u64)],
         removes: &[primitives::Address],
     ) -> Result<usize, KeyChangeError> {
-        if adds.is_empty() && removes.is_empty() {
-            return Ok(0);
-        }
+        self.apply_epoch_changes(&[], adds, removes)
+    }
+
+    /// Build the next-epoch `ValidatorSet` from a combined
+    /// transition record — key replacements, member removals, and
+    /// member additions — without scheduling anything.
+    ///
+    /// Fixed application order is the determinism contract: key
+    /// replacements run against the *current* set's indices, then
+    /// removals descend through those same original indices, then
+    /// additions append at the tail. Every replica that folds the
+    /// same finalized deltas through this builder derives the same
+    /// committee — order, keys, and stakes included.
+    ///
+    /// Returns the candidate set plus the count of deltas that
+    /// actually landed (a key change for an address not in the set
+    /// is skipped, not counted).
+    fn build_next_set(
+        &self,
+        key_changes: &[(primitives::Address, Vec<u8>)],
+        adds: &[(primitives::Address, Vec<u8>, u64)],
+        removes: &[primitives::Address],
+    ) -> Result<(ValidatorSet, usize), KeyChangeError> {
         let mut keys = self.validator_set.public_keys().to_vec();
         let mut stakes = self.validator_set.stakes().to_vec();
         let mut addresses = self.validator_set.validator_addresses().to_vec();
         let mut applied = 0usize;
 
-        // Apply removes first — collect indices and sort descending
-        // so removing index 2 doesn't shift index 3.
+        // 1. Key replacements — against the original indices.
+        for (addr, key_bytes) in key_changes {
+            let new_key = crypto::bls::PublicKey::from_slice(key_bytes)
+                .map_err(|_| KeyChangeError::InvalidKeyLength)?;
+            if let Some(idx) = self.validator_set.index_of(addr) {
+                keys[usize::from(idx)] = new_key;
+                applied += 1;
+            }
+        }
+
+        // 2. Removals — original indices, descending so positions
+        //    don't shift under later removals.
         let mut to_remove: Vec<usize> = Vec::new();
         for addr in removes {
             if let Some(idx) = self.validator_set.index_of(addr) {
@@ -1126,6 +1217,10 @@ impl OxideBft {
             }
         }
         to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        // A record that names the same member twice must not eat a
+        // second validator — after the first removal the index it
+        // held now belongs to the next member.
+        to_remove.dedup();
         for idx in to_remove {
             keys.remove(idx);
             stakes.remove(idx);
@@ -1133,8 +1228,20 @@ impl OxideBft {
             applied += 1;
         }
 
-        // Apply adds.
+        // 3. Additions — appended at the tail. Membership is checked
+        //    against the post-removal set: re-offering an add whose
+        //    address already sits there is a replay of an enacted
+        //    transition (a queue drain that repeated after a
+        //    mid-transition restart) and must fold to a no-op, not
+        //    fail on the duplicate-key error. A remove+add of the
+        //    same address in one record still lands — the removal
+        //    dropped it from `remaining`, so the add applies.
+        let mut remaining: std::collections::HashSet<primitives::Address> =
+            addresses.iter().copied().collect();
         for (addr, key_bytes, stake) in adds {
+            if !remaining.insert(*addr) {
+                continue;
+            }
             let new_key = crypto::bls::PublicKey::from_slice(key_bytes)
                 .map_err(|_| KeyChangeError::InvalidKeyLength)?;
             if *stake == 0 {
@@ -1146,11 +1253,93 @@ impl OxideBft {
             applied += 1;
         }
 
+        let set = ValidatorSet::with_addresses(keys, stakes, addresses)
+            .map_err(|_| KeyChangeError::InvalidSet)?;
+        Ok((set, applied))
+    }
+
+    /// Apply a combined epoch transition — key changes, additions,
+    /// and removals — as ONE candidate set and ONE scheduled
+    /// rotation.
+    ///
+    /// The separate `apply_key_changes`/`apply_validator_changes`
+    /// entry points each schedule their own rotation, so a block
+    /// that enacted both kinds of delta could not be applied
+    /// through them (the second call would hit
+    /// `RotationAlreadyPending`). This is the production path: the
+    /// executor's [`types::EpochChanges`] record is drained as one
+    /// unit and folded through [`build_next_set`](Self::build_next_set)
+    /// into a single transition.
+    ///
+    /// # Errors
+    /// Same conditions as `build_next_set` plus
+    /// [`KeyChangeError::RotationAlreadyPending`].
+    pub fn apply_epoch_changes(
+        &mut self,
+        key_changes: &[(primitives::Address, Vec<u8>)],
+        adds: &[(primitives::Address, Vec<u8>, u64)],
+        removes: &[primitives::Address],
+    ) -> Result<usize, KeyChangeError> {
+        if key_changes.is_empty() && adds.is_empty() && removes.is_empty() {
+            return Ok(0);
+        }
+        let (new_set, applied) = self.build_next_set(key_changes, adds, removes)?;
         if applied > 0 {
-            let new_set = ValidatorSet::with_addresses(keys, stakes, addresses)
-                .map_err(|_| KeyChangeError::InvalidSet)?;
             self.schedule_rotation(new_set).map_err(|_| KeyChangeError::RotationAlreadyPending)?;
         }
+        Ok(applied)
+    }
+
+    /// Drive the epoch lifecycle: drain the app's pending
+    /// validator-set transition and, if it produces a different
+    /// committee, rotate the epoch.
+    ///
+    /// This is the production bridge the epoch protocol needs:
+    /// executed blocks record staking deltas in the module's
+    /// pending queues; the engine folds them into a candidate set
+    /// and certifies the swap through the two-phase handoff —
+    /// `schedule_rotation` (announce) + `rotate_epoch` (the old set
+    /// has already committed the change, so completing immediately
+    /// activates the new set from the next view). Every node that
+    /// executes the same finalized block derives the same
+    /// transition — the drain is deterministic because the module
+    /// queues are deterministic.
+    ///
+    /// The dedup check is the restart-mid-transition case: a crash
+    /// between a rotation and the queue drain re-pends the same
+    /// deltas after recovery (module state persists them), and
+    /// re-applying would produce *this same set* — recognized by
+    /// equality, so the queues drain without a spurious second
+    /// epoch bump that would diverge us from every peer that
+    /// stayed up.
+    ///
+    /// Returns the number of deltas applied, `0` when nothing was
+    /// pending or the transition was already enacted.
+    ///
+    /// # Errors
+    /// [`KeyChangeError`] when the drained deltas cannot fold into
+    /// a valid set — deterministic on every node, so the rejection
+    /// is consistent; the queues are drained first precisely so a
+    /// bad record cannot wedge the loop in a retry cycle.
+    pub fn drive_epoch_changes(&mut self) -> Result<usize, KeyChangeError> {
+        let changes = self.app.take_epoch_changes();
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        // Build the candidate BEFORE touching rotation state — an
+        // invalid transition is rejected here, deterministically on
+        // every replica, and the (already drained) record cannot
+        // re-pend.
+        let (new_set, applied) =
+            self.build_next_set(&changes.key_changes, &changes.adds, &changes.removes)?;
+        if applied == 0 || new_set == self.validator_set {
+            return Ok(0);
+        }
+        self.schedule_rotation(new_set).map_err(|_| KeyChangeError::RotationAlreadyPending)?;
+        // The pending set is already the old committee's committed
+        // output — complete immediately so the transition takes
+        // effect at this height boundary on every node.
+        let _ = self.rotate_epoch();
         Ok(applied)
     }
 
@@ -1158,6 +1347,16 @@ impl OxideBft {
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.validator_set.leader(self.current_view) == self.validator_index
+    }
+
+    /// Our index in the *current* validator set — re-seated by epoch
+    /// rotation and by WAL recovery, so it tracks committee
+    /// membership rather than the construction-time value. Callers
+    /// deciding "am I the leader/voter for this view" must read
+    /// this, not a cached startup index.
+    #[must_use]
+    pub fn validator_index(&self) -> ValidatorIndex {
+        self.validator_index
     }
 
     /// The next height at which this engine will propose a block.
@@ -8032,5 +8231,208 @@ mod tests {
         let updated = vs.apply_key_change(0, new_key).expect("apply key change");
         assert_eq!(updated.validator(0).expect("v0").as_bytes(), new_key.as_bytes());
         assert_eq!(updated.validator_addresses()[0], vs.validator_addresses()[0]);
+    }
+
+    /// A BLS-keyed validator set for index re-seat tests — keys that
+    /// correspond to real secret keys, so `index_of_key` can find
+    /// them after membership moves.
+    fn bls_validator_set() -> (Vec<crypto::BlsSecretKey>, ValidatorSet) {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+        (keys, vs)
+    }
+
+    /// The production epoch bridge: staged adds drain through the
+    /// app seam and complete a rotation in one drive.
+    #[test]
+    fn drive_epoch_changes_rotates_committee() {
+        let app = Arc::new(MockApp::new());
+        let mut engine =
+            OxideBft::new(app.clone(), single_validator_set()).without_signature_verification();
+        let (new_keys, _) = bls_validator_set();
+        app.queue_epoch_changes(types::EpochChanges {
+            key_changes: Vec::new(),
+            adds: vec![(
+                primitives::Address([0x09; 20]),
+                new_keys[0].public_key().as_bytes().to_vec(),
+                1,
+            )],
+            removes: Vec::new(),
+        });
+        assert_eq!(engine.drive_epoch_changes().expect("drive"), 1);
+        assert_eq!(engine.epoch(), Epoch::new(1));
+        assert_eq!(engine.validator_set().n(), 2);
+        // A second drain sees nothing — the queues were consumed.
+        assert_eq!(engine.drive_epoch_changes().expect("drive"), 0);
+    }
+
+    /// Key replacement + removal + addition fold into ONE rotation —
+    /// the combined path the two separate apply methods could not
+    /// express (the second schedule would hit `AlreadyPending`).
+    #[test]
+    fn drive_epoch_changes_combines_key_add_remove() {
+        let app = Arc::new(MockApp::new());
+        let (_, vs) = bls_validator_set();
+        let mut engine =
+            OxideBft::with_index(app.clone(), vs.clone(), 1).without_signature_verification();
+        let old_addr = vs.validator_addresses()[0];
+        let rotate_key_addr = vs.validator_addresses()[1];
+        let fresh = bls_key(9);
+        app.queue_epoch_changes(types::EpochChanges {
+            key_changes: vec![(rotate_key_addr, fresh.public_key().as_bytes().to_vec())],
+            adds: vec![(
+                primitives::Address([0x0A; 20]),
+                bls_key(10).public_key().as_bytes().to_vec(),
+                1,
+            )],
+            removes: vec![old_addr],
+        });
+        let applied = engine.drive_epoch_changes().expect("drive");
+        assert_eq!(applied, 3, "key change + remove + add");
+        assert_eq!(engine.epoch(), Epoch::new(1));
+        let new_set = engine.validator_set();
+        // Original members 0 removed; 1..3 remain, plus the append.
+        assert_eq!(new_set.n(), 4);
+        assert_eq!(new_set.index_of(&old_addr), None, "removed member gone");
+        assert_eq!(new_set.index_of_key(&fresh.public_key()), Some(0), "key replaced at index 0");
+    }
+
+    /// The restart-mid-transition case: module queues persist the
+    /// deltas, so a node that rotated then crashed before draining
+    /// would re-offer the same transition post-recovery. Re-applying
+    /// must recognize the already-enacted set and NOT bump the
+    /// epoch a second time — a spurious extra epoch diverges us
+    /// from every peer that stayed up.
+    #[test]
+    fn drive_epoch_changes_dedups_replayed_transition() {
+        let app = Arc::new(MockApp::new());
+        let mut engine =
+            OxideBft::new(app.clone(), single_validator_set()).without_signature_verification();
+        let change = types::EpochChanges {
+            key_changes: Vec::new(),
+            adds: vec![(
+                primitives::Address([0x09; 20]),
+                bls_key(9).public_key().as_bytes().to_vec(),
+                1,
+            )],
+            removes: Vec::new(),
+        };
+        app.queue_epoch_changes(change.clone());
+        assert_eq!(engine.drive_epoch_changes().expect("drive"), 1);
+        assert_eq!(engine.epoch(), Epoch::new(1));
+        // Replay: the same deltas re-pend after a restart — the
+        // candidate equals the current set, so it is a no-op, not
+        // a second transition.
+        app.queue_epoch_changes(change);
+        assert_eq!(engine.drive_epoch_changes().expect("re-drive"), 0);
+        assert_eq!(engine.epoch(), Epoch::new(1), "no duplicate epoch bump");
+    }
+
+    /// Local index remapping: removing a lower-index member shifts
+    /// our slot; the engine must re-seat `validator_index` by
+    /// matching our BLS key, or we'd sign under the wrong identity.
+    #[test]
+    fn rotation_reseats_validator_index() {
+        let (keys, vs) = bls_validator_set();
+        let app = Arc::new(MockApp::new());
+        // We are validator index 3 (key 4).
+        let mut engine = OxideBft::with_index(app.clone(), vs.clone(), 3)
+            .without_signature_verification()
+            .with_secret_key(keys[3].clone());
+        let removed_addr = vs.validator_addresses()[0];
+        app.queue_epoch_changes(types::EpochChanges {
+            key_changes: Vec::new(),
+            adds: Vec::new(),
+            removes: vec![removed_addr],
+        });
+        engine.drive_epoch_changes().expect("drive");
+        // Validator 0 removed → our key now sits at index 2.
+        assert_eq!(engine.validator_index(), 2);
+        assert_eq!(engine.validator_set().index_of_key(&keys[3].public_key()), Some(2));
+    }
+
+    /// Recovery is a full lifecycle restore: the rotated committee,
+    /// the epoch, AND the pacemaker's epoch/membership all come
+    /// back — not just the view. A restart that rebuilt only the
+    /// view would stamp timeouts under the wrong epoch and reject
+    /// the cluster's TCs.
+    #[test]
+    fn recover_from_wal_restores_rotated_set_and_pacemaker() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("consensus.wal");
+
+        let (_, rotated_vs) = bls_validator_set();
+        // Engine commits a rotation, which appends a set-bearing
+        // WAL entry.
+        {
+            let app = Arc::new(MockApp::new());
+            let mut engine = OxideBft::new(app, single_validator_set())
+                .without_signature_verification()
+                .with_wal(crate::wal::Wal::open(&path).expect("wal"));
+            engine.schedule_rotation(rotated_vs.clone()).expect("schedule");
+            engine.rotate_epoch().expect("rotate");
+            assert_eq!(engine.epoch(), Epoch::new(1));
+        }
+
+        // Restart: a fresh engine built with the GENESIS set
+        // recovers from the same WAL — it must come back with the
+        // rotated committee, epoch, and a pacemaker rebuilt for
+        // both (leader schedule + timeout epoch correctness).
+        let app = Arc::new(MockApp::new());
+        let mut engine = OxideBft::new(app, single_validator_set())
+            .without_signature_verification()
+            .with_wal(crate::wal::Wal::open(&path).expect("wal"));
+        engine.recover_from_wal().expect("recover");
+        assert_eq!(engine.epoch(), Epoch::new(1), "epoch recovered");
+        assert_eq!(engine.validator_set(), &rotated_vs, "committee recovered");
+        assert_eq!(
+            engine.pacemaker.current_epoch(),
+            Epoch::new(1),
+            "pacemaker rebuilt with the recovered epoch — timeouts attest the right epoch"
+        );
+        assert_eq!(
+            engine.pacemaker.validator_set().n(),
+            rotated_vs.n(),
+            "pacemaker rebuilt with the recovered committee — quorum math matches peers"
+        );
+    }
+
+    /// Recovery re-seats `validator_index` through the key match:
+    /// a restart whose committee moved under it must not sign under
+    /// the stale construction index.
+    #[test]
+    fn recover_from_wal_reseats_index_by_key() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("consensus.wal");
+
+        let (keys, vs) = bls_validator_set();
+        // Rotate: drop validator 0 — key 4 moves from index 3 to 2.
+        {
+            let app = Arc::new(MockApp::new());
+            let mut engine = OxideBft::with_index(app, vs.clone(), 3)
+                .without_signature_verification()
+                .with_secret_key(keys[3].clone())
+                .with_wal(crate::wal::Wal::open(&path).expect("wal"));
+            engine
+                .apply_validator_changes(&[], &[vs.validator_addresses()[0]])
+                .expect("apply remove");
+            engine.rotate_epoch().expect("rotate");
+        }
+
+        // Restart with the ORIGINAL set at the ORIGINAL index — the
+        // WAL carries the rotated committee; recovery must both
+        // restore it and re-seat us at index 2.
+        let app = Arc::new(MockApp::new());
+        let mut engine = OxideBft::with_index(app, vs, 3)
+            .without_signature_verification()
+            .with_secret_key(keys[3].clone())
+            .with_wal(crate::wal::Wal::open(&path).expect("wal"));
+        engine.recover_from_wal().expect("recover");
+        assert_eq!(engine.validator_set().n(), 3);
+        assert_eq!(engine.validator_index(), 2, "re-seated by BLS key match");
     }
 }
