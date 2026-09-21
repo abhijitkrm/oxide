@@ -107,6 +107,19 @@ impl<'a> codec::Decode<'a> for Manifest {
                 remaining: expected,
             });
         }
+        // The self-consistency check above bounds `count` only by
+        // the *claimed* `total_len` — a manifest can legally claim
+        // u32::MAX chunks (~137 GiB of hashes) in a tiny message.
+        // Every hash occupies exactly 32 bytes on the wire, so a
+        // count exceeding `remaining / 32` is definitively malformed;
+        // reject before the reserve trusts the claim.
+        let max_count = reader.remaining() / Hash::LEN;
+        if count > max_count {
+            return Err(codec::DecodeError::LengthPrefixTooLarge {
+                claimed: u64::try_from(count).unwrap_or(u64::MAX),
+                remaining: u64::try_from(max_count).unwrap_or(u64::MAX),
+            });
+        }
         let mut chunk_hashes = Vec::with_capacity(count);
         for _ in 0..count {
             chunk_hashes.push(Hash::decode(reader)?);

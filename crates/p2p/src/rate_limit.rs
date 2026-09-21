@@ -240,15 +240,22 @@ mod tests {
 
     #[test]
     fn rate_limiter_refills_over_time() {
-        let mut rl = RateLimiter::with_capacity(100, 1000);
         let peer = vec![1u8];
-        // Exhaust the bucket.
+        // Exhaustion is deterministic at a zero refill rate: the
+        // bucket can never regain a token, so the over-budget check
+        // fails no matter how long the scheduler stalls between
+        // calls (a 1k tok/s rate refills a token per millisecond —
+        // the old test raced exactly that window).
+        let mut dry = RateLimiter::with_capacity(100, 0);
+        assert!(dry.check(&peer, 100));
+        assert!(!dry.check(&peer, 1));
+        // Refill is deterministic at a rate that refills the whole
+        // bucket in ~0.1ms: any real sleep restores it to capacity.
+        let mut rl = RateLimiter::with_capacity(100, 1_000_000);
         assert!(rl.check(&peer, 100));
-        assert!(!rl.check(&peer, 1));
-        // Wait for refill.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // Should have refilled ~50 tokens.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(rl.check(&peer, 1));
+        assert_eq!(rl.peer_tokens(&peer), Some(99), "refill caps at capacity");
     }
 
     #[test]

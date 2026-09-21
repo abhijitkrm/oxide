@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -272,6 +272,27 @@ const INBOUND_CHANNEL_BOUND: usize = 10_000;
 /// exceed a few hundred queued frames per peer.
 const OUTBOUND_CHANNEL_BOUND: usize = 10_000;
 
+/// Default aggregate byte budget for the inbound queue, shared by
+/// all peers (unit: bytes). The message-count bound alone does not
+/// bound memory: `10_000` slots × the 16 MiB per-message ceiling is a
+/// ~156 GiB worst case. 64 MiB admits the honest traffic profile
+/// (consensus frames run ~200 B–1 KiB, so `10_000` of them is ~10 MiB)
+/// plus a handful of maximum-size proposals in flight, while capping
+/// worst-case queued payload at roughly four max-size messages.
+/// Raising it lets a flood queue more payload before drops; lowering
+/// it drops legitimate max-size proposals under backlog.
+const DEFAULT_MAX_INBOUND_QUEUE_BYTES: usize = 64 << 20;
+
+/// Default per-peer byte budget for each outbound queue (unit:
+/// bytes). Outbound payload is self-generated, so the budget is a
+/// slow-consumer bound: a peer draining slower than we produce gets
+/// its sends rejected with `ChannelFull` instead of queueing
+/// unboundedly. 32 MiB fits two maximum-size frames plus headroom —
+/// a proposal in flight behind one already queued — while bounding
+/// worst-case outbound memory at `peers × 32 MiB` instead of
+/// `peers × 10_000 × 16 MiB`.
+const DEFAULT_MAX_OUTBOUND_QUEUE_BYTES: usize = 32 << 20;
+
 /// The default connect timeout for outbound TCP connections. Short
 /// enough that a dead peer is detected quickly during devnet startup.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -311,6 +332,22 @@ pub struct TcpTransportConfig {
     /// for testing). In production, this must be set to the
     /// validator set's peer IDs.
     pub allowed_peer_ids: Option<std::collections::HashSet<PeerId>>,
+
+    /// Aggregate queued payload bytes across ALL inbound peers.
+    /// Shared so one flooding peer cannot starve the whole queue's
+    /// memory budget with maximum-size frames; messages arriving
+    /// over budget are dropped at the reader (the frame stream stays
+    /// in sync — framing never desyncs on a drop). Default
+    /// [`DEFAULT_MAX_INBOUND_QUEUE_BYTES`].
+    pub max_inbound_queue_bytes: usize,
+
+    /// Queued payload bytes per outbound peer. A peer whose writer
+    /// drains slower than producers send gets `send()` rejected with
+    /// [`TransportError::ChannelFull`] — the slow-consumer policy is
+    /// explicit backpressure to the caller, not silent growth.
+    /// Must be ≥ `max_message_bytes` or every maximum-size send
+    /// fails. Default [`DEFAULT_MAX_OUTBOUND_QUEUE_BYTES`].
+    pub max_outbound_queue_bytes: usize,
 }
 
 impl Default for TcpTransportConfig {
@@ -323,12 +360,49 @@ impl Default for TcpTransportConfig {
             // behavior). Production callers must set this to the
             // validator set's peer IDs via `with_allowed_peer_ids`.
             allowed_peer_ids: None,
+            max_inbound_queue_bytes: DEFAULT_MAX_INBOUND_QUEUE_BYTES,
+            max_outbound_queue_bytes: DEFAULT_MAX_OUTBOUND_QUEUE_BYTES,
         }
     }
 }
 
 /// A peer's TCP address (host:port).
 pub type TcpAddr = String;
+
+/// A peer's outbound queue handle: the send channel plus the live
+/// count of queued payload bytes waiting for the writer thread.
+/// `send()` reserves bytes against the peer's budget before
+/// queueing; the writer thread releases them as it dequeues. The
+/// counter lives exactly as long as the slot — a removed connection
+/// takes its accounting with it.
+struct OutboundSlot {
+    /// Send side of the peer's writer channel.
+    tx: mpsc::SyncSender<Vec<u8>>,
+    /// Payload bytes currently queued for this peer.
+    queued: Arc<AtomicUsize>,
+}
+
+/// Atomically reserve `len` bytes against `budget` on a shared
+/// counter. Returns `true` when the reservation landed (caller now
+/// owns those bytes and must release them with `fetch_sub`); on
+/// `false` the counter is left untouched. A CAS loop is required —
+/// check-then-add would let every racing reader overshoot the
+/// budget by a full maximum-size frame each.
+fn try_reserve_bytes(counter: &AtomicUsize, budget: usize, len: usize) -> bool {
+    let mut cur = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(new) = cur.checked_add(len) else {
+            return false;
+        };
+        if new > budget {
+            return false;
+        }
+        match counter.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
 
 /// A TCP transport: real network I/O over `std::net`.
 ///
@@ -361,13 +435,21 @@ pub struct TcpTransport {
     /// accept thread may insert new connections concurrently. The
     /// lock is held only to look up the channel sender, not during
     /// I/O.
-    streams: Arc<Mutex<HashMap<PeerId, mpsc::SyncSender<Vec<u8>>>>>,
+    streams: Arc<Mutex<HashMap<PeerId, OutboundSlot>>>,
     /// Inbound message channel. Reader threads write; `recv()`
     /// reads.
     inbound_rx: Mutex<mpsc::Receiver<InboundMessage>>,
     /// Inbound message channel sender. Stored so `add_peer` can
     /// spawn new reader threads that write to the same channel.
     inbound_tx: mpsc::SyncSender<InboundMessage>,
+    /// Queued inbound payload bytes across ALL peers — the aggregate
+    /// bound the message-count channel cannot express. Every reader
+    /// thread reserves a frame's bytes before queueing it (dropping
+    /// the frame instead when the shared budget is full); `recv()`
+    /// releases bytes as messages are consumed. `Relaxed` ordering
+    /// is deliberate: the counter is approximate-capacity
+    /// accounting, never a happens-before edge for message data.
+    inbound_queued: Arc<AtomicUsize>,
     /// This node's peer ID.
     peer_id: PeerId,
     /// The transport configuration (max message size, timeouts).
@@ -562,14 +644,16 @@ impl TcpTransport {
         let listener = TcpListener::bind(listen_addr)
             .unwrap_or_else(|e| panic!("failed to bind TCP transport to {listen_addr}: {e}"));
 
-        let streams: Arc<Mutex<HashMap<PeerId, mpsc::SyncSender<Vec<u8>>>>> =
+        let streams: Arc<Mutex<HashMap<PeerId, OutboundSlot>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::sync_channel::<InboundMessage>(INBOUND_CHANNEL_BOUND);
+        let inbound_queued = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let max_message_bytes = config.max_message_bytes;
+        let max_inbound_queue_bytes = config.max_inbound_queue_bytes;
         let connect_timeout = config.connect_timeout;
         let read_timeout = config.read_timeout;
 
@@ -582,6 +666,7 @@ impl TcpTransport {
         let accept_streams = streams.clone();
         let accept_shutdown_streams = shutdown_streams.clone();
         let accept_tx = inbound_tx.clone();
+        let accept_queued = inbound_queued.clone();
         let accept_shutdown = shutdown.clone();
         // C4 fix: clone the allowed_peer_ids set for the accept
         // thread. When present, the accept thread rejects connections
@@ -683,20 +768,23 @@ impl TcpTransport {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .insert(peer_id.clone(), shutdown_stream);
                         }
-                        let writer_tx = spawn_writer(write_stream, &accept_shutdown);
+                        let slot = spawn_writer(write_stream, &accept_shutdown);
                         accept_streams
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(peer_id.clone(), writer_tx);
+                            .insert(peer_id.clone(), slot);
                         // Spawn a reader thread for this connection.
                         let tx = accept_tx.clone();
+                        let queued = accept_queued.clone();
                         let reader_shutdown = accept_shutdown.clone();
                         thread::spawn(move || {
                             reader_loop(
                                 reader_stream,
                                 peer_id,
                                 tx,
+                                queued,
                                 max_message_bytes,
+                                max_inbound_queue_bytes,
                                 reader_shutdown,
                             );
                         });
@@ -717,6 +805,7 @@ impl TcpTransport {
         let connect_streams = streams.clone();
         let connect_shutdown_streams = shutdown_streams.clone();
         let connect_tx = inbound_tx.clone();
+        let connect_queued = inbound_queued.clone();
         let connect_shutdown = shutdown.clone();
         let our_id = peer_id.clone();
         let connect_admission = admission.clone();
@@ -732,6 +821,7 @@ impl TcpTransport {
                 let cs = connect_streams.clone();
                 let css = connect_shutdown_streams.clone();
                 let ct = connect_tx.clone();
+                let cq = connect_queued.clone();
                 let rshut = connect_shutdown.clone();
                 let cac = connect_admission.clone();
                 #[cfg(feature = "tls")]
@@ -808,16 +898,18 @@ impl TcpTransport {
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .insert(pid.clone(), shutdown_stream);
                                 }
-                                let writer_tx = spawn_writer(write_stream, &rshut);
+                                let slot = spawn_writer(write_stream, &rshut);
                                 cs.lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .insert(pid.clone(), writer_tx);
+                                    .insert(pid.clone(), slot);
                                 // Reader loop for this connection.
                                 reader_loop(
                                     reader_stream,
                                     pid.clone(),
                                     ct.clone(),
+                                    cq.clone(),
                                     max_message_bytes,
+                                    max_inbound_queue_bytes,
                                     rshut.clone(),
                                 );
                                 // Reader loop exited — connection broke.
@@ -866,16 +958,18 @@ impl TcpTransport {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .insert(pid.clone(), shutdown_stream);
                         }
-                        let writer_tx = spawn_writer(write_stream, &rshut);
+                        let slot = spawn_writer(write_stream, &rshut);
                         cs.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(pid.clone(), writer_tx);
+                            .insert(pid.clone(), slot);
                         // Reader loop for this connection.
                         reader_loop(
                             reader_stream,
                             pid.clone(),
                             ct.clone(),
+                            cq.clone(),
                             max_message_bytes,
+                            max_inbound_queue_bytes,
                             rshut.clone(),
                         );
                         // Reader loop exited — connection broke.
@@ -899,6 +993,7 @@ impl TcpTransport {
             streams,
             inbound_rx: Mutex::new(inbound_rx),
             inbound_tx,
+            inbound_queued,
             peer_id,
             config,
             shutdown,
@@ -987,26 +1082,30 @@ impl TcpTransport {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let connect_timeout = self.config.connect_timeout;
-        let read_timeout = self.config.read_timeout;
-        let max_message_bytes = self.config.max_message_bytes;
-        let streams = self.streams.clone();
-        let shutdown_streams = self.shutdown_streams.clone();
-        let tx = self.inbound_tx.clone();
-        let shutdown = self.shutdown.clone();
-        let our_id = self.peer_id.clone();
-        #[cfg(feature = "tls")]
-        let tls = self.tls.clone();
+        let ctx = ConnectCtx {
+            our_id: self.peer_id.clone(),
+            connect_timeout: self.config.connect_timeout,
+            read_timeout: self.config.read_timeout,
+            max_message_bytes: self.config.max_message_bytes,
+            max_inbound_queue_bytes: self.config.max_inbound_queue_bytes,
+            streams: self.streams.clone(),
+            shutdown_streams: self.shutdown_streams.clone(),
+            tx: self.inbound_tx.clone(),
+            queued: self.inbound_queued.clone(),
+            shutdown: self.shutdown.clone(),
+            #[cfg(feature = "tls")]
+            tls: self.tls.clone(),
+        };
         let pid = peer_id.clone();
         thread::spawn(move || {
             // Retry connection — the peer may not be listening yet.
             let stream = loop {
-                if shutdown.load(Ordering::Relaxed) {
+                if ctx.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
                 if let Ok(s) = TcpStream::connect_timeout(
                     &addr.parse().unwrap_or_else(|_| panic!("invalid TCP address: {addr}")),
-                    connect_timeout,
+                    ctx.connect_timeout,
                 ) {
                     break s;
                 }
@@ -1014,7 +1113,7 @@ impl TcpTransport {
             };
             #[cfg(feature = "tls")]
             {
-                if let Some(ref tls_config) = tls {
+                if let Some(ref tls_config) = ctx.tls {
                     let _ = stream.set_nodelay(true);
                     let server_name = rustls::pki_types::ServerName::try_from("localhost")
                         .expect("localhost is a valid server name");
@@ -1024,7 +1123,7 @@ impl TcpTransport {
                     )
                     .expect("client connection must be valid");
                     let mut tls_stream = rustls::StreamOwned::new(client_conn, stream);
-                    if write_frame(&mut tls_stream, &our_id).is_err() {
+                    if write_frame(&mut tls_stream, &ctx.our_id).is_err() {
                         return;
                     }
                     let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
@@ -1032,45 +1131,94 @@ impl TcpTransport {
                     let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
                     let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
                     let write_stream = Box::new(shared) as Box<dyn PeerStream>;
-                    if let Some(shutdown_stream) = shutdown_stream {
-                        let _ = shutdown_streams
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(pid.clone(), shutdown_stream);
-                    }
-                    let writer_tx = spawn_writer(write_stream, &shutdown);
-                    streams
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(pid.clone(), writer_tx);
-                    reader_loop(reader_stream, pid, tx, max_message_bytes, shutdown);
+                    install_connected_peer(
+                        &ctx,
+                        pid,
+                        reader_stream,
+                        write_stream,
+                        shutdown_stream,
+                    );
                     return;
                 }
             }
             let mut stream = stream;
             let _ = stream.set_nodelay(true);
-            if write_frame(&mut stream, &our_id).is_err() {
+            if write_frame(&mut stream, &ctx.our_id).is_err() {
                 return;
             }
-            let _ = stream.set_read_timeout(Some(read_timeout));
+            let _ = stream.set_read_timeout(Some(ctx.read_timeout));
             let shutdown_stream = stream.try_clone().ok();
             let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
             let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
-            // Duplicate handling: see accept path.
-            if let Some(shutdown_stream) = shutdown_stream {
-                let _ = shutdown_streams
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(pid.clone(), shutdown_stream);
-            }
-            let writer_tx = spawn_writer(write_stream, &shutdown);
-            streams
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(pid.clone(), writer_tx);
-            reader_loop(reader_stream, pid, tx, max_message_bytes, shutdown);
+            install_connected_peer(&ctx, pid, reader_stream, write_stream, shutdown_stream);
         });
     }
+}
+
+/// Context a connect thread needs to bring a fresh peer online:
+/// the shared maps its handles register into, the inbound channel
+/// its reader loop feeds, and the limits that loop enforces.
+/// Bundled so the TLS and plain connect paths share the same
+/// install steps instead of duplicating them.
+struct ConnectCtx {
+    /// This transport's own peer ID, sent as the first frame.
+    our_id: PeerId,
+    /// Timeout for the initial TCP connect.
+    connect_timeout: Duration,
+    /// Read timeout applied to plain (non-TLS) streams.
+    read_timeout: Duration,
+    /// Per-message wire size cap enforced by the frame decoder.
+    max_message_bytes: u64,
+    /// Aggregate inbound byte budget enforced at queue time.
+    max_inbound_queue_bytes: usize,
+    /// Live outbound slots keyed by peer id.
+    streams: Arc<Mutex<HashMap<PeerId, OutboundSlot>>>,
+    /// Raw sockets kept for forced-close on shutdown.
+    shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    /// Shared inbound queue every reader loop feeds.
+    tx: mpsc::SyncSender<InboundMessage>,
+    /// Aggregate queued inbound payload bytes.
+    queued: Arc<AtomicUsize>,
+    /// Transport-wide shutdown flag.
+    shutdown: Arc<AtomicBool>,
+    /// TLS configuration, when the transport was built with it.
+    #[cfg(feature = "tls")]
+    tls: Option<Arc<TlsConfig>>,
+}
+
+/// Register a connected peer's handles and run its reader loop to
+/// completion — the loop owns the calling thread until the
+/// connection dies. Shared by the TLS and plain connect paths so
+/// neither can drift on the accounting or map bookkeeping.
+fn install_connected_peer(
+    ctx: &ConnectCtx,
+    pid: PeerId,
+    reader_stream: Box<dyn PeerStream>,
+    write_stream: Box<dyn PeerStream>,
+    shutdown_stream: Option<TcpStream>,
+) {
+    // Duplicate handling: see accept path.
+    if let Some(shutdown_stream) = shutdown_stream {
+        let _ = ctx
+            .shutdown_streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pid.clone(), shutdown_stream);
+    }
+    let slot = spawn_writer(write_stream, &ctx.shutdown);
+    ctx.streams
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(pid.clone(), slot);
+    reader_loop(
+        reader_stream,
+        pid,
+        ctx.tx.clone(),
+        ctx.queued.clone(),
+        ctx.max_message_bytes,
+        ctx.max_inbound_queue_bytes,
+        ctx.shutdown.clone(),
+    );
 }
 
 impl Transport for TcpTransport {
@@ -1082,17 +1230,31 @@ impl Transport for TcpTransport {
         // The lock is held only for the lookup, not during I/O —
         // the writer thread handles the actual write asynchronously.
         let streams = self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(sender) = streams.get(peer) else {
+        let Some(slot) = streams.get(peer) else {
             return Err(TransportError::UnknownPeer);
         };
+        // Per-peer byte budget: reserve before queueing so a peer
+        // draining slower than we produce bounds its queued payload
+        // at `max_outbound_queue_bytes` instead of
+        // `OUTBOUND_CHANNEL_BOUND × max_message_bytes`. On overflow
+        // the caller sees `ChannelFull` — explicit backpressure,
+        // the slow-consumer policy.
+        if !try_reserve_bytes(&slot.queued, self.config.max_outbound_queue_bytes, bytes.len()) {
+            return Err(TransportError::ChannelFull);
+        }
         // Clone the bytes into a Vec for the channel. The writer
         // thread owns the stream and writes the frame. Use
         // `try_send` (non-blocking) so a full outbound channel
         // returns `ChannelFull` instead of blocking the caller or
         // growing the queue without bound.
-        sender.try_send(bytes.to_vec()).map_err(|e| match e {
-            mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
-            mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
+        slot.tx.try_send(bytes.to_vec()).map_err(|e| {
+            // The reservation must not outlive the message that
+            // failed to queue — release it on every error path.
+            slot.queued.fetch_sub(bytes.len(), Ordering::Relaxed);
+            match e {
+                mpsc::TrySendError::Full(_) => TransportError::ChannelFull,
+                mpsc::TrySendError::Disconnected(_) => TransportError::ChannelClosed,
+            }
         })
     }
 
@@ -1125,6 +1287,13 @@ impl Transport for TcpTransport {
                     | std::sync::mpsc::TryRecvError::Disconnected,
                 ) => return None,
             };
+            // Release the reader's byte reservation the moment the
+            // message leaves the queue — before the admission check,
+            // so a message dropped by admission control still frees
+            // its budget. The reservation was taken against
+            // `msg.bytes.len()` at queue time, so this is the exact
+            // inverse.
+            self.inbound_queued.fetch_sub(msg.bytes.len(), Ordering::Relaxed);
             // Admission control: check rate limit and reputation.
             // If rejected, drop the message and try the next one.
             if let Some(ref ac) = self.admission {
@@ -1341,7 +1510,9 @@ fn reader_loop(
     mut stream: Box<dyn PeerStream>,
     peer_id: PeerId,
     tx: mpsc::SyncSender<InboundMessage>,
+    queued: Arc<AtomicUsize>,
     max_message_bytes: u64,
+    max_inbound_queue_bytes: usize,
     shutdown: Arc<AtomicBool>,
 ) {
     // The incremental decoder owns the partially consumed frame
@@ -1356,9 +1527,25 @@ fn reader_loop(
         }
         match stream.read_frame(&mut framer, max_message_bytes) {
             Ok(Some(bytes)) => {
+                // Aggregate byte budget: reserve the frame's bytes
+                // before queueing. Over budget, drop the frame and
+                // keep reading — the decoder has already consumed
+                // it, so the frame stream stays in sync and a peer
+                // flooding us with maximum-size messages cannot pin
+                // `INBOUND_CHANNEL_BOUND × max_message_bytes` of
+                // heap. Small honest frames still fit under the
+                // freed budget; the count bound keeps its own
+                // blocking backpressure for message floods.
+                if !try_reserve_bytes(&queued, max_inbound_queue_bytes, bytes.len()) {
+                    continue;
+                }
+                let len = bytes.len();
                 let msg = InboundMessage { from: peer_id.clone(), bytes };
                 if tx.send(msg).is_err() {
-                    return; // channel closed — transport shut down
+                    // Channel closed — release the reservation this
+                    // message will never consume.
+                    queued.fetch_sub(len, Ordering::Relaxed);
+                    return;
                 }
             }
             Ok(None) => {
@@ -1405,6 +1592,7 @@ const WRITER_BATCH_MAX_BYTES: usize = 1 << 20;
 fn writer_loop(
     mut stream: Box<dyn PeerStream>,
     rx: mpsc::Receiver<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
@@ -1412,6 +1600,11 @@ fn writer_loop(
         // check the shutdown flag periodically.
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(first) => {
+                // Dequeued bytes free the sender's reservation —
+                // release on dequeue, not on write, so a failed
+                // write still accounts honestly (the message is
+                // gone from the queue either way).
+                queued.fetch_sub(first.len(), Ordering::Relaxed);
                 // Drain whatever else is already queued and write
                 // the batch in one syscall + one flush. Consensus
                 // bursts (votes → QCs) queue several frames within
@@ -1429,6 +1622,7 @@ fn writer_loop(
                     }
                     match rx.try_recv() {
                         Ok(next) => {
+                            queued.fetch_sub(next.len(), Ordering::Relaxed);
                             total_bytes += next.len();
                             batch.push(next);
                         }
@@ -1454,16 +1648,18 @@ fn writer_loop(
 /// The writer thread owns the write stream and drains the channel.
 /// The returned sender is stored in the `streams` map for `send()`
 /// to use.
-fn spawn_writer(
-    write_stream: Box<dyn PeerStream>,
-    shutdown: &Arc<AtomicBool>,
-) -> mpsc::SyncSender<Vec<u8>> {
+fn spawn_writer(write_stream: Box<dyn PeerStream>, shutdown: &Arc<AtomicBool>) -> OutboundSlot {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_CHANNEL_BOUND);
+    // The byte counter is shared between `send()` (reserves) and
+    // the writer thread (releases on dequeue). It starts at zero
+    // and dies with the slot when the connection is replaced.
+    let queued = Arc::new(AtomicUsize::new(0));
+    let writer_queued = queued.clone();
     let shutdown = Arc::clone(shutdown);
     thread::spawn(move || {
-        writer_loop(write_stream, rx, shutdown);
+        writer_loop(write_stream, rx, writer_queued, shutdown);
     });
-    tx
+    OutboundSlot { tx, queued }
 }
 
 /// The result of accepting a connection: the peer's ID, a write
@@ -1832,6 +2028,8 @@ mod tests {
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(30),
             allowed_peer_ids: None,
+            max_inbound_queue_bytes: DEFAULT_MAX_INBOUND_QUEUE_BYTES,
+            max_outbound_queue_bytes: DEFAULT_MAX_OUTBOUND_QUEUE_BYTES,
         };
 
         let mut transport_a = TcpTransport::with_config(
@@ -2350,5 +2548,193 @@ mod tests {
         thread::sleep(Duration::from_millis(500));
         let msg = poll_recv(&mut transport_a, Duration::from_millis(500));
         assert!(msg.is_none(), "A must not receive from untrusted C");
+    }
+
+    // ------------------------------------------------------------------
+    // Queue byte budgets: aggregate memory caps layered on the
+    // per-queue message-count bounds, so `BOUND × max_message_bytes`
+    // of payload can never sit queued at once.
+    // ------------------------------------------------------------------
+
+    /// A `PeerStream` whose writes block until `release` is set —
+    /// lets a test observe queue-byte accounting while a frame is
+    /// still in-flight inside the writer thread.
+    struct BlockingWriter {
+        release: Arc<AtomicBool>,
+        written: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl PeerStream for BlockingWriter {
+        fn read_frame(
+            &mut self,
+            _state: &mut FrameReader,
+            _max_message_bytes: u64,
+        ) -> io::Result<Option<Vec<u8>>> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "write-only test stream"))
+        }
+
+        fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+            while !self.release.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            self.written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Byte reservations are budget-checked atomically: an
+    /// over-budget reserve fails without touching the counter, a
+    /// release reopens exactly that much space, and a `usize`
+    /// overflow refuses instead of wrapping.
+    #[test]
+    fn try_reserve_bytes_enforces_budget_atomically() {
+        let counter = AtomicUsize::new(0);
+        assert!(try_reserve_bytes(&counter, 100, 60));
+        assert!(try_reserve_bytes(&counter, 100, 40), "reserve landing exactly on budget");
+        assert!(!try_reserve_bytes(&counter, 100, 1), "101 > 100 must refuse");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            100,
+            "a refused reserve must leave the counter untouched"
+        );
+        counter.fetch_sub(40, Ordering::Relaxed);
+        assert!(try_reserve_bytes(&counter, 100, 40), "released space must be reusable");
+        // Overflow: usize::MAX + 1 is a refused reserve, not a wrap
+        // to a small count that would pass the budget check.
+        let huge = AtomicUsize::new(usize::MAX);
+        assert!(!try_reserve_bytes(&huge, usize::MAX, 1));
+        assert_eq!(huge.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    /// The writer thread frees a peer's byte reservation on
+    /// *dequeue*, not on write completion: while the stream write is
+    /// still blocked, the budget must already show the space back.
+    /// Otherwise a slow peer would hold budget hostage for bytes it
+    /// has already taken off the queue.
+    #[test]
+    fn outbound_slot_releases_bytes_on_dequeue() {
+        let release = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let stream = BlockingWriter { release: release.clone(), written: written.clone() };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let slot = spawn_writer(Box::new(stream), &shutdown);
+
+        let budget = 150;
+        // Queue a 100-byte frame: reserve, then enqueue.
+        assert!(try_reserve_bytes(&slot.queued, budget, 100));
+        slot.tx.try_send(vec![0u8; 100]).expect("queue has room");
+        // The reservation stands while the frame sits queued.
+        assert!(!try_reserve_bytes(&slot.queued, budget, 100), "100 + 100 > 150");
+
+        // Wait for the writer to dequeue the frame — it then blocks
+        // inside `write_frame` until `release` is set.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while slot.queued.load(Ordering::Relaxed) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer must dequeue the frame and release its bytes"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // The write is still blocked (release is unset), yet the
+        // budget is already free — proving release-on-dequeue.
+        assert!(written.lock().unwrap().is_empty(), "frame must still be in-flight");
+        assert!(try_reserve_bytes(&slot.queued, budget, 100), "budget must recover");
+
+        release.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// A send whose payload exceeds the per-peer outbound byte
+    /// budget fails with `ChannelFull` instead of queueing — the
+    /// reserve can never land, so this is deterministic regardless
+    /// of how fast the writer drains.
+    #[test]
+    fn tcp_send_over_byte_budget_is_channel_full() {
+        let addr_a = "127.0.0.1:19220";
+        let addr_b = "127.0.0.1:19221";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        let config_a = TcpTransportConfig { max_outbound_queue_bytes: 100, ..Default::default() };
+        let mut transport_a = TcpTransport::with_config(
+            addr_a,
+            id_a.clone(),
+            vec![(id_b.clone(), addr_b.to_string())],
+            config_a,
+        );
+        let mut transport_b =
+            TcpTransport::new(addr_b, id_b.clone(), vec![(id_a.clone(), addr_a.to_string())]);
+
+        thread::sleep(Duration::from_millis(500));
+
+        // 200 payload bytes > 100-byte budget → refused at reserve.
+        let err = transport_a.send(&id_b, &[7u8; 200]).expect_err("over-budget send must fail");
+        assert_eq!(err, TransportError::ChannelFull);
+        // The budget isn't wedged: an under-budget frame still goes.
+        transport_a.send(&id_b, &[9u8; 50]).expect("under-budget send must succeed");
+        let msg = poll_recv(&mut transport_b, Duration::from_secs(5));
+        assert_eq!(msg.expect("B must receive the small frame").bytes, vec![9u8; 50]);
+    }
+
+    /// Inbound frames queue only while the aggregate byte budget has
+    /// room; once it fills, further frames are dropped — and reading
+    /// the queued ones frees the budget for the next batch.
+    #[test]
+    fn tcp_inbound_byte_budget_drops_then_recovers() {
+        let addr_a = "127.0.0.1:19222";
+        let addr_b = "127.0.0.1:19223";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        // Budget fits exactly three 100-byte frames.
+        let config_a = TcpTransportConfig { max_inbound_queue_bytes: 300, ..Default::default() };
+        let mut transport_a = TcpTransport::with_config(
+            addr_a,
+            id_a.clone(),
+            vec![(id_b.clone(), addr_b.to_string())],
+            config_a,
+        );
+        let mut transport_b =
+            TcpTransport::new(addr_b, id_b.clone(), vec![(id_a.clone(), addr_a.to_string())]);
+
+        thread::sleep(Duration::from_millis(500));
+
+        // B sends ten 100-byte frames; A's queue holds three.
+        for _ in 0..10 {
+            transport_b.send(&id_a, &[5u8; 100]).expect("send must succeed");
+        }
+        // Wait for the aggregate counter to reach the cap: ten sent
+        // frames guarantee the reader fills it — and the budget
+        // guarantees it stops at exactly 300 (the pre-fix code let
+        // it grow to 1000).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while transport_a.inbound_queued.load(Ordering::Relaxed) < 300 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "inbound queue must fill to the 300-byte cap"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            transport_a.inbound_queued.load(Ordering::Relaxed),
+            300,
+            "aggregate inbound bytes must stop at the budget"
+        );
+        // Draining yields exactly the three frames that fit.
+        let mut received = 0;
+        while transport_a.recv().is_some() {
+            received += 1;
+        }
+        assert_eq!(received, 3, "seven frames must have been dropped at the budget");
+        assert_eq!(transport_a.inbound_queued.load(Ordering::Relaxed), 0);
+
+        // Reading freed the budget: a fresh frame must be delivered.
+        transport_b.send(&id_a, &[6u8; 100]).expect("send must succeed");
+        let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+        assert_eq!(msg.expect("queue must accept after drain").bytes, vec![6u8; 100]);
     }
 }

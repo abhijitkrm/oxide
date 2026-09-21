@@ -267,7 +267,8 @@ impl Node {
         // Register the exchange module with a default spot market
         // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
         // exchange settles fills against EVM balances (plan.md §9.2).
-        let mut exchange_mod = exchange::ExchangeModule::with_ledger(evm_module.clone());
+        let mut exchange_mod = exchange::ExchangeModule::with_ledger(evm_module.clone())
+            .with_committee(staking_module.clone());
         if let Some(operator) = config.settlement_operator {
             exchange_mod.set_settlement_operator(operator);
         }

@@ -159,6 +159,30 @@ pub struct PerpsMarketConfig {
     pub mmr_base_bps: u16,
 }
 
+impl PerpsMarketConfig {
+    /// Validate configuration self-consistency for the transaction
+    /// listing path — the base engine config (which bounds
+    /// `max_resting` at `MAX_RESTING_LIMIT`) plus the perps-specific
+    /// fields. `max_leverage = 0` would mean infinite margin and
+    /// `mmr_base_bps > 10_000` a maintenance rate above 100%; both
+    /// are nonsense configs a listing proposal must not carry.
+    ///
+    /// # Errors
+    /// [`TradingError::InvalidConfig`] naming the broken field.
+    pub fn validate(&self) -> Result<(), TradingError> {
+        self.base.validate()?;
+        if self.max_leverage == 0 {
+            return Err(TradingError::InvalidConfig("max_leverage must be >= 1"));
+        }
+        if self.mmr_base_bps > 10_000 {
+            return Err(TradingError::InvalidConfig(
+                "mmr_base_bps must be <= 10_000 (a 100% maintenance rate)",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Maintenance margin rate as a fraction (basis points → `u128` numerator
 /// over `10_000`).
 fn mmr_rate(cfg: &PerpsMarketConfig) -> u128 {
@@ -1705,10 +1729,8 @@ impl Module for PerpsModule {
                 self.handle_cancel(ctx, body)
             }
             TAG_LIST_MARKET => {
-                let cfg = Self::parse_list_market(body).ok_or(ExecError::Malformed)?;
                 drop(inner);
-                let id = self.list_market(cfg)?;
-                Ok(vec![Event { module: "perps", kind: "market_listed", data: vec![id] }])
+                self.handle_list_market(ctx, msg, body)
             }
             TAG_DEPOSIT => {
                 drop(inner);
@@ -1901,6 +1923,56 @@ impl framework::MarkSink for PerpsModule {
 // ── Fill → position application ──────────────────────────────────────
 
 impl PerpsModule {
+    /// Handle a list-market message (extracted from `handle` to keep
+    /// the dispatch function under the clippy line-count gate).
+    fn handle_list_market(
+        &self,
+        ctx: &TxContext,
+        msg: &[u8],
+        body: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let cfg = Self::parse_list_market(body).ok_or(ExecError::Malformed)?;
+        // Reject an invalid config before recording an
+        // endorsement — pending actions are a bounded set,
+        // so a proposal that can never apply must not occupy
+        // a slot. `base.validate` also caps `max_resting`
+        // at `MAX_RESTING_LIMIT`, bounding the arenas
+        // `list_market` allocates at quorum.
+        cfg.validate()
+            .map_err(|e| ExecError::ModuleRejected(format!("list_market: {e}")))?;
+        // Same quorum gate as `TAG_SET_MARK`: a listing
+        // eagerly allocates the market's order-pool and
+        // id-map arenas, so an unauthenticated listing is a
+        // memory-exhaustion primitive. Each tx endorses the
+        // exact tagged message; the market lists only once
+        // endorsing power strictly exceeds two-thirds.
+        let Some(committee) = self.committee.clone() else {
+            return Err(ExecError::ModuleRejected("list_market: no committee wired".to_string()));
+        };
+        match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
+            framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
+                module: "perps",
+                kind: "list_market_endorse",
+                data: body.to_vec(),
+            }]),
+            framework::EndorsementOutcome::Quorum => match self.list_market(cfg) {
+                Ok(id) => Ok(vec![Event {
+                    module: "perps",
+                    kind: "market_listed",
+                    data: vec![id],
+                }]),
+                // Quorum reached but the listing no longer
+                // applies (e.g. all slots filled while the
+                // proposal accumulated votes).
+                Err(_) => Ok(vec![Event {
+                    module: "perps",
+                    kind: "list_market_stale",
+                    data: body.to_vec(),
+                }]),
+            },
+        }
+    }
+
     /// Handle a place-order message (extracted from `handle` to keep
     /// the dispatch function under the clippy line-count gate).
     fn handle_place(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
@@ -3130,11 +3202,54 @@ mod tests {
 
     #[test]
     fn list_market_via_message() {
-        let perps = PerpsModule::new();
+        // A single-validator committee reaches quorum on the first
+        // endorsement — the tx path then lists exactly like the
+        // in-process call.
+        let perps = PerpsModule::new().with_committee(Arc::new(SingleValidatorCommittee));
         let list_msg = msg::list_market(test_cfg());
         let events = perps.handle(&ctx(1), &list_msg).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "market_listed");
+    }
+
+    /// The `TAG_LIST_MARKET` tx path is fail-closed without a
+    /// committee — same gate as `TAG_SET_MARK`: an unauthenticated
+    /// listing eagerly allocates the market's `max_resting` arenas,
+    /// so a bare module rejects it outright.
+    #[test]
+    fn list_market_tx_rejected_without_committee() {
+        let perps = PerpsModule::new();
+        let err = perps.handle(&ctx(1), &msg::list_market(test_cfg())).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "got {err:?}");
+    }
+
+    /// A listing is a governance action: one endorsement records the
+    /// vote; the market lists only once endorsing power strictly
+    /// exceeds two-thirds of the committee.
+    #[test]
+    fn list_market_requires_committee_quorum() {
+        let perps = PerpsModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        let list_msg = msg::list_market(test_cfg());
+
+        let events = perps.handle(&ctx(1), &list_msg).unwrap();
+        assert_eq!(events[0].kind, "list_market_endorse", "one endorsement must not list");
+
+        let events = perps.handle(&ctx(2), &list_msg).unwrap();
+        assert_eq!(events[0].kind, "market_listed", "quorum lists the market");
+    }
+
+    /// A config failing `PerpsMarketConfig::validate` — here a
+    /// `max_resting` above the protocol's `MAX_RESTING_LIMIT`, which
+    /// would make `list_market` reserve oversized arenas — is
+    /// rejected before an endorsement occupies the bounded pending
+    /// set.
+    #[test]
+    fn list_market_tx_rejects_unbounded_max_resting() {
+        let perps = PerpsModule::new().with_committee(Arc::new(SingleValidatorCommittee));
+        let mut cfg = test_cfg();
+        cfg.base.max_resting = trading::MAX_RESTING_LIMIT + 1;
+        let err = perps.handle(&ctx(1), &msg::list_market(cfg)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "got {err:?}");
     }
 
     #[test]

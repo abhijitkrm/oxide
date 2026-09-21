@@ -2047,6 +2047,44 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     peers. Now a stalled read just pauses mid-message and picks up
     exactly where it stopped.
 
+- **Resource bounds: market-listing governance, decode guards,
+  and queue byte budgets** (`crates/trading`, `modules/exchange`,
+  `modules/perps`, `crates/executor`, `crates/storage`,
+  `crates/statesync`, `crates/p2p`, `crates/matcher`, `crates/node`,
+  `crates/devnet`)
+  - Market creation is now committee-gated: `TAG_LIST_MARKET`
+    transactions on the exchange and perps modules record an
+    endorsement for the exact listing payload and only create the
+    market once validators holding strictly more than two-thirds
+    of committee power endorse it. Pending endorsements are part
+    of committed module state, so a quorum survives restarts and
+    snapshot import. Operators listing markets at genesis or in
+    test harnesses can still call `list_market` in-process.
+  - `MarketConfig::max_resting` is capped at `MAX_RESTING_LIMIT`
+    (2²⁰) — the order-pool and id-map arenas a listing allocates
+    eagerly are now bounded by protocol, not by whatever a
+    transaction claims.
+  - Snapshot and state-sync decoders no longer trust count
+    prefixes for allocation: the executor snapshot, storage
+    snapshot, and statesync manifest cap speculative `Vec`
+    capacity at what the remaining input could plausibly hold.
+  - P2P queues bound bytes as well as counts: inbound traffic
+    shares a 64 MiB aggregate budget (per `TcpTransportConfig`),
+    each peer's outbound queue caps at 32 MiB before `send`
+    returns `ChannelFull`, and accounting is released the moment
+    a message leaves a queue.
+  - Matcher market-data subscribers get bounded queues (256
+    messages): a client that falls behind is disconnected rather
+    than letting its backlog grow, and `evicted_subscriber_count`
+    exposes the slow-consumer signal.
+  - **In plain words:** several doors let one peer or one
+    transaction make the node allocate effectively unlimited
+    memory — a forged market listing, a snapshot claiming billions
+    of entries, a flooded network queue, or a market-data client
+    that never reads. Every one of those paths now has a hard,
+    enforced budget, and creating a market at all now requires
+    the validator committee to agree.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

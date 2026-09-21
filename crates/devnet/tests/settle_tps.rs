@@ -144,10 +144,10 @@ fn run_settle_tps(
     min_fills_per_sec: f64,
 ) {
     // `run_pipelined_txs` consumes exactly `rounds * txs_per_round`
-    // txs in contiguous chunks — the `list_market` setup tx occupies
-    // the first slot of round 0, leaving `needed - 1` batch slots.
+    // txs in contiguous chunks — every slot is a batch tx; the
+    // market is listed in-process before the run (see below).
     let total_txs = rounds * txs_per_round;
-    let total_batch_txs = total_txs - 1;
+    let total_batch_txs = total_txs;
     let total_fills = total_batch_txs * fills_per_tx;
     eprintln!(
         "settle TPS test: {n_validators} validators, {rounds} rounds, \
@@ -168,14 +168,22 @@ fn run_settle_tps(
     );
     eprintln!("settle TPS test: assembled in {:.3}s", assemble_start.elapsed().as_secs_f64());
 
-    // Build the workload: round 0 = list_market + batches, rounds 1+
-    // = batches. All batch txs come from the operator with
-    // incrementing nonces; `list_market` uses nonce 0.
+    // List the market in-process on every validator — the
+    // genesis-style setup path. `TAG_LIST_MARKET` transactions are
+    // committee-gated governance actions, not a setup shortcut, so
+    // the workload carries only batch txs; the identical config on
+    // every validator assigns the same market id 0 and lands the
+    // same state-root contribution.
+    for ex in devnet.exchange_modules() {
+        ex.list_market(cfg()).expect("test market config is valid");
+    }
+
+    // Build the workload: all batch txs from the operator with
+    // incrementing nonces starting at 0.
     let build_start = Instant::now();
     let mut all_txs = Vec::with_capacity(total_txs);
-    all_txs.push(make_tx(OPERATOR_BYTE, 0, exchange::msg::list_market(cfg())));
     let mut next_fill = 0usize;
-    for nonce in (1u64..).take(total_batch_txs) {
+    for nonce in (0u64..).take(total_batch_txs) {
         all_txs.push(make_batch_tx(nonce, next_fill, fills_per_tx));
         next_fill += fills_per_tx;
     }
@@ -208,7 +216,7 @@ fn run_settle_tps(
     let min_blocks = result.finalized.iter().map(Vec::len).min().unwrap_or(0);
     assert!(min_blocks > 0, "should have finalized at least one block");
 
-    // 2. Every submitted tx finalized (list_market + all batches).
+    // 2. Every submitted tx finalized (all batch txs).
     let finalized_txs: usize = result.finalized[0][..min_blocks].iter().map(|b| b.txs.len()).sum();
     assert_eq!(
         finalized_txs, total_txs,

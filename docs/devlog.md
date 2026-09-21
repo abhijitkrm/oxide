@@ -16638,3 +16638,63 @@ proves: stalls return `None` with state retained, completed frames
 deliver exact bytes, oversize prefixes error regardless of poll
 count, and EOF mid-frame is a fatal truncation. 101 p2p tests
 green (both feature sets clippy-clean); fmt clean.
+
+## Resource bounds across market listing, decoders, and queues (audit 6.3)
+
+Four unbounded-resource findings, one theme: every byte a peer can
+make us hold must be budgeted before it's allocated.
+
+**Market listing** — `MarketConfig::max_resting` sized the order-pool
+and id-map arenas eagerly, but `validate` only rejected zero. A forged
+`TAG_LIST_MARKET` could claim `u32::MAX` resting slots (~280 GiB of
+arenas) and kill the validator before its first order. Now
+`MAX_RESTING_LIMIT` (2^20, plan.md §9.1's default scale) is a protocol
+bound enforced in `validate`. Deeper than the parameter, though, the
+listing path itself was unauthenticated: any sender could create
+markets. Exchange and perps `TAG_LIST_MARKET` txs now go through the
+existing committee-endorsement machinery — validate before voting,
+fail closed with no committee, reject powerless senders, list only
+once endorsing power strictly exceeds two-thirds, and record pending
+endorsements in canonical state so a quorum survives snapshot
+round-trips. Production node and devnet wire the staking committee;
+devnet throughput tests list in-process at assembly (genesis-style
+setup, same as trading_throughput already did).
+
+**Snapshot decodes** — `ExecutorSnapshot::decode`,
+`storage::Snapshot::decode`, and `Manifest::decode` each called
+`Vec::with_capacity(count)` on attacker-controlled prefixes. A tiny
+crafted payload could reserve hundreds of GiB and abort the importer.
+Each now caps the speculative reserve at what the remaining input
+could actually contain (`remaining / min-wire-size`), and the
+manifest additionally cross-checks the count against
+`ceil(total_len / chunk_size)` before allocating. Regression tests
+forge `u32::MAX` into every counted section and require a plain
+decode error, not a reserve.
+
+**P2P queues** — the 10,000-message channel bounds only counted
+frames: at the 16 MiB message ceiling a flooded queue could hold
+~156 GiB. Now `try_reserve_bytes` does a CAS-checked aggregate byte
+reservation per enqueue — inbound shares a 64 MiB transport budget
+(reader drops over-budget frames but keeps the stream in sync),
+outbound budgets 32 MiB per peer (`send` returns `ChannelFull`).
+Writers release on dequeue, not write completion, so a stalled peer
+can't hold budget hostage; `recv` releases before admission drops so
+rejected messages still free their bytes. A `BlockingWriter` test
+stream proves release-on-dequeue; the inbound test pins the counter
+at exactly the cap across ten over-budget sends.
+
+**Matcher market data** — subscribers used `unbounded_channel` while
+the code comment claimed full queues drop messages. Now bounded at
+`SUB_QUEUE_DEPTH` (256 ≈ 128 KiB of JSON), `broadcast` uses
+`try_send`, and full-or-closed subscribers are evicted in the same
+`retain` pass with an `evicted_subscribers` counter for operators.
+Tests cover the exact depth boundary, closed-receiver eviction,
+per-subscriber isolation, and that filtered-out traffic can't evict.
+
+Also made two pre-existing timing tests deterministic
+(`ban_expires`, `rate_limiter_refills_over_time`) — they raced
+millisecond-scale refills/expiry against scheduler stalls.
+
+105 p2p + 115 matcher + 68 perps + 44 exchange + 88 executor + 56
+storage + 59 trading + 6 statesync tests green; clippy clean on all
+touched crates (p2p both feature sets); fmt clean.

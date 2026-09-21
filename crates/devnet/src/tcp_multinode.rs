@@ -312,6 +312,9 @@ impl TcpMultiNodeDevnet {
             connect_timeout: config.network.connect_timeout(),
             read_timeout: config.network.read_timeout(),
             allowed_peer_ids: None,
+            // Queue byte budgets stay at the protocol defaults —
+            // `NetworkConfig` does not expose them separately.
+            ..Default::default()
         };
 
         Self::build(
@@ -521,55 +524,18 @@ impl TcpMultiNodeDevnet {
             (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
 
         for (i, key) in secret_keys.iter().cloned().enumerate() {
-            let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold)
-                // Devnet measures throughput, not gas policy — the
-                // block gas cap matches the consensus budget's
-                // `max_gas` (1 gigagas) so large test blocks fit
-                // under the declared-gas proposal check.
-                .with_gas_limit(1 << 30);
-            executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-            // The EVM account store is the single native-token
-            // ledger: it is created first so staking and exchange
-            // settle through it, and it collects native-module fees.
-            // Prefunded senders are credited `genesis_balance` base
-            // units (scaled to wei) so delegation bonds, fills, gas,
-            // and fees all debit the same accounts EVM txs see.
-            let evm_module = Arc::new(
-                evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL),
+            let (executor, evm_module, exchange_module) = Self::assemble_executor(
+                max_mempool_entries,
+                parallel_threshold,
+                genesis_balance,
+                num_senders,
+                register_exchange,
+                settlement_operator,
             );
-            let genesis_wei = u128::from(genesis_balance) * framework::WEI_PER_UNIT;
-            for sender_byte in 0u8..num_senders {
-                evm_module
-                    .fund_account_for_test(&primitives::Address([sender_byte; 20]), genesis_wei);
-            }
-            executor.register_module(evm_module.clone());
-            // The EVM ledger collects fees for all native-module txs
-            // — without this the module txs ran free.
-            executor.set_fee_module(framework::module_id::EVM);
-            // EVM-ledger staking: delegation debits the delegator
-            // into the bonded pool (no free stake inflation). The
-            // devnet validator identity `Address::ZERO` is registered
-            // so the key-change/validator-change keep-alive delegate
-            // has a registered target.
-            let staking_module = staking::StakingModule::new();
-            staking_module.set_ledger(evm_module.clone());
-            staking_module.register_validator(primitives::Address::ZERO);
-            executor.register_module(Arc::new(staking_module));
-            // Optionally register the exchange module backed by this
-            // validator's EVM ledger. Each validator gets its own
-            // exchange instance; state diverges during proposal but
-            // converges after finality (all validators execute the
-            // same block).
-            if register_exchange {
-                let mut ex = exchange::ExchangeModule::with_ledger(evm_module.clone());
-                if let Some(operator) = settlement_operator {
-                    ex.set_settlement_operator(operator);
-                }
-                let ex = Arc::new(ex);
-                executor.register_module(ex.clone());
+            evm_modules.push(evm_module);
+            if let Some(ex) = exchange_module {
                 exchange_modules.push(ex);
             }
-            evm_modules.push(evm_module);
             let app: Arc<Executor> = Arc::new(executor);
             // `DEVNET_EXEC_LANE=1`: run the async execution worker —
             // `finalize_block` hands each committed block to a
@@ -639,6 +605,73 @@ impl TcpMultiNodeDevnet {
             commit_seqs,
             last_phase_timers: PhaseTimers::default(),
         }
+    }
+
+    /// Assemble one validator's executor with the devnet module
+    /// stack (extracted from `build_with_modules` to keep it under
+    /// the clippy line-count gate). Returns the executor plus the
+    /// module handles tests inspect — the EVM ledger always, the
+    /// exchange only when `register_exchange` is set.
+    fn assemble_executor(
+        max_mempool_entries: usize,
+        parallel_threshold: usize,
+        genesis_balance: u64,
+        num_senders: u8,
+        register_exchange: bool,
+        settlement_operator: Option<primitives::Address>,
+    ) -> (Executor, Arc<evm::EvmModule>, Option<Arc<exchange::ExchangeModule>>) {
+        let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold)
+            // Devnet measures throughput, not gas policy — the
+            // block gas cap matches the consensus budget's
+            // `max_gas` (1 gigagas) so large test blocks fit
+            // under the declared-gas proposal check.
+            .with_gas_limit(1 << 30);
+        executor.register_module(Arc::new(oxide_core::CoreModule::new()));
+        // The EVM account store is the single native-token
+        // ledger: it is created first so staking and exchange
+        // settle through it, and it collects native-module fees.
+        // Prefunded senders are credited `genesis_balance` base
+        // units (scaled to wei) so delegation bonds, fills, gas,
+        // and fees all debit the same accounts EVM txs see.
+        let evm_module = Arc::new(
+            evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL),
+        );
+        let genesis_wei = u128::from(genesis_balance) * framework::WEI_PER_UNIT;
+        for sender_byte in 0u8..num_senders {
+            evm_module.fund_account_for_test(&primitives::Address([sender_byte; 20]), genesis_wei);
+        }
+        executor.register_module(evm_module.clone());
+        // The EVM ledger collects fees for all native-module txs
+        // — without this the module txs ran free.
+        executor.set_fee_module(framework::module_id::EVM);
+        // EVM-ledger staking: delegation debits the delegator
+        // into the bonded pool (no free stake inflation). The
+        // devnet validator identity `Address::ZERO` is registered
+        // so the key-change/validator-change keep-alive delegate
+        // has a registered target.
+        let staking_module = staking::StakingModule::new();
+        staking_module.set_ledger(evm_module.clone());
+        staking_module.register_validator(primitives::Address::ZERO);
+        let staking_module = Arc::new(staking_module);
+        executor.register_module(staking_module.clone());
+        // Optionally register the exchange module backed by this
+        // validator's EVM ledger, gated on the staking committee —
+        // the same quorum path the production node wires, so a
+        // devnet listing tx exercises the real endorsement flow.
+        // Each validator gets its own exchange instance; state
+        // diverges during proposal but converges after finality
+        // (all validators execute the same block).
+        let exchange_module = register_exchange.then(|| {
+            let mut ex = exchange::ExchangeModule::with_ledger(evm_module.clone())
+                .with_committee(staking_module);
+            if let Some(operator) = settlement_operator {
+                ex.set_settlement_operator(operator);
+            }
+            let ex = Arc::new(ex);
+            executor.register_module(ex.clone());
+            ex
+        });
+        (executor, evm_module, exchange_module)
     }
 
     /// The number of validators.

@@ -71,12 +71,6 @@ fn make_trading_tx(sender_byte: u8, nonce: u64, place_payload: Vec<u8>) -> types
     types::TxBytes::new(bytes)
 }
 
-/// Build a list-market tx (round 0 setup).
-fn make_list_market_tx(sender_byte: u8, nonce: u64) -> types::TxBytes {
-    let payload = exchange::msg::list_market(cfg());
-    make_trading_tx(sender_byte, nonce, payload)
-}
-
 /// Build a maker sell order at tick 500 ($15.00), 1 lot.
 fn make_maker_sell_tx(sender_byte: u8, nonce: u64) -> types::TxBytes {
     let order = NewOrder {
@@ -144,9 +138,18 @@ fn run_trading_tps(
         devnet.exchange_modules().len(),
     );
 
+    // List the market in-process on every validator — the
+    // genesis-style setup path. `TAG_LIST_MARKET` transactions are
+    // committee-gated governance actions, not a setup shortcut, so
+    // the workload carries only order txs; the identical config on
+    // every validator assigns the same market id 0.
+    for ex in devnet.exchange_modules() {
+        ex.list_market(cfg()).expect("test market config is valid");
+    }
+
     // Build the trading workload.
     //
-    // Round 0: list market (1 tx) + (txs_per_round - 1) maker sells.
+    // Round 0: maker sells (the market is already listed).
     // Rounds 1+: alternating maker sells and taker buys.
     //
     // Within each block, maker sells are processed before taker buys
@@ -163,11 +166,8 @@ fn run_trading_tps(
 
     for round in 0..rounds {
         if round == 0 {
-            // Round 0: list market + rest makers.
-            all_txs.push(make_list_market_tx(0x01, taker_nonce));
-            taker_nonce += 1;
-            let makers_in_round0 = txs_per_round.saturating_sub(1);
-            for _ in 0..makers_in_round0 {
+            // Round 0: all makers.
+            for _ in 0..txs_per_round {
                 all_txs.push(make_maker_sell_tx(0x09, maker_nonce));
                 maker_nonce += 1;
             }

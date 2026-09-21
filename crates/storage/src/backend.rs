@@ -239,7 +239,13 @@ impl<'a> Decode<'a> for Snapshot {
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         let height = reader.read_u64()?;
         let count = reader.read_u32()?;
-        let mut entries = Vec::with_capacity(count as usize);
+        // Each entry costs ≥ 33 bytes on the wire: a 32-byte key plus
+        // a varint length prefix (≥1) for the value. Cap the
+        // speculative reserve at what the remaining input could
+        // actually contain — the count is attacker-controlled, so
+        // `with_capacity(count)` would let a tiny crafted snapshot
+        // reserve gigabytes before the first element read fails.
+        let mut entries = Vec::with_capacity((count as usize).min(reader.remaining() / 33));
         for _ in 0..count {
             let key = Hash::decode(reader)?;
             let value = reader.read_bytes()?.to_vec();
@@ -467,5 +473,23 @@ mod tests {
     fn test_volatile_caps_unauthenticated() {
         let store = Volatile::new();
         assert_eq!(store.capabilities(), Caps { authenticated: false });
+    }
+
+    /// A forged entry count must not become an allocation size:
+    /// `decode` reserves at most `remaining / 33` slots (each entry
+    /// costs ≥ 33 bytes on the wire), so a `u32::MAX` count on a tiny
+    /// payload fails with a decode error instead of reserving
+    /// ~hundreds of GiB and killing the importer.
+    #[test]
+    fn test_snapshot_decode_bounds_count_driven_allocation() {
+        let mut buf = Vec::new();
+        codec::write::u64(&mut buf, 7); // height
+        codec::write::u32(&mut buf, u32::MAX); // forged count
+        // One real entry so the first loop iteration succeeds and the
+        // failure lands on the honest end-of-input path.
+        key(1).encode(&mut buf);
+        codec::write::bytes(&mut buf, b"v");
+        let mut reader = Reader::new(&buf);
+        assert!(Snapshot::decode(&mut reader).is_err());
     }
 }

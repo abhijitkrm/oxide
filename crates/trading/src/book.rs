@@ -59,6 +59,23 @@ impl PriceLevel {
     pub const EMPTY: PriceLevel = PriceLevel { head: NIL, tail: NIL, total_qty: 0 };
 }
 
+/// Protocol ceiling on [`MarketConfig::max_resting`] — the largest
+/// order-pool/ID-map allocation a market listing may request.
+///
+/// `max_resting` sizes two arenas at engine construction: the
+/// `OrderPool` (`max_resting` × 64-byte cache-line nodes) and the
+/// `IdMap` (the next power of two above `2 × max_resting` 16-byte
+/// entries). Unbounded, a single listing transaction could claim
+/// `u32::MAX` resting slots — roughly 280 GiB of arenas — and kill
+/// the validator before the first order arrives. 2^20 orders is the
+/// plan.md §9.1 default scale: ~96 MiB of arenas per market, an
+/// honest bound a governance listing can actually justify, while
+/// still two orders of magnitude beyond observed resting depth on
+/// production CLOBs (2^16 covers every testnet/devnet market).
+/// Raising it re-opens the allocation-driven `DoS`; lowering it
+/// rejects markets deep books legitimately need.
+pub const MAX_RESTING_LIMIT: u32 = 1 << 20;
+
 /// Per-market parameters fixed at genesis (plan.md §9.1/§9.2).
 ///
 /// All raw values: prices in scale-8 units, quantities in scale-6
@@ -79,7 +96,9 @@ pub struct MarketConfig {
     pub max_price: u64,
     /// Maximum simultaneously-resting orders. Sizes the order pool and
     /// the id map at construction (plan default 2^20; tests use
-    /// small values).
+    /// small values). Bounded above by [`MAX_RESTING_LIMIT`] — the
+    /// arenas reserve `max_resting` slots eagerly, so an unchecked
+    /// value is an allocation-size injection.
     pub max_resting: u32,
 }
 
@@ -111,6 +130,12 @@ impl MarketConfig {
         }
         if self.max_resting == 0 {
             return Err(TradingError::InvalidConfig("max_resting must be > 0"));
+        }
+        if self.max_resting > MAX_RESTING_LIMIT {
+            return Err(TradingError::InvalidConfig(
+                "max_resting exceeds MAX_RESTING_LIMIT (2^20): the pool and id-map \
+                 arenas reserve this many slots eagerly",
+            ));
         }
         Ok(())
     }
@@ -592,6 +617,30 @@ mod tests {
             c.validate(),
             Err(TradingError::InvalidConfig("price band must be a whole number of ticks"))
         );
+    }
+
+    /// `max_resting` is an allocation-size input: the order pool and
+    /// id map reserve that many slots eagerly at engine
+    /// construction, so `validate` must cap it at the protocol's
+    /// `MAX_RESTING_LIMIT` — an unchecked `u32::MAX` would reserve
+    /// ~280 GiB of arenas on a single listing.
+    #[test]
+    fn config_validation_bounds_max_resting() {
+        let mut c = cfg();
+        c.max_resting = MAX_RESTING_LIMIT;
+        assert_eq!(c.validate(), Ok(()), "the bound itself is legal");
+
+        let mut c = cfg();
+        c.max_resting = MAX_RESTING_LIMIT + 1;
+        assert!(matches!(c.validate(), Err(TradingError::InvalidConfig(_))));
+
+        let mut c = cfg();
+        c.max_resting = u32::MAX;
+        assert!(matches!(c.validate(), Err(TradingError::InvalidConfig(_))));
+
+        let mut c = cfg();
+        c.max_resting = 0;
+        assert_eq!(c.validate(), Err(TradingError::InvalidConfig("max_resting must be > 0")));
     }
 
     #[test]

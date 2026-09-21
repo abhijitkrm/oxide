@@ -383,10 +383,14 @@ mod tests {
     #[test]
     fn ban_expires() {
         let mut rep = PeerReputation::new();
-        rep.ban(Duration::from_millis(1));
+        // A live ban reports banned and not yet expired.
+        rep.ban(Duration::from_secs(60));
         assert!(rep.is_banned());
-        // Wait for ban to expire.
-        std::thread::sleep(Duration::from_millis(10));
+        assert!(!rep.ban_expired());
+        // A zero-length ban is expired the instant it is set — the
+        // boundary is `elapsed >= duration`, so this is deterministic
+        // where a sleep-based check races the scheduler.
+        rep.ban(Duration::ZERO);
         assert!(rep.ban_expired());
         assert!(!rep.is_banned());
     }

@@ -130,6 +130,20 @@ pub enum MarketDataMessage {
     Trade(TradeMessage),
 }
 
+/// Per-subscriber outbound queue depth, in messages.
+///
+/// Market-data messages are a few hundred bytes of JSON, so 256
+/// queued messages bound a subscriber at ~128 KiB — and a client
+/// that is 256 updates behind is already too stale to be useful.
+/// The matching engine must never back-pressure on a slow socket,
+/// so the queue is the only place a slow consumer can accumulate
+/// cost; over this depth the subscriber is evicted (its send side
+/// dropped), which closes the WebSocket task's `recv()` and ends
+/// the connection — the standard exchange slow-consumer policy.
+/// Raising it tolerates more client lag at more memory per lagging
+/// subscriber; lowering it disconnects mildly slow clients.
+const SUB_QUEUE_DEPTH: usize = 256;
+
 /// A subscriber's subscription: which feeds and markets they want.
 #[derive(Debug, Clone)]
 struct Subscription {
@@ -137,8 +151,9 @@ struct Subscription {
     feeds: Vec<FeedType>,
     /// The markets this subscriber wants (empty = all).
     markets: Vec<u8>,
-    /// The channel to send messages on.
-    tx: mpsc::UnboundedSender<String>,
+    /// The bounded channel to send messages on — capacity
+    /// [`SUB_QUEUE_DEPTH`].
+    tx: mpsc::Sender<String>,
 }
 
 /// The market data publisher — owns subscriber list and per-market
@@ -158,6 +173,10 @@ pub struct MarketDataPublisher {
     l2_seq: Arc<AtomicU64>,
     /// Per-market trades sequence counter.
     trades_seq: Arc<AtomicU64>,
+    /// Subscribers evicted for a full queue or a closed receiver —
+    /// the slow-consumer signal an operator watches to detect
+    /// clients that cannot keep up with the feed rate.
+    evicted_subscribers: Arc<AtomicU64>,
 }
 
 impl MarketDataPublisher {
@@ -169,21 +188,21 @@ impl MarketDataPublisher {
             l1_seq: Arc::new(AtomicU64::new(0)),
             l2_seq: Arc::new(AtomicU64::new(0)),
             trades_seq: Arc::new(AtomicU64::new(0)),
+            evicted_subscribers: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Subscribe a new client. Returns an `UnboundedReceiver` that
-    /// the caller polls for messages to send over the WebSocket.
+    /// Subscribe a new client. Returns a bounded [`mpsc::Receiver`]
+    /// (capacity [`SUB_QUEUE_DEPTH`]) that the caller polls for
+    /// messages to send over the WebSocket. When the queue stays
+    /// full the publisher evicts the subscription — the receiver's
+    /// `recv()` then returns `None` and the connection task ends.
     ///
     /// The `feeds` parameter specifies which feeds the client wants.
     /// The `markets` parameter specifies which markets (empty = all).
     #[must_use]
-    pub fn subscribe(
-        &self,
-        feeds: Vec<FeedType>,
-        markets: Vec<u8>,
-    ) -> mpsc::UnboundedReceiver<String> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn subscribe(&self, feeds: Vec<FeedType>, markets: Vec<u8>) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(SUB_QUEUE_DEPTH);
         let sub = Subscription { feeds, markets, tx };
         self.subscribers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(sub);
         rx
@@ -234,24 +253,46 @@ impl MarketDataPublisher {
     /// market. Serializes once, sends the same string to all.
     fn broadcast<T: Serialize>(&self, market: u8, feed: FeedType, msg: &T) {
         let json = serde_json::to_string(msg).unwrap_or_default();
-        let subs = self.subscribers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for sub in subs.iter() {
+        let mut subs = self.subscribers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut evict = 0usize;
+        // `retain` walks the list once; `true` keeps the slot. The
+        // eviction count doubles as an index-shift-free way to count
+        // removals for the observability counter below.
+        subs.retain(|sub| {
             // Check if this subscriber wants this feed.
             if !sub.feeds.contains(&feed) {
-                continue;
+                return true;
             }
             // Check if this subscriber wants this market (empty = all).
             if !sub.markets.is_empty() && !sub.markets.contains(&market) {
-                continue;
+                return true;
             }
-            // Send the pre-serialized JSON. `UnboundedSender::send`
-            // is non-blocking; if the channel is full (slow client),
-            // the send fails and the client misses the update. This
-            // is intentional — market data is lossy by design; a
-            // slow client should not back-pressure the matching
-            // engine.
-            let _ = sub.tx.send(json.clone());
+            // `try_send` never blocks the matching engine on a slow
+            // socket. A full queue means the client has fallen
+            // [`SUB_QUEUE_DEPTH`] updates behind — stale beyond
+            // usefulness — and a closed receiver means the WS task
+            // is gone; either way the subscription is dead weight.
+            // Evicting it (dropping the send side) ends the client
+            // task and frees the slot: the explicit slow-consumer
+            // policy is disconnect, not silent accumulation.
+            if sub.tx.try_send(json.clone()).is_ok() {
+                true
+            } else {
+                evict += 1;
+                false
+            }
+        });
+        if evict > 0 {
+            self.evicted_subscribers.fetch_add(evict as u64, Ordering::Relaxed);
         }
+    }
+
+    /// Total subscribers evicted for full queues or closed
+    /// receivers since startup — the operator-facing slow-consumer
+    /// signal.
+    #[must_use]
+    pub fn evicted_subscriber_count(&self) -> u64 {
+        self.evicted_subscribers.load(Ordering::Relaxed)
     }
 
     /// Get the current subscriber count (for monitoring).
@@ -410,5 +451,82 @@ mod tests {
         assert_eq!(FeedType::L2.as_str(), "l2");
         assert_eq!(FeedType::L3.as_str(), "l3");
         assert_eq!(FeedType::Trades.as_str(), "trades");
+    }
+
+    /// A subscriber that stops reading fills its bounded queue and
+    /// is evicted: the publisher must never back-pressure the
+    /// matching engine on a slow socket, so the documented
+    /// slow-consumer policy is disconnect. The queue is the only
+    /// place a slow consumer can accumulate memory — the unbounded
+    /// channel this replaced let it grow without limit.
+    #[test]
+    fn slow_consumer_is_evicted_at_queue_depth() {
+        let publisher = MarketDataPublisher::new();
+        let mut rx = publisher.subscribe(vec![FeedType::L1], vec![]);
+        // Fill exactly to capacity: every send must succeed — a full
+        // queue alone is not yet an eviction.
+        for _ in 0..SUB_QUEUE_DEPTH {
+            publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
+        }
+        assert_eq!(publisher.subscriber_count(), 1);
+        assert_eq!(publisher.evicted_subscriber_count(), 0);
+        // One more update than the queue holds → evict.
+        publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
+        assert_eq!(publisher.subscriber_count(), 0);
+        assert_eq!(publisher.evicted_subscriber_count(), 1);
+        // Buffered messages stay receivable; once drained the
+        // channel reports disconnection so the client task exits.
+        for _ in 0..SUB_QUEUE_DEPTH {
+            assert!(rx.try_recv().is_ok(), "queued messages survive eviction");
+        }
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "channel must report disconnection once the buffer drains"
+        );
+    }
+
+    /// A subscriber whose receiver is gone is dead weight — the
+    /// first publish that finds the closed channel evicts it, and
+    /// the eviction counter records it for the operator.
+    #[test]
+    fn closed_receiver_is_evicted() {
+        let publisher = MarketDataPublisher::new();
+        let rx = publisher.subscribe(vec![FeedType::L1], vec![]);
+        drop(rx);
+        publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
+        assert_eq!(publisher.subscriber_count(), 0);
+        assert_eq!(publisher.evicted_subscriber_count(), 1);
+    }
+
+    /// Eviction is per-subscriber: a lagging L1 client is dropped
+    /// while a healthy subscriber on another feed keeps receiving —
+    /// feed and market filters must not turn one client's failure
+    /// into everyone's disconnect.
+    #[test]
+    fn eviction_is_per_subscriber() {
+        let publisher = MarketDataPublisher::new();
+        let _lagging = publisher.subscribe(vec![FeedType::L1], vec![]);
+        let mut healthy = publisher.subscribe(vec![FeedType::Trades], vec![]);
+        for _ in 0..=SUB_QUEUE_DEPTH {
+            publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
+        }
+        assert_eq!(publisher.subscriber_count(), 1, "only the lagging subscriber is evicted");
+        assert_eq!(publisher.evicted_subscriber_count(), 1);
+        publisher.publish_trade(0, Price(1), Qty(1), true);
+        assert!(healthy.try_recv().is_ok(), "healthy subscriber still receives its feed");
+    }
+
+    /// Market filtering still applies under the bounded queue: a
+    /// subscriber whose market filter excludes the update is never
+    /// sent it — and so is never evicted by traffic it doesn't want.
+    #[test]
+    fn filtered_out_traffic_cannot_evict() {
+        let publisher = MarketDataPublisher::new();
+        let _rx = publisher.subscribe(vec![FeedType::L1], vec![1]);
+        for _ in 0..=SUB_QUEUE_DEPTH {
+            publisher.publish_l1(0, Some((Price(1), Qty(1))), None);
+        }
+        assert_eq!(publisher.subscriber_count(), 1, "no send attempt → no eviction");
+        assert_eq!(publisher.evicted_subscriber_count(), 0);
     }
 }

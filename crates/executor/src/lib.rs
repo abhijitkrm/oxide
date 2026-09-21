@@ -354,12 +354,27 @@ impl codec::Encode for ExecutorSnapshot {
     }
 }
 
+/// Minimum wire bytes one element of a length-prefixed decode loop
+/// can occupy — used to cap `Vec::with_capacity` against the
+/// attacker-controlled count prefix. A count can promise at most
+/// `remaining / MIN` elements; reserving beyond that is pure
+/// allocation amplification (a crafted `u32::MAX` count would
+/// otherwise reserve gigabytes before the first element read fails).
+/// The decode still fails honestly on truncation — the cap only
+/// prevents the speculative reserve from trusting the claim.
+fn bounded_capacity(count: u32, min_elem_wire: usize, remaining: usize) -> usize {
+    (count as usize).min(remaining / min_elem_wire.max(1))
+}
+
 impl<'a> codec::Decode<'a> for ExecutorSnapshot {
     fn decode(reader: &mut codec::Reader<'a>) -> Result<Self, codec::DecodeError> {
         let height = reader.read_u64()?;
         let state_root = Hash::decode(reader)?;
         let roots_count = reader.read_u32()?;
-        let mut module_roots = Vec::with_capacity(roots_count as usize);
+        // Each entry costs ≥ 33 bytes on the wire: a varint length
+        // prefix (≥1) for the name plus a 32-byte root.
+        let mut module_roots =
+            Vec::with_capacity(bounded_capacity(roots_count, 33, reader.remaining()));
         for _ in 0..roots_count {
             let name_bytes = reader.read_bytes()?;
             let name = String::from_utf8(name_bytes.to_vec())
@@ -368,7 +383,9 @@ impl<'a> codec::Decode<'a> for ExecutorSnapshot {
             module_roots.push((name, root));
         }
         let state_count = reader.read_u32()?;
-        let mut module_state = Vec::with_capacity(state_count as usize);
+        // Each entry costs ≥ 1 byte: the `present` bool.
+        let mut module_state =
+            Vec::with_capacity(bounded_capacity(state_count, 1, reader.remaining()));
         for _ in 0..state_count {
             let present = reader.read_bool()?;
             if present {
@@ -378,7 +395,9 @@ impl<'a> codec::Decode<'a> for ExecutorSnapshot {
             }
         }
         let nonces_count = reader.read_u32()?;
-        let mut executed_nonces = Vec::with_capacity(nonces_count as usize);
+        // Each entry is exactly 28 bytes: 20-byte address + u64 nonce.
+        let mut executed_nonces =
+            Vec::with_capacity(bounded_capacity(nonces_count, 28, reader.remaining()));
         for _ in 0..nonces_count {
             let addr = primitives::Address::decode(reader)?;
             let nonce = reader.read_u64()?;
@@ -393,7 +412,8 @@ impl<'a> codec::Decode<'a> for ExecutorSnapshot {
         if reader.remaining() > 0 {
             version = reader.read_u32()?;
             let versions_count = reader.read_u32()?;
-            module_versions.reserve(versions_count as usize);
+            // Each version is exactly 4 bytes.
+            module_versions.reserve(bounded_capacity(versions_count, 4, reader.remaining()));
             for _ in 0..versions_count {
                 module_versions.push(reader.read_u32()?);
             }
@@ -4527,6 +4547,42 @@ mod tests {
         assert_eq!(decoded.version, 1, "absent tail reads as format v1");
         assert!(decoded.module_versions.is_empty());
         assert_eq!(decoded.height, snapshot.height);
+    }
+
+    /// A forged count prefix must not become an allocation size:
+    /// `decode` reserves at most `remaining / min-wire-size` slots
+    /// per section, so a `u32::MAX` count fails with a plain decode
+    /// error instead of reserving ~hundreds of GiB and killing the
+    /// importer. Covers every counted section: roots, state,
+    /// nonces, versions.
+    #[test]
+    fn snapshot_decode_bounds_count_driven_allocations() {
+        // An empty executor (no modules, no nonces) produces a
+        // layout with fixed count offsets:
+        //   [0..8)   height
+        //   [8..40)  state_root
+        //   [40..44) roots_count   = 0
+        //   [44..48) state_count   = 0
+        //   [48..52) nonces_count  = 0
+        //   [52..84) nonce_root
+        //   [84..88) version
+        //   [88..92) versions_count = 0
+        let executor = Executor::new(100);
+        let snapshot = executor.export_snapshot();
+        assert!(snapshot.module_roots.is_empty() && snapshot.module_state.is_empty());
+        let mut buf = Vec::new();
+        codec::Encode::encode(&snapshot, &mut buf);
+        assert_eq!(buf.len(), 92, "empty snapshot layout must be the fixed size asserted below");
+
+        for offset in [40usize, 44, 48, 88] {
+            let mut forged = buf.clone();
+            forged[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let mut reader = codec::Reader::new(&forged);
+            assert!(
+                <ExecutorSnapshot as codec::Decode>::decode(&mut reader).is_err(),
+                "count field at offset {offset} inflated to u32::MAX must fail decode"
+            );
+        }
     }
 
     /// A snapshot from a newer binary must be refused — importing

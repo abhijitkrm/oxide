@@ -152,6 +152,21 @@ pub struct ExchangeModule {
     /// batch settlement entirely (fail-closed) — an unconfigured
     /// operator must never be able to move balances.
     settlement_operator: Option<Address>,
+    /// The validator-committee handle gating the `TAG_LIST_MARKET`
+    /// transaction path. `None` (bare `new()`) means the tx path is
+    /// *closed*: only the in-process `list_market` call (genesis /
+    /// node setup) works. That is the safe default — an
+    /// unauthenticated listing eagerly allocates the market's
+    /// `max_resting` arenas (~96 MiB at the protocol bound), so the
+    /// tx path must require committee quorum before one executes.
+    committee: Option<Arc<dyn framework::Committee + Send + Sync>>,
+    /// Committee endorsements for pending `TAG_LIST_MARKET`
+    /// proposals — the full tagged message is the action payload, so
+    /// byte-identical configs accumulate voting power and the market
+    /// is listed only once endorsing power strictly exceeds
+    /// two-thirds of the committee. One validator's signature is a
+    /// vote, never a command.
+    endorsements: framework::Endorsements,
 }
 
 struct Inner {
@@ -177,6 +192,8 @@ impl ExchangeModule {
             store: Mutex::new(BTreeMap::new()),
             ledger: None,
             settlement_operator: None,
+            committee: None,
+            endorsements: framework::Endorsements::new(),
         }
     }
 
@@ -213,6 +230,25 @@ impl ExchangeModule {
     #[must_use]
     pub fn with_settlement_operator(mut self, operator: Address) -> Self {
         self.settlement_operator = Some(operator);
+        self
+    }
+
+    /// Attach the validator-committee handle that authorizes the
+    /// `TAG_LIST_MARKET` transaction path. Each list-market tx then
+    /// records a committee endorsement for its exact config payload;
+    /// the market is listed only when endorsing power strictly
+    /// exceeds two-thirds.
+    ///
+    /// Without a committee the tx path rejects everything — closed
+    /// by default, since a listing eagerly allocates the market's
+    /// `max_resting` arenas and an unauthenticated listing is a
+    /// memory-exhaustion primitive.
+    #[must_use]
+    pub fn with_committee(
+        mut self,
+        committee: Arc<dyn framework::Committee + Send + Sync>,
+    ) -> Self {
+        self.committee = Some(committee);
         self
     }
 
@@ -358,6 +394,14 @@ impl ExchangeModule {
                 }
             }
         }
+        drop(inner);
+        // Pending list-market endorsements are future-affecting
+        // state: the tally decides whether the next endorsement
+        // lists a market, so replicas holding different tallies must
+        // diverge in the root. Trailing section — readers written
+        // before this field existed reject the extra bytes rather
+        // than silently dropping the tally.
+        self.endorsements.write_canonical(w);
     }
 
     /// Decode the canonical fields following the leading store root —
@@ -371,7 +415,7 @@ impl ExchangeModule {
         r: &mut framework::CanonicalReader<'_>,
         store: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
         slots: usize,
-    ) -> Option<Vec<Option<MatchingEngine>>> {
+    ) -> Option<(Vec<Option<MatchingEngine>>, framework::Endorsements)> {
         let n = r.get_count()?;
         if n != slots {
             return None;
@@ -410,7 +454,12 @@ impl ExchangeModule {
                 }
             }
         }
-        Some(markets)
+        // Trailing section: the pending-endorsement tally written by
+        // `write_committed`. Decode is strict (duplicates rejected)
+        // so a crafted blob cannot smuggle a second opinion about
+        // who endorsed what.
+        let endorsements = framework::Endorsements::read_canonical(r)?;
+        Some((markets, endorsements))
     }
 }
 
@@ -585,12 +634,48 @@ impl Module for ExchangeModule {
 
             TAG_LIST_MARKET => {
                 let cfg = Self::parse_list_market(body).ok_or(ExecError::Malformed)?;
-                // list_market finds the first empty slot and persists
-                // the config. We drop the inner lock to avoid
-                // double-locking (list_market locks inner again).
+                // Reject an invalid config before recording an
+                // endorsement — pending actions are a bounded set, so
+                // a proposal that can never apply must not occupy a
+                // slot. This also bounds the allocation `list_market`
+                // performs at quorum: `validate` caps `max_resting`
+                // at `MAX_RESTING_LIMIT`.
+                cfg.validate()
+                    .map_err(|e| ExecError::ModuleRejected(format!("list_market: {e}")))?;
                 drop(inner);
-                let id = self.list_market(cfg)?;
-                Ok(vec![Event { module: "exchange", kind: "market_listed", data: vec![id] }])
+                // Committee-quorum gate: a listing eagerly allocates
+                // the market's order-pool and id-map arenas, so an
+                // unauthenticated listing is a memory-exhaustion
+                // primitive. Each tx endorses the exact tagged
+                // message; the market lists only once endorsing power
+                // strictly exceeds two-thirds of the committee.
+                let Some(committee) = self.committee.clone() else {
+                    return Err(ExecError::ModuleRejected(
+                        "list_market: no committee wired".to_string(),
+                    ));
+                };
+                match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
+                    framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
+                        module: "exchange",
+                        kind: "list_market_endorse",
+                        data: body.to_vec(),
+                    }]),
+                    framework::EndorsementOutcome::Quorum => match self.list_market(cfg) {
+                        Ok(id) => Ok(vec![Event {
+                            module: "exchange",
+                            kind: "market_listed",
+                            data: vec![id],
+                        }]),
+                        // Quorum reached but the listing no longer
+                        // applies (e.g. all slots filled while the
+                        // proposal accumulated votes).
+                        Err(_) => Ok(vec![Event {
+                            module: "exchange",
+                            kind: "list_market_stale",
+                            data: body.to_vec(),
+                        }]),
+                    },
+                }
             }
 
             TAG_BATCH_SETTLE => self.handle_batch_settle(ctx, body, &inner),
@@ -640,7 +725,7 @@ impl Module for ExchangeModule {
     fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
         let slots =
             self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
-        let (canon, _markets, _store) = framework::stage_blob_snapshot(snapshot, |r, store| {
+        let (canon, _decoded, _store) = framework::stage_blob_snapshot(snapshot, |r, store| {
             Self::decode_committed(r, store, slots)
         })?;
         Ok(framework::canon_root(canon))
@@ -652,7 +737,7 @@ impl Module for ExchangeModule {
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let slots =
             self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
-        let (_canon, markets, store) =
+        let (_canon, (markets, endorsements), store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
         *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -660,6 +745,11 @@ impl Module for ExchangeModule {
         // `fills` is per-call scratch — clear it so a buffer left
         // mid-transaction cannot leak across the import boundary.
         inner.fills.clear();
+        drop(inner);
+        // Restore the pending-endorsement tally so an in-flight
+        // listing resumes accumulating exactly where the snapshot
+        // left it — the tally is committed state, not local cache.
+        self.endorsements.replace_with(endorsements);
         Ok(())
     }
 }
@@ -1392,6 +1482,45 @@ mod tests {
         }
     }
 
+    /// A committee stub treating `addr(1)` as the sole validator —
+    /// the tx-path tests for the gated `TAG_LIST_MARKET` listing.
+    struct SingleValidatorCommittee;
+
+    impl framework::Committee for SingleValidatorCommittee {
+        fn is_active_validator(&self, a: &Address) -> bool {
+            *a == addr(1)
+        }
+        fn active_validator_count(&self) -> usize {
+            1
+        }
+        fn power(&self, a: &Address) -> u64 {
+            u64::from(self.is_active_validator(a))
+        }
+        fn total_power(&self) -> u64 {
+            1
+        }
+    }
+
+    /// A two-member committee stub — `addr(1)` and `addr(2)` each
+    /// carry one unit of power, so neither reaches the two-thirds
+    /// quorum alone: endorsement-gated paths need both.
+    struct TwoValidatorCommittee;
+
+    impl framework::Committee for TwoValidatorCommittee {
+        fn is_active_validator(&self, a: &Address) -> bool {
+            *a == addr(1) || *a == addr(2)
+        }
+        fn active_validator_count(&self) -> usize {
+            2
+        }
+        fn power(&self, a: &Address) -> u64 {
+            u64::from(self.is_active_validator(a))
+        }
+        fn total_power(&self) -> u64 {
+            2
+        }
+    }
+
     #[test]
     fn list_market_and_place_resting() {
         let ex = ExchangeModule::new();
@@ -1542,12 +1671,82 @@ mod tests {
 
     #[test]
     fn list_market_via_message() {
-        let ex = ExchangeModule::new();
+        // A single-validator committee reaches quorum on the first
+        // endorsement — the tx path then lists exactly like the
+        // in-process call.
+        let ex = ExchangeModule::new().with_committee(Arc::new(SingleValidatorCommittee));
         let list_msg = msg::list_market(test_cfg());
         let events = ex.handle(&ctx(1), &list_msg).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "market_listed");
         assert_eq!(events[0].data, vec![0]);
+    }
+
+    /// The `TAG_LIST_MARKET` tx path is fail-closed without a
+    /// committee: an unauthenticated listing eagerly allocates the
+    /// market's `max_resting` arenas, so a bare module must reject
+    /// it outright rather than allocate on any sender's word.
+    #[test]
+    fn list_market_tx_rejected_without_committee() {
+        let ex = ExchangeModule::new();
+        let list_msg = msg::list_market(test_cfg());
+        let err = ex.handle(&ctx(1), &list_msg).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "got {err:?}");
+        assert_eq!(ex.resting_count(0), 0, "no market may be listed");
+    }
+
+    /// A listing is a governance action: one validator's signature
+    /// endorses the exact config payload; the market lists only once
+    /// endorsing power strictly exceeds two-thirds of the committee.
+    #[test]
+    fn list_market_requires_committee_quorum() {
+        let ex = ExchangeModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        let list_msg = msg::list_market(test_cfg());
+
+        let events = ex.handle(&ctx(1), &list_msg).unwrap();
+        assert_eq!(events[0].kind, "list_market_endorse", "one endorsement must not list");
+        assert!(ex.l1(0).is_none(), "no market exists yet");
+
+        let events = ex.handle(&ctx(2), &list_msg).unwrap();
+        assert_eq!(events[0].kind, "market_listed", "quorum lists the market");
+        assert_eq!(events[0].data, vec![0]);
+    }
+
+    /// A non-validator's tx cannot even start a listing proposal —
+    /// `power == 0` senders are rejected before an endorsement
+    /// occupies the bounded pending-action set.
+    #[test]
+    fn list_market_rejects_powerless_sender() {
+        let ex = ExchangeModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        let err = ex.handle(&ctx(9), &msg::list_market(test_cfg())).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "got {err:?}");
+    }
+
+    /// The bounded pending set must never hold a proposal that
+    /// cannot apply: a config failing `MarketConfig::validate` —
+    /// here a `max_resting` above the protocol's `MAX_RESTING_LIMIT`,
+    /// which would make `list_market` reserve oversized arenas — is
+    /// rejected before an endorsement is recorded.
+    #[test]
+    fn list_market_tx_rejects_unbounded_max_resting() {
+        let ex = ExchangeModule::new().with_committee(Arc::new(SingleValidatorCommittee));
+        let mut cfg = test_cfg();
+        cfg.max_resting = trading::MAX_RESTING_LIMIT + 1;
+        let err = ex.handle(&ctx(1), &msg::list_market(cfg)).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "got {err:?}");
+    }
+
+    /// Pending endorsements are future-affecting state: a replica
+    /// that has not recorded the first validator's vote must diverge
+    /// in `state_root`, or it would silently disagree about whether
+    /// the next endorsement lists a market.
+    #[test]
+    fn list_market_endorsement_changes_state_root() {
+        let ex = ExchangeModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        let root0 = ex.state_root();
+        ex.handle(&ctx(1), &msg::list_market(test_cfg())).unwrap();
+        let root1 = ex.state_root();
+        assert_ne!(root0, root1, "a recorded endorsement is committed state");
     }
 
     #[test]
@@ -2275,6 +2474,26 @@ mod tests {
         assert_eq!(dst.state_root(), src.state_root());
         assert_eq!(dst.resting_count(mid), 3);
         assert_eq!(dst.l1(mid), src.l1(mid));
+    }
+
+    /// A pending list-market endorsement is committed state: after
+    /// a snapshot round-trip the imported module resumes the tally
+    /// exactly where the source left it — the second validator's
+    /// endorsement must reach quorum and list.
+    #[test]
+    fn state_snapshot_preserves_pending_endorsements() {
+        let src = ExchangeModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        src.handle(&ctx(1), &msg::list_market(test_cfg())).unwrap();
+
+        let snapshot = src.export_state().expect("exchange exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+        let dst = ExchangeModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+
+        let events = dst.handle(&ctx(2), &msg::list_market(test_cfg())).unwrap();
+        assert_eq!(events[0].kind, "market_listed", "restored tally reaches quorum");
     }
 
     /// A truncated blob and a non-canonical stream must both fail
