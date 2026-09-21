@@ -57,8 +57,14 @@ fn main() {
     };
     println!("oxide-spammer: engine = {}, mode = {}, txs = {txs}", engine.as_str(), mode);
 
-    let config =
-        NodeConfig { consensus: engine, max_mempool_entries: txs + 100, ..NodeConfig::default() };
+    let config = NodeConfig {
+        consensus: engine,
+        max_mempool_entries: txs + 100,
+        // The spammer's native-module builders emit unsigned
+        // envelopes — explicit dev-mode opt-out.
+        require_signed_txs: false,
+        ..NodeConfig::default()
+    };
     let mut node = Node::assemble(&config);
     println!("oxide-spammer: devnet assembled (executor + modules)");
 

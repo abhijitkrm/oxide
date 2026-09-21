@@ -17585,3 +17585,53 @@ against the `Σ custody == deposits − withdrawals` invariant.
 Residual: the fee vault is a sink — a governance withdrawal path
 is deliberately deferred (needs the param/vote plumbing to be
 worth anything).
+
+## Node/executor: authenticated transactions are now the default everywhere
+
+The audit's sharpest deployment risk: the validator admitted unsigned
+native-module envelopes unless `--require-signed-txs` was passed —
+`ctx.sender` was whatever the tx claimed, so every "sender must be X"
+check in staking/exchange/governance was decorative on a default
+launch, including the configs described as mainnet/testnet.
+
+**What flipped.** `Executor`'s `unsigned_tx_policy` now defaults to
+`Reject` (was `Allow`); `NodeConfig::require_signed_txs` defaults to
+`true`; and the TOML knob inverted polarity — `[executor]
+require_signed_txs` is gone, replaced by `allow_unsigned_txs` (env
+`OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS`), an OR with the renamed CLI
+flag `--unsafe-allow-unsigned-txs`. Inverting the name matters: the
+old shape made *enabling* security the explicit act; now the
+explicit act is opting *out*, and it's labeled unsafe at every
+layer.
+
+**Fail-closed, not just defaulted.** The validator refuses to start
+with unsigned admission on any externally reachable bind:
+`--bind-host` (devnet transport) and `--rpc-listen`/`rpc.listen_addr`
+must resolve to loopback when the unsafe mode is on. A devnet on
+127.0.0.1 keeps working; `0.0.0.0` + unsigned is a startup error
+with the offending surfaces listed.
+
+**Blast radius.** Every `Executor::new` test site that submits
+unsigned envelopes now opts out via `test_executor`/
+`test_executor_with_config` helpers (the policy is visible at each
+construction). The devnet harnesses (`multinode`, `tcp_multinode`),
+the block-pipeline bench, journal-replay, spammer, and the driver
+test keep their unsigned workloads with an explicit `Allow` — the
+envelope migration to signed flows is the remaining half of this
+item. The matcher follows its `--settlement-key`: key present ⇒
+signed envelopes + enforcement; absent ⇒ explicit unsigned opt-out.
+`run_node_smoke_test` and the validator's own smoke tests now sign —
+the "does a default node work" check exercises the production path
+instead of a carve-out.
+
+**Tests.** New: `binary_default_requires_signed_txs` (the audit's
+"test the binary defaults" — `Config::default()` → `node_config_from`
+→ `require_signed_txs`), `default_policy_rejects_unsigned_envelopes`
+(executor default is `Reject`), loopback classification + external-
+bind scan coverage, and the `node_config_from` OR-semantics test
+rewritten for the inverted polarity.
+
+Residual: devnet/matcher/spammer workload builders still emit
+unsigned envelopes behind their explicit opt-outs — migrating them
+to `mempool::build_signed_tx` with deterministic per-sender keys is
+the tracked follow-up.

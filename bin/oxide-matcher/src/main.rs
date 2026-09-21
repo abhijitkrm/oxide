@@ -226,9 +226,10 @@ fn main() {
     }
 
     // The settlement operator: with `--settlement-key` the sender is
-    // the key-derived secp256k1 address (and envelopes are signed);
-    // without it the devnet default is the well-known zero address
-    // and envelopes stay unsigned (`UnsignedTxPolicy::Allow` only).
+    // the key-derived secp256k1 address and envelopes are signed —
+    // the node then runs the default `Reject` policy. Without a key
+    // the devnet default is the well-known zero address and the
+    // envelopes stay unsigned, so the node opts out explicitly.
     let sender = match &cli.settlement_key {
         Some(key) => crypto::secp::signable_pubkey_address(key)
             .expect("--settlement-key must be a valid secp256k1 secret"),
@@ -245,6 +246,10 @@ fn main() {
         consensus: ConsensusConfig::Sequencer,
         max_mempool_entries: 100_000,
         settlement_operator: Some(sender),
+        // Signed envelopes are enforced iff the settler has a key to
+        // sign with — an unsigned devnet settler is the only reason
+        // to admit unsigned txs.
+        require_signed_txs: cli.settlement_key.is_some(),
         ..NodeConfig::default()
     };
     let mut node = Node::assemble(&node_config);

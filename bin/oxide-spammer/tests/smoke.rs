@@ -32,6 +32,9 @@ fn smoke_spammer_batch_100_txs() {
     let config = NodeConfig {
         consensus: ConsensusConfig::Sequencer,
         max_mempool_entries: 10_000,
+        // The fixture submits unsigned envelopes — explicit dev-mode
+        // opt-out, mirroring the spammer's own wiring.
+        require_signed_txs: false,
         ..NodeConfig::default()
     };
     let mut node = Node::assemble(&config);

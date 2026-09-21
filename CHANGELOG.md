@@ -5473,3 +5473,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     the seller had the goods. Now the goods must be deposited and
     locked before a sell can even enter the book, so every trade
     is a genuine atomic swap.
+
+- **Native transactions now require signatures by default.** A node
+  launched with no flags rejects unsigned envelopes.
+  - The old `[executor] require_signed_txs` TOML field is replaced
+    by `allow_unsigned_txs` (env `OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS`)
+    — inverted polarity so opting *out* of authentication is the
+    explicit act. The CLI flag is now `--unsafe-allow-unsigned-txs`
+    (`--require-signed-txs` is gone — enforcement is the default).
+  - The validator refuses to start in unsigned mode when any bind
+    is externally reachable (`--bind-host`/`--rpc-listen`/
+    `rpc.listen_addr` must be loopback). Loopback devnets keep
+    working; a public-facing node cannot run unauthenticated.
+  - `Executor`'s own default policy is now reject-unsigned, so
+    forgetting to configure authentication fails closed at every
+    layer.
+  - **In plain words:** a default validator used to believe whatever
+    sender a transaction claimed — anyone could spend anyone's
+    tokens on a stock config. Now every transaction must be signed
+    like a normal blockchain, and the only way to turn that off is a
+    flag that says "unsafe" in its name and refuses to run on a real
+    network interface.

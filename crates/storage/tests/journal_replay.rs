@@ -47,7 +47,8 @@ fn delegate_tx(nonce: u64, amount: u64) -> types::TxBytes {
 /// devnet multi-node runner). Genesis-mints to the sender address
 /// so delegates can bond and fees can debit.
 fn build_executor() -> Arc<Executor> {
-    let mut executor = Executor::new(10_000);
+    let mut executor =
+        Executor::new(10_000).with_unsigned_tx_policy(executor::UnsignedTxPolicy::Allow);
     executor.register_module(Arc::new(oxide_core::CoreModule::new()));
     // The EVM account store is the native-token ledger: fund the
     // sender, register it, and set it as the fee module.

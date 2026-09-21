@@ -419,15 +419,19 @@ pub struct ExecutorConfig {
     #[serde(default)]
     pub min_fee: u64,
 
-    /// Whether to reject unsigned transactions to
-    /// non-self-authenticating modules (everything but the EVM).
-    /// `false` (default) admits unsigned envelopes — the historical
-    /// devnet behaviour, where `ctx.sender` is trusted as declared.
-    /// `true` enforces EIP-712 envelope signatures at mempool
-    /// admission and execution. Required for production: without it,
-    /// any native-module tx can claim any sender.
+    /// Admit unsigned transactions to non-self-authenticating
+    /// modules (everything but the EVM), trusting `ctx.sender` as
+    /// declared.
+    ///
+    /// `false` (default) requires every native-module envelope to
+    /// carry a valid EIP-712 signature — the only safe setting for
+    /// a network that faces untrusted submitters. `true` is an
+    /// explicitly unsafe development mode: any account can be
+    /// impersonated, so the binaries gate it behind
+    /// `--unsafe-allow-unsigned-txs` and refuse to combine it with
+    /// externally reachable transports.
     #[serde(default)]
-    pub require_signed_txs: bool,
+    pub allow_unsigned_txs: bool,
 }
 
 fn default_max_mempool_entries() -> usize {
@@ -443,7 +447,7 @@ impl Default for ExecutorConfig {
             max_mempool_entries: default_max_mempool_entries(),
             parallel_threshold: default_parallel_threshold(),
             min_fee: 0,
-            require_signed_txs: false,
+            allow_unsigned_txs: false,
         }
     }
 }
@@ -466,8 +470,8 @@ impl ExecutorConfig {
                 self.min_fee = n;
             }
         }
-        if let Ok(v) = env::var("OXIDE_EXECUTOR_REQUIRE_SIGNED_TXS") {
-            self.require_signed_txs = matches!(v.as_str(), "1" | "true" | "yes");
+        if let Ok(v) = env::var("OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS") {
+            self.allow_unsigned_txs = matches!(v.as_str(), "1" | "true" | "yes");
         }
     }
 }
@@ -822,7 +826,7 @@ listen_addr = "127.0.0.1:20000"
         let toml_str = r#"
 [executor]
 min_fee = 7
-require_signed_txs = true
+allow_unsigned_txs = true
 
 [storage]
 data_dir = "/var/lib/oxide"
@@ -832,7 +836,7 @@ settlement_operator = "0xoperator"
 "#;
         let config = Config::from_toml_str(toml_str).expect("parse");
         assert_eq!(config.executor.min_fee, 7);
-        assert!(config.executor.require_signed_txs);
+        assert!(config.executor.allow_unsigned_txs);
         assert_eq!(
             config.storage.data_dir.as_deref(),
             Some(std::path::Path::new("/var/lib/oxide"))
@@ -851,14 +855,14 @@ settlement_operator = "0xoperator"
         // test body; vars are cleaned up before it returns.
         unsafe {
             env::set_var("OXIDE_EXECUTOR_MIN_FEE", "42");
-            env::set_var("OXIDE_EXECUTOR_REQUIRE_SIGNED_TXS", "true");
+            env::set_var("OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS", "true");
             env::set_var("OXIDE_STORAGE_DATA_DIR", "/tmp/oxide-data");
             env::set_var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR", "0xop");
         }
         let mut config = Config::default();
         config.apply_env_vars();
         assert_eq!(config.executor.min_fee, 42);
-        assert!(config.executor.require_signed_txs);
+        assert!(config.executor.allow_unsigned_txs);
         assert_eq!(
             config.storage.data_dir.as_deref(),
             Some(std::path::Path::new("/tmp/oxide-data"))
@@ -875,7 +879,7 @@ settlement_operator = "0xoperator"
 
         unsafe {
             env::remove_var("OXIDE_EXECUTOR_MIN_FEE");
-            env::remove_var("OXIDE_EXECUTOR_REQUIRE_SIGNED_TXS");
+            env::remove_var("OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS");
             env::remove_var("OXIDE_STORAGE_DATA_DIR");
             env::remove_var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR");
         }

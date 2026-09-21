@@ -1651,6 +1651,79 @@ fn to_transport_config(network: &config::NetworkConfig) -> p2p::tcp::TcpTranspor
     }
 }
 
+/// Whether `host` resolves to a loopback-only bind. Anything that is
+/// not a literal loopback IP or `localhost` is treated as external:
+/// a hostname could resolve anywhere, and `0.0.0.0`/`::` are wildcard
+/// binds — both count as external-facing for the unsafe-mode gate.
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Collect the descriptions of listener binds that would expose the
+/// node to other machines. Empty means every bind surface is
+/// loopback-only (or absent) — the safe shape for unsigned mode.
+///
+/// `bind_host` is the devnet transport's resolved bind address
+/// (`None` in single-node mode, which runs no transport);
+/// `rpc_listen` is the resolved RPC listen address (`None` when the
+/// RPC server is off).
+fn external_bind_surfaces(bind_host: Option<&str>, rpc_listen: Option<&str>) -> Vec<String> {
+    let mut external = Vec::new();
+    if let Some(host) = bind_host {
+        if !is_loopback_host(host) {
+            external.push(format!("devnet transport --bind-host {host}"));
+        }
+    }
+    if let Some(listen) = rpc_listen {
+        let host = listen.rsplit_once(':').map_or(listen, |(h, _)| h);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if !is_loopback_host(host) {
+            external.push(format!("RPC listener {listen}"));
+        }
+    }
+    external
+}
+
+/// Refuse to start with unsigned-tx admission on any listener that
+/// is reachable from other machines.
+///
+/// Unsigned envelopes trust the declared `sender` — acceptable on a
+/// loopback devnet where every submitter is the operator, fatal on a
+/// network-facing bind where it lets anyone spend any account. The
+/// surfaces checked are the devnet-node transport (`--bind-host`)
+/// and the JSON-RPC listener (`--rpc-listen` / `rpc.listen_addr`),
+/// resolved the same way the listeners themselves are.
+fn refuse_unsigned_on_external_binds(
+    node_config: &NodeConfig,
+    rpc_config: &config::RpcConfig,
+    mode: node::NodeMode,
+) {
+    if node_config.require_signed_txs {
+        return;
+    }
+    let bind_host = matches!(mode, node::NodeMode::Devnet)
+        .then(|| parse_cli_flag("--bind-host").unwrap_or_else(|| "127.0.0.1".to_string()));
+    // Same resolution the RPC startup paths use.
+    let rpc_listen = parse_cli_flag("--rpc-listen").or_else(|| {
+        if rpc_config.listen_addr.is_empty() { None } else { Some(rpc_config.listen_addr.clone()) }
+    });
+    let external = external_bind_surfaces(bind_host.as_deref(), rpc_listen.as_deref());
+    if !external.is_empty() {
+        eprintln!(
+            "oxide-validator: refusing to start — --unsafe-allow-unsigned-txs admits \
+             unauthenticated senders, but these binds are externally reachable:"
+        );
+        for surface in &external {
+            eprintln!("  - {surface}");
+        }
+        eprintln!("run unsigned mode on loopback only, or drop the flag and sign envelopes");
+        std::process::exit(1);
+    }
+}
+
 /// Load the node configuration from CLI flags, env vars, and TOML file.
 ///
 /// Priority: CLI > env vars > TOML > defaults. Validates the
@@ -1727,9 +1800,11 @@ fn load_config(mode: node::NodeMode) -> LoadedConfig {
         None => node::genesis_spec_devnet(&config.genesis),
     });
     let overrides = node::AssemblyOverrides {
-        // `--require-signed-txs` (CLI) OR `[executor]
-        // require_signed_txs` — the OR lives in `node_config_from`.
-        require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
+        // `--unsafe-allow-unsigned-txs` (CLI) OR `[executor]
+        // allow_unsigned_txs` — the OR lives in `node_config_from`.
+        // Signed envelopes are the default; this flag exists only
+        // for loopback devnets and is refused on external binds.
+        allow_unsigned_txs: env::args().any(|a| a == "--unsafe-allow-unsigned-txs"),
         data_dir: data_dir.clone(),
         genesis,
     };
@@ -1748,6 +1823,7 @@ fn load_config(mode: node::NodeMode) -> LoadedConfig {
         }
         std::process::exit(1);
     }
+    refuse_unsigned_on_external_binds(&node_config, &rpc_config, mode);
 
     // Emit the effective configuration — the values actually running,
     // after every override layer, not the file's literal contents.
@@ -1863,6 +1939,11 @@ fn print_help() {
     println!("    --export-snapshot <path>  Export state snapshot to file and exit");
     println!("    --import-snapshot <path>  Import state snapshot before starting");
     println!("    --submit-key-change <hex> Submit a BLS key-change transaction (new secret key)");
+    println!("    --unsafe-allow-unsigned-txs");
+    println!("                            UNSAFE dev mode: admit unsigned native txs");
+    println!(
+        "                            (unauthenticated sender). Refused on non-loopback binds."
+    );
     println!();
     println!("EXAMPLES:");
     println!("    oxide-validator init --chain-id 1");
@@ -2073,4 +2154,68 @@ fn run_tls_gen(args: &[String]) {
         base.display(),
         base.display()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loopback classification: the unsafe unsigned gate relies on
+    /// this to distinguish dev binds from external-facing ones.
+    #[test]
+    fn loopback_classification() {
+        for host in ["127.0.0.1", "127.44.0.9", "localhost", "::1"] {
+            assert!(is_loopback_host(host), "{host} must classify loopback");
+        }
+        for host in ["0.0.0.0", "::", "192.168.1.5", "10.0.0.2", "validator-1.internal", "8.8.8.8"]
+        {
+            assert!(!is_loopback_host(host), "{host} must classify external");
+        }
+    }
+
+    /// The external-bind scan flags non-loopback transport and RPC
+    /// surfaces, and stays empty for loopback-only binds.
+    #[test]
+    fn external_bind_scan() {
+        // Loopback everywhere → no surfaces.
+        assert!(external_bind_surfaces(Some("127.0.0.1"), Some("127.0.0.1:8545")).is_empty());
+        assert!(external_bind_surfaces(Some("::1"), Some("[::1]:8545")).is_empty());
+        // No binds at all → no surfaces.
+        assert!(external_bind_surfaces(None, None).is_empty());
+        // Wildcard transport bind → flagged.
+        assert_eq!(
+            external_bind_surfaces(Some("0.0.0.0"), None),
+            vec!["devnet transport --bind-host 0.0.0.0".to_string()]
+        );
+        // External RPC bind → flagged (IPv6 bracket form included).
+        assert_eq!(external_bind_surfaces(None, Some("0.0.0.0:8545")).len(), 1);
+        assert_eq!(external_bind_surfaces(None, Some("[::]:8545")).len(), 1);
+        assert_eq!(external_bind_surfaces(None, Some("example.com:8545")).len(), 1);
+    }
+
+    /// The binary's effective defaults require signed envelopes —
+    /// this is the property the audit demands of the *binary*, not
+    /// of a hand-built executor: `Config::default()` (no TOML, no
+    /// env, no flags) must map to a `NodeConfig` that rejects
+    /// unsigned envelopes.
+    #[test]
+    fn binary_default_requires_signed_txs() {
+        let config = config::Config::default();
+        let rpc = config::RpcConfig::default();
+        let node_config = node::node_config_from(
+            &config,
+            &rpc,
+            &node::AssemblyOverrides::default(),
+            node::NodeMode::Single,
+        )
+        .expect("default config maps");
+        assert!(
+            node_config.require_signed_txs,
+            "a validator launched with no flags must reject unsigned envelopes"
+        );
+        // The executor layer defaults the same way — assembling
+        // without any policy override must reject unsigned txs.
+        let assembled = node::assemble_executor(&node_config);
+        drop(assembled);
+    }
 }

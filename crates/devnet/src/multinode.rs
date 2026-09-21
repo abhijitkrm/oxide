@@ -128,7 +128,11 @@ impl MultiNodeDevnet {
         // per-engine counters) is required.
         let block_clock = Arc::new(std::sync::atomic::AtomicU64::new(SIM_CLOCK_BASE_MS));
         for (i, key) in secret_keys.iter().cloned().enumerate() {
-            let mut executor = Executor::new(max_mempool_entries);
+            let mut executor = Executor::new(max_mempool_entries)
+                // The devnet workload builders emit unsigned
+                // envelopes — opt out of signature enforcement
+                // explicitly until they are migrated to sign.
+                .with_unsigned_tx_policy(executor::UnsignedTxPolicy::Allow);
             executor.register_module(Arc::new(oxide_core::CoreModule::new()));
             // The EVM account store is the single native-token
             // ledger: genesis-mint to the sender addresses so

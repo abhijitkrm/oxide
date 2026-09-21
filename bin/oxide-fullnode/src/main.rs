@@ -203,7 +203,7 @@ fn load_config() -> NodeConfig {
         None => node::genesis_spec_devnet(&config.genesis),
     });
     let overrides = node::AssemblyOverrides {
-        require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
+        allow_unsigned_txs: env::args().any(|a| a == "--unsafe-allow-unsigned-txs"),
         data_dir,
         genesis,
     };

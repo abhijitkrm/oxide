@@ -71,7 +71,8 @@ fn make_delegate_tx(sender: Address, nonce: u64, fee: u64, amount: u64) -> TxByt
 /// Build an executor with the EVM ledger + staking module and
 /// `n_txs` transactions pre-loaded into the mempool.
 fn setup_executor(n_txs: usize) -> Executor {
-    let mut executor = Executor::new(n_txs + 100);
+    let mut executor =
+        Executor::new(n_txs + 100).with_unsigned_tx_policy(executor::UnsignedTxPolicy::Allow);
 
     // The EVM account store is the native-token ledger: fund the
     // sender so delegates can bond and fees can debit.

@@ -57,7 +57,7 @@ fn unsigned_tx(claimed_sender: Address, nonce: u64, fee: u64, payload: &[u8]) ->
 /// An executor with the EVM ledger (fee module) + staking wired to
 /// it — the same ledger topology as a production node.
 fn executor_with_ledger() -> (Executor, Arc<evm::EvmModule>) {
-    let mut executor = Executor::new(1_000);
+    let mut executor = Executor::new(1_000).with_unsigned_tx_policy(UnsignedTxPolicy::Allow);
     let evm = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
     executor.register_module(evm.clone());
     executor.set_fee_module(module_id::EVM);
@@ -167,9 +167,34 @@ fn foreign_signed_tx_executes_without_ingest() {
     assert_eq!(Balances::balance(evm.as_ref(), &sender), 800);
 }
 
-/// Compat policy documents the migration path: with the default
-/// `Allow`, unsigned txs still execute (devnet/tests) — production
-/// validators run `Reject` via `--require-signed-txs`.
+/// The executor's own default is `Reject`: a caller that never
+/// thinks about the policy gets the safe one. This is the property
+/// the secure-defaults change exists for — forgetting to configure
+/// authentication must fail closed, not open.
+#[test]
+fn default_policy_rejects_unsigned_envelopes() {
+    let mut executor = Executor::new(1_000);
+    let evm = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    executor.register_module(evm.clone());
+    executor.set_fee_module(module_id::EVM);
+    let staking = staking::StakingModule::new();
+    staking.set_ledger(evm.clone());
+    staking.genesis_register_validator(VALIDATOR, 1_000_000);
+    executor.register_module(Arc::new(staking));
+
+    let victim = Address([0xAB; 20]);
+    evm.mint(&victim, 10_000);
+    let forged = unsigned_tx(victim, 0, 0, &staking::msg::delegate(VALIDATOR, 5_000));
+    assert!(
+        matches!(executor.ingest_tx(forged), MempoolAck::Rejected { .. }),
+        "default executor must reject unsigned native txs"
+    );
+}
+
+/// Compat policy documents the migration path: `Allow` still admits
+/// unsigned txs for devnet/test harnesses that emit them — the
+/// binaries gate it behind `--unsafe-allow-unsigned-txs` /
+/// `[executor] allow_unsigned_txs`.
 #[test]
 fn unsigned_tx_executes_under_compat_policy() {
     let (executor, ledger) = executor_with_ledger();

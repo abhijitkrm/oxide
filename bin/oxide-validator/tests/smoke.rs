@@ -10,17 +10,33 @@ use node::{ConsensusConfig, Node, NodeConfig};
 use ports::AppInterface;
 use primitives::Address;
 
-/// Build a staking-delegate tx in the same wire format the binary
-/// uses. `Address::ZERO` is genesis-registered by `Node::assemble`.
-fn build_staking_tx(nonce: u64) -> types::TxBytes {
+/// Build a *signed* staking-delegate tx in the v1 envelope format
+/// the binary now requires by default (`[sender][nonce][fee]
+/// [module_id|0x80][sig:65][payload]`). `Address::ZERO` is
+/// genesis-registered by `Node::assemble`; the sender is the signing
+/// key's derived address and must be funded before the delegate can
+/// bond.
+fn build_signed_staking_tx(privkey: &[u8], sender: Address, chain_id: u64) -> types::TxBytes {
     let payload = staking::msg::delegate(Address::ZERO, 100);
-    let sender = Address([0u8; 20]);
+    let nonce = 0u64;
     let fee = 100u64;
-    let mut bytes = Vec::with_capacity(36 + 1 + payload.len());
+    let sig = crypto::eip712::sign_tx(
+        privkey,
+        chain_id,
+        &sender,
+        nonce,
+        fee,
+        framework::module_id::STAKING,
+        &payload,
+    )
+    .expect("test key must sign");
+    let mut bytes = Vec::with_capacity(36 + 1 + 65 + payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::STAKING);
+    bytes.push(framework::module_id::STAKING | 0x80);
+    bytes.extend_from_slice(&sig.sig);
+    bytes.push(sig.recid.as_u8());
     bytes.extend_from_slice(&payload);
     types::TxBytes::new(bytes)
 }
@@ -46,7 +62,11 @@ fn smoke_submit_finalize_state_root_sequencer() {
     let config = NodeConfig::default();
     let mut node = Node::assemble(&config);
 
-    node.engine().submit_tx(build_staking_tx(0));
+    // The default node requires signed envelopes — the tx is signed
+    // and its sender funded, mirroring a real submitter.
+    let (privkey, sender) = crypto::secp::generate_keypair_for_test();
+    node.fund_evm_account(&sender, 1_000_000_000_000_000_000);
+    node.engine().submit_tx(build_signed_staking_tx(&privkey, sender, config.chain_id));
     node.engine().run_until_idle();
 
     let height = node.engine().finalized_height();
@@ -68,7 +88,9 @@ fn smoke_submit_finalize_state_root_oxidebft() {
     };
     let mut node = Node::assemble(&config);
 
-    node.engine().submit_tx(build_staking_tx(0));
+    let (privkey, sender) = crypto::secp::generate_keypair_for_test();
+    node.fund_evm_account(&sender, 1_000_000_000_000_000_000);
+    node.engine().submit_tx(build_signed_staking_tx(&privkey, sender, config.chain_id));
     node.engine().run_until_idle();
 
     let height = node.engine().finalized_height();

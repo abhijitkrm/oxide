@@ -309,8 +309,9 @@ surface is the reference for "complete L1 functionality":
     spec-vector KATs; executor verifies at ingest/batch/execute and
     `process_proposal` statically rejects the flag on self-authenticating
     modules; `Module::authenticates_sender` (EVM = true, its RLP sig is
-    authoritative); `UnsignedTxPolicy` (`Allow` compat default, validator
-    `--require-signed-txs` rejects unsigned); `mempool::build_signed_tx`
+    authoritative); `UnsignedTxPolicy` (`Reject` default; the
+    `--unsafe-allow-unsigned-txs` dev opt-out is refused on
+    externally reachable binds); `mempool::build_signed_tx`
     helper; `oxide_sendRawTransaction` RPC submits hex envelopes and
     returns the BLAKE3 tx hash. This also closed the pre-existing hole
     where native senders were merely *declared*, not proven.

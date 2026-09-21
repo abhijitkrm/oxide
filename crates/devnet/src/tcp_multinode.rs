@@ -625,6 +625,10 @@ impl TcpMultiNodeDevnet {
         settlement_operator: Option<primitives::Address>,
     ) -> (Executor, Arc<evm::EvmModule>, Option<Arc<exchange::ExchangeModule>>) {
         let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold)
+            // The devnet workload builders emit unsigned envelopes —
+            // opt out of signature enforcement explicitly until they
+            // are migrated to sign.
+            .with_unsigned_tx_policy(executor::UnsignedTxPolicy::Allow)
             // Devnet measures throughput, not gas policy — the
             // block gas cap matches the consensus budget's
             // `max_gas` (1 gigagas) so large test blocks fit

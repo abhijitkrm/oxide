@@ -1007,9 +1007,10 @@ impl ValidatorChanges {
 pub enum UnsignedTxPolicy {
     /// Accept unsigned txs for non-self-authenticating modules.
     ///
-    /// This is the devnet/test default: the sender field is trusted
-    /// as declared, so any account can be impersonated. Never enable
-    /// this on a network that faces untrusted submitters.
+    /// The sender field is trusted as declared, so any account can
+    /// be impersonated. Only acceptable for devnet/test harnesses
+    /// that must emit unsigned envelopes — never on a network that
+    /// faces untrusted submitters.
     Allow,
     /// Reject unsigned txs for non-self-authenticating modules at
     /// mempool admission and skip them at execution.
@@ -1459,8 +1460,10 @@ pub struct Executor {
     /// journal's job.
     history_retention: usize,
     /// Whether unsigned txs to non-self-authenticating modules are
-    /// admitted. See [`UnsignedTxPolicy`]. Default `Allow` for
-    /// devnet/test compatibility; production wiring sets `Reject`.
+    /// admitted. See [`UnsignedTxPolicy`]. Default `Reject` —
+    /// authenticated envelopes are the default everywhere; devnet
+    /// and test harnesses that emit unsigned envelopes opt out
+    /// explicitly via [`Executor::with_unsigned_tx_policy`].
     unsigned_tx_policy: UnsignedTxPolicy,
 }
 
@@ -1512,7 +1515,7 @@ impl Executor {
             fee_module: None,
             min_fee: 0,
             chain_id: 1,
-            unsigned_tx_policy: UnsignedTxPolicy::Allow,
+            unsigned_tx_policy: UnsignedTxPolicy::Reject,
             history_retention: MAX_RETAINED_HISTORY,
         }
     }
@@ -1533,11 +1536,11 @@ impl Executor {
     /// Set the policy for unsigned txs to non-self-authenticating
     /// modules. See [`UnsignedTxPolicy`].
     ///
-    /// The default is [`UnsignedTxPolicy::Allow`] — the historical
-    /// devnet behaviour — because every devnet/test harness today
-    /// emits unsigned envelopes. Production deployments must call
-    /// this with [`UnsignedTxPolicy::Reject`]; without it,
-    /// `ctx.sender` is unauthenticated for all native modules.
+    /// The default is [`UnsignedTxPolicy::Reject`] — unauthenticated
+    /// `ctx.sender` is a privilege-escalation hole, so the safe
+    /// policy is the one you get by forgetting to configure it.
+    /// Devnet/test harnesses that emit unsigned envelopes must opt
+    /// out explicitly with [`UnsignedTxPolicy::Allow`].
     #[must_use]
     pub fn with_unsigned_tx_policy(mut self, policy: UnsignedTxPolicy) -> Self {
         self.unsigned_tx_policy = policy;
@@ -3472,6 +3475,19 @@ mod tests {
     use ports::ConsensusEngine;
     use primitives::Address;
 
+    /// Test executor with unsigned envelopes admitted — most tests
+    /// submit unsigned envelopes built by `build_tx`. The policy is
+    /// set explicitly at every construction so the `Reject` default
+    /// exercised by production wiring stays honest.
+    fn test_executor(max_mempool_entries: usize) -> Executor {
+        Executor::new(max_mempool_entries).with_unsigned_tx_policy(UnsignedTxPolicy::Allow)
+    }
+
+    /// [`test_executor`] with explicit sizing — same reasoning.
+    fn test_executor_with_config(mempool: usize, threshold: usize) -> Executor {
+        Executor::with_config(mempool, threshold).with_unsigned_tx_policy(UnsignedTxPolicy::Allow)
+    }
+
     /// A trivial test module that counts messages.
     struct CounterModule {
         /// Dispatch id — parametrized so snapshot tests can register
@@ -3585,7 +3601,7 @@ mod tests {
 
     #[test]
     fn executor_executes_block_and_produces_state_root() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // Submit a tx to the executor's mempool (via AppInterface).
@@ -3620,7 +3636,7 @@ mod tests {
         // `execute_block` hashed module roots alone while
         // `export_snapshot` appended the nonce root: two different
         // commitments for the same state.
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         executor.ingest_tx(make_tx(1, &[42]));
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
@@ -3644,7 +3660,7 @@ mod tests {
     fn executor_with_sequencer_engine_end_to_end() {
         // Wire the executor behind a SequencerEngine and run the full
         // OAI flow: submit → propose → finalize → attest.
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // Wrap in Arc for the engine.
@@ -3667,7 +3683,7 @@ mod tests {
 
     #[test]
     fn executor_skips_unknown_module() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // Submit a tx for an unregistered module (ID 99).
@@ -3693,7 +3709,7 @@ mod tests {
 
     #[test]
     fn executor_multiple_blocks_state_advances() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -3785,7 +3801,7 @@ mod tests {
     /// txs ever paid a fee.
     #[test]
     fn fee_module_charges_other_module_txs() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         let collector = Arc::new(FeeCollector { charged: Mutex::new(0) });
         executor.register_module(counter.clone());
@@ -3819,7 +3835,7 @@ mod tests {
     /// sender-controlled, so without a floor every tx could declare 0.
     #[test]
     fn min_fee_floor_skips_underpaying_txs() {
-        let mut executor = Executor::new(100).with_min_fee(50);
+        let mut executor = test_executor(100).with_min_fee(50);
         let counter = Arc::new(CounterModule::new());
         let collector = Arc::new(FeeCollector { charged: Mutex::new(0) });
         executor.register_module(counter.clone());
@@ -3857,7 +3873,7 @@ mod tests {
 
     #[test]
     fn process_proposal_accepts_valid_tx() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let tx = make_tx(1, &[42]);
         let proposal = Proposal { height: Height::new(0), txs: vec![tx], attestation: None };
@@ -3866,7 +3882,7 @@ mod tests {
 
     #[test]
     fn process_proposal_rejects_too_short_tx() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let proposal = Proposal {
             height: Height::new(0),
@@ -3881,7 +3897,7 @@ mod tests {
 
     #[test]
     fn process_proposal_rejects_unknown_module() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let tx = make_tx(99, &[1]); // module 99 is not registered
         let proposal = Proposal { height: Height::new(0), txs: vec![tx], attestation: None };
@@ -3893,7 +3909,7 @@ mod tests {
 
     #[test]
     fn process_proposal_rejects_malformed_context() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         // A tx with 37 bytes (minimum for module ID) but with a
         // malformed sender (not a valid address — but actually
@@ -3979,7 +3995,7 @@ mod tests {
     /// hash, so the preverified path is taken.
     #[test]
     fn preverify_cache_key_matches_between_ingest_and_execute() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let tracker = Arc::new(PreverifyTrackingModule::new());
         executor.register_module(tracker.clone());
 
@@ -4099,7 +4115,7 @@ mod tests {
     /// limit all arrive exactly as consensus produced them.
     #[test]
     fn execute_block_delivers_consensus_context() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let recorder = Arc::new(BlockCtxRecorder::new());
         executor.register_module(recorder.clone());
 
@@ -4129,7 +4145,7 @@ mod tests {
     /// correctly and *diverged*.
     #[test]
     fn preverified_path_preserves_per_tx_context() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let recorder = Arc::new(CtxRecordingModule::new());
         executor.register_module(recorder.clone());
 
@@ -4173,7 +4189,7 @@ mod tests {
     /// after block selection can be re-submitted and re-executed.
     #[test]
     fn h4_ingest_rejects_stale_nonce_after_execution() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -4210,7 +4226,7 @@ mod tests {
     /// allowing replayed txs to enter the mempool via the batch path.
     #[test]
     fn h4_ingest_batch_rejects_stale_nonce_after_execution() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -4255,7 +4271,7 @@ mod tests {
     /// proposer cannot reorder same-account txs.
     #[test]
     fn h5_process_proposal_rejects_nonce_gap() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // Two txs from the same sender: nonce 0 then nonce 2 (gap).
@@ -4277,7 +4293,7 @@ mod tests {
     /// sender's nonces are out of order (e.g. nonce 1 before nonce 0).
     #[test]
     fn h5_process_proposal_rejects_nonce_reorder() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // Nonce 1 before nonce 0 — reorder.
@@ -4299,7 +4315,7 @@ mod tests {
     /// contiguous, strictly increasing nonces.
     #[test]
     fn h5_process_proposal_accepts_contiguous_nonces() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         let tx0 = make_tx_with_nonce(1, &[0], 0);
@@ -4314,7 +4330,7 @@ mod tests {
     /// already executed). This is the cross-block continuity check.
     #[test]
     fn h5_execute_block_skips_stale_nonce() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -4357,7 +4373,7 @@ mod tests {
     /// proposal validation.
     #[test]
     fn nonce_u64_max_is_reserved() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -4410,7 +4426,7 @@ mod tests {
     /// execution completes.
     #[test]
     fn h5_ingest_tx_rejects_stale_nonce_after_execution() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -4458,7 +4474,7 @@ mod tests {
     #[test]
     fn self_authenticating_module_cannot_advance_another_accounts_nonce() {
         const VICTIM: u8 = 0x11;
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(SelfAuthModule));
 
         // The attacker's payload, wrapped in the victim's envelope at
@@ -4485,7 +4501,7 @@ mod tests {
     #[test]
     fn envelope_authenticating_module_still_advances_nonce() {
         const SENDER: u8 = 0x22;
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         let tx = make_tx_with_fee_and_sender(1, &[0xAA], 0, 0, SENDER);
@@ -4506,7 +4522,7 @@ mod tests {
 
     #[test]
     fn h4h5_snapshot_preserves_executed_nonce() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -4531,7 +4547,7 @@ mod tests {
         assert_eq!(snapshot.executed_nonces[0].1, 2, "next expected nonce is 2");
 
         // Import into a fresh executor.
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(CounterModule::new()));
         executor2.import_snapshot(&snapshot).expect("import must succeed");
 
@@ -4559,7 +4575,7 @@ mod tests {
     #[test]
     fn process_proposal_rejects_block_exceeding_gas_limit() {
         let mut executor =
-            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2000);
+            test_executor_with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2000);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // Each tx costs 1000 gas (base) + payload bytes. With a 2000
@@ -4588,7 +4604,7 @@ mod tests {
     #[test]
     fn process_proposal_accepts_block_within_gas_limit() {
         let mut executor =
-            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(10_000);
+            test_executor_with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(10_000);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // One tx with a small payload: 1000 + 1 = 1001 gas, well
@@ -4606,7 +4622,7 @@ mod tests {
     #[test]
     fn execute_block_skips_txs_exceeding_gas_limit() {
         let mut executor =
-            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2000);
+            test_executor_with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2000);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // Two txs, each costing ~1001 gas. The first fits (cumulative
@@ -4640,7 +4656,7 @@ mod tests {
     #[test]
     fn prepare_proposal_respects_block_gas_limit() {
         let mut executor =
-            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2500);
+            test_executor_with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2500);
         executor.register_module(Arc::new(CounterModule::new()));
 
         // Submit 4 txs, each ~1001 gas (1000 base + 1 byte). Under
@@ -4716,7 +4732,7 @@ mod tests {
     /// A properly signed native tx is admitted and executes.
     #[test]
     fn signed_tx_executes_end_to_end() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -4737,7 +4753,7 @@ mod tests {
     /// A corrupted signature is rejected at mempool admission.
     #[test]
     fn bad_signature_rejected_at_ingest() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         let (tx, _sender) = signed_counter_tx(1, 0, b"inc");
@@ -4751,7 +4767,7 @@ mod tests {
     /// the domain separator binds the chain ID.
     #[test]
     fn cross_chain_signature_rejected() {
-        let mut executor = Executor::new(100).with_chain_id(1);
+        let mut executor = test_executor(100).with_chain_id(1);
         executor.register_module(Arc::new(CounterModule::new()));
 
         let (tx, _sender) = signed_counter_tx(2, 0, b"inc");
@@ -4763,7 +4779,7 @@ mod tests {
     /// signer's key, not the claimed field.
     #[test]
     fn forged_declared_sender_rejected() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         let victim = Address([0xEE; 20]);
@@ -4834,7 +4850,7 @@ mod tests {
     /// exact module message bytes.
     #[test]
     fn tampered_payload_rejected_at_execution() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
 
@@ -4861,7 +4877,7 @@ mod tests {
     /// malformed — it would corrupt the module's own payload.
     #[test]
     fn flagged_self_auth_module_rejected() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(SelfAuthModule));
 
         // Flagged envelope routed to module 3 (SelfAuthModule).
@@ -4881,7 +4897,7 @@ mod tests {
     /// error, no crypto needed.
     #[test]
     fn proposal_rejects_flagged_self_auth() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(SelfAuthModule));
 
         let mut bytes = Vec::new();
@@ -4902,7 +4918,7 @@ mod tests {
     /// rejection, not a panic.
     #[test]
     fn truncated_signed_envelope_rejected_cleanly() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         let (tx, _s) = signed_counter_tx(1, 0, b"inc");
@@ -5020,7 +5036,7 @@ mod tests {
     /// which `migrate(from)` calls to run.
     #[test]
     fn snapshot_export_records_format_and_module_versions() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(VersionedModule::new(3) as Arc<dyn Module>);
         let snapshot = executor.export_snapshot();
         assert_eq!(snapshot.version, SNAPSHOT_FORMAT_VERSION);
@@ -5031,7 +5047,7 @@ mod tests {
     /// the version tail is absent → version 1, empty `module_versions`.
     #[test]
     fn snapshot_v1_payload_decodes_as_version_one() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let snapshot = executor.export_snapshot();
         let mut buf = Vec::new();
@@ -5065,7 +5081,7 @@ mod tests {
         //   [52..84) nonce_root
         //   [84..88) version
         //   [88..92) versions_count = 0
-        let executor = Executor::new(100);
+        let executor = test_executor(100);
         let snapshot = executor.export_snapshot();
         assert!(snapshot.module_roots.is_empty() && snapshot.module_state.is_empty());
         let mut buf = Vec::new();
@@ -5087,11 +5103,11 @@ mod tests {
     /// state it can't interpret would corrupt the validator.
     #[test]
     fn snapshot_newer_version_rejected() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let mut snapshot = executor.export_snapshot();
         snapshot.version = SNAPSHOT_FORMAT_VERSION + 1;
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(CounterModule::new()));
         match executor2.import_snapshot(&snapshot) {
             Err(SnapshotImportError::UnsupportedVersion { snapshot, supported }) => {
@@ -5106,7 +5122,7 @@ mod tests {
     /// must get `migrate(from)` called with the recorded version.
     #[test]
     fn snapshot_import_runs_module_migration() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(VersionedModule::new(1) as Arc<dyn Module>);
         let mut snapshot = executor.export_snapshot();
         // Forge an old-schema record: the importer declares v2 but
@@ -5115,7 +5131,7 @@ mod tests {
 
         let module = VersionedModule::new(2);
         let spy = Arc::clone(&module);
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(module as Arc<dyn Module>);
         executor2.import_snapshot(&snapshot).expect("import + migrate must succeed");
         assert_eq!(
@@ -5129,7 +5145,7 @@ mod tests {
     /// migrated state set is worse than no import at all.
     #[test]
     fn snapshot_import_fails_closed_on_migration_error() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(VersionedModule::new(1) as Arc<dyn Module>);
         let mut snapshot = executor.export_snapshot();
         snapshot.module_versions = vec![1];
@@ -5141,7 +5157,7 @@ mod tests {
             migrate_fails: true,
             kv: Mutex::new(Vec::new()),
         };
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(module) as Arc<dyn Module>);
         match executor2.import_snapshot(&snapshot) {
             Err(SnapshotImportError::MigrationFailed { module, from }) => {
@@ -5175,7 +5191,7 @@ mod tests {
     /// a forged name (a different chain's ordering) must reject.
     #[test]
     fn snapshot_import_rejects_module_name_mismatch() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         exec_one_tx(&executor);
         let mut snapshot = executor.export_snapshot();
@@ -5183,7 +5199,7 @@ mod tests {
         // so a name swap does not disturb `state_root`.
         snapshot.module_roots[0].0 = "not-counter".to_string();
 
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(CounterModule::new()));
         match executor2.import_snapshot(&snapshot) {
             Err(SnapshotImportError::ModuleNameMismatch { index, snapshot, registered }) => {
@@ -5199,13 +5215,13 @@ mod tests {
     /// the tail modules' state was never committed.
     #[test]
     fn snapshot_import_rejects_module_state_count_mismatch() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         exec_one_tx(&executor);
         let mut snapshot = executor.export_snapshot();
         snapshot.module_state.clear(); // module claims state, none carried
 
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(CounterModule::new()));
         match executor2.import_snapshot(&snapshot) {
             Err(SnapshotImportError::MissingModuleState { module }) => {
@@ -5219,13 +5235,13 @@ mod tests {
     /// not a sparse encoding.
     #[test]
     fn snapshot_import_rejects_dropped_module_state() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         exec_one_tx(&executor);
         let mut snapshot = executor.export_snapshot();
         snapshot.module_state[0] = None;
 
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(CounterModule::new()));
         match executor2.import_snapshot(&snapshot) {
             Err(SnapshotImportError::MissingModuleState { module }) => {
@@ -5239,14 +5255,14 @@ mod tests {
     /// it must be rejected, not silently ignored.
     #[test]
     fn snapshot_import_rejects_unexpected_module_state() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(SelfAuthModule));
         let mut snapshot = executor.export_snapshot();
         assert!(snapshot.module_state[0].is_none());
         snapshot.module_state[0] =
             Some(storage::Snapshot { height: 0, entries: vec![(Hash([0; 32]), vec![1])] });
 
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(SelfAuthModule));
         match executor2.import_snapshot(&snapshot) {
             Err(SnapshotImportError::UnexpectedModuleState { module }) => {
@@ -5260,7 +5276,7 @@ mod tests {
     /// malformed during the verify pass.
     #[test]
     fn snapshot_import_rejects_malformed_module_state() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         exec_one_tx(&executor);
         let mut snapshot = executor.export_snapshot();
@@ -5268,7 +5284,7 @@ mod tests {
         snapshot.module_state[0] =
             Some(storage::Snapshot { height: 0, entries: vec![(Hash([0xEE; 32]), vec![1, 2, 3])] });
 
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(CounterModule::new()));
         match executor2.import_snapshot(&snapshot) {
             Err(SnapshotImportError::MalformedModuleState { module }) => {
@@ -5283,7 +5299,7 @@ mod tests {
     /// the data.
     #[test]
     fn snapshot_import_rejects_forged_module_root() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         exec_one_tx(&executor);
         let mut snapshot = executor.export_snapshot();
@@ -5295,7 +5311,7 @@ mod tests {
             snapshot.nonce_root,
         );
 
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(CounterModule::new()));
         match executor2.import_snapshot(&snapshot) {
             Err(SnapshotImportError::ModuleRootMismatch { module, expected, actual }) => {
@@ -5312,7 +5328,7 @@ mod tests {
     /// installed until every module's payload verifies.
     #[test]
     fn snapshot_import_verifies_all_modules_before_mutating() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let c1 = Arc::new(CounterModule::new());
         let c2 = Arc::new(CounterModule::other());
         executor.register_module(c1.clone());
@@ -5327,7 +5343,7 @@ mod tests {
 
         let d1 = Arc::new(CounterModule::new());
         let d2 = Arc::new(CounterModule::other());
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(d1.clone());
         executor2.register_module(d2.clone());
         assert!(
@@ -5350,7 +5366,7 @@ mod tests {
     /// modules are all stateless — then it applies cleanly.
     #[test]
     fn snapshot_import_metadata_only_with_stateless_modules() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(SelfAuthModule));
         executor.finalize_block(&FinalizedBlock {
             context: types::BlockContext::default(),
@@ -5361,7 +5377,7 @@ mod tests {
         let mut snapshot = executor.export_snapshot();
         snapshot.module_state.clear();
 
-        let mut executor2 = Executor::new(100);
+        let mut executor2 = test_executor(100);
         executor2.register_module(Arc::new(SelfAuthModule));
         executor2.import_snapshot(&snapshot).expect("stateless modules need no payloads");
     }
@@ -5371,7 +5387,7 @@ mod tests {
     /// mutating state at the same height.
     #[test]
     fn halt_height_freezes_execution() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
         let halter = VersionedModule::new(1);
@@ -5414,7 +5430,7 @@ mod tests {
     /// operators swap binaries.
     #[test]
     fn prepare_proposal_empty_past_halt() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let halter = VersionedModule::new(1);
         *halter.halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(0);
@@ -5434,7 +5450,7 @@ mod tests {
 
     #[test]
     fn exec_lane_executes_and_attests() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let executor = Arc::new(executor);
         executor.spawn_exec_lane();
@@ -5466,9 +5482,9 @@ mod tests {
     fn exec_lane_matches_sync_roots() {
         // The lane must produce byte-identical state roots to the
         // synchronous path — same blocks, same order.
-        let mut sync_exec = Executor::new(100);
+        let mut sync_exec = test_executor(100);
         sync_exec.register_module(Arc::new(CounterModule::new()));
-        let mut async_exec = Executor::new(100);
+        let mut async_exec = test_executor(100);
         async_exec.register_module(Arc::new(CounterModule::new()));
         let async_exec = Arc::new(async_exec);
         async_exec.spawn_exec_lane();
@@ -5496,7 +5512,7 @@ mod tests {
         // attest_state for a height the lane never saw must return
         // `None` immediately — never wait on execution that isn't
         // coming.
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let executor = Arc::new(executor);
         executor.spawn_exec_lane();
@@ -5572,7 +5588,7 @@ mod tests {
         // waiting forever: the lane's death is terminal, so the
         // attest for the lost height returns `None` (no root landed)
         // instead of blocking on a watermark that can never advance.
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(PanicOnceModule::new()));
         let executor = Arc::new(executor);
         executor.spawn_exec_lane();
@@ -5653,7 +5669,7 @@ mod tests {
         // drain must fail closed (panic) instead of re-executing:
         // recovery belongs to durable state at restart, not to a
         // blind in-process replay.
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(PanicOnceModule::new()));
         let executor = Arc::new(executor);
         executor.spawn_exec_lane();
@@ -5693,7 +5709,7 @@ mod tests {
         // refusal must ALSO leave the mutation unreplayed: `calls`
         // stays at exactly 1 — a blind replay would have run the
         // same mutation a second time.
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         let module = Arc::new(MutateThenPanicModule {
             calls: Mutex::new(0),
             armed: std::sync::atomic::AtomicBool::new(true),
@@ -5784,7 +5800,7 @@ mod tests {
         // height without a state root is the drain's backlog and
         // must survive pruning no matter how far behind execution
         // falls.
-        let executor = Executor::new(100).with_history_retention(2);
+        let executor = test_executor(100).with_history_retention(2);
 
         // Nothing executed: every committed height is unexecuted —
         // the pin holds all of them even past the window.
@@ -5815,7 +5831,7 @@ mod tests {
         // blocks, `finalize_block` blocks until the worker drains —
         // backpressure, not an unbounded backlog that outlives the
         // retained history.
-        let mut executor = Executor::new(100).with_history_retention(5);
+        let mut executor = test_executor(100).with_history_retention(5);
         // lane depth = min(EXEC_LANE_DEPTH, retention - 1) = 4.
         let module = Arc::new(GatedModule {
             gate: std::sync::atomic::AtomicBool::new(false),
@@ -5870,7 +5886,7 @@ mod tests {
     /// proposal was built — a losing proposal erased its txs forever.
     #[test]
     fn uncommitted_proposal_keeps_txs() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         executor.ingest_tx(make_tx(1, &[42]));
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
@@ -5887,7 +5903,7 @@ mod tests {
     /// block finalizes them.
     #[test]
     fn committed_txs_leave_pool_at_finalize() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         executor.ingest_tx(make_tx(1, &[42]));
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
@@ -5914,7 +5930,7 @@ mod tests {
     #[test]
     fn gas_filtered_candidates_stay_pooled() {
         let mut executor =
-            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2500);
+            test_executor_with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2500);
         executor.register_module(Arc::new(CounterModule::new()));
         // Four ~1001-gas txs; only 2 fit under a 2500 cap per block.
         for n in 0..4u64 {
@@ -5943,7 +5959,7 @@ mod tests {
     /// actually-rejected tx acknowledged.
     #[test]
     fn batch_acks_map_to_original_indices() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let good = make_tx(1, &[42]);
         let results = executor.ingest_tx_batch(vec![
@@ -5970,7 +5986,7 @@ mod tests {
     /// execution time, exactly where they occur in production.
     #[test]
     fn tx_outcome_records_executed_and_skipped() {
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
 
         let good = make_tx_with_nonce(1, &[42], 0);
@@ -6051,7 +6067,7 @@ mod tests {
             }
         }
 
-        let mut executor = Executor::new(100);
+        let mut executor = test_executor(100);
         executor.register_module(Arc::new(RejectingModule));
         let tx = make_tx_with_nonce(3, &[1], 0);
         let block = FinalizedBlock {

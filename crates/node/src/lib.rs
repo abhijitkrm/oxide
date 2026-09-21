@@ -33,7 +33,7 @@
 //!     settlement_operator: None,
 //!     min_fee: 0,
 //!     chain_id: 1,
-//!     require_signed_txs: false,
+//!     require_signed_txs: true,
 //!     history_retention: None,
 //!     base_fee: 7_000_000_000,
 //!     genesis: None,
@@ -166,11 +166,12 @@ pub struct NodeConfig {
     /// Whether to reject unsigned transactions to
     /// non-self-authenticating modules (everything but the EVM).
     ///
-    /// `false` (default) admits unsigned envelopes — the historical
-    /// devnet behaviour, where `ctx.sender` is trusted as declared.
-    /// `true` enforces EIP-712 envelope signatures at mempool
-    /// admission and execution. Required for production: without it,
-    /// any native-module tx can claim any sender.
+    /// `true` (default) enforces EIP-712 envelope signatures at
+    /// mempool admission and execution. `false` admits unsigned
+    /// envelopes where `ctx.sender` is trusted as declared — any
+    /// account can be impersonated, so the opt-out exists only for
+    /// devnet/test harnesses and is gated behind the operator's
+    /// explicit unsafe flag at the binary layer.
     pub require_signed_txs: bool,
     /// Heights of finalized-block / state-root history the executor
     /// retains in memory (`Executor::with_history_retention`).
@@ -215,7 +216,7 @@ impl Default for NodeConfig {
             settlement_operator: None,
             min_fee: 0,
             chain_id: 1,
-            require_signed_txs: false,
+            require_signed_txs: true,
             history_retention: None,
             base_fee: 7_000_000_000,
             genesis: None,
@@ -690,11 +691,22 @@ pub fn run_node_smoke_test() {
     let config = NodeConfig::default();
     let mut node = Node::assemble(&config);
 
-    // Submit a staking delegate tx — sender [0u8;20] is a
-    // registered validator and is genesis-funded on the EVM ledger.
+    // Submit a *signed* staking delegate tx — the default node
+    // requires authenticated envelopes, so the smoke test exercises
+    // the same path a production submitter would. The sender is the
+    // signing key's derived address, funded on the EVM ledger; the
+    // delegate targets the genesis validator [0u8;20].
+    let (privkey, sender) = crypto::secp::generate_keypair_for_test();
+    node.fund_evm_account(&sender, 1_000_000_000_000_000_000);
     let validator = Address([0u8; 20]);
     let module_payload = staking::msg::delegate(validator, 100);
-    let tx = build_tx(framework::module_id::STAKING, &module_payload);
+    let tx = build_signed_tx(
+        &privkey,
+        sender,
+        config.chain_id,
+        framework::module_id::STAKING,
+        &module_payload,
+    );
     node.engine().submit_tx(tx);
     node.metrics().incr_counter("txs_submitted", 1);
     node.engine().run_until_idle();
@@ -720,6 +732,9 @@ pub fn run_node_smoke_test() {
 }
 
 /// Build a tx in the mempool's v0 format with a module dispatch byte.
+/// Test-only: the default policy rejects unsigned envelopes, so the
+/// only non-test caller (the smoke test) signs instead.
+#[cfg(test)]
 fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
     let sender = Address([0u8; 20]);
     let nonce = 0u64;
@@ -729,6 +744,34 @@ fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
     bytes.extend_from_slice(&nonce.to_le_bytes());
     bytes.extend_from_slice(&fee.to_le_bytes());
     bytes.push(module_id);
+    bytes.extend_from_slice(module_payload);
+    types::TxBytes::new(bytes)
+}
+
+/// Build a *signed* tx envelope (v1) for `privkey`'s derived sender:
+/// `[sender][nonce][fee][module_id|0x80][sig:65][payload]`. The
+/// signature is the EIP-712 envelope signature wallets produce —
+/// `crypto::eip712::sign_tx` — over the declared fields, so the
+/// executor's `Reject`-default policy accepts it.
+fn build_signed_tx(
+    privkey: &[u8],
+    sender: primitives::Address,
+    chain_id: u64,
+    module_id: u8,
+    module_payload: &[u8],
+) -> types::TxBytes {
+    let nonce = 0u64;
+    let fee = 100u64;
+    let sig =
+        crypto::eip712::sign_tx(privkey, chain_id, &sender, nonce, fee, module_id, module_payload)
+            .expect("test key must sign");
+    let mut bytes = Vec::with_capacity(36 + 1 + 65 + module_payload.len());
+    bytes.extend_from_slice(&sender.0);
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&fee.to_le_bytes());
+    bytes.push(module_id | 0x80);
+    bytes.extend_from_slice(&sig.sig);
+    bytes.push(sig.recid.as_u8());
     bytes.extend_from_slice(module_payload);
     types::TxBytes::new(bytes)
 }
@@ -760,13 +803,14 @@ pub enum NodeMode {
 
 /// Inputs the shared conversion cannot source from `config::Config`
 /// itself — CLI flags and binary-resolved choices. `Default` maps
-/// to "no overrides" (devnet-compatible unsigned txs, in-memory
-/// state, devnet genesis).
+/// to "no overrides" (signed envelopes required, in-memory state,
+/// devnet genesis).
 #[derive(Debug, Clone, Default)]
 pub struct AssemblyOverrides {
-    /// `--require-signed-txs` CLI flag — OR'd with
-    /// `[executor] require_signed_txs`.
-    pub require_signed_txs: bool,
+    /// `--unsafe-allow-unsigned-txs` CLI flag — OR'd with
+    /// `[executor] allow_unsigned_txs`. Named for the hazard it
+    /// enables: unsigned envelopes carry an unauthenticated sender.
+    pub allow_unsigned_txs: bool,
     /// `--data-dir` / `[storage] data_dir` — the resolved data
     /// directory; its `evm.redb` child becomes `storage_path`.
     pub data_dir: Option<std::path::PathBuf>,
@@ -845,7 +889,10 @@ pub fn node_config_from(
         // advertised and enforced parameters cannot diverge.
         chain_id: rpc.chain_id,
         base_fee: rpc.base_fee,
-        require_signed_txs: overrides.require_signed_txs || config.executor.require_signed_txs,
+        // Signed envelopes are the default at every layer; the
+        // opt-out is an OR of the unsafe flag and the config field
+        // so neither can silently weaken the other.
+        require_signed_txs: !(overrides.allow_unsigned_txs || config.executor.allow_unsigned_txs),
         history_retention: Some(config.storage.history_retention),
         genesis: overrides.genesis.clone(),
         block_budget: types::BlockBudget {
@@ -1016,8 +1063,10 @@ pub fn validate_effective_config(
 
     if !node_config.require_signed_txs {
         warnings.push(
-            "executor.require_signed_txs is off — unsigned native-module envelopes are \
-             admitted (devnet compatibility; enable for production)"
+            "UNSAFE: unsigned native-module envelopes are admitted \
+             ([executor] allow_unsigned_txs / --unsafe-allow-unsigned-txs) — \
+             ctx.sender is unauthenticated and any account can be impersonated; \
+             never run this on a network reachable by untrusted submitters"
                 .to_string(),
         );
     }
@@ -1564,7 +1613,7 @@ mod tests {
         config.executor.max_mempool_entries = 777;
         config.executor.parallel_threshold = 64;
         config.executor.min_fee = 42;
-        config.executor.require_signed_txs = true;
+        config.executor.allow_unsigned_txs = true;
         config.storage.history_retention = 128;
         config.exchange.settlement_operator = Some(format!("0x{}", "ab".repeat(20)));
         config
@@ -1576,7 +1625,7 @@ mod tests {
         let rpc = config::RpcConfig { chain_id: 7777, base_fee: 123_456, ..Default::default() };
         let data_dir = std::path::PathBuf::from("/tmp/oxide-test");
         let overrides = AssemblyOverrides {
-            require_signed_txs: false,
+            allow_unsigned_txs: true,
             data_dir: Some(data_dir.clone()),
             genesis: None,
         };
@@ -1589,7 +1638,10 @@ mod tests {
         assert_eq!(node_config.min_fee, 42);
         assert_eq!(node_config.chain_id, 7777);
         assert_eq!(node_config.base_fee, 123_456);
-        assert!(node_config.require_signed_txs);
+        assert!(
+            !node_config.require_signed_txs,
+            "allow_unsigned_txs from either layer disables enforcement"
+        );
         assert_eq!(node_config.history_retention, Some(128));
         assert_eq!(
             node_config.storage_path,
@@ -1610,22 +1662,30 @@ mod tests {
         assert_eq!(node_config.max_timeout_ms, 60_000);
     }
 
+    /// Signed enforcement is the default; the unsafe opt-out is an
+    /// OR of the CLI flag and the TOML field — neither layer can
+    /// silently weaken the other.
     #[test]
-    fn node_config_from_cli_flag_or_toml_enables_signed_txs() {
+    fn node_config_from_unsigned_opt_out_requires_an_explicit_layer() {
         let mut config = config::Config::default();
-        config.executor.require_signed_txs = false;
         let rpc = config::RpcConfig::default();
-        // CLI flag alone enables it.
-        let with_cli = AssemblyOverrides { require_signed_txs: true, ..Default::default() };
+        // Defaults: signed required.
         assert!(
-            node_config_from(&config, &rpc, &with_cli, NodeMode::Single)
+            node_config_from(&config, &rpc, &AssemblyOverrides::default(), NodeMode::Single)
                 .expect("ok")
                 .require_signed_txs
         );
-        // TOML alone enables it.
-        config.executor.require_signed_txs = true;
+        // CLI flag alone disables it.
+        let with_cli = AssemblyOverrides { allow_unsigned_txs: true, ..Default::default() };
         assert!(
-            node_config_from(&config, &rpc, &AssemblyOverrides::default(), NodeMode::Single)
+            !node_config_from(&config, &rpc, &with_cli, NodeMode::Single)
+                .expect("ok")
+                .require_signed_txs
+        );
+        // TOML alone disables it.
+        config.executor.allow_unsigned_txs = true;
+        assert!(
+            !node_config_from(&config, &rpc, &AssemblyOverrides::default(), NodeMode::Single)
                 .expect("ok")
                 .require_signed_txs
         );
@@ -1747,6 +1807,9 @@ mod tests {
     fn validate_effective_config_warns_on_overrides_and_unsigned() {
         let mut config = config::Config::default();
         config.network.peers = vec!["127.0.0.1:20001".to_string()];
+        // The unsafe opt-out is what produces the warning — signed
+        // envelopes are the default and warn-free.
+        config.executor.allow_unsigned_txs = true;
         let node_config = node_config_from(
             &config,
             &config::RpcConfig::default(),
@@ -1761,7 +1824,7 @@ mod tests {
             "derived peer config should warn: {warnings:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("require_signed_txs")),
+            warnings.iter().any(|w| w.contains("unsigned")),
             "unsigned envelopes should warn: {warnings:?}"
         );
     }
@@ -1829,11 +1892,20 @@ mod tests {
         let config = NodeConfig { consensus: ConsensusConfig::OxideBft, ..Default::default() };
         let mut node = Node::assemble(&config);
 
-        // A staking delegate tx — the same payload the smoke test
-        // uses, from the genesis-funded `[0u8;20]` validator.
+        // A signed staking delegate tx — the default config requires
+        // authenticated envelopes. The sender is the signing key's
+        // derived address, funded on the EVM ledger.
+        let (privkey, sender) = crypto::secp::generate_keypair_for_test();
+        node.fund_evm_account(&sender, 1_000_000_000_000_000_000);
         let validator = Address([0u8; 20]);
         let module_payload = staking::msg::delegate(validator, 100);
-        let tx = build_tx(framework::module_id::STAKING, &module_payload);
+        let tx = build_signed_tx(
+            &privkey,
+            sender,
+            config.chain_id,
+            framework::module_id::STAKING,
+            &module_payload,
+        );
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
         assert!(node.engine().finalized_height().is_some(), "a block finalized");
