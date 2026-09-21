@@ -102,6 +102,10 @@ struct DispatchState<'a> {
     relays: &'a mut Vec<Vec<u8>>,
     /// This validator's index — the relay-ownership check.
     me: u8,
+    /// Reconstruction threshold for reassembling bodies — the
+    /// committee's `erasure_params` output, identical on every
+    /// validator because it derives from the shared stakes.
+    shard_k: usize,
 }
 
 /// A TCP-based multi-node devnet: N validators running oxideBFT with
@@ -1427,6 +1431,12 @@ impl TcpMultiNodeDevnet {
         // solely for pruning.
         let mut shard_sets: HashMap<primitives::Hash, (types::shard::ShardSet, u64)> =
             HashMap::new();
+        // The reconstruction threshold for this committee — every
+        // validator derives the same `k` from the shared stakes and
+        // quorum, so dispersal and reassembly agree on it without a
+        // wire field.
+        let shard_k =
+            types::shard::erasure_params(validator_set.stakes(), validator_set.quorum_stake()).0;
         let mut proposed_views: HashSet<u64> = HashSet::new();
         let mut voted_views: HashSet<u64> = HashSet::new();
         let mut marked_done = false;
@@ -1464,6 +1474,7 @@ impl TcpMultiNodeDevnet {
                     shard_sets: &mut shard_sets,
                     relays: &mut relays,
                     me: me_u8,
+                    shard_k,
                 };
                 if let Some((v, vote)) =
                     Self::dispatch_inbound(&mut engine, &mut state, from, &msg.bytes, &mut t_commit)
@@ -1491,6 +1502,7 @@ impl TcpMultiNodeDevnet {
                     shard_sets: &mut shard_sets,
                     relays: &mut relays,
                     me: me_u8,
+                    shard_k,
                 };
                 if let Some((v, vote)) =
                     Self::dispatch_inbound(&mut engine, &mut state, from, &bytes, &mut t_commit)
@@ -1543,7 +1555,7 @@ impl TcpMultiNodeDevnet {
                     // the body off the vote critical path.
                     let mut body = Vec::new();
                     proposal.encode(&mut body);
-                    let (root, shards) = types::shard::disperse_body(&body, n);
+                    let (root, shards) = types::shard::disperse_body(&body, n, shard_k);
                     debug_assert_eq!(
                         root, header.body_commitment,
                         "engine and harness must compute the same body commitment"
@@ -1843,7 +1855,10 @@ impl TcpMultiNodeDevnet {
                 // ever commit.
                 let entry = state.shard_sets.entry(block_hash).or_insert_with(|| {
                     (
-                        types::shard::ShardSet::new(usize::try_from(shard.total).unwrap_or(0)),
+                        types::shard::ShardSet::new(
+                            usize::try_from(shard.total).unwrap_or(0),
+                            state.shard_k,
+                        ),
                         header.height.value(),
                     )
                 });

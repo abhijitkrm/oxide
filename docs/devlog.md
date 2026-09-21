@@ -17000,3 +17000,52 @@ drive-rotation, combined key+add+remove in one transition, replay
 dedup, index re-seat by BLS key, full recovery restoring
 set/epoch/pacemaker, post-recovery re-seat (engine); staged
 `EpochChanges` queue on `MockApp` exercising the drain seam.
+
+## Dispersed bodies reconstruct from a fault-model threshold, not all n
+
+The dispersed-broadcast path (`types::shard`) split a proposal
+body into `n` contiguous chunks — one per validator — and
+`ShardSet::reconstruct` required *every* slot. A single withheld
+shard (one Byzantine validator that never relays, one crashed
+peer) made a notarized block unfinalizable forever: the QC forms
+on the commitment, but the body never lands at `supply_body`.
+
+**Threshold from the fault model.** Reconstruction now uses
+Reed–Solomon over GF(256): `k` data + `m = n − k` parity shards,
+any `k` rebuild the body. `k` is not a constant — it is derived
+by `erasure_params(stakes, quorum_stake)`: Byzantine validators
+together hold less than `total_stake − quorum_stake`, so the
+largest coalition they can field is the greedily-counted smallest
+stakes fitting that budget (`f_count`). Every remaining validator
+is honest and serves its shard, so ≥ `n − f_count` distinct
+shards are guaranteed retrievable — `k = n − f_count`. Equal
+stake reduces to `n − f` (the classic `2f+1`-of-`3f+1` at the
+bound); a quorum resting on few whales degenerates to `k = 1`,
+plain replication — the honest answer when one validator can be
+the whole honest quorum.
+
+**Reuse, not a second implementation.** `broadcast` already
+carried a tested `ReedSolomon`/`Gf256` pair (its own
+`ErasureBroadcast` path uses `2f+1`/`f`). The modules moved to
+`types` — `broadcast` already depended on `types`, so no cycle —
+and both call sites now share one implementation. `Shard`'s wire
+format is unchanged (`index`, `total`, `bytes`, `proof`); `k` is
+consensus-derived from the shared committee, never wire-carried,
+so a leader cannot negotiate a weaker threshold — a misencoded
+body merely orphans its own block at `supply_body`.
+
+**Wiring.** The engine computes `body_commitment` through a new
+`erasure_k()` helper over the *live* validator set (rotation
+changes stakes and quorum — a stale `k` would desynchronise the
+root). The TCP devnet disperses and reassembles with the same
+committee-derived `k`. Payloads are `varint(len) ‖ body` padded
+to `k·shard_size`, so reconstruction strips padding exactly and a
+corrupt decode fails the length check before `supply_body` ever
+sees it.
+
+Tests: `erasure_params` uniform/skewed/whale/f=0 cases; every
+k-subset of n∈{4,7} reconstructs while k−1 does not (the
+availability contract, enumerated); roundtrip across n∈{1..16}
+and body sizes to 3.8 MB; a rotated-committee engine test proving
+the next proposal's root follows the new stake distribution.
+All 31 devnet TCP tests green on the erasure-coded path.

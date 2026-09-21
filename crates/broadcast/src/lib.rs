@@ -31,9 +31,7 @@ use ports::broadcast::{BroadcastCaps, BroadcastEngine, BroadcastError};
 use primitives::Hash;
 use types::Proposal;
 
-mod gf256;
 mod net;
-mod rs;
 
 pub use net::NetworkedBroadcast;
 
@@ -130,7 +128,7 @@ pub struct ErasureBroadcast {
     /// Maximum fault tolerance (f). Reconstruction needs k = 2f+1 shards.
     f: usize,
     /// The Reed-Solomon code (k = 2f+1 data, m = f parity).
-    rs: rs::ReedSolomon,
+    rs: types::rs::ReedSolomon,
     /// Shards stored per validator, keyed by proposal hash.
     /// `shards[hash]` is a Vec of (`validator_index`, `shard_data`) pairs.
     stored: HashMap<Hash, Vec<(usize, Vec<u8>)>>,
@@ -156,7 +154,7 @@ impl ErasureBroadcast {
         Self {
             n: num_validators,
             f,
-            rs: rs::ReedSolomon::new(k, m),
+            rs: types::rs::ReedSolomon::new(k, m),
             stored: HashMap::new(),
             proof: HashMap::new(),
             proposals: HashMap::new(),

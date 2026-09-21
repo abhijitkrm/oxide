@@ -69,7 +69,7 @@ use ports::transport::{Transport, TransportError};
 use primitives::Hash;
 use types::Proposal;
 
-use crate::rs::ReedSolomon;
+use types::rs::ReedSolomon;
 
 /// The default maximum payload for `NetworkedBroadcast`: 16 MiB.
 /// Matches `ErasureBroadcast` — the erasure coding limit.

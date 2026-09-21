@@ -2250,6 +2250,36 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     re-seat, and full-recovery engine tests; staged `EpochChanges`
     on `MockApp`.
 
+- **Dispersed block bodies tolerate withheld shards**
+  (`crates/types`, `crates/consensus`, `crates/devnet`,
+  `crates/broadcast`)
+  - The dispersed broadcast split each proposal body into `n`
+    chunks and needed *every* one to reconstruct — a single
+    validator that never relayed its shard (Byzantine or simply
+    offline) made a notarized block unfinalizable forever.
+  - Reconstruction is now Reed–Solomon erasure-coded over GF(256):
+    `k` data + `m = n − k` parity shards, and any `k` rebuild the
+    body. `k` is derived from the committee's fault model by
+    `erasure_params` — the Byzantine stake budget bounds how many
+    validators can be hostile, so `n − f_count` honest-held shards
+    are guaranteed retrievable. Equal stake yields the classic
+    `n − f` threshold; a whale-dominated committee honestly
+    degenerates to replication.
+  - The Reed–Solomon/GF(256) modules moved from `broadcast` to
+    `types` so the dispersed path and `ErasureBroadcast` share one
+    tested implementation. `Shard`'s wire format is unchanged; `k`
+    is derived from the shared committee on every node, never
+    wire-carried.
+  - **In plain words:** when a block's data is fanned out in
+    pieces, one missing piece used to jam the whole block forever.
+    Now the pieces carry spare repair information — the chain can
+    rebuild a block even while the maximum number of bad actors
+    the protocol tolerates is refusing to share.
+  - Regression: `erasure_params` stake-distribution cases,
+    exhaustive k-subset reconstruction proofs, and an engine test
+    showing the signed commitment follows the live committee's
+    layout after an epoch rotation.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

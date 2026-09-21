@@ -15,6 +15,8 @@
 //! pinned by unit tests in this crate and round-tripped by the codec
 //! property tests.
 
+pub(crate) mod gf256;
+pub mod rs;
 pub mod shard;
 
 use codec::{Decode, DecodeError, Encode, Reader, write};

@@ -983,6 +983,17 @@ impl OxideBft {
         &self.validator_set
     }
 
+    /// The reconstruction threshold for the dispersed-body layout
+    /// under the CURRENT committee — `types::shard::erasure_params`
+    /// over live stakes and quorum. Recomputed per call: an epoch
+    /// rotation changes both inputs, and a stale `k` would either
+    /// stall reconstruction (too high) or weaken the withholding
+    /// tolerance the commitment format implies (too low).
+    fn erasure_k(&self) -> usize {
+        types::shard::erasure_params(self.validator_set.stakes(), self.validator_set.quorum_stake())
+            .0
+    }
+
     /// Last voted view (diagnostic).
     #[must_use]
     pub fn last_voted_view(&self) -> Option<View> {
@@ -1846,7 +1857,8 @@ impl OxideBft {
         // identically in `supply_body`.
         let mut body_bytes = Vec::new();
         proposal.encode(&mut body_bytes);
-        let body_commitment = types::shard::commitment(&body_bytes, self.validator_set.n());
+        let body_commitment =
+            types::shard::commitment(&body_bytes, self.validator_set.n(), self.erasure_k());
         let mut header = BlockHeader {
             height,
             view: self.current_view,
@@ -1940,7 +1952,9 @@ impl OxideBft {
         if self.verify_signatures {
             let mut buf = Vec::new();
             proposal.encode(&mut buf);
-            if types::shard::commitment(&buf, self.validator_set.n()) != header.body_commitment {
+            if types::shard::commitment(&buf, self.validator_set.n(), self.erasure_k())
+                != header.body_commitment
+            {
                 return None;
             }
         }
@@ -2400,6 +2414,7 @@ impl OxideBft {
         proposal: &Proposal,
     ) -> Result<(), ConsensusError> {
         let n = self.validator_set.n();
+        let k = self.erasure_k();
         let Some((header, body)) = self.blocks.get_mut(&block_hash) else {
             // The header never arrived or the block was already
             // pruned — nothing to certify; the caller drops the body.
@@ -2410,7 +2425,7 @@ impl OxideBft {
         }
         let mut buf = Vec::new();
         proposal.encode(&mut buf);
-        if types::shard::commitment(&buf, n) != header.body_commitment {
+        if types::shard::commitment(&buf, n, k) != header.body_commitment {
             return Err(ConsensusError::BodyRejected { block_hash });
         }
         match self.app.process_proposal(proposal) {
@@ -5584,6 +5599,42 @@ mod tests {
         assert_eq!(make_engine().block_budget(), types::CHAIN_BLOCK_BUDGET);
     }
 
+    /// The body commitment must follow the LIVE committee's
+    /// erasure layout: after a rotation that changes the stake
+    /// distribution, the next proposal's `body_commitment`
+    /// recomputes with the new set's `k` — not the construction
+    /// set's. A stale `k` would make honest replicas (deriving the
+    /// same new `k`) fail to reproduce the signed root.
+    #[test]
+    fn body_commitment_uses_rotated_committee_layout() {
+        let mut engine = make_engine();
+        // Single-validator committee: no Byzantine possible —
+        // k = 1, one plain chunk.
+        assert_eq!(engine.erasure_k(), 1);
+        // Rotate into a 4-validator committee with skewed stakes:
+        // the Byzantine budget admits the two small validators,
+        // so k = 2 — different layout, different root.
+        let rotated = ValidatorSet::new(vec![pk(5), pk(6), pk(7), pk(8)], vec![3, 3, 1, 1])
+            .expect("rotated set");
+        engine.schedule_rotation(rotated.clone()).expect("schedule");
+        engine.rotate_epoch().expect("rotate");
+        assert_eq!(engine.erasure_k(), 2);
+        engine.submit_tx(TxBytes::new(vec![1, 2, 3]));
+        let (header, proposal) = engine.propose().expect("propose after rotation");
+        let mut buf = Vec::new();
+        proposal.encode(&mut buf);
+        assert_eq!(
+            header.body_commitment,
+            types::shard::commitment(&buf, rotated.n(), engine.erasure_k()),
+            "the signed root must follow the rotated committee's layout"
+        );
+        assert_ne!(
+            header.body_commitment,
+            types::shard::commitment(&buf, rotated.n(), rotated.n()),
+            "and must differ from the plain n-of-n layout a stale derivation would produce"
+        );
+    }
+
     /// The proposal clock lands in the signed header: a leader
     /// stamps `with_clock`'s value — the value the whole cluster
     /// will execute under — not a height-derived stand-in.
@@ -6127,7 +6178,7 @@ mod tests {
             epoch: Epoch::new(0),
             prev_block: Hash::ZERO,
             tx_root: OxideBft::tx_root(&proposal.txs),
-            body_commitment: types::shard::commitment(&body, 1),
+            body_commitment: types::shard::commitment(&body, 1, 1),
             high_qc: None,
             timeout_cert: None,
             proposer: proposer_hash(0),
@@ -6175,7 +6226,7 @@ mod tests {
             epoch: Epoch::new(0),
             prev_block: Hash::ZERO,
             tx_root: OxideBft::tx_root(&proposal.txs),
-            body_commitment: types::shard::commitment(&body, 1),
+            body_commitment: types::shard::commitment(&body, 1, 1),
             high_qc: None,
             timeout_cert: None,
             proposer: proposer_hash(0),
@@ -6529,7 +6580,7 @@ mod tests {
             epoch: Epoch::new(0),
             prev_block: Hash::ZERO,
             tx_root: OxideBft::tx_root(&proposal.txs),
-            body_commitment: types::shard::commitment(&body, 4),
+            body_commitment: types::shard::commitment(&body, 4, 3),
             high_qc: None,
             timeout_cert: None,
             proposer: proposer_hash(0),
@@ -6670,7 +6721,7 @@ mod tests {
             epoch: Epoch::new(0),
             prev_block: Hash::ZERO,
             tx_root: OxideBft::tx_root(&proposal.txs),
-            body_commitment: types::shard::commitment(&body, 4),
+            body_commitment: types::shard::commitment(&body, 4, 3),
             high_qc: None,
             timeout_cert: None,
             proposer: proposer_hash(0),
@@ -6825,7 +6876,7 @@ mod tests {
             epoch: Epoch::new(0),
             prev_block: parent_hash,
             tx_root: OxideBft::tx_root(&proposal.txs),
-            body_commitment: types::shard::commitment(&body, 4),
+            body_commitment: types::shard::commitment(&body, 4, 3),
             high_qc: Some(thin_qc),
             timeout_cert: None,
             proposer: proposer_hash(0),
