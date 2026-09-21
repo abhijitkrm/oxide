@@ -5397,3 +5397,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     same and voting twice counted double. Proposals also have a
     genuine voting window instead of closing the same block they
     opened.
+
+### Fixed (2026-09-21)
+
+- **Double-sign evidence can no longer be replayed or dodged by
+  key rotation** (`modules/staking/src/lib.rs`)
+  - Replays are now keyed by the canonical offense —
+    `(validator, view, phase, epoch)` — so resubmitting the same
+    equivocation with the two votes swapped, or proving it with a
+    different conflicting pair at the same position, is one
+    offense and one slash, not two.
+  - Verification now tries every key the validator has held
+    inside the evidence window (current plus a bounded history
+    of 8 retired keys per validator, populated on rotation,
+    re-admission, and removal paths). A validator can no longer
+    rotate its consensus key to invalidate a pending proof.
+  - The retired-key set is committed chain state (snapshot
+    codec v2; pre-upgrade snapshots decode with an empty
+    history — live-key verification only, the old bound).
+  - **In plain words:** before, an attacker could punish a
+    validator twice for one double-sign by resubmitting the
+    proof with the votes swapped, and a validator could escape
+    slashing entirely by changing its key before the evidence
+    landed. Both holes are closed — one offense is one slash,
+    and rotating keys no longer dodges a valid proof.

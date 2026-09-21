@@ -17402,3 +17402,66 @@ closing on schedule. The round-trip test caught a real assumption
 bug — two proposals submitted in the same block share a deadline,
 so the fixture needed staggered `begin_block`s to prove per-proposal
 deadline persistence.
+
+## 2026-09-21 — staking: canonical offense identity + evidence keys that survive rotation
+
+**Bug.** Two findings in double-sign evidence:
+
+- `seen_evidence` replay keys hashed the RAW ORDERED PAIR of
+  signed votes — resubmitting the same equivocation with
+  `(hash_a, sig_a)` and `(hash_b, sig_b)` swapped produced a
+  byte-distinct payload, a fresh hash, and a SECOND 10% slash
+  for one offense. Same for any different conflicting pair at
+  the same (view, phase, epoch) — a triple-signed view could be
+  penalized per pair, not per offense.
+- Signature verification used only the validator's CURRENT
+  `bls_keys` entry (`take_key_changes` doc literally admitted
+  "evidence stops verifying from this point — a documented v1
+  bound"). A validator could equivocate, rotate keys at the
+  next epoch boundary, and their proof would fail verification
+  forever — rotate-away-from-evidence.
+
+**Fix.**
+
+- **Canonical offense identity.** The replay key is now
+  `hash(Domain::Vote, validator ‖ view ‖ phase ‖ epoch)` — the
+  offense is equivocation AT a consensus position, and
+  penalties are per offense, not per conflicting pair: swapped
+  pairs and different pairs at the same triple all collide
+  into the one penalty. (Same-position distinct offenses —
+  different view/phase/epoch — still slash independently.)
+- **Retired-key history.** `retired_bls_keys` — a bounded
+  per-validator history (`EVIDENCE_KEY_HISTORY = 8`, oldest
+  evicted) fed by a uniform `retire_key` at every site that
+  displaces or removes a live `bls_keys` entry: rotation
+  (`take_key_changes`), re-admission overwrite
+  (`validator_add` quorum), lapsed-add removal, and
+  cancelled-candidate removal. Evidence verification tries
+  each signature against the candidate set (current ∪
+  retired) INDEPENDENTLY — the offense is the validator
+  signing conflicting votes regardless of which of its keys
+  signed which, so even a mid-view key split verifies.
+- **Committed.** The retired set rides a tolerant trailing
+  codec section: two replicas disagreeing on it disagree on
+  whether a proof verifies. Pre-upgrade blobs decode empty —
+  evidence verifies against the live key only, the exact
+  pre-upgrade bound.
+
+**Downtime caveat reviewed.** The audit's secondary note asked
+whether absence from an early-formed QC bitmap is really proof
+of non-voting. Verified the feed: `record_block_attendance`
+receives the signers of the COMMITTING QC inside
+`execute_block` — the finalized vote record, not an early
+bitmap — and the penalty is jail-only (no slash), the
+correctly conservative posture for a liveness fault. No code
+change; documented in the audit resolution.
+
+**Tests.** 8 new: swapped-pair and different-pair replay
+(single slash), distinct-view double offense (double slash),
+retired-key evidence after `key_change`+rotation, mixed-key
+pairs, cross-validator retired-key rejection, the 8-deep
+history bound with oldest-eviction, snapshot round-trip
+carrying retired keys into post-import evidence, and a
+hand-truncated pre-upgrade blob (canon minus the section's
+`put_count(0)`) decoding to empty history with live-key
+evidence intact. 83 staking tests green.

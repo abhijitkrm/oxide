@@ -163,6 +163,16 @@ const MIN_JAIL_BLOCKS: u64 = 600;
 /// has to forward what the wire carried.
 const EVIDENCE_PAYLOAD_LEN: usize = 8 + 1 + 8 + 32 + 96 + 32 + 96;
 
+/// How many retired consensus keys are kept per validator for
+/// evidence verification. Double-sign evidence must arrive while
+/// the offender's stake is still slashable (the unbonding window);
+/// key rotations are endorsement-driven, not on a fixed block
+/// schedule, so the bound is a COUNT of displaced keys rather than
+/// an epoch span. `8` covers a validator rotating eight times
+/// inside one unbonding window — far beyond honest churn — while
+/// keeping attacker-driven growth bounded per validator.
+const EVIDENCE_KEY_HISTORY: usize = 8;
+
 /// Sliding window (blocks) over which downtime is measured.
 ///
 /// Unit: blocks. Mirrors Cosmos `SignedBlocksWindow` (= 100
@@ -346,6 +356,16 @@ pub struct StakingModule {
     /// stale key is harmless (evidence requires the validator to
     /// still exist) and re-adds overwrite it.
     bls_keys: Mutex<BTreeMap<Address, Vec<u8>>>,
+    /// Recently displaced consensus keys per validator, oldest
+    /// first, capped at [`EVIDENCE_KEY_HISTORY`]. A rotation or
+    /// re-admission moves the previous key here: the key can no
+    /// longer sign new votes but `handle_evidence` must still
+    /// verify proofs for votes signed BEFORE the rotation —
+    /// otherwise a validator could rotate away from an offense
+    /// (the v1 bound: evidence died the moment keys changed).
+    /// Committed state: two replicas disagreeing on the retired
+    /// set disagree on whether a proof verifies.
+    retired_bls_keys: Mutex<BTreeMap<Address, Vec<Vec<u8>>>>,
     /// Jailed validators: address → height jailed. Jailed
     /// validators are emitted as `removes` at the next epoch
     /// rotation (out of consensus), stop earning rewards, and keep
@@ -368,10 +388,15 @@ pub struct StakingModule {
     /// module state (set by a tx), so every replica schedules the
     /// same halt deterministically.
     scheduled_halt: Mutex<Option<u64>>,
-    /// Hashes of evidence payloads already applied — replaying the
-    /// same double-sign proof must not re-slash. Keyed by
-    /// BLAKE3 of the two-vote payload (deterministic, no sender
-    /// component — any reporter resubmitting hits the same key).
+    /// Canonical offense identities already applied — the hash of
+    /// `(validator, view, phase, epoch)`, NOT of the evidence
+    /// payload. Penalties are per OFFENSE: once a validator is
+    /// slashed for equivocating at a consensus position, any
+    /// further proof of that same position — the pair swapped, or
+    /// a different conflicting pair entirely — is a replay, not a
+    /// new offense. (The v1 key hashed the raw ordered pair, so
+    /// resubmitting the same offense with the votes swapped
+    /// minted a fresh identity and slashed twice.)
     seen_evidence: Mutex<std::collections::BTreeSet<Hash>>,
     /// Per-validator attendance ring: `true` = signed the block's
     /// committing QC, `false` = absent. Fed by
@@ -408,6 +433,7 @@ impl StakingModule {
             pending_validator_removes: Mutex::new(Vec::new()),
             endorsements: framework::Endorsements::new(),
             bls_keys: Mutex::new(BTreeMap::new()),
+            retired_bls_keys: Mutex::new(BTreeMap::new()),
             jailed: Mutex::new(BTreeMap::new()),
             pending_jails: Mutex::new(Vec::new()),
             pending_unjails: Mutex::new(Vec::new()),
@@ -748,10 +774,10 @@ impl StakingModule {
     /// Draining means the rotation *applied* — the new key is now
     /// the validator's current consensus key, so `bls_keys` is
     /// updated here (not at `handle_key_change`, which is only the
-    /// pending stage). Evidence for votes signed with the previous
-    /// key stops verifying from this point — a documented v1
-    /// bound: double-sign proofs must be submitted before the
-    /// offender rotates keys.
+    /// pending stage). The displaced key moves to
+    /// `retired_bls_keys`: it cannot sign new votes but evidence
+    /// for votes signed before the rotation still verifies — an
+    /// offender cannot rotate away from a pending proof.
     ///
     /// # Panics
     ///
@@ -767,9 +793,34 @@ impl StakingModule {
         .collect();
         let mut bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (addr, key) in &changes {
-            bls_keys.insert(*addr, key.clone());
+            if let Some(old) = bls_keys.insert(*addr, key.clone()) {
+                if old != *key {
+                    self.retire_key(*addr, old);
+                }
+            }
         }
         changes
+    }
+
+    /// Move `old_key` into `validator`'s retired-key history —
+    /// bounded at [`EVIDENCE_KEY_HISTORY`] entries, oldest dropped
+    /// first. Every site that displaces or removes a live
+    /// `bls_keys` entry routes through here: the key can no longer
+    /// sign new votes but evidence for votes it already signed
+    /// must still verify — the uniform rule keeps re-admission,
+    /// rotation, and lapse paths from silently dropping the one
+    /// key a pending proof needs.
+    fn retire_key(&self, validator: Address, old_key: Vec<u8>) {
+        let mut retired =
+            self.retired_bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keys = retired.entry(validator).or_default();
+        keys.push(old_key);
+        if keys.len() > EVIDENCE_KEY_HISTORY {
+            // The oldest retirements fall off — evidence that old
+            // is almost certainly outside the slashable window
+            // anyway.
+            keys.remove(0);
+        }
     }
 
     /// Take all pending validator changes, clearing all queues.
@@ -825,7 +876,13 @@ impl StakingModule {
                     // add would let an unfunded address hold a queue
                     // slot forever.)
                     validators.remove(&addr);
-                    bls_keys.remove(&addr);
+                    // Retire, not drop — a lapsed admission's key
+                    // never signed votes, but if the address was a
+                    // previously-active validator this entry is its
+                    // last live key and old evidence still needs it.
+                    if let Some(old) = bls_keys.remove(&addr) {
+                        self.retire_key(addr, old);
+                    }
                     continue;
                 }
                 adds.push((addr, key, bonded));
@@ -1342,6 +1399,8 @@ impl Module for StakingModule {
             staged.scheduled_halt;
         *self.seen_evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             staged.seen_evidence;
+        *self.retired_bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            staged.retired_bls_keys;
         *self.attendance.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             staged.attendance;
         *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -1396,6 +1455,9 @@ struct StagedStaking {
     endorsements: framework::Endorsements,
     /// Live BLS consensus keys.
     bls_keys: BTreeMap<Address, Vec<u8>>,
+    /// Retired BLS consensus keys per validator (bounded history —
+    /// [`EVIDENCE_KEY_HISTORY`]). Empty in pre-upgrade blobs.
+    retired_bls_keys: BTreeMap<Address, Vec<Vec<u8>>>,
     /// Jailed validators: address → height jailed.
     jailed: BTreeMap<Address, u64>,
     /// Jail events awaiting the next validator-set broadcast.
@@ -1599,6 +1661,23 @@ impl StakingModule {
             }
         }
         w.put_u64(*self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        // ── Trailing section (v2): retired consensus keys ──
+        // Evidence verification consults the retired set for
+        // proofs spanning a key rotation — committed because two
+        // replicas disagreeing on it disagree on whether a proof
+        // verifies. Appended last so pre-upgrade blobs decode
+        // with the empty-history default.
+        {
+            let retired =
+                self.retired_bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.put_count(retired.len());
+            for (a, keys) in retired.iter() {
+                w.put_addr(a).put_count(keys.len());
+                for k in keys {
+                    w.put_bytes(k);
+                }
+            }
+        }
     }
 
     /// Write the module's committed state into `w` — shared by
@@ -1855,6 +1934,33 @@ impl StakingModule {
             }
         }
         out.current_height = r.get_u64()?;
+        // ── Trailing section (v2), tolerant of pre-upgrade blobs ──
+        // Absent = the blob predates key-history retention: the
+        // retired set decodes empty and evidence verifies only
+        // against the live key — exactly the pre-upgrade bound.
+        if r.remaining() != 0 {
+            let n = r.get_count()?;
+            for _ in 0..n {
+                let a = r.get_addr()?;
+                let kn = r.get_count()?;
+                // Live code only writes non-empty lists bounded at
+                // EVIDENCE_KEY_HISTORY — anything else is crafted.
+                if kn == 0 || kn > EVIDENCE_KEY_HISTORY {
+                    return None;
+                }
+                let mut keys = Vec::with_capacity(kn);
+                for _ in 0..kn {
+                    let k = r.get_bytes()?.to_vec();
+                    if k.len() != crypto::bls::PublicKey::LEN {
+                        return None;
+                    }
+                    keys.push(k);
+                }
+                if out.retired_bls_keys.insert(a, keys).is_some() {
+                    return None;
+                }
+            }
+        }
         Some(())
     }
 
@@ -2477,12 +2583,20 @@ impl StakingModule {
     /// `[hash_a: 32B][sig_a: 96B][hash_b: 32B][sig_b: 96B]`.
     ///
     /// Permissionless — anyone may submit; the two BLS signatures
-    /// are the authentication. Both are verified against the
-    /// validator's registered consensus key over the exact
-    /// `vote_signing_message` layout the engine signs
+    /// are the authentication. Each is verified against ANY key the
+    /// validator holds in `bls_keys` ∪ `retired_bls_keys` over the
+    /// exact `vote_signing_message` layout the engine signs
     /// (`view LE | phase | block_hash | epoch LE`, `Domain::Vote`):
     /// a forged or misattributed proof fails verification and the
-    /// reporter loses only their envelope fee.
+    /// reporter loses only their envelope fee. Retired-key coverage
+    /// means a proof stays valid across a rotation — an offender
+    /// cannot rotate away from evidence of its own offense.
+    ///
+    /// The replay guard keys on the CANONICAL OFFENSE —
+    /// `(validator, view, phase, epoch)` — so penalties are per
+    /// offense, not per payload: the same equivocation resubmitted
+    /// with the votes swapped, or proven by a different conflicting
+    /// pair at the same position, is a replay, not a second slash.
     ///
     /// On a valid proof: the offender is slashed
     /// [`double_sign_slash_amount`](msg::double_sign_slash_amount)
@@ -2519,29 +2633,63 @@ impl StakingModule {
         let sig_b =
             crypto::bls::Signature::from_slice(&msg[198..294]).map_err(|_| ExecError::Malformed)?;
 
-        let key = self
-            .bls_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&validator)
-            .cloned()
-            .ok_or(ExecError::ModuleRejected(
+        // Candidate verification keys: the validator's CURRENT
+        // consensus key plus its bounded retired history — evidence
+        // can span a key rotation (the offense predates it), so
+        // every key the validator has held inside the evidence
+        // window is tried. A signature that verifies under ANY of
+        // the validator's own keys is a real signature by that
+        // validator — BLS unforgeability makes a foreign key's
+        // signature impossible to fake.
+        let mut candidates: Vec<Vec<u8>> = Vec::new();
+        {
+            let bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(k) = bls_keys.get(&validator) {
+                candidates.push(k.clone());
+            }
+        }
+        {
+            let retired =
+                self.retired_bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(keys) = retired.get(&validator) {
+                candidates.extend(keys.iter().cloned());
+            }
+        }
+        if candidates.is_empty() {
+            return Err(ExecError::ModuleRejected(
                 "evidence: no consensus key on record for validator".to_string(),
-            ))?;
-        let pk = crypto::bls::PublicKey::from_slice(&key).map_err(|_| ExecError::Malformed)?;
+            ));
+        }
 
-        // Replay guard: the same proof must not slash twice.
-        let evidence_hash = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Vote, &msg[21..]);
+        // Replay guard keyed by the CANONICAL OFFENSE IDENTITY —
+        // `(validator, view, phase, epoch)` — not the raw payload.
+        // Penalties are per offense: the same equivocation proven
+        // by the swapped pair, or by a different conflicting pair
+        // at the same position, is one offense and one penalty.
+        // The v1 key hashed the ordered payload bytes, so a
+        // resubmission with the votes swapped produced a fresh
+        // identity and slashed a second time.
+        let mut offense = Vec::with_capacity(37);
+        offense.extend_from_slice(&validator.0);
+        offense.extend_from_slice(&view.to_le_bytes());
+        offense.push(phase);
+        offense.extend_from_slice(&epoch.to_le_bytes());
+        let offense_id = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Vote, &offense);
         {
             let seen = self.seen_evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if seen.contains(&evidence_hash) {
+            if seen.contains(&offense_id) {
                 return Err(ExecError::ModuleRejected("evidence: already applied".to_string()));
             }
         }
 
         // Rebuild the exact 49-byte signing messages and verify
         // both signatures — a valid proof is two verifying
-        // signatures over different block hashes.
+        // signatures over different block hashes. Each signature
+        // is checked against every candidate independently: the
+        // votes were cast at the same view, but a rotation mid-way
+        // could in principle split them across keys, and the
+        // offense is the validator signing conflicting votes
+        // regardless of which of its keys signed which.
         let mut vote_msg_a = [0u8; 49];
         vote_msg_a[..8].copy_from_slice(&view.to_le_bytes());
         vote_msg_a[8] = phase;
@@ -2552,10 +2700,15 @@ impl StakingModule {
         vote_msg_b[8] = phase;
         vote_msg_b[9..41].copy_from_slice(hash_b);
         vote_msg_b[41..49].copy_from_slice(&epoch.to_le_bytes());
-        if crypto::bls_signer::verify(&sig_a, crypto::hash::Domain::Vote, &vote_msg_a, &pk).is_err()
-            || crypto::bls_signer::verify(&sig_b, crypto::hash::Domain::Vote, &vote_msg_b, &pk)
-                .is_err()
-        {
+        let verifies = |sig: &crypto::bls::Signature, vote_msg: &[u8; 49]| {
+            candidates.iter().any(|key| {
+                crypto::bls::PublicKey::from_slice(key).is_ok_and(|pk| {
+                    crypto::bls_signer::verify(sig, crypto::hash::Domain::Vote, vote_msg, &pk)
+                        .is_ok()
+                })
+            })
+        };
+        if !verifies(&sig_a, &vote_msg_a) || !verifies(&sig_b, &vote_msg_b) {
             return Err(ExecError::ModuleRejected(
                 "evidence: signature verification failed".to_string(),
             ));
@@ -2583,7 +2736,7 @@ impl StakingModule {
         self.seen_evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(evidence_hash);
+            .insert(offense_id);
 
         events.push(Event { module: "staking", kind: "evidence", data: msg.to_vec() });
         Ok(events)
@@ -2948,11 +3101,19 @@ impl StakingModule {
                         .insert(new_validator, 0);
                     // Record the consensus key immediately — evidence
                     // submitted before the rotation still needs it
-                    // for verification.
-                    self.bls_keys
+                    // for verification. A re-admission overwrites
+                    // the previous live key — retire it rather
+                    // than dropping the one a pending proof needs.
+                    let displaced = self
+                        .bls_keys
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(new_validator, bls_key.clone());
+                    if let Some(old) = displaced {
+                        if old != bls_key {
+                            self.retire_key(new_validator, old);
+                        }
+                    }
                     self.pending_validator_adds
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3154,7 +3315,17 @@ impl StakingModule {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(validator);
         self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(validator);
-        self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(validator);
+        // Retire rather than drop: the cancelled candidate's key
+        // never went live, but a previous incarnation's key may be
+        // what this entry held — the uniform retire rule applies.
+        let removed_key = self
+            .bls_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(validator);
+        if let Some(old) = removed_key {
+            self.retire_key(*validator, old);
+        }
         // Clear the store mirror so queries cannot report a phantom
         // stake or delegation for the cancelled candidate.
         {
@@ -4714,5 +4885,287 @@ mod tests {
         snapshot.entries[0].1.truncate(12);
         assert!(src.inspect_state(&snapshot).is_err());
         assert!(StakingModule::new().import_state(&snapshot).is_err());
+    }
+
+    /// The replay key is the canonical OFFENSE identity —
+    /// `(validator, view, phase, epoch)` — so resubmitting the
+    /// same equivocation with the two votes swapped hits the same
+    /// key. The v1 key hashed the ordered pair and double-slashed.
+    #[test]
+    fn evidence_swapped_pair_is_same_offense() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        staking.genesis_set_bls_key(v, key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        let evidence = signed_evidence(v, &key, 7, 0);
+        staking.handle(&ctx(), &evidence).unwrap();
+        assert_eq!(staking.stake(&v), 900);
+
+        // Rebuild the same proof with (hash_a, sig_a) and
+        // (hash_b, sig_b) swapped — byte-distinct message, same
+        // offense.
+        let view = 7u64;
+        let epoch = 0u64;
+        let hash_a = [0xAAu8; 32];
+        let hash_b = [0xBBu8; 32];
+        let vote_msg = |hash: &[u8; 32]| {
+            let mut m = [0u8; 49];
+            m[..8].copy_from_slice(&view.to_le_bytes());
+            m[9..41].copy_from_slice(hash);
+            m[41..49].copy_from_slice(&epoch.to_le_bytes());
+            m
+        };
+        let sig_a = key.sign(crypto::hash::Domain::Vote, &vote_msg(&hash_a));
+        let sig_b = key.sign(crypto::hash::Domain::Vote, &vote_msg(&hash_b));
+        let swapped =
+            msg::evidence(v, view, 0, epoch, &hash_b, sig_b.as_bytes(), &hash_a, sig_a.as_bytes());
+        let result = staking.handle(&ctx(), &swapped);
+        assert!(result.is_err(), "swapped pair must not re-slash");
+        assert_eq!(staking.stake(&v), 900, "still exactly one slash");
+    }
+
+    /// Penalties are per OFFENSE: a different conflicting pair at
+    /// the same (view, phase, epoch) — e.g. the validator triple-
+    /// signed the view — is still one offense, one penalty.
+    #[test]
+    fn evidence_different_pair_same_offense() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        staking.genesis_set_bls_key(v, key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        staking.handle(&ctx(), &signed_evidence(v, &key, 7, 0)).unwrap();
+        assert_eq!(staking.stake(&v), 900);
+
+        // Same triple, different second hash — still the same
+        // offense position.
+        let hash_a = [0xAAu8; 32];
+        let hash_c = [0xCCu8; 32];
+        let vote_msg = |hash: &[u8; 32]| {
+            let mut m = [0u8; 49];
+            m[..8].copy_from_slice(&7u64.to_le_bytes());
+            m[9..41].copy_from_slice(hash);
+            m[41..49].copy_from_slice(&0u64.to_le_bytes());
+            m
+        };
+        let sig_a = key.sign(crypto::hash::Domain::Vote, &vote_msg(&hash_a));
+        let sig_c = key.sign(crypto::hash::Domain::Vote, &vote_msg(&hash_c));
+        let second =
+            msg::evidence(v, 7, 0, 0, &hash_a, sig_a.as_bytes(), &hash_c, sig_c.as_bytes());
+        assert!(staking.handle(&ctx(), &second).is_err(), "same offense — no second slash");
+        assert_eq!(staking.stake(&v), 900);
+    }
+
+    /// A DIFFERENT consensus position is a different offense —
+    /// equivocating again at another view must slash again.
+    #[test]
+    fn evidence_distinct_view_is_distinct_offense() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        staking.genesis_set_bls_key(v, key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        staking.handle(&ctx(), &signed_evidence(v, &key, 7, 0)).unwrap();
+        staking.handle(&ctx(), &signed_evidence(v, &key, 8, 0)).unwrap();
+        // Two offenses, two 10% slashes: 1000 → 900 → 810.
+        assert_eq!(staking.stake(&v), 810, "each distinct offense slashes");
+    }
+
+    /// Evidence for votes signed with a rotated-out key must still
+    /// verify — the retired-key history covers the evidence
+    /// window. v1 used only the live key, so a validator could
+    /// rotate away from a pending proof.
+    #[test]
+    fn evidence_verifies_with_retired_key() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let old_key = bls_key(1);
+        let new_key = bls_key(2);
+        staking.genesis_set_bls_key(v, old_key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        // The offense predates the rotation: signed under K1.
+        let evidence = signed_evidence(v, &old_key, 7, 0);
+        // Rotate K1 → K2.
+        let pop = new_key.pop_prove();
+        staking
+            .handle(
+                &ctx_with_sender(1),
+                &msg::key_change(v, new_key.public_key().as_bytes(), pop.as_bytes()),
+            )
+            .unwrap();
+        let changes = staking.take_key_changes();
+        assert_eq!(changes.len(), 1, "rotation applied");
+
+        // Evidence signed with the retired key still verifies —
+        // and slashes.
+        staking.handle(&ctx(), &evidence).unwrap();
+        assert_eq!(staking.stake(&v), 900, "rotated-out key evidence still slashes");
+        assert!(staking.is_jailed(&v));
+    }
+
+    /// Each signature may verify under a different validator-owned
+    /// key — a mid-view rotation could split them. The offense is
+    /// the validator signing conflicting votes either way.
+    #[test]
+    fn evidence_verifies_mixed_keys() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        let old_key = bls_key(1);
+        let new_key = bls_key(2);
+        staking.genesis_set_bls_key(v, old_key.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let pop = new_key.pop_prove();
+        staking
+            .handle(
+                &ctx_with_sender(1),
+                &msg::key_change(v, new_key.public_key().as_bytes(), pop.as_bytes()),
+            )
+            .unwrap();
+        staking.take_key_changes();
+
+        // Vote A signed under retired K1, vote B under current K2.
+        let hash_a = [0xAAu8; 32];
+        let hash_b = [0xBBu8; 32];
+        let vote_msg = |hash: &[u8; 32]| {
+            let mut m = [0u8; 49];
+            m[..8].copy_from_slice(&7u64.to_le_bytes());
+            m[9..41].copy_from_slice(hash);
+            m[41..49].copy_from_slice(&0u64.to_le_bytes());
+            m
+        };
+        let sig_a = old_key.sign(crypto::hash::Domain::Vote, &vote_msg(&hash_a));
+        let sig_b = new_key.sign(crypto::hash::Domain::Vote, &vote_msg(&hash_b));
+        let evidence =
+            msg::evidence(v, 7, 0, 0, &hash_a, sig_a.as_bytes(), &hash_b, sig_b.as_bytes());
+        staking.handle(&ctx(), &evidence).unwrap();
+        assert_eq!(staking.stake(&v), 900);
+    }
+
+    /// A key no validator ever held still cannot verify — the
+    /// retired set is validator-scoped, not a global forgery pool.
+    #[test]
+    fn evidence_rejects_unrelated_retired_key() {
+        let staking = setup(&[1, 2]);
+        let (v1, v2) = (addr(1), addr(2));
+        let k1 = bls_key(1);
+        let k2 = bls_key(2);
+        staking.genesis_set_bls_key(v1, k1.public_key().as_bytes());
+        staking.genesis_set_bls_key(v2, k2.public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v1, 1000)).unwrap();
+        staking.handle(&ctx(), &msg::delegate(v2, 1000)).unwrap();
+        // Rotate v2's key — v1's evidence signed with v2's OLD key
+        // must still fail: the key was never v1's.
+        let k2_new = bls_key(3);
+        let pop = k2_new.pop_prove();
+        staking
+            .handle(
+                &ctx_with_sender(2),
+                &msg::key_change(v2, k2_new.public_key().as_bytes(), pop.as_bytes()),
+            )
+            .unwrap();
+        staking.take_key_changes();
+        let forged = signed_evidence(v1, &k2, 7, 0);
+        assert!(
+            staking.handle(&ctx(), &forged).is_err(),
+            "another validator's key must not verify"
+        );
+        assert_eq!(staking.stake(&v1), 1000);
+    }
+
+    /// The retired history is bounded — rotations beyond
+    /// `EVIDENCE_KEY_HISTORY` evict the oldest entries.
+    #[test]
+    fn retired_key_history_is_bounded() {
+        let staking = setup(&[1]);
+        let v = addr(1);
+        staking.genesis_set_bls_key(v, bls_key(0).public_key().as_bytes());
+        staking.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        // Nine rotations: keys 1..=9 displace 0..=8 → retired
+        // holds at most EVIDENCE_KEY_HISTORY (8).
+        for i in 1u8..=9 {
+            let k = bls_key(i);
+            let pop = k.pop_prove();
+            staking
+                .handle(
+                    &ctx_with_sender(1),
+                    &msg::key_change(v, k.public_key().as_bytes(), pop.as_bytes()),
+                )
+                .unwrap();
+            staking.take_key_changes();
+        }
+        let retired = staking.retired_bls_keys.lock().unwrap();
+        let keys = retired.get(&v).expect("history exists");
+        assert_eq!(keys.len(), EVIDENCE_KEY_HISTORY, "history capped");
+        // The oldest (key 0) was evicted; the newest (key 8) kept.
+        assert_eq!(keys.last().unwrap().as_slice(), bls_key(8).public_key().as_bytes());
+    }
+
+    /// Retired keys are committed state — they must survive a
+    /// snapshot round-trip so every replica verifies the same
+    /// post-rotation evidence.
+    #[test]
+    fn snapshot_roundtrips_retired_keys() {
+        let src = setup(&[1]);
+        let v = addr(1);
+        let old_key = bls_key(1);
+        let new_key = bls_key(2);
+        src.genesis_set_bls_key(v, old_key.public_key().as_bytes());
+        src.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        let pop = new_key.pop_prove();
+        src.handle(
+            &ctx_with_sender(1),
+            &msg::key_change(v, new_key.public_key().as_bytes(), pop.as_bytes()),
+        )
+        .unwrap();
+        src.take_key_changes();
+        let evidence = signed_evidence(v, &old_key, 7, 0);
+
+        let snapshot = src.export_state().unwrap();
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+        let dst = StakingModule::new();
+        dst.set_ledger(std::sync::Arc::new(framework::MemoryBalances::new()));
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        // The imported replica verifies retired-key evidence too.
+        dst.handle(&ctx(), &evidence).unwrap();
+        assert_eq!(dst.stake(&v), 900);
+    }
+
+    /// Pre-upgrade blobs carry no retired-keys section: they decode
+    /// with an empty history — evidence verifies against the live
+    /// key, the exact pre-upgrade bound.
+    #[test]
+    fn pre_upgrade_blob_decodes_without_key_history() {
+        let src = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        src.genesis_set_bls_key(v, key.public_key().as_bytes());
+        src.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        // Strip the trailing retired-keys section from the canon:
+        // with an empty history the section is a single
+        // `put_count(0)` — 8 zero bytes at the canon tail.
+        let mut snapshot = src.export_state().unwrap();
+        let blob = &mut snapshot.entries[0].1;
+        let canon_len = usize::try_from(u64::from_le_bytes(blob[..8].try_into().unwrap())).unwrap();
+        let section_len = 8usize; // put_count(0)
+        blob[..8].copy_from_slice(&(canon_len as u64 - section_len as u64).to_le_bytes());
+        blob.drain(8 + canon_len - section_len..8 + canon_len);
+        let v1_snapshot = snapshot.clone();
+
+        let dst = StakingModule::new();
+        dst.set_ledger(std::sync::Arc::new(framework::MemoryBalances::new()));
+        dst.inspect_state(&v1_snapshot).unwrap();
+        dst.import_state(&v1_snapshot).unwrap();
+        // Empty retired history — but live-key evidence works.
+        assert!(dst.retired_bls_keys.lock().unwrap().is_empty());
+        let evidence = signed_evidence(v, &key, 7, 0);
+        dst.handle(&ctx(), &evidence).unwrap();
+        assert_eq!(dst.stake(&v), 900);
     }
 }
