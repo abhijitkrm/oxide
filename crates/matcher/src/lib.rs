@@ -92,6 +92,94 @@ use trading::{
 /// Matches `modules/exchange/src/lib.rs`.
 const PRICE_SCALE: u128 = 100_000_000;
 
+/// The leg identity a fill merges into — identical to the key
+/// `aggregate_fills` groups batch legs by
+/// (`market, price, buy order key, sell order key`, with the order
+/// keys flattened to `(owner, client_id)`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LegId {
+    /// Market the fill traded on.
+    market: u16,
+    /// Execution price (scale-8).
+    price: u64,
+    /// Buy order owner.
+    buyer: [u8; 20],
+    /// Buy order's client id.
+    buyer_id: u64,
+    /// Sell order owner.
+    seller: [u8; 20],
+    /// Sell order's client id.
+    seller_id: u64,
+}
+
+impl LegId {
+    /// Build the leg key for a fill — the same identity
+    /// `aggregate_fills` merges batch legs by.
+    fn new(
+        market: u16,
+        price: u64,
+        buyer: primitives::Address,
+        buyer_id: u64,
+        seller: primitives::Address,
+        seller_id: u64,
+    ) -> Self {
+        Self { market, price, buyer: buyer.0, buyer_id, seller: seller.0, seller_id }
+    }
+}
+
+/// Marginal per-leg settlement-cost accumulator — one entry per
+/// pending settlement leg, keyed EXACTLY the way
+/// `aggregate_fills` merges fills into batch legs
+/// (see [`LegId`]).
+///
+/// Why marginal: the chain computes a leg's quote as
+/// `floor(price × Σqty / PRICE_SCALE)` — one truncation over the
+/// merged quantity. Per-fill truncation (`Σ floor(price × qty_i)`)
+/// under-counts by up to `merges−1` dust units, so the off-chain
+/// cache diverged from the on-chain settlement whenever the engine
+/// emitted multiple fills for the same pair at the same price.
+///
+/// The fix: each fill contributes only the DELTA in the leg's
+/// floored total — `floor(price × (acc+q)/S) − floor(price × acc/S)`.
+/// The marginals telescope: after fills `q1..qn` at price `p` the
+/// accumulated total IS `floor(p × Σq / S)` — bit-identical to the
+/// leg the chain will settle. When a leg has exactly one fill (the
+/// common case) the marginal equals the old per-fill floor, so
+/// unmerged accounting is unchanged.
+///
+/// Scope: entries accumulate across orders until `seal_batch`
+/// drains the pending fills — the same boundary the settler
+/// aggregates at — then reset. A fractional residue below one
+/// unit is never a payment on either side (the chain's floor drops
+/// it identically); nothing is lost on reset.
+#[derive(Default)]
+struct LegCostAcc {
+    /// `LegId` → (accumulated qty, `floor(price × qty / PRICE_SCALE)`
+    /// so far).
+    legs: std::collections::BTreeMap<LegId, (u64, u64)>,
+}
+
+impl LegCostAcc {
+    /// Accumulate `qty` into `leg` and return the marginal floored
+    /// quote — the amount to credit the seller / charge the buyer
+    /// for THIS fill so the running total equals the chain's
+    /// merged-leg floor.
+    fn add(&mut self, leg: LegId, qty: u64) -> u64 {
+        let (acc_qty, acc_floor) = self.legs.entry(leg).or_insert((0, 0));
+        // `saturating_add` mirrors the cache's never-panic rule; the
+        // overflow the batch-side `checked_add` rejects needs
+        // ~1.8e13 lots in one leg — unreachable, and a rejected
+        // batch makes the cache's view moot anyway.
+        let new_qty = acc_qty.saturating_add(qty);
+        let new_floor = u64::try_from(u128::from(leg.price) * u128::from(new_qty) / PRICE_SCALE)
+            .unwrap_or(u64::MAX);
+        let marginal = new_floor.saturating_sub(*acc_floor);
+        *acc_qty = new_qty;
+        *acc_floor = new_floor;
+        marginal
+    }
+}
+
 /// Settlement arithmetic for a buy order's reservation (C6).
 ///
 /// `reservation` was debited at admission: `limit_price × qty` for
@@ -99,11 +187,12 @@ const PRICE_SCALE: u128 = 100_000_000;
 /// the WORST CASE the taker could owe. This returns how much of it
 /// comes back:
 ///
-/// - Fills cost their ACTUAL execution price (`fill.price`), not the
+/// - `fill_cost` is the telescoped leg cost — the sum of marginal
+///   floor deltas from [`LegCostAcc`], bit-identical to the
+///   `floor(price × Σqty / PRICE_SCALE)` the chain settles per
+///   merged leg. Fills cost their ACTUAL execution price, not the
 ///   limit — the difference is taker price improvement, refunded
-///   here. Each fill's quote is truncated at `/PRICE_SCALE` exactly
-///   the way the seller credits are computed, so buyer-out equals
-///   seller-in to the unit (no rounding drift).
+///   here.
 /// - A `Resting` outcome keeps `limit_price × resting_qty` held —
 ///   precisely the amount `cancel_order` refunds later, exactly once.
 ///   The resting remainder IS the reservation; the book is the
@@ -119,15 +208,8 @@ fn buy_reservation_refund(
     reservation: u64,
     limit_price: u64,
     outcome: &OrderOutcome,
-    fills: &[FillEvent],
+    fill_cost: u64,
 ) -> u64 {
-    let fill_cost: u64 = fills
-        .iter()
-        .map(|f| {
-            u64::try_from(u128::from(f.price.0) * u128::from(f.qty.0) / PRICE_SCALE)
-                .unwrap_or(u64::MAX)
-        })
-        .sum();
     let held = match outcome {
         OrderOutcome::Resting { resting_qty, .. } => {
             u64::try_from(u128::from(limit_price) * u128::from(resting_qty.0) / PRICE_SCALE)
@@ -241,9 +323,12 @@ pub struct SettledFill {
     /// The seller's client order id (same convention as
     /// `buyer_id`).
     pub seller_id: u64,
-    /// Quote amount debited from buyer / credited to seller (scale-6)
-    /// in the off-chain cache — recorded for reconciliation; the
-    /// on-chain batch settles a recomputed amount, not this value.
+    /// The marginal leg-cost delta this fill contributed (scale-6)
+    /// — credited to the seller / charged to the buyer's
+    /// reservation in the off-chain cache. Marginals telescope:
+    /// summed over the fills that merge into one chain leg they
+    /// equal `floor(price × Σqty / PRICE_SCALE)` exactly — the same
+    /// value the chain recomputes and settles.
     pub quote_amount: u64,
 }
 
@@ -463,6 +548,10 @@ pub struct MatchingServer {
     auth_rejections: u64,
     /// The pending settlement batch.
     settlement_batch: Vec<SettledFill>,
+    /// Marginal per-leg cost accumulator — credits/charges deltas
+    /// that telescope to the chain's merged-leg floors. Cleared by
+    /// `seal_batch` (the same boundary the batch drains at).
+    cost_acc: LegCostAcc,
     /// Per-owner replay gate (see [`NonceTracker`]).
     nonces: NonceTracker,
     /// Book order id → the client order id (request nonce) of the
@@ -513,6 +602,7 @@ impl MatchingServer {
             risk: RiskEngine::with_defaults(),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
+            cost_acc: LegCostAcc::default(),
             nonces: NonceTracker::new(),
             order_client_ids: HashMap::with_capacity(65_536),
             clock: Arc::new(wall_clock_ms),
@@ -548,6 +638,7 @@ impl MatchingServer {
             risk: RiskEngine::new(risk_config),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
+            cost_acc: LegCostAcc::default(),
             nonces: NonceTracker::new(),
             order_client_ids: HashMap::with_capacity(65_536),
             clock: Arc::new(wall_clock_ms),
@@ -757,25 +848,38 @@ impl MatchingServer {
         };
 
         // ── Settle fills ─────────────────────────────────────────
-        // For each fill: credit the seller. The buyer's side of the
-        // payment comes out of the reservation debited at admission
-        // (buy orders) — see `buy_reservation_refund` below. Sell
-        // takers simply receive quote; their fills' buyers are
-        // resting makers whose own reservations paid at rest.
+        // For each fill: credit the seller its MARGINAL leg cost —
+        // the delta in the merged leg's floored total, so the sum
+        // telescopes to exactly the `floor(price × Σqty / SCALE)`
+        // the chain settles (see `LegCostAcc`). The buyer's side of
+        // the payment comes out of the reservation debited at
+        // admission (buy orders) — see `buy_reservation_refund`
+        // below. Sell takers simply receive quote; their fills'
+        // buyers are resting makers whose own reservations paid at
+        // rest.
+        let mut taker_fill_cost: u64 = 0;
         for f in &self.fills {
             self.fills_produced += 1;
-            let notional = u128::from(f.price.0) * u128::from(f.qty.0);
-            let quote_amount = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
             // The taker's client id is this request's nonce; the
             // maker's resolves through the resting-order map (see
             // `fill_parties` for the fallback rules).
             let (buyer, seller, buyer_id, seller_id) =
                 fill_parties(f, req.nonce, &self.order_client_ids);
-            // Credit the seller.
+            let market = self.engine.config().market_id;
+            let quote_amount = self
+                .cost_acc
+                .add(LegId::new(market, f.price.0, buyer, buyer_id, seller, seller_id), f.qty.0);
+            // Credit the seller the marginal leg delta.
             self.balances.credit(&seller, quote_amount);
+            // The taker's own cost accumulates the same marginals —
+            // for a buy outcome every fill's buyer is the taker, so
+            // this is exactly what the chain's legs will debit.
+            // (Sell-taker outcomes ignore the value — their buyers
+            // paid from resting reservations, not this request's.)
+            taker_fill_cost = taker_fill_cost.saturating_add(quote_amount);
             // Accumulate for batch settlement.
             self.settlement_batch.push(SettledFill {
-                market: self.engine.config().market_id,
+                market,
                 price: f.price,
                 qty: f.qty,
                 buyer,
@@ -801,7 +905,8 @@ impl MatchingServer {
         // exactly once. A resting buy keeps `price × resting_qty`
         // locked, which is what `cancel_order` refunds.
         if reservation > 0 {
-            let refund = buy_reservation_refund(reservation, req.price.0, &outcome, &self.fills);
+            let refund =
+                buy_reservation_refund(reservation, req.price.0, &outcome, taker_fill_cost);
             if refund > 0 {
                 self.balances.credit(&req.owner, refund);
             }
@@ -1047,9 +1152,13 @@ impl MatchingServer {
     ///
     /// Also checkpoints consumed nonces — the settler's seal cadence
     /// is a natural, off-hot-path durability point for the replay
-    /// gate.
+    /// gate — and resets the marginal leg-cost accumulator: legs are
+    /// re-formed per batch, so the telescoping must restart here
+    /// (any residual below one unit is never a payment on either
+    /// side — the chain's floor drops it identically).
     pub fn seal_batch(&mut self) -> Vec<SettledFill> {
         self.nonces.flush();
+        self.cost_acc.legs.clear();
         std::mem::take(&mut self.settlement_batch)
     }
 
@@ -2202,6 +2311,10 @@ struct MarketWorker {
     fills: Vec<FillEvent>,
     /// The pending settlement batch (local to this worker).
     settlement_batch: Vec<SettledFill>,
+    /// Worker-local marginal leg-cost accumulator — same
+    /// telescoping semantics as [`MatchingServer::cost_acc`],
+    /// reset when `Seal` drains the batch.
+    cost_acc: LegCostAcc,
     /// Total orders processed by this worker.
     orders_processed: u64,
     /// Total fills produced by this worker.
@@ -2252,6 +2365,7 @@ impl MarketWorker {
             risk: RiskEngine::with_defaults(),
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
+            cost_acc: LegCostAcc::default(),
             clock,
             chain_id,
             removed: Vec::with_capacity(64),
@@ -2275,6 +2389,10 @@ impl MarketWorker {
                     let _ = action_work.response_tx.send(resp);
                 }
                 Ok(MarketMessage::Seal(reply)) => {
+                    // Same boundary as `MatchingServer::seal_batch`:
+                    // legs re-form per batch, so the marginal-cost
+                    // accumulator resets with the drain.
+                    worker.cost_acc.legs.clear();
                     let batch = std::mem::take(&mut worker.settlement_batch);
                     let _ = reply.send(batch);
                 }
@@ -2406,22 +2524,29 @@ impl MarketWorker {
         };
 
         // ── Settle fills ─────────────────────────────────────────
-        // Credit the seller for each fill (cross-shard if needed).
-        // The buyer's payment comes out of the reservation debited
-        // at admission — released piecewise below via
+        // Credit the seller each fill's MARGINAL leg cost (cross-
+        // shard if needed) — the delta in the merged leg's floored
+        // total, telescoping to exactly the chain's
+        // `floor(price × Σqty / SCALE)` (see `LegCostAcc`). The
+        // buyer's payment comes out of the reservation debited at
+        // admission — released piecewise below via
         // `buy_reservation_refund`.
+        let mut taker_fill_cost: u64 = 0;
         for f in &self.fills {
             self.fills_produced += 1;
-            let notional = u128::from(f.price.0) * u128::from(f.qty.0);
-            let quote_amount = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
             // Client-id resolution mirrors
             // `MatchingServer::execute_order` (see `fill_parties`).
             let (buyer, seller, buyer_id, seller_id) =
                 fill_parties(f, req.nonce, &self.order_client_ids);
+            let market = self.engine.config().market_id;
+            let quote_amount = self
+                .cost_acc
+                .add(LegId::new(market, f.price.0, buyer, buyer_id, seller, seller_id), f.qty.0);
             self.balances.credit(&seller, quote_amount);
+            taker_fill_cost = taker_fill_cost.saturating_add(quote_amount);
             // Accumulate for batch settlement.
             self.settlement_batch.push(SettledFill {
-                market: self.engine.config().market_id,
+                market,
                 price: f.price,
                 qty: f.qty,
                 buyer,
@@ -2446,7 +2571,8 @@ impl MarketWorker {
         // held (exactly what cancel refunds — once), dead
         // remainders come back in full.
         if reservation > 0 {
-            let refund = buy_reservation_refund(reservation, req.price.0, &outcome, &self.fills);
+            let refund =
+                buy_reservation_refund(reservation, req.price.0, &outcome, taker_fill_cost);
             if refund > 0 {
                 self.balances.credit(&req.owner, refund);
             }
@@ -3725,5 +3851,63 @@ mod tests {
         });
         assert!(result.is_err(), "corrupt nonce store must panic, not reset the gate");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two fills between the same registered order pair at the same
+    /// price merge into ONE chain leg — `floor(price × Σqty / SCALE)`,
+    /// not `Σ floor(price × qty_i / SCALE)`. The marginal-cost
+    /// accumulator must telescope to the merged value exactly: each
+    /// fill contributes the delta in the leg's floored total.
+    #[test]
+    fn leg_cost_acc_telescopes_to_merged_floor() {
+        let mut acc = LegCostAcc::default();
+        let (buyer, seller) = (addr(1), addr(9));
+        // price 60_000_000 (0.6 quote/lot, scale-8), qty 1+1
+        // (scale-6): per-fill floors are 0 and 0 — sum 0. The
+        // merged leg floors 60_000_000 × 2 / 1e8 = 1.2 → 1, so the
+        // second fill's marginal must carry the whole unit.
+        let leg = LegId {
+            market: 0,
+            price: 60_000_000,
+            buyer: buyer.0,
+            buyer_id: 1,
+            seller: seller.0,
+            seller_id: 2,
+        };
+        let m1 = acc.add(leg, 1);
+        let m2 = acc.add(leg, 1);
+        assert_eq!((m1, m2), (0, 1), "marginals telescope to the merged floor");
+        assert_eq!(m1 + m2, 60_000_000u64 * 2 / 100_000_000);
+        // A third fill lifts the merged floor again — marginals
+        // keep tracking the running total, not per-fill floors.
+        let m3 = acc.add(leg, 1);
+        assert_eq!(m1 + m2 + m3, 60_000_000u64 * 3 / 100_000_000);
+        // A different price forms a different leg — no cross-talk
+        // between keys.
+        let other = acc.add(LegId { price: 100_000_000, ..leg }, 1);
+        assert_eq!(other, 1, "distinct legs floor independently");
+    }
+
+    /// `seal_batch` is the leg-formation boundary — the accumulator
+    /// must reset with the drained batch or the NEXT batch's
+    /// marginals would keep accumulating into legs that no longer
+    /// exist on-chain.
+    #[test]
+    fn seal_batch_resets_leg_cost_accumulator() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        server.cost_acc.add(
+            LegId {
+                market: 0,
+                price: 60_000_000,
+                buyer: addr(1).0,
+                buyer_id: 1,
+                seller: addr(9).0,
+                seller_id: 2,
+            },
+            1,
+        );
+        assert!(!server.cost_acc.legs.is_empty());
+        let _ = server.seal_batch();
+        assert!(server.cost_acc.legs.is_empty(), "seal must reset the accumulator");
     }
 }

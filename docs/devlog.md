@@ -17307,3 +17307,40 @@ accounts), `funding_rate_bound_enforced` (±500 ok, ±501 and
 `i64::MIN` rejected), `state_snapshot_round_trips_mark_age_and_cursor`
 (v2 codec). Perps 77, executor, and the full workspace suite green;
 clippy + fmt clean.
+
+### Settlement rounding: one policy, both sides — marginal leg-cost accumulation
+
+The 4.3 residual: the off-chain cache computed fill cost as
+`Σ floor(price × qty_i / PRICE_SCALE)` per engine fill while the
+chain settles `floor(price × Σqty / PRICE_SCALE)` per AGGREGATED leg
+(`aggregate_fills` merges same-price same-pair fills into one leg).
+Whenever the engine emitted two fills for the same order pair at the
+same price, the cache under-charged / over-credited by up to
+`merges−1` dust units — escrow-covered, never insolvent, but a real
+accounting divergence between the cache and the settlement of
+record.
+
+**Fix — `LegCostAcc`.** A marginal-cost accumulator keyed EXACTLY
+the way `aggregate_fills` merges: `(market, price, buy order key,
+sell order key)`. Each fill contributes only the DELTA in its leg's
+floored total — `floor(price × (acc+q)/S) − floor(price × acc/S)` —
+so the marginals telescope: after `q1..qn` the accumulated total IS
+`floor(price × Σq / S)`, bit-identical to the leg the chain will
+settle. Seller credits and the buyer's `taker_fill_cost` (feeding
+`buy_reservation_refund`) both book the marginal — buyer-out equals
+seller-in to the unit AND equals the chain's debit, not just within
+dust. Unmerged legs are unchanged (single-fill marginal == old
+per-fill floor).
+
+**Boundary.** The accumulator resets in `seal_batch` / the worker
+`Seal` handler — the same drain that hands fills to the settler —
+because legs re-form per batch. A sub-unit fractional residue at
+reset is never a payment on either side (the chain's floor drops it
+identically). `buy_reservation_refund` now takes the precomputed
+telescoped `fill_cost` instead of re-flooring raw fills.
+
+Tests: `leg_cost_acc_telescopes_to_merged_floor` (two same-key fills
+at 0.6 quote/lot: marginals (0,1) — the merged floor carries the
+unit the per-fill floors dropped; third fill + distinct leg
+independence) and `seal_batch_resets_leg_cost_accumulator`. Matcher
+126 lib tests + workspace suite green; clippy, fmt clean.

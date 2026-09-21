@@ -5352,3 +5352,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     oracle feed dies, the affected market goes reduce-only instead of
     silently trading on a stale price, and liquidation still works so
     underwater accounts can be closed.
+
+### Fixed (2026-09-14)
+
+- **Off-chain settlement cache no longer diverges from on-chain leg
+  rounding** (`crates/matcher/src/lib.rs`)
+  - The matcher cache floored each fill's quote separately while the
+    chain floors the merged per-leg quantity — a dust-level
+    divergence (≤ merges−1 units, escrow-covered) whenever multiple
+    fills for the same order pair at the same price merged into one
+    settlement leg.
+  - Fills now book their MARGINAL leg-cost delta — the change in the
+    merged leg's floored total — so seller credits and buyer
+    reservation refunds sum to exactly the `floor(price × Σqty)`
+    the chain settles. The accumulator resets at each batch seal.
+  - **In plain words:** the matcher's local balances now agree with
+    the chain's settlement to the unit, always — previously they
+    could drift by a fraction of a unit when fills merged.

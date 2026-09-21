@@ -326,12 +326,14 @@ fn is_retryable_skip(reason: executor::TxSkipReason) -> bool {
 /// merge into one entry — merging across different order keys is not
 /// possible because each key authorizes only its own remaining
 /// quantity. The wire carries no claimed settlement amount — the
-/// chain recomputes `price * qty / PRICE_SCALE` per leg — so
-/// aggregation must not sum the off-chain `quote_amount`
-/// (floor-division dust would make the sums diverge).
+/// chain recomputes `price * qty / PRICE_SCALE` per leg.
 ///
 /// `BTreeMap` keeps the encoded entry order deterministic and
-/// reproducible for a given fill sequence.
+/// reproducible for a given fill sequence. Because fills carry
+/// MARGINAL leg-cost deltas (`LegCostAcc`), their `quote_amount`s
+/// sum to exactly the leg's `floor(price × Σqty / SCALE)` — the
+/// cache's accounting is bit-identical to the chain's, not just
+/// bounded-dust close.
 fn aggregate_fills(fills: &[crate::SettledFill]) -> Result<Vec<BatchFillEntry>, String> {
     let mut aggregated: std::collections::BTreeMap<
         (u16, Price, exchange::OrderKey, exchange::OrderKey),
