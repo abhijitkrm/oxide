@@ -98,9 +98,10 @@ impl Module for CoreModule {
         Ok(vec![])
     }
 
-    fn end_block(&self, height: Height) {
+    fn end_block(&self, height: Height) -> Vec<Event> {
         *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             height.value();
+        Vec::new()
     }
 
     fn state_root(&self) -> Hash {

@@ -321,13 +321,14 @@ impl Module for GovernanceModule {
         Ok(vec![Event { module: "governance", kind: "propose", data: msg.to_vec() }])
     }
 
-    fn end_block(&self, _height: Height) {
+    fn end_block(&self, _height: Height) -> Vec<Event> {
         // Finalize all proposals at the end of each block.
         let mut proposals =
             self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for proposal in proposals.values_mut() {
             Self::finalize_proposal(proposal);
         }
+        Vec::new()
     }
 
     fn state_root(&self) -> Hash {

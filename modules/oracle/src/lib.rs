@@ -582,8 +582,9 @@ impl Module for OracleModule {
         }
     }
 
-    fn end_block(&self, height: Height) {
+    fn end_block(&self, height: Height) -> Vec<Event> {
         self.aggregate(height);
+        Vec::new()
     }
 
     fn state_root(&self) -> Hash {

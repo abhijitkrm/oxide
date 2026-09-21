@@ -704,7 +704,12 @@ pub trait Module: Send + Sync {
     }
 
     /// Called at the end of each block, after all txs.
-    fn end_block(&self, height: Height);
+    ///
+    /// Returns the module's end-of-block events — appended to the
+    /// block's event log after every tx event, so scheduled effects
+    /// (liquidation sweeps, epoch work) are as auditable as
+    /// transaction effects.
+    fn end_block(&self, height: Height) -> Vec<Event>;
 
     /// Called at the end of each block with the same canonical
     /// [`BlockContext`] `begin_block_ctx` received. The default
@@ -713,9 +718,9 @@ pub trait Module: Send + Sync {
     /// per-block state from consensus-provided values override this.
     /// Same sentinel rule as `begin_block_ctx`: zero fields mean
     /// "no data", not real values.
-    fn end_block_ctx(&self, height: Height, ctx: &types::BlockContext) {
+    fn end_block_ctx(&self, height: Height, ctx: &types::BlockContext) -> Vec<Event> {
         let _ = ctx;
-        self.end_block(height);
+        self.end_block(height)
     }
 
     /// Called once per finalized block with the staking addresses of
@@ -2732,37 +2737,26 @@ impl Executor {
                     group.iter().map(|(ctx, payload, _tx_hash)| (*ctx, *payload)).collect();
                 module.handle_batch(&batch)
             };
-            // Record the per-tx finalized outcome: `results` is
-            // index-aligned with `group` (every `handle_batch*`
-            // contract returns one result per input tx). `Ok` carries
-            // the module's events — which may still report per-leg
-            // failures for batch ops; `Err` means the module rejected
-            // the whole tx (fee charged, nonce consumed — a revert,
-            // not a skip).
-            {
-                let mut outcomes =
-                    self.tx_outcomes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                for ((_ctx, _payload, tx_hash), result) in group.iter().zip(results) {
-                    let outcome = match result {
-                        Ok(events) => {
-                            block_events.extend(events.iter().cloned());
-                            TxOutcome::Executed { events, error: None }
-                        }
-                        Err(e) => TxOutcome::Executed {
-                            events: Vec::new(),
-                            error: Some(format!("{e:?}")),
-                        },
-                    };
-                    outcomes.record(*tx_hash, outcome);
-                }
-            }
+            self.record_group_outcomes(group, results, &mut block_events);
         }
         // Publish all events from this block in one lock acquisition.
         self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(block_events);
 
         // end_block for all modules — same context as begin_block.
-        for module in self.modules.iter().flatten() {
-            module.end_block_ctx(block.height, &block.context);
+        // Module scheduled effects (liquidation sweeps, epoch work)
+        // emit events that land in the block log AFTER every tx
+        // event — same publish path, one extension.
+        let end_block_events: Vec<Event> = self
+            .modules
+            .iter()
+            .flatten()
+            .flat_map(|module| module.end_block_ctx(block.height, &block.context))
+            .collect();
+        if !end_block_events.is_empty() {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(end_block_events);
         }
 
         // Attendance delivery, inside execute_block so journal
@@ -2805,6 +2799,35 @@ impl Executor {
             local_nonce;
 
         canonical_state_root(module_roots, nonce_root)
+    }
+
+    /// Record the finalized outcome for every tx in one module
+    /// group and append the executed txs' events to `block_events`.
+    /// `results` is index-aligned with `group` (every
+    /// `handle_batch*` contract returns one result per input tx):
+    /// `Ok` carries the module's events — which may still report
+    /// per-leg failures for batch ops; `Err` means the module
+    /// rejected the whole tx (fee charged, nonce consumed — a
+    /// revert, not a skip). One lock acquisition per group keeps
+    /// the outcome store off the per-tx path.
+    fn record_group_outcomes(
+        &self,
+        group: &[GroupedTx<'_>],
+        results: Vec<Result<Vec<Event>, ExecError>>,
+        block_events: &mut Vec<Event>,
+    ) {
+        let mut outcomes =
+            self.tx_outcomes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for ((_ctx, _payload, tx_hash), result) in group.iter().zip(results) {
+            let outcome = match result {
+                Ok(events) => {
+                    block_events.extend(events.iter().cloned());
+                    TxOutcome::Executed { events, error: None }
+                }
+                Err(e) => TxOutcome::Executed { events: Vec::new(), error: Some(format!("{e:?}")) },
+            };
+            outcomes.record(*tx_hash, outcome);
+        }
     }
 }
 
@@ -3487,7 +3510,9 @@ mod tests {
             Ok(vec![Event { module: "counter", kind: "increment", data: vec![] }])
         }
 
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
 
         fn state_root(&self) -> Hash {
             let c = *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3718,7 +3743,9 @@ mod tests {
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             Ok(vec![])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             Hash::ZERO
         }
@@ -3914,7 +3941,9 @@ mod tests {
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             Ok(vec![])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             Hash::ZERO
         }
@@ -4010,7 +4039,9 @@ mod tests {
             self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(*ctx);
             Ok(vec![])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             Hash::ZERO
         }
@@ -4055,7 +4086,9 @@ mod tests {
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             Ok(vec![])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             Hash::ZERO
         }
@@ -4648,7 +4681,9 @@ mod tests {
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             Ok(vec![])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             Hash::ZERO
         }
@@ -4931,7 +4966,9 @@ mod tests {
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             Ok(vec![Event { module: "versioned", kind: "noop", data: vec![] }])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             // A stable non-zero root — upgrade tests assert on
             // version plumbing, not root math.
@@ -5519,7 +5556,9 @@ mod tests {
             *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
             Ok(vec![Event { module: "panic-once", kind: "call", data: vec![] }])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             // Non-zero once any call has landed (count 1 → byte 1).
             let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5597,7 +5636,9 @@ mod tests {
             );
             Ok(vec![Event { module: "mutate-then-panic", kind: "call", data: vec![] }])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Hash([u8::try_from(c.max(1)).unwrap_or(0xff); 32])
@@ -5719,7 +5760,9 @@ mod tests {
             *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
             Ok(vec![Event { module: "gated", kind: "call", data: vec![] }])
         }
-        fn end_block(&self, _height: Height) {}
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Hash([u8::try_from(c.max(1)).unwrap_or(0xff); 32])
@@ -6000,7 +6043,9 @@ mod tests {
             fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
                 Err(ExecError::ModuleRejected("nope".to_string()))
             }
-            fn end_block(&self, _height: Height) {}
+            fn end_block(&self, _height: Height) -> Vec<Event> {
+                Vec::new()
+            }
             fn state_root(&self) -> Hash {
                 Hash::ZERO
             }

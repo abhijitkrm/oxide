@@ -64,6 +64,13 @@ const TAG_DEPOSIT: u8 = 3;
 const TAG_WITHDRAW: u8 = 4;
 const TAG_SET_MARK: u8 = 5;
 const TAG_APPLY_FUNDING: u8 = 6;
+/// `[account: 20B]` — permissionless liquidation trigger. Any
+/// sender may submit it; the module runs `liquidation_check` on
+/// `account` — a no-op (fee-burning) tx on a solvent account, a
+/// full liquidation on an underwater one. This is the live path
+/// the audit called missing: liquidation used to exist only as a
+/// test/sim/bench entry point.
+const TAG_LIQUIDATE: u8 = 7;
 
 // ── Message sizes (body, excluding the 1-byte tag) ───────────────────
 
@@ -127,6 +134,40 @@ const MAX_MARK_CHANGE_BPS: u64 = 1000; // 10%
 /// during legitimate large moves; higher cap = faster price
 /// discovery but more exposure to cumulative oracle manipulation.
 const MAX_ORACLE_UPDATES_PER_BLOCK: u8 = 1;
+
+/// Mark staleness horizon, in blocks: a mark last accepted more
+/// than this many blocks ago is STALE. Non-reduce-only orders
+/// against the market are rejected at admission — the market is in
+/// reduce-only mode until a fresh mark lands.
+///
+/// Mirrors the oracle module's `STALE_AFTER_BLOCKS = 60`: the two
+/// bounds measure the same thing from different sides of the
+/// `MarkSink` push (oracle: time since ITS last successful publish;
+/// perps: time since the last mark IT accepted). Keeping the
+/// constant local — not importing oracle's — is deliberate: the
+/// perps bound must hold even when no oracle is wired (the
+/// committee-override path refreshes marks directly).
+const MAX_MARK_STALENESS_BLOCKS: u64 = 60;
+
+/// `end_block` liquidation sweep budget: the maximum number of
+/// accounts checked for under-margin per block. 32 keeps the
+/// sweep's worst-case cost bounded (~32 × O(positions + resting
+/// orders)) regardless of account count, while the rotating cursor
+/// still covers the whole account set every `accounts/32` blocks —
+/// ~100 blocks (~30 s) at 3,200 accounts. The permissionless
+/// `TAG_LIQUIDATE` path covers the urgent cases between sweep
+/// visits.
+const LIQUIDATION_SWEEP_BUDGET: usize = 32;
+
+/// Bound on the absolute funding rate a quorum-endorsed
+/// `TAG_APPLY_FUNDING` may apply, in basis points: 500 = 5% per
+/// period. The endorsement authenticates the rate but cannot bound
+/// its magnitude — without a cap, a quorum bug or compromised
+/// committee could move an arbitrary fraction of every open
+/// position's notional between longs and shorts in one block.
+/// 5%/period is far above honest funding (venues clamp near ±2%)
+/// yet converts "unbounded transfer" into "bounded loss".
+const MAX_FUNDING_RATE_BPS: i64 = 500;
 
 /// Compute the absolute deviation between a new and old mark price,
 /// in basis points. Returns `|new - old| * 10_000 / old`.
@@ -502,6 +543,26 @@ struct Inner {
     ///
     /// Reset to 0 in `begin_block`.
     oracle_updates_this_block: BTreeMap<u8, u8>,
+    /// The height of the block currently executing, captured at
+    /// `begin_block`. Mark staleness and the liquidation sweep are
+    /// computed against it. `0` outside block execution (unit tests
+    /// driving `handle` directly) — which makes every mark read
+    /// fresh, so direct-call tests see the pre-staleness behavior.
+    current_height: u64,
+    /// The block height at which each market's mark was last
+    /// ACCEPTED — set by `set_mark_price`, `set_mark_price_unchecked`,
+    /// and `list_market` seeding. This is the module's OWN freshness
+    /// record, independent of the oracle's: a healthy oracle feeding
+    /// a rejected update still means a stale mark here, and the
+    /// committee-override path is a legitimate refresh. Committed —
+    /// staleness decisions must agree across nodes.
+    mark_updated_at: BTreeMap<u8, u64>,
+    /// Rotating cursor for the bounded `end_block` liquidation
+    /// sweep: the last account checked. `None` = next sweep starts
+    /// from the first account. Committed — the sweep position is
+    /// consensus-visible state (two nodes sweeping different
+    /// windows produce different liquidation sets).
+    liquidation_cursor: Option<Address>,
 }
 
 /// [`MakerCap`] gate enforcing reduce-only at the match decision:
@@ -590,6 +651,9 @@ impl PerpsModule {
                 insurance_fund: 0,
                 fills: Vec::with_capacity(64),
                 oracle_updates_this_block: BTreeMap::new(),
+                current_height: 0,
+                mark_updated_at: BTreeMap::new(),
+                liquidation_cursor: None,
             }),
             store: Mutex::new(BTreeMap::new()),
             ledger: None,
@@ -651,9 +715,14 @@ impl PerpsModule {
             .map_err(|e| ExecError::ModuleRejected(format!("engine init: {e}")))?;
         inner.markets[id] = Some(engine);
         inner.configs.insert(id_u8, cfg);
-        // Initialize mark price to the mid of the price band.
+        // Initialize mark price to the mid of the price band — a
+        // fresh mark, so the market trades for its first
+        // [`MAX_MARK_STALENESS_BLOCKS`] blocks even before the
+        // first oracle update lands.
         let initial_mark = cfg.base.min_price.midpoint(cfg.base.max_price);
         inner.marks.insert(id_u8, initial_mark);
+        let h = inner.current_height;
+        inner.mark_updated_at.insert(id_u8, h);
         // Persist config for state-root replay.
         let key = market_config_key(id_u8);
         self.store
@@ -724,6 +793,10 @@ impl PerpsModule {
         }
         inner.marks.insert(market, mark);
         inner.oracle_updates_this_block.insert(market, current_updates + 1);
+        // An ACCEPTED update refreshes the mark's age — even a
+        // no-change mark means the feed is alive.
+        let h = inner.current_height;
+        inner.mark_updated_at.insert(market, h);
         Ok(())
     }
 
@@ -748,7 +821,37 @@ impl PerpsModule {
             return Err(ExecError::ModuleRejected("market does not exist".to_string()));
         }
         inner.marks.insert(market, mark);
+        let h = inner.current_height;
+        inner.mark_updated_at.insert(market, h);
         Ok(())
+    }
+
+    /// Whether `market`'s mark is stale: last accepted more than
+    /// [`MAX_MARK_STALENESS_BLOCKS`] ago, or never accepted at all.
+    ///
+    /// Staleness puts the market in reduce-only mode — see the
+    /// admission gate in `handle_place`. Liquidations still run at
+    /// the last mark: freezing risk-reduction during an oracle
+    /// outage would strand underwater accounts exactly when they
+    /// need closing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned.
+    #[must_use]
+    pub fn mark_is_stale(&self, market: u8) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match inner.mark_updated_at.get(&market) {
+            // No accepted update on record — an untracked mark
+            // cannot be proven fresh, so fail closed. (Snapshot
+            // decode seeds ages for imported marks, and
+            // `list_market` seeds at listing, so `None` only occurs
+            // for markets that never received a mark at all.)
+            None => true,
+            Some(&updated) => {
+                inner.current_height.saturating_sub(updated) > MAX_MARK_STALENESS_BLOCKS
+            }
+        }
     }
 
     /// Get an account's position in a market (read-only).
@@ -810,6 +913,19 @@ impl PerpsModule {
             .marks
             .get(&market)
             .ok_or_else(|| ExecError::ModuleRejected("market does not exist".to_string()))?;
+
+        // Bound the applied rate: the quorum gate authenticates the
+        // rate but cannot bound its magnitude — an out-of-range rate
+        // is rejected (mapped to `apply_funding_stale` upstream),
+        // converting "unbounded transfer between longs and shorts"
+        // into "bounded loss".
+        // `i64::MIN` has no positive abs — checked_abs maps it to
+        // out-of-range rather than panicking.
+        if rate_i64.checked_abs().is_none_or(|a| a > MAX_FUNDING_RATE_BPS) {
+            return Err(ExecError::ModuleRejected(format!(
+                "funding rate {rate_i64} bps exceeds bound ±{MAX_FUNDING_RATE_BPS} bps"
+            )));
+        }
 
         let mut events = Vec::new();
         let rate = i128::from(rate_i64);
@@ -1272,6 +1388,14 @@ struct StagedPerps {
     oracle_updates_this_block: BTreeMap<u8, u8>,
     /// Pending governance endorsements (C9).
     endorsements: framework::Endorsements,
+    /// Trailing section (v2): last-accepted-mark height per market.
+    /// Absent in pre-upgrade blobs — decode seeds age 0, which
+    /// reads as STALE at any real chain height: fail closed on an
+    /// unverifiable mark age (the next live update clears it).
+    mark_updated_at: BTreeMap<u8, u64>,
+    /// Trailing section (v2): the liquidation-sweep cursor.
+    /// Absent in pre-upgrade blobs — `None` = sweep from the start.
+    liquidation_cursor: Option<Address>,
 }
 
 impl PerpsModule {
@@ -1349,6 +1473,26 @@ impl PerpsModule {
         // override applies — future-affecting state, committed like
         // everything else.
         self.endorsements.write_canonical(w);
+        // ── Trailing section (v2) ── appended after endorsements
+        // so pre-upgrade blobs decode with the defaults below:
+        // mark ages + the liquidation-sweep cursor. Both are
+        // consensus-visible state — staleness decisions and the
+        // sweep window must agree across nodes.
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_count(inner.mark_updated_at.len());
+        for (market, updated) in &inner.mark_updated_at {
+            w.put_u8(*market);
+            w.put_u64(*updated);
+        }
+        match inner.liquidation_cursor {
+            Some(addr) => {
+                w.put_u8(1);
+                w.put_addr(&addr);
+            }
+            None => {
+                w.put_u8(0);
+            }
+        }
     }
 
     /// Decode the canonical fields following the leading store root —
@@ -1393,6 +1537,40 @@ impl PerpsModule {
             }
         }
         let endorsements = framework::Endorsements::read_canonical(r)?;
+        // ── Trailing section (v2), tolerant of pre-upgrade blobs ──
+        // `remaining() == 0` means the blob predates mark ages and
+        // the sweep cursor: marks decode at age 0 — stale at real
+        // heights until refreshed — and a `None` cursor sweeps from
+        // the first account.
+        let mut mark_updated_at = BTreeMap::new();
+        let mut liquidation_cursor = None;
+        if r.remaining() != 0 {
+            let n = r.get_count()?;
+            for _ in 0..n {
+                let market = r.get_u8()?;
+                let updated = r.get_u64()?;
+                if !configs.contains_key(&market) {
+                    return None; // mark age for an unlisted market is dead state
+                }
+                if mark_updated_at.insert(market, updated).is_some() {
+                    return None;
+                }
+            }
+            liquidation_cursor = match r.get_u8()? {
+                0 => None,
+                1 => Some(r.get_addr()?),
+                _ => return None,
+            };
+        }
+        // A mark with no recorded age — pre-upgrade blobs — is
+        // seeded at height 0: stale at any real chain height until
+        // a live update lands. Fail closed on unknown age (the
+        // safe direction; the opposite would forgive a dead feed),
+        // and recovery is cheap: a healthy oracle clears it in one
+        // block.
+        for m in marks.keys() {
+            mark_updated_at.entry(*m).or_insert(0);
+        }
         Some(StagedPerps {
             markets,
             configs,
@@ -1401,6 +1579,8 @@ impl PerpsModule {
             insurance_fund,
             oracle_updates_this_block,
             endorsements,
+            mark_updated_at,
+            liquidation_cursor,
         })
     }
 
@@ -1689,6 +1869,18 @@ pub mod msg {
         msg.extend_from_slice(&rate_i64.to_le_bytes());
         msg
     }
+
+    /// Build a permissionless liquidation message: `[tag][account:
+    /// 20B]`. Any sender may submit it — the module runs
+    /// `liquidation_check` on `account`: a no-op on a solvent
+    /// account (the sender still pays the tx fee, which prices the
+    /// spam vector) and a full liquidation on an underwater one.
+    pub fn liquidate(account: &primitives::Address) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(21);
+        msg.push(super::TAG_LIQUIDATE);
+        msg.extend_from_slice(&account.0);
+        msg
+    }
 }
 
 // ── Module trait impl ────────────────────────────────────────────────
@@ -1702,12 +1894,15 @@ impl Module for PerpsModule {
         module_id::PERPS
     }
 
-    fn begin_block(&self, _height: Height) {
+    fn begin_block(&self, height: Height) {
         // M4 fix: reset the per-block oracle update counter at the
         // start of each block. Each market gets a fresh budget of
         // [`MAX_ORACLE_UPDATES_PER_BLOCK`] updates per block.
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.oracle_updates_this_block.clear();
+        // The executing height drives mark-staleness decisions
+        // (`mark_is_stale`) for every tx this block.
+        inner.current_height = height.value();
     }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
@@ -1831,11 +2026,74 @@ impl Module for PerpsModule {
                     }
                 }
             }
+            TAG_LIQUIDATE => {
+                // `[account: 20B]` — permissionless trigger: the
+                // sender pays the tx fee, which prices the spam
+                // vector; the check is bounded by the target's
+                // positions + orders.
+                let Ok(account) = <[u8; 20]>::try_from(body) else {
+                    return Err(ExecError::Malformed);
+                };
+                drop(inner);
+                self.liquidation_check(&primitives::Address(account))
+            }
             _ => Err(ExecError::Malformed),
         }
     }
 
-    fn end_block(&self, _height: Height) {}
+    /// Bounded rotating liquidation sweep: check up to
+    /// [`LIQUIDATION_SWEEP_BUDGET`] accounts past the committed
+    /// cursor and emit whatever the checks produce. The cursor
+    /// makes coverage deterministic across nodes — every validator
+    /// sweeps the same window per block — and bounds the sweep's
+    /// worst-case cost regardless of account count. Urgent cases
+    /// don't wait for the sweep: `TAG_LIQUIDATE` is permissionless
+    /// and checks a specific account immediately.
+    ///
+    /// Stale-mark note: the sweep still runs during an oracle
+    /// outage — liquidation is risk-reducing, and the last accepted
+    /// mark is the best estimate available. Freezing the sweep on
+    /// staleness would strand underwater accounts exactly when they
+    /// need closing.
+    fn end_block(&self, _height: Height) -> Vec<Event> {
+        // Collect this block's sweep window under a short lock:
+        // `liquidation_check` takes the same mutex internally, so
+        // the address list must be materialized first.
+        let batch: Vec<Address> = {
+            let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match inner.liquidation_cursor {
+                Some(cursor) => inner
+                    .accounts
+                    .range((std::ops::Bound::Excluded(cursor), std::ops::Bound::Unbounded))
+                    .take(LIQUIDATION_SWEEP_BUDGET)
+                    .map(|(addr, _)| *addr)
+                    .collect(),
+                None => inner.accounts.keys().take(LIQUIDATION_SWEEP_BUDGET).copied().collect(),
+            }
+        };
+
+        let mut events = Vec::new();
+        if batch.is_empty() {
+            // The cursor passed the last account — wrap so the next
+            // block restarts coverage from the beginning.
+            let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.liquidation_cursor = None;
+            return events;
+        }
+
+        for account in &batch {
+            // The only error the check produces is
+            // `ModuleRejected("account not found")` — the account
+            // vanished between the scan and the check; skip it
+            // and keep sweeping.
+            if let Ok(ev) = self.liquidation_check(account) {
+                events.extend(ev);
+            }
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.liquidation_cursor = batch.last().copied();
+        events
+    }
 
     fn state_root(&self) -> Hash {
         // C8: commit EVERY field that can affect future execution —
@@ -1899,6 +2157,10 @@ impl Module for PerpsModule {
         inner.accounts = staged.accounts;
         inner.insurance_fund = staged.insurance_fund;
         inner.oracle_updates_this_block = staged.oracle_updates_this_block;
+        inner.mark_updated_at = staged.mark_updated_at;
+        inner.liquidation_cursor = staged.liquidation_cursor;
+        // Block-transient: refreshed by the next `begin_block`.
+        inner.current_height = 0;
         // `fills` is per-call scratch — clear it so a buffer left
         // mid-transaction cannot leak across the import boundary.
         inner.fills.clear();
@@ -1995,6 +2257,24 @@ impl PerpsModule {
         // that all later fill (C7).
         if !inner.configs.contains_key(&market) {
             return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+        }
+        // Oracle-staleness gate (live-pipeline risk control): a
+        // market whose mark is older than
+        // [`MAX_MARK_STALENESS_BLOCKS`] is in reduce-only mode — new
+        // exposure against a price nobody has vouched for recently
+        // cannot be margined honestly. Only reduce-only orders
+        // pass: closing exposure must never be blocked by a feed
+        // outage. Liquidations similarly keep running at the last
+        // mark — freezing risk-reduction during an outage would
+        // strand underwater accounts exactly when they need
+        // closing.
+        let stale = inner.mark_updated_at.get(&market).is_none_or(|&updated| {
+            inner.current_height.saturating_sub(updated) > MAX_MARK_STALENESS_BLOCKS
+        });
+        if stale && !reduce_only {
+            return Err(ExecError::ModuleRejected(format!(
+                "market {market} mark is stale (no update in {MAX_MARK_STALENESS_BLOCKS}+ blocks); reduce-only orders only"
+            )));
         }
         {
             let acct = inner.accounts.get(&ctx.sender);
@@ -4403,5 +4683,192 @@ mod tests {
         snapshot.entries[0].1.truncate(12);
         assert!(src.inspect_state(&snapshot).is_err());
         assert!(PerpsModule::new().import_state(&snapshot).is_err());
+    }
+
+    // ── Live-pipeline liquidation + oracle staleness ─────────────
+
+    /// An underwater position fixture: long `50_000` at entry 1.5B
+    /// with 100k margin; the mark is crashed to 1.0B via the
+    /// unchecked setter (the deviation cap would need several
+    /// checked steps). Loss = `50_000·0.5e9/1e8` = 250k > margin —
+    /// equity ≈ −150k against ~2.5k maintenance.
+    fn setup_underwater() -> (PerpsModule, u8, Address) {
+        let (perps, mid, acct) = setup_with_position(100_000, 50_000, 1_500_000_000);
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
+        (perps, mid, acct)
+    }
+
+    /// `TAG_LIQUIDATE` is the live liquidation path: a permissionless
+    /// tx on an underwater account must run the full liquidation
+    /// (position closed, `liquidated` event emitted) — the path
+    /// that previously existed only in tests/sims/benches.
+    #[test]
+    fn liquidate_tx_liquidates_underwater_account() {
+        let (perps, mid, acct) = setup_underwater();
+        // A DIFFERENT sender submits the trigger — the tx is
+        // permissionless (the keeper is not the liquidated account).
+        let events = perps.handle(&ctx(7), &msg::liquidate(&acct)).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "liquidated"),
+            "liquidate tx must emit liquidated events, got: {events:?}"
+        );
+        assert_eq!(perps.position(&acct, mid).size, 0, "position must be closed");
+    }
+
+    /// The same tx on a solvent account is a no-op (the sender only
+    /// burns its fee — the spam vector is priced, not free).
+    #[test]
+    fn liquidate_tx_solvent_account_is_noop() {
+        let (perps, mid, acct) = setup_with_position(1_000_000_000, 1_000, 1_500_000_000);
+        let events = perps.handle(&ctx(7), &msg::liquidate(&acct)).unwrap();
+        assert!(events.is_empty(), "solvent account must not liquidate");
+        assert_eq!(perps.position(&acct, mid).size, 1_000);
+    }
+
+    /// Malformed liquidate bodies are rejected, not ignored.
+    #[test]
+    fn liquidate_tx_rejects_bad_length() {
+        let perps = PerpsModule::new();
+        perps.list_market(test_cfg()).unwrap();
+        let mut bad = vec![super::TAG_LIQUIDATE];
+        bad.extend_from_slice(&[0u8; 19]);
+        assert_eq!(perps.handle(&ctx(1), &bad), Err(ExecError::Malformed));
+    }
+
+    /// Staleness puts a market in reduce-only mode: a mark last
+    /// accepted more than `MAX_MARK_STALENESS_BLOCKS` ago rejects
+    /// new exposure but still admits risk-reducing orders.
+    #[test]
+    fn stale_mark_rejects_new_exposure_allows_reduce_only() {
+        let (perps, mid, acct) = setup_with_position(1_000_000_000, 50_000, 1_500_000_000);
+        assert!(!perps.mark_is_stale(mid), "freshly listed mark is fresh");
+
+        // Advance past the staleness horizon without a mark update.
+        perps.begin_block(Height::new(61));
+        assert!(perps.mark_is_stale(mid), "60+ blocks without an update is stale");
+
+        // New exposure is refused…
+        let err = perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap_err();
+        match err {
+            ExecError::ModuleRejected(reason) => {
+                assert!(reason.contains("stale"), "expected stale rejection, got: {reason}");
+            }
+            _ => panic!("expected ModuleRejected, got {err:?}"),
+        }
+
+        // …but a reduce-only close of the existing long still lands
+        // (closing exposure is never blocked by a feed outage).
+        let resp =
+            perps.handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 500, 1, 1)));
+        assert!(resp.is_ok(), "reduce-only must pass the stale gate: {resp:?}");
+        let _ = acct;
+    }
+
+    /// A fresh mark refresh restores full trading: the staleness
+    /// gate releases on the next accepted update.
+    #[test]
+    fn stale_mark_refresh_restores_trading() {
+        let (perps, mid, _) = setup_with_position(1_000_000_000, 50_000, 1_500_000_000);
+        perps.begin_block(Height::new(61));
+        assert!(perps.mark_is_stale(mid));
+        // Any accepted setter refreshes the age — unchecked used
+        // here (the checked path's deviation cap is orthogonal).
+        perps.set_mark_price_unchecked(mid, 1_500_000_000).unwrap();
+        assert!(!perps.mark_is_stale(mid), "accepted update must refresh the mark age");
+    }
+
+    /// The `end_block` sweep enforces liquidation in the live
+    /// pipeline: an underwater account is liquidated by the sweep
+    /// itself, emitting `liquidated` events into the block log —
+    /// no keeper tx required.
+    #[test]
+    fn end_block_sweep_liquidates_underwater_account() {
+        let (perps, mid, acct) = setup_underwater();
+        // A solvent account alongside (cursor must still land on it).
+        perps.handle(&ctx(2), &msg::deposit(super::CROSS_MARGIN_MARKET, 1_000)).unwrap();
+
+        let events = perps.end_block(Height::new(1));
+        assert!(
+            events.iter().any(|e| e.kind == "liquidated"),
+            "sweep must liquidate the underwater account: {events:?}"
+        );
+        assert_eq!(perps.position(&acct, mid).size, 0);
+        // The cursor advanced past the checked accounts — addr(1)
+        // and addr(2) were both in this block's window.
+        let inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.liquidation_cursor, Some(addr(2)));
+    }
+
+    /// The sweep covers the whole account set over successive
+    /// blocks: `LIQUIDATION_SWEEP_BUDGET` per block, then the cursor
+    /// wraps and coverage restarts. 33 accounts (> 32-budget)
+    /// proves the window advances rather than rescanning the head.
+    #[test]
+    fn end_block_sweep_cursor_advances_and_wraps() {
+        let perps = PerpsModule::new();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for n in 1u8..=33 {
+                PerpsModule::account_mut(&mut inner, &addr(n));
+            }
+        }
+        // Block 1: first 32 accounts checked.
+        perps.end_block(Height::new(1));
+        assert_eq!(
+            perps.inner.lock().unwrap().liquidation_cursor,
+            Some(addr(32)),
+            "cursor lands on the last checked account"
+        );
+        // Block 2: the 33rd.
+        perps.end_block(Height::new(2));
+        assert_eq!(perps.inner.lock().unwrap().liquidation_cursor, Some(addr(33)));
+        // Block 3: past the end — wrap to restart coverage.
+        perps.end_block(Height::new(3));
+        assert_eq!(perps.inner.lock().unwrap().liquidation_cursor, None);
+        // Block 4: coverage restarts from the first account.
+        perps.end_block(Height::new(4));
+        assert_eq!(perps.inner.lock().unwrap().liquidation_cursor, Some(addr(32)));
+    }
+
+    /// The funding-rate bound: ±500 bps applies, ±501 and `i64::MIN`
+    /// are rejected — a quorum-endorsed rate can still not move an
+    /// arbitrary fraction of open notional.
+    #[test]
+    fn funding_rate_bound_enforced() {
+        let (perps, mid, _) = setup_with_position(1_000_000_000, 50_000, 1_500_000_000);
+        assert!(perps.apply_funding(mid, 500).is_ok(), "boundary rate applies");
+        assert!(perps.apply_funding(mid, -500).is_ok());
+        assert!(perps.apply_funding(mid, 501).is_err(), "over bound rejected");
+        assert!(perps.apply_funding(mid, -501).is_err());
+        assert!(perps.apply_funding(mid, i64::MIN).is_err(), "MIN must not panic");
+    }
+
+    /// The committed trailing section round-trips: mark ages and
+    /// the liquidation cursor survive export → import, so staleness
+    /// decisions and sweep position agree across nodes and restarts.
+    #[test]
+    fn state_snapshot_round_trips_mark_age_and_cursor() {
+        let src = PerpsModule::new();
+        let mid = src.list_market(test_cfg()).unwrap();
+        // Give the market a recorded age at height 3 and a checked
+        // cursor position.
+        src.begin_block(Height::new(3));
+        src.set_mark_price_unchecked(mid, 1_500_000_000).unwrap();
+        src.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 1_000)).unwrap();
+        src.handle(&ctx(2), &msg::deposit(super::CROSS_MARGIN_MARKET, 1_000)).unwrap();
+        src.end_block(Height::new(3)); // sweep checks both accounts
+
+        let snapshot = src.export_state().expect("perps exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+        let dst = PerpsModule::new();
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        assert_eq!(dst.mark_is_stale(mid), src.mark_is_stale(mid));
+        let src_cursor =
+            src.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).liquidation_cursor;
+        let dst_cursor =
+            dst.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).liquidation_cursor;
+        assert_eq!(dst_cursor, src_cursor);
     }
 }

@@ -963,7 +963,9 @@ mod tests {
                 .insert(b"last".to_vec(), msg.to_vec());
             Ok(vec![])
         }
-        fn end_block(&self, _h: Height) {}
+        fn end_block(&self, _h: Height) -> Vec<Event> {
+            Vec::new()
+        }
         fn state_root(&self) -> Hash {
             subtree_root(&self.store)
         }

@@ -3715,7 +3715,7 @@ impl Module for EvmModule {
     /// A zero `ctx.gas_limit` keeps the running `max_gas`; a nonzero
     /// one re-targets the fee curve to the consensus-enforced limit
     /// (a governance block-budget change moves the fee with it).
-    fn end_block_ctx(&self, height: Height, ctx: &types::BlockContext) {
+    fn end_block_ctx(&self, height: Height, ctx: &types::BlockContext) -> Vec<Event> {
         self.end_block(height);
         let gas_used = {
             let history = self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3733,6 +3733,7 @@ impl Module for EvmModule {
             }
             fee_state.update(gas_used);
         }
+        Vec::new()
     }
 
     /// A4: validate a signed EVM transaction for mempool admission.
@@ -4116,7 +4117,7 @@ impl Module for EvmModule {
         EvmModule::handle_batch_parallel_preverified(self, &ctx, &evm_txs)
     }
 
-    fn end_block(&self, height: Height) {
+    fn end_block(&self, height: Height) -> Vec<Event> {
         // Seal the executed-block history for RPC queries. Every
         // block seals an entry — including blocks with zero EVM txs —
         // so `eth_getBlockByNumber` can distinguish "empty block" from
@@ -4212,6 +4213,7 @@ impl Module for EvmModule {
         drop(backend_guard);
 
         self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        Vec::new()
     }
 
     #[allow(clippy::too_many_lines)]

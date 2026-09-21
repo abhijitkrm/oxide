@@ -1142,7 +1142,7 @@ impl Module for StakingModule {
         }
     }
 
-    fn end_block(&self, height: Height) {
+    fn end_block(&self, height: Height) -> Vec<Event> {
         // Process completed unbonding entries: pay each delegator out
         // of the bonded pool. Before this, unbonded funds vanished
         // (entries were dropped with no payout — the bonded pool kept
@@ -1176,6 +1176,7 @@ impl Module for StakingModule {
             let total_reward = self.collect_block_reward(ledger.as_ref());
             self.distribute_rewards(total_reward);
         }
+        Vec::new()
     }
 
     /// Record QC signers for `height` and jail validators whose

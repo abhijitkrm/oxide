@@ -5323,3 +5323,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** Docker testnet blocks are now produced ~15
     times per second instead of the previous slow rate, giving much
     faster response times for transactions.
+
+### Added (2026-09-14)
+
+- **Perps liquidation now runs in the live pipeline; stale marks gate
+  new exposure** (`modules/perps/src/lib.rs`,
+  `crates/executor/src/lib.rs`, `crates/framework` trait)
+  - `TAG_LIQUIDATE` (`[tag][account:20B]`) is a permissionless
+    liquidation trigger: any keeper can force a `liquidation_check` on
+    a specific account. On an underwater account it runs the full
+    liquidation; on a solvent one it is a no-op (the sender still pays
+    the tx fee, which prices the spam vector).
+  - `end_block` now runs a bounded liquidation sweep: up to 32
+    accounts per block past a committed rotating cursor, emitting
+    `liquidated` events into the block log. The `Module::end_block`
+    trait returns `Vec<Event>` so module scheduled effects are
+    auditable.
+  - Mark-age tracking (`mark_updated_at`, committed) + a staleness
+    gate at order admission: a market whose mark is older than 60
+    blocks rejects non-reduce-only orders (reduce-only mode) until a
+    fresh mark lands. Reduce-only orders and liquidations still run —
+    closing exposure is never blocked by a feed outage.
+  - Quorum-endorsed funding rates are bounded to ±500 bps (5%/period)
+    — the endorsement authenticates the rate but cannot bound its
+    magnitude.
+  - **In plain words:** liquidation is no longer test-only code — it
+    runs every block (bounded sweep) and on demand (keeper tx). If the
+    oracle feed dies, the affected market goes reduce-only instead of
+    silently trading on a stale price, and liquidation still works so
+    underwater accounts can be closed.

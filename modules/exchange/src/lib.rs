@@ -866,7 +866,9 @@ impl Module for ExchangeModule {
         }
     }
 
-    fn end_block(&self, _height: Height) {}
+    fn end_block(&self, _height: Height) -> Vec<Event> {
+        Vec::new()
+    }
 
     fn state_root(&self) -> Hash {
         // C8: commit EVERY field that can affect future execution.

@@ -17237,3 +17237,73 @@ rescan), `ring_lease_exhaustion_waits` (1 ring → `None` until drop),
 and `ring_concurrent_exchanges_isolate_responses` (8 tasks × distinct
 batch sizes through ONE ring — a stolen batch would be a length
 mismatch). Matcher suite 124 lib + e2e green; clippy, fmt clean.
+
+### Perps live liquidation + oracle staleness — the missing risk pipeline
+
+The audit flagged that perps risk machinery existed only off the live
+path: `liquidation_check` was reachable solely from tests/sims/benches,
+`end_block` was a no-op, mark freshness was never consulted at order
+admission, and quorum-endorsed funding rates were unbounded in
+magnitude. A chain whose liquidation logic never runs doesn't have
+liquidations — it has a suggestion.
+
+**`end_block` sweep.** `Module::end_block`/`end_block_ctx` now return
+`Vec<Event>` (mechanical across all impls + test doubles) so module
+scheduled effects land in the block log after tx events — the same
+publish path, auditable. Perps sweeps up to
+`LIQUIDATION_SWEEP_BUDGET = 32` accounts past a committed rotating
+cursor each block: ~32 × O(positions + resting orders) worst case
+regardless of account count, full coverage every `accounts/32` blocks,
+deterministic across validators because the cursor is consensus state.
+
+**Permissionless `TAG_LIQUIDATE`.** `[tag][account:20B]` — any keeper
+triggers `liquidation_check` on a specific account immediately;
+urgent cases don't wait for the sweep. The sender pays the tx fee,
+which prices the spam vector (a solvent target is a fee-burning
+no-op). The check is bounded by the target's own state — one tx can
+never scan the account set.
+
+**Mark-age tracking + staleness gate.** `Inner.mark_updated_at`
+records the height of every *accepted* mark — set by `set_mark_price`,
+`set_mark_price_unchecked`, and `list_market` seeding; `begin_block`
+captures `current_height`. The module keeps its OWN freshness record
+rather than importing the oracle's `is_stale`: a healthy oracle whose
+update was rejected (deviation cap, per-block rate limit) still means
+a stale mark here, and the committee-override path must count as a
+legitimate refresh. `handle_place` rejects non-reduce-only orders
+when `current_height - updated > MAX_MARK_STALENESS_BLOCKS = 60` —
+new exposure against a price nobody has vouched for recently cannot
+be margined honestly. Reduce-only orders still pass: closing
+exposure must never be blocked by a feed outage. Liquidations also
+keep running at the last mark — freezing risk-reduction during an
+outage would strand underwater accounts exactly when they need
+closing.
+
+**Funding bound.** `apply_funding` rejects |rate| > 500 bps —
+`checked_abs` so `i64::MIN` maps to out-of-range rather than a panic.
+The quorum gate authenticates the rate but cannot bound its
+magnitude; 5%/period converts "unbounded transfer between every long
+and short" into "bounded loss" while staying far above honest
+funding (venues clamp near ±2%).
+
+**Codec.** Canonical state gains a trailing v2 section
+(`mark_updated_at` map + `liquidation_cursor`) after endorsements —
+tolerated absent in pre-upgrade blobs (`remaining() == 0`), decoded
+fail-closed: marks of unknown age read STALE at real heights until a
+live update lands. Both fields are consensus-visible — staleness
+decisions and the sweep window must agree across nodes, so they ride
+the state root like everything else.
+
+**Executor plumbing.** `execute_block` collects `end_block_ctx`
+events into the block log; the per-group outcome recording moved
+into `record_group_outcomes` (clippy line-count gate).
+
+Tests: `liquidate_tx_*` (underwater → full liquidation from a
+different sender; solvent → no-op; bad length → Malformed),
+`stale_mark_*` (rejects new exposure at 61 blocks, admits
+reduce-only, refresh restores), `end_block_sweep_*` (liquidates
+underwater into the block log; cursor advances 32/wraps over 33
+accounts), `funding_rate_bound_enforced` (±500 ok, ±501 and
+`i64::MIN` rejected), `state_snapshot_round_trips_mark_age_and_cursor`
+(v2 codec). Perps 77, executor, and the full workspace suite green;
+clippy + fmt clean.
