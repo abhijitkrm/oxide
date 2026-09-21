@@ -35,6 +35,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use devnet::tcp_multinode::TcpMultiNodeDevnet;
+use devnet::txs;
 use ports::AppInterface;
 use primitives::fixed::{Price, Qty};
 use std::time::Instant;
@@ -57,46 +58,38 @@ fn cfg() -> MarketConfig {
     }
 }
 
-/// Build a tx envelope for an exchange place order.
-///
-/// Format: `[sender:20B][nonce:8B LE][fee:8B LE][module_id:1B][payload]`
-/// where `module_id` = `EXCHANGE` (5) and payload = `exchange::msg::place(...)`.
-fn make_trading_tx(sender_byte: u8, nonce: u64, place_payload: Vec<u8>) -> types::TxBytes {
-    let mut bytes = Vec::with_capacity(36 + 1 + place_payload.len());
-    bytes.extend_from_slice(&[sender_byte; 20]);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
-    bytes.extend_from_slice(&100u64.to_le_bytes());
-    bytes.push(framework::module_id::EXCHANGE);
-    bytes.extend_from_slice(&place_payload);
-    types::TxBytes::new(bytes)
+/// Build a signed tx envelope for an exchange module message from
+/// devnet identity `sender_idx` (fee 100).
+fn make_trading_tx(sender_idx: u8, nonce: u64, payload: Vec<u8>) -> types::TxBytes {
+    txs::signed_tx(sender_idx, nonce, 100, framework::module_id::EXCHANGE, &payload)
 }
 
 /// Build a maker sell order at tick 500 ($15.00), 1 lot.
-fn make_maker_sell_tx(sender_byte: u8, nonce: u64) -> types::TxBytes {
+fn make_maker_sell_tx(sender_idx: u8, nonce: u64) -> types::TxBytes {
     let order = NewOrder {
         side: Side::Sell,
         order_type: OrderType::Limit,
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
-        owner: primitives::Address([sender_byte; 20]),
+        owner: txs::identity_addr(sender_idx),
         stp: StpMode::None,
     };
-    make_trading_tx(sender_byte, nonce, exchange::msg::place(0, order))
+    make_trading_tx(sender_idx, nonce, exchange::msg::place(0, order))
 }
 
 /// Build a taker buy order at tick 500 ($15.00), 1 lot.
-fn make_taker_buy_tx(sender_byte: u8, nonce: u64) -> types::TxBytes {
+fn make_taker_buy_tx(sender_idx: u8, nonce: u64) -> types::TxBytes {
     let order = NewOrder {
         side: Side::Buy,
         order_type: OrderType::Limit,
         tif: TimeInForce::Gtc,
         price: Price(1_500_000_000),
         qty: Qty(1_000),
-        owner: primitives::Address([sender_byte; 20]),
+        owner: txs::identity_addr(sender_idx),
         stp: StpMode::None,
     };
-    make_trading_tx(sender_byte, nonce, exchange::msg::place(0, order))
+    make_trading_tx(sender_idx, nonce, exchange::msg::place(0, order))
 }
 
 /// Run a trading TPS test with the given parameters.
@@ -157,7 +150,12 @@ fn run_trading_tps(
     // same block as a maker sell will match it.
     //
     // Sender 0x09 = maker (seller), sender 0x01 = taker (buyer).
-    // Each sender has its own nonce sequence.
+    // Each sender has its own nonce sequence. Sell orders escrow
+    // base custody at admission, so the maker's first tx (nonce 0,
+    // round-0 slot 0 — `run_pipelined_txs` consumes exactly
+    // `rounds * txs_per_round`, so the deposit replaces the first
+    // maker sell rather than extending the workload) deposits
+    // enough base to cover every sell it will place.
     eprintln!("trading TPS test: building {total_txs} trading txs...");
     let build_start = Instant::now();
     let mut all_txs = Vec::with_capacity(total_txs);
@@ -166,9 +164,17 @@ fn run_trading_tps(
 
     for round in 0..rounds {
         if round == 0 {
-            // Round 0: all makers.
-            for _ in 0..txs_per_round {
-                all_txs.push(make_maker_sell_tx(0x09, maker_nonce));
+            // Round 0: the maker's base-custody deposit, then sells.
+            for j in 0..txs_per_round {
+                if j == 0 {
+                    all_txs.push(make_trading_tx(
+                        0x09,
+                        maker_nonce,
+                        exchange::msg::deposit_base(0, (total_txs as u64) * 1_000),
+                    ));
+                } else {
+                    all_txs.push(make_maker_sell_tx(0x09, maker_nonce));
+                }
                 maker_nonce += 1;
             }
         } else {
@@ -232,7 +238,7 @@ fn run_trading_tps(
     );
     assert_eq!(
         finalized_txs, total_txs,
-        "all {total_txs} txs must be finalized, got {finalized_txs}"
+        "all {total_txs} txs (maker deposit + orders) must be finalized, got {finalized_txs}"
     );
 
     // 3. All validators agree on tx contents (common prefix only).

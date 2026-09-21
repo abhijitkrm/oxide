@@ -17,6 +17,9 @@ path = "src/main.rs"
 [dependencies]
 matcher = { workspace = true }
 node = { workspace = true }
+# devnet: deterministic devnet identity keys for the default
+# settlement operator.
+devnet = { workspace = true }
 primitives = { workspace = true }
 types = { workspace = true }
 trading = { workspace = true }

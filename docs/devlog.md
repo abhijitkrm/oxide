@@ -17635,3 +17635,58 @@ Residual: devnet/matcher/spammer workload builders still emit
 unsigned envelopes behind their explicit opt-outs — migrating them
 to `mempool::build_signed_tx` with deterministic per-sender keys is
 the tracked follow-up.
+
+---
+
+## Signed-envelope devnet migration — completing the auth remediation
+
+The second half of the secure-defaults item: every workload builder
+that emitted unsigned native envelopes now signs, and the explicit
+`Allow`/`require_signed_txs: false` carve-outs in devnet harnesses,
+binaries, and the driver are deleted.
+
+**Identity model.** Devnet identities are key-derived, never byte
+patterns: `crypto::secp::test_identity_key(i)` is scalar `i + 1`
+(deterministic, shared by `node`, `devnet`, and the binaries — a
+signed envelope's sender must recover to its key, so `Address([i;20])`
+could never authenticate). `devnet::txs::{identity_key,
+identity_addr, signed_tx}` is the shared constructor — thin wrapper
+over `crypto::eip712::sign_tx` on chain id 1, mirroring
+`mempool::build_signed_tx`'s wire layout without the mempool dep.
+
+**Genesis.** `Node::assemble`'s single-node devnet default now funds
+*and validator-registers* `test_identity_address(0)` alongside the
+legacy `[0u8;20]` (kept as the delegate target for the remaining
+unsigned test fixtures). The multi-process `--devnet-node`
+deterministic validator set also switched to key-derived staking
+addresses, matching `tcp_multinode`/`multinode`.
+
+**Migrated flows.** `tcp_multinode` validator identities, committee
+endorsements, key-rotation and add/remove tests now run as signed
+identity txs (the `key_change` sender==validator check is what forced
+key-derived committee identities — not a workaround). `settle_tps`
+and `trading_tps` sign every deposit/register/place/batch_settle;
+the tps tests gained a maker `deposit_base` (sell-side custody) in
+the same round-0 slot so tx counts are unchanged. The spammer drops
+its opt-out and signs staking/order load (sellers get a custody
+deposit at nonce 0). The matcher *always* signs: `--settlement-key`
+now defaults to `test_identity_key(0)` instead of enabling unsigned
+mode — `require_signed_txs` is unconditional and the operator
+address is genesis-funded post-assembly. The validator's
+`--submit-key-change`, startup smoke tx, and consensus keep-alive
+all sign as identity 0 (`build_signed_tx` helper); the driver's
+async test signs with a fixed key instead of opting out. Sim chaos
+delegates sign (`identity_addr(0)`), and the censor sets match the
+derived address.
+
+**What stays unsigned.** Module-level `TxContext` tests, executor
+`test_executor*` fixtures, benches, and the journal/standalone
+fixtures — explicit `Allow` where the auth layer isn't the thing
+under test. `evm::wrap_evm_tx_envelope` stays v0-unsigned by design
+(EVM payloads are self-authenticating; an envelope signature is
+rejected there as malformed).
+
+**Tests.** New `devnet::txs` unit tests: identity uniqueness +
+envelope-sender match for 0..32, and EIP-712 recovery of the
+declared sender through `verify_tx_sender` — the exact check
+`check_envelope_auth` runs under `Reject`.

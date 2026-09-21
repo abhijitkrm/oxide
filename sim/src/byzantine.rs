@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn censor_strategy() {
-        let censored = HashSet::from([[0u8; 20]]);
+        let censored = HashSet::from([devnet::txs::identity_addr(0).0]);
         let strategy = ByzantineStrategy::Censor { censored };
         assert!(!strategy.is_honest());
         assert!(!strategy.withholds_votes());

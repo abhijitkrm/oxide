@@ -332,9 +332,11 @@ oxide-validator --devnet-node 0 --num-nodes 4 \
     --peer-host validator-{i}.example.com
 ```
 
-This derives BLS keys from the node index (deterministic) and
-uses `Address([i; 20])` for staking addresses. Peers are computed
-as `validator-{i}.example.com:2200{i}`.
+This derives BLS keys from the node index (deterministic) and uses
+key-derived secp256k1 staking addresses (`test_identity_address(i)`
+in `crypto::secp`) so every validator identity can sign its own
+envelopes — the executor's default policy rejects unsigned native
+txs. Peers are computed as `validator-{i}.example.com:2200{i}`.
 
 **Limitations of `--devnet-node` for public testnet:**
 

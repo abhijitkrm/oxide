@@ -287,7 +287,9 @@ pub mod scenarios {
         let mut scenario = ByzantineScenario::all_honest(7);
         scenario.set_byzantine(
             0,
-            ByzantineStrategy::Censor { censored: std::collections::HashSet::from([[0u8; 20]]) },
+            ByzantineStrategy::Censor {
+                censored: std::collections::HashSet::from([devnet::txs::identity_addr(0).0]),
+            },
         );
         Swarm::new(7, NetworkModel::perfect(), scenario)
     }

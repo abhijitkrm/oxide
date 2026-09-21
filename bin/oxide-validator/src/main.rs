@@ -243,10 +243,14 @@ fn run_single_node() {
 
     handle_import_snapshot(&mut node);
 
-    // Submit a smoke-test staking delegate to the local validator
-    // identity (`Address::ZERO` is genesis-registered on devnet).
-    let module_payload = staking::msg::delegate(primitives::Address::ZERO, 100);
-    let tx = build_tx(framework::module_id::STAKING, &module_payload);
+    // Submit a smoke-test staking delegate signed by devnet
+    // identity 0 (genesis-funded and validator-registered in the
+    // single-node default — the signed default policy requires it).
+    let module_payload = staking::msg::delegate(
+        crypto::secp::test_identity_address(0).expect("valid devnet identity"),
+        100,
+    );
+    let tx = build_signed_tx(cfg.node.chain_id, framework::module_id::STAKING, &module_payload, 0);
     node.engine().submit_tx(tx);
 
     // Drive consensus once to finalize the smoke-test block.
@@ -271,7 +275,7 @@ fn run_single_node() {
     if handle_export_snapshot(&mut node) {
         return;
     }
-    handle_key_change(&mut node);
+    handle_key_change(&mut node, cfg.node.chain_id);
 
     // Start the JSON-RPC HTTP server.
     tracing::info!(
@@ -451,7 +455,7 @@ fn handle_export_snapshot(node: &mut Node) -> bool {
 /// rotating to a key it does not possess could never sign votes with
 /// it anyway, so requiring the secret here matches operational
 /// reality and the C3 rogue-key defense.
-fn handle_key_change(node: &mut Node) {
+fn handle_key_change(node: &mut Node, chain_id: u64) {
     if let Some(hex_key) = parse_cli_flag("--submit-key-change") {
         let secret_bytes =
             hex_decode(&hex_key).unwrap_or_else(|e| panic!("invalid BLS secret key hex: {e}"));
@@ -459,18 +463,21 @@ fn handle_key_change(node: &mut Node) {
             .unwrap_or_else(|e| panic!("invalid BLS secret key: {e:?}"));
         let new_key_bytes = new_sk.public_key().as_bytes().to_vec();
         let pop = new_sk.pop_prove();
-        // The validator address is the tx sender (Address([0u8; 20])
-        // in devnet mode). In production this would be the node's
-        // configured validator address.
-        let validator_addr = primitives::Address([0u8; 20]);
+        // The validator address is the tx sender — devnet identity
+        // 0, the key-derived account the single-node genesis funds
+        // and registers (a signed envelope's sender must recover to
+        // its key, so a byte-pattern address cannot do this).
+        let validator_addr =
+            crypto::secp::test_identity_address(0).expect("devnet identity 0 is a valid key");
         // Ensure the validator has stake (delegate 1 unit if needed)
         // so the key-change handler accepts the tx.
         let delegate_msg = staking::msg::delegate(validator_addr, 1);
-        let delegate_tx = build_tx(framework::module_id::STAKING, &delegate_msg);
+        let delegate_tx =
+            build_signed_tx(chain_id, framework::module_id::STAKING, &delegate_msg, 0);
         node.engine().submit_tx(delegate_tx);
         node.engine().run_until_idle();
         let msg_payload = staking::msg::key_change(validator_addr, &new_key_bytes, pop.as_bytes());
-        let tx = build_tx(framework::module_id::STAKING, &msg_payload);
+        let tx = build_signed_tx(chain_id, framework::module_id::STAKING, &msg_payload, 1);
         node.engine().submit_tx(tx);
         tracing::info!("oxide-validator: submitted key-change transaction");
         // Drive consensus once more to include the key-change tx.
@@ -730,11 +737,15 @@ fn run_devnet_node(node_index_str: &str) {
 
     println!("oxide-validator[{node_index}]: consensus engine started, waiting for blocks...");
 
-    // Submit a smoke-test transaction: a staking delegate to the
-    // devnet validator identity `Address::ZERO` (registered at
-    // genesis in `build_devnet_executor`).
-    let module_payload = staking::msg::delegate(primitives::Address::ZERO, 100);
-    let tx = build_tx(framework::module_id::STAKING, &module_payload);
+    // Submit a smoke-test transaction: a staking delegate signed by
+    // devnet identity 0 to itself (registered by the single-node
+    // genesis default; a `--genesis-file` deployment must fund and
+    // register it for this tx to land).
+    let module_payload = staking::msg::delegate(
+        crypto::secp::test_identity_address(0).expect("valid devnet identity"),
+        100,
+    );
+    let tx = build_signed_tx(cfg.node.chain_id, framework::module_id::STAKING, &module_payload, 0);
     engine.submit_tx(tx);
 
     let height = engine.finalized_height();
@@ -781,6 +792,7 @@ fn run_devnet_node(node_index_str: &str) {
         rpc_handle.as_deref(),
         &shared_validator_set,
         &gossip_rx,
+        cfg.node.chain_id,
     );
 
     // Graceful shutdown: if --data-dir is set, export the current
@@ -884,8 +896,14 @@ fn load_validator_set(num_nodes: usize, _node_index: usize) -> consensus::Valida
         let pks: Vec<crypto::bls::PublicKey> =
             secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
         let stakes = vec![1u64; num_nodes];
+        // Key-derived devnet identities (`test_identity_address(i)`)
+        // so each validator's staking address is one it could sign
+        // for — byte-pattern addresses can never authenticate.
         let addresses: Vec<primitives::Address> = (0..num_nodes)
-            .map(|i| primitives::Address([u8::try_from(i).unwrap_or(0); 20]))
+            .map(|i| {
+                crypto::secp::test_identity_address(u8::try_from(i).unwrap_or(0))
+                    .expect("devnet identity is a valid key")
+            })
             .collect();
         consensus::ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set")
     }
@@ -1039,6 +1057,7 @@ fn run_consensus_loop(
     rpc: Option<&rpc::RpcServer>,
     shared_validator_set: &std::sync::RwLock<consensus::ValidatorSet>,
     gossip_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    chain_id: u64,
 ) {
     // Gossip dedup cap: tx hashes we've already ingested (ours +
     // peers'). 100k entries covers several blocks' worth of txs; a
@@ -1089,8 +1108,12 @@ fn run_consensus_loop(
         // to ensure the mempool is never empty (the leader won't propose
         // empty blocks without pending txs).
         if iter_count % 50 == 1 {
-            let module_payload = staking::msg::delegate(primitives::Address::ZERO, 1);
-            let tx = build_tx_with_nonce(
+            let module_payload = staking::msg::delegate(
+                crypto::secp::test_identity_address(0).expect("valid devnet identity"),
+                1,
+            );
+            let tx = build_signed_tx(
+                chain_id,
                 framework::module_id::STAKING,
                 &module_payload,
                 keepalive_nonce,
@@ -1852,8 +1875,31 @@ fn parse_cli_flag(flag: &str) -> Option<String> {
     None
 }
 
-fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
-    build_tx_with_nonce(module_id, module_payload, 0)
+/// Build a signed v1 envelope from devnet identity 0 — the account
+/// every devnet convenience flow (smoke tx, keep-alive delegate,
+/// key-change) submits as. Signing is mandatory: the executor's
+/// default `Reject` policy admits no unsigned native txs.
+fn build_signed_tx(
+    chain_id: u64,
+    module_id: u8,
+    module_payload: &[u8],
+    nonce: u64,
+) -> types::TxBytes {
+    let key = crypto::secp::test_identity_key(0);
+    let sender = crypto::secp::test_identity_address(0).expect("valid devnet identity");
+    let fee = 100u64;
+    let sig =
+        crypto::eip712::sign_tx(&key, chain_id, &sender, nonce, fee, module_id, module_payload)
+            .expect("devnet identity key must sign");
+    let mut bytes = Vec::with_capacity(36 + 1 + 65 + module_payload.len());
+    bytes.extend_from_slice(&sender.0);
+    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&fee.to_le_bytes());
+    bytes.push(module_id | 0x80);
+    bytes.extend_from_slice(&sig.sig);
+    bytes.push(sig.recid.as_u8());
+    bytes.extend_from_slice(module_payload);
+    types::TxBytes::new(bytes)
 }
 
 /// Encode bytes as a hex string (lowercase, no `0x` prefix).
@@ -1882,18 +1928,6 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
                 .map_err(|e| format!("invalid hex at byte {}: {e}", i / 2))
         })
         .collect()
-}
-
-fn build_tx_with_nonce(module_id: u8, module_payload: &[u8], nonce: u64) -> types::TxBytes {
-    let sender = primitives::Address([0u8; 20]);
-    let fee = 100u64;
-    let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
-    bytes.extend_from_slice(&sender.0);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
-    bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(module_id);
-    bytes.extend_from_slice(module_payload);
-    types::TxBytes::new(bytes)
 }
 
 // ── Subcommands ───────────────────────────────────────────────────

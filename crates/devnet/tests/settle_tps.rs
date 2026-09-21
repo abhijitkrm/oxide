@@ -13,13 +13,16 @@
 //!
 //! Each `batch_settle` tx carries `fills_per_tx` fill legs; the
 //! settlement operator (a prefunded sender) submits
-//! `txs_per_round` batch txs per round. Buyers are prefunded senders
-//! 0..16, sellers are senders 16..31, round-robin — so every fill is
-//! a distinct-ish pair mix that still exercises aggregation. Every
-//! account first submits one order-registration tx (the first 31
-//! workload txs) authorizing a single working order under client id
-//! 1; the batch legs then reference those `(owner, 1)` registered
-//! orders — the on-chain authorization model this test exercises.
+//! `txs_per_round` batch txs per round. Buyers are prefunded devnet
+//! identities 0..16, sellers are identities 16..31, round-robin — so
+//! every fill is a distinct-ish pair mix that still exercises
+//! aggregation. Every account first submits one order-registration
+//! tx (the first 31 workload txs) authorizing a single working order
+//! under client id 1; the batch legs then reference those
+//! `(owner, 1)` registered orders — the on-chain authorization model
+//! this test exercises. All envelopes are signed (the executor's
+//! default `Reject` policy): sender `i` signs with
+//! `devnet::txs::identity_key(i)` and is `txs::identity_addr(i)`.
 //! The test verifies:
 //!
 //! - All txs are finalized (no batches dropped).
@@ -59,8 +62,8 @@
 #![allow(clippy::cast_precision_loss)]
 
 use devnet::tcp_multinode::TcpMultiNodeDevnet;
+use devnet::txs;
 use ports::AppInterface;
-use primitives::Address;
 use primitives::fixed::{Price, Qty};
 use std::time::Instant;
 use trading::MarketConfig;
@@ -82,14 +85,14 @@ fn cfg() -> MarketConfig {
     }
 }
 
-/// Sender byte of the settlement operator — the last of the devnet's
-/// 32 prefunded senders, kept clear of the buyer/seller ranges so its
-/// balance changes reflect only tx fees.
-const OPERATOR_BYTE: u8 = 31;
-/// Buyer senders are prefunded bytes 0..16.
+/// Identity index of the settlement operator — the last of the
+/// devnet's 32 prefunded identities, kept clear of the buyer/seller
+/// ranges so its balance changes reflect only tx fees.
+const OPERATOR_IDX: u8 = 31;
+/// Buyer identities are prefunded indices 0..16.
 const NUM_BUYERS: u8 = 16;
-/// Seller senders are prefunded bytes 16..31 (15 accounts — byte 31
-/// is the operator).
+/// Seller identities are prefunded indices 16..31 (15 accounts —
+/// index 31 is the operator).
 const NUM_SELLERS: u8 = 15;
 /// Fill price: $15.00, mid-band. Orders register at this limit so
 /// every leg's crossing check passes exactly.
@@ -103,18 +106,10 @@ const FILL_QUOTE: u64 = 15_000;
 /// order under — the `(owner, 1)` key the batch legs reference.
 const CLIENT_ID: u64 = 1;
 
-/// Build a tx envelope for an exchange module message.
-///
-/// Format: `[sender:20B][nonce:8B LE][fee:8B LE][module_id:1B][payload]`
-/// where `module_id` = `EXCHANGE` (5).
-fn make_tx(sender_byte: u8, nonce: u64, payload: Vec<u8>) -> types::TxBytes {
-    let mut bytes = Vec::with_capacity(36 + 1 + payload.len());
-    bytes.extend_from_slice(&[sender_byte; 20]);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
-    bytes.extend_from_slice(&100u64.to_le_bytes());
-    bytes.push(framework::module_id::EXCHANGE);
-    bytes.extend_from_slice(&payload);
-    types::TxBytes::new(bytes)
+/// Build a signed tx envelope for an exchange module message from
+/// devnet identity `sender_idx` (sender `txs::identity_addr`, fee 100).
+fn make_tx(sender_idx: u8, nonce: u64, payload: Vec<u8>) -> types::TxBytes {
+    txs::signed_tx(sender_idx, nonce, 100, framework::module_id::EXCHANGE, &payload)
 }
 
 /// Build one order-registration tx for `sender_byte`: a single
@@ -124,15 +119,15 @@ fn make_tx(sender_byte: u8, nonce: u64, payload: Vec<u8>) -> types::TxBytes {
 /// of quote, sells `qty` of base custody — sized to the per-account
 /// fill count so the reservation is exact. `nonce` is the sender's
 /// sequence: 0 for buys, 1 for sells (the deposit tx takes nonce 0).
-fn make_register_tx(sender_byte: u8, nonce: u64, side: trading::Side, qty: u64) -> types::TxBytes {
-    make_tx(sender_byte, nonce, exchange::msg::register_order(0, side, FILL_PRICE, qty, CLIENT_ID))
+fn make_register_tx(sender_idx: u8, nonce: u64, side: trading::Side, qty: u64) -> types::TxBytes {
+    make_tx(sender_idx, nonce, exchange::msg::register_order(0, side, FILL_PRICE, qty, CLIENT_ID))
 }
 
 /// Build one deposit-base tx for `sender_byte`: move `amount` of
 /// native tokens into the sender's base custody on market 0 — the
 /// escrow every registered sell must hold before it can settle.
-fn make_deposit_tx(sender_byte: u8, amount: u64) -> types::TxBytes {
-    make_tx(sender_byte, 0, exchange::msg::deposit_base(0, amount))
+fn make_deposit_tx(sender_idx: u8, amount: u64) -> types::TxBytes {
+    make_tx(sender_idx, 0, exchange::msg::deposit_base(0, amount))
 }
 
 /// Build one batch-settle tx carrying `count` fills starting at
@@ -145,9 +140,9 @@ fn make_batch_tx(nonce: u64, start: usize, count: usize) -> types::TxBytes {
         .map(|j| {
             let i = start + j;
             #[allow(clippy::cast_possible_truncation)]
-            let buyer = Address([(i % usize::from(NUM_BUYERS)) as u8; 20]);
+            let buyer = txs::identity_addr((i % usize::from(NUM_BUYERS)) as u8);
             #[allow(clippy::cast_possible_truncation)]
-            let seller = Address([NUM_BUYERS + (i % usize::from(NUM_SELLERS)) as u8; 20]);
+            let seller = txs::identity_addr(NUM_BUYERS + (i % usize::from(NUM_SELLERS)) as u8);
             exchange::BatchFillEntry {
                 market: 0,
                 price: Price(FILL_PRICE),
@@ -157,7 +152,7 @@ fn make_batch_tx(nonce: u64, start: usize, count: usize) -> types::TxBytes {
             }
         })
         .collect();
-    make_tx(OPERATOR_BYTE, nonce, exchange::msg::batch_settle(&fills))
+    make_tx(OPERATOR_IDX, nonce, exchange::msg::batch_settle(&fills))
 }
 
 /// Run the batch-settlement TPS test with the given parameters.
@@ -192,7 +187,7 @@ fn run_settle_tps(
     );
 
     let max_mempool = total_txs + 1000;
-    let operator = Address([OPERATOR_BYTE; 20]);
+    let operator = txs::identity_addr(OPERATOR_IDX);
 
     let assemble_start = Instant::now();
     let mut devnet = TcpMultiNodeDevnet::with_exchange_settlement_and_base_port(
@@ -312,8 +307,9 @@ fn run_settle_tps(
         * wei;
     for i in 0..n_validators {
         let evm = devnet.evm_module(i);
-        let seller_total: u128 =
-            (NUM_BUYERS..NUM_BUYERS + NUM_SELLERS).map(|b| evm.balance(&Address([b; 20]))).sum();
+        let seller_total: u128 = (NUM_BUYERS..NUM_BUYERS + NUM_SELLERS)
+            .map(|b| evm.balance(&txs::identity_addr(b)))
+            .sum();
         assert_eq!(
             seller_total, expected_seller_total,
             "validator {i} seller aggregate {seller_total} != {expected_seller_total}"

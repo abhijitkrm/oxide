@@ -261,11 +261,13 @@ mod tests {
             settlement_operator: None,
             min_fee: 0,
             chain_id: 1,
-            require_signed_txs: false,
             history_retention: None,
             ..Default::default()
         };
         let mut node = Node::assemble(&config);
+        // The signed-envelope sender is this test key's derived
+        // address — fund it for fee + bond.
+        node.fund_evm_account(&test_sender(), u128::MAX);
 
         // Submit a transaction so the engine has work to do —
         // a staking delegate to `Address::ZERO` (registered at
@@ -283,7 +285,7 @@ mod tests {
         // one block). Submit another tx and verify the driver
         // finalizes it.
         let module_payload2 = staking::msg::delegate(primitives::Address::ZERO, 200);
-        let tx2 = build_tx(framework::module_id::STAKING, &module_payload2);
+        let tx2 = build_tx_with_nonce(framework::module_id::STAKING, &module_payload2, 1);
         node.engine().submit_tx(tx2);
 
         let driver = ConsensusDriver::with_defaults();
@@ -312,15 +314,38 @@ mod tests {
         );
     }
 
+    /// Fixed secp256k1 test key — scalar 1, valid and deterministic.
+    const TEST_KEY: [u8; 32] = {
+        let mut k = [0u8; 32];
+        k[31] = 1;
+        k
+    };
+
+    /// The address `TEST_KEY` signs for — funded in the test before
+    /// submission.
+    fn test_sender() -> primitives::Address {
+        crypto::secp::signable_pubkey_address(&TEST_KEY).expect("valid test key")
+    }
+
+    /// A signed v1 envelope — the executor's default `Reject` policy
+    /// only admits signed native txs.
     fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
-        let sender = primitives::Address([0u8; 20]);
-        let nonce = 0u64;
+        build_tx_with_nonce(module_id, module_payload, 0)
+    }
+
+    fn build_tx_with_nonce(module_id: u8, module_payload: &[u8], nonce: u64) -> types::TxBytes {
+        let sender = test_sender();
         let fee = 100u64;
-        let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
+        let sig =
+            crypto::eip712::sign_tx(&TEST_KEY, 1, &sender, nonce, fee, module_id, module_payload)
+                .expect("test key must sign");
+        let mut bytes = Vec::with_capacity(36 + 1 + 65 + module_payload.len());
         bytes.extend_from_slice(&sender.0);
         bytes.extend_from_slice(&nonce.to_le_bytes());
         bytes.extend_from_slice(&fee.to_le_bytes());
-        bytes.push(module_id);
+        bytes.push(module_id | 0x80);
+        bytes.extend_from_slice(&sig.sig);
+        bytes.push(sig.recid.as_u8());
         bytes.extend_from_slice(module_payload);
         types::TxBytes::new(bytes)
     }

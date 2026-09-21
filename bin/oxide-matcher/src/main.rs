@@ -113,11 +113,14 @@ fn parse_cli() -> CliConfig {
         // lets any captured signed request replay once.
         nonce_state: parse_flag_opt::<String>("--nonce-state").map(std::path::PathBuf::from),
         // The settlement operator's secp256k1 secret (64 hex chars).
-        // When set, batch envelopes are signed and the sender is the
-        // key-derived address — which is also wired as the exchange's
-        // settlement operator. Without it envelopes are unsigned
-        // (devnet only — `UnsignedTxPolicy::Allow`).
-        settlement_key: parse_flag_opt::<String>("--settlement-key").map(|hex| parse_key_hex(&hex)),
+        // Batch envelopes are always signed — without an explicit key
+        // the deterministic devnet identity-0 key is used, and its
+        // derived address is wired as the exchange's settlement
+        // operator.
+        settlement_key: Some(
+            parse_flag_opt::<String>("--settlement-key")
+                .map_or_else(|| devnet::txs::identity_key(0), |hex| parse_key_hex(&hex)),
+        ),
         // Durable settlement-lane checkpoint — without it, a restart
         // forgets an in-flight batch (fills drained, outcome unknown).
         settlement_outbox: parse_flag_opt::<String>("--settlement-outbox")
@@ -225,16 +228,14 @@ fn main() {
         println!("  settlement outbox: {}", p.display());
     }
 
-    // The settlement operator: with `--settlement-key` the sender is
-    // the key-derived secp256k1 address and envelopes are signed —
-    // the node then runs the default `Reject` policy. Without a key
-    // the devnet default is the well-known zero address and the
-    // envelopes stay unsigned, so the node opts out explicitly.
-    let sender = match &cli.settlement_key {
-        Some(key) => crypto::secp::signable_pubkey_address(key)
-            .expect("--settlement-key must be a valid secp256k1 secret"),
-        None => primitives::Address([0u8; 20]),
-    };
+    // The settlement operator is always the key-derived secp256k1
+    // address — envelopes are signed, so the node keeps the default
+    // `Reject` unsigned policy. The default key is the deterministic
+    // devnet identity 0; `--settlement-key` overrides it for real
+    // deployments.
+    let key = cli.settlement_key.expect("settlement key always set");
+    let sender = crypto::secp::signable_pubkey_address(&key)
+        .expect("settlement key must be a valid secp256k1 secret");
     println!("  settlement operator: {sender:?}");
 
     // Assemble the Oxide node (single-node devnet with executor +
@@ -246,13 +247,13 @@ fn main() {
         consensus: ConsensusConfig::Sequencer,
         max_mempool_entries: 100_000,
         settlement_operator: Some(sender),
-        // Signed envelopes are enforced iff the settler has a key to
-        // sign with — an unsigned devnet settler is the only reason
-        // to admit unsigned txs.
-        require_signed_txs: cli.settlement_key.is_some(),
         ..NodeConfig::default()
     };
     let mut node = Node::assemble(&node_config);
+    // The operator pays envelope fees on its batch-settle txs — fund
+    // the key-derived address (the single-node devnet genesis only
+    // funds `Address::ZERO`).
+    node.fund_evm_account(&sender, u128::MAX);
     println!("oxide-matcher: devnet assembled (executor + exchange + perps on the EVM ledger)");
 
     // One executor handle serves both settlement roles: submitting

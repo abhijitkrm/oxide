@@ -5494,3 +5494,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     like a normal blockchain, and the only way to turn that off is a
     flag that says "unsafe" in its name and refuses to run on a real
     network interface.
+
+- **All devnet and scripted transaction flows now sign.** The unsafe
+  unsigned opt-outs the devnet harnesses, load tools, and validator
+  convenience flows carried are gone.
+  - Devnet accounts are deterministic secp256k1 identities
+    (`crypto::secp::test_identity_key(i)` → `test_identity_address(i)`)
+    instead of `Address([i; 20])` byte patterns — only a key-derived
+    address can produce a valid envelope signature. Validator
+    identities, genesis funding, and workload senders all share the
+    same index space.
+  - `devnet::txs::signed_tx` is the shared signed-envelope builder
+    (EIP-712, chain id 1). Multi-node and TCP devnets, the settle/
+    trading TPS tests, the spammer, and the sim chaos workloads all
+    emit signed envelopes; the matcher's `--settlement-key` now
+    defaults to the devnet identity-0 key so it signs out of the box.
+  - The validator's `--submit-key-change`, startup smoke tx, and
+    consensus keep-alive delegate sign as devnet identity 0.
+  - **In plain words:** the test network and load tools used to send
+    transactions that just *claimed* a sender — fine when the chain
+    didn't check, but the chain now checks. Every built-in flow now
+    signs for real, so the development network behaves like
+    production instead of quietly bypassing authentication.

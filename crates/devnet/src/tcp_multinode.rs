@@ -42,6 +42,8 @@ use ports::transport::Transport;
 use ports::{AppInterface, ConsensusEngine};
 use types::{FinalizedBlock, TxBytes};
 
+use crate::txs;
+
 /// The genesis balance minted to each sender on every validator's
 /// EVM account store. Large enough that the simulation never
 /// exhausts it.
@@ -493,14 +495,12 @@ impl TcpMultiNodeDevnet {
         let pks: Vec<crypto::bls::PublicKey> =
             secret_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
         let stakes = vec![1u64; n];
-        // Devnet convention: validator `i` has staking address
-        // `Address([i as u8; 20])` — `Address::ZERO` for validator 0.
-        // `with_addresses` preserves these explicit identities (the
-        // derived `validator_address(pk)` would produce hash-based
-        // addresses that don't match the devnet's `Address([i; 20])`
-        // convention used by `build_tx` and `handle_key_change`).
+        // Devnet convention: validator `i`'s staking address is the
+        // secp256k1 identity `txs::identity_addr(i)` — key-derived so
+        // validators can sign their own `key_change`/endorsement txs
+        // (a signed envelope's sender must recover to its key).
         let addresses: Vec<primitives::Address> =
-            (0..n).map(|i| primitives::Address([u8::try_from(i).unwrap_or(0); 20])).collect();
+            (0..n).map(|i| txs::identity_addr(u8::try_from(i).unwrap_or(0))).collect();
         let vs = ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set");
 
         // Build peer addresses for full mesh.
@@ -625,10 +625,6 @@ impl TcpMultiNodeDevnet {
         settlement_operator: Option<primitives::Address>,
     ) -> (Executor, Arc<evm::EvmModule>, Option<Arc<exchange::ExchangeModule>>) {
         let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold)
-            // The devnet workload builders emit unsigned envelopes —
-            // opt out of signature enforcement explicitly until they
-            // are migrated to sign.
-            .with_unsigned_tx_policy(executor::UnsignedTxPolicy::Allow)
             // Devnet measures throughput, not gas policy — the
             // block gas cap matches the consensus budget's
             // `max_gas` (1 gigagas) so large test blocks fit
@@ -644,8 +640,8 @@ impl TcpMultiNodeDevnet {
         let evm_module =
             Arc::new(evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL));
         let genesis_wei = u128::from(genesis_balance) * framework::WEI_PER_UNIT;
-        for sender_byte in 0u8..num_senders {
-            evm_module.fund_account_for_test(&primitives::Address([sender_byte; 20]), genesis_wei);
+        for sender_idx in 0u8..num_senders {
+            evm_module.fund_account_for_test(&txs::identity_addr(sender_idx), genesis_wei);
         }
         executor.register_module(evm_module.clone());
         // The EVM ledger collects fees for all native-module txs
@@ -653,12 +649,12 @@ impl TcpMultiNodeDevnet {
         executor.set_fee_module(framework::module_id::EVM);
         // EVM-ledger staking: delegation debits the delegator
         // into the bonded pool (no free stake inflation). The
-        // devnet validator identity `Address::ZERO` is registered
-        // so the key-change/validator-change keep-alive delegate
-        // has a registered target.
+        // devnet validator identity `txs::identity_addr(0)` is
+        // registered so the key-change/validator-change keep-alive
+        // delegate has a registered target.
         let staking_module = staking::StakingModule::new();
         staking_module.set_ledger(evm_module.clone());
-        staking_module.register_validator(primitives::Address::ZERO);
+        staking_module.register_validator(txs::identity_addr(0));
         let staking_module = Arc::new(staking_module);
         executor.register_module(staking_module.clone());
         // Optionally register the exchange module backed by this
@@ -2492,44 +2488,31 @@ fn bls_key(byte: u8) -> crypto::BlsSecretKey {
 }
 
 /// Construct a staking-delegate tx for batch throughput testing.
-/// Delegation bonds 1 unit to `Address::ZERO` (registered in the
+/// Delegation bonds 1 unit to `identity_addr(0)` (registered in the
 /// constructor), exercising the real EVM-ledger transfer path.
 fn make_batch_tx(round: usize, tx_i: usize) -> TxBytes {
-    let sender = primitives::Address([0u8; 20]);
     let nonce = u64::try_from(round * 1000 + tx_i).unwrap();
     let fee = 100u64;
-    let module_payload = staking::msg::delegate(primitives::Address::ZERO, 1);
-    let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
-    bytes.extend_from_slice(&sender.0);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
-    bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::STAKING);
-    bytes.extend_from_slice(&module_payload);
-    TxBytes::new(bytes)
+    let module_payload = staking::msg::delegate(txs::identity_addr(0), 1);
+    txs::signed_tx(0, nonce, fee, framework::module_id::STAKING, &module_payload)
 }
 
-/// Build a staking-module tx with the given nonce. The sender is
-/// `Address::ZERO` (the devnet's default sender — it has a genesis
-/// balance for fee payment).
+/// Build a signed staking-module tx from devnet identity 0 — the
+/// registered validator and default sender (genesis-funded).
 #[cfg(test)]
 fn make_staking_tx(module_payload: &[u8], nonce: u64) -> TxBytes {
-    make_staking_tx_from(primitives::Address([0u8; 20]), module_payload, nonce)
+    make_staking_tx_from(0, module_payload, nonce)
 }
 
-/// Build a staking-module tx from an explicit sender. Committee
-/// endorsement tests need txs from *different* validators — the
-/// sender must carry a genesis balance for fee payment (the
-/// devnet prefunds `Address([b; 20])` for `b < 32`).
+/// Build a signed staking-module tx from devnet identity `idx` —
+/// the sender is `txs::identity_addr(idx)`. Committee endorsement
+/// tests need txs from *different* validators — the identity must
+/// carry a genesis balance for fee payment (the devnet prefunds
+/// identities `< 32`).
 #[cfg(test)]
-fn make_staking_tx_from(sender: primitives::Address, module_payload: &[u8], nonce: u64) -> TxBytes {
+fn make_staking_tx_from(idx: u8, module_payload: &[u8], nonce: u64) -> TxBytes {
     let fee = 100u64;
-    let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
-    bytes.extend_from_slice(&sender.0);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
-    bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::STAKING);
-    bytes.extend_from_slice(module_payload);
-    TxBytes::new(bytes)
+    txs::signed_tx(idx, nonce, fee, framework::module_id::STAKING, module_payload)
 }
 
 #[cfg(test)]
@@ -2550,17 +2533,17 @@ mod tests {
         // Record the original key for validator 0.
         let original_key = *devnet.validator_set().validator(0).expect("validator 0");
 
-        // Build a key-change tx for validator 0 (Address::ZERO in
-        // the devnet's `Address([i; 20])` convention). The delegate
+        // Build a key-change tx for validator 0 (devnet identity 0
+        // — `txs::identity_addr(0)`). The delegate
         // must come first so `handle_key_change` accepts the tx.
         // The new key carries its proof-of-possession — required
         // since C3 made PoP admission mandatory (rogue-key defense).
         let new_sk = bls_key(0xAA);
         let new_key_bytes = new_sk.public_key().as_bytes().to_vec();
         let pop = new_sk.pop_prove();
-        let delegate_msg = staking::msg::delegate(primitives::Address::ZERO, 1);
+        let delegate_msg = staking::msg::delegate(txs::identity_addr(0), 1);
         let key_change_msg =
-            staking::msg::key_change(primitives::Address::ZERO, &new_key_bytes, pop.as_bytes());
+            staking::msg::key_change(txs::identity_addr(0), &new_key_bytes, pop.as_bytes());
 
         // Submit both txs to the first app's mempool — they'll be
         // included in the next block.
@@ -2571,7 +2554,7 @@ mod tests {
         devnet.run_batch(3, 0);
 
         // Apply the pending key change — should find 1 change for
-        // validator 0 (Address::ZERO → index 0).
+        // validator 0 (identity_addr(0) → index 0).
         let applied = devnet.rotate_epoch_with_key_changes();
         assert_eq!(applied, 1, "one key change should be applied");
 
@@ -2583,7 +2566,7 @@ mod tests {
         // The staking address is preserved (identity survives rotation).
         assert_eq!(
             devnet.validator_set().validator_addresses()[0],
-            primitives::Address::ZERO,
+            txs::identity_addr(0),
             "staking address must be preserved across key rotation",
         );
     }
@@ -2602,11 +2585,11 @@ mod tests {
         let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21600);
         let initial_n = devnet.validator_set().n();
 
-        // Address::ZERO must be a validator (have stake) to submit
-        // governance txs — delegate first. With ZERO the only
+        // Identity 0 must be a validator (have stake) to submit
+        // governance txs — delegate first. With it the only
         // powered committee member, its endorsement alone is the
         // two-thirds quorum (1·3 > 1·2).
-        let delegate_msg = staking::msg::delegate(primitives::Address::ZERO, 1);
+        let delegate_msg = staking::msg::delegate(txs::identity_addr(0), 1);
         devnet.apps[0].ingest_tx(make_staking_tx(&delegate_msg, 0));
         devnet.run_batch(2, 0);
 
@@ -2614,9 +2597,10 @@ mod tests {
         // The candidate's address must be (a) one of the 32
         // prefunded senders so it can pay fees and cast its own
         // endorsement later, and (b) OUTSIDE the engine identity
-        // range — engine i already holds `Address([i; 20])` in the
+        // range — engine i already holds `identity_addr(i)` in the
         // ValidatorSet, so 0..n would collide at apply time.
-        // `Address([9; 20])` satisfies both.
+        // `identity_addr(9)` satisfies both (funded: `num_senders`
+        // is 32).
         // Bonded stake stays at 1 — the devnet does not
         // spawn an engine for the added validator, so its voting
         // power must stay below the quorum the existing 4 engines
@@ -2628,7 +2612,7 @@ mod tests {
         let new_sk = bls_key(0xAA);
         let new_key = new_sk.public_key();
         let pop = new_sk.pop_prove();
-        let new_addr = primitives::Address([9u8; 20]);
+        let new_addr = txs::identity_addr(9);
         let add_msg = staking::msg::validator_add(new_addr, new_key.as_bytes(), pop.as_bytes());
         devnet.apps[0].ingest_tx(make_staking_tx(&add_msg, 1));
         devnet.run_batch(3, 0);
@@ -2670,7 +2654,7 @@ mod tests {
             "one endorsement must not remove — no quorum yet",
         );
         // The seated member casts the second endorsement → quorum.
-        devnet.apps[0].ingest_tx(make_staking_tx_from(new_addr, &remove_msg, 0));
+        devnet.apps[0].ingest_tx(make_staking_tx_from(9, &remove_msg, 0));
         devnet.run_batch(5, 0);
 
         let applied = devnet.rotate_epoch_with_validator_changes();

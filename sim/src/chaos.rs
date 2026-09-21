@@ -536,19 +536,12 @@ fn tx_is_censored(tx: &TxBytes, censored: &HashSet<[u8; 20]>) -> bool {
     censored.contains(&sender)
 }
 
-/// A deterministic staking-delegate tx: sender `[0;20]` (genesis-
-/// funded), nonce derived from `(round, t)`, 1 unit to validator 0.
-/// Same wire layout as the devnet harness's `make_batch_tx`.
+/// A deterministic signed staking-delegate tx: devnet identity 0
+/// (genesis-funded — `devnet::txs::identity_addr(0)`), nonce derived
+/// from `(round, t)`, 1 unit delegated to validator 0.
 fn make_tx(round: usize, t: usize) -> TxBytes {
-    let sender = primitives::Address([0u8; 20]);
     let nonce = u64::try_from(round.saturating_mul(1000).saturating_add(t)).unwrap_or(u64::MAX - 1);
     let fee = 100u64;
-    let payload = staking::msg::delegate(sender, 1);
-    let mut bytes = Vec::with_capacity(37 + payload.len());
-    bytes.extend_from_slice(&sender.0);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
-    bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(framework::module_id::STAKING);
-    bytes.extend_from_slice(&payload);
-    TxBytes::new(bytes)
+    let payload = staking::msg::delegate(devnet::txs::identity_addr(0), 1);
+    devnet::txs::signed_tx(0, nonce, fee, framework::module_id::STAKING, &payload)
 }

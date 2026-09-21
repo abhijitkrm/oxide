@@ -13,9 +13,9 @@
 //!
 //! ## Modes
 //!
-//! - **Staking** (default): delegate txs bonding 1 unit to the
-//!   genesis validator from a funded sender. Each tx increments the
-//!   sender's nonce.
+//! - **Staking** (default): signed delegate txs bonding 1 unit to
+//!   the genesis validator from devnet identity 0. Each tx
+//!   increments the sender's nonce.
 //! - **EVM** (`--evm`): signed EVM transactions (transfers, deploys,
 //!   contract calls) from secp256k1-funded senders. Uses the
 //!   `devnet::evm_workload` generator to build a realistic tx mix.
@@ -57,14 +57,8 @@ fn main() {
     };
     println!("oxide-spammer: engine = {}, mode = {}, txs = {txs}", engine.as_str(), mode);
 
-    let config = NodeConfig {
-        consensus: engine,
-        max_mempool_entries: txs + 100,
-        // The spammer's native-module builders emit unsigned
-        // envelopes — explicit dev-mode opt-out.
-        require_signed_txs: false,
-        ..NodeConfig::default()
-    };
+    let config =
+        NodeConfig { consensus: engine, max_mempool_entries: txs + 100, ..NodeConfig::default() };
     let mut node = Node::assemble(&config);
     println!("oxide-spammer: devnet assembled (executor + modules)");
 
@@ -105,15 +99,20 @@ fn main() {
     println!("oxide-spammer: load test complete");
 }
 
-/// Run staking-delegate load: submit `txs` delegates and run the
-/// engine to finality.
+/// Run staking-delegate load: submit `txs` signed delegates and run
+/// the engine to finality.
 fn run_staking_load(node: &mut Node, txs: usize) {
+    // Devnet identity 0 is the sender — fund it for fee + bond. The
+    // delegate target stays the genesis-registered validator
+    // (`Address::ZERO` is registered by `Node::assemble`).
+    node.fund_evm_account(&devnet::txs::identity_addr(0), u128::MAX);
     let module_payload = staking::msg::delegate(primitives::Address::ZERO, 1);
     let submit_start = std::time::Instant::now();
     for i in 0..txs {
-        let tx = build_module_tx(
-            primitives::Address([0u8; 20]),
+        let tx = devnet::txs::signed_tx(
+            0,
             i as u64,
+            100,
             framework::module_id::STAKING,
             &module_payload,
         );
@@ -150,9 +149,10 @@ fn run_order_load(node: &mut Node, txs: usize) {
     use primitives::fixed::{Price, Qty};
     use trading::{NewOrder, OrderType, Side, StpMode, TimeInForce};
 
-    /// Number of distinct funded senders — enough that per-sender
-    /// nonce chains stay short while the mempool's parallel
-    /// preverification has real work to split.
+    /// Number of distinct funded senders — devnet identities
+    /// `0..NUM_ORDER_SENDERS`, enough that per-sender nonce chains
+    /// stay short while the mempool's parallel preverification has
+    /// real work to split.
     const NUM_ORDER_SENDERS: u64 = 100;
     /// The default market's mid price — inside the [1e9, 2e9] band
     /// and a multiple of the 1M tick.
@@ -160,23 +160,41 @@ fn run_order_load(node: &mut Node, txs: usize) {
     /// One lot — the smallest valid quantity.
     const LOT: u64 = 1_000;
 
-    // Fund every sender: buys need `price·qty` quote, everyone pays
-    // the envelope fee.
+    // Fund every sender identity: buys need `price·qty` quote,
+    // everyone pays the envelope fee.
     for i in 0..NUM_ORDER_SENDERS {
         node.fund_evm_account(
-            &primitives::Address([u8::try_from(i).unwrap_or_default(); 20]),
+            &devnet::txs::identity_addr(u8::try_from(i).unwrap_or_default()),
             u128::MAX,
         );
     }
     println!("oxide-spammer: funded {NUM_ORDER_SENDERS} order senders");
 
+    // Sell orders escrow base custody at admission — each seller
+    // deposits enough base up front (nonce 0; per-sender nonce order
+    // runs it before its sells) to cover the worst case of every
+    // order it might place.
+    let sells_per_seller = txs as u64 / (NUM_ORDER_SENDERS / 2) + 2;
+    for i in 0..NUM_ORDER_SENDERS / 2 {
+        let idx = u8::try_from(i).unwrap_or_default();
+        let deposit = exchange::msg::deposit_base(0, sells_per_seller * LOT);
+        node.engine().submit_tx(devnet::txs::signed_tx(
+            idx,
+            0,
+            100,
+            framework::module_id::EXCHANGE,
+            &deposit,
+        ));
+    }
+
     let submit_start = std::time::Instant::now();
     for i in 0..txs as u64 {
         let sender_idx = i % NUM_ORDER_SENDERS;
-        let nonce = i / NUM_ORDER_SENDERS;
         // First half of the sender space sells (resting asks), second
         // half buys — the buy crosses the standing asks → a fill.
         let side = if sender_idx < NUM_ORDER_SENDERS / 2 { Side::Sell } else { Side::Buy };
+        // Sellers spent nonce 0 on the custody deposit.
+        let nonce = i / NUM_ORDER_SENDERS + u64::from(side == Side::Sell);
         let order = NewOrder {
             side,
             order_type: OrderType::Limit,
@@ -187,9 +205,10 @@ fn run_order_load(node: &mut Node, txs: usize) {
             stp: StpMode::None,
         };
         let payload = exchange::msg::place(0, order);
-        let tx = build_module_tx(
-            primitives::Address([u8::try_from(sender_idx).unwrap_or_default(); 20]),
+        let tx = devnet::txs::signed_tx(
+            u8::try_from(sender_idx).unwrap_or_default(),
             nonce,
+            100,
             framework::module_id::EXCHANGE,
             &payload,
         );
@@ -284,21 +303,4 @@ fn run_evm_load(node: &mut Node, txs: usize) {
         exec_elapsed.as_secs_f64() * 1000.0,
         txs as f64 / exec_elapsed.as_secs_f64()
     );
-}
-
-/// Build a module tx with the given sender + nonce.
-fn build_module_tx(
-    sender: primitives::Address,
-    nonce: u64,
-    module_id: u8,
-    module_payload: &[u8],
-) -> types::TxBytes {
-    let fee = 100u64;
-    let mut bytes = Vec::with_capacity(36 + 1 + module_payload.len());
-    bytes.extend_from_slice(&sender.0);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
-    bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(module_id);
-    bytes.extend_from_slice(module_payload);
-    types::TxBytes::new(bytes)
 }

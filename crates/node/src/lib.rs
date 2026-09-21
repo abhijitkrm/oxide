@@ -184,7 +184,8 @@ pub struct NodeConfig {
     /// `7_000_000_000` (7 gwei).
     pub base_fee: u64,
     /// Genesis state applied at assembly. `None` selects the
-    /// single-node devnet default: `[0u8; 20]` is funded with
+    /// single-node devnet default: `[0u8; 20]` and devnet identity 0
+    /// (`crypto::secp::test_identity_address`) are funded with
     /// `u128::MAX` wei and registered as the sole staking validator.
     /// That default is a development convenience — production
     /// deployments pass a [`GenesisSpec`] converted from the genesis
@@ -266,7 +267,8 @@ impl Node {
     /// - [`CoreModule`](oxide_core::CoreModule) — block height, timestamps.
     /// - [`StakingModule`](staking::StakingModule) — validator staking.
     /// - [`EvmModule`](evm::EvmModule) — `revm`-based EVM. Base fee 7 gwei.
-    ///   Funds `[0u8; 20]` with `u128::MAX` for test/devnet use. The
+    ///   Funds `[0u8; 20]` and devnet identity 0 with `u128::MAX` for
+    ///   test/devnet use. The
     ///   EVM account store is also the chain's **single balance
     ///   ledger**: envelope fees, staking bonds, exchange settlement,
     ///   and perps margin all debit/credit the same accounts EVM
@@ -582,14 +584,23 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     let staking_module = staking::StakingModule::new();
     staking_module.set_ledger(evm_module.clone());
     match &config.genesis {
-        // Single-node devnet default: fund and register the
-        // deterministic `[0u8;20]` sender/validator identity so
-        // self-delegation (e.g. the key-change keep-alive delegate)
-        // has a registered target. Development convenience only —
-        // production passes an explicit `GenesisSpec`.
+        // Single-node devnet default: fund and register two
+        // deterministic identities —
+        //   * `[0u8;20]`: the legacy byte-pattern sender/validator,
+        //     kept as a delegate target for unsigned test fixtures;
+        //   * `test_identity_address(0)`: the key-derived devnet
+        //     validator — the only identity that can *sign*
+        //     envelopes, so sender-gated flows (key_change,
+        //     endorsements) must run as it.
+        // Development convenience only — production passes an
+        // explicit `GenesisSpec`.
         None => {
             evm_module.fund_account_for_test(&primitives::Address([0u8; 20]), u128::MAX);
             staking_module.register_validator(primitives::Address([0u8; 20]));
+            let identity0 = crypto::secp::test_identity_address(0)
+                .expect("devnet identity 0 is a valid secp256k1 key");
+            evm_module.fund_account_for_test(&identity0, u128::MAX);
+            staking_module.register_validator(identity0);
         }
         Some(spec) => {
             for (addr, wei) in &spec.balances {

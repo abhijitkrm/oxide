@@ -124,7 +124,10 @@ fn spam_flood_dropped_at_decode() {
 #[test]
 fn censorship_delays_not_denies() {
     let mut strategies = HashMap::new();
-    strategies.insert(1, ByzantineStrategy::Censor { censored: HashSet::from([[0u8; 20]]) });
+    strategies.insert(
+        1,
+        ByzantineStrategy::Censor { censored: HashSet::from([devnet::txs::identity_addr(0).0]) },
+    );
     let report = run(4, &ChaosScenario { strategies: strategies.clone(), ..scenario(&[], 12) });
     assert!(report.safety_holds(&strategies));
     assert!(report.liveness_holds(&strategies), "txs must land via honest leaders");
@@ -249,7 +252,9 @@ fn run_one_scenario(seed: u64) -> (usize, usize, usize, usize) {
             1 => ByzantineStrategy::DoubleVote,
             2 => ByzantineStrategy::Equivocate,
             3 => ByzantineStrategy::Spam { rate: (rng.next_u64() % 64) as u32 },
-            _ => ByzantineStrategy::Censor { censored: HashSet::from([[0u8; 20]]) },
+            _ => ByzantineStrategy::Censor {
+                censored: HashSet::from([devnet::txs::identity_addr(0).0]),
+            },
         };
         strategies.insert(idx, strategy);
     }

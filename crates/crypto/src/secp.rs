@@ -306,6 +306,34 @@ pub fn signable_pubkey_address(privkey: &[u8]) -> Option<Address> {
     Some(Address(addr))
 }
 
+/// The deterministic secp256k1 secret for dev/test identity `index`.
+///
+/// The secret is the scalar `index + 1` encoded as a 32-byte
+/// big-endian integer — index 0 yields key 1 (0 is not a valid
+/// secp256k1 secret). Any `u8` index produces a scalar far below the
+/// curve order, so the key is always valid and always distinct.
+///
+/// Devnet harnesses, load tools, and single-node dev defaults share
+/// this index space: identity `i` is the same account in every
+/// process, so a signed envelope from `test_identity_key(i)`
+/// authenticates as [`test_identity_address(i)`] everywhere.
+/// Not for production use — the secrets are public.
+#[must_use]
+pub fn test_identity_key(index: u8) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[24..].copy_from_slice(&(u64::from(index) + 1).to_be_bytes());
+    key
+}
+
+/// The address [`test_identity_key`] `index` authenticates as — the
+/// account a signed envelope carrying that key's signature recovers
+/// to. `None` only if the (always-valid) derived key is rejected by
+/// the secp256k1 backend.
+#[must_use]
+pub fn test_identity_address(index: u8) -> Option<Address> {
+    signable_pubkey_address(&test_identity_key(index))
+}
+
 /// Generate a random private key for testing. Not for production use.
 ///
 /// # Panics
