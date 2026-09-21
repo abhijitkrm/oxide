@@ -23,8 +23,9 @@
 //! trading engine). It IS on the per-block proposal path, which runs
 //! at 50–100ms cadence. Allocations here are per-block, not per-tx:
 //! the pool reuses its `Vec` capacity across `prepare_proposal` calls.
-//! The `select` method returns a `Vec<TxBytes>` by draining selected
-//! entries; the caller owns the allocation.
+//! `select` is a peek — it clones the chosen `TxBytes` and leaves
+//! every entry pooled until `remove_committed` runs at block
+//! finality, so losing a proposal round can never lose the txs in it.
 //!
 //! # Phase 1 scope
 //!
@@ -32,7 +33,7 @@
 //! per-account nonce tracking. No rate limiting, no eviction policy
 //! beyond size cap, no mempool gossip. Those arrive in Phase 2+.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use primitives::{Address, Hash};
 use types::TxBytes;
@@ -78,8 +79,15 @@ pub struct Mempool {
     by_sender: HashMap<Address, BTreeMap<u64, Hash>>,
     /// The fee-priority index: fee density (fee/size) → set of tx
     /// hashes at that density. `BTreeMap` ordered by key gives us
-    /// highest-fee-first iteration by reversing.
-    by_fee: BTreeMap<FeeDensity, Vec<Hash>>,
+    /// highest-fee-first iteration by reversing. Buckets are
+    /// `BTreeSet`s so member removal is O(log n): every removal
+    /// path (`remove`, `remove_committed`, `refresh_anchors`
+    /// pruning) keeps `by_fee` exactly in sync with `by_hash` — no
+    /// tombstones may accumulate, which is what bounds the index's
+    /// memory under steady-state throughput (a hash left behind by
+    /// a draining selection pass would otherwise linger until an
+    /// eviction happened to reach it).
+    by_fee: BTreeMap<FeeDensity, BTreeSet<Hash>>,
     /// Maximum number of transactions in the pool. Beyond this, the
     /// lowest-fee entries are evicted.
     max_entries: usize,
@@ -304,13 +312,22 @@ impl Mempool {
             // slot — no orphan is created.
         }
 
-        // If the pool is full, try to evict the lowest-fee entry —
-        // but only if the new tx has a higher fee than the lowest.
-        if self.by_hash.len() >= self.max_entries {
-            // Find the lowest fee density in the pool.
+        // If the pool is full, evict the lowest-fee entries until
+        // there is room — but only while the new tx outbids the
+        // current lowest density. `evict_lowest_fee` can report
+        // "nothing evicted" when the lowest bucket turned out to be
+        // all tombstones: that outcome is retried (the bucket is
+        // gone, so the next iteration re-checks the new lowest
+        // density), and the loop exits with `PoolFull` only when no
+        // live entry is outbiddable. The previous code ignored the
+        // result and inserted anyway, letting the pool exceed
+        // `max_entries` by one entry per stale-bucket drain.
+        while self.by_hash.len() >= self.max_entries {
             let lowest_density = self.by_fee.keys().next().copied();
             match lowest_density {
                 Some(lowest) if density > lowest => {
+                    // Live evict or stale-bucket drain — either way
+                    // the loop re-checks capacity and the new lowest.
                     self.evict_lowest_fee();
                 }
                 _ => {
@@ -324,7 +341,7 @@ impl Mempool {
         let entry = PoolEntry { tx, hash, sender, nonce, fee, size };
         self.by_hash.insert(hash, entry);
         self.by_sender.entry(sender).or_default().insert(nonce, hash);
-        self.by_fee.entry(density).or_default().push(hash);
+        self.by_fee.entry(density).or_default().insert(hash);
         Ok(())
     }
 
@@ -349,8 +366,12 @@ impl Mempool {
         results
     }
 
-    /// Evict the lowest-fee entry from the pool. Returns `true` if an
-    /// entry was evicted, `false` if the pool was empty.
+    /// Evict the lowest-fee entry from the pool. Returns `true` if a
+    /// live entry was evicted, `false` if there was nothing evictable
+    /// — an empty index or a lowest bucket that turned out to hold
+    /// only stale hashes (drained so the caller can re-check the new
+    /// lowest density). Callers MUST handle `false`: inserting
+    /// anyway would grow the pool past `max_entries`.
     fn evict_lowest_fee(&mut self) -> bool {
         // The lowest fee density is the first key in `by_fee` (ascending).
         let Some(lowest_density) = self.by_fee.keys().next().copied() else {
@@ -364,14 +385,15 @@ impl Mempool {
         let Some(hashes) = self.by_fee.get_mut(&lowest_density) else {
             return false;
         };
-        // `by_fee` is lazily pruned — `select` no longer filters
-        // buckets per block, so a bucket may hold hashes already
-        // selected out of the pool. Skip stale entries and only
-        // evict a hash that still exists in `by_hash`.
+        // Every removal path keeps `by_fee` in sync with `by_hash`,
+        // so a bucket should only ever hold live hashes. The
+        // contains-key check is defence-in-depth for a corrupted
+        // internal state (a stale hash is skipped rather than
+        // evicting a ghost slot and reporting success).
         let hash = loop {
-            match hashes.pop() {
+            match hashes.pop_first() {
                 Some(h) if self.by_hash.contains_key(&h) => break h,
-                Some(_) => {} // stale — already selected
+                Some(_) => {} // stale — inconsistent state, skip
                 None => {
                     // Bucket drained (all stale) — remove it and
                     // report no eviction; the caller can retry.
@@ -398,8 +420,18 @@ impl Mempool {
     /// Select up to `max_bytes` of transactions, ordered by fee
     /// density (highest first), respecting per-account nonce ordering.
     ///
-    /// Returns the selected transactions as a `Vec<TxBytes>`. The
-    /// selected entries are removed from the pool.
+    /// Returns the selected transactions as a `Vec<TxBytes>` —
+    /// **without removing them from the pool**. Selection is a peek:
+    /// a proposed-but-uncommitted tx must survive a lost round, a
+    /// gas-filtered candidate must survive to the next block, and
+    /// the pool's job is to hold txs until they are *finalized*.
+    /// Removal happens in [`remove_committed`](Self::remove_committed)
+    /// when the executor finalizes a block, and in
+    /// [`refresh_anchors`](Self::refresh_anchors) for entries whose
+    /// nonce was consumed by a different tx. The previous remove-on-
+    /// select behaviour dropped every selected tx the moment a
+    /// proposal was built: a lost proposal or a gas-filter skip
+    /// erased the tx permanently — a silent liveness leak.
     ///
     /// The selection algorithm:
     /// 1. Iterate fee densities from highest to lowest.
@@ -505,37 +537,99 @@ impl Mempool {
             }
         }
 
-        // Batch-remove all selected entries in a single pass over each
-        // index. This is O(total pool size) — each fee bucket is
-        // filtered at most once, each sender queue is filtered at most
-        // once, and `by_hash` is drained in one pass.
-        // Move selected txs out of `by_hash` in selection order —
-        // no clone. Collect (sender, nonce) for index cleanup while
-        // already touching the entries.
+        // Peek: clone the selected txs out in selection order —
+        // entries stay in every index until `remove_committed` runs
+        // at finalization. `TxBytes` is a `Vec<u8>`, so this copies
+        // up to `max_bytes` of payload per proposal; at block
+        // cadence that memcpy is the price of keeping proposed txs
+        // alive across lost rounds (the alternative — removing at
+        // selection — silently dropped every tx in a losing
+        // proposal and every gas-filtered candidate).
         let mut selected = Vec::with_capacity(selected_order.len());
-        let mut sender_cleanups: Vec<(Address, u64)> = Vec::with_capacity(selected_order.len());
         for hash in selected_order {
-            if let Some(entry) = self.by_hash.remove(&hash) {
-                sender_cleanups.push((entry.sender, entry.nonce));
-                selected.push(entry.tx);
-            }
-        }
-
-        // Clean the per-sender queues for the selected txs. `by_fee`
-        // needs no per-block maintenance: it exists only for
-        // pool-full eviction (`evict_lowest_fee`), which lazily skips
-        // stale hashes — removing the per-block O(pool) retain pass
-        // was the point of the heap-walk select.
-        for (sender, nonce) in sender_cleanups {
-            if let Some(queue) = self.by_sender.get_mut(&sender) {
-                queue.remove(&nonce);
-                if queue.is_empty() {
-                    self.by_sender.remove(&sender);
-                }
+            if let Some(entry) = self.by_hash.get(&hash) {
+                selected.push(entry.tx.clone());
             }
         }
 
         selected
+    }
+
+    /// Remove committed transactions from the pool. Called by the
+    /// executor at block finalization (`finalize_block`) with the
+    /// block's tx list: a committed tx — whether it executed or was
+    /// skipped inside the block — has left the mempool's custody,
+    /// and re-proposing it can only waste block space (a nonce-
+    /// consumed copy is rejected by the executor's continuity gate;
+    /// a deterministically-skipped copy skips again). Entries are
+    /// removed from all three indices through the same path as
+    /// eviction and replacement, so `by_fee` never accumulates
+    /// tombstones — the steady-state leak the lazy-pruning scheme
+    /// allowed when selection drained the pool without touching the
+    /// fee index.
+    ///
+    /// Hashes are recomputed here because `FinalizedBlock` carries
+    /// only `TxBytes`: O(block txs) hashing on the commit path.
+    pub fn remove_committed(&mut self, txs: &[TxBytes]) {
+        for tx in txs {
+            let hash = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+            self.remove(&hash);
+        }
+    }
+
+    /// Refresh the executed-nonce anchors from the executor's
+    /// post-block nonce map, and prune entries whose nonce was
+    /// already consumed.
+    ///
+    /// The executor calls this once per executed block with its
+    /// `executed_nonce` map — the live update path the anchor
+    /// mechanism was built for (without it, `select` always
+    /// anchored at the sender's minimum queued nonce and could
+    /// re-propose already-executed nonces).
+    ///
+    /// # Map semantics: next-expected in, last-executed stored
+    ///
+    /// The executor's map stores the *next expected* nonce per
+    /// sender (`expected + 1` after each executed tx) while this
+    /// pool's `executed_nonces` — like `set_executed_nonce` —
+    /// records the *last executed* nonce (`select` starts at
+    /// `anchor + 1`). Refresh converts: `last = next - 1`. Only
+    /// senders with pooled transactions need an anchor, so the map
+    /// is *rebuilt* from `by_sender`'s keys each block: entries for
+    /// senders that left the pool are dropped, keeping the map
+    /// bounded by pool occupancy rather than growing forever with
+    /// every account ever executed.
+    ///
+    /// Pruning drops queued entries with `nonce < next_expected`:
+    /// their nonce slot is already spent (a different tx consumed
+    /// it — e.g. a same-nonce replacement that won in a competing
+    /// block), so they can never execute and would otherwise occupy
+    /// pool space until a size-cap eviction reached them.
+    pub fn refresh_anchors(&mut self, next_expected: &HashMap<Address, u64>) {
+        self.executed_nonces = self
+            .by_sender
+            .keys()
+            .filter_map(|sender| {
+                next_expected
+                    .get(sender)
+                    // `next - 1` = last executed. A `next` of 0 is
+                    // corrupt (a consumed nonce is at least 1) —
+                    // skip the anchor rather than underflow.
+                    .and_then(|&next| next.checked_sub(1))
+                    .map(|last| (*sender, last))
+            })
+            .collect();
+        // Collect stale hashes first — `by_sender` can't be mutated
+        // while its queues are borrowed for the range scan.
+        let mut stale: Vec<Hash> = Vec::new();
+        for (sender, queue) in &self.by_sender {
+            if let Some(&next) = next_expected.get(sender) {
+                stale.extend(queue.range(..next).map(|(_, &hash)| hash));
+            }
+        }
+        for hash in stale {
+            self.remove(&hash);
+        }
     }
 
     /// Snapshot the pool for `txpool_*`-style introspection.
@@ -586,14 +680,17 @@ impl Mempool {
 
     /// Remove a single transaction by hash from all indices. This is
     /// the per-tx removal path — used by same-nonce replacement in
-    /// [`submit`](Self::submit) and when a specific tx needs to be
-    /// dropped (e.g. after a failed proposal or mempool eviction).
-    /// [`select`](Self::select) removes in bulk for the block path.
+    /// [`submit`](Self::submit), by [`remove_committed`](
+    /// Self::remove_committed) at finalization, by
+    /// [`refresh_anchors`](Self::refresh_anchors) pruning, and by
+    /// pool-full eviction. Keeping every removal on this one path is
+    /// what guarantees `by_fee` stays exactly in sync with
+    /// `by_hash`.
     fn remove(&mut self, hash: &Hash) {
         if let Some(entry) = self.by_hash.remove(hash) {
             let density = FeeDensity { fee: entry.fee, size: entry.size };
             if let Some(hashes) = self.by_fee.get_mut(&density) {
-                hashes.retain(|h| h != hash);
+                hashes.remove(hash);
                 if hashes.is_empty() {
                     self.by_fee.remove(&density);
                 }
@@ -703,7 +800,11 @@ mod tests {
         assert_eq!(pool.len(), 1);
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 1);
-        assert_eq!(pool.len(), 0, "selected txs are removed");
+        // Selection is a peek — the tx stays pooled until the block
+        // finalizes, so a losing proposal can't lose it.
+        assert_eq!(pool.len(), 1, "peek select leaves entries pooled");
+        pool.remove_committed(&selected);
+        assert_eq!(pool.len(), 0, "finalization removes committed txs");
     }
 
     #[test]
@@ -776,7 +877,8 @@ mod tests {
         assert_eq!(nonce0, 0);
         let (_, nonce1, _) = parse_tx(selected[1].as_bytes()).unwrap();
         assert_eq!(nonce1, 1);
-        // Both txs are removed from the pool.
+        // Both txs stay pooled until finalization removes them.
+        pool.remove_committed(&selected);
         assert_eq!(pool.len(), 0);
     }
 
@@ -789,7 +891,10 @@ mod tests {
         // Budget for only one tx (58 bytes).
         let selected = pool.select(58);
         assert_eq!(selected.len(), 1);
-        assert_eq!(pool.len(), 1, "one tx remains");
+        assert_eq!(pool.len(), 2, "peek: both txs stay pooled");
+        // After the selected tx commits, one remains for next block.
+        pool.remove_committed(&selected);
+        assert_eq!(pool.len(), 1, "one tx remains after commit");
     }
 
     #[test]
@@ -916,7 +1021,12 @@ mod tests {
         assert_eq!(pool.len(), 10);
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 10, "all 10 txs should be selected");
-        assert_eq!(pool.len(), 0, "pool should be empty after selection");
+        pool.remove_committed(&selected);
+        assert_eq!(pool.len(), 0, "pool should be empty after commit");
+        // Committing drained every index — a `by_fee` tombstone
+        // would leave a non-empty bucket behind.
+        assert!(pool.by_fee.is_empty(), "fee index fully drained");
+        assert!(pool.by_sender.is_empty(), "sender index fully drained");
     }
 
     /// Prove that batch removal correctly cleans up sender queues
@@ -928,9 +1038,10 @@ mod tests {
         pool.submit(build_tx(addr(1), 0, 100, &[0])).unwrap();
         pool.submit(build_tx(addr(1), 1, 100, &[0])).unwrap();
         pool.submit(build_tx(addr(1), 2, 100, &[0])).unwrap();
-        // Select all — batch removal should clean up the sender queue.
+        // Commit all — removal should clean up the sender queue.
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 3);
+        pool.remove_committed(&selected);
         assert_eq!(pool.len(), 0);
         // The sender's queue should be gone (no orphaned entries).
         // Verify by submitting a new tx from the same sender — it
@@ -959,13 +1070,16 @@ mod tests {
         let spammer_txs =
             selected.iter().filter(|tx| parse_tx(tx.as_bytes()).unwrap().0 == addr(1)).count();
         assert_eq!(spammer_txs, 2, "cap must bound the spammer to 2 txs");
-        assert_eq!(pool.len(), 3, "3 spammer txs remain after the capped selection");
         // The victim's tx is selected too (room left after capping).
         assert!(
             selected.iter().any(|tx| parse_tx(tx.as_bytes()).unwrap().0 == addr(2)),
             "the victim's tx must not be starved"
         );
-        // Next select drains the spammer's remaining nonce chain.
+        // Peek: nothing leaves the pool until the block commits.
+        assert_eq!(pool.len(), 6, "peek keeps all entries pooled");
+        // Commit the selected txs, then the next select takes the
+        // spammer's next two capped nonces.
+        pool.remove_committed(&selected);
         let selected2 = pool.select(1 << 20);
         assert_eq!(selected2.len(), 2, "next block takes the next 2 capped txs");
     }
@@ -1063,7 +1177,9 @@ mod tests {
         }
         let selected = pool.select(1 << 20);
         assert_eq!(selected.len(), 3, "chain stops at cap even with more nonces");
-        // Nonces `0..2` selected, `3..5` remain.
+        // Peek: nonces `0..2` selected, all 6 stay pooled; commit
+        // removes the selected three.
+        pool.remove_committed(&selected);
         assert_eq!(pool.len(), 3);
     }
 
@@ -1084,5 +1200,107 @@ mod tests {
         let snap = pool.txpool_snapshot();
         assert_eq!(snap.len(), 2);
         assert!(snap.iter().all(|(_, _, _, pending)| !pending));
+    }
+
+    // ---- Finalization-custody tests (peek select + commit removal) ----
+
+    /// A tx in a losing proposal must survive: `select` is a peek,
+    /// so the same candidate is re-proposed until a block commits
+    /// it. The old remove-on-select behaviour silently dropped every
+    /// tx in any proposal that didn't win.
+    #[test]
+    fn losing_proposal_keeps_txs() {
+        let mut pool = Mempool::new(100);
+        pool.submit(build_tx(addr(1), 0, 100, &[1])).unwrap();
+        let first = pool.select(1 << 20);
+        assert_eq!(first.len(), 1);
+        // The proposal loses (no `remove_committed`) — the next
+        // selection must still offer the tx.
+        let second = pool.select(1 << 20);
+        assert_eq!(second, first, "uncommitted txs stay re-proposable");
+        // And when a block DOES commit it, it leaves for good.
+        pool.remove_committed(&second);
+        assert!(pool.select(1 << 20).is_empty());
+    }
+
+    /// `remove_committed` drains every index — no `by_fee` tombstone
+    /// may survive steady-state propose→commit cycles (the leak the
+    /// lazy-pruning scheme allowed).
+    #[test]
+    fn commit_cycles_leave_no_fee_tombstones() {
+        let mut pool = Mempool::new(100);
+        for round in 0..5u64 {
+            for i in 0..4u8 {
+                pool.submit(build_tx(addr(i), round, 100 + round, &[0])).unwrap();
+            }
+            let selected = pool.select(1 << 20);
+            pool.remove_committed(&selected);
+        }
+        assert_eq!(pool.len(), 0);
+        assert!(
+            pool.by_fee.values().all(BTreeSet::is_empty),
+            "every fee bucket must be empty after commit removal"
+        );
+        assert!(pool.by_fee.is_empty(), "no empty-bucket keys may linger either");
+    }
+
+    /// A `by_fee` bucket made entirely of stale hashes must not let
+    /// the pool exceed `max_entries`: the submit loop retries the
+    /// eviction until a *live* entry is removed or a real `PoolFull`
+    /// is decided against the next bucket's density.
+    #[test]
+    fn eviction_retries_past_stale_bucket() {
+        let mut pool = Mempool::new(2);
+        pool.submit(build_tx(addr(1), 0, 50, &[0])).unwrap();
+        pool.submit(build_tx(addr(2), 0, 60, &[0])).unwrap();
+        // Corrupt the index the way the old lazy-prune scheme left
+        // it: a tombstone hash in the lowest bucket, present in
+        // `by_fee` but absent from `by_hash`.
+        let ghost = Hasher::hash_one(Domain::Transaction, b"ghost");
+        pool.by_fee.entry(FeeDensity { fee: 1, size: 1 }).or_default().insert(ghost);
+        // A new tx outbidding the live floor must still get in — the
+        // stale bucket drains, then a real entry is evicted.
+        pool.submit(build_tx(addr(3), 0, 70, &[0])).unwrap();
+        assert_eq!(pool.len(), 2, "pool stays at capacity");
+        assert!(!pool.contains(&ghost), "tombstone bucket is gone");
+    }
+
+    /// `refresh_anchors` wires the executor's post-block nonce map
+    /// into selection: consumed nonces are pruned outright, and the
+    /// anchor re-bases the sender's chain at `executed + 1`.
+    #[test]
+    fn refresh_anchors_prunes_consumed_nonces() {
+        let mut pool = Mempool::new(100);
+        for nonce in 0..3u64 {
+            pool.submit(build_tx(addr(1), nonce, 100, &[0])).unwrap();
+        }
+        pool.submit(build_tx(addr(2), 0, 100, &[0])).unwrap();
+        // A block consumed addr(1) nonces 0 and 1 — the executor's
+        // map reports the *next* expected nonce (2).
+        let next_expected = HashMap::from([(addr(1), 2u64)]);
+        pool.refresh_anchors(&next_expected);
+        assert_eq!(pool.len(), 2, "nonces 0 and 1 are pruned");
+        // The next selection starts at nonce 2 — the consumed
+        // entries can't be re-proposed.
+        let selected = pool.select(1 << 20);
+        assert_eq!(selected.len(), 2);
+        let (s0, n0, _) = parse_tx(selected[0].as_bytes()).unwrap();
+        assert_eq!((s0, n0), (addr(2), 0), "equal density: higher address wins the heap tie-break");
+        let (s1, n1, _) = parse_tx(selected[1].as_bytes()).unwrap();
+        assert_eq!((s1, n1), (addr(1), 2), "addr(1)'s chain re-bases at nonce 2");
+    }
+
+    /// Anchors for senders that left the pool are dropped on
+    /// refresh, so `executed_nonces` stays bounded by pool
+    /// occupancy rather than every account ever executed.
+    #[test]
+    fn refresh_anchors_drops_departed_senders() {
+        let mut pool = Mempool::new(100);
+        pool.submit(build_tx(addr(1), 5, 100, &[0])).unwrap();
+        pool.set_executed_nonce(addr(1), 4);
+        pool.set_executed_nonce(addr(9), 10); // not pooled
+        pool.refresh_anchors(&HashMap::from([(addr(1), 4u64), (addr(9), 10u64)]));
+        assert_eq!(pool.executed_nonces.len(), 1, "only pooled senders keep an anchor");
+        assert!(pool.executed_nonces.contains_key(&addr(1)));
     }
 }

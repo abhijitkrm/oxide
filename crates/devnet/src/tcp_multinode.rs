@@ -633,9 +633,8 @@ impl TcpMultiNodeDevnet {
         // Prefunded senders are credited `genesis_balance` base
         // units (scaled to wei) so delegation bonds, fills, gas,
         // and fees all debit the same accounts EVM txs see.
-        let evm_module = Arc::new(
-            evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL),
-        );
+        let evm_module =
+            Arc::new(evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL));
         let genesis_wei = u128::from(genesis_balance) * framework::WEI_PER_UNIT;
         for sender_byte in 0u8..num_senders {
             evm_module.fund_account_for_test(&primitives::Address([sender_byte; 20]), genesis_wei);

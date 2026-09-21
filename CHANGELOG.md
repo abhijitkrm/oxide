@@ -2085,6 +2085,46 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     enforced budget, and creating a market at all now requires
     the validator committee to agree.
 
+- **Mempool keeps transactions until they are final, and its fee
+  index can no longer leak** (`crates/mempool`,
+  `crates/executor`)
+  - Selection is now a peek: transactions chosen for a proposal
+    stay in the pool until a block actually commits them
+    (`finalize_block` calls `remove_committed`). A proposal that
+    loses its round no longer erases its transactions from the
+    node — with no mempool gossip layer, the submitter's own node
+    was previously the only copy, so a lost round meant silent
+    loss. Candidates skipped by the proposal-time gas filter also
+    survive for the next block instead of being deleted.
+  - `executed_nonce` anchoring is wired live: `execute_block`
+    pushes its post-block nonce map into the pool each commit,
+    which re-bases per-sender selection and prunes entries whose
+    nonce a competing transaction already consumed. Anchors are
+    rebuilt for pooled senders only, so the map stays bounded by
+    pool occupancy.
+  - The fee index can no longer accumulate tombstones: every
+    removal path (commit, eviction, replacement, anchor pruning)
+    goes through one index-consistent `remove`, and fee buckets
+    are sets, so the index's size tracks the pool's live contents
+    instead of total historical throughput.
+  - Pool-full eviction now retries until a live entry is actually
+    evicted — a drained stale bucket can no longer push the pool
+    past its capacity bound.
+  - Two intake fixes in the same area: the preverified-sender
+    cache is populated only after bounded-intake acceptance (a
+    flood of rejected submissions could previously grow the one
+    unbounded map), and `ingest_tx_batch` maps pool rejections
+    back to the transaction's position in the caller's batch
+    instead of the filtered position — a rejection could
+    previously acknowledge the wrong transaction.
+  - **In plain words:** the mempool used to throw away your
+    transaction the instant the node drafted a block proposal —
+    if that proposal lost, the transaction was gone with no way
+    to recover it. Now transactions only leave once a block
+    finalizes them. A slow memory leak in the fee index is
+    sealed, and the "your transaction was rejected" receipts can
+    no longer be attached to the wrong transaction.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

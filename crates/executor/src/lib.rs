@@ -2544,6 +2544,17 @@ impl Executor {
             module_roots.push(module.state_root());
         }
 
+        // Push the fresh nonce anchors into the mempool — the live
+        // update path the pool's `executed_nonces` anchoring was
+        // built for. `refresh_anchors` also prunes pooled entries
+        // whose nonce this block consumed (a losing same-nonce
+        // candidate can never execute), so stale entries don't
+        // linger until a size-cap eviction reaches them.
+        self.mempool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .refresh_anchors(&local_nonce);
+
         // H4/H5: persist the updated nonce map. `local_nonce` was
         // advanced as each tx passed the continuity check. We write
         // it back in a single lock acquisition so the next block's
@@ -2554,6 +2565,22 @@ impl Executor {
 
         canonical_state_root(module_roots, nonce_root)
     }
+}
+
+/// A batch-ingest tx that passed validation and awaits pool
+/// submission. Carries the metadata the pool-admission pass needs
+/// that the tx bytes alone can't recover.
+struct AcceptedTx {
+    /// The tx's index in the *caller's* batch — the `results` slot
+    /// a pool rejection must be written back to. `accepted_txs` is
+    /// filtered, so its own position cannot stand in for this.
+    result_idx: usize,
+    /// The preverified `(tx_hash, sender)` pair to cache once the
+    /// pool admits the tx — `None` for admitted-unsigned txs with
+    /// no authenticated sender.
+    cacheable: Option<(Hash, [u8; 20])>,
+    /// The transaction itself.
+    tx: TxBytes,
 }
 
 impl AppInterface for Executor {
@@ -2640,27 +2667,28 @@ impl AppInterface for Executor {
         // `PreverifiedTx` borrows the payload slice.
         let msgs = [payload];
         let preverify_result = module.preverify_batch(&msgs);
-        if let Ok(preverified) = &preverify_result[0] {
-            let trustworthy = if preverified.sender != [0u8; 20] {
-                Some(preverified.sender)
-            } else if envelope_verified {
-                Some(ctx.sender.0)
-            } else {
-                None
-            };
-            if let Some(sender) = trustworthy {
-                let tx_hash = crypto::hash::Hasher::hash_one(
-                    crypto::hash::Domain::Transaction,
-                    tx.as_bytes(),
-                );
-                // Only the sender is cached — the payload is
-                // re-borrowed from the block's tx at execution time.
-                self.preverify_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(tx_hash, sender);
-            }
-        }
+        // Compute the cacheable entry now but insert it only if the
+        // bounded intake accepts the tx below — a cache populated
+        // ahead of admission grew on *rejected* submissions (an
+        // intake-full flood filled it with senders for txs the pool
+        // never held), the one intake-side map that wasn't bounded
+        // by any capacity check. The hash is taken now because `tx`
+        // moves into the channel below.
+        let cacheable = preverify_result[0]
+            .as_ref()
+            .ok()
+            .and_then(|preverified| {
+                if preverified.sender != [0u8; 20] {
+                    Some(preverified.sender)
+                } else if envelope_verified {
+                    Some(ctx.sender.0)
+                } else {
+                    None
+                }
+            })
+            .map(|sender| {
+                (crypto::hash::Hasher::hash_one(crypto::hash::Domain::Transaction, bytes), sender)
+            });
 
         // Push to the bounded intake ring. The mempool submission
         // is deferred to `prepare_proposal` — this eliminates the
@@ -2676,7 +2704,18 @@ impl AppInterface for Executor {
         // deadlock: a full intake returns `Rejected` (backpressure)
         // instead of blocking forever. The caller can retry later.
         match self.mempool_intake_tx.try_send(tx) {
-            Ok(()) => MempoolAck::Accepted,
+            Ok(()) => {
+                if let Some((tx_hash, sender)) = cacheable {
+                    // Only the sender is cached — the payload is
+                    // re-borrowed from the block's tx at execution
+                    // time.
+                    self.preverify_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(tx_hash, sender);
+                }
+                MempoolAck::Accepted
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 MempoolAck::Rejected { reason: "intake ring full".to_string() }
             }
@@ -2693,8 +2732,13 @@ impl AppInterface for Executor {
     fn ingest_tx_batch(&self, txs: Vec<TxBytes>) -> Vec<MempoolAck> {
         let mut results = Vec::with_capacity(txs.len());
         // Validate and preverify each tx, collecting the accepted
-        // ones for batch submission to the mempool.
-        let mut accepted_txs: Vec<TxBytes> = Vec::with_capacity(txs.len());
+        // ones for batch submission to the mempool. Each entry
+        // carries its index into `results` (the accepted vec is
+        // filtered — position `i` here is not position `i` in the
+        // caller's batch) and an optional preverified
+        // `(tx_hash, sender)` that is cached only if the pool
+        // accepts the tx.
+        let mut accepted_txs: Vec<AcceptedTx> = Vec::with_capacity(txs.len());
         for tx in txs {
             let bytes = tx.as_bytes();
             let Some(ctx) = parse_tx_context(bytes) else {
@@ -2762,31 +2806,34 @@ impl AppInterface for Executor {
             // false and the group keeps the plain `handle_batch`
             // path. `msgs` must outlive `preverify_result` — the
             // returned `PreverifiedTx` borrows the payload slice.
+            // The entry is *computed* here but cached only after the
+            // pool accepts the tx below — caching ahead of bounded
+            // admission let rejected submissions grow the map past
+            // every capacity check.
             let msgs = [payload];
             let preverify_result = module.preverify_batch(&msgs);
-            if let Ok(preverified) = &preverify_result[0] {
-                let trustworthy = if preverified.sender != [0u8; 20] {
-                    Some(preverified.sender)
-                } else if envelope_verified {
-                    Some(ctx.sender.0)
-                } else {
-                    None
-                };
-                if let Some(sender) = trustworthy {
-                    let tx_hash = crypto::hash::Hasher::hash_one(
-                        crypto::hash::Domain::Transaction,
-                        tx.as_bytes(),
-                    );
-                    // Only the sender is cached — the payload is
-                    // re-borrowed from the block's tx at execution
-                    // time.
-                    self.preverify_cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(tx_hash, sender);
-                }
-            }
-            accepted_txs.push(tx);
+            let cacheable = preverify_result[0]
+                .as_ref()
+                .ok()
+                .and_then(|preverified| {
+                    if preverified.sender != [0u8; 20] {
+                        Some(preverified.sender)
+                    } else if envelope_verified {
+                        Some(ctx.sender.0)
+                    } else {
+                        None
+                    }
+                })
+                .map(|sender| {
+                    (
+                        crypto::hash::Hasher::hash_one(
+                            crypto::hash::Domain::Transaction,
+                            tx.as_bytes(),
+                        ),
+                        sender,
+                    )
+                });
+            accepted_txs.push(AcceptedTx { result_idx: results.len(), cacheable, tx });
             results.push(MempoolAck::Accepted);
         }
         // Batch-submit all accepted txs to the mempool in one lock
@@ -2794,10 +2841,28 @@ impl AppInterface for Executor {
         if !accepted_txs.is_empty() {
             let mut mempool =
                 self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (i, tx) in accepted_txs.into_iter().enumerate() {
-                if let Err(e) = mempool.submit(tx) {
-                    // Overwrite the Accepted result with the rejection.
-                    results[i] = MempoolAck::Rejected { reason: format!("{e:?}") };
+            // `result_idx` is the tx's index in the *caller's*
+            // batch — `accepted_txs` is filtered, so a positional
+            // `enumerate()` would write pool rejections into the
+            // wrong result slots (acknowledging a rejected tx as
+            // Accepted and re-rejecting an unrelated one — the bug
+            // this field fixes).
+            for AcceptedTx { result_idx, cacheable, tx } in accepted_txs {
+                match mempool.submit(tx) {
+                    Ok(()) => {
+                        // Admitted — now the preverified sender may
+                        // be cached.
+                        if let Some((tx_hash, sender)) = cacheable {
+                            self.preverify_cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(tx_hash, sender);
+                        }
+                    }
+                    Err(e) => {
+                        // Overwrite the Accepted result with the rejection.
+                        results[result_idx] = MempoolAck::Rejected { reason: format!("{e:?}") };
+                    }
                 }
             }
         }
@@ -3009,6 +3074,17 @@ impl AppInterface for Executor {
 
     fn finalize_block(&self, block: &FinalizedBlock) -> CommitAck {
         let start = std::time::Instant::now();
+        // Remove the committed txs from the mempool at finality.
+        // `select` is a peek — pooled entries outlive proposals — so
+        // this is the single point where inclusion becomes permanent
+        // and the pool releases custody. Doing it here (rather than
+        // inside `execute_block`) also covers the async lane: a
+        // committed tx can never be re-proposed by a `prepare` that
+        // runs while the worker is still draining the backlog.
+        self.mempool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_committed(&block.txs);
         if let Some(tx) = self.exec_lane_tx.get() {
             // Async execution lane: `finalized` and the proposal
             // height advance now — they record *ordering* finality,
@@ -5342,6 +5418,105 @@ mod tests {
             *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             6,
             "every committed block executed exactly once"
+        );
+    }
+
+    // ---- Mempool finality-custody tests ----
+
+    /// A tx in a proposal that never commits must stay re-proposable:
+    /// `select` is a peek, so losing the round doesn't lose the tx.
+    /// The old remove-on-select path drained the pool the moment a
+    /// proposal was built — a losing proposal erased its txs forever.
+    #[test]
+    fn uncommitted_proposal_keeps_txs() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        executor.ingest_tx(make_tx(1, &[42]));
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let first = executor.prepare_proposal(&budget);
+        assert_eq!(first.txs.len(), 1);
+        // The proposal loses — no `finalize_block` — so the next
+        // round's proposal must offer the same tx again.
+        let second = executor.prepare_proposal(&budget);
+        assert_eq!(second.txs.len(), 1, "uncommitted txs stay re-proposable");
+        assert_eq!(second.txs, first.txs);
+    }
+
+    /// The mirror image: txs DO leave the pool — but only when a
+    /// block finalizes them.
+    #[test]
+    fn committed_txs_leave_pool_at_finalize() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        executor.ingest_tx(make_tx(1, &[42]));
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        assert_eq!(proposal.txs.len(), 1);
+        // Before finality the tx is still pooled.
+        assert_eq!(executor.mempool_len(), 1);
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        });
+        assert_eq!(executor.mempool_len(), 0, "committed txs leave the pool");
+        assert!(
+            executor.prepare_proposal(&budget).txs.is_empty(),
+            "nothing may be re-proposed after commit"
+        );
+    }
+
+    /// Candidates the proposal-time gas filter skips must survive
+    /// for the next block — previously they were silently deleted
+    /// with the rest of the selection.
+    #[test]
+    fn gas_filtered_candidates_stay_pooled() {
+        let mut executor =
+            Executor::with_config(100, DEFAULT_PARALLEL_THRESHOLD).with_gas_limit(2500);
+        executor.register_module(Arc::new(CounterModule::new()));
+        // Four ~1001-gas txs; only 2 fit under a 2500 cap per block.
+        for n in 0..4u64 {
+            let tx = make_tx_with_nonce(1, &[u8::try_from(n).unwrap_or(0xff)], n);
+            assert!(matches!(executor.ingest_tx(tx), MempoolAck::Accepted));
+        }
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let first = executor.prepare_proposal(&budget);
+        assert_eq!(first.txs.len(), 2);
+        // Committing the first two leaves the filtered two pooled —
+        // they fill the next block exactly.
+        executor.finalize_block(&FinalizedBlock {
+            height: Height::new(0),
+            txs: first.txs,
+            signers: Vec::new(),
+        });
+        let second = executor.prepare_proposal(&budget);
+        assert_eq!(second.txs.len(), 2, "filtered candidates fill the next block");
+    }
+
+    /// `ingest_tx_batch` must map pool rejections back to the
+    /// tx's slot in the *caller's* batch — the filtered `accepted`
+    /// vec's position used to be used as the index, so a rejection
+    /// overwrote an unrelated earlier `Accepted` result and left the
+    /// actually-rejected tx acknowledged.
+    #[test]
+    fn batch_acks_map_to_original_indices() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let good = make_tx(1, &[42]);
+        let results = executor.ingest_tx_batch(vec![
+            TxBytes::new(vec![1, 2, 3]), // malformed — rejected in validation
+            good.clone(),                // accepted
+            good,                        // duplicate — rejected by the pool
+        ]);
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0], MempoolAck::Rejected { .. }), "malformed tx rejected");
+        assert!(
+            matches!(results[1], MempoolAck::Accepted),
+            "the valid tx must be acknowledged Accepted — not clobbered by the duplicate's rejection"
+        );
+        assert!(
+            matches!(results[2], MempoolAck::Rejected { .. }),
+            "the duplicate must be the one reported Rejected"
         );
     }
 }

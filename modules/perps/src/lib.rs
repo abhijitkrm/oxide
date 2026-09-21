@@ -1938,8 +1938,7 @@ impl PerpsModule {
         // a slot. `base.validate` also caps `max_resting`
         // at `MAX_RESTING_LIMIT`, bounding the arenas
         // `list_market` allocates at quorum.
-        cfg.validate()
-            .map_err(|e| ExecError::ModuleRejected(format!("list_market: {e}")))?;
+        cfg.validate().map_err(|e| ExecError::ModuleRejected(format!("list_market: {e}")))?;
         // Same quorum gate as `TAG_SET_MARK`: a listing
         // eagerly allocates the market's order-pool and
         // id-map arenas, so an unauthenticated listing is a
@@ -1956,11 +1955,9 @@ impl PerpsModule {
                 data: body.to_vec(),
             }]),
             framework::EndorsementOutcome::Quorum => match self.list_market(cfg) {
-                Ok(id) => Ok(vec![Event {
-                    module: "perps",
-                    kind: "market_listed",
-                    data: vec![id],
-                }]),
+                Ok(id) => {
+                    Ok(vec![Event { module: "perps", kind: "market_listed", data: vec![id] }])
+                }
                 // Quorum reached but the listing no longer
                 // applies (e.g. all slots filled while the
                 // proposal accumulated votes).

@@ -16698,3 +16698,52 @@ millisecond-scale refills/expiry against scheduler stalls.
 105 p2p + 115 matcher + 68 perps + 44 exchange + 88 executor + 56
 storage + 59 trading + 6 statesync tests green; clippy clean on all
 touched crates (p2p both feature sets); fmt clean.
+
+## Mempool custody moves to finality — and the fee index can't leak (audit 6.4)
+
+The pool removed every selected tx the moment a proposal was built.
+Three consequences, all bad: a losing proposal erased its txs forever
+(no gossip layer exists to resurrect them — the submitter's own node
+was the only copy); `prepare_proposal`'s gas filter silently deleted
+candidates it skipped; and the `by_fee` index kept every selected
+hash as a tombstone until an eviction happened to reach it — a
+steady-state leak proportional to total throughput, not pool size.
+
+`select` is now a **peek**: candidates are cloned out but stay in all
+indices. Removal happens exactly once — `remove_committed` at
+`finalize_block`, on the consensus thread, before the async exec
+lane's lag can let a committed tx slip into the next proposal. All
+removals (commit, eviction, replacement, anchor pruning) share one
+path that keeps `by_fee` in sync; buckets became `BTreeSet`s so
+member removal is O(log n) instead of a Vec scan.
+
+The eviction result is now checked in a retry loop: an all-tombstone
+bucket drain no longer lets the pool exceed `max_entries` by one per
+call.
+
+`executed_nonces` anchoring finally has its live update path —
+`set_executed_nonce` existed but no production code called it.
+`execute_block` now feeds its post-block map into `refresh_anchors`
+each commit: anchors are rebuilt for *pooled* senders only (the map
+can't grow with every account ever executed), and pooled entries
+below the next-expected nonce are pruned — a losing same-nonce
+candidate can never execute, so it leaves rather than waiting for a
+size-cap eviction. One subtlety mattered: the executor's map stores
+*next-expected* (`expected + 1`) while pool anchors are
+*last-executed* (`start = anchor + 1`) — refresh converts, and a
+regression test pins the boundary.
+
+Two intake-side fixes in the same blast radius: the preverify cache
+was populated *before* bounded-intake acceptance, so a flood of
+rejected submissions still filled the one unbounded map — inserts
+are now gated on actual admission (`try_send` success / `submit`
+success). And `ingest_tx_batch` wrote pool rejections into
+`results[i]` where `i` indexed the *filtered* accepted vec, not the
+caller's batch — a rejection could overwrite an unrelated `Accepted`
+while the actually-rejected tx stayed acknowledged. The original
+index now travels with each accepted tx; a malformed,valid,dup batch
+proves the three acks land in order.
+
+30 mempool + executor tests green (peek re-proposal, commit drain,
+no-tombstone cycles, stale-bucket eviction retry, anchor pruning,
+batch-ack mapping, gas-filter survival).

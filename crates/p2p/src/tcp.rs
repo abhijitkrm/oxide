@@ -1131,13 +1131,7 @@ impl TcpTransport {
                     let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
                     let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
                     let write_stream = Box::new(shared) as Box<dyn PeerStream>;
-                    install_connected_peer(
-                        &ctx,
-                        pid,
-                        reader_stream,
-                        write_stream,
-                        shutdown_stream,
-                    );
+                    install_connected_peer(&ctx, pid, reader_stream, write_stream, shutdown_stream);
                     return;
                 }
             }
@@ -1206,10 +1200,7 @@ fn install_connected_peer(
             .insert(pid.clone(), shutdown_stream);
     }
     let slot = spawn_writer(write_stream, &ctx.shutdown);
-    ctx.streams
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(pid.clone(), slot);
+    ctx.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(pid.clone(), slot);
     reader_loop(
         reader_stream,
         pid,
