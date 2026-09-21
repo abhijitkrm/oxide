@@ -16610,3 +16610,31 @@ Tests: `rate_limit_applies_per_real_ip` (per-source buckets),
 `ws_requests_share_the_per_ip_rate_budget` (real tungstenite
 client floods a 3 req/s server — tail gets -32005). 90 rpc lib +
 6 ws + 2 state-sync tests green; fmt + clippy clean.
+
+## TCP framing resumes mid-frame instead of desyncing (audit 6.2)
+
+`read_frame` used two `read_exact` calls with local buffers. On a
+`TimedOut`/`WouldBlock` the reader loop retried the whole call —
+but `read_exact` had already consumed bytes, so the retry read the
+middle of a payload as the next length prefix. One stalled read
+scrambled every subsequent frame on the connection (or fabricated
+a giant bogus length and stalled behind it forever). TLS made it
+worse: the 500 ms poll timeout makes mid-frame stalls routine, so
+"just close on partial timeout" would kill healthy connections.
+
+The fix is the audit's first option — incremental framing state.
+`FrameReader` keeps a 4-byte prefix cursor plus the payload buffer
+and its fill cursor; `PeerStream::read_frame` now takes the
+caller-owned decoder and returns `Ok(None)` on timeout with every
+consumed byte retained, `Ok(Some)` on a completed frame, `Err` on
+real I/O/oversize/EOF-mid-frame (fatal — close). The reader loop
+owns one decoder per connection, so a stall simply resumes on the
+next poll. Accept-time handshakes keep the old whole-call
+`read_frame` — a failed accept closes the stream anyway, so no
+desync is possible there.
+
+A scripted `Read` that dribbles bytes and injects `WouldBlock`
+proves: stalls return `None` with state retained, completed frames
+deliver exact bytes, oversize prefixes error regardless of poll
+count, and EOF mid-frame is a fatal truncation. 101 p2p tests
+green (both feature sets clippy-clean); fmt clean.

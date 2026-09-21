@@ -71,13 +71,25 @@ use crate::admission::SharedAdmissionControl;
 /// `dyn Write` on stable. Putting the frame methods on the trait
 /// avoids the upcasting issue entirely.
 pub trait PeerStream: Send {
-    /// Read a length-prefixed frame from the stream.
+    /// Read the next length-prefixed frame from the stream through
+    /// the caller-owned incremental [`FrameReader`].
+    ///
+    /// `Ok(Some)` delivers a complete frame; `Ok(None)` means the
+    /// stream timed out or would block mid-frame — `state` retains
+    /// every consumed byte so the next call resumes exactly where
+    /// this one stopped (a fresh `read_frame` per attempt would
+    /// re-interpret the middle of the payload as a length prefix —
+    /// the stream desync the audit flagged).
     ///
     /// # Errors
     ///
-    /// Returns `Err` on I/O error, EOF, timeout, or if the frame
-    /// exceeds `max_message_bytes`.
-    fn read_frame(&mut self, max_message_bytes: u64) -> io::Result<Vec<u8>>;
+    /// Returns `Err` on I/O error, EOF, or if the frame exceeds
+    /// `max_message_bytes` — all fatal to the connection.
+    fn read_frame(
+        &mut self,
+        state: &mut FrameReader,
+        max_message_bytes: u64,
+    ) -> io::Result<Option<Vec<u8>>>;
 
     /// Write a length-prefixed frame to the stream.
     ///
@@ -106,8 +118,12 @@ pub trait PeerStream: Send {
 }
 
 impl PeerStream for TcpStream {
-    fn read_frame(&mut self, max_message_bytes: u64) -> io::Result<Vec<u8>> {
-        read_frame(self, max_message_bytes)
+    fn read_frame(
+        &mut self,
+        state: &mut FrameReader,
+        max_message_bytes: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        state.poll(self, max_message_bytes)
     }
 
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -205,9 +221,13 @@ impl<S: Read + Write + Send> Write for SharedStream<S> {
 
 #[cfg(feature = "tls")]
 impl<S: Read + Write + Send> PeerStream for SharedStream<S> {
-    fn read_frame(&mut self, max_message_bytes: u64) -> io::Result<Vec<u8>> {
+    fn read_frame(
+        &mut self,
+        state: &mut FrameReader,
+        max_message_bytes: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
         let mut stream = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        read_frame(&mut *stream, max_message_bytes)
+        state.poll(&mut *stream, max_message_bytes)
     }
 
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -1131,9 +1151,140 @@ impl Transport for TcpTransport {
     }
 }
 
+/// Incremental length-prefixed frame decoder — the framing state
+/// the reader loop owns per connection so a read timeout mid-frame
+/// *resumes* the partial frame instead of restarting at a fresh
+/// boundary.
+///
+/// The audit flagged the old behavior: `read_exact` consumes bytes
+/// before it times out, so retrying a whole `read_frame` call
+/// re-interpreted the middle of a payload as the next length
+/// prefix — a silent stream desync that scrambles every message
+/// after it (or fabricates a bogus length and stalls behind a fake
+/// giant frame). With this decoder, `Ok(None)` means "the stream
+/// timed out / would block and no bytes were lost — call again";
+/// the next call picks up exactly where the last one stopped.
+///
+/// A decoder is NOT reusable across connections: it belongs to one
+/// ordered byte stream.
+#[derive(Default)]
+pub struct FrameReader {
+    /// Length-prefix buffer; `len_pos` bytes filled so far.
+    len_buf: [u8; 4],
+    /// Bytes of `len_buf` already consumed from the stream.
+    len_pos: usize,
+    /// Allocated payload buffer once the length is known;
+    /// `payload_pos` bytes filled so far.
+    payload: Option<Vec<u8>>,
+    /// Bytes of the payload already consumed.
+    payload_pos: usize,
+}
+
+impl FrameReader {
+    /// Create a fresh decoder positioned at a frame boundary.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drive the decode forward. Returns:
+    ///
+    /// - `Ok(Some(frame))` — a complete frame; internal state is
+    ///   reset for the next one.
+    /// - `Ok(None)` — the stream hit `TimedOut`/`WouldBlock` part
+    ///   way through; consumed bytes are retained and the next
+    ///   call resumes mid-frame. The caller decides whether to
+    ///   retry, yield, or shut down.
+    /// - `Err` — real I/O failure, EOF (`Ok(0)` mid-frame), or an
+    ///   over-limit length prefix. Fatal: the stream state can no
+    ///   longer be trusted and the connection must close.
+    ///
+    /// # Errors
+    ///
+    /// `std::io::Error` on I/O error, unexpected EOF, or a frame
+    /// length above `max_message_bytes`.
+    pub fn poll<R: Read>(
+        &mut self,
+        stream: &mut R,
+        max_message_bytes: u64,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        // Phase 1: the 4-byte big-endian length prefix.
+        while self.len_pos < 4 {
+            match stream.read(&mut self.len_buf[self.len_pos..]) {
+                // The peer closed the stream — at a frame boundary
+                // or mid-prefix alike, the connection is over.
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed while reading frame header",
+                    ));
+                }
+                Ok(n) => self.len_pos += n,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if self.payload.is_none() {
+            let len = u64::from(u32::from_be_bytes(self.len_buf));
+            if len > max_message_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame exceeds max message size",
+                ));
+            }
+            self.payload = Some(vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)]);
+        }
+        // Phase 2: the payload — resumable for the same reason.
+        let Some(payload) = self.payload.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame decoder state corrupt: prefix complete but no payload buffer",
+            ));
+        };
+        while self.payload_pos < payload.len() {
+            match stream.read(&mut payload[self.payload_pos..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed mid-frame",
+                    ));
+                }
+                Ok(n) => self.payload_pos += n,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Frame complete — reset to the next boundary.
+        let Some(frame) = self.payload.take() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame decoder state corrupt: payload buffer missing at completion",
+            ));
+        };
+        self.len_pos = 0;
+        self.payload_pos = 0;
+        Ok(Some(frame))
+    }
+}
+
 /// Read a length-prefixed frame from any readable stream.
 ///
 /// Frame format: `[length: 4 bytes BE u32][payload: length bytes]`.
+///
+/// Used ONLY by accept-time handshakes, where a failed read closes
+/// the stream immediately — partial consumption is irrelevant
+/// there. The steady-state reader uses [`FrameReader`] so timeouts
+/// resume mid-frame instead of desyncing the stream.
 ///
 /// # Errors
 ///
@@ -1193,30 +1344,34 @@ fn reader_loop(
     max_message_bytes: u64,
     shutdown: Arc<AtomicBool>,
 ) {
+    // The incremental decoder owns the partially consumed frame
+    // across timeouts: `Ok(None)` resumes mid-frame on the next
+    // poll instead of restarting at a fresh boundary — the old
+    // per-attempt `read_exact` dropped consumed bytes and let the
+    // middle of a payload be read as the next length prefix.
+    let mut framer = FrameReader::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return; // shutting down
         }
-        match stream.read_frame(max_message_bytes) {
-            Ok(bytes) => {
+        match stream.read_frame(&mut framer, max_message_bytes) {
+            Ok(Some(bytes)) => {
                 let msg = InboundMessage { from: peer_id.clone(), bytes };
                 if tx.send(msg).is_err() {
                     return; // channel closed — transport shut down
                 }
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
+            Ok(None) => {
                 // Read timeout or would block (TLS poll timeout) —
-                // loop will check the shutdown flag and retry.
-                // C4 fix: SharedStream uses a single Mutex for both
-                // read and write. The reader holds the Mutex during
-                // read_frame (up to read_timeout). Without a yield,
-                // the reader starves the writer — it re-acquires the
-                // Mutex before the writer can. A short sleep gives
-                // the writer a window to acquire the Mutex and flush
-                // pending outbound frames.
+                // the frame state is retained; loop will check the
+                // shutdown flag and retry. C4 fix: SharedStream uses
+                // a single Mutex for both read and write. The reader
+                // holds the Mutex during read_frame (up to
+                // read_timeout). Without a yield, the reader starves
+                // the writer — it re-acquires the Mutex before the
+                // writer can. A short sleep gives the writer a
+                // window to acquire the Mutex and flush pending
+                // outbound frames.
                 #[cfg(feature = "tls")]
                 thread::sleep(Duration::from_millis(1));
             }
@@ -1406,6 +1561,99 @@ fn accept_tls_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    /// A `Read` that replays a script of `io::Result` chunks — one
+    /// entry per `read()` call — so partial frames and stalls are
+    /// fully deterministic.
+    struct ScriptedStream {
+        steps: VecDeque<std::io::Result<Vec<u8>>>,
+    }
+
+    impl Read for ScriptedStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(Ok(bytes)) => {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    Ok(n)
+                }
+                Some(Err(e)) => Err(e),
+                // Script exhausted: behave like a closed stream.
+                None => Ok(0),
+            }
+        }
+    }
+
+    fn dat(steps: &mut VecDeque<std::io::Result<Vec<u8>>>, b: &[u8]) {
+        steps.push_back(Ok(b.to_vec()));
+    }
+
+    fn stall() -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "stall"))
+    }
+
+    /// A timeout mid-frame must RESUME the partial frame on the
+    /// next poll — the old per-attempt `read_exact` dropped the
+    /// consumed bytes and let the middle of a payload be read as
+    /// the next length prefix (stream desync).
+    #[test]
+    fn frame_reader_resumes_mid_frame_timeouts() {
+        let mut steps: VecDeque<std::io::Result<Vec<u8>>> = VecDeque::new();
+        // Frame 1: len=5 "hello", dribbled across two stalls.
+        dat(&mut steps, &[0, 0]);
+        steps.push_back(stall());
+        dat(&mut steps, &[0, 5]);
+        dat(&mut steps, b"he");
+        steps.push_back(stall());
+        dat(&mut steps, b"llo");
+        // Frame 2: len=1 "x", stalled after the prefix.
+        dat(&mut steps, &[0, 0, 0, 1]);
+        steps.push_back(stall());
+        dat(&mut steps, b"x");
+
+        let mut stream = ScriptedStream { steps };
+        let mut fr = FrameReader::new();
+        let max = 1024;
+
+        // Each stall returns `None` with every consumed byte
+        // retained — none of them may restart the frame.
+        assert_eq!(fr.poll(&mut stream, max).unwrap(), None);
+        assert_eq!(fr.poll(&mut stream, max).unwrap(), None);
+        assert_eq!(fr.poll(&mut stream, max).unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(fr.poll(&mut stream, max).unwrap(), None);
+        assert_eq!(fr.poll(&mut stream, max).unwrap(), Some(b"x".to_vec()));
+    }
+
+    /// An over-limit length prefix is fatal regardless of how many
+    /// polls it took to arrive.
+    #[test]
+    fn frame_reader_oversize_is_fatal() {
+        let mut steps: VecDeque<std::io::Result<Vec<u8>>> = VecDeque::new();
+        dat(&mut steps, &[0, 0]);
+        steps.push_back(stall());
+        dat(&mut steps, &[4, 0]); // len = 1024
+        let mut stream = ScriptedStream { steps };
+        let mut fr = FrameReader::new();
+        assert_eq!(fr.poll(&mut stream, 1024).unwrap(), None);
+        let err = fr.poll(&mut stream, 10).expect_err("oversize frame must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A clean close mid-frame is a fatal truncation, not a frame.
+    #[test]
+    fn frame_reader_eof_mid_frame_is_fatal() {
+        let mut steps: VecDeque<std::io::Result<Vec<u8>>> = VecDeque::new();
+        dat(&mut steps, &[0, 0, 0, 4]);
+        dat(&mut steps, b"ab");
+        steps.push_back(stall());
+        // Script exhausted → Ok(0) EOF on the next read.
+        let mut stream = ScriptedStream { steps };
+        let mut fr = FrameReader::new();
+        assert_eq!(fr.poll(&mut stream, 1024).unwrap(), None);
+        let err = fr.poll(&mut stream, 1024).expect_err("EOF mid-frame must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
 
     /// Basic send/recv over TCP: two nodes exchange a message.
     #[test]

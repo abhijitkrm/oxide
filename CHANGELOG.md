@@ -2035,6 +2035,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     client gets its own allowance no matter how it connects, and
     the node sheds overload instead of drowning.
 
+- **P2P message framing no longer desyncs after a stalled read**
+  (`crates/p2p`)
+  - The TCP/TLS reader now keeps an incremental frame decoder per
+    connection (`FrameReader`): a read timeout partway through a
+    frame resumes where it left off instead of restarting and
+    misreading payload bytes as the next frame's length.
+  - **In plain words:** a single slow network read used to corrupt
+    the stream permanently — every consensus message after it
+    arrived garbled, which could stall a validator's view of its
+    peers. Now a stalled read just pauses mid-message and picks up
+    exactly where it stopped.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).
