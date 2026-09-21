@@ -2,18 +2,29 @@
 //!
 //! Runs the executor + modules without a consensus engine (read-only
 //! follower mode). Configuration is loaded from TOML + env vars + CLI
-//! flags (same layered model as `oxide-validator`).
+//! flags (same layered model and the same `node::node_config_from`
+//! conversion as `oxide-validator` — both binaries run identical
+//! effective config).
+//!
+//! Follower mode (consensus sync from the network) is **not
+//! implemented**: the only honest function today is
+//! `--state-sync` + `--verify-only` — fetch a trusted snapshot,
+//! verify it end-to-end, import it, and exit 0. Without
+//! `--verify-only` the process exits non-zero rather than claim a
+//! "ready" node that cannot follow the chain.
 //!
 //! Usage:
 //!
 //! ```sh
-//! oxide-fullnode --config config/devnet.toml
+//! oxide-fullnode --config config/devnet.toml \
+//!   --state-sync 127.0.0.1:8545 --trusted-height 100 \
+//!   --trusted-root 0x<64-hex> --verify-only
 //! ```
 
 use std::env;
 use std::path::PathBuf;
 
-use node::{ConsensusConfig, Node, NodeConfig};
+use node::{Node, NodeConfig};
 
 fn main() {
     println!("oxide-fullnode: starting (follower mode)");
@@ -29,7 +40,24 @@ fn main() {
     bootstrap_state_sync(&mut node);
 
     println!("oxide-fullnode: assembled stack (executor + core/staking/evm modules)");
-    println!("oxide-fullnode: ready (consensus sync not yet implemented — Phase 2)");
+
+    // Follower mode (consensus sync from the network) is not
+    // implemented — the only thing this binary can honestly do today
+    // is fetch, verify, and import a trusted snapshot. `--verify-only`
+    // makes that the explicit contract: exit 0 after a verified
+    // bootstrap. Without it, exiting 0 would claim the node is
+    // "ready" when it cannot follow the chain — so the process exits
+    // non-zero with an actionable message instead.
+    if std::env::args().any(|a| a == "--verify-only") {
+        println!("oxide-fullnode: verify-only complete");
+        return;
+    }
+    eprintln!(
+        "oxide-fullnode: consensus sync (follower mode) is not implemented — \
+         the assembled node cannot follow the chain. \
+         Re-run with --verify-only for the supported bootstrap-and-verify flow."
+    );
+    std::process::exit(1);
 }
 
 /// `--state-sync <host:port>` bootstrap: fetch a chunked snapshot
@@ -130,32 +158,78 @@ fn load_config() -> NodeConfig {
     if let Some(engine_str) = parse_cli_flag("--engine") {
         if let Some(engine) = config::ConsensusEngineKind::parse(&engine_str) {
             config.consensus.engine = engine;
+        } else {
+            eprintln!(
+                "oxide-fullnode: unknown --engine value {engine_str:?} \
+                      (expected \"sequencer\" or \"oxidebft\")"
+            );
+            std::process::exit(1);
         }
     }
 
-    // Convert the config crate's ConsensusEngineKind to node's
-    // ConsensusConfig.
-    let consensus = match config.consensus.engine {
-        config::ConsensusEngineKind::Sequencer => ConsensusConfig::Sequencer,
-        config::ConsensusEngineKind::OxideBft => ConsensusConfig::OxideBft,
-    };
+    // `--genesis-file`: same chain-state source the validator uses —
+    // the shared conversion applies its validators and native
+    // balances at assembly.
+    let genesis_file = parse_cli_flag("--genesis-file").map(|p| {
+        config::genesis::Genesis::from_json_file(&PathBuf::from(&p))
+            .unwrap_or_else(|e| panic!("failed to load genesis file {p}: {e}"))
+    });
 
-    // The RPC config carries the chain ID — the executor needs it for
-    // EIP-712 native-tx signature verification (domain separator).
-    let chain_id = config.rpc.as_ref().map_or(1, |r| r.chain_id);
+    // `--data-dir` wins over `[storage] data_dir`.
+    let data_dir =
+        parse_cli_flag("--data-dir").map(PathBuf::from).or_else(|| config.storage.data_dir.clone());
 
-    NodeConfig {
-        consensus,
-        max_mempool_entries: config.executor.max_mempool_entries,
-        parallel_threshold: config.executor.parallel_threshold,
-        evm_persistence: true,
-        storage_path: None,
-        settlement_operator: None,
-        min_fee: 0,
-        chain_id,
-        require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
-        history_retention: Some(config.storage.history_retention),
+    // The RPC config carries the chain ID and base fee — the
+    // executor, the EVM module, and the RPC layer all read the same
+    // source so advertised and enforced parameters cannot diverge.
+    let rpc_config = config.rpc.clone().unwrap_or_default();
+
+    // Genesis chain id must match the RPC chain id.
+    if let Some(g) = &genesis_file {
+        if g.chain_id != rpc_config.chain_id {
+            eprintln!(
+                "oxide-fullnode: genesis chain_id {} != rpc.chain_id {} — \
+                 refusing to run a node whose signatures advertise a different chain",
+                g.chain_id, rpc_config.chain_id
+            );
+            std::process::exit(1);
+        }
     }
+
+    let genesis = Some(match &genesis_file {
+        Some(g) => {
+            node::genesis_spec_from_file(g).unwrap_or_else(|e| panic!("invalid genesis file: {e}"))
+        }
+        None => node::genesis_spec_devnet(&config.genesis),
+    });
+    let overrides = node::AssemblyOverrides {
+        require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
+        data_dir,
+        genesis,
+    };
+    // The shared conversion — the same mapping the validator binary
+    // uses, so both binaries run identical effective config.
+    let node_config =
+        node::node_config_from(&config, &rpc_config, &overrides, node::NodeMode::Single)
+            .unwrap_or_else(|e| panic!("invalid configuration: {e}"));
+
+    // Validate BEFORE building anything: unsupported settings fail,
+    // overridden ones warn — never silently do nothing.
+    let (warnings, errors) =
+        node::validate_effective_config(&config, &node_config, node::NodeMode::Single);
+    for w in &warnings {
+        eprintln!("oxide-fullnode: config warning: {w}");
+    }
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("oxide-fullnode: config error: {e}");
+        }
+        std::process::exit(1);
+    }
+
+    // Emit the effective configuration — the values actually running.
+    println!("oxide-fullnode: effective node config: {node_config:?}");
+    node_config
 }
 
 /// Parse a `--flag value` pair from CLI args.

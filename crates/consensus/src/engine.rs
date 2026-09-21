@@ -53,8 +53,8 @@ use crypto::hash::{Domain, Hasher};
 use ports::{AppInterface, ConsensusEngine};
 use primitives::{Address, Epoch, Hash, Height, View};
 use types::{
-    BlockBudget, BlockHeader, ExecCertificate, FinalizedBlock, MempoolAck, Proposal,
-    QuorumCertificate, StateAttestation, TimeoutCertificate, TxBytes, Verdict, Vote, VotePhase,
+    BlockHeader, ExecCertificate, FinalizedBlock, MempoolAck, Proposal, QuorumCertificate,
+    StateAttestation, TimeoutCertificate, TxBytes, Verdict, Vote, VotePhase,
 };
 
 use crate::validator::{ValidatorIndex, ValidatorSet};
@@ -514,6 +514,20 @@ pub struct OxideBft {
     /// proposal signatures are all withheld until the operator
     /// restarts the validator on healthy storage.
     wal_failed: bool,
+    /// The block budget the engine passes to `app.prepare_proposal`.
+    /// Configured via [`OxideBft::with_block_budget`]; defaults to
+    /// [`types::CHAIN_BLOCK_BUDGET`]. The TOML
+    /// `consensus.max_block_bytes` / `consensus.max_block_gas`
+    /// values reach the proposal path through this field — before it
+    /// existed they parsed fine and then silently did nothing.
+    block_budget: types::BlockBudget,
+    /// Pacemaker timeout config (milliseconds), retained on the
+    /// engine so the pacemaker rebuilt at each epoch rotation keeps
+    /// the operator's timeouts instead of reverting to defaults.
+    /// Configured via [`OxideBft::with_pacemaker_timeouts`].
+    pacemaker_base_timeout_ms: u64,
+    /// See `pacemaker_base_timeout_ms`.
+    pacemaker_max_timeout_ms: u64,
 }
 
 impl OxideBft {
@@ -575,6 +589,9 @@ impl OxideBft {
             verify_per_vote: false,
             wal: None,
             wal_failed: false,
+            block_budget: types::CHAIN_BLOCK_BUDGET,
+            pacemaker_base_timeout_ms: crate::pacemaker::DEFAULT_BASE_TIMEOUT_MS,
+            pacemaker_max_timeout_ms: crate::pacemaker::DEFAULT_MAX_TIMEOUT_MS,
         }
     }
 
@@ -646,6 +663,57 @@ impl OxideBft {
     #[must_use]
     pub fn with_wal(mut self, wal: crate::wal::Wal) -> Self {
         self.wal = Some(wal);
+        self
+    }
+
+    /// Set the proposal block budget (bytes + gas) the engine passes
+    /// to `app.prepare_proposal` when this validator leads.
+    ///
+    /// Consensus is the natural owner of the block-size policy:
+    /// every validator enforces the same bounds in
+    /// `process_proposal`, so a proposal built within this budget is
+    /// valid cluster-wide. The TOML `consensus.max_block_bytes` /
+    /// `consensus.max_block_gas` values reach the running engine
+    /// through this knob — without it they parsed fine and then
+    /// silently did nothing while the engine always proposed at the
+    /// compiled-in [`types::CHAIN_BLOCK_BUDGET`].
+    #[must_use]
+    pub fn with_block_budget(mut self, budget: types::BlockBudget) -> Self {
+        self.block_budget = budget;
+        self
+    }
+
+    /// Set pacemaker timeouts (base + backoff cap, milliseconds).
+    ///
+    /// The values are stored on the engine so the pacemaker rebuilt
+    /// at each epoch rotation keeps the configured timeouts — a
+    /// rebuild via `Pacemaker::new` would silently revert to the
+    /// compiled defaults and desynchronize view timing from what the
+    /// operator configured. The TOML `consensus.base_timeout_ms` /
+    /// `consensus.max_timeout_ms` values reach the running engine
+    /// through this knob.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `base_timeout_ms` is 0 or exceeds `max_timeout_ms`:
+    /// a misconfigured pacemaker either never times out or starts
+    /// past its own backoff cap, and startup must fail loudly rather
+    /// than limp into an unrecoverable view schedule.
+    #[must_use]
+    pub fn with_pacemaker_timeouts(mut self, base_timeout_ms: u64, max_timeout_ms: u64) -> Self {
+        assert!(
+            base_timeout_ms > 0 && base_timeout_ms <= max_timeout_ms,
+            "invalid pacemaker timeouts: base {base_timeout_ms}ms must be in 1..={max_timeout_ms}ms"
+        );
+        self.pacemaker_base_timeout_ms = base_timeout_ms;
+        self.pacemaker_max_timeout_ms = max_timeout_ms;
+        self.pacemaker = crate::pacemaker::Pacemaker::with_config(
+            self.validator_set.clone(),
+            self.pacemaker.current_view(),
+            self.pacemaker.current_epoch(),
+            base_timeout_ms,
+            max_timeout_ms,
+        );
         self
     }
 
@@ -755,10 +823,15 @@ impl OxideBft {
     }
 
     /// The budget the engine uses when assembling proposals. Ceiling 1:
-    /// reads the chain-configured limit from `types::CHAIN_BLOCK_BUDGET`
-    /// (10 GG/block, 16 MiB) so the engine, the EVM, and the tests all
-    /// agree on a single source of truth (plan.md §3).
-    const BUDGET: BlockBudget = types::CHAIN_BLOCK_BUDGET;
+    /// defaults to the chain-configured limit from
+    /// `types::CHAIN_BLOCK_BUDGET` (10 GG/block, 16 MiB) so the
+    /// engine, the EVM, and the tests all agree on a single source of
+    /// truth (plan.md §3); `with_block_budget` overrides it from
+    /// parsed config.
+    #[must_use]
+    pub fn block_budget(&self) -> types::BlockBudget {
+        self.block_budget
+    }
 
     /// Current view.
     #[must_use]
@@ -896,9 +969,19 @@ impl OxideBft {
         // entries can never be released by a commit). A failure here
         // latches `wal_failed` — signing stays disabled from now on.
         let _ = self.append_wal();
-        // Reset the pacemaker for the new epoch.
-        self.pacemaker =
-            crate::pacemaker::Pacemaker::new(self.validator_set.clone(), View::new(0), self.epoch);
+        // Reset the pacemaker for the new epoch — carrying the
+        // configured timeouts, not the compiled defaults: a rebuild
+        // through `Pacemaker::new` here would silently revert the
+        // operator's `base_timeout_ms`/`max_timeout_ms` at the first
+        // rotation and desynchronize view timing from the effective
+        // config every other validator is running.
+        self.pacemaker = crate::pacemaker::Pacemaker::with_config(
+            self.validator_set.clone(),
+            View::new(0),
+            self.epoch,
+            self.pacemaker_base_timeout_ms,
+            self.pacemaker_max_timeout_ms,
+        );
         Ok(())
     }
 
@@ -1419,7 +1502,7 @@ impl OxideBft {
         if self.wal_failed {
             return None;
         }
-        let proposal = self.app.prepare_proposal(&Self::BUDGET);
+        let proposal = self.app.prepare_proposal(&self.block_budget);
         let has_pending_txs = !proposal.txs.is_empty();
         // Liveness gate: the leader stays silent only when no work
         // is locally visible. Two sources count as work:
@@ -5149,6 +5232,44 @@ mod tests {
     }
 
     #[test]
+    fn pacemaker_timeouts_reach_the_running_engine() {
+        // `with_pacemaker_timeouts` must override the compiled
+        // defaults — the parsed `consensus.base_timeout_ms` /
+        // `max_timeout_ms` values flow through this knob.
+        let engine = make_engine().with_pacemaker_timeouts(5_000, 60_000);
+        assert_eq!(
+            engine.pacemaker_timeout_ms(),
+            5_000,
+            "the current view timeout must equal the configured base"
+        );
+    }
+
+    #[test]
+    fn pacemaker_timeouts_survive_epoch_rotation() {
+        // Rotation rebuilds the pacemaker — a rebuild from
+        // `Pacemaker::new` would silently revert configured timeouts
+        // to defaults. The engine must carry them across the rebuild.
+        let mut engine = make_engine().with_pacemaker_timeouts(5_000, 60_000);
+        engine.schedule_rotation(second_validator_set()).expect("schedule");
+        engine.rotate_epoch().expect("rotate");
+        assert_eq!(
+            engine.pacemaker_timeout_ms(),
+            5_000,
+            "configured timeouts must survive the rotation rebuild, \
+             not revert to the 2000ms default"
+        );
+    }
+
+    #[test]
+    fn block_budget_is_configurable() {
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1_000_000_000 };
+        let engine = make_engine().with_block_budget(budget);
+        assert_eq!(engine.block_budget(), budget);
+        // Default remains the chain-configured budget.
+        assert_eq!(make_engine().block_budget(), types::CHAIN_BLOCK_BUDGET);
+    }
+
+    #[test]
     fn engine_continues_after_rotation() {
         let mut engine = make_engine();
         // Commit a block in epoch 0.
@@ -5819,7 +5940,7 @@ mod tests {
         fn ingest_tx(&self, _tx: TxBytes) -> MempoolAck {
             MempoolAck::Accepted
         }
-        fn prepare_proposal(&self, _budget: &BlockBudget) -> Proposal {
+        fn prepare_proposal(&self, _budget: &types::BlockBudget) -> Proposal {
             Proposal { height: Height::new(0), txs: Vec::new(), attestation: None }
         }
         fn has_queued_txs(&self) -> bool {

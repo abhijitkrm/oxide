@@ -16747,3 +16747,82 @@ proves the three acks land in order.
 30 mempool + executor tests green (peek re-proposal, commit drain,
 no-tombstone cycles, stale-bucket eviction retry, anchor pruning,
 batch-ack mapping, gas-filter survival).
+
+## One assembly, one config: the binaries stop diverging (audit 6.5)
+
+The two node binaries each maintained their own config→NodeConfig
+conversion and their own executor assembly — and both silently
+dropped most of what they parsed. `consensus.base_timeout_ms`,
+`max_timeout_ms`, `max_block_bytes`, `max_block_gas`,
+`executor.min_fee`, `[storage] data_dir`, and the settlement
+operator all parsed fine and then did nothing. Worse, the
+validator's `build_devnet_executor` registered the EVM module twice
+(first as the ledger, again after the alloc loop) — `register_module`
+asserts unique IDs, so `--devnet-node` had panicked at startup since
+the bank-removal commit, and no test exercised the shipped binary
+path.
+
+The fix is structural: `node::assemble_executor` is now THE executor
+assembly — `Node::assemble` calls it, and the multi-validator binary
+path calls it directly before attaching its own transport-driven
+OxideBft. Both binaries get the full module graph (core, staking,
+exchange, perps, oracle, governance, EVM registered exactly once)
+and the same async exec lane — the devnet binary previously ran
+without the lane, a second pipeline with different backpressure
+behavior. `build_devnet_executor` is deleted.
+
+`node::node_config_from` is likewise THE conversion: every field
+that affects execution, persistence, fees, or consensus parameters
+is propagated in one place — min_fee, settlement_operator, chain id,
+base fee (the EVM's were hardcoded `1`/7 gwei while the executor's
+chain id was configurable — the EIP-712 domain and the EVM chain
+could diverge), require_signed_txs, history retention, storage path,
+genesis, block budget, and pacemaker timeouts. New TOML/env surface
+for the fields that had none: `[executor] min_fee`,
+`[executor] require_signed_txs`, `[storage] data_dir`,
+`[exchange] settlement_operator`, each with an `OXIDE_*` override.
+
+`OxideBft` gained `with_block_budget` and
+`with_pacemaker_timeouts`; the parsed `consensus.*` values reach
+`prepare_proposal` through them. Epoch rotation now rebuilds the
+pacemaker with the configured timeouts — a `Pacemaker::new` rebuild
+would have reverted them at the first rotation.
+
+Genesis got one shared spec: `GenesisSpec` (validators + native
+balances) is what `assemble_executor` applies; `genesis_spec_from_file`
+converts the JSON file (fail-loud on malformed addresses, BLS keys,
+and balances — the old code silently zeroed bad balances, corrupting
+the money supply with no signal), `genesis_spec_devnet` synthesizes
+the deterministic fallback. `evm.alloc` stays caller-side (256-bit
+storage slots would drag `node` into an alloy dep for one map).
+
+Before assembly, `node::validate_effective_config` runs: settings
+with no consumer fail (`storage.archive`, non-default
+`journal_retain_segments`), overridden settings warn (network
+listen/peers in devnet-node and single-node mode, unsigned txs,
+`engine = "sequencer"` in devnet mode — which must warn, not fail,
+because sequencer is the serde default and the multi-process
+launcher passes no `--engine`). The effective `NodeConfig` is then
+printed, so the running parameters are never ambiguous.
+
+The fullnode got an honest contract: follower mode (consensus sync)
+is not implemented, so without `--verify-only` it now exits non-zero
+with an actionable message instead of printing "ready" for a node
+that cannot follow the chain. `--verify-only` + `--state-sync` +
+`--trusted-height` + `--trusted-root` remains the supported
+bootstrap-verify-exit flow.
+
+The transport got its config too: `[network]` timeouts and
+`max_message_bytes` reach `TcpTransportConfig`, and
+`allowed_peer_ids` is pinned to the derived validator set — it was
+`None`, letting any peer self-claim an ID into consensus traffic.
+
+Tests: pacemaker timeout propagation + survival across rotation,
+block budget override/default, genesis file conversion (validators,
+BLS keys, base-units→wei balances, malformed-entry failures),
+devnet spec synthesis, assembly parity (the shared path's module
+roots == `Node::assemble`'s), config mapping for every propagated
+field, validate_effective_config warn/fail behavior, and the three
+new config env/TOML fields. Smoke: `--devnet-node 0` finalizes
+blocks (was: startup panic), single-node runs, TOML path warns
+correctly, bare fullnode exits 1.

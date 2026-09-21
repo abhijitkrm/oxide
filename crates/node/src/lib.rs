@@ -35,6 +35,11 @@
 //!     chain_id: 1,
 //!     require_signed_txs: false,
 //!     history_retention: None,
+//!     base_fee: 7_000_000_000,
+//!     genesis: None,
+//!     block_budget: types::CHAIN_BLOCK_BUDGET,
+//!     base_timeout_ms: 2_000,
+//!     max_timeout_ms: 30_000,
 //! };
 //! let mut node = Node::assemble(&config);
 //! // Drive consensus, inspect state, etc.
@@ -73,6 +78,46 @@ impl ConsensusConfig {
             Self::OxideBft => "oxideBFT",
         }
     }
+}
+
+/// One staking validator declared at genesis.
+///
+/// This is the runtime-neutral shape the binaries hand to
+/// [`assemble_executor`]; the TOML/JSON genesis-file types in the
+/// `config` crate are converted into it by the binary (hex decode,
+/// unit conversion) so this crate stays free of file-format concerns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenesisValidator {
+    /// The validator's account address — also its on-chain link to
+    /// the consensus identity.
+    pub address: Address,
+    /// Declaration stake (unattributed — not backed by the bonding
+    /// pool, so it cannot be undelegated).
+    pub stake: u64,
+    /// Optional BLS public key — the validator's consensus identity,
+    /// kept by staking so double-sign evidence can be verified
+    /// on-chain. `None` is acceptable on single-node devnets where
+    /// there are no real signatures to prove against.
+    pub public_key: Option<Vec<u8>>,
+}
+
+/// Genesis state applied at executor assembly.
+///
+/// The single shared input to [`assemble_executor`]'s genesis path:
+/// `Node::assemble` passes `None` (selecting the documented devnet
+/// default) and the validator binary converts a `--genesis-file` or
+/// synthesizes a spec from `[genesis]` config values. Keeping one
+/// application path means the shipped multi-validator binary and the
+/// single-node path run the same state initialization — previously
+/// the binary maintained its own divergent copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GenesisSpec {
+    /// Validators registered in the staking module at genesis.
+    pub validators: Vec<GenesisValidator>,
+    /// Native-token balances minted at genesis, in wei (the EVM
+    /// account store is the single ledger — there is no bank).
+    /// `(address, wei balance)`.
+    pub balances: Vec<(Address, u128)>,
 }
 
 /// The node configuration: engine selection + mempool size + parallel
@@ -131,6 +176,32 @@ pub struct NodeConfig {
     /// retains in memory (`Executor::with_history_retention`).
     /// `None` = the executor default (4096).
     pub history_retention: Option<usize>,
+    /// The EVM base fee (wei per gas) the module advertises and
+    /// charges. Must equal the RPC-advertised base fee — the
+    /// validator binary sources both from `rpc.base_fee` so the
+    /// advertised and enforced parameters agree. Default:
+    /// `7_000_000_000` (7 gwei).
+    pub base_fee: u64,
+    /// Genesis state applied at assembly. `None` selects the
+    /// single-node devnet default: `[0u8; 20]` is funded with
+    /// `u128::MAX` wei and registered as the sole staking validator.
+    /// That default is a development convenience — production
+    /// deployments pass a [`GenesisSpec`] converted from the genesis
+    /// file.
+    pub genesis: Option<GenesisSpec>,
+    /// The block budget the consensus engine passes to
+    /// `prepare_proposal` (bytes + gas). Maps
+    /// `consensus.max_block_bytes` / `consensus.max_block_gas` from
+    /// TOML. Default: [`types::CHAIN_BLOCK_BUDGET`].
+    pub block_budget: types::BlockBudget,
+    /// Pacemaker base timeout in milliseconds — the first view's
+    /// timeout before exponential backoff. Maps
+    /// `consensus.base_timeout_ms` from TOML. Default: 2000 ms.
+    pub base_timeout_ms: u64,
+    /// Pacemaker maximum timeout in milliseconds — the cap on
+    /// exponential backoff. Maps `consensus.max_timeout_ms` from
+    /// TOML. Default: `30_000` ms.
+    pub max_timeout_ms: u64,
 }
 
 impl Default for NodeConfig {
@@ -146,6 +217,11 @@ impl Default for NodeConfig {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            base_fee: 7_000_000_000,
+            genesis: None,
+            block_budget: types::CHAIN_BLOCK_BUDGET,
+            base_timeout_ms: 2_000,
+            max_timeout_ms: 30_000,
         }
     }
 }
@@ -201,133 +277,9 @@ impl Node {
     /// or if the validator set construction fails (impossible with
     /// equal stakes >= 1).
     pub fn assemble(config: &NodeConfig) -> Self {
-        // Build the executor with standard modules. Use
-        // `with_config` so the parallel threshold is configurable
-        // (default: 32 txs, lowered from 100 in the block-size sweep
-        // session — rayon overhead amortizes at 32+).
-        let mut executor =
-            Executor::with_config(config.max_mempool_entries, config.parallel_threshold)
-                .with_min_fee(config.min_fee)
-                .with_chain_id(config.chain_id)
-                .with_unsigned_tx_policy(if config.require_signed_txs {
-                    executor::UnsignedTxPolicy::Reject
-                } else {
-                    executor::UnsignedTxPolicy::Allow
-                });
-        if let Some(n) = config.history_retention {
-            executor = executor.with_history_retention(n);
-        }
-        executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-
-        // The EVM module is built FIRST: it is the chain's balance
-        // ledger, so staking/exchange/perps take its `Arc` for
-        // settlement and it is the executor's fee module.
-        //
-        // Persistence: when `evm_persistence` is enabled (the
-        // default), the EVM module is created with a storage backend
-        // and flushes state at `end_block`. When `storage_path` is
-        // `Some`, a disk-backed `RedbBackend` is used (durable ACID
-        // persistence — state survives restarts). When `None`, a
-        // `Volatile` (in-memory) backend is used. When disabled
-        // entirely (`evm_persistence = false`), the EVM runs
-        // in-memory only.
-        let evm_module: Arc<evm::EvmModule> = if config.evm_persistence {
-            let backend: Box<dyn storage::StorageBackend + Send> = match &config.storage_path {
-                Some(path) => Box::new(storage::RedbBackend::open(path).expect("redb backend")),
-                None => Box::new(storage::Volatile::new()),
-            };
-            Arc::new(
-                evm::EvmModule::with_storage(1, 7_000_000_000, backend)
-                    .with_fee_recipient(staking::FEE_POOL),
-            )
-        } else {
-            Arc::new(evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL))
-        };
-        evm_module.fund_account_for_test(&primitives::Address([0u8; 20]), u128::MAX);
-        // Canonical preinstalls (CREATE2 factory, Multicall3, Permit2,
-        // singleton factories) — Foundry/Hardhat/Safe tooling assumes
-        // they exist at fixed addresses on every EVM chain.
-        evm_module.install_preinstalls();
-        // The EVM account store is the fee collector: every
-        // native-module tx is charged `ctx.fee` (base units → wei)
-        // from the sender's EVM balance before execution.
-        executor.set_fee_module(framework::module_id::EVM);
-        // Staking is EVM-ledger-backed: delegation debits the
-        // delegator into the bonded pool, unbonding refunds from it.
-        // Register the devnet sender/validator identity so
-        // self-delegation (e.g. the key-change keep-alive delegate)
-        // has a registered target.
-        let staking_module = staking::StakingModule::new();
-        staking_module.set_ledger(evm_module.clone());
-        staking_module.register_validator(primitives::Address([0u8; 20]));
-        // Shared: perps consults it for committee-gated mark/funding
-        // overrides, the oracle for feed authorization + quorum sizing.
-        let staking_module = Arc::new(staking_module);
-        executor.register_module(staking_module.clone());
-        // Register the exchange module with a default spot market
-        // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
-        // exchange settles fills against EVM balances (plan.md §9.2).
-        let mut exchange_mod = exchange::ExchangeModule::with_ledger(evm_module.clone())
-            .with_committee(staking_module.clone());
-        if let Some(operator) = config.settlement_operator {
-            exchange_mod.set_settlement_operator(operator);
-        }
-        let exchange = Arc::new(exchange_mod);
-        exchange
-            .list_market(trading::MarketConfig {
-                market_id: 0,
-                tick_size: 1_000_000,
-                lot_size: 1_000,
-                min_price: 1_000_000_000,
-                max_price: 2_000_000_000,
-                max_resting: 64,
-            })
-            .expect("default market config is valid");
-        executor.register_module(exchange.clone());
-        // Register the perps module with a default perpetual market
-        // (10x max leverage, 0.5% maintenance margin). The perps
-        // module settles margin deposits/withdrawals against EVM
-        // balances (plan.md §9.3).
-        let perps = Arc::new(
-            perps::PerpsModule::with_ledger(evm_module.clone())
-                .with_committee(staking_module.clone()),
-        );
-        perps
-            .list_market(perps::PerpsMarketConfig {
-                base: trading::MarketConfig {
-                    market_id: 0,
-                    tick_size: 1_000_000,
-                    lot_size: 1_000,
-                    min_price: 1_000_000_000,
-                    max_price: 2_000_000_000,
-                    max_resting: 64,
-                },
-                max_leverage: 10,
-                mmr_base_bps: 50,
-            })
-            .expect("default perps market config is valid");
-        executor.register_module(perps.clone());
-        // The oracle module: validators submit per-market price
-        // observations during the block; at end_block it aggregates
-        // them (strict-majority quorum → median → EMA) and pushes the
-        // result into perps through `MarkSink`. Staking supplies both
-        // feeder authorization and the quorum denominator.
-        let oracle = Arc::new(oracle::OracleModule::new().with_committee(staking_module.clone()));
-        oracle.with_sink(perps.clone());
-        executor.register_module(oracle);
-        // Governance: minimal on-chain parameter votes (plan.md §7 —
-        // Phase 4 scope: propose/vote/finalize, no timelock/veto).
-        executor.register_module(Arc::new(governance::GovernanceModule::new()));
-        // Wire the exchange and perps modules into the EVM for
-        // read-only precompiles (plan.md §10), then register the EVM.
-        evm_module.set_native_modules(Some(exchange), Some(perps));
-        executor.register_module(evm_module.clone());
-        let app: Arc<Executor> = Arc::new(executor);
-        // Spawn the async execution lane (plan.md §13 Phase D):
-        // `finalize_block` hands each committed block to a worker
-        // thread, overlapping execution of block h with consensus
-        // for block h+1.
-        app.spawn_exec_lane();
+        let assembled = assemble_executor(config);
+        let app = assembled.app.clone();
+        let evm_module = assembled.evm_module.clone();
         let app_dyn: Arc<dyn AppInterface> = app.clone();
 
         // Select the consensus engine.
@@ -348,7 +300,12 @@ impl Node {
                 let pk = key.public_key();
                 let vs =
                     consensus::ValidatorSet::new(vec![pk], vec![1]).expect("single validator set");
-                Box::new(OxideBft::new(app_dyn.clone(), vs).with_secret_key(key))
+                Box::new(
+                    OxideBft::new(app_dyn.clone(), vs)
+                        .with_secret_key(key)
+                        .with_pacemaker_timeouts(config.base_timeout_ms, config.max_timeout_ms)
+                        .with_block_budget(config.block_budget),
+                )
             }
         };
 
@@ -505,6 +462,218 @@ impl Node {
     }
 }
 
+/// The executor half of node assembly: the `Arc`'d executor plus the
+/// module handles callers need after construction.
+///
+/// `Node::assemble` keeps these internally; the multi-validator
+/// binary path (which drives its own `OxideBft` engine over a real
+/// transport) consumes the same struct so both binaries run an
+/// identical module graph — previously the validator binary
+/// maintained a second, narrower assembly that silently omitted
+/// exchange/perps/oracle/governance and never spawned the execution
+/// lane.
+pub struct AssembledExecutor {
+    /// The shared executor handle: the engine drives it through
+    /// `Arc<dyn AppInterface>`; the RPC layer clones it for mempool
+    /// submission and state reads.
+    pub app: Arc<Executor>,
+    /// The EVM module — the chain's single native-token ledger and
+    /// the fee collector for native-module txs.
+    pub evm_module: Arc<evm::EvmModule>,
+    /// The staking module — the committee source wired into
+    /// exchange, perps, and oracle.
+    pub staking_module: Arc<staking::StakingModule>,
+}
+
+/// Assemble the executor + full module graph from `config`.
+///
+/// This is **the** executor assembly path: `Node::assemble` calls it,
+/// and the multi-validator binary path calls it directly before
+/// attaching its own transport-driven `OxideBft` engine. Every
+/// config field that affects execution is consumed here:
+///
+/// - `max_mempool_entries`, `parallel_threshold`, `min_fee`,
+///   `chain_id`, `require_signed_txs`, `history_retention` → executor
+/// - `evm_persistence`, `storage_path`, `chain_id`, `base_fee` →
+///   EVM module (the EVM's chain id and base fee now come from
+///   config — they were previously hardcoded to `1` / 7 gwei while
+///   the executor's chain id was configurable, letting the EIP-712
+///   domain and the EVM chain diverge)
+/// - `genesis` → validators + native balances (or the documented
+///   single-node devnet default when `None`)
+/// - `settlement_operator` → exchange batch-settlement gate
+///
+/// # Modules registered
+///
+/// core, staking, exchange, perps, oracle, governance, EVM — the
+/// full production graph, in both binary paths.
+///
+/// The async execution lane is spawned before returning, so every
+/// consumer gets the same commit→execute pipeline.
+///
+/// # Panics
+///
+/// Panics if the `RedbBackend` cannot open `storage_path`, if a
+/// genesis validator has zero stake, or if a genesis BLS key is not
+/// 48 bytes.
+#[must_use]
+pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
+    // Build the executor with standard modules. Use `with_config`
+    // so the parallel threshold is configurable (default: 32 txs,
+    // lowered from 100 in the block-size sweep session — rayon
+    // overhead amortizes at 32+).
+    let mut executor = Executor::with_config(config.max_mempool_entries, config.parallel_threshold)
+        .with_min_fee(config.min_fee)
+        .with_chain_id(config.chain_id)
+        .with_unsigned_tx_policy(if config.require_signed_txs {
+            executor::UnsignedTxPolicy::Reject
+        } else {
+            executor::UnsignedTxPolicy::Allow
+        });
+    if let Some(n) = config.history_retention {
+        executor = executor.with_history_retention(n);
+    }
+    executor.register_module(Arc::new(oxide_core::CoreModule::new()));
+
+    // The EVM module is built FIRST: it is the chain's balance
+    // ledger, so staking/exchange/perps take its `Arc` for
+    // settlement and it is the executor's fee module.
+    //
+    // Persistence: when `evm_persistence` is enabled (the
+    // default), the EVM module is created with a storage backend
+    // and flushes state at `end_block`. When `storage_path` is
+    // `Some`, a disk-backed `RedbBackend` is used (durable ACID
+    // persistence — state survives restarts). When `None`, a
+    // `Volatile` (in-memory) backend is used. When disabled
+    // entirely (`evm_persistence = false`), the EVM runs
+    // in-memory only.
+    //
+    // `chain_id` and `base_fee` come from config — the same values
+    // the RPC layer advertises, so the enforced and advertised
+    // parameters cannot diverge.
+    let evm_module: Arc<evm::EvmModule> = if config.evm_persistence {
+        let backend: Box<dyn storage::StorageBackend + Send> = match &config.storage_path {
+            Some(path) => Box::new(storage::RedbBackend::open(path).expect("redb backend")),
+            None => Box::new(storage::Volatile::new()),
+        };
+        Arc::new(
+            evm::EvmModule::with_storage(config.chain_id, config.base_fee, backend)
+                .with_fee_recipient(staking::FEE_POOL),
+        )
+    } else {
+        Arc::new(
+            evm::EvmModule::new(config.chain_id, config.base_fee)
+                .with_fee_recipient(staking::FEE_POOL),
+        )
+    };
+    // Canonical preinstalls (CREATE2 factory, Multicall3, Permit2,
+    // singleton factories) — Foundry/Hardhat/Safe tooling assumes
+    // they exist at fixed addresses on every EVM chain. Applied
+    // before genesis balances/alloc so a genesis entry can still
+    // intentionally override a preinstall address.
+    evm_module.install_preinstalls();
+    // The EVM account store is the fee collector: every
+    // native-module tx is charged `ctx.fee` (base units → wei)
+    // from the sender's EVM balance before execution.
+    executor.set_fee_module(framework::module_id::EVM);
+    // Staking is EVM-ledger-backed: delegation debits the
+    // delegator into the bonded pool, unbonding refunds from it.
+    let staking_module = staking::StakingModule::new();
+    staking_module.set_ledger(evm_module.clone());
+    match &config.genesis {
+        // Single-node devnet default: fund and register the
+        // deterministic `[0u8;20]` sender/validator identity so
+        // self-delegation (e.g. the key-change keep-alive delegate)
+        // has a registered target. Development convenience only —
+        // production passes an explicit `GenesisSpec`.
+        None => {
+            evm_module.fund_account_for_test(&primitives::Address([0u8; 20]), u128::MAX);
+            staking_module.register_validator(primitives::Address([0u8; 20]));
+        }
+        Some(spec) => {
+            for (addr, wei) in &spec.balances {
+                evm_module.genesis_insert_account(addr, *wei, 0, Vec::new(), Vec::new());
+            }
+            for v in &spec.validators {
+                staking_module.genesis_register_validator(v.address, v.stake);
+                if let Some(pk) = &v.public_key {
+                    staking_module.genesis_set_bls_key(v.address, pk);
+                }
+            }
+        }
+    }
+    // Shared: perps consults it for committee-gated mark/funding
+    // overrides, the oracle for feed authorization + quorum sizing.
+    let staking_module = Arc::new(staking_module);
+    executor.register_module(staking_module.clone());
+    // Register the exchange module with a default spot market
+    // (tick 0.01, lot 0.001, [$10, $20], 64 max resting). The
+    // exchange settles fills against EVM balances (plan.md §9.2).
+    let mut exchange_mod = exchange::ExchangeModule::with_ledger(evm_module.clone())
+        .with_committee(staking_module.clone());
+    if let Some(operator) = config.settlement_operator {
+        exchange_mod.set_settlement_operator(operator);
+    }
+    let exchange = Arc::new(exchange_mod);
+    exchange
+        .list_market(trading::MarketConfig {
+            market_id: 0,
+            tick_size: 1_000_000,
+            lot_size: 1_000,
+            min_price: 1_000_000_000,
+            max_price: 2_000_000_000,
+            max_resting: 64,
+        })
+        .expect("default market config is valid");
+    executor.register_module(exchange.clone());
+    // Register the perps module with a default perpetual market
+    // (10x max leverage, 0.5% maintenance margin). The perps
+    // module settles margin deposits/withdrawals against EVM
+    // balances (plan.md §9.3).
+    let perps = Arc::new(
+        perps::PerpsModule::with_ledger(evm_module.clone()).with_committee(staking_module.clone()),
+    );
+    perps
+        .list_market(perps::PerpsMarketConfig {
+            base: trading::MarketConfig {
+                market_id: 0,
+                tick_size: 1_000_000,
+                lot_size: 1_000,
+                min_price: 1_000_000_000,
+                max_price: 2_000_000_000,
+                max_resting: 64,
+            },
+            max_leverage: 10,
+            mmr_base_bps: 50,
+        })
+        .expect("default perps market config is valid");
+    executor.register_module(perps.clone());
+    // The oracle module: validators submit per-market price
+    // observations during the block; at end_block it aggregates
+    // them (strict-majority quorum → median → EMA) and pushes the
+    // result into perps through `MarkSink`. Staking supplies both
+    // feeder authorization and the quorum denominator.
+    let oracle = Arc::new(oracle::OracleModule::new().with_committee(staking_module.clone()));
+    oracle.with_sink(perps.clone());
+    executor.register_module(oracle);
+    // Governance: minimal on-chain parameter votes (plan.md §7 —
+    // Phase 4 scope: propose/vote/finalize, no timelock/veto).
+    executor.register_module(Arc::new(governance::GovernanceModule::new()));
+    // Wire the exchange and perps modules into the EVM for
+    // read-only precompiles (plan.md §10), then register the EVM.
+    evm_module.set_native_modules(Some(exchange), Some(perps));
+    executor.register_module(evm_module.clone());
+    let app: Arc<Executor> = Arc::new(executor);
+    // Spawn the async execution lane (plan.md §13 Phase D):
+    // `finalize_block` hands each committed block to a worker
+    // thread, overlapping execution of block h with consensus
+    // for block h+1. Both binary paths get the lane — the
+    // multi-validator binary previously ran without it, a second
+    // execution pipeline with different backpressure behavior.
+    app.spawn_exec_lane();
+    AssembledExecutor { app, evm_module, staking_module }
+}
+
 /// Run a simple smoke test: assemble a node, submit a tx, finalize a block.
 ///
 /// This is used by the `oxide-deploy` binary's smoke test and by
@@ -560,6 +729,311 @@ fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
     types::TxBytes::new(bytes)
 }
 
+// ── Parsed-config → assembly conversion ─────────────────────────
+//
+// The functions below are THE mapping between the TOML/env/CLI
+// `config::Config` and the running `NodeConfig`. Both node binaries
+// (`oxide-validator`, `oxide-fullnode`) call them — keeping one
+// conversion means a field added to the parsed schema cannot drift
+// out of sync between the binaries' running systems (the audit's
+// core 6.5 complaint: the two binaries each maintained their own
+// conversion, and both silently dropped most fields).
+
+/// Which startup path the configuration is being resolved for.
+///
+/// The modes consume different config fields — e.g. the TCP
+/// transport only exists in devnet-node mode — so
+/// [`validate_effective_config`] needs the mode to decide which
+/// settings are harmless and which are operator-visible lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeMode {
+    /// Single-node mode: in-process engine, no transport.
+    Single,
+    /// Multi-validator devnet-node mode: real `OxideBft` over the
+    /// TCP transport.
+    Devnet,
+}
+
+/// Inputs the shared conversion cannot source from `config::Config`
+/// itself — CLI flags and binary-resolved choices. `Default` maps
+/// to "no overrides" (devnet-compatible unsigned txs, in-memory
+/// state, devnet genesis).
+#[derive(Debug, Clone, Default)]
+pub struct AssemblyOverrides {
+    /// `--require-signed-txs` CLI flag — OR'd with
+    /// `[executor] require_signed_txs`.
+    pub require_signed_txs: bool,
+    /// `--data-dir` / `[storage] data_dir` — the resolved data
+    /// directory; its `evm.redb` child becomes `storage_path`.
+    pub data_dir: Option<std::path::PathBuf>,
+    /// The resolved genesis spec — from `--genesis-file` via
+    /// [`genesis_spec_from_file`], or the devnet fallback via
+    /// [`genesis_spec_devnet`]. `None` selects `NodeConfig`'s
+    /// single-node devnet default.
+    pub genesis: Option<GenesisSpec>,
+}
+
+/// Map a parsed `config::Config` onto the `NodeConfig` the shared
+/// assembly consumes.
+///
+/// Every field that affects execution, persistence, fees, or
+/// consensus parameters is propagated — previously the binaries'
+/// per-path conversions hardcoded `min_fee`, `settlement_operator`,
+/// `storage_path`, `evm_persistence`, and dropped the consensus
+/// timeout/block-budget and network settings entirely.
+///
+/// In [`NodeMode::Devnet`] the engine is always [`ConsensusConfig::OxideBft`]
+/// — the mode itself is the engine selection (a multi-validator
+/// cluster cannot run a single-leader sequencer). A parsed
+/// `engine = "sequencer"` therefore warns in
+/// [`validate_effective_config`] rather than silently running the
+/// wrong protocol or failing on a value the operator never set
+/// (`ConsensusEngineKind`'s serde default is `sequencer`, so every
+/// config-less `--devnet-node` launch would otherwise be fatal).
+///
+/// # Errors
+///
+/// Returns `Err` for malformed values that would panic later (e.g.
+/// a bad `exchange.settlement_operator` address) — config errors
+/// belong at startup, not mid-run.
+pub fn node_config_from(
+    config: &config::Config,
+    rpc: &config::RpcConfig,
+    overrides: &AssemblyOverrides,
+    mode: NodeMode,
+) -> Result<NodeConfig, String> {
+    let consensus = match (config.consensus.engine, mode) {
+        (config::ConsensusEngineKind::Sequencer, NodeMode::Single) => ConsensusConfig::Sequencer,
+        (_, NodeMode::Devnet) | (config::ConsensusEngineKind::OxideBft, NodeMode::Single) => {
+            ConsensusConfig::OxideBft
+        }
+    };
+    // `[exchange] settlement_operator` is a 0x-hex string in TOML —
+    // parse it here so a malformed address fails at startup, not at
+    // the first settlement tx.
+    let settlement_operator = config
+        .exchange
+        .settlement_operator
+        .as_ref()
+        .map(|hex| {
+            let bytes = hex_decode(hex)
+                .map_err(|e| format!("invalid exchange.settlement_operator address: {e}"))?;
+            let arr: [u8; 20] = bytes
+                .try_into()
+                .map_err(|_| "exchange.settlement_operator must be 20 bytes".to_string())?;
+            Ok::<primitives::Address, String>(primitives::Address(arr))
+        })
+        .transpose()?;
+    Ok(NodeConfig {
+        consensus,
+        max_mempool_entries: config.executor.max_mempool_entries,
+        parallel_threshold: config.executor.parallel_threshold,
+        // Persistence is always on; `storage_path` selects the
+        // backend. With a data dir the EVM state lives in
+        // `<dir>/evm.redb` (survives restarts); without one the
+        // `Volatile` backend keeps the in-memory behavior.
+        evm_persistence: true,
+        storage_path: overrides.data_dir.as_ref().map(|d| d.join("evm.redb")),
+        settlement_operator,
+        min_fee: config.executor.min_fee,
+        // One chain id, one base fee: the executor, the EVM module,
+        // and the RPC layer all read the same source so the
+        // advertised and enforced parameters cannot diverge.
+        chain_id: rpc.chain_id,
+        base_fee: rpc.base_fee,
+        require_signed_txs: overrides.require_signed_txs || config.executor.require_signed_txs,
+        history_retention: Some(config.storage.history_retention),
+        genesis: overrides.genesis.clone(),
+        block_budget: types::BlockBudget {
+            max_bytes: config.consensus.max_block_bytes,
+            max_gas: config.consensus.max_block_gas,
+        },
+        base_timeout_ms: config.consensus.base_timeout_ms,
+        max_timeout_ms: config.consensus.max_timeout_ms,
+    })
+}
+
+/// Convert a parsed `--genesis-file` into the [`GenesisSpec`] the
+/// shared assembly applies: staking validators (address, stake,
+/// optional BLS key) plus the legacy `bank.balances` map folded
+/// into the EVM ledger scaled to wei (the EVM account store is the
+/// single ledger — there is no bank).
+///
+/// `evm.alloc` is deliberately NOT folded here: its storage slots
+/// need a 256-bit type this crate doesn't depend on. The binary
+/// applies it directly to the assembled EVM module.
+///
+/// # Errors
+///
+/// Returns `Err` naming the malformed entry (index + reason) —
+/// genesis errors belong at startup, not mid-run.
+pub fn genesis_spec_from_file(genesis: &config::genesis::Genesis) -> Result<GenesisSpec, String> {
+    let validators = genesis
+        .staking
+        .validators
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let addr_bytes = hex_decode(&v.address)
+                .map_err(|e| format!("genesis validator {i} invalid address: {e}"))?;
+            let addr: [u8; 20] = addr_bytes
+                .try_into()
+                .map_err(|_| format!("genesis validator {i} address must be 20 bytes"))?;
+            let public_key = v
+                .public_key
+                .as_ref()
+                .map(|pk_hex| {
+                    hex_decode(pk_hex)
+                        .map_err(|e| format!("genesis validator {i} invalid BLS key: {e}"))
+                })
+                .transpose()?;
+            Ok(GenesisValidator { address: primitives::Address(addr), stake: v.stake, public_key })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // Legacy `bank.balances` (base units) folds into the EVM ledger
+    // scaled to wei — the EVM store is the single ledger. Malformed
+    // entries fail loudly: silently skipping (or zeroing, as an
+    // earlier conversion did) a genesis balance corrupts the money
+    // supply with no signal.
+    let balances = genesis
+        .bank
+        .balances
+        .iter()
+        .map(|(addr_hex, balance_val)| {
+            let balance = balance_val
+                .as_u64()
+                .or_else(|| balance_val.as_str().and_then(|s| s.parse::<u64>().ok()))
+                .ok_or_else(|| format!("genesis bank balance for {addr_hex} is not an integer"))?;
+            let bytes = hex_decode(addr_hex)
+                .map_err(|e| format!("genesis bank address {addr_hex}: {e}"))?;
+            let addr: [u8; 20] = bytes
+                .try_into()
+                .map_err(|_| format!("genesis bank address {addr_hex} must be 20 bytes"))?;
+            Ok((primitives::Address(addr), u128::from(balance) * framework::WEI_PER_UNIT))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(GenesisSpec { validators, balances })
+}
+
+/// The deterministic devnet genesis spec — `num_validators`
+/// validators `[i;20]` at stake `1_000_000` and
+/// `num_prefunded_senders` funded addresses `[i;20]` at
+/// `genesis_balance` units each. NOT suitable for production.
+#[must_use]
+pub fn genesis_spec_devnet(fallback: &config::GenesisConfig) -> GenesisSpec {
+    let validators = (0..fallback.num_validators)
+        .map(|i| GenesisValidator {
+            address: primitives::Address([u8::try_from(i).unwrap_or(0); 20]),
+            stake: 1_000_000,
+            public_key: None,
+        })
+        .collect();
+    let balances = (0..fallback.num_prefunded_senders)
+        .map(|i| {
+            (
+                primitives::Address([i; 20]),
+                u128::from(fallback.genesis_balance) * framework::WEI_PER_UNIT,
+            )
+        })
+        .collect();
+    GenesisSpec { validators, balances }
+}
+
+/// Validate the effective configuration before the node builds
+/// anything — the "unsupported settings fail rather than silently
+/// do nothing" gate.
+///
+/// Returns `(warnings, fatal_errors)`: warnings are settings that
+/// are consumed-but-overridden in this mode (log them, startup
+/// continues); fatal errors are settings that would silently do
+/// nothing or are semantically impossible (log them, abort).
+///
+/// Pure: takes the parsed config, the derived `NodeConfig`, and the
+/// mode explicitly so tests can drive it without CLI/env.
+#[must_use]
+pub fn validate_effective_config(
+    config: &config::Config,
+    node_config: &NodeConfig,
+    mode: NodeMode,
+) -> (Vec<String>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+
+    // The sequencer engine cannot run a multi-validator cluster —
+    // devnet-node mode forces oxideBFT regardless (see
+    // `node_config_from`). A parsed `engine = "sequencer"` is an
+    // override, not a fatal error: `ConsensusEngineKind`'s serde
+    // default IS sequencer, so the setting is indistinguishable from
+    // "unset" for config-less launches — warning is the honest
+    // signal.
+    if mode == NodeMode::Devnet && config.consensus.engine == config::ConsensusEngineKind::Sequencer
+    {
+        warnings.push(
+            "consensus.engine = \"sequencer\" is overridden in --devnet-node mode — \
+             running oxideBFT (a single-leader engine cannot run a multi-validator cluster)"
+                .to_string(),
+        );
+    }
+
+    // `storage.archive` and `journal_retain_segments` have no
+    // consumer in the node's storage stack — setting them would
+    // silently do nothing, so they fail rather than parse-then-drop.
+    if config.storage.archive {
+        errors.push(
+            "storage.archive = true is not implemented — archive retention is not wired \
+             to a consumer in this binary"
+                .to_string(),
+        );
+    }
+    if config.storage.journal_retain_segments != 1_000 {
+        errors.push(format!(
+            "storage.journal_retain_segments = {} is not wired to a consumer in this \
+             binary (the EVM backend does not use storage journals)",
+            config.storage.journal_retain_segments
+        ));
+    }
+
+    // `network.listen_addr`/`network.peers` are derived per-index in
+    // devnet-node mode and unused entirely in single-node mode — a
+    // config that sets them is valid TOML but not what the operator
+    // expects, so it warns rather than fails.
+    let network_addr_set = config.network.listen_addr != "127.0.0.1:20000";
+    let network_peers_set = !config.network.peers.is_empty();
+    if network_addr_set || network_peers_set {
+        let why = match mode {
+            NodeMode::Devnet => "overridden by the --devnet-node/--base-port index derivation",
+            NodeMode::Single => "no transport runs in single-node mode",
+        };
+        warnings.push(format!(
+            "network.listen_addr/network.peers are set but {why} — \
+             only network.*_timeout_secs and network.max_message_bytes apply"
+        ));
+    }
+
+    if !node_config.require_signed_txs {
+        warnings.push(
+            "executor.require_signed_txs is off — unsigned native-module envelopes are \
+             admitted (devnet compatibility; enable for production)"
+                .to_string(),
+        );
+    }
+
+    (warnings, errors)
+}
+
+/// Decode a bare-or-`0x` hex string to bytes (genesis addresses,
+/// keys, operator addresses).
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() % 2 != 0 {
+        return Err("odd-length hex".to_string());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +1052,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node = Node::assemble(&config);
         // The engine should be ready (no blocks yet).
@@ -597,6 +1072,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node = Node::assemble(&config);
         assert!(node.engine().finalized_height().is_none());
@@ -629,6 +1105,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let bft_config = NodeConfig {
             consensus: ConsensusConfig::OxideBft,
@@ -641,6 +1118,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
 
         let mut seq_node = Node::assemble(&seq_config);
@@ -684,6 +1162,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -724,6 +1203,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node_src = Node::assemble(&config_src);
         // Submit a tx and finalize a block to produce EVM state.
@@ -752,6 +1232,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let node_dst = Node::assemble(&config_dst);
 
@@ -800,6 +1281,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node = Node::assemble(&config);
         // Submit a tx and finalize a block.
@@ -919,6 +1401,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node = Node::assemble(&config);
         // Finalize one block.
@@ -964,6 +1447,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node1 = Node::assemble(&config);
         let mut node2 = Node::assemble(&config);
@@ -1007,6 +1491,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node = Node::assemble(&config);
         // Finalize a block.
@@ -1034,6 +1519,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node = Node::assemble(&config);
         let module_payload = staking::msg::delegate(Address([0u8; 20]), 100);
@@ -1057,5 +1543,276 @@ mod tests {
         let prom = node.metrics().prometheus();
         assert!(prom.contains("oxide_counter{name=\"test_counter\"} 42"));
         assert!(prom.contains("oxide_gauge{name=\"test_gauge\"} 100"));
+    }
+
+    // ── Shared config conversion (the 6.5 remediation) ──────────
+
+    /// A `config::Config` with every propagated field set to a
+    /// non-default value — the fixture `node_config_from` tests run
+    /// against.
+    fn full_config() -> config::Config {
+        let mut config = config::Config::default();
+        config.consensus.engine = config::ConsensusEngineKind::OxideBft;
+        config.consensus.base_timeout_ms = 5_000;
+        config.consensus.max_timeout_ms = 60_000;
+        config.consensus.max_block_bytes = 4 << 20;
+        config.consensus.max_block_gas = 2_000_000_000;
+        config.executor.max_mempool_entries = 777;
+        config.executor.parallel_threshold = 64;
+        config.executor.min_fee = 42;
+        config.executor.require_signed_txs = true;
+        config.storage.history_retention = 128;
+        config.exchange.settlement_operator = Some(format!("0x{}", "ab".repeat(20)));
+        config
+    }
+
+    #[test]
+    fn node_config_from_propagates_every_field() {
+        let config = full_config();
+        let rpc = config::RpcConfig { chain_id: 7777, base_fee: 123_456, ..Default::default() };
+        let data_dir = std::path::PathBuf::from("/tmp/oxide-test");
+        let overrides = AssemblyOverrides {
+            require_signed_txs: false,
+            data_dir: Some(data_dir.clone()),
+            genesis: None,
+        };
+        let node_config = node_config_from(&config, &rpc, &overrides, NodeMode::Single)
+            .expect("valid config maps cleanly");
+
+        assert_eq!(node_config.consensus, ConsensusConfig::OxideBft);
+        assert_eq!(node_config.max_mempool_entries, 777);
+        assert_eq!(node_config.parallel_threshold, 64);
+        assert_eq!(node_config.min_fee, 42);
+        assert_eq!(node_config.chain_id, 7777);
+        assert_eq!(node_config.base_fee, 123_456);
+        assert!(node_config.require_signed_txs);
+        assert_eq!(node_config.history_retention, Some(128));
+        assert_eq!(
+            node_config.storage_path,
+            Some(data_dir.join("evm.redb")),
+            "data_dir must become the EVM state path"
+        );
+        assert_eq!(
+            node_config.settlement_operator,
+            Some(primitives::Address([0xab; 20])),
+            "the hex operator address must parse"
+        );
+        assert_eq!(
+            node_config.block_budget,
+            types::BlockBudget { max_bytes: 4 << 20, max_gas: 2_000_000_000 },
+            "consensus block budgets must reach the engine"
+        );
+        assert_eq!(node_config.base_timeout_ms, 5_000);
+        assert_eq!(node_config.max_timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn node_config_from_cli_flag_or_toml_enables_signed_txs() {
+        let mut config = config::Config::default();
+        config.executor.require_signed_txs = false;
+        let rpc = config::RpcConfig::default();
+        // CLI flag alone enables it.
+        let with_cli = AssemblyOverrides { require_signed_txs: true, ..Default::default() };
+        assert!(
+            node_config_from(&config, &rpc, &with_cli, NodeMode::Single)
+                .expect("ok")
+                .require_signed_txs
+        );
+        // TOML alone enables it.
+        config.executor.require_signed_txs = true;
+        assert!(
+            node_config_from(&config, &rpc, &AssemblyOverrides::default(), NodeMode::Single)
+                .expect("ok")
+                .require_signed_txs
+        );
+    }
+
+    #[test]
+    fn node_config_from_rejects_bad_operator_address() {
+        let mut config = config::Config::default();
+        config.exchange.settlement_operator = Some("0xzz".to_string());
+        let err = node_config_from(
+            &config,
+            &config::RpcConfig::default(),
+            &AssemblyOverrides::default(),
+            NodeMode::Single,
+        )
+        .expect_err("malformed operator hex must fail");
+        assert!(err.contains("settlement_operator"), "error should name the field: {err}");
+    }
+
+    #[test]
+    fn genesis_spec_from_file_converts_validators_and_balances() {
+        let bls_hex = "11".repeat(48);
+        let json = format!(
+            r#"{{
+                "chain_id": 1,
+                "bank": {{ "balances": {{ "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "1000" }} }},
+                "staking": {{ "validators": [
+                    {{ "address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                      "stake": 5000,
+                      "public_key": "{bls_hex}" }}
+                ] }}
+            }}"#
+        );
+        let genesis = config::genesis::Genesis::from_json_str(&json).expect("test genesis parses");
+        let spec = genesis_spec_from_file(&genesis).expect("valid genesis converts");
+        assert_eq!(spec.validators.len(), 1);
+        assert_eq!(spec.validators[0].address, primitives::Address([0xbb; 20]));
+        assert_eq!(spec.validators[0].stake, 5_000);
+        assert_eq!(spec.validators[0].public_key.as_ref().map(Vec::len), Some(48));
+        assert_eq!(spec.balances.len(), 1);
+        assert_eq!(spec.balances[0].0, primitives::Address([0xaa; 20]));
+        assert_eq!(spec.balances[0].1, 1_000 * framework::WEI_PER_UNIT);
+    }
+
+    #[test]
+    fn genesis_spec_devnet_synthesizes_fallback() {
+        let fallback = config::GenesisConfig {
+            num_validators: 3,
+            num_prefunded_senders: 5,
+            genesis_balance: 7,
+            ..Default::default()
+        };
+        let spec = genesis_spec_devnet(&fallback);
+        assert_eq!(spec.validators.len(), 3);
+        assert_eq!(spec.balances.len(), 5);
+        assert_eq!(spec.validators[0].stake, 1_000_000);
+        assert_eq!(spec.balances[4].1, 7 * framework::WEI_PER_UNIT);
+    }
+
+    #[test]
+    fn devnet_mode_forces_oxidebft_and_warns_on_sequencer() {
+        // `--devnet-node` with no --engine/--config parses
+        // `ConsensusEngineKind`'s serde default (sequencer) — the
+        // mode must still run oxideBFT, and warn rather than fail
+        // on a value indistinguishable from "unset".
+        let mut config = config::Config::default();
+        config.consensus.engine = config::ConsensusEngineKind::Sequencer;
+        let node_config = node_config_from(
+            &config,
+            &config::RpcConfig::default(),
+            &AssemblyOverrides::default(),
+            NodeMode::Devnet,
+        )
+        .expect("ok");
+        assert_eq!(
+            node_config.consensus,
+            ConsensusConfig::OxideBft,
+            "devnet-node mode always runs oxideBFT"
+        );
+        let (warnings, errors) = validate_effective_config(&config, &node_config, NodeMode::Devnet);
+        assert!(errors.is_empty(), "the override warns, never fails: {errors:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("sequencer")),
+            "the override must be visible: {warnings:?}"
+        );
+        // The same parsed engine is honored (not overridden) in
+        // single-node mode.
+        let single_config = node_config_from(
+            &config,
+            &config::RpcConfig::default(),
+            &AssemblyOverrides::default(),
+            NodeMode::Single,
+        )
+        .expect("ok");
+        assert_eq!(single_config.consensus, ConsensusConfig::Sequencer);
+    }
+
+    #[test]
+    fn validate_effective_config_fails_on_unwired_settings() {
+        let mut config = config::Config::default();
+        config.storage.archive = true;
+        config.storage.journal_retain_segments = 5;
+        let node_config = node_config_from(
+            &config,
+            &config::RpcConfig::default(),
+            &AssemblyOverrides::default(),
+            NodeMode::Devnet,
+        )
+        .expect("ok");
+        let (_, errors) = validate_effective_config(&config, &node_config, NodeMode::Single);
+        assert!(errors.iter().any(|e| e.contains("archive")), "archive must fail: {errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("journal_retain_segments")),
+            "journal_retain_segments must fail: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_effective_config_warns_on_overrides_and_unsigned() {
+        let mut config = config::Config::default();
+        config.network.peers = vec!["127.0.0.1:20001".to_string()];
+        let node_config = node_config_from(
+            &config,
+            &config::RpcConfig::default(),
+            &AssemblyOverrides::default(),
+            NodeMode::Devnet,
+        )
+        .expect("ok");
+        let (warnings, errors) = validate_effective_config(&config, &node_config, NodeMode::Devnet);
+        assert!(errors.is_empty());
+        assert!(
+            warnings.iter().any(|w| w.contains("network.peers")),
+            "derived peer config should warn: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("require_signed_txs")),
+            "unsigned envelopes should warn: {warnings:?}"
+        );
+    }
+
+    // ── Shared executor assembly ─────────────────────────────────
+
+    #[test]
+    fn assemble_executor_registers_the_full_module_graph() {
+        let assembled = assemble_executor(&NodeConfig::default());
+        let snap = assembled.app.export_snapshot();
+        let names: Vec<&str> = snap.module_roots.iter().map(|(name, _)| name.as_str()).collect();
+        for expected in ["core", "staking", "exchange", "perps", "oracle", "governance", "evm"] {
+            assert!(
+                names.contains(&expected),
+                "module {expected} missing from the assembled graph: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assemble_executor_honors_chain_id_and_base_fee() {
+        // Previously the EVM module hardcoded chain id 1 / 7 gwei
+        // while the executor's chain id was configurable — the two
+        // could silently diverge.
+        let config = NodeConfig { chain_id: 7777, base_fee: 555, ..Default::default() };
+        let assembled = assemble_executor(&config);
+        assert_eq!(assembled.evm_module.chain_id(), 7777);
+        assert_eq!(assembled.evm_module.base_fee(), 555);
+    }
+
+    #[test]
+    fn assemble_executor_applies_genesis_spec() {
+        let validator = primitives::Address([0x11; 20]);
+        let funded = primitives::Address([0x22; 20]);
+        let spec = GenesisSpec {
+            validators: vec![GenesisValidator {
+                address: validator,
+                stake: 9_000,
+                public_key: None,
+            }],
+            balances: vec![(funded, 42_000)],
+        };
+        let config = NodeConfig { genesis: Some(spec), ..Default::default() };
+        let assembled = assemble_executor(&config);
+        assert_eq!(assembled.staking_module.stake(&validator), 9_000);
+        assert_eq!(assembled.evm_module.balance(&funded), 42_000);
+        // The devnet-default `[0u8;20]` validator must NOT be
+        // registered when an explicit spec is given.
+        assert_eq!(assembled.staking_module.stake(&primitives::Address([0u8; 20])), 0);
+    }
+
+    #[test]
+    fn assemble_executor_devnet_default_registers_zero_identity() {
+        let assembled = assemble_executor(&NodeConfig::default());
+        // The devnet default funds and registers `[0u8;20]`.
+        assert!(assembled.evm_module.balance(&primitives::Address([0u8; 20])) > 0);
     }
 }

@@ -2736,7 +2736,11 @@ mod tests {
                 genesis_balance: 500_000_000_000,
                 num_prefunded_senders: 16,
             },
-            executor: config::ExecutorConfig { max_mempool_entries: 5_000, parallel_threshold: 50 },
+            executor: config::ExecutorConfig {
+                max_mempool_entries: 5_000,
+                parallel_threshold: 50,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut devnet = TcpMultiNodeDevnet::from_config(&config);

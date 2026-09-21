@@ -2125,6 +2125,46 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     sealed, and the "your transaction was rejected" receipts can
     no longer be attached to the wrong transaction.
 
+- **One assembly path for every binary:** the validator and
+  fullnode used to each wire their own executor and module set —
+  and the multi-validator binary's copy registered the EVM module
+  twice, which panicked at startup. Both binaries now share the
+  same `node::assemble_executor` path (full module graph, same
+  execution lane) and the same `node::node_config_from`
+  conversion, so they cannot drift into different systems again.
+- **Parsed config actually reaches the runtime:** consensus
+  timeouts (`base_timeout_ms`, `max_timeout_ms`), block budgets
+  (`max_block_bytes`, `max_block_gas`), `min_fee`, the settlement
+  operator, chain id, base fee, signed-tx policy, history
+  retention, storage path, and genesis state all propagate — most
+  previously parsed and then did nothing. New TOML fields:
+  `[executor] min_fee`, `[executor] require_signed_txs`,
+  `[storage] data_dir`, `[exchange] settlement_operator`, each
+  with an `OXIDE_*` environment override. Epoch rotation now
+  keeps configured pacemaker timeouts instead of reverting to
+  defaults.
+- **Effective config is validated and printed at startup:**
+  settings with no consumer fail loudly, overridden settings warn
+  (e.g. `engine = "sequencer"` under `--devnet-node`, network
+  listen/peers where no transport consumes them, unsigned txs),
+  and the node prints the `NodeConfig` it is actually running.
+- **Validator transport is configurable:** `[network]` timeouts
+  and `max_message_bytes` now reach the TCP transport, and the
+  allowed peer-id set is pinned to the validator set (it was
+  previously open to any peer claiming an id).
+- **Fullnode is honest about what it cannot do:** follower mode
+  is not implemented, so the binary exits non-zero with an
+  actionable message unless `--verify-only` is given — the
+  supported fetch-verify-import-exit flow — instead of printing
+  "ready".
+- **In plain words:** the two node programs used to build
+  slightly different chains from the same settings file, most
+  settings were silently ignored, and the multi-validator mode
+  crashed the moment it started. Now both programs build the same
+  system, honor every setting you give them (or tell you why they
+  can't), show you the settings they ended up with, and the
+  multi-validator mode actually runs.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

@@ -263,6 +263,7 @@ mod tests {
             chain_id: 1,
             require_signed_txs: false,
             history_retention: None,
+            ..Default::default()
         };
         let mut node = Node::assemble(&config);
 

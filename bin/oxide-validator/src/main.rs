@@ -17,6 +17,14 @@
 //!   validator node that connects to other validator processes over
 //!   TCP. Used by the multi-process devnet launcher.
 //!
+//! Both modes run the SAME executor assembly
+//! (`node::assemble_executor` — full module graph + exec lane) and
+//! the SAME `node::node_config_from` conversion as `oxide-fullnode`,
+//! so the shipped binaries cannot drift into different systems.
+//! Parsed config is validated before assembly (`node::
+//! validate_effective_config`): unsupported settings fail, overridden
+//! ones warn, and the effective config is printed at startup.
+//!
 //! Usage:
 //!
 //! ```sh
@@ -37,7 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use node::{ConsensusConfig, Node, NodeConfig};
+use node::{Node, NodeConfig};
 use ports::transport::Transport;
 use ports::{AppInterface, ConsensusEngine};
 use types::{MempoolAck, TxBytes};
@@ -223,14 +231,14 @@ fn main() {
 /// for either the server to exit or a SIGTERM/SIGINT shutdown signal,
 /// enabling graceful shutdown.
 fn run_single_node() {
-    let (node_config, rpc_config, _genesis_config) = load_config();
+    let cfg = load_config(node::NodeMode::Single);
     tracing::info!(
-        engine = node_config.consensus.as_str(),
-        max_mempool_entries = node_config.max_mempool_entries,
+        engine = cfg.node.consensus.as_str(),
+        max_mempool_entries = cfg.node.max_mempool_entries,
         "oxide-validator: starting"
     );
 
-    let mut node = Node::assemble(&node_config);
+    let mut node = Node::assemble(&cfg.node);
     tracing::info!("oxide-validator: assembled stack (executor + core/staking/evm modules)");
 
     handle_import_snapshot(&mut node);
@@ -267,7 +275,7 @@ fn run_single_node() {
 
     // Start the JSON-RPC HTTP server.
     tracing::info!(
-        listen_addr = %rpc_config.listen_addr,
+        listen_addr = %cfg.rpc.listen_addr,
         "oxide-validator: starting RPC server"
     );
 
@@ -275,7 +283,7 @@ fn run_single_node() {
     let recorder = Arc::new(metrics::Recorder::new());
 
     let (rpc_shared, http_server) =
-        build_single_node_rpc(&node, &rpc_config, height, recorder.clone());
+        build_single_node_rpc(&node, &cfg.rpc, height, recorder.clone());
 
     // Build a single tokio runtime for the consensus driver, HTTP
     // server, and signal handling.
@@ -538,8 +546,12 @@ fn handle_key_change(node: &mut Node) {
 /// the node's `rpc.listen_addr` config is used.
 #[allow(clippy::too_many_lines)]
 fn run_devnet_node(node_index_str: &str) {
-    // Load base config (TOML + env vars + CLI overrides).
-    let (node_config, rpc_config, genesis_config) = load_config();
+    // Load base config (TOML + env vars + CLI overrides), validated
+    // and emitted as the effective config.
+    let cfg = load_config(node::NodeMode::Devnet);
+    let node_config = &cfg.node;
+    let rpc_config = &cfg.rpc;
+    let genesis_config = &cfg.genesis_cfg;
 
     let node_index: usize =
         node_index_str.parse().unwrap_or_else(|e| panic!("invalid --devnet-node index: {e}"));
@@ -581,36 +593,41 @@ fn run_devnet_node(node_index_str: &str) {
 
     println!("oxide-validator[{node_index}]: listening on {listen_addr}, {} peers", peers.len());
 
-    // Create the executor with modules. If --genesis-file was given,
-    // the staking module registers the genesis validators directly
-    // (bypassing the delegate-transaction path — genesis state is
-    // not a user tx).
-    let genesis = parse_cli_flag("--genesis-file").map(|p| {
-        config::genesis::Genesis::from_json_file(&PathBuf::from(&p))
-            .unwrap_or_else(|e| panic!("failed to load genesis file {p}: {e}"))
-    });
-    let (executor, evm_module) =
-        build_devnet_executor(&genesis_config, &node_config, &rpc_config, genesis.as_ref());
-    let app: Arc<executor::Executor> = Arc::new(executor);
+    // Assemble the executor through the ONE shared production path
+    // (`node::assemble_executor`) — the same module graph and exec
+    // lane `Node::assemble` produces. If --genesis-file was given,
+    // the staking validators and native balances are already applied
+    // via `node.genesis`; `evm.alloc` is applied on the module
+    // handle below.
+    let assembled = node::assemble_executor(&cfg.node);
+    let app: Arc<executor::Executor> = assembled.app.clone();
+    let evm_module = assembled.evm_module.clone();
+    if let Some(genesis) = &cfg.genesis_file {
+        apply_evm_alloc(&evm_module, genesis);
+    }
     let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
 
     // Create the TCP transport: --tls-dir for mTLS, plain TCP
-    // otherwise.
-    let mut transport = build_transport(&listen_addr, node_index, peers);
+    // otherwise. `[network]` timeouts and the frame bound flow into
+    // `TcpTransportConfig`.
+    let mut transport = build_transport(&listen_addr, node_index, peers, &cfg.network);
 
     // Give connections time to establish. TLS handshakes take
     // longer than plain TCP — 2s gives all peers time to connect
     // and complete the handshake before the first proposal.
     thread::sleep(Duration::from_millis(2000));
 
-    // Create the consensus engine.
+    // Create the consensus engine — with the configured pacemaker
+    // timeouts and block budget, not the compiled defaults.
     let validator_set_clone = validator_set.clone();
     let mut engine = consensus::OxideBft::with_index(
         app_dyn,
         validator_set,
         u16::try_from(node_index).expect("index fits in u16"),
     )
-    .with_secret_key(our_key.clone());
+    .with_secret_key(our_key.clone())
+    .with_pacemaker_timeouts(node_config.base_timeout_ms, node_config.max_timeout_ms)
+    .with_block_budget(node_config.block_budget);
 
     // WAL persistence: --wal-file.
     if let Some(wal_path) = parse_cli_flag("--wal-file") {
@@ -620,30 +637,35 @@ fn run_devnet_node(node_index_str: &str) {
         println!("oxide-validator[{node_index}]: WAL loaded from {wal_path}");
     }
 
-    // Data directory: --data-dir <dir> enables auto-snapshot
-    // persistence — on startup, if `<dir>/snapshot.bin` exists,
-    // import it; on shutdown, export the current state to
-    // `<dir>/snapshot.bin`.
+    // Data directory: `--data-dir` or `[storage] data_dir` enables
+    // auto-snapshot persistence — on startup, if
+    // `<dir>/snapshot.bin` exists, import it; on shutdown, export
+    // the current state to `<dir>/snapshot.bin`. The EVM state
+    // database at `<dir>/evm.redb` was already wired by
+    // `assemble_executor` via `node.storage_path`.
     //
     // This gives a restarting validator full state persistence
     // without requiring manual `--export-snapshot` /
     // `--import-snapshot` flags. The WAL (if `--wal-file` is also
     // given) protects consensus safety state across the restart.
-    let data_dir = parse_cli_flag("--data-dir");
+    let data_dir = cfg.data_dir.clone();
     if let Some(ref dir) = data_dir {
         std::fs::create_dir_all(dir)
-            .unwrap_or_else(|e| panic!("failed to create data dir {dir}: {e}"));
-        let snap_path = format!("{dir}/snapshot.bin");
-        if std::path::Path::new(&snap_path).exists() {
+            .unwrap_or_else(|e| panic!("failed to create data dir {}: {e}", dir.display()));
+        let snap_path = dir.join("snapshot.bin");
+        if snap_path.exists() {
             let bytes = std::fs::read(&snap_path)
-                .unwrap_or_else(|e| panic!("failed to read snapshot {snap_path}: {e}"));
+                .unwrap_or_else(|e| panic!("failed to read snapshot {}: {e}", snap_path.display()));
             let mut reader = codec::Reader::new(&bytes);
-            let snap = executor::ExecutorSnapshot::decode(&mut reader)
-                .unwrap_or_else(|e| panic!("failed to decode snapshot {snap_path}: {e}"));
-            app.import_snapshot(&snap)
-                .unwrap_or_else(|e| panic!("failed to import snapshot {snap_path}: {e}"));
+            let snap = executor::ExecutorSnapshot::decode(&mut reader).unwrap_or_else(|e| {
+                panic!("failed to decode snapshot {}: {e}", snap_path.display())
+            });
+            app.import_snapshot(&snap).unwrap_or_else(|e| {
+                panic!("failed to import snapshot {}: {e}", snap_path.display())
+            });
             println!(
-                "oxide-validator[{node_index}]: imported snapshot from {snap_path} (height {})",
+                "oxide-validator[{node_index}]: imported snapshot from {} (height {})",
+                snap_path.display(),
                 snap.height
             );
         }
@@ -663,7 +685,7 @@ fn run_devnet_node(node_index_str: &str) {
 
     // Start the RPC server if --rpc-listen or rpc.listen_addr is set.
     let rpc_handle = start_devnet_rpc(
-        &rpc_config,
+        rpc_config,
         &app,
         node_index,
         shared_validator_set.clone(),
@@ -734,11 +756,12 @@ fn run_devnet_node(node_index_str: &str) {
         let snap = app.export_snapshot();
         let mut buf = Vec::new();
         snap.encode(&mut buf);
-        let snap_path = format!("{dir}/snapshot.bin");
+        let snap_path = dir.join("snapshot.bin");
         std::fs::write(&snap_path, &buf)
-            .unwrap_or_else(|e| panic!("failed to write snapshot {snap_path}: {e}"));
+            .unwrap_or_else(|e| panic!("failed to write snapshot {}: {e}", snap_path.display()));
         println!(
-            "oxide-validator[{node_index}]: exported snapshot to {snap_path} (height {})",
+            "oxide-validator[{node_index}]: exported snapshot to {} (height {})",
+            snap_path.display(),
             snap.height
         );
     }
@@ -834,186 +857,13 @@ fn load_validator_set(num_nodes: usize, _node_index: usize) -> consensus::Valida
     }
 }
 
-/// Build the devnet executor with core, staking, and EVM modules.
-///
-/// The EVM account store is the single native-token ledger: it is
-/// built first so staking settles through it, genesis `bank`
-/// balances fold into `evm.alloc` (base units → wei), and the EVM
-/// module collects native-module fees.
-///
-/// Uses `genesis_config` for the number of pre-funded senders and
-/// genesis balance, `node_config` for executor params (mempool size,
-/// parallel threshold), and `rpc_config` for the EVM chain ID and
-/// base fee so `eth_chainId`/`eth_gasPrice` agree with execution.
-///
-/// Returns the executor and the shared `Arc<EvmModule>` so the RPC
-/// server can serve `eth_*` reads against the same instance the
-/// executor commits.
-fn build_devnet_executor(
-    genesis_config: &config::GenesisConfig,
-    node_config: &NodeConfig,
-    rpc_config: &config::RpcConfig,
-    genesis: Option<&config::genesis::Genesis>,
-) -> (executor::Executor, Arc<evm::EvmModule>) {
-    let mut executor = executor::Executor::with_config(
-        node_config.max_mempool_entries,
-        node_config.parallel_threshold,
-    )
-    .with_chain_id(rpc_config.chain_id)
-    .with_unsigned_tx_policy(if node_config.require_signed_txs {
-        executor::UnsignedTxPolicy::Reject
-    } else {
-        executor::UnsignedTxPolicy::Allow
-    });
-    executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-
-    // EVM module first: it is the native-token ledger every other
-    // module settles through, so it must exist before staking wires
-    // its `Balances` handle. Uses the RPC-config chain ID/base fee
-    // so the advertised and enforced parameters agree.
-    let evm_module = Arc::new(
-        evm::EvmModule::new(rpc_config.chain_id, rpc_config.base_fee)
-            .with_fee_recipient(staking::FEE_POOL),
-    );
-    // Canonical preinstalls first — a user `alloc` entry below can
-    // still intentionally override a preinstall address.
-    evm_module.install_preinstalls();
-
-    apply_genesis_balances(&evm_module, genesis_config, genesis);
-    executor.register_module(evm_module.clone());
-    // The EVM ledger collects fees for all native-module txs —
-    // without this the module txs ran free.
-    executor.set_fee_module(framework::module_id::EVM);
-
-    // Staking module: register genesis validators directly if
-    // --genesis-file was given; otherwise use deterministic devnet
-    // validators (Address([i; 20]) with stake 1).
-    let staking_module = staking::StakingModule::new();
-    if let Some(genesis) = genesis {
-        for v in &genesis.staking.validators {
-            let addr_bytes = hex_decode(&v.address)
-                .unwrap_or_else(|e| panic!("genesis validator invalid address: {e}"));
-            let addr: [u8; 20] = addr_bytes
-                .try_into()
-                .unwrap_or_else(|_| panic!("genesis validator address must be 20 bytes"));
-            let validator = primitives::Address(addr);
-            staking_module.genesis_register_validator(validator, v.stake);
-            // The genesis `public_key` is the validator's consensus
-            // identity — staking keeps it so double-sign evidence
-            // can be verified on-chain. Optional: single-node
-            // devnets have no real signatures to prove against.
-            if let Some(pk_hex) = &v.public_key {
-                let key = hex_decode(pk_hex)
-                    .unwrap_or_else(|e| panic!("genesis validator invalid BLS key: {e}"));
-                staking_module.genesis_set_bls_key(validator, &key);
-            }
-        }
-    } else {
-        // Deterministic devnet fallback — NOT suitable for production.
-        for i in 0..genesis_config.num_validators {
-            let addr = primitives::Address([u8::try_from(i).unwrap_or(0); 20]);
-            staking_module.genesis_register_validator(addr, 1_000_000);
-        }
-    }
-    // Delegation is EVM-ledger-backed: `delegate` debits the
-    // delegator into the bonded pool, unbonding refunds from it.
-    // Genesis stake registered above is unattributed (declaration
-    // stake, not pool-backed) and cannot be undelegated.
-    staking_module.set_ledger(evm_module.clone());
-    executor.register_module(Arc::new(staking_module));
-
-    // Apply the genesis `alloc` map (Ethereum `genesis.json`
-    // convention): balances, nonces, code, and storage for
-    // pre-funded accounts and preinstalled contracts.
-    if let Some(genesis) = genesis {
-        for (addr_hex, account) in &genesis.evm.alloc {
-            let addr_bytes = hex_decode(addr_hex)
-                .unwrap_or_else(|e| panic!("genesis evm.alloc invalid address: {e}"));
-            let addr: [u8; 20] = addr_bytes
-                .try_into()
-                .unwrap_or_else(|_| panic!("genesis evm.alloc address must be 20 bytes"));
-            let balance = if let Some(hex) = account.balance.strip_prefix("0x") {
-                u128::from_str_radix(hex, 16)
-            } else {
-                account.balance.parse::<u128>()
-            }
-            .unwrap_or_else(|e| panic!("genesis evm.alloc invalid balance: {e}"));
-            let code = account
-                .code
-                .as_deref()
-                .map(|c| hex_decode(c).unwrap_or_else(|e| panic!("evm.alloc code: {e}")))
-                .unwrap_or_default();
-            let storage = account
-                .storage
-                .iter()
-                .map(|(slot, value)| {
-                    let slot = alloy_primitives::U256::from_str_radix(
-                        slot.strip_prefix("0x").unwrap_or(slot),
-                        16,
-                    )
-                    .unwrap_or_else(|e| panic!("evm.alloc slot: {e}"));
-                    let value = alloy_primitives::U256::from_str_radix(
-                        value.strip_prefix("0x").unwrap_or(value),
-                        16,
-                    )
-                    .unwrap_or_else(|e| panic!("evm.alloc storage value: {e}"));
-                    (slot, value)
-                })
-                .collect();
-            evm_module.genesis_insert_account(
-                &primitives::Address(addr),
-                balance,
-                account.nonce,
-                code,
-                storage,
-            );
-        }
-    }
-    executor.register_module(evm_module.clone());
-    (executor, evm_module)
-}
-
-/// Apply genesis native-token balances to the EVM account store.
-///
-/// With `--genesis-file`: the legacy `bank.balances` map (base
-/// units) folds into the EVM ledger scaled to wei — the EVM store
-/// is the single ledger, there is no separate bank. Without one:
-/// the deterministic devnet pre-funded senders get
-/// `genesis_config.genesis_balance` units each.
-fn apply_genesis_balances(
-    evm_module: &evm::EvmModule,
-    genesis_config: &config::GenesisConfig,
-    genesis: Option<&config::genesis::Genesis>,
-) {
-    if let Some(genesis) = genesis {
-        for (addr_hex, balance_val) in &genesis.bank.balances {
-            let balance = balance_val.as_u64().unwrap_or(0);
-            if let Ok(bytes) = hex_decode(addr_hex) {
-                if let Ok(addr) = <[u8; 20]>::try_from(bytes.as_slice()) {
-                    evm_module.genesis_insert_account(
-                        &primitives::Address(addr),
-                        u128::from(balance) * framework::WEI_PER_UNIT,
-                        0,
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                }
-            }
-        }
-    } else {
-        for sender_byte in 0..genesis_config.num_prefunded_senders {
-            evm_module.genesis_insert_account(
-                &primitives::Address([sender_byte; 20]),
-                u128::from(genesis_config.genesis_balance) * framework::WEI_PER_UNIT,
-                0,
-                Vec::new(),
-                Vec::new(),
-            );
-        }
-    }
-}
-
 /// Build the TCP transport: `--tls-dir` for mTLS, plain TCP otherwise.
+///
+/// The `[network]` section supplies the timeouts and frame bound.
+/// `allowed_peer_ids` is pinned to the derived validator set so a
+/// non-validator peer cannot self-claim an ID and join the
+/// consensus traffic (the `TcpTransportConfig` docs mark this as
+/// required in production — it was previously left `None`).
 ///
 /// # Panics
 ///
@@ -1023,7 +873,15 @@ fn build_transport(
     listen_addr: &str,
     node_index: usize,
     peers: Vec<(Vec<u8>, String)>,
+    network: &config::NetworkConfig,
 ) -> p2p::tcp::TcpTransport {
+    let own_id = vec![u8::try_from(node_index).expect("peer id fits in u8")];
+    let allowed: std::collections::HashSet<Vec<u8>> =
+        peers.iter().map(|(id, _)| id.clone()).chain([own_id.clone()]).collect();
+    let transport_config = p2p::tcp::TcpTransportConfig {
+        allowed_peer_ids: Some(allowed),
+        ..to_transport_config(network)
+    };
     if let Some(tls_dir) = parse_cli_flag("--tls-dir") {
         let cert_path = format!("{tls_dir}/cert.pem");
         let key_path = format!("{tls_dir}/key.pem");
@@ -1040,19 +898,9 @@ fn build_transport(
             p2p::tls::TlsConfig::from_files(&cert_path, &key_path, &trusted_peers_refs)
                 .unwrap_or_else(|e| panic!("failed to build TLS config from {tls_dir}: {e}"));
         println!("oxide-validator[{node_index}]: mTLS enabled ({tls_dir})");
-        p2p::tcp::TcpTransport::with_tls(
-            listen_addr,
-            vec![u8::try_from(node_index).expect("peer id fits in u8")],
-            peers,
-            p2p::tcp::TcpTransportConfig::default(),
-            tls_config,
-        )
+        p2p::tcp::TcpTransport::with_tls(listen_addr, own_id, peers, transport_config, tls_config)
     } else {
-        p2p::tcp::TcpTransport::new(
-            listen_addr,
-            vec![u8::try_from(node_index).expect("peer id fits in u8")],
-            peers,
-        )
+        p2p::tcp::TcpTransport::with_config(listen_addr, own_id, peers, transport_config)
     }
 }
 
@@ -1618,10 +1466,111 @@ fn bls_key(byte: u8) -> crypto::BlsSecretKey {
     crypto::BlsSecretKey::from_ikm(&ikm).expect("BLS key generation from valid IKM")
 }
 
+/// The fully-resolved runtime configuration: parsed TOML + env +
+/// CLI, mapped into the types each subsystem consumes and checked by
+/// `node::validate_effective_config` before the node builds anything.
+struct LoadedConfig {
+    /// The canonical node/executor config — consumed by
+    /// `Node::assemble` (single-node mode) and
+    /// `node::assemble_executor` (devnet-node mode).
+    node: NodeConfig,
+    /// The JSON-RPC server config.
+    rpc: config::RpcConfig,
+    /// The `[network]` section — transport timeouts and the frame
+    /// bound for the devnet-node TCP transport.
+    network: config::NetworkConfig,
+    /// The `[genesis]` section — devnet validator/sender fallbacks
+    /// used when no `--genesis-file` is given.
+    genesis_cfg: config::GenesisConfig,
+    /// The parsed `--genesis-file`, when given. Its validators and
+    /// native balances are already folded into `node.genesis`; the
+    /// raw file is kept for `evm.alloc` and for
+    /// `load_validator_set`'s BLS-key extraction, which need richer
+    /// shapes than `GenesisSpec` carries.
+    genesis_file: Option<config::genesis::Genesis>,
+    /// The resolved data directory (`--data-dir` or
+    /// `[storage] data_dir`): auto-snapshot persistence root and the
+    /// parent of the EVM state database.
+    data_dir: Option<PathBuf>,
+}
+
+/// Apply a genesis file's `evm.alloc` map to the assembled EVM
+/// module: balances, nonces, code, and storage for pre-funded
+/// accounts and preinstalled contracts (Ethereum `genesis.json`
+/// convention).
+///
+/// Kept in the binary (not the shared assembly) because storage
+/// slots are 256-bit words — converting them here avoids dragging
+/// the `node` crate into a `revm`/`alloy` dependency for one map.
+/// Applied after `install_preinstalls`, so an alloc entry can still
+/// intentionally override a preinstall address.
+fn apply_evm_alloc(evm_module: &evm::EvmModule, genesis: &config::genesis::Genesis) {
+    for (addr_hex, account) in &genesis.evm.alloc {
+        let addr_bytes = hex_decode(addr_hex)
+            .unwrap_or_else(|e| panic!("genesis evm.alloc invalid address: {e}"));
+        let addr: [u8; 20] = addr_bytes
+            .try_into()
+            .unwrap_or_else(|_| panic!("genesis evm.alloc address must be 20 bytes"));
+        let balance = if let Some(hex) = account.balance.strip_prefix("0x") {
+            u128::from_str_radix(hex, 16)
+        } else {
+            account.balance.parse::<u128>()
+        }
+        .unwrap_or_else(|e| panic!("genesis evm.alloc invalid balance: {e}"));
+        let code = account
+            .code
+            .as_deref()
+            .map(|c| hex_decode(c).unwrap_or_else(|e| panic!("evm.alloc code: {e}")))
+            .unwrap_or_default();
+        let storage = account
+            .storage
+            .iter()
+            .map(|(slot, value)| {
+                let slot = alloy_primitives::U256::from_str_radix(
+                    slot.strip_prefix("0x").unwrap_or(slot),
+                    16,
+                )
+                .unwrap_or_else(|e| panic!("evm.alloc slot: {e}"));
+                let value = alloy_primitives::U256::from_str_radix(
+                    value.strip_prefix("0x").unwrap_or(value),
+                    16,
+                )
+                .unwrap_or_else(|e| panic!("evm.alloc storage value: {e}"));
+                (slot, value)
+            })
+            .collect();
+        evm_module.genesis_insert_account(
+            &primitives::Address(addr),
+            balance,
+            account.nonce,
+            code,
+            storage,
+        );
+    }
+}
+
+/// Map the `[network]` config onto the transport's tunables.
+///
+/// `listen_addr`/`peers` are NOT taken from here in devnet-node
+/// mode — they are derived per-index (`--devnet-node`,
+/// `--base-port`) so one TOML file serves the whole cluster. The
+/// timeouts and frame bound DO apply to both TLS and plain TCP.
+fn to_transport_config(network: &config::NetworkConfig) -> p2p::tcp::TcpTransportConfig {
+    p2p::tcp::TcpTransportConfig {
+        connect_timeout: network.connect_timeout(),
+        read_timeout: network.read_timeout(),
+        max_message_bytes: network.max_message_bytes,
+        ..Default::default()
+    }
+}
+
 /// Load the node configuration from CLI flags, env vars, and TOML file.
 ///
-/// Priority: CLI > env vars > TOML > defaults.
-fn load_config() -> (NodeConfig, config::RpcConfig, config::GenesisConfig) {
+/// Priority: CLI > env vars > TOML > defaults. Validates the
+/// effective config (unsupported settings fail, overridden settings
+/// warn) and prints it before returning, so the running node's
+/// parameters are never ambiguous.
+fn load_config(mode: node::NodeMode) -> LoadedConfig {
     let mut config = config::Config::default();
 
     // 1. Load from TOML file if --config is given.
@@ -1647,40 +1596,84 @@ fn load_config() -> (NodeConfig, config::RpcConfig, config::GenesisConfig) {
     if let Some(engine_str) = parse_cli_flag("--engine") {
         if let Some(engine) = config::ConsensusEngineKind::parse(&engine_str) {
             config.consensus.engine = engine;
+        } else {
+            eprintln!(
+                "oxide-validator: unknown --engine value {engine_str:?} \
+                      (expected \"sequencer\" or \"oxidebft\")"
+            );
+            std::process::exit(1);
         }
     }
 
-    // Extract the RPC config (defaults to 127.0.0.1:8545 if not set).
+    // `--genesis-file`: chain state (validators, balances, evm.alloc).
+    let genesis_file = parse_cli_flag("--genesis-file").map(|p| {
+        config::genesis::Genesis::from_json_file(&PathBuf::from(&p))
+            .unwrap_or_else(|e| panic!("failed to load genesis file {p}: {e}"))
+    });
+
+    // `--data-dir` wins over `[storage] data_dir`.
+    let data_dir =
+        parse_cli_flag("--data-dir").map(PathBuf::from).or_else(|| config.storage.data_dir.clone());
+
     let rpc_config = config.rpc.clone().unwrap_or_default();
 
-    // Convert the config crate's ConsensusEngineKind to devnet's
-    // ConsensusConfig.
-    let consensus = match config.consensus.engine {
-        config::ConsensusEngineKind::Sequencer => ConsensusConfig::Sequencer,
-        config::ConsensusEngineKind::OxideBft => ConsensusConfig::OxideBft,
-    };
+    // Genesis chain id must match the RPC chain id — a mismatch means
+    // the node's signatures and its advertised chain disagree.
+    if let Some(g) = &genesis_file {
+        if g.chain_id != rpc_config.chain_id {
+            eprintln!(
+                "oxide-validator: genesis chain_id {} != rpc.chain_id {} — \
+                 refusing to run a node whose signatures advertise a different chain",
+                g.chain_id, rpc_config.chain_id
+            );
+            std::process::exit(1);
+        }
+    }
 
-    (
-        NodeConfig {
-            consensus,
-            max_mempool_entries: config.executor.max_mempool_entries,
-            parallel_threshold: config.executor.parallel_threshold,
-            evm_persistence: true,
-            storage_path: None,
-            settlement_operator: None,
-            min_fee: 0,
-            chain_id: rpc_config.chain_id,
-            // `--require-signed-txs` enforces EIP-712 envelope
-            // signatures on native-module txs. Default off because
-            // devnet flows (key-change keep-alive, scripted test txs)
-            // still submit unsigned envelopes — production must
-            // enable it.
-            require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
-            history_retention: Some(config.storage.history_retention),
-        },
-        rpc_config,
-        config.genesis,
-    )
+    // The genesis spec: `--genesis-file` when given, else the
+    // deterministic devnet fallback. A malformed genesis file fails
+    // at startup with the offending entry named.
+    let genesis = Some(match &genesis_file {
+        Some(g) => {
+            node::genesis_spec_from_file(g).unwrap_or_else(|e| panic!("invalid genesis file: {e}"))
+        }
+        None => node::genesis_spec_devnet(&config.genesis),
+    });
+    let overrides = node::AssemblyOverrides {
+        // `--require-signed-txs` (CLI) OR `[executor]
+        // require_signed_txs` — the OR lives in `node_config_from`.
+        require_signed_txs: env::args().any(|a| a == "--require-signed-txs"),
+        data_dir: data_dir.clone(),
+        genesis,
+    };
+    let node_config = node::node_config_from(&config, &rpc_config, &overrides, mode)
+        .unwrap_or_else(|e| panic!("invalid configuration: {e}"));
+
+    // Validate BEFORE building anything: unsupported settings fail,
+    // overridden ones warn — never silently do nothing.
+    let (warnings, errors) = node::validate_effective_config(&config, &node_config, mode);
+    for w in &warnings {
+        eprintln!("oxide-validator: config warning: {w}");
+    }
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("oxide-validator: config error: {e}");
+        }
+        std::process::exit(1);
+    }
+
+    // Emit the effective configuration — the values actually running,
+    // after every override layer, not the file's literal contents.
+    println!("oxide-validator: effective node config: {node_config:?}");
+
+    LoadedConfig {
+        node: node_config,
+        rpc: rpc_config,
+        network: config.network,
+        genesis_cfg: config.genesis,
+        genesis_file,
+        data_dir,
+    }
 }
 
 /// Parse a `--flag value` pair from CLI args.

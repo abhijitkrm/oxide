@@ -73,6 +73,7 @@ fn bench_executor_staking_throughput(c: &mut Criterion) {
                     chain_id: 1,
                     require_signed_txs: false,
                     history_retention: None,
+                    ..Default::default()
                 };
                 let mut node = Node::assemble(&config);
 
@@ -152,6 +153,7 @@ fn bench_sustained_pipeline(c: &mut Criterion) {
                         chain_id: 1,
                         require_signed_txs: false,
                         history_retention: None,
+                        ..Default::default()
                     };
                     let mut node = Node::assemble(&config);
 

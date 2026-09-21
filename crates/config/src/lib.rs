@@ -57,7 +57,7 @@
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,10 @@ pub struct Config {
     /// If `None`, the node does not start an RPC server.
     #[serde(default)]
     pub rpc: Option<RpcConfig>,
+
+    /// Exchange module configuration (settlement operator).
+    #[serde(default)]
+    pub exchange: ExchangeConfig,
 }
 
 /// RPC server configuration (JSON-RPC HTTP endpoint for
@@ -159,6 +163,7 @@ impl Config {
         self.executor.apply_env_vars();
         self.storage.apply_env_vars();
         self.genesis.apply_env_vars();
+        self.exchange.apply_env_vars();
     }
 }
 
@@ -403,6 +408,26 @@ pub struct ExecutorConfig {
     /// faster (avoids rayon thread-pool overhead). Default: 100.
     #[serde(default = "default_parallel_threshold")]
     pub parallel_threshold: usize,
+
+    /// Minimum transaction fee (`ctx.fee`, base units) for
+    /// native-module txs. Txs declaring less are skipped before
+    /// execution — the fee field is sender-controlled, so without a
+    /// floor every tx could declare 0 and execute for free.
+    /// Self-funded modules (EVM: gas is the fee) are exempt.
+    /// `0` = no floor. Default: 0 (devnet); production should set a
+    /// positive floor.
+    #[serde(default)]
+    pub min_fee: u64,
+
+    /// Whether to reject unsigned transactions to
+    /// non-self-authenticating modules (everything but the EVM).
+    /// `false` (default) admits unsigned envelopes — the historical
+    /// devnet behaviour, where `ctx.sender` is trusted as declared.
+    /// `true` enforces EIP-712 envelope signatures at mempool
+    /// admission and execution. Required for production: without it,
+    /// any native-module tx can claim any sender.
+    #[serde(default)]
+    pub require_signed_txs: bool,
 }
 
 fn default_max_mempool_entries() -> usize {
@@ -417,6 +442,8 @@ impl Default for ExecutorConfig {
         Self {
             max_mempool_entries: default_max_mempool_entries(),
             parallel_threshold: default_parallel_threshold(),
+            min_fee: 0,
+            require_signed_txs: false,
         }
     }
 }
@@ -434,6 +461,14 @@ impl ExecutorConfig {
                 self.parallel_threshold = n;
             }
         }
+        if let Ok(v) = env::var("OXIDE_EXECUTOR_MIN_FEE") {
+            if let Ok(n) = v.parse() {
+                self.min_fee = n;
+            }
+        }
+        if let Ok(v) = env::var("OXIDE_EXECUTOR_REQUIRE_SIGNED_TXS") {
+            self.require_signed_txs = matches!(v.as_str(), "1" | "true" | "yes");
+        }
     }
 }
 
@@ -444,7 +479,7 @@ impl ExecutorConfig {
 /// Bounds how much history a node keeps. Everything here is a
 /// retention *policy*: none of it changes consensus or execution,
 /// only how much past state this node can serve after the fact.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageConfig {
     /// Journal segments to retain (count-based bound). Old sealed
     /// segments beyond this are deleted once their contents are
@@ -466,6 +501,14 @@ pub struct StorageConfig {
     /// Default: false.
     #[serde(default)]
     pub archive: bool,
+
+    /// The node's data directory. When set, the EVM state database
+    /// is persisted to `<data_dir>/evm.redb` (durable across
+    /// restarts) and auto-snapshot persistence uses
+    /// `<data_dir>/snapshot.bin`. `None` = fully in-memory state.
+    /// The `--data-dir` CLI flag overrides this value.
+    #[serde(default)]
+    pub data_dir: Option<PathBuf>,
 }
 
 fn default_journal_retain_segments() -> u32 {
@@ -481,6 +524,7 @@ impl Default for StorageConfig {
             journal_retain_segments: default_journal_retain_segments(),
             history_retention: default_history_retention(),
             archive: false,
+            data_dir: None,
         }
     }
 }
@@ -500,6 +544,35 @@ impl StorageConfig {
         }
         if let Ok(v) = env::var("OXIDE_ARCHIVE") {
             self.archive = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(v) = env::var("OXIDE_STORAGE_DATA_DIR") {
+            self.data_dir = Some(PathBuf::from(v));
+        }
+    }
+}
+
+// ── Exchange config ──────────────────────────────────────────────
+
+/// Exchange module configuration.
+///
+/// Controls who may submit batch-settlement transactions — the
+/// off-chain matching service's on-chain identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExchangeConfig {
+    /// The settlement operator address (`0x`-prefixed 20-byte hex).
+    /// The only account allowed to submit exchange `batch_settle`
+    /// transactions. `None` disables batch settlement entirely
+    /// (fail-closed default — safe when no external matcher is
+    /// attached to this node).
+    #[serde(default)]
+    pub settlement_operator: Option<String>,
+}
+
+impl ExchangeConfig {
+    /// Apply env var overrides.
+    fn apply_env_vars(&mut self) {
+        if let Ok(v) = env::var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR") {
+            self.settlement_operator = if v.is_empty() { None } else { Some(v) };
         }
     }
 }
@@ -739,5 +812,72 @@ listen_addr = "127.0.0.1:20000"
             NetworkConfig { connect_timeout_secs: 10, read_timeout_secs: 60, ..Default::default() };
         assert_eq!(net.connect_timeout(), Duration::from_secs(10));
         assert_eq!(net.read_timeout(), Duration::from_secs(60));
+    }
+
+    /// TOML parsing picks up the fee policy, storage, and exchange
+    /// fields — these reach the executor/module wiring via
+    /// `node::node_config_from`.
+    #[test]
+    fn toml_parse_fee_storage_exchange_fields() {
+        let toml_str = r#"
+[executor]
+min_fee = 7
+require_signed_txs = true
+
+[storage]
+data_dir = "/var/lib/oxide"
+
+[exchange]
+settlement_operator = "0xoperator"
+"#;
+        let config = Config::from_toml_str(toml_str).expect("parse");
+        assert_eq!(config.executor.min_fee, 7);
+        assert!(config.executor.require_signed_txs);
+        assert_eq!(
+            config.storage.data_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/oxide"))
+        );
+        assert_eq!(config.exchange.settlement_operator.as_deref(), Some("0xoperator"));
+    }
+
+    /// Env vars override the fee policy, storage, and exchange
+    /// fields — including the empty-operator clear. One test for all
+    /// of them: `set_var`/`remove_var` are process-global, so two
+    /// tests touching `OXIDE_EXCHANGE_SETTLEMENT_OPERATOR` on
+    /// parallel threads would race each other.
+    #[test]
+    fn env_vars_override_fee_storage_exchange() {
+        // SAFETY: the env mutations are serialized inside this one
+        // test body; vars are cleaned up before it returns.
+        unsafe {
+            env::set_var("OXIDE_EXECUTOR_MIN_FEE", "42");
+            env::set_var("OXIDE_EXECUTOR_REQUIRE_SIGNED_TXS", "true");
+            env::set_var("OXIDE_STORAGE_DATA_DIR", "/tmp/oxide-data");
+            env::set_var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR", "0xop");
+        }
+        let mut config = Config::default();
+        config.apply_env_vars();
+        assert_eq!(config.executor.min_fee, 42);
+        assert!(config.executor.require_signed_txs);
+        assert_eq!(
+            config.storage.data_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/oxide-data"))
+        );
+        assert_eq!(config.exchange.settlement_operator.as_deref(), Some("0xop"));
+
+        // An empty operator value clears the setting.
+        unsafe {
+            env::set_var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR", "");
+        }
+        let mut config = Config::default();
+        config.apply_env_vars();
+        assert_eq!(config.exchange.settlement_operator, None);
+
+        unsafe {
+            env::remove_var("OXIDE_EXECUTOR_MIN_FEE");
+            env::remove_var("OXIDE_EXECUTOR_REQUIRE_SIGNED_TXS");
+            env::remove_var("OXIDE_STORAGE_DATA_DIR");
+            env::remove_var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR");
+        }
     }
 }
