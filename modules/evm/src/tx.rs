@@ -597,21 +597,29 @@ impl SignedTx {
 
     /// Decode a signed transaction from raw RLP bytes.
     ///
-    /// This is a convenience wrapper around [`alloy_rlp::Decodable::decode`]
-    /// that accepts a `&[u8]` slice (the raw bytes a client submits via
-    /// `eth_sendRawTransaction`) and returns the decoded [`SignedTx`].
+    /// This is THE canonical decoder at every trust boundary — the
+    /// RPC layer (`eth_sendRawTransaction`), mempool admission, and
+    /// block execution all route through it, so a byte string one
+    /// path accepts can never be rejected by another.
     ///
-    /// Unlike `Decodable::decode`, which advances a `&mut &[u8]` cursor,
-    /// this method copies the slice into a local cursor, decodes, and
-    /// verifies there is no trailing garbage. This is the entry point
-    /// used by the RPC layer to parse a client-submitted transaction
-    /// before wrapping it in the Oxide envelope and submitting it to
-    /// the mempool.
+    /// Exact-consumption semantics: the decode must consume the
+    /// entire input — trailing garbage is an error, not ignored.
+    /// Combined with the per-decoder list-payload bounds (fields
+    /// can't bleed past the declared RLP list length, and unconsumed
+    /// declared payload is an error), this makes the accepted byte
+    /// string the canonical encoding of the transaction: one tx, one
+    /// byte string, one `keccak256` hash — deduplication, tx hashes,
+    /// and history indexing can't disagree about identity.
+    ///
+    /// Prefer this over [`alloy_rlp::Decodable::decode`], which
+    /// advances a `&mut &[u8]` cursor and silently tolerates a
+    /// non-empty remainder.
     ///
     /// # Errors
     ///
-    /// Returns [`alloy_rlp::Error`] if the bytes are not a valid RLP-encoded
-    /// signed transaction (legacy, EIP-2930, or EIP-1559).
+    /// Returns [`alloy_rlp::Error`] if the bytes are not a valid
+    /// RLP-encoded signed transaction (legacy, EIP-2930, EIP-1559,
+    /// or EIP-7702), or if valid RLP is followed by trailing bytes.
     pub fn decode_raw(raw: &[u8]) -> alloy_rlp::Result<Self> {
         let mut cursor = raw;
         let decoded = <Self as alloy_rlp::Decodable>::decode(&mut cursor)?;
@@ -1115,17 +1123,33 @@ impl SignedTx {
         if !header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        let chain_id = decode_u256(buf)?;
-        let nonce = decode_u256(buf)?;
-        let gas_price = decode_u256(buf)?;
-        let gas_limit = decode_u256(buf)?;
-        let to = TxKind::decode(buf)?;
-        let value = decode_u256(buf)?;
-        let data = Bytes::decode(buf)?;
-        let access_list = decode_access_list(buf)?;
-        let recid = Self::decode_recid(buf)?;
-        let r = decode_u256(buf)?;
-        let s = decode_u256(buf)?;
+        let payload_len = header.payload_length;
+        if buf.len() < payload_len {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
+        // Bound every field decode to the declared list payload —
+        // a field can't bleed past the list's own length, and any
+        // payload byte the fields don't consume is a decode error.
+        // Without this bound, noncanonical encodings (a padded list
+        // header, or a header shorter than the fields) decode to the
+        // same transaction as the canonical form — two byte strings,
+        // one tx, disagreeing hashes.
+        let mut payload = &buf[..payload_len];
+        let chain_id = decode_u256(&mut payload)?;
+        let nonce = decode_u256(&mut payload)?;
+        let gas_price = decode_u256(&mut payload)?;
+        let gas_limit = decode_u256(&mut payload)?;
+        let to = TxKind::decode(&mut payload)?;
+        let value = decode_u256(&mut payload)?;
+        let data = Bytes::decode(&mut payload)?;
+        let access_list = decode_access_list(&mut payload)?;
+        let recid = Self::decode_recid(&mut payload)?;
+        let r = decode_u256(&mut payload)?;
+        let s = decode_u256(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        *buf = &buf[payload_len..];
         Ok(Self::Eip2930(
             TxEip2930 {
                 fields: TxFields {
@@ -1150,18 +1174,30 @@ impl SignedTx {
         if !header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        let chain_id = decode_u256(buf)?;
-        let nonce = decode_u256(buf)?;
-        let max_priority_fee = decode_u256(buf)?;
-        let max_fee = decode_u256(buf)?;
-        let gas_limit = decode_u256(buf)?;
-        let to = TxKind::decode(buf)?;
-        let value = decode_u256(buf)?;
-        let data = Bytes::decode(buf)?;
-        let access_list = decode_access_list(buf)?;
-        let recid = Self::decode_recid(buf)?;
-        let r = decode_u256(buf)?;
-        let s = decode_u256(buf)?;
+        let payload_len = header.payload_length;
+        if buf.len() < payload_len {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
+        // Same payload bound as `decode_eip2930`: fields can't bleed
+        // past the declared list length, and unconsumed payload is
+        // an error — one canonical byte string per transaction.
+        let mut payload = &buf[..payload_len];
+        let chain_id = decode_u256(&mut payload)?;
+        let nonce = decode_u256(&mut payload)?;
+        let max_priority_fee = decode_u256(&mut payload)?;
+        let max_fee = decode_u256(&mut payload)?;
+        let gas_limit = decode_u256(&mut payload)?;
+        let to = TxKind::decode(&mut payload)?;
+        let value = decode_u256(&mut payload)?;
+        let data = Bytes::decode(&mut payload)?;
+        let access_list = decode_access_list(&mut payload)?;
+        let recid = Self::decode_recid(&mut payload)?;
+        let r = decode_u256(&mut payload)?;
+        let s = decode_u256(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        *buf = &buf[payload_len..];
         Ok(Self::Eip1559(
             TxEip1559 {
                 fields: TxFields {
@@ -1196,24 +1232,35 @@ impl SignedTx {
         if !header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        let chain_id = decode_u256(buf)?;
-        let nonce = decode_u256(buf)?;
-        let max_priority_fee = decode_u256(buf)?;
-        let max_fee = decode_u256(buf)?;
-        let gas_limit = decode_u256(buf)?;
+        let payload_len = header.payload_length;
+        if buf.len() < payload_len {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
+        // Same payload bound as the other typed decoders: one
+        // canonical byte string per transaction.
+        let mut payload = &buf[..payload_len];
+        let chain_id = decode_u256(&mut payload)?;
+        let nonce = decode_u256(&mut payload)?;
+        let max_priority_fee = decode_u256(&mut payload)?;
+        let max_fee = decode_u256(&mut payload)?;
+        let gas_limit = decode_u256(&mut payload)?;
         // EIP-7702: `to` is a mandatory address, not TxKind — an
         // empty-string `to` (Create) fails Address::decode.
-        let to = Address::decode(buf)?;
-        let value = decode_u256(buf)?;
-        let data = Bytes::decode(buf)?;
-        let access_list = decode_access_list(buf)?;
-        let authorization_list = decode_authorization_list(buf)?;
+        let to = Address::decode(&mut payload)?;
+        let value = decode_u256(&mut payload)?;
+        let data = Bytes::decode(&mut payload)?;
+        let access_list = decode_access_list(&mut payload)?;
+        let authorization_list = decode_authorization_list(&mut payload)?;
         if authorization_list.is_empty() {
             return Err(alloy_rlp::Error::Custom("empty authorization list"));
         }
-        let recid = Self::decode_recid(buf)?;
-        let r = decode_u256(buf)?;
-        let s = decode_u256(buf)?;
+        let recid = Self::decode_recid(&mut payload)?;
+        let r = decode_u256(&mut payload)?;
+        let s = decode_u256(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        *buf = &buf[payload_len..];
         Ok(Self::Eip7702(
             TxEip7702 {
                 fields: TxFields {
@@ -1239,15 +1286,27 @@ impl SignedTx {
         if !header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        let nonce = decode_u256(buf)?;
-        let gas_price = decode_u256(buf)?;
-        let gas_limit = decode_u256(buf)?;
-        let to = TxKind::decode(buf)?;
-        let value = decode_u256(buf)?;
-        let data = Bytes::decode(buf)?;
-        let v = decode_u256(buf)?;
-        let r = decode_u256(buf)?;
-        let s = decode_u256(buf)?;
+        let payload_len = header.payload_length;
+        if buf.len() < payload_len {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
+        // Same payload bound as the typed decoders: fields can't
+        // bleed past the declared list length and unconsumed payload
+        // is an error — one canonical byte string per transaction.
+        let mut payload = &buf[..payload_len];
+        let nonce = decode_u256(&mut payload)?;
+        let gas_price = decode_u256(&mut payload)?;
+        let gas_limit = decode_u256(&mut payload)?;
+        let to = TxKind::decode(&mut payload)?;
+        let value = decode_u256(&mut payload)?;
+        let data = Bytes::decode(&mut payload)?;
+        let v = decode_u256(&mut payload)?;
+        let r = decode_u256(&mut payload)?;
+        let s = decode_u256(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        *buf = &buf[payload_len..];
         // Decode v: pre-EIP-155 (27/28) or EIP-155 (35 + 2*chain_id + recid).
         // Fuzz fix: U256::to::<u64>() panics if the value doesn't fit
         // in u64. Use the safe helper.
@@ -1695,5 +1754,139 @@ mod tests {
             SignedTx::decode_raw(&raw2).is_err(),
             "type-4 tx with empty authorization list must be rejected"
         );
+    }
+
+    /// A signed EIP-1559 test tx plus the offset of its RLP list
+    /// header in the encoding (`1` — after the type byte).
+    fn signed_1559_bytes() -> Vec<u8> {
+        let (privkey, _) = make_signer();
+        let tx = TxEip1559 {
+            fields: TxFields {
+                nonce: 0,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::from([0x42; 20])),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                chain_id: 1,
+            },
+            max_priority_fee_per_gas: U256::from(1_000_000_000),
+            max_fee_per_gas: U256::from(2_000_000_000),
+            access_list: Vec::new(),
+        };
+        SignedTx::sign_eip1559(tx, &privkey).expect("sign").encode_to_bytes()
+    }
+
+    /// Split `type || header || payload` into (declared payload
+    /// length, payload bytes). `hdr_offset` is 1 for typed txs, 0
+    /// for legacy (no type byte).
+    fn split_encoding(raw: &[u8], hdr_offset: usize) -> (usize, &[u8]) {
+        let mut hdr_buf = &raw[hdr_offset..];
+        let header = Header::decode(&mut hdr_buf).expect("list header");
+        let payload = &raw[raw.len() - header.payload_length..];
+        (header.payload_length, payload)
+    }
+
+    /// The 1.5 regression: an RLP list header that declares MORE
+    /// payload than the fields consume must fail to decode —
+    /// previously fields were read from the outer buffer, so the
+    /// overstated bytes became a silently-tolerated cursor
+    /// remainder on the executor path while RPC's `decode_raw`
+    /// trailing check rejected the same bytes. Two byte strings
+    /// decoded to the same tx, and only one route rejected them.
+    #[test]
+    fn decode_rejects_overstated_list_payload() {
+        let raw = signed_1559_bytes();
+        let (payload_len, payload) = split_encoding(&raw, 1);
+
+        // Forge: declare 2 extra payload bytes, append 2 junk bytes.
+        let mut forged = vec![raw[0]];
+        Header { list: true, payload_length: payload_len + 2 }.encode(&mut forged);
+        forged.extend_from_slice(payload);
+        forged.extend_from_slice(&[0xde, 0xad]);
+
+        assert!(
+            SignedTx::decode_raw(&forged).is_err(),
+            "an overstated list payload must fail — the declared \
+             bytes the fields don't consume are noncanonical"
+        );
+        // The raw `Decodable` entry point must agree — execution and
+        // RPC can no longer disagree about the same bytes.
+        let mut cur: &[u8] = &forged;
+        assert!(
+            <SignedTx as alloy_rlp::Decodable>::decode(&mut cur).is_err(),
+            "the streaming decoder must bound fields to the declared payload too"
+        );
+    }
+
+    /// A list header declaring LESS payload than the fields consume
+    /// must fail — previously the fields just bled past the declared
+    /// boundary into whatever followed.
+    #[test]
+    fn decode_rejects_underestated_list_payload() {
+        let raw = signed_1559_bytes();
+        let (payload_len, payload) = split_encoding(&raw, 1);
+
+        let mut forged = vec![raw[0]];
+        Header { list: true, payload_length: payload_len - 4 }.encode(&mut forged);
+        forged.extend_from_slice(payload);
+
+        assert!(
+            SignedTx::decode_raw(&forged).is_err(),
+            "an understated list payload must fail — fields can't \
+             bleed past the declared boundary"
+        );
+    }
+
+    /// Legacy transactions carry no type byte — the same payload
+    /// bound applies to their top-level list.
+    #[test]
+    fn decode_legacy_rejects_overstated_list_payload() {
+        let (privkey, _) = make_signer();
+        let tx = TxLegacy {
+            fields: TxFields {
+                nonce: 0,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::from([0x42; 20])),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        let raw = sign_legacy(&privkey, tx).encode_to_bytes();
+        let (payload_len, payload) = split_encoding(&raw, 0);
+
+        let mut forged = Vec::new();
+        Header { list: true, payload_length: payload_len + 2 }.encode(&mut forged);
+        forged.extend_from_slice(payload);
+        forged.extend_from_slice(&[0xde, 0xad]);
+
+        assert!(SignedTx::decode_raw(&forged).is_err(), "legacy overstated list payload must fail");
+        let mut cur: &[u8] = &forged;
+        assert!(<SignedTx as alloy_rlp::Decodable>::decode(&mut cur).is_err());
+    }
+
+    /// Sanity: the canonical encodings still round-trip — the bounds
+    /// reject noncanonical bytes, not valid transactions.
+    #[test]
+    fn decode_accepts_canonical_encodings() {
+        let raw = signed_1559_bytes();
+        SignedTx::decode_raw(&raw).expect("canonical 1559 tx must decode");
+        let (privkey, _) = make_signer();
+        let legacy = sign_legacy(
+            &privkey,
+            TxLegacy {
+                fields: TxFields {
+                    nonce: 0,
+                    gas_limit: 21_000,
+                    to: TxKind::Create,
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    chain_id: 1,
+                },
+                gas_price: U256::from(1_000_000_000),
+            },
+        );
+        SignedTx::decode_raw(&legacy.encode_to_bytes()).expect("canonical legacy tx must decode");
     }
 }

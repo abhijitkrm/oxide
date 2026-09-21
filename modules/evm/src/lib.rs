@@ -2025,9 +2025,8 @@ impl EvmModule {
         let decoded: Vec<DecodedTx> = msgs
             .par_iter()
             .map(|raw| {
-                let mut buf = raw.as_ref();
-                let signed: tx::SignedTx =
-                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                let signed =
+                    tx::SignedTx::decode_raw(raw.as_ref()).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
@@ -2084,9 +2083,8 @@ impl EvmModule {
     ) -> Vec<Result<PreverifiedTx<'a>, ExecError>> {
         msgs.par_iter()
             .map(|raw| {
-                let mut buf = raw.as_ref();
-                let signed: tx::SignedTx =
-                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                let signed =
+                    tx::SignedTx::decode_raw(raw.as_ref()).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
@@ -2159,9 +2157,7 @@ impl EvmModule {
         let decoded: Vec<DecodedTx> = txs
             .par_iter()
             .map(|pv| {
-                let mut buf = pv.raw;
-                let signed: tx::SignedTx =
-                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                let signed = tx::SignedTx::decode_raw(pv.raw).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
@@ -2488,9 +2484,8 @@ impl EvmModule {
         let decoded: Vec<DecodedTx> = msgs
             .par_iter()
             .map(|raw| {
-                let mut buf = raw.as_ref();
-                let signed: tx::SignedTx =
-                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                let signed =
+                    tx::SignedTx::decode_raw(raw.as_ref()).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
@@ -2563,9 +2558,7 @@ impl EvmModule {
         let decoded: Vec<DecodedTx> = txs
             .par_iter()
             .map(|pv| {
-                let mut buf = pv.raw;
-                let signed: tx::SignedTx =
-                    alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+                let signed = tx::SignedTx::decode_raw(pv.raw).map_err(|_| ExecError::Malformed)?;
                 if signed.chain_id() != self.chain_id {
                     return Err(ExecError::Malformed);
                 }
@@ -3672,10 +3665,11 @@ impl Module for EvmModule {
     /// [`ExecError::ModuleRejected`] for nonce, gas, or balance
     /// violations.
     fn validate(&self, _ctx: &TxContext, msg: &[u8]) -> Result<(), ExecError> {
-        // 1. RLP decode.
-        let mut buf = msg;
-        let signed: tx::SignedTx =
-            alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+        // 1. RLP decode — `decode_raw` enforces complete input
+        // consumption: the trust boundary is exactly as strict as
+        // the RPC parse, so a trailing-junk encoding that RPC
+        // rejects can't enter through the mempool/executor path.
+        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
 
         // 2. Chain ID (EIP-155 replay protection).
         if signed.chain_id() != self.chain_id {
@@ -3834,8 +3828,10 @@ impl Module for EvmModule {
     /// limit and is rejected at `process_proposal` — the safe
     /// direction.
     fn estimate_gas(&self, msg: &[u8]) -> u64 {
-        let mut buf = msg;
-        match <tx::SignedTx as alloy_rlp::Decodable>::decode(&mut buf) {
+        // `decode_raw` (exact-consumption): a tx with trailing junk
+        // is undecodable here too, so its proposal is rejected at
+        // `process_proposal` — the same treatment the RPC path gives.
+        match tx::SignedTx::decode_raw(msg) {
             Ok(signed) => signed.gas_limit(),
             Err(_) => u64::MAX,
         }
@@ -3847,9 +3843,7 @@ impl Module for EvmModule {
         // The old code decoded twice — once in handle() for the tx
         // type, once in execute() for execution. The decode is
         // ~1 µs, so this saves ~1 µs per tx on the cold path.
-        let mut buf = msg;
-        let signed: tx::SignedTx =
-            alloy_rlp::Decodable::decode(&mut buf).map_err(|_| ExecError::Malformed)?;
+        let signed = tx::SignedTx::decode_raw(msg).map_err(|_| ExecError::Malformed)?;
         let tx_type = signed.tx_type();
         // The canonical Ethereum tx hash is keccak256 of the raw
         // RLP — the same value `eth_sendRawTransaction` returns.
@@ -6686,6 +6680,44 @@ mod tests {
         let msg = signed.encode_to_bytes();
         // gas_cost = 30M * 1 gwei = 30M gwei = 0.03 ETH — but balance is 0.
         assert!(matches!(m.validate(&dummy_ctx(), &msg), Err(ExecError::ModuleRejected(_))));
+    }
+
+    /// The 1.5 regression at the execution trust boundary: a tx with
+    /// valid RLP followed by trailing junk must be `Malformed` at
+    /// `validate` — previously the executor's `Decodable::decode`
+    /// ignored the cursor remainder, so bytes the RPC parse rejected
+    /// were admitted and executed (with a tx hash computed over the
+    /// noncanonical encoding).
+    #[test]
+    fn validate_rejects_trailing_bytes_after_valid_rlp() {
+        let (privkey, sender) = test_keypair();
+        let m = make_module();
+        fund(&m, &sender);
+        let mut msg = signed_tx(&privkey, 0, tx::TxKind::Create, &[]);
+        msg.push(0x00);
+        assert!(
+            matches!(m.validate(&dummy_ctx(), &msg), Err(ExecError::Malformed)),
+            "trailing junk must be Malformed at the executor boundary too"
+        );
+    }
+
+    /// Same boundary strictness through `handle` — the path a
+    /// proposed block's txs actually execute through.
+    #[test]
+    fn handle_rejects_trailing_bytes_after_valid_rlp() {
+        let (privkey, sender) = test_keypair();
+        let m = make_module();
+        fund(&m, &sender);
+        let mut msg = signed_tx(&privkey, 0, tx::TxKind::Create, &[]);
+        msg.push(0x00);
+        assert!(
+            matches!(m.handle(&dummy_ctx(), &msg), Err(ExecError::Malformed)),
+            "a tx with trailing junk must not execute"
+        );
+        // The canonical bytes still succeed — the bound rejects
+        // noncanonical encodings, not valid transactions.
+        let msg = signed_tx(&privkey, 0, tx::TxKind::Create, &[]);
+        m.handle(&dummy_ctx(), &msg).expect("canonical tx must execute");
     }
 
     #[test]

@@ -2165,6 +2165,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   can't), show you the settings they ended up with, and the
   multi-validator mode actually runs.
 
+- **Transaction decoding is equally strict everywhere:** the RPC
+  submission path used to reject transactions with extra trailing
+  bytes, while the execution path silently ignored them — the same
+  transaction could be refused through the front door and admitted
+  through the mempool. All execution-side decode sites now route
+  through the same exact-consumption decoder (`decode_raw`) as
+  RPC, and every transaction decoder enforces its declared RLP
+  list length: fields can't read past it and leftover declared
+  bytes are an error. One transaction, one canonical byte string,
+  one hash — deduplication and history indexing can no longer
+  disagree about a transaction's identity.
+- **In plain words:** a transaction padded with junk bytes used
+  to be rejected by the API but accepted by the block executor —
+  and the two routes would compute different hashes for the same
+  transaction. Now every route applies the same rule: the bytes
+  must be exactly the canonical encoding or the transaction is
+  malformed everywhere.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

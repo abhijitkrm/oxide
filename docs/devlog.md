@@ -16826,3 +16826,39 @@ field, validate_effective_config warn/fail behavior, and the three
 new config env/TOML fields. Smoke: `--devnet-node 0` finalizes
 blocks (was: startup panic), single-node runs, TOML path warns
 correctly, bare fullnode exits 1.
+
+## One canonical decoder at the execution boundary (audit 1.5)
+
+RPC was stricter than execution: `eth_sendRawTransaction` ran
+`decode_raw` (trailing-byte check) while every executor-side decode
+site — batch decode, preverified decode, `validate`, `handle`,
+`estimate_gas` — called `Decodable::decode` directly and ignored
+the cursor remainder. A tx with valid RLP followed by junk was
+rejected at RPC but admitted and executed through the mempool path,
+with its `keccak256` computed over the noncanonical bytes — the same
+semantic transaction getting different identities on different
+routes.
+
+Inside the decoders it was worse: all four tx decoders (legacy,
+2930, 1559, 7702) read the RLP list header and then decoded fields
+from the *outer* buffer, ignoring `header.payload_length`
+entirely. A header declaring more payload than the fields consume
+left unconsumed bytes as silent remainder; a header declaring less
+let fields bleed past the declared boundary. The nested-list
+decoders (`decode_access_list`, `decode_authorization_list`)
+already enforced the bound — the top-level ones were the gap.
+
+All four decoders now bound a `payload` view to the declared list
+length: fields can't bleed past it, and unconsumed payload is a
+decode error — one canonical byte string per transaction. All
+eight execution-boundary call sites route through `decode_raw`,
+which is now documented as THE canonical decoder (RPC, mempool,
+and execution share exactly one acceptance rule). The `keccak256`
+in `handle` is thereby guaranteed to hash the canonical encoding.
+
+Tests: forged encodings with overstated and understated list
+payloads are rejected at both `decode_raw` and the raw `Decodable`
+entry point (1559 + legacy); `validate` and `handle` reject
+valid-RLP + trailing byte as `Malformed` while the canonical bytes
+still execute; canonical encodings still round-trip. 191 lib +
+31 conformance + 17 exploit + 8 integration tests green.
