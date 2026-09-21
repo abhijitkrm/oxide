@@ -193,6 +193,13 @@ impl AuthenticatedJournal {
     pub fn active_segment(&self) -> u32 {
         self.writer.active_segment()
     }
+
+    /// Arm a one-shot journal fault — crash-atomicity test hook.
+    /// See [`crate::journal::FaultPoint`].
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&mut self, point: crate::journal::FaultPoint) {
+        self.writer.inject_fault(point);
+    }
 }
 
 /// Replay a journal directory and reconstruct the MMR root from
@@ -429,6 +436,10 @@ impl JournalBackend {
             &self.journal.mmr.peak_hashes(),
         );
         let location = self.journal.append(&marker)?;
+        // Crash boundary: the marker is framed but not yet durable —
+        // a fault here must reopen as if the checkpoint never ran.
+        #[cfg(test)]
+        self.journal.writer.check_fault(crate::journal::FaultPoint::CheckpointSync)?;
         self.journal.sync()?;
         Ok(location.segment)
     }
@@ -463,6 +474,13 @@ impl JournalBackend {
     /// Returns `JournalError` on write or sync failure.
     pub fn sync(&mut self) -> Result<(), crate::journal::JournalError> {
         self.journal.sync()
+    }
+
+    /// Arm a one-shot journal fault — crash-atomicity test hook.
+    /// See [`crate::journal::FaultPoint`].
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&mut self, point: crate::journal::FaultPoint) {
+        self.journal.inject_fault(point);
     }
 
     /// Compute the state root from the current in-memory state.
@@ -1355,5 +1373,186 @@ mod tests {
         // Everything still replays (the journal is intact).
         let replayed = crate::journal::replay(&dir.0).unwrap();
         assert!(replayed.truncated_at.is_none(), "journal must stay intact");
+    }
+
+    // ---------------------------------------------------------------
+    // Crash atomicity at the backend boundary (fault injection).
+    //
+    // A `FaultPoint` arms the writer's next I/O step to fail once;
+    // the backend is then dropped (a dead process cannot resume
+    // mid-call) and reopened to compare durable state against what
+    // the caller was told.
+    // ---------------------------------------------------------------
+
+    /// Crash inside the batch's journal append: `apply_batch` must
+    /// roll back in-memory state AND the journal must carry nothing
+    /// — reopening replays exactly the committed prefix and the
+    /// expected log root still matches.
+    #[test]
+    fn journal_backend_crash_at_batch_append_rolls_back_and_reopens_clean() {
+        use crate::journal::FaultPoint;
+        let dir = TempDir::new("backend-fault-append");
+        let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
+        let committed_key = Hash([0x01; 32]);
+        backend
+            .apply_batch(&[Op::Set { key: committed_key, value: vec![0xAA] }])
+            .expect("committed batch must apply");
+        backend.sync().unwrap();
+        let committed_root = backend.log_root();
+        let committed_state_root = backend.state_root();
+
+        // Crash the next append — the batch record never reaches the
+        // journal buffer, let alone the file.
+        backend.inject_fault(FaultPoint::Append);
+        let lost_key = Hash([0x02; 32]);
+        let result = backend.apply_batch(&[
+            Op::Set { key: lost_key, value: vec![0xBB] },
+            Op::Delete { key: committed_key },
+        ]);
+        assert!(result.is_err(), "append fault must surface as ApplyError");
+
+        // In-memory rollback: committed key restored, lost key absent,
+        // both roots back to the committed values.
+        assert_eq!(backend.get(&committed_key), Some(vec![0xAA]));
+        assert_eq!(backend.get(&lost_key), None);
+        assert_eq!(backend.state_root(), committed_state_root);
+        assert_eq!(backend.log_root(), committed_root, "MMR must not grow a failed leaf");
+
+        // Crash: reopen under the committed log root — replay must
+        // reproduce the pre-crash state exactly.
+        drop(backend);
+        let reopened = JournalBackend::open(&dir.0, JournalConfig::default(), Some(committed_root))
+            .expect("committed journal must reopen under its root");
+        assert_eq!(reopened.get(&committed_key), Some(vec![0xAA]));
+        assert_eq!(reopened.get(&lost_key), None);
+        assert_eq!(reopened.state_root(), committed_state_root);
+    }
+
+    /// Crash inside `snapshot_import`'s journal append: the import
+    /// must fail closed and leave the live state untouched — the
+    /// all-or-nothing contract the error propagation exists for.
+    #[test]
+    fn journal_backend_crash_at_snapshot_import_keeps_old_state() {
+        use crate::journal::FaultPoint;
+        let dir = TempDir::new("backend-fault-import");
+        let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
+        let old_key = Hash([0x01; 32]);
+        backend
+            .apply_batch(&[Op::Set { key: old_key, value: vec![0xAA] }])
+            .expect("seed batch must apply");
+        backend.sync().unwrap();
+        let committed_root = backend.log_root();
+        let committed_state_root = backend.state_root();
+
+        backend.inject_fault(FaultPoint::Append);
+        let snapshot = Snapshot { height: 0, entries: vec![(Hash([0x99; 32]), vec![0x99])] };
+        let result = backend.snapshot_import(snapshot);
+        assert!(result.is_err(), "append fault must surface as SnapshotError");
+
+        // Old state intact — nothing was swapped in.
+        assert_eq!(backend.get(&old_key), Some(vec![0xAA]));
+        assert_eq!(backend.state_root(), committed_state_root);
+        assert_eq!(backend.log_root(), committed_root);
+
+        drop(backend);
+        let reopened = JournalBackend::open(&dir.0, JournalConfig::default(), Some(committed_root))
+            .expect("journal must reopen under the committed root");
+        assert_eq!(reopened.get(&old_key), Some(vec![0xAA]));
+        assert_eq!(reopened.state_root(), committed_state_root);
+    }
+
+    /// Crash at the checkpoint marker's sync: `seal_and_rotate`
+    /// succeeded (the marker heads a fresh segment) but the marker
+    /// never became durable. Reopen must behave as if no checkpoint
+    /// ran — no marker replays, the log root is unchanged, and the
+    /// backend opens under the pre-checkpoint root.
+    #[test]
+    fn journal_backend_crash_at_checkpoint_sync_leaves_no_marker() {
+        use crate::journal::FaultPoint;
+        let dir = TempDir::new("backend-fault-ckpt");
+        let config = JournalConfig { max_segment_bytes: 1 << 20 };
+        let mut backend = JournalBackend::create(&dir.0, config).unwrap();
+        let key = Hash([0x07; 32]);
+        backend.apply_batch(&[Op::Set { key, value: vec![0x77] }]).expect("batch must apply");
+        backend.sync().unwrap();
+        let committed_root = backend.log_root();
+
+        backend.inject_fault(FaultPoint::CheckpointSync);
+        assert!(backend.checkpoint().is_err(), "armed checkpoint sync must fail");
+
+        // Crash. On disk: segment 0 sealed with the batch; segment 1
+        // holds only its magic header — the marker was buffer-only.
+        drop(backend);
+        let replayed = crate::journal::replay(&dir.0).unwrap();
+        assert_eq!(replayed.records.len(), 1, "no marker record may be durable");
+        let reopened = JournalBackend::open(&dir.0, config, Some(committed_root))
+            .expect("reopen must see the pre-checkpoint journal");
+        assert_eq!(reopened.get(&key), Some(vec![0x77]));
+        // The backend keeps working — a real checkpoint now succeeds
+        // on a clean journal.
+        let mut reopened = reopened;
+        reopened
+            .apply_batch(&[Op::Set { key: Hash([0x08; 32]), value: vec![0x88] }])
+            .expect("post-crash batch must apply");
+        reopened.checkpoint().expect("post-crash checkpoint must succeed");
+    }
+
+    /// A failed `sync` leaves the group buffer intact, so a retry on
+    /// the live writer lands the batch exactly once — a transient
+    /// I/O failure is recoverable, not corrupting. (The crash twin —
+    /// failed sync followed by process death — is covered by the
+    /// journal-level `FlushWrite` test, which replays only the
+    /// durable prefix.)
+    #[test]
+    fn journal_backend_failed_sync_is_retryable_without_corruption() {
+        use crate::journal::FaultPoint;
+        let dir = TempDir::new("backend-fault-retry");
+        let mut backend = JournalBackend::create(&dir.0, JournalConfig::default()).unwrap();
+        let key = Hash([0x03; 32]);
+        backend.apply_batch(&[Op::Set { key, value: vec![0xCC] }]).expect("batch must apply");
+        backend.inject_fault(FaultPoint::FlushWrite);
+        assert!(backend.sync().is_err(), "armed flush must fail");
+        // Retry: the retained buffer writes the same framed record.
+        backend.sync().expect("retry must succeed on the intact buffer");
+        drop(backend);
+        let reopened = JournalBackend::open(&dir.0, JournalConfig::default(), None)
+            .expect("journal must reopen");
+        assert_eq!(reopened.get(&key), Some(vec![0xCC]), "batch landed exactly once");
+    }
+
+    /// A crash that loses the tail (torn write) must not silently
+    /// pass integrity verification: `open` with the pre-truncation
+    /// log root fails with `IntegrityMismatch`, while `open` without
+    /// an expected root exposes the shortened history so the caller
+    /// can reconcile.
+    #[test]
+    fn journal_backend_reopen_rejects_truncated_history_under_expected_root() {
+        let dir = TempDir::new("backend-fault-trunc");
+        let config = JournalConfig::default();
+        let mut backend = JournalBackend::create(&dir.0, config).unwrap();
+        for i in 0..3u8 {
+            backend
+                .apply_batch(&[Op::Set { key: Hash([i; 32]), value: vec![i] }])
+                .expect("batch must apply");
+        }
+        backend.sync().unwrap();
+        let full_root = backend.log_root();
+        drop(backend);
+
+        // Tear the last record — the classic crash tail.
+        let path = dir.0.join("segment-0.log");
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
+
+        let err = JournalBackend::open(&dir.0, config, Some(full_root));
+        assert!(
+            matches!(err.map(|_| ()), Err(OpenError::IntegrityMismatch { .. })),
+            "truncated history must not verify against the full root"
+        );
+        // Without an expected root the shortened prefix opens — torn
+        // tails are a normal crash artifact, not corruption.
+        let reopened = JournalBackend::open(&dir.0, config, None).expect("torn prefix must open");
+        assert_eq!(reopened.get(&Hash([0; 32])), Some(vec![0]));
+        assert_eq!(reopened.get(&Hash([2; 32])), None, "torn batch is absent");
     }
 }

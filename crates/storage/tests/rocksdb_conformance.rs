@@ -5,7 +5,9 @@
 
 #![cfg(feature = "rocksdb")]
 
-use ports::storage_conformance::assert_storage_conformance;
+use ports::storage_conformance::{
+    assert_persistent_storage_conformance, assert_storage_conformance,
+};
 use storage::RocksDbBackend;
 
 fn make_rocksdb() -> RocksDbBackend {
@@ -20,4 +22,9 @@ fn make_rocksdb() -> RocksDbBackend {
 #[test]
 fn rocksdb_passes_storage_conformance() {
     assert_storage_conformance(make_rocksdb);
+}
+
+#[test]
+fn rocksdb_passes_persistent_storage_conformance() {
+    assert_persistent_storage_conformance(|path| RocksDbBackend::open(path).expect("open rocksdb"));
 }

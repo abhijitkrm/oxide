@@ -6,7 +6,9 @@
 
 #![cfg(feature = "mdbx")]
 
-use ports::storage_conformance::assert_storage_conformance;
+use ports::storage_conformance::{
+    assert_persistent_storage_conformance, assert_storage_conformance,
+};
 use storage::MdbxBackend;
 
 fn make_mdbx() -> MdbxBackend {
@@ -21,4 +23,9 @@ fn make_mdbx() -> MdbxBackend {
 #[test]
 fn mdbx_passes_storage_conformance() {
     assert_storage_conformance(make_mdbx);
+}
+
+#[test]
+fn mdbx_passes_persistent_storage_conformance() {
+    assert_persistent_storage_conformance(|path| MdbxBackend::open(path).expect("open mdbx"));
 }

@@ -6,7 +6,9 @@
 
 #![cfg(feature = "redb")]
 
-use ports::storage_conformance::assert_storage_conformance;
+use ports::storage_conformance::{
+    assert_persistent_storage_conformance, assert_storage_conformance,
+};
 use storage::RedbBackend;
 
 fn make_redb() -> RedbBackend {
@@ -21,4 +23,9 @@ fn make_redb() -> RedbBackend {
 #[test]
 fn redb_passes_storage_conformance() {
     assert_storage_conformance(make_redb);
+}
+
+#[test]
+fn redb_passes_persistent_storage_conformance() {
+    assert_persistent_storage_conformance(|path| RedbBackend::open(path).expect("open redb"));
 }

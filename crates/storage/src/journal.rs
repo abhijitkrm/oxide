@@ -134,6 +134,49 @@ impl Default for JournalConfig {
     }
 }
 
+/// Fault-injection points for crash-atomicity tests (audit finding:
+/// conformance must establish crash atomicity via fault injection at
+/// the write/flush/sync/rotation/checkpoint/reopen boundaries). Each
+/// arm names the exact operation a crash interrupts; once it fires,
+/// the correct continuation is "drop the writer and reopen" — a dead
+/// process does not resume mid-call.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FaultPoint {
+    /// `flush`'s `write_all` — the buffered group commit never reaches
+    /// the OS. The file keeps only what earlier flushes wrote.
+    FlushWrite,
+    /// `sync`'s `sync_data` — bytes sit in the page cache, never
+    /// durable. (On local filesystems the bytes still reach the file
+    /// via `write_all`, so post-reopen they replay — the injected
+    /// failure models the API boundary, not lost pages.)
+    SyncFsync,
+    /// `rotate`'s seal `sync_data` — the sealed segment's tail was
+    /// flushed but not synced before the handle moved on.
+    RotateSealSync,
+    /// `rotate`'s height-index append — the segment is sealed on disk
+    /// but `heights.idx` never records it: the crash state a
+    /// height-prune must survive (unindexed = "unknown contents,
+    /// never delete").
+    RotateHeightIndex,
+    /// `rotate`'s successor-file create — the sealed segment is on
+    /// disk and indexed, but `segment-<n+1>.log` never existed.
+    RotateCreate,
+    /// `JournalBackend::checkpoint`'s marker `sync` — the marker was
+    /// framed into the buffer but never reached the OS, so a crash
+    /// must reopen the journal as if no checkpoint happened.
+    CheckpointSync,
+    /// `snapshot_import`'s journal append — the replacement batch
+    /// never reaches the journal, so the import must roll back
+    /// rather than swap in-memory state the disk cannot replay.
+    ///
+    /// Set on `JournalWriter`; the append itself is memory-only, so
+    /// the injection point is checked at the top of `append` — it
+    /// models "the process died before the record was framed", the
+    /// strongest form of an import crash.
+    Append,
+}
+
 /// Write side of the journal: append, flush, sync, rotate.
 ///
 /// Cold path (open/rotate/sync) may do IO; [`JournalWriter::append`] is
@@ -154,6 +197,11 @@ pub struct JournalWriter {
     /// no `heights.idx` entry and are skipped by height pruning.
     current_segment_max: Option<u64>,
     config: JournalConfig,
+    /// Armed one-shot fault point — see [`FaultPoint`]. Test builds
+    /// only: the field does not exist in production, so the injector
+    /// costs nothing and cannot leak into a release binary.
+    #[cfg(test)]
+    fault: Option<FaultPoint>,
 }
 
 impl JournalWriter {
@@ -179,7 +227,30 @@ impl JournalWriter {
             next_offset: 0,
             current_segment_max: None,
             config,
+            #[cfg(test)]
+            fault: None,
         })
+    }
+
+    /// Fire the armed fault point exactly once (one-shot: a dead
+    /// process does not fail the same boundary twice). Callers treat
+    /// the `Err` like any `JournalError::Io` — and the crash-faithful
+    /// continuation is to drop the writer and reopen the directory.
+    #[cfg(test)]
+    pub(crate) fn check_fault(&mut self, point: FaultPoint) -> Result<(), JournalError> {
+        if self.fault == Some(point) {
+            self.fault = None;
+            return Err(JournalError::Io(io::Error::other("injected fault")));
+        }
+        Ok(())
+    }
+
+    /// Arm a one-shot fault at `point` — crash-atomicity test hook.
+    /// `pub(crate)` so `AuthenticatedJournal`/`JournalBackend` can
+    /// forward it; invisible outside the crate's test build.
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&mut self, point: FaultPoint) {
+        self.fault = Some(point);
     }
 
     /// Append one record; returns its lifetime-stable [`Location`].
@@ -198,6 +269,8 @@ impl JournalWriter {
         if payload.len() > MAX_RECORD_BYTES as usize {
             return Err(JournalError::RecordTooLarge { len: payload.len(), max: MAX_RECORD_BYTES });
         }
+        #[cfg(test)]
+        self.check_fault(FaultPoint::Append)?;
         // Framing: [len u32 LE][crc32 u32 LE][payload].
         let record_bytes = 8 + payload.len();
         if self.segment_bytes + self.buf.len() + record_bytes > self.config.max_segment_bytes
@@ -250,6 +323,8 @@ impl JournalWriter {
         if self.buf.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        self.check_fault(FaultPoint::FlushWrite)?;
         self.file.write_all(&self.buf).map_err(JournalError::Io)?;
         self.segment_bytes += self.buf.len();
         self.buf.clear();
@@ -263,6 +338,8 @@ impl JournalWriter {
     /// [`JournalError::Io`] on write or sync failure.
     pub fn sync(&mut self) -> Result<(), JournalError> {
         self.flush()?;
+        #[cfg(test)]
+        self.check_fault(FaultPoint::SyncFsync)?;
         self.file.sync_data().map_err(JournalError::Io)?;
         Ok(())
     }
@@ -276,6 +353,8 @@ impl JournalWriter {
         // writes could sit in the page cache indefinitely. "Sealed"
         // must mean durable, or a crash can drop records the caller
         // believes the journal committed.
+        #[cfg(test)]
+        self.check_fault(FaultPoint::RotateSealSync)?;
         self.file.sync_data().map_err(JournalError::Io)?;
         // Seal the height index FIRST: the entry
         // `[sealed_seq → max_height]` must exist before the new
@@ -284,9 +363,13 @@ impl JournalWriter {
         // conservatively skips anyway — but the entry is cheap:
         // 12 bytes on a path already doing IO).
         if let Some(max_height) = self.current_segment_max.take() {
+            #[cfg(test)]
+            self.check_fault(FaultPoint::RotateHeightIndex)?;
             append_height_index(&self.dir, self.segment, max_height)?;
         }
         self.segment += 1;
+        #[cfg(test)]
+        self.check_fault(FaultPoint::RotateCreate)?;
         let (file, buf) = new_segment_file(&self.dir, self.segment)?;
         self.file = file;
         self.buf = buf;
@@ -814,6 +897,161 @@ mod tests {
         assert!(read_height_index(&dir).unwrap().is_empty());
         let deleted = j.prune_below_height(1_000).unwrap();
         assert_eq!(deleted, 0, "unindexed segments are never deleted by height");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    // Crash atomicity via fault injection.
+    //
+    // Each test arms a [`FaultPoint`], drops the writer on the error
+    // (a dead process does not resume mid-call), reopens, and asserts
+    // the disk state equals the prefix the caller had durably acked.
+    // ---------------------------------------------------------------
+
+    /// Crash inside `flush`'s `write_all`: the group buffer never
+    /// reaches the file, so replay after reopen must expose only the
+    /// previously-synced prefix — and the failed `append`/`flush` must
+    /// not have claimed durability for anything.
+    #[test]
+    fn test_crash_at_flush_replays_only_durable_prefix() {
+        let dir = temp_dir("fault-flush");
+        {
+            let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
+            j.append(b"durable").unwrap();
+            j.sync().unwrap();
+            j.append(b"lost").unwrap();
+            j.inject_fault(FaultPoint::FlushWrite);
+            assert!(j.flush().is_err(), "armed flush must fail");
+            // Crash: drop without flushing again.
+        }
+        let replayed = replay(&dir).unwrap();
+        assert_eq!(replayed.records.len(), 1, "only the synced record survives");
+        assert_eq!(replayed.records[0].payload, b"durable");
+        assert!(replayed.truncated_at.is_none(), "clean file, no torn tail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Crash at `sync`'s fsync: `write_all` already ran, so the bytes
+    /// are in the file — the error lies about durability only. The
+    /// caller must see the failure (never a false durable ack), and a
+    /// real crash where the pages did land replays the record whole.
+    #[test]
+    fn test_crash_at_sync_reports_failure_but_bytes_landed() {
+        let dir = temp_dir("fault-sync");
+        {
+            let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
+            j.append(b"payload").unwrap();
+            j.inject_fault(FaultPoint::SyncFsync);
+            assert!(j.sync().is_err(), "armed sync must fail");
+        }
+        let replayed = replay(&dir).unwrap();
+        assert_eq!(replayed.records.len(), 1);
+        assert_eq!(replayed.records[0].payload, b"payload");
+        assert!(replayed.truncated_at.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Crash mid-rotation at the sealed segment's fsync: the sealed
+    /// file holds its records (flush already ran); the successor
+    /// segment and the triggering record never existed. Reopen must
+    /// recover the sealed records and continue on a fresh segment.
+    #[test]
+    fn test_crash_during_rotate_seal_recovers_sealed_segment() {
+        let dir = temp_dir("fault-seal");
+        let config = JournalConfig { max_segment_bytes: 8 };
+        {
+            let mut j = JournalWriter::create(&dir, config).unwrap();
+            j.append(&[0u8; 16]).unwrap();
+            j.inject_fault(FaultPoint::RotateSealSync);
+            // This append triggers rotate (16 > 8) and dies at the
+            // seal fsync — the triggering payload is never framed.
+            assert!(j.append(b"trigger").is_err(), "rotation must fail");
+        }
+        let replayed = replay(&dir).unwrap();
+        assert_eq!(replayed.records.len(), 1, "sealed segment's record survives");
+        assert_eq!(replayed.records[0].payload, &[0u8; 16]);
+        // Recovery: reopen and keep writing — a new segment starts, so
+        // the sealed file is never touched again.
+        let mut j = JournalWriter::create(&dir, config).unwrap();
+        j.append(b"after-crash").unwrap();
+        j.sync().unwrap();
+        let replayed = replay(&dir).unwrap();
+        assert_eq!(replayed.records.len(), 2);
+        assert_eq!(replayed.records[1].payload, b"after-crash");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Crash between seal and the height-index write: the sealed
+    /// segment is on disk but `heights.idx` has no entry for it. The
+    /// crash-faithful invariant is that height pruning treats the
+    /// segment as "unknown contents" and keeps it — deleting it would
+    /// lose sealed, synced records.
+    #[test]
+    fn test_crash_before_height_index_keeps_unindexed_segment() {
+        let dir = temp_dir("fault-hidx");
+        let config = JournalConfig { max_segment_bytes: 8 };
+        {
+            let mut j = JournalWriter::create(&dir, config).unwrap();
+            j.append_at_height(1, b"h1").unwrap();
+            j.inject_fault(FaultPoint::RotateHeightIndex);
+            // Triggers rotate; dies after seal, before index write.
+            assert!(j.append_at_height(2, b"h2").is_err());
+        }
+        let index = read_height_index(&dir).unwrap();
+        assert!(!index.contains_key(&0), "segment 0 must be missing from the index");
+        let mut j = JournalWriter::create(&dir, config).unwrap();
+        let deleted = j.prune_below_height(1_000).unwrap();
+        assert_eq!(deleted, 0, "unindexed sealed segment must be kept");
+        let replayed = replay(&dir).unwrap();
+        assert_eq!(replayed.records.len(), 1, "h1 must still replay");
+        assert_eq!(replayed.records[0].payload, b"h1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Crash between indexing the sealed segment and creating its
+    /// successor: `heights.idx` points at a complete segment and no
+    /// `segment-<n+1>.log` exists. Reopen must start a fresh successor
+    /// at the right sequence number and keep the sealed history.
+    #[test]
+    fn test_crash_before_rotate_create_reopens_on_fresh_segment() {
+        let dir = temp_dir("fault-create");
+        let config = JournalConfig { max_segment_bytes: 8 };
+        {
+            let mut j = JournalWriter::create(&dir, config).unwrap();
+            j.append_at_height(1, b"h1").unwrap();
+            j.inject_fault(FaultPoint::RotateCreate);
+            assert!(j.append_at_height(2, b"h2").is_err(), "create must fail");
+        }
+        // The index recorded segment 0 as sealed through height 1.
+        let index = read_height_index(&dir).unwrap();
+        assert_eq!(index.get(&0), Some(&1));
+        assert!(!dir.join("segment-1.log").exists(), "successor was never created");
+        // Reopen writes a fresh segment 1 — same name, clean magic.
+        let mut j = JournalWriter::create(&dir, config).unwrap();
+        j.append_at_height(3, b"h3").unwrap();
+        j.sync().unwrap();
+        let replayed = replay(&dir).unwrap();
+        let payloads: Vec<&[u8]> = replayed.records.iter().map(|r| r.payload.as_slice()).collect();
+        assert_eq!(payloads, vec![b"h1".as_slice(), b"h3".as_slice()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `FaultPoint::Append` models death before the record is framed:
+    /// nothing enters the buffer, nothing touches the file.
+    #[test]
+    fn test_crash_before_append_frames_nothing() {
+        let dir = temp_dir("fault-append");
+        {
+            let mut j = JournalWriter::create(&dir, JournalConfig::default()).unwrap();
+            j.append(b"kept").unwrap();
+            j.sync().unwrap();
+            j.inject_fault(FaultPoint::Append);
+            assert!(j.append(b"never-framed").is_err());
+            j.flush().unwrap(); // even a clean flush writes nothing new
+        }
+        let replayed = replay(&dir).unwrap();
+        assert_eq!(replayed.records.len(), 1);
+        assert_eq!(replayed.records[0].payload, b"kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

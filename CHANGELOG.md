@@ -305,6 +305,40 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     nodes mid-run, 10,000 different ways, and honest validators
     never once finalized two different histories.
 
+- **Storage crash atomicity: fault injection at every durability
+  boundary** (`crates/storage`, `crates/ports`)
+  - The journal carries a test-only `FaultPoint` injector
+    (`#[cfg(test)]` — zero production surface) that arms a one-shot
+    failure at each crash boundary: record append, `flush`'s
+    `write_all`, `sync`'s fsync, rotation's seal-fsync, the
+    `heights.idx` sidecar write, the successor-segment create, and
+    the checkpoint marker's sync.
+  - Each test drops the writer at the injected failure — a dead
+    process does not resume mid-call — and reopens to verify the
+    contract: only the synced prefix replays; sealed segments
+    survive interrupted rotation (and a segment whose height-index
+    write was lost is kept as "unknown contents", never pruned);
+    `apply_batch` and `snapshot_import` roll back memory, MMR, and
+    disk together; a killed checkpoint leaves no marker and reopens
+    under the pre-checkpoint root; a failed `sync` leaves the group
+    buffer intact so a retry lands the batch exactly once; and a
+    torn tail reopened under the caller's expected log root fails
+    `IntegrityMismatch` instead of silently continuing.
+  - New `assert_persistent_storage_conformance` takes a path factory
+    (every persistent adapter's `open` already serves first-open and
+    reopen) and asserts the adapter-generic crash contract: synced
+    state survives drop+reopen byte-identical, an unsynced batch is
+    all-or-nothing across a crash — never torn — and a reopened
+    backend keeps accumulating state. `JournalBackend`, MDBX, redb,
+    and RocksDB all pass.
+  - **In plain words:** we now pull the plug on the database at the
+    exact moments a real crash would hurt most — mid-write,
+    mid-flush, mid-checkpoint — and verify after every restart that
+    the disk tells the same story the caller was told: committed
+    data survives, half-written data never shows up as a torn
+    batch, and tampered or truncated history is rejected outright
+    instead of quietly continuing.
+
 - **Fuzz campaign: soaks, committed corpus, coverage, nightly CI**
   (`fuzz/`, `.github/workflows/nightly.yml`, `.gitignore`)
   - All 9 targets ran 10-minute libFuzzer soaks — zero crashes,

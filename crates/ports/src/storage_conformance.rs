@@ -28,10 +28,20 @@
 //!   function.)
 //! - **Prefix exactness**: `range(prefix)` returns exactly the keys
 //!   starting with `prefix`, no more, no less.
+//! - **Crash atomicity across reopen** (persistent backends only, via
+//!   [`assert_persistent_storage_conformance`]): dropping the handle —
+//!   the closest a process boundary gets to a crash — never splits a
+//!   batch: reopened state is always a whole-batch prefix of what was
+//!   applied, and synced state always survives. (Torn-write and
+//!   interrupted-rotation coverage lives in the journal's fault-
+//!   injection tests; this layer asserts the adapter-level contract.)
 //!
 //! Snapshot export/import round-trip: export a snapshot from one
 //! backend, import it into a fresh backend, and verify the state
 //! is byte-identical (plan.md §8, §2.5).
+
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use primitives::Hash;
 
@@ -50,6 +60,147 @@ pub fn assert_storage_conformance<B: StorageBackend>(make_backend: impl Fn() -> 
     prefix_exactness(&make_backend);
     delete_idempotence(&make_backend);
     snapshot_round_trip(&make_backend);
+}
+
+/// Crash-atomicity conformance for backends that persist to a path.
+///
+/// `make_at` opens (creating if needed) the backend rooted at the
+/// given path — the same call must serve first-open and reopen, which
+/// every persistent adapter's `open` already does.
+///
+/// The suite asserts the crash contract the trait can express:
+///
+/// - **Synced state survives reopen.** Everything acknowledged before
+///   a `sync` + drop is readable after reopening the same path, and
+///   the re-exported snapshot is byte-identical.
+/// - **A crash never splits a batch.** A batch applied but never
+///   synced may be entirely absent after reopen (write-behind
+///   buffering) or entirely present (write-through) — never torn:
+///   the reopened state must equal either the pre-batch or the
+///   post-batch snapshot, nothing in between.
+/// - **Reopened state accepts new batches.** After a restart the
+///   backend keeps accumulating state on top of whatever survived —
+///   a reopened backend is not read-only.
+///
+/// # Panics
+/// This is a conformance assertion: it panics on any contract
+/// violation and on filesystem errors creating its temp dirs —
+/// like the base suite, failure of the harness is failure of the
+/// backend under test.
+pub fn assert_persistent_storage_conformance<B, F>(make_at: F)
+where
+    B: StorageBackend,
+    F: Fn(&Path) -> B,
+{
+    let base = std::env::temp_dir().join(format!(
+        "oxide-persist-conformance-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("create conformance temp dir");
+
+    // ---- Synced state survives reopen ----
+    let dir = base.join("reopen");
+    let committed: Vec<(Hash, Vec<u8>)> =
+        (0..8u8).map(|i| (key1(i), vec![i; i as usize + 1])).collect();
+    {
+        let mut b = make_at(&dir);
+        for (k, v) in &committed {
+            b.apply_batch(&[Op::Set { key: *k, value: v.clone() }])
+                .expect("apply_batch must succeed");
+        }
+        b.sync().expect("sync must succeed");
+        // Explicit drop = the process boundary: nothing after this
+        // line may rely on in-memory state.
+    }
+    {
+        let b = make_at(&dir);
+        for (k, v) in &committed {
+            assert_eq!(b.get(k).as_deref(), Some(v.as_slice()), "synced key lost on reopen");
+        }
+        let exported = b.snapshot_export();
+        assert_eq!(
+            exported.entries, committed,
+            "reopened state must re-export the identical snapshot"
+        );
+    }
+
+    // ---- A crash never splits a batch ----
+    // `unset` writes three keys and deletes one; after an unsynced
+    // drop the reopened state must be exactly `committed` (buffered
+    // backend discarded the batch) or `committed + batch` (write-
+    // through backend persisted it) — any mixture is a torn batch.
+    let dir = base.join("split");
+    let batch: Vec<Op> = vec![
+        Op::Set { key: key1(0xA0), value: vec![1] },
+        Op::Set { key: key1(0xA1), value: vec![2] },
+        Op::Set { key: key1(0xA2), value: vec![3] },
+        Op::Delete { key: committed[0].0 },
+    ];
+    {
+        let mut b = make_at(&dir);
+        for (k, v) in &committed {
+            b.apply_batch(&[Op::Set { key: *k, value: v.clone() }])
+                .expect("apply_batch must succeed");
+        }
+        b.sync().expect("sync must succeed");
+        b.apply_batch(&batch).expect("apply_batch must succeed");
+        // No sync: drop here is a crash one step after the API call.
+    }
+    let expected_without: BTreeMap<Hash, Vec<u8>> = committed.iter().cloned().collect();
+    let mut expected_with = expected_without.clone();
+    apply_ops_to_map(&mut expected_with, &batch);
+    {
+        let b = make_at(&dir);
+        let actual: BTreeMap<Hash, Vec<u8>> = b.range(b"").into_iter().collect();
+        assert!(
+            actual == expected_without || actual == expected_with,
+            "reopened state must be a whole-batch prefix — partial \
+             batch application across a crash is a torn write \
+             (missing: {:?}, extra: {:?})",
+            expected_without
+                .keys()
+                .chain(expected_with.keys())
+                .filter(|k| !actual.contains_key(*k))
+                .collect::<Vec<_>>(),
+            actual.keys().filter(|k| !expected_with.contains_key(*k)).collect::<Vec<_>>(),
+        );
+        // ---- Reopened state accepts new batches ----
+        let mut b = b;
+        let more = vec![Op::Set { key: key1(0xF0), value: vec![9] }];
+        b.apply_batch(&more).expect("post-reopen batch must apply");
+        b.sync().expect("post-reopen sync must succeed");
+        drop(b);
+        let b = make_at(&dir);
+        let mut expected = actual.clone();
+        apply_ops_to_map(&mut expected, &more);
+        let actual2: BTreeMap<Hash, Vec<u8>> = b.range(b"").into_iter().collect();
+        assert_eq!(
+            actual2, expected,
+            "state after reopen+append+reopen must accumulate, not reset"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Replay ops into a map — the suite's model of `apply_batch` for
+/// comparing expected vs actual state (same last-op-wins rule).
+fn apply_ops_to_map(state: &mut BTreeMap<Hash, Vec<u8>>, ops: &[Op]) {
+    for op in ops {
+        match op {
+            Op::Set { key, value } => {
+                state.insert(*key, value.clone());
+            }
+            Op::Delete { key } => {
+                state.remove(key);
+            }
+        }
+    }
 }
 
 // ---- Test keys ----

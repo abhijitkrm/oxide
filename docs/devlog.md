@@ -17796,3 +17796,51 @@ emitted (the view already moved on / the node already voted).
 `end_state` (per-node view / high_qc view / next_height / stored
 blocks) — the metadata that made the wedge diagnosable. The gate's
 failure line now prints tips+sizes so a violation carries its shape.
+
+## Storage: crash atomicity is now fault-injected at every durability boundary
+
+The conformance suite's "crash replay" test only re-applied the same
+batches to two fresh backends — determinism, not a crash. The journal
+now carries a test-only `FaultPoint` injector (`#[cfg(test)]` only —
+the field doesn't exist in production builds, so the mechanism costs
+nothing and cannot leak into a release binary). Each arm is one-shot:
+the call fails, the writer is dropped (a dead process does not resume
+mid-call), and the test reopens the directory to compare what the
+caller was told against what the disk actually holds.
+
+Armed points cover every boundary the finding names: `append`
+(pre-framing death), `flush`'s `write_all`, `sync`'s fsync, rotation's
+seal-fsync, the height-index sidecar write, the successor-segment
+create, and the checkpoint marker's sync (injected inside
+`JournalBackend::checkpoint`, between "marker framed" and "marker
+durable").
+
+The assertions pin down the contract, not just the absence of panics:
+
+- Crash at `flush` → reopen replays only the previously-synced prefix.
+- Crash mid-rotation → the sealed segment's records all replay; a
+  crash between seal and the `heights.idx` write leaves an *unindexed*
+  sealed segment, which height-pruning must keep (unindexed means
+  "unknown contents, never delete").
+- Crash between indexing and the successor create → reopen starts a
+  fresh segment at the right sequence number over the intact history.
+- `apply_batch` killed mid-append → in-memory state AND the MMR roll
+  back; reopening under the pre-crash log root succeeds.
+- `snapshot_import` killed mid-append → old state stays; nothing
+  swaps in that the journal can't replay.
+- `checkpoint` killed at the marker sync → reopen sees no marker at
+  all: the journal opens under the pre-checkpoint root and a later
+  checkpoint succeeds.
+- A failed `sync` leaves the group buffer intact — retry lands the
+  batch exactly once, no torn or doubled record.
+- A torn tail reopen under the pre-truncation `expected_root` fails
+  `IntegrityMismatch` — shortened history never verifies silently.
+
+At the trait level, `assert_persistent_storage_conformance` is the
+adapter-generic half of the contract: `StorageBackend` has no reopen
+method, so the suite takes a `Fn(&Path) -> B` factory (every adapter's
+`open` already serves first-open and reopen) and asserts synced state
+survives drop+reopen byte-identical, an unsynced batch is all-or-
+nothing across the crash (write-through or buffered — never torn),
+and a reopened backend keeps accumulating state. `JournalBackend`,
+MDBX, redb, and RocksDB all pass it.

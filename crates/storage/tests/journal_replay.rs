@@ -388,3 +388,16 @@ fn journal_replay_deterministic_state_roots() {
     let _ = std::fs::remove_dir_all(&dir1);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+/// Crash-atomicity conformance for the journal-backed persistent
+/// backend: synced state survives reopen, a crash never splits a
+/// batch, and a reopened backend keeps accumulating (the journal-level
+/// fault-injection tests cover the torn-write/interrupted-rotation
+/// internals).
+#[test]
+fn journal_backend_passes_persistent_storage_conformance() {
+    ports::storage_conformance::assert_persistent_storage_conformance(|path| {
+        storage::JournalBackend::open(path, JournalConfig::default(), None)
+            .expect("open journal backend")
+    });
+}
