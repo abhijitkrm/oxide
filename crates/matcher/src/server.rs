@@ -267,10 +267,11 @@ impl BatchSettler {
     /// Seal the current batch and submit it to consensus. Returns
     /// the number of fills settled.
     ///
-    /// Aggregates fills by (buyer, seller) pair before encoding —
-    /// multiple fills between the same pair are combined into one
-    /// net transfer. This reduces the number of ledger operations from
-    /// `fill_count` to `unique_pair_count` (typically 2-5x fewer).
+    /// Aggregates fills by (market, price, buy order, sell order)
+    /// before encoding — multiple fills at one price between the
+    /// same registered order pair are combined into one leg. This
+    /// reduces the number of ledger operations from `fill_count` to
+    /// `unique_pair_count` (typically 2-5x fewer).
     ///
     /// # Errors
     ///
@@ -331,21 +332,29 @@ impl BatchSettler {
             return Ok(0);
         }
 
-        // Aggregate fills by (market, price, buyer, seller): legs at
-        // the same price between the same pair merge into one entry.
-        // The wire carries no claimed settlement amount — the chain
-        // recomputes `price * qty / PRICE_SCALE` per leg — so
-        // aggregation must not sum the off-chain `quote_amount`
-        // (floor-division dust would make the sums diverge).
+        // Aggregate fills by (market, price, buy order, sell order):
+        // legs at the same price between the same REGISTERED order
+        // pair merge into one entry — merging across different order
+        // keys is not possible because each key authorizes only its
+        // own remaining quantity. The wire carries no claimed
+        // settlement amount — the chain recomputes
+        // `price * qty / PRICE_SCALE` per leg — so aggregation must
+        // not sum the off-chain `quote_amount` (floor-division dust
+        // would make the sums diverge).
         //
         // BTreeMap keeps the encoded entry order deterministic and
         // reproducible for a given fill sequence.
         let mut aggregated: std::collections::BTreeMap<
-            (u16, Price, primitives::Address, primitives::Address),
+            (u16, Price, exchange::OrderKey, exchange::OrderKey),
             Qty,
         > = std::collections::BTreeMap::new();
         for f in &fills {
-            let key = (f.market, f.price, f.buyer, f.seller);
+            let key = (
+                f.market,
+                f.price,
+                exchange::OrderKey { owner: f.buyer, client_id: f.buyer_id },
+                exchange::OrderKey { owner: f.seller, client_id: f.seller_id },
+            );
             match aggregated.get_mut(&key) {
                 Some(q) => {
                     // A qty sum above u64::MAX is unreachable in
@@ -363,12 +372,12 @@ impl BatchSettler {
         }
         let entries: Vec<BatchFillEntry> = aggregated
             .into_iter()
-            .map(|((market, price, buyer, seller), qty)| BatchFillEntry {
+            .map(|((market, price, buy, sell), qty)| BatchFillEntry {
                 market,
                 price,
                 qty,
-                buyer,
-                seller,
+                buy,
+                sell,
             })
             .collect();
         let pair_count = entries.len();

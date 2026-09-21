@@ -15,8 +15,12 @@
 //! settlement operator (a prefunded sender) submits
 //! `txs_per_round` batch txs per round. Buyers are prefunded senders
 //! 0..16, sellers are senders 16..31, round-robin — so every fill is
-//! a distinct-ish pair mix that still exercises aggregation. The
-//! test verifies:
+//! a distinct-ish pair mix that still exercises aggregation. Every
+//! account first submits one order-registration tx (the first 31
+//! workload txs) authorizing a single working order under client id
+//! 1; the batch legs then reference those `(owner, 1)` registered
+//! orders — the on-chain authorization model this test exercises.
+//! The test verifies:
 //!
 //! - All txs are finalized (no batches dropped).
 //! - All validators agree on identical blocks and state roots.
@@ -87,13 +91,17 @@ const NUM_BUYERS: u8 = 16;
 /// Seller senders are prefunded bytes 16..31 (15 accounts — byte 31
 /// is the operator).
 const NUM_SELLERS: u8 = 15;
-/// Fill price: $15.00, mid-band.
+/// Fill price: $15.00, mid-band. Orders register at this limit so
+/// every leg's crossing check passes exactly.
 const FILL_PRICE: u64 = 1_500_000_000;
 /// Fill quantity: one lot.
 const FILL_QTY: u64 = 1_000;
 /// Quote units moved per fill: `price × qty / PRICE_SCALE`
 /// = `1_500_000_000 × 1_000 / 100_000_000` = `15_000` base units.
 const FILL_QUOTE: u64 = 15_000;
+/// Client order id every account registers its single working
+/// order under — the `(owner, 1)` key the batch legs reference.
+const CLIENT_ID: u64 = 1;
 
 /// Build a tx envelope for an exchange module message.
 ///
@@ -109,10 +117,20 @@ fn make_tx(sender_byte: u8, nonce: u64, payload: Vec<u8>) -> types::TxBytes {
     types::TxBytes::new(bytes)
 }
 
+/// Build one order-registration tx for `sender_byte`: a single
+/// resting order under `CLIENT_ID` sized to cover every fill the
+/// account will see in the workload. Buys escrow
+/// `price × qty / PRICE_SCALE` at registration — sized to the
+/// per-account fill count so the reservation is exact.
+fn make_register_tx(sender_byte: u8, side: trading::Side, qty: u64) -> types::TxBytes {
+    make_tx(sender_byte, 0, exchange::msg::register_order(0, side, FILL_PRICE, qty, CLIENT_ID))
+}
+
 /// Build one batch-settle tx carrying `count` fills starting at
-/// global fill index `start`. Fill `i` trades between buyer
-/// `i % 16` and seller `16 + i % 15`, so pair composition varies
-/// across the batch (aggregation exercised, not fully collapsed).
+/// global fill index `start`. Fill `i` trades between registered
+/// buy order `(i % 16, 1)` and sell order `(16 + i % 15, 1)`, so
+/// pair composition varies across the batch (aggregation
+/// exercised, not fully collapsed).
 fn make_batch_tx(nonce: u64, start: usize, count: usize) -> types::TxBytes {
     let fills: Vec<exchange::BatchFillEntry> = (0..count)
         .map(|j| {
@@ -125,8 +143,8 @@ fn make_batch_tx(nonce: u64, start: usize, count: usize) -> types::TxBytes {
                 market: 0,
                 price: Price(FILL_PRICE),
                 qty: Qty(FILL_QTY),
-                buyer,
-                seller,
+                buy: exchange::OrderKey { owner: buyer, client_id: CLIENT_ID },
+                sell: exchange::OrderKey { owner: seller, client_id: CLIENT_ID },
             }
         })
         .collect();
@@ -144,10 +162,17 @@ fn run_settle_tps(
     min_fills_per_sec: f64,
 ) {
     // `run_pipelined_txs` consumes exactly `rounds * txs_per_round`
-    // txs in contiguous chunks — every slot is a batch tx; the
-    // market is listed in-process before the run (see below).
+    // txs in contiguous chunks — the first `NUM_BUYERS +
+    // NUM_SELLERS` slots are the order registrations every batch leg
+    // authorizes against; the rest are batch txs. The market is
+    // listed in-process before the run (see below).
+    let registration_txs = usize::from(NUM_BUYERS) + usize::from(NUM_SELLERS);
     let total_txs = rounds * txs_per_round;
-    let total_batch_txs = total_txs;
+    assert!(
+        total_txs > registration_txs,
+        "workload too small for the {registration_txs} registration txs"
+    );
+    let total_batch_txs = total_txs - registration_txs;
     let total_fills = total_batch_txs * fills_per_tx;
     eprintln!(
         "settle TPS test: {n_validators} validators, {rounds} rounds, \
@@ -178,10 +203,22 @@ fn run_settle_tps(
         ex.list_market(cfg()).expect("test market config is valid");
     }
 
-    // Build the workload: all batch txs from the operator with
-    // incrementing nonces starting at 0.
+    // Build the workload: 31 order registrations FIRST (each account
+    // authorizes one working order under CLIENT_ID sized to cover
+    // its fills), then all batch txs from the operator with
+    // incrementing nonces starting at 0. A batch leg without a
+    // registered order is a rejected leg — registration order in
+    // the workload is what makes the batches valid.
     let build_start = Instant::now();
     let mut all_txs = Vec::with_capacity(total_txs);
+    let buy_qty = (total_fills.div_ceil(usize::from(NUM_BUYERS)) as u64) * FILL_QTY;
+    let sell_qty = (total_fills.div_ceil(usize::from(NUM_SELLERS)) as u64) * FILL_QTY;
+    for b in 0..NUM_BUYERS {
+        all_txs.push(make_register_tx(b, trading::Side::Buy, buy_qty));
+    }
+    for b in NUM_BUYERS..NUM_BUYERS + NUM_SELLERS {
+        all_txs.push(make_register_tx(b, trading::Side::Sell, sell_qty));
+    }
     let mut next_fill = 0usize;
     for nonce in (0u64..).take(total_batch_txs) {
         all_txs.push(make_batch_tx(nonce, next_fill, fills_per_tx));
@@ -193,9 +230,9 @@ fn run_settle_tps(
     );
 
     // Feed the pipeline: `run_pipelined_txs` slices `all_txs` into
-    // `txs_per_round` chunks per round, so round 0 carries the
-    // `list_market` setup tx plus `txs_per_round - 1` batches and
-    // later rounds are all batches.
+    // `txs_per_round` chunks per round, so round 0 carries the 31
+    // registration txs (batch legs referencing them must execute
+    // after them) and later rounds are all batches.
     //
     // `SETTLE_DRIVER=threaded` switches to `run_threaded_txs`: each
     // validator on its own OS thread with proposals shipped over TCP —
@@ -241,13 +278,16 @@ fn run_settle_tps(
     }
 
     // 5. Settlement conservation: sellers received exactly
-    //    `total_fills × FILL_QUOTE` units in aggregate. Check on
-    //    every validator — catches both dropped fills and divergent
-    //    settlement. `EvmModule::balance` returns wei, so scale the
-    //    expectation by `WEI_PER_UNIT`.
+    //    `total_fills × FILL_QUOTE` units in aggregate MINUS the
+    //    `fee` each seller paid for its order-registration tx
+    //    (15 senders × 100 units — fees are burned, not credited to
+    //    sellers). Check on every validator — catches both dropped
+    //    fills and divergent settlement. `EvmModule::balance`
+    //    returns wei, so scale the expectation by `WEI_PER_UNIT`.
     let genesis_units: u64 = 1_000_000_000_000; // GENESIS_BALANCE
     let wei = framework::WEI_PER_UNIT;
     let expected_seller_total = (u128::from(genesis_units) * u128::from(NUM_SELLERS)
+        - u128::from(NUM_SELLERS) * 100
         + u128::from(FILL_QUOTE) * total_fills as u128)
         * wei;
     for i in 0..n_validators {
@@ -267,7 +307,7 @@ fn run_settle_tps(
     let fills_per_sec = total_fills as f64 / secs;
     let orders_per_sec = fills_per_sec * 2.0;
     let tx_rate = total_txs as f64 / secs;
-    let payload_mb = (total_fills * 58) as f64 / (1024.0 * 1024.0);
+    let payload_mb = (total_fills * 74) as f64 / (1024.0 * 1024.0);
     eprintln!();
     eprintln!("=== Batch-Settlement TPS Results (consensus pipeline) ===");
     eprintln!("  validators:        {n_validators}");

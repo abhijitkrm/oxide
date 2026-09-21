@@ -2280,6 +2280,43 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     showing the signed commitment follows the live committee's
     layout after an epoch rotation.
 
+- **Batch settlement only moves money the owners authorized**
+  (`modules/exchange`, `crates/matcher`, `crates/devnet`)
+  - The settlement operator could previously submit fills naming any
+    buyer and seller: the chain checked the numbers but never that an
+    order existed, had quantity left, or had not already settled —
+    the operator was a de-facto transfer authority over every
+    account.
+  - Orders are now registered on-chain (`TAG_REGISTER_ORDER`) under a
+    `(owner, client_id)` key — the matcher's per-account request
+    nonce — with market, side, limit price, and quantity, and buys
+    escrow `limit × qty` of quote up front. `TAG_CANCEL_REGISTERED`
+    refunds the remaining escrow exactly once.
+  - Batch legs name two registered orders instead of bare addresses.
+    Each leg is checked on-chain for live orders, side/market binding,
+    `sell.limit ≤ price ≤ buy.limit`, and a batch-wide remaining
+    bound that makes overfills and replayed batches fail. The buy
+    side is never debited at settle time — the escrow pays, the
+    seller is credited the fill amount, and the buyer's price
+    improvement is rebated deterministically; a failed seller credit
+    voids the pair with zero economic effect.
+  - The registry is committed state (state root + snapshots carry
+    it) and capped at 65,536 orders. The matcher carries each fill's
+    client ids from intake through `seal_batch`, and aggregation
+    keys on the full order pair so merges never cross an order
+    boundary.
+  - **In plain words:** the settlement clerk used to be able to move
+    money between anyone it named. Now every fill must point at two
+    orders the owners actually filed — the chain checks the price is
+    inside both limits, the orders still have room, and nothing
+    settles twice. The clerk can still be fired for bad behavior; it
+    just can't invent the paperwork anymore.
+  - Regression: 52 exchange tests covering registration, escrow,
+    crossing, overfill, replay, atomic voiding, rebates, residue
+    refunds, snapshot round-trip; `settle_tps` drives registrations
+    + fills through the 4-validator TCP pipeline with seller
+    conservation verified on every validator.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

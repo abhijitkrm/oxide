@@ -17049,3 +17049,67 @@ availability contract, enumerated); roundtrip across n∈{1..16}
 and body sizes to 3.8 MB; a rotated-committee engine test proving
 the next proposal's root follows the new stake distribution.
 All 31 devnet TCP tests green on the erasure-coded path.
+
+## Batch settlement settles only what the owners signed for
+
+The exchange's `TAG_BATCH_SETTLE` path trusted the configured
+settlement operator completely: a fill leg named a market, price,
+qty, and two bare addresses, and the chain moved quote between
+them after checking only arithmetic. It never verified that the
+buyer authorized an order, that the order had remaining quantity,
+or that the same fill had not already settled under another
+batch — the operator was effectively a balance-transfer
+authority for every account.
+
+**On-chain registered orders.** `TAG_REGISTER_ORDER` (tag 4) puts
+a `(owner, client_id)` order authorization into committed state:
+market, side, limit price, total quantity, and — for buys — a
+quote escrow of `limit × qty / PRICE_SCALE` debited at
+registration. `TAG_CANCEL_REGISTERED` (tag 5) removes the
+sender's order and refunds its remaining escrow, once. The
+client id reuses the matcher's existing per-account request
+nonce, so an order's identity is the same on- and off-chain and
+no protocol field was added.
+
+**Legs name orders, not addresses.** A `BatchFillEntry` now
+carries two `OrderKey`s — `(owner, client_id)` for the buy and
+the sell — in a 74-byte wire entry. `settle_leg` resolves both
+keys against the registry and requires: live orders on the
+leg's market, buy key is a buy and sell key a sell, distinct
+owners, `sell.limit ≤ price ≤ buy.limit`, tick/lot/band market
+rules, and a batch-wide `consumed` bound so two legs cannot
+spend the same authorized quantity — which is also what makes a
+replayed batch fail every leg.
+
+**Escrow-backed settlement.** The buy side is never debited at
+settle time: the registration escrow pays. Each leg releases
+`buy.limit × qty` of escrow, pays `price × qty` to the seller,
+and returns the difference as a deterministic price-improvement
+rebate. Settlement runs as a pipeline — validate all legs →
+credit sellers once per aggregated (buyer, seller) pair → drain
+rebates → apply per-order consumption — so a pair whose seller
+credit fails voids its legs wholesale (zero economic effect)
+and a withheld rebate stays escrowed for the residue refund.
+Fully consumed orders are removed; replaying their fills fails
+lookup.
+
+**Committed state.** The registry serializes as a trailing
+canonical section after endorsements: `state_root` and snapshot
+export hash it, old binaries reject the extra bytes through the
+staged reader's end-of-stream check, and the decoder treats its
+absence as an empty registry. Registry capped at 65,536 orders.
+
+**Matcher.** `SettledFill` carries each side's request nonce as
+its client id; the book keeps an order-id → client-id map
+evicted on fill/cancel/removal. `BatchSettler` aggregates on
+the full `(market, price, buy key, sell key)` tuple, so merging
+can never cross an order boundary.
+
+Tests: registration dedup/escrow/validation, unauthorized and
+disabled operator, forged keys, wrong side/market/limit,
+overfill, replayed batch, canceled order, failed seller credit
+voiding the pair atomically, price-improvement rebate, residue
+refund, deterministic pair ordering, registry in the state
+root, snapshot round-trip. `settle_tps` devnet test drives the
+full pipeline: 31 registration txs then batch fills through
+oxideBFT with seller conservation verified on every validator.

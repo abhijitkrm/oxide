@@ -119,6 +119,30 @@ fn limit(side: Side, ticks: u64, lots: u64, owner: u8) -> NewOrder {
     }
 }
 
+/// The batch legs' fill price: tick 500 ($15.00), the same value the
+/// registered orders carry as their limit.
+const FILL_PRICE: u64 = 1_500_000_000;
+/// The registered-order pool size (scale-6 qty units): every
+/// account's working order is sized so criterion iterations can
+/// never exhaust `remaining` — a bench iteration draws at most
+/// `FILLS × fill qty` ≈ 16M units from a 1e15 pool.
+const ORDER_POOL_QTY: u64 = 1_000_000_000_000_000;
+
+/// Register one working order for `owner` under `client_id` — the
+/// on-chain authorization every batch leg consumes. Buys escrow
+/// `FILL_PRICE × ORDER_POOL_QTY / PRICE_SCALE` = 1.5e16 quote units
+/// (well under the `u64::MAX/4` mint); sells authorize with no
+/// escrow. `client_id` is per-side (buys 1, sells 2) so an account
+/// can hold both a buy and a sell working order — the
+/// `distinct_pairs` fixture's seller range overlaps its buyers.
+fn register_working_order(ex: &ExchangeModule, owner: u8, side: Side, mid: u8, client_id: u64) {
+    ex.handle(
+        &ctx(owner),
+        &exchange::msg::register_order(u16::from(mid), side, FILL_PRICE, ORDER_POOL_QTY, client_id),
+    )
+    .expect("working-order registration");
+}
+
 /// Gate: p50 < 2 µs (≥500k orders/s/core settled).
 ///
 /// Measures the full `ExchangeModule::handle()` path for a single
@@ -260,23 +284,31 @@ fn batch_settle_1k_distinct_pairs(c: &mut Criterion) {
     let mid = ex.list_market(cfg()).expect("market config valid");
 
     // Pre-build the batch: 1000 fills, each between a distinct
-    // (buyer, seller) pair — the aggregation-hostile case. Addresses
-    // are derived from the fill index so pairs never repeat.
+    // (buyer, seller) registered-order pair — the
+    // aggregation-hostile case. Addresses are derived from the fill
+    // index so pairs never repeat; each account registers ONE
+    // working order under client id 1 (4 buyers × 256 sellers ⇒
+    // 1024 possible order pairs, 1000 exercised).
     // u8→u16 indexing keeps 2×256 = 65k distinct pairs available.
+    for b in 1u8..=4 {
+        ledger.mint(&addr(b), u64::MAX / 4);
+        register_working_order(&ex, b, Side::Buy, mid, 1);
+    }
+    for s in 0u8..=255 {
+        register_working_order(&ex, s.wrapping_add(100), Side::Sell, mid, 2);
+    }
     let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
         .map(|i| {
             #[allow(clippy::cast_possible_truncation)]
             let buyer = addr(((i / 256) + 1) as u8);
             #[allow(clippy::cast_possible_truncation)]
             let seller = addr(((i % 256) + 100) as u8);
-            // Fund both sides far past any settlement total.
-            ledger.mint(&buyer, u64::MAX / 4);
             exchange::BatchFillEntry {
                 market: u16::from(mid),
-                price: Price(1_500_000_000),
+                price: Price(FILL_PRICE),
                 qty: Qty(1_000),
-                buyer,
-                seller,
+                buy: exchange::OrderKey { owner: buyer, client_id: 1 },
+                sell: exchange::OrderKey { owner: seller, client_id: 2 },
             }
         })
         .collect();
@@ -306,14 +338,16 @@ fn batch_settle_1k_same_pair(c: &mut Criterion) {
     ex.set_settlement_operator(addr(0x5E));
     let mid = ex.list_market(cfg()).expect("market config valid");
     ledger.mint(&addr(1), u64::MAX / 4);
+    register_working_order(&ex, 1, Side::Buy, mid, 1);
+    register_working_order(&ex, 9, Side::Sell, mid, 2);
 
     let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
         .map(|_| exchange::BatchFillEntry {
             market: u16::from(mid),
-            price: Price(1_500_000_000),
+            price: Price(FILL_PRICE),
             qty: Qty(1_000),
-            buyer: addr(1),
-            seller: addr(9),
+            buy: exchange::OrderKey { owner: addr(1), client_id: 1 },
+            sell: exchange::OrderKey { owner: addr(9), client_id: 2 },
         })
         .collect();
     let payload = exchange::msg::batch_settle(&fills);
@@ -348,21 +382,28 @@ fn batch_settle_16k_clustered_pairs(c: &mut Criterion) {
     ex.set_settlement_operator(addr(0x5E));
     let mid = ex.list_market(cfg()).expect("market config valid");
 
-    // Buyer ids 1..=16, seller ids 100..=114 — 240 disjoint pairs,
-    // matching the devnet fixture's fan-out.
+    // Buyer ids 1..=16, seller ids 100..=114 — 240 disjoint
+    // registered-order pairs, matching the devnet fixture's fan-out.
+    // Each account registers one working order under client id 1.
+    for b in 1u8..=BUYERS {
+        ledger.mint(&addr(b), u64::MAX / 4);
+        register_working_order(&ex, b, Side::Buy, mid, 1);
+    }
+    for s in 100u8..100 + SELLERS {
+        register_working_order(&ex, s, Side::Sell, mid, 2);
+    }
     let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
         .map(|i| {
             #[allow(clippy::cast_possible_truncation)]
             let buyer = addr(((i % usize::from(BUYERS)) + 1) as u8);
             #[allow(clippy::cast_possible_truncation)]
             let seller = addr(((i % usize::from(SELLERS)) + 100) as u8);
-            ledger.mint(&buyer, u64::MAX / 4);
             exchange::BatchFillEntry {
                 market: u16::from(mid),
-                price: Price(1_500_000_000),
+                price: Price(FILL_PRICE),
                 qty: Qty(1_000),
-                buyer,
-                seller,
+                buy: exchange::OrderKey { owner: buyer, client_id: 1 },
+                sell: exchange::OrderKey { owner: seller, client_id: 2 },
             }
         })
         .collect();

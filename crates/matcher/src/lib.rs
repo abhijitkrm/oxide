@@ -174,6 +174,49 @@ fn gone_makers(
     gone.into_iter().map(|(_, owner)| owner).collect()
 }
 
+/// Resolve a book fill's settlement attribution into the
+/// `(buyer, seller, buyer_id, seller_id)` tuple a `SettledFill`
+/// carries. The taker's client id is its request nonce (the same
+/// value the owner registers the order under on-chain); the maker's
+/// comes from the resting-order map. A missing maker entry yields
+/// 0 — the on-chain leg will fail its order lookup rather than
+/// settle against a guessed order.
+fn fill_parties(
+    f: &FillEvent,
+    taker_nonce: u64,
+    order_client_ids: &HashMap<u64, u64>,
+) -> (primitives::Address, primitives::Address, u64, u64) {
+    let maker_id = order_client_ids.get(&f.maker_order_id.0).copied().unwrap_or(0);
+    if f.taker_side == Side::Buy {
+        (f.taker_owner, f.maker_owner, taker_nonce, maker_id)
+    } else {
+        (f.maker_owner, f.taker_owner, maker_id, taker_nonce)
+    }
+}
+
+/// Drop the client-id bindings of every order the last match left
+/// out of the book — makers exhausted by fills (no `order_owner`
+/// left) and non-fill removals the sweep reported with zero
+/// remaining. Cancels evict directly at their own site. Shared by
+/// `MatchingServer` and `MarketWorker`.
+fn evict_gone_client_ids(
+    engine: &MatchingEngine,
+    fills: &[FillEvent],
+    removed: &[trading::MakerRemoval],
+    order_client_ids: &mut HashMap<u64, u64>,
+) {
+    for f in fills {
+        if engine.order_owner(f.maker_order_id).is_none() {
+            order_client_ids.remove(&f.maker_order_id.0);
+        }
+    }
+    for r in removed {
+        if r.remaining == 0 {
+            order_client_ids.remove(&r.order_id.0);
+        }
+    }
+}
+
 /// A matched fill with settlement attribution.
 #[derive(Debug, Clone, Copy)]
 pub struct SettledFill {
@@ -187,8 +230,17 @@ pub struct SettledFill {
     pub qty: Qty,
     /// Buyer address.
     pub buyer: primitives::Address,
+    /// The buyer's client order id — the per-account request nonce
+    /// of their order request, which is also the `client_id` they
+    /// registered the order under on-chain. The batch-settle leg
+    /// names `(buyer, buyer_id)` so the chain can resolve the
+    /// registered order this fill consumes.
+    pub buyer_id: u64,
     /// Seller address.
     pub seller: primitives::Address,
+    /// The seller's client order id (same convention as
+    /// `buyer_id`).
+    pub seller_id: u64,
     /// Quote amount debited from buyer / credited to seller (scale-6)
     /// in the off-chain cache — recorded for reconciliation; the
     /// on-chain batch settles a recomputed amount, not this value.
@@ -413,6 +465,13 @@ pub struct MatchingServer {
     settlement_batch: Vec<SettledFill>,
     /// Per-owner replay gate (see [`NonceTracker`]).
     nonces: NonceTracker,
+    /// Book order id → the client order id (request nonce) of the
+    /// owner who placed it — kept for every resting order so a fill
+    /// can carry the `(owner, client_id)` key the on-chain
+    /// registered-order authorization model settles against.
+    /// Entries are inserted when an order rests and evicted when it
+    /// leaves the book (filled, cancelled, or removed).
+    order_client_ids: HashMap<u64, u64>,
     /// Millisecond time source for the rate limiter — the limiter's
     /// sliding window only has meaning against real elapsed time.
     /// Injectable so tests control the window deterministically and
@@ -455,6 +514,7 @@ impl MatchingServer {
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
             nonces: NonceTracker::new(),
+            order_client_ids: HashMap::with_capacity(65_536),
             clock: Arc::new(wall_clock_ms),
             chain_id: protocol::CHAIN_ID,
             removed: Vec::with_capacity(64),
@@ -489,6 +549,7 @@ impl MatchingServer {
             fills: Vec::with_capacity(64),
             settlement_batch: Vec::with_capacity(10_000),
             nonces: NonceTracker::new(),
+            order_client_ids: HashMap::with_capacity(65_536),
             clock: Arc::new(wall_clock_ms),
             chain_id: protocol::CHAIN_ID,
             removed: Vec::with_capacity(64),
@@ -705,11 +766,11 @@ impl MatchingServer {
             self.fills_produced += 1;
             let notional = u128::from(f.price.0) * u128::from(f.qty.0);
             let quote_amount = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
-            let (buyer, seller) = if f.taker_side == Side::Buy {
-                (f.taker_owner, f.maker_owner)
-            } else {
-                (f.maker_owner, f.taker_owner)
-            };
+            // The taker's client id is this request's nonce; the
+            // maker's resolves through the resting-order map (see
+            // `fill_parties` for the fallback rules).
+            let (buyer, seller, buyer_id, seller_id) =
+                fill_parties(f, req.nonce, &self.order_client_ids);
             // Credit the seller.
             self.balances.credit(&seller, quote_amount);
             // Accumulate for batch settlement.
@@ -718,7 +779,9 @@ impl MatchingServer {
                 price: f.price,
                 qty: f.qty,
                 buyer,
+                buyer_id,
                 seller,
+                seller_id,
                 quote_amount,
             });
         }
@@ -730,6 +793,7 @@ impl MatchingServer {
         for owner in gone_makers(&self.engine, &self.removed, &self.fills) {
             self.risk.dec_resting(&owner);
         }
+        evict_gone_client_ids(&self.engine, &self.fills, &self.removed, &mut self.order_client_ids);
 
         // ── Release the reservation (buys) ──────────────────────
         // Everything not consumed by fills (at their actual price)
@@ -751,6 +815,10 @@ impl MatchingServer {
                 // Track the new resting order for the resting-cap
                 // risk check.
                 self.risk.inc_resting(&req.owner);
+                // Bind the book id to the request nonce — fills
+                // against this maker resolve `(owner, client_id)`
+                // through this entry.
+                self.order_client_ids.insert(order_id.0, req.nonce);
                 OrderResponse::resting(order_id, fills_count)
             }
             OrderOutcome::Killed => {
@@ -864,6 +932,9 @@ impl MatchingServer {
         };
         // Decrement the resting-order counter for this account.
         self.risk.dec_resting(&canceled.owner);
+        // The order left the book — drop its client-id binding so a
+        // stale id can never be attributed to a later order.
+        self.order_client_ids.remove(&order_id);
         // Refund the reserved balance for buy orders. The canceled
         // order's `qty` is the remaining (unfilled) quantity; the
         // reserved notional was `price * qty / PRICE_SCALE`.
@@ -897,6 +968,9 @@ impl MatchingServer {
         };
         // Decrement resting count for the canceled order.
         self.risk.dec_resting(&canceled.owner);
+        // The order left the book — drop its client-id binding so a
+        // stale id can never be attributed to a later order.
+        self.order_client_ids.remove(&order_id);
         // Refund the reserved balance for buy orders (the cancel side).
         if canceled.side == Side::Buy {
             let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
@@ -951,6 +1025,9 @@ impl MatchingServer {
         };
         // Decrement resting count for the canceled order.
         self.risk.dec_resting(&canceled.owner);
+        // The order left the book — drop its client-id binding so a
+        // stale id can never be attributed to a later order.
+        self.order_client_ids.remove(&order_id);
         // Refund the reserved balance for buy orders.
         if canceled.side == Side::Buy {
             let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
@@ -2001,6 +2078,11 @@ struct MarketWorker {
     chain_id: u64,
     /// Scratch for non-fill book removals the sweep reports.
     removed: Vec<trading::MakerRemoval>,
+    /// Book order id → the client order id (request nonce) of the
+    /// owner who placed it — the same bookkeeping
+    /// [`MatchingServer`] keeps so fills carry the on-chain
+    /// `(owner, client_id)` authorization key.
+    order_client_ids: HashMap<u64, u64>,
 }
 
 impl MarketWorker {
@@ -2027,6 +2109,7 @@ impl MarketWorker {
             clock,
             chain_id,
             removed: Vec::with_capacity(64),
+            order_client_ids: HashMap::with_capacity(65_536),
             orders_processed: 0,
             fills_produced: 0,
             balance_rejections: 0,
@@ -2185,11 +2268,10 @@ impl MarketWorker {
             self.fills_produced += 1;
             let notional = u128::from(f.price.0) * u128::from(f.qty.0);
             let quote_amount = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
-            let (buyer, seller) = if f.taker_side == Side::Buy {
-                (f.taker_owner, f.maker_owner)
-            } else {
-                (f.maker_owner, f.taker_owner)
-            };
+            // Client-id resolution mirrors
+            // `MatchingServer::execute_order` (see `fill_parties`).
+            let (buyer, seller, buyer_id, seller_id) =
+                fill_parties(f, req.nonce, &self.order_client_ids);
             self.balances.credit(&seller, quote_amount);
             // Accumulate for batch settlement.
             self.settlement_batch.push(SettledFill {
@@ -2197,7 +2279,9 @@ impl MarketWorker {
                 price: f.price,
                 qty: f.qty,
                 buyer,
+                buyer_id,
                 seller,
+                seller_id,
                 quote_amount,
             });
         }
@@ -2208,6 +2292,7 @@ impl MarketWorker {
         for owner in gone_makers(&self.engine, &self.removed, &self.fills) {
             self.risk.dec_resting(&owner);
         }
+        evict_gone_client_ids(&self.engine, &self.fills, &self.removed, &mut self.order_client_ids);
 
         // ── Release the reservation (buys) ──────────────────────
         // Fills pay their actual price (improvement refunded), a
@@ -2229,6 +2314,9 @@ impl MarketWorker {
                 // Track the new resting order for the resting-cap
                 // risk check.
                 self.risk.inc_resting(&req.owner);
+                // Bind the book id to the request nonce (see
+                // `MatchingServer::execute_order`).
+                self.order_client_ids.insert(order_id.0, req.nonce);
                 OrderResponse::resting(order_id, fills_count)
             }
             OrderOutcome::CanceledRemainder { .. } => {
@@ -2290,6 +2378,9 @@ impl MarketWorker {
             return OrderResponse::rejected(RejectReason::OrderNotFound);
         };
         self.risk.dec_resting(&canceled.owner);
+        // The order left the book — drop its client-id binding so a
+        // stale id can never be attributed to a later order.
+        self.order_client_ids.remove(&order_id);
         if canceled.side == Side::Buy {
             let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
             let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
@@ -2318,6 +2409,9 @@ impl MarketWorker {
             return OrderResponse::rejected(RejectReason::OrderNotFound);
         };
         self.risk.dec_resting(&canceled.owner);
+        // The order left the book — drop its client-id binding so a
+        // stale id can never be attributed to a later order.
+        self.order_client_ids.remove(&order_id);
         if canceled.side == Side::Buy {
             let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
             let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
@@ -2358,6 +2452,9 @@ impl MarketWorker {
             return OrderResponse::rejected(RejectReason::OrderNotFound);
         };
         self.risk.dec_resting(&canceled.owner);
+        // The order left the book — drop its client-id binding so a
+        // stale id can never be attributed to a later order.
+        self.order_client_ids.remove(&order_id);
         if canceled.side == Side::Buy {
             let notional = u128::from(canceled.price.0) * u128::from(canceled.qty.0);
             let refund = u64::try_from(notional / PRICE_SCALE).unwrap_or(u64::MAX);
@@ -2685,9 +2782,12 @@ mod tests {
         // Push a maker sell + taker buy as one batch through ring 0.
         // The ring only accepts `VerifiedOrder` proofs — transport
         // threads authenticate, the matcher thread never sees a raw
-        // unauthenticated request.
-        let maker = signed_req(&seller_sk, 0, Side::Sell, 0, 1_500_000_000, 1_000);
-        let taker = signed_req(&buyer_sk, 0, Side::Buy, 0, 1_500_000_000, 1_000);
+        // unauthenticated request. Distinct request nonces (5 and 7)
+        // let the fill assertions prove the (owner, client_id)
+        // plumbing: a fill's buyer_id/seller_id must carry the
+        // request nonces the owners registered on-chain.
+        let maker = signed_req(&seller_sk, 0, Side::Sell, 5, 1_500_000_000, 1_000);
+        let taker = signed_req(&buyer_sk, 0, Side::Buy, 7, 1_500_000_000, 1_000);
         let verified: Vec<crate::protocol::VerifiedOrder> = [maker, taker]
             .into_iter()
             .map(|req| crate::protocol::VerifiedOrder::new(req).expect("signed orders must verify"))
@@ -2714,6 +2814,11 @@ mod tests {
         assert_eq!(fills[0].qty, Qty(1_000));
         assert_eq!(fills[0].buyer, buyer);
         assert_eq!(fills[0].seller, seller);
+        // The fill carries each side's request nonce as its client
+        // id — the (owner, client_id) key the on-chain batch leg
+        // resolves to a registered order.
+        assert_eq!(fills[0].buyer_id, 7);
+        assert_eq!(fills[0].seller_id, 5);
 
         // Stats via the control channel.
         let stats = ring.stats();

@@ -57,28 +57,84 @@ use trading::{
     OrderOutcome, OrderType, Side, StpMode, TimeInForce, TradingError,
 };
 
+/// The on-chain identity of a registered order: `(owner, client_id)`.
+///
+/// The owner is the account that submitted the `register_order`
+/// transaction (the tx signature is the order's authorization), and
+/// `client_id` is the owner-chosen order identifier — the same value
+/// the off-chain matching server sees as the order request's
+/// per-account nonce, so a fill can name both parties' orders without
+/// the matcher learning chain-assigned ids. Keys are unique per owner:
+/// a second registration under the same key is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OrderKey {
+    /// Order owner — the account that signed the registration.
+    pub owner: primitives::Address,
+    /// Owner-chosen client order id (the matcher order-request nonce).
+    pub client_id: u64,
+}
+
 /// A pre-matched fill entry for batch settlement from the off-chain
 /// matching server. Encoded as
-/// `[market:2][price:8][qty:8][buyer:20][seller:20]` = 58 bytes.
+/// `[market:2][price:8][qty:8][buy_owner:20][buy_id:8][sell_owner:20][sell_id:8]`
+/// = 74 bytes.
 ///
-/// The wire carries no claimed settlement amount: the chain computes
-/// `price * qty / PRICE_SCALE` itself after validating the leg against
-/// the market's tick/lot/price-band config, so a malformed or forged
-/// entry cannot move funds it should not.
+/// The wire carries no claimed settlement amount and no bare
+/// counterparties: each leg names the two [`OrderKey`]s it fills, and
+/// the chain derives buyer and seller from the registered orders —
+/// orders the owners themselves signed on-chain. The settlement amount
+/// is recomputed as `price * qty / PRICE_SCALE` after validating the
+/// leg against the market config AND both orders' limits and remaining
+/// quantities, so a forged or replayed entry cannot move funds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchFillEntry {
     /// Market the fill executed on — selects the config used for
-    /// tick/lot/price-band validation. Legs for markets that are not
-    /// listed on-chain are rejected.
+    /// tick/lot/price-band validation and must match both orders'
+    /// registered market.
     pub market: u16,
-    /// Execution price (scale-8).
+    /// Execution price (scale-8). Must satisfy both limits:
+    /// `sell.limit <= price <= buy.limit`.
     pub price: Price,
-    /// Traded quantity (scale-6).
+    /// Traded quantity (scale-6). Consumes both orders' remaining
+    /// quantity and may not exceed either.
     pub qty: Qty,
-    /// Buyer address.
-    pub buyer: primitives::Address,
-    /// Seller address.
-    pub seller: primitives::Address,
+    /// The registered buy order being filled.
+    pub buy: OrderKey,
+    /// The registered sell order being filled.
+    pub sell: OrderKey,
+}
+
+/// A resting off-chain-matched order registered on-chain.
+///
+/// Registration is the authorization the batch-settle path verifies:
+/// the owner's signed tx fixed `market`, `side`, `limit_price`, and
+/// `qty`, and every fill against the order consumes `remaining`. A
+/// buy order additionally escrows its worst-case quote cost at
+/// registration (`limit_price × qty / PRICE_SCALE`, debited into
+/// `reserved`), so batch settlement can never fail on buyer
+/// insolvency — the funds are already held. `reserved` is released
+/// piecewise per fill (`limit × fill_qty`, split into the seller's
+/// payment and the buyer's price-improvement rebate) and the residue
+/// is refunded when the order completes or is canceled.
+///
+/// Sell orders carry `reserved == 0` in v0: there is no base-asset
+/// custody, so a sell's obligation is untracked (quote-only settlement,
+/// same as the on-chain book path).
+#[derive(Debug, Clone, Copy)]
+struct RegisteredOrder {
+    /// Market the order is authorized on (must be listed).
+    market: u16,
+    /// Buy or sell — a fill leg must name a buy key and a sell key.
+    side: Side,
+    /// The owner's limit price (scale-8): the maximum a buy pays,
+    /// the minimum a sell accepts.
+    limit_price: u64,
+    /// Unfilled authorized quantity (scale-6).
+    remaining: u64,
+    /// Quote units still escrowed for this order (scale-6). Buys
+    /// only; equals the as-yet-unreleased portion of the
+    /// registration-time debit.
+    reserved: u64,
 }
 
 // ── Wire tags ────────────────────────────────────────────────────────
@@ -91,18 +147,44 @@ const TAG_CANCEL: u8 = 1;
 const TAG_LIST_MARKET: u8 = 2;
 /// Batch-settle message tag: applies pre-matched fills from the
 /// off-chain matching server without re-matching. Each fill entry
-/// is `[market:2][price:8][qty:8][buyer:20][seller:20]` = 58 bytes.
-/// The body is `[fill_count:4][fill entries...]`.
+/// is `[market:2][price:8][qty:8][buy_owner:20][buy_id:8][sell_owner:20][sell_id:8]`
+/// = 74 bytes, naming the two registered orders it consumes. The body
+/// is `[fill_count:4][fill entries...]`.
 const TAG_BATCH_SETTLE: u8 = 3;
 
+/// Register-order message tag: puts an off-chain-matched order's
+/// authorization on-chain so batch-settle legs can reference it.
+/// Body: `[market:2][side:1][price:8][qty:8][client_id:8]` = 27
+/// bytes; the tx sender is the owner and the signature is the
+/// authorization. A buy debits `price × qty / PRICE_SCALE` of quote
+/// into the order's escrow at registration.
+const TAG_REGISTER_ORDER: u8 = 4;
+
+/// Cancel-registered-order message tag: removes the sender's
+/// registered order and refunds its remaining escrow.
+/// Body: `[client_id:8]` = 8 bytes.
+const TAG_CANCEL_REGISTERED: u8 = 5;
+
 /// Size of a single fill entry in a batch-settle message:
-/// 2 + 8 + 8 + 20 + 20 = 58 bytes.
-const FILL_ENTRY_LEN: usize = 58;
+/// 2 + 8 + 8 + 20 + 8 + 20 + 8 = 74 bytes.
+const FILL_ENTRY_LEN: usize = 74;
 
 /// Maximum number of fills in a single batch-settle message. Prevents
 /// a byzantine settlement operator from submitting a huge batch that
-/// causes excessive processing. `65_536` fills × 58 bytes = ~3.8 MiB.
+/// causes excessive processing. `65_536` fills × 74 bytes = ~4.8 MiB.
 const MAX_BATCH_FILLS: usize = 65_536;
+
+/// Maximum live registered orders module-wide.
+///
+/// Registered orders are committed state: `state_root` and snapshot
+/// export iterate the whole map every block, so an uncapped registry
+/// would be a free state-bloat vector for sell orders (which escrow
+/// nothing). `65_536` matches the book-side `max_resting` default and
+/// bounds the canon section at ~3.5 MiB worst case — the same order
+/// as a fully populated book. Buy orders are additionally
+/// economically bounded by their escrow, but the cap is what stops a
+/// registration spammer from crowding out the map.
+const MAX_REGISTERED_ORDERS: usize = 65_536;
 
 // ── Message sizes (body, excluding the 1-byte tag) ───────────────────
 
@@ -112,6 +194,10 @@ const PLACE_BODY_LEN: usize = 21;
 const CANCEL_BODY_LEN: usize = 9;
 /// `[tick:8][lot:8][min:8][max:8][max_resting:4]` = 36.
 const LIST_MARKET_BODY_LEN: usize = 36;
+/// `[market:2][side:1][price:8][qty:8][client_id:8]` = 27.
+const REGISTER_BODY_LEN: usize = 27;
+/// `[client_id:8]` = 8.
+const CANCEL_REGISTERED_BODY_LEN: usize = 8;
 
 /// Quote-currency scale: the ledger stores native `u64` base units.
 /// The notional from a fill is scale-14 (`qty_scale_6 × price_scale_8`);
@@ -174,7 +260,18 @@ struct Inner {
     markets: Vec<Option<MatchingEngine>>,
     /// Reusable fill buffer — cleared and refilled per `place` call.
     fills: Vec<FillEvent>,
+    /// On-chain authorizations for off-chain-matched orders, keyed by
+    /// `(owner, client_id)`. Every batch-settle leg consumes from two
+    /// of these — the operator can only settle fills the owners
+    /// themselves signed for. Committed state (canonical section).
+    registered: BTreeMap<OrderKey, RegisteredOrder>,
 }
+
+/// The committed state a snapshot decodes into — the per-market
+/// engines, pending governance endorsements, and the registered-order
+/// map, in canonical layout order.
+type CommittedState =
+    (Vec<Option<MatchingEngine>>, framework::Endorsements, BTreeMap<OrderKey, RegisteredOrder>);
 
 impl ExchangeModule {
     /// Construct a fresh exchange module with no markets and no
@@ -188,6 +285,7 @@ impl ExchangeModule {
             inner: Mutex::new(Inner {
                 markets: (0..=u8::MAX).map(|_| None).collect(),
                 fills: Vec::with_capacity(64),
+                registered: BTreeMap::new(),
             }),
             store: Mutex::new(BTreeMap::new()),
             ledger: None,
@@ -394,14 +492,31 @@ impl ExchangeModule {
                 }
             }
         }
-        drop(inner);
         // Pending list-market endorsements are future-affecting
         // state: the tally decides whether the next endorsement
         // lists a market, so replicas holding different tallies must
-        // diverge in the root. Trailing section — readers written
-        // before this field existed reject the extra bytes rather
-        // than silently dropping the tally.
+        // diverge in the root.
         self.endorsements.write_canonical(w);
+        // Registered off-chain-matched orders are committed state:
+        // they decide whether the next batch-settle leg is
+        // authorized, and their `remaining`/`reserved` move real
+        // escrow — two replicas holding different registries would
+        // settle differently. Encoded sorted by `(owner, client_id)`
+        // (BTreeMap order is the canonical order). Trailing section —
+        // decoders written before this field existed reject the
+        // extra bytes via the staged reader's end-of-stream check,
+        // while this decoder treats an absent section as an empty
+        // registry.
+        w.put_count(inner.registered.len());
+        for (key, order) in &inner.registered {
+            w.put_addr(&key.owner);
+            w.put_u64(key.client_id);
+            w.put_u16(order.market);
+            w.put_u8(encode_side(order.side));
+            w.put_u64(order.limit_price);
+            w.put_u64(order.remaining);
+            w.put_u64(order.reserved);
+        }
     }
 
     /// Decode the canonical fields following the leading store root —
@@ -415,7 +530,7 @@ impl ExchangeModule {
         r: &mut framework::CanonicalReader<'_>,
         store: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
         slots: usize,
-    ) -> Option<(Vec<Option<MatchingEngine>>, framework::Endorsements)> {
+    ) -> Option<CommittedState> {
         let n = r.get_count()?;
         if n != slots {
             return None;
@@ -459,7 +574,29 @@ impl ExchangeModule {
         // so a crafted blob cannot smuggle a second opinion about
         // who endorsed what.
         let endorsements = framework::Endorsements::read_canonical(r)?;
-        Some((markets, endorsements))
+        // Final trailing section: the registered-order map. Tolerant
+        // tail — a blob written before the section existed decodes as
+        // an empty registry, while the staged reader still rejects a
+        // truncated or non-canonical one. Duplicate keys are rejected
+        // (a `BTreeMap` insert would silently absorb them).
+        let mut registered = BTreeMap::new();
+        if r.remaining() > 0 {
+            let count = r.get_count()?;
+            for _ in 0..count {
+                let key = OrderKey { owner: r.get_addr()?, client_id: r.get_u64()? };
+                let order = RegisteredOrder {
+                    market: r.get_u16()?,
+                    side: decode_side(r.get_u8()?)?,
+                    limit_price: r.get_u64()?,
+                    remaining: r.get_u64()?,
+                    reserved: r.get_u64()?,
+                };
+                if registered.insert(key, order).is_some() {
+                    return None; // Duplicate key — non-canonical.
+                }
+            }
+        }
+        Some((markets, endorsements, registered))
     }
 }
 
@@ -517,11 +654,50 @@ pub mod msg {
         msg
     }
 
+    /// Build a register-order message: authorize an off-chain-matched
+    /// order on-chain under `(sender, client_id)`. The sender's
+    /// signature is the order's authorization; batch-settle legs can
+    /// only fill within the registered market/side/limit/qty.
+    ///
+    /// `client_id` is the owner-chosen order id — the same value the
+    /// matching server sees as the order request's per-account nonce.
+    /// A buy escrows `price × qty / PRICE_SCALE` of quote at
+    /// registration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_order(
+        market: u16,
+        side: trading::Side,
+        price: u64,
+        qty: u64,
+        client_id: u64,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::REGISTER_BODY_LEN);
+        msg.push(super::TAG_REGISTER_ORDER);
+        msg.extend_from_slice(&market.to_le_bytes());
+        msg.push(encode_side(side));
+        msg.extend_from_slice(&price.to_le_bytes());
+        msg.extend_from_slice(&qty.to_le_bytes());
+        msg.extend_from_slice(&client_id.to_le_bytes());
+        msg
+    }
+
+    /// Build a cancel-registered message: remove the sender's
+    /// registered order and refund its remaining escrow.
+    pub fn cancel_registered(client_id: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::CANCEL_REGISTERED_BODY_LEN);
+        msg.push(super::TAG_CANCEL_REGISTERED);
+        msg.extend_from_slice(&client_id.to_le_bytes());
+        msg
+    }
+
     /// Build a batch-settle message for pre-matched fills from the
     /// off-chain matching server. Each fill is encoded as
-    /// `[market:2][price:8][qty:8][buyer:20][seller:20]` (58 bytes).
-    /// The wire carries no claimed settlement amount — the chain
-    /// recomputes `price * qty / PRICE_SCALE` per leg.
+    /// `[market:2][price:8][qty:8][buy_owner:20][buy_id:8][sell_owner:20][sell_id:8]`
+    /// (74 bytes) — the two [`OrderKey`](crate::OrderKey)s the leg
+    /// consumes, not bare counterparties. The wire carries no claimed
+    /// settlement amount — the chain recomputes
+    /// `price * qty / PRICE_SCALE` per leg out of the buy order's
+    /// escrow.
     ///
     /// The resulting message is submitted as the module payload of
     /// an Oxide transaction envelope with `module_id = EXCHANGE (5)`.
@@ -540,8 +716,10 @@ pub mod msg {
             msg.extend_from_slice(&f.market.to_le_bytes());
             msg.extend_from_slice(&f.price.0.to_le_bytes());
             msg.extend_from_slice(&f.qty.0.to_le_bytes());
-            msg.extend_from_slice(&f.buyer.0);
-            msg.extend_from_slice(&f.seller.0);
+            msg.extend_from_slice(&f.buy.owner.0);
+            msg.extend_from_slice(&f.buy.client_id.to_le_bytes());
+            msg.extend_from_slice(&f.sell.owner.0);
+            msg.extend_from_slice(&f.sell.client_id.to_le_bytes());
         }
         msg
     }
@@ -575,7 +753,7 @@ impl Module for ExchangeModule {
             TAG_CANCEL => {
                 let (market, order_id) = Self::parse_cancel(body).ok_or(ExecError::Malformed)?;
 
-                let Inner { markets, fills: _ } = &mut *inner;
+                let Inner { markets, .. } = &mut *inner;
                 let Some(engine) = markets[usize::from(market)].as_mut() else {
                     return Err(ExecError::ModuleRejected(format!(
                         "market {market} does not exist"
@@ -678,7 +856,11 @@ impl Module for ExchangeModule {
                 }
             }
 
-            TAG_BATCH_SETTLE => self.handle_batch_settle(ctx, body, &inner),
+            TAG_BATCH_SETTLE => self.handle_batch_settle(ctx, body, &mut inner),
+
+            TAG_REGISTER_ORDER => self.handle_register(ctx, body, &mut inner),
+
+            TAG_CANCEL_REGISTERED => self.handle_cancel_registered(ctx, body, &mut inner),
 
             _ => Err(ExecError::Malformed),
         }
@@ -737,11 +919,12 @@ impl Module for ExchangeModule {
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let slots =
             self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
-        let (_canon, (markets, endorsements), store) =
+        let (_canon, (markets, endorsements, registered), store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
         *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.markets = markets;
+        inner.registered = registered;
         // `fills` is per-call scratch — clear it so a buffer left
         // mid-transaction cannot leak across the import boundary.
         inner.fills.clear();
@@ -775,7 +958,7 @@ impl ExchangeModule {
 
         // Split the borrow: `inner` derefs to `Inner`, and we need
         // `&mut markets` and `&mut fills` at once.
-        let Inner { markets, fills } = inner;
+        let Inner { markets, fills, .. } = inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
             return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
         };
@@ -961,48 +1144,221 @@ impl ExchangeModule {
         Ok(())
     }
 
+    /// Handle a register-order message: put an off-chain-matched
+    /// order's authorization on-chain under `(sender, client_id)`.
+    ///
+    /// Registration is what makes a batch-settle leg authorized: the
+    /// sender's signature fixes `market`, `side`, `limit_price`, and
+    /// `qty`, so the settlement operator can later fill the order
+    /// only within those bounds. A buy additionally escrows
+    /// `price × qty / PRICE_SCALE` quote at registration — the
+    /// reservation every later fill pays out of, which is why batch
+    /// settlement can never fail on buyer insolvency.
+    ///
+    /// Rejects: malformed body, unlisted market, non-positive or
+    /// off-config price/qty (same tick/lot/band rules as a fill
+    /// leg), a duplicate `(owner, client_id)` key, the module-wide
+    /// registered-order cap, missing ledger wiring, and (buys) an
+    /// escrow the sender cannot cover.
+    fn handle_register(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != REGISTER_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let market = u16::from_le_bytes(body[0..2].try_into().map_err(|_| ExecError::Malformed)?);
+        let side = decode_side(body[2]).ok_or(ExecError::Malformed)?;
+        let price = u64::from_le_bytes(body[3..11].try_into().map_err(|_| ExecError::Malformed)?);
+        let qty = u64::from_le_bytes(body[11..19].try_into().map_err(|_| ExecError::Malformed)?);
+        let client_id =
+            u64::from_le_bytes(body[19..27].try_into().map_err(|_| ExecError::Malformed)?);
+
+        let Inner { markets, registered, .. } = &mut *inner;
+        let cfg = markets
+            .get(usize::from(market))
+            .and_then(Option::as_ref)
+            .map(|e| *e.config())
+            .ok_or_else(|| ExecError::ModuleRejected(format!("market {market} does not exist")))?;
+        // The order itself must be placeable: same tick/lot/band
+        // rules a fill leg enforces, applied at authorization time so
+        // an off-book order can never be registered.
+        if qty == 0
+            || qty % cfg.lot_size != 0
+            || price < cfg.min_price
+            || price > cfg.max_price
+            || price % cfg.tick_size != 0
+        {
+            return Err(ExecError::ModuleRejected(
+                "register: price/qty outside market config".to_string(),
+            ));
+        }
+
+        let key = OrderKey { owner: ctx.sender, client_id };
+        if registered.contains_key(&key) {
+            return Err(ExecError::ModuleRejected(
+                "register: duplicate client order id".to_string(),
+            ));
+        }
+        if registered.len() >= MAX_REGISTERED_ORDERS {
+            return Err(ExecError::ModuleRejected("register: order registry full".to_string()));
+        }
+
+        let ledger = self.ledger.as_ref().ok_or_else(|| {
+            ExecError::ModuleRejected("register requires ledger wiring".to_string())
+        })?;
+
+        // Escrow (buys): debit `limit × qty` up front — every fill
+        // against this order pays out of the escrow, so settlement
+        // can never draw on an insolvent buyer. Reject rather than
+        // cap on u64 overflow: saturating would silently change what
+        // the buyer authorized.
+        let reserved = if side == Side::Buy {
+            let amount =
+                u64::try_from(u128::from(price) * u128::from(qty) / PRICE_SCALE).map_err(|_| {
+                    ExecError::ModuleRejected(
+                        "register: escrow exceeds u64 quote range".to_string(),
+                    )
+                })?;
+            ledger.debit(&ctx.sender, amount).map_err(|_| {
+                ExecError::ModuleRejected(
+                    "register: insufficient balance for buy escrow".to_string(),
+                )
+            })?;
+            amount
+        } else {
+            0
+        };
+
+        registered.insert(
+            key,
+            RegisteredOrder { market, side, limit_price: price, remaining: qty, reserved },
+        );
+        Ok(vec![Event {
+            module: "exchange",
+            kind: "order_registered",
+            data: {
+                let mut d = Vec::with_capacity(20 + 8 + 2 + 1 + 8 + 8);
+                d.extend_from_slice(&ctx.sender.0);
+                d.extend_from_slice(&client_id.to_le_bytes());
+                d.extend_from_slice(&market.to_le_bytes());
+                d.push(encode_side(side));
+                d.extend_from_slice(&price.to_le_bytes());
+                d.extend_from_slice(&qty.to_le_bytes());
+                d
+            },
+        }])
+    }
+
+    /// Handle a cancel-registered message: remove the sender's order
+    /// and refund its remaining escrow.
+    ///
+    /// The escrow refund is credited BEFORE the order is removed, so
+    /// a credit failure (balance overflow — impossible while supply
+    /// stays under `u64::MAX`) leaves the order live rather than
+    /// stranding its escrow.
+    fn handle_cancel_registered(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != CANCEL_REGISTERED_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let client_id =
+            u64::from_le_bytes(body[0..8].try_into().map_err(|_| ExecError::Malformed)?);
+        let key = OrderKey { owner: ctx.sender, client_id };
+        let Some(order) = inner.registered.get(&key) else {
+            return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
+        };
+        let refund = order.reserved;
+        if refund > 0 {
+            let ledger = self.ledger.as_ref().ok_or_else(|| {
+                ExecError::ModuleRejected("cancel requires ledger wiring".to_string())
+            })?;
+            ledger.credit(&ctx.sender, refund).map_err(|_| {
+                ExecError::ModuleRejected("cancel: escrow refund failed".to_string())
+            })?;
+        }
+        inner.registered.remove(&key);
+        Ok(vec![Event {
+            module: "exchange",
+            kind: "order_canceled",
+            data: {
+                let mut d = Vec::with_capacity(20 + 8 + 8);
+                d.extend_from_slice(&ctx.sender.0);
+                d.extend_from_slice(&client_id.to_le_bytes());
+                d.extend_from_slice(&refund.to_le_bytes());
+                d
+            },
+        }])
+    }
+
     /// Handle a batch-settle message: apply pre-matched fills from
-    /// the off-chain matching server. Each valid fill leg debits the
-    /// buyer and credits the seller by a **chain-computed** amount —
-    /// no re-matching, and no trust in operator-supplied amounts.
+    /// the off-chain matching server against on-chain registered
+    /// orders. Each valid fill leg credits the seller a
+    /// **chain-computed** amount out of the buy order's escrow and
+    /// returns the buyer's price-improvement rebate — no re-matching,
+    /// no trust in operator-supplied amounts, and no bare
+    /// counterparties: the operator can only settle between orders
+    /// the owners themselves signed for.
     ///
     /// Body format: `[fill_count:4 LE][fill entries...]`
-    /// Each fill entry: `[market:2][price:8][qty:8][buyer:20][seller:20]`.
+    /// Each fill entry:
+    /// `[market:2][price:8][qty:8][buy_owner:20][buy_id:8][sell_owner:20][sell_id:8]`.
     ///
     /// # Security
     ///
     /// - **Authorization:** only `ctx.sender == settlement_operator`
     ///   (the genesis-configured matcher identity) may submit batch
-    ///   settlements. Without this check any account could forge
-    ///   fills and drain arbitrary balances.
-    /// - **Validation:** every leg is checked against the market's
-    ///   config (listed market, positive lot-aligned qty, on-tick
-    ///   price inside the configured band, distinct buyer/seller).
+    ///   settlements. But the operator is NOT a balance-transfer
+    ///   authority: every leg must name two live registered orders,
+    ///   and the fill is checked against what those owners signed
+    ///   for — market, side, limit price, and remaining quantity.
+    ///   A leg that fails validation is skipped with a
+    ///   `fill_rejected` event — unauthorized legs cannot move funds.
+    /// - **Replay safety:** a fill consumes both orders'
+    ///   `remaining`. Resubmitting the same batch (or the same fills
+    ///   re-encoded under a new batch) re-references orders whose
+    ///   quantity is already consumed, so every replayed leg fails
+    ///   its remaining-quantity check — unique fills come from
+    ///   consumption, not an unbounded fill-id set.
     /// - **Amounts:** the settlement amount is recomputed on-chain as
     ///   `price * qty / PRICE_SCALE` with checked `u128`/`u64` math.
-    ///   A leg that fails validation or overflows is skipped with a
-    ///   `fill_rejected` event — invalid legs cannot move funds.
-    /// - **Aggregation:** amounts are accumulated per (buyer, seller)
-    ///   pair in an open-addressed flat index map (one probe vs the
-    ///   `BTreeMap`'s ~16-level pointer chase per leg); the drain
-    ///   sorts by key, so transfer order is deterministic and each
-    ///   pair settles in one atomic `ledger.transfer`.
+    ///   The buy side is never debited at settle time: its escrow was
+    ///   debited at registration, so a leg credits the seller and
+    ///   rebates the buyer's price improvement out of the escrow
+    ///   slice `buy.limit * qty / PRICE_SCALE` — insolvency during
+    ///   settlement is impossible by construction.
+    /// - **Aggregation:** seller payments accumulate per (buyer,
+    ///   seller) pair in an open-addressed flat index map (one probe
+    ///   vs the `BTreeMap`'s ~16-level pointer chase per leg); the
+    ///   drain sorts by key, so credit order is deterministic and
+    ///   each pair settles in one `ledger.credit`. Buyer rebates and
+    ///   per-order consumption accumulate the same way and apply in
+    ///   sorted order.
     ///
-    /// A leg whose buyer is insolvent is skipped with a
-    /// `settlement_failed` event (the venue reconciles off-chain);
-    /// other legs in the batch still settle — one insolvent account
-    /// cannot halt settlement for the whole batch.
+    /// A pair whose seller credit fails is skipped with a
+    /// `settlement_failed` event and its legs are voided wholesale —
+    /// no order quantity is consumed and no rebate released, so a
+    /// failed leg has exactly zero economic effect. Other legs in
+    /// the batch still settle — one overflowing account cannot halt
+    /// settlement for the whole batch.
     ///
-    /// `inner` is the already-held module lock (batch settle only
-    /// reads market configs — it never mutates the books).
+    /// `inner` is the already-held module lock (batch settle never
+    /// mutates the books — only the registered-order map).
     fn handle_batch_settle(
         &self,
         ctx: &TxContext,
         body: &[u8],
-        inner: &Inner,
+        inner: &mut Inner,
     ) -> Result<Vec<Event>, ExecError> {
         // Authorization gate: the settlement operator is the only
-        // account allowed to move balances via this path.
+        // account allowed to submit fills — but only against orders
+        // the owners signed for (see `settle_leg`).
         if self.settlement_operator != Some(ctx.sender) {
             return Err(ExecError::ModuleRejected("unauthorized settlement operator".to_string()));
         }
@@ -1027,21 +1383,29 @@ impl ExchangeModule {
             ExecError::ModuleRejected("batch settle requires ledger wiring".to_string())
         })?;
 
-        // Snapshot the market configs once — batch settle never
-        // mutates the books, so one pass over `inner.markets` serves
-        // every leg.
-        let configs: Vec<Option<MarketConfig>> =
-            inner.markets.iter().map(|m| m.as_ref().map(|e| *e.config())).collect();
+        let Inner { markets, registered, .. } = &mut *inner;
 
-        // Validate every leg and accumulate the settlement total per
-        // (buyer, seller) pair. Aggregation uses an open-addressed
-        // flat index map over a flat `entries` Vec instead of a
-        // `BTreeMap`: the tree version costs ~150-250ns/leg at large
-        // batch sizes (16+ levels of pointer-chasing per lookup on a
-        // 40-byte key), while the flat probe is ~15-25ns — one hash,
-        // 1-3 cache-resident slots. `entries` keeps insertion order;
-        // the drain sorts by key, preserving the BTreeMap's exact
-        // deterministic transfer order, so observable behavior is
+        // Snapshot the market configs once — batch settle never
+        // mutates the books, so one pass over `markets` serves every
+        // leg.
+        let configs: Vec<Option<MarketConfig>> =
+            markets.iter().map(|m| m.as_ref().map(|e| *e.config())).collect();
+
+        // ── Pass 1: parse + validate every leg ────────────────────
+        // Each valid leg produces a `LegPlan` and accumulates its
+        // seller payment into the (buyer, seller) pair map. The
+        // `consumed` scratch bounds each order's cumulative quantity
+        // across the whole batch BEFORE anything mutates, so two
+        // legs can never spend the same authorized quantity.
+        //
+        // Pair aggregation uses an open-addressed flat index map
+        // over a flat `entries` Vec instead of a `BTreeMap`: the
+        // tree version costs ~150-250ns/leg at large batch sizes
+        // (16+ levels of pointer-chasing per lookup on a 40-byte
+        // key), while the flat probe is ~15-25ns — one hash, 1-3
+        // cache-resident slots. `entries` keeps insertion order; the
+        // drain sorts by key, preserving the BTreeMap's exact
+        // deterministic credit order, so observable behavior is
         // unchanged.
         //
         // Table capacity is 2× the leg count (load factor ≤ 0.5,
@@ -1052,21 +1416,23 @@ impl ExchangeModule {
         // untouched reserved pages cost nothing, while distinct-heavy
         // batches avoid ~16 realloc copies.
         let mut entries: Vec<((Address, Address), u64)> = Vec::with_capacity(fill_count);
+        let mut plans: Vec<LegPlan> = Vec::with_capacity(fill_count);
+        let mut consumed: BTreeMap<OrderKey, u64> = BTreeMap::new();
         let mut events = Vec::new();
         for i in 0..fill_count {
-            match settle_leg(body, 4 + i * FILL_ENTRY_LEN, &configs)? {
-                Some((buyer, seller, amount)) => {
+            match settle_leg(body, 4 + i * FILL_ENTRY_LEN, &configs, registered, &mut consumed)? {
+                Some(plan) => {
                     // Flat-map lookup: hash the pair, linear-probe
                     // the table for a matching key or an empty slot.
                     // On miss, append to `entries` and record the
                     // index; on hit, accumulate in place.
-                    let key = (buyer, seller);
+                    let key = (plan.buyer, plan.seller);
                     let mask = table_cap - 1;
                     // Masked to < 2^17 slots on the same line — the
                     // u64->usize cast cannot truncate a meaningful
                     // index on any supported target.
                     #[allow(clippy::cast_possible_truncation)]
-                    let mut slot = (pair_hash(&buyer.0, &seller.0) as usize) & mask;
+                    let mut slot = (pair_hash(&plan.buyer.0, &plan.seller.0) as usize) & mask;
                     let idx = loop {
                         let t = table[slot];
                         if t == u32::MAX {
@@ -1083,11 +1449,14 @@ impl ExchangeModule {
                     };
                     let entry =
                         &mut entries[usize::try_from(idx).map_err(|_| ExecError::Malformed)?].1;
-                    match entry.checked_add(amount) {
-                        Some(sum) => *entry = sum,
+                    match entry.checked_add(plan.pays) {
+                        Some(sum) => {
+                            *entry = sum;
+                            plans.push(plan);
+                        }
                         // Practically unreachable (needs > u64::MAX
-                        // quote for one pair) — skip rather than
-                        // silently saturating the settlement.
+                        // quote for one pair) — void the leg rather
+                        // than silently saturating the settlement.
                         None => events.push(rejected_leg_event(i, "pair total overflow")),
                     }
                 }
@@ -1095,16 +1464,18 @@ impl ExchangeModule {
             }
         }
 
-        // Drain in sorted key order — identical transfer order to the
-        // previous `BTreeMap` iteration, so event sequence and every
-        // observable outcome are preserved.
+        // ── Drain 1: pay sellers, one credit per pair ─────────────
+        // Sorted key order — identical to the previous `BTreeMap`
+        // iteration, so event sequence is deterministic. The buyer
+        // side needs no debit: the escrow was taken at registration.
+        // A pair whose credit fails is voided wholesale below — its
+        // legs consume nothing.
         entries.sort_unstable_by_key(|e| e.0);
+        let mut failed_pairs: std::collections::BTreeSet<(Address, Address)> =
+            std::collections::BTreeSet::new();
         for ((buyer, seller), amount) in &entries {
-            // Atomic settlement: debit buyer, credit seller. Using
-            // `transfer` instead of separate `debit` + `credit`
-            // ensures atomicity — if the credit fails (e.g.
-            // overflow), the debit is rolled back.
-            if ledger.transfer(buyer, seller, *amount).is_err() {
+            if ledger.credit(seller, *amount).is_err() {
+                failed_pairs.insert((*buyer, *seller));
                 events.push(Event {
                     module: "exchange",
                     kind: "settlement_failed",
@@ -1132,8 +1503,177 @@ impl ExchangeModule {
             });
         }
 
+        // ── Pass 2 + drains: apply the surviving legs ────────────
+        // Order consumption, buyer rebates, and residue refunds run
+        // in `consume_and_release` — every mutation is derived from
+        // the validated plans, so a voided pair's legs consume
+        // nothing.
+        consume_and_release(&plans, &failed_pairs, registered, ledger, &mut events);
+
         Ok(events)
     }
+}
+
+/// Apply validated fill legs to the registered-order map: consume
+/// `remaining`, release buy-side escrow, pay price-improvement
+/// rebates, and refund the residue of fully consumed orders.
+///
+/// Phases (all iteration is over sorted `BTreeMap`s — deterministic
+/// event order):
+///
+/// 1. **Accumulate** each surviving leg into per-order deltas
+///    (quantity consumed, escrow released, rebate portion tracked
+///    separately) and per-buyer rebate totals.
+/// 2. **Rebate drain**: credit each buyer's rebate. A failed credit
+///    withholds that buyer's rebate — the payment still settled, but
+///    the rebate stays in the order's escrow (refunded with the
+///    residue) rather than vanishing.
+/// 3. **Consumption**: `remaining` drops by the consumed quantity,
+///    `reserved` by the released slice minus any withheld rebate. A
+///    fully consumed order is removed and its residue — floor-
+///    division dust plus any withheld rebate — refunded.
+fn consume_and_release(
+    plans: &[LegPlan],
+    failed_pairs: &std::collections::BTreeSet<(Address, Address)>,
+    registered: &mut BTreeMap<OrderKey, RegisteredOrder>,
+    ledger: &Arc<dyn framework::Balances + Send + Sync>,
+    events: &mut Vec<Event>,
+) {
+    // ── Accumulate deltas ───────────────────────────────────────
+    // Per order: quantity consumed, escrow released, and the
+    // rebate portion of the release (tracked separately so a
+    // failed rebate credit can leave it escrowed). Per buyer:
+    // total rebate to release.
+    let mut deltas: BTreeMap<OrderKey, OrderDelta> = BTreeMap::new();
+    let mut rebates: BTreeMap<Address, u64> = BTreeMap::new();
+    for plan in plans {
+        if failed_pairs.contains(&(plan.buyer, plan.seller)) {
+            continue;
+        }
+        let buy = deltas.entry(plan.buy).or_default();
+        buy.consumed += plan.qty;
+        buy.released += plan.release;
+        buy.rebate += plan.release - plan.pays;
+        deltas.entry(plan.sell).or_default().consumed += plan.qty;
+        let rebate = plan.release - plan.pays;
+        if rebate > 0 {
+            *rebates.entry(plan.buyer).or_default() += rebate;
+        }
+    }
+
+    // ── Rebate drain ────────────────────────────────────────────
+    // Sorted address order. A rebate credit that fails is withheld.
+    let mut failed_rebates: std::collections::BTreeSet<Address> = std::collections::BTreeSet::new();
+    for (buyer, amount) in &rebates {
+        if ledger.credit(buyer, *amount).is_err() {
+            failed_rebates.insert(*buyer);
+            events.push(Event {
+                module: "exchange",
+                kind: "reservation_release_failed",
+                data: {
+                    let mut d = Vec::with_capacity(20 + 8);
+                    d.extend_from_slice(&buyer.0);
+                    d.extend_from_slice(&amount.to_le_bytes());
+                    d
+                },
+            });
+            continue;
+        }
+        events.push(Event {
+            module: "exchange",
+            kind: "reservation_released",
+            data: {
+                let mut d = Vec::with_capacity(20 + 8);
+                d.extend_from_slice(&buyer.0);
+                d.extend_from_slice(&amount.to_le_bytes());
+                d
+            },
+        });
+    }
+
+    // ── Consumption + residue refunds ───────────────────────────
+    let mut completed: Vec<(OrderKey, Address, u64)> = Vec::new();
+    for (key, delta) in &deltas {
+        let Some(order) = registered.get_mut(key) else { continue };
+        order.remaining = order.remaining.saturating_sub(delta.consumed);
+        let withheld = if failed_rebates.contains(&key.owner) { delta.rebate } else { 0 };
+        order.reserved = order.reserved.saturating_sub(delta.released.saturating_sub(withheld));
+        if order.remaining == 0 {
+            completed.push((*key, key.owner, order.reserved));
+        }
+    }
+    for (key, owner, residue) in completed {
+        registered.remove(&key);
+        if residue == 0 {
+            continue;
+        }
+        if ledger.credit(&owner, residue).is_err() {
+            // The order is dead; a refund failure strands its
+            // residue. Impossible while supply stays below
+            // `u64::MAX` — the event keeps it visible.
+            events.push(Event {
+                module: "exchange",
+                kind: "reservation_release_failed",
+                data: {
+                    let mut d = Vec::with_capacity(20 + 8);
+                    d.extend_from_slice(&owner.0);
+                    d.extend_from_slice(&residue.to_le_bytes());
+                    d
+                },
+            });
+            continue;
+        }
+        events.push(Event {
+            module: "exchange",
+            kind: "escrow_refunded",
+            data: {
+                let mut d = Vec::with_capacity(20 + 8 + 8);
+                d.extend_from_slice(&owner.0);
+                d.extend_from_slice(&key.client_id.to_le_bytes());
+                d.extend_from_slice(&residue.to_le_bytes());
+                d
+            },
+        });
+    }
+}
+
+/// A validated batch-settle leg, planned but not yet applied.
+///
+/// Constructed only after `settle_leg` has resolved both orders and
+/// checked market, sides, crossing, config, and the batch-wide
+/// remaining-quantity bound.
+struct LegPlan {
+    /// The buy order being consumed (`buy.owner` is the buyer).
+    buy: OrderKey,
+    /// The sell order being consumed (`sell.owner` is the seller).
+    sell: OrderKey,
+    /// Buyer address (== `buy.owner`) — kept for the pair key and
+    /// rebate drain without a second map lookup.
+    buyer: Address,
+    /// Seller address (== `sell.owner`).
+    seller: Address,
+    /// Filled quantity (scale-6).
+    qty: u64,
+    /// The seller's payment: `floor(price × qty / PRICE_SCALE)`.
+    pays: u64,
+    /// The escrow slice this leg releases:
+    /// `floor(buy.limit × qty / PRICE_SCALE)`. Always `>= pays`
+    /// (`price <= buy.limit` is a leg-validity rule); the difference
+    /// is the buyer's price-improvement rebate.
+    release: u64,
+}
+
+/// Per-order accumulated effects of the legs that survived the
+/// seller-credit drain.
+#[derive(Default)]
+struct OrderDelta {
+    /// Total quantity consumed (scale-6).
+    consumed: u64,
+    /// Total escrow released by those legs (buys only).
+    released: u64,
+    /// The rebate portion of `released` — tracked separately so a
+    /// failed rebate credit leaves exactly that much still escrowed.
+    rebate: u64,
 }
 
 /// Hash a `(buyer, seller)` pair for the batch-settle aggregation
@@ -1178,69 +1718,145 @@ fn pair_hash(buyer: &[u8; 20], seller: &[u8; 20]) -> u64 {
     h
 }
 
-/// Parse and validate one batch-settle leg at byte offset `off`.
+/// Parse and validate one batch-settle leg at byte offset `off`,
+/// resolving both order keys against the registered-order map.
 ///
-/// Returns `Ok(Some((buyer, seller, amount)))` for a valid leg (the
-/// quote amount is recomputed on-chain with checked fixed-point
-/// math), `Ok(None)` for a leg that fails validation (caller emits a
-/// `fill_rejected` event — invalid legs cannot move funds), and
-/// `Err(Malformed)` on a truncated entry (unreachable in practice —
-/// the caller bounds-checks the batch length up front).
+/// Returns `Ok(Some(LegPlan))` for a valid leg, `Ok(None)` for a leg
+/// that fails validation (caller emits a `fill_rejected` event —
+/// invalid legs cannot move funds), and `Err(Malformed)` on a
+/// truncated entry (unreachable in practice — the caller
+/// bounds-checks the batch length up front).
 ///
-/// A leg is valid iff its market is listed, the qty is positive and
-/// lot-aligned, the price is on-tick inside the configured band, and
-/// buyer != seller. An over-u64 notional rejects the leg rather than
-/// silently capping the transfer.
+/// A leg is valid iff:
+/// - both order keys name live registered orders — a buy and a sell
+///   respectively, both on the leg's market, with distinct owners;
+/// - the price crosses: `sell.limit <= price <= buy.limit` (each
+///   party only ever fills inside the price they signed for);
+/// - market config holds: positive lot-aligned qty, on-tick price
+///   inside the configured band;
+/// - neither order's `remaining` is exceeded by the leg PLUS the
+///   quantity earlier legs in this batch already consumed — the
+///   `consumed` scratch is what makes two legs in one batch unable
+///   to spend the same authorized quantity, and what makes a
+///   replayed batch fail outright.
+///
+/// `pays`/`release` are recomputed on-chain with checked
+/// fixed-point math; an over-u64 notional rejects the leg rather
+/// than silently capping the transfer.
 fn settle_leg(
     body: &[u8],
     off: usize,
     configs: &[Option<MarketConfig>],
-) -> Result<Option<(Address, Address, u64)>, ExecError> {
+    registered: &BTreeMap<OrderKey, RegisteredOrder>,
+    consumed: &mut BTreeMap<OrderKey, u64>,
+) -> Result<Option<LegPlan>, ExecError> {
     let market = u16::from_le_bytes(
         body.get(off..off + 2)
             .ok_or(ExecError::Malformed)?
             .try_into()
             .map_err(|_| ExecError::Malformed)?,
     );
-    let price = Price(u64::from_le_bytes(
+    let price = u64::from_le_bytes(
         body.get(off + 2..off + 10)
             .ok_or(ExecError::Malformed)?
             .try_into()
             .map_err(|_| ExecError::Malformed)?,
-    ));
-    let qty = Qty(u64::from_le_bytes(
+    );
+    let qty = u64::from_le_bytes(
         body.get(off + 10..off + 18)
             .ok_or(ExecError::Malformed)?
             .try_into()
             .map_err(|_| ExecError::Malformed)?,
-    ));
-    let buyer = Address(
-        body.get(off + 18..off + 38)
-            .ok_or(ExecError::Malformed)?
-            .try_into()
-            .map_err(|_| ExecError::Malformed)?,
     );
-    let seller = Address(
-        body.get(off + 38..off + 58)
-            .ok_or(ExecError::Malformed)?
-            .try_into()
-            .map_err(|_| ExecError::Malformed)?,
-    );
+    let buy = OrderKey {
+        owner: Address(
+            body.get(off + 18..off + 38)
+                .ok_or(ExecError::Malformed)?
+                .try_into()
+                .map_err(|_| ExecError::Malformed)?,
+        ),
+        client_id: u64::from_le_bytes(
+            body.get(off + 38..off + 46)
+                .ok_or(ExecError::Malformed)?
+                .try_into()
+                .map_err(|_| ExecError::Malformed)?,
+        ),
+    };
+    let sell = OrderKey {
+        owner: Address(
+            body.get(off + 46..off + 66)
+                .ok_or(ExecError::Malformed)?
+                .try_into()
+                .map_err(|_| ExecError::Malformed)?,
+        ),
+        client_id: u64::from_le_bytes(
+            body.get(off + 66..off + 74)
+                .ok_or(ExecError::Malformed)?
+                .try_into()
+                .map_err(|_| ExecError::Malformed)?,
+        ),
+    };
 
-    Ok(configs
-        .get(usize::from(market))
-        .copied()
-        .flatten()
-        .filter(|c| {
-            qty.0 > 0
-                && qty.0 % c.lot_size == 0
-                && price.0 >= c.min_price
-                && price.0 <= c.max_price
-                && price.0 % c.tick_size == 0
-                && buyer != seller
-        })
-        .and_then(|_| u64::try_from(u128::from(price.0) * u128::from(qty.0) / PRICE_SCALE).ok())
-        .map(|amount| (buyer, seller, amount)))
+    let (Some(buy_order), Some(sell_order)) = (registered.get(&buy), registered.get(&sell)) else {
+        return Ok(None); // A leg naming no live order is unauthorized.
+    };
+
+    // Role + market binding: the buy key must be a buy order, the
+    // sell key a sell order, both on this leg's market — and never
+    // the same account on both sides.
+    if buy_order.side != Side::Buy
+        || sell_order.side != Side::Sell
+        || buy_order.market != market
+        || sell_order.market != market
+        || buy.owner == sell.owner
+    {
+        return Ok(None);
+    }
+
+    // Crossing: the fill price must lie inside both limits — the
+    // buyer never pays above their limit, the seller never accepts
+    // below theirs. `sell.limit > buy.limit` (no crossing) rejects.
+    if price < sell_order.limit_price || price > buy_order.limit_price {
+        return Ok(None);
+    }
+
+    // Market config: listed market, positive lot-aligned qty,
+    // on-tick price inside the band.
+    let cfg_ok = configs.get(usize::from(market)).copied().flatten().is_some_and(|c| {
+        qty > 0
+            && qty % c.lot_size == 0
+            && price >= c.min_price
+            && price <= c.max_price
+            && price % c.tick_size == 0
+    });
+    if !cfg_ok {
+        return Ok(None);
+    }
+
+    // Batch-wide remaining bound: this leg plus everything earlier
+    // legs already took from each order must fit its `remaining`.
+    // `consumed` is updated only for valid legs, so a rejected leg
+    // consumes nothing.
+    let buy_used = consumed.get(&buy).copied().unwrap_or(0);
+    let sell_used = consumed.get(&sell).copied().unwrap_or(0);
+    let Some(buy_total) = buy_used.checked_add(qty) else { return Ok(None) };
+    let Some(sell_total) = sell_used.checked_add(qty) else { return Ok(None) };
+    if buy_total > buy_order.remaining || sell_total > sell_order.remaining {
+        return Ok(None);
+    }
+
+    // Amounts: pays at the fill price, release at the buy limit —
+    // checked u128 math; over-u64 notionals reject the leg.
+    let (Some(pays), Some(release)) = (
+        u64::try_from(u128::from(price) * u128::from(qty) / PRICE_SCALE).ok(),
+        u64::try_from(u128::from(buy_order.limit_price) * u128::from(qty) / PRICE_SCALE).ok(),
+    ) else {
+        return Ok(None);
+    };
+
+    consumed.insert(buy, buy_total);
+    consumed.insert(sell, sell_total);
+    Ok(Some(LegPlan { buy, sell, buyer: buy.owner, seller: sell.owner, qty, pays, release }))
 }
 
 /// Build a `fill_rejected` event for a malformed batch-settle leg.
@@ -1480,6 +2096,50 @@ mod tests {
             owner: addr(owner_byte),
             stp: StpMode::None,
         }
+    }
+
+    /// Register an off-chain-matched order on-chain under
+    /// `(owner_byte, client_id)` on market 0. `price`/`qty` are raw
+    /// scale-8/scale-6 values; a buy escrows `price × qty /
+    /// PRICE_SCALE` at registration.
+    fn register(ex: &ExchangeModule, owner: u8, client_id: u64, side: Side, price: u64, qty: u64) {
+        ex.handle(&ctx(owner), &msg::register_order(0, side, price, qty, client_id))
+            .expect("registration must succeed");
+    }
+
+    /// A fill leg between two registered orders.
+    fn leg(
+        market: u16,
+        price: u64,
+        qty: u64,
+        buy_owner: u8,
+        buy_id: u64,
+        sell_owner: u8,
+        sell_id: u64,
+    ) -> BatchFillEntry {
+        BatchFillEntry {
+            market,
+            price: Price(price),
+            qty: Qty(qty),
+            buy: crate::OrderKey { owner: addr(buy_owner), client_id: buy_id },
+            sell: crate::OrderKey { owner: addr(sell_owner), client_id: sell_id },
+        }
+    }
+
+    /// The standard fixture: a funded buyer and seller with orders
+    /// registered on market 0 — buy `(1, 1)` at `buy_price`, sell
+    /// `(9, 1)` at `sell_price`, each for `qty` units.
+    fn registered_pair(
+        ledger: &Arc<framework::MemoryBalances>,
+        ex: &ExchangeModule,
+        buy_price: u64,
+        sell_price: u64,
+        qty: u64,
+    ) {
+        ledger.mint(&addr(1), 10_000_000_000);
+        ledger.mint(&addr(9), 10_000_000_000);
+        register(ex, 1, 1, Side::Buy, buy_price, qty);
+        register(ex, 9, 1, Side::Sell, sell_price, qty);
     }
 
     /// A committee stub treating `addr(1)` as the sole validator —
@@ -1894,15 +2554,15 @@ mod tests {
         assert_eq!(ledger.balance(&addr(9)), seller_before + total_quote);
     }
 
-    /// Regression test: batch settlement must be atomic. If the
-    /// credit fails (e.g., overflow), the debit must be rolled
-    /// back. Before the fix, `handle_batch_settle` used separate
-    /// `debit` + `credit` calls — a failed credit after a successful
-    /// debit would lose funds.
+    /// Regression test: a failed seller credit must void the leg
+    /// wholesale — no quantity consumed, no escrow released. The buy
+    /// side's escrow was debited at registration, so the proof is
+    /// that the full `reserved` comes back at cancel afterward.
     #[test]
-    fn batch_settle_rolls_back_on_credit_overflow() {
+    fn batch_settle_failed_credit_voids_leg() {
         let ledger = Arc::new(framework::MemoryBalances::new());
-        // Fund buyer with enough for the transfer.
+        // Fund buyer with exactly the escrow the order will debit:
+        // 1e9 * 100_000 / 1e8 = 1_000_000.
         ledger.mint(&addr(1), 1_000_000);
         // Fund seller near u64::MAX so the credit overflows.
         ledger.mint(&addr(9), u64::MAX - 500_000);
@@ -1910,38 +2570,31 @@ mod tests {
         ex.set_settlement_operator(addr(1));
         ex.list_market(test_cfg()).unwrap();
 
-        let buyer_before = ledger.balance(&addr(1));
-        let seller_before = ledger.balance(&addr(9));
+        register(&ex, 1, 1, Side::Buy, 1_000_000_000, 100_000);
+        register(&ex, 9, 1, Side::Sell, 1_000_000_000, 100_000);
+        // Registration escrowed the full 1_000_000.
+        assert_eq!(ledger.balance(&addr(1)), 0);
 
         // Chain-computed quote = 1e9 * 100_000 / 1e8 = 1_000_000,
         // which overflows the seller's u64::MAX - 500_000 balance.
-        let fill = BatchFillEntry {
-            market: 0,
-            price: Price(1_000_000_000),
-            qty: Qty(100_000),
-            buyer: addr(1),
-            seller: addr(9),
-        };
-        let msg = msg::batch_settle(&[fill]);
-        let events = ex.handle(&ctx(1), &msg).unwrap();
-
-        // The settlement should fail atomically — buyer is NOT debited.
-        assert_eq!(
-            ledger.balance(&addr(1)),
-            buyer_before,
-            "buyer must not be debited on failed settlement"
-        );
-        assert_eq!(
-            ledger.balance(&addr(9)),
-            seller_before,
-            "seller balance must not change on failed settlement"
-        );
-
-        // A settlement_failed event should be emitted.
+        let fill = leg(0, 1_000_000_000, 100_000, 1, 1, 9, 1);
+        let events = ex.handle(&ctx(1), &msg::batch_settle(&[fill])).unwrap();
         assert!(
             events.iter().any(|e| e.kind == "settlement_failed"),
             "expected settlement_failed event on credit overflow"
         );
+        assert_eq!(
+            ledger.balance(&addr(9)),
+            u64::MAX - 500_000,
+            "seller balance must not change on failed settlement"
+        );
+
+        // The leg was voided wholesale: the order still holds its
+        // full remaining quantity and escrow — canceling it refunds
+        // the entire 1_000_000, proving nothing was consumed.
+        let ev = ex.handle(&ctx(1), &msg::cancel_registered(1)).unwrap();
+        assert_eq!(ev[0].kind, "order_canceled");
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000);
     }
 
     /// Regression test: `batch_settle` must reject any sender that is
@@ -1951,33 +2604,29 @@ mod tests {
     #[test]
     fn batch_settle_rejects_unauthorized_sender() {
         let ledger = Arc::new(framework::MemoryBalances::new());
-        ledger.mint(&addr(1), 1_000_000);
-        ledger.mint(&addr(9), 1_000_000);
         let mut ex = ExchangeModule::with_ledger(ledger.clone());
         ex.set_settlement_operator(addr(0xAA));
         ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_000_000_000, 1_000_000_000, 1_000);
+        // Buy escrow debited at registration: 1e9 * 1_000 / 1e8 = 10_000.
+        let buyer_after_register = ledger.balance(&addr(1));
 
-        let fill = BatchFillEntry {
-            market: 0,
-            price: Price(1_000_000_000),
-            qty: Qty(1_000),
-            buyer: addr(1),
-            seller: addr(9),
-        };
+        let fill = leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1);
         let msg = msg::batch_settle(&[fill]);
 
         // ctx(1) is not the operator — must be rejected, no funds move.
         let err = ex.handle(&ctx(1), &msg).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
-        assert_eq!(ledger.balance(&addr(1)), 1_000_000);
-        assert_eq!(ledger.balance(&addr(9)), 1_000_000);
+        assert_eq!(ledger.balance(&addr(1)), buyer_after_register);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000);
 
         // The configured operator is accepted.
         let events = ex.handle(&ctx(0xAA), &msg).unwrap();
         assert!(events.iter().any(|e| e.kind == "batch_fill"));
-        // quote = 1e9 * 1_000 / 1e8 = 10_000
-        assert_eq!(ledger.balance(&addr(1)), 1_000_000 - 10_000);
-        assert_eq!(ledger.balance(&addr(9)), 1_000_000 + 10_000);
+        // Fill at the limit → zero rebate: the whole 10_000 escrow
+        // slice pays the seller.
+        assert_eq!(ledger.balance(&addr(1)), buyer_after_register);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 10_000);
     }
 
     /// Regression test: `batch_settle` must be fail-closed when no
@@ -1985,145 +2634,119 @@ mod tests {
     #[test]
     fn batch_settle_disabled_without_operator() {
         let ledger = Arc::new(framework::MemoryBalances::new());
-        ledger.mint(&addr(1), 1_000_000);
-        ledger.mint(&addr(9), 1_000_000);
         let ex = ExchangeModule::with_ledger(ledger.clone());
         ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_000_000_000, 1_000_000_000, 1_000);
 
-        let fill = BatchFillEntry {
-            market: 0,
-            price: Price(1_000_000_000),
-            qty: Qty(1_000),
-            buyer: addr(1),
-            seller: addr(9),
-        };
+        let fill = leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1);
         let msg = msg::batch_settle(&[fill]);
         let err = ex.handle(&ctx(1), &msg).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
-        assert_eq!(ledger.balance(&addr(1)), 1_000_000);
+        // Nothing moved: the seller never got paid and the buy
+        // order's escrow stays held.
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000);
     }
 
     /// Regression test: every batch-settle leg is validated against
-    /// the market config. Invalid legs (unlisted market, off-tick
-    /// price, out-of-band price, non-lot-aligned or zero qty,
-    /// self-trade) must be skipped with `fill_rejected` events and
-    /// must not move funds. Before the fix there was no validation
-    /// at all — the wire's `quote_amount` was trusted blindly.
+    /// the market config AND the registered orders' authorization.
+    /// Legs failing either layer (unlisted market, off-tick price,
+    /// out-of-band price, non-lot-aligned or zero qty, self-trade,
+    /// unknown order key, wrong side for the key, price outside an
+    /// order's limit, quantity beyond the order's remaining) are
+    /// skipped with `fill_rejected` events and move no funds.
     #[test]
     fn batch_settle_rejects_invalid_legs() {
         let ledger = Arc::new(framework::MemoryBalances::new());
-        ledger.mint(&addr(1), 10_000_000);
-        ledger.mint(&addr(9), 10_000_000);
         let mut ex = ExchangeModule::with_ledger(ledger.clone());
         ex.set_settlement_operator(addr(0xAA));
         ex.list_market(test_cfg()).unwrap();
 
+        // Working pair: buy (1,1) limit $15 qty 100k, sell (9,1)
+        // limit $10 qty 100k — the valid leg and the config-invalid
+        // legs all reference it.
+        registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 100_000);
+        // Self-trade pair: owner 1 holds a sell order too.
+        register(&ex, 1, 2, Side::Sell, 1_000_000_000, 10_000);
+        // Small pair for the over-remaining leg: 1 lot authorized.
+        ledger.mint(&addr(3), 10_000_000_000);
+        ledger.mint(&addr(4), 10_000_000_000);
+        register(&ex, 3, 1, Side::Buy, 1_500_000_000, 1_000);
+        register(&ex, 4, 1, Side::Sell, 1_000_000_000, 1_000);
+        // Non-crossing pair for the limit violations: buy $12 max.
+        ledger.mint(&addr(5), 10_000_000_000);
+        ledger.mint(&addr(6), 10_000_000_000);
+        register(&ex, 5, 1, Side::Buy, 1_200_000_000, 10_000);
+        register(&ex, 6, 1, Side::Sell, 1_000_000_000, 10_000);
+        // High sell limit for the below-limit leg.
+        ledger.mint(&addr(8), 10_000_000_000);
+        register(&ex, 8, 1, Side::Sell, 1_800_000_000, 10_000);
+
         let legs = [
-            // Unlisted market.
-            BatchFillEntry {
-                market: 7,
-                price: Price(1_000_000_000),
-                qty: Qty(1_000),
-                buyer: addr(1),
-                seller: addr(9),
-            },
+            // Unlisted market (orders live on market 0).
+            leg(7, 1_000_000_000, 1_000, 1, 1, 9, 1),
             // Off-tick price (1_000_000_500 % 1_000_000 != 0).
-            BatchFillEntry {
-                market: 0,
-                price: Price(1_000_000_500),
-                qty: Qty(1_000),
-                buyer: addr(1),
-                seller: addr(9),
-            },
+            leg(0, 1_000_000_500, 1_000, 1, 1, 9, 1),
             // Price out of band (> 2_000_000_000 max).
-            BatchFillEntry {
-                market: 0,
-                price: Price(3_000_000_000),
-                qty: Qty(1_000),
-                buyer: addr(1),
-                seller: addr(9),
-            },
+            leg(0, 3_000_000_000, 1_000, 1, 1, 9, 1),
             // Zero qty.
-            BatchFillEntry {
-                market: 0,
-                price: Price(1_000_000_000),
-                qty: Qty(0),
-                buyer: addr(1),
-                seller: addr(9),
-            },
+            leg(0, 1_000_000_000, 0, 1, 1, 9, 1),
             // Qty not lot-aligned (lot = 1_000).
-            BatchFillEntry {
-                market: 0,
-                price: Price(1_000_000_000),
-                qty: Qty(1_500),
-                buyer: addr(1),
-                seller: addr(9),
-            },
-            // Self-trade.
-            BatchFillEntry {
-                market: 0,
-                price: Price(1_000_000_000),
-                qty: Qty(1_000),
-                buyer: addr(1),
-                seller: addr(1),
-            },
-            // One valid leg for contrast: quote = 10_000.
-            BatchFillEntry {
-                market: 0,
-                price: Price(1_000_000_000),
-                qty: Qty(1_000),
-                buyer: addr(1),
-                seller: addr(9),
-            },
+            leg(0, 1_000_000_000, 1_500, 1, 1, 9, 1),
+            // Self-trade: same owner on both sides.
+            leg(0, 1_000_000_000, 1_000, 1, 1, 1, 2),
+            // Unregistered order key (1, 99) was never registered.
+            leg(0, 1_000_000_000, 1_000, 1, 99, 9, 1),
+            // Wrong role: the sell order (9,1) as the buy key.
+            leg(0, 1_000_000_000, 1_000, 9, 1, 1, 2),
+            // Price above the buy's $12 limit.
+            leg(0, 1_500_000_000, 1_000, 5, 1, 6, 1),
+            // Price below the sell's $18 limit (crossing exists:
+            // buy limit $15 ≥ sell $10 but fill is below $18).
+            leg(0, 1_500_000_000, 1_000, 1, 1, 8, 1),
+            // Qty beyond both orders' remaining (1 lot authorized).
+            leg(0, 1_000_000_000, 2_000, 3, 1, 4, 1),
+            // One valid leg for contrast: quote = 1e9*1000/1e8 = 10_000.
+            leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1),
         ];
         let msg = msg::batch_settle(&legs);
         let events = ex.handle(&ctx(0xAA), &msg).unwrap();
 
         let rejected = events.iter().filter(|e| e.kind == "fill_rejected").count();
-        assert_eq!(rejected, 6, "all six invalid legs must be rejected");
-        // Only the valid leg settled: quote = 1e9 * 1_000 / 1e8 = 10_000.
-        assert_eq!(ledger.balance(&addr(1)), 10_000_000 - 10_000);
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000 + 10_000);
+        assert_eq!(rejected, 11, "all eleven invalid legs must be rejected");
+        // Only the valid leg settled: seller got 10_000 of quote.
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 10_000);
     }
 
     /// Regression test: the chain computes settlement amounts itself.
     /// Two legs between the same pair at different prices aggregate
-    /// into one transfer of `sum(price_i * qty_i / PRICE_SCALE)` —
+    /// into one credit of `sum(price_i * qty_i / PRICE_SCALE)` —
     /// the operator cannot inflate or deflate the amount.
     #[test]
     fn batch_settle_computes_quote_onchain() {
         let ledger = Arc::new(framework::MemoryBalances::new());
-        ledger.mint(&addr(1), 10_000_000);
-        ledger.mint(&addr(9), 10_000_000);
         let mut ex = ExchangeModule::with_ledger(ledger.clone());
         ex.set_settlement_operator(addr(0xAA));
         ex.list_market(test_cfg()).unwrap();
+        // Buy limit $15 covers both legs; escrow = 1.5e9*3_000/1e8 =
+        // 45_000 at registration.
+        registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 3_000);
 
-        // Leg 1: 1e9 * 1_000 / 1e8 = 10_000.
-        // Leg 2: 1.5e9 * 2_000 / 1e8 = 30_000. Pair total = 40_000.
-        let legs = [
-            BatchFillEntry {
-                market: 0,
-                price: Price(1_000_000_000),
-                qty: Qty(1_000),
-                buyer: addr(1),
-                seller: addr(9),
-            },
-            BatchFillEntry {
-                market: 0,
-                price: Price(1_500_000_000),
-                qty: Qty(2_000),
-                buyer: addr(1),
-                seller: addr(9),
-            },
-        ];
+        // Leg 1: 1e9 * 1_000 / 1e8 = 10_000 (rebate 5_000).
+        // Leg 2: 1.5e9 * 2_000 / 1e8 = 30_000 (rebate 0).
+        // Seller total = 40_000; released escrow = 45_000.
+        let legs =
+            [leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1), leg(0, 1_500_000_000, 2_000, 1, 1, 9, 1)];
         let msg = msg::batch_settle(&legs);
         let events = ex.handle(&ctx(0xAA), &msg).unwrap();
 
-        assert_eq!(ledger.balance(&addr(1)), 10_000_000 - 40_000);
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000 + 40_000);
-        // Exactly one pair transfer → one batch_fill event.
+        // Buyer net = −40_000 from the post-registration balance
+        // (escrow 45_000 − rebate 5_000 − pays 40_000).
+        assert_eq!(ledger.balance(&addr(1)), 10_000_000_000 - 40_000);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 40_000);
+        // Exactly one pair credit → one batch_fill event; one buyer
+        // rebate → one reservation_released event.
         assert_eq!(events.iter().filter(|e| e.kind == "batch_fill").count(), 1);
+        assert_eq!(events.iter().filter(|e| e.kind == "reservation_released").count(), 1);
     }
 
     /// The flat aggregation table must emit pair transfers in sorted
@@ -2134,24 +2757,27 @@ mod tests {
     #[test]
     fn batch_settle_pair_order_deterministic() {
         let ledger = Arc::new(framework::MemoryBalances::new());
-        for b in [addr(9), addr(3), addr(1)] {
-            ledger.mint(&b, 10_000_000);
-        }
         let mut ex = ExchangeModule::with_ledger(ledger.clone());
         ex.set_settlement_operator(addr(0xAA));
         ex.list_market(test_cfg()).unwrap();
+        // Register an order pair per counterparty: buys (9,1), (1,1),
+        // (3,1); sells (7,1), (5,1), (2,1).
+        for (buyer, seller) in [(9u8, 7u8), (1, 5), (3, 2)] {
+            ledger.mint(&addr(buyer), 10_000_000_000);
+            ledger.mint(&addr(seller), 10_000_000_000);
+            register(&ex, buyer, 1, Side::Buy, 1_000_000_000, 10_000);
+            register(&ex, seller, 1, Side::Sell, 1_000_000_000, 10_000);
+        }
 
         // Submit pairs deliberately out of sorted order: (9,7),
         // (1,5), (3,2) — plus a duplicate (9,7) leg to confirm
         // aggregation collapses it into the sorted (9,7) slot.
-        let leg = |buyer: u8, seller: u8| BatchFillEntry {
-            market: 0,
-            price: Price(1_000_000_000),
-            qty: Qty(1_000),
-            buyer: addr(buyer),
-            seller: addr(seller),
-        };
-        let legs = [leg(9, 7), leg(1, 5), leg(3, 2), leg(9, 7)];
+        let legs = [
+            leg(0, 1_000_000_000, 1_000, 9, 1, 7, 1),
+            leg(0, 1_000_000_000, 1_000, 1, 1, 5, 1),
+            leg(0, 1_000_000_000, 1_000, 3, 1, 2, 1),
+            leg(0, 1_000_000_000, 1_000, 9, 1, 7, 1),
+        ];
         let events = ex.handle(&ctx(0xAA), &msg::batch_settle(&legs)).unwrap();
 
         let pairs: Vec<([u8; 20], [u8; 20])> = events
@@ -2163,10 +2789,9 @@ mod tests {
             pairs,
             vec![(addr(1).0, addr(5).0), (addr(3).0, addr(2).0), (addr(9).0, addr(7).0)]
         );
-        // The duplicate (9,7) leg aggregated into one transfer of
-        // 2×10_000 quote units.
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000 - 20_000);
-        assert_eq!(ledger.balance(&addr(7)), 20_000);
+        // The duplicate (9,7) leg aggregated into one credit of
+        // 2×10_000 quote units paid out of the buy order's escrow.
+        assert_eq!(ledger.balance(&addr(7)), 10_000_000_000 + 20_000);
     }
 
     /// Regression test: market buys must pass the pre-trade balance
@@ -2506,5 +3131,239 @@ mod tests {
         snapshot.entries[0].1.truncate(12);
         assert!(src.inspect_state(&snapshot).is_err());
         assert!(ExchangeModule::new().import_state(&snapshot).is_err());
+    }
+
+    // ── Registered-order authorization (batch settlement) ─────────
+
+    /// Registration escrows the buy's worst-case cost up front and
+    /// records the order under `(owner, client_id)`. A duplicate key
+    /// is rejected — replayed registrations cannot double-authorize.
+    #[test]
+    fn register_order_escrows_and_dedups() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.list_market(test_cfg()).unwrap();
+
+        // Buy 5 lots at $15: escrow = 1.5e9 * 5_000 / 1e8 = 75_000.
+        let events = ex
+            .handle(&ctx(1), &msg::register_order(0, Side::Buy, 1_500_000_000, 5_000, 7))
+            .unwrap();
+        assert_eq!(events[0].kind, "order_registered");
+        assert_eq!(ledger.balance(&addr(1)), 1_000_000 - 75_000);
+
+        // Same key again → rejected (a second signed tx with the
+        // same client_id is a new authorization attempt, never a
+        // silent overwrite).
+        let err = ex
+            .handle(&ctx(1), &msg::register_order(0, Side::Buy, 1_500_000_000, 5_000, 7))
+            .unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+
+        // Sells escrow nothing.
+        ex.handle(&ctx(9), &msg::register_order(0, Side::Sell, 1_000_000_000, 5_000, 3)).unwrap();
+        assert_eq!(ledger.balance(&addr(9)), 0);
+    }
+
+    /// Registration validates the order itself: unlisted market,
+    /// off-config price/qty, and a buy escrow the sender cannot
+    /// cover are all rejected — an off-book or unfunded order can
+    /// never become fillable.
+    #[test]
+    fn register_order_validates() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.list_market(test_cfg()).unwrap();
+
+        // Unlisted market.
+        assert!(matches!(
+            ex.handle(&ctx(1), &msg::register_order(7, Side::Sell, 1_000_000_000, 1_000, 1))
+                .unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        // Off-tick price.
+        assert!(matches!(
+            ex.handle(&ctx(1), &msg::register_order(0, Side::Sell, 1_000_000_500, 1_000, 1))
+                .unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        // Zero qty.
+        assert!(matches!(
+            ex.handle(&ctx(1), &msg::register_order(0, Side::Sell, 1_000_000_000, 0, 1))
+                .unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        // Buy escrow exceeds the sender's balance (needs 10_000,
+        // has 1_000).
+        assert!(matches!(
+            ex.handle(&ctx(1), &msg::register_order(0, Side::Buy, 1_000_000_000, 1_000, 1))
+                .unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        // The failed registration must not have debited anything.
+        assert_eq!(ledger.balance(&addr(1)), 1_000);
+    }
+
+    /// A leg that references an order the owner never registered is
+    /// rejected and moves no funds — the operator cannot fabricate
+    /// authorization.
+    #[test]
+    fn batch_settle_rejects_unregistered_order() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        ledger.mint(&addr(1), 10_000_000_000);
+        ledger.mint(&addr(9), 10_000_000_000);
+        register(&ex, 9, 1, Side::Sell, 1_000_000_000, 10_000);
+
+        // The buy key (1,1) was never registered — the operator
+        // cannot conjure a buyer.
+        let events = ex
+            .handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1)]))
+            .unwrap();
+        assert!(events.iter().any(|e| e.kind == "fill_rejected"));
+        assert!(!events.iter().any(|e| e.kind == "batch_fill"));
+        assert_eq!(ledger.balance(&addr(1)), 10_000_000_000);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000);
+    }
+
+    /// Replay safety: a settled batch cannot settle twice. The second
+    /// submission re-references orders whose `remaining` is already
+    /// consumed — every replayed leg fails its quantity check. This
+    /// is the "unique fill" property: consumption, not a fill-id
+    /// registry, prevents double settlement.
+    #[test]
+    fn batch_settle_replay_consumed_orders() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_000_000_000, 1_000_000_000, 2_000);
+
+        let msg = msg::batch_settle(&[leg(0, 1_000_000_000, 2_000, 1, 1, 9, 1)]);
+        let first = ex.handle(&ctx(0xAA), &msg).unwrap();
+        assert_eq!(first.iter().filter(|e| e.kind == "batch_fill").count(), 1);
+        let seller_after = ledger.balance(&addr(9));
+
+        // The identical batch again: both orders are fully consumed
+        // — the buy order is gone entirely, so the leg fails.
+        let second = ex.handle(&ctx(0xAA), &msg).unwrap();
+        assert_eq!(second.iter().filter(|e| e.kind == "batch_fill").count(), 0);
+        assert!(second.iter().any(|e| e.kind == "fill_rejected"));
+        assert_eq!(ledger.balance(&addr(9)), seller_after);
+    }
+
+    /// Two legs in one batch cannot spend the same authorized
+    /// quantity — the batch-wide `consumed` bound applies the second
+    /// time the order is referenced, not just against the map.
+    #[test]
+    fn batch_settle_cannot_overspend_within_batch() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        // Both orders authorize exactly 1 lot; two 1-lot legs in the
+        // same batch would double-spend them.
+        registered_pair(&ledger, &ex, 1_000_000_000, 1_000_000_000, 1_000);
+
+        let legs =
+            [leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1), leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1)];
+        let events = ex.handle(&ctx(0xAA), &msg::batch_settle(&legs)).unwrap();
+        assert_eq!(events.iter().filter(|e| e.kind == "batch_fill").count(), 1);
+        assert_eq!(events.iter().filter(|e| e.kind == "fill_rejected").count(), 1);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 10_000);
+    }
+
+    /// Price improvement: a fill below the buy's limit releases the
+    /// escrow slice at the LIMIT and returns the difference to the
+    /// buyer — the seller is paid the fill price, the buyer keeps
+    /// the improvement.
+    #[test]
+    fn batch_settle_price_improvement_rebate() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        // Buy limit $15, sell limit $10, fill at $10, 2 lots.
+        // Escrow: 1.5e9*2_000/1e8 = 30_000. Pays: 20_000. Rebate: 10_000.
+        registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 2_000);
+        let after_register = ledger.balance(&addr(1));
+
+        let events = ex
+            .handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 2_000, 1, 1, 9, 1)]))
+            .unwrap();
+        assert!(events.iter().any(|e| e.kind == "reservation_released"));
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 20_000);
+        assert_eq!(ledger.balance(&addr(1)), after_register + 10_000);
+    }
+
+    /// Cancel refunds the remaining escrow exactly once — a
+    /// partially filled buy returns `limit × remaining`, and the
+    /// canceled order can no longer be filled.
+    #[test]
+    fn cancel_registered_refunds_residual() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_000_000_000, 1_000_000_000, 5_000);
+        // Escrow at registration: 50_000. Fill 2 lots (releases
+        // 20_000, all to the seller at-limit) → 30_000 remains.
+        ex.handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 2_000, 1, 1, 9, 1)]))
+            .unwrap();
+        let before_cancel = ledger.balance(&addr(1));
+
+        let events = ex.handle(&ctx(1), &msg::cancel_registered(1)).unwrap();
+        assert_eq!(events[0].kind, "order_canceled");
+        assert_eq!(ledger.balance(&addr(1)), before_cancel + 30_000);
+
+        // The canceled order cannot be filled anymore — a leg
+        // referencing it is rejected.
+        let events = ex
+            .handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1)]))
+            .unwrap();
+        assert!(events.iter().any(|e| e.kind == "fill_rejected"));
+        // And canceling it twice is rejected too.
+        assert!(matches!(
+            ex.handle(&ctx(1), &msg::cancel_registered(1)).unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        // Only the owner can cancel — anyone else's cancel misses.
+        register(&ex, 9, 9, Side::Sell, 1_000_000_000, 1_000);
+        assert!(matches!(
+            ex.handle(&ctx(2), &msg::cancel_registered(9)).unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+    }
+
+    /// Registered orders are committed state: registration must move
+    /// the state root, and a snapshot round-trip must restore the
+    /// registry so the imported module authorizes fills identically.
+    #[test]
+    fn registered_orders_survive_snapshot() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut src = ExchangeModule::with_ledger(ledger.clone());
+        src.set_settlement_operator(addr(0xAA));
+        src.list_market(test_cfg()).unwrap();
+        let root0 = src.state_root();
+        registered_pair(&ledger, &src, 1_000_000_000, 1_000_000_000, 5_000);
+        let root1 = src.state_root();
+        assert_ne!(root0, root1, "a registered order is committed state");
+
+        let snapshot = src.export_state().expect("exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), root1);
+
+        let mut dst = ExchangeModule::with_ledger(ledger);
+        dst.set_settlement_operator(addr(0xAA));
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), root1);
+
+        // The restored registry authorizes the same fill.
+        let events = dst
+            .handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1)]))
+            .unwrap();
+        assert!(events.iter().any(|e| e.kind == "batch_fill"));
     }
 }
