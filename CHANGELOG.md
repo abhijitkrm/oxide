@@ -5533,3 +5533,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     it. Now transactions execute in exactly the order consensus
     committed, with batching kept only where the order already made
     transactions adjacent.
+
+### Fixed — bounded consensus view catch-up
+
+- Timeout signatures on the validator wire now carry the certificate
+  evidence that justifies the sender's view (its high QC, or the
+  previous view's timeout certificate). A peer's timeout message can
+  only move your view as far as real quorum-signed evidence reaches
+  — a lone signature for a far-future view is now ignored instead of
+  dragging the node to an arbitrary view. NOTE: the `MSG_TIMEOUT`
+  wire format changed — validators must run matching builds.
+  - **In plain words:** a single validator used to be able to yank
+    the whole network to any view number just by signing a timeout
+    for it. Now a timeout only counts if it comes with cryptographic
+    proof that a quorum actually reached that view — catching up is
+    bounded by what the network really did.

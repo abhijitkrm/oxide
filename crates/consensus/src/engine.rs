@@ -3443,6 +3443,67 @@ impl OxideBft {
         true
     }
 
+    /// The certificate evidence that justifies our presence at
+    /// `current_view` — the `DiemBFT` v4 timeout-message fields a
+    /// receiver needs before honoring a claimed view.
+    ///
+    /// Entering view *v* is legitimate only via QC(*v−1*) (the
+    /// preceding round certified a block) or TC(*v−1*) (quorum
+    /// timed out there). The sender therefore attaches its
+    /// `high_qc`, plus `last_tc` when the high QC is not from the
+    /// immediately preceding view — the same disjunction `DiemBFT`'s
+    /// `TimeoutMsg` carries (`high_qc` + `last_round_tc` when
+    /// `high_qc.view ≠ view − 1`).
+    ///
+    /// The evidence is self-authenticating (each certificate
+    /// carries its own aggregate signature), so it is not bound
+    /// into the timeout signature — a relay swapping it for another
+    /// real certificate can only attach evidence that itself
+    /// verifies, which justifies the same view regardless of
+    /// carrier.
+    pub fn timeout_evidence(&self) -> (Option<QuorumCertificate>, Option<TimeoutCertificate>) {
+        let needs_tc = match &self.high_qc {
+            Some(qc) => qc.view.saturating_next() != self.current_view,
+            None => true,
+        };
+        (self.high_qc.clone(), if needs_tc { self.last_tc.clone() } else { None })
+    }
+
+    /// Process the certificate evidence attached to a remote
+    /// timeout signature. Each piece feeds the verified ingestion
+    /// path (`deliver_qc`, `on_timeout_certificate`) — a real
+    /// certificate is useful even when it doesn't justify the
+    /// sender's claimed view, and a forged one is rejected there.
+    ///
+    /// The bounded-catch-up rule lives in the *caller*: after this
+    /// returns, a remote signature is only collectible when its
+    /// claimed `view == self.current_view` — either the evidence
+    /// moved us there, or we were already there. A bare signature
+    /// for a far-future view moves nothing, so a single peer can no
+    /// longer pull us to an arbitrary view (previously
+    /// `sync_to_view(sig_view)` trusted the claimed view outright).
+    ///
+    /// Cross-epoch evidence is dropped: certificates are verified
+    /// against the *current* validator set, so a foreign-epoch cert
+    /// would fail verification anyway — the explicit check makes
+    /// the intent loud rather than emergent.
+    pub fn deliver_timeout_evidence(
+        &mut self,
+        high_qc: Option<QuorumCertificate>,
+        last_tc: Option<TimeoutCertificate>,
+    ) {
+        if let Some(qc) = high_qc {
+            if qc.epoch == self.epoch {
+                let _ = self.deliver_qc(qc);
+            }
+        }
+        if let Some(tc) = last_tc {
+            if tc.epoch == self.epoch {
+                let _ = self.on_timeout_certificate(&tc);
+            }
+        }
+    }
+
     /// Returns the pacemaker's current timeout duration in
     /// milliseconds. The devnet consensus loop uses this to decide
     /// when to fire `on_timeout()` and initiate a view change when
@@ -7540,6 +7601,154 @@ mod tests {
             restarted.current_view().value(),
             peer_view + 1,
             "restarted validator must catch up to tc.view + 1"
+        );
+    }
+
+    // ---- Bounded view catch-up (DiemBFT v4 timeout evidence) ----
+    //
+    // A remote timeout signature may not pull a node to an arbitrary
+    // view: the claimed view is honored only when certificate
+    // evidence (QC or TC for the preceding view) moves us there.
+    // `deliver_timeout_evidence` feeds attached certificates through
+    // the verified ingestion paths; the wire handler then collects
+    // the signature only when `sig_view == current_view`.
+
+    /// A TC for the preceding view carried as timeout evidence
+    /// advances a lagging validator — the certificate, not the
+    /// signature, does the moving.
+    #[test]
+    fn timeout_evidence_tc_advances_view() {
+        let mut engine = make_multi_engine(0);
+        assert_eq!(engine.current_view().value(), 0);
+        let tc = TimeoutCertificate {
+            view: View::new(4),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.deliver_timeout_evidence(None, Some(tc));
+        assert_eq!(
+            engine.current_view().value(),
+            5,
+            "TC(4) evidence moves the validator to view 5"
+        );
+        // And the TC is recorded as the view's successor evidence.
+        assert_eq!(
+            engine.last_tc.as_ref().map(|t| t.view.value()),
+            Some(4),
+            "the carried TC becomes last_tc — the next proposal embeds it"
+        );
+    }
+
+    /// A QC carried as timeout evidence both advances the view AND
+    /// updates `high_qc` — the timeout message doubles as high-QC
+    /// propagation, as in `DiemBFT`.
+    #[test]
+    fn timeout_evidence_qc_advances_view_and_high_qc() {
+        let mut engine = make_multi_engine(0);
+        let qc = QuorumCertificate {
+            view: View::new(7),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x77; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.deliver_timeout_evidence(Some(qc), None);
+        assert_eq!(engine.current_view().value(), 8, "QC(7) evidence moves to view 8");
+        assert_eq!(
+            engine.high_qc().map(|q| q.view.value()),
+            Some(7),
+            "the carried QC updates high_qc"
+        );
+    }
+
+    /// Evidence that cannot verify must move nothing — a forged QC
+    /// (zero aggregate) is rejected by `deliver_qc`, so the claimed
+    /// jump collapses to nothing.
+    #[test]
+    fn timeout_evidence_forged_qc_moves_nothing() {
+        let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+        let pks: Vec<crypto::bls::PublicKey> =
+            keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+        let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+        let mut engine =
+            OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+        let forged_qc = QuorumCertificate {
+            view: View::new(49),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0xAA; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111],
+            aggregate_signature: AggregateSignature::ZERO, // forged
+        };
+        engine.deliver_timeout_evidence(Some(forged_qc), None);
+        assert_eq!(
+            engine.current_view().value(),
+            0,
+            "a forged QC justifies nothing — the view stays put"
+        );
+    }
+
+    /// A validly-signed TC from a different epoch is ignored — the
+    /// explicit epoch check keeps foreign-epoch evidence out even
+    /// when the validator sets happen to share keys.
+    #[test]
+    fn timeout_evidence_ignores_foreign_epoch() {
+        let mut engine = make_multi_engine(0);
+        let foreign_tc = TimeoutCertificate {
+            view: View::new(4),
+            epoch: Epoch::new(9), // not our epoch
+            signer_bitmap: vec![0b0000_0111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.deliver_timeout_evidence(None, Some(foreign_tc));
+        assert_eq!(engine.current_view().value(), 0, "foreign-epoch evidence must be ignored");
+    }
+
+    /// The sender side: `timeout_evidence` reports the certificate
+    /// that justifies our current view. Entered via QC → the high QC
+    /// alone justifies (no TC attached). Entered via TC → the last
+    /// TC rides alongside the (older) high QC.
+    #[test]
+    fn timeout_evidence_reports_justifying_certificates() {
+        let mut engine = make_multi_engine(0);
+        // Enter view 6 via QC(5).
+        let qc = QuorumCertificate {
+            view: View::new(5),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x55; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.deliver_qc(qc).expect("QC accepted");
+        assert_eq!(engine.current_view().value(), 6);
+        let (qc_ev, tc_ev) = engine.timeout_evidence();
+        assert_eq!(qc_ev.map(|q| q.view.value()), Some(5));
+        assert!(tc_ev.is_none(), "QC(view−1) alone justifies the view");
+
+        // Then enter view 10 via TC(9) — high_qc stays at 5, so the
+        // TC is the justifying evidence.
+        let tc = TimeoutCertificate {
+            view: View::new(9),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0111],
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        engine.on_timeout_certificate(&tc).expect("TC accepted");
+        assert_eq!(engine.current_view().value(), 10);
+        let (qc_ev, tc_ev) = engine.timeout_evidence();
+        assert_eq!(
+            qc_ev.map(|q| q.view.value()),
+            Some(5),
+            "high_qc still propagates (it feeds the receiver's own high_qc)"
+        );
+        assert_eq!(
+            tc_ev.map(|t| t.view.value()),
+            Some(9),
+            "TC(view−1) is the justifying evidence here"
         );
     }
 

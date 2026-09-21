@@ -17725,3 +17725,32 @@ needs per-tx charge/execute interleaving, which costs batching.
 order inverts block order): funding visible to a later tx's fee
 charge, the reverse order failing, and fee-failure nonce-chain
 rewind. All three fail under the old grouping. Executor suite 99.
+
+## Consensus: bounded view catch-up via timeout evidence
+
+A *validly signed* peer timeout for a far-future view used to pull
+the node straight to that view — `sync_to_view(sig_view)` trusted
+the claimed view outright, so one peer could force an arbitrary
+jump near the view counter's limits.
+
+Timeouts now carry the DiemBFT v4 evidence fields: `high_qc`, plus
+`last_tc` when the high QC is not from the immediately preceding
+view (`TimeoutMsg`'s `high_qc.round ≠ round−1 ⇒ last_round_tc`
+rule). The wire format gained `[has_qc][qc?][has_tc][tc?]` between
+the epoch and the signature; the signature stays bound to
+`(view, epoch)` — evidence is self-authenticating (each certificate
+carries its own aggregate signature), so binding it would add bytes
+to the TC aggregation path without changing what's verifiable.
+
+The receiver feeds attached certificates through the already-
+verified ingestion paths (`deliver_qc` / `on_timeout_certificate`)
+and then collects the signature only when `sig_view ==
+current_view` — either the evidence moved us there, or we were
+already there. A bare signature for view 10⁶ moves nothing. The
+view timer resets only when evidence actually advanced the view, so
+a peer spraying same-view sigs cannot starve the local timeout.
+
+Sender side: `OxideBft::timeout_evidence()` reports the justifying
+certificates; receiver side: `deliver_timeout_evidence()` runs the
+gate. Five engine regressions cover TC/QC-driven jumps, forged and
+foreign-epoch evidence, and sender-side certificate selection.
