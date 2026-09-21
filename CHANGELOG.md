@@ -5421,3 +5421,33 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     slashing entirely by changing its key before the evidence
     landed. Both holes are closed — one offense is one slash,
     and rotating keys no longer dodges a valid proof.
+
+### Fixed (2026-09-21)
+
+- **Perps losses now land in a funded liability, and liquidated
+  positions go to a real backstop** (`modules/perps/src/lib.rs`)
+  - Losses that outlast margin and the insurance fund used to be
+    emitted as a `bad_debt` event — logged and forgotten, while the
+    matching gain was already spendable. They now accrue to
+    `unfunded_bad_debt`, a committed liability that every future
+    fund inflow retires *before* the fund grows — a senior claim
+    on the fund's next revenue.
+  - Liquidated positions no longer vanish: the module-owned
+    clearing account inherits them at mark, so net position per
+    market stays zero including the backstop. `end_block` unwinds
+    its inventory into the book with IOC orders at mark, and its
+    realized P&L settles against the insurance fund.
+  - Auto-deleveraging now transfers the clawed quantity to the
+    backstop instead of shrinking it unilaterally — and no longer
+    also debits the counterparty's margin (the old code extracted
+    twice the shortfall: once as the destroyed profit claim and
+    again as cash).
+  - The clearing account cannot be a transaction sender and can
+    never be liquidated — its collateral is the fund itself.
+  - **In plain words:** when a trader's loss exceeded everything
+    they had, the system used to write it down in a log and move
+    on — while the winner kept money that was never actually paid.
+    Now unpaid losses are a real debt the protocol tracks and
+    repays, and seized positions go to a dedicated account that
+    sells them back into the market instead of pretending they
+    never existed.

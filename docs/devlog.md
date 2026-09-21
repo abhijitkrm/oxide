@@ -17465,3 +17465,59 @@ carrying retired keys into post-import evidence, and a
 hand-truncated pre-upgrade blob (canon minus the section's
 `put_count(0)`) decoding to empty history with live-key
 evidence intact. 83 staking tests green.
+
+## 2026-09-21 — perps: a funded-liability clearing model (audit 5.1)
+
+**Bug.** The deepest financial finding: realized P&L conservation
+was asserted nowhere.
+
+- A losing close drained the account's margin, then the insurance
+  fund, and emitted the remainder as a `bad_debt` EVENT — an
+  event is not a funded liability. The counterparty's matching
+  gain had already been credited into spendable margin, so the
+  module minted `residual` of unbacked claim every time the fund
+  ran dry.
+- Liquidation ZEROED seized positions in place. Net position per
+  market — required to be zero — went one-sided, leaving a
+  phantom book the funding engine, OI accounting, and ADL
+  candidate scan all read as real.
+- ADL had the same break in the other direction plus an
+  over-extraction bug: it shrank the profitable counterparty's
+  position (destroying the unrealized-profit claim — worth
+  exactly `realized`) AND debited `realized` from their margin,
+  extracting twice the shortfall whenever margin sufficed —
+  silently burning the difference.
+
+**Fix — the clearing model, specified then enforced.**
+
+- **`CLEARING_ACCOUNT`** — a module-owned backstop (no key,
+  rejected as a tx sender). Liquidation transfers seized
+  positions to it at mark via `adjust_position`; ADL-clawed
+  quantities land on it the same way. Net position per market
+  stays zero *including* it — the audit's required property is
+  now a regression-tested invariant.
+- **`unfunded_bad_debt`** — where unpaid losses live: a committed
+  `u64` liability (trailing v3 codec section; pre-upgrade blobs
+  decode `0`, the only honest default). The cascade is uniform
+  everywhere: margin → insurance → ADL → liability.
+- **`fund_inflow`** — every insurance-fund inflow retires the
+  debt *before* accruing. That is what "socialized loss affects
+  claims" means concretely: the fund's next revenue is already
+  spoken for.
+- **Unwind** — `end_block` sells the backstop's inventory into
+  the book with IOC limit orders at mark (never worse — the fund
+  pays no slippage; a falling book unwinds slowly, which is
+  honest). Realized `PnL` settles against the fund via
+  `settle_realized`'s clearing branch, and its losses run the
+  same residual cascade.
+- **ADL over-extraction removed** — the position still shrinks
+  (the destroyed claim is the extraction) but margin is
+  untouched; the closed quantity transfers to the backstop.
+
+**Tests.** 9 new: net-position-zero across liquidation and ADL,
+clawed-exposure transfer with margin untouched, liability
+accrual on a fund-dry residual, debt-retires-first inflow,
+clearing settle-to-fund both directions, the sender guard, the
+no-op liquidation of the backstop, the `end_block` book unwind,
+and a snapshot round-trip carrying debt + inventory. 86 perps
+tests green.

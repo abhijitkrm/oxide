@@ -169,6 +169,23 @@ const LIQUIDATION_SWEEP_BUDGET: usize = 32;
 /// yet converts "unbounded transfer" into "bounded loss".
 const MAX_FUNDING_RATE_BPS: i64 = 500;
 
+/// The module-owned clearing account — the counterparty of last
+/// resort in the clearing model (audit 5.1).
+///
+/// Every unilateral position change is mirrored here so net
+/// position per market stays zero *including* this account:
+/// liquidation transfers the seized inventory to it at mark, and
+/// ADL lands the clawed counterparty quantity on it. Its
+/// collateral is the insurance fund — [`settle_realized`] settles
+/// its realized `PnL` against the fund directly — and `end_block`
+/// unwinds its inventory into the book with IOC orders at mark.
+///
+/// The address has no private key: it cannot sign and `handle`
+/// rejects it as a sender, so only internal module paths move it.
+/// The byte pattern is arbitrary — any reserved constant works —
+/// but it must not collide with a plausible user address.
+const CLEARING_ACCOUNT: Address = Address([0xEE; 20]);
+
 /// Compute the absolute deviation between a new and old mark price,
 /// in basis points. Returns `|new - old| * 10_000 / old`.
 ///
@@ -532,6 +549,14 @@ struct Inner {
     accounts: BTreeMap<Address, AccountState>,
     /// Insurance fund balance (scale-6 quote).
     insurance_fund: u64,
+    /// Losses the margin→insurance→ADL cascade could not allocate
+    /// (scale-6 quote). This is where unpaid losses LIVE: a real,
+    /// committed liability — not an event. Future insurance-fund
+    /// inflows retire it before accruing to the fund
+    /// ([`Self::fund_inflow`]), so it is the socialized-loss claim
+    /// the audit requires: a first-priority draw on the fund's
+    /// next revenue, not a number logged and forgotten.
+    unfunded_bad_debt: u64,
     /// Reusable fill buffer.
     fills: Vec<FillEvent>,
     /// M4 fix: per-market oracle update count for the current
@@ -649,6 +674,7 @@ impl PerpsModule {
                 marks: BTreeMap::new(),
                 accounts: BTreeMap::new(),
                 insurance_fund: 0,
+                unfunded_bad_debt: 0,
                 fills: Vec::with_capacity(64),
                 oracle_updates_this_block: BTreeMap::new(),
                 current_height: 0,
@@ -888,6 +914,16 @@ impl PerpsModule {
         self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insurance_fund
     }
 
+    /// Unpaid-loss liability the margin→insurance→ADL cascade could
+    /// not allocate (read-only). See [`Inner::unfunded_bad_debt`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned.
+    pub fn unfunded_bad_debt(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).unfunded_bad_debt
+    }
+
     /// Get or create an account state entry.
     fn account_mut<'a>(inner: &'a mut Inner, addr: &Address) -> &'a mut AccountState {
         inner.accounts.entry(*addr).or_default()
@@ -1052,10 +1088,11 @@ impl PerpsModule {
 
         // Surplus (rounding dust, un-creditable receivers, and any
         // collected > due) accrues to the insurance fund — the only
-        // place value may accumulate without a named owner.
+        // place value may accumulate without a named owner. Routed
+        // through `fund_inflow` so outstanding `unfunded_bad_debt`
+        // retires before the fund balance grows.
         let surplus = collected.saturating_sub(distributed);
-        inner.insurance_fund =
-            inner.insurance_fund.saturating_add(u64::try_from(surplus).unwrap_or(u64::MAX));
+        Self::fund_inflow(&mut inner, u64::try_from(surplus).unwrap_or(u64::MAX));
         if collected < total_due {
             events.push(Event { module: "perps", kind: "funding_shortfall", data: vec![market] });
         }
@@ -1073,6 +1110,15 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn liquidation_check(&self, account: &Address) -> Result<Vec<Event>, ExecError> {
+        // The clearing account is module-owned — the counterparty of
+        // last resort that holds seized inventory. It cannot be
+        // liquidated: its collateral is the insurance fund itself,
+        // so "is it solvent" and "who pays its losses" are the same
+        // question, and liquidating it would be circular. Its risk
+        // is managed by the unwind in `end_block`, not by seizure.
+        if account == &CLEARING_ACCOUNT {
+            return Ok(vec![]);
+        }
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Phase 1 — read-only solvency check: the old code cloned
@@ -1135,9 +1181,15 @@ impl PerpsModule {
         // `marks`/`accounts` are destructured so the mark lookup
         // (shared) and the position mutation (mutable) borrow
         // disjoint fields — no clone, no materialized positions.
+        //
+        // Each seized position is collected for transfer to the
+        // clearing account — the exposure does not vanish, it moves
+        // to the backstop at mark so net position per market stays
+        // zero (audit 5.1's "where do liquidated positions go").
         let mut total_loss_scale14: i128 = 0;
         let mut total_margin_recovered: u64 = 0;
         let cross_margin;
+        let mut seized: Vec<(u8, i64, u64)> = Vec::new(); // (market, size, mark)
         {
             let Inner { marks, accounts, .. } = &mut *inner;
             let Some(acct_mut) = accounts.get_mut(account) else {
@@ -1152,6 +1204,9 @@ impl PerpsModule {
                 let pnl = pos.unrealized_pnl(mark); // scale-14
                 total_loss_scale14 = total_loss_scale14.saturating_add(pnl);
                 total_margin_recovered = total_margin_recovered.saturating_add(pos.isolated_margin);
+                // Record the transfer BEFORE zeroing — `size` is the
+                // signed quantity the clearing account inherits.
+                seized.push((*market, pos.size, mark));
                 // Close the position in the same pass — the old code
                 // walked the map a second time to zero these fields.
                 pos.size = 0;
@@ -1160,6 +1215,19 @@ impl PerpsModule {
                 events.push(Event { module: "perps", kind: "liquidated", data: vec![*market] });
             }
             acct_mut.cross_margin = 0;
+        }
+
+        // Transfer each seized position to the clearing account at
+        // the same mark used for the `PnL` computation. The backstop
+        // inherits the exposure with `entry = mark`, so its future
+        // `PnL` is pure mark-tracking settled against the insurance
+        // fund. Runs after the account borrow above is released —
+        // `adjust_position` re-borrows `accounts` internally and may
+        // net the incoming position against inventory the clearing
+        // account already holds in the same market (the realized
+        // piece then settles to the fund via `settle_realized`).
+        for (market, size, mark) in seized {
+            Self::adjust_position(&mut inner, &CLEARING_ACCOUNT, market, mark, size, &mut events);
         }
 
         // Convert total_loss from scale-14 to scale-6 before combining
@@ -1171,16 +1239,17 @@ impl PerpsModule {
         let margin_total = i128::from(cross_margin.saturating_add(total_margin_recovered));
         let net = margin_total + total_loss_scale6; // both scale-6
         if net < 0 {
-            // Insurance fund covers the shortfall (scale-6).
+            // Insurance fund covers the shortfall (scale-6); what
+            // it cannot pay runs the residual cascade — ADL against
+            // profitable counterparties, then the tracked
+            // `unfunded_bad_debt` liability.
             let shortfall = u64::try_from(-net).unwrap_or(u64::MAX);
             let fund = inner.insurance_fund;
-            if shortfall >= fund {
-                // Insurance fund depleted — trigger ADL.
-                inner.insurance_fund = 0;
-                let adl_events = Self::auto_deleverage(&mut inner, account, shortfall - fund);
-                events.extend(adl_events);
-            } else {
-                inner.insurance_fund -= shortfall;
+            let cover = fund.min(shortfall);
+            inner.insurance_fund = fund - cover;
+            let residual = shortfall - cover;
+            if residual > 0 {
+                Self::socialize_residual(&mut inner, account, residual, &mut events);
             }
         } else {
             // Account has leftover margin after liquidation — return it.
@@ -1203,9 +1272,10 @@ impl PerpsModule {
     /// ADL ranks all open positions by a priority score that combines
     /// profit and leverage: the most profitable, highest-leverage
     /// counterparties are deleveraged first. Each counterparty's
-    /// position is partially or fully closed at the bankruptcy price
-    /// (the liquidated account's entry price), realizing their profit
-    /// and using it to cover the shortfall.
+    /// position is partially closed at mark — the destroyed
+    /// unrealized-profit claim on the closed portion is the clawback
+    /// (worth exactly the realized `PnL`), and the closed exposure
+    /// transfers to the clearing account so net position stays zero.
     ///
     /// # Algorithm
     ///
@@ -1220,9 +1290,10 @@ impl PerpsModule {
     ///    - Compute the `PnL` to claw back: `min(remaining_shortfall,
     ///      counterparty_pnl)`.
     ///    - Reduce the counterparty's position size proportionally
-    ///      to the clawback fraction.
-    ///    - Realize the clawed-back `PnL` (debit the counterparty's
-    ///      margin).
+    ///      to the clawback fraction — the destroyed profit claim
+    ///      is the extraction (margin untouched).
+    ///    - Transfer the closed quantity to the clearing account
+    ///      at mark (net position stays zero).
     ///    - Reduce the remaining shortfall.
     /// 5. Stop when the shortfall is covered or no more profitable
     ///    counterparties remain.
@@ -1236,15 +1307,16 @@ impl PerpsModule {
     ///
     /// # Returns
     ///
-    /// A vector of ADL events, one per deleveraged counterparty.
+    /// The ADL events plus the shortfall ADL could not cover —
+    /// the caller books the remainder as `unfunded_bad_debt`.
     fn auto_deleverage(
         inner: &mut Inner,
         liquidated_account: &Address,
         mut remaining_shortfall: u64,
-    ) -> Vec<Event> {
+    ) -> (Vec<Event>, u64) {
         let mut events = Vec::new();
         if remaining_shortfall == 0 {
-            return events;
+            return (events, 0);
         }
 
         // Step 1-2: Collect all open positions with their PnL.
@@ -1255,7 +1327,13 @@ impl PerpsModule {
         // directly here via shared borrows.
         let mut candidates: Vec<(Address, u8, i64, u64, i128)> = Vec::new();
         for (addr, state) in &inner.accounts {
-            if addr == liquidated_account {
+            // Skip the liquidated account (it is the loss-bearer,
+            // not a profitable counterparty) and the clearing
+            // account — the backstop's "profit" is insurance-fund
+            // property, so clawing it would move value from the
+            // fund to the fund while shrinking its inventory for
+            // no coverage gained.
+            if addr == liquidated_account || addr == &CLEARING_ACCOUNT {
                 continue;
             }
             for (market, pos) in &state.positions {
@@ -1285,83 +1363,138 @@ impl PerpsModule {
         // Step 4: Deleverage each candidate until shortfall is covered.
         // `marks`/`accounts` are destructured so mark lookups (shared)
         // and position mutations (mutable) borrow disjoint fields.
-        let Inner { marks, accounts, .. } = &mut *inner;
-        for (addr, market, pos_size, pos_entry_price, pnl_scale6) in candidates {
-            if remaining_shortfall == 0 {
-                break;
-            }
-            // Claw back min(remaining_shortfall, counterparty_pnl).
-            let clawback_target =
-                remaining_shortfall.min(u64::try_from(pnl_scale6).unwrap_or(u64::MAX));
-            // The candidate came from a live account — `get_mut`
-            // suffices (no account_mut side effects needed).
-            let Some(acct) = accounts.get_mut(&addr) else {
-                continue;
-            };
-            let Some(pos_entry) = acct.positions.get_mut(&market) else {
-                continue;
-            };
+        //
+        // Each clawed quantity is collected for transfer to the
+        // clearing account — the closed exposure moves to the
+        // backstop at mark so net position stays zero.
+        let mut clawed: Vec<(u8, i64, u64)> = Vec::new(); // (market, signed_qty, mark)
+        {
+            let Inner { marks, accounts, .. } = &mut *inner;
+            for (addr, market, pos_size, pos_entry_price, pnl_scale6) in candidates {
+                if remaining_shortfall == 0 {
+                    break;
+                }
+                // Claw back min(remaining_shortfall, counterparty_pnl).
+                let clawback_target =
+                    remaining_shortfall.min(u64::try_from(pnl_scale6).unwrap_or(u64::MAX));
+                // The candidate came from a live account — `get_mut`
+                // suffices (no account_mut side effects needed).
+                let Some(acct) = accounts.get_mut(&addr) else {
+                    continue;
+                };
+                let Some(pos_entry) = acct.positions.get_mut(&market) else {
+                    continue;
+                };
 
-            // H3 fix: compute close_qty from scale-14 PnL to avoid
-            // double-flooring. The PnL per unit at scale-14 is
-            // |mark - entry|. To cover `clawback_target` (scale-6),
-            // we need to close:
-            //   close_qty = clawback_target * PRICE_SCALE / pnl_per_unit
-            // The realized PnL is then:
-            //   realized = close_qty * pnl_per_unit / PRICE_SCALE
-            // which may differ from clawback_target by at most 1
-            // scale-6 unit due to integer flooring. We debit the
-            // *realized* amount, not the target, to keep accounting
-            // exact.
-            let mark = marks.get(&market).copied().unwrap_or(pos_entry_price);
-            let pnl_per_unit = if pos_size > 0 {
-                i128::from(mark) - i128::from(pos_entry_price)
-            } else {
-                i128::from(pos_entry_price) - i128::from(mark)
-            };
-            if pnl_per_unit <= 0 {
-                continue; // not actually profitable at current mark
-            }
-            let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
-            let close_qty_i128 = (i128::from(clawback_target) * price_scale) / pnl_per_unit;
-            let size_abs = i128::from(pos_size.unsigned_abs());
-            let close_qty = i64::try_from(close_qty_i128.min(size_abs)).unwrap_or(0);
-            if close_qty == 0 {
-                continue;
-            }
-            // Compute the exact realized PnL (scale-6) from closing
-            // close_qty units. This is the amount we actually debit.
-            let realized_scale6 =
-                u64::try_from((i128::from(close_qty) * pnl_per_unit) / price_scale)
-                    .unwrap_or(u64::MAX);
+                // H3 fix: compute close_qty from scale-14 PnL to avoid
+                // double-flooring. The PnL per unit at scale-14 is
+                // |mark - entry|. To cover `clawback_target` (scale-6),
+                // we need to close:
+                //   close_qty = clawback_target * PRICE_SCALE / pnl_per_unit
+                // The realized PnL is then:
+                //   realized = close_qty * pnl_per_unit / PRICE_SCALE
+                // which may differ from clawback_target by at most 1
+                // scale-6 unit due to integer flooring. We debit the
+                // *realized* amount, not the target, to keep accounting
+                // exact.
+                let mark = marks.get(&market).copied().unwrap_or(pos_entry_price);
+                let pnl_per_unit = if pos_size > 0 {
+                    i128::from(mark) - i128::from(pos_entry_price)
+                } else {
+                    i128::from(pos_entry_price) - i128::from(mark)
+                };
+                if pnl_per_unit <= 0 {
+                    continue; // not actually profitable at current mark
+                }
+                let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
+                let close_qty_i128 = (i128::from(clawback_target) * price_scale) / pnl_per_unit;
+                let size_abs = i128::from(pos_size.unsigned_abs());
+                let close_qty = i64::try_from(close_qty_i128.min(size_abs)).unwrap_or(0);
+                if close_qty == 0 {
+                    continue;
+                }
+                // Compute the exact realized PnL (scale-6) from closing
+                // close_qty units — the destroyed profit claim, and
+                // the amount credited against the shortfall.
+                let realized_scale6 =
+                    u64::try_from((i128::from(close_qty) * pnl_per_unit) / price_scale)
+                        .unwrap_or(u64::MAX);
 
-            // Reduce the position size (preserve sign).
-            if pos_size > 0 {
-                pos_entry.size -= close_qty;
-            } else {
-                pos_entry.size += close_qty;
-            }
-            // Debit the *realized* PnL (not the target) from the
-            // counterparty's margin. This keeps accounting exact.
-            if pos_entry.isolated_margin > 0 {
-                pos_entry.isolated_margin =
-                    pos_entry.isolated_margin.saturating_sub(realized_scale6);
-            } else {
-                acct.cross_margin = acct.cross_margin.saturating_sub(realized_scale6);
-            }
-            remaining_shortfall = remaining_shortfall.saturating_sub(realized_scale6);
+                // Shrink the counterparty's position (preserve sign).
+                // The destroyed unrealized-profit claim on the closed
+                // portion IS the extraction — worth exactly
+                // `realized_scale6`. The margin is deliberately
+                // untouched: the old code ALSO debited `realized` from
+                // the margin bucket, taking the clawback twice — once
+                // as a confiscated claim and again as cash — an
+                // over-extraction that silently destroyed value
+                // whenever the margin sufficed.
+                if pos_size > 0 {
+                    pos_entry.size -= close_qty;
+                } else {
+                    pos_entry.size += close_qty;
+                }
+                // The clearing account inherits the closed exposure
+                // in the same direction (long stays long, short
+                // stays short) — transferred at mark below.
+                let signed_qty = if pos_size > 0 { close_qty } else { -close_qty };
+                clawed.push((market, signed_qty, mark));
+                remaining_shortfall = remaining_shortfall.saturating_sub(realized_scale6);
 
-            events.push(Event { module: "perps", kind: "adl_executed", data: vec![market] });
+                events.push(Event { module: "perps", kind: "adl_executed", data: vec![market] });
+            }
         }
 
-        // If there's still a shortfall after ADL, it's an unrecoverable
-        // loss. In production, this would trigger socialized loss or
-        // emergency governance. For now, we log it as an event.
+        // Transfer the clawed exposure to the clearing account at
+        // mark — second pass, since `adjust_position` re-borrows
+        // `accounts` internally.
+        for (market, signed_qty, mark) in clawed {
+            Self::adjust_position(inner, &CLEARING_ACCOUNT, market, mark, signed_qty, &mut events);
+        }
+
+        // A shortfall ADL could not cover is booked by the caller
+        // as `unfunded_bad_debt` — the event marks that boundary.
         if remaining_shortfall > 0 {
             events.push(Event { module: "perps", kind: "adl_shortfall_remaining", data: vec![] });
         }
 
-        events
+        (events, remaining_shortfall)
+    }
+
+    /// The residual-allocation cascade for a loss the insurance
+    /// fund could not cover: claw profitable counterparties (ADL),
+    /// then book whatever remains as [`Inner::unfunded_bad_debt`] —
+    /// the committed, named place unpaid losses live (audit 5.1).
+    /// `excluded` is the loss-bearer, kept out of the ADL candidate
+    /// set. Returns the unallocated remainder — the amount booked
+    /// into the liability — for the caller's `bad_debt` audit event.
+    fn socialize_residual(
+        inner: &mut Inner,
+        excluded: &Address,
+        shortfall: u64,
+        events: &mut Vec<Event>,
+    ) -> u64 {
+        let (mut adl_events, remaining) = Self::auto_deleverage(inner, excluded, shortfall);
+        events.append(&mut adl_events);
+        if remaining > 0 {
+            inner.unfunded_bad_debt = inner.unfunded_bad_debt.saturating_add(remaining);
+            let mut data = Vec::with_capacity(8);
+            data.extend_from_slice(&remaining.to_le_bytes());
+            events.push(Event { module: "perps", kind: "unfunded_bad_debt", data });
+        }
+        remaining
+    }
+
+    /// Route an insurance-fund inflow. `unfunded_bad_debt` is a
+    /// senior claim on the fund — every inflow first retires the
+    /// tracked liability, and only the remainder accrues to the
+    /// fund balance. This is what makes the liability *funded*
+    /// rather than an event: the module's next revenue is already
+    /// spoken for.
+    fn fund_inflow(inner: &mut Inner, amount: u64) {
+        let repay = inner.unfunded_bad_debt.min(amount);
+        inner.unfunded_bad_debt -= repay;
+        inner.insurance_fund = inner.insurance_fund.saturating_add(amount - repay);
     }
 }
 
@@ -1396,6 +1529,12 @@ struct StagedPerps {
     /// Trailing section (v2): the liquidation-sweep cursor.
     /// Absent in pre-upgrade blobs — `None` = sweep from the start.
     liquidation_cursor: Option<Address>,
+    /// Trailing section (v3): unpaid-loss liability the
+    /// margin→insurance→ADL cascade could not allocate. Absent in
+    /// pre-upgrade blobs — `0` = nothing owed (the pre-upgrade
+    /// module emitted the same losses as events and forgot them;
+    /// there is no honest non-zero default to reconstruct).
+    unfunded_bad_debt: u64,
 }
 
 impl PerpsModule {
@@ -1493,6 +1632,11 @@ impl PerpsModule {
                 w.put_u8(0);
             }
         }
+        // ── Trailing section (v3) ── the unpaid-loss liability is
+        // consensus-visible state: future fund inflows split between
+        // retiring it and growing the fund, so two nodes disagreeing
+        // on it would diverge on the next funding round.
+        w.put_u64(inner.unfunded_bad_debt);
     }
 
     /// Decode the canonical fields following the leading store root —
@@ -1544,6 +1688,7 @@ impl PerpsModule {
         // the first account.
         let mut mark_updated_at = BTreeMap::new();
         let mut liquidation_cursor = None;
+        let mut unfunded_bad_debt = 0;
         if r.remaining() != 0 {
             let n = r.get_count()?;
             for _ in 0..n {
@@ -1561,6 +1706,13 @@ impl PerpsModule {
                 1 => Some(r.get_addr()?),
                 _ => return None,
             };
+            // Trailing v3: pre-v3 blobs end at the cursor. `0` is
+            // the only honest default — the pre-upgrade code forgot
+            // residual losses entirely, so there is no non-zero
+            // liability to reconstruct.
+            if r.remaining() != 0 {
+                unfunded_bad_debt = r.get_u64()?;
+            }
         }
         // A mark with no recorded age — pre-upgrade blobs — is
         // seeded at height 0: stale at any real chain height until
@@ -1581,6 +1733,7 @@ impl PerpsModule {
             endorsements,
             mark_updated_at,
             liquidation_cursor,
+            unfunded_bad_debt,
         })
     }
 
@@ -1909,6 +2062,7 @@ impl Module for PerpsModule {
         if msg.is_empty() {
             return Err(ExecError::Malformed);
         }
+        Self::reject_clearing_sender(ctx)?;
         let tag = msg[0];
         let body = &msg[1..];
 
@@ -2073,14 +2227,6 @@ impl Module for PerpsModule {
         };
 
         let mut events = Vec::new();
-        if batch.is_empty() {
-            // The cursor passed the last account — wrap so the next
-            // block restarts coverage from the beginning.
-            let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            inner.liquidation_cursor = None;
-            return events;
-        }
-
         for account in &batch {
             // The only error the check produces is
             // `ModuleRejected("account not found")` — the account
@@ -2091,6 +2237,13 @@ impl Module for PerpsModule {
             }
         }
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Exit path for the backstop: sell this block's seized
+        // inventory (and anything carried over) into the book at
+        // mark before advancing the cursor.
+        Self::unwind_clearing(&mut inner, &mut events);
+        // An empty batch means the cursor passed the last account —
+        // wrap so the next block restarts coverage from the
+        // beginning.
         inner.liquidation_cursor = batch.last().copied();
         events
     }
@@ -2159,6 +2312,7 @@ impl Module for PerpsModule {
         inner.oracle_updates_this_block = staged.oracle_updates_this_block;
         inner.mark_updated_at = staged.mark_updated_at;
         inner.liquidation_cursor = staged.liquidation_cursor;
+        inner.unfunded_bad_debt = staged.unfunded_bad_debt;
         // Block-transient: refreshed by the next `begin_block`.
         inner.current_height = 0;
         // `fills` is per-call scratch — clear it so a buffer left
@@ -2615,6 +2769,103 @@ impl PerpsModule {
             events.push(Event { module: "perps", kind: "margin_call", data: vec![market] });
         }
     }
+
+    /// Reject the module-owned clearing account as a tx sender.
+    /// No private key exists for it, so an authenticated sender can
+    /// never equal it — but a forged-sender path (unsigned devnet
+    /// txs) must not move backstop collateral or inventory through
+    /// the ordinary message surface. Only internal module paths may
+    /// touch the account.
+    fn reject_clearing_sender(ctx: &TxContext) -> Result<(), ExecError> {
+        if ctx.sender == CLEARING_ACCOUNT {
+            return Err(ExecError::ModuleRejected("clearing account cannot transact".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Unwind the clearing account's inventory into the book —
+    /// the exit path of the backstop model (audit 5.1). Seized and
+    /// ADL-clawed positions would otherwise sit on the clearing
+    /// account forever: funded by the insurance fund but growing
+    /// without bound. Each call fires one IOC limit order at mark
+    /// per inventory market, closing as much as the book takes at
+    /// mark-or-better; the unfilled remainder is killed by the IOC
+    /// and retried on the next call. The realized `PnL` settles to
+    /// the fund via `settle_realized`'s clearing branch.
+    ///
+    /// The order price is the mark, never worse — a backstop that
+    /// swept the whole book would pay arbitrary slippage out of the
+    /// fund. A falling book therefore unwinds slowly, which is the
+    /// honest behavior: the fund sells into bids willing to pay
+    /// mark, and inventory persists while none are.
+    ///
+    /// `qty` is floored to a whole lot: position sizes are
+    /// lot-aligned from fills, but ADL clawbacks can land
+    /// sub-lot remainders on the account. The residual — strictly
+    /// under one lot — cannot trade and simply persists until a
+    /// later transfer in the same direction merges it back to a
+    /// lot boundary.
+    fn unwind_clearing(inner: &mut Inner, events: &mut Vec<Event>) {
+        // Collect the backstop's open inventory (market, signed
+        // size) under a shared borrow — the order pass mutates.
+        let inventory: Vec<(u8, i64)> =
+            inner.accounts.get(&CLEARING_ACCOUNT).map_or_else(Vec::new, |acct| {
+                acct.positions
+                    .iter()
+                    .filter(|(_, p)| p.is_open())
+                    .map(|(m, p)| (*m, p.size))
+                    .collect()
+            });
+        for (market, size) in inventory {
+            let Some(cfg) = inner.configs.get(&market) else { continue };
+            // `lot_size` is validated nonzero at listing; `max(1)`
+            // keeps the division total for hand-built states.
+            let lot = cfg.base.lot_size.max(1);
+            let qty = size.unsigned_abs() - (size.unsigned_abs() % lot);
+            if qty == 0 {
+                continue;
+            }
+            let mark = inner.marks.get(&market).copied().unwrap_or(0);
+            if mark == 0 {
+                continue; // no mark — nothing to price the exit at
+            }
+            let order = NewOrder {
+                side: if size > 0 { Side::Sell } else { Side::Buy },
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Ioc,
+                price: Price(mark),
+                qty: Qty(qty),
+                owner: CLEARING_ACCOUNT,
+                stp: StpMode::None,
+            };
+            // `markets`/`fills`/`accounts` are destructured so the
+            // engine (mutable), the fill buffer, and the maker-cap
+            // account read borrow disjoint fields. The block yields
+            // the fills and cap removals; both are consumed after
+            // the borrows die, matching `handle_place`'s two-pass
+            // structure.
+            let (fills_owned, removed) = {
+                let Inner { markets, fills, accounts, .. } = &mut *inner;
+                let Some(engine) = markets.get_mut(usize::from(market)).and_then(Option::as_mut)
+                else {
+                    continue;
+                };
+                fills.clear();
+                let mut cap =
+                    ReduceOnlyCap { accounts, market, spent: BTreeMap::new(), removed: Vec::new() };
+                let _ = engine.place_with_cap(order, fills, &mut cap);
+                (std::mem::take(fills), cap.removed)
+            };
+            // Makers the sweep removed or decremented — cap kills
+            // and self-trade removals — release their reservations
+            // before fill application, the same order `handle_place`
+            // uses, so fills never see stale entries.
+            Self::release_removal_reservations(inner, market, &removed);
+            for fill in &fills_owned {
+                Self::apply_fill_to_position(inner, market, fill, events);
+            }
+        }
+    }
 }
 
 impl PerpsModule {
@@ -2783,10 +3034,14 @@ impl PerpsModule {
     /// `cross_margin`. A loss drains the same bucket; an isolated
     /// position's loss is capped at its isolated bucket (that is the
     /// point of isolation — the cross pool is NOT tapped), while a
-    /// cross-backed position drains the cross pool. Any remainder is
-    /// bad debt covered by the insurance fund, and a shortfall
-    /// beyond the fund is reported as a `bad_debt` event — value is
-    /// never silently invented or destroyed.
+    /// cross-backed position drains the cross pool. The remainder
+    /// runs the loss cascade — insurance fund, then ADL, then the
+    /// committed `unfunded_bad_debt` liability — so an unpaid loss
+    /// always lands in a funded account, never just an event.
+    ///
+    /// The clearing account settles against the fund directly: its
+    /// collateral IS the fund, so its gains are fund inflows and its
+    /// losses run the same cascade from the fund step down.
     fn settle_realized(
         inner: &mut Inner,
         account: &Address,
@@ -2794,51 +3049,89 @@ impl PerpsModule {
         realized_scale6: i128,
         events: &mut Vec<Event>,
     ) {
-        let mut bad_debt: u64 = 0;
-        {
-            let acct = Self::account_mut(inner, account);
-            let iso_backed = acct.positions.get(&market).is_some_and(|p| p.isolated_margin > 0);
+        if account == &CLEARING_ACCOUNT {
+            // The backstop's collateral IS the insurance fund — its
+            // realized PnL settles against the fund directly rather
+            // than margin buckets. A gain is a fund inflow (retiring
+            // `unfunded_bad_debt` first, like every inflow); a loss
+            // the fund cannot cover runs the same residual cascade
+            // every other unpaid loss runs — ADL, then the tracked
+            // liability.
             if realized_scale6 > 0 {
                 let gain = u64::try_from(realized_scale6).unwrap_or(u64::MAX);
-                if iso_backed {
-                    let pos = acct.positions.entry(market).or_default();
-                    if let Some(v) = pos.isolated_margin.checked_add(gain) {
-                        pos.isolated_margin = v;
+                Self::fund_inflow(inner, gain);
+            } else {
+                let loss = u64::try_from(realized_scale6.unsigned_abs()).unwrap_or(u64::MAX);
+                let cover = inner.insurance_fund.min(loss);
+                inner.insurance_fund -= cover;
+                let residual = loss - cover;
+                if residual > 0 {
+                    let unpaid = Self::socialize_residual(inner, account, residual, events);
+                    let mut data = Vec::with_capacity(1 + 8);
+                    data.push(market);
+                    data.extend_from_slice(&unpaid.to_le_bytes());
+                    events.push(Event { module: "perps", kind: "bad_debt", data });
+                }
+            }
+        } else {
+            let mut bad_debt: u64 = 0;
+            {
+                let acct = Self::account_mut(inner, account);
+                let iso_backed = acct.positions.get(&market).is_some_and(|p| p.isolated_margin > 0);
+                if realized_scale6 > 0 {
+                    let gain = u64::try_from(realized_scale6).unwrap_or(u64::MAX);
+                    if iso_backed {
+                        let pos = acct.positions.entry(market).or_default();
+                        if let Some(v) = pos.isolated_margin.checked_add(gain) {
+                            pos.isolated_margin = v;
+                        } else {
+                            // Bucket overflow: hold the max and spill
+                            // the excess to cross rather than destroy
+                            // value.
+                            let spill = gain - (u64::MAX - pos.isolated_margin);
+                            pos.isolated_margin = u64::MAX;
+                            acct.cross_margin = acct.cross_margin.saturating_add(spill);
+                        }
                     } else {
-                        // Bucket overflow: hold the max and spill the
-                        // excess to cross rather than destroy value.
-                        let spill = gain - (u64::MAX - pos.isolated_margin);
-                        pos.isolated_margin = u64::MAX;
-                        acct.cross_margin = acct.cross_margin.saturating_add(spill);
+                        acct.cross_margin = acct.cross_margin.saturating_add(gain);
                     }
                 } else {
-                    acct.cross_margin = acct.cross_margin.saturating_add(gain);
+                    let mut loss =
+                        u64::try_from(realized_scale6.unsigned_abs()).unwrap_or(u64::MAX);
+                    if iso_backed {
+                        let pos = acct.positions.entry(market).or_default();
+                        let from = pos.isolated_margin.min(loss);
+                        pos.isolated_margin -= from;
+                        loss -= from;
+                    } else {
+                        let from = acct.cross_margin.min(loss);
+                        acct.cross_margin -= from;
+                        loss -= from;
+                    }
+                    bad_debt = loss;
                 }
-            } else {
-                let mut loss = u64::try_from(realized_scale6.unsigned_abs()).unwrap_or(u64::MAX);
-                if iso_backed {
-                    let pos = acct.positions.entry(market).or_default();
-                    let from = pos.isolated_margin.min(loss);
-                    pos.isolated_margin -= from;
-                    loss -= from;
-                } else {
-                    let from = acct.cross_margin.min(loss);
-                    acct.cross_margin -= from;
-                    loss -= from;
-                }
-                bad_debt = loss;
             }
-        }
-        if bad_debt > 0 {
-            // The account's collateral is exhausted — the insurance
-            // fund is the designated backstop for uncovered losses.
-            let cover = inner.insurance_fund.min(bad_debt);
-            inner.insurance_fund -= cover;
-            let residual = bad_debt - cover;
-            let mut data = Vec::with_capacity(1 + 8);
-            data.push(market);
-            data.extend_from_slice(&residual.to_le_bytes());
-            events.push(Event { module: "perps", kind: "bad_debt", data });
+            if bad_debt > 0 {
+                // The account's collateral is exhausted — the
+                // insurance fund is the designated backstop. What
+                // the fund cannot cover runs the residual cascade:
+                // ADL against profitable counterparties, then the
+                // `unfunded_bad_debt` liability. The event reports
+                // the post-cascade remainder — the amount that
+                // became a tracked liability this transaction.
+                let cover = inner.insurance_fund.min(bad_debt);
+                inner.insurance_fund -= cover;
+                let residual = bad_debt - cover;
+                let unpaid = if residual > 0 {
+                    Self::socialize_residual(inner, account, residual, events)
+                } else {
+                    0
+                };
+                let mut data = Vec::with_capacity(1 + 8);
+                data.push(market);
+                data.extend_from_slice(&unpaid.to_le_bytes());
+                events.push(Event { module: "perps", kind: "bad_debt", data });
+            }
         }
         // Emit the realized amount (scale-6, signed) for the audit
         // trail — clamped to i64 range; a larger realized amount is
@@ -3104,9 +3397,9 @@ fn encode_perps_config(cfg: &PerpsMarketConfig) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CROSS_MARGIN_MARKET, MarketConfig, NewOrder, OrderId, OrderType, PRICE_SCALE,
-        PerpsMarketConfig, PerpsModule, Position, Side, StpMode, TimeInForce, encode_reject_reason,
-        mark_price_deviation_bps, msg,
+        CLEARING_ACCOUNT, CROSS_MARGIN_MARKET, MarketConfig, NewOrder, OrderId, OrderType,
+        PRICE_SCALE, PerpsMarketConfig, PerpsModule, Position, Side, StpMode, TimeInForce,
+        encode_reject_reason, mark_price_deviation_bps, msg,
     };
     use executor::{ExecError, Module, TxContext};
     use framework::{Balances, module_id};
@@ -4870,5 +5163,272 @@ mod tests {
         let dst_cursor =
             dst.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).liquidation_cursor;
         assert_eq!(dst_cursor, src_cursor);
+    }
+
+    // ── Clearing-model tests (funded liabilities, net position) ──
+
+    /// Sum of signed position sizes across every account —
+    /// clearing account included — for one market. The clearing
+    /// model's central invariant: zero net position per market.
+    fn net_position(perps: &PerpsModule, market: u8) -> i128 {
+        let inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .accounts
+            .values()
+            .map(|a| a.positions.get(&market).map_or(0i128, |p| i128::from(p.size)))
+            .sum()
+    }
+
+    /// Liquidation moves the seized position to the clearing
+    /// account at mark rather than zeroing it — the audit's "where
+    /// do liquidated positions go" is the backstop, and net
+    /// position stays zero including it.
+    #[test]
+    fn liquidation_transfers_position_to_clearing_account() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Long + short counterparties — the book nets to zero.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
+                mid,
+                Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
+            );
+            PerpsModule::account_mut(&mut inner, &addr(2)).positions.insert(
+                mid,
+                Position { size: -100_000, entry_price: 1_500_000_000, isolated_margin: 100_000 },
+            );
+            // A funded insurance fund covers the loss outright —
+            // no ADL, so the transfer is isolated for the assertion.
+            inner.insurance_fund = 1_000_000;
+        }
+        assert_eq!(net_position(&perps, mid), 0);
+        // Mark drops — the long is deep underwater.
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
+        let events = perps.liquidation_check(&addr(1)).unwrap();
+        assert!(events.iter().any(|e| e.kind == "liquidated"));
+
+        assert_eq!(perps.position(&addr(1), mid).size, 0, "seized position closed");
+        let clearing = perps.position(&CLEARING_ACCOUNT, mid);
+        assert_eq!(clearing.size, 100_000, "backstop inherits the long");
+        assert_eq!(clearing.entry_price, 1_000_000_000, "inherited at mark");
+        // The audit's required property holds with the backstop in
+        // the sum.
+        assert_eq!(net_position(&perps, mid), 0, "net position stays zero");
+    }
+
+    /// ADL claws the PROFIT — the counterparty's margin is
+    /// untouched (claim destruction is the extraction, not a margin
+    /// debit), and the closed quantity transfers to the clearing
+    /// account so net position stays zero.
+    #[test]
+    fn adl_clawed_exposure_transfers_to_clearing() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
+                mid,
+                Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
+            );
+            PerpsModule::account_mut(&mut inner, &addr(2)).positions.insert(
+                mid,
+                Position { size: -100_000, entry_price: 1_500_000_000, isolated_margin: 100_000 },
+            );
+            inner.insurance_fund = 0;
+        }
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
+        let events = perps.liquidation_check(&addr(1)).unwrap();
+        assert!(events.iter().any(|e| e.kind == "adl_executed"), "ADL must run: {events:?}");
+
+        let counter = perps.position(&addr(2), mid);
+        let clearing = perps.position(&CLEARING_ACCOUNT, mid);
+        // The counterparty's short shrank by exactly the clawed
+        // quantity; the clearing account now holds BOTH the seized
+        // long AND the clawed short, netting the difference.
+        assert_eq!(counter.size + clearing.size, 0, "clawed exposure nets through clearing");
+        assert_eq!(counter.isolated_margin, 100_000, "margin untouched — claim destruction only");
+        assert_eq!(net_position(&perps, mid), 0);
+    }
+
+    /// A loss exceeding margin AND the insurance fund becomes a
+    /// tracked liability, not just an event: `unfunded_bad_debt`
+    /// accrues the post-ADL remainder.
+    #[test]
+    fn bad_debt_residual_becomes_tracked_liability() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
+                mid,
+                Position { size: 1_000, entry_price: 1_500_000_000, isolated_margin: 10 },
+            );
+            inner.insurance_fund = 0;
+        }
+        // Realize a loss far beyond margin with no profitable
+        // counterparty to claw — the full remainder is booked.
+        let mut events = Vec::new();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::settle_realized(&mut inner, &addr(1), mid, -50_000, &mut events);
+        }
+        assert_eq!(perps.unfunded_bad_debt(), 50_000 - 10);
+        assert!(events.iter().any(|e| e.kind == "unfunded_bad_debt"));
+        assert!(events.iter().any(|e| e.kind == "bad_debt"));
+    }
+
+    /// `unfunded_bad_debt` is a senior claim: fund inflows retire
+    /// the liability before the fund balance grows.
+    #[test]
+    fn fund_inflow_retires_bad_debt_before_fund() {
+        let perps = PerpsModule::new();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.unfunded_bad_debt = 30_000;
+            PerpsModule::fund_inflow(&mut inner, 50_000);
+            assert_eq!(inner.unfunded_bad_debt, 0, "inflow retires the debt first");
+            assert_eq!(inner.insurance_fund, 20_000, "remainder accrues");
+            PerpsModule::fund_inflow(&mut inner, 10_000);
+            assert_eq!(inner.insurance_fund, 30_000);
+        }
+        assert_eq!(perps.insurance_fund(), 30_000);
+    }
+
+    /// The clearing account's realized `PnL` settles against the
+    /// insurance fund directly — a gain replenishes the fund, a
+    /// loss the fund cannot cover becomes tracked bad debt.
+    #[test]
+    fn clearing_realized_pnl_settles_against_fund() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.insurance_fund = 1_000;
+            // A gain flows into the fund.
+            let mut events = Vec::new();
+            PerpsModule::settle_realized(&mut inner, &CLEARING_ACCOUNT, mid, 500, &mut events);
+            assert_eq!(inner.insurance_fund, 1_500);
+            // A loss beyond the fund books the remainder as debt.
+            let mut events = Vec::new();
+            PerpsModule::settle_realized(&mut inner, &CLEARING_ACCOUNT, mid, -3_000, &mut events);
+            assert_eq!(inner.insurance_fund, 0, "fund drained covering the loss");
+            assert_eq!(inner.unfunded_bad_debt, 1_500, "uncovered remainder tracked");
+        }
+    }
+
+    /// The clearing account can never be a tx sender — forged-
+    /// sender paths must not move backstop collateral through the
+    /// ordinary message surface.
+    #[test]
+    fn clearing_account_cannot_transact() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let perps = PerpsModule::with_ledger(ledger);
+        perps.list_market(test_cfg()).unwrap();
+        let forged = TxContext { sender: CLEARING_ACCOUNT, nonce: 0, fee: 0 };
+        for m in [
+            msg::deposit(CROSS_MARGIN_MARKET, 1_000),
+            msg::withdraw(CROSS_MARGIN_MARKET, 1_000),
+            msg::place(0, limit(Side::Buy, 500, 1, 9)),
+        ] {
+            assert!(
+                matches!(perps.handle(&forged, &m), Err(ExecError::ModuleRejected(_))),
+                "clearing sender must be rejected"
+            );
+        }
+    }
+
+    /// The backstop cannot be liquidated — its losses are the
+    /// fund's own exposure, managed by the unwind, not seizure.
+    #[test]
+    fn liquidation_check_noops_on_clearing_account() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
+                mid,
+                Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+        }
+        perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
+        let events = perps.liquidation_check(&CLEARING_ACCOUNT).unwrap();
+        assert!(events.is_empty(), "backstop is never seized");
+        assert_eq!(perps.position(&CLEARING_ACCOUNT, mid).size, 100_000, "inventory intact");
+    }
+
+    /// `end_block` unwinds clearing inventory into the book at
+    /// mark: the IOC sell fills a resting bid, the backstop exits,
+    /// and its realized `PnL` settles against the fund.
+    #[test]
+    fn end_block_unwinds_clearing_inventory() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(2), 10_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        // Backstop holds a long at mark — entry equals mark so the
+        // unwind fill realizes ~0 for the fund (the settle-to-fund
+        // path itself is covered by clearing_realized_pnl_settles).
+        // A short counterparty balances the book: in the live flow
+        // the seized long's original counterparty is still short.
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
+                mid,
+                Position { size: 5_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+            PerpsModule::account_mut(&mut inner, &addr(3)).positions.insert(
+                mid,
+                Position { size: -5_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
+            );
+        }
+        assert_eq!(net_position(&perps, mid), 0);
+        // A buyer rests a bid at mark.
+        perps.handle(&ctx(2), &msg::deposit(CROSS_MARGIN_MARKET, 10_000_000)).unwrap();
+        let resp = perps.handle(
+            &ctx(2),
+            &msg::place(mid, limit(Side::Buy, 500, 5, 2)), // price 1.5B, qty 5000
+        );
+        assert!(resp.is_ok(), "bid must rest: {resp:?}");
+
+        perps.end_block(Height::new(1));
+        let clearing = perps.position(&CLEARING_ACCOUNT, mid);
+        assert_eq!(clearing.size, 0, "inventory unwound through the book");
+        let buyer = perps.position(&addr(2), mid);
+        assert_eq!(buyer.size, 5_000, "buyer took the other side");
+        // The maker's reservation for the filled order is released.
+        {
+            let inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct2 = inner.accounts.get(&addr(2)).expect("buyer exists");
+            assert!(acct2.open_orders.is_empty(), "filled reservation released");
+        }
+        // Entry = mark = fill, so the clearing account realizes ~0 —
+        // the fund is unchanged by a flat unwind.
+        assert_eq!(perps.insurance_fund(), 0);
+        assert_eq!(net_position(&perps, mid), 0);
+    }
+
+    /// The unpaid-loss liability and the clearing account's
+    /// inventory are committed state — they survive export → import
+    /// so all nodes agree on who is owed what after a restart.
+    #[test]
+    fn state_snapshot_round_trips_unfunded_debt_and_clearing() {
+        let src = PerpsModule::new();
+        let mid = src.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = src.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.unfunded_bad_debt = 42_000;
+            PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
+                mid,
+                Position { size: 7_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+        }
+        let snapshot = src.export_state().expect("perps exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+        let dst = PerpsModule::new();
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        assert_eq!(dst.unfunded_bad_debt(), 42_000);
+        assert_eq!(dst.position(&CLEARING_ACCOUNT, mid).size, 7_000);
     }
 }
