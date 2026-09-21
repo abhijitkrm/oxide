@@ -159,6 +159,25 @@ const MAX_MARK_STALENESS_BLOCKS: u64 = 60;
 /// visits.
 const LIQUIDATION_SWEEP_BUDGET: usize = 32;
 
+/// Backstop unwind slippage allowance, in basis points: the IOC
+/// exit order's limit is the mark moved AGAINST the fund by this
+/// much — a long sells down to `mark·(1−1%)`, a short buys up to
+/// `mark·(1+1%)`. Bids/asks between mark and the bound fill, so the
+/// backstop still exits a book that has gapped away from the last
+/// mark instead of stranding while unrealized losses accrue.
+///
+/// Origin: audit residual — a mark-only exit never fills once bids
+/// fall below mark, so a fast-falling book left the fund holding a
+/// depreciating inventory indefinitely. 100 bps is deliberately an
+/// order of magnitude under `MAX_MARK_CHANGE_BPS`: the fund pays at
+/// most ~1% of notional per unwind pass — a bounded, known cost —
+/// while the mark itself can keep tracking the fall.
+///
+/// Tradeoff: a larger allowance exits faster in deeper gaps but
+/// bleeds more fund capital per block; a smaller one preserves
+/// capital but re-strands inventory whenever the book gaps wider.
+const BACKSTOP_UNWIND_SLIPPAGE_BPS: u64 = 100;
+
 /// Bound on the absolute funding rate a quorum-endorsed
 /// `TAG_APPLY_FUNDING` may apply, in basis points: 500 = 5% per
 /// period. The endorsement authenticates the rate but cannot bound
@@ -1361,15 +1380,16 @@ impl PerpsModule {
         });
 
         // Step 4: Deleverage each candidate until shortfall is covered.
-        // `marks`/`accounts` are destructured so mark lookups (shared)
-        // and position mutations (mutable) borrow disjoint fields.
+        // `marks`/`accounts`/`configs` are destructured so mark and
+        // lot-size lookups (shared) and position mutations (mutable)
+        // borrow disjoint fields.
         //
         // Each clawed quantity is collected for transfer to the
         // clearing account — the closed exposure moves to the
         // backstop at mark so net position stays zero.
         let mut clawed: Vec<(u8, i64, u64)> = Vec::new(); // (market, signed_qty, mark)
         {
-            let Inner { marks, accounts, .. } = &mut *inner;
+            let Inner { marks, accounts, configs, .. } = &mut *inner;
             for (addr, market, pos_size, pos_entry_price, pnl_scale6) in candidates {
                 if remaining_shortfall == 0 {
                     break;
@@ -1409,7 +1429,22 @@ impl PerpsModule {
                 let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
                 let close_qty_i128 = (i128::from(clawback_target) * price_scale) / pnl_per_unit;
                 let size_abs = i128::from(pos_size.unsigned_abs());
-                let close_qty = i64::try_from(close_qty_i128.min(size_abs)).unwrap_or(0);
+                // Lot-align partial claws: a sub-lot transfer would
+                // strand untradeable dust on the clearing account —
+                // `unwind_clearing` exits whole lots only — so the
+                // claw rounds DOWN to the lot grid. A target covering
+                // the entire position takes it whole instead: closing
+                // removes a dusty position outright rather than
+                // leaving the remainder untradeable on either side.
+                // A claw that floors to zero contributes nothing and
+                // the shortfall moves to the next candidate.
+                let lot = i128::from(configs.get(&market).map_or(1, |c| c.base.lot_size.max(1)));
+                let capped = close_qty_i128.min(size_abs);
+                let close_qty = if capped >= size_abs {
+                    i64::try_from(capped).unwrap_or(0)
+                } else {
+                    i64::try_from(capped - capped % lot).unwrap_or(0)
+                };
                 if close_qty == 0 {
                     continue;
                 }
@@ -2793,18 +2828,22 @@ impl PerpsModule {
     /// and retried on the next call. The realized `PnL` settles to
     /// the fund via `settle_realized`'s clearing branch.
     ///
-    /// The order price is the mark, never worse — a backstop that
-    /// swept the whole book would pay arbitrary slippage out of the
-    /// fund. A falling book therefore unwinds slowly, which is the
-    /// honest behavior: the fund sells into bids willing to pay
-    /// mark, and inventory persists while none are.
+    /// The order price is the mark moved against the fund by at
+    /// most [`BACKSTOP_UNWIND_SLIPPAGE_BPS`], snapped to the tick
+    /// grid toward mark (a sell floor rounds up, a buy cap down) and
+    /// clamped to the market's absolute band. A backstop that swept
+    /// the whole book would pay arbitrary slippage out of the fund;
+    /// a mark-only exit strands inventory the moment the book gaps.
+    /// The bound sits between them: the fund pays at most ~1% of
+    /// notional to leave, and bids/asks resting between mark and the
+    /// bound now fill the unwind.
     ///
     /// `qty` is floored to a whole lot: position sizes are
-    /// lot-aligned from fills, but ADL clawbacks can land
-    /// sub-lot remainders on the account. The residual — strictly
-    /// under one lot — cannot trade and simply persists until a
-    /// later transfer in the same direction merges it back to a
-    /// lot boundary.
+    /// lot-aligned from fills and ADL claws are floored to the lot
+    /// grid at the source, so the only sub-lot inventory left is
+    /// dust predating that rule — strictly under one lot, unable to
+    /// trade, and carried until a same-direction transfer merges it
+    /// back to a lot boundary.
     fn unwind_clearing(inner: &mut Inner, events: &mut Vec<Event>) {
         // Collect the backstop's open inventory (market, signed
         // size) under a shared borrow — the order pass mutates.
@@ -2829,11 +2868,36 @@ impl PerpsModule {
             if mark == 0 {
                 continue; // no mark — nothing to price the exit at
             }
+            // Exit limit = mark ± the slippage allowance, computed in
+            // u128 so a huge mark cannot overflow mid-multiply. The
+            // snap direction is conservative on purpose: a sell floor
+            // rounds UP (less depth allowed), a buy cap rounds DOWN —
+            // the fund can never pay beyond the allowance just to hit
+            // the tick grid.
+            let tick = cfg.base.tick_size.max(1);
+            let raw_limit = if size > 0 {
+                u64::try_from(
+                    u128::from(mark) * u128::from(10_000u64 - BACKSTOP_UNWIND_SLIPPAGE_BPS)
+                        / 10_000,
+                )
+                .unwrap_or(0)
+            } else {
+                u64::try_from(
+                    u128::from(mark) * u128::from(10_000u64 + BACKSTOP_UNWIND_SLIPPAGE_BPS)
+                        / 10_000,
+                )
+                .unwrap_or(u64::MAX)
+            };
+            let limit_price = if size > 0 {
+                raw_limit.div_ceil(tick).saturating_mul(tick).max(cfg.base.min_price)
+            } else {
+                (raw_limit / tick).saturating_mul(tick).min(cfg.base.max_price)
+            };
             let order = NewOrder {
                 side: if size > 0 { Side::Sell } else { Side::Buy },
                 order_type: OrderType::Limit,
                 tif: TimeInForce::Ioc,
-                price: Price(mark),
+                price: Price(limit_price),
                 qty: Qty(qty),
                 owner: CLEARING_ACCOUNT,
                 stp: StpMode::None,
@@ -5464,6 +5528,168 @@ mod tests {
         // the fund is unchanged by a flat unwind.
         assert_eq!(perps.insurance_fund(), 0);
         assert_eq!(net_position(&perps, mid), 0);
+    }
+
+    /// When the book gaps below mark, the unwind pays bounded
+    /// slippage — the IOC limit sits at `mark·(1−
+    /// BACKSTOP_UNWIND_SLIPPAGE_BPS)` — so bids resting just under
+    /// mark still take the inventory instead of stranding it while
+    /// the mark keeps falling.
+    #[test]
+    fn unwind_pays_bounded_slippage_when_book_gaps() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(2), 10_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
+                mid,
+                Position { size: 5_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+            PerpsModule::account_mut(&mut inner, &addr(3)).positions.insert(
+                mid,
+                Position { size: -5_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
+            );
+            inner.insurance_fund = 10_000;
+        }
+        // The bid rests ~0.67% below the 1.5B mark — inside the 1%
+        // allowance (floor 1.485B), so it fills at its resting price.
+        perps.handle(&ctx(2), &msg::deposit(CROSS_MARGIN_MARKET, 10_000_000)).unwrap();
+        perps
+            .handle(&ctx(2), &msg::place(mid, limit(Side::Buy, 490, 5, 2))) // 1.49B
+            .unwrap();
+
+        perps.end_block(Height::new(1));
+        assert_eq!(
+            perps.position(&CLEARING_ACCOUNT, mid).size,
+            0,
+            "a bid inside the allowance must take the inventory"
+        );
+        assert_eq!(perps.position(&addr(2), mid).size, 5_000);
+        // Fill at 1.49B against a 1.5B entry: −0.01B × 5_000 / 1e8 =
+        // −500 scale-6 settles against the fund — bounded slippage
+        // paid, never arbitrary.
+        assert_eq!(perps.insurance_fund(), 9_500, "fund pays only the bounded slippage");
+        assert_eq!(net_position(&perps, mid), 0);
+    }
+
+    /// The allowance is a real bound: bids deeper than
+    /// `mark·(1−1%)` are not swept — the IOC dies unfilled and the
+    /// inventory persists for the next pass.
+    #[test]
+    fn unwind_does_not_sweep_beyond_the_allowance() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(2), 10_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
+                mid,
+                Position { size: 5_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+            PerpsModule::account_mut(&mut inner, &addr(3)).positions.insert(
+                mid,
+                Position { size: -5_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
+            );
+        }
+        perps.handle(&ctx(2), &msg::deposit(CROSS_MARGIN_MARKET, 10_000_000)).unwrap();
+        // Bid at 1.4B — ~6.7% below mark, under the 1.485B floor.
+        perps.handle(&ctx(2), &msg::place(mid, limit(Side::Buy, 400, 5, 2))).unwrap();
+
+        perps.end_block(Height::new(1));
+        assert_eq!(
+            perps.position(&CLEARING_ACCOUNT, mid).size,
+            5_000,
+            "a bid beyond the allowance must not be swept"
+        );
+        assert_eq!(perps.position(&addr(2), mid).size, 0, "the deep bid is untouched");
+        assert_eq!(net_position(&perps, mid), 0);
+    }
+
+    /// The buy side is symmetric: a short inventory exits into asks
+    /// up to `mark·(1+1%)` — the cap rounds DOWN to the tick grid so
+    /// the fund never pays past the allowance to stay on-grid.
+    #[test]
+    fn unwind_short_inventory_buys_up_to_the_cap() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(2), 10_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
+                mid,
+                Position { size: -5_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+            PerpsModule::account_mut(&mut inner, &addr(3)).positions.insert(
+                mid,
+                Position { size: 5_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
+            );
+            inner.insurance_fund = 10_000;
+        }
+        // Ask at 1.51B — ~0.67% above the 1.5B mark, inside the
+        // 1.515B cap.
+        perps.handle(&ctx(2), &msg::deposit(CROSS_MARGIN_MARKET, 10_000_000)).unwrap();
+        perps
+            .handle(&ctx(2), &msg::place(mid, limit(Side::Sell, 510, 5, 2))) // 1.51B
+            .unwrap();
+
+        perps.end_block(Height::new(1));
+        assert_eq!(
+            perps.position(&CLEARING_ACCOUNT, mid).size,
+            0,
+            "an ask inside the allowance must take the short inventory"
+        );
+        assert_eq!(perps.position(&addr(2), mid).size, -5_000);
+        assert_eq!(net_position(&perps, mid), 0);
+    }
+
+    /// ADL claws are lot-aligned: a claw target that prices to a
+    /// sub-lot quantity floors down to the lot grid, so the transfer
+    /// to the clearing account never strands untradeable dust there
+    /// — the unwind exits whole lots only. Whatever the floored claw
+    /// cannot cover falls through to `unfunded_bad_debt`, the
+    /// designed sink.
+    #[test]
+    fn adl_claw_is_lot_aligned() {
+        let perps = PerpsModule::new();
+        let mid = perps.list_market(test_cfg()).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Long 100 lots at 1.5B with 480k margin; short
+            // counterparty at the same entry.
+            PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
+                mid,
+                Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 480_000 },
+            );
+            PerpsModule::account_mut(&mut inner, &addr(2)).positions.insert(
+                mid,
+                Position { size: -100_000, entry_price: 1_500_000_000, isolated_margin: 100_000 },
+            );
+            inner.insurance_fund = 0;
+        }
+        // Mark 1.01B: the long's loss is 100_000 × 0.49e9 / 1e8 =
+        // 490_000 → shortfall 10_000 over margin. The short's
+        // pnl_per_unit is 0.49e9, so claw_qty = 10_000 × 1e8 /
+        // 0.49e9 ≈ 2_040.8 — sub-lot before the fix.
+        perps.set_mark_price_unchecked(mid, 1_010_000_000).unwrap();
+        let events = perps.liquidation_check(&addr(1)).unwrap();
+        assert!(events.iter().any(|e| e.kind == "adl_executed"), "ADL must run: {events:?}");
+
+        // The clawed quantity is exactly 2_000 (2_040 floored to
+        // the lot grid) — both sides stay lot-aligned.
+        assert_eq!(perps.position(&addr(2), mid).size, -98_000, "claw floors to a whole lot");
+        assert_eq!(
+            perps.position(&CLEARING_ACCOUNT, mid).size,
+            98_000,
+            "seized 100_000 long netted against the 2_000 clawed short stays aligned"
+        );
+        assert_eq!(net_position(&perps, mid), 0);
+        // Realized cover = 2_000 × 0.49e9 / 1e8 = 9_800 of the
+        // 10_000 shortfall; the floored-away remainder is debt.
+        assert_eq!(perps.unfunded_bad_debt(), 200);
     }
 
     /// The unpaid-loss liability and the clearing account's

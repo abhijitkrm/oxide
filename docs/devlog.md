@@ -17968,3 +17968,35 @@ review surfaced:
   reduce-only orders against one position: the second is rejected at
   admission when it over-allocates `cover_booked`, the pair fills to
   exactly zero — no flip into unbacked exposure.
+
+## Perps: bounded-slippage backstop unwind + lot-aligned ADL claws (5.1 residuals)
+
+Two residuals from the funded-liability clearing model are closed:
+
+- **The unwind no longer exits at mark only.** `unwind_clearing`
+  priced its IOC exactly at mark, so once the book gapped below
+  mark the backstop held a depreciating inventory forever — losses
+  kept accruing to the fund while the exit never filled. The IOC
+  limit is now mark moved against the fund by
+  `BACKSTOP_UNWIND_SLIPPAGE_BPS` (100 bps), snapped toward mark on
+  the tick grid (sell floors round up, buy caps round down) and
+  clamped to the market's absolute band: bids/asks between mark
+  and the bound fill, deeper liquidity is never swept, and the
+  fund's cost per pass is bounded at ~1% of notional — an order of
+  magnitude under `MAX_MARK_CHANGE_BPS`, so the mark itself still
+  tracks a cliff fall while the unwind keeps working.
+  Regressions: `unwind_pays_bounded_slippage_when_book_gaps` (fills
+  a bid 0.67% under mark, fund pays exactly the bounded slippage),
+  `unwind_short_inventory_buys_up_to_the_cap` (symmetric buy side),
+  `unwind_does_not_sweep_beyond_the_allowance` (deep bid untouched).
+
+- **ADL claws are lot-aligned at the source.** `close_qty` could
+  land a sub-lot transfer on the clearing account — dust the
+  whole-lot unwind can never trade. Partial claws now floor to the
+  lot grid (`raw − raw % lot`); a target covering the whole
+  position still takes it entire (closing removes dust, it doesn't
+  create it), and a claw flooring to zero contributes nothing —
+  the shortfall moves on to the next candidate or the debt sink.
+  Regression: `adl_claw_is_lot_aligned` (a claw pricing to ~2040.8
+  closes exactly 2000, both sides stay aligned, the 200-unit
+  remainder lands in `unfunded_bad_debt`).

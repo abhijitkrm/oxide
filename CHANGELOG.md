@@ -1102,6 +1102,34 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **The perps backstop could not exit inventory once the book
+  gapped below mark** (`modules/perps`)
+  - The clearing account's unwind IOC was priced exactly at mark,
+    so bids sitting below it never took the inventory — a falling
+    market left the fund holding depreciating positions
+    indefinitely.
+  - The exit limit is now the mark moved against the fund by
+    `BACKSTOP_UNWIND_SLIPPAGE_BPS` (100 bps), snapped toward mark on
+    the tick grid and clamped to the market's band: liquidity
+    between mark and the bound fills the unwind, deeper book is
+    never swept, and the fund's cost per pass is bounded at ~1% of
+    notional.
+  - ADL claws now floor partial closes to the lot grid, so the
+    transfer to the clearing account never strands sub-lot dust the
+    whole-lot unwind cannot trade; a target covering the whole
+    position still takes it entire, and the floored-away remainder
+    lands in `unfunded_bad_debt`, the designed sink.
+  - **In plain words:** when the market dropped fast, the insurance
+    fund's cleanup seller used to only accept the last quoted price
+    — if bids fell below it, the fund was stuck holding losing
+    positions forever. Now it accepts prices up to 1% worse,
+    guaranteed, and the small leftover losses are tracked as named
+    debt instead of dust.
+  - Regressions: `unwind_pays_bounded_slippage_when_book_gaps`,
+    `unwind_short_inventory_buys_up_to_the_cap`,
+    `unwind_does_not_sweep_beyond_the_allowance`,
+    `adl_claw_is_lot_aligned`.
+
 - **The synchronous executor path could silently double-apply a
   half-executed block after a module panic** (`crates/executor`)
   - The exec lane already refuses to replay a block whose execution
