@@ -254,3 +254,54 @@ async fn ws_subscribe_rejects_unknown_type() {
     let resp = request(&mut ws, "eth_subscribe", vec![json!("syncing")]).await;
     assert_eq!(resp["error"]["code"], json!(-32602));
 }
+
+/// The WS transport honors the same per-IP budget as HTTP — a
+/// client flooding frames past the per-second window gets
+/// JSON-RPC limit errors, not silent execution. WebSocket must
+/// not be a rate-limit bypass.
+#[tokio::test]
+async fn ws_requests_share_the_per_ip_rate_budget() {
+    // Minimal server — `eth_chainId` needs no EVM attachment. A
+    // 3 req/s budget makes the window trip deterministic without
+    // depending on wall-clock speed: 4+ requests inside any
+    // 1-second span must reject.
+    let rpc = Arc::new(RpcServer::new(1, 7));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind probe")
+        .local_addr()
+        .expect("local addr")
+        .port();
+    let server = HttpServer::from_shared(rpc, format!("127.0.0.1:{port}")).with_rate_limit(3);
+    tokio::spawn(server.serve());
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut ws = connect(&format!("ws://127.0.0.1:{port}")).await;
+
+    // Pipeline all sends first, then read every response in
+    // order — the tail must carry -32005 limit errors.
+    for i in 0..12u64 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"jsonrpc": "2.0", "id": i, "method": "eth_chainId", "params": []})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send flood frame");
+    }
+    let mut limited = 0u32;
+    for _ in 0..12 {
+        let resp = next_json(&mut ws, Duration::from_secs(5))
+            .await
+            .expect("every frame gets an ordered response");
+        if resp["error"]["code"] == json!(-32005) {
+            limited += 1;
+        } else {
+            assert_eq!(resp["result"], json!("0x1"), "allowed frames still dispatch");
+        }
+    }
+    assert!(limited >= 3, "frames past the per-IP window must be rate-limited, got {limited}");
+}

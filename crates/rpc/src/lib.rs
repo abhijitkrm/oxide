@@ -506,6 +506,7 @@ impl Default for SubscriptionManager {
 /// notification volume is bounded by subscription count × block
 /// rate — both small relative to memory. Requests responses go
 /// through the same channel.
+#[derive(Clone)]
 pub(crate) struct WsConn {
     /// The connection's unique ID (scopes its subscriptions).
     pub(crate) conn_id: u64,

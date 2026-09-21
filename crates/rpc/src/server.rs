@@ -45,14 +45,16 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::serve::Listener;
+use axum::serve::{Listener, ListenerExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::{RpcServer, WsConn};
 
@@ -96,6 +98,32 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// never returns. On timeout the connection is closed, freeing
 /// the slot.
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum RPC dispatches allowed on the blocking pool at once —
+/// the bound that keeps expensive work (`eth_call` sweeps, log
+/// scans, snapshot exports) from saturating every runtime blocking
+/// slot and starving the rest of the node. Requests past the cap
+/// are refused fast (HTTP 429 / a WS error frame) rather than
+/// queued unboundedly. Units: in-flight blocking tasks. Origin:
+/// the audit requires *bounded* expensive-work concurrency —
+/// `spawn_blocking` tasks cannot be cancelled, so a client's
+/// abandoned request still occupies a slot until it finishes;
+/// this semaphore makes that occupancy finite. Tradeoff: lower
+/// protects the node harder but rejects heavy-but-legitimate
+/// bursts; 64 is deep enough for real dashboards while still
+/// ~8× under tokio's default 512-thread pool ceiling.
+const RPC_BLOCKING_PERMITS: usize = 64;
+
+/// Maximum distinct source IPs tracked by the rate limiter —
+/// now that buckets key on *real* connection IPs, an attacker
+/// rotating source addresses could otherwise grow the map
+/// without bound (the limiter itself becoming the memory-DoS
+/// vector). On overflow the limiter first evicts expired windows;
+/// a still-full map refuses the request (fail closed — the
+/// attacked node rejects rather than allocates). Units: map
+/// entries. Tradeoff: 65,536 ≈ 64K IPs ≈ a few MB worst case —
+/// generous for real client diversity, bounded for memory.
+const MAX_RATE_BUCKETS: usize = 65_536;
 
 /// A process-wide cap on open RPC connections.
 ///
@@ -271,10 +299,38 @@ impl RateLimiter {
                 false
             }
         } else {
+            // Bound the map: real per-IP keys mean an attacker
+            // rotating source addresses could otherwise allocate
+            // without limit. Sweep expired windows first; a map
+            // still at cap refuses rather than grows.
+            if buckets.len() >= MAX_RATE_BUCKETS {
+                buckets.retain(|_, (window_start, _)| {
+                    now.duration_since(*window_start) < Duration::from_secs(1)
+                });
+                if buckets.len() >= MAX_RATE_BUCKETS {
+                    return false;
+                }
+            }
             buckets.insert(ip, (now, 1));
             true
         }
     }
+}
+
+/// State shared by every handler: the RPC dispatcher, the per-IP
+/// rate limiter, and the semaphore bounding concurrent expensive
+/// dispatches. One `Arc` keeps handler extraction cheap and lets
+/// the WebSocket path share the same budgets as HTTP.
+#[derive(Clone)]
+struct RpcState {
+    /// The JSON-RPC dispatcher.
+    rpc: Arc<RpcServer>,
+    /// Per-IP fixed-window limiter — transport-independent: one
+    /// client cannot get more budget by switching to WebSocket.
+    rate_limiter: Arc<RateLimiter>,
+    /// Bound on concurrent `spawn_blocking` dispatches — covers
+    /// HTTP handlers, WS frames, and snapshot exports.
+    work_permits: Arc<Semaphore>,
 }
 
 /// The HTTP server wrapping an [`RpcServer`] in an axum router.
@@ -323,6 +379,17 @@ impl HttpServer {
         }
     }
 
+    /// Override the per-IP request budget (requests/second). The
+    /// default [`DEFAULT_RATE_LIMIT_PER_SEC`] suits private
+    /// endpoints; operators exposing the RPC publicly lower it,
+    /// and tests use small values so limit behavior is exercised
+    /// without hundred-request floods.
+    #[must_use]
+    pub fn with_rate_limit(mut self, max_per_sec: u32) -> Self {
+        self.rate_limiter = Arc::new(RateLimiter::new(max_per_sec));
+        self
+    }
+
     /// Get a clone of the inner `Arc<RpcServer>` (for external state
     /// updates, e.g. `set_block_height`).
     #[must_use]
@@ -354,12 +421,28 @@ impl HttpServer {
     /// Panics if axum fails while serving.
     pub async fn serve_on(self, listener: TcpListener) {
         let app = Self::router(self.rpc, self.rate_limiter);
-        let listener = LimitedListener { inner: listener, limiter: self.conn_limiter };
-        axum::serve(listener, app).await.unwrap_or_else(|e| panic!("RPC HTTP server: {e}"));
+        // `tap_io` wraps the listener so axum's generic `Connected`
+        // impl can surface the accepted `SocketAddr` to handlers —
+        // the tap itself is a no-op; only the type plumbing matters.
+        let listener =
+            LimitedListener { inner: listener, limiter: self.conn_limiter }.tap_io(|_io| {});
+        // `into_make_service_with_connect_info` attaches the real
+        // peer `SocketAddr` to every request — `ConnectInfo` then
+        // hands handlers the client's actual IP so the rate
+        // limiter buckets per source instead of sharing one
+        // loopback bucket across all clients.
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap_or_else(|e| panic!("RPC HTTP server: {e}"));
     }
 
     /// Build the axum router with the RPC handler and rate limiter.
     fn router(rpc: Arc<RpcServer>, rate_limiter: Arc<RateLimiter>) -> Router {
+        let state = RpcState {
+            rpc,
+            rate_limiter,
+            work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
+        };
         Router::new()
             .route("/", post(handle_rpc).get(ws_handler))
             .route("/health", get(health_check))
@@ -368,8 +451,31 @@ impl HttpServer {
             .route("/snapshot/manifest", get(snapshot_manifest_handler))
             .route("/snapshot/chunk/{index}", get(snapshot_chunk_handler))
             .route("/validator-set", get(validator_set_handler))
-            .with_state((rpc, rate_limiter))
+            .with_state(state)
     }
+}
+
+/// Build the standard 429 rate-limit JSON-RPC response — shared by
+/// the HTTP handler and the GET endpoints so every transport
+/// reports budget exhaustion identically.
+fn rate_limited_response() -> Response<String> {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"rate limit exceeded"},"id":null}"#.to_string())
+        .unwrap_or_else(|_| Response::new("{}".to_string()))
+}
+
+/// Build the standard 429 response for an exhausted
+/// blocking-work budget — the node is refusing NEW expensive
+/// dispatches, not rate-limiting a client. Same shape so clients
+/// retry the same way.
+fn busy_response() -> Response<String> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"server busy — too many in-flight requests"},"id":null}"#.to_string())
+        .unwrap_or_else(|_| Response::new("{}".to_string()))
 }
 
 /// Handle a JSON-RPC POST request.
@@ -377,35 +483,35 @@ impl HttpServer {
 /// The request body is the raw JSON-RPC request string. The response
 /// is the raw JSON-RPC response string from [`RpcServer::handle_raw`].
 async fn handle_rpc(
-    State((rpc, rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<RpcState>,
     body: String,
 ) -> Response<String> {
-    // HIGH fix: rate-limit per IP. Use 127.0.0.1 as a fallback when
-    // the connection info isn't available (e.g. behind a proxy).
-    // In production, axum's `ConnectInfo` extractor provides the
-    // real client IP; for now, we use a default since the server
-    // doesn't yet use `into_make_service_with_connect_info`.
-    let ip: IpAddr = "127.0.0.1".parse().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    if !rate_limiter.allow(ip) {
-        return Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .header("content-type", "application/json")
-            .body(r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"rate limit exceeded"},"id":null}"#.to_string())
-            .unwrap_or_else(|_| {
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body("{}".to_string())
-                    .unwrap()
-            });
+    // Rate-limit per REAL connection IP — `ConnectInfo` is the
+    // peer address axum accepted, so one client can no longer
+    // consume the quota other clients share.
+    if !state.rate_limiter.allow(addr.ip()) {
+        return rate_limited_response();
     }
+    // Bound concurrent expensive dispatches: `spawn_blocking`
+    // tasks cannot be cancelled once running (a timed-out request
+    // still occupies its slot), so an unbounded spawn rate would
+    // let a flood pin the whole blocking pool. Refusing fast here
+    // keeps the occupancy provably finite.
+    let Ok(permit) = state.work_permits.clone().try_acquire_owned() else {
+        return busy_response();
+    };
     // `handle_raw` is synchronous CPU work — run it on the
     // blocking pool so a heavy request (proof rebuild, 10k-log
     // sweep, max-size batch) cannot pin a tokio worker thread,
     // and bound it with `HTTP_REQUEST_TIMEOUT`: past the deadline
     // the client gets a timeout response while the orphaned task
     // drains to completion on the blocking pool.
-    let rpc2 = Arc::clone(&rpc);
-    let work = tokio::task::spawn_blocking(move || rpc2.handle_raw(&body));
+    let rpc2 = Arc::clone(&state.rpc);
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        rpc2.handle_raw(&body)
+    });
     let response = match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, work).await {
         Ok(Ok(response)) => response,
         Ok(Err(_join_err)) => {
@@ -441,10 +547,11 @@ async fn handle_rpc(
 /// like ethers/MetaMask default to `ws://host:8545`. A plain
 /// `GET /` without the upgrade header fails extraction with 426.
 async fn ws_handler(
-    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<RpcState>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_ws_socket(socket, rpc))
+    ws.on_upgrade(move |socket| handle_ws_socket(socket, state, addr.ip()))
 }
 
 /// Drive one WebSocket connection: inbound text frames are
@@ -458,8 +565,8 @@ async fn ws_handler(
 /// outlives the reader (`rx` closes when every sender drops; the
 /// last sender lives in the subscription table and is reaped by
 /// `drop_connection` below).
-async fn handle_ws_socket(mut socket: WebSocket, rpc: Arc<RpcServer>) {
-    let conn_id = rpc.next_connection_id();
+async fn handle_ws_socket(mut socket: WebSocket, state: RpcState, ip: IpAddr) {
+    let conn_id = state.rpc.next_connection_id();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let conn = WsConn::new(conn_id, tx.clone());
     loop {
@@ -480,7 +587,36 @@ async fn handle_ws_socket(mut socket: WebSocket, rpc: Arc<RpcServer>) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
-                    let response = rpc.handle_ws_raw(&text, &conn);
+                    // Transport-independent budget: a WS frame
+                    // costs the same per-IP quota as an HTTP POST,
+                    // so switching transports buys a client nothing.
+                    if !state.rate_limiter.allow(ip) {
+                        if conn.sink.send(
+                            r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"rate limit exceeded"},"id":null}"#.to_string()
+                        ).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    // Same bounded-work rule as HTTP: synchronous
+                    // dispatch never runs on the async task, and
+                    // the semaphore caps total in-flight work.
+                    let Ok(permit) = state.work_permits.clone().try_acquire_owned() else {
+                        if conn.sink.send(
+                            r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"server busy — too many in-flight requests"},"id":null}"#.to_string()
+                        ).is_err() {
+                            break;
+                        }
+                        continue;
+                    };
+                    let rpc2 = Arc::clone(&state.rpc);
+                    let conn2 = conn.clone();
+                    // A panicked dispatch is a dead connection:
+                    // subscriptions may be half-bound.
+                    let Ok(response) = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        rpc2.handle_ws_raw(&text, &conn2)
+                    }).await else { break };
                     if conn.sink.send(response).is_err() {
                         break;
                     }
@@ -504,7 +640,7 @@ async fn handle_ws_socket(mut socket: WebSocket, rpc: Arc<RpcServer>) {
     }
     // Reap this connection's subscriptions before `conn`/`tx` drop
     // so a publish racing the shutdown can't target a dead sink.
-    rpc.drop_connection(conn_id);
+    state.rpc.drop_connection(conn_id);
 }
 
 /// State snapshot endpoint (`GET /snapshot`).
@@ -515,10 +651,25 @@ async fn handle_ws_socket(mut socket: WebSocket, rpc: Arc<RpcServer>) {
 ///
 /// Returns 404 if no snapshot provider is attached (stateless config).
 async fn snapshot_handler(
-    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<RpcState>,
 ) -> Response<String> {
-    match rpc.snapshot_provider() {
-        Some(provider) => match provider.export_snapshot() {
+    // A full export serializes the entire state — it costs quota
+    // AND a blocking-pool slot like any other expensive request.
+    if !state.rate_limiter.allow(addr.ip()) {
+        return rate_limited_response();
+    }
+    let Ok(permit) = state.work_permits.clone().try_acquire_owned() else {
+        return busy_response();
+    };
+    match state.rpc.snapshot_provider().cloned() {
+        Some(provider) => match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            provider.export_snapshot()
+        })
+        .await
+        .unwrap_or_else(|_| Err("snapshot export failed".to_string()))
+        {
             Ok(bytes) => {
                 let hex = format!("0x{}", hex_encode(&bytes));
                 Response::builder()
@@ -594,15 +745,31 @@ fn hex_response(result: Result<Vec<u8>, String>, err_status: StatusCode) -> Resp
 ///
 /// 404 when no snapshot provider is attached.
 async fn snapshot_manifest_handler(
-    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<RpcState>,
 ) -> Response<String> {
-    if rpc.snapshot_provider().is_none() {
+    if !state.rate_limiter.allow(addr.ip()) {
+        return rate_limited_response();
+    }
+    if state.rpc.snapshot_provider().is_none() {
         return hex_response(
             Err("snapshot provider not configured".to_string()),
             StatusCode::NOT_FOUND,
         );
     }
-    hex_response(rpc.snapshot_manifest(), StatusCode::INTERNAL_SERVER_ERROR)
+    // The manifest re-exports the snapshot — same bounded
+    // blocking-pool rule as every expensive dispatch.
+    let Ok(permit) = state.work_permits.clone().try_acquire_owned() else {
+        return busy_response();
+    };
+    let rpc2 = Arc::clone(&state.rpc);
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        rpc2.snapshot_manifest()
+    })
+    .await
+    .unwrap_or_else(|_| Err("manifest export failed".to_string()));
+    hex_response(result, StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Sync chunk endpoint (`GET /snapshot/chunk/{index}`).
@@ -613,16 +780,33 @@ async fn snapshot_manifest_handler(
 /// should re-fetch the manifest (the cached snapshot may have been
 /// replaced by a newer export).
 async fn snapshot_chunk_handler(
-    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<RpcState>,
     Path(index): Path<usize>,
 ) -> Response<String> {
-    if rpc.snapshot_provider().is_none() {
+    if !state.rate_limiter.allow(addr.ip()) {
+        return rate_limited_response();
+    }
+    if state.rpc.snapshot_provider().is_none() {
         return hex_response(
             Err("snapshot provider not configured".to_string()),
             StatusCode::NOT_FOUND,
         );
     }
-    hex_response(rpc.snapshot_chunk(index), StatusCode::NOT_FOUND)
+    // Chunk reads hit the cached export — cheap-ish but still
+    // behind the same quotas so a chunk-flood loop can't bypass
+    // the budget through a cheaper endpoint.
+    let Ok(permit) = state.work_permits.clone().try_acquire_owned() else {
+        return busy_response();
+    };
+    let rpc2 = Arc::clone(&state.rpc);
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        rpc2.snapshot_chunk(index)
+    })
+    .await
+    .unwrap_or_else(|_| Err("chunk read failed".to_string()));
+    hex_response(result, StatusCode::NOT_FOUND)
 }
 
 /// Validator set endpoint (`GET /validator-set`).
@@ -635,9 +819,13 @@ async fn snapshot_chunk_handler(
 ///
 /// Returns 404 if no validator-set provider is attached.
 async fn validator_set_handler(
-    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<RpcState>,
 ) -> Response<String> {
-    match rpc.validator_set_provider() {
+    if !state.rate_limiter.allow(addr.ip()) {
+        return rate_limited_response();
+    }
+    match state.rpc.validator_set_provider() {
         Some(provider) => match provider.validator_set() {
             Ok(entries) => {
                 let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
@@ -699,9 +887,13 @@ async fn health_check() -> impl IntoResponse {
 /// The `Content-Type` is `text/plain; version=0.0.4` (the standard
 /// Prometheus exposition format).
 async fn metrics_handler(
-    State((rpc, _rate_limiter)): State<(Arc<RpcServer>, Arc<RateLimiter>)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<RpcState>,
 ) -> Response<String> {
-    let body = rpc.metrics_text();
+    if !state.rate_limiter.allow(addr.ip()) {
+        return rate_limited_response();
+    }
+    let body = state.rpc.metrics_text();
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
@@ -753,8 +945,13 @@ mod tests {
         rpc.increment_tx_count();
         rpc.increment_tx_count();
         rpc.set_mempool_size(7);
-        let rate_limiter = Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC));
-        let response = metrics_handler(State((rpc, rate_limiter))).await;
+        let state = RpcState {
+            rpc,
+            rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
+            work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
+        };
+        let addr: SocketAddr = "127.0.0.1:8545".parse().unwrap();
+        let response = metrics_handler(ConnectInfo(addr), State(state)).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.body();
         assert!(body.contains("oxide_block_height 42"), "body: {body}");
@@ -771,6 +968,75 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert!(parsed["error"].is_object(), "should return an error");
         assert!(parsed["result"].is_null(), "result should be null on error");
+    }
+
+    /// Build test state with explicit limits.
+    fn test_state(max_per_sec: u32, permits: usize) -> RpcState {
+        RpcState {
+            rpc: Arc::new(RpcServer::new(1, 1_000_000_000)),
+            rate_limiter: Arc::new(RateLimiter::new(max_per_sec)),
+            work_permits: Arc::new(Semaphore::new(permits)),
+        }
+    }
+
+    /// Each source IP gets its own rate-limit bucket: one client
+    /// exhausting its quota must not consume anyone else's — the
+    /// old loopback fallback shared a single bucket across all
+    /// clients, so one flooder starved the entire RPC.
+    #[tokio::test]
+    async fn rate_limit_applies_per_real_ip() {
+        let state = test_state(2, 8);
+        let a: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+        let body = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#.to_string();
+
+        // IP A exhausts its 2-request window.
+        assert_eq!(
+            handle_rpc(ConnectInfo(a), State(state.clone()), body.clone()).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            handle_rpc(ConnectInfo(a), State(state.clone()), body.clone()).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            handle_rpc(ConnectInfo(a), State(state.clone()), body.clone()).await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "IP A must hit its own bucket's limit"
+        );
+
+        // IP B is unaffected — per-source accounting, not shared.
+        assert_eq!(
+            handle_rpc(ConnectInfo(b), State(state), body).await.status(),
+            StatusCode::OK,
+            "a different IP must get an independent bucket"
+        );
+    }
+
+    /// An exhausted blocking-work budget refuses new dispatches
+    /// fast instead of queueing unboundedly — zero permits means
+    /// every request is rejected immediately.
+    #[tokio::test]
+    async fn exhausted_work_budget_refuses_fast() {
+        let state = test_state(1_000_000, 0);
+        let a: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+        let body = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#.to_string();
+        let response = handle_rpc(ConnectInfo(a), State(state), body).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A fresh IP always wins its first request even when the
+    /// limiter map is under pressure — and the per-IP window still
+    /// governs it afterwards.
+    #[tokio::test]
+    async fn rate_limiter_independent_windows() {
+        let limiter = RateLimiter::new(1);
+        let ip1: IpAddr = "1.2.3.4".parse().unwrap();
+        let ip2: IpAddr = "5.6.7.8".parse().unwrap();
+        assert!(limiter.allow(ip1));
+        assert!(!limiter.allow(ip1), "second in-window request denied");
+        assert!(limiter.allow(ip2), "a new IP gets its own window");
+        assert!(!limiter.allow(ip2));
     }
 
     /// Test that a malformed JSON returns a parse error.

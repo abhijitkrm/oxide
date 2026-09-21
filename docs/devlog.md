@@ -16577,3 +16577,36 @@ nothing is evicted, then that executed heights evict normally.
 module, fills the queue, and proves the next `finalize_block`
 blocks until the worker drains. 87 executor unit + 5 signed-tx
 integration tests green; fmt + clippy clean.
+
+## RPC protections are transport-independent and bounded (audit 6.1)
+
+Four gaps, one shape: HTTP rate limiting bucketed every client
+under hardcoded 127.0.0.1 (one flooder consumed everyone's quota),
+WebSocket frames bypassed the limiter entirely and ran synchronous
+dispatch on the async task (pinning a runtime worker per expensive
+request), timed-out HTTP work was unbounded (spawn_blocking can't
+be cancelled), and — discovered while wiring real IPs — the
+per-IP limiter map itself became an unbounded allocation target
+for source-IP rotation.
+
+Fixes: `into_make_service_with_connect_info` + a `tap_io` wrapper
+feed the real peer `SocketAddr` to every handler (HTTP, WS
+upgrade, snapshots, metrics, validator-set). WS frames run the
+same `rate_limiter.allow(ip)` as POSTs and dispatch through
+`spawn_blocking` — ordered per connection by awaiting each task.
+A single `Semaphore` (`RPC_BLOCKING_PERMITS`, 64) bounds
+concurrent expensive dispatches across all transports; exhaustion
+refuses fast (HTTP 503 / WS -32005) instead of queueing.
+Snapshot export/manifest/chunk endpoints ride the same
+blocking-pool + permit path — a full-state export no longer pins
+an async worker. The limiter map is capped (`MAX_RATE_BUCKETS`,
+sweep expired windows then fail closed). `with_rate_limit` is the
+new operator knob; the WS flood test uses it so the window trip
+is deterministic under any host load.
+
+Tests: `rate_limit_applies_per_real_ip` (per-source buckets),
+`exhausted_work_budget_refuses_fast` (503 under zero permits),
+`rate_limiter_independent_windows`, and e2e
+`ws_requests_share_the_per_ip_rate_budget` (real tungstenite
+client floods a 3 req/s server — tail gets -32005). 90 rpc lib +
+6 ws + 2 state-sync tests green; fmt + clippy clean.

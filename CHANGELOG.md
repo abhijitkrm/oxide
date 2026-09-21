@@ -2017,6 +2017,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     execution lane simply slows consensus down, and nothing that
     still needs executing is ever thrown away.
 
+- **RPC rate limiting now applies to every client and transport**
+  (`crates/rpc`)
+  - HTTP requests are rate-limited by the real connection IP
+    instead of one shared loopback bucket; WebSocket frames share
+    the same per-IP budget and now dispatch on the blocking pool
+    instead of pinning async workers.
+  - A single semaphore bounds concurrent expensive work across
+    HTTP, WS, and snapshot endpoints — a flood of heavy requests
+    gets refused fast instead of queuing without limit, and
+    snapshot exports ride the same budget.
+  - New `HttpServer::with_rate_limit` builder for tuning the
+    per-IP requests/second budget on public endpoints.
+  - **In plain words:** previously one abusive client could burn
+    through the node's request budget for everyone, and switching
+    to a WebSocket connection dodged the limit entirely. Now every
+    client gets its own allowance no matter how it connects, and
+    the node sheds overload instead of drowning.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).
