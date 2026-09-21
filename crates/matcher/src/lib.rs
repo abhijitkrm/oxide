@@ -1276,7 +1276,9 @@ enum ControlCommand {
 /// - For batch requests, the matcher processes all orders in a ring
 ///   before moving to the next — natural batching.
 pub struct RingMatcher {
-    /// The order rings (one per connection). Producer = connection,
+    /// The order rings (one per in-flight exchange — an exclusive
+    /// [`RingLease`] serializes who the connection-side producer is).
+    /// Producer = lease-holding request handler,
     /// consumer = matcher thread. Each item is a WHOLE BATCH of
     /// orders (`Vec<VerifiedOrder>`) — one mpsc send per batch, not
     /// per order. This keeps the per-order overhead near zero.
@@ -1288,10 +1290,22 @@ pub struct RingMatcher {
     /// can never be placed on the ring because `VerifiedOrder` is
     /// constructible only by passing `verify_order`.
     order_rings: Vec<ring::SpscSender<Vec<protocol::VerifiedOrder>>>,
-    /// The response rings (one per connection). Producer = matcher,
-    /// consumer = connection. Each item is a WHOLE BATCH of
-    /// responses.
+    /// The response rings (one per in-flight exchange). Producer =
+    /// matcher, consumer = the lease-holding request handler. Each
+    /// item is a WHOLE BATCH of responses.
     response_rings: Vec<ring::SpscReceiver<Vec<OrderResponse>>>,
+    /// One exclusive-occupancy flag per ring pair. A request handler
+    /// must hold the lease for the WHOLE submit→response exchange:
+    /// without it, two connections landing on the same ring index
+    /// interleave order batches and — worse — race on the shared
+    /// response ring, so a response batch addressed to request A can
+    /// be consumed by request B. `true` = a lease holder owns the
+    /// ring; acquisition is a `false→true` CAS.
+    ring_leases: Vec<std::sync::atomic::AtomicBool>,
+    /// Wakes one lease waiter when a ring is released. Async (`Notify`)
+    /// because waiters run on tokio tasks — a condvar would block an
+    /// executor thread.
+    lease_notify: tokio::sync::Notify,
     /// Control channel sender (protocol side). The matcher thread
     /// polls the receiver between ring polls and services seal/stats
     /// commands without touching the order rings.
@@ -1301,8 +1315,9 @@ pub struct RingMatcher {
     /// matcher thread, so this can never diverge). Transport threads
     /// verify `VerifiedOrder` proofs with the same value.
     chain_id: u64,
-    /// The matcher thread handle (kept for shutdown).
-    _thread: std::thread::JoinHandle<()>,
+    /// The matcher thread handle — its `is_finished` flag is the
+    /// worker-liveness oracle for lease holders awaiting a response.
+    worker_thread: std::thread::JoinHandle<()>,
 }
 
 impl RingMatcher {
@@ -1312,7 +1327,10 @@ impl RingMatcher {
     ///
     /// # Arguments
     /// - `server`: the matching server (moved to the matcher thread).
-    /// - `num_rings`: number of ring pairs (one per connection).
+    /// - `num_rings`: number of ring pairs — the bound on
+    ///   CONCURRENT submit→response exchanges (each holds an
+    ///   exclusive [`RingLease`]); excess requesters wait for a
+    ///   free ring rather than share one.
     /// - `ring_capacity`: capacity of each ring (power of 2).
     ///
     /// # Panics
@@ -1428,9 +1446,76 @@ impl RingMatcher {
         Self {
             order_rings: order_senders,
             response_rings: response_receivers,
+            ring_leases: (0..num_rings)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            lease_notify: tokio::sync::Notify::new(),
             control_tx,
             chain_id,
-            _thread: thread,
+            worker_thread: thread,
+        }
+    }
+
+    /// Try to take the exclusive lease on one ring pair without
+    /// waiting. `hint` biases the starting index so concurrent
+    /// acquirers spread across rings instead of pile-driving ring 0.
+    ///
+    /// Returns `None` when every ring is leased — the caller decides
+    /// whether to wait ([`acquire_ring`]) or shed load.
+    #[must_use]
+    pub fn try_acquire_ring(&self, hint: usize) -> Option<RingLease<'_>> {
+        let n = self.order_rings.len();
+        let start = hint % n;
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            if self.ring_leases[idx]
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Acquire,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Some(RingLease { matcher: self, ring_idx: idx });
+            }
+        }
+        None
+    }
+
+    /// Take the exclusive lease on one ring pair, waiting until a
+    /// ring frees. The lease MUST cover the whole submit→response
+    /// exchange: it is the only thing that keeps two request
+    /// handlers from sharing one ring and consuming each other's
+    /// responses.
+    ///
+    /// `hint` is the caller's round-robin counter value — used as the
+    /// scan start so load spreads across rings.
+    ///
+    /// Fairness: waiters re-scan all rings on wake in hint order, so
+    /// a busy matcher can starve an unlucky waiter under sustained
+    /// saturation. That is the intended bound — `num_rings`
+    /// concurrent exchanges is the system's throughput limit, and
+    /// excess requests wait rather than corrupt each other.
+    pub async fn acquire_ring(&self, hint: usize) -> RingLease<'_> {
+        let mut hint = hint;
+        loop {
+            if let Some(lease) = self.try_acquire_ring(hint) {
+                return lease;
+            }
+            // Register interest BEFORE re-checking: a release landing
+            // between the failed scan and `await` would otherwise be
+            // missed and the waiter could sleep with a free ring.
+            let notified = self.lease_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(lease) = self.try_acquire_ring(hint) {
+                return lease;
+            }
+            notified.await;
+            // Drift the scan start so a herd of waiters doesn't all
+            // pile onto the same ring after each release.
+            hint = hint.wrapping_add(1);
         }
     }
 
@@ -1491,6 +1576,10 @@ impl RingMatcher {
     /// (`Vec<VerifiedOrder>`) to this ring — one push per batch, not
     /// per order. Only `VerifiedOrder`s can enter the ring, so the
     /// matcher thread never sees an unauthenticated order.
+    ///
+    /// CALLERS MUST HOLD the [`RingLease`] for `ring_idx` — pushing
+    /// without it interleaves batches from concurrent requesters and
+    /// breaks the response pairing the lease exists to guarantee.
     pub fn order_sender(&self, ring_idx: usize) -> &ring::SpscSender<Vec<protocol::VerifiedOrder>> {
         &self.order_rings[ring_idx]
     }
@@ -1498,13 +1587,70 @@ impl RingMatcher {
     /// Get a connection's response receiver (consumer side of the
     /// response ring). The caller pops WHOLE BATCHES
     /// (`Vec<OrderResponse>`) from this ring.
+    ///
+    /// CALLERS MUST HOLD the [`RingLease`] for `ring_idx` — the
+    /// receiver is not `Clone`, but shared `&` access still lets two
+    /// requesters race `pop`, and whichever loses gets the other's
+    /// response batch (wrong order IDs to the wrong client).
     pub fn response_receiver(&self, ring_idx: usize) -> &ring::SpscReceiver<Vec<OrderResponse>> {
         &self.response_rings[ring_idx]
     }
 
-    /// Number of ring pairs (connections supported).
+    /// Number of ring pairs — the bound on concurrent in-flight
+    /// exchanges (one exclusive lease each).
     pub fn num_rings(&self) -> usize {
         self.order_rings.len()
+    }
+
+    /// Whether the matcher worker thread is still running.
+    ///
+    /// A lease holder awaiting a response checks this to escape the
+    /// wait: if the thread died mid-batch, its response senders are
+    /// dropped and no response can ever arrive — the caller must
+    /// bail rather than spin (and hold the ring) forever. crossbeam
+    /// 0.5 has no receiver-side disconnect probe, so the
+    /// `JoinHandle` is the liveness oracle.
+    #[must_use]
+    pub fn worker_is_alive(&self) -> bool {
+        !self.worker_thread.is_finished()
+    }
+}
+
+/// Exclusive ownership of one ring pair for a single
+/// submit→response exchange.
+///
+/// Obtained from [`RingMatcher::acquire_ring`] or
+/// [`RingMatcher::try_acquire_ring`]. While the guard lives, no other
+/// requester can lease the same ring — the matcher thread's response
+/// batch can only be popped by this holder. Release on `Drop`
+/// (frees the ring and wakes one waiter), so the lease covers
+/// exactly the lexical scope of the exchange — including early
+/// returns and disconnect paths.
+///
+/// The guard borrows the `RingMatcher`; it cannot outlive the
+/// matcher or move to another thread's exchange.
+pub struct RingLease<'a> {
+    /// The matcher that owns the leased ring (for release + notify).
+    matcher: &'a RingMatcher,
+    /// The leased ring pair index — pass to
+    /// [`RingMatcher::order_sender`]/[`RingMatcher::response_receiver`].
+    ring_idx: usize,
+}
+
+impl RingLease<'_> {
+    /// The leased ring index.
+    #[must_use]
+    pub fn ring_idx(&self) -> usize {
+        self.ring_idx
+    }
+}
+
+impl Drop for RingLease<'_> {
+    fn drop(&mut self) {
+        // Release BEFORE notify so a woken waiter can never observe
+        // the flag still held. Ordering pairs with acquire's CAS.
+        self.matcher.ring_leases[self.ring_idx].store(false, std::sync::atomic::Ordering::Release);
+        self.matcher.lease_notify.notify_one();
     }
 }
 
@@ -2792,8 +2938,11 @@ mod tests {
             .into_iter()
             .map(|req| crate::protocol::VerifiedOrder::new(req).expect("signed orders must verify"))
             .collect();
-        let sender = ring.order_sender(0);
-        let receiver = ring.response_receiver(0);
+        // Hold the ring lease for the exchange — the same contract
+        // the production submit path follows.
+        let lease = ring.try_acquire_ring(0).expect("a free ring must lease");
+        let sender = ring.order_sender(lease.ring_idx());
+        let receiver = ring.response_receiver(lease.ring_idx());
         let mut batch = verified;
         while let Err(crate::ring::PushError::Full(returned)) = sender.push(batch) {
             batch = returned;
@@ -2824,6 +2973,48 @@ mod tests {
         let stats = ring.stats();
         assert_eq!(stats.orders_processed, 2);
         assert_eq!(stats.fills_produced, 1);
+    }
+
+    /// The ring lease grants exclusive use of a ring pair: a second
+    /// acquisition on the same ring must fail while the lease lives,
+    /// and succeed after the holder drops it. This is what stops two
+    /// requesters sharing a response ring.
+    #[test]
+    fn ring_lease_grants_exclusive_ownership() {
+        let server = MatchingServer::new(cfg(), 100);
+        let ring = RingMatcher::new(server, 2, 64);
+
+        let lease = ring.try_acquire_ring(0).expect("a free ring leases");
+        let held_idx = lease.ring_idx();
+
+        // With 2 rings the other index is still free — the lease
+        // excludes per-ring, not globally.
+        let other = ring.try_acquire_ring(held_idx).expect("the other ring is free");
+        assert_ne!(other.ring_idx(), held_idx);
+        drop(other);
+
+        // Every ring now free except the held one: scanning from the
+        // held index must skip it and find the other.
+        let other2 = ring.try_acquire_ring(held_idx).expect("scan finds the free ring");
+        assert_ne!(other2.ring_idx(), held_idx);
+        drop(other2);
+
+        // Drop the held lease — its ring becomes leasable again.
+        drop(lease);
+        let reacquired = ring.try_acquire_ring(held_idx);
+        assert_eq!(reacquired.map(|l| l.ring_idx()), Some(held_idx));
+    }
+
+    /// With a single ring, a held lease leaves NO free ring —
+    /// `try_acquire_ring` must report exhaustion rather than share.
+    #[test]
+    fn ring_lease_exhaustion_waits() {
+        let server = MatchingServer::new(cfg(), 100);
+        let ring = RingMatcher::new(server, 1, 64);
+        let lease = ring.try_acquire_ring(0).expect("first lease");
+        assert!(ring.try_acquire_ring(0).is_none(), "held ring cannot re-lease");
+        drop(lease);
+        assert!(ring.try_acquire_ring(0).is_some(), "drop frees the ring");
     }
 
     // ── MultiMarketMatcher tests ────────────────────────────────

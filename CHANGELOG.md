@@ -2360,6 +2360,32 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     signed-envelope verify round-trip), and a `settle_tps` section
     asserting identical `Executed` outcomes with zero rejected legs
     on all four validators.
+- **Ring-mode order submission can no longer return another
+  connection's responses** (`crates/matcher`)
+  - The ring submission path picked a ring by round-robin counter,
+    so two concurrent requests could land on the same ring, clone
+    the same response receiver, and race `pop` — whichever task got
+    the batch consumed the other's responses (wrong order IDs, fill
+    counts, or rejections to the wrong client). The "SPSC" name
+    asserted a discipline nothing enforced.
+  - `RingMatcher` now hands out an exclusive `RingLease` per ring
+    pair (CAS + async `Notify` wake). A request holds the lease for
+    the whole submit→response exchange; with `num_rings` rings,
+    `num_rings` exchanges run concurrently and the rest wait rather
+    than share a ring and corrupt each other.
+  - `SpscSender`/`SpscReceiver` are no longer `Clone`, so a second
+    consumer cannot even be constructed; and the response wait now
+    fails fast to `EngineError` if the matcher worker thread dies
+    mid-exchange instead of spinning forever.
+  - **In plain words:** two customers phoning the same desk line
+    could each grab whichever answer came back first — so one
+    client's "order accepted" could land in another client's lap.
+    Now each caller gets a private line for the whole call; extra
+    callers wait for a free line instead of listening to someone
+    else's.
+  - Regression: lease exclusivity/exhaustion unit tests plus an
+    8-task × 1-ring concurrency test where each request's batch
+    size fingerprints its own response batch.
 
 ### Benchmark Results (M2 MacBook Pro, release profile)
 

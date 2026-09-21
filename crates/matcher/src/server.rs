@@ -32,13 +32,16 @@ use trading::MarketConfig;
 use types::TxBytes;
 
 /// Submit a batch of orders through the ring matcher's SPSC rings
-/// (no mutex). Assigns this connection a ring index round-robin,
-/// pushes the WHOLE batch as one item, and pops the batch response.
+/// (no mutex). Acquires an exclusive ring lease, pushes the WHOLE
+/// batch as one item, and pops the batch response — all under the
+/// same lease, so no other requester can interleave a batch or
+/// steal this exchange's responses.
 ///
 /// This is the lock-free submission path shared by all protocol
-/// servers. Each connection must use its OWN ring index for the
-/// duration of the request (the matcher thread replies to the same
-/// ring the request came in on).
+/// servers. The lease — not the round-robin counter — is what makes
+/// each exchange single-producer/single-consumer: more concurrent
+/// requests than `num_rings` wait for a free ring rather than share
+/// one and consume each other's responses.
 ///
 /// # Errors
 ///
@@ -81,10 +84,18 @@ async fn submit_batch_ring(
         }
     }
     if !verified.is_empty() {
-        let ring_idx =
-            ring_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % ring.num_rings();
-        let order_sender = ring.order_sender(ring_idx).clone();
-        let response_receiver = ring.response_receiver(ring_idx).clone();
+        // Lease a ring for the WHOLE exchange — without the lease,
+        // two handlers landing on the same ring index push
+        // interleaved batches and race `pop` on the shared response
+        // ring, so a response batch addressed to request A can be
+        // consumed by request B. The counter only seeds the scan
+        // start; exclusivity comes from the lease, not the index.
+        let lease = ring
+            .acquire_ring(ring_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            .await;
+        let ring_idx = lease.ring_idx();
+        let order_sender = ring.order_sender(ring_idx);
+        let response_receiver = ring.response_receiver(ring_idx);
         let mut pending = verified;
         let sent = loop {
             match order_sender.push(pending) {
@@ -103,14 +114,24 @@ async fn submit_batch_ring(
         if sent {
             let worker_responses = loop {
                 if let Some(r) = response_receiver.pop() {
-                    break r;
+                    break Some(r);
+                }
+                // The response ring's senders live on the matcher
+                // thread — if it died mid-batch no response can ever
+                // arrive, so bail instead of holding the lease (and
+                // spinning) forever.
+                if !ring.worker_is_alive() {
+                    break None;
                 }
                 tokio::task::yield_now().await;
             };
-            for (pos, resp) in positions.into_iter().zip(worker_responses) {
-                responses[pos] = Some(resp);
+            if let Some(worker_responses) = worker_responses {
+                for (pos, resp) in positions.into_iter().zip(worker_responses) {
+                    responses[pos] = Some(resp);
+                }
             }
         }
+        drop(lease); // release the ring before response mapping
     }
     // Every slot is Some: verified entries got worker responses,
     // unverified got BadSignature, dead-worker entries get
@@ -1676,9 +1697,10 @@ pub async fn run_server_ring(
 ) {
     // The ring matcher owns the server (and thus the one book).
     let ring = Arc::new(crate::RingMatcher::new(server, DEFAULT_RING_COUNT, DEFAULT_RING_CAPACITY));
-    // Shared ring-index counter: every connection across ALL
-    // protocols gets a unique ring pair, so responses never
-    // interleave between connections.
+    // Shared lease-scan hint: every request across ALL protocols
+    // starts its free-ring search at a different index, so load
+    // spreads across rings. Response isolation comes from the
+    // exclusive ring lease — the counter only biases the scan.
     let ring_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Batch settler seals from the same book via the control channel.
@@ -2714,5 +2736,61 @@ mod tests {
         )
         .expect("signature must verify");
         assert_eq!(recovered, operator, "signer must equal the declared sender");
+    }
+
+    /// Regression: concurrent requests that land on the SAME ring
+    /// index must never consume each other's responses. Eight tasks
+    /// submit through ONE ring (maximal contention); task `i` sends
+    /// `i + 1` orders so a stolen response is a length mismatch.
+    /// Before the ring lease, every task cloned the same receiver
+    /// and raced `pop` — any task could take another's batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ring_concurrent_exchanges_isolate_responses() {
+        let mut server = MatchingServer::new(cfg(), 100);
+        // Fund 8 distinct accounts, one per task.
+        let accounts: Vec<_> = (0u8..8).map(test_account).collect();
+        for (_, owner) in &accounts {
+            server.fund_account(owner, 1_000_000_000_000);
+        }
+        // ONE ring: every request contends on the same pair — the
+        // exact shape of the old round-robin collision.
+        let ring = std::sync::Arc::new(crate::RingMatcher::new(server, 1, 64));
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for (i, (secret, _)) in accounts.into_iter().enumerate() {
+            let ring = std::sync::Arc::clone(&ring);
+            let counter = std::sync::Arc::clone(&counter);
+            handles.push(tokio::spawn(async move {
+                // Task i sends i+1 sell orders at a task-distinct
+                // price — no bids exist, so every order rests and
+                // the response batch length identifies it.
+                let price = 1_500_000_000u64 + i as u64 * 1_000_000;
+                let reqs: Vec<OrderRequest> = (0..=i)
+                    .map(|n| {
+                        let mut req = signed_req(&secret, Side::Sell, (n + 1) as u64);
+                        req.price = Price(price);
+                        crate::protocol::sign_order(&mut req, &secret);
+                        req
+                    })
+                    .collect();
+                let expected = reqs.len();
+                let responses = submit_batch_ring(&ring, &counter, reqs).await;
+                (i, expected, responses)
+            }));
+        }
+        for handle in handles {
+            let (i, expected, responses) = handle.await.expect("task panicked");
+            assert_eq!(
+                responses.len(),
+                expected,
+                "task {i}: response batch must be ITS OWN — a stolen \
+                 batch has a different length"
+            );
+            assert!(
+                responses.iter().all(|r| !r.rejected),
+                "task {i}: funded sell orders must all be accepted"
+            );
+        }
     }
 }

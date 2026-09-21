@@ -110,7 +110,12 @@ pub enum PushError<T> {
 /// `push` is non-blocking — it returns `Err(Full)` when the ring is
 /// full (the consumer must catch up first). This provides backpressure
 /// without blocking the producer.
-#[derive(Clone)]
+///
+/// Deliberately NOT `Clone`: `push(&self)` means callers never need
+/// an owned copy, and forbidding clones keeps the single-producer
+/// guarantee enforceable — an MPMC channel with a `Clone` handle is
+/// only "SPSC" by convention. Shared use is serialized by the
+/// [`RingMatcher`](crate::RingMatcher) ring lease.
 pub struct SpscSender<T> {
     tx: Sender<T>,
     /// Maximum items in the ring.
@@ -128,7 +133,11 @@ pub struct SpscSender<T> {
 /// wrapper is needed (unlike `std::sync::mpsc::Receiver` which is
 /// only `Send`). This eliminates the uncontended mutex lock on every
 /// `pop` that the previous implementation had.
-#[derive(Clone)]
+///
+/// Deliberately NOT `Clone`: a cloned consumer can race the real
+/// one and steal responses addressed to another requester. Exclusive
+/// consumption is enforced by the [`RingMatcher`](crate::RingMatcher)
+/// ring lease — the only supported path to `pop` a response ring.
 pub struct SpscReceiver<T> {
     rx: Receiver<T>,
     /// Shared wakeup signal — the consumer calls `wait_for_work` on
@@ -253,6 +262,11 @@ impl<T> SpscReceiver<T> {
     pub fn is_empty(&self) -> bool {
         self.rx.is_empty()
     }
+
+    // Note: crossbeam 0.5 exposes no receiver-side disconnect probe
+    // (`try_recv` conflates it with `Empty` and would consume a
+    // value), so consumer liveness is checked on the worker's
+    // `JoinHandle` instead — see `RingMatcher::worker_is_alive`.
 
     /// Block until the producer signals work is available, or the
     /// timeout elapses. Used by the matcher consumer thread to avoid

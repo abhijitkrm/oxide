@@ -17195,3 +17195,45 @@ signed-envelope layout + `verify_tx_sender` round-trip), and a new
 zero rejected legs on all four validators plus
 `executed_nonce_of(operator) == batch count`. Full workspace suite,
 clippy, fmt green; settle_tps devnet run verified end-to-end.
+
+## Session: settlement ring lease — responses can no longer be stolen
+
+**Root cause.** `submit_batch_ring` picked a ring by
+`ring_counter.fetch_add(1) % num_rings` — a round-robin *hint*, not an
+assignment. Two concurrent requests landing on the same index each
+cloned `response_receiver(i)` (`SpscReceiver` was `Clone`, wrapping a
+crossbeam MPMC channel) and raced `pop`: whichever task got the batch
+consumed the other's responses, returning wrong order IDs / fills to
+the wrong client. The name "SPSC" asserted a discipline nothing
+enforced.
+
+**Fix — exclusive ring lease.** `RingMatcher` gains
+`ring_leases: Vec<AtomicBool>` + `lease_notify: tokio::sync::Notify`.
+`acquire_ring` scans for a `false→true` CAS starting at the counter
+hint; saturated rings wait on `Notify` (with the enable-then-recheck
+pattern so a release between scan and await can't be missed).
+`RingLease` is a drop guard — release + `notify_one` — covering the
+whole push→pop exchange including error paths. Concurrency is now
+honestly bounded at `num_rings` in-flight exchanges; excess waiters
+queue instead of corrupting each other.
+
+**Type-level backing.** `Clone` removed from `SpscSender`/
+`SpscReceiver` — `push`/`pop` take `&self`, so the clones were never
+needed; without them a second consumer cannot even be constructed.
+Accessors still vend `&` (the lease is the semantic guarantee —
+crossbeam can't express exclusive consumption through `&`).
+
+**Liveness fix.** The response-wait loop now bails to `EngineError`
+when `worker_is_alive()` is false — `JoinHandle::is_finished` is the
+oracle (crossbeam 0.5 has no receiver-side disconnect probe). Before,
+a dead worker meant an infinite yield-spin holding the ring.
+
+**Perf.** Lease cost is one CAS + one store per batch (~10-20ns)
+against an Ed25519 verify + ring round-trip — noise. `Notify` only
+contends past 256 concurrent exchanges (`DEFAULT_RING_COUNT`).
+
+Tests: `ring_lease_grants_exclusive_ownership` (per-ring exclusion +
+rescan), `ring_lease_exhaustion_waits` (1 ring → `None` until drop),
+and `ring_concurrent_exchanges_isolate_responses` (8 tasks × distinct
+batch sizes through ONE ring — a stolen batch would be a length
+mismatch). Matcher suite 124 lib + e2e green; clippy, fmt clean.
