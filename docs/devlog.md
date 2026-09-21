@@ -17113,3 +17113,85 @@ refund, deterministic pair ordering, registry in the state
 root, snapshot round-trip. `settle_tps` devnet test drives the
 full pipeline: 31 registration txs then batch fills through
 oxideBFT with seller conservation verified on every validator.
+
+---
+
+## 2026-09-26 — Settlement confirmation: mempool acceptance is not finality
+
+**Problem (audit).** `BatchSettler` advanced its nonce and forgot a
+batch the moment `ingest_tx` accepted it into the mempool. That is
+admission, not execution: the tx could still be gate-skipped when
+its block ran (stale nonce, bad signature, gas limit, fee floor) or
+rejected by the module — while the settler had already drained the
+fills and moved on. Worse, `oxide-matcher` never configured the
+exchange's `settlement_operator`, so every batch would have been
+rejected at execution under a properly gated deployment — silently
+counted as settled. The pending-envelope and nonce state were also
+memory-only, so a restart forgot in-flight batches entirely. And
+the envelopes were unsigned, incompatible with
+`UnsignedTxPolicy::Reject`.
+
+**Design.** The settlement lane now has three stages — submitted,
+confirmed, reconciled — instead of one "submitted" guess:
+
+1. **Finalized outcome store (executor).** `execute_block` records
+   a `TxOutcome` per proposed tx, keyed by `Domain::Transaction`
+   hash, in a bounded 8,192-entry window: `Executed { events,
+   error }` when the module dispatched (error = revert: fee charged,
+   nonce consumed) and `Skipped { reason }` for each pre-execution
+   gate (`Malformed`, `UnknownModule`, `StaleNonce`, `BadSignature`,
+   `GasLimit`, `FeeFloor`, `FeeCharge`). `group_block_txs` now
+   reports why each dropped tx died instead of a bare `continue`.
+   `Skipped` is provisional — a gas-skipped tx that lands in a
+   later block overwrites it; `Executed` is final. Public reads:
+   `tx_outcome(hash)` and `executed_nonce_of(sender)`.
+
+2. **Confirmation lifecycle (matcher).** `BatchSettler` takes a
+   `TxConfirmer` oracle alongside `TxSubmitter`. Each tick: check
+   the pending batch's outcome FIRST (so a batch that executed
+   during a restart is reconciled, never replayed), then resubmit
+   only if the last submission failed, then wait — resubmitting
+   verbatim after ~10 s in case the pooled copy was evicted. The
+   nonce advances only on a confirmed `Executed` (or a terminal
+   skip, which never consumed it): it is resynced from
+   `executed_nonce_of` on every resolution, so drift and
+   dead-lettered batches cannot gap the sequence. Terminal skips
+   dead-letter the batch — loudly — and the next sealed batch
+   reuses the same nonce value. `settle_now` returns a
+   `SettleReport` (submitted / confirmed / rejected_legs /
+   failed_pairs / batch_rejected / dead_lettered), and `run()`
+   prints CRITICAL alerts on any non-clean outcome.
+   `settlement_failed`/`fill_rejected` events inside an applied
+   batch are counted into the report — partial failures are
+   reconciled, not silently buried in the block's event log.
+
+3. **Durability + signing.** `SettlementOutbox` checkpoints
+   `{next_nonce, pending}` with the same write-tmp-fsync-rename
+   discipline as `NonceStore`; `with_outbox` restores an in-flight
+   batch across restarts (corrupt file = fail closed).
+   `with_signing` produces the executor's v1 envelope —
+   `module_id|0x80` + a 65-byte recoverable secp256k1 signature over
+   the EIP-712 digest — and derives the sender from the key via
+   `signable_pubkey_address`, so declared sender, recovered signer,
+   and configured operator can never diverge.
+
+4. **Binary wiring.** `oxide-matcher` gains `--settlement-key`
+   (64-hex) and `--settlement-outbox`, sets
+   `NodeConfig.settlement_operator` to the key-derived (or devnet
+   zero) address, and hands the one executor handle to the settler
+   as both submitter and confirmer.
+
+**Dead end.** None — but the e2e test initially asserted one
+`batch_fill` event per leg and failed with 240 ≠ 512: the event is
+emitted per aggregated (buyer, seller) PAIR, and the workload's
+240 distinct pairs over 512 fills was the correct expectation.
+
+Tests: outcome store (executed/skipped/module-rejection,
+overwrite semantics, eviction bound), settler lifecycle (submit→
+confirm, dead-letter nonce reuse, batch-rejected nonce advance,
+partial-failure reconciliation, retryable skip, outbox restore,
+signed-envelope layout + `verify_tx_sender` round-trip), and a new
+`settle_tps` section asserting identical `Executed` outcomes with
+zero rejected legs on all four validators plus
+`executed_nonce_of(operator) == batch count`. Full workspace suite,
+clippy, fmt green; settle_tps devnet run verified end-to-end.

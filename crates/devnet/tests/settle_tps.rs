@@ -301,6 +301,66 @@ fn run_settle_tps(
     }
     eprintln!("settle TPS test: seller conservation verified on all {n_validators} validators");
 
+    // 6. Finalized-outcome agreement: every validator must record
+    //    the same Executed outcome for the same batch tx — the
+    //    record a settlement client confirms against. `batch_fill`
+    //    is emitted once per aggregated (buyer, seller) PAIR, not
+    //    per leg — the expected count is the batch's distinct pairs.
+    //    Zero `fill_rejected`/`settlement_failed` events means every
+    //    leg authorized and every credit landed.
+    let h =
+        |tx: &types::TxBytes| crypto::Hasher::hash_one(crypto::Domain::Transaction, tx.as_bytes());
+    let expected_pairs = |start: usize| -> usize {
+        let mut pairs = std::collections::HashSet::new();
+        for j in 0..fills_per_tx {
+            let i = start + j;
+            #[allow(clippy::cast_possible_truncation)]
+            pairs.insert((
+                (i % usize::from(NUM_BUYERS)) as u8,
+                NUM_BUYERS + (i % usize::from(NUM_SELLERS)) as u8,
+            ));
+        }
+        pairs.len()
+    };
+    for (tx, start) in [
+        (&all_txs[registration_txs], 0usize), // first batch
+        (&all_txs[total_txs - 1], (total_batch_txs - 1) * fills_per_tx), // last batch
+    ] {
+        let hash = h(tx);
+        for i in 0..n_validators {
+            match devnet.app(i).tx_outcome(&hash) {
+                Some(executor::TxOutcome::Executed { events, error }) => {
+                    assert!(error.is_none(), "validator {i}: batch rejected: {error:?}");
+                    let fills = events.iter().filter(|e| e.kind == "batch_fill").count();
+                    assert_eq!(
+                        fills,
+                        expected_pairs(start),
+                        "validator {i}: pair-settlement events != distinct batch pairs"
+                    );
+                    assert_eq!(
+                        events.iter().filter(|e| e.kind == "fill_rejected").count(),
+                        0,
+                        "validator {i}: clean batch must reject no legs"
+                    );
+                    assert_eq!(
+                        events.iter().filter(|e| e.kind == "settlement_failed").count(),
+                        0,
+                        "validator {i}: clean batch must void no pairs"
+                    );
+                }
+                other => panic!("validator {i}: batch tx must be Executed, got {other:?}"),
+            }
+        }
+    }
+    // The operator's executed nonce equals the number of batch txs —
+    // the value a settler resyncs to after restart.
+    let operator_nonce = devnet.app(0).executed_nonce_of(&operator);
+    assert_eq!(
+        operator_nonce, total_batch_txs as u64,
+        "operator nonce {operator_nonce} != {total_batch_txs} executed batches"
+    );
+    eprintln!("settle TPS test: finalized outcomes agree on all {n_validators} validators");
+
     // ── Report ─────────────────────────────────────────────────
 
     let secs = elapsed.as_secs_f64();

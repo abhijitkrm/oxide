@@ -31,13 +31,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use matcher::MatchingServer;
-use matcher::server::{ServerConfig, TxSubmitter, run_server_multi, run_server_ring};
+use matcher::server::{ServerConfig, TxConfirmer, TxSubmitter, run_server_multi, run_server_ring};
 use node::{ConsensusConfig, Node, NodeConfig};
 use ports::AppInterface;
 use types::{MempoolAck, TxBytes};
 
 /// Adapter that submits settlement transactions into the executor's
-/// mempool via the `matcher::server::TxSubmitter` trait.
+/// mempool via the `matcher::server::TxSubmitter` trait — and reads
+/// their FINALIZED outcomes back via `TxConfirmer`. Mempool
+/// acceptance is only admission; the settler treats a batch as
+/// settled only when `tx_outcome` proves the block executed it.
 struct ExecutorTxSubmitter {
     executor: Arc<executor::Executor>,
 }
@@ -48,6 +51,16 @@ impl TxSubmitter for ExecutorTxSubmitter {
             MempoolAck::Accepted => Ok(()),
             MempoolAck::Rejected { reason } => Err(reason),
         }
+    }
+}
+
+impl TxConfirmer for ExecutorTxSubmitter {
+    fn tx_outcome(&self, tx_hash: &primitives::Hash) -> Option<executor::TxOutcome> {
+        self.executor.tx_outcome(tx_hash)
+    }
+
+    fn executed_nonce(&self, sender: &primitives::Address) -> u64 {
+        self.executor.executed_nonce_of(sender)
     }
 }
 
@@ -76,6 +89,8 @@ struct CliConfig {
     accounts_cap: usize,
     chain_id: u64,
     nonce_state: Option<std::path::PathBuf>,
+    settlement_key: Option<[u8; 32]>,
+    settlement_outbox: Option<std::path::PathBuf>,
 }
 
 /// Parse CLI flags into a `CliConfig`.
@@ -97,7 +112,33 @@ fn parse_cli() -> CliConfig {
         // Durable replay-gate checkpoint — without it, every restart
         // lets any captured signed request replay once.
         nonce_state: parse_flag_opt::<String>("--nonce-state").map(std::path::PathBuf::from),
+        // The settlement operator's secp256k1 secret (64 hex chars).
+        // When set, batch envelopes are signed and the sender is the
+        // key-derived address — which is also wired as the exchange's
+        // settlement operator. Without it envelopes are unsigned
+        // (devnet only — `UnsignedTxPolicy::Allow`).
+        settlement_key: parse_flag_opt::<String>("--settlement-key").map(|hex| parse_key_hex(&hex)),
+        // Durable settlement-lane checkpoint — without it, a restart
+        // forgets an in-flight batch (fills drained, outcome unknown).
+        settlement_outbox: parse_flag_opt::<String>("--settlement-outbox")
+            .map(std::path::PathBuf::from),
     }
+}
+
+/// Parse a 64-character hex string into a 32-byte secret key.
+///
+/// # Panics
+///
+/// Panics on malformed input — a bad operator key is a startup
+/// misconfiguration, not a runtime condition.
+fn parse_key_hex(hex: &str) -> [u8; 32] {
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    assert_eq!(hex.len(), 64, "--settlement-key must be 32 bytes (64 hex chars)");
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("--settlement-key must be hex");
+    }
+    key
 }
 
 /// Build a `ServerConfig` from the CLI port settings.
@@ -110,6 +151,8 @@ fn build_server_config(cli: &CliConfig) -> ServerConfig {
         batch_interval_ms: cli.batch_interval,
         chain_id: cli.chain_id,
         nonce_state_path: cli.nonce_state.clone(),
+        settlement_key: cli.settlement_key,
+        settlement_outbox: cli.settlement_outbox.clone(),
     }
 }
 
@@ -178,19 +221,42 @@ fn main() {
     } else {
         println!("  nonce state:     memory-only (restart replays possible)");
     }
+    if let Some(p) = &cli.settlement_outbox {
+        println!("  settlement outbox: {}", p.display());
+    }
 
-    // Assemble the Oxide node (single-node devnet with executor + modules).
+    // The settlement operator: with `--settlement-key` the sender is
+    // the key-derived secp256k1 address (and envelopes are signed);
+    // without it the devnet default is the well-known zero address
+    // and envelopes stay unsigned (`UnsignedTxPolicy::Allow` only).
+    let sender = match &cli.settlement_key {
+        Some(key) => crypto::secp::signable_pubkey_address(key)
+            .expect("--settlement-key must be a valid secp256k1 secret"),
+        None => primitives::Address([0u8; 20]),
+    };
+    println!("  settlement operator: {sender:?}");
+
+    // Assemble the Oxide node (single-node devnet with executor +
+    // modules). The exchange's settlement gate MUST name the same
+    // operator the settler signs/sends as — left disabled, every
+    // batch would be rejected at execution while the settler kept
+    // counting submissions as settled.
     let node_config = NodeConfig {
         consensus: ConsensusConfig::Sequencer,
         max_mempool_entries: 100_000,
+        settlement_operator: Some(sender),
         ..NodeConfig::default()
     };
     let mut node = Node::assemble(&node_config);
     println!("oxide-matcher: devnet assembled (executor + exchange + perps on the EVM ledger)");
 
-    let submitter: Arc<dyn TxSubmitter> =
-        Arc::new(ExecutorTxSubmitter { executor: node.app_handle() });
-    let sender = primitives::Address([0u8; 20]);
+    // One executor handle serves both settlement roles: submitting
+    // envelopes into the mempool and reading their finalized
+    // execution outcomes back. The second is what turns "accepted"
+    // into "settled".
+    let link = Arc::new(ExecutorTxSubmitter { executor: node.app_handle() });
+    let submitter: Arc<dyn TxSubmitter> = Arc::clone(&link) as Arc<dyn TxSubmitter>;
+    let confirmer: Arc<dyn TxConfirmer> = link;
     let config = build_server_config(&cli);
 
     println!("oxide-matcher: starting protocol servers + batch settler...");
@@ -217,7 +283,9 @@ fn main() {
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             let configs = build_market_configs(cli.markets);
             println!("oxide-matcher: spawning {} market worker threads...", configs.len());
-            runtime.block_on(run_server_multi(configs, balances, submitter, config, sender));
+            runtime.block_on(run_server_multi(
+                configs, balances, submitter, confirmer, config, sender,
+            ));
         }
         "ring" => {
             println!("oxide-matcher: funding {} accounts (single-market ring)...", cli.accounts);
@@ -228,7 +296,7 @@ fn main() {
             }
             fund_server(&mut server, cli.accounts);
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
-            runtime.block_on(run_server_ring(server, submitter, config, sender));
+            runtime.block_on(run_server_ring(server, submitter, confirmer, config, sender));
         }
         "mutex" => {
             println!("oxide-matcher: funding {} accounts (single-market mutex)...", cli.accounts);
@@ -240,7 +308,9 @@ fn main() {
             fund_server(&mut server, cli.accounts);
             println!("oxide-matcher: funded {} accounts with {DEFAULT_BALANCE} each", cli.accounts);
             let shared = Arc::new(matcher::SharedMatcher::new(server));
-            runtime.block_on(matcher::server::run_server(shared, submitter, config, sender));
+            runtime.block_on(matcher::server::run_server(
+                shared, submitter, confirmer, config, sender,
+            ));
         }
         _ => {
             eprintln!("oxide-matcher: unknown mode '{}' (use multi, ring, or mutex)", cli.mode);

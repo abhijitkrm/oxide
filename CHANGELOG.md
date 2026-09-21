@@ -2317,6 +2317,50 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     + fills through the 4-validator TCP pipeline with seller
     conservation verified on every validator.
 
+- **Batch settlement now waits for the chain to actually settle**
+  (`crates/executor`, `crates/matcher`, `bin/oxide-matcher`)
+  - The batch settler used to treat "the mempool accepted the
+    transaction" as "the batch settled": it advanced its nonce and
+    forgot the batch immediately. A settlement tx could still be
+    skipped at execution (stale nonce, bad signature, gas limit,
+    fee floor) or rejected by the module — while the matcher had
+    already drained the fills and counted them settled.
+  - The executor now records a finalized outcome per proposed
+    transaction — `Executed` (with the module's events or its
+    rejection) or `Skipped` with the gate that killed it — in a
+    bounded 8,192-tx window queryable by tx hash, plus an
+    `executed_nonce_of` accessor for the sender's authoritative
+    next nonce.
+  - `BatchSettler` drives each batch through a real lifecycle:
+    outcome check → resubmit → confirm or dead-letter. The nonce
+    advances only on confirmed execution and resyncs from the
+    executor on every resolution, so a restart or dead-lettered
+    batch cannot gap the sequence. `settle_now` returns a
+    `SettleReport` separating submitted, confirmed, rejected legs,
+    voided pairs, wholesale batch rejections, and dead letters —
+    and `run()` raises CRITICAL alerts on anything non-clean.
+  - A `SettlementOutbox` checkpoint (`--settlement-outbox`) makes
+    the in-flight batch + next nonce durable across restarts, and
+    `--settlement-key` signs envelopes (EIP-712 v1 layout) with the
+    operator's secp256k1 key — the sender is derived from the key,
+    so declared sender, recovered signer, and the exchange's
+    configured `settlement_operator` (now wired in the binary) can
+    never diverge. Unsigned envelopes remain the devnet default.
+  - **In plain words:** the settlement clerk used to mark a batch
+    "done" the moment it was dropped in the chain's inbox — even
+    though the chain could still refuse it at the counter. Now the
+    clerk waits for the stamped receipt: if the batch was refused,
+    that refusal is reported loudly instead of silently counted as
+    money moved. And if the clerk's office loses power mid-filing,
+    the paperwork is still in the tray when it comes back.
+  - Regression: executor outcome tests (executed / skipped /
+    module-rejected, overwrite semantics), settler lifecycle tests
+    (confirm, dead-letter nonce reuse, rejected-batch nonce
+    advance, partial-failure reconciliation, outbox restore,
+    signed-envelope verify round-trip), and a `settle_tps` section
+    asserting identical `Executed` outcomes with zero rejected legs
+    on all four validators.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

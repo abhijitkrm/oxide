@@ -24,6 +24,8 @@ exchange = { workspace = true }
 framework = { workspace = true }
 executor = { workspace = true }
 ports = { workspace = true }
+# crypto: secp256k1 key→address derivation for --settlement-key.
+crypto = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

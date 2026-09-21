@@ -165,7 +165,7 @@ fn submit_action_ring(
     ring.submit_action(req)
 }
 
-// ── TxSubmitter trait ────────────────────────────────────────────────
+// ── TxSubmitter / TxConfirmer traits ─────────────────────────────────
 
 /// A handle that submits transactions to the consensus mempool.
 /// Mirrors `rpc::TxSubmitter` but lives in the matcher crate to
@@ -173,56 +173,99 @@ fn submit_action_ring(
 pub trait TxSubmitter: Send + Sync {
     /// Submit a wrapped Oxide transaction envelope to the mempool.
     ///
+    /// `Ok` means ONLY that the bytes passed mempool admission — it
+    /// is not inclusion, not execution, and not settlement. A
+    /// submitted tx can still be gate-skipped at execution (stale
+    /// nonce, bad signature, block gas limit) or rejected by its
+    /// module. Settlement is only real once a [`TxConfirmer`]
+    /// reports the finalized outcome.
+    ///
     /// # Errors
     ///
     /// Returns `Err(reason)` if the mempool rejects the transaction.
     fn submit_tx(&self, tx: TxBytes) -> Result<(), String>;
 }
 
-// ── BatchSettler ─────────────────────────────────────────────────────
+/// A handle that reads FINALIZED execution outcomes — the settler's
+/// finality oracle. Implemented in-process by the executor handle;
+/// a remote deployment would back it with a node query API.
+pub trait TxConfirmer: Send + Sync {
+    /// The finalized outcome for `tx_hash` (the `Domain::Transaction`
+    /// hash of the full envelope), or `None` while the tx is in
+    /// flight — still pooled, proposed-but-unexecuted, or aged out
+    /// of the executor's bounded outcome window.
+    fn tx_outcome(&self, tx_hash: &primitives::Hash) -> Option<executor::TxOutcome>;
 
-/// The batch settler: periodically seals the fill buffer and submits
-/// a batch settlement transaction to consensus.
-///
-/// Runs on a dedicated tokio task. Every `interval` milliseconds,
-/// it seals the current batch from the matching server, encodes it
-/// as a `TAG_BATCH_SETTLE` message, wraps it in an Oxide transaction
-/// envelope, and submits it via `TxSubmitter`.
-pub struct BatchSettler {
-    /// The batch sealer — either the mutex path (`SharedMatcher`) or
-    /// the ring owner thread (`RingMatcher`). Both seal from THE ONE
-    /// order book.
-    sealer: Arc<dyn crate::BatchSealer>,
-    submitter: Arc<dyn TxSubmitter>,
-    interval: Duration,
-    /// The sender address for settlement txs (the matcher operator).
-    sender: primitives::Address,
-    /// Next settlement nonce — advanced ONLY on a successful submit,
-    /// never at encode time. A failed submission keeps its nonce so
-    /// the retried envelope (and the next batch) stay contiguous
-    /// with the executor's `executed_nonce` counter; a burned nonce
-    /// would gap the sequence and nonce-skip every later settlement
-    /// from this sender forever.
-    nonce: std::sync::atomic::AtomicU64,
-    /// The encoded envelope whose last submit failed, awaiting
-    /// retry. Sealing pauses while a batch is pending — fills keep
-    /// accumulating in the sealer's buffer (nothing is lost), and
-    /// the same envelope is resubmitted verbatim because the
-    /// executor still expects exactly that nonce next.
-    pending: std::sync::Mutex<Option<PendingBatch>>,
+    /// The next nonce the executor expects from `sender` — the
+    /// authoritative resync anchor. The settler's local nonce only
+    /// ever tracks this value; querying it on every resolution makes
+    /// drift (restart, dead-lettered batch) self-healing.
+    fn executed_nonce(&self, sender: &primitives::Address) -> u64;
 }
 
-/// A settlement envelope whose submission is being retried.
+// ── BatchSettler ─────────────────────────────────────────────────────
+
+/// What one `settle_now` tick accomplished, split across the three
+/// stages the old bare `usize` conflated: mempool-submitted,
+/// execution-CONFIRMED, and reconciled failures. A tick that
+/// submitted a batch reports `submitted > 0` and `confirmed == 0` —
+/// the batch is in flight, not settled.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SettleReport {
+    /// Pairs in a batch whose envelope was accepted by the mempool
+    /// this tick. Acceptance is NOT settlement — the batch stays in
+    /// flight until an outcome lands.
+    pub submitted: usize,
+    /// Pairs whose batch EXECUTED this tick (the module returned
+    /// `Ok`). This is the settlement boundary — the chain applied
+    /// the batch. Partial failures inside it are reported
+    /// separately below; they do not subtract from `confirmed`.
+    pub confirmed: usize,
+    /// Fill legs the exchange rejected inside an applied batch
+    /// (`fill_rejected` events — a leg failed validation; its pair
+    /// settlement is voided). Nonzero means the matched book said
+    /// "fill" but the chain said "no" — investigate.
+    pub rejected_legs: usize,
+    /// Pair settlements that failed economically inside an applied
+    /// batch (`settlement_failed` events — the pair's legs were
+    /// voided atomically; escrow stays withheld pending residue
+    /// refunds). Same severity as `rejected_legs`.
+    pub failed_pairs: usize,
+    /// A batch the module rejected wholesale (`handle` returned
+    /// `Err`): the fee was charged and the nonce consumed, but NO
+    /// leg settled — a revert, not a skip. The fills are lost
+    /// on-chain; the operator must re-issue the affected orders.
+    pub batch_rejected: Option<String>,
+    /// A batch that can never execute was dead-lettered (a terminal
+    /// `TxSkipReason` — malformed envelope, bad signature, stale
+    /// nonce, unknown module, fee floor). Same loss semantics as
+    /// `batch_rejected`, but the nonce was NOT consumed — the next
+    /// sealed batch reuses it.
+    pub dead_lettered: Option<String>,
+}
+
+/// A settlement envelope in flight — mempool-submitted (or
+/// awaiting resubmission) but not yet confirmed by execution.
 struct PendingBatch {
     /// The full encoded tx envelope (nonce baked in).
     envelope: Vec<u8>,
-    /// Aggregated pair count (returned when the retry lands).
+    /// `Domain::Transaction` hash of `envelope` — the confirmer key.
+    tx_hash: primitives::Hash,
+    /// Aggregated pair count (reported when the batch confirms).
     pair_count: usize,
     /// Failed submission attempts so far.
     attempts: u32,
+    /// Whether the last `submit_tx` returned `Ok`. `false` means the
+    /// envelope is awaiting (re)submission — a fresh outbox restore
+    /// also lands here, since the pool's copy may not have survived.
+    submitted: bool,
+    /// Ticks spent waiting for an outcome with none recorded. At
+    /// [`RESUBMIT_AFTER_TICKS`] the envelope is resubmitted — the
+    /// pooled copy may have been evicted without ever executing.
+    wait_ticks: u32,
 }
 
-/// Maximum retries before a pending batch is dropped: 60.
+/// Maximum retries before a pending batch is flagged: 60.
 ///
 /// At the default 100 ms settle interval this is ~6 seconds of
 /// retry — long enough to ride out a transient mempool-full or a
@@ -236,6 +279,130 @@ struct PendingBatch {
 /// settlement can eventually land when the chain recovers.
 const MAX_PENDING_RETRIES: u32 = 60;
 
+/// Ticks to wait for an execution outcome before resubmitting the
+/// pending envelope: 100 (~10 s at the default interval).
+///
+/// A pooled tx that was never proposed survives indefinitely (the
+/// mempool keeps it), so `None` outcomes normally mean "still in
+/// flight". But an executor restart drops the mempool — the pooled
+/// copy is gone and no outcome will ever land. Resubmitting the
+/// verbatim envelope re-pools it; the envelope's baked-in nonce is
+/// still the one the executor expects, so a duplicate in the pool
+/// (hash-identical) is either deduplicated or rejected harmlessly.
+const RESUBMIT_AFTER_TICKS: u32 = 100;
+
+/// Whether a pre-execution skip can still land if the tx stays
+/// pooled. `GasLimit`/`FeeCharge` resolve themselves (the next block
+/// has a fresh budget; a later funding fixes the charge). Everything
+/// else is a deterministic property of the envelope bytes — the same
+/// tx can never pass that gate.
+fn is_retryable_skip(reason: executor::TxSkipReason) -> bool {
+    matches!(reason, executor::TxSkipReason::GasLimit | executor::TxSkipReason::FeeCharge)
+}
+
+/// Aggregate sealed fills by (market, price, buy order, sell order):
+/// legs at the same price between the same REGISTERED order pair
+/// merge into one entry — merging across different order keys is not
+/// possible because each key authorizes only its own remaining
+/// quantity. The wire carries no claimed settlement amount — the
+/// chain recomputes `price * qty / PRICE_SCALE` per leg — so
+/// aggregation must not sum the off-chain `quote_amount`
+/// (floor-division dust would make the sums diverge).
+///
+/// `BTreeMap` keeps the encoded entry order deterministic and
+/// reproducible for a given fill sequence.
+fn aggregate_fills(fills: &[crate::SettledFill]) -> Result<Vec<BatchFillEntry>, String> {
+    let mut aggregated: std::collections::BTreeMap<
+        (u16, Price, exchange::OrderKey, exchange::OrderKey),
+        Qty,
+    > = std::collections::BTreeMap::new();
+    for f in fills {
+        let key = (
+            f.market,
+            f.price,
+            exchange::OrderKey { owner: f.buyer, client_id: f.buyer_id },
+            exchange::OrderKey { owner: f.seller, client_id: f.seller_id },
+        );
+        match aggregated.get_mut(&key) {
+            Some(q) => {
+                // A qty sum above u64::MAX is unreachable in practice
+                // (would require ~1.8e13 lots traded in one batch);
+                // fail loudly rather than saturate.
+                *q = Qty(q
+                    .0
+                    .checked_add(f.qty.0)
+                    .ok_or_else(|| "fill qty aggregation overflow".to_string())?);
+            }
+            None => {
+                aggregated.insert(key, f.qty);
+            }
+        }
+    }
+    Ok(aggregated
+        .into_iter()
+        .map(|((market, price, buy, sell), qty)| BatchFillEntry { market, price, qty, buy, sell })
+        .collect())
+}
+
+/// The settler's secp256k1 identity for signing settlement
+/// envelopes — required when the executor enforces
+/// `UnsignedTxPolicy::Reject`, and correct in any case because the
+/// exchange gates batch settlement on the declared sender matching
+/// the configured settlement operator.
+struct SigningConfig {
+    /// The operator's 32-byte secret key.
+    privkey: [u8; 32],
+    /// EIP-712 chain ID bound into the signature.
+    chain_id: u64,
+}
+
+/// The batch settler: periodically seals the fill buffer and
+/// submits a batch settlement transaction to consensus — then waits
+/// for the transaction's FINALIZED execution outcome before calling
+/// it settled.
+///
+/// Runs on a dedicated tokio task. Every `interval` milliseconds it
+/// resolves any in-flight batch (outcome check → resubmit → confirm
+/// or dead-letter), then seals and submits the next batch. At most
+/// one batch is ever in flight: the executor's nonce gate makes a
+/// second envelope unreachable while the first is pending, and the
+/// pause lets fills keep accumulating in the sealer's buffer.
+pub struct BatchSettler {
+    /// The batch sealer — either the mutex path (`SharedMatcher`) or
+    /// the ring owner thread (`RingMatcher`). Both seal from THE ONE
+    /// order book.
+    sealer: Arc<dyn crate::BatchSealer>,
+    submitter: Arc<dyn TxSubmitter>,
+    /// The finalized-outcome oracle — the difference between
+    /// "accepted into the mempool" and "executed on-chain".
+    confirmer: Arc<dyn TxConfirmer>,
+    interval: Duration,
+    /// The sender address for settlement txs (the matcher operator).
+    /// When `signing` is configured this is the key-derived address
+    /// — the three views of identity (declared sender, recovered
+    /// signer, exchange operator) can never diverge.
+    sender: primitives::Address,
+    /// Optional envelope signing (EIP-712 + secp256k1, executor v1
+    /// layout). `None` produces v0 unsigned envelopes — fine for the
+    /// devnet `UnsignedTxPolicy::Allow`, rejected under `Reject`.
+    signing: Option<SigningConfig>,
+    /// Next settlement nonce — advanced ONLY when the confirmer
+    /// proves the previous batch executed (or was terminally
+    /// skipped), never at submit time. It is resynced from
+    /// `confirmer.executed_nonce` on every resolution, so restart
+    /// drift and dead-lettered batches cannot gap the sequence.
+    nonce: std::sync::atomic::AtomicU64,
+    /// The in-flight envelope awaiting its execution outcome. At
+    /// most one — see the struct doc.
+    pending: std::sync::Mutex<Option<PendingBatch>>,
+    /// Durable checkpoint of `{next_nonce, pending}` — survives a
+    /// matcher restart so an in-flight batch is resolved, not
+    /// forgotten. `None` keeps the legacy memory-only behavior
+    /// (a restart mid-flight then falls back to the executor's
+    /// `executed_nonce` resync on the next resolution).
+    outbox: std::sync::Mutex<Option<SettlementOutbox>>,
+}
+
 impl BatchSettler {
     /// Create a new batch settler.
     ///
@@ -243,13 +410,20 @@ impl BatchSettler {
     /// - `sealer`: the batch sealer (`SharedMatcher` or `RingMatcher` —
     ///   both seal from the single order book).
     /// - `submitter`: the consensus tx submitter.
+    /// - `confirmer`: the finalized-outcome oracle — usually the same
+    ///   in-process executor handle as `submitter`.
     /// - `interval_ms`: how often to seal and submit batches.
     /// - `sender`: the matcher operator's address (for tx envelope).
-    /// - `start_nonce`: the initial nonce for settlement txs.
+    ///   Ignored when `with_signing` is used — the sender is derived
+    ///   from the key so the envelope can never name a different
+    ///   account than the signer.
+    /// - `start_nonce`: the initial nonce for settlement txs. Ignored
+    ///   when an outbox is attached — the checkpoint's value wins.
     #[must_use]
     pub fn new(
         sealer: Arc<dyn crate::BatchSealer>,
         submitter: Arc<dyn TxSubmitter>,
+        confirmer: Arc<dyn TxConfirmer>,
         interval_ms: u64,
         sender: primitives::Address,
         start_nonce: u64,
@@ -257,15 +431,121 @@ impl BatchSettler {
         Self {
             sealer,
             submitter,
+            confirmer,
             interval: Duration::from_millis(interval_ms),
             sender,
+            signing: None,
             nonce: std::sync::atomic::AtomicU64::new(start_nonce),
             pending: std::sync::Mutex::new(None),
+            outbox: std::sync::Mutex::new(None),
         }
     }
 
-    /// Seal the current batch and submit it to consensus. Returns
-    /// the number of fills settled.
+    /// Sign settlement envelopes with `privkey` under `chain_id`.
+    /// The sender becomes the key-derived address: the declared
+    /// sender, the recovered signer, and the exchange's configured
+    /// settlement operator can never diverge.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `privkey` is not a valid secp256k1 secret — a
+    /// settler that cannot sign its own envelopes is a fatal
+    /// misconfiguration, not a runtime condition.
+    #[must_use]
+    pub fn with_signing(mut self, privkey: [u8; 32], chain_id: u64) -> Self {
+        self.sender = crypto::secp::signable_pubkey_address(&privkey)
+            .expect("settlement key must be a valid secp256k1 secret");
+        self.signing = Some(SigningConfig { privkey, chain_id });
+        self
+    }
+
+    /// Attach a durable outbox checkpoint at `path`. Any previously
+    /// checkpointed `{next_nonce, pending}` is restored: a batch
+    /// in-flight across the restart is resumed (its outcome is
+    /// checked before any resubmission, so a batch that executed
+    /// during the downtime is reconciled, not replayed).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the checkpoint exists but does not decode — a
+    /// corrupt outbox must fail closed: starting with a forgotten
+    /// in-flight batch would misreport its fills as unsettled forever
+    /// or, worse, reuse a consumed nonce.
+    #[must_use]
+    pub fn with_outbox(self, path: std::path::PathBuf) -> Self {
+        let state = SettlementOutbox::load(&path)
+            .unwrap_or_else(|e| panic!("settlement outbox at {} is corrupt: {e}", path.display()));
+        self.nonce.store(state.next_nonce, std::sync::atomic::Ordering::Relaxed);
+        if let Some(p) = state.pending {
+            *self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(p);
+        }
+        *self.outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SettlementOutbox { path });
+        self
+    }
+
+    /// Checkpoint `{next_nonce, pending}` if an outbox is attached.
+    /// Called on every settlement-lane state transition; a failed
+    /// write is best-effort (the in-memory lane keeps working — the
+    /// restart window just widens).
+    fn persist(&self, pending: Option<&PendingBatch>) {
+        let mut guard = self.outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(store) = guard.as_mut() {
+            let _ = store.save(self.nonce.load(std::sync::atomic::Ordering::Relaxed), pending);
+        }
+    }
+
+    /// Reconcile an in-flight batch against its finalized outcome.
+    /// Returns the populated report fields; `pending` is cleared on
+    /// every terminal outcome and the nonce is resynced from the
+    /// executor's authoritative counter.
+    fn resolve_pending(
+        &self,
+        guard: &mut Option<PendingBatch>,
+        report: &mut SettleReport,
+        outcome: executor::TxOutcome,
+    ) {
+        match outcome {
+            executor::TxOutcome::Executed { events, error } => {
+                let pair_count = guard.as_ref().map_or(0, |p| p.pair_count);
+                *guard = None;
+                self.nonce.store(
+                    self.confirmer.executed_nonce(&self.sender),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                match error {
+                    None => {
+                        report.confirmed = pair_count;
+                        report.rejected_legs =
+                            events.iter().filter(|e| e.kind == "fill_rejected").count();
+                        report.failed_pairs =
+                            events.iter().filter(|e| e.kind == "settlement_failed").count();
+                    }
+                    Some(e) => report.batch_rejected = Some(e),
+                }
+            }
+            executor::TxOutcome::Skipped { reason } if is_retryable_skip(reason) => {
+                // The tx stays pooled and can still land — keep
+                // waiting rather than resubmitting a live copy.
+            }
+            executor::TxOutcome::Skipped { reason } => {
+                *guard = None;
+                // The skipped tx never consumed its nonce — resync
+                // (a no-op unless out-of-band drift moved it) so the
+                // next sealed batch reuses the same nonce value.
+                self.nonce.store(
+                    self.confirmer.executed_nonce(&self.sender),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                report.dead_lettered = Some(format!("{reason:?}"));
+            }
+        }
+        self.persist(guard.as_ref());
+    }
+
+    /// Seal the current batch and submit it to consensus, then drive
+    /// any in-flight batch toward its finalized outcome. Returns the
+    /// tick's report — see [`SettleReport`] for the stage semantics.
     ///
     /// Aggregates fills by (market, price, buy order, sell order)
     /// before encoding — multiple fills at one price between the
@@ -275,53 +555,63 @@ impl BatchSettler {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the settlement tx is rejected by the mempool.
+    /// Returns `Err` if a mempool (re)submission is rejected — the
+    /// batch stays pending and the next tick retries.
     ///
     /// # Panics
     ///
     /// Panics if the underlying sealer's mutex/control channel is
     /// poisoned or disconnected.
-    pub fn settle_now(&self) -> Result<usize, String> {
-        // Retry a pending envelope before sealing anything new.
-        // Previously a failed submit dropped the sealed fills AND
-        // burned the nonce — the next batch carried nonce N+1 while
-        // the executor still expected N, so every later settlement
-        // was nonce-skipped forever. Now the same envelope is
-        // resubmitted verbatim and the nonce advances only on
-        // success.
+    pub fn settle_now(&self) -> Result<SettleReport, String> {
+        let mut report = SettleReport::default();
         {
             let mut pending =
                 self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(p) = pending.as_mut() {
-                return match self.submitter.submit_tx(TxBytes::new(p.envelope.clone())) {
-                    Ok(()) => {
-                        self.nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let settled = p.pair_count;
-                        *pending = None;
-                        Ok(settled)
+                // The outcome check runs before ANY (re)submission:
+                // a batch that executed during a matcher restart —
+                // or while a resubmit was queued — is reconciled from
+                // the authoritative record instead of replayed.
+                if let Some(outcome) = self.confirmer.tx_outcome(&p.tx_hash) {
+                    self.resolve_pending(&mut pending, &mut report, outcome);
+                    return Ok(report);
+                }
+                if p.submitted {
+                    p.wait_ticks += 1;
+                    if p.wait_ticks >= RESUBMIT_AFTER_TICKS {
+                        // No outcome after ~10 s: the pooled copy may
+                        // have been evicted (executor restart drops
+                        // the mempool). Re-arm submission — the same
+                        // envelope is resubmitted verbatim, so a
+                        // still-pooled duplicate is a harmless no-op.
+                        p.submitted = false;
+                        p.wait_ticks = 0;
                     }
-                    Err(e) => {
-                        p.attempts += 1;
-                        if p.attempts >= MAX_PENDING_RETRIES {
-                            // HIGH fix: do NOT drop the pending
-                            // envelope. The fills were already removed
-                            // from the order book by `seal_batch` and
-                            // the off-chain cache reflects the trades.
-                            // Dropping the envelope would leave the
-                            // cache applied without on-chain settlement,
-                            // causing cache/chain divergence. Instead,
-                            // log a critical alert and keep the
-                            // envelope pending so the operator can
-                            // intervene and the settlement can land
-                            // when the chain recovers.
-                            eprintln!(
-                                "batch settler: CRITICAL — batch of {} pairs failed {} submissions, keeping pending: {e}",
-                                p.pair_count, p.attempts
-                            );
+                } else {
+                    match self.submitter.submit_tx(TxBytes::new(p.envelope.clone())) {
+                        Ok(()) => {
+                            p.submitted = true;
+                            p.wait_ticks = 0;
+                            report.submitted = p.pair_count;
+                            self.persist(pending.as_ref());
                         }
-                        Err(e)
+                        Err(e) => {
+                            p.attempts += 1;
+                            let (attempts, pair_count) = (p.attempts, p.pair_count);
+                            self.persist(pending.as_ref());
+                            if attempts >= MAX_PENDING_RETRIES {
+                                // Do NOT drop the pending envelope —
+                                // dropping strands already-sealed fills
+                                // (cache applied, chain never settled).
+                                eprintln!(
+                                    "batch settler: CRITICAL — batch of {pair_count} pairs failed {attempts} submissions, keeping pending: {e}"
+                                );
+                            }
+                            return Err(e);
+                        }
                     }
-                };
+                }
+                return Ok(report);
             }
         }
 
@@ -329,90 +619,99 @@ impl BatchSettler {
         let fills = self.sealer.seal_batch();
 
         if fills.is_empty() {
-            return Ok(0);
+            return Ok(report);
         }
 
-        // Aggregate fills by (market, price, buy order, sell order):
-        // legs at the same price between the same REGISTERED order
-        // pair merge into one entry — merging across different order
-        // keys is not possible because each key authorizes only its
-        // own remaining quantity. The wire carries no claimed
-        // settlement amount — the chain recomputes
-        // `price * qty / PRICE_SCALE` per leg — so aggregation must
-        // not sum the off-chain `quote_amount` (floor-division dust
-        // would make the sums diverge).
-        //
-        // BTreeMap keeps the encoded entry order deterministic and
-        // reproducible for a given fill sequence.
-        let mut aggregated: std::collections::BTreeMap<
-            (u16, Price, exchange::OrderKey, exchange::OrderKey),
-            Qty,
-        > = std::collections::BTreeMap::new();
-        for f in &fills {
-            let key = (
-                f.market,
-                f.price,
-                exchange::OrderKey { owner: f.buyer, client_id: f.buyer_id },
-                exchange::OrderKey { owner: f.seller, client_id: f.seller_id },
-            );
-            match aggregated.get_mut(&key) {
-                Some(q) => {
-                    // A qty sum above u64::MAX is unreachable in
-                    // practice (would require ~1.8e13 lots traded in
-                    // one batch); fail loudly rather than saturate.
-                    *q = Qty(q
-                        .0
-                        .checked_add(f.qty.0)
-                        .ok_or_else(|| "fill qty aggregation overflow".to_string())?);
-                }
-                None => {
-                    aggregated.insert(key, f.qty);
-                }
-            }
-        }
-        let entries: Vec<BatchFillEntry> = aggregated
-            .into_iter()
-            .map(|((market, price, buy, sell), qty)| BatchFillEntry {
-                market,
-                price,
-                qty,
-                buy,
-                sell,
-            })
-            .collect();
+        let entries = aggregate_fills(&fills)?;
         let pair_count = entries.len();
 
         // Encode as a batch-settle message.
         let module_payload = exchange::msg::batch_settle(&entries);
 
         // Wrap in an Oxide transaction envelope. The nonce is READ
-        // here, not consumed — it advances only when the submit
-        // succeeds, so a failed submission leaves the sequence
-        // contiguous for the retry (and for the next batch if this
-        // envelope is eventually dropped).
+        // here, not consumed — it advances only when the confirmer
+        // proves execution, so a rejected submission or a terminal
+        // skip leaves the sequence contiguous for the retry (and for
+        // the next batch).
         let nonce = self.nonce.load(std::sync::atomic::Ordering::Relaxed);
         let fee = 100u64;
-        let mut envelope = Vec::with_capacity(36 + module_payload.len());
+        let envelope = self.encode_envelope(nonce, fee, &module_payload)?;
+
+        let tx_hash = crypto::Hasher::hash_one(crypto::Domain::Transaction, &envelope);
+        match self.submitter.submit_tx(TxBytes::new(envelope.clone())) {
+            Ok(()) => {
+                report.submitted = pair_count;
+                let mut pending =
+                    self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                *pending = Some(PendingBatch {
+                    envelope,
+                    tx_hash,
+                    pair_count,
+                    attempts: 0,
+                    submitted: true,
+                    wait_ticks: 0,
+                });
+                self.persist(pending.as_ref());
+            }
+            Err(e) => {
+                let mut pending =
+                    self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                *pending = Some(PendingBatch {
+                    envelope,
+                    tx_hash,
+                    pair_count,
+                    attempts: 1,
+                    submitted: false,
+                    wait_ticks: 0,
+                });
+                self.persist(pending.as_ref());
+                return Err(e);
+            }
+        }
+        Ok(report)
+    }
+
+    /// Encode the tx envelope — v0 unsigned layout, or the v1 signed
+    /// layout (`module_id|0x80`, then a 65-byte recoverable secp256k1
+    /// signature over the EIP-712 digest) when `signing` is set.
+    fn encode_envelope(
+        &self,
+        nonce: u64,
+        fee: u64,
+        module_payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let signed = self.signing.is_some();
+        let mut envelope = Vec::with_capacity(37 + usize::from(signed) * 65 + module_payload.len());
         envelope.extend_from_slice(&self.sender.0);
         envelope.extend_from_slice(&nonce.to_le_bytes());
         envelope.extend_from_slice(&fee.to_le_bytes());
-        envelope.push(framework::module_id::EXCHANGE);
-        envelope.extend_from_slice(&module_payload);
-
-        // Submit to consensus. On failure the envelope is kept for
-        // retry — the fills are NOT lost (they were drained from the
-        // sealer but live on in `pending`).
-        match self.submitter.submit_tx(TxBytes::new(envelope.clone())) {
-            Ok(()) => {
-                self.nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(pair_count)
-            }
-            Err(e) => {
-                *self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(PendingBatch { envelope, pair_count, attempts: 1 });
-                Err(e)
-            }
+        if let Some(signing) = &self.signing {
+            let sig = crypto::eip712::sign_tx(
+                &signing.privkey,
+                signing.chain_id,
+                &self.sender,
+                nonce,
+                fee,
+                framework::module_id::EXCHANGE,
+                module_payload,
+            )
+            .map_err(|e| format!("sign settlement envelope: {e:?}"))?;
+            envelope.push(framework::module_id::EXCHANGE | 0x80);
+            envelope.extend_from_slice(&sig.sig);
+            envelope.push(sig.recid.as_u8());
+        } else {
+            envelope.push(framework::module_id::EXCHANGE);
         }
+        envelope.extend_from_slice(module_payload);
+        Ok(envelope)
+    }
+
+    /// Whether a batch is currently in flight (submitted or awaiting
+    /// resubmission, but not yet resolved by an outcome). Exposed for
+    /// tests and operator introspection.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
     }
 
     /// Run the batch settler loop. Seals and submits batches every
@@ -422,10 +721,148 @@ impl BatchSettler {
         let mut ticker = tokio::time::interval(self.interval);
         loop {
             ticker.tick().await;
-            if let Err(e) = self.settle_now() {
-                eprintln!("batch settler: submission failed: {e}");
+            match self.settle_now() {
+                Err(e) => eprintln!("batch settler: submission failed: {e}"),
+                Ok(report) => {
+                    if let Some(e) = &report.batch_rejected {
+                        eprintln!(
+                            "batch settler: CRITICAL — batch of {} pairs rejected at execution: {e}",
+                            report.submitted + report.confirmed
+                        );
+                    }
+                    if let Some(reason) = &report.dead_lettered {
+                        eprintln!(
+                            "batch settler: CRITICAL — batch dead-lettered ({reason}); fills lost on-chain"
+                        );
+                    }
+                    if report.rejected_legs > 0 || report.failed_pairs > 0 {
+                        eprintln!(
+                            "batch settler: batch confirmed with {} rejected legs, {} failed pairs",
+                            report.rejected_legs, report.failed_pairs
+                        );
+                    }
+                }
             }
         }
+    }
+}
+
+/// A file-backed checkpoint of the settlement lane's `{next_nonce,
+/// pending}` state — the same write-tmp-fsync-rename discipline as
+/// `NonceStore`. Without it a matcher restart forgets an in-flight
+/// batch: its fills were drained from the sealer but the settler
+/// loses track of whether they ever settled.
+struct SettlementOutbox {
+    /// Checkpoint file path (`<path>.tmp` is the write scratch).
+    path: std::path::PathBuf,
+}
+
+/// The decoded outbox state.
+struct SettlementOutboxState {
+    /// Next nonce the settler will seal with.
+    next_nonce: u64,
+    /// The in-flight batch, if one was pending at checkpoint time.
+    pending: Option<PendingBatch>,
+}
+
+impl SettlementOutbox {
+    /// Checkpoint format magic + version for strict decode.
+    const MAGIC: &'static [u8; 4] = b"OXSO";
+    /// Current format version.
+    const VERSION: u32 = 1;
+    /// Bound on a stored envelope — larger means corrupt or hostile;
+    /// a batch-settle envelope is ~37 + 65 + legs bytes, nowhere
+    /// near this ceiling.
+    const MAX_ENVELOPE_LEN: usize = 1 << 20;
+
+    /// Read the checkpoint. Missing file = empty state (first run).
+    /// `Err` on ANY structural violation — the caller fails closed.
+    fn load(path: &std::path::Path) -> Result<SettlementOutboxState, String> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SettlementOutboxState { next_nonce: 0, pending: None });
+            }
+            Err(e) => return Err(format!("read failed: {e}")),
+        };
+        // Header: magic(4) + version(4) + next_nonce(8) +
+        // pending_flag(1) = 17 bytes.
+        if bytes.len() < 17 {
+            return Err(format!("truncated header ({} bytes)", bytes.len()));
+        }
+        if &bytes[0..4] != Self::MAGIC {
+            return Err("bad magic".to_string());
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or_default());
+        if version != Self::VERSION {
+            return Err(format!("unsupported version {version}"));
+        }
+        let next_nonce = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default());
+        let has_pending = bytes[16] != 0;
+        if !has_pending {
+            if bytes.len() != 17 {
+                return Err(format!("trailing bytes without pending: {}", bytes.len()));
+            }
+            return Ok(SettlementOutboxState { next_nonce, pending: None });
+        }
+        // Pending section: envelope_len(4) + envelope + pair_count(8)
+        // + attempts(4) + submitted(1).
+        if bytes.len() < 21 {
+            return Err(format!("truncated pending header ({} bytes)", bytes.len()));
+        }
+        let env_len = u32::from_le_bytes(bytes[17..21].try_into().unwrap_or_default()) as usize;
+        if env_len > Self::MAX_ENVELOPE_LEN {
+            return Err(format!("envelope len {env_len} exceeds bound"));
+        }
+        let end = 21 + env_len;
+        if bytes.len() != end + 13 {
+            return Err(format!("size mismatch: {} bytes, expected {}", bytes.len(), end + 13));
+        }
+        let envelope = bytes[21..end].to_vec();
+        let pair_count =
+            usize::try_from(u64::from_le_bytes(bytes[end..end + 8].try_into().unwrap_or_default()))
+                .map_err(|_| "pair count overflows usize".to_string())?;
+        let attempts = u32::from_le_bytes(bytes[end + 8..end + 12].try_into().unwrap_or_default());
+        let submitted = bytes[end + 12] != 0;
+        let tx_hash = crypto::Hasher::hash_one(crypto::Domain::Transaction, &envelope);
+        Ok(SettlementOutboxState {
+            next_nonce,
+            pending: Some(PendingBatch {
+                envelope,
+                tx_hash,
+                pair_count,
+                attempts,
+                submitted,
+                wait_ticks: 0,
+            }),
+        })
+    }
+
+    /// Serialize and atomically replace the checkpoint.
+    fn save(&mut self, next_nonce: u64, pending: Option<&PendingBatch>) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(30);
+        buf.extend_from_slice(Self::MAGIC);
+        buf.extend_from_slice(&Self::VERSION.to_le_bytes());
+        buf.extend_from_slice(&next_nonce.to_le_bytes());
+        match pending {
+            None => buf.push(0),
+            Some(p) => {
+                buf.push(1);
+                buf.extend_from_slice(
+                    &u32::try_from(p.envelope.len()).unwrap_or(u32::MAX).to_le_bytes(),
+                );
+                buf.extend_from_slice(&p.envelope);
+                buf.extend_from_slice(&(p.pair_count as u64).to_le_bytes());
+                buf.extend_from_slice(&p.attempts.to_le_bytes());
+                buf.push(u8::from(p.submitted));
+            }
+        }
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, &buf)?;
+        if let Ok(f) = std::fs::File::open(&tmp) {
+            let _ = f.sync_all();
+        }
+        std::fs::rename(&tmp, &self.path)
     }
 }
 
@@ -1089,6 +1526,19 @@ pub struct ServerConfig {
     /// Same scope note as `chain_id`: used where this module builds
     /// the matcher (`run_server_multi`); `None` = memory-only gate.
     pub nonce_state_path: Option<std::path::PathBuf>,
+    /// The settlement operator's secp256k1 secret — when set, batch
+    /// envelopes are signed (EIP-712 v1 layout) and the sender is
+    /// the key-derived address, which is what the exchange's
+    /// `settlement_operator` gate must be configured with. `None`
+    /// produces unsigned envelopes — accepted only under the
+    /// executor's `UnsignedTxPolicy::Allow` (devnet).
+    pub settlement_key: Option<[u8; 32]>,
+    /// Durable checkpoint file for the settlement lane's
+    /// `{next_nonce, pending}` state — survives restarts so an
+    /// in-flight batch is resolved rather than forgotten. `None`
+    /// keeps the memory-only behavior (a restart mid-flight then
+    /// relies on the executor's `executed_nonce` resync).
+    pub settlement_outbox: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -1101,8 +1551,31 @@ impl Default for ServerConfig {
             batch_interval_ms: 100,
             chain_id: crate::protocol::CHAIN_ID,
             nonce_state_path: None,
+            settlement_key: None,
+            settlement_outbox: None,
         }
     }
+}
+
+/// Build the batch settler from a sealer + server config — shared
+/// by all three server entry points so signing, confirmation, and
+/// the durable outbox are wired identically on every path.
+fn build_settler(
+    sealer: Arc<dyn crate::BatchSealer>,
+    submitter: Arc<dyn TxSubmitter>,
+    confirmer: Arc<dyn TxConfirmer>,
+    config: &ServerConfig,
+    sender: primitives::Address,
+) -> Arc<BatchSettler> {
+    let mut settler =
+        BatchSettler::new(sealer, submitter, confirmer, config.batch_interval_ms, sender, 0);
+    if let Some(key) = config.settlement_key {
+        settler = settler.with_signing(key, config.chain_id);
+    }
+    if let Some(path) = &config.settlement_outbox {
+        settler = settler.with_outbox(path.clone());
+    }
+    Arc::new(settler)
 }
 
 /// Default number of ring pairs for the ring-backed server.
@@ -1119,24 +1592,24 @@ const DEFAULT_RING_CAPACITY: usize = 8192;
 /// # Arguments
 /// - `matcher`: the shared matching server.
 /// - `submitter`: the consensus tx submitter (for batch settlement).
-/// - `config`: server configuration (ports, batch interval).
-/// - `sender`: the matcher operator's address (for settlement txs).
+/// - `confirmer`: the finalized-outcome oracle (usually the same
+///   executor handle as `submitter`).
+/// - `config`: server configuration (ports, batch interval,
+///   settlement key/outbox).
+/// - `sender`: the matcher operator's address (for settlement txs —
+///   overridden by the key-derived address when
+///   `config.settlement_key` is set).
 pub async fn run_server(
     matcher: Arc<SharedMatcher>,
     submitter: Arc<dyn TxSubmitter>,
+    confirmer: Arc<dyn TxConfirmer>,
     config: ServerConfig,
     sender: primitives::Address,
 ) {
     // Start the batch settler. `Arc<SharedMatcher>` coerces to
     // `Arc<dyn BatchSealer>` (the mutex-seal implementation).
     let sealer: Arc<dyn crate::BatchSealer> = Arc::clone(&matcher) as Arc<dyn crate::BatchSealer>;
-    let settler = Arc::new(BatchSettler::new(
-        sealer,
-        Arc::clone(&submitter),
-        config.batch_interval_ms,
-        sender,
-        0,
-    ));
+    let settler = build_settler(sealer, submitter, confirmer, &config, sender);
     let settler_clone = Arc::clone(&settler);
     tokio::spawn(async move {
         settler_clone.run().await;
@@ -1190,11 +1663,14 @@ pub async fn run_server(
 /// # Arguments
 /// - `server`: the funded matching server (moved to the owner thread).
 /// - `submitter`: the consensus tx submitter (for batch settlement).
-/// - `config`: server configuration (ports, batch interval).
+/// - `confirmer`: the finalized-outcome oracle.
+/// - `config`: server configuration (ports, batch interval,
+///   settlement key/outbox).
 /// - `sender`: the matcher operator's address (for settlement txs).
 pub async fn run_server_ring(
     server: MatchingServer,
     submitter: Arc<dyn TxSubmitter>,
+    confirmer: Arc<dyn TxConfirmer>,
     config: ServerConfig,
     sender: primitives::Address,
 ) {
@@ -1207,13 +1683,7 @@ pub async fn run_server_ring(
 
     // Batch settler seals from the same book via the control channel.
     let sealer: Arc<dyn crate::BatchSealer> = Arc::clone(&ring) as Arc<dyn crate::BatchSealer>;
-    let settler = Arc::new(BatchSettler::new(
-        sealer,
-        Arc::clone(&submitter),
-        config.batch_interval_ms,
-        sender,
-        0,
-    ));
+    let settler = build_settler(sealer, submitter, confirmer, &config, sender);
     let settler_clone = Arc::clone(&settler);
     tokio::spawn(async move {
         settler_clone.run().await;
@@ -1641,12 +2111,15 @@ pub async fn run_websocket_server_multi(
 /// - `balances`: the shared sharded balance cache (fund accounts
 ///   before calling this).
 /// - `submitter`: the consensus tx submitter (for batch settlement).
-/// - `config`: server configuration (ports, batch interval).
+/// - `confirmer`: the finalized-outcome oracle.
+/// - `config`: server configuration (ports, batch interval,
+///   settlement key/outbox).
 /// - `sender`: the matcher operator's address (for settlement txs).
 pub async fn run_server_multi(
     configs: Vec<MarketConfig>,
     balances: Arc<crate::ShardedBalanceCache>,
     submitter: Arc<dyn TxSubmitter>,
+    confirmer: Arc<dyn TxConfirmer>,
     config: ServerConfig,
     sender: primitives::Address,
 ) {
@@ -1660,13 +2133,7 @@ pub async fn run_server_multi(
 
     // Batch settler seals from ALL markets via the control channel.
     let sealer: Arc<dyn crate::BatchSealer> = Arc::clone(&matcher) as Arc<dyn crate::BatchSealer>;
-    let settler = Arc::new(BatchSettler::new(
-        sealer,
-        Arc::clone(&submitter),
-        config.batch_interval_ms,
-        sender,
-        0,
-    ));
+    let settler = build_settler(sealer, submitter, confirmer, &config, sender);
     let settler_clone = Arc::clone(&settler);
     tokio::spawn(async move {
         settler_clone.run().await;
@@ -1782,6 +2249,74 @@ mod tests {
         }
     }
 
+    /// A mock finality oracle: outcomes are injected per tx hash,
+    /// and the "executor's" expected nonce is set directly.
+    struct MockConfirmer {
+        outcomes:
+            std::sync::Mutex<std::collections::HashMap<primitives::Hash, executor::TxOutcome>>,
+        nonce: std::sync::atomic::AtomicU64,
+    }
+
+    impl MockConfirmer {
+        fn new() -> Self {
+            Self {
+                outcomes: std::sync::Mutex::new(std::collections::HashMap::new()),
+                nonce: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        /// The confirmer key for a submitted envelope — the same
+        /// `Domain::Transaction` hash the executor records under.
+        fn hash_of(tx: &TxBytes) -> primitives::Hash {
+            crypto::Hasher::hash_one(crypto::Domain::Transaction, tx.as_bytes())
+        }
+
+        /// Inject a finalized outcome for `tx` (as a block executing
+        /// it would), and set the post-execution expected nonce.
+        fn execute(&self, tx: &TxBytes, outcome: executor::TxOutcome, next_nonce: u64) {
+            self.outcomes.lock().unwrap().insert(Self::hash_of(tx), outcome);
+            self.nonce.store(next_nonce, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl TxConfirmer for MockConfirmer {
+        fn tx_outcome(&self, tx_hash: &primitives::Hash) -> Option<executor::TxOutcome> {
+            self.outcomes.lock().unwrap().get(tx_hash).cloned()
+        }
+
+        fn executed_nonce(&self, _sender: &primitives::Address) -> u64 {
+            self.nonce.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Build a settler + its mock submitter/confirmer handles.
+    fn settler_harness(
+        shared: &Arc<SharedMatcher>,
+    ) -> (BatchSettler, Arc<MockSubmitter>, Arc<MockConfirmer>) {
+        let submitter = Arc::new(MockSubmitter::new());
+        let confirmer = Arc::new(MockConfirmer::new());
+        let settler = BatchSettler::new(
+            Arc::clone(shared) as Arc<dyn crate::BatchSealer>,
+            Arc::clone(&submitter) as Arc<dyn TxSubmitter>,
+            Arc::clone(&confirmer) as Arc<dyn TxConfirmer>,
+            100,
+            addr(0),
+            0,
+        );
+        (settler, submitter, confirmer)
+    }
+
+    /// The `Executed` outcome for a clean batch — one `batch_fill`
+    /// event per settled pair (kinds are what the exchange emits).
+    fn clean_outcome(pair_count: usize) -> executor::TxOutcome {
+        executor::TxOutcome::Executed {
+            events: (0..pair_count)
+                .map(|_| executor::Event { module: "exchange", kind: "batch_fill", data: vec![] })
+                .collect(),
+            error: None,
+        }
+    }
+
     #[test]
     fn batch_settler_seals_and_submits() {
         let (seller_sk, seller) = test_account(9);
@@ -1799,28 +2334,33 @@ mod tests {
 
         // Create the shared matcher and settler.
         let shared = Arc::new(SharedMatcher::new(server));
-        let counter = Arc::new(MockSubmitter::new());
-        let submitter: Arc<dyn TxSubmitter> = Arc::clone(&counter) as Arc<dyn TxSubmitter>;
-        let batch_sealer: Arc<dyn crate::BatchSealer> =
-            Arc::clone(&shared) as Arc<dyn crate::BatchSealer>;
-        let settler = BatchSettler::new(batch_sealer, Arc::clone(&submitter), 100, addr(0), 0);
+        let (settler, counter, confirmer) = settler_harness(&shared);
 
-        // Settle now.
-        let settled = settler.settle_now().expect("settle");
-        assert_eq!(settled, 1, "should settle 1 fill");
+        // Settle now — mempool acceptance only. `submitted` counts
+        // the in-flight batch; `confirmed` stays 0 until the
+        // finalized outcome lands.
+        let report = settler.settle_now().expect("settle");
+        assert_eq!(report.submitted, 1, "should submit 1 fill batch");
+        assert_eq!(report.confirmed, 0, "submission is not settlement");
         assert_eq!(counter.count(), 1, "should submit 1 tx");
         assert_eq!(shared.stats().pending_settlements, 0, "batch should be empty after settle");
+
+        // The batch executes — the outcome confirms it and the
+        // nonce resyncs to the executor's post-execution value.
+        let tx = counter.submissions.lock().unwrap()[0].clone();
+        confirmer.execute(&tx, clean_outcome(1), 1);
+        let report = settler.settle_now().expect("confirm");
+        assert_eq!(report.confirmed, 1, "executed batch confirms");
     }
 
     #[test]
     fn batch_settler_empty_batch_is_noop() {
         let server = MatchingServer::new(cfg(), 100);
         let shared = Arc::new(SharedMatcher::new(server));
-        let submitter: Arc<dyn TxSubmitter> = Arc::new(MockSubmitter::new());
-        let settler = BatchSettler::new(shared, submitter, 100, addr(0), 0);
+        let (settler, _counter, _confirmer) = settler_harness(&shared);
 
-        let settled = settler.settle_now().expect("settle");
-        assert_eq!(settled, 0, "empty batch should settle 0");
+        let report = settler.settle_now().expect("settle");
+        assert_eq!(report, SettleReport::default(), "empty batch should be a no-op");
     }
 
     /// A submitter that fails the first `fail_count` submissions,
@@ -1863,9 +2403,11 @@ mod tests {
             fail_remaining: std::sync::Mutex::new(1),
             submissions: std::sync::Mutex::new(Vec::new()),
         });
+        let confirmer = Arc::new(MockConfirmer::new());
         let settler = BatchSettler::new(
             Arc::clone(&shared) as Arc<dyn crate::BatchSealer>,
             Arc::clone(&flaky) as Arc<dyn TxSubmitter>,
+            Arc::clone(&confirmer) as Arc<dyn TxConfirmer>,
             100,
             addr(0),
             0,
@@ -1877,9 +2419,11 @@ mod tests {
         assert_eq!(flaky.submissions.lock().unwrap().len(), 1);
 
         // The retry resubmits the SAME envelope (same nonce — the
-        // executor still expects it) and succeeds.
-        let settled = settler.settle_now().expect("retry must succeed");
-        assert_eq!(settled, 1);
+        // executor still expects it) and is accepted into the
+        // mempool — still in flight, not settled.
+        let report = settler.settle_now().expect("retry must succeed");
+        assert_eq!(report.submitted, 1);
+        assert_eq!(report.confirmed, 0);
         let subs = flaky.submissions.lock().unwrap();
         assert_eq!(subs.len(), 2, "one original + one retry");
         assert_eq!(
@@ -1887,13 +2431,21 @@ mod tests {
             subs[1].as_bytes(),
             "the retry must resubmit the identical envelope (nonce baked in)"
         );
+        let retried = subs[1].clone();
         drop(subs);
+
+        // Execution confirms the batch and advances the nonce — the
+        // sequence stayed contiguous because a failed submit never
+        // consumed one.
+        confirmer.execute(&retried, clean_outcome(1), 1);
+        let report = settler.settle_now().expect("confirm");
+        assert_eq!(report.confirmed, 1);
 
         // The next batch gets the NEXT nonce — the sequence stayed
         // contiguous because the failed submit never consumed one.
         server_refill(&shared);
-        let settled = settler.settle_now().expect("second batch");
-        assert_eq!(settled, 1);
+        let report = settler.settle_now().expect("second batch");
+        assert_eq!(report.submitted, 1);
         let subs = flaky.submissions.lock().unwrap();
         assert_eq!(subs.len(), 3);
         assert_ne!(subs[1].as_bytes(), subs[2].as_bytes(), "the next batch carries the next nonce");
@@ -1932,9 +2484,11 @@ mod tests {
             fail_remaining: std::sync::Mutex::new(u32::MAX),
             submissions: std::sync::Mutex::new(Vec::new()),
         });
+        let confirmer = Arc::new(MockConfirmer::new());
         let settler = BatchSettler::new(
             Arc::clone(&shared) as Arc<dyn crate::BatchSealer>,
             Arc::clone(&flaky) as Arc<dyn TxSubmitter>,
+            Arc::clone(&confirmer) as Arc<dyn TxConfirmer>,
             100,
             addr(0),
             0,
@@ -1954,5 +2508,211 @@ mod tests {
         let first_nonce = &subs[0].as_bytes()[20..28];
         let last_nonce = &subs[subs.len() - 1].as_bytes()[20..28];
         assert_eq!(first_nonce, last_nonce, "nonce must not advance while pending");
+    }
+
+    /// Seed the shared matcher's book with one matched pair.
+    fn matched_pair() -> (Arc<SharedMatcher>, u64) {
+        let (seller_sk, seller) = test_account(9);
+        let (buyer_sk, buyer) = test_account(1);
+        let mut server = MatchingServer::new(cfg(), 100);
+        server.fund_account(&seller, 1_000_000_000_000);
+        server.fund_account(&buyer, 1_000_000_000_000);
+        server.submit_order(&signed_req(&seller_sk, Side::Sell, 0));
+        server.submit_order(&signed_req(&buyer_sk, Side::Buy, 0));
+        (Arc::new(SharedMatcher::new(server)), 1)
+    }
+
+    /// The submitted envelope's nonce field (bytes 20..28).
+    fn envelope_nonce(tx: &TxBytes) -> u64 {
+        u64::from_le_bytes(tx.as_bytes()[20..28].try_into().unwrap())
+    }
+
+    /// Regression: a terminal execution-time skip must dead-letter
+    /// the batch — loudly — WITHOUT consuming the nonce. The next
+    /// sealed batch reuses the same nonce value, which is exactly
+    /// what the executor still expects.
+    #[test]
+    fn batch_settler_dead_letter_reuses_nonce() {
+        let (shared, _) = matched_pair();
+        let (settler, submitter, confirmer) = settler_harness(&shared);
+
+        let report = settler.settle_now().expect("submit");
+        assert_eq!(report.submitted, 1);
+        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        assert_eq!(envelope_nonce(&tx), 0);
+
+        // The block executes but the tx is gate-skipped — e.g. an
+        // unsigned envelope under a Reject policy. Terminal reason:
+        // the same bytes can never pass that gate.
+        confirmer.execute(
+            &tx,
+            executor::TxOutcome::Skipped { reason: executor::TxSkipReason::BadSignature },
+            0,
+        );
+        let report = settler.settle_now().expect("resolve");
+        assert_eq!(report.dead_lettered.as_deref(), Some("BadSignature"));
+        assert_eq!(report.confirmed, 0);
+
+        // The nonce was NOT consumed — the next batch reuses nonce 0
+        // (the executor's expected value), un-wedging the sequence.
+        server_refill(&shared);
+        let report = settler.settle_now().expect("next batch");
+        assert_eq!(report.submitted, 1);
+        let subs = submitter.submissions.lock().unwrap();
+        assert_eq!(envelope_nonce(&subs[1]), 0, "dead-lettered batch must not burn a nonce");
+    }
+
+    /// Regression: a batch whose module call returned `Err` executed
+    /// (fee + nonce consumed) but settled nothing. The report must
+    /// carry the rejection and the nonce must still advance — the
+    /// sequence continues past the dead batch.
+    #[test]
+    fn batch_settler_batch_rejected_advances_nonce() {
+        let (shared, _) = matched_pair();
+        let (settler, submitter, confirmer) = settler_harness(&shared);
+
+        settler.settle_now().expect("submit");
+        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        confirmer.execute(
+            &tx,
+            executor::TxOutcome::Executed {
+                events: vec![],
+                error: Some("settle: sender is not the settlement operator".to_string()),
+            },
+            1,
+        );
+        let report = settler.settle_now().expect("resolve");
+        assert!(report.batch_rejected.is_some(), "module rejection must surface");
+        assert_eq!(report.confirmed, 0);
+
+        // The nonce WAS consumed — the next batch carries nonce 1.
+        server_refill(&shared);
+        settler.settle_now().expect("next batch");
+        let subs = submitter.submissions.lock().unwrap();
+        assert_eq!(envelope_nonce(&subs[1]), 1, "executed batch consumed its nonce");
+    }
+
+    /// Regression: `settlement_failed`/`fill_rejected` events inside
+    /// an applied batch are reconciled into the report — the chain
+    /// can void individual pairs even when the batch succeeds.
+    #[test]
+    fn batch_settler_reconciles_partial_failures() {
+        let (shared, _) = matched_pair();
+        let (settler, submitter, confirmer) = settler_harness(&shared);
+
+        settler.settle_now().expect("submit");
+        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        confirmer.execute(
+            &tx,
+            executor::TxOutcome::Executed {
+                events: vec![
+                    executor::Event { module: "exchange", kind: "settlement_failed", data: vec![] },
+                    executor::Event { module: "exchange", kind: "fill_rejected", data: vec![] },
+                ],
+                error: None,
+            },
+            1,
+        );
+        let report = settler.settle_now().expect("resolve");
+        assert_eq!(report.confirmed, 1, "the batch applied");
+        assert_eq!(report.failed_pairs, 1);
+        assert_eq!(report.rejected_legs, 1);
+    }
+
+    /// Regression: a retryable skip (block gas limit) keeps the
+    /// batch in flight — the pooled tx lands in a later block and
+    /// the eventual `Executed` outcome confirms it.
+    #[test]
+    fn batch_settler_retryable_skip_keeps_waiting() {
+        let (shared, _) = matched_pair();
+        let (settler, submitter, confirmer) = settler_harness(&shared);
+
+        settler.settle_now().expect("submit");
+        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        confirmer.execute(
+            &tx,
+            executor::TxOutcome::Skipped { reason: executor::TxSkipReason::GasLimit },
+            0,
+        );
+        let report = settler.settle_now().expect("gas-skip tick");
+        assert_eq!(report, SettleReport::default(), "retryable skip just keeps waiting");
+        assert!(settler.has_pending(), "batch stays in flight");
+
+        // A later block executes it — the updated outcome confirms.
+        confirmer.execute(&tx, clean_outcome(1), 1);
+        let report = settler.settle_now().expect("confirm");
+        assert_eq!(report.confirmed, 1);
+    }
+
+    /// Regression: the durable outbox restores an in-flight batch
+    /// across a settler restart — the outcome is checked BEFORE any
+    /// resubmission, so a batch that executed during the downtime is
+    /// reconciled, not replayed.
+    #[test]
+    fn batch_settler_outbox_restores_pending() {
+        let dir = std::env::temp_dir().join(format!("oxso-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let (shared, _) = matched_pair();
+        let (settler, submitter, confirmer) = settler_harness(&shared);
+        let settler = settler.with_outbox(dir.clone());
+
+        settler.settle_now().expect("submit");
+        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        drop(settler); // simulate a restart: in-memory state is gone
+
+        // Rebuild with the same outbox — the pending batch resumes.
+        let restored = BatchSettler::new(
+            Arc::clone(&shared) as Arc<dyn crate::BatchSealer>,
+            Arc::clone(&submitter) as Arc<dyn TxSubmitter>,
+            Arc::clone(&confirmer) as Arc<dyn TxConfirmer>,
+            100,
+            addr(0),
+            0,
+        )
+        .with_outbox(dir.clone());
+        assert!(restored.has_pending(), "outbox restore must resume the in-flight batch");
+
+        // The batch executed during the downtime — the outcome check
+        // reconciles it without any resubmission.
+        confirmer.execute(&tx, clean_outcome(1), 1);
+        let report = restored.settle_now().expect("resolve restored");
+        assert_eq!(report.confirmed, 1);
+        assert_eq!(submitter.count(), 1, "no replay — the outcome resolved it");
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// Regression: `with_signing` produces the executor's v1 signed
+    /// envelope — flagged module byte, 65-byte signature, and a
+    /// recovered signer equal to the key-derived sender.
+    #[test]
+    fn batch_settler_signed_envelope_layout() {
+        let (shared, _) = matched_pair();
+        let (settler, submitter, _confirmer) = settler_harness(&shared);
+        let (privkey, operator) = crypto::secp::generate_keypair_for_test();
+        let settler = settler.with_signing(privkey, 777);
+
+        settler.settle_now().expect("submit signed");
+        let subs = submitter.submissions.lock().unwrap();
+        let env = subs[0].as_bytes();
+        // v1 layout: sender(20) nonce(8) fee(8) module|0x80 sig(65) payload.
+        assert_eq!(env[36] & 0x80, 0x80, "signed flag on the module byte");
+        assert_eq!(&env[0..20], &operator.0, "sender is the key-derived address");
+        let sig = crypto::secp::RecoverableSignature::from_bytes(&env[37..101], env[101])
+            .expect("65-byte recoverable sig");
+        let payload = &env[102..];
+        let nonce = u64::from_le_bytes(env[20..28].try_into().unwrap());
+        let fee = u64::from_le_bytes(env[28..36].try_into().unwrap());
+        let recovered = crypto::eip712::verify_tx_sender(
+            777,
+            &operator,
+            nonce,
+            fee,
+            framework::module_id::EXCHANGE,
+            payload,
+            &sig,
+        )
+        .expect("signature must verify");
+        assert_eq!(recovered, operator, "signer must equal the declared sender");
     }
 }

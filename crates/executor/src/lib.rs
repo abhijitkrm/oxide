@@ -1030,6 +1030,117 @@ pub struct Event {
     pub data: Vec<u8>,
 }
 
+/// Why a transaction proposed in a finalized block never reached
+/// module execution. A skipped tx was dropped at a pre-execution
+/// gate: no fee was charged and the sender's `executed_nonce` was
+/// NOT advanced — so the distinction between retryable and terminal
+/// skips matters to any submitter waiting for confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxSkipReason {
+    /// The envelope failed to parse (truncated, or no module-ID
+    /// byte). Deterministic — the same bytes can never execute.
+    Malformed,
+    /// No module is registered at the declared module ID.
+    /// Deterministic until a chain upgrade registers the module.
+    UnknownModule,
+    /// `ctx.nonce` was not the sender's next expected nonce (stale,
+    /// gapped, or the reserved `u64::MAX`). Deterministic dead end:
+    /// the executor's expected nonce only moves forward, so a nonce
+    /// it has already passed can never become expected again, and a
+    /// nonce ahead of expectation can never be reached while this
+    /// tx itself is the gap.
+    StaleNonce,
+    /// Missing or invalid envelope signature, wrong chain ID, or a
+    /// recovered signer that does not match the declared sender.
+    /// Deterministic — the same bytes can never pass.
+    BadSignature,
+    /// The block gas budget was exhausted before this tx. The tx
+    /// stays pooled and is re-proposed in later blocks — retryable.
+    GasLimit,
+    /// The declared fee is below the executor's `min_fee` floor.
+    /// Deterministic until the floor policy changes.
+    FeeFloor,
+    /// The sender could not pay the declared fee (insufficient
+    /// balance). Retryable if the account is later funded.
+    FeeCharge,
+}
+
+/// The finalized outcome of one proposed transaction, recorded when
+/// its block executes. This is the settlement-relevant boundary:
+/// mempool acceptance only means a tx MAY be proposed; a `TxOutcome`
+/// means the tx was in a block the executor actually ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxOutcome {
+    /// The tx reached its module and was dispatched.
+    ///
+    /// `error` is `Some` when the module rejected the operation —
+    /// the fee was still charged and the sender nonce still consumed
+    /// (the tx executed; the business operation failed, like a
+    /// revert). `events` carries whatever the module emitted —
+    /// including per-leg failure events for batch operations that
+    /// partially succeeded.
+    Executed {
+        /// Events the module emitted for this tx (empty on `Err`).
+        events: Vec<Event>,
+        /// The module's rejection, if it returned `Err`.
+        error: Option<String>,
+    },
+    /// The tx was dropped at a pre-execution gate — see
+    /// [`TxSkipReason`]. The nonce was not consumed; whether a
+    /// resubmission can ever land depends on the reason.
+    Skipped {
+        /// The gate that rejected the tx.
+        reason: TxSkipReason,
+    },
+}
+
+/// Bound on the finalized-outcome window: 8192 txs.
+///
+/// The store exists so submitters can distinguish "executed" from
+/// "accepted into the mempool" — it is a recent-history ring, not an
+/// archive. 8192 covers ~8 full blocks at the 1000-tx default or
+/// ~160 settlement batches, far beyond any sane confirmation
+/// latency; entries older than that return `None`, which a waiter
+/// must treat the same as "still in flight" (and bound its wait).
+/// Memory cost is bounded: outcomes hold at most a few events each.
+const MAX_TX_OUTCOMES: usize = 8192;
+
+/// Insertion-ordered bounded map of tx hash → finalized outcome.
+/// The `order` deque is the eviction frontier: the oldest recorded
+/// hash is removed when the window is full.
+#[derive(Default)]
+struct TxOutcomeStore {
+    /// Hashes in record order — front is oldest.
+    order: std::collections::VecDeque<Hash>,
+    /// The outcomes themselves.
+    outcomes: HashMap<Hash, TxOutcome>,
+}
+
+impl TxOutcomeStore {
+    /// Record an outcome, evicting the oldest entry at capacity.
+    ///
+    /// A tx may be `Skipped` in several blocks before landing (e.g.
+    /// a gas-limit skip while it waits pooled for a freer block), so
+    /// a `Skipped` entry is provisional — later records overwrite it.
+    /// `Executed` is final: execution consumes the sender nonce, so
+    /// an executed tx can never dispatch again; any later record for
+    /// the same hash can only be a stale re-proposal being skipped.
+    fn record(&mut self, hash: Hash, outcome: TxOutcome) {
+        if matches!(self.outcomes.get(&hash), Some(TxOutcome::Executed { .. })) {
+            return;
+        }
+        if self.outcomes.insert(hash, outcome).is_some() {
+            return; // replaced a provisional skip — position unchanged
+        }
+        if self.order.len() >= MAX_TX_OUTCOMES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.outcomes.remove(&oldest);
+            }
+        }
+        self.order.push_back(hash);
+    }
+}
+
 /// The v0 tx envelope payload format. The full tx is owned by the
 /// mempool: `[sender: 20B][nonce: 8B LE][fee: 8B LE][payload]`. The
 /// executor routes on the first byte of `payload`:
@@ -1298,6 +1409,11 @@ pub struct Executor {
     /// The map is restored from snapshots via `import_snapshot` so
     /// replay protection survives restarts.
     executed_nonce: Mutex<HashMap<primitives::Address, u64>>,
+    /// Finalized per-tx outcomes — the submitter-facing confirmation
+    /// surface. Written once per proposed tx inside `execute_block`;
+    /// read by `tx_outcome` from any thread (e.g. the matcher's
+    /// settlement confirmer).
+    tx_outcomes: Mutex<TxOutcomeStore>,
     /// Block gas limit. The total gas of all txs in a block must not
     /// exceed this limit. Enforced in `process_proposal` (rejects
     /// blocks that exceed the limit) and `execute_block` (skips
@@ -1380,6 +1496,7 @@ impl Executor {
                 std::sync::Condvar::new(),
             )),
             events: Mutex::new(Vec::new()),
+            tx_outcomes: Mutex::new(TxOutcomeStore::default()),
             preverify_cache: Mutex::new(HashMap::new()),
             parallel_threshold,
             recorder: None,
@@ -1757,6 +1874,37 @@ impl Executor {
             .get(&height)
             .copied()
             .unwrap_or(Hash::ZERO)
+    }
+
+    /// The finalized execution outcome for a proposed transaction,
+    /// keyed by its full `Domain::Transaction` hash.
+    ///
+    /// `None` means the tx has not appeared in an executed block yet
+    /// (still pooled, proposed-but-not-finalized, or evicted from the
+    /// bounded [`MAX_TX_OUTCOMES`] window). Callers must bound their
+    /// wait — `None` is ambiguous between "in flight" and "aged out".
+    #[must_use]
+    pub fn tx_outcome(&self, tx_hash: &Hash) -> Option<TxOutcome> {
+        self.tx_outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcomes
+            .get(tx_hash)
+            .cloned()
+    }
+
+    /// The next nonce the executor expects from `sender` — the count
+    /// of its txs that have passed execution-time continuity. This is
+    /// the authoritative resync anchor for a submitter whose local
+    /// nonce may have drifted (restart, dead-lettered batch).
+    #[must_use]
+    pub fn executed_nonce_of(&self, sender: &primitives::Address) -> u64 {
+        self.executed_nonce
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(sender)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The latest state root (at the current chain height).
@@ -2335,24 +2483,38 @@ impl Executor {
     /// zero-copy borrow into the block bytes and the hash is the
     /// preverify-cache key. `BTreeMap` ordering makes module-group
     /// processing deterministic (sorted by module ID).
+    ///
+    /// `skipped` collects the hash + gate for every proposed tx that
+    /// never reaches a module — the caller records each as a
+    /// [`TxOutcome::Skipped`] so a submitter can tell "dropped at a
+    /// gate" apart from "executed and rejected".
     fn group_block_txs<'b>(
         &self,
         txs: &'b [TxBytes],
         local_nonce: &mut HashMap<primitives::Address, u64>,
         preverify_cache: &HashMap<Hash, [u8; 20]>,
+        skipped: &mut Vec<(Hash, TxSkipReason)>,
     ) -> BTreeMap<u8, Vec<GroupedTx<'b>>> {
         let mut groups: BTreeMap<u8, Vec<GroupedTx<'b>>> = BTreeMap::new();
         let mut cumulative_gas: u64 = 0;
         for tx in txs {
             let bytes = tx.as_bytes();
+            // Hash once up front: grouped txs already paid for this
+            // hash (preverify key), and skipped txs need it for the
+            // outcome record. Skips are rare in honest traffic, so
+            // the extra hash on a dropped tx costs nothing real.
+            let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
             let Some(ctx) = parse_tx_context(bytes) else {
-                continue; // skip malformed txs
+                skipped.push((tx_hash, TxSkipReason::Malformed));
+                continue;
             };
             let Some(module_id) = parse_module_id(bytes) else {
-                continue; // skip malformed txs
+                skipped.push((tx_hash, TxSkipReason::Malformed));
+                continue;
             };
             let Some(module) = self.modules[module_id as usize].as_ref() else {
-                continue; // unknown module — skip
+                skipped.push((tx_hash, TxSkipReason::UnknownModule));
+                continue;
             };
             // A self-authenticating module (the EVM) recovers its real
             // sender and nonce from its own payload, so the envelope's
@@ -2374,18 +2536,21 @@ impl Executor {
             // sender's whole nonce range to replay).
             let expected = local_nonce.get(&ctx.sender).copied().unwrap_or(0);
             if !self_authenticating && (ctx.nonce != expected || ctx.nonce == u64::MAX) {
-                continue; // stale, out-of-order, or reserved nonce — skip
+                skipped.push((tx_hash, TxSkipReason::StaleNonce));
+                continue;
             }
             if self
                 .check_envelope_auth(bytes, &ctx, module_id, module.as_ref(), Some(preverify_cache))
                 .is_err()
             {
-                continue; // bad/missing signature — skip
+                skipped.push((tx_hash, TxSkipReason::BadSignature));
+                continue;
             }
             let payload = module_payload(bytes);
             let gas = module.estimate_gas(payload);
             if cumulative_gas.saturating_add(gas) > self.block_gas_limit {
-                continue; // block gas limit exceeded — skip remaining txs
+                skipped.push((tx_hash, TxSkipReason::GasLimit));
+                continue;
             }
             // Fee gate: every tx routed to a non-self-funded module
             // pays `ctx.fee` through the configured fee collector
@@ -2396,13 +2561,15 @@ impl Executor {
             // are exempt — charging here would double-charge.
             if !module.pays_own_fee() {
                 if ctx.fee < self.min_fee {
-                    continue; // below the fee floor — skip
+                    skipped.push((tx_hash, TxSkipReason::FeeFloor));
+                    continue;
                 }
                 if let Some(fee_module) =
                     self.fee_module.and_then(|id| self.modules[usize::from(id)].as_ref())
                 {
                     if fee_module.charge_fee(&ctx).is_err() {
-                        continue; // insufficient balance for fee — skip
+                        skipped.push((tx_hash, TxSkipReason::FeeCharge));
+                        continue;
                     }
                 }
             }
@@ -2420,7 +2587,6 @@ impl Executor {
             // Zero-copy: the payload is borrowed from the block tx
             // bytes; the full-tx hash is the same key `ingest_tx`
             // used for the preverify cache.
-            let tx_hash = Hasher::hash_one(Domain::Transaction, bytes);
             groups.entry(module_id).or_default().push((ctx, payload, tx_hash));
         }
         groups
@@ -2493,7 +2659,22 @@ impl Executor {
             &mut *self.preverify_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         );
 
-        let groups = self.group_block_txs(&block.txs, &mut local_nonce, &preverify_cache);
+        let mut skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
+        let groups =
+            self.group_block_txs(&block.txs, &mut local_nonce, &preverify_cache, &mut skipped);
+
+        // Record finalized outcomes for txs that never reached a
+        // module. These are the only outcomes a submitter can get
+        // for a gate-dropped tx — the mempool no longer holds it
+        // (it was proposed), so without this record a skipped tx is
+        // indistinguishable from "still in flight" forever.
+        {
+            let mut outcomes =
+                self.tx_outcomes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (hash, reason) in skipped {
+                outcomes.record(hash, TxOutcome::Skipped { reason });
+            }
+        }
 
         // Execute each module's txs as a batch.
         let mut block_events: Vec<Event> = Vec::new();
@@ -2551,8 +2732,29 @@ impl Executor {
                     group.iter().map(|(ctx, payload, _tx_hash)| (*ctx, *payload)).collect();
                 module.handle_batch(&batch)
             };
-            for events in results.into_iter().flatten() {
-                block_events.extend(events);
+            // Record the per-tx finalized outcome: `results` is
+            // index-aligned with `group` (every `handle_batch*`
+            // contract returns one result per input tx). `Ok` carries
+            // the module's events — which may still report per-leg
+            // failures for batch ops; `Err` means the module rejected
+            // the whole tx (fee charged, nonce consumed — a revert,
+            // not a skip).
+            {
+                let mut outcomes =
+                    self.tx_outcomes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for ((_ctx, _payload, tx_hash), result) in group.iter().zip(results) {
+                    let outcome = match result {
+                        Ok(events) => {
+                            block_events.extend(events.iter().cloned());
+                            TxOutcome::Executed { events, error: None }
+                        }
+                        Err(e) => TxOutcome::Executed {
+                            events: Vec::new(),
+                            error: Some(format!("{e:?}")),
+                        },
+                    };
+                    outcomes.record(*tx_hash, outcome);
+                }
             }
         }
         // Publish all events from this block in one lock acquisition.
@@ -5716,5 +5918,115 @@ mod tests {
             matches!(results[2], MempoolAck::Rejected { .. }),
             "the duplicate must be the one reported Rejected"
         );
+    }
+
+    /// Finalized outcomes distinguish executed txs from gate-skipped
+    /// ones — the record a settlement client waits on. Mempool
+    /// acceptance alone must never read as "settled": these txs are
+    /// hand-built into the block so the gate-skips are exercised at
+    /// execution time, exactly where they occur in production.
+    #[test]
+    fn tx_outcome_records_executed_and_skipped() {
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+
+        let good = make_tx_with_nonce(1, &[42], 0);
+        let stale = make_tx_with_nonce(1, &[7], 7);
+        let unknown = make_tx(99, &[1]);
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: vec![good.clone(), stale.clone(), unknown.clone()],
+            signers: vec![],
+        };
+        executor.finalize_block(&block);
+
+        let h = |tx: &TxBytes| Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+        match executor.tx_outcome(&h(&good)) {
+            Some(TxOutcome::Executed { events, error }) => {
+                assert!(error.is_none(), "clean dispatch");
+                assert_eq!(events.len(), 1, "the module's event is attached to the outcome");
+            }
+            other => panic!("expected Executed, got {other:?}"),
+        }
+        assert_eq!(
+            executor.tx_outcome(&h(&stale)),
+            Some(TxOutcome::Skipped { reason: TxSkipReason::StaleNonce }),
+        );
+        assert_eq!(
+            executor.tx_outcome(&h(&unknown)),
+            Some(TxOutcome::Skipped { reason: TxSkipReason::UnknownModule }),
+        );
+        // Only the executed tx consumed its sender's nonce — the
+        // skips left the counter at the executed value.
+        assert_eq!(executor.executed_nonce_of(&Address([0u8; 20])), 1);
+        // A tx never proposed has no outcome — `None` is "in flight".
+        assert!(executor.tx_outcome(&Hash::ZERO).is_none());
+    }
+
+    /// A provisional `Skipped` outcome is overwritten when the same
+    /// tx later executes — the gas-limit case in production — while
+    /// an `Executed` outcome is final and can never be rewritten by
+    /// a stale re-proposal's skip.
+    #[test]
+    fn tx_outcome_store_overwrite_semantics() {
+        let mut store = TxOutcomeStore::default();
+        let h = Hash([1u8; 32]);
+        store.record(h, TxOutcome::Skipped { reason: TxSkipReason::GasLimit });
+        // The tx lands in a later block — Executed supersedes.
+        let executed = TxOutcome::Executed { events: vec![], error: None };
+        store.record(h, executed.clone());
+        assert_eq!(store.outcomes.get(&h), Some(&executed));
+        // A stale re-proposal skipping afterwards cannot rewrite it.
+        store.record(h, TxOutcome::Skipped { reason: TxSkipReason::StaleNonce });
+        assert_eq!(store.outcomes.get(&h), Some(&executed), "Executed is final");
+    }
+
+    /// A module rejection is still an execution: the fee was charged
+    /// and the nonce consumed — the outcome records the error so a
+    /// submitter can tell a revert apart from a clean apply.
+    #[test]
+    fn tx_outcome_records_module_rejection() {
+        /// A module whose `handle` always rejects.
+        struct RejectingModule;
+        impl Module for RejectingModule {
+            fn name(&self) -> &'static str {
+                "rejector"
+            }
+            fn id(&self) -> u8 {
+                3
+            }
+            fn begin_block(&self, _height: Height) {}
+            fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+                Err(ExecError::ModuleRejected("nope".to_string()))
+            }
+            fn end_block(&self, _height: Height) {}
+            fn state_root(&self) -> Hash {
+                Hash::ZERO
+            }
+        }
+
+        let mut executor = Executor::new(100);
+        executor.register_module(Arc::new(RejectingModule));
+        let tx = make_tx_with_nonce(3, &[1], 0);
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: vec![tx.clone()],
+            signers: vec![],
+        };
+        executor.finalize_block(&block);
+
+        let h = Hasher::hash_one(Domain::Transaction, tx.as_bytes());
+        match executor.tx_outcome(&h) {
+            Some(TxOutcome::Executed { events, error }) => {
+                assert!(events.is_empty());
+                assert!(error.unwrap_or_default().contains("nope"));
+            }
+            other => panic!("expected Executed-with-error, got {other:?}"),
+        }
+        // The rejection still consumed the nonce — a revert, not a
+        // skip.
+        assert_eq!(executor.executed_nonce_of(&Address([0u8; 20])), 1);
     }
 }

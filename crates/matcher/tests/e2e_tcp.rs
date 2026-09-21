@@ -141,6 +141,21 @@ impl matcher::server::TxSubmitter for CountingSubmitter {
     }
 }
 
+/// A finality oracle that reports every tx as still in flight —
+/// these e2e tests measure submission throughput, not confirmation
+/// latency.
+struct NullConfirmer;
+
+impl matcher::server::TxConfirmer for NullConfirmer {
+    fn tx_outcome(&self, _tx_hash: &primitives::Hash) -> Option<executor::TxOutcome> {
+        None
+    }
+
+    fn executed_nonce(&self, _sender: &primitives::Address) -> u64 {
+        0
+    }
+}
+
 /// End-to-end TCP benchmark: client → binary TCP → match → settle.
 #[tokio::test]
 #[ignore = "long-running e2e TCP benchmark; run with --release --ignored --nocapture"]
@@ -170,9 +185,11 @@ async fn e2e_tcp_benchmark() {
         Arc::clone(&counter) as Arc<dyn matcher::server::TxSubmitter>;
     let sealer: Arc<dyn matcher::BatchSealer> =
         Arc::clone(&shared) as Arc<dyn matcher::BatchSealer>;
+    let confirmer: Arc<dyn matcher::server::TxConfirmer> = Arc::new(NullConfirmer);
     let settler = Arc::new(matcher::server::BatchSettler::new(
         sealer,
         Arc::clone(&submitter),
+        confirmer,
         100, // 100ms batch interval.
         addr_from_index(0),
         0,
@@ -290,9 +307,11 @@ async fn e2e_tcp_smoke() {
         Arc::clone(&counter) as Arc<dyn matcher::server::TxSubmitter>;
     let sealer: Arc<dyn matcher::BatchSealer> =
         Arc::clone(&shared) as Arc<dyn matcher::BatchSealer>;
+    let confirmer: Arc<dyn matcher::server::TxConfirmer> = Arc::new(NullConfirmer);
     let settler = Arc::new(matcher::server::BatchSettler::new(
         sealer,
         Arc::clone(&submitter),
+        confirmer,
         100,
         addr_from_index(0),
         0,

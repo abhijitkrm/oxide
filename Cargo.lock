@@ -2843,6 +2843,7 @@ dependencies = [
 name = "oxide-matcher"
 version = "0.1.0"
 dependencies = [
+ "crypto",
  "exchange",
  "executor",
  "framework",
