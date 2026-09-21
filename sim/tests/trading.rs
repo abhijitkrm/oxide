@@ -94,8 +94,10 @@ fn deterministic_trading_scenario() {
     // The key invariant: the order rests on the book.
     assert!(exchange.resting_count(0) > 0, "order should rest on book");
 
-    // Trader 2 places a limit sell at $1.50, qty 3 lots — matches
-    // trader 1's resting buy.
+    // Trader 2 deposits base custody, then places a limit sell at
+    // $1.50, qty 3 lots — matches trader 1's resting buy. The sell
+    // escrows its base at admission (delivery-versus-payment).
+    exchange.handle(&ctx(2), &exchange::msg::deposit_base(0, 10_000)).expect("base deposit ok");
     let sell_msg = exchange::msg::place(
         0,
         NewOrder {
@@ -194,7 +196,9 @@ fn exchange_l1_invariant() {
     );
     exchange.handle(&ctx(1), &buy_msg).expect("buy order ok");
 
-    // Place a sell at $1.60.
+    // Place a sell at $1.60 — custody-backed (the sell escrows its
+    // base quantity out of trader 2's deposited custody).
+    exchange.handle(&ctx(2), &exchange::msg::deposit_base(0, 10_000)).expect("base deposit ok");
     let sell_msg = exchange::msg::place(
         0,
         NewOrder {

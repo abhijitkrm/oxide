@@ -129,13 +129,27 @@ const FILL_PRICE: u64 = 1_500_000_000;
 const ORDER_POOL_QTY: u64 = 1_000_000_000_000_000;
 
 /// Register one working order for `owner` under `client_id` — the
-/// on-chain authorization every batch leg consumes. Buys escrow
-/// `FILL_PRICE × ORDER_POOL_QTY / PRICE_SCALE` = 1.5e16 quote units
-/// (well under the `u64::MAX/4` mint); sells authorize with no
-/// escrow. `client_id` is per-side (buys 1, sells 2) so an account
-/// can hold both a buy and a sell working order — the
-/// `distinct_pairs` fixture's seller range overlaps its buyers.
-fn register_working_order(ex: &ExchangeModule, owner: u8, side: Side, mid: u8, client_id: u64) {
+/// on-chain authorization every batch leg consumes. Both sides
+/// escrow at registration: buys `FILL_PRICE × ORDER_POOL_QTY /
+/// PRICE_SCALE` = 1.5e16 quote units (well under the `u64::MAX/4`
+/// mint); sells `ORDER_POOL_QTY` of base custody, funded by a
+/// same-size mint + deposit here. `client_id` is per-side (buys 1,
+/// sells 2) so an account can hold both a buy and a sell working
+/// order — the `distinct_pairs` fixture's seller range overlaps its
+/// buyers.
+fn register_working_order(
+    ex: &ExchangeModule,
+    ledger: &Arc<evm::EvmModule>,
+    owner: u8,
+    side: Side,
+    mid: u8,
+    client_id: u64,
+) {
+    if side == Side::Sell {
+        ledger.mint(&addr(owner), ORDER_POOL_QTY);
+        ex.handle(&ctx(owner), &exchange::msg::deposit_base(mid, ORDER_POOL_QTY))
+            .expect("working-order base deposit");
+    }
     ex.handle(
         &ctx(owner),
         &exchange::msg::register_order(u16::from(mid), side, FILL_PRICE, ORDER_POOL_QTY, client_id),
@@ -163,6 +177,9 @@ fn settlement_single_fill(c: &mut Criterion) {
     ledger.mint(&addr(9), 1_000_000_000_000_000); // 1e15 units for seller
     let ex = ExchangeModule::with_ledger(ledger);
     let mid = ex.list_market(cfg()).expect("market config valid");
+    // Seller base custody: each iteration's maker sell escrows
+    // 5_000 units at admission — 1e12 covers ~200M iterations.
+    ex.handle(&ctx(9), &exchange::msg::deposit_base(mid, 1_000_000_000_000)).unwrap();
     let maker = limit(Side::Sell, 500, 5, 9);
     let taker = limit(Side::Buy, 500, 5, 1);
 
@@ -197,6 +214,9 @@ fn settlement_sweep_10_levels(c: &mut Criterion) {
     ledger.mint(&addr(9), 1_000_000_000_000_000);
     let ex = ExchangeModule::with_ledger(ledger);
     let mid = ex.list_market(cfg()).expect("market config valid");
+    // Seller base custody: each iteration rests 10 lots of sells —
+    // 1e12 units covers ~100M iterations of 10_000-unit escrows.
+    ex.handle(&ctx(9), &exchange::msg::deposit_base(mid, 1_000_000_000_000)).unwrap();
     let taker = NewOrder {
         side: Side::Buy,
         order_type: OrderType::Limit,
@@ -292,10 +312,10 @@ fn batch_settle_1k_distinct_pairs(c: &mut Criterion) {
     // u8→u16 indexing keeps 2×256 = 65k distinct pairs available.
     for b in 1u8..=4 {
         ledger.mint(&addr(b), u64::MAX / 4);
-        register_working_order(&ex, b, Side::Buy, mid, 1);
+        register_working_order(&ex, &ledger, b, Side::Buy, mid, 1);
     }
     for s in 0u8..=255 {
-        register_working_order(&ex, s.wrapping_add(100), Side::Sell, mid, 2);
+        register_working_order(&ex, &ledger, s.wrapping_add(100), Side::Sell, mid, 2);
     }
     let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
         .map(|i| {
@@ -318,7 +338,9 @@ fn batch_settle_1k_distinct_pairs(c: &mut Criterion) {
     c.bench_function("batch_settle_1k_distinct_pairs", |b| {
         b.iter(|| {
             let events = ex.handle(black_box(&op_ctx), black_box(&payload)).expect("batch settles");
-            assert_eq!(events.len(), FILLS, "one event per fill");
+            // 1 `batch_fill` per (buyer, seller) pair + 1
+            // `base_delivered` per (buyer, market) — 4 buyers.
+            assert_eq!(events.len(), FILLS + 4, "pair fills + base deliveries");
             black_box(events);
         });
     });
@@ -338,8 +360,8 @@ fn batch_settle_1k_same_pair(c: &mut Criterion) {
     ex.set_settlement_operator(addr(0x5E));
     let mid = ex.list_market(cfg()).expect("market config valid");
     ledger.mint(&addr(1), u64::MAX / 4);
-    register_working_order(&ex, 1, Side::Buy, mid, 1);
-    register_working_order(&ex, 9, Side::Sell, mid, 2);
+    register_working_order(&ex, &ledger, 1, Side::Buy, mid, 1);
+    register_working_order(&ex, &ledger, 9, Side::Sell, mid, 2);
 
     let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
         .map(|_| exchange::BatchFillEntry {
@@ -356,10 +378,10 @@ fn batch_settle_1k_same_pair(c: &mut Criterion) {
     c.bench_function("batch_settle_1k_same_pair", |b| {
         b.iter(|| {
             let events = ex.handle(black_box(&op_ctx), black_box(&payload)).expect("batch settles");
-            // All 1k fills share one (buyer, seller) pair, so they
-            // aggregate into exactly one transfer — one `batch_fill`
-            // event carrying the summed quote amount.
-            assert_eq!(events.len(), 1, "one transfer event per pair");
+            // All 1k fills share one (buyer, seller) pair — one
+            // `batch_fill` event for the summed quote transfer plus
+            // one `base_delivered` for the buyer's custody credit.
+            assert_eq!(events.len(), 2, "one transfer + one delivery");
             black_box(events);
         });
     });
@@ -387,10 +409,10 @@ fn batch_settle_16k_clustered_pairs(c: &mut Criterion) {
     // Each account registers one working order under client id 1.
     for b in 1u8..=BUYERS {
         ledger.mint(&addr(b), u64::MAX / 4);
-        register_working_order(&ex, b, Side::Buy, mid, 1);
+        register_working_order(&ex, &ledger, b, Side::Buy, mid, 1);
     }
     for s in 100u8..100 + SELLERS {
-        register_working_order(&ex, s, Side::Sell, mid, 2);
+        register_working_order(&ex, &ledger, s, Side::Sell, mid, 2);
     }
     let fills: Vec<exchange::BatchFillEntry> = (0..FILLS)
         .map(|i| {
@@ -415,8 +437,9 @@ fn batch_settle_16k_clustered_pairs(c: &mut Criterion) {
             let events = ex.handle(black_box(&op_ctx), black_box(&payload)).expect("batch settles");
             // gcd(16,15)=1 ⇒ the i%16 × i%15 cycle hits all 240
             // combos; buyer/seller id ranges are disjoint so every
-            // leg is valid — exactly 240 aggregated transfers.
-            assert_eq!(events.len(), 240, "one transfer event per pair");
+            // leg is valid — 240 aggregated `batch_fill` transfers
+            // plus one `base_delivered` per buyer (16).
+            assert_eq!(events.len(), 256, "pair transfers + base deliveries");
             black_box(events);
         });
     });

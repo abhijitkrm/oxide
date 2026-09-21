@@ -17521,3 +17521,67 @@ clearing settle-to-fund both directions, the sender guard, the
 no-op liquidation of the backstop, the `end_block` book unwind,
 and a snapshot round-trip carrying debt + inventory. 86 perps
 tests green.
+
+## Exchange: base-asset custody + delivery-versus-payment
+
+`docs/audit001.md` §4.1. Spot settlement was one-legged: buys
+escrowed quote but sells carried no base obligation at all — a fill
+credited the seller and debited the buyer's reservation while the
+"delivery" of base was pure narrative. Nothing tracked base, so the
+book could settle trades where the seller never owned the asset.
+
+**Model.** Each listed market is now a base-asset custody domain —
+the market id IS the base asset id (the ledger is single-asset, so
+custody lives module-side, keyed `(owner, market)`):
+
+- `base_balances` — free custody. `deposit_base` mints it 1:1
+  against a ledger debit (every custodial base unit is
+  native-backed; the module never mints unbacked); `withdraw_base`
+  returns it.
+- `base_holds` — book-path sell obligations. A sell's full qty
+  locks at admission; fills draw it down, cancels/STP-removals/
+  dead remainders release it back.
+- `RegisteredOrder::reserved` is now side-aware: quote escrow for
+  buys (unchanged), base escrow for sells (new) — a registered sell
+  without custody cannot register.
+- `fee_vault` — the committed per-market sink for the new protocol
+  fee: `FEE_BPS = 10` bps of the seller's quote proceeds per fill
+  (`pays − fee` credited; floor-rounded so `fee ≤ pays` always).
+
+**DvP.** Both settlement paths now prove delivery before payment:
+the book fill loop checks the maker's hold (a taker sell always
+covers — admission reserved it) and `settle_leg` adds
+`sell_total ≤ sell.reserved` to leg validity. A voided pair
+consumes nothing on either side. Fills deliver base into buyer
+custody and pay quote to the seller atomically.
+
+**Codec.** Custody state is a committed trailing section —
+`tolerant tail` decode keeps pre-upgrade blobs loading (empty
+custody). That is deliberately fail-closed for legacy orders: a
+pre-upgrade resting sell holds nothing, so a fill against it
+settles void (`unbacked_sell_fill` event); a pre-upgrade
+registered sell has `reserved == 0`, so every leg naming it
+rejects. Naked legacy sells can be canceled — never paid.
+
+**Surfaced during integration.** The devnet `settle_tps` E2E is
+the real check: 1.31M fills across 4 validators settle through the
+full consensus pipeline with seller-conservation assertions that
+now account for deposits + the 10 bps fee (verified arithmetic,
+not a fudge — the delta decomposed exactly into deposits +
+fee × fills + the extra registration-tx fee). The bench harness
+and the trading sim needed the same deposit step — a fair amount
+of "the sell needs base now" plumbing, which is precisely the
+point of the change.
+
+**Tests.** 13 new: deposit/withdraw edges, unfunded sell
+rejection on both paths, hold release on cancel + STP +
+IOC-remainder, DvP fill semantics both directions, registered
+sell escrow + batch delivery + fee accrual, mixed-op custody
+conservation, custody snapshot round-trip, the pre-custody blob
+fail-closed case — plus a proptest sweeping random op sequences
+against the `Σ custody == deposits − withdrawals` invariant.
+65 exchange tests green; the devnet settle E2E passes end-to-end.
+
+Residual: the fee vault is a sink — a governance withdrawal path
+is deliberately deferred (needs the param/vote plumbing to be
+worth anything).

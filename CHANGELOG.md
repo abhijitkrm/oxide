@@ -5451,3 +5451,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     repays, and seized positions go to a dedicated account that
     sells them back into the market instead of pretending they
     never existed.
+
+- **Exchange: spot trades are now delivery-versus-payment.** Selling
+  an asset requires owning it first.
+  - Two new messages: `deposit_base` moves native tokens into
+    per-market base custody (1:1 backed — the module never mints
+    unbacked assets) and `withdraw_base` returns them.
+  - Sell orders — on the book or registered off-chain — escrow
+    their full base quantity at admission. A fill then swaps
+    atomically: the seller's base moves into the buyer's custody
+    and the buyer's escrowed quote pays the seller. A seller who
+    cannot prove custody cannot rest, register, or settle.
+  - Every fill charges a 10 bps protocol fee on the seller's
+    proceeds, accrued to a committed per-market vault (a
+    governance withdrawal path is a deliberate residual).
+  - Custody state is committed and snapshot-round-tripped; state
+    imported from before custody existed treats legacy sells
+    fail-closed (cancelable, never payable).
+  - **In plain words:** the exchange used to settle trades on an
+    honor system — it moved the buyer's money but only *assumed*
+    the seller had the goods. Now the goods must be deposited and
+    locked before a sell can even enter the book, so every trade
+    is a genuine atomic swap.

@@ -119,11 +119,20 @@ fn make_tx(sender_byte: u8, nonce: u64, payload: Vec<u8>) -> types::TxBytes {
 
 /// Build one order-registration tx for `sender_byte`: a single
 /// resting order under `CLIENT_ID` sized to cover every fill the
-/// account will see in the workload. Buys escrow
-/// `price × qty / PRICE_SCALE` at registration — sized to the
-/// per-account fill count so the reservation is exact.
-fn make_register_tx(sender_byte: u8, side: trading::Side, qty: u64) -> types::TxBytes {
-    make_tx(sender_byte, 0, exchange::msg::register_order(0, side, FILL_PRICE, qty, CLIENT_ID))
+/// account will see in the workload. Both sides escrow their
+/// obligation at registration — buys `price × qty / PRICE_SCALE`
+/// of quote, sells `qty` of base custody — sized to the per-account
+/// fill count so the reservation is exact. `nonce` is the sender's
+/// sequence: 0 for buys, 1 for sells (the deposit tx takes nonce 0).
+fn make_register_tx(sender_byte: u8, nonce: u64, side: trading::Side, qty: u64) -> types::TxBytes {
+    make_tx(sender_byte, nonce, exchange::msg::register_order(0, side, FILL_PRICE, qty, CLIENT_ID))
+}
+
+/// Build one deposit-base tx for `sender_byte`: move `amount` of
+/// native tokens into the sender's base custody on market 0 — the
+/// escrow every registered sell must hold before it can settle.
+fn make_deposit_tx(sender_byte: u8, amount: u64) -> types::TxBytes {
+    make_tx(sender_byte, 0, exchange::msg::deposit_base(0, amount))
 }
 
 /// Build one batch-settle tx carrying `count` fills starting at
@@ -162,11 +171,12 @@ fn run_settle_tps(
     min_fills_per_sec: f64,
 ) {
     // `run_pipelined_txs` consumes exactly `rounds * txs_per_round`
-    // txs in contiguous chunks — the first `NUM_BUYERS +
-    // NUM_SELLERS` slots are the order registrations every batch leg
-    // authorizes against; the rest are batch txs. The market is
-    // listed in-process before the run (see below).
-    let registration_txs = usize::from(NUM_BUYERS) + usize::from(NUM_SELLERS);
+    // txs in contiguous chunks — the first `NUM_BUYERS + 2 ×
+    // NUM_SELLERS` slots are the custody deposits (sellers) and
+    // order registrations every batch leg authorizes against; the
+    // rest are batch txs. The market is listed in-process before
+    // the run (see below).
+    let registration_txs = usize::from(NUM_BUYERS) + 2 * usize::from(NUM_SELLERS);
     let total_txs = rounds * txs_per_round;
     assert!(
         total_txs > registration_txs,
@@ -203,21 +213,25 @@ fn run_settle_tps(
         ex.list_market(cfg()).expect("test market config is valid");
     }
 
-    // Build the workload: 31 order registrations FIRST (each account
-    // authorizes one working order under CLIENT_ID sized to cover
-    // its fills), then all batch txs from the operator with
-    // incrementing nonces starting at 0. A batch leg without a
-    // registered order is a rejected leg — registration order in
+    // Build the workload: custody deposits + order registrations
+    // FIRST (each seller deposits its full sell quantity into base
+    // custody at nonce 0, then registers at nonce 1; each buyer
+    // registers at nonce 0), then all batch txs from the operator
+    // with incrementing nonces starting at 0. A batch leg without a
+    // registered, escrowed order is a rejected leg — ordering in
     // the workload is what makes the batches valid.
     let build_start = Instant::now();
     let mut all_txs = Vec::with_capacity(total_txs);
     let buy_qty = (total_fills.div_ceil(usize::from(NUM_BUYERS)) as u64) * FILL_QTY;
     let sell_qty = (total_fills.div_ceil(usize::from(NUM_SELLERS)) as u64) * FILL_QTY;
+    for b in NUM_BUYERS..NUM_BUYERS + NUM_SELLERS {
+        all_txs.push(make_deposit_tx(b, sell_qty));
+    }
     for b in 0..NUM_BUYERS {
-        all_txs.push(make_register_tx(b, trading::Side::Buy, buy_qty));
+        all_txs.push(make_register_tx(b, 0, trading::Side::Buy, buy_qty));
     }
     for b in NUM_BUYERS..NUM_BUYERS + NUM_SELLERS {
-        all_txs.push(make_register_tx(b, trading::Side::Sell, sell_qty));
+        all_txs.push(make_register_tx(b, 1, trading::Side::Sell, sell_qty));
     }
     let mut next_fill = 0usize;
     for nonce in (0u64..).take(total_batch_txs) {
@@ -277,18 +291,24 @@ fn run_settle_tps(
         assert_eq!(root_0, root_i, "validator {i} state root != validator 0");
     }
 
-    // 5. Settlement conservation: sellers received exactly
-    //    `total_fills × FILL_QUOTE` units in aggregate MINUS the
-    //    `fee` each seller paid for its order-registration tx
-    //    (15 senders × 100 units — fees are burned, not credited to
-    //    sellers). Check on every validator — catches both dropped
-    //    fills and divergent settlement. `EvmModule::balance`
-    //    returns wei, so scale the expectation by `WEI_PER_UNIT`.
+    // 5. Settlement conservation: sellers' ledger aggregate is
+    //    genesis MINUS two tx fees each (deposit nonce 0 + register
+    //    nonce 1 — fees burn) MINUS the base deposits moved into
+    //    exchange custody (`sell_qty` each — custody is module
+    //    state, not ledger balance) PLUS `total_fills ×` the net
+    //    seller payment (`FILL_QUOTE` less the 10 bps protocol fee:
+    //    `15_000 − 15 = 14_985` per fill; the fee accrues to the
+    //    committed market vault, not to sellers). Check on every
+    //    validator — catches both dropped fills and divergent
+    //    settlement. `EvmModule::balance` returns wei, so scale the
+    //    expectation by `WEI_PER_UNIT`.
     let genesis_units: u64 = 1_000_000_000_000; // GENESIS_BALANCE
     let wei = framework::WEI_PER_UNIT;
+    let fill_fee = FILL_QUOTE / 1_000; // FEE_BPS = 10 bps of 15_000 → 15
     let expected_seller_total = (u128::from(genesis_units) * u128::from(NUM_SELLERS)
-        - u128::from(NUM_SELLERS) * 100
-        + u128::from(FILL_QUOTE) * total_fills as u128)
+        - u128::from(NUM_SELLERS) * 200
+        - u128::from(NUM_SELLERS) * u128::from(sell_qty)
+        + u128::from(FILL_QUOTE - fill_fee) * total_fills as u128)
         * wei;
     for i in 0..n_validators {
         let evm = devnet.evm_module(i);

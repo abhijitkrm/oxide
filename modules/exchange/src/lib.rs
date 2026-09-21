@@ -15,10 +15,39 @@
 //!   no contention in the hot path.
 //! - **No settlement in the engine:** the matching engine produces
 //!   [`FillEvent`]s (price, qty, maker/taker owners). Settlement —
-//!   debiting/crediting balances — is the module's job, and in v0 it
-//!   records fills as events unless a balance ledger is wired.
+//!   debiting/crediting balances — is the module's job, and it only
+//!   moves funds when a balance ledger is wired (bare `new()` is a
+//!   matching-only test mode that records fills as events).
 //!   Atomic settlement (ledger + exchange in one tx) arrives with the
 //!   cross-module coordinator (plan.md §9.2).
+//! - **Two assets per market:** the quote asset is the chain's native
+//!   token held by [`framework::Balances`]; the base asset is a
+//!   per-market custodial asset whose asset id IS the market id.
+//!   Base units enter custody via `deposit_base` (debit native 1:1 —
+//!   every base unit in custody is backed by native held by the
+//!   module) and leave via `withdraw_base`. A future multi-asset
+//!   ledger can replace the base side wholesale; the
+//!   reservation/delivery structure below is unchanged by it.
+//! - **Delivery-versus-payment:** both sides of a trade are escrowed
+//!   before it can execute. A buy reserves its worst-case quote cost
+//!   (book path: `price × qty` debited at admission; registered
+//!   path: `limit × qty` escrowed at registration). A sell locks its
+//!   full quantity of base out of the owner's free custody into a
+//!   hold (book path) or the order's `reserved` field (registered
+//!   path). A fill then swaps atomically: buyer's quote → seller
+//!   (minus the protocol fee), seller's base → buyer's custody. A
+//!   sell that cannot prove base custody cannot rest, register, or
+//!   settle — unbacked fills settle as void, never as paid.
+//! - **Fees:** every fill charges [`FEE_BPS`] on the seller's quote
+//!   proceeds; accruals land in the committed per-market
+//!   `fee_vault`. A governance withdrawal path is a deliberate
+//!   residual (the vault is a sink until then).
+//! - **Conservation:** `Σ base_balances + Σ base_holds + Σ sell-side
+//!   registered `reserved` == native deposited for base − withdrawn`,
+//!   enforced by construction — base units are created only by a
+//!   paired ledger debit and every transfer moves whole units
+//!   between those three committed maps. The property tests assert
+//!   the invariant over randomized op sequences.
 //! - **Deterministic fill ordering:** the engine emits fills in match
 //!   order (best price first, FIFO within a level). Two validators
 //!   applying the same block produce byte-identical fill sequences.
@@ -35,6 +64,11 @@
 //! | 0   | Place order | `[market: 1B][side: 1B][order_type: 1B][tif: 1B][stp: 1B][price: 8B LE][qty: 8B LE]` |
 //! | 1   | Cancel order | `[market: 1B][order_id: 8B LE]` |
 //! | 2   | List market | `[tick: 8B LE][lot: 8B LE][min: 8B LE][max: 8B LE][max_resting: 4B LE]` |
+//! | 3   | Batch settle | `[fill_count: 4B LE][fill entries: 74B each]` |
+//! | 4   | Register order | `[market: 2B][side: 1B][price: 8B LE][qty: 8B LE][client_id: 8B LE]` |
+//! | 5   | Cancel registered | `[client_id: 8B LE]` |
+//! | 6   | Deposit base | `[market: 1B][amount: 8B LE]` |
+//! | 7   | Withdraw base | `[market: 1B][amount: 8B LE]` |
 //!
 //! The sender (from the tx envelope) becomes the order owner.
 //!
@@ -108,18 +142,24 @@ pub struct BatchFillEntry {
 ///
 /// Registration is the authorization the batch-settle path verifies:
 /// the owner's signed tx fixed `market`, `side`, `limit_price`, and
-/// `qty`, and every fill against the order consumes `remaining`. A
-/// buy order additionally escrows its worst-case quote cost at
-/// registration (`limit_price × qty / PRICE_SCALE`, debited into
-/// `reserved`), so batch settlement can never fail on buyer
-/// insolvency — the funds are already held. `reserved` is released
-/// piecewise per fill (`limit × fill_qty`, split into the seller's
-/// payment and the buyer's price-improvement rebate) and the residue
-/// is refunded when the order completes or is canceled.
+/// `qty`, and every fill against the order consumes `remaining`. Both
+/// sides escrow their obligation at registration:
 ///
-/// Sell orders carry `reserved == 0` in v0: there is no base-asset
-/// custody, so a sell's obligation is untracked (quote-only settlement,
-/// same as the on-chain book path).
+/// - A **buy** escrows its worst-case quote cost (`limit_price × qty
+///   / PRICE_SCALE`, debited from the ledger into `reserved`), so
+///   batch settlement can never fail on buyer insolvency — the funds
+///   are already held. `reserved` is released piecewise per fill
+///   (`limit × fill_qty`, split into the seller's payment and the
+///   buyer's price-improvement rebate) and the residue is refunded to
+///   the ledger when the order completes or is canceled.
+/// - A **sell** escrows its full base quantity (`qty`, moved out of
+///   the owner's free base custody into `reserved`), so a leg can
+///   never pay a seller who did not deliver. `reserved` shrinks
+///   qty-for-qty per fill and the residue returns to the owner's free
+///   base custody (not the ledger) on cancel or completion.
+///
+/// The `reserved` field is therefore denominated in the side's
+/// escrowed asset: quote for buys, base for sells.
 #[derive(Debug, Clone, Copy)]
 struct RegisteredOrder {
     /// Market the order is authorized on (must be listed).
@@ -131,9 +171,8 @@ struct RegisteredOrder {
     limit_price: u64,
     /// Unfilled authorized quantity (scale-6).
     remaining: u64,
-    /// Quote units still escrowed for this order (scale-6). Buys
-    /// only; equals the as-yet-unreleased portion of the
-    /// registration-time debit.
+    /// Escrowed units of the side's obligation asset (scale-6):
+    /// quote for buys, base for sells.
     reserved: u64,
 }
 
@@ -164,6 +203,19 @@ const TAG_REGISTER_ORDER: u8 = 4;
 /// registered order and refunds its remaining escrow.
 /// Body: `[client_id:8]` = 8 bytes.
 const TAG_CANCEL_REGISTERED: u8 = 5;
+
+/// Deposit-base message tag: move native tokens into the sender's
+/// per-market base custody so they can back sell orders.
+/// Body: `[market:1][amount:8]` = 9 bytes. The base asset of a
+/// market is a custodial unit minted 1:1 against the native debit —
+/// the module never creates unbacked base.
+const TAG_DEPOSIT_BASE: u8 = 6;
+
+/// Withdraw-base message tag: return free base custody to native
+/// balance. Reserved/escrowed base cannot be withdrawn — it must be
+/// released by a fill, cancel, or book removal first.
+/// Body: `[market:1][amount:8]` = 9 bytes.
+const TAG_WITHDRAW_BASE: u8 = 7;
 
 /// Size of a single fill entry in a batch-settle message:
 /// 2 + 8 + 8 + 20 + 8 + 20 + 8 = 74 bytes.
@@ -198,12 +250,27 @@ const LIST_MARKET_BODY_LEN: usize = 36;
 const REGISTER_BODY_LEN: usize = 27;
 /// `[client_id:8]` = 8.
 const CANCEL_REGISTERED_BODY_LEN: usize = 8;
+/// `[market:1][amount:8]` = 9 (deposit-base and withdraw-base
+/// share the same body shape).
+const CUSTODY_BODY_LEN: usize = 9;
 
 /// Quote-currency scale: the ledger stores native `u64` base units.
 /// The notional from a fill is scale-14 (`qty_scale_6 × price_scale_8`);
 /// dividing by `PRICE_SCALE` (1e8) yields the quote amount in scale-6
 /// base units — the `Balances` unit for this settlement path.
 const PRICE_SCALE: u128 = 100_000_000;
+
+/// Protocol fee on the seller's quote proceeds per fill, in basis
+/// points (10 bps = 0.1%). Charged on both settlement paths — the
+/// on-chain book and registered-order batch settlement — and accrued
+/// into the committed per-market `fee_vault`. Floor-rounded per fill
+/// (`pays × FEE_BPS / 10_000`), so a fill can never overcharge the
+/// seller: `seller_net = pays − fee` with `fee ≤ pays` always. A
+/// constant (not per-market config) in this revision — fee policy is
+/// protocol-level until a governance set-fee path exists.
+const FEE_BPS: u64 = 10;
+/// Basis-point denominator for [`FEE_BPS`].
+const BPS_DENOM: u64 = 10_000;
 
 // ── Module ───────────────────────────────────────────────────────────
 
@@ -219,11 +286,15 @@ type L1 = (Option<(Price, Qty)>, Option<(Price, Qty)>);
 /// uncontended on the hot path.
 ///
 /// **Settlement (plan.md §9.2):** when wired with a [`Balances`]
-/// ledger via [`ExchangeModule::with_ledger`], the module settles each
-/// fill by debiting the buyer and crediting the seller (quote
-/// currency only, base units). Pre-trade balance checks reject buy
-/// orders that would overdraw. Base-asset tracking is deferred to
-/// multi-asset support; v0 is quote-settled cash markets.
+/// ledger via [`ExchangeModule::with_ledger`], the module settles
+/// each fill delivery-versus-payment: the buyer's reserved quote pays
+/// the seller (minus the [`FEE_BPS`] protocol fee, accrued to the
+/// per-market `fee_vault`) and the seller's reserved base moves into
+/// the buyer's per-market custody. Pre-trade checks reject orders
+/// that cannot prove their obligation — buys without quote, sells
+/// without base custody. Both assets are escrowed before a fill can
+/// execute, so settlement cannot fail on insolvency after the book
+/// has matched.
 pub struct ExchangeModule {
     inner: Mutex<Inner>,
     store: KVStore,
@@ -265,13 +336,42 @@ struct Inner {
     /// of these — the operator can only settle fills the owners
     /// themselves signed for. Committed state (canonical section).
     registered: BTreeMap<OrderKey, RegisteredOrder>,
+    /// Free base-asset custody: `(owner, market) → unreserved base
+    /// qty` (scale-6). Units enter via `TAG_DEPOSIT_BASE` — each one
+    /// backed 1:1 by a native-token ledger debit the module holds —
+    /// and leave via `TAG_WITHDRAW_BASE`. Sell orders draw this down
+    /// into `base_holds` (book path) or `RegisteredOrder::reserved`
+    /// (registered path); fills deliver out of those holds into the
+    /// buyer's entry here. Committed state.
+    base_balances: BTreeMap<(Address, u8), u64>,
+    /// Base locked by this account's resting sell orders on the
+    /// book path: `(owner, market) → Σ unfilled sell qty`. A resting
+    /// sell contributes its full remaining qty at rest; fills
+    /// decrement into the buyer's `base_balances`, and cancels /
+    /// non-fill book removals release back to `base_balances`. The
+    /// invariant `holds[(o,m)] == Σ unfilled qty of o's resting sells
+    /// on m` is maintained at every mutation point. Committed state.
+    base_holds: BTreeMap<(Address, u8), u64>,
+    /// Accrued protocol fees per market, in quote units — the
+    /// committed sink every fill's `FEE_BPS` slice lands in. A
+    /// governance withdrawal path is a deliberate residual; until it
+    /// exists the vault only grows (bounded by cumulative volume, so
+    /// `checked_add` guards are honored rather than assumed).
+    /// Committed state.
+    fee_vault: BTreeMap<u8, u64>,
 }
 
 /// The committed state a snapshot decodes into — the per-market
-/// engines, pending governance endorsements, and the registered-order
-/// map, in canonical layout order.
-type CommittedState =
-    (Vec<Option<MatchingEngine>>, framework::Endorsements, BTreeMap<OrderKey, RegisteredOrder>);
+/// engines, pending governance endorsements, the registered-order
+/// map, and the base-asset custody maps, in canonical layout order.
+type CommittedState = (
+    Vec<Option<MatchingEngine>>,
+    framework::Endorsements,
+    BTreeMap<OrderKey, RegisteredOrder>,
+    BTreeMap<(Address, u8), u64>,
+    BTreeMap<(Address, u8), u64>,
+    BTreeMap<u8, u64>,
+);
 
 impl ExchangeModule {
     /// Construct a fresh exchange module with no markets and no
@@ -286,6 +386,9 @@ impl ExchangeModule {
                 markets: (0..=u8::MAX).map(|_| None).collect(),
                 fills: Vec::with_capacity(64),
                 registered: BTreeMap::new(),
+                base_balances: BTreeMap::new(),
+                base_holds: BTreeMap::new(),
+                fee_vault: BTreeMap::new(),
             }),
             store: Mutex::new(BTreeMap::new()),
             ledger: None,
@@ -414,6 +517,51 @@ impl ExchangeModule {
             .map_or(0, MatchingEngine::resting_count)
     }
 
+    /// The account's free (unreserved) base custody on a market —
+    /// withdrawable via `TAG_WITHDRAW_BASE`, drawable by sell
+    /// orders. Zero when the account never deposited.
+    ///
+    /// # Panics
+    /// Panics if the inner mutex is poisoned.
+    pub fn base_balance(&self, owner: Address, market: u8) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .base_balances
+            .get(&(owner, market))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The account's base locked by resting sells on a market.
+    /// Fills draw it down; cancels and book removals release it.
+    ///
+    /// # Panics
+    /// Panics if the inner mutex is poisoned.
+    pub fn base_hold(&self, owner: Address, market: u8) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .base_holds
+            .get(&(owner, market))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Protocol fees accrued to a market's vault (quote units).
+    ///
+    /// # Panics
+    /// Panics if the inner mutex is poisoned.
+    pub fn fee_vault(&self, market: u8) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fee_vault
+            .get(&market)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Parse a place-order message body (tag already consumed).
     fn parse_place(msg: &[u8]) -> Option<(u8, NewOrder, Address)> {
         if msg.len() != PLACE_BODY_LEN {
@@ -517,6 +665,29 @@ impl ExchangeModule {
             w.put_u64(order.remaining);
             w.put_u64(order.reserved);
         }
+        // Base-asset custody state — committed because it decides
+        // every future sell's admissibility and every fill's delivery:
+        // two replicas disagreeing on custody would settle different
+        // trades. Trailing section; decoders predate it read an empty
+        // custody set (see `decode_committed` for what that means for
+        // legacy orders).
+        w.put_count(inner.base_balances.len());
+        for ((owner, market), amount) in &inner.base_balances {
+            w.put_addr(owner);
+            w.put_u8(*market);
+            w.put_u64(*amount);
+        }
+        w.put_count(inner.base_holds.len());
+        for ((owner, market), amount) in &inner.base_holds {
+            w.put_addr(owner);
+            w.put_u8(*market);
+            w.put_u64(*amount);
+        }
+        w.put_count(inner.fee_vault.len());
+        for (market, amount) in &inner.fee_vault {
+            w.put_u8(*market);
+            w.put_u64(*amount);
+        }
     }
 
     /// Decode the canonical fields following the leading store root —
@@ -596,7 +767,41 @@ impl ExchangeModule {
                 }
             }
         }
-        Some((markets, endorsements, registered))
+        // Final trailing section: base custody (`base_balances`,
+        // `base_holds`, `fee_vault`). Tolerant tail — a blob written
+        // before custody existed decodes with empty maps. That is
+        // fail-closed for legacy orders: a pre-upgrade resting sell
+        // carries no hold, so the next fill against it settles void
+        // (`unbacked_sell_fill`), and a pre-upgrade registered sell
+        // has `reserved == 0`, so `settle_leg` rejects every leg
+        // naming it — naked sells can be canceled but never paid.
+        let mut base_balances = BTreeMap::new();
+        let mut base_holds = BTreeMap::new();
+        let mut fee_vault = BTreeMap::new();
+        if r.remaining() > 0 {
+            let count = r.get_count()?;
+            for _ in 0..count {
+                let key = (r.get_addr()?, r.get_u8()?);
+                if base_balances.insert(key, r.get_u64()?).is_some() {
+                    return None; // Duplicate key — non-canonical.
+                }
+            }
+            let count = r.get_count()?;
+            for _ in 0..count {
+                let key = (r.get_addr()?, r.get_u8()?);
+                if base_holds.insert(key, r.get_u64()?).is_some() {
+                    return None; // Duplicate key — non-canonical.
+                }
+            }
+            let count = r.get_count()?;
+            for _ in 0..count {
+                let market = r.get_u8()?;
+                if fee_vault.insert(market, r.get_u64()?).is_some() {
+                    return None; // Duplicate key — non-canonical.
+                }
+            }
+        }
+        Some((markets, endorsements, registered, base_balances, base_holds, fee_vault))
     }
 }
 
@@ -690,6 +895,29 @@ pub mod msg {
         msg
     }
 
+    /// Build a deposit-base message: move `amount` of native tokens
+    /// into the sender's base custody on `market`. The deposit debits
+    /// the ledger 1:1 — every custodial base unit is native-backed.
+    pub fn deposit_base(market: u8, amount: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::CUSTODY_BODY_LEN);
+        msg.push(super::TAG_DEPOSIT_BASE);
+        msg.push(market);
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
+    /// Build a withdraw-base message: return `amount` of the sender's
+    /// free base custody on `market` to native balance. Reserved
+    /// (resting/registered sell) base is not free and cannot be
+    /// withdrawn.
+    pub fn withdraw_base(market: u8, amount: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(1 + super::CUSTODY_BODY_LEN);
+        msg.push(super::TAG_WITHDRAW_BASE);
+        msg.push(market);
+        msg.extend_from_slice(&amount.to_le_bytes());
+        msg
+    }
+
     /// Build a batch-settle message for pre-matched fills from the
     /// off-chain matching server. Each fill is encoded as
     /// `[market:2][price:8][qty:8][buy_owner:20][buy_id:8][sell_owner:20][sell_id:8]`
@@ -750,65 +978,7 @@ impl Module for ExchangeModule {
         match tag {
             TAG_PLACE => self.handle_place(ctx, body, &mut inner),
 
-            TAG_CANCEL => {
-                let (market, order_id) = Self::parse_cancel(body).ok_or(ExecError::Malformed)?;
-
-                let Inner { markets, .. } = &mut *inner;
-                let Some(engine) = markets[usize::from(market)].as_mut() else {
-                    return Err(ExecError::ModuleRejected(format!(
-                        "market {market} does not exist"
-                    )));
-                };
-
-                // Authorization: only the order's owner may cancel.
-                if let Some(owner) = engine.order_owner(order_id) {
-                    if owner != ctx.sender {
-                        return Err(ExecError::ModuleRejected(
-                            "cancel: not the order owner".to_string(),
-                        ));
-                    }
-                } else {
-                    return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
-                }
-
-                match engine.cancel(order_id) {
-                    Ok(canceled) => {
-                        // Release the resting reservation (C6): a
-                        // resting buy holds `price × remaining_qty`
-                        // of quote debited since the order rested.
-                        // Cancel releases it — exactly once. A sell
-                        // rest unreserved (no base-asset tracking in
-                        // v0), so there is nothing to refund. The
-                        // credit cannot overflow: the refund returns
-                        // funds that were debited from this account.
-                        if canceled.side == Side::Buy {
-                            if let Some(ledger) = &self.ledger {
-                                let refund = u64::try_from(
-                                    u128::from(canceled.price.0) * u128::from(canceled.qty.0)
-                                        / PRICE_SCALE,
-                                )
-                                .map_err(|_| {
-                                    ExecError::ModuleRejected(
-                                        "cancel refund exceeds u64 quote range".to_string(),
-                                    )
-                                })?;
-                                if refund > 0 {
-                                    ledger.credit(&canceled.owner, refund).map_err(|_| {
-                                        ExecError::ModuleRejected(
-                                            "cancel refund failed".to_string(),
-                                        )
-                                    })?;
-                                }
-                            }
-                        }
-                        Ok(vec![cancel_event(market, canceled)])
-                    }
-                    Err(TradingError::OrderNotFound) => {
-                        Err(ExecError::ModuleRejected("cancel: order not found".to_string()))
-                    }
-                    Err(e) => Err(ExecError::ModuleRejected(format!("cancel: {e}"))),
-                }
-            }
+            TAG_CANCEL => self.handle_cancel(ctx, body, &mut inner),
 
             TAG_LIST_MARKET => {
                 let cfg = Self::parse_list_market(body).ok_or(ExecError::Malformed)?;
@@ -861,6 +1031,10 @@ impl Module for ExchangeModule {
             TAG_REGISTER_ORDER => self.handle_register(ctx, body, &mut inner),
 
             TAG_CANCEL_REGISTERED => self.handle_cancel_registered(ctx, body, &mut inner),
+
+            TAG_DEPOSIT_BASE => self.handle_deposit_base(ctx, body, &mut inner),
+
+            TAG_WITHDRAW_BASE => self.handle_withdraw_base(ctx, body, &mut inner),
 
             _ => Err(ExecError::Malformed),
         }
@@ -921,12 +1095,15 @@ impl Module for ExchangeModule {
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let slots =
             self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
-        let (_canon, (markets, endorsements, registered), store) =
+        let (_canon, (markets, endorsements, registered, balances, holds, fees), store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
         *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
         let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.markets = markets;
         inner.registered = registered;
+        inner.base_balances = balances;
+        inner.base_holds = holds;
+        inner.fee_vault = fees;
         // `fills` is per-call scratch — clear it so a buffer left
         // mid-transaction cannot leak across the import boundary.
         inner.fills.clear();
@@ -940,6 +1117,80 @@ impl Module for ExchangeModule {
 }
 
 impl ExchangeModule {
+    /// Handle a cancel-order message (extracted from `handle`):
+    /// remove the resting order and release its reservation — quote
+    /// for buys, base for sells — exactly once.
+    fn handle_cancel(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        let (market, order_id) = Self::parse_cancel(body).ok_or(ExecError::Malformed)?;
+
+        let Inner { markets, base_balances, base_holds, .. } = inner;
+        let Some(engine) = markets[usize::from(market)].as_mut() else {
+            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+        };
+
+        // Authorization: only the order's owner may cancel.
+        if let Some(owner) = engine.order_owner(order_id) {
+            if owner != ctx.sender {
+                return Err(ExecError::ModuleRejected("cancel: not the order owner".to_string()));
+            }
+        } else {
+            return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
+        }
+
+        match engine.cancel(order_id) {
+            Ok(canceled) => {
+                // Release the resting reservation (C6 + DvP): a
+                // resting buy holds `price × remaining_qty` of quote
+                // debited since it rested; a resting sell holds
+                // `remaining_qty` of base in `base_holds`. Cancel
+                // releases each — exactly once. The quote credit
+                // cannot overflow: the refund returns funds debited
+                // from this same account. The base release clamps to
+                // the hold actually present (a pre-custody sell
+                // holds nothing and releases nothing).
+                match canceled.side {
+                    Side::Buy => {
+                        if let Some(ledger) = &self.ledger {
+                            let refund = u64::try_from(
+                                u128::from(canceled.price.0) * u128::from(canceled.qty.0)
+                                    / PRICE_SCALE,
+                            )
+                            .map_err(|_| {
+                                ExecError::ModuleRejected(
+                                    "cancel refund exceeds u64 quote range".to_string(),
+                                )
+                            })?;
+                            if refund > 0 {
+                                ledger.credit(&canceled.owner, refund).map_err(|_| {
+                                    ExecError::ModuleRejected("cancel refund failed".to_string())
+                                })?;
+                            }
+                        }
+                    }
+                    Side::Sell => {
+                        let key = (canceled.owner, market);
+                        let release =
+                            base_holds.get(&key).copied().unwrap_or(0).min(canceled.qty.0);
+                        if release > 0 {
+                            *base_holds.get_mut(&key).ok_or(ExecError::Malformed)? -= release;
+                            *base_balances.entry(key).or_insert(0) += release;
+                        }
+                    }
+                }
+                Ok(vec![cancel_event(market, canceled)])
+            }
+            Err(TradingError::OrderNotFound) => {
+                Err(ExecError::ModuleRejected("cancel: order not found".to_string()))
+            }
+            Err(e) => Err(ExecError::ModuleRejected(format!("cancel: {e}"))),
+        }
+    }
+
     /// Handle a place-order message (extracted from `handle`).
     ///
     /// Runs the full order lifecycle: parse → pre-trade balance check
@@ -958,16 +1209,19 @@ impl ExchangeModule {
         // and settlement attribution use this).
         order.owner = ctx.sender;
 
-        // Split the borrow: `inner` derefs to `Inner`, and we need
-        // `&mut markets` and `&mut fills` at once.
-        let Inner { markets, fills, .. } = inner;
+        // Split the borrow: `inner` derefs to `Inner`, and the
+        // settlement code below needs the book maps and the base
+        // custody maps disjointly.
+        let Inner { markets, fills, base_balances, base_holds, fee_vault, .. } = inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
             return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
         };
 
-        // Reservation (C6): if the ledger is wired, a buy order
-        // DEBITS its worst-case quote cost up front — this is a
-        // reservation, not a check. Limit buys reserve
+        // Reservations (C6 + DvP): if the ledger is wired, BOTH sides
+        // escrow their obligation up front — a reservation, not a
+        // check.
+        //
+        // A buy DEBITS its worst-case quote cost: limit buys reserve
         // `price × qty` (fills can only cost less); market buys
         // reserve the real sweep cost of `qty` through the ask
         // ladder (`engine.sweep_cost`) — a market order has no
@@ -975,32 +1229,63 @@ impl ExchangeModule {
         // reservation an unfunded taker could sweep the book and
         // leave every fill unsettled.
         //
-        // The reservation is released piecewise at settlement:
-        // fills pay their actual price, a surviving resting
-        // remainder keeps `price × resting_qty` held — which is
-        // exactly what `TAG_CANCEL` refunds later, exactly once.
-        // Resting buy orders ARE the reservation ledger: a maker
-        // fill pays from quote already debited at rest time, so
-        // settlement below cannot fail on insolvency.
+        // A sell moves its full `qty` out of the owner's free base
+        // custody (`base_balances`) into `taker_base` — the
+        // deliverable side of every fill the order produces. A sell
+        // whose owner cannot prove base custody cannot rest or
+        // execute at all.
+        //
+        // Both reservations release piecewise at settlement: fills
+        // deliver their actual quantity, a surviving resting
+        // remainder keeps `price × resting_qty` quote / `resting_qty`
+        // base held — which is exactly what `TAG_CANCEL` refunds
+        // later, exactly once. Resting orders ARE the reservation
+        // ledger (buys implicitly via `price × qty`, sells via
+        // `base_holds`): a maker fill pays from obligations already
+        // escrowed at rest time, so settlement below cannot fail on
+        // insolvency.
         let mut reservation = 0u64;
-        if let Some(ledger) = &self.ledger {
-            if order.side == Side::Buy {
-                // Scale-14 notional → scale-6 quote. Reject rather
-                // than cap on u64 overflow — saturating would
-                // silently change what the buyer pays.
-                let notional = match order.order_type {
-                    OrderType::Market => engine.sweep_cost(Side::Buy, order.qty.0, None),
-                    _ => u128::from(order.price.0) * u128::from(order.qty.0),
-                };
-                let quote_needed = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
-                    ExecError::ModuleRejected("buy notional exceeds u64 quote range".to_string())
-                })?;
-                // Debit up front — fails here, BEFORE the book is
-                // touched, on insufficient funds.
-                ledger.debit(&ctx.sender, quote_needed).map_err(|_| {
-                    ExecError::ModuleRejected("insufficient balance for buy order".to_string())
-                })?;
-                reservation = quote_needed;
+        let mut taker_base = 0u64;
+        if self.ledger.is_some() {
+            match order.side {
+                Side::Buy => {
+                    let ledger = self.ledger.as_ref().ok_or(ExecError::Malformed)?;
+                    // Scale-14 notional → scale-6 quote. Reject rather
+                    // than cap on u64 overflow — saturating would
+                    // silently change what the buyer pays.
+                    let notional = match order.order_type {
+                        OrderType::Market => engine.sweep_cost(Side::Buy, order.qty.0, None),
+                        _ => u128::from(order.price.0) * u128::from(order.qty.0),
+                    };
+                    let quote_needed = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
+                        ExecError::ModuleRejected(
+                            "buy notional exceeds u64 quote range".to_string(),
+                        )
+                    })?;
+                    // Debit up front — fails here, BEFORE the book is
+                    // touched, on insufficient funds.
+                    ledger.debit(&ctx.sender, quote_needed).map_err(|_| {
+                        ExecError::ModuleRejected("insufficient balance for buy order".to_string())
+                    })?;
+                    reservation = quote_needed;
+                }
+                Side::Sell => {
+                    // Deduct the order's full qty from free base
+                    // custody. Custody only exists once deposits are
+                    // made — and deposits require the ledger — so
+                    // inside `self.ledger.is_some()` a zero entry is
+                    // an honest rejection, not a test-mode artifact.
+                    let key = (ctx.sender, market);
+                    let free = base_balances.get(&key).copied().unwrap_or(0);
+                    if free < order.qty.0 {
+                        return Err(ExecError::ModuleRejected(
+                            "insufficient base custody for sell order".to_string(),
+                        ));
+                    }
+                    // `free >= qty` was just proven — cannot underflow.
+                    *base_balances.get_mut(&key).ok_or(ExecError::Malformed)? -= order.qty.0;
+                    taker_base = order.qty.0;
+                }
             }
         }
 
@@ -1008,10 +1293,10 @@ impl ExchangeModule {
         fills.clear();
         // `ObserveRemovals` never restricts a fill — it records
         // every maker the sweep shrank or removed without one (STP
-        // prevention), so the quote those orders held at rest can be
-        // released below. A resting buy IS its reservation; a maker
-        // the engine deletes unreported would strand that quote
-        // forever.
+        // prevention), so the obligations those orders held at rest
+        // can be released below. A resting order IS its reservation;
+        // a maker the engine deletes unreported would strand that
+        // escrow forever.
         let mut removed: Vec<trading::MakerRemoval> = Vec::new();
         let outcome = match engine.place_with_cap(
             order,
@@ -1021,8 +1306,8 @@ impl ExchangeModule {
             Ok(outcome) => outcome,
             Err(e) => {
                 // Engine rejected the order — nothing matched and
-                // nothing rests, so the full reservation comes back.
-                // Crediting the account we just debited cannot
+                // nothing rests, so both reservations come back in
+                // full. Crediting the account we just debited cannot
                 // overflow; the map_err is defensive.
                 if reservation > 0 {
                     if let Some(ledger) = &self.ledger {
@@ -1030,6 +1315,9 @@ impl ExchangeModule {
                             ExecError::ModuleRejected("engine-reject refund failed".to_string())
                         })?;
                     }
+                }
+                if taker_base > 0 {
+                    *base_balances.entry((ctx.sender, market)).or_insert(0) += taker_base;
                 }
                 return Err(ExecError::ModuleRejected(format!("engine: {e}")));
             }
@@ -1041,63 +1329,41 @@ impl ExchangeModule {
             events.push(fill_event(*f));
         }
 
-        // Settlement (plan.md §9.2, C6): the payer's side of every
-        // fill was ALREADY debited — the taker via the reservation
-        // above, a resting maker buy via the reservation it has held
-        // since it rested. So each fill only needs `credit(seller)`:
-        // no debit can fail here, which is the point — the book
-        // mutation above is NOT rolled back on a post-`place` error
-        // (the engine lives in module memory, invisible to the
-        // executor's state journal), so nothing after `place` may
-        // fail. The remaining `map_err`s guard invariants that are
-        // unreachable while they hold: per-fill notional ≤ the
-        // debited reservation (u64 range), and credit overflow only
-        // if an account approaches u64::MAX — impossible while total
-        // supply stays below it (enforced at mint/genesis).
+        // Settlement (plan.md §9.2, C6 + DvP): BOTH sides of every
+        // fill were ALREADY escrowed — the buyer's quote via the
+        // reservation above (taker) or the debit it has held since
+        // resting (maker), the seller's base via `taker_base` or the
+        // maker's `base_holds` entry. Each fill therefore swaps
+        // obligations that provably exist: no debit can fail here,
+        // which is the point — the book mutation above is NOT rolled
+        // back on a post-`place` error (the engine lives in module
+        // memory, invisible to the executor's state journal), so
+        // nothing after `place` may fail. The remaining `map_err`s
+        // guard invariants that are unreachable while they hold:
+        // per-fill notional ≤ the debited reservation (u64 range),
+        // and credit overflow only if an account approaches
+        // u64::MAX — impossible while total supply stays below it
+        // (enforced at mint/genesis).
+        //
+        // A maker sell whose hold cannot cover its fill is the one
+        // provably-impossible case this code still handles: state
+        // imported from before custody existed carries resting sells
+        // with no hold. Such a fill settles VOID — the book consumed
+        // the order, but no quote moves and no base is minted — the
+        // `unbacked_sell_fill` event keeps the anomaly auditable.
         if let Some(ledger) = &self.ledger {
-            for f in fills.iter() {
-                let notional = u128::from(f.price.0) * u128::from(f.qty.0);
-                let quote_amount = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
-                    ExecError::ModuleRejected(format!(
-                        "fill notional exceeds u64 quote range (market {market})"
-                    ))
-                })?;
-                // The seller is whichever party did NOT pay the
-                // quote: the maker when the taker bought, the taker
-                // when the taker sold.
-                let seller = if f.taker_side == Side::Buy { f.maker_owner } else { f.taker_owner };
-                ledger.credit(&seller, quote_amount).map_err(|_| {
-                    ExecError::ModuleRejected(format!("settlement credit failed (market {market})"))
-                })?;
-            }
-
-            // Release the taker's reservation: fills the taker BOUGHT
-            // cost their actual fill price (improvement refunded), a
-            // surviving GTC remainder keeps `price × resting_qty`
-            // held for the cancel path, and dead remainders
-            // (IOC/FOK/Killed/Rejected) come back in full.
-            if reservation > 0 {
-                let taker_paid: u64 = fills
-                    .iter()
-                    .map(|f| {
-                        u64::try_from(u128::from(f.price.0) * u128::from(f.qty.0) / PRICE_SCALE)
-                            .unwrap_or(u64::MAX)
-                    })
-                    .sum();
-                let held = match outcome {
-                    OrderOutcome::Resting { resting_qty, .. } => u64::try_from(
-                        u128::from(order.price.0) * u128::from(resting_qty.0) / PRICE_SCALE,
-                    )
-                    .unwrap_or(u64::MAX),
-                    _ => 0,
-                };
-                let refund = reservation.saturating_sub(taker_paid.saturating_add(held));
-                if refund > 0 {
-                    ledger.credit(&ctx.sender, refund).map_err(|_| {
-                        ExecError::ModuleRejected("reservation refund failed".to_string())
-                    })?;
-                }
-            }
+            BookSettlement { ledger, base_balances, base_holds, fee_vault, events: &mut events }
+                .apply(
+                    market,
+                    TakerCtx {
+                        price: order.price,
+                        owner: ctx.sender,
+                        reservation,
+                        base: taker_base,
+                    },
+                    outcome,
+                    fills,
+                )?;
         }
 
         events.push(outcome_event(market, outcome));
@@ -1105,22 +1371,29 @@ impl ExchangeModule {
         // the sweep applied, so downstream accounting sees each
         // obligation the book released — a maker the engine deleted
         // silently would be invisible to settlement reconciliation.
-        self.release_maker_holds(market, &removed, &mut events)?;
+        self.release_maker_holds(market, &removed, base_balances, base_holds, &mut events)?;
         Ok(events)
     }
 
-    /// Release quote the sweep freed without a fill and emit one
-    /// event per removal/decrement: a removed resting buy held
-    /// `price × removed_qty` since it rested; a decremented one
-    /// holds `price × remaining` now, so the released slice is
-    /// `price × removed_qty` in both cases. Resting sells hold no
-    /// quote reservation (base-asset custody is a separate build) —
-    /// nothing to refund there. The credit cannot overflow: it
-    /// returns funds debited from this same account at rest time.
+    /// Release the obligations the sweep freed without a fill and
+    /// emit one event per removal/decrement.
+    ///
+    /// - A resting **buy** held `price × removed_qty` of quote since
+    ///   it rested; a decremented one holds `price × remaining` now,
+    ///   so the released slice is `price × removed_qty` in both
+    ///   cases. The ledger credit cannot overflow: it returns funds
+    ///   debited from this same account at rest time.
+    /// - A resting **sell** holds `removed_qty` of base in
+    ///   `base_holds` — released back to the owner's free custody.
+    ///   `min(hold, removed_qty)` clamps the release to what is
+    ///   actually held: a sell imported from before custody existed
+    ///   holds nothing, so it releases nothing.
     fn release_maker_holds(
         &self,
         market: u8,
         removed: &[trading::MakerRemoval],
+        base_balances: &mut BTreeMap<(Address, u8), u64>,
+        base_holds: &mut BTreeMap<(Address, u8), u64>,
         events: &mut Vec<Event>,
     ) -> Result<(), ExecError> {
         if let Some(ledger) = &self.ledger {
@@ -1141,6 +1414,14 @@ impl ExchangeModule {
             }
         }
         for r in removed {
+            if r.side == Side::Sell && r.removed_qty > 0 {
+                let key = (r.owner, market);
+                let release = base_holds.get(&key).copied().unwrap_or(0).min(r.removed_qty);
+                if release > 0 {
+                    *base_holds.get_mut(&key).ok_or(ExecError::Malformed)? -= release;
+                    *base_balances.entry(key).or_insert(0) += release;
+                }
+            }
             events.push(removal_event(market, *r));
         }
         Ok(())
@@ -1152,10 +1433,12 @@ impl ExchangeModule {
     /// Registration is what makes a batch-settle leg authorized: the
     /// sender's signature fixes `market`, `side`, `limit_price`, and
     /// `qty`, so the settlement operator can later fill the order
-    /// only within those bounds. A buy additionally escrows
-    /// `price × qty / PRICE_SCALE` quote at registration — the
-    /// reservation every later fill pays out of, which is why batch
-    /// settlement can never fail on buyer insolvency.
+    /// only within those bounds. Both sides escrow at registration:
+    /// a buy escrows `price × qty / PRICE_SCALE` of quote (the
+    /// reservation every later fill pays out of, so settlement can
+    /// never fail on buyer insolvency) and a sell escrows `qty` of
+    /// base custody (the delivery every later fill demands, so a
+    /// leg can never pay an undelivering seller).
     ///
     /// Rejects: malformed body, unlisted market, non-positive or
     /// off-config price/qty (same tick/lot/band rules as a fill
@@ -1178,7 +1461,7 @@ impl ExchangeModule {
         let client_id =
             u64::from_le_bytes(body[19..27].try_into().map_err(|_| ExecError::Malformed)?);
 
-        let Inner { markets, registered, .. } = &mut *inner;
+        let Inner { markets, registered, base_balances, .. } = &mut *inner;
         let cfg = markets
             .get(usize::from(market))
             .and_then(Option::as_ref)
@@ -1208,30 +1491,53 @@ impl ExchangeModule {
             return Err(ExecError::ModuleRejected("register: order registry full".to_string()));
         }
 
-        let ledger = self.ledger.as_ref().ok_or_else(|| {
-            ExecError::ModuleRejected("register requires ledger wiring".to_string())
-        })?;
-
-        // Escrow (buys): debit `limit × qty` up front — every fill
-        // against this order pays out of the escrow, so settlement
-        // can never draw on an insolvent buyer. Reject rather than
-        // cap on u64 overflow: saturating would silently change what
-        // the buyer authorized.
-        let reserved = if side == Side::Buy {
-            let amount =
-                u64::try_from(u128::from(price) * u128::from(qty) / PRICE_SCALE).map_err(|_| {
+        // Escrow — both sides, denominated in the side's obligation
+        // asset (`reserved` is quote for buys, base for sells):
+        //
+        // - A buy debits `limit × qty` of ledger quote up front —
+        //   every fill against this order pays out of the escrow, so
+        //   settlement can never draw on an insolvent buyer. Reject
+        //   rather than cap on u64 overflow: saturating would
+        //   silently change what the buyer authorized.
+        // - A sell moves `qty` of base out of the owner's free
+        //   custody into `reserved` — the delivery a fill can demand.
+        //   Without the ledger no deposit path exists, so the free
+        //   balance is always zero and the check rejects naturally.
+        let reserved = match side {
+            Side::Buy => {
+                let ledger = self.ledger.as_ref().ok_or_else(|| {
+                    ExecError::ModuleRejected("register requires ledger wiring".to_string())
+                })?;
+                let amount = u64::try_from(u128::from(price) * u128::from(qty) / PRICE_SCALE)
+                    .map_err(|_| {
+                        ExecError::ModuleRejected(
+                            "register: escrow exceeds u64 quote range".to_string(),
+                        )
+                    })?;
+                ledger.debit(&ctx.sender, amount).map_err(|_| {
                     ExecError::ModuleRejected(
-                        "register: escrow exceeds u64 quote range".to_string(),
+                        "register: insufficient balance for buy escrow".to_string(),
                     )
                 })?;
-            ledger.debit(&ctx.sender, amount).map_err(|_| {
-                ExecError::ModuleRejected(
-                    "register: insufficient balance for buy escrow".to_string(),
-                )
-            })?;
-            amount
-        } else {
-            0
+                amount
+            }
+            Side::Sell => {
+                // `u8` conversion cannot fail: the market-existence
+                // check above bounds `market` to the 256-slot engine
+                // space.
+                let m = u8::try_from(market).map_err(|_| {
+                    ExecError::ModuleRejected("register: market out of range".to_string())
+                })?;
+                let key = (ctx.sender, m);
+                let free = base_balances.get(&key).copied().unwrap_or(0);
+                if free < qty {
+                    return Err(ExecError::ModuleRejected(
+                        "register: insufficient base custody for sell".to_string(),
+                    ));
+                }
+                *base_balances.get_mut(&key).ok_or(ExecError::Malformed)? -= qty;
+                qty
+            }
         };
 
         registered.insert(
@@ -1277,13 +1583,30 @@ impl ExchangeModule {
             return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
         };
         let refund = order.reserved;
-        if refund > 0 {
-            let ledger = self.ledger.as_ref().ok_or_else(|| {
-                ExecError::ModuleRejected("cancel requires ledger wiring".to_string())
-            })?;
-            ledger.credit(&ctx.sender, refund).map_err(|_| {
-                ExecError::ModuleRejected("cancel: escrow refund failed".to_string())
-            })?;
+        match order.side {
+            // Buy escrow is ledger quote — refund to the ledger.
+            Side::Buy => {
+                if refund > 0 {
+                    let ledger = self.ledger.as_ref().ok_or_else(|| {
+                        ExecError::ModuleRejected("cancel requires ledger wiring".to_string())
+                    })?;
+                    ledger.credit(&ctx.sender, refund).map_err(|_| {
+                        ExecError::ModuleRejected("cancel: escrow refund failed".to_string())
+                    })?;
+                }
+            }
+            // Sell escrow is base custody — refund to the owner's
+            // free base balance on the order's market, not the
+            // ledger. `u8` conversion is safe: registration rejected
+            // any market beyond the 256-slot engine space.
+            Side::Sell => {
+                if refund > 0 {
+                    let market = u8::try_from(order.market).map_err(|_| {
+                        ExecError::ModuleRejected("cancel: market out of range".to_string())
+                    })?;
+                    *inner.base_balances.entry((ctx.sender, market)).or_insert(0) += refund;
+                }
+            }
         }
         inner.registered.remove(&key);
         Ok(vec![Event {
@@ -1294,6 +1617,118 @@ impl ExchangeModule {
                 d.extend_from_slice(&ctx.sender.0);
                 d.extend_from_slice(&client_id.to_le_bytes());
                 d.extend_from_slice(&refund.to_le_bytes());
+                d
+            },
+        }])
+    }
+
+    /// Handle a deposit-base message: debit `amount` of native token
+    /// from the sender's ledger balance into their free base custody
+    /// on `market` — the 1:1 backing that makes custodial base a real
+    /// asset rather than an unbacked module mint.
+    ///
+    /// Rejects: malformed body, zero amount, unlisted market (base
+    /// for a market that does not exist is dead state), missing
+    /// ledger wiring (nothing to back the deposit), and a ledger
+    /// debit the sender cannot cover. A custody-entry overflow
+    /// refunds the debit and rejects — conservation is never broken
+    /// to admit a deposit.
+    fn handle_deposit_base(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != CUSTODY_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let market = body[0];
+        let amount = u64::from_le_bytes(body[1..9].try_into().map_err(|_| ExecError::Malformed)?);
+        if amount == 0 {
+            return Err(ExecError::ModuleRejected("deposit: zero amount".to_string()));
+        }
+        if inner.markets[usize::from(market)].is_none() {
+            return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
+        }
+        let ledger = self.ledger.as_ref().ok_or_else(|| {
+            ExecError::ModuleRejected("deposit requires ledger wiring".to_string())
+        })?;
+        ledger
+            .debit(&ctx.sender, amount)
+            .map_err(|_| ExecError::ModuleRejected("deposit: insufficient balance".to_string()))?;
+        let entry = inner.base_balances.entry((ctx.sender, market)).or_insert(0);
+        if let Some(v) = entry.checked_add(amount) {
+            *entry = v;
+        } else {
+            // Unreachable while total native supply < u64::MAX
+            // (custody is native-backed). Refund the debit so the
+            // failed deposit is a no-op, not a loss.
+            ledger
+                .credit(&ctx.sender, amount)
+                .map_err(|_| ExecError::ModuleRejected("deposit: refund failed".to_string()))?;
+            return Err(ExecError::ModuleRejected("deposit: base custody overflow".to_string()));
+        }
+        Ok(vec![Event {
+            module: "exchange",
+            kind: "base_deposited",
+            data: {
+                let mut d = Vec::with_capacity(20 + 1 + 8);
+                d.extend_from_slice(&ctx.sender.0);
+                d.push(market);
+                d.extend_from_slice(&amount.to_le_bytes());
+                d
+            },
+        }])
+    }
+
+    /// Handle a withdraw-base message: return `amount` of the
+    /// sender's free base custody on `market` to their ledger
+    /// balance. Only `base_balances` (free) is drawable — base locked
+    /// in `base_holds` or a registered order's `reserved` must be
+    /// released by a fill or cancel first.
+    ///
+    /// The ledger credit runs BEFORE the custody decrement, so a
+    /// credit failure (impossible while supply < `u64::MAX` — the
+    /// units were debited out of circulation at deposit) leaves
+    /// custody untouched.
+    ///
+    /// Rejects: malformed body, zero amount, missing ledger wiring,
+    /// and a free balance that does not cover the withdrawal.
+    fn handle_withdraw_base(
+        &self,
+        ctx: &TxContext,
+        body: &[u8],
+        inner: &mut Inner,
+    ) -> Result<Vec<Event>, ExecError> {
+        if body.len() != CUSTODY_BODY_LEN {
+            return Err(ExecError::Malformed);
+        }
+        let market = body[0];
+        let amount = u64::from_le_bytes(body[1..9].try_into().map_err(|_| ExecError::Malformed)?);
+        if amount == 0 {
+            return Err(ExecError::ModuleRejected("withdraw: zero amount".to_string()));
+        }
+        let ledger = self.ledger.as_ref().ok_or_else(|| {
+            ExecError::ModuleRejected("withdraw requires ledger wiring".to_string())
+        })?;
+        let free = inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or(0);
+        if free < amount {
+            return Err(ExecError::ModuleRejected("withdraw: insufficient free base".to_string()));
+        }
+        ledger
+            .credit(&ctx.sender, amount)
+            .map_err(|_| ExecError::ModuleRejected("withdraw: credit failed".to_string()))?;
+        // `free >= amount` was just proven — the decrement cannot
+        // underflow.
+        *inner.base_balances.get_mut(&(ctx.sender, market)).ok_or(ExecError::Malformed)? -= amount;
+        Ok(vec![Event {
+            module: "exchange",
+            kind: "base_withdrawn",
+            data: {
+                let mut d = Vec::with_capacity(20 + 1 + 8);
+                d.extend_from_slice(&ctx.sender.0);
+                d.push(market);
+                d.extend_from_slice(&amount.to_le_bytes());
                 d
             },
         }])
@@ -1330,11 +1765,14 @@ impl ExchangeModule {
     ///   consumption, not an unbounded fill-id set.
     /// - **Amounts:** the settlement amount is recomputed on-chain as
     ///   `price * qty / PRICE_SCALE` with checked `u128`/`u64` math.
-    ///   The buy side is never debited at settle time: its escrow was
-    ///   debited at registration, so a leg credits the seller and
-    ///   rebates the buyer's price improvement out of the escrow
-    ///   slice `buy.limit * qty / PRICE_SCALE` — insolvency during
-    ///   settlement is impossible by construction.
+    ///   Neither side is debited at settle time: the buy's quote and
+    ///   the sell's base were both escrowed at registration. A leg
+    ///   pays the seller `pays − fee` out of the escrow slice
+    ///   `buy.limit * qty / PRICE_SCALE` (the remainder rebating the
+    ///   buyer's price improvement), delivers `qty` of base into the
+    ///   buyer's custody, and accrues `fee` into the market vault —
+    ///   insolvency during settlement is impossible by construction,
+    ///   on both legs.
     /// - **Aggregation:** seller payments accumulate per (buyer,
     ///   seller) pair in an open-addressed flat index map (one probe
     ///   vs the `BTreeMap`'s ~16-level pointer chase per leg); the
@@ -1358,22 +1796,20 @@ impl ExchangeModule {
         body: &[u8],
         inner: &mut Inner,
     ) -> Result<Vec<Event>, ExecError> {
-        // Authorization gate: the settlement operator is the only
-        // account allowed to submit fills — but only against orders
-        // the owners signed for (see `settle_leg`).
+        // Authorization: only the settlement operator may submit
+        // fills — and only against orders the owners signed for.
         if self.settlement_operator != Some(ctx.sender) {
             return Err(ExecError::ModuleRejected("unauthorized settlement operator".to_string()));
         }
-        if body.len() < 4 {
-            return Err(ExecError::Malformed);
-        }
         let fill_count = usize::try_from(u32::from_le_bytes(
-            body[0..4].try_into().map_err(|_| ExecError::Malformed)?,
+            body.get(0..4)
+                .ok_or(ExecError::Malformed)?
+                .try_into()
+                .map_err(|_| ExecError::Malformed)?,
         ))
         .map_err(|_| ExecError::Malformed)?;
-        // HIGH fix: bound the batch size to prevent a byzantine
-        // settlement operator from submitting a huge batch that
-        // causes excessive processing.
+        // Bound the batch: a byzantine operator must not be able to
+        // submit arbitrarily large fill sets.
         if fill_count > MAX_BATCH_FILLS {
             return Err(ExecError::Malformed);
         }
@@ -1385,7 +1821,7 @@ impl ExchangeModule {
             ExecError::ModuleRejected("batch settle requires ledger wiring".to_string())
         })?;
 
-        let Inner { markets, registered, .. } = &mut *inner;
+        let Inner { markets, registered, base_balances, fee_vault, .. } = &mut *inner;
 
         // Snapshot the market configs once — batch settle never
         // mutates the books, so one pass over `markets` serves every
@@ -1451,15 +1887,16 @@ impl ExchangeModule {
                     };
                     let entry =
                         &mut entries[usize::try_from(idx).map_err(|_| ExecError::Malformed)?].1;
-                    match entry.checked_add(plan.pays) {
-                        Some(sum) => {
-                            *entry = sum;
-                            plans.push(plan);
-                        }
-                        // Practically unreachable (needs > u64::MAX
-                        // quote for one pair) — void the leg rather
-                        // than silently saturating the settlement.
-                        None => events.push(rejected_leg_event(i, "pair total overflow")),
+                    // The pair credit is the seller's NET payment —
+                    // gross minus the fee (the fee accrues per
+                    // market in `consume_and_release`).
+                    if let Some(sum) = entry.checked_add(plan.pays - plan.fee) {
+                        *entry = sum;
+                        plans.push(plan);
+                    } else {
+                        // Practically unreachable — void the leg
+                        // rather than silently saturating.
+                        events.push(rejected_leg_event(i, "pair total overflow"));
                     }
                 }
                 None => events.push(rejected_leg_event(i, "invalid fill leg")),
@@ -1478,66 +1915,239 @@ impl ExchangeModule {
         for ((buyer, seller), amount) in &entries {
             if ledger.credit(seller, *amount).is_err() {
                 failed_pairs.insert((*buyer, *seller));
-                events.push(Event {
-                    module: "exchange",
-                    kind: "settlement_failed",
-                    data: {
-                        let mut d = Vec::with_capacity(20 + 20 + 8);
-                        d.extend_from_slice(&buyer.0);
-                        d.extend_from_slice(&seller.0);
-                        d.extend_from_slice(&amount.to_le_bytes());
-                        d
-                    },
-                });
+                events.push(pair_event("settlement_failed", buyer, seller, *amount));
                 continue;
             }
-
-            events.push(Event {
-                module: "exchange",
-                kind: "batch_fill",
-                data: {
-                    let mut d = Vec::with_capacity(20 + 20 + 8);
-                    d.extend_from_slice(&buyer.0);
-                    d.extend_from_slice(&seller.0);
-                    d.extend_from_slice(&amount.to_le_bytes());
-                    d
-                },
-            });
+            events.push(pair_event("batch_fill", buyer, seller, *amount));
         }
 
         // ── Pass 2 + drains: apply the surviving legs ────────────
-        // Order consumption, buyer rebates, and residue refunds run
-        // in `consume_and_release` — every mutation is derived from
-        // the validated plans, so a voided pair's legs consume
-        // nothing.
-        consume_and_release(&plans, &failed_pairs, registered, ledger, &mut events);
+        // Order consumption, buyer rebates, base deliveries, fee
+        // accrual, and residue refunds run in `consume_and_release`
+        // — every mutation is derived from the validated plans, so
+        // a voided pair's legs consume nothing.
+        consume_and_release(
+            &plans,
+            &failed_pairs,
+            registered,
+            base_balances,
+            fee_vault,
+            ledger,
+            &mut events,
+        );
 
         Ok(events)
     }
 }
 
+/// The taker's side of a book-path settlement — everything `apply`
+/// needs from the admitted order and its admission-time escrows.
+struct TakerCtx {
+    /// Taker limit price — bounds the buy-side reservation residue.
+    price: Price,
+    /// Taker owner — recipient of refunds and taker-side deliveries.
+    owner: Address,
+    /// Quote units reserved at admission (buys only; 0 for sells).
+    reservation: u64,
+    /// Base units reserved at admission (sells only; 0 for buys).
+    base: u64,
+}
+
+/// The mutable settlement surfaces a book-path place touches,
+/// bundled so the fill loop borrows one value instead of five
+/// disjoint `Inner` fields. All custody mutations go through here.
+struct BookSettlement<'a> {
+    /// The native ledger — quote credits and reservation refunds.
+    ledger: &'a Arc<dyn framework::Balances + Send + Sync>,
+    /// Free base custody (buyer deliveries land here).
+    base_balances: &'a mut BTreeMap<(Address, u8), u64>,
+    /// Resting-sell base holds (maker deliveries draw from here).
+    base_holds: &'a mut BTreeMap<(Address, u8), u64>,
+    /// Per-market protocol-fee sink (quote units).
+    fee_vault: &'a mut BTreeMap<u8, u64>,
+    /// The event sink every settlement-visible mutation appends to.
+    events: &'a mut Vec<Event>,
+}
+
+impl BookSettlement<'_> {
+    /// Settle every fill the engine produced, then release the
+    /// taker's leftover reservations.
+    ///
+    /// Per fill, `DvP`: the seller's base moves into the buyer's free
+    /// custody and the buyer's quote pays the seller minus the
+    /// [`FEE_BPS`] protocol fee (accrued to `fee_vault`). Delivery
+    /// is proven BEFORE payment: a maker sell whose `base_holds`
+    /// entry cannot cover the fill settles VOID — the book consumed
+    /// the order, but no quote moves and no base is minted. Only
+    /// state imported from before custody existed can produce that
+    /// shape; the `unbacked_sell_fill` event keeps it auditable.
+    /// The remaining `map_err`s guard invariants unreachable while
+    /// they hold: per-fill notional ≤ the debited reservation (u64
+    /// range), and credit overflow only if an account approaches
+    /// `u64::MAX` — impossible while total supply stays below it
+    /// (enforced at mint/genesis).
+    fn apply(
+        &mut self,
+        market: u8,
+        taker: TakerCtx,
+        outcome: OrderOutcome,
+        fills: &[FillEvent],
+    ) -> Result<(), ExecError> {
+        // `taker_paid` accumulates only fills that actually settled
+        // — a voided fill neither pays nor receives.
+        let mut taker_paid = 0u64;
+        let mut taker_base = taker.base;
+        for f in fills {
+            let notional = u128::from(f.price.0) * u128::from(f.qty.0);
+            let quote_amount = u64::try_from(notional / PRICE_SCALE).map_err(|_| {
+                ExecError::ModuleRejected(format!(
+                    "fill notional exceeds u64 quote range (market {market})"
+                ))
+            })?;
+            // Buyer and seller from the taker's side: the maker
+            // sells when the taker buys and vice versa.
+            let (buyer, seller) = if f.taker_side == Side::Buy {
+                (f.taker_owner, f.maker_owner)
+            } else {
+                (f.maker_owner, f.taker_owner)
+            };
+
+            // ── Base leg: prove delivery BEFORE paying ──
+            // A taker sell always covers (its qty was reserved at
+            // admission); a maker sell must still hold the fill
+            // qty in `base_holds`.
+            let maker_covered = f.taker_side == Side::Sell
+                || self.base_holds.get(&(f.maker_owner, market)).copied().unwrap_or(0) >= f.qty.0;
+            if !maker_covered {
+                self.events.push(unbacked_sell_fill_event(market, *f));
+                continue;
+            }
+            let bkey = (buyer, market);
+            let Some(buyer_next) =
+                self.base_balances.get(&bkey).copied().unwrap_or(0).checked_add(f.qty.0)
+            else {
+                // Unreachable while Σ custody < u64::MAX (custody is
+                // native-backed). Void rather than mint.
+                self.events.push(fill_voided_event(market, *f));
+                continue;
+            };
+            if f.taker_side == Side::Buy {
+                // `maker_covered` proved the entry exists with
+                // enough held.
+                *self
+                    .base_holds
+                    .get_mut(&(f.maker_owner, market))
+                    .ok_or(ExecError::Malformed)? -= f.qty.0;
+            } else {
+                // Admission reserved `qty`; Σ fills ≤ qty by engine
+                // contract — `checked_sub` documents it.
+                taker_base = taker_base.checked_sub(f.qty.0).ok_or(ExecError::Malformed)?;
+            }
+            *self.base_balances.entry(bkey).or_insert(0) = buyer_next;
+            if f.taker_side == Side::Buy {
+                taker_paid = taker_paid.saturating_add(quote_amount);
+            }
+
+            // ── Quote leg: seller receives notional minus the
+            // protocol fee; the fee accrues to the market's
+            // committed vault.
+            let fee = u64::try_from(
+                u128::from(quote_amount) * u128::from(FEE_BPS) / u128::from(BPS_DENOM),
+            )
+            .map_err(|_| ExecError::ModuleRejected(format!("fee overflow (market {market})")))?;
+            self.ledger.credit(&seller, quote_amount - fee).map_err(|_| {
+                ExecError::ModuleRejected(format!("settlement credit failed (market {market})"))
+            })?;
+            let vault = self.fee_vault.entry(market).or_insert(0);
+            match vault.checked_add(fee) {
+                Some(v) => *vault = v,
+                // Saturation burns the excess (the units were
+                // deducted from the seller's payment regardless) —
+                // reachable only past u64::MAX cumulative fees.
+                None => self.events.push(fee_overflow_event(market, fee)),
+            }
+        }
+
+        // Release the taker's quote reservation (buys): settled fills
+        // cost their actual price (improvement refunded), a
+        // surviving GTC remainder keeps `price × resting_qty` held
+        // for the cancel path, and dead remainders
+        // (IOC/FOK/Killed/Rejected) come back in full.
+        if taker.reservation > 0 {
+            let held = match outcome {
+                OrderOutcome::Resting { resting_qty, .. } => u64::try_from(
+                    u128::from(taker.price.0) * u128::from(resting_qty.0) / PRICE_SCALE,
+                )
+                .unwrap_or(u64::MAX),
+                _ => 0,
+            };
+            let refund = taker.reservation.saturating_sub(taker_paid.saturating_add(held));
+            if refund > 0 {
+                self.ledger.credit(&taker.owner, refund).map_err(|_| {
+                    ExecError::ModuleRejected("reservation refund failed".to_string())
+                })?;
+            }
+        }
+
+        // Release the taker's base reservation (sells): the unfilled
+        // remainder either becomes the resting order's hold (GTC
+        // remainder) or returns to free custody
+        // (IOC/FOK/Killed/STP-consumed). `resting_qty` is the
+        // engine's reported remainder; any STP-consumed slice
+        // (`taker_base − resting_qty`) books no fill and is
+        // released free.
+        if taker_base > 0 {
+            let resting = match outcome {
+                OrderOutcome::Resting { resting_qty, .. } => resting_qty.0,
+                _ => 0,
+            };
+            if resting > 0 {
+                *self.base_holds.entry((taker.owner, market)).or_insert(0) += resting;
+            }
+            let release = taker_base.saturating_sub(resting);
+            if release > 0 {
+                *self.base_balances.entry((taker.owner, market)).or_insert(0) += release;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Apply validated fill legs to the registered-order map: consume
 /// `remaining`, release buy-side escrow, pay price-improvement
-/// rebates, and refund the residue of fully consumed orders.
+/// rebates, deliver base to buyers, accrue fees, and refund the
+/// residue of fully consumed orders.
 ///
 /// Phases (all iteration is over sorted `BTreeMap`s — deterministic
 /// event order):
 ///
 /// 1. **Accumulate** each surviving leg into per-order deltas
 ///    (quantity consumed, escrow released, rebate portion tracked
-///    separately) and per-buyer rebate totals.
+///    separately), per-buyer rebate totals, per-(buyer, market)
+///    base deliveries, and per-market fee accruals.
 /// 2. **Rebate drain**: credit each buyer's rebate. A failed credit
 ///    withholds that buyer's rebate — the payment still settled, but
 ///    the rebate stays in the order's escrow (refunded with the
 ///    residue) rather than vanishing.
-/// 3. **Consumption**: `remaining` drops by the consumed quantity,
-///    `reserved` by the released slice minus any withheld rebate. A
+/// 3. **Base delivery**: each surviving leg's `qty` moves into the
+///    buyer's free custody — the delivery half of the swap. The seller's
+///    side was escrowed at registration (`reserved`), so delivery
+///    cannot fail for want of base.
+/// 4. **Fee accrual**: the per-market `FEE_BPS` total lands in the
+///    committed `fee_vault`.
+/// 5. **Consumption**: `remaining` drops by the consumed quantity;
+///    `reserved` drops by the released slice (buys: released minus
+///    withheld rebate; sells: qty-for-qty with consumption). A
 ///    fully consumed order is removed and its residue — floor-
-///    division dust plus any withheld rebate — refunded.
+///    division dust plus any withheld rebate — refunded to the
+///    asset's home: ledger quote for buys, free base custody for
+///    sells.
 fn consume_and_release(
     plans: &[LegPlan],
     failed_pairs: &std::collections::BTreeSet<(Address, Address)>,
     registered: &mut BTreeMap<OrderKey, RegisteredOrder>,
+    base_balances: &mut BTreeMap<(Address, u8), u64>,
+    fee_vault: &mut BTreeMap<u8, u64>,
     ledger: &Arc<dyn framework::Balances + Send + Sync>,
     events: &mut Vec<Event>,
 ) {
@@ -1545,9 +2155,12 @@ fn consume_and_release(
     // Per order: quantity consumed, escrow released, and the
     // rebate portion of the release (tracked separately so a
     // failed rebate credit can leave it escrowed). Per buyer:
-    // total rebate to release.
+    // total rebate to release and base to receive. Per market:
+    // total fee to accrue.
     let mut deltas: BTreeMap<OrderKey, OrderDelta> = BTreeMap::new();
     let mut rebates: BTreeMap<Address, u64> = BTreeMap::new();
+    let mut deliveries: BTreeMap<(Address, u8), u64> = BTreeMap::new();
+    let mut fees: BTreeMap<u8, u64> = BTreeMap::new();
     for plan in plans {
         if failed_pairs.contains(&(plan.buyer, plan.seller)) {
             continue;
@@ -1561,24 +2174,16 @@ fn consume_and_release(
         if rebate > 0 {
             *rebates.entry(plan.buyer).or_default() += rebate;
         }
+        *deliveries.entry((plan.buyer, plan.market)).or_default() += plan.qty;
+        *fees.entry(plan.market).or_default() += plan.fee;
     }
 
     // ── Rebate drain ────────────────────────────────────────────
     // Sorted address order. A rebate credit that fails is withheld.
     let mut failed_rebates: std::collections::BTreeSet<Address> = std::collections::BTreeSet::new();
     for (buyer, amount) in &rebates {
-        if ledger.credit(buyer, *amount).is_err() {
+        if !credit_or_stranded(ledger, *buyer, *amount, events) {
             failed_rebates.insert(*buyer);
-            events.push(Event {
-                module: "exchange",
-                kind: "reservation_release_failed",
-                data: {
-                    let mut d = Vec::with_capacity(20 + 8);
-                    d.extend_from_slice(&buyer.0);
-                    d.extend_from_slice(&amount.to_le_bytes());
-                    d
-                },
-            });
             continue;
         }
         events.push(Event {
@@ -1593,44 +2198,66 @@ fn consume_and_release(
         });
     }
 
+    deliver_base(&deliveries, base_balances, events);
+    accrue_fees(&fees, fee_vault, events);
+
     // ── Consumption + residue refunds ───────────────────────────
-    let mut completed: Vec<(OrderKey, Address, u64)> = Vec::new();
+    let mut completed: Vec<(OrderKey, Side, u16, u64)> = Vec::new();
     for (key, delta) in &deltas {
         let Some(order) = registered.get_mut(key) else { continue };
         order.remaining = order.remaining.saturating_sub(delta.consumed);
-        let withheld = if failed_rebates.contains(&key.owner) { delta.rebate } else { 0 };
-        order.reserved = order.reserved.saturating_sub(delta.released.saturating_sub(withheld));
+        match order.side {
+            // Buys: release the escrow slice, minus any withheld
+            // rebate that stays escrowed for the residue refund.
+            Side::Buy => {
+                let withheld = if failed_rebates.contains(&key.owner) { delta.rebate } else { 0 };
+                order.reserved =
+                    order.reserved.saturating_sub(delta.released.saturating_sub(withheld));
+            }
+            // Sells: `reserved` IS the remaining base escrow — it
+            // shrinks qty-for-qty with consumption.
+            Side::Sell => {
+                order.reserved = order.reserved.saturating_sub(delta.consumed);
+            }
+        }
         if order.remaining == 0 {
-            completed.push((*key, key.owner, order.reserved));
+            completed.push((*key, order.side, order.market, order.reserved));
         }
     }
-    for (key, owner, residue) in completed {
+    for (key, side, market, residue) in completed {
         registered.remove(&key);
         if residue == 0 {
             continue;
         }
-        if ledger.credit(&owner, residue).is_err() {
+        match side {
             // The order is dead; a refund failure strands its
             // residue. Impossible while supply stays below
             // `u64::MAX` — the event keeps it visible.
-            events.push(Event {
-                module: "exchange",
-                kind: "reservation_release_failed",
-                data: {
-                    let mut d = Vec::with_capacity(20 + 8);
-                    d.extend_from_slice(&owner.0);
-                    d.extend_from_slice(&residue.to_le_bytes());
-                    d
-                },
-            });
-            continue;
+            Side::Buy => {
+                credit_or_stranded(ledger, key.owner, residue, events);
+            }
+            // Sell residue is base escrow — it returns to the
+            // owner's free custody, not the ledger. `u8` conversion
+            // is safe (registration bounded markets to 256 slots);
+            // the add-back cannot overflow (the units came from
+            // this same custody pool).
+            Side::Sell => {
+                let Ok(m) = u8::try_from(market) else {
+                    // Unreachable: registration bounds markets to
+                    // the 256-slot engine space. Stranding the
+                    // residue beats misrouting it to a wrong
+                    // market — and the order is already removed.
+                    continue;
+                };
+                *base_balances.entry((key.owner, m)).or_insert(0) += residue;
+            }
         }
         events.push(Event {
             module: "exchange",
             kind: "escrow_refunded",
             data: {
                 let mut d = Vec::with_capacity(20 + 8 + 8);
-                d.extend_from_slice(&owner.0);
+                d.extend_from_slice(&key.owner.0);
                 d.extend_from_slice(&key.client_id.to_le_bytes());
                 d.extend_from_slice(&residue.to_le_bytes());
                 d
@@ -1654,10 +2281,18 @@ struct LegPlan {
     buyer: Address,
     /// Seller address (== `sell.owner`).
     seller: Address,
+    /// The market the fill settles on — keys the buyer's base
+    /// custody credit and the fee vault. `u8`-bounded: validation
+    /// rejects any market outside the 256-slot engine space.
+    market: u8,
     /// Filled quantity (scale-6).
     qty: u64,
-    /// The seller's payment: `floor(price × qty / PRICE_SCALE)`.
+    /// The seller's gross payment: `floor(price × qty / PRICE_SCALE)`.
     pays: u64,
+    /// The protocol fee carved out of `pays`:
+    /// `floor(pays × FEE_BPS / BPS_DENOM)` — the pair drain credits
+    /// `pays − fee`, the vault accrues `fee`.
+    fee: u64,
     /// The escrow slice this leg releases:
     /// `floor(buy.limit × qty / PRICE_SCALE)`. Always `>= pays`
     /// (`price <= buy.limit` is a leg-validity rule); the difference
@@ -1720,6 +2355,36 @@ fn pair_hash(buyer: &[u8; 20], seller: &[u8; 20]) -> u64 {
     h
 }
 
+/// Build a pair-scoped settlement event (`batch_fill` on a settled
+/// pair, `settlement_failed` on a voided one):
+/// `[buyer:20][seller:20][amount:8]`.
+fn pair_event(kind: &'static str, buyer: &Address, seller: &Address, amount: u64) -> Event {
+    let mut data = Vec::with_capacity(20 + 20 + 8);
+    data.extend_from_slice(&buyer.0);
+    data.extend_from_slice(&seller.0);
+    data.extend_from_slice(&amount.to_le_bytes());
+    Event { module: "exchange", kind, data }
+}
+
+/// Parse an `OrderKey` (`[owner:20][client_id:8]` = 28 bytes) out of
+/// a batch-settle leg at byte offset `off`.
+fn leg_key(body: &[u8], off: usize) -> Result<OrderKey, ExecError> {
+    Ok(OrderKey {
+        owner: Address(
+            body.get(off..off + 20)
+                .ok_or(ExecError::Malformed)?
+                .try_into()
+                .map_err(|_| ExecError::Malformed)?,
+        ),
+        client_id: u64::from_le_bytes(
+            body.get(off + 20..off + 28)
+                .ok_or(ExecError::Malformed)?
+                .try_into()
+                .map_err(|_| ExecError::Malformed)?,
+        ),
+    })
+}
+
 /// Parse and validate one batch-settle leg at byte offset `off`,
 /// resolving both order keys against the registered-order map.
 ///
@@ -1770,34 +2435,8 @@ fn settle_leg(
             .try_into()
             .map_err(|_| ExecError::Malformed)?,
     );
-    let buy = OrderKey {
-        owner: Address(
-            body.get(off + 18..off + 38)
-                .ok_or(ExecError::Malformed)?
-                .try_into()
-                .map_err(|_| ExecError::Malformed)?,
-        ),
-        client_id: u64::from_le_bytes(
-            body.get(off + 38..off + 46)
-                .ok_or(ExecError::Malformed)?
-                .try_into()
-                .map_err(|_| ExecError::Malformed)?,
-        ),
-    };
-    let sell = OrderKey {
-        owner: Address(
-            body.get(off + 46..off + 66)
-                .ok_or(ExecError::Malformed)?
-                .try_into()
-                .map_err(|_| ExecError::Malformed)?,
-        ),
-        client_id: u64::from_le_bytes(
-            body.get(off + 66..off + 74)
-                .ok_or(ExecError::Malformed)?
-                .try_into()
-                .map_err(|_| ExecError::Malformed)?,
-        ),
-    };
+    let buy = leg_key(body, off + 18)?;
+    let sell = leg_key(body, off + 46)?;
 
     let (Some(buy_order), Some(sell_order)) = (registered.get(&buy), registered.get(&sell)) else {
         return Ok(None); // A leg naming no live order is unauthorized.
@@ -1846,19 +2485,137 @@ fn settle_leg(
     if buy_total > buy_order.remaining || sell_total > sell_order.remaining {
         return Ok(None);
     }
+    // Delivery-versus-payment: the sell order must still hold enough
+    // escrowed base — `reserved` on a sell is its base custody, which
+    // registration filled qty-for-qty with `remaining`. This is what
+    // stops a leg from paying a seller who cannot deliver — including
+    // a pre-custody registered sell (`reserved == 0`), which is now
+    // unfillable but still cancelable.
+    if sell_total > sell_order.reserved {
+        return Ok(None);
+    }
 
     // Amounts: pays at the fill price, release at the buy limit —
-    // checked u128 math; over-u64 notionals reject the leg.
+    // checked u128 math; over-u64 notionals reject the leg. The fee
+    // is `pays`-bounded (`FEE_BPS < BPS_DENOM`), so `pays − fee` can
+    // never underflow.
     let (Some(pays), Some(release)) = (
         u64::try_from(u128::from(price) * u128::from(qty) / PRICE_SCALE).ok(),
         u64::try_from(u128::from(buy_order.limit_price) * u128::from(qty) / PRICE_SCALE).ok(),
     ) else {
         return Ok(None);
     };
+    let Some(fee) =
+        u64::try_from(u128::from(pays) * u128::from(FEE_BPS) / u128::from(BPS_DENOM)).ok()
+    else {
+        return Ok(None); // Unreachable: `pays`-bounded.
+    };
+    let Ok(market_u8) = u8::try_from(market) else {
+        return Ok(None); // Post-validation unreachable — engines are u8-indexed.
+    };
 
     consumed.insert(buy, buy_total);
     consumed.insert(sell, sell_total);
-    Ok(Some(LegPlan { buy, sell, buyer: buy.owner, seller: sell.owner, qty, pays, release }))
+    Ok(Some(LegPlan {
+        buy,
+        sell,
+        buyer: buy.owner,
+        seller: sell.owner,
+        market: market_u8,
+        qty,
+        pays,
+        fee,
+        release,
+    }))
+}
+
+/// Credit `owner` `amount` of ledger quote, emitting a
+/// `reservation_release_failed` event (and returning `false`) if the
+/// credit fails — the shared rebate/residue drain pattern. A failed
+/// credit strands the funds in place: the caller decides what the
+/// residue does next. Impossible while total supply stays below
+/// `u64::MAX` — the event keeps it visible regardless.
+fn credit_or_stranded(
+    ledger: &Arc<dyn framework::Balances + Send + Sync>,
+    owner: Address,
+    amount: u64,
+    events: &mut Vec<Event>,
+) -> bool {
+    if ledger.credit(&owner, amount).is_err() {
+        events.push(Event {
+            module: "exchange",
+            kind: "reservation_release_failed",
+            data: {
+                let mut d = Vec::with_capacity(20 + 8);
+                d.extend_from_slice(&owner.0);
+                d.extend_from_slice(&amount.to_le_bytes());
+                d
+            },
+        });
+        return false;
+    }
+    true
+}
+
+/// Deliver accumulated base quantities into buyer custody — the
+/// delivery half of the trade for batch settlement. Sorted (buyer, market)
+/// order. The credit cannot fail against a shortfall — the seller
+/// escrowed the qty at registration — only on a buyer-custody
+/// overflow, which is unreachable while Σ custody < `u64::MAX`; the
+/// event keeps it visible regardless.
+fn deliver_base(
+    deliveries: &BTreeMap<(Address, u8), u64>,
+    base_balances: &mut BTreeMap<(Address, u8), u64>,
+    events: &mut Vec<Event>,
+) {
+    for ((buyer, market), qty) in deliveries {
+        let entry = base_balances.entry((*buyer, *market)).or_insert(0);
+        if let Some(v) = entry.checked_add(*qty) {
+            *entry = v;
+            events.push(Event {
+                module: "exchange",
+                kind: "base_delivered",
+                data: {
+                    let mut d = Vec::with_capacity(20 + 1 + 8);
+                    d.extend_from_slice(&buyer.0);
+                    d.push(*market);
+                    d.extend_from_slice(&qty.to_le_bytes());
+                    d
+                },
+            });
+        } else {
+            events.push(Event {
+                module: "exchange",
+                kind: "base_delivery_overflow",
+                data: {
+                    let mut d = Vec::with_capacity(20 + 1 + 8);
+                    d.extend_from_slice(&buyer.0);
+                    d.push(*market);
+                    d.extend_from_slice(&qty.to_le_bytes());
+                    d
+                },
+            });
+        }
+    }
+}
+
+/// Accrue per-market fees into the committed `fee_vault`. Sorted
+/// market order. Vault saturation burns the excess (the fee was
+/// already deducted from the seller's payment) — reachable only past
+/// `u64::MAX` cumulative quote volume.
+fn accrue_fees(
+    fees: &BTreeMap<u8, u64>,
+    fee_vault: &mut BTreeMap<u8, u64>,
+    events: &mut Vec<Event>,
+) {
+    for (market, fee) in fees {
+        let vault = fee_vault.entry(*market).or_insert(0);
+        if let Some(v) = vault.checked_add(*fee) {
+            *vault = v;
+        } else {
+            events.push(fee_overflow_event(*market, *fee));
+        }
+    }
 }
 
 /// Build a `fill_rejected` event for a malformed batch-settle leg.
@@ -1870,6 +2627,43 @@ fn rejected_leg_event(idx: usize, reason: &'static str) -> Event {
     data.extend_from_slice(&(idx as u32).to_le_bytes());
     data.extend_from_slice(reason.as_bytes());
     Event { module: "exchange", kind: "fill_rejected", data }
+}
+
+/// Build an `unbacked_sell_fill` event: a book-path fill whose maker
+/// sell held less base than the fill quantity — only reachable for
+/// orders imported from before custody existed. The fill settles
+/// void: the book consumed the order but no quote moves and no base
+/// is minted.
+fn unbacked_sell_fill_event(market: u8, fill: FillEvent) -> Event {
+    let mut data = Vec::with_capacity(1 + 8 + 8 + 20);
+    data.push(market);
+    data.extend_from_slice(&fill.maker_order_id.0.to_le_bytes());
+    data.extend_from_slice(&fill.qty.0.to_le_bytes());
+    data.extend_from_slice(&fill.maker_owner.0);
+    Event { module: "exchange", kind: "unbacked_sell_fill", data }
+}
+
+/// Build a `fill_voided` event: a fill skipped because the buyer's
+/// base custody credit would overflow — unreachable while total
+/// custody stays under `u64::MAX`, emitted rather than silently
+/// clamped.
+fn fill_voided_event(market: u8, fill: FillEvent) -> Event {
+    let mut data = Vec::with_capacity(1 + 8 + 8);
+    data.push(market);
+    data.extend_from_slice(&fill.maker_order_id.0.to_le_bytes());
+    data.extend_from_slice(&fill.qty.0.to_le_bytes());
+    Event { module: "exchange", kind: "fill_voided", data }
+}
+
+/// Build a `fee_vault_overflow` event: a fill's fee could not accrue
+/// because the market's vault is saturated — reachable only past
+/// `u64::MAX` cumulative quote volume. The excess fee is burned (it
+/// was already deducted from the seller's payment).
+fn fee_overflow_event(market: u8, fee: u64) -> Event {
+    let mut data = Vec::with_capacity(1 + 8);
+    data.push(market);
+    data.extend_from_slice(&fee.to_le_bytes());
+    Event { module: "exchange", kind: "fee_vault_overflow", data }
 }
 
 // ── Event helpers ────────────────────────────────────────────────────
@@ -2060,7 +2854,7 @@ fn encode_market_config(cfg: &MarketConfig) -> Vec<u8> {
 mod tests {
     use super::{
         BatchFillEntry, ExchangeModule, MarketConfig, NewOrder, OrderId, OrderType, Side, StpMode,
-        TAG_PLACE, TimeInForce, encode_reject_reason, msg,
+        TAG_PLACE, TimeInForce, encode_reject_reason, encode_side, msg,
     };
     use executor::{ExecError, Module, TxContext};
     use framework::{Balances, module_id};
@@ -2103,10 +2897,17 @@ mod tests {
     /// Register an off-chain-matched order on-chain under
     /// `(owner_byte, client_id)` on market 0. `price`/`qty` are raw
     /// scale-8/scale-6 values; a buy escrows `price × qty /
-    /// PRICE_SCALE` at registration.
+    /// PRICE_SCALE` of quote and a sell escrows `qty` of base
+    /// custody at registration.
     fn register(ex: &ExchangeModule, owner: u8, client_id: u64, side: Side, price: u64, qty: u64) {
         ex.handle(&ctx(owner), &msg::register_order(0, side, price, qty, client_id))
             .expect("registration must succeed");
+    }
+
+    /// Deposit `amount` of base custody for `owner` on market 0 —
+    /// the native debit backing every sell-side obligation.
+    fn deposit(ex: &ExchangeModule, owner: u8, amount: u64) {
+        ex.handle(&ctx(owner), &msg::deposit_base(0, amount)).expect("deposit must succeed");
     }
 
     /// A fill leg between two registered orders.
@@ -2130,7 +2931,9 @@ mod tests {
 
     /// The standard fixture: a funded buyer and seller with orders
     /// registered on market 0 — buy `(1, 1)` at `buy_price`, sell
-    /// `(9, 1)` at `sell_price`, each for `qty` units.
+    /// `(9, 1)` at `sell_price`, each for `qty` units. The seller
+    /// deposits `qty` of base custody first — a sell can only
+    /// register against base the owner actually holds.
     fn registered_pair(
         ledger: &Arc<framework::MemoryBalances>,
         ex: &ExchangeModule,
@@ -2140,6 +2943,7 @@ mod tests {
     ) {
         ledger.mint(&addr(1), 10_000_000_000);
         ledger.mint(&addr(9), 10_000_000_000);
+        deposit(ex, 9, qty);
         register(ex, 1, 1, Side::Buy, buy_price, qty);
         register(ex, 9, 1, Side::Sell, sell_price, qty);
     }
@@ -2464,6 +3268,13 @@ mod tests {
         ledger.mint(&addr(9), 1_000_000_000_000); // 1T quote
         let ex = ExchangeModule::with_ledger(ledger.clone());
         ex.list_market(test_cfg()).unwrap();
+        // Both hold base custody too — owner 9 is the usual seller,
+        // owner 1 sells in the self-trade tests. Deposits debit
+        // native 1:1, so each keeps 1T of quote and 1T of base.
+        ledger.mint(&addr(1), 1_000_000_000_000);
+        ledger.mint(&addr(9), 1_000_000_000_000);
+        deposit(&ex, 1, 1_000_000_000_000);
+        deposit(&ex, 9, 1_000_000_000_000);
         (ledger, ex)
     }
 
@@ -2484,10 +3295,14 @@ mod tests {
         ex.handle(&ctx(1), &msg::place(mid, taker)).unwrap();
 
         // Notional = 5_000 * 1_500_000_000 = 7_500_000_000_000 (scale-14).
-        // Quote amount = 7_500_000_000_000 / 100_000_000 = 75_000 (scale-6).
+        // Quote amount = 7_500_000_000_000 / 100_000_000 = 75_000
+        // (scale-6). The seller nets 75_000 − 75 fee = 74_925 and
+        // the buyer received 5_000 base into custody.
         let quote_amount = 75_000u64;
         assert_eq!(ledger.balance(&addr(1)), buyer_before - quote_amount);
-        assert_eq!(ledger.balance(&addr(9)), seller_before + quote_amount);
+        assert_eq!(ledger.balance(&addr(9)), seller_before + quote_amount - 75);
+        assert_eq!(ex.base_balance(addr(1), mid), 1_000_000_000_000 + 5_000);
+        assert_eq!(ex.fee_vault(mid), 75);
     }
 
     #[test]
@@ -2551,9 +3366,11 @@ mod tests {
 
         // Total quote = (1_500M + 1_501M + 1_502M) * 1_000 / 1e8
         //            = (15_000 + 15_010 + 15_020) = 45_030
+        // Fees per fill: 15 + 15 + 15 = 45 (floor per fill).
         let total_quote = 45_030u64;
         assert_eq!(ledger.balance(&addr(1)), buyer_before - total_quote);
-        assert_eq!(ledger.balance(&addr(9)), seller_before + total_quote);
+        assert_eq!(ledger.balance(&addr(9)), seller_before + total_quote - 45);
+        assert_eq!(ex.base_balance(addr(1), mid), 1_000_000_000_000 + 3_000);
     }
 
     /// Regression test: a failed seller credit must void the leg
@@ -2573,12 +3390,17 @@ mod tests {
         ex.list_market(test_cfg()).unwrap();
 
         register(&ex, 1, 1, Side::Buy, 1_000_000_000, 100_000);
+        // The sell needs base custody: deposit the qty first (the
+        // debit drops the seller to u64::MAX - 600_000, still close
+        // enough to overflow on the fill's net payment).
+        deposit(&ex, 9, 100_000);
         register(&ex, 9, 1, Side::Sell, 1_000_000_000, 100_000);
         // Registration escrowed the full 1_000_000.
         assert_eq!(ledger.balance(&addr(1)), 0);
 
         // Chain-computed quote = 1e9 * 100_000 / 1e8 = 1_000_000,
-        // which overflows the seller's u64::MAX - 500_000 balance.
+        // minus the 10bps fee = 999_000 — still overflows the
+        // seller's u64::MAX - 600_000 balance.
         let fill = leg(0, 1_000_000_000, 100_000, 1, 1, 9, 1);
         let events = ex.handle(&ctx(1), &msg::batch_settle(&[fill])).unwrap();
         assert!(
@@ -2587,7 +3409,7 @@ mod tests {
         );
         assert_eq!(
             ledger.balance(&addr(9)),
-            u64::MAX - 500_000,
+            u64::MAX - 600_000,
             "seller balance must not change on failed settlement"
         );
 
@@ -2620,15 +3442,16 @@ mod tests {
         let err = ex.handle(&ctx(1), &msg).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
         assert_eq!(ledger.balance(&addr(1)), buyer_after_register);
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000);
+        // The fixture deposited 1_000 of base for the seller.
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 1_000);
 
         // The configured operator is accepted.
         let events = ex.handle(&ctx(0xAA), &msg).unwrap();
         assert!(events.iter().any(|e| e.kind == "batch_fill"));
         // Fill at the limit → zero rebate: the whole 10_000 escrow
-        // slice pays the seller.
+        // slice pays out — the seller nets 10_000 − 10 fee.
         assert_eq!(ledger.balance(&addr(1)), buyer_after_register);
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 10_000);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 1_000 + 9_990);
     }
 
     /// Regression test: `batch_settle` must be fail-closed when no
@@ -2645,8 +3468,9 @@ mod tests {
         let err = ex.handle(&ctx(1), &msg).unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
         // Nothing moved: the seller never got paid and the buy
-        // order's escrow stays held.
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000);
+        // order's escrow stays held. (The fixture's 1_000 base
+        // deposit was already debited at registration.)
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 1_000);
     }
 
     /// Regression test: every batch-settle leg is validated against
@@ -2668,19 +3492,23 @@ mod tests {
         // legs all reference it.
         registered_pair(&ledger, &ex, 1_500_000_000, 1_000_000_000, 100_000);
         // Self-trade pair: owner 1 holds a sell order too.
+        deposit(&ex, 1, 10_000);
         register(&ex, 1, 2, Side::Sell, 1_000_000_000, 10_000);
         // Small pair for the over-remaining leg: 1 lot authorized.
         ledger.mint(&addr(3), 10_000_000_000);
         ledger.mint(&addr(4), 10_000_000_000);
+        deposit(&ex, 4, 1_000);
         register(&ex, 3, 1, Side::Buy, 1_500_000_000, 1_000);
         register(&ex, 4, 1, Side::Sell, 1_000_000_000, 1_000);
         // Non-crossing pair for the limit violations: buy $12 max.
         ledger.mint(&addr(5), 10_000_000_000);
         ledger.mint(&addr(6), 10_000_000_000);
+        deposit(&ex, 6, 10_000);
         register(&ex, 5, 1, Side::Buy, 1_200_000_000, 10_000);
         register(&ex, 6, 1, Side::Sell, 1_000_000_000, 10_000);
         // High sell limit for the below-limit leg.
         ledger.mint(&addr(8), 10_000_000_000);
+        deposit(&ex, 8, 10_000);
         register(&ex, 8, 1, Side::Sell, 1_800_000_000, 10_000);
 
         let legs = [
@@ -2715,8 +3543,10 @@ mod tests {
 
         let rejected = events.iter().filter(|e| e.kind == "fill_rejected").count();
         assert_eq!(rejected, 11, "all eleven invalid legs must be rejected");
-        // Only the valid leg settled: seller got 10_000 of quote.
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 10_000);
+        // Only the valid leg settled: seller netted 10_000 − 10 fee
+        // = 9_990 of quote (the fixture's 100_000 base deposit was
+        // already debited from its ledger balance).
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 100_000 + 9_990);
     }
 
     /// Regression test: the chain computes settlement amounts itself.
@@ -2742,9 +3572,13 @@ mod tests {
         let events = ex.handle(&ctx(0xAA), &msg).unwrap();
 
         // Buyer net = −40_000 from the post-registration balance
-        // (escrow 45_000 − rebate 5_000 − pays 40_000).
+        // (escrow 45_000 − rebate 5_000 − pays 40_000). Seller nets
+        // 40_000 − 40 fee = 39_960; its ledger balance also carried
+        // the fixture's 3_000 base deposit.
         assert_eq!(ledger.balance(&addr(1)), 10_000_000_000 - 40_000);
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 40_000);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 3_000 + 39_960);
+        // The 40 quote of fees accrued to market 0's vault.
+        assert_eq!(ex.fee_vault(0), 40);
         // Exactly one pair credit → one batch_fill event; one buyer
         // rebate → one reservation_released event.
         assert_eq!(events.iter().filter(|e| e.kind == "batch_fill").count(), 1);
@@ -2767,6 +3601,7 @@ mod tests {
         for (buyer, seller) in [(9u8, 7u8), (1, 5), (3, 2)] {
             ledger.mint(&addr(buyer), 10_000_000_000);
             ledger.mint(&addr(seller), 10_000_000_000);
+            deposit(&ex, seller, 10_000);
             register(&ex, buyer, 1, Side::Buy, 1_000_000_000, 10_000);
             register(&ex, seller, 1, Side::Sell, 1_000_000_000, 10_000);
         }
@@ -2792,8 +3627,10 @@ mod tests {
             vec![(addr(1).0, addr(5).0), (addr(3).0, addr(2).0), (addr(9).0, addr(7).0)]
         );
         // The duplicate (9,7) leg aggregated into one credit of
-        // 2×10_000 quote units paid out of the buy order's escrow.
-        assert_eq!(ledger.balance(&addr(7)), 10_000_000_000 + 20_000);
+        // 2×(10_000 − 10 fee) = 19_980 quote units net, paid out of
+        // the buy order's escrow (the seller's 10_000 base deposit
+        // was already debited).
+        assert_eq!(ledger.balance(&addr(7)), 10_000_000_000 - 10_000 + 19_980);
     }
 
     /// Regression test: market buys must pass the pre-trade balance
@@ -2853,9 +3690,11 @@ mod tests {
         };
         ex.handle(&ctx(1), &msg::place(mid, mkt)).unwrap();
 
-        // Cost = 15_000 + 15_010 = 30_010 quote units.
+        // Cost = 15_000 + 15_010 = 30_010 quote units; seller nets
+        // 30_010 − (15 + 15) fees = 29_980 and delivers 2_000 base.
         assert_eq!(ledger.balance(&addr(1)), buyer_before - 30_010);
-        assert_eq!(ledger.balance(&addr(9)), seller_before + 30_010);
+        assert_eq!(ledger.balance(&addr(9)), seller_before + 30_010 - 30);
+        assert_eq!(ex.base_balance(addr(1), mid), 1_000_000_000_000 + 2_000);
         assert_eq!(ex.resting_count(mid), 0);
     }
 
@@ -2871,6 +3710,7 @@ mod tests {
         let ex = ExchangeModule::with_ledger(ledger.clone());
         ex.list_market(test_cfg()).unwrap();
         let mid = 0;
+        deposit(&ex, 9, 2_000);
 
         ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
         ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 501, 1, 9))).unwrap();
@@ -2947,16 +3787,17 @@ mod tests {
         let ex = ExchangeModule::with_ledger(ledger.clone());
         ex.list_market(test_cfg()).unwrap();
         let mid = 0;
+        deposit(&ex, 9, 1_000);
 
         // Maker rests the buy — balance drops to zero (fully reserved).
         ex.handle(&ctx(5), &msg::place(mid, limit(Side::Buy, 500, 1, 5))).unwrap();
         assert_eq!(ledger.balance(&addr(5)), 0);
 
         // Taker sell fills the maker's bid. The seller must receive
-        // 15_000 even though the buyer's free balance is 0 — the
-        // money comes from the held reservation.
+        // 15_000 − 15 fee even though the buyer's free balance is 0 —
+        // the money comes from the held reservation.
         ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
-        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000);
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 - 1_000 + 14_985);
         assert_eq!(ledger.balance(&addr(5)), 0, "buyer paid at rest, not at fill");
         assert_eq!(ex.resting_count(mid), 0);
     }
@@ -2982,7 +3823,8 @@ mod tests {
         // Cancel the resting remainder — releases the held 15_000.
         ex.handle(&ctx(1), &msg::cancel(mid, order_id)).unwrap();
         assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 15_000);
-        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000);
+        // Seller netted 15_000 − 15 fee for the filled lot.
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000 - 15);
     }
 
     /// An IOC buy's dead remainder is released in full — nothing is
@@ -3023,9 +3865,10 @@ mod tests {
         ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
         ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 600, 1, 1))).unwrap();
 
-        // Reserved 16_000, paid 15_000 → net 15_000 gone.
+        // Reserved 16_000, paid 15_000 → net 15_000 gone. The seller
+        // nets 15_000 − 15 fee.
         assert_eq!(ledger.balance(&addr(1)), 1_000_000_000_000 - 15_000);
-        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000);
+        assert_eq!(ledger.balance(&addr(9)), 1_000_000_000_000 + 15_000 - 15);
     }
 
     /// An STP-removed resting buy releases its held quote — a
@@ -3162,8 +4005,18 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ExecError::ModuleRejected(_)));
 
-        // Sells escrow nothing.
+        // Sells escrow base custody, not quote: owner 9 deposits
+        // 5_000 base, registers the sell, and its ledger balance is
+        // untouched while the base moves into the order's `reserved`.
+        ledger.mint(&addr(9), 5_000);
+        deposit(&ex, 9, 5_000);
+        assert_eq!(ledger.balance(&addr(9)), 0);
         ex.handle(&ctx(9), &msg::register_order(0, Side::Sell, 1_000_000_000, 5_000, 3)).unwrap();
+        assert_eq!(ledger.balance(&addr(9)), 0);
+        assert_eq!(ex.base_balance(addr(9), 0), 0, "sell escrowed the full qty");
+        // Cancel returns the escrow to free custody (not the ledger).
+        ex.handle(&ctx(9), &msg::cancel_registered(3)).unwrap();
+        assert_eq!(ex.base_balance(addr(9), 0), 5_000);
         assert_eq!(ledger.balance(&addr(9)), 0);
     }
 
@@ -3218,6 +4071,7 @@ mod tests {
         ex.list_market(test_cfg()).unwrap();
         ledger.mint(&addr(1), 10_000_000_000);
         ledger.mint(&addr(9), 10_000_000_000);
+        deposit(&ex, 9, 10_000);
         register(&ex, 9, 1, Side::Sell, 1_000_000_000, 10_000);
 
         // The buy key (1,1) was never registered — the operator
@@ -3228,7 +4082,7 @@ mod tests {
         assert!(events.iter().any(|e| e.kind == "fill_rejected"));
         assert!(!events.iter().any(|e| e.kind == "batch_fill"));
         assert_eq!(ledger.balance(&addr(1)), 10_000_000_000);
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 10_000);
     }
 
     /// Replay safety: a settled batch cannot settle twice. The second
@@ -3275,7 +4129,8 @@ mod tests {
         let events = ex.handle(&ctx(0xAA), &msg::batch_settle(&legs)).unwrap();
         assert_eq!(events.iter().filter(|e| e.kind == "batch_fill").count(), 1);
         assert_eq!(events.iter().filter(|e| e.kind == "fill_rejected").count(), 1);
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 10_000);
+        // 1_000 base deposit + 10_000 − 10 fee netted.
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 1_000 + 9_990);
     }
 
     /// Price improvement: a fill below the buy's limit releases the
@@ -3297,7 +4152,9 @@ mod tests {
             .handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 2_000, 1, 1, 9, 1)]))
             .unwrap();
         assert!(events.iter().any(|e| e.kind == "reservation_released"));
-        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 + 20_000);
+        // Seller nets 20_000 − 20 fee; its 2_000 base deposit was
+        // already debited at registration.
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 2_000 + 19_980);
         assert_eq!(ledger.balance(&addr(1)), after_register + 10_000);
     }
 
@@ -3333,6 +4190,9 @@ mod tests {
             ExecError::ModuleRejected(_)
         ));
         // Only the owner can cancel — anyone else's cancel misses.
+        // (Owner 9's earlier 5_000 deposit is fully escrowed by the
+        // live sell; deposit more before registering a second.)
+        deposit(&ex, 9, 1_000);
         register(&ex, 9, 9, Side::Sell, 1_000_000_000, 1_000);
         assert!(matches!(
             ex.handle(&ctx(2), &msg::cancel_registered(9)).unwrap_err(),
@@ -3367,5 +4227,592 @@ mod tests {
             .handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1)]))
             .unwrap();
         assert!(events.iter().any(|e| e.kind == "batch_fill"));
+    }
+
+    // ── Base-asset custody (DvP) ────────────────────────────────────
+
+    /// Sum every committed base-custody slot: free balances, book
+    /// holds, and sell-side `reserved` on registered orders. Tests
+    /// assert this equals deposits minus withdrawals — the custody
+    /// conservation invariant.
+    fn total_base_custody(ex: &ExchangeModule) -> u64 {
+        let inner = ex.inner.lock().unwrap();
+        let free: u64 = inner.base_balances.values().sum();
+        let held: u64 = inner.base_holds.values().sum();
+        let escrowed: u64 =
+            inner.registered.values().filter(|o| o.side == Side::Sell).map(|o| o.reserved).sum();
+        free + held + escrowed
+    }
+
+    /// A deposit debits native 1:1 into free base custody — the
+    /// module never mints unbacked base.
+    #[test]
+    fn deposit_base_debits_native_into_custody() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(2), 50_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.list_market(test_cfg()).unwrap();
+
+        let events = ex.handle(&ctx(2), &msg::deposit_base(0, 20_000)).unwrap();
+        assert_eq!(events[0].kind, "base_deposited");
+        assert_eq!(ledger.balance(&addr(2)), 30_000);
+        assert_eq!(ex.base_balance(addr(2), 0), 20_000);
+    }
+
+    /// Deposits debit the sender's ledger balance into custody and
+    /// withdrawals reverse it — rejected shapes (zero, unlisted
+    /// market, overdrawn custody) move nothing.
+    #[test]
+    fn deposit_withdraw_base_edges() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(2), 50_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.list_market(test_cfg()).unwrap();
+        let mid = 0;
+
+        deposit(&ex, 2, 20_000);
+        assert_eq!(ledger.balance(&addr(2)), 30_000);
+        assert_eq!(ex.base_balance(addr(2), mid), 20_000);
+
+        ex.handle(&ctx(2), &msg::withdraw_base(mid, 8_000)).unwrap();
+        assert_eq!(ledger.balance(&addr(2)), 38_000);
+        assert_eq!(ex.base_balance(addr(2), mid), 12_000);
+
+        // Overdraft: only 12_000 free.
+        assert!(matches!(
+            ex.handle(&ctx(2), &msg::withdraw_base(mid, 12_001)).unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        // Zero amounts and unlisted markets are rejected.
+        assert!(matches!(
+            ex.handle(&ctx(2), &msg::deposit_base(mid, 0)).unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        assert!(matches!(
+            ex.handle(&ctx(2), &msg::withdraw_base(mid, 0)).unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        assert!(matches!(
+            ex.handle(&ctx(2), &msg::deposit_base(200, 1_000)).unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        // Deposit beyond the ledger balance is rejected.
+        assert!(matches!(
+            ex.handle(&ctx(2), &msg::deposit_base(mid, 99_000_000)).unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+        assert_eq!(ex.base_balance(addr(2), mid), 12_000);
+    }
+
+    /// A sell order on the book path must prove base custody: no
+    /// deposit → no order. The book is untouched by the rejection.
+    #[test]
+    fn sell_rejected_without_base_custody() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(9), 1_000_000_000_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.list_market(test_cfg()).unwrap();
+        let mid = 0;
+
+        // Owner 9 has quote but no base custody — the sell must
+        // reject BEFORE the book is touched.
+        let err = ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)));
+        assert_eq!(ex.resting_count(mid), 0);
+
+        // Depositing less than the order needs still rejects.
+        deposit(&ex, 9, 999);
+        assert!(
+            ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).is_err(),
+            "999 < 1_000 required"
+        );
+        deposit(&ex, 9, 1);
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 1, 9))).unwrap();
+        assert_eq!(ex.resting_count(mid), 1);
+        // The full qty moved from free custody into the hold.
+        assert_eq!(ex.base_balance(addr(9), mid), 0);
+        assert_eq!(ex.base_hold(addr(9), mid), 1_000);
+    }
+
+    /// Cancel releases a resting sell's base hold back to free
+    /// custody — symmetric with the buy-side quote refund.
+    #[test]
+    fn cancel_resting_sell_releases_base_hold() {
+        let (_ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+        let free_before = ex.base_balance(addr(9), mid);
+
+        let events = ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 2, 9))).unwrap();
+        let order_id = OrderId(u64::from_le_bytes(events[0].data[1..9].try_into().unwrap()));
+        assert_eq!(ex.base_hold(addr(9), mid), 2_000);
+        assert_eq!(ex.base_balance(addr(9), mid), free_before - 2_000);
+
+        ex.handle(&ctx(9), &msg::cancel(mid, order_id)).unwrap();
+        assert_eq!(ex.base_hold(addr(9), mid), 0);
+        assert_eq!(ex.base_balance(addr(9), mid), free_before);
+    }
+
+    /// The core `DvP` property on the book path: a fill moves base
+    /// seller→buyer AND quote buyer→seller in one state transition.
+    /// The seller's ledger gain is net of the protocol fee; the fee
+    /// lands in the market vault.
+    #[test]
+    fn book_fill_is_delivery_versus_payment() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+        let seller_free = ex.base_balance(addr(9), mid);
+        let buyer_free = ex.base_balance(addr(1), mid);
+
+        // Maker sell 4 lots, taker buy fills 3, remainder rests.
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 4, 9))).unwrap();
+        assert_eq!(ex.base_hold(addr(9), mid), 4_000);
+        assert_eq!(ex.base_balance(addr(9), mid), seller_free - 4_000);
+        let seller_quote = ledger.balance(&addr(9));
+        let buyer_quote = ledger.balance(&addr(1));
+
+        let ioc = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Ioc,
+            price: Price(1_500_000_000),
+            qty: Qty(3_000),
+            owner: addr(1),
+            stp: StpMode::None,
+        };
+        ex.handle(&ctx(1), &msg::place(mid, ioc)).unwrap();
+
+        // Base: 3_000 delivered to the buyer; the maker's hold keeps
+        // the 1_000 remainder for its still-resting sell.
+        assert_eq!(ex.base_balance(addr(1), mid), buyer_free + 3_000);
+        assert_eq!(ex.base_hold(addr(9), mid), 1_000);
+        // Quote: buyer paid 45_000 gross; seller netted 45_000 − 45.
+        assert_eq!(ledger.balance(&addr(1)), buyer_quote - 45_000);
+        assert_eq!(ledger.balance(&addr(9)), seller_quote + 45_000 - 45);
+        assert_eq!(ex.fee_vault(mid), 45);
+    }
+
+    /// A taker sell delivers its admission-reserved base to the
+    /// resting maker buy — and an IOC remainder comes back free.
+    #[test]
+    fn taker_sell_delivers_reserved_base() {
+        let (ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+
+        ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        let taker_free = ex.base_balance(addr(9), mid);
+        let maker_free = ex.base_balance(addr(1), mid);
+        let seller_quote = ledger.balance(&addr(9));
+
+        // IOC sell 3 lots vs a 1-lot bid: 1 fills, 2 die unfilled.
+        let ioc = NewOrder {
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Ioc,
+            price: Price(1_000_000_000),
+            qty: Qty(3_000),
+            owner: addr(9),
+            stp: StpMode::None,
+        };
+        ex.handle(&ctx(9), &msg::place(mid, ioc)).unwrap();
+
+        // 1_000 delivered to the maker; the 2_000 dead remainder
+        // released back to the taker's free custody.
+        assert_eq!(ex.base_balance(addr(9), mid), taker_free - 1_000);
+        assert_eq!(ex.base_balance(addr(1), mid), maker_free + 1_000);
+        assert_eq!(ex.base_hold(addr(9), mid), 0);
+        assert_eq!(ledger.balance(&addr(9)), seller_quote + 15_000 - 15);
+    }
+
+    /// A GTC sell's unfilled remainder becomes the resting order's
+    /// hold — not free custody, not stranded.
+    #[test]
+    fn gtc_sell_remainder_becomes_hold() {
+        let (_ledger, ex) = ledger_and_exchange();
+        let mid = 0;
+        let free_before = ex.base_balance(addr(9), mid);
+
+        ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 3, 9))).unwrap();
+
+        // 1 lot filled+delivered, 2 rest as the maker hold.
+        assert_eq!(ex.base_hold(addr(9), mid), 2_000);
+        assert_eq!(ex.base_balance(addr(9), mid), free_before - 3_000);
+        assert_eq!(ex.resting_count(mid), 1);
+    }
+
+    /// Registered sells escrow base at registration; cancel refunds
+    /// to free custody, never the ledger.
+    #[test]
+    fn registered_sell_escrow_is_base() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(9), 10_000_000_000);
+        let ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.list_market(test_cfg()).unwrap();
+
+        // A sell registration without base custody is rejected.
+        assert!(matches!(
+            ex.handle(&ctx(9), &msg::register_order(0, Side::Sell, 1_000_000_000, 5_000, 1))
+                .unwrap_err(),
+            ExecError::ModuleRejected(_)
+        ));
+
+        deposit(&ex, 9, 5_000);
+        register(&ex, 9, 1, Side::Sell, 1_000_000_000, 5_000);
+        assert_eq!(ex.base_balance(addr(9), 0), 0);
+
+        ex.handle(&ctx(9), &msg::cancel_registered(1)).unwrap();
+        assert_eq!(ex.base_balance(addr(9), 0), 5_000);
+        assert_eq!(ledger.balance(&addr(9)), 10_000_000_000 - 5_000);
+    }
+
+    /// The batch path delivers base seller→buyer custody alongside
+    /// the quote credit, consumes the sell's escrow qty-for-qty, and
+    /// accrues the fee — all in one committed transition.
+    #[test]
+    fn batch_settle_delivers_base_and_fee() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        registered_pair(&ledger, &ex, 1_000_000_000, 1_000_000_000, 5_000);
+        // The fixture deposited 5_000 for the sell — all escrowed.
+        assert_eq!(ex.base_balance(addr(9), 0), 0);
+
+        // Fill 2 lots at $10: pays 20_000, fee 20.
+        let ev = ex
+            .handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 2_000, 1, 1, 9, 1)]))
+            .unwrap();
+        assert!(ev.iter().any(|e| e.kind == "batch_fill"));
+        assert!(ev.iter().any(|e| e.kind == "base_delivered"));
+        assert_eq!(ex.base_balance(addr(1), 0), 2_000);
+        assert_eq!(ex.fee_vault(0), 20);
+
+        // The sell's remaining escrow is 3_000 — cancelable back to
+        // free custody.
+        ex.handle(&ctx(9), &msg::cancel_registered(1)).unwrap();
+        assert_eq!(ex.base_balance(addr(9), 0), 3_000);
+    }
+
+    /// Conservation: free custody + book holds + sell-side escrow
+    /// always equal deposits minus withdrawals, across a mixed
+    /// sequence of places, fills, cancels, deposits, withdrawals,
+    /// and a batch settle. The complementary native-side invariant:
+    /// total minted = Σ free ledger balances + Σ base custody +
+    /// buy-side escrows + the fee vault (resting book buys hold
+    /// `limit × remaining` implicitly — none rest at the end here).
+    #[test]
+    fn base_custody_conserves_across_mixed_ops() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        let mut ex = ExchangeModule::with_ledger(ledger.clone());
+        ex.set_settlement_operator(addr(0xAA));
+        ex.list_market(test_cfg()).unwrap();
+        ledger.mint(&addr(1), 10_000_000_000);
+        ledger.mint(&addr(9), 10_000_000_000);
+        ledger.mint(&addr(3), 10_000_000_000);
+        let mid = 0;
+        let minted = 30_000_000_000u64;
+
+        // Deposits: 7_000 + 4_000 + 2_000 = 13_000 custodied.
+        deposit(&ex, 9, 7_000);
+        deposit(&ex, 1, 4_000);
+        deposit(&ex, 3, 2_000);
+        assert_eq!(total_base_custody(&ex), 13_000);
+
+        // Rest a 4-lot sell (9) and a 2-lot sell (3); partially fill
+        // 9's order with a taker buy; withdraw some free custody.
+        ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 4, 9))).unwrap();
+        ex.handle(&ctx(3), &msg::place(mid, limit(Side::Sell, 501, 2, 3))).unwrap();
+        assert_eq!(total_base_custody(&ex), 13_000);
+        ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 2, 1))).unwrap();
+        assert_eq!(total_base_custody(&ex), 13_000);
+        ex.handle(&ctx(1), &msg::withdraw_base(mid, 1_000)).unwrap();
+        assert_eq!(total_base_custody(&ex), 12_000);
+
+        // Registered pair + batch fill of 1 lot.
+        deposit(&ex, 9, 3_000);
+        register(&ex, 1, 7, Side::Buy, 1_000_000_000, 1_000);
+        register(&ex, 9, 7, Side::Sell, 1_000_000_000, 1_000);
+        assert_eq!(total_base_custody(&ex), 15_000);
+        ex.handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 1_000, 1, 7, 9, 7)]))
+            .unwrap();
+        assert_eq!(total_base_custody(&ex), 15_000);
+
+        // Sweep the best ask — 9's 2-lot remainder @500 — with a
+        // taker buy: the maker's hold drains into the buyer's
+        // custody; total unchanged.
+        ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 501, 2, 1))).unwrap();
+        assert_eq!(total_base_custody(&ex), 15_000);
+
+        // Native-side conservation: supply = free ledger + base
+        // custody + buy escrows + fee vault. No book buys rest at
+        // the end (the sweep filled all asks within its limit) and
+        // the registered buy was fully consumed, so no implicit
+        // quote holds remain.
+        let ledger_total: u64 = [addr(1), addr(3), addr(9)].iter().map(|a| ledger.balance(a)).sum();
+        let custody = total_base_custody(&ex);
+        let buy_escrow: u64 = ex
+            .inner
+            .lock()
+            .unwrap()
+            .registered
+            .values()
+            .filter(|o| o.side == Side::Buy)
+            .map(|o| o.reserved)
+            .sum();
+        assert_eq!(
+            minted,
+            ledger_total + custody + buy_escrow + ex.fee_vault(0),
+            "supply == free + base custody + buy escrows + fee vault"
+        );
+    }
+
+    /// Custody maps are committed state: a snapshot round-trip must
+    /// restore free balances, book holds, and the fee vault — a
+    /// replica that lost them would settle different fills.
+    #[test]
+    fn custody_state_survives_snapshot() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 10_000_000_000);
+        ledger.mint(&addr(9), 10_000_000_000);
+        let mut src = ExchangeModule::with_ledger(ledger.clone());
+        src.set_settlement_operator(addr(0xAA));
+        src.list_market(test_cfg()).unwrap();
+        deposit(&src, 9, 10_000);
+        deposit(&src, 1, 5_000);
+        // Rest a sell (hold 4_000), fill 1 lot via a registered pair
+        // (fee accrues), leave free balances behind.
+        src.handle(&ctx(9), &msg::place(0, limit(Side::Sell, 500, 4, 9))).unwrap();
+        register(&src, 1, 1, Side::Buy, 1_000_000_000, 1_000);
+        register(&src, 9, 1, Side::Sell, 1_000_000_000, 1_000);
+        src.handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 1_000, 1, 1, 9, 1)]))
+            .unwrap();
+        let root = src.state_root();
+
+        let snapshot = src.export_state().expect("exports state");
+        let mut dst = ExchangeModule::with_ledger(ledger);
+        dst.set_settlement_operator(addr(0xAA));
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), root, "custody state is committed");
+        assert_eq!(dst.base_hold(addr(9), 0), 4_000);
+        assert_eq!(dst.base_balance(addr(1), 0), 5_000 + 1_000);
+        assert_eq!(dst.fee_vault(0), 10);
+    }
+
+    /// Pre-custody blobs decode with empty custody maps — and a
+    /// registered sell that predates custody (`reserved == 0`) is
+    /// unfillable but cancelable. Fail-closed, not grandfathered.
+    #[test]
+    fn pre_custody_sell_orders_cannot_settle() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 10_000_000_000);
+        ledger.mint(&addr(9), 10_000_000_000);
+        let mut src = ExchangeModule::with_ledger(ledger.clone());
+        src.set_settlement_operator(addr(0xAA));
+        src.list_market(test_cfg()).unwrap();
+        // A live buy with real escrow stays fillable post-import.
+        register(&src, 1, 1, Side::Buy, 1_000_000_000, 5_000);
+
+        // Hand-craft a pre-custody blob: decode the source's own
+        // export, inject a naked sell (`reserved == 0`, the legacy
+        // shape), and re-encode WITHOUT the trailing custody
+        // section — exactly what a pre-upgrade blob contains.
+        let snapshot = src.export_state().expect("exports state");
+        let (canon_bytes, store_map) =
+            framework::decode_state_blob(&snapshot.entries[0].1).expect("blob decodes");
+        let mut r = framework::CanonicalReader::new(canon_bytes);
+        // `stage_blob_snapshot` consumes the store-subtree root
+        // before handing the reader to the module decoder.
+        assert_eq!(
+            r.get_root().expect("root"),
+            framework::subtree_root_map(&store_map),
+            "store section must hash to the committed root"
+        );
+        let (markets, endorsements, mut registered, _, _, _) =
+            ExchangeModule::decode_committed(&mut r, &store_map, 256).expect("decodes");
+        registered.insert(
+            crate::OrderKey { owner: addr(9), client_id: 9 },
+            crate::RegisteredOrder {
+                market: 0,
+                side: Side::Sell,
+                limit_price: 1_000_000_000,
+                remaining: 5_000,
+                reserved: 0,
+            },
+        );
+        let mut w = framework::CanonicalState::new();
+        w.put_root(&framework::subtree_root_map(&store_map));
+        w.put_count(markets.len());
+        let mut book_bytes = Vec::new();
+        let mut entries = Vec::new();
+        for engine in &markets {
+            match engine {
+                Some(e) => {
+                    w.put_u8(1);
+                    book_bytes.clear();
+                    e.write_canonical_state(&mut book_bytes, &mut entries);
+                    w.put_bytes(&book_bytes);
+                }
+                None => {
+                    w.put_u8(0);
+                }
+            }
+        }
+        endorsements.write_canonical(&mut w);
+        w.put_count(registered.len());
+        for (key, order) in &registered {
+            w.put_addr(&key.owner);
+            w.put_u64(key.client_id);
+            w.put_u16(order.market);
+            w.put_u8(encode_side(order.side));
+            w.put_u64(order.limit_price);
+            w.put_u64(order.remaining);
+            w.put_u64(order.reserved);
+        }
+        // No custody tail — the pre-upgrade blob shape.
+        let kv: framework::KVStore = std::sync::Mutex::new(store_map);
+        let snapshot = storage::Snapshot {
+            height: 0,
+            entries: vec![(
+                framework::state_blob_key(),
+                framework::encode_state_blob(w.as_bytes(), &kv),
+            )],
+        };
+
+        let mut dst = ExchangeModule::with_ledger(ledger.clone());
+        dst.set_settlement_operator(addr(0xAA));
+        dst.import_state(&snapshot).unwrap();
+
+        // The legacy sell cannot settle — `reserved` (0) < any qty.
+        let events = dst
+            .handle(&ctx(0xAA), &msg::batch_settle(&[leg(0, 1_000_000_000, 1_000, 1, 1, 9, 9)]))
+            .unwrap();
+        assert!(events.iter().any(|e| e.kind == "fill_rejected"));
+        assert!(!events.iter().any(|e| e.kind == "batch_fill"));
+
+        // …but it can still be canceled (refund = 0 base, harmless).
+        dst.handle(&ctx(9), &msg::cancel_registered(9)).unwrap();
+    }
+
+    // ── Property tests ───────────────────────────────────────────
+    //
+    // The fixed tests above pin specific sequences; these sweep the
+    // op space itself. The property under test is the custody
+    // conservation invariant: the committed base maps (free custody
+    // + book holds + sell-side `reserved`) always equal deposits
+    // minus withdrawals — the module can neither mint nor lose a
+    // base unit, regardless of the order in which fills, cancels,
+    // STP removals, and dead remainders interleave.
+
+    use proptest::prelude::*;
+
+    // One random op: `(owner_idx, kind, amount, tick)` where `kind`
+    // selects deposit/withdraw/limit-sell/limit-buy/IOC-sell/IOC-
+    // buy/cancel. Amounts and ticks are deliberately small and
+    // lot-aligned so most orders are admissible — the invariant
+    // must hold through successes AND rejections alike.
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(48))]
+
+        #[test]
+        fn base_custody_conserved_over_random_ops(
+            ops in proptest::collection::vec(
+                (0u8..3, 0u8..7, 1_000u64..50_000, 0u64..3),
+                1..192,
+            ),
+        ) {
+            let ledger = Arc::new(framework::MemoryBalances::new());
+            let ex = ExchangeModule::with_ledger(ledger.clone());
+            ex.list_market(test_cfg()).unwrap();
+            let owners = [1u8, 9, 3];
+            for w in owners {
+                ledger.mint(&addr(w), u64::MAX / 4);
+            }
+            let mid = 0u8;
+            // Each owner's live resting orders — cancels draw only
+            // from this set so they exercise the release path.
+            let mut resting: [Vec<OrderId>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            let mut custodied = 0u64;
+
+            for (who, op, amount, tick) in ops {
+                let wi = usize::from(who);
+                let lots = (amount / 1_000 % 8) + 1;
+                let res = match op {
+                    0 => ex.handle(&ctx(who), &msg::deposit_base(mid, amount)),
+                    1 => ex.handle(&ctx(who), &msg::withdraw_base(mid, amount)),
+                    2 => ex.handle(&ctx(who), &msg::place(mid, limit(Side::Sell, tick, lots, who))),
+                    3 => ex.handle(&ctx(who), &msg::place(mid, limit(Side::Buy, tick, lots, who))),
+                    4 => ex.handle(
+                        &ctx(who),
+                        &msg::place(
+                            mid,
+                            NewOrder {
+                                side: Side::Sell,
+                                order_type: OrderType::Limit,
+                                tif: TimeInForce::Ioc,
+                                price: Price(1_000_000_000 + tick * 1_000_000),
+                                qty: Qty(lots * 1_000),
+                                owner: addr(who),
+                                stp: StpMode::None,
+                            },
+                        ),
+                    ),
+                    5 => ex.handle(
+                        &ctx(who),
+                        &msg::place(
+                            mid,
+                            NewOrder {
+                                side: Side::Buy,
+                                order_type: OrderType::Limit,
+                                tif: TimeInForce::Ioc,
+                                price: Price(1_000_000_000 + tick * 1_000_000),
+                                qty: Qty(lots * 1_000),
+                                owner: addr(who),
+                                stp: StpMode::None,
+                            },
+                        ),
+                    ),
+                    _ => {
+                        // Cancel the owner's oldest tracked resting
+                        // order, if any; otherwise a harmless no-op.
+                        match resting[wi].first().copied() {
+                            Some(id) => {
+                                let r = ex.handle(&ctx(who), &msg::cancel(mid, id));
+                                // Err means the id is dead (filled
+                                // or already canceled) — either way
+                                // it is no longer live, so untrack.
+                                resting[wi].remove(0);
+                                r
+                            }
+                            None => continue,
+                        }
+                    }
+                };
+                let Ok(events) = res else {
+                    // Rejected ops move nothing — still assert.
+                    prop_assert_eq!(total_base_custody(&ex), custodied);
+                    continue;
+                };
+                match op {
+                    0 => custodied += amount,
+                    1 => custodied -= amount,
+                    2 | 3 => {
+                        // A GTC place that rests emits its order id
+                        // in the trailing "resting" outcome event.
+                        if let Some(e) = events.iter().find(|e| e.kind == "resting") {
+                            let id = OrderId(u64::from_le_bytes(
+                                e.data[1..9].try_into().unwrap(),
+                            ));
+                            resting[wi].push(id);
+                        }
+                        // Filled orders may drop other owners' ids —
+                        // prune anything no longer cancelable lazily:
+                        // a stale id just makes cancel return Err,
+                        // which the `is_ok` gate already filters.
+                    }
+                    _ => {}
+                }
+                prop_assert_eq!(total_base_custody(&ex), custodied);
+            }
+        }
     }
 }

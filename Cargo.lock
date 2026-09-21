@@ -1754,6 +1754,7 @@ dependencies = [
  "executor",
  "framework",
  "primitives",
+ "proptest",
  "storage",
  "trading",
  "types",
