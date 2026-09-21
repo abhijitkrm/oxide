@@ -105,10 +105,10 @@ impl StorageBackend for RocksDbBackend {
                 out.push((Hash(arr), v.to_vec()));
             }
             // If we've passed the prefix range, stop.
-            if let Some(hi) = &hi {
-                if key_bytes >= hi.as_slice() {
-                    break;
-                }
+            if let Some(hi) = &hi
+                && key_bytes >= hi.as_slice()
+            {
+                break;
             }
         }
         // Sort by key (RocksDB iterator is sorted, but be explicit).
@@ -165,10 +165,10 @@ impl StorageBackend for RocksDbBackend {
         // Validate: keys must be sorted and unique.
         let mut prev: Option<&Hash> = None;
         for (k, _) in &snapshot.entries {
-            if let Some(p) = prev {
-                if k <= p {
-                    return Err(SnapshotError::Malformed);
-                }
+            if let Some(p) = prev
+                && k <= p
+            {
+                return Err(SnapshotError::Malformed);
             }
             prev = Some(k);
         }

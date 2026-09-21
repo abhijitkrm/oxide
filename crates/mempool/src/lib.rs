@@ -295,22 +295,22 @@ impl Mempool {
         // counting toward `max_entries` and could be "evicted" as a
         // ghost) and letting a *lower*-fee resubmit shadow a
         // higher-fee tx.
-        if let Some(&old_hash) = self.by_sender.get(&sender).and_then(|q| q.get(&nonce)) {
-            if let Some(old) = self.by_hash.get(&old_hash) {
-                let bumped = u128::from(fee) * REPLACEMENT_BUMP_DENOMINATOR
-                    >= u128::from(old.fee) * REPLACEMENT_BUMP_NUMERATOR;
-                if !bumped {
-                    return Err(MempoolError::ReplacementUnderpriced);
-                }
-                // The bump check passed — displace the old entry from
-                // all indices. A replacement frees its own slot, so
-                // the capacity check below sees the post-removal size.
-                self.remove(&old_hash);
+        if let Some(&old_hash) = self.by_sender.get(&sender).and_then(|q| q.get(&nonce))
+            && let Some(old) = self.by_hash.get(&old_hash)
+        {
+            let bumped = u128::from(fee) * REPLACEMENT_BUMP_DENOMINATOR
+                >= u128::from(old.fee) * REPLACEMENT_BUMP_NUMERATOR;
+            if !bumped {
+                return Err(MempoolError::ReplacementUnderpriced);
             }
-            // If `by_sender` holds a hash `by_hash` doesn't know
-            // (inconsistent state), the `insert` below overwrites the
-            // slot — no orphan is created.
+            // The bump check passed — displace the old entry from
+            // all indices. A replacement frees its own slot, so
+            // the capacity check below sees the post-removal size.
+            self.remove(&old_hash);
         }
+        // If `by_sender` holds a hash `by_hash` doesn't know
+        // (inconsistent state), the `insert` below overwrites the
+        // slot — no orphan is created.
 
         // If the pool is full, evict the lowest-fee entries until
         // there is room — but only while the new tx outbids the
@@ -406,12 +406,12 @@ impl Mempool {
             self.by_fee.remove(&lowest_density);
         }
         // Remove from by_hash and by_sender.
-        if let Some(entry) = self.by_hash.remove(&hash) {
-            if let Some(queue) = self.by_sender.get_mut(&entry.sender) {
-                queue.remove(&entry.nonce);
-                if queue.is_empty() {
-                    self.by_sender.remove(&entry.sender);
-                }
+        if let Some(entry) = self.by_hash.remove(&hash)
+            && let Some(queue) = self.by_sender.get_mut(&entry.sender)
+        {
+            queue.remove(&entry.nonce);
+            if queue.is_empty() {
+                self.by_sender.remove(&entry.sender);
             }
         }
         true
@@ -473,10 +473,10 @@ impl Mempool {
         let mut heap: std::collections::BinaryHeap<(FeeDensity, Address)> =
             std::collections::BinaryHeap::with_capacity(self.by_sender.len());
         for (sender, queue) in &self.by_sender {
-            if let Some(&hash) = queue.values().next() {
-                if let Some(entry) = self.by_hash.get(&hash) {
-                    heap.push((FeeDensity { fee: entry.fee, size: entry.size }, *sender));
-                }
+            if let Some(&hash) = queue.values().next()
+                && let Some(entry) = self.by_hash.get(&hash)
+            {
+                heap.push((FeeDensity { fee: entry.fee, size: entry.size }, *sender));
             }
         }
 

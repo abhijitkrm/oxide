@@ -2835,10 +2835,10 @@ fn txpool_content_json(items: &[TxpoolItem], only: Option<primitives::Address>) 
     let mut pending = serde_json::Map::new();
     let mut queued = serde_json::Map::new();
     for item in items {
-        if let Some(addr) = only {
-            if item.sender != addr {
-                continue;
-            }
+        if let Some(addr) = only
+            && item.sender != addr
+        {
+            continue;
         }
         let addr = format!("0x{}", hex::encode(item.sender.0));
         let bucket = if item.pending { &mut pending } else { &mut queued };

@@ -169,7 +169,7 @@ impl NewOrder {
     ) -> Result<(), RejectReason> {
         // Quantity: positive and a whole number of lots. Zero-qty and
         // sub-lot orders can never produce a well-formed fill.
-        if self.qty.0 == 0 || self.qty.0 % lot != 0 {
+        if self.qty.0 == 0 || !self.qty.0.is_multiple_of(lot) {
             return Err(RejectReason::InvalidQty);
         }
         // Type/TIF coherence: market orders never rest (Ioc only);
@@ -191,7 +191,7 @@ impl NewOrder {
             }
             // Off-grid check relative to the band's floor: a price is
             // on-grid iff (p - min) is a whole number of ticks.
-            if (p - min_price) % tick != 0 {
+            if !(p - min_price).is_multiple_of(tick) {
                 return Err(RejectReason::PriceOffTick);
             }
         }

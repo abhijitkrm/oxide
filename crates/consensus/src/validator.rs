@@ -388,7 +388,7 @@ impl ValidatorSet {
     #[must_use]
     pub fn quorum_stake(&self) -> u64 {
         let t = self.total_stake;
-        t - t / 3 + u64::from(t % 3 == 0)
+        t - t / 3 + u64::from(t.is_multiple_of(3))
     }
 
     /// Voting power carried by `bitmap`: the sum of the stakes of the

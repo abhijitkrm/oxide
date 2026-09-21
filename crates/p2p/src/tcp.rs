@@ -719,25 +719,25 @@ impl TcpTransport {
                         // and impersonate a validator. When
                         // `allowed_peer_ids` is `None` (test mode), all
                         // peer IDs are accepted.
-                        if let Some(ref allowed) = accept_allowed_peer_ids {
-                            if !allowed.contains(&peer_id) {
-                                // Drop the streams, closing the connection.
-                                drop(write_stream);
-                                drop(reader_stream);
-                                continue;
-                            }
+                        if let Some(ref allowed) = accept_allowed_peer_ids
+                            && !allowed.contains(&peer_id)
+                        {
+                            // Drop the streams, closing the connection.
+                            drop(write_stream);
+                            drop(reader_stream);
+                            continue;
                         }
 
                         // Admission control: check reputation and
                         // connection cap. If rejected, close the
                         // connection and continue.
-                        if let Some(ref ac) = accept_admission {
-                            if !ac.admit_connection(&peer_id) {
-                                // Connection rejected — the stream
-                                // is dropped, closing the TCP
-                                // connection.
-                                continue;
-                            }
+                        if let Some(ref ac) = accept_admission
+                            && !ac.admit_connection(&peer_id)
+                        {
+                            // Connection rejected — the stream
+                            // is dropped, closing the TCP
+                            // connection.
+                            continue;
                         }
 
                         // Spawn a writer thread and register its
@@ -1287,10 +1287,10 @@ impl Transport for TcpTransport {
             self.inbound_queued.fetch_sub(msg.bytes.len(), Ordering::Relaxed);
             // Admission control: check rate limit and reputation.
             // If rejected, drop the message and try the next one.
-            if let Some(ref ac) = self.admission {
-                if !ac.admit_message(&msg.from, msg.bytes.len()) {
-                    continue; // message dropped by admission control
-                }
+            if let Some(ref ac) = self.admission
+                && !ac.admit_message(&msg.from, msg.bytes.len())
+            {
+                continue; // message dropped by admission control
             }
             return Some(msg);
         }

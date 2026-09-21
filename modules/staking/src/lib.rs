@@ -793,10 +793,10 @@ impl StakingModule {
         .collect();
         let mut bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (addr, key) in &changes {
-            if let Some(old) = bls_keys.insert(*addr, key.clone()) {
-                if old != *key {
-                    self.retire_key(*addr, old);
-                }
+            if let Some(old) = bls_keys.insert(*addr, key.clone())
+                && old != *key
+            {
+                self.retire_key(*addr, old);
             }
         }
         changes
@@ -2564,15 +2564,14 @@ impl StakingModule {
         // Burn only the amount removed from pool-backed delegations —
         // unattributed stake (genesis self-stake) was never in the
         // pool, so burning it would overdraw.
-        if burned_from_pool > 0 {
-            if let Some(ledger) =
+        if burned_from_pool > 0
+            && let Some(ledger) =
                 self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
-            {
-                // Burn = debit the pool with no credit — supply
-                // shrinks (Ethereum burn semantics; cleaner than
-                // accumulating at the zero address).
-                let _ = ledger.debit(&BONDED_POOL, burned_from_pool);
-            }
+        {
+            // Burn = debit the pool with no credit — supply
+            // shrinks (Ethereum burn semantics; cleaner than
+            // accumulating at the zero address).
+            let _ = ledger.debit(&BONDED_POOL, burned_from_pool);
         }
 
         Ok(vec![Event { module: "staking", kind: "slash", data: msg.to_vec() }])
@@ -3109,10 +3108,10 @@ impl StakingModule {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(new_validator, bls_key.clone());
-                    if let Some(old) = displaced {
-                        if old != bls_key {
-                            self.retire_key(new_validator, old);
-                        }
+                    if let Some(old) = displaced
+                        && old != bls_key
+                    {
+                        self.retire_key(new_validator, old);
                     }
                     self.pending_validator_adds
                         .lock()

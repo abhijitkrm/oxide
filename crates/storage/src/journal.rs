@@ -619,7 +619,7 @@ pub fn read_height_index(dir: &Path) -> Result<std::collections::BTreeMap<u32, u
         Err(e) => return Err(JournalError::Io(e)),
     };
     let mut out = std::collections::BTreeMap::new();
-    for record in bytes.chunks_exact(12) {
+    for record in bytes.as_chunks::<12>().0 {
         let seq = u32::from_le_bytes(record[0..4].try_into().unwrap_or([0; 4]));
         let height = u64::from_le_bytes(record[4..12].try_into().unwrap_or([0; 8]));
         out.insert(seq, height);

@@ -21,7 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Matches rust-toolchain.toml — bump both together.
+      - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Add swap space
         # See ci.yml for rationale.
@@ -35,7 +36,7 @@ jobs:
         # included so adapter regressions are caught nightly too
         # (audit session 24 gap 4).
         run: |
-          cargo test --release --workspace --all-targets \
+          cargo test --release --workspace --all-targets --locked \
             --features storage/redb,storage/rocksdb,storage/mdbx -- \
             --ignored --nocapture --test-threads=1
       - name: Upload simulation output
@@ -89,7 +90,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Matches rust-toolchain.toml — bump both together.
+      - uses: dtolnay/rust-toolchain@1.98.1
       - name: Install cargo-audit
         run: cargo install cargo-audit
       - name: Run cargo audit
@@ -100,7 +102,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Matches rust-toolchain.toml — bump both together.
+      - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Add swap space
         run: |
@@ -117,12 +120,12 @@ jobs:
         # plan.md §13 Phase 3 gates (≥1M ops/s raw engine,
         # ≥100k ops/s exchange settlement).
         run: |
-          cargo bench --workspace --features storage/redb,storage/rocksdb,storage/mdbx
+          cargo bench --workspace --locked --features storage/redb,storage/rocksdb,storage/mdbx
       - name: Run throughput gate tests
         # Run the throughput gate tests with assertions that
         # enforce the plan.md §13 Phase 3 gates.
         run: |
-          THROUGHPUT_TRADES=1_000_000 cargo test --release --workspace \
+          THROUGHPUT_TRADES=1_000_000 cargo test --release --workspace --locked \
             --features storage/redb,storage/rocksdb,storage/mdbx -- \
             --ignored --nocapture --test-threads=1 trading_throughput_smoke
       - name: Upload benchmark output

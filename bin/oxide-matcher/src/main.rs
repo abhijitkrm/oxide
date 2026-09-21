@@ -330,12 +330,11 @@ fn main() {
 fn parse_flag<T: std::str::FromStr>(name: &str, default: T) -> T {
     let args: Vec<String> = env::args().collect();
     for (i, arg) in args.iter().enumerate() {
-        if arg == name {
-            if let Some(val) = args.get(i + 1) {
-                if let Ok(parsed) = val.parse() {
-                    return parsed;
-                }
-            }
+        if arg == name
+            && let Some(val) = args.get(i + 1)
+            && let Ok(parsed) = val.parse()
+        {
+            return parsed;
         }
     }
     default

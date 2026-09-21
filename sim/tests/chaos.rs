@@ -244,7 +244,7 @@ fn run_one_scenario(seed: u64) -> (usize, usize, usize, usize) {
     // `DeterministicRng` rejects seed 0 (splitmix64 zero-state guard);
     // offset by 1 so seed s covers scenario s.
     let mut rng = DeterministicRng::new(seed + 1);
-    let n = if rng.next_u64() % 4 == 0 { 7 } else { 4 };
+    let n = if rng.next_u64().is_multiple_of(4) { 7 } else { 4 };
     let f = (n - 1) / 3;
 
     // Byzantine count: mostly within bound, ~15% exceed it (safety
@@ -269,7 +269,7 @@ fn run_one_scenario(seed: u64) -> (usize, usize, usize, usize) {
 
     let rounds = usize::try_from(6 + rng.next_u64() % 10).unwrap_or(6);
     // ~25% of runs carry a temporary partition.
-    let partition = if rng.next_u64() % 4 == 0 {
+    let partition = if rng.next_u64().is_multiple_of(4) {
         let idx = usize::try_from(rng.next_u64() % u64::try_from(n).unwrap_or(1)).unwrap_or(0);
         Some(PartitionPlan {
             nodes: vec![idx],
@@ -336,7 +336,7 @@ fn run_one_scenario(seed: u64) -> (usize, usize, usize, usize) {
 fn scenario_for_seed(seed: u64) -> (usize, ChaosScenario, HashMap<usize, ByzantineStrategy>, bool) {
     // Mirrors `run_one_scenario`'s draw order exactly.
     let mut rng = DeterministicRng::new(seed + 1);
-    let n = if rng.next_u64() % 4 == 0 { 7 } else { 4 };
+    let n = if rng.next_u64().is_multiple_of(4) { 7 } else { 4 };
     let max_byz = if rng.next_u64() % 100 < 15 { n } else { (n - 1) / 3 };
     let num_byz =
         usize::try_from(rng.next_u64() % u64::try_from(max_byz + 1).unwrap_or(1)).unwrap_or(0);
@@ -355,7 +355,7 @@ fn scenario_for_seed(seed: u64) -> (usize, ChaosScenario, HashMap<usize, Byzanti
         strategies.insert(idx, strategy);
     }
     let rounds = usize::try_from(6 + rng.next_u64() % 10).unwrap_or(6);
-    let partition = if rng.next_u64() % 4 == 0 {
+    let partition = if rng.next_u64().is_multiple_of(4) {
         let idx = usize::try_from(rng.next_u64() % u64::try_from(n).unwrap_or(1)).unwrap_or(0);
         Some(PartitionPlan {
             nodes: vec![idx],

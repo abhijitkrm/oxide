@@ -18066,3 +18066,35 @@ sequenced blocks through the voting window and timelock, waits for
 the exec lane, and finds the 50-unit payout on the destination's
 EVM balance. Unit tests pin the sink contract: exact payout,
 overdraft/malformed/zero/foreign-key rejections move nothing.
+
+## Build: pinned toolchain, honest MSRV, locked CI builds
+
+`rust-version = "1.85"` was false the day let-chains landed — the
+syntax needs 1.88, and the dependency floor is higher still:
+`revm` 42 requires 1.91, `redb` 4.2/`ruint` 1.20 require 1.90.
+`cargo +1.91 check --workspace --all-targets --locked` passes;
+`+1.88` dies inside dependency builds. The manifest now advertises
+**1.91** — a number verified by compile, not guessed.
+
+`rust-toolchain.toml` pins `channel = "1.98.1"` (+rustfmt/clippy)
+as THE build toolchain — the moving `@stable` refs in ci.yml and
+nightly.yml are now `@1.98.1` to match (fuzz keeps `@nightly`;
+`+nightly` beats the file). Every CI cargo invocation runs
+`--locked`, so what gets built and tested is the committed
+`Cargo.lock`, not whatever semver resolution produces that day.
+A new `msrv` CI job runs the check under `cargo +1.91` (the
+explicit toolchain arg overrides the pin file — a subtle trap:
+without it the job would silently test 1.98.1, proving nothing).
+
+The pin immediately did its job: 1.98's clippy surfaced ~70
+warnings invisible on the previous toolchain — `collapsible_if`
+(now understands edition-2024 let-chains), `manual_is_multiple_of`,
+and `chunks_exact_to_as_chunks`. All fixed; most via
+`cargo clippy --fix`, with one manual pass on `storage` (the
+`as_chunks::<Hash::LEN>` suggestion was wrong — const-generic arg
+needs braces and the `try_into` fallback was dead code anyway, so
+the decode now maps `Hash(*c)` directly off `&[u8; 32]`).
+
+Still open from the finding: dependency release-age is a review
+convention, not a machine check (`cargo vet` or a deny age gate
+would close it).

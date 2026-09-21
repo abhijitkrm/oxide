@@ -559,10 +559,10 @@ impl Wal {
         // the caller restores epoch *and* membership atomically —
         // a tail of plain vote entries after a rotation still
         // resolves to the rotated set.
-        if let Some(ref mut entry) = last_valid {
-            if entry.validator_set.is_none() {
-                entry.validator_set = last_set;
-            }
+        if let Some(ref mut entry) = last_valid
+            && entry.validator_set.is_none()
+        {
+            entry.validator_set = last_set;
         }
         Ok(last_valid)
     }

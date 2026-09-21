@@ -12,7 +12,12 @@ members = ["crates/*", "modules/*", "bin/*", "sim"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Verified floor — `cargo +1.91 check --workspace --all-targets
+# --locked` passes. The code itself needs 1.88 (edition-2024
+# let-chains); revm 42/redb 4.2/ruint 1.20 push the real floor to
+# 1.91. CI's `msrv` job keeps this honest — a dep bump that raises
+# its own MSRV fails that job, forcing this number up with it.
+rust-version = "1.91"
 license = "GPL-3.0-only"
 repository = "https://github.com/abhijitkrm/oxide"
 

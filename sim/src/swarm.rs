@@ -57,10 +57,10 @@ impl SwarmResult {
             }
             if honest_heights.is_none() {
                 honest_heights = Some(heights);
-            } else if let Some(honest) = honest_heights {
-                if honest != heights {
-                    return false;
-                }
+            } else if let Some(honest) = honest_heights
+                && honest != heights
+            {
+                return false;
             }
         }
         true

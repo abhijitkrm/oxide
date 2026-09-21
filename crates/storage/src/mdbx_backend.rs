@@ -169,10 +169,10 @@ impl StorageBackend for MdbxBackend {
         // Validate: keys must be sorted and unique.
         let mut prev: Option<&Hash> = None;
         for (k, _) in &snapshot.entries {
-            if let Some(p) = prev {
-                if k <= p {
-                    return Err(SnapshotError::Malformed);
-                }
+            if let Some(p) = prev
+                && k <= p
+            {
+                return Err(SnapshotError::Malformed);
             }
             prev = Some(k);
         }

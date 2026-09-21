@@ -342,7 +342,7 @@ pub fn fetch_snapshot(
 /// crate stays std-only — the body is a hex string, nothing more.
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex".to_string());
     }
     (0..s.len())

@@ -1,0 +1,16 @@
+# Pinned build toolchain — the version CI, releases, and developers
+# all compile with. Deliberately an exact channel, not "stable": a
+# moving toolchain makes builds irreproducible (the audit's 9.G
+# finding) and lets a new rustc land warnings/regressions uninvited.
+#
+# Bump deliberately: update this file and the matching
+# `dtolnay/rust-toolchain@<version>` refs in .github/workflows/*.yml
+# together. The advertised minimum (`workspace.package.rust-version`)
+# stays lower — this pin is the *tested* toolchain, the MSRV job in
+# ci.yml proves the floor still compiles.
+#
+# Fuzz targets still take `+nightly` explicitly — cargo-fuzz needs it
+# and the flag overrides this file.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

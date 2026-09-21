@@ -107,7 +107,7 @@ fn build_tree(leaves: &[Hash]) -> (Hash, Vec<Vec<Hash>>) {
             proof.push(level[sib]);
         }
         let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks_exact(2) {
+        for pair in level.as_chunks::<2>().0 {
             next.push(node_hash(&pair[0], &pair[1]));
         }
         level = next;
@@ -395,7 +395,7 @@ mod tests {
     /// `⌊2T/3⌋ + 1` rule.
     fn uniform_quorum(n: usize) -> u64 {
         let t = n as u64;
-        t - t / 3 + u64::from(t % 3 == 0)
+        t - t / 3 + u64::from(t.is_multiple_of(3))
     }
 
     #[test]

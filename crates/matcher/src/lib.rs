@@ -398,10 +398,10 @@ impl NonceTracker {
     /// (the map is not modified). The first request from a new
     /// owner is always accepted.
     fn check_and_consume(&mut self, owner: &primitives::Address, nonce: u64) -> bool {
-        if let Some(&last) = self.last_seen.get(owner) {
-            if nonce <= last {
-                return false;
-            }
+        if let Some(&last) = self.last_seen.get(owner)
+            && nonce <= last
+        {
+            return false;
         }
         self.last_seen.insert(*owner, nonce);
         self.dirty += 1;

@@ -1425,12 +1425,12 @@ impl ExchangeModule {
                 // nothing rests, so both reservations come back in
                 // full. Crediting the account we just debited cannot
                 // overflow; the map_err is defensive.
-                if reservation > 0 {
-                    if let Some(ledger) = &self.ledger {
-                        ledger.credit(&ctx.sender, reservation).map_err(|_| {
-                            ExecError::ModuleRejected("engine-reject refund failed".to_string())
-                        })?;
-                    }
+                if reservation > 0
+                    && let Some(ledger) = &self.ledger
+                {
+                    ledger.credit(&ctx.sender, reservation).map_err(|_| {
+                        ExecError::ModuleRejected("engine-reject refund failed".to_string())
+                    })?;
                 }
                 if taker_base > 0 {
                     *base_balances.entry((ctx.sender, market)).or_insert(0) += taker_base;

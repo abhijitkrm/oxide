@@ -157,10 +157,10 @@ impl ChaosReport {
             // Contiguous prefix: every height below the node's
             // committed tip must be present (the collection already
             // iterates 0..=tip, so a gap shows as a short vec).
-            if let Some(tip) = blocks.last() {
-                if blocks.len() as u64 != tip.height.value() + 1 {
-                    return false;
-                }
+            if let Some(tip) = blocks.last()
+                && blocks.len() as u64 != tip.height.value() + 1
+            {
+                return false;
             }
             for block in blocks {
                 match canonical.entry(block.height.value()) {
@@ -421,10 +421,10 @@ fn run_chaos_round(
         };
         for t in 0..scenario.txs_per_round {
             let tx = make_tx(round, t);
-            if let Some(set) = censors_here {
-                if tx_is_censored(&tx, set) {
-                    continue;
-                }
+            if let Some(set) = censors_here
+                && tx_is_censored(&tx, set)
+            {
+                continue;
             }
             devnet.engines_mut()[i].submit_tx(tx);
         }

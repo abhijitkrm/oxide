@@ -350,10 +350,10 @@ impl JournalBackend {
                 let mut base = std::collections::BTreeMap::new();
                 let mut prev: Option<Hash> = None;
                 for (k, v) in &snapshot.entries {
-                    if let Some(p) = prev {
-                        if *k <= p {
-                            return Err(OpenError::MalformedCheckpoint);
-                        }
+                    if let Some(p) = prev
+                        && *k <= p
+                    {
+                        return Err(OpenError::MalformedCheckpoint);
                     }
                     prev = Some(*k);
                     base.insert(*k, v.clone());
@@ -388,10 +388,10 @@ impl JournalBackend {
             apply_ops(&mut state, &decode_batch_record(&record.payload));
         }
         let actual_root = mmr.root();
-        if let Some(expected) = expected_root {
-            if actual_root != expected {
-                return Err(OpenError::IntegrityMismatch { expected, actual: actual_root });
-            }
+        if let Some(expected) = expected_root
+            && actual_root != expected
+        {
+            return Err(OpenError::IntegrityMismatch { expected, actual: actual_root });
         }
         let state_root = compute_state_root(&state);
         Ok(Self {
@@ -565,10 +565,10 @@ impl StorageBackend for JournalBackend {
         // Validate: keys must be sorted and unique.
         let mut prev: Option<&Hash> = None;
         for (k, _) in &snapshot.entries {
-            if let Some(p) = prev {
-                if k <= p {
-                    return Err(SnapshotError::Malformed);
-                }
+            if let Some(p) = prev
+                && k <= p
+            {
+                return Err(SnapshotError::Malformed);
             }
             prev = Some(k);
         }
@@ -769,8 +769,10 @@ fn decode_checkpoint(payload: &[u8]) -> Option<(Hash, u64, Vec<Hash>)> {
         return None;
     }
     let peaks = payload[CHECKPOINT_FIXED_LEN..]
-        .chunks_exact(Hash::LEN)
-        .map(|c| Hash(c.try_into().unwrap_or([0u8; 32])))
+        .as_chunks::<{ Hash::LEN }>()
+        .0
+        .iter()
+        .map(|c| Hash(*c))
         .collect();
     Some((state_root, leaf_count, peaks))
 }

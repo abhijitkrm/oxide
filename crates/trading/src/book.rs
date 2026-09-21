@@ -120,7 +120,7 @@ impl MarketConfig {
         if self.min_price >= self.max_price {
             return Err(TradingError::InvalidConfig("min_price must be < max_price"));
         }
-        if (self.max_price - self.min_price) % self.tick_size != 0 {
+        if !(self.max_price - self.min_price).is_multiple_of(self.tick_size) {
             return Err(TradingError::InvalidConfig("price band must be a whole number of ticks"));
         }
         if self.level_count() > MAX_DENSE_LEVELS {

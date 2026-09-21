@@ -19,7 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Matches rust-toolchain.toml — bump both together. The file
+      # already pins the channel; the explicit ref keeps the runner
+      # deterministic even if rustup shim behavior differs.
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -37,12 +40,31 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets --features storage/redb,storage/rocksdb,storage/mdbx
+        # --locked: CI builds the committed dependency graph, not
+        # whatever semver resolution happens to produce today.
+        run: cargo clippy --workspace --all-targets --locked --features storage/redb,storage/rocksdb,storage/mdbx
       - name: Test
         # Feature-gated conformance tests (redb, RocksDB, MDBX) must
         # run on every PR — a regression in an adapter would otherwise
         # land unnoticed (audit session 24 gap 4).
-        run: cargo test --workspace --all-targets --features storage/redb,storage/rocksdb,storage/mdbx
+        run: cargo test --workspace --all-targets --locked --features storage/redb,storage/rocksdb,storage/mdbx
+
+  msrv:
+    name: msrv (rust-version floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The manifest's advertised minimum — revm 42 sets the real
+      # floor at 1.91. If a dependency bump raises its own MSRV,
+      # this job fails and forces `rust-version` up with it — the
+      # number can never silently drift below reality again.
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace at advertised MSRV
+        # `+1.91` (not the default) — rust-toolchain.toml pins the
+        # repo toolchain at 1.98.1 and would silently override this
+        # job's selection. The explicit toolchain arg beats the file.
+        run: cargo +1.91 check --workspace --all-targets --locked
 
   supply-chain:
     name: cargo-deny

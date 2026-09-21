@@ -251,20 +251,20 @@ impl NetworkConfig {
         if let Ok(v) = env::var("OXIDE_NETWORK_PEERS") {
             self.peers = v.split(',').map(|s| s.trim().to_string()).collect();
         }
-        if let Ok(v) = env::var("OXIDE_NETWORK_CONNECT_TIMEOUT_SECS") {
-            if let Ok(secs) = v.parse() {
-                self.connect_timeout_secs = secs;
-            }
+        if let Ok(v) = env::var("OXIDE_NETWORK_CONNECT_TIMEOUT_SECS")
+            && let Ok(secs) = v.parse()
+        {
+            self.connect_timeout_secs = secs;
         }
-        if let Ok(v) = env::var("OXIDE_NETWORK_READ_TIMEOUT_SECS") {
-            if let Ok(secs) = v.parse() {
-                self.read_timeout_secs = secs;
-            }
+        if let Ok(v) = env::var("OXIDE_NETWORK_READ_TIMEOUT_SECS")
+            && let Ok(secs) = v.parse()
+        {
+            self.read_timeout_secs = secs;
         }
-        if let Ok(v) = env::var("OXIDE_NETWORK_MAX_MESSAGE_BYTES") {
-            if let Ok(bytes) = v.parse() {
-                self.max_message_bytes = bytes;
-            }
+        if let Ok(v) = env::var("OXIDE_NETWORK_MAX_MESSAGE_BYTES")
+            && let Ok(bytes) = v.parse()
+        {
+            self.max_message_bytes = bytes;
         }
     }
 }
@@ -362,30 +362,30 @@ impl Default for ConsensusConfig {
 impl ConsensusConfig {
     /// Apply env var overrides.
     fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_ENGINE") {
-            if let Some(engine) = ConsensusEngineKind::parse(&v) {
-                self.engine = engine;
-            }
+        if let Ok(v) = env::var("OXIDE_CONSENSUS_ENGINE")
+            && let Some(engine) = ConsensusEngineKind::parse(&v)
+        {
+            self.engine = engine;
         }
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_BASE_TIMEOUT_MS") {
-            if let Ok(ms) = v.parse() {
-                self.base_timeout_ms = ms;
-            }
+        if let Ok(v) = env::var("OXIDE_CONSENSUS_BASE_TIMEOUT_MS")
+            && let Ok(ms) = v.parse()
+        {
+            self.base_timeout_ms = ms;
         }
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_TIMEOUT_MS") {
-            if let Ok(ms) = v.parse() {
-                self.max_timeout_ms = ms;
-            }
+        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_TIMEOUT_MS")
+            && let Ok(ms) = v.parse()
+        {
+            self.max_timeout_ms = ms;
         }
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_BLOCK_BYTES") {
-            if let Ok(bytes) = v.parse() {
-                self.max_block_bytes = bytes;
-            }
+        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_BLOCK_BYTES")
+            && let Ok(bytes) = v.parse()
+        {
+            self.max_block_bytes = bytes;
         }
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_BLOCK_GAS") {
-            if let Ok(gas) = v.parse() {
-                self.max_block_gas = gas;
-            }
+        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_BLOCK_GAS")
+            && let Ok(gas) = v.parse()
+        {
+            self.max_block_gas = gas;
         }
     }
 }
@@ -455,20 +455,20 @@ impl Default for ExecutorConfig {
 impl ExecutorConfig {
     /// Apply env var overrides.
     fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_EXECUTOR_MAX_MEMPOOL_ENTRIES") {
-            if let Ok(n) = v.parse() {
-                self.max_mempool_entries = n;
-            }
+        if let Ok(v) = env::var("OXIDE_EXECUTOR_MAX_MEMPOOL_ENTRIES")
+            && let Ok(n) = v.parse()
+        {
+            self.max_mempool_entries = n;
         }
-        if let Ok(v) = env::var("OXIDE_EXECUTOR_PARALLEL_THRESHOLD") {
-            if let Ok(n) = v.parse() {
-                self.parallel_threshold = n;
-            }
+        if let Ok(v) = env::var("OXIDE_EXECUTOR_PARALLEL_THRESHOLD")
+            && let Ok(n) = v.parse()
+        {
+            self.parallel_threshold = n;
         }
-        if let Ok(v) = env::var("OXIDE_EXECUTOR_MIN_FEE") {
-            if let Ok(n) = v.parse() {
-                self.min_fee = n;
-            }
+        if let Ok(v) = env::var("OXIDE_EXECUTOR_MIN_FEE")
+            && let Ok(n) = v.parse()
+        {
+            self.min_fee = n;
         }
         if let Ok(v) = env::var("OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS") {
             self.allow_unsigned_txs = matches!(v.as_str(), "1" | "true" | "yes");
@@ -536,15 +536,15 @@ impl Default for StorageConfig {
 impl StorageConfig {
     /// Apply env var overrides.
     fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_JOURNAL_RETAIN_SEGMENTS") {
-            if let Ok(n) = v.parse() {
-                self.journal_retain_segments = n;
-            }
+        if let Ok(v) = env::var("OXIDE_JOURNAL_RETAIN_SEGMENTS")
+            && let Ok(n) = v.parse()
+        {
+            self.journal_retain_segments = n;
         }
-        if let Ok(v) = env::var("OXIDE_HISTORY_RETENTION") {
-            if let Ok(n) = v.parse() {
-                self.history_retention = n;
-            }
+        if let Ok(v) = env::var("OXIDE_HISTORY_RETENTION")
+            && let Ok(n) = v.parse()
+        {
+            self.history_retention = n;
         }
         if let Ok(v) = env::var("OXIDE_ARCHIVE") {
             self.archive = matches!(v.as_str(), "1" | "true" | "yes");
@@ -639,25 +639,25 @@ impl Default for GenesisConfig {
 impl GenesisConfig {
     /// Apply env var overrides.
     fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_GENESIS_BALANCE") {
-            if let Ok(b) = v.parse() {
-                self.genesis_balance = b;
-            }
+        if let Ok(v) = env::var("OXIDE_GENESIS_BALANCE")
+            && let Ok(b) = v.parse()
+        {
+            self.genesis_balance = b;
         }
-        if let Ok(v) = env::var("OXIDE_GENESIS_NUM_PREFUNDED_SENDERS") {
-            if let Ok(n) = v.parse() {
-                self.num_prefunded_senders = n;
-            }
+        if let Ok(v) = env::var("OXIDE_GENESIS_NUM_PREFUNDED_SENDERS")
+            && let Ok(n) = v.parse()
+        {
+            self.num_prefunded_senders = n;
         }
-        if let Ok(v) = env::var("OXIDE_GENESIS_NUM_VALIDATORS") {
-            if let Ok(n) = v.parse() {
-                self.num_validators = n;
-            }
+        if let Ok(v) = env::var("OXIDE_GENESIS_NUM_VALIDATORS")
+            && let Ok(n) = v.parse()
+        {
+            self.num_validators = n;
         }
-        if let Ok(v) = env::var("OXIDE_GENESIS_BASE_PORT") {
-            if let Ok(p) = v.parse() {
-                self.base_port = p;
-            }
+        if let Ok(v) = env::var("OXIDE_GENESIS_BASE_PORT")
+            && let Ok(p) = v.parse()
+        {
+            self.base_port = p;
         }
     }
 }

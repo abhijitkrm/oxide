@@ -1273,12 +1273,12 @@ impl PerpsModule {
         } else {
             // Account has leftover margin after liquidation — return it.
             let leftover = u64::try_from(net).unwrap_or(0);
-            if leftover > 0 {
-                if let Some(ledger) = &self.ledger {
-                    // Credit the leftover back to the account's
-                    // balance. (The margin was deposited from it.)
-                    let _ = ledger.credit(account, leftover);
-                }
+            if leftover > 0
+                && let Some(ledger) = &self.ledger
+            {
+                // Credit the leftover back to the account's
+                // balance. (The margin was deposited from it.)
+                let _ = ledger.credit(account, leftover);
             }
         }
 
@@ -3002,17 +3002,16 @@ impl PerpsModule {
                     None => (false, false),
                 }
             };
-            if cancel_remainder {
-                if let Some(engine) =
+            if cancel_remainder
+                && let Some(engine) =
                     inner.markets.get_mut(usize::from(market)).and_then(Option::as_mut)
-                {
-                    let _ = engine.cancel(fill.maker_order_id);
-                    events.push(Event {
-                        module: "perps",
-                        kind: "reduce_only_cancel",
-                        data: vec![market],
-                    });
-                }
+            {
+                let _ = engine.cancel(fill.maker_order_id);
+                events.push(Event {
+                    module: "perps",
+                    kind: "reduce_only_cancel",
+                    data: vec![market],
+                });
             }
             if !keep || cancel_remainder {
                 let acct = Self::account_mut(inner, &fill.maker_owner);

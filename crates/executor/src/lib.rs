@@ -1138,10 +1138,10 @@ impl TxOutcomeStore {
         if self.outcomes.insert(hash, outcome).is_some() {
             return; // replaced a provisional skip — position unchanged
         }
-        if self.order.len() >= MAX_TX_OUTCOMES {
-            if let Some(oldest) = self.order.pop_front() {
-                self.outcomes.remove(&oldest);
-            }
+        if self.order.len() >= MAX_TX_OUTCOMES
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.outcomes.remove(&oldest);
         }
         self.order.push_back(hash);
     }
@@ -2648,11 +2648,11 @@ impl Executor {
         let mut survivors = Vec::with_capacity(run.len());
         for entry in run {
             let ctx = entry.0;
-            if let Some(&broken) = broken_nonce.get(&ctx.sender) {
-                if ctx.nonce >= broken {
-                    dispatch_skipped.push((entry.2, TxSkipReason::StaleNonce));
-                    continue;
-                }
+            if let Some(&broken) = broken_nonce.get(&ctx.sender)
+                && ctx.nonce >= broken
+            {
+                dispatch_skipped.push((entry.2, TxSkipReason::StaleNonce));
+                continue;
             }
             let charged = fee_module.is_none_or(|m| m.charge_fee(&ctx).is_ok());
             if !charged {
@@ -2738,10 +2738,10 @@ impl Executor {
         // halt height, so every replica freezes on identical state.
         // Deterministic across live and replayed execution (the
         // schedule lives in module state, journaled like any other).
-        if let Some(halt) = self.halt_height() {
-            if block.height.value() > halt {
-                return self.state_root_at(halt);
-            }
+        if let Some(halt) = self.halt_height()
+            && block.height.value() > halt
+        {
+            return self.state_root_at(halt);
         }
 
         // Single lock acquisition for the events vector: clear at start,

@@ -781,37 +781,37 @@ impl OxideBft {
             // wrong quorum, divergent from every peer that stayed up.
             // `None` means the WAL predates set persistence (or no
             // rotation ever committed): the construction set stands.
-            if let Some(set) = entry.validator_set {
-                if set != self.validator_set {
-                    self.validator_set = set;
-                    // Per-set state is sized/keyed to membership:
-                    // vote buffers index by `ValidatorIndex`, timeout
-                    // sigs likewise, and exec-cert artifacts verify
-                    // against the signing epoch's set. All are
-                    // view/epoch-scoped — a restart drops in-flight
-                    // collections regardless — so resize fresh rather
-                    // than carry stale shape or stale verdicts.
-                    self.votes = vec![None; self.validator_set.n()];
-                    self.vote_count = 0;
-                    self.vote_stake = 0;
-                    self.timeout_signatures = vec![None; self.validator_set.n()];
-                    self.exec_attest_pool.clear();
-                    self.exec_certs.clear();
-                    self.verified_exec_certs.clear();
-                    // Re-seat our own index: the committed set may
-                    // have moved us (removals shift positions, our
-                    // key may be at a different index than genesis).
-                    // The BLS key is the identity the operator
-                    // actually holds — `index_of_key` is the honest
-                    // remap. `None` means we are no longer in the
-                    // committee: leave the stale index — our
-                    // signatures will fail verification against the
-                    // new set anyway, which is fail-closed.
-                    if let Some(ref key) = self.secret_key {
-                        if let Some(idx) = self.validator_set.index_of_key(&key.public_key()) {
-                            self.validator_index = idx;
-                        }
-                    }
+            if let Some(set) = entry.validator_set
+                && set != self.validator_set
+            {
+                self.validator_set = set;
+                // Per-set state is sized/keyed to membership:
+                // vote buffers index by `ValidatorIndex`, timeout
+                // sigs likewise, and exec-cert artifacts verify
+                // against the signing epoch's set. All are
+                // view/epoch-scoped — a restart drops in-flight
+                // collections regardless — so resize fresh rather
+                // than carry stale shape or stale verdicts.
+                self.votes = vec![None; self.validator_set.n()];
+                self.vote_count = 0;
+                self.vote_stake = 0;
+                self.timeout_signatures = vec![None; self.validator_set.n()];
+                self.exec_attest_pool.clear();
+                self.exec_certs.clear();
+                self.verified_exec_certs.clear();
+                // Re-seat our own index: the committed set may
+                // have moved us (removals shift positions, our
+                // key may be at a different index than genesis).
+                // The BLS key is the identity the operator
+                // actually holds — `index_of_key` is the honest
+                // remap. `None` means we are no longer in the
+                // committee: leave the stale index — our
+                // signatures will fail verification against the
+                // new set anyway, which is fail-closed.
+                if let Some(ref key) = self.secret_key
+                    && let Some(idx) = self.validator_set.index_of_key(&key.public_key())
+                {
+                    self.validator_index = idx;
                 }
             }
             // Rebuild the pacemaker with the recovered epoch AND the
@@ -1050,10 +1050,10 @@ impl OxideBft {
         // `None` means we were removed: keep the stale index — our
         // signatures fail verification against the new set, which
         // is fail-closed silence, not authority.
-        if let Some(ref key) = self.secret_key {
-            if let Some(idx) = self.validator_set.index_of_key(&key.public_key()) {
-                self.validator_index = idx;
-            }
+        if let Some(ref key) = self.secret_key
+            && let Some(idx) = self.validator_set.index_of_key(&key.public_key())
+        {
+            self.validator_index = idx;
         }
         // Saturating: epoch = u64::MAX would wrap to 0, confusing
         // the epoch boundary. Saturation is safe — the chain is
@@ -2156,10 +2156,10 @@ impl OxideBft {
         // peers who adopted the justify chain commit a different
         // block at the same height (fork). TLC's `InvNoGap`
         // counterexample is exactly this shape.
-        if let Some(hqc) = &header.high_qc {
-            if header.prev_block != hqc.block_hash {
-                return None;
-            }
+        if let Some(hqc) = &header.high_qc
+            && header.prev_block != hqc.block_hash
+        {
+            return None;
         }
         // Timestamp monotonicity: a block's committed timestamp must
         // never go backwards relative to its declared parent. This is
@@ -2171,12 +2171,12 @@ impl OxideBft {
         // information, so the rule binds only when both stamps are
         // present. Equal timestamps are legal — the millisecond
         // granularity can stamp two blocks in the same tick.
-        if header.timestamp != 0 {
-            if let Some(parent_ts) = self.parent_timestamp(header) {
-                if parent_ts != 0 && header.timestamp < parent_ts {
-                    return None;
-                }
-            }
+        if header.timestamp != 0
+            && let Some(parent_ts) = self.parent_timestamp(header)
+            && parent_ts != 0
+            && header.timestamp < parent_ts
+        {
+            return None;
         }
         // Tail-fork resistance / extends-highest-QC rule
         // (docs/oxidebft-spec.md §4): reject proposals that don't
@@ -2310,34 +2310,34 @@ impl OxideBft {
         //
         // The check is skipped when `verify_signatures` is false
         // (conformance mode) since the app may not have real state.
-        if self.verify_signatures {
-            if let Some(cert) = &header.exec_cert {
-                // Full validation once per unique certificate
-                // (cached in `verified_exec_certs`): epoch match,
-                // bitmap bounds, quorum power, aggregate signature.
-                // A forged cert — even one carrying a
-                // locally-matching root — is unproven execution
-                // agreement and must never ride into a committed
-                // block as if it were evidence. The old code skipped
-                // verification whenever the root matched, letting a
-                // fabricated cert be committed unquestioned.
-                if !self.exec_cert_verified(cert) {
-                    return None;
-                }
-                // The now-verified cert's root must equal what WE
-                // executed at that height. `None` means the height
-                // has not executed locally — we cannot confirm the
-                // certificate, so the vote is withheld. (The old
-                // `Hash::ZERO` sentinel here let a forged cert
-                // claiming a zero root "match" an unexecuted
-                // height.) A mismatch on a *verified* cert means a
-                // stake supermajority really attested a root we did
-                // not compute — confirmed divergence; refuse to
-                // extend it.
-                let local = self.app.attest_state(cert.height)?;
-                if local.root != cert.state_root {
-                    return None;
-                }
+        if self.verify_signatures
+            && let Some(cert) = &header.exec_cert
+        {
+            // Full validation once per unique certificate
+            // (cached in `verified_exec_certs`): epoch match,
+            // bitmap bounds, quorum power, aggregate signature.
+            // A forged cert — even one carrying a
+            // locally-matching root — is unproven execution
+            // agreement and must never ride into a committed
+            // block as if it were evidence. The old code skipped
+            // verification whenever the root matched, letting a
+            // fabricated cert be committed unquestioned.
+            if !self.exec_cert_verified(cert) {
+                return None;
+            }
+            // The now-verified cert's root must equal what WE
+            // executed at that height. `None` means the height
+            // has not executed locally — we cannot confirm the
+            // certificate, so the vote is withheld. (The old
+            // `Hash::ZERO` sentinel here let a forged cert
+            // claiming a zero root "match" an unexecuted
+            // height.) A mismatch on a *verified* cert means a
+            // stake supermajority really attested a root we did
+            // not compute — confirmed divergence; refuse to
+            // extend it.
+            let local = self.app.attest_state(cert.height)?;
+            if local.root != cert.state_root {
+                return None;
             }
         }
         // Process the proposal through the app (static validity).
@@ -2443,10 +2443,10 @@ impl OxideBft {
             Verdict::Reject { .. } => return Err(ConsensusError::BodyRejected { block_hash }),
         }
         *body = BlockBody::Complete(proposal.clone());
-        if let Some(qc) = self.high_qc.clone() {
-            if let Some((tip, _)) = self.blocks.get(&qc.block_hash).cloned() {
-                self.commit_walk(&tip);
-            }
+        if let Some(qc) = self.high_qc.clone()
+            && let Some((tip, _)) = self.blocks.get(&qc.block_hash).cloned()
+        {
+            self.commit_walk(&tip);
         }
         Ok(())
     }
@@ -2571,13 +2571,12 @@ impl OxideBft {
         // The epoch must match — the signed message binds it, so a
         // signature minted before a rotation verifies against
         // nothing in the new epoch.
-        if let Some((cached_att, cached_epoch, cached_sig)) = &self.last_attestation {
-            if cached_att.height == att.height
-                && cached_att.root == att.root
-                && *cached_epoch == self.epoch
-            {
-                return (Some(*cached_att), Some(*cached_sig));
-            }
+        if let Some((cached_att, cached_epoch, cached_sig)) = &self.last_attestation
+            && cached_att.height == att.height
+            && cached_att.root == att.root
+            && *cached_epoch == self.epoch
+        {
+            return (Some(*cached_att), Some(*cached_sig));
         }
         let sig = match &self.secret_key {
             Some(sk) => {
@@ -2775,15 +2774,15 @@ impl OxideBft {
         // collected for this view. All votes in a QC must be for the
         // same (view, block_hash) — otherwise the QC does not
         // represent agreement on a single block.
-        if let Some(first) = self.votes.iter().find_map(Option::as_ref) {
-            if first.view != vote.view || first.block_hash != vote.block_hash {
-                return Err(ConsensusError::ConflictingVote {
-                    voter,
-                    view: vote.view,
-                    expected_block: first.block_hash,
-                    actual_block: vote.block_hash,
-                });
-            }
+        if let Some(first) = self.votes.iter().find_map(Option::as_ref)
+            && (first.view != vote.view || first.block_hash != vote.block_hash)
+        {
+            return Err(ConsensusError::ConflictingVote {
+                voter,
+                view: vote.view,
+                expected_block: first.block_hash,
+                actual_block: vote.block_hash,
+            });
         }
 
         // Harvest the execution attestation (if any) for exec-cert
@@ -2794,61 +2793,59 @@ impl OxideBft {
         // embedded cert. The vote itself is unaffected either way:
         // attestations ride along as best-effort signals and are
         // dropped individually when invalid.
-        if self.verify_signatures {
-            if let (Some(att), Some(sig)) = (&vote.attestation, &vote.attestation_sig) {
-                // Skip the BLS verify (~1.5ms) when a cert already
-                // exists for this height — quorum is proven, so
-                // further attestations are redundant. Attestations
-                // for the committed tip are NOT redundant: the
-                // normal steady state is voters attesting their
-                // newest executed (= committed) block, and that is
-                // precisely the root the next proposals certify.
-                let valid = !self.exec_certs.contains_key(&att.height.value())
-                    && self.validator_set.validator(voter).is_ok_and(|pk| {
-                        let msg = self.attestation_signing_message(att.height, &att.root);
-                        crypto::verify(sig, crypto::hash::Domain::ExecAttest, &msg, pk).is_ok()
-                    });
-                if valid {
-                    let bucket = self
-                        .exec_attest_pool
-                        .entry(att.height.value())
-                        .or_default()
-                        .entry(att.root)
-                        .or_default();
-                    if !bucket.iter().any(|(v, _)| *v == voter) {
-                        bucket.push((voter, *sig));
-                        // Quorum of identical attestations measured
-                        // in voting power — the same stake-weighted
-                        // threshold the cert will be validated
-                        // against downstream. Checked on every
-                        // insert; the `exec_certs.contains_key` gate
-                        // above makes a formed cert stop absorbing
-                        // further attestations, so this aggregates
-                        // exactly once.
-                        let bucket_power: u64 = bucket
-                            .iter()
-                            .map(|(v, _)| self.validator_set.stake(*v).unwrap_or(0))
-                            .sum();
-                        if bucket_power >= self.validator_set.quorum_stake() {
-                            let sigs: Vec<Signature> = bucket.iter().map(|(_, s)| *s).collect();
-                            if let Ok(aggregate_signature) = crypto::aggregate(&sigs) {
-                                let bitmap_len = self.validator_set.n().div_ceil(8);
-                                let mut signer_bitmap = vec![0u8; bitmap_len];
-                                for (v, _) in bucket.iter() {
-                                    let i = usize::from(*v);
-                                    signer_bitmap[i / 8] |= 1u8 << (i % 8);
-                                }
-                                self.exec_certs.insert(
-                                    att.height.value(),
-                                    ExecCertificate {
-                                        height: att.height,
-                                        state_root: att.root,
-                                        epoch: self.epoch,
-                                        signer_bitmap,
-                                        aggregate_signature,
-                                    },
-                                );
+        if self.verify_signatures
+            && let (Some(att), Some(sig)) = (&vote.attestation, &vote.attestation_sig)
+        {
+            // Skip the BLS verify (~1.5ms) when a cert already
+            // exists for this height — quorum is proven, so
+            // further attestations are redundant. Attestations
+            // for the committed tip are NOT redundant: the
+            // normal steady state is voters attesting their
+            // newest executed (= committed) block, and that is
+            // precisely the root the next proposals certify.
+            let valid = !self.exec_certs.contains_key(&att.height.value())
+                && self.validator_set.validator(voter).is_ok_and(|pk| {
+                    let msg = self.attestation_signing_message(att.height, &att.root);
+                    crypto::verify(sig, crypto::hash::Domain::ExecAttest, &msg, pk).is_ok()
+                });
+            if valid {
+                let bucket = self
+                    .exec_attest_pool
+                    .entry(att.height.value())
+                    .or_default()
+                    .entry(att.root)
+                    .or_default();
+                if !bucket.iter().any(|(v, _)| *v == voter) {
+                    bucket.push((voter, *sig));
+                    // Quorum of identical attestations measured
+                    // in voting power — the same stake-weighted
+                    // threshold the cert will be validated
+                    // against downstream. Checked on every
+                    // insert; the `exec_certs.contains_key` gate
+                    // above makes a formed cert stop absorbing
+                    // further attestations, so this aggregates
+                    // exactly once.
+                    let bucket_power: u64 =
+                        bucket.iter().map(|(v, _)| self.validator_set.stake(*v).unwrap_or(0)).sum();
+                    if bucket_power >= self.validator_set.quorum_stake() {
+                        let sigs: Vec<Signature> = bucket.iter().map(|(_, s)| *s).collect();
+                        if let Ok(aggregate_signature) = crypto::aggregate(&sigs) {
+                            let bitmap_len = self.validator_set.n().div_ceil(8);
+                            let mut signer_bitmap = vec![0u8; bitmap_len];
+                            for (v, _) in bucket.iter() {
+                                let i = usize::from(*v);
+                                signer_bitmap[i / 8] |= 1u8 << (i % 8);
                             }
+                            self.exec_certs.insert(
+                                att.height.value(),
+                                ExecCertificate {
+                                    height: att.height,
+                                    state_root: att.root,
+                                    epoch: self.epoch,
+                                    signer_bitmap,
+                                    aggregate_signature,
+                                },
+                            );
                         }
                     }
                 }
@@ -3064,13 +3061,13 @@ impl OxideBft {
         // leader could replay it to regress the engine's state.
         // Exception: the first QC (when high_qc is None) is always
         // accepted.
-        if let Some(current_high_qc) = &self.high_qc {
-            if qc.view.value() <= current_high_qc.view.value() {
-                return Err(ConsensusError::StaleQc {
-                    qc_view: qc.view,
-                    high_qc_view: current_high_qc.view,
-                });
-            }
+        if let Some(current_high_qc) = &self.high_qc
+            && qc.view.value() <= current_high_qc.view.value()
+        {
+            return Err(ConsensusError::StaleQc {
+                qc_view: qc.view,
+                high_qc_view: current_high_qc.view,
+            });
         }
 
         // Hardening: enforce quorum threshold regardless of whether
@@ -3525,15 +3522,15 @@ impl OxideBft {
         high_qc: Option<QuorumCertificate>,
         last_tc: Option<TimeoutCertificate>,
     ) {
-        if let Some(qc) = high_qc {
-            if qc.epoch == self.epoch {
-                let _ = self.deliver_qc(qc);
-            }
+        if let Some(qc) = high_qc
+            && qc.epoch == self.epoch
+        {
+            let _ = self.deliver_qc(qc);
         }
-        if let Some(tc) = last_tc {
-            if tc.epoch == self.epoch {
-                let _ = self.on_timeout_certificate(&tc);
-            }
+        if let Some(tc) = last_tc
+            && tc.epoch == self.epoch
+        {
+            let _ = self.on_timeout_certificate(&tc);
         }
     }
 
@@ -3677,10 +3674,10 @@ impl OxideBft {
             if self.secret_key.is_some() {
                 let sigs: Vec<Signature> =
                     self.timeout_signatures.iter().filter_map(|s| *s).collect();
-                if !sigs.is_empty() {
-                    if let Ok(agg) = crypto::aggregate(&sigs) {
-                        tc.aggregate_signature = agg;
-                    }
+                if !sigs.is_empty()
+                    && let Ok(agg) = crypto::aggregate(&sigs)
+                {
+                    tc.aggregate_signature = agg;
                 }
             }
             // Clear per-view state for the new view. The TC
@@ -3976,11 +3973,11 @@ mod tests {
         let mut found = false;
         let h = engine.finalized_height().unwrap().value();
         for i in 0..=h {
-            if let Some(block) = engine.finalized_block(Height::new(i)) {
-                if block.txs.iter().any(|t| t.as_bytes() == [1, 2, 3]) {
-                    found = true;
-                    break;
-                }
+            if let Some(block) = engine.finalized_block(Height::new(i))
+                && block.txs.iter().any(|t| t.as_bytes() == [1, 2, 3])
+            {
+                found = true;
+                break;
             }
         }
         assert!(found, "tx must appear in a committed block");
@@ -5842,11 +5839,11 @@ mod tests {
         let h = engine.finalized_height().expect("finalized").value();
         let mut found = false;
         for i in 0..=h {
-            if let Some(block) = engine.finalized_block(Height::new(i)) {
-                if block.txs.iter().any(|t| t.as_bytes() == [2]) {
-                    found = true;
-                    break;
-                }
+            if let Some(block) = engine.finalized_block(Height::new(i))
+                && block.txs.iter().any(|t| t.as_bytes() == [2])
+            {
+                found = true;
+                break;
             }
         }
         assert!(found, "tx submitted after rotation must be committed");

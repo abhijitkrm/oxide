@@ -1252,111 +1252,105 @@ fn run_consensus_loop(
                     // The certificate fields are the DiemBFT v4
                     // timeout evidence: entering view v is
                     // legitimate only via QC(v−1) or TC(v−1).
-                    if let Ok(voter_idx_byte) = reader.read_u8() {
-                        if let Ok(sig_view) = reader.read_u64() {
-                            if let Ok(sig_epoch) = reader.read_u64() {
-                                if let (Ok(has_qc), Ok(has_tc)) =
-                                    (reader.read_u8(), reader.read_u8())
-                                {
-                                    let qc_ev = if has_qc == 1 {
-                                        types::QuorumCertificate::decode(&mut reader).ok()
-                                    } else {
-                                        None
-                                    };
-                                    let tc_ev = if has_tc == 1 {
-                                        types::TimeoutCertificate::decode(&mut reader).ok()
-                                    } else {
-                                        None
-                                    };
-                                    if let Ok(sig) = crypto::Signature::decode(&mut reader) {
-                                        let voter_idx = u16::from(voter_idx_byte);
-                                        // Authenticate the evidence BEFORE acting
-                                        // on it. Everything below mutates
-                                        // consensus state — the pacemaker timer,
-                                        // the vote buffer, high_qc — so a peer
-                                        // claiming a high view with a garbage
-                                        // signature must be rejected here rather
-                                        // than after the damage is done. The
-                                        // signature is checked against the
-                                        // (view, epoch) the sender actually signed,
-                                        // never against our own current view.
-                                        if engine
-                                            .verify_timeout_signature_for(
-                                                voter_idx,
-                                                primitives::View::new(sig_view),
-                                                primitives::Epoch::new(sig_epoch),
-                                                &sig,
-                                            )
-                                            .is_err()
-                                        {
-                                            continue;
-                                        }
-                                        let my_epoch = engine.epoch().value();
-                                        // Ignore timeout sigs from a different
-                                        // epoch — they are not valid for this epoch.
-                                        if sig_epoch != my_epoch {
-                                            continue;
-                                        }
-                                        // Bounded catch-up: feed the attached
-                                        // certificate evidence through the
-                                        // verified ingestion paths first — a
-                                        // timeout signature alone cannot move
-                                        // our view; only real QC/TC evidence
-                                        // can. After this, a collectible sig
-                                        // must claim exactly our current view.
-                                        let view_before = engine.current_view().value();
-                                        engine.deliver_timeout_evidence(qc_ev, tc_ev);
-                                        // If the sig is for a past view, ignore it
-                                        // (stale — the sender is behind us); if it
-                                        // is for a view the evidence didn't reach,
-                                        // ignore it — an unjustified jump (the
-                                        // old code synced to the claimed view
-                                        // unconditionally, letting one peer pull
-                                        // the node to an arbitrary view).
-                                        if sig_view != engine.current_view().value() {
-                                            continue;
-                                        }
-                                        // Reset the view timer only when the
-                                        // evidence actually moved us — resetting
-                                        // on every same-view sig would let a peer
-                                        // starve our own timeout.
-                                        if engine.current_view().value() != view_before {
-                                            view_start = std::time::Instant::now();
-                                            timeout_sent_for_view = None;
-                                        }
-                                        match engine.collect_timeout_signature(voter_idx, sig) {
-                                            Ok(Some(tc)) => {
-                                                // TC formed — broadcast to all peers.
-                                                eprintln!(
-                                                    "oxide-validator[{node_index}]: TC formed after collecting timeout sig from voter={voter_idx} view={}",
-                                                    engine.current_view().value()
-                                                );
-                                                let mut tc_buf = Vec::with_capacity(1 + 200);
-                                                tc_buf.push(MSG_TC);
-                                                tc.encode(&mut tc_buf);
-                                                for i in 0..num_nodes {
-                                                    if i != node_index {
-                                                        let _ = transport.send(
-                                                            &vec![u8::try_from(i).unwrap()],
-                                                            &tc_buf,
-                                                        );
-                                                    }
-                                                }
-                                                view_start = std::time::Instant::now();
-                                                timeout_sent_for_view = None;
-                                            }
-                                            Ok(None) => {
-                                                // Timeout sig collected but
-                                                // no TC yet — no log needed
-                                                // (this is the common case).
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "oxide-validator[{node_index}]: timeout sig from voter={voter_idx} rejected: {e:?}"
-                                                );
-                                            }
+                    if let Ok(voter_idx_byte) = reader.read_u8()
+                        && let Ok(sig_view) = reader.read_u64()
+                        && let Ok(sig_epoch) = reader.read_u64()
+                        && let (Ok(has_qc), Ok(has_tc)) = (reader.read_u8(), reader.read_u8())
+                    {
+                        let qc_ev = if has_qc == 1 {
+                            types::QuorumCertificate::decode(&mut reader).ok()
+                        } else {
+                            None
+                        };
+                        let tc_ev = if has_tc == 1 {
+                            types::TimeoutCertificate::decode(&mut reader).ok()
+                        } else {
+                            None
+                        };
+                        if let Ok(sig) = crypto::Signature::decode(&mut reader) {
+                            let voter_idx = u16::from(voter_idx_byte);
+                            // Authenticate the evidence BEFORE acting
+                            // on it. Everything below mutates
+                            // consensus state — the pacemaker timer,
+                            // the vote buffer, high_qc — so a peer
+                            // claiming a high view with a garbage
+                            // signature must be rejected here rather
+                            // than after the damage is done. The
+                            // signature is checked against the
+                            // (view, epoch) the sender actually signed,
+                            // never against our own current view.
+                            if engine
+                                .verify_timeout_signature_for(
+                                    voter_idx,
+                                    primitives::View::new(sig_view),
+                                    primitives::Epoch::new(sig_epoch),
+                                    &sig,
+                                )
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let my_epoch = engine.epoch().value();
+                            // Ignore timeout sigs from a different
+                            // epoch — they are not valid for this epoch.
+                            if sig_epoch != my_epoch {
+                                continue;
+                            }
+                            // Bounded catch-up: feed the attached
+                            // certificate evidence through the
+                            // verified ingestion paths first — a
+                            // timeout signature alone cannot move
+                            // our view; only real QC/TC evidence
+                            // can. After this, a collectible sig
+                            // must claim exactly our current view.
+                            let view_before = engine.current_view().value();
+                            engine.deliver_timeout_evidence(qc_ev, tc_ev);
+                            // If the sig is for a past view, ignore it
+                            // (stale — the sender is behind us); if it
+                            // is for a view the evidence didn't reach,
+                            // ignore it — an unjustified jump (the
+                            // old code synced to the claimed view
+                            // unconditionally, letting one peer pull
+                            // the node to an arbitrary view).
+                            if sig_view != engine.current_view().value() {
+                                continue;
+                            }
+                            // Reset the view timer only when the
+                            // evidence actually moved us — resetting
+                            // on every same-view sig would let a peer
+                            // starve our own timeout.
+                            if engine.current_view().value() != view_before {
+                                view_start = std::time::Instant::now();
+                                timeout_sent_for_view = None;
+                            }
+                            match engine.collect_timeout_signature(voter_idx, sig) {
+                                Ok(Some(tc)) => {
+                                    // TC formed — broadcast to all peers.
+                                    eprintln!(
+                                        "oxide-validator[{node_index}]: TC formed after collecting timeout sig from voter={voter_idx} view={}",
+                                        engine.current_view().value()
+                                    );
+                                    let mut tc_buf = Vec::with_capacity(1 + 200);
+                                    tc_buf.push(MSG_TC);
+                                    tc.encode(&mut tc_buf);
+                                    for i in 0..num_nodes {
+                                        if i != node_index {
+                                            let _ = transport
+                                                .send(&vec![u8::try_from(i).unwrap()], &tc_buf);
                                         }
                                     }
+                                    view_start = std::time::Instant::now();
+                                    timeout_sent_for_view = None;
+                                }
+                                Ok(None) => {
+                                    // Timeout sig collected but
+                                    // no TC yet — no log needed
+                                    // (this is the common case).
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "oxide-validator[{node_index}]: timeout sig from voter={voter_idx} rejected: {e:?}"
+                                    );
                                 }
                             }
                         }
@@ -1424,10 +1418,10 @@ fn run_consensus_loop(
 
         // Phase 5: advance views.
         let prev_view = engine.current_view().value();
-        if let Some(hqc) = engine.high_qc() {
-            if hqc.view == engine.current_view() {
-                engine.advance_view();
-            }
+        if let Some(hqc) = engine.high_qc()
+            && hqc.view == engine.current_view()
+        {
+            engine.advance_view();
         }
 
         // Phase 5b: view-change timeout. If the current view hasn't
@@ -1744,10 +1738,10 @@ fn is_loopback_host(host: &str) -> bool {
 /// RPC server is off).
 fn external_bind_surfaces(bind_host: Option<&str>, rpc_listen: Option<&str>) -> Vec<String> {
     let mut external = Vec::new();
-    if let Some(host) = bind_host {
-        if !is_loopback_host(host) {
-            external.push(format!("devnet transport --bind-host {host}"));
-        }
+    if let Some(host) = bind_host
+        && !is_loopback_host(host)
+    {
+        external.push(format!("devnet transport --bind-host {host}"));
     }
     if let Some(listen) = rpc_listen {
         let host = listen.rsplit_once(':').map_or(listen, |(h, _)| h);
@@ -1851,15 +1845,15 @@ fn load_config(mode: node::NodeMode) -> LoadedConfig {
 
     // Genesis chain id must match the RPC chain id — a mismatch means
     // the node's signatures and its advertised chain disagree.
-    if let Some(g) = &genesis_file {
-        if g.chain_id != rpc_config.chain_id {
-            eprintln!(
-                "oxide-validator: genesis chain_id {} != rpc.chain_id {} — \
+    if let Some(g) = &genesis_file
+        && g.chain_id != rpc_config.chain_id
+    {
+        eprintln!(
+            "oxide-validator: genesis chain_id {} != rpc.chain_id {} — \
                  refusing to run a node whose signatures advertise a different chain",
-                g.chain_id, rpc_config.chain_id
-            );
-            std::process::exit(1);
-        }
+            g.chain_id, rpc_config.chain_id
+        );
+        std::process::exit(1);
     }
 
     // The genesis spec: `--genesis-file` when given, else the
@@ -1967,7 +1961,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Returns `Err` if the string is not valid hex or has an odd length.
 fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("hex string has odd length".to_string());
     }
     (0..hex.len())

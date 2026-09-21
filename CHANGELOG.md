@@ -1159,6 +1159,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **The advertised minimum Rust version was false, and builds
+  were not reproducible** (`Cargo.toml`, `rust-toolchain.toml`,
+  `.github/workflows/*`)
+  - `rust-version` claimed 1.85 while let-chains (1.88) were in
+    use — and the real floor is 1.91, set by `revm` 42 (`redb`
+    4.2/`ruint` 1.20 need 1.90). The manifest now says 1.91,
+    verified by `cargo +1.91 check --workspace --all-targets
+    --locked`, and a new `msrv` CI job runs exactly that command
+    so a dependency bump that raises its own MSRV fails the gate
+    instead of silently stranding the number.
+  - `rust-toolchain.toml` pins `channel = "1.98.1"` with
+    rustfmt+clippy, and CI moved from the moving `@stable` tag to
+    `@1.98.1` — CI, releases, and local builds now compile with
+    the same toolchain (the fuzz job keeps `@nightly`, which
+    cargo-fuzz requires).
+  - Every CI cargo invocation passes `--locked`, so the committed
+    `Cargo.lock` — not the day's semver resolution — is what
+    actually gets built.
+  - The pin surfaced ~70 warnings from lints new in clippy 1.98
+    (let-chain-aware `collapsible_if`, `manual_is_multiple_of`,
+    `chunks_exact_to_as_chunks`); all are fixed mechanically.
+  - **In plain words:** the project now tells the truth about
+    which compiler it needs, everyone builds with the same one,
+    and a dependency update can't quietly move the goalposts.
+
 - **The perps backstop could not exit inventory once the book
   gapped below mark** (`modules/perps`)
   - The clearing account's unwind IOC was priced exactly at mark,

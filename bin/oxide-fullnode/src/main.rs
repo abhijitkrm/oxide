@@ -120,7 +120,7 @@ fn bootstrap_state_sync(node: &mut Node) {
 
 /// Decode a bare hex string (no `0x` needed — CLI args).
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex".to_string());
     }
     (0..s.len())
@@ -185,15 +185,15 @@ fn load_config() -> NodeConfig {
     let rpc_config = config.rpc.clone().unwrap_or_default();
 
     // Genesis chain id must match the RPC chain id.
-    if let Some(g) = &genesis_file {
-        if g.chain_id != rpc_config.chain_id {
-            eprintln!(
-                "oxide-fullnode: genesis chain_id {} != rpc.chain_id {} — \
+    if let Some(g) = &genesis_file
+        && g.chain_id != rpc_config.chain_id
+    {
+        eprintln!(
+            "oxide-fullnode: genesis chain_id {} != rpc.chain_id {} — \
                  refusing to run a node whose signatures advertise a different chain",
-                g.chain_id, rpc_config.chain_id
-            );
-            std::process::exit(1);
-        }
+            g.chain_id, rpc_config.chain_id
+        );
+        std::process::exit(1);
     }
 
     let genesis = Some(match &genesis_file {

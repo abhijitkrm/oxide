@@ -2923,11 +2923,11 @@ impl EvmModule {
                                 revm::database::DbAccount,
                             )> = Vec::new();
                             for addr in &reads {
-                                if let Some(dba) = db.cache.accounts.get(addr) {
-                                    if dba.account_state != revm::database::AccountState::None {
-                                        writes.insert(*addr);
-                                        write_accounts.push((*addr, dba.clone()));
-                                    }
+                                if let Some(dba) = db.cache.accounts.get(addr)
+                                    && dba.account_state != revm::database::AccountState::None
+                                {
+                                    writes.insert(*addr);
+                                    write_accounts.push((*addr, dba.clone()));
                                 }
                             }
 
@@ -4253,12 +4253,12 @@ impl Module for EvmModule {
         // touched since the last computation, return the cached
         // root. This makes consecutive `state_root` calls with no
         // intervening execution O(1).
-        if *leaves_ready && touched.is_empty() {
-            if let Some(cached) =
+        if *leaves_ready
+            && touched.is_empty()
+            && let Some(cached) =
                 *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
-                return Hash(cached.0);
-            }
+        {
+            return Hash(cached.0);
         }
 
         let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
