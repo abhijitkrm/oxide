@@ -17344,3 +17344,61 @@ at 0.6 quote/lot: marginals (0,1) — the merged floor carries the
 unit the per-fill floors dropped; third fill + distinct leg
 independence) and `seal_batch_resets_leg_cost_accumulator`. Matcher
 126 lib tests + workspace suite green; clippy, fmt clean.
+
+## 2026-09-21 — governance: stake-weighted ballots, real deadlines, explicit wire tags
+
+**Bug.** Governance counted CALLS, not stake: `yes_votes += 1` per
+`msg::vote` regardless of the voter's bonded power, a second vote
+overwrote the stored ballot but never subtracted the old tally
+(double-count inflation), proposals finalized at EVERY `end_block`
+(the voting window was decorative), a finalized proposal still
+accepted votes, and the wire format told proposals from votes by
+MESSAGE LENGTH — a 9-byte proposal body decoded as a vote.
+
+**Fix.**
+
+- **Committee-weighted tallies.** `GovernanceModule::with_committee`
+  takes the same `framework::Committee` seam oracle/perps use;
+  `node` wires the staking module at registration. A vote books
+  `committee.power(sender)` at cast — zero-power senders are
+  rejected and a module built without a committee rejects votes
+  outright (no unweighted fallback; the fallback WAS the bug).
+- **Replace, don't stack.** Vote records are now 9 bytes
+  `[choice][power:8B LE]`; a revote subtracts the recorded power
+  from the old choice's tally before adding the current power to
+  the new one. Same-choice revotes are a power refresh; flips move
+  the whole weight. A legacy 1-byte record decodes with power
+  approximated by the voter's CURRENT power — best available for a
+  ballot cast under call-counting.
+- **Real lifecycle.** `begin_block` captures the height; a proposal
+  opens with `end_height = height + voting_period` (1_000 blocks
+  default, builder-overridable). Votes at or after the deadline
+  are rejected, votes on finalized proposals are rejected, and
+  `end_block` finalizes only proposals at their deadline — each
+  emitting `proposal_finalized` (`[id][passed]`) into the block
+  log via the `Vec<Event>` trait return added for the perps
+  liquidation sweep.
+- **Committed deadline.** `end_height` is consensus state, so it
+  rides a trailing section in the canonical blob; pre-upgrade
+  blobs lack it and decode `end_height = 0` — open legacy
+  proposals then close at the next `end_block`, the same
+  immediate-close behavior they had.
+- **Explicit tags.** `TAG_PROPOSE` / `TAG_VOTE` lead every message;
+  unknown tags and truncated bodies are `Malformed`. The 9-byte
+  collision is dead.
+
+**Not done (honest scope).** This is the voting/ tallying core.
+Parameter APPLICATION — deposit escrow, quorum floors, timelock,
+an execution/apply path for passed proposals, veto — remains open;
+the audit text keeps those.
+
+**Tests.** 9 new + 7 adapted unit tests: weighted tallies, revote
+correction both directions, no-committee/zero-power rejection,
+deadline and finalized rejection, mid-window `end_block` NOT
+closing, the finalized event's byte layout, the 9-byte-hijack
+regression, a snapshot round-trip carrying both deadlines, and a
+hand-built pre-upgrade blob decoding to `end_height = 0` and
+closing on schedule. The round-trip test caught a real assumption
+bug — two proposals submitted in the same block share a deadline,
+so the fixture needed staggered `begin_block`s to prove per-proposal
+deadline persistence.

@@ -5369,3 +5369,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** the matcher's local balances now agree with
     the chain's settlement to the unit, always — previously they
     could drift by a fraction of a unit when fills merged.
+
+### Fixed (2026-09-21)
+
+- **Governance votes are now stake-weighted, replaceable, and
+  time-boxed** (`modules/governance/src/lib.rs`,
+  `crates/node/src/lib.rs`)
+  - Tallies book the voter's bonded-stake power from the staking
+    committee at cast time — one head no longer equals one vote.
+    Senders with no bonded power, and modules built without a
+    committee, cannot vote at all.
+  - A second vote now REPLACES the first: the recorded
+    `(choice, power)` ballot is removed from the old tally before
+    the new power lands, so revoting cannot inflate the count.
+  - Proposals carry a real voting deadline (1,000 blocks from
+    submission): votes after the window or on a finalized proposal
+    are rejected, and `end_block` finalizes only due proposals,
+    emitting an auditable `proposal_finalized` event.
+  - Proposal vs. vote messages are distinguished by an explicit
+    leading tag — a 9-byte proposal payload can no longer be
+    misread as a vote.
+  - The deadline travels in the committed state blob; snapshots
+    from before the upgrade decode with a zero deadline and close
+    on schedule at the next block.
+  - **In plain words:** governance ballots now weigh the voter's
+    actual stake like a real L1 — before, every vote counted the
+    same and voting twice counted double. Proposals also have a
+    genuine voting window instead of closing the same block they
+    opened.

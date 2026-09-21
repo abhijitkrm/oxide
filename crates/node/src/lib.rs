@@ -656,9 +656,13 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     let oracle = Arc::new(oracle::OracleModule::new().with_committee(staking_module.clone()));
     oracle.with_sink(perps.clone());
     executor.register_module(oracle);
-    // Governance: minimal on-chain parameter votes (plan.md §7 —
+    // Governance: stake-weighted parameter votes (plan.md §7 —
     // Phase 4 scope: propose/vote/finalize, no timelock/veto).
-    executor.register_module(Arc::new(governance::GovernanceModule::new()));
+    // Staking supplies the voting power — bonded stake of active
+    // validators, same `Committee` seam the oracle and perps use.
+    executor.register_module(Arc::new(
+        governance::GovernanceModule::new().with_committee(staking_module.clone()),
+    ));
     // Wire the exchange and perps modules into the EVM for
     // read-only precompiles (plan.md §10), then register the EVM.
     evm_module.set_native_modules(Some(exchange), Some(perps));
