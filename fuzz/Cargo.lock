@@ -2103,7 +2103,9 @@ version = "0.1.0"
 dependencies = [
  "codec",
  "evm",
+ "exchange",
  "executor",
+ "framework",
  "libfuzzer-sys",
  "p2p",
  "primitives",

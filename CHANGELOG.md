@@ -361,6 +361,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     the engine's homework, so a misunderstanding shared by the
     original checker gets caught here instead of passing twice.
 
+- **Trading fuzz coverage: real fills, and a settlement/accounting
+  target** (`fuzz/`, `modules/exchange`)
+  - `trading-engine` previously generated every order with the same
+    owner and `CancelOldest` — crossings only ever self-canceled, so
+    ordinary fills were unreachable. It now derives the market
+    config (tick/lot/band/capacity/owner-count tables) from the
+    input header and mixes cancels (~20%) with varied-STP places;
+    invariants check after every op.
+  - New `exchange-settlement` target drives the module's `handle()`
+    over an in-memory ledger — deposits, withdrawals, book ops,
+    registered orders, operator `batch_settle` legs, malformed
+    messages — and asserts money conservation after every op: every
+    native unit sits in exactly one bucket (ledger, quote escrow,
+    fee vault, or base custody). Two `#[doc(hidden)]` probes
+    (`escrowed_quote`/`escrowed_base`) expose the escrow buckets the
+    public getters don't cover.
+  - 387k + 502k smoke runs clean; both corpora minimized and
+    committed; the nightly job now soaks 10 targets.
+  - **In plain words:** the book fuzzer used to only test orders
+    canceling themselves — now it tests real trades between many
+    accounts, and a second fuzzer watches the money itself: if any
+    operation ever makes a token appear or vanish, it fails on the
+    spot.
+
 - **Fuzz campaign: soaks, committed corpus, coverage, nightly CI**
   (`fuzz/`, `.github/workflows/nightly.yml`, `.gitignore`)
   - All 9 targets ran 10-minute libFuzzer soaks — zero crashes,

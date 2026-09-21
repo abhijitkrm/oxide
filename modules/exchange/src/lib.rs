@@ -562,6 +562,61 @@ impl ExchangeModule {
             .unwrap_or(0)
     }
 
+    /// Quote escrow held on `market`: the implied `price × qty /
+    /// PRICE_SCALE` reservation of every resting bid plus the
+    /// `reserved` field of every live registered buy. Combined with
+    /// [`base_balance`](Self::base_balance),
+    /// [`base_hold`](Self::base_hold), [`fee_vault`](Self::fee_vault),
+    /// and [`escrowed_base`](Self::escrowed_base), this closes the
+    /// module's money-conservation equation from the outside —
+    /// harnesses assert `Σ ledger + Σ all buckets == minted` instead
+    /// of trusting internals.
+    ///
+    /// `#[doc(hidden)]`: a conservation probe for tests/fuzzers, not
+    /// part of the query surface clients should depend on.
+    ///
+    /// # Panics
+    /// Panics if the inner mutex is poisoned.
+    #[doc(hidden)]
+    pub fn escrowed_quote(&self, market: u8) -> u64 {
+        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut total = 0u64;
+        if let Some(Some(engine)) = inner.markets.get(usize::from(market)) {
+            let mut entries = Vec::new();
+            engine.resting_entries(&mut entries);
+            for e in entries.iter().filter(|e| e.side == Side::Buy) {
+                let q = u128::from(e.price.0) * u128::from(e.qty.0) / PRICE_SCALE;
+                total = total.saturating_add(u64::try_from(q).unwrap_or(u64::MAX));
+            }
+        }
+        for o in inner.registered.values() {
+            if o.market == u16::from(market) && o.side == Side::Buy {
+                total = total.saturating_add(o.reserved);
+            }
+        }
+        total
+    }
+
+    /// Base-asset escrow on `market` held inside live registered
+    /// sell orders' `reserved` fields. Book-path sells lock into
+    /// `base_holds` instead — both buckets plus `base_balances` close
+    /// the base conservation equation.
+    ///
+    /// `#[doc(hidden)]`: a conservation probe for tests/fuzzers.
+    ///
+    /// # Panics
+    /// Panics if the inner mutex is poisoned.
+    #[doc(hidden)]
+    pub fn escrowed_base(&self, market: u8) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .registered
+            .values()
+            .filter(|o| o.market == u16::from(market) && o.side == Side::Sell)
+            .fold(0u64, |acc, o| acc.saturating_add(o.reserved))
+    }
+
     /// Parse a place-order message body (tag already consumed).
     fn parse_place(msg: &[u8]) -> Option<(u8, NewOrder, Address)> {
         if msg.len() != PLACE_BODY_LEN {

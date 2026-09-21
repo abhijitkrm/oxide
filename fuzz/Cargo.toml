@@ -23,6 +23,8 @@ storage = { path = "../crates/storage" }
 types = { path = "../crates/types" }
 executor = { path = "../crates/executor" }
 evm = { path = "../modules/evm" }
+exchange = { path = "../modules/exchange" }
+framework = { path = "../modules/framework" }
 p2p = { path = "../crates/p2p" }
 trading = { path = "../crates/trading" }
 
@@ -77,5 +79,10 @@ doc = false
 [[bin]]
 name = "trading-order-validate"
 path = "fuzz_targets/trading_order_validate.rs"
+test = false
+doc = false
+[[bin]]
+name = "exchange-settlement"
+path = "fuzz_targets/exchange_settlement.rs"
 test = false
 doc = false

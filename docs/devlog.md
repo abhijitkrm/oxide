@@ -17885,3 +17885,34 @@ assertions (DaC decrements count toward `filled_qty` in
 `CanceledRemainder`, and `Filled` can legitimately consume qty via
 decrement) — exactly the correlated-semantics trap the finding
 describes, demonstrated in miniature.
+
+## Fuzzing: the trading target now exercises real fills — plus a new settlement/accounting target
+
+`trading_engine` previously generated every order with owner `[0;20]`
+and `CancelOldest` STP — crossing orders only ever self-canceled, so
+the ordinary fill path was unreachable. The target now derives the
+market config from an 8-byte header (tick/lot/band-depth/capacity/
+owner-count tables — including single-owner books that keep pure
+self-trade coverage and 16-owner books where real fills dominate),
+and feeds 24-byte ops mixing places (~80%, varied STP/TIF/type,
+loosely-aligned price+qty so the rejection path is fuzzed too) and
+cancels (~20%, mostly live ids, some phantom). Invariants now check
+after EVERY op — never-crossed, fills ≤ request, fill prices inside
+the limit — and resting state sanity at the end (unique ids, nonzero
+qty). 502k runs clean in the smoke.
+
+New `exchange-settlement` target drives the settlement/accounting
+layer the book fuzzer can't reach: `ExchangeModule::handle()` over a
+`MemoryBalances` ledger — deposits/withdrawals, book places/cancels,
+registered-order lifecycle, and operator `batch_settle` legs (with
+known + fabricated keys, plus wrong-sender probes). The asserted
+invariant is money conservation after every op: `Σ ledger balances
+== minted − (Σ buy-side quote escrow + fee_vault + base custody)` —
+closing it required two new `#[doc(hidden)]` read-only probes on the
+module, `escrowed_quote(m)` (resting bids' implied reservation +
+registered buys' `reserved`) and `escrowed_base(m)` (registered
+sells' `reserved`). 387k runs, zero violations, coverage climbed to
+1187 edges over a 544-entry corpus before minimization.
+
+Both corpora minimized and committed; the nightly fuzz list now runs
+10 targets including `exchange-settlement`.

@@ -25,8 +25,9 @@ a silent no-op** — check the contract before trusting coverage numbers.
 | `evm-execute` | Bytes drive transaction construction + `revm` execution. |
 | `journal-replay` | Bytes are written as `segment-0.log` inside a fresh journal dir and replayed. **The filename must match `SEGMENT_PREFIX<seq>.log`** (`segment-0.log`) — `segment_files()` skips foreign names, so a bare `0.log` exercises only the empty-replay path. Valid inputs need the `OXDJRN01` magic + `[len:u32][crc32:u32][payload]` records. Named seeds: `jr_valid`, `jr_torn`, `jr_badcrc`, `jr_badlen`. |
 | `mmr-proof-verify` | Bytes encode leaf index + proof nodes for `Mmr::verify`. |
+| `exchange-settlement` | Byte 0 picks owner count; byte 1 the second market's config variant; then 24-byte ops drive `ExchangeModule::handle` — place/cancel/deposit/withdraw/register/cancel-registered/batch-settle plus raw malformed msgs. Asserts money conservation (`Σ ledger + Σ module buckets == minted`) after every op. |
 | `sync-decode` | Raw bytes decoded as state-sync wire messages (manifests, chunks). |
-| `trading-engine` | Byte stream drives order ops against the matching engine. |
+| `trading-engine` | Header (8B) picks market config (tick/lot/band/capacity/owner-count tables); then 24-byte ops: place (varied owner/STP/TIF/type, loosely-aligned price+qty) or cancel (~20%, live and phantom ids). Asserts never-crossed + fill discipline after every op. |
 | `trading-order-validate` | `[side:1][type:1][tif:1][price:u64][qty:u64]` (19 bytes) → `Order::validate`. Saturated at 14 edges — all branches covered by `seed_*` files. |
 | `types-decode` | Raw bytes decoded as core types (`Address`, `Hash`, headers). |
 
