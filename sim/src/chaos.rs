@@ -55,11 +55,12 @@ use codec::{Decode, Encode};
 use consensus::{ConsensusError, OxideBft};
 use crypto::hash::Domain;
 use devnet::multinode::MultiNodeDevnet;
-use ports::{ConsensusEngine, Transport};
+use ports::{AppInterface, ConsensusEngine, Transport};
 use primitives::Hash;
 use types::{FinalizedBlock, TxBytes, Vote, VotePhase};
 
 use crate::byzantine::ByzantineStrategy;
+use crate::network::DeterministicRng;
 
 /// Cap on spam messages per round per node. `Spam { rate }` is a
 /// user-supplied knob; unbounded rates would make the 10k randomized
@@ -76,6 +77,11 @@ pub struct ChaosReport {
     /// Finalized blocks per node index (as observed by that node's
     /// own engine).
     pub finalized: Vec<Vec<FinalizedBlock>>,
+    /// Executed state roots per node index, keyed by committed
+    /// height. Identical committed content with divergent roots
+    /// means the execution layer forked — the checker compares them
+    /// per height across honest nodes.
+    pub roots: Vec<std::collections::BTreeMap<u64, Hash>>,
     /// Votes rejected by leaders for structural/signature reasons
     /// (stale view, bad signature, unknown voter).
     pub votes_rejected: usize,
@@ -90,15 +96,48 @@ pub struct ChaosReport {
     pub leader_equivocations: usize,
     /// Rounds actually executed (always `rounds` unless noted).
     pub rounds_run: usize,
+    /// Per-node end-of-run engine state — the consensus position
+    /// behind `finalized`: a lagging node stuck on an old `high_qc`
+    /// (view ahead of every delivered QC) reads differently from one
+    /// that kept adopting QCs but whose commit walk found a gap.
+    pub end_state: Vec<NodeEndState>,
+}
+
+/// One node's consensus position when the run ended — diagnostics for
+/// attributing liveness failures (and the metadata axis the safety
+/// checker can extend to).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEndState {
+    /// View the engine is parked in.
+    pub current_view: u64,
+    /// View of the highest QC the engine adopted (`None` = never saw
+    /// a QC — genesis-only runs).
+    pub high_qc_view: Option<u64>,
+    /// Height the engine expects to propose/vote next.
+    pub next_height: u64,
+    /// In-flight (uncommitted) blocks still stored — commit-walk
+    /// material the node holds but couldn't link into a commit.
+    pub stored_blocks: usize,
 }
 
 impl ChaosReport {
     /// Safety gate: honest nodes must never finalize conflicting
     /// histories. A lagging honest node may have *gaps* (heights it
     /// never saw — e.g. while partitioned), so this compares per-height
-    /// content: for every height present in two honest nodes'
-    /// finalized sets, the tx payload must be identical. Same height +
-    /// different txs = a fork = violation.
+    /// content across the UNION of all honest committed histories: the
+    /// first honest node presenting a height defines the canonical
+    /// block; every other honest node committing that height must
+    /// match it exactly — whole-block equality (txs, committing-QC
+    /// signers, execution context). A per-height canonical value
+    /// covers every honest pair: the old first-node-as-reference
+    /// scheme could not see a fork between two later nodes whenever
+    /// the reference node was empty or lagging.
+    ///
+    /// The same-height agreement extends to execution: `roots` must
+    /// match per height too — identical committed content with a
+    /// different post-execution root means the engines agreed on the
+    /// block but diverged applying it (a shared-ledger ordering bug
+    /// produces exactly that shape).
     ///
     /// It also asserts each honest node's committed heights form a
     /// contiguous prefix from 0 — the property both TLA+ findings
@@ -107,44 +146,79 @@ impl ChaosReport {
     /// lengths, so pruning never masquerades as a gap here.
     #[must_use]
     pub fn safety_holds(&self, strategies: &HashMap<usize, ByzantineStrategy>) -> bool {
-        let mut reference: Option<std::collections::BTreeMap<u64, &FinalizedBlock>> = None;
+        let mut canonical: std::collections::BTreeMap<u64, &FinalizedBlock> =
+            std::collections::BTreeMap::new();
+        let mut canonical_roots: std::collections::BTreeMap<u64, Hash> =
+            std::collections::BTreeMap::new();
         for (i, blocks) in self.finalized.iter().enumerate() {
             if strategies.contains_key(&i) {
                 continue;
             }
-            let mine: std::collections::BTreeMap<u64, &FinalizedBlock> =
-                blocks.iter().map(|b| (b.height.value(), b)).collect();
             // Contiguous prefix: every height below the node's
-            // committed tip must be present.
-            if let Some((&max_h, _)) = mine.iter().next_back() {
-                if mine.len() as u64 != max_h + 1 {
+            // committed tip must be present (the collection already
+            // iterates 0..=tip, so a gap shows as a short vec).
+            if let Some(tip) = blocks.last() {
+                if blocks.len() as u64 != tip.height.value() + 1 {
                     return false;
                 }
             }
-            if let Some(reference) = &reference {
-                for (h, block) in &mine {
-                    if let Some(ref_block) = reference.get(h) {
-                        if ref_block.txs != block.txs {
+            for block in blocks {
+                match canonical.entry(block.height.value()) {
+                    std::collections::btree_map::Entry::Occupied(e) => {
+                        if *e.get() != block {
                             return false;
                         }
                     }
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(block);
+                    }
                 }
-            } else {
-                reference = Some(mine);
+            }
+            // `roots` is parallel to `finalized` when the report
+            // comes from `run()`; `get()` keeps a hand-constructed
+            // report (tests, fixtures) from panicking here.
+            for (h, root) in self.roots.get(i).into_iter().flatten() {
+                match canonical_roots.entry(*h) {
+                    std::collections::btree_map::Entry::Occupied(e) => {
+                        if *e.get() != *root {
+                            return false;
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(*root);
+                    }
+                }
             }
         }
         true
     }
 
-    /// Liveness gate: at least one honest node finalized at least one
-    /// block. Only meaningful when the scenario is within the BFT
-    /// bound (byz ≤ f) and no permanent partition is in effect.
+    /// Liveness gate: EVERY honest node finalized at least one block
+    /// and all honest nodes converged to the same committed tip —
+    /// the union-coverage counterpart of `safety_holds`. The old
+    /// predicate ("at least one honest node finalized something")
+    /// passed even when most honest nodes never made progress; the
+    /// sim's synchronous message schedule means a healthy honest
+    /// node should reach the same tip as every other by the end of
+    /// the run (callers skip this gate when a partition is in
+    /// effect or the Byzantine count exceeds f).
     #[must_use]
     pub fn liveness_holds(&self, strategies: &HashMap<usize, ByzantineStrategy>) -> bool {
-        self.finalized
-            .iter()
-            .enumerate()
-            .any(|(i, blocks)| !strategies.contains_key(&i) && !blocks.is_empty())
+        let mut tip: Option<u64> = None;
+        for (i, blocks) in self.finalized.iter().enumerate() {
+            if strategies.contains_key(&i) {
+                continue;
+            }
+            let Some(last) = blocks.last() else {
+                return false; // an honest node finalized nothing
+            };
+            match tip {
+                None => tip = Some(last.height.value()),
+                Some(t) if t == last.height.value() => {}
+                Some(_) => return false, // honest tips diverged
+            }
+        }
+        tip.is_some()
     }
 
     /// Count of finalized blocks across all honest nodes (used by
@@ -174,6 +248,14 @@ pub struct ChaosScenario {
     /// Nodes partitioned for `partition_rounds` rounds starting at
     /// `partition_start`, then healed. Tests recovery-after-heal.
     pub partition: Option<PartitionPlan>,
+    /// Seed driving the per-round message schedule: which follower
+    /// votes reach the leader first, which node ingests the QC first,
+    /// and the order timeout signatures are collected. `0` selects
+    /// the fixed index-order schedule every hand-written scenario has
+    /// used; any nonzero seed draws an independent deterministic
+    /// permutation per `(round, phase)` so randomized sweeps explore
+    /// cross-view delivery orderings, not just strategy mixes.
+    pub schedule_seed: u64,
 }
 
 /// A temporary partition: `nodes` are silenced for
@@ -192,7 +274,13 @@ impl ChaosScenario {
     /// All-honest baseline: `rounds` rounds, 1 tx per round.
     #[must_use]
     pub fn honest(rounds: usize) -> Self {
-        Self { strategies: HashMap::new(), rounds, txs_per_round: 1, partition: None }
+        Self {
+            strategies: HashMap::new(),
+            rounds,
+            txs_per_round: 1,
+            partition: None,
+            schedule_seed: 0,
+        }
     }
 
     /// Node indices carrying a Byzantine strategy.
@@ -254,7 +342,57 @@ pub fn run(n: usize, scenario: &ChaosScenario) -> ChaosReport {
             (0..=h).filter_map(|i| e.finalized_block(primitives::Height::new(i))).collect()
         })
         .collect();
+    // Per-node execution roots for the committed heights — the
+    // checker's cross-node root agreement is what catches an
+    // execution-layer fork hiding behind identical tx lists.
+    report.roots = report
+        .finalized
+        .iter()
+        .enumerate()
+        .map(|(i, blocks)| {
+            blocks
+                .iter()
+                .filter_map(|b| {
+                    devnet.app(i).attest_state(b.height).map(|att| (b.height.value(), att.root))
+                })
+                .collect()
+        })
+        .collect();
+    report.end_state = devnet
+        .engines()
+        .iter()
+        .map(|e| NodeEndState {
+            current_view: e.current_view().value(),
+            high_qc_view: e.high_qc().map(|qc| qc.view.value()),
+            next_height: e.next_height_value(),
+            stored_blocks: e.stored_block_count(),
+        })
+        .collect();
     report
+}
+
+/// Deterministic per-round node order for one pipeline `phase` of
+/// `round`, drawn from the scenario's `schedule_seed`. Seed `0` is
+/// the identity order (what hand-written scenarios have always run);
+/// a nonzero seed produces an independent Fisher–Yates permutation
+/// per `(round, phase)`, so vote delivery, QC ingest, and timeout
+/// collection interleave differently across views — the schedule
+/// axis the audit's randomized gate was missing.
+fn round_order(n: usize, seed: u64, round: usize, phase: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    if seed == 0 || n < 2 {
+        return order;
+    }
+    // `phase` namespaces the draw so pipeline stages don't share a
+    // permutation; `round as u64` truncates harmlessly for the
+    // `usize::MAX` flush round (only the low bits feed the mix).
+    let mixed = seed ^ ((round as u64) << 8 | phase);
+    let mut rng = DeterministicRng::new(mixed.max(1));
+    for i in (1..n).rev() {
+        let j = usize::try_from(rng.next_u64() % u64::try_from(i + 1).unwrap_or(1)).unwrap_or(0);
+        order.swap(i, j);
+    }
+    order
 }
 
 /// One round of the chaos loop: submit → propose → vote → collect →
@@ -296,12 +434,12 @@ fn run_chaos_round(
     // silence and the view advances empty via the real timeout path
     // (timeout signatures -> TC -> view change).
     if matches!(leader_strat, Some(ByzantineStrategy::Withhold)) {
-        timeout_all(devnet);
+        timeout_all(devnet, scenario, round);
         return;
     }
 
     let Some((header, proposal)) = devnet.engines_mut()[leader_idx].propose() else {
-        timeout_all(devnet);
+        timeout_all(devnet, scenario, round);
         return;
     };
     let hash_a = OxideBft::block_hash(&header);
@@ -334,16 +472,21 @@ fn run_chaos_round(
             .expect("leader self-vote must verify");
     }
 
-    // Followers vote. Under leader equivocation, the first half of
-    // the follower set sees header A and the second half sees B —
-    // modelling equivocating proposal delivery.
+    // Followers vote in the scheduled order: delivery sequence is
+    // part of the cross-view schedule, so a nonzero `schedule_seed`
+    // permutes it per round.
+    let vote_order = round_order(n, scenario.schedule_seed, round, 0);
+    // Under leader equivocation, the first half of the follower set
+    // sees header A and the second half sees B — modelling
+    // equivocating proposal delivery. The split indexes into the
+    // *schedule* so which half sees which header is also randomized.
     let split_at = n.div_ceil(2);
-    for i in 0..n {
+    for (seq, &i) in vote_order.iter().enumerate() {
         if i == leader_idx {
             continue;
         }
         let (seen_header, seen_hash) = match &alt {
-            Some((h2, h2_hash)) if i >= split_at => (h2, *h2_hash),
+            Some((h2, h2_hash)) if seq >= split_at => (h2, *h2_hash),
             _ => (&header, hash_a),
         };
         match scenario.strategies.get(&i) {
@@ -424,7 +567,7 @@ fn run_chaos_round(
         // Split vote / withheld votes: no quorum this view — the
         // timeout path forms a TC so the next leader carries
         // successor evidence (and locked voters can re-vote).
-        timeout_all(devnet);
+        timeout_all(devnet, scenario, round);
         return;
     };
 
@@ -443,11 +586,32 @@ fn run_chaos_round(
             .send(&p2p::MeshNetwork::peer_id(i), payload)
             .expect("mesh send");
     }
+    // Block gossip under equivocation: the QC'd block is the one
+    // half the follower set never received as a proposal. Without
+    // it, their commit walk breaks at the missing ancestor on every
+    // later QC — a permanently wedged commit pipeline despite a
+    // healthy view/high_qc. Re-delivering the winning (header, body)
+    // through `vote()` stores the block even though no vote is
+    // emitted (each node already voted this view) — the same path a
+    // peer's late proposal relay takes in production.
+    if let Some((h2, h2_hash)) = &alt {
+        let winning = if qc.block_hash == *h2_hash { h2 } else { &header };
+        // The leader is included: when the QC certifies the *alt*
+        // header, even the equivocator only stored its real
+        // proposal — `vote()` inserts the winning block while the
+        // eligibility checks keep a second signature from escaping.
+        for i in 0..n {
+            let _ = devnet.engines_mut()[i].vote(winning, &proposal);
+        }
+    }
     // Transport handles are grabbed before the mutable engine borrow:
     // `MeshTransport` is a handle into the shared mesh, so collecting
     // them upfront avoids interleaved borrows of `devnet`.
     let mut transports: Vec<p2p::MeshTransport> = (0..n).map(|i| devnet.transport(i)).collect();
-    for (i, engine) in devnet.engines_mut().iter_mut().enumerate() {
+    // QC ingest order is the second schedule axis: which node locks
+    // the new QC first changes which votes/evidence it emits next.
+    for i in round_order(n, scenario.schedule_seed, round, 1) {
+        let engine = &mut devnet.engines_mut()[i];
         if i == leader_idx {
             if engine.deliver_qc(qc.clone()).is_err() {
                 report.votes_rejected += 1;
@@ -507,15 +671,19 @@ fn advance_all(devnet: &mut MultiNodeDevnet) {
 /// lets voters release same-height vote locks left over from the
 /// timed-out view — without TC evidence, a split view wedges
 /// forever.
-fn timeout_all(devnet: &mut MultiNodeDevnet) {
+fn timeout_all(devnet: &mut MultiNodeDevnet, scenario: &ChaosScenario, round: usize) {
     let n = devnet.engines().len();
+    // Timeout emission order is fixed (each engine signs its own
+    // view's timeout — emission has no receiver), but collection
+    // order is a schedule axis: which collector forms its TC first
+    // and which signatures it saw when it did.
     let sigs: Vec<crypto::bls::Signature> = (0..n)
         .map(|i| devnet.engines_mut()[i].on_timeout().unwrap_or(crypto::bls::Signature::ZERO))
         .collect();
-    for collector in 0..n {
-        for (signer, sig) in sigs.iter().enumerate() {
+    for collector in round_order(n, scenario.schedule_seed, round, 2) {
+        for signer in round_order(n, scenario.schedule_seed, round, 3) {
             let _ = devnet.engines_mut()[collector]
-                .collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig);
+                .collect_timeout_signature(u16::try_from(signer).unwrap_or(0), sigs[signer]);
         }
     }
     let max_height = devnet.engines().iter().map(OxideBft::next_height_value).max().unwrap_or(0);

@@ -27,6 +27,7 @@ fn scenario(strategies: &[(usize, ByzantineStrategy)], rounds: usize) -> ChaosSc
         rounds,
         txs_per_round: 1,
         partition: None,
+        schedule_seed: 0,
     }
 }
 
@@ -146,6 +147,7 @@ fn partition_then_heal_recovers() {
             rounds: 10,
             txs_per_round: 1,
             partition: Some(PartitionPlan { nodes: vec![3], start: 2, duration: 3 }),
+            schedule_seed: 0,
         },
     );
     let _ = strategies;
@@ -160,7 +162,13 @@ fn same_scenario_identical_result() {
     let mut strategies = HashMap::new();
     strategies.insert(0, ByzantineStrategy::DoubleVote);
     strategies.insert(2, ByzantineStrategy::Spam { rate: 8 });
-    let scenario = ChaosScenario { strategies, rounds: 8, txs_per_round: 1, partition: None };
+    let scenario = ChaosScenario {
+        strategies,
+        rounds: 8,
+        txs_per_round: 1,
+        partition: None,
+        schedule_seed: 0,
+    };
     let a = run(4, &scenario);
     let b = run(4, &scenario);
     assert_eq!(a.conflicting_votes, b.conflicting_votes);
@@ -273,8 +281,17 @@ fn run_one_scenario(seed: u64) -> (usize, usize, usize, usize) {
     };
 
     let has_partition = partition.is_some();
-    let scenario =
-        ChaosScenario { strategies: strategies.clone(), rounds, txs_per_round: 1, partition };
+    // The schedule axis is the point of the randomized gate: each
+    // scenario also draws its own per-round message ordering, so the
+    // sweep explores cross-view delivery interleavings rather than
+    // replaying the fixed index-order schedule every time.
+    let scenario = ChaosScenario {
+        strategies: strategies.clone(),
+        rounds,
+        txs_per_round: 1,
+        partition,
+        schedule_seed: rng.next_u64().max(1),
+    };
     let report = run(n, &scenario);
 
     let mut out = (0usize, 0usize, 0usize, 0usize);
@@ -299,8 +316,94 @@ fn run_one_scenario(seed: u64) -> (usize, usize, usize, usize) {
         out.1 += 1;
         if !report.liveness_holds(&strategies) {
             out.2 += 1;
-            eprintln!("LIVENESS FAILURE seed={seed} n={n} byz={num_byz}");
+            eprintln!(
+                "LIVENESS FAILURE seed={seed} n={n} byz={num_byz} tips={:?} sizes={:?}",
+                report
+                    .finalized
+                    .iter()
+                    .map(|v| v.last().map(|b| b.height.value()))
+                    .collect::<Vec<_>>(),
+                report.finalized.iter().map(Vec::len).collect::<Vec<_>>()
+            );
         }
     }
     out
+}
+
+/// Rebuild the exact scenario `run_one_scenario` draws for `seed` —
+/// same draw sequence, same `schedule_seed` — so a failing gate seed
+/// can be replayed or bisected with a different schedule.
+fn scenario_for_seed(seed: u64) -> (usize, ChaosScenario, HashMap<usize, ByzantineStrategy>, bool) {
+    // Mirrors `run_one_scenario`'s draw order exactly.
+    let mut rng = DeterministicRng::new(seed + 1);
+    let n = if rng.next_u64() % 4 == 0 { 7 } else { 4 };
+    let max_byz = if rng.next_u64() % 100 < 15 { n } else { (n - 1) / 3 };
+    let num_byz =
+        usize::try_from(rng.next_u64() % u64::try_from(max_byz + 1).unwrap_or(1)).unwrap_or(0);
+    let mut strategies = HashMap::new();
+    for _ in 0..num_byz {
+        let idx = usize::try_from(rng.next_u64() % u64::try_from(n).unwrap_or(1)).unwrap_or(0);
+        let strategy = match rng.next_u64() % 5 {
+            0 => ByzantineStrategy::Withhold,
+            1 => ByzantineStrategy::DoubleVote,
+            2 => ByzantineStrategy::Equivocate,
+            3 => ByzantineStrategy::Spam { rate: (rng.next_u64() % 64) as u32 },
+            _ => ByzantineStrategy::Censor {
+                censored: HashSet::from([devnet::txs::identity_addr(0).0]),
+            },
+        };
+        strategies.insert(idx, strategy);
+    }
+    let rounds = usize::try_from(6 + rng.next_u64() % 10).unwrap_or(6);
+    let partition = if rng.next_u64() % 4 == 0 {
+        let idx = usize::try_from(rng.next_u64() % u64::try_from(n).unwrap_or(1)).unwrap_or(0);
+        Some(PartitionPlan {
+            nodes: vec![idx],
+            start: usize::try_from(rng.next_u64() % 4).unwrap_or(0),
+            duration: 1 + usize::try_from(rng.next_u64() % 3).unwrap_or(1),
+        })
+    } else {
+        None
+    };
+    let within_bound = num_byz <= (n - 1) / 3;
+    let scenario = ChaosScenario {
+        strategies: strategies.clone(),
+        rounds,
+        txs_per_round: 1,
+        partition: partition.clone(),
+        schedule_seed: rng.next_u64().max(1),
+    };
+    (n, scenario, strategies, within_bound && partition.is_none())
+}
+
+/// Bisect tool: run one gate seed under its drawn schedule and under
+/// the fixed index-order schedule, printing both honest tip sets.
+/// `CHAOS_SEED=7504 cargo test -p oxide-sim --test chaos -- --ignored debug`
+#[test]
+#[ignore = "manual debugging aid — replay one gate seed"]
+fn debug_seed_tips() {
+    let seed: u64 = std::env::var("CHAOS_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(7504);
+    let (n, drawn, _strategies, _) = scenario_for_seed(seed);
+    let drawn_seed = drawn.schedule_seed;
+    for label_seed in [drawn_seed, 0] {
+        let scenario = ChaosScenario { schedule_seed: label_seed, ..drawn.clone() };
+        let report = run(n, &scenario);
+        eprintln!(
+            "sched={label_seed} byz={:?} tips={:?} sizes={:?} votes_rej={} conflict={} equiv={}",
+            scenario.byzantine_indices(),
+            report.finalized.iter().map(|v| v.last().map(|b| b.height.value())).collect::<Vec<_>>(),
+            report.finalized.iter().map(Vec::len).collect::<Vec<_>>(),
+            report.votes_rejected,
+            report.conflicting_votes,
+            report.leader_equivocations,
+        );
+        for (i, s) in report.end_state.iter().enumerate() {
+            eprintln!(
+                "  node {i}: view={} highqc={:?} next_h={} stored={}",
+                s.current_view, s.high_qc_view, s.next_height, s.stored_blocks
+            );
+        }
+    }
+    // Cross-check against the gate's own scenario construction.
+    eprintln!("gate fn: {:?}", run_one_scenario(seed));
 }

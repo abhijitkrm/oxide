@@ -270,11 +270,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - The Phase 4 acceptance gate
     (`sim/tests/chaos.rs::randomized_10k_zero_safety_violations`)
     runs 10,000 randomized scenarios — randomized validator counts,
-    Byzantine assignments, strategies, round counts, and
-    partition-then-heal plans — with **zero safety violations and
-    zero liveness failures on 6,899 within-bound runs**; ~6 minutes
-    when fanned across cores, picked up by the nightly
-    `throughput-sims` job.
+    Byzantine assignments, strategies, round counts,
+    partition-then-heal plans, and per-round message schedules
+    (`ChaosScenario::schedule_seed` permutes vote delivery, QC
+    ingest, and timeout-collection order per `(round, phase)`) —
+    with **zero safety violations and zero liveness failures on the
+    within-bound runs**; ~13 minutes when fanned across cores,
+    picked up by the nightly `throughput-sims` job.
+  - The safety checker compares the *union* of all honest committed
+    histories per height — whole `FinalizedBlock` equality plus
+    per-height execution state roots (`attest_state` →
+    `ChaosReport::roots`) — so a fork between any two honest nodes
+    is caught regardless of which node is examined first; liveness
+    requires every honest node to finalize and all honest tips to
+    converge. `ChaosReport::end_state` (per-node view / high-QC
+    view / next height / stored blocks) makes a failure attributable
+    from the report alone.
+  - The stronger assertions caught a real harness gap: followers
+    shown the losing header under leader equivocation never
+    received the winning block, so their commit walk deferred at
+    the missing ancestor forever — in-sync engines wedged at stale
+    committed tips. The harness now re-gossips the QC'd block
+    through `vote()` after QC formation (stored without a vote,
+    exactly like a late peer relay).
   - Engine surface: `OxideBft::proposal_signing_hash`,
     `vote_signing_message`, and the `ConsensusError` re-export are
     now public (documented simulation surface), and

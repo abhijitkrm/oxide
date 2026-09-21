@@ -17754,3 +17754,45 @@ Sender side: `OxideBft::timeout_evidence()` reports the justifying
 certificates; receiver side: `deliver_timeout_evidence()` runs the
 gate. Five engine regressions cover TC/QC-driven jumps, forged and
 foreign-epoch evidence, and sender-side certificate selection.
+
+## Sim: the chaos checker now compares the union of honest histories — and the harness gossips equivocated blocks
+
+The safety checker picked the FIRST honest node as a fixed reference
+and compared only overlapping heights against it — a fork between two
+later honest nodes was invisible whenever the reference was empty or
+behind. `safety_holds` now builds a per-height canonical map across
+the union of all honest committed histories: any shared height must
+carry the *same* `FinalizedBlock` (txs, committing-QC signers,
+execution context — whole-value equality) and the same execution
+state root from `attest_state`. The per-node contiguous-prefix rule
+is unchanged. `liveness_holds` went from "some honest node finalized
+something" to requiring EVERY honest node to finalize at least one
+block AND converge on the same tip — sustained progress by all
+required participants, not one node masking lagging peers.
+
+The randomized gate also gained the schedule axis it was missing:
+`ChaosScenario.schedule_seed` drives a deterministic Fisher–Yates
+permutation per `(round, phase)` over follower vote delivery, QC
+ingest, and timeout-signature collection order — cross-view message
+schedules are now swept, not just strategy mixes. Seed `0` keeps the
+fixed index order every hand-written scenario used.
+
+**The checker immediately paid off.** With the stronger predicates,
+the 10k gate surfaced ~690 within-bound liveness failures that the
+old assertions had never seen: honest nodes parked at height 1 while
+peers reached 9+, in perfect view/high-QC sync (`view=13 highqc=12`
+on every node — nobody was "behind" on consensus state). Root cause
+was a harness gap, not an engine bug: under leader equivocation the
+half of followers shown the losing header never received the
+*winning* block, so every later `commit_walk` hit the missing
+ancestor and deferred forever — the engine correctly refuses to
+commit over a gap, and the sim simply had no block-gossip path to
+deliver the QC'd body. The fix models what production peers do:
+after the QC forms, the winning `(header, proposal)` is redelivered
+through `vote()`, which stores the block even though no vote is
+emitted (the view already moved on / the node already voted).
+
+`ChaosReport` grew `roots` (per-node execution roots by height) and
+`end_state` (per-node view / high_qc view / next_height / stored
+blocks) — the metadata that made the wedge diagnosable. The gate's
+failure line now prints tips+sizes so a violation carries its shape.

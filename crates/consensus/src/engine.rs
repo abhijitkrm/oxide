@@ -1385,6 +1385,16 @@ impl OxideBft {
         self.vote_count
     }
 
+    /// Number of in-flight (not yet committed) blocks the engine is
+    /// storing — headers received via `vote`/`vote_header` that the
+    /// commit walk may still traverse. Diagnostic for simulation
+    /// harnesses attributing commit lag: a node whose stored count
+    /// is far below its peers' committed tip is missing ancestors.
+    #[must_use]
+    pub fn stored_block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// Returns the number of timeout signatures collected so far for
     /// the current view. Used by the devnet consensus loop for debug
     /// logging.
