@@ -2489,21 +2489,37 @@ impl Executor {
     ///
     /// Entries are `(ctx, payload, full_tx_hash)`; the payload is a
     /// zero-copy borrow into the block bytes and the hash is the
-    /// preverify-cache key. `BTreeMap` ordering makes module-group
-    /// processing deterministic (sorted by module ID).
+    /// preverify-cache key.
+    ///
+    /// The plan preserves **committed block order**: the returned
+    /// `Vec` is a sequence of contiguous same-module *runs* — a new
+    /// run starts whenever the module id changes, so cross-module
+    /// semantics are exactly sequential (an EVM transfer funding a
+    /// later delegate is visible to it). Batching amortizes only
+    /// where the committed order already made txs adjacent; it never
+    /// reorders across modules. This replaces the old global
+    /// `BTreeMap<module_id>` grouping, which was deterministic but
+    /// NOT faithful to the ordering consensus finalized — modules
+    /// share one balance ledger, so sorted-module execution could
+    /// reorder a funding transfer past its dependent.
+    ///
+    /// The fee *floor* is a stateless gate and stays here; the fee
+    /// *charge* does NOT — it debits the shared ledger, so it must
+    /// observe the effects of every earlier tx. It runs at dispatch
+    /// time, per run in block order (see `execute_block`).
     ///
     /// `skipped` collects the hash + gate for every proposed tx that
     /// never reaches a module — the caller records each as a
     /// [`TxOutcome::Skipped`] so a submitter can tell "dropped at a
     /// gate" apart from "executed and rejected".
-    fn group_block_txs<'b>(
+    fn plan_block_runs<'b>(
         &self,
         txs: &'b [TxBytes],
         local_nonce: &mut HashMap<primitives::Address, u64>,
         preverify_cache: &HashMap<Hash, [u8; 20]>,
         skipped: &mut Vec<(Hash, TxSkipReason)>,
-    ) -> BTreeMap<u8, Vec<GroupedTx<'b>>> {
-        let mut groups: BTreeMap<u8, Vec<GroupedTx<'b>>> = BTreeMap::new();
+    ) -> Vec<(u8, Vec<GroupedTx<'b>>)> {
+        let mut runs: Vec<(u8, Vec<GroupedTx<'b>>)> = Vec::new();
         let mut cumulative_gas: u64 = 0;
         for tx in txs {
             let bytes = tx.as_bytes();
@@ -2560,34 +2576,28 @@ impl Executor {
                 skipped.push((tx_hash, TxSkipReason::GasLimit));
                 continue;
             }
-            // Fee gate: every tx routed to a non-self-funded module
-            // pays `ctx.fee` through the configured fee collector
-            // (the EVM ledger) — not the target module. `min_fee` is
-            // enforced first because the envelope's fee field is
-            // sender-declared — without a floor every tx could
-            // declare 0. Self-funded modules (EVM: gas is the fee)
-            // are exempt — charging here would double-charge.
-            if !module.pays_own_fee() {
-                if ctx.fee < self.min_fee {
-                    skipped.push((tx_hash, TxSkipReason::FeeFloor));
-                    continue;
-                }
-                if let Some(fee_module) =
-                    self.fee_module.and_then(|id| self.modules[usize::from(id)].as_ref())
-                {
-                    if fee_module.charge_fee(&ctx).is_err() {
-                        skipped.push((tx_hash, TxSkipReason::FeeCharge));
-                        continue;
-                    }
-                }
+            // Fee floor gate: the envelope's fee field is
+            // sender-declared, so `min_fee` is enforced here — a
+            // pure predicate, no ledger effect. The charge itself
+            // moved to dispatch (`execute_block`) so it observes the
+            // balance effects of every earlier tx; charging it here
+            // would debit all senders before ANY module ran — a
+            // later tx's fee failing though an earlier tx funded
+            // the account is exactly the reordering this plan
+            // exists to eliminate. Self-funded modules (EVM: gas is
+            // the fee) are exempt either way.
+            if !module.pays_own_fee() && ctx.fee < self.min_fee {
+                skipped.push((tx_hash, TxSkipReason::FeeFloor));
+                continue;
             }
-            // Advance the local nonce counter for this sender — only
-            // after the fee charge succeeds; a tx that can't pay its
-            // fee doesn't get its nonce advanced. `expected + 1`
-            // cannot overflow: the reserved-nonce skip above keeps
-            // `expected ≤ u64::MAX - 1`. Self-authenticating modules
-            // keep their own account nonce (enforced inside the module),
-            // so the executor tracks nothing for them.
+            // Advance the local nonce counter for this sender —
+            // provisionally: a dispatch-time fee failure rewinds it
+            // (see `execute_block`) so a failed charge never consumes
+            // the nonce. `expected + 1` cannot overflow: the
+            // reserved-nonce skip above keeps `expected ≤ u64::MAX -
+            // 1`. Self-authenticating modules keep their own account
+            // nonce (enforced inside the module), so the executor
+            // tracks nothing for them.
             if !self_authenticating {
                 local_nonce.insert(ctx.sender, expected + 1);
             }
@@ -2595,25 +2605,132 @@ impl Executor {
             // Zero-copy: the payload is borrowed from the block tx
             // bytes; the full-tx hash is the same key `ingest_tx`
             // used for the preverify cache.
-            groups.entry(module_id).or_default().push((ctx, payload, tx_hash));
+            match runs.last_mut() {
+                Some((run_module, run)) if *run_module == module_id => {
+                    run.push((ctx, payload, tx_hash));
+                }
+                _ => runs.push((module_id, vec![(ctx, payload, tx_hash)])),
+            }
         }
-        groups
+        runs
     }
 
-    /// Execute a finalized block: call `begin_block`, group txs by
-    /// module, call `handle_batch` per module group, call `end_block`,
+    /// Charge the fee for every tx in one contiguous run, in run
+    /// order, and return the survivors for dispatch. The charge
+    /// lives at dispatch time — not in `plan_block_runs` — because it
+    /// debits the shared ledger and must observe every earlier tx's
+    /// effects. Cross-module ordering is exact; within a run, a tx's
+    /// fee does not see earlier same-run txs (the documented
+    /// residual — closing it would need per-tx charge/execute
+    /// interleaving and lose batching entirely).
+    ///
+    /// `broken_nonce` records the first failed-charge nonce per
+    /// sender: under sequential semantics a failed charge consumes
+    /// no nonce, so that sender's later txs are unreachable this
+    /// block — they're skipped `StaleNonce` rather than executed
+    /// with a gap. `local_nonce` is rewound to the failed nonce so
+    /// `executed_nonce` reflects the last consumed nonce + 1 and
+    /// the failed tx stays retryable. Self-funded modules (EVM:
+    /// gas is the fee) skip charging entirely.
+    fn charge_run_fees<'b>(
+        &self,
+        run: Vec<GroupedTx<'b>>,
+        module: &dyn Module,
+        local_nonce: &mut HashMap<primitives::Address, u64>,
+        broken_nonce: &mut HashMap<primitives::Address, u64>,
+        dispatch_skipped: &mut Vec<(Hash, TxSkipReason)>,
+    ) -> Vec<GroupedTx<'b>> {
+        if module.pays_own_fee() {
+            return run;
+        }
+        let fee_module = self.fee_module.and_then(|id| self.modules[usize::from(id)].as_ref());
+        let self_authenticating = module.authenticates_sender();
+        let mut survivors = Vec::with_capacity(run.len());
+        for entry in run {
+            let ctx = entry.0;
+            if let Some(&broken) = broken_nonce.get(&ctx.sender) {
+                if ctx.nonce >= broken {
+                    dispatch_skipped.push((entry.2, TxSkipReason::StaleNonce));
+                    continue;
+                }
+            }
+            let charged = fee_module.is_none_or(|m| m.charge_fee(&ctx).is_ok());
+            if !charged {
+                dispatch_skipped.push((entry.2, TxSkipReason::FeeCharge));
+                broken_nonce.entry(ctx.sender).or_insert(ctx.nonce);
+                if !self_authenticating {
+                    local_nonce.insert(ctx.sender, ctx.nonce);
+                }
+                continue;
+            }
+            survivors.push(entry);
+        }
+        survivors
+    }
+
+    /// Dispatch one run to its module and return per-tx results.
+    ///
+    /// Phase E: zero-copy payload handling. If every tx in the run
+    /// has a cached sender, borrowed `PreverifiedTx`s are built
+    /// straight from the block bytes and the run goes through the
+    /// preverified path — parallel when it clears
+    /// `parallel_threshold` (speculation is sound inside a run:
+    /// the planner only batches contiguous same-module txs). If any
+    /// sender is uncached, the fallback `handle_batch` path is used
+    /// directly — no preverified Vec constructed, no wasted clones.
+    /// (Previously the preverified Vec was always built, cloning
+    /// payloads for txs the fallback path never used.)
+    fn dispatch_run(
+        &self,
+        module: &dyn Module,
+        group: &[GroupedTx<'_>],
+        preverify_cache: &mut HashMap<Hash, [u8; 20]>,
+    ) -> Vec<Result<Vec<Event>, ExecError>> {
+        let all_cached =
+            group.iter().all(|(_ctx, _payload, tx_hash)| preverify_cache.contains_key(tx_hash));
+        if !all_cached {
+            let batch: Vec<(TxContext, &[u8])> =
+                group.iter().map(|(ctx, payload, _tx_hash)| (*ctx, *payload)).collect();
+            return module.handle_batch(&batch);
+        }
+        // All senders are pre-recovered — build borrowed
+        // `PreverifiedTx`s straight from the block bytes.
+        let preverified: Vec<PreverifiedTx<'_>> = group
+            .iter()
+            .map(|(_ctx, payload, tx_hash)| PreverifiedTx {
+                raw: payload,
+                sender: preverify_cache.remove(tx_hash).unwrap_or([0u8; 20]),
+            })
+            .collect();
+        // Each tx keeps its own authenticated envelope context —
+        // `ctxs[i]` pairs with `preverified[i]`. Passing `group[0].0`
+        // here previously executed the whole group under the first
+        // tx's identity.
+        let ctxs: Vec<TxContext> = group.iter().map(|(ctx, _, _)| *ctx).collect();
+        if group.len() >= self.parallel_threshold {
+            module.handle_batch_parallel_preverified(&ctxs, &preverified)
+        } else {
+            module.handle_batch_preverified(&ctxs, &preverified)
+        }
+    }
+
+    /// Execute a finalized block: call `begin_block`, plan contiguous
+    /// same-module runs (preserving committed block order), charge
+    /// fees + dispatch each run via `handle_batch`, call `end_block`,
     /// compute the state root.
     ///
-    /// Txs are grouped by module ID, preserving block order within
-    /// each group. Each module's group is passed to `handle_batch`
-    /// in one call — this lets modules with batch-optimized paths
-    /// (e.g. EVM parallel sender recovery, pre-verified senders)
-    /// amortize per-tx overhead across the whole group.
-    ///
-    /// Modules are independent (each owns its storage subtree), so
-    /// grouping by module produces identical state roots to the
-    /// per-tx interleaved execution. Events are grouped by module
-    /// rather than interleaved, but state roots are unchanged.
+    /// Execution order is the committed block order at run
+    /// granularity: a new run starts when the module id changes, so
+    /// a tx always observes the ledger effects of every earlier
+    /// cross-module tx — and of its own fee charge, which happens at
+    /// dispatch time rather than during planning. Contiguous
+    /// same-module txs still batch in one `handle_batch*` call, so
+    /// modules with batch-optimized paths (EVM parallel sender
+    /// recovery, pre-verified senders) amortize per-tx overhead.
+    /// This replaces the old sort-by-module grouping, which was
+    /// deterministic but not faithful to committed order — modules
+    /// share one balance ledger, so "group then execute" was not
+    /// equivalent to sequential execution.
     fn execute_block(&self, block: &FinalizedBlock) -> Hash {
         // Coordinated halt: above the scheduled height the chain is
         // frozen — no begin/handle/end_block, no fee charge, no
@@ -2668,8 +2785,8 @@ impl Executor {
         );
 
         let mut skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
-        let groups =
-            self.group_block_txs(&block.txs, &mut local_nonce, &preverify_cache, &mut skipped);
+        let mut runs =
+            self.plan_block_runs(&block.txs, &mut local_nonce, &preverify_cache, &mut skipped);
 
         // Record finalized outcomes for txs that never reached a
         // module. These are the only outcomes a submitter can get
@@ -2684,63 +2801,40 @@ impl Executor {
             }
         }
 
-        // Execute each module's txs as a batch.
+        // Execute each contiguous same-module run in committed block
+        // order — sequential cross-module semantics. Fee charging
+        // happens inside `charge_run_fees`, immediately before each
+        // run's dispatch.
         let mut block_events: Vec<Event> = Vec::new();
+        let mut broken_nonce: HashMap<primitives::Address, u64> = HashMap::new();
+        let mut dispatch_skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
 
-        for (module_id, group) in &groups {
+        for (module_id, run) in &mut runs {
             let Some(module) = self.modules[*module_id as usize].as_ref() else {
                 continue; // unknown module — skip
             };
 
-            // Phase E: zero-copy payload handling.
-            //
-            // First, check if all txs in this group have cached
-            // senders. If yes, construct the preverified Vec (no
-            // payload clones — the cached PreverifiedTx already
-            // owns the raw bytes). If no, use the fallback path
-            // directly (no preverified Vec constructed, no wasted
-            // clones).
-            //
-            // Previously, the preverified Vec was always
-            // constructed, cloning payloads for txs without cached
-            // senders — even when the fallback path would be used,
-            // making those clones wasted work.
-            let all_cached =
-                group.iter().all(|(_ctx, _payload, tx_hash)| preverify_cache.contains_key(tx_hash));
-
-            let results = if all_cached {
-                // All senders are pre-recovered — build borrowed
-                // `PreverifiedTx`s straight from the block bytes.
-                let preverified: Vec<PreverifiedTx<'_>> = group
-                    .iter()
-                    .map(|(_ctx, payload, tx_hash)| PreverifiedTx {
-                        raw: payload,
-                        sender: preverify_cache.remove(tx_hash).unwrap_or([0u8; 20]),
-                    })
-                    .collect();
-
-                // Each tx keeps its own authenticated envelope
-                // context — `ctxs[i]` pairs with `preverified[i]`.
-                // Passing `group[0].0` here previously executed the
-                // whole group under the first tx's identity.
-                let ctxs: Vec<TxContext> = group.iter().map(|(ctx, _, _)| *ctx).collect();
-
-                // Use the pre-verified path. For large batches, use
-                // the parallel speculative path; for small batches,
-                // serial is faster (avoids rayon overhead).
-                if group.len() >= self.parallel_threshold {
-                    module.handle_batch_parallel_preverified(&ctxs, &preverified)
-                } else {
-                    module.handle_batch_preverified(&ctxs, &preverified)
-                }
-            } else {
-                // Fall back to the recovery path — no preverified
-                // Vec constructed, no payload clones.
-                let batch: Vec<(TxContext, &[u8])> =
-                    group.iter().map(|(ctx, payload, _tx_hash)| (*ctx, *payload)).collect();
-                module.handle_batch(&batch)
-            };
-            self.record_group_outcomes(group, results, &mut block_events);
+            // Charge each tx's fee through the configured collector
+            // (the EVM ledger), in run order — see `charge_run_fees`.
+            let group: Vec<GroupedTx<'_>> = self.charge_run_fees(
+                std::mem::take(run),
+                module.as_ref(),
+                &mut local_nonce,
+                &mut broken_nonce,
+                &mut dispatch_skipped,
+            );
+            if group.is_empty() {
+                continue;
+            }
+            let results = self.dispatch_run(module.as_ref(), &group, &mut preverify_cache);
+            self.record_group_outcomes(&group, results, &mut block_events);
+        }
+        if !dispatch_skipped.is_empty() {
+            let mut outcomes =
+                self.tx_outcomes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (hash, reason) in dispatch_skipped {
+                outcomes.record(hash, TxOutcome::Skipped { reason });
+            }
         }
         // Publish all events from this block in one lock acquisition.
         self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(block_events);
@@ -6089,5 +6183,188 @@ mod tests {
         // The rejection still consumed the nonce — a revert, not a
         // skip.
         assert_eq!(executor.executed_nonce_of(&Address([0u8; 20])), 1);
+    }
+
+    // ── Cross-module ordering regression fixtures — committed block
+    //    order, not module-id order, decides execution. ────────────
+
+    /// A ledger both fixture modules share — the test-side analogue
+    /// of the real EVM account store every module settles against.
+    type SharedLedger = Arc<Mutex<HashMap<Address, u64>>>;
+
+    /// Module id 7: credits `Address([payload[0]; 20])` with
+    /// `payload[1]` units. Deliberately a *higher* module id than
+    /// `CounterModule` (1) — under sorted-module grouping the funder
+    /// ran *after* the counter regardless of block order.
+    struct FunderModule {
+        ledger: SharedLedger,
+    }
+
+    impl Module for FunderModule {
+        fn name(&self) -> &'static str {
+            "funder"
+        }
+        fn id(&self) -> u8 {
+            7
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            if msg.len() >= 2 {
+                let mut ledger =
+                    self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                *ledger.entry(Address([msg[0]; 20])).or_insert(0) += u64::from(msg[1]);
+            }
+            Ok(vec![Event { module: "funder", kind: "funded", data: vec![] }])
+        }
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+    }
+
+    /// Fee collector (id 9) that debits the shared ledger — a charge
+    /// fails when the sender's balance is short, so tests can observe
+    /// *when* the charge ran relative to other txs' effects.
+    struct LedgerFeeCollector {
+        ledger: SharedLedger,
+    }
+
+    impl Module for LedgerFeeCollector {
+        fn name(&self) -> &'static str {
+            "ledgerfeecollector"
+        }
+        fn id(&self) -> u8 {
+            9
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            Ok(vec![])
+        }
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
+            let mut ledger = self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let balance = ledger.entry(ctx.sender).or_insert(0);
+            if *balance < ctx.fee {
+                return Err(ExecError::ModuleRejected("insufficient fee balance".to_string()));
+            }
+            *balance -= ctx.fee;
+            Ok(())
+        }
+    }
+
+    fn ordering_executor(ledger: &SharedLedger) -> (Executor, Arc<CounterModule>) {
+        let mut executor = test_executor(100);
+        let counter = Arc::new(CounterModule::new());
+        executor.register_module(counter.clone());
+        executor.register_module(Arc::new(FunderModule { ledger: ledger.clone() }));
+        executor.register_module(Arc::new(LedgerFeeCollector { ledger: ledger.clone() }));
+        executor.set_fee_module(9);
+        (executor, counter)
+    }
+
+    /// Finalize `txs` in the given order — the committed order is the
+    /// semantic under test, so blocks are built directly rather than
+    /// routed through `prepare_proposal` (whose fee-priority mempool
+    /// ordering is a separate, legitimate concern).
+    fn run_block(executor: &Executor, txs: Vec<TxBytes>) {
+        executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs,
+            signers: Vec::new(),
+        });
+    }
+
+    /// The audit's core case: a tx in a *higher-numbered* module
+    /// (funder, id 7) credits the sender of a *lower-numbered*
+    /// module's tx (counter, id 1). Committed order is [funder,
+    /// counter] — sequential execution funds sender 9 before its
+    /// fee is charged. The old sort-by-module grouping ran the
+    /// counter's group first and charged fees before ANY module
+    /// executed — this tx was skipped either way. Now it runs.
+    #[test]
+    fn cross_module_funding_visible_to_later_fee_charge() {
+        let ledger: SharedLedger = Arc::new(Mutex::new(HashMap::new()));
+        let (executor, counter) = ordering_executor(&ledger);
+
+        // Funder tx (sender 8, fee 0) credits sender 9 with 100 —
+        // committed BEFORE the counter tx.
+        let funder = make_tx_with_fee_and_sender(7, &[9, 100], 0, 0, 8);
+        // Counter tx (sender 9, fee 100) — spends exactly what the
+        // funder grants.
+        let counter_tx = make_tx_with_fee_and_sender(1, &[1], 0, 100, 9);
+        run_block(&executor, vec![funder, counter_tx]);
+
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "the counter tx must execute — its sender was funded earlier in the block"
+        );
+        assert_eq!(
+            ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[&Address([9u8; 20])],
+            0,
+            "the 100-unit fee was charged against the funding"
+        );
+    }
+
+    /// The reverse order proves block order — not module order —
+    /// decides: counter (id 1) before funder (id 7), so the fee
+    /// charge fails on the empty balance even though the funder
+    /// runs later in the same block.
+    #[test]
+    fn later_module_funding_does_not_help_earlier_tx() {
+        let ledger: SharedLedger = Arc::new(Mutex::new(HashMap::new()));
+        let (executor, counter) = ordering_executor(&ledger);
+
+        // Counter tx FIRST (sender 9 unfunded, fee 100 → charge fails).
+        let counter_tx = make_tx_with_fee_and_sender(1, &[1], 0, 100, 9);
+        // Funder SECOND — too late to help.
+        let funder = make_tx_with_fee_and_sender(7, &[9, 100], 0, 0, 8);
+        run_block(&executor, vec![counter_tx, funder]);
+
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "the counter tx must be skipped — its fee preceded the funding"
+        );
+        assert_eq!(
+            ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[&Address([9u8; 20])],
+            100,
+            "the funder still executed — its own fee was 0"
+        );
+    }
+
+    /// A dispatch-time fee failure must not consume the nonce:
+    /// sequential semantics skip the failed tx AND everything behind
+    /// it in the sender's chain (the gap is unreachable), while the
+    /// executed-nonce marker stays retryable.
+    #[test]
+    fn fee_failure_rewinds_sender_nonce_chain() {
+        let ledger: SharedLedger = Arc::new(Mutex::new(HashMap::new()));
+        let (executor, counter) = ordering_executor(&ledger);
+
+        // Sender 9: nonce 0 fee 100 (fails — empty balance), nonce 1
+        // fee 0 (would charge fine — but the chain is broken).
+        let head = make_tx_with_fee_and_sender(1, &[1], 0, 100, 9);
+        let next = make_tx_with_fee_and_sender(1, &[1], 1, 0, 9);
+        run_block(&executor, vec![head, next]);
+
+        assert_eq!(
+            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "neither tx executes — the chain broke at nonce 0"
+        );
+        assert_eq!(
+            executor.executed_nonce_of(&Address([9u8; 20])),
+            0,
+            "nonce 0 stays unconsumed — the failed tx is retryable"
+        );
     }
 }

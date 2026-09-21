@@ -1920,6 +1920,11 @@ mod tests {
         node.engine().submit_tx(tx);
         node.engine().run_until_idle();
         assert!(node.engine().finalized_height().is_some(), "a block finalized");
+        // `finalized_height` is consensus-side — execution runs on
+        // the exec lane. `attest_state` blocks until the worker's
+        // watermark reaches height 0, which implies `end_block` (and
+        // its history seal) already ran inside `execute_block`.
+        node.app().attest_state(primitives::Height::new(0)).expect("block 0 executed");
 
         let evm = node.evm_module().expect("evm module registered");
         let sealed = {

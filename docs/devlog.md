@@ -17690,3 +17690,38 @@ rejected there as malformed).
 envelope-sender match for 0..32, and EIP-712 recovery of the
 declared sender through `verify_tx_sender` — the exact check
 `check_envelope_auth` runs under `Reject`.
+
+## Executor: committed-order execution across modules
+
+`group_block_txs` globally grouped a block's txs by module id and
+executed the groups in `BTreeMap` order. That was deterministic but
+NOT faithful to committed order: modules share one balance ledger
+(EVM is also the fee collector), so sorted-module execution could
+reorder a funding transfer past its dependent — and all fees were
+charged during grouping, before ANY module ran.
+
+`plan_block_runs` replaces the grouping: the plan is a `Vec` of
+contiguous same-module *runs* in committed block order — a new run
+starts only when the module id changes, so cross-module semantics
+are exactly sequential. The fee floor stays a stateless planning
+gate; the fee *charge* moved to dispatch time (`charge_run_fees`,
+per run in block order) so it observes every earlier tx's ledger
+effects. A failed charge consumes no nonce — `local_nonce` rewinds
+and the rest of that sender's chain skips `StaleNonce` (the gap is
+unreachable; the failed tx stays retryable).
+
+Batching survives — but only inside a run: contiguous same-module
+txs still take `handle_batch*` including the preverified parallel
+path (speculation is sound there because the planner only batches
+txs the committed order already made adjacent). `dispatch_run`
+carries the preverified/fallback selection.
+
+Known residual, documented in-code: within a single contiguous run
+a tx's fee does not observe earlier same-run effects — closing that
+needs per-tx charge/execute interleaving, which costs batching.
+
+**Tests.** Three ordering regressions on a shared-ledger fixture
+(`FunderModule` + `LedgerFeeCollector`, module ids chosen so sorted
+order inverts block order): funding visible to a later tx's fee
+charge, the reverse order failing, and fee-failure nonce-chain
+rewind. All three fail under the old grouping. Executor suite 99.

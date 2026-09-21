@@ -5516,3 +5516,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     didn't check, but the chain now checks. Every built-in flow now
     signs for real, so the development network behaves like
     production instead of quietly bypassing authentication.
+
+### Fixed — executor cross-module ordering
+
+- `execute_block` now honors committed transaction order across
+  modules: `plan_block_runs` emits contiguous same-module runs in
+  block order instead of globally grouping by module id, and fees
+  are charged at dispatch time so they observe earlier transactions'
+  balance effects. A failed fee charge consumes no nonce and leaves
+  the sender's later transactions unreachable (skipped, retryable)
+  instead of executing them over a nonce gap.
+  - **In plain words:** the chain used to reorder transactions so
+    all of one module's ran before another's — mostly harmless until
+    modules started sharing the same balance ledger, where a
+    funding transfer could land *after* the transaction depending on
+    it. Now transactions execute in exactly the order consensus
+    committed, with batching kept only where the order already made
+    transactions adjacent.
