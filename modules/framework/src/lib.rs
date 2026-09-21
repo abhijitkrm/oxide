@@ -184,6 +184,41 @@ pub enum EndorsementOutcome {
 /// an in-flight decision.
 pub const MAX_PENDING_ACTIONS: usize = 64;
 
+/// The parameter-application seam — a module that accepts
+/// governance-decided parameter changes.
+///
+/// Governance proposals carry an opaque `(param_key, param_val)`
+/// pair; tallying yes/no power is only half the lifecycle — a
+/// PASSED proposal still needs something downstream to enact the
+/// change. Modules that expose governed parameters implement this
+/// trait and register on the governance module under a name
+/// prefix: `param_key = "<name>.<rest>"` routes the application to
+/// the sink registered for `<name>`. A key whose prefix matches no
+/// registered sink is an advisory (text) proposal — the vote is the
+/// outcome and finalization is a no-op.
+///
+/// The sink is invoked from governance's `end_block` once the
+/// proposal's timelock elapses. Implementations must apply the
+/// change atomically — either the parameter moves or an error is
+/// returned and the proposal is recorded as apply-failed (the
+/// decision stands; a failed apply is not retried, because retrying
+/// a stale value under newer state is worse than forcing a fresh
+/// proposal).
+pub trait ParameterSink {
+    /// Apply a governance-approved parameter change.
+    ///
+    /// `key` is the proposal's full parameter key (prefix included);
+    /// `value` is the opaque proposed value. The sink MUST reject
+    /// keys it does not own rather than guessing — governance routes
+    /// by prefix but the sink is the authority on its own keyspace.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::ModuleRejected`] if the key is unknown to the
+    /// sink or the value fails the sink's own validation.
+    fn apply_param(&self, key: &[u8], value: &[u8]) -> Result<(), ExecError>;
+}
+
 /// Tracks committee endorsements for governance-gated actions.
 ///
 /// Each privileged tx names an exact action — encoded bytes such as

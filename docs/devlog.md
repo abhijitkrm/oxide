@@ -18000,3 +18000,48 @@ Two residuals from the funded-liability clearing model are closed:
   Regression: `adl_claw_is_lot_aligned` (a claw pricing to ~2040.8
   closes exactly 2000, both sides stay aligned, the 200-unit
   remainder lands in `unfunded_bad_debt`).
+
+### Governance: the parameter-application lifecycle
+
+The voting core was already sound — what was missing was everything
+after "count the votes": deposits, quorum, veto, timelock, and the
+apply path itself. The module now runs the full machine:
+
+- **Deposit escrow.** `Propose` opens a `DepositPeriod` proposal;
+  `TAG_DEPOSIT` moves funds `depositor → GOVERNANCE_ESCROW` through
+  the wired `Balances` ledger and records each contribution for the
+  refund manifest (128 depositor cap; a repeat depositor merges).
+  Crossing `min_deposit` opens voting — `end_height` starts at the
+  funding block, so a late-funded proposal still gets its full
+  window. Underfunded at `deposit_deadline` → `Expired` and the
+  escrow burns: the bond is anti-spam, not a donation back.
+- **Quorum + veto at decide.** `end_block` decides `Voting`
+  proposals against the committee's live `total_power`: turnout
+  under `quorum_bps` (33.4%) → `FailedQuorum` (burn); `no` at
+  `veto_bps` (33.4%) → `Vetoed` even when `yes > no` (burn);
+  otherwise `yes > no` → `Passed`, `yes ≤ no` → `Rejected` — both
+  refund every depositor to the unit.
+- **Timelock + sink apply.** `Passed` waits `timelock` blocks, then
+  `param_key` routes by its `"<name>."` prefix to a registered
+  `framework::ParameterSink` — `Ok` → `Applied`, `Err` →
+  `ApplyFailed` (terminal; replaying a stale value under newer
+  state is worse than forcing a fresh proposal). An unregistered
+  prefix is an advisory proposal: `Applied` + `proposal_noop`.
+- **Fail closed.** No ledger → deposits impossible → no voting;
+  no committee → no quorum reachable. `min_deposit = 0` is an
+  explicit config, not a silent fallback.
+- **Wire/codec.** Lifecycle status, escrow totals, deadlines, apply
+  heights, and depositor records ride a third tolerant canonical
+  section. Pre-upgrade blobs derive status from the v1 flags — a
+  v1 *passed* proposal decodes `Applied` on purpose: its decision
+  was advisory and must not retroactively enact under rules the
+  vote predated.
+
+`proposal_finalized` events gain a status byte (`[id][passed]
+[status]`) so the log distinguishes rejected/vetoed/quorum-failed.
+Node wires `with_ledger(evm_module)` — an unfundable proposal can
+never reach a vote in production. 12 new tests cover threshold
+crossing, expiry/quorum/veto burns, per-depositor refunds, the
+depositor cap, fail-closed paths, timelock delay, apply/noop/failed
+terminals, and a snapshot round-trip that keeps mid-deposit,
+mid-vote, and mid-timelock proposals settling correctly.

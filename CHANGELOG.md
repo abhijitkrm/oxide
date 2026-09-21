@@ -1100,6 +1100,44 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     network agrees on the next block, the previous one is already
     being executed on a separate thread.
 
+- **Governance parameter changes now run the full proposal
+  lifecycle** (`modules/governance`, `modules/framework`,
+  `crates/node`)
+  - Proposals open in a deposit period: `TAG_DEPOSIT` escrows funds
+    into the module-owned `GOVERNANCE_ESCROW` account, any account
+    can top up (per-depositor records are committed for refunds),
+    and reaching `min_deposit` opens the vote. An underfunded
+    proposal expires at its deposit deadline and its deposits burn.
+  - The tally now decides against real thresholds: turnout under
+    33.4% of committee power fails the proposal (`FailedQuorum`),
+    and `no` votes reaching 33.4% veto it regardless of the
+    majority — both burn the escrowed deposit. Plain rejection and
+    passage refund every depositor to the unit.
+  - A passed proposal waits out a timelock, then its parameter key
+    routes by `"<module>."` prefix to a registered
+    `framework::ParameterSink` that actually enacts the change.
+    A sink rejection is terminal (`ApplyFailed` — never retried);
+    a key with no registered sink is an advisory proposal and
+    closes `Applied` with a `proposal_noop` event.
+  - Everything fails closed: with no balance ledger wired,
+    deposits can't be taken and no proposal can reach a vote; with
+    no committee, quorum is unreachable. The wire gains a third
+    tolerant snapshot section carrying statuses, escrow totals,
+    deadlines, and depositor records — pre-upgrade blobs decode
+    their decided proposals as already-applied advisories rather
+    than retroactively enacting them.
+  - **In plain words:** governance proposals used to be a
+    scoreboard with no game — votes were counted, but nothing
+    decided what happened next. Now a proposal has to be funded to
+    open, needs real turnout to pass, can be vetoed by a blocking
+    minority, waits through a review window, and then actually
+    applies the parameter change it approved — or burns the
+    deposit if it was spam.
+  - Regressions: deposit-threshold opens voting, expiry/quorum/
+    veto burns, per-depositor refunds, depositor merge + cap,
+    fail-closed deposit path, timelock delay, sink apply/noop/
+    failed terminals, lifecycle snapshot round-trip.
+
 ### Fixed
 
 - **The perps backstop could not exit inventory once the book
