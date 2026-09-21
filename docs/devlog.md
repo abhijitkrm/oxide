@@ -16862,3 +16862,75 @@ entry point (1559 + legacy); `validate` and `handle` reject
 valid-RLP + trailing byte as `Malformed` while the canonical bytes
 still execute; canonical encodings still round-trip. 191 lib +
 31 conformance + 17 exploit + 8 integration tests green.
+## Consensus-committed block context: real timestamps, proposer beneficiary, live EIP-1559 (audit 1.6)
+
+The executor never saw the consensus header. `FinalizedBlock`
+carried only `{height, txs, signers}` — so the EVM derived
+`block.timestamp` from height (`h * BLOCK_TIME_SECS`), stamped
+`coinbase` from a module-local default, enforced a
+constructor-fixed block gas limit, and charged a
+constructor-fixed `base_fee` forever. Consensus stamped
+`header.timestamp = 0`. `BaseFeeState` — a complete EIP-1559
+update implementation — existed in `fee.rs` with no live
+consumer. Deadline-based contracts, fee markets, and Ethereum
+compat were all decorative. (The chain-id part of this finding
+landed earlier with the shared-assembly work.)
+
+**`types::BlockContext` is now part of the durable protocol
+model.** `FinalizedBlock` gains
+`{ timestamp_ms, beneficiary, gas_limit }`; the wire encoding
+appends the three fields after `signers` and the decoder treats
+a missing tail as the all-zero sentinel, so old journals replay
+unchanged. Zero means "no consensus value" on every field —
+never a real timestamp, address, or limit — which keeps
+clockless/mock engines and pre-context history valid.
+
+**`Module` gains context-aware hooks** —
+`begin_block_ctx`/`end_block_ctx` default-forward to the
+existing `begin_block`/`end_block`, so every other module and
+test compiles untouched. `execute_block` calls the ctx variants,
+and journal replay feeds the *recorded* context — replay sees
+byte-identical inputs, which is what makes the context
+deterministic rather than a local-clock race.
+
+**oxideBFT stamps real time.** The engine takes an injectable
+`with_clock` (system-clock ms by default; conformance adapters
+inject fixed clocks so the determinism suite still compares
+byte-identical blocks). `vote_if_eligible` rejects a proposal
+whose nonzero timestamp is less than its committed parent's —
+an objective, header-chain-based check, not local wall clock;
+equal timestamps pass. `commit_block` resolves the proposer
+index through `ValidatorSet::validator_addresses()` for the
+beneficiary (zero when unresolvable, e.g. sequencer) and carries
+`block_budget.max_gas` as the block's gas limit.
+
+**The EVM runs live EIP-1559.** `fee_state: Mutex<BaseFeeState>`
+replaces the fixed `base_fee` field; `block_gas_limit` becomes
+atomic because RPC `validate` reads it while the executor writes
+it. `begin_block_ctx` runs the legacy begin first (height, undo
+reset, EIP-2935) then overlays the three context fields.
+`end_block_ctx` seals the block under the fee it *executed* with
+— Ethereum semantics, `block.baseFee` describes the block itself
+— then advances the state from the sealed `gas_used` (the same
+number `eth_getBlock` reports, so fee transitions and observable
+history always agree). Validation, the revm block env, receipts,
+and `latest_base_fee` all read the live state.
+
+**Restart determinism:** `load_from_storage` rehydrates the fee
+by replaying `BaseFeeState::new(last.base_fee, last.gas_limit)
+.update(last.gas_used)` on the newest sealed block — the exact
+transition a crash dropped. Writing that test exposed a latent
+bug: the loader early-returned on an empty *account* range and
+never restored block history, the undo window, or the version
+marker — a backend holding only empty blocks silently lost its
+history. Only the account section is conditional now.
+
+Tests: wire roundtrip + legacy-tail decode (types); injected
+clock on proposals, backwards-timestamp rejection, committed
+context on all four validators (engine); context delivery
+through the executor boundary; zero-context legacy behavior,
+populated-context env fields, fee rise under congestion, fee
+fall under underutilization, rehydrated fee across a storage
+reload (EVM); real `Node::assemble` → oxideBFT → executor →
+sealed-block e2e proving header timestamp/beneficiary/gas limit
+reach EVM history. Workspace suite, fmt, and clippy all green.

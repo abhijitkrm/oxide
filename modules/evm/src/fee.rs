@@ -89,6 +89,17 @@ impl BaseFeeState {
         self.max_gas
     }
 
+    /// Replace the block gas limit the congestion target derives
+    /// from (`target_gas = max_gas / 2`). Called when the
+    /// consensus-enforced block budget changes — e.g. a governance
+    /// parameter update carried in the block context — so the fee
+    /// curve tracks the limit actually enforced, not the
+    /// construction-time one. The base fee itself is untouched:
+    /// the retarget applies to the *next* `update`.
+    pub fn set_max_gas(&mut self, max_gas: u64) {
+        self.max_gas = max_gas;
+    }
+
     /// The target gas per block (half the max, per EIP-1559).
     #[must_use]
     pub fn target_gas(&self) -> u64 {

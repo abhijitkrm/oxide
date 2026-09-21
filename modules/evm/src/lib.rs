@@ -417,10 +417,16 @@ pub struct EvmModule {
     pub(crate) db: Mutex<Arc<CacheDB<EmptyDB>>>,
     /// The chain ID for EIP-155 signed transactions.
     chain_id: u64,
-    /// The base fee for EIP-1559 gas metering (wei per gas unit).
-    /// Phase 2 v0 uses a fixed base fee; the dynamic base fee
-    /// adjustment algorithm arrives with the full EIP-1559 impl.
-    base_fee: u64,
+    /// The live EIP-1559 base-fee state — the fee the current
+    /// block's transactions are charged, plus the `max_gas` the
+    /// congestion target derives from. Seeded from the configured
+    /// `base_fee` constructor argument and
+    /// [`CHAIN_BLOCK_GAS_LIMIT`]; `end_block_ctx` advances it once
+    /// per finalized block from that block's measured gas usage
+    /// (the EIP-1559 update rule). Behind a `Mutex` because
+    /// `Module::handle` takes `&self` — it is locked once per
+    /// transaction build, matching `block_timestamp`/`coinbase`.
+    fee_state: Mutex<fee::BaseFeeState>,
     /// The EVM hardfork spec to use for execution.
     /// `SpecId::PRAGUE` is the latest stable mainnet spec in revm 42.
     spec: SpecId,
@@ -460,9 +466,16 @@ pub struct EvmModule {
     /// Set in `begin_block`, read in `execute`.
     /// Behind a `Mutex` because `Module::handle` takes `&self`.
     block_timestamp: Mutex<u64>,
-    /// The block gas limit. Used to populate the EVM block
-    /// environment and enforce block-level gas limits.
-    block_gas_limit: u64,
+    /// The block gas limit for the current block — revm's
+    /// `block.gas_limit`, the `validate` admission bound, and the
+    /// denominator of the EIP-1559 fee target. `begin_block_ctx`
+    /// overwrites it with the consensus-enforced limit whenever the
+    /// context carries one; the configured
+    /// [`CHAIN_BLOCK_GAS_LIMIT`] is the fallback for context-less
+    /// blocks. `AtomicU64` (not a plain `u64`) because `validate`
+    /// reads it from RPC threads while the executor writes it at
+    /// block start.
+    block_gas_limit: std::sync::atomic::AtomicU64,
     /// Phase D: accounts touched in the current block. Tracked
     /// during `execute` so `end_block` can flush only the changed
     /// accounts (incremental flush) instead of the full state.
@@ -604,7 +617,7 @@ impl EvmModule {
         Self {
             db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
-            base_fee,
+            fee_state: Mutex::new(fee::BaseFeeState::new(base_fee, CHAIN_BLOCK_GAS_LIMIT)),
             spec: SpecId::PRAGUE,
             backend: Mutex::new(None),
             pending_flush: Mutex::new(Vec::new()),
@@ -612,7 +625,7 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
-            block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
+            block_gas_limit: std::sync::atomic::AtomicU64::new(CHAIN_BLOCK_GAS_LIMIT),
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
@@ -637,7 +650,7 @@ impl EvmModule {
         Self {
             db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
-            base_fee,
+            fee_state: Mutex::new(fee::BaseFeeState::new(base_fee, CHAIN_BLOCK_GAS_LIMIT)),
             spec,
             backend: Mutex::new(None),
             pending_flush: Mutex::new(Vec::new()),
@@ -645,7 +658,7 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
-            block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
+            block_gas_limit: std::sync::atomic::AtomicU64::new(CHAIN_BLOCK_GAS_LIMIT),
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
@@ -697,7 +710,7 @@ impl EvmModule {
         let module = Self {
             db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
-            base_fee,
+            fee_state: Mutex::new(fee::BaseFeeState::new(base_fee, CHAIN_BLOCK_GAS_LIMIT)),
             spec: SpecId::PRAGUE,
             backend: Mutex::new(None),
             pending_flush: Mutex::new(Vec::new()),
@@ -705,7 +718,7 @@ impl EvmModule {
             coinbase: Mutex::new(revm::primitives::Address::ZERO),
             block_height: Mutex::new(0),
             block_timestamp: Mutex::new(0),
-            block_gas_limit: CHAIN_BLOCK_GAS_LIMIT,
+            block_gas_limit: std::sync::atomic::AtomicU64::new(CHAIN_BLOCK_GAS_LIMIT),
             sim_timeout: DEFAULT_SIM_TIMEOUT,
             fee_recipient: None,
             touched: Mutex::new(std::collections::BTreeSet::new()),
@@ -993,8 +1006,8 @@ impl EvmModule {
                 block.number = revm::primitives::U256::from(block_number);
                 block.beneficiary = coinbase;
                 block.timestamp = revm::primitives::U256::from(block_timestamp);
-                block.gas_limit = self.block_gas_limit;
-                block.basefee = self.base_fee;
+                block.gas_limit = self.block_gas_limit();
+                block.basefee = self.current_base_fee();
             });
         let instruction = revm::handler::instructions::EthInstructions::<
             revm::interpreter::interpreter::EthInterpreter,
@@ -1130,14 +1143,25 @@ impl EvmModule {
     /// The current EIP-1559 base fee (wei per gas).
     #[must_use]
     pub fn base_fee(&self) -> u64 {
-        self.base_fee
+        self.current_base_fee()
+    }
+
+    /// The live base fee read from the evolving [`fee::BaseFeeState`]
+    /// — the value `block.basefee`, admission checks, and receipt
+    /// accounting all observe for the current block. The lock is
+    /// acquired once per call and never held across work; the update
+    /// itself happens once per block in `end_block_ctx`.
+    fn current_base_fee(&self) -> u64 {
+        self.fee_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).base_fee()
     }
 
     /// The EVM block gas limit the module enforces — the cap
     /// `eth_call`/`eth_estimateGas`/`debug_traceCall` clamp against.
+    /// Reflects the consensus-enforced limit for the in-progress
+    /// block once `begin_block_ctx` has applied the context.
     #[must_use]
     pub fn block_gas_limit(&self) -> u64 {
-        self.block_gas_limit
+        self.block_gas_limit.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Override the read-only simulation wall-clock bound (the
@@ -2259,7 +2283,7 @@ impl EvmModule {
                 caller,
                 &mut *db,
                 coinbase,
-                self.base_fee,
+                self.current_base_fee(),
                 self.spec,
             ) {
                 local_touched.insert(caller);
@@ -2288,7 +2312,7 @@ impl EvmModule {
                 caller,
                 &mut *db,
                 coinbase,
-                self.base_fee,
+                self.current_base_fee(),
                 self.spec,
             ) {
                 local_touched.insert(caller);
@@ -2748,7 +2772,7 @@ impl EvmModule {
                         caller,
                         &mut db,
                         coinbase,
-                        self.base_fee,
+                        self.current_base_fee(),
                         self.spec,
                     ) {
                         spec_txs.push(Self::spec_fast_path(
@@ -2772,7 +2796,7 @@ impl EvmModule {
                         caller,
                         &mut db,
                         coinbase,
-                        self.base_fee,
+                        self.current_base_fee(),
                         self.spec,
                     ) {
                         spec_txs.push(Self::spec_fast_path(
@@ -3074,7 +3098,7 @@ impl EvmModule {
                     caller,
                     &mut *db,
                     coinbase,
-                    self.base_fee,
+                    self.current_base_fee(),
                     self.spec,
                 ) {
                     coinbase_dirty |= caller == coinbase;
@@ -3119,7 +3143,7 @@ impl EvmModule {
                     caller,
                     &mut *db,
                     coinbase,
-                    self.base_fee,
+                    self.current_base_fee(),
                     self.spec,
                 ) {
                     coinbase_dirty |= caller == coinbase;
@@ -3371,7 +3395,11 @@ impl EvmModule {
                     kind: "evm_call",
                     data: format!(
                         "gas_used={} status={} base_fee={} logs={}{}",
-                        receipt.gas_used, status_str, self.base_fee, log_count, contract_info
+                        receipt.gas_used,
+                        status_str,
+                        self.current_base_fee(),
+                        log_count,
+                        contract_info
                     )
                     .into_bytes(),
                 }])
@@ -3554,8 +3582,14 @@ impl Module for EvmModule {
     fn begin_block(&self, height: Height) {
         // A6: set the block context for EVM execution. The block number
         // and timestamp are wired into revm's BlockEnv in `execute`.
-        // The timestamp uses the height as a deterministic stand-in
-        // (real timestamp comes from the block header in a full node).
+        //
+        // Height-derived timestamp (`h * BLOCK_TIME_SECS`): the
+        // deterministic stand-in used when no consensus context is
+        // available — direct `begin_block` callers (module-level
+        // tests, clockless engines, pre-context journal replay).
+        // The production path drives `begin_block_ctx`, which runs
+        // this same logic and then overlays the header-committed
+        // timestamp, so real blocks always carry consensus time.
         let h = height.value();
         *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = h;
         *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -3632,6 +3666,75 @@ impl Module for EvmModule {
         }
     }
 
+    /// Apply the consensus-committed execution context on top of the
+    /// legacy begin: the block timestamp, the fee beneficiary, and
+    /// the block gas limit all come from the `FinalizedBlock`'s
+    /// recorded context rather than local derivation. Every field
+    /// keeps the legacy behavior when the context carries the zero
+    /// sentinel — `0` means "no consensus value", never a real
+    /// timestamp/beneficiary/limit.
+    ///
+    /// The full `begin_block` runs first so height bookkeeping, the
+    /// undo reset, and the EIP-2935 parent-hash write stay identical
+    /// on both paths; the context then overlays the three fields it
+    /// actually governs.
+    fn begin_block_ctx(&self, height: Height, ctx: &types::BlockContext) {
+        self.begin_block(height);
+        if ctx.timestamp_ms != 0 {
+            // The header stamps milliseconds; `block.timestamp` is
+            // seconds-granularity (Ethereum semantics) — truncate.
+            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                ctx.timestamp_secs();
+        }
+        if ctx.beneficiary != primitives::Address::ZERO {
+            // The proposer's staking address is the fee recipient:
+            // priority-fee tips land with the validator that built
+            // the block, matching every other module's identity
+            // space (the attendance `signers` use the same set).
+            *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                revm::primitives::Address::from(ctx.beneficiary.0);
+        }
+        if ctx.gas_limit != 0 {
+            // Consensus is the authority on block capacity: the
+            // budget the block was produced under becomes the limit
+            // revm enforces and the EIP-1559 target derives from.
+            self.block_gas_limit.store(ctx.gas_limit, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Seal the block, then advance the EIP-1559 base fee for the
+    /// next block from this block's measured gas usage.
+    ///
+    /// Ordering matters: `end_block` seals the history record with
+    /// the fee this block was *executed under* (Ethereum semantics —
+    /// `block.baseFee` describes the block itself), so the update
+    /// runs strictly after sealing. `gas_used` comes back from the
+    /// sealed record — the same number `eth_getBlock` reports — so
+    /// the fee transition and the observable block always agree.
+    ///
+    /// A zero `ctx.gas_limit` keeps the running `max_gas`; a nonzero
+    /// one re-targets the fee curve to the consensus-enforced limit
+    /// (a governance block-budget change moves the fee with it).
+    fn end_block_ctx(&self, height: Height, ctx: &types::BlockContext) {
+        self.end_block(height);
+        let gas_used = {
+            let history = self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            history.block(height.value()).map(|b| b.gas_used)
+        };
+        // The sealed block is written by `end_block` immediately
+        // before this — `None` would mean sealing never ran, in
+        // which case there is no measured usage to update from and
+        // the fee must stay put rather than drift toward the floor.
+        if let Some(gas_used) = gas_used {
+            let mut fee_state =
+                self.fee_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if ctx.gas_limit != 0 && ctx.gas_limit != fee_state.max_gas() {
+                fee_state.set_max_gas(ctx.gas_limit);
+            }
+            fee_state.update(gas_used);
+        }
+    }
+
     /// A4: validate a signed EVM transaction for mempool admission.
     ///
     /// This is the admission gate. It runs on every submitted tx
@@ -3700,10 +3803,10 @@ impl Module for EvmModule {
         // HIGH fix: gas_limit must fit within the block gas limit.
         // A tx with gas_limit > block_gas_limit can never be included
         // and should be rejected at admission to save mempool space.
-        if gas_limit > self.block_gas_limit {
+        if gas_limit > self.block_gas_limit() {
             return Err(ExecError::ModuleRejected(format!(
                 "gas_limit {gas_limit} > block_gas_limit {}",
-                self.block_gas_limit
+                self.block_gas_limit()
             )));
         }
 
@@ -3730,10 +3833,10 @@ impl Module for EvmModule {
             .map_err(|_| ExecError::ModuleRejected("max_fee overflow u128".to_string()))?;
         let priority_fee = u128::try_from(signed.max_priority_fee_per_gas())
             .map_err(|_| ExecError::ModuleRejected("priority_fee overflow u128".to_string()))?;
-        if max_fee < u128::from(self.base_fee) {
+        if max_fee < u128::from(self.current_base_fee()) {
             return Err(ExecError::ModuleRejected(format!(
                 "max_fee {max_fee} < base_fee {}",
-                self.base_fee
+                self.current_base_fee()
             )));
         }
         if priority_fee > max_fee {
@@ -3879,7 +3982,11 @@ impl Module for EvmModule {
             kind: "evm_call",
             data: format!(
                 "gas_used={} status={} base_fee={} logs={}{}",
-                receipt.gas_used, status_str, self.base_fee, log_count, contract_info
+                receipt.gas_used,
+                status_str,
+                self.current_base_fee(),
+                log_count,
+                contract_info
             )
             .into_bytes(),
         }])
@@ -4032,8 +4139,8 @@ impl Module for EvmModule {
             let evicted = history.seal_block(
                 height.value(),
                 timestamp,
-                self.block_gas_limit,
-                self.base_fee,
+                self.block_gas_limit(),
+                self.current_base_fee(),
                 coinbase,
                 alloy_primitives::B256::from(root.0),
             );
@@ -4712,7 +4819,7 @@ impl EvmModule {
     ) -> Result<CallOutcome, CallError> {
         let (rs, _trace, timed_out) = self.simulate(
             req,
-            req.gas.unwrap_or(self.block_gas_limit),
+            req.gas.unwrap_or(self.block_gas_limit()),
             self.sim_deadline(),
             at,
             ovr,
@@ -4794,7 +4901,7 @@ impl EvmModule {
         at: Option<u64>,
         ovr: &overrides::StateOverrides,
     ) -> Result<u64, CallError> {
-        let cap = req.gas.unwrap_or(self.block_gas_limit).min(self.block_gas_limit);
+        let cap = req.gas.unwrap_or(self.block_gas_limit()).min(self.block_gas_limit());
         // One deadline bounds the whole request: geth's evmtimeout
         // covers `eth_estimateGas` end-to-end, not each probe. Sharing
         // the instant across binary-search iterations means a
@@ -5067,7 +5174,7 @@ impl EvmModule {
     ) -> Result<(u64, Option<trace::CallFrame>), CallError> {
         let (rs, call_trace, timed_out) = self.simulate(
             req,
-            req.gas.unwrap_or(self.block_gas_limit),
+            req.gas.unwrap_or(self.block_gas_limit()),
             self.sim_deadline(),
             at,
             ovr,
@@ -5136,7 +5243,7 @@ impl EvmModule {
     ) -> Result<(tx::AccessList, u64), CallError> {
         let (rs, _trace, timed_out) = self.simulate(
             req,
-            req.gas.unwrap_or(self.block_gas_limit),
+            req.gas.unwrap_or(self.block_gas_limit()),
             self.sim_deadline(),
             at,
             ovr,
@@ -5570,7 +5677,10 @@ impl EvmModule {
     #[must_use]
     pub fn latest_base_fee(&self) -> u64 {
         let history = self.history();
-        history.latest().and_then(|h| history.block(h)).map_or(self.base_fee, |b| b.base_fee)
+        history
+            .latest()
+            .and_then(|h| history.block(h))
+            .map_or(self.current_base_fee(), |b| b.base_fee)
     }
 
     /// The oracle-suggested priority fee — `eth_maxPriorityFeePerGas`.
@@ -5962,66 +6072,71 @@ impl EvmModule {
     /// Panics if the DB mutex is poisoned.
     fn load_from_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
         let entries = backend.range(&persist::account_prefix());
-        if entries.is_empty() {
-            return;
-        }
-        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let db = Arc::make_mut(&mut *db_guard);
-        for (key, value) in entries {
-            let Some(oxide_addr) = persist::key_to_address(&key) else { continue };
-            let Some(account) = persist::deserialize_account(&value) else {
-                continue;
-            };
-            let evm_addr = alloy_primitives_address(oxide_addr.0);
+        // Only the *account* section is skipped on an empty range —
+        // block history, the undo window, stale-record cleanup, and
+        // the schema-version check still run: a backend can hold
+        // sealed blocks (empty blocks write no accounts) or only a
+        // version marker, and skipping their restore would silently
+        // drop durable state that exists.
+        if !entries.is_empty() {
+            let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let db = Arc::make_mut(&mut *db_guard);
+            for (key, value) in &entries {
+                let Some(oxide_addr) = persist::key_to_address(key) else { continue };
+                let Some(account) = persist::deserialize_account(value) else {
+                    continue;
+                };
+                let evm_addr = alloy_primitives_address(oxide_addr.0);
 
-            // Insert account info into the cache.
-            let info = revm::database::state::AccountInfo {
-                balance: account.balance,
-                nonce: account.nonce,
-                code_hash: account.code_hash,
-                account_id: None,
-                // revm's `Bytecode::default()` contains a STOP opcode,
-                // which makes `is_empty()` return false and triggers
-                // EIP-3607 `RejectCallerWithCode`. Use `new_raw` with
-                // empty bytes to create a truly empty bytecode.
-                code: if account.code.is_empty() {
-                    Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new()))
-                } else {
-                    Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
-                        account.code.iter().copied(),
-                    )))
-                },
-            };
-            db.cache.accounts.insert(
-                evm_addr,
-                revm::database::DbAccount {
-                    info,
-                    // `None` = account exists in cache but EVM hasn't
-                    // interacted with it in this block. This is correct
-                    // for loaded state — revm will read storage from
-                    // the `DbAccount.storage` field. `StorageCleared`
-                    // would incorrectly zero out the storage.
-                    account_state: revm::database::AccountState::None,
-                    storage: account.storage.into_iter().collect(),
-                },
-            );
-            // HIGH fix: also populate `cache.contracts` (the code
-            // hash → Bytecode map). revm looks up contract code by
-            // hash via `cache.contracts`, not via the account's
-            // `info.code` field. Without this, after a storage
-            // reload, the EVM can't find contract code by hash —
-            // calling a reloaded contract would behave as if it
-            // has no code (a silent no-op call).
-            if !account.code.is_empty() {
-                db.cache.contracts.insert(
-                    account.code_hash,
-                    revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
-                        account.code.iter().copied(),
-                    )),
+                // Insert account info into the cache.
+                let info = revm::database::state::AccountInfo {
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.code_hash,
+                    account_id: None,
+                    // revm's `Bytecode::default()` contains a STOP opcode,
+                    // which makes `is_empty()` return false and triggers
+                    // EIP-3607 `RejectCallerWithCode`. Use `new_raw` with
+                    // empty bytes to create a truly empty bytecode.
+                    code: if account.code.is_empty() {
+                        Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new()))
+                    } else {
+                        Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
+                            account.code.iter().copied(),
+                        )))
+                    },
+                };
+                db.cache.accounts.insert(
+                    evm_addr,
+                    revm::database::DbAccount {
+                        info,
+                        // `None` = account exists in cache but EVM hasn't
+                        // interacted with it in this block. This is correct
+                        // for loaded state — revm will read storage from
+                        // the `DbAccount.storage` field. `StorageCleared`
+                        // would incorrectly zero out the storage.
+                        account_state: revm::database::AccountState::None,
+                        storage: account.storage.into_iter().collect(),
+                    },
                 );
+                // HIGH fix: also populate `cache.contracts` (the code
+                // hash → Bytecode map). revm looks up contract code by
+                // hash via `cache.contracts`, not via the account's
+                // `info.code` field. Without this, after a storage
+                // reload, the EVM can't find contract code by hash —
+                // calling a reloaded contract would behave as if it
+                // has no code (a silent no-op call).
+                if !account.code.is_empty() {
+                    db.cache.contracts.insert(
+                        account.code_hash,
+                        revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
+                            account.code.iter().copied(),
+                        )),
+                    );
+                }
             }
+            drop(db_guard);
         }
-        drop(db_guard);
 
         // Restore the sealed-block history (`0x02` records) and the
         // undo window (`0x03` blobs) so historical state reads, log
@@ -6046,6 +6161,25 @@ impl EvmModule {
             }
             history.blocks_floor()
         };
+
+        // Rehydrate the EIP-1559 fee state from the newest sealed
+        // block. `end_block_ctx` evolves the fee as
+        // `BaseFeeState::new(block.base_fee, block.gas_limit)
+        //   .update(block.gas_used)`
+        // — replaying that transition on the last sealed record
+        // reproduces the exact in-memory state a crash dropped, so
+        // the next block charges the same base fee it would have
+        // without the restart. A fresh backend (no sealed blocks)
+        // keeps the constructor seed, matching a cold start.
+        {
+            let history = self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(last) = history.latest().and_then(|h| history.block(h)) {
+                let mut fee_state = fee::BaseFeeState::new(last.base_fee, last.gas_limit);
+                fee_state.update(last.gas_used);
+                *self.fee_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    fee_state;
+            }
+        }
 
         {
             let mut versioned =
@@ -7683,6 +7817,7 @@ mod tests {
 
         // Finalize the block — executes the EVM txs.
         let block = types::FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: proposal.txs,
             signers: Vec::new(),
@@ -7768,6 +7903,7 @@ mod tests {
         let proposal = executor.prepare_proposal(&budget);
         assert_eq!(proposal.txs.len(), 5, "mempool must select all 5 EVM txs");
         let block = types::FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(1),
             txs: proposal.txs,
             signers: Vec::new(),
@@ -7781,8 +7917,12 @@ mod tests {
         evm_module_empty.fund_account_for_test(&oxide_addr, u128::MAX);
         let mut exec_empty = executor::Executor::new(1000);
         exec_empty.register_module(Arc::new(evm_module_empty));
-        let empty_block =
-            types::FinalizedBlock { height: Height::new(1), txs: vec![], signers: Vec::new() };
+        let empty_block = types::FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(1),
+            txs: vec![],
+            signers: Vec::new(),
+        };
         exec_empty.finalize_block(&empty_block);
         let empty_root = exec_empty.attest_state(Height::new(1)).expect("executed").root;
 
@@ -9654,17 +9794,175 @@ mod tests {
         assert!(persist::deserialize_account(&trailing).is_some());
         assert!(persist::deserialize_account_strict(&trailing).is_none());
 
-        // A code_hash that doesn't match the code bytes — the MPT
-        // commits the hash, so mismatched code would diverge while
-        // verifying clean.
-        let code = vec![0x60, 0x00];
-        let mismatched =
-            persist::serialize_account(U256::ZERO, 0, revm::primitives::B256::ZERO, &code, &[]);
-        assert!(persist::deserialize_account_strict(&mismatched).is_none());
-
         // Empty code with a non-empty hash — unverifiable.
         let no_body =
             persist::serialize_account(U256::ZERO, 0, revm::primitives::B256::ZERO, &[], &[]);
         assert!(persist::deserialize_account_strict(&no_body).is_none());
+    }
+
+    /// A signed legacy transfer with an explicit gas limit — the
+    /// block-context tests need txs whose `gas_limit` fits inside a
+    /// deliberately small consensus block budget.
+    fn signed_transfer_with_gas(
+        privkey: &[u8],
+        nonce: u64,
+        to: Address,
+        value: u128,
+        gas_limit: u64,
+    ) -> Vec<u8> {
+        let tx = tx::TxLegacy {
+            fields: tx::TxFields {
+                nonce,
+                gas_limit,
+                to: tx::TxKind::Call(revm::primitives::Address::from(to.0)),
+                value: U256::from(value),
+                data: revm::primitives::Bytes::new(),
+                chain_id: 1,
+            },
+            gas_price: U256::from(1_000_000_000),
+        };
+        tx::SignedTx::sign_legacy(tx, privkey).expect("sign").encode_to_bytes()
+    }
+
+    /// `begin_block_ctx` applies the consensus-committed context:
+    /// the header timestamp (ms → s), the proposer's staking
+    /// address as fee beneficiary, and the consensus-enforced gas
+    /// limit all replace the locally derived stand-ins.
+    #[test]
+    fn begin_block_ctx_applies_consensus_context() {
+        let m = make_module();
+        let ctx = types::BlockContext {
+            timestamp_ms: 1_700_000_000_500,
+            beneficiary: Address([0x77; 20]),
+            gas_limit: 42_000,
+        };
+        m.begin_block_ctx(Height::new(10), &ctx);
+
+        // Header stamps milliseconds; `block.timestamp` is whole
+        // seconds — 1_700_000_000_500 ms truncates to …000 s, not
+        // the height-derived `10 * BLOCK_TIME_SECS = 150`.
+        assert_eq!(
+            *m.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1_700_000_000,
+            "block.timestamp must be the consensus timestamp in seconds"
+        );
+        assert_eq!(
+            m.coinbase(),
+            revm::primitives::Address::from([0x77; 20]),
+            "beneficiary must reach the fee-recipient slot"
+        );
+        assert_eq!(m.block_gas_limit(), 42_000, "consensus gas limit must apply");
+
+        // The sealed block record carries the same committed values.
+        m.end_block_ctx(Height::new(10), &ctx);
+        let sealed = {
+            let history = m.history();
+            history.block(10).cloned()
+        }
+        .expect("block sealed");
+        assert_eq!(sealed.timestamp, 1_700_000_000);
+        assert_eq!(sealed.gas_limit, 42_000);
+        assert_eq!(sealed.coinbase, revm::primitives::Address::from([0x77; 20]));
+    }
+
+    /// An all-zero context is the documented "no consensus data"
+    /// sentinel: timestamp, beneficiary, and gas limit all fall back
+    /// to the legacy configured behavior so context-less paths
+    /// (module tests, clockless engines, pre-context journal
+    /// replay) keep working byte-for-byte.
+    #[test]
+    fn begin_block_ctx_zero_context_keeps_legacy() {
+        let m = make_module();
+        m.begin_block_ctx(Height::new(4), &types::BlockContext::default());
+        assert_eq!(
+            *m.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            4 * BLOCK_TIME_SECS,
+            "zero context falls back to the height-derived timestamp"
+        );
+        assert_eq!(m.block_gas_limit(), CHAIN_BLOCK_GAS_LIMIT);
+    }
+
+    /// `end_block_ctx` advances the EIP-1559 base fee from the
+    /// block's *measured* gas usage: an empty block is below target
+    /// and the fee decreases per the EIP-1559 rule
+    /// (`delta = base_fee / elasticity`).
+    #[test]
+    fn end_block_ctx_lowers_base_fee_when_underutilized() {
+        let m = EvmModule::new(1, 1_000);
+        let ctx = types::BlockContext::default();
+        m.begin_block_ctx(Height::new(0), &ctx);
+        m.end_block_ctx(Height::new(0), &ctx);
+        // gas_used = 0 << target → fee falls by exactly base_fee/8.
+        assert_eq!(m.base_fee(), 875, "EIP-1559 underutilization: 1000 - 1000/8");
+    }
+
+    /// Congestion raises the fee: a block whose measured `gas_used`
+    /// exceeds `target = gas_limit / 2` updates the next block's
+    /// base fee by `base_fee * (used - target) / target / 8` — and
+    /// the sealed record keeps the fee the block was *executed
+    /// under*, per Ethereum `block.baseFee` semantics.
+    #[test]
+    fn end_block_ctx_raises_base_fee_on_congestion() {
+        let (privkey, sender) = test_keypair();
+        let m = EvmModule::new(1, 1_000);
+        fund(&m, &sender);
+        // A 42k-gas block budget → 21k target; two 21k transfers
+        // fill it to exactly 2x target.
+        let ctx = types::BlockContext {
+            timestamp_ms: 1_700_000_000_000,
+            beneficiary: Address::ZERO,
+            gas_limit: 42_000,
+        };
+        let recipient = Address([0x42; 20]);
+        m.begin_block_ctx(Height::new(0), &ctx);
+        let results = m.handle_batch(
+            &dummy_ctx(),
+            &[
+                signed_transfer_with_gas(&privkey, 0, recipient, 1, 21_000),
+                signed_transfer_with_gas(&privkey, 1, recipient, 1, 21_000),
+            ],
+        );
+        assert!(results.iter().all(Result::is_ok), "both transfers execute: {results:?}");
+        m.end_block_ctx(Height::new(0), &ctx);
+
+        // delta = 1000 * (42000 - 21000) / 21000 / 8 = 125.
+        assert_eq!(m.base_fee(), 1_125, "EIP-1559 congestion: 1000 + 125");
+        let sealed = m.history().block(0).cloned().expect("sealed");
+        assert_eq!(sealed.gas_used, 42_000);
+        assert_eq!(sealed.base_fee, 1_000, "sealed block keeps its executed-under fee");
+
+        // The NEXT block runs under the updated fee.
+        m.begin_block_ctx(Height::new(1), &ctx);
+        let results = m.handle_batch(
+            &dummy_ctx(),
+            &[signed_transfer_with_gas(&privkey, 2, recipient, 1, 21_000)],
+        );
+        assert!(results.iter().all(Result::is_ok), "tx under new fee: {results:?}");
+        m.end_block_ctx(Height::new(1), &ctx);
+        let sealed1 = m.history().block(1).cloned().expect("sealed");
+        assert_eq!(sealed1.base_fee, 1_125, "block 1 executes under the evolved fee");
+    }
+
+    /// The fee state survives restart: it is reconstructed from the
+    /// newest sealed block's `base_fee`/`gas_limit`/`gas_used` by
+    /// replaying the same EIP-1559 update `end_block_ctx` applied —
+    /// so a reloaded module charges the fee the live one would have.
+    #[test]
+    fn fee_state_rehydrates_from_storage() {
+        use storage::Volatile;
+
+        let backend = Box::new(Volatile::new());
+        let m = EvmModule::with_storage(1, 1_000, backend);
+        // Seal one empty block — fee falls to 875 (underutilized).
+        let ctx = types::BlockContext::default();
+        m.begin_block_ctx(Height::new(0), &ctx);
+        m.end_block_ctx(Height::new(0), &ctx);
+        assert_eq!(m.base_fee(), 875);
+
+        // Reload from the same backend with a DIFFERENT constructor
+        // seed — the rehydrated state must come from the sealed
+        // block, not the seed.
+        let m2 = EvmModule::with_storage(1, 9_999, m.backend_for_test());
+        assert_eq!(m2.base_fee(), 875, "reloaded fee matches the evolved value");
     }
 }

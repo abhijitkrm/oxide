@@ -1815,4 +1815,45 @@ mod tests {
         // The devnet default funds and registers `[0u8;20]`.
         assert!(assembled.evm_module.balance(&primitives::Address([0u8; 20])) > 0);
     }
+
+    /// End-to-end: a real oxideBFT commit drives the executor, which
+    /// delivers the consensus execution context to the EVM — the
+    /// sealed block's timestamp is the proposer's wall-clock stamp
+    /// (seconds), not the height-derived stand-in.
+    #[test]
+    fn committed_block_timestamp_reaches_evm_history() {
+        let config = NodeConfig { consensus: ConsensusConfig::OxideBft, ..Default::default() };
+        let mut node = Node::assemble(&config);
+
+        // A staking delegate tx — the same payload the smoke test
+        // uses, from the genesis-funded `[0u8;20]` validator.
+        let validator = Address([0u8; 20]);
+        let module_payload = staking::msg::delegate(validator, 100);
+        let tx = build_tx(framework::module_id::STAKING, &module_payload);
+        node.engine().submit_tx(tx);
+        node.engine().run_until_idle();
+        assert!(node.engine().finalized_height().is_some(), "a block finalized");
+
+        let evm = node.evm_module().expect("evm module registered");
+        let sealed = {
+            let history = evm.history();
+            history.block(0).cloned()
+        }
+        .expect("block 0 sealed in history");
+        // Height-derived would be `0 * 15 = 0`; a real epoch stamp is
+        // post-2001 — assert the value came from a wall clock, not
+        // the stand-in formula.
+        assert!(
+            sealed.timestamp > 1_000_000_000,
+            "sealed timestamp {} must be a real epoch value",
+            sealed.timestamp
+        );
+        // The gas limit is the consensus-enforced budget, and the
+        // beneficiary is the single validator's staking address —
+        // derived from its BLS key the same way `ValidatorSet` does.
+        assert_eq!(sealed.gas_limit, config.block_budget.max_gas);
+        let key = crypto::BlsSecretKey::from_ikm(&[1u8; 32]).expect("BLS key");
+        let expected_beneficiary = crypto::bls::validator_address(&key.public_key());
+        assert_eq!(sealed.coinbase.0, expected_beneficiary.0);
+    }
 }

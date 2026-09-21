@@ -108,8 +108,12 @@ fn standalone_evm_only_50_blocks() {
         let budget = BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
         assert!(!proposal.txs.is_empty(), "block {block} proposal must contain the tx");
-        let finalized =
-            FinalizedBlock { height: Height::new(block), txs: proposal.txs, signers: Vec::new() };
+        let finalized = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(block),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&finalized);
 
         let attestation = executor.attest_state(Height::new(block)).expect("executed");

@@ -524,6 +524,31 @@ pub trait Module: Send + Sync {
     /// Called at the beginning of each block, before any txs.
     fn begin_block(&self, height: Height);
 
+    /// Called at the beginning of each block with the canonical
+    /// consensus-derived [`BlockContext`] — the timestamp, fee
+    /// beneficiary, and block gas limit the engine committed in the
+    /// block header and carried onto the [`FinalizedBlock`].
+    ///
+    /// The default implementation discards the context and forwards
+    /// to [`begin_block`](Self::begin_block), preserving the
+    /// height-only contract for modules that consume no consensus
+    /// context (and for every legacy call site). Modules that need
+    /// the real timestamp, proposer beneficiary, or
+    /// consensus-enforced gas limit override this method — the
+    /// production path (`Executor::execute_block`) always drives
+    /// `begin_block_ctx`, so an overriding module observes the
+    /// committed values on every finalized block, including journal
+    /// replay (the context is encoded on the block).
+    ///
+    /// An all-zero context field is the documented "no data"
+    /// sentinel (clockless engines, hand-built blocks, pre-context
+    /// journals): treat it as "keep configured defaults", never as
+    /// a real value.
+    fn begin_block_ctx(&self, height: Height, ctx: &types::BlockContext) {
+        let _ = ctx;
+        self.begin_block(height);
+    }
+
     /// Validate a message for mempool admission. This is the
     /// admission gate: it runs *before* `handle`, on every tx
     /// submitted to the mempool. It must be:
@@ -680,6 +705,18 @@ pub trait Module: Send + Sync {
 
     /// Called at the end of each block, after all txs.
     fn end_block(&self, height: Height);
+
+    /// Called at the end of each block with the same canonical
+    /// [`BlockContext`] `begin_block_ctx` received. The default
+    /// forwards to [`end_block`](Self::end_block); modules that seal
+    /// block metadata (timestamp, beneficiary, gas limit) or evolve
+    /// per-block state from consensus-provided values override this.
+    /// Same sentinel rule as `begin_block_ctx`: zero fields mean
+    /// "no data", not real values.
+    fn end_block_ctx(&self, height: Height, ctx: &types::BlockContext) {
+        let _ = ctx;
+        self.end_block(height);
+    }
 
     /// Called once per finalized block with the staking addresses of
     /// the validators whose votes formed the committing QC — the
@@ -2439,9 +2476,11 @@ impl Executor {
             executed.clone()
         };
 
-        // begin_block for all modules.
+        // begin_block for all modules — via `begin_block_ctx` so the
+        // consensus-committed execution context (timestamp,
+        // beneficiary, gas limit) reaches modules that consume it.
         for module in self.modules.iter().flatten() {
-            module.begin_block(block.height);
+            module.begin_block_ctx(block.height, &block.context);
         }
 
         // Move the preverify cache out before the grouping loop —
@@ -2519,9 +2558,9 @@ impl Executor {
         // Publish all events from this block in one lock acquisition.
         self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(block_events);
 
-        // end_block for all modules.
+        // end_block for all modules — same context as begin_block.
         for module in self.modules.iter().flatten() {
-            module.end_block(block.height);
+            module.end_block_ctx(block.height, &block.context);
         }
 
         // Attendance delivery, inside execute_block so journal
@@ -3315,8 +3354,12 @@ mod tests {
         assert_eq!(proposal.txs.len(), 1);
 
         // Finalize the block.
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         let ack = executor.finalize_block(&block);
         assert_eq!(ack.height, Height::new(0));
 
@@ -3338,8 +3381,12 @@ mod tests {
         executor.ingest_tx(make_tx(1, &[42]));
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
         let block_root = executor.state_root_at(0);
         let snapshot = executor.export_snapshot();
@@ -3385,8 +3432,12 @@ mod tests {
 
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
 
         // The unknown module's tx should be silently skipped.
@@ -3411,8 +3462,12 @@ mod tests {
             executor.ingest_tx(tx);
             let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
             let proposal = executor.prepare_proposal(&budget);
-            let block =
-                FinalizedBlock { height: Height::new(h), txs: proposal.txs, signers: Vec::new() };
+            let block = FinalizedBlock {
+                context: types::BlockContext::default(),
+                height: Height::new(h),
+                txs: proposal.txs,
+                signers: Vec::new(),
+            };
             executor.finalize_block(&block);
         }
 
@@ -3495,6 +3550,7 @@ mod tests {
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: proposal.txs,
             signers: Vec::new(),
@@ -3533,6 +3589,7 @@ mod tests {
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: proposal.txs,
             signers: Vec::new(),
@@ -3687,8 +3744,12 @@ mod tests {
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
         assert_eq!(proposal.txs.len(), 1, "the ingested tx should be in the proposal");
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
 
         // The preverified path should have been taken (cache hit),
@@ -3745,6 +3806,64 @@ mod tests {
         }
     }
 
+    /// Records every `(height, BlockContext)` the executor delivers —
+    /// the oracle proving the consensus execution context crosses the
+    /// application boundary verbatim.
+    struct BlockCtxRecorder {
+        seen: Mutex<Vec<(Height, types::BlockContext)>>,
+    }
+
+    impl BlockCtxRecorder {
+        fn new() -> Self {
+            Self { seen: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl Module for BlockCtxRecorder {
+        fn name(&self) -> &'static str {
+            "block-ctx-recorder"
+        }
+        fn id(&self) -> u8 {
+            6
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn begin_block_ctx(&self, height: Height, ctx: &types::BlockContext) {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((height, *ctx));
+        }
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            Ok(vec![])
+        }
+        fn end_block(&self, _height: Height) {}
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+    }
+
+    /// The execution context committed on the `FinalizedBlock` must
+    /// reach modules verbatim — timestamp, beneficiary, and gas
+    /// limit all arrive exactly as consensus produced them.
+    #[test]
+    fn execute_block_delivers_consensus_context() {
+        let mut executor = Executor::new(100);
+        let recorder = Arc::new(BlockCtxRecorder::new());
+        executor.register_module(recorder.clone());
+
+        let ctx = types::BlockContext {
+            timestamp_ms: 1_700_000_000_123,
+            beneficiary: Address([0x77; 20]),
+            gas_limit: 42_000,
+        };
+        let block =
+            FinalizedBlock { height: Height::new(3), txs: vec![], signers: vec![], context: ctx };
+        executor.finalize_block(&block);
+
+        let seen = recorder.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(seen.as_slice(), &[(Height::new(3), ctx)]);
+    }
+
     /// Regression test for the cached-execution identity bug: the
     /// preverified path must execute each tx under **its own**
     /// `TxContext` — sender, nonce, and fee — not the first tx's.
@@ -3772,8 +3891,12 @@ mod tests {
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
         assert_eq!(proposal.txs.len(), 2, "both txs should be in the proposal");
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
 
         let seen = recorder.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3807,8 +3930,12 @@ mod tests {
         executor.ingest_tx(tx0);
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
 
         // Re-submit nonce 0 — must be rejected (replay).
@@ -3840,8 +3967,12 @@ mod tests {
         executor.ingest_tx(tx0);
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
 
         // Re-submit nonce 0 via the batch path — must be rejected.
@@ -3940,15 +4071,23 @@ mod tests {
         executor.ingest_tx(tx0);
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
-        let block0 =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block0 = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block0);
         assert_eq!(*counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
 
         // Try to execute nonce 0 again in block 1 — must be skipped.
         let tx0_again = make_tx_with_nonce(1, &[0], 0);
-        let block1 =
-            FinalizedBlock { height: Height::new(1), txs: vec![tx0_again], signers: Vec::new() };
+        let block1 = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(1),
+            txs: vec![tx0_again],
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block1);
 
         // Counter should still be 1 — the stale tx was skipped.
@@ -3980,8 +4119,12 @@ mod tests {
         // Execution: a MAX-nonce tx smuggled into a block is skipped
         // — the counter does not move and the nonce map is not
         // poisoned.
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: vec![tx_max], signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: vec![tx_max],
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
         assert_eq!(
             *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
@@ -3992,7 +4135,12 @@ mod tests {
         // The nonce map must still expect 0 — a subsequent nonce-0 tx
         // executes normally (no wrap-induced replay window).
         let tx0 = make_tx_with_nonce(1, &[0], 0);
-        let block1 = FinalizedBlock { height: Height::new(1), txs: vec![tx0], signers: Vec::new() };
+        let block1 = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(1),
+            txs: vec![tx0],
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block1);
         assert_eq!(
             *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
@@ -4019,8 +4167,12 @@ mod tests {
         executor.ingest_tx(tx0);
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
-        let block0 =
-            FinalizedBlock { height: Height::new(0), txs: proposal.txs, signers: Vec::new() };
+        let block0 = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block0);
         assert_eq!(*counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
 
@@ -4063,6 +4215,7 @@ mod tests {
         // `authenticates_sender() == true` exactly like the EVM.
         let tx = make_tx_with_fee_and_sender(3, &[0xAA], 0, 0, VICTIM);
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![tx],
             signers: vec![],
@@ -4085,6 +4238,7 @@ mod tests {
 
         let tx = make_tx_with_fee_and_sender(1, &[0xAA], 0, 0, SENDER);
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![tx],
             signers: vec![],
@@ -4110,8 +4264,12 @@ mod tests {
             executor.ingest_tx(tx);
             let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
             let proposal = executor.prepare_proposal(&budget);
-            let block =
-                FinalizedBlock { height: Height::new(n), txs: proposal.txs, signers: Vec::new() };
+            let block = FinalizedBlock {
+                context: types::BlockContext::default(),
+                height: Height::new(n),
+                txs: proposal.txs,
+                signers: Vec::new(),
+            };
             executor.finalize_block(&block);
         }
 
@@ -4203,8 +4361,12 @@ mod tests {
         // 1001 ≤ 2000), the second would push to 2002 > 2000.
         let tx1 = make_tx(1, &[0]);
         let tx2 = make_tx_with_nonce(1, &[1], 1);
-        let block =
-            FinalizedBlock { height: Height::new(0), txs: vec![tx1, tx2], signers: Vec::new() };
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: vec![tx1, tx2],
+            signers: Vec::new(),
+        };
         executor.finalize_block(&block);
 
         // Only the first tx should have been executed (counter = 1).
@@ -4310,6 +4472,7 @@ mod tests {
         let proposal = executor.prepare_proposal(&budget);
         assert_eq!(proposal.txs.len(), 1);
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: proposal.txs,
             signers: Vec::new(),
@@ -4378,6 +4541,7 @@ mod tests {
         executor.register_module(counter.clone());
 
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![make_tx(1, b"unsigned")],
             signers: Vec::new(),
@@ -4399,6 +4563,7 @@ mod tests {
 
         let (tx, _sender) = signed_counter_tx(1, 0, b"inc");
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![tx],
             signers: Vec::new(),
@@ -4426,6 +4591,7 @@ mod tests {
         bytes[n - 4..].copy_from_slice(b"evil");
 
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![TxBytes::new(bytes)],
             signers: Vec::new(),
@@ -4742,6 +4908,7 @@ mod tests {
     fn exec_one_tx(executor: &Executor) {
         let tx = make_tx(1, &[0xAA]);
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![tx],
             signers: vec![],
@@ -4930,6 +5097,7 @@ mod tests {
         let mut executor = Executor::new(100);
         executor.register_module(Arc::new(SelfAuthModule));
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![],
             signers: vec![],
@@ -4960,6 +5128,7 @@ mod tests {
         let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
         let proposal = executor.prepare_proposal(&budget);
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(1),
             txs: proposal.txs,
             signers: Vec::new(),
@@ -4970,6 +5139,7 @@ mod tests {
         // Height 2 is past the halt: state must not change even
         // though the block carries a tx.
         let block2 = FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(2),
             txs: vec![make_tx(1, &[1])],
             signers: Vec::new(),
@@ -5018,6 +5188,7 @@ mod tests {
         // returns for unexecuted heights — a zero-root block would
         // make this test vacuous).
         let block = FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![make_tx_with_nonce(1, &[7], 0)],
             signers: vec![],
@@ -5048,6 +5219,7 @@ mod tests {
 
         for h in 0..5u64 {
             let block = FinalizedBlock {
+                context: types::BlockContext::default(),
                 height: Height::new(h),
                 txs: vec![make_tx_with_nonce(1, &[u8::try_from(h).unwrap_or(0)], h)],
                 signers: vec![],
@@ -5073,6 +5245,7 @@ mod tests {
         let executor = Arc::new(executor);
         executor.spawn_exec_lane();
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![make_tx_with_nonce(1, &[1], 0)],
             signers: vec![],
@@ -5148,6 +5321,7 @@ mod tests {
 
         // The panic tx kills the worker during block 0's execution.
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![make_tx_with_nonce(2, &[1], 0)],
             signers: vec![],
@@ -5226,6 +5400,7 @@ mod tests {
 
         // Block 0 kills the worker mid-execution.
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![make_tx_with_nonce(2, &[1], 0)],
             signers: vec![],
@@ -5236,6 +5411,7 @@ mod tests {
         // refuse to replay the partially applied block 0.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             executor.finalize_block(&FinalizedBlock {
+                context: types::BlockContext::default(),
                 height: Height::new(1),
                 txs: vec![make_tx_with_nonce(2, &[2], 1)],
                 signers: vec![],
@@ -5267,6 +5443,7 @@ mod tests {
         executor.spawn_exec_lane();
 
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![make_tx_with_nonce(3, &[1], 0)],
             signers: vec![],
@@ -5284,6 +5461,7 @@ mod tests {
         // The drain refuses; the mutation is never replayed.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             executor.finalize_block(&FinalizedBlock {
+                context: types::BlockContext::default(),
                 height: Height::new(1),
                 txs: vec![make_tx_with_nonce(3, &[2], 1)],
                 signers: vec![],
@@ -5331,6 +5509,7 @@ mod tests {
 
     fn finalized_block(height: u64, module: u8, nonce: u64) -> FinalizedBlock {
         FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(height),
             txs: vec![make_tx_with_nonce(module, &[u8::try_from(height).unwrap_or(0xff)], nonce)],
             signers: vec![],
@@ -5455,6 +5634,7 @@ mod tests {
         // Before finality the tx is still pooled.
         assert_eq!(executor.mempool_len(), 1);
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: proposal.txs,
             signers: Vec::new(),
@@ -5485,6 +5665,7 @@ mod tests {
         // Committing the first two leaves the filtered two pooled —
         // they fill the next block exactly.
         executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: first.txs,
             signers: Vec::new(),

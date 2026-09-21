@@ -107,8 +107,12 @@ fn run_full_pipeline(executor: &Executor, height: u64) {
     let verdict = executor.process_proposal(&proposal);
     black_box(&verdict);
 
-    let block =
-        FinalizedBlock { height: Height::new(height), txs: proposal.txs, signers: Vec::new() };
+    let block = FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(height),
+        txs: proposal.txs,
+        signers: Vec::new(),
+    };
     let ack = executor.finalize_block(&block);
     black_box(&ack);
 
@@ -168,6 +172,7 @@ fn bench_execute_only(c: &mut Criterion) {
                 },
                 |(executor, proposal)| {
                     let block = FinalizedBlock {
+                        context: types::BlockContext::default(),
                         height: Height::new(1),
                         txs: proposal.txs,
                         signers: Vec::new(),

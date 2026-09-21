@@ -528,6 +528,18 @@ pub struct OxideBft {
     pacemaker_base_timeout_ms: u64,
     /// See `pacemaker_base_timeout_ms`.
     pacemaker_max_timeout_ms: u64,
+    /// The proposal clock: milliseconds since the Unix epoch, read
+    /// once per `propose()` and committed into the block header's
+    /// `timestamp` field. The header is signed and QC-certified, so
+    /// the stamp is the value every replica executes under — voters
+    /// never compare it against their own clocks (only against the
+    /// parent's, an objective ordering rule), so clock skew between
+    /// validators cannot fork execution.
+    ///
+    /// Injectable via [`OxideBft::with_clock`] so tests and the
+    /// deterministic sim control time; production defaults to
+    /// [`types::system_time_ms`].
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl OxideBft {
@@ -592,6 +604,7 @@ impl OxideBft {
             block_budget: types::CHAIN_BLOCK_BUDGET,
             pacemaker_base_timeout_ms: crate::pacemaker::DEFAULT_BASE_TIMEOUT_MS,
             pacemaker_max_timeout_ms: crate::pacemaker::DEFAULT_MAX_TIMEOUT_MS,
+            clock: Arc::new(types::system_time_ms),
         }
     }
 
@@ -680,6 +693,26 @@ impl OxideBft {
     #[must_use]
     pub fn with_block_budget(mut self, budget: types::BlockBudget) -> Self {
         self.block_budget = budget;
+        self
+    }
+
+    /// Set the proposal clock — the function `propose()` calls once
+    /// per proposal to stamp `BlockHeader.timestamp` (milliseconds
+    /// since the Unix epoch).
+    ///
+    /// The stamp travels inside the signed header, so every replica
+    /// executes under the leader's reading: voters validate only the
+    /// objective monotonicity rule (`vote_if_eligible` rejects a
+    /// timestamp earlier than its parent's), never their own clocks.
+    /// That keeps the consensus outcome independent of validator
+    /// clock skew — a skewed leader's stamp is committed, not judged.
+    ///
+    /// Tests and the deterministic sim inject a fixed or scripted
+    /// clock so block context stays reproducible; production uses
+    /// the default [`types::system_time_ms`].
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
         self
     }
 
@@ -1635,7 +1668,12 @@ impl OxideBft {
                 tc.epoch == self.epoch && tc.view.saturating_next() == self.current_view
             }),
             proposer: proposer_hash(self.validator_set.leader(self.current_view)),
-            timestamp: 0,             // deterministic: no real clock in the test model
+            // The proposer's clock reading, committed under the
+            // proposal signature. Voters enforce only the objective
+            // rule (non-decreasing vs. the parent) — never their own
+            // clocks — so the committed value is what every replica's
+            // execution context carries via `FinalizedBlock`.
+            timestamp: (self.clock)(),
             proposer_signature: None, // set below after signing
             // Embed the newest execution certificate that every voter
             // can verify locally. The bound is `cert.height <= h - 2`:
@@ -1797,6 +1835,30 @@ impl OxideBft {
         Some(Self::block_hash(header))
     }
 
+    /// The committed timestamp of `header`'s declared parent, if the
+    /// parent is known locally. Two sources cover both states a
+    /// parent can be in:
+    ///
+    /// - **In-flight** (`self.blocks`): the parent header is stored
+    ///   verbatim, timestamp included.
+    /// - **Committed** (`last_committed` → `finalized`): the header
+    ///   is dropped at commit, but its timestamp survives on the
+    ///   `FinalizedBlock`'s execution context — the same value the
+    ///   app executed under.
+    ///
+    /// `None` means "parent unknown" (e.g. a genesis proposal): the
+    /// caller skips the monotonicity check — an unavailable parent
+    /// timestamp proves nothing either way.
+    fn parent_timestamp(&self, header: &BlockHeader) -> Option<u64> {
+        if let Some((parent, _)) = self.blocks.get(&header.prev_block) {
+            return Some(parent.timestamp);
+        }
+        self.last_committed
+            .filter(|(hash, _)| *hash == header.prev_block)
+            .and_then(|(_, height)| self.finalized.get(&height.value()))
+            .map(|block| block.context.timestamp_ms)
+    }
+
     /// Shared vote-eligibility chain for both vote paths. `body` is
     /// `Some` for the complete-proposal path (`vote`) and `None` for
     /// the commitment path (`vote_header`): the app's static
@@ -1874,6 +1936,23 @@ impl OxideBft {
         if let Some(hqc) = &header.high_qc {
             if header.prev_block != hqc.block_hash {
                 return None;
+            }
+        }
+        // Timestamp monotonicity: a block's committed timestamp must
+        // never go backwards relative to its declared parent. This is
+        // an *objective* rule — the parent is fixed by the header's
+        // own `prev_block`/`high_qc` chain, so the check needs no
+        // local clock and cannot fork on validator skew. `0` is the
+        // "no timestamp" sentinel (clockless engines, hand-built
+        // headers): either side reading zero carries no ordering
+        // information, so the rule binds only when both stamps are
+        // present. Equal timestamps are legal — the millisecond
+        // granularity can stamp two blocks in the same tick.
+        if header.timestamp != 0 {
+            if let Some(parent_ts) = self.parent_timestamp(header) {
+                if parent_ts != 0 && header.timestamp < parent_ts {
+                    return None;
+                }
             }
         }
         // Tail-fork resistance / extends-highest-QC rule
@@ -2995,7 +3074,38 @@ impl OxideBft {
                 })
             })
             .collect();
-        let block = FinalizedBlock { height: header.height, txs: proposal.txs, signers };
+        // The execution context every replica must agree on. All
+        // three fields are derived from consensus-committed material,
+        // never local state:
+        //
+        // - `timestamp_ms`: the header's own stamp — signed by the
+        //   proposer and QC-certified, so every node reads the same
+        //   value the leader committed.
+        // - `beneficiary`: the proposer's staking address, recovered
+        //   from `header.proposer` (the validator index is encoded in
+        //   the hash — see `proposer_hash`) against this epoch's
+        //   validator set. `Address::ZERO` when the index doesn't
+        //   resolve — a header whose proposer passed authentication
+        //   always resolves, so ZERO only marks conformance-shaped
+        //   headers; modules read it as "no beneficiary".
+        // - `gas_limit`: the block budget this engine enforced when
+        //   building/processing proposals — the authoritative block
+        //   capacity the EVM must run under. Config-derived (same on
+        //   every correctly configured node) rather than
+        //   header-carried, so it cannot be lied about per-block.
+        let proposer_idx = u16::from_le_bytes([header.proposer.0[0], header.proposer.0[1]]);
+        let beneficiary = self
+            .validator_set
+            .validator_addresses()
+            .get(usize::from(proposer_idx))
+            .copied()
+            .unwrap_or(Address::ZERO);
+        let context = types::BlockContext {
+            timestamp_ms: header.timestamp,
+            beneficiary,
+            gas_limit: self.block_budget.max_gas,
+        };
+        let block = FinalizedBlock { height: header.height, txs: proposal.txs, signers, context };
         // Notify the commit listener before inserting into `finalized`
         // — the map prunes at `MAX_RETAINED_FINALIZED`, so external
         // consumers that need full history must observe commits here.
@@ -3525,7 +3635,13 @@ mod tests {
 
     fn make_engine() -> OxideBft {
         let app = Arc::new(MockApp::new());
-        OxideBft::new(app, single_validator_set()).without_signature_verification()
+        // Fixed clock: the conformance determinism gate compares
+        // finalized blocks byte-for-byte across two runs, and the
+        // committed header timestamp now lands in the execution
+        // context — a wall clock would make identical runs differ.
+        OxideBft::new(app, single_validator_set())
+            .without_signature_verification()
+            .with_clock(|| 1_700_000_000_000)
     }
 
     #[test]
@@ -5269,6 +5385,92 @@ mod tests {
         assert_eq!(make_engine().block_budget(), types::CHAIN_BLOCK_BUDGET);
     }
 
+    /// The proposal clock lands in the signed header: a leader
+    /// stamps `with_clock`'s value — the value the whole cluster
+    /// will execute under — not a height-derived stand-in.
+    #[test]
+    fn propose_stamps_injected_clock() {
+        let mut leader = make_multi_engine(0).with_clock(|| 1_700_000_000_123);
+        let (header, _proposal) = leader.propose().expect("leader proposes");
+        assert_eq!(header.timestamp, 1_700_000_000_123);
+    }
+
+    /// The committed block carries the consensus execution context
+    /// on every replica: the header's signed timestamp, the
+    /// proposer's staking address resolved from `header.proposer`
+    /// against the validator set, and the block budget's gas limit.
+    /// Because all three derive from committed material, leader and
+    /// followers observe identical contexts.
+    #[test]
+    fn committed_block_carries_execution_context() {
+        const TS: u64 = 1_700_000_000_123;
+        let mut leader = make_multi_engine(0).with_clock(|| TS);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        let mut followers = [&mut f1, &mut f2, &mut f3];
+        drive_round(&mut leader, &mut followers, Some(TxBytes::new(vec![1])));
+        // The QC for h1 is what commits h0 (2-chain rule).
+        drive_round(&mut leader, &mut followers, None);
+
+        let expected_beneficiary = four_validator_set().validator_addresses()[0];
+        for (name, e) in [("leader", &leader), ("f1", &f1), ("f2", &f2), ("f3", &f3)] {
+            let block = e
+                .finalized_block(Height::new(0))
+                .unwrap_or_else(|| panic!("{name}: h0 must be committed"));
+            assert_eq!(block.context.timestamp_ms, TS, "{name}: committed timestamp");
+            assert_eq!(
+                block.context.beneficiary, expected_beneficiary,
+                "{name}: beneficiary is the proposer's staking address"
+            );
+            assert_eq!(
+                block.context.gas_limit,
+                types::CHAIN_BLOCK_BUDGET.max_gas,
+                "{name}: gas limit is the enforced block budget"
+            );
+        }
+    }
+
+    /// `vote()` rejects a proposal whose committed timestamp goes
+    /// backwards relative to its parent — the one objective clock
+    /// rule consensus enforces. An equal timestamp (same millisecond
+    /// tick) remains legal.
+    #[test]
+    fn vote_rejects_backwards_timestamp() {
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let mut leader = make_multi_engine(0).with_clock({
+            let c = Arc::clone(&clock);
+            move || c.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        let mut followers = [&mut f1, &mut f2, &mut f3];
+        // Round 1: h0 is proposed (ts=1000), voted, and QC'd — the
+        // followers store its header in `blocks`, which is what
+        // `parent_timestamp` consults for the round-2 child.
+        drive_round(&mut leader, &mut followers, Some(TxBytes::new(vec![1])));
+
+        // Round 2 with a backwards clock: the child of the
+        // ts=1000 parent stamps 500 — an objective violation.
+        clock.store(500, std::sync::atomic::Ordering::Relaxed);
+        let (header, proposal) = leader.propose().expect("round-2 proposal");
+        assert_eq!(header.timestamp, 500);
+        assert!(
+            f1.vote(&header, &proposal).is_none(),
+            "a timestamp earlier than the parent's must be rejected"
+        );
+
+        // An equal stamp (same millisecond as the parent) is legal.
+        clock.store(1_000, std::sync::atomic::Ordering::Relaxed);
+        let (header2, proposal2) = leader.propose().expect("re-proposal");
+        assert_eq!(header2.timestamp, 1_000);
+        assert!(
+            f2.vote(&header2, &proposal2).is_some(),
+            "a timestamp equal to the parent's must be accepted"
+        );
+    }
+
     #[test]
     fn engine_continues_after_rotation() {
         let mut engine = make_engine();
@@ -5903,11 +6105,13 @@ mod tests {
         // height 0's mock root is Hash::ZERO, the never-attested
         // sentinel).
         app.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(0),
             txs: vec![],
             signers: vec![],
         });
         app.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(1),
             txs: vec![],
             signers: vec![],
@@ -6110,6 +6314,7 @@ mod tests {
         // "nothing executed" sentinel — so an attestation for height 0
         // could never be observed. Height 1 attests cleanly.
         engine.app.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(1),
             txs: vec![],
             signers: vec![],

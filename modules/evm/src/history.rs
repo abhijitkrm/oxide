@@ -158,8 +158,10 @@ pub struct ExecutedBlock {
     pub parent_hash: B256,
     /// Block height (== Ethereum block number).
     pub number: u64,
-    /// Block timestamp the module executed under (currently the
-    /// height-derived deterministic stand-in — see `begin_block`).
+    /// Block timestamp the module executed under — the consensus-
+    /// committed header timestamp in whole seconds on real blocks
+    /// (`begin_block_ctx`), or the height-derived deterministic
+    /// stand-in for context-less blocks (`begin_block`).
     pub timestamp: u64,
     /// Total gas consumed by all EVM txs in the block.
     pub gas_used: u64,

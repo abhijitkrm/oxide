@@ -100,6 +100,7 @@ fn journal_replay_reproduces_state_root_bit_exact() {
         let txs: Vec<types::TxBytes> =
             (0..3).map(|i| delegate_tx(u64::try_from(h * 10 + i).unwrap(), 1)).collect();
         let block = FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(u64::try_from(h).unwrap()),
             txs,
             signers: Vec::new(),
@@ -195,6 +196,7 @@ fn journal_replay_torn_tail_preserves_prefix() {
     // Write 5 complete blocks.
     for h in 0..5u64 {
         let block = FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(h),
             txs: vec![delegate_tx(h, 1)],
             signers: Vec::new(),
@@ -238,6 +240,7 @@ fn journal_replay_bad_crc_preserves_prefix() {
     // Write 3 complete blocks.
     for h in 0..3u64 {
         let block = FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(h),
             txs: vec![delegate_tx(h, 1)],
             signers: Vec::new(),
@@ -286,6 +289,7 @@ fn journal_replay_multiple_segments() {
     // with the 1024-byte segment limit).
     for h in 0..20u64 {
         let block = FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(h),
             txs: vec![delegate_tx(h, 1)],
             signers: Vec::new(),
@@ -328,6 +332,7 @@ fn journal_replay_deterministic_state_roots() {
 
     for h in 0..5u64 {
         let block = FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(h),
             txs: vec![delegate_tx(h, h + 1)],
             signers: Vec::new(),
@@ -353,6 +358,7 @@ fn journal_replay_deterministic_state_roots() {
 
     for h in 0..5u64 {
         let block = FinalizedBlock {
+            context: types::BlockContext::default(),
             height: Height::new(h),
             txs: vec![delegate_tx(h, h + 1)],
             signers: Vec::new(),

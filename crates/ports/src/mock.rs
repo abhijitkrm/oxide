@@ -246,8 +246,17 @@ impl crate::ConsensusEngine for MockEngine {
             }
             // Mock engine attributes no signers — attendance is
             // meaningless without real consensus; empty = no data.
-            let block =
-                FinalizedBlock { height: proposal.height, txs: proposal.txs, signers: Vec::new() };
+            // The execution context is the all-zero sentinel: a
+            // clockless mock commits no timestamp/beneficiary, and
+            // modules keep configured defaults under it — the
+            // conformance suite's cross-engine block comparisons
+            // stay engine-agnostic on the context.
+            let block = FinalizedBlock {
+                height: proposal.height,
+                txs: proposal.txs,
+                signers: Vec::new(),
+                context: types::BlockContext::default(),
+            };
             self.app.finalize_block(&block);
             self.finalized.insert(block.height.value(), block);
             self.next_height = Height::new(self.next_height.value() + 1);

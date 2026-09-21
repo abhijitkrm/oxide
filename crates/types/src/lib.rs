@@ -274,6 +274,81 @@ impl<'a> Decode<'a> for MempoolAck {
     }
 }
 
+/// The consensus-derived execution context for a finalized block —
+/// the values consensus commits in the block header that execution
+/// must consume verbatim rather than reconstruct locally.
+///
+/// This is the durable protocol model the application boundary
+/// carries: every field is committed under the proposer's signature
+/// and the committing QC (it travels inside the block header), so
+/// all replicas execute the block under identical context. Journal
+/// replay decodes the same context from the recorded block, so
+/// replayed execution observes the values the live run used.
+///
+/// A context with `timestamp_ms == 0` is the documented "no
+/// consensus timestamp" sentinel — emitted by engines that have no
+/// clock (conformance mocks, hand-built test blocks) and produced
+/// when decoding journals written before the field existed.
+/// Modules must interpret a zero context field as "no data" and
+/// keep their configured defaults — never as a real epoch value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockContext {
+    /// Block timestamp in milliseconds since the Unix epoch — the
+    /// proposer's clock reading committed in the header. `0` means
+    /// "no timestamp" (legacy/test block); execution falls back to
+    /// its deterministic stand-in for those.
+    pub timestamp_ms: u64,
+    /// The block's fee beneficiary: the proposer's staking address,
+    /// resolved from the committed `header.proposer` identity
+    /// against the epoch's validator set — the same address space
+    /// the attendance `signers` use. `Address::ZERO` when the
+    /// engine cannot attribute a proposer (sequencer, mock).
+    pub beneficiary: Address,
+    /// The consensus-enforced block gas limit for this height — the
+    /// `max_gas` budget the block was produced under. `0` means
+    /// "unknown"; modules keep their configured limit. Consensus
+    /// is the authority on block capacity: a module-level limit
+    /// that disagrees with the budget the engine enforced would let
+    /// the mempool accept transactions the block can never hold.
+    pub gas_limit: u64,
+}
+
+impl Default for BlockContext {
+    /// The all-zero "no consensus context" sentinel — every field
+    /// reads as "no data", and modules keep their configured
+    /// defaults. Produced by hand-built test blocks, clockless
+    /// engines, and pre-context journal decode.
+    fn default() -> Self {
+        Self { timestamp_ms: 0, beneficiary: Address::ZERO, gas_limit: 0 }
+    }
+}
+
+impl BlockContext {
+    /// Milliseconds per second — conversion factor for the EVM's
+    /// seconds-granularity `block.timestamp`.
+    const MS_PER_SEC: u64 = 1_000;
+
+    /// The timestamp in whole seconds (EVM `block.timestamp`
+    /// granularity). Sub-second precision is truncated — matching
+    /// Ethereum, whose header timestamps are integer seconds.
+    #[must_use]
+    pub fn timestamp_secs(&self) -> u64 {
+        self.timestamp_ms / Self::MS_PER_SEC
+    }
+}
+
+/// Milliseconds since the Unix epoch on the system clock — the
+/// default proposal clock for engines with no injected time
+/// source. A clock reading before the epoch (or past `u64::MAX`
+/// ms, i.e. the year ~584 million) saturates to `0`, which callers
+/// read as "no timestamp" rather than a panic.
+#[must_use]
+pub fn system_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// The engine's whole output: a finalized, reorg-free ordering of
 /// transactions at a height. After this is emitted the engine never
 /// re-emits this height and never finalizes a different block here
@@ -297,6 +372,17 @@ pub struct FinalizedBlock {
     /// signers (sequencer mode, mock) leave it empty — the app reads
     /// empty as "no attendance data", never as "everyone absent".
     pub signers: Vec<Address>,
+    /// The consensus-derived execution context — timestamp, fee
+    /// beneficiary, and the block gas limit the block was produced
+    /// under. Carried on the block for the same reason `signers` is:
+    /// journal replay must re-execute under the values the live run
+    /// committed, which are only available if they are recorded.
+    ///
+    /// An all-zero context is the legacy/test sentinel — blocks
+    /// decoded from journals that predate this field, or produced
+    /// by engines with no clock/committee, carry it and modules
+    /// keep their configured defaults for those fields.
+    pub context: BlockContext,
 }
 
 impl Encode for FinalizedBlock {
@@ -310,6 +396,14 @@ impl Encode for FinalizedBlock {
         for signer in &self.signers {
             buf.extend_from_slice(&signer.0);
         }
+        // The context is the newest tail: a fixed-shape trio
+        // (varint timestamp, `Address::LEN` beneficiary, varint gas
+        // limit) appended after signers. Pre-context journals stop
+        // at signers — decode reads the absent tail as an all-zero
+        // context rather than failing.
+        write::varint(buf, self.context.timestamp_ms);
+        buf.extend_from_slice(&self.context.beneficiary.0);
+        write::varint(buf, self.context.gas_limit);
     }
 }
 
@@ -337,7 +431,21 @@ impl<'a> Decode<'a> for FinalizedBlock {
                 signers.push(Address(reader.read_fixed::<{ Address::LEN }>()?));
             }
         }
-        Ok(Self { height, txs, signers })
+        // Second tolerant tail: the execution context (timestamp,
+        // beneficiary, gas limit) postdates `signers`. Journals
+        // written before it existed end at signers — an all-zero
+        // context is the "no data" sentinel modules already treat
+        // as "keep configured defaults". Once any context byte is
+        // present the tail must be complete: a partial context is
+        // corruption, not a legacy record, so fields decode
+        // strictly (a truncated varint or short beneficiary fails).
+        let mut context = BlockContext::default();
+        if reader.remaining() > 0 {
+            context.timestamp_ms = reader.read_varint()?;
+            context.beneficiary = Address(reader.read_fixed::<{ Address::LEN }>()?);
+            context.gas_limit = reader.read_varint()?;
+        }
+        Ok(Self { height, txs, signers, context })
     }
 }
 
@@ -973,13 +1081,57 @@ mod tests {
             height: Height::new(7),
             txs: vec![TxBytes(vec![0x01])],
             signers: Vec::new(),
+            context: BlockContext::default(),
         };
         let mut expected = Vec::new();
         expected.extend_from_slice(&7u64.to_le_bytes());
         expected.push(1); // tx count
         expected.extend_from_slice(&[1, 0x01]); // tx
         expected.push(0); // signer count
+        // Execution context tail: timestamp varint 0, 20-byte zero
+        // beneficiary, gas-limit varint 0 — the all-zero sentinel.
+        expected.push(0);
+        expected.extend_from_slice(&[0u8; Address::LEN]);
+        expected.push(0);
         roundtrip(&fb, &expected);
+    }
+
+    /// A populated execution context survives the wire: timestamp,
+    /// beneficiary, and gas limit all decode to the committed values.
+    #[test]
+    fn finalized_block_context_roundtrips() {
+        let ctx = BlockContext {
+            timestamp_ms: 1_700_000_000_123,
+            beneficiary: Address([0xAB; 20]),
+            gas_limit: 1 << 30,
+        };
+        let fb = FinalizedBlock {
+            height: Height::new(9),
+            txs: vec![TxBytes(vec![0x01])],
+            signers: vec![Address([0x01; 20])],
+            context: ctx,
+        };
+        let mut buf = Vec::new();
+        fb.encode(&mut buf);
+        let mut reader = Reader::new(&buf);
+        let decoded = FinalizedBlock::decode(&mut reader).expect("decodes");
+        assert_eq!(decoded, fb);
+        assert_eq!(decoded.context, ctx);
+    }
+
+    /// Journals written before the context field existed end at
+    /// `signers` — decode must synthesize the all-zero sentinel
+    /// rather than fail, keeping pre-change histories replayable.
+    #[test]
+    fn finalized_block_without_context_decodes_legacy() {
+        let mut buf = Vec::new();
+        Height::new(4).encode(&mut buf);
+        write::varint(&mut buf, 1); // 1 tx
+        TxBytes(vec![0xAA]).encode(&mut buf);
+        write::varint(&mut buf, 0); // 0 signers — stream ends here
+        let mut reader = Reader::new(&buf);
+        let decoded = FinalizedBlock::decode(&mut reader).expect("legacy tail decodes");
+        assert_eq!(decoded.context, BlockContext::default());
     }
 
     #[test]

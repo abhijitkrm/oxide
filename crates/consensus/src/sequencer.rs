@@ -71,12 +71,33 @@ pub struct SequencerEngine {
     /// Finalized blocks keyed by height. `BTreeMap` for ordered
     /// iteration (the conformance suite checks the height sequence).
     finalized: BTreeMap<u64, FinalizedBlock>,
+    /// The block clock — milliseconds since the Unix epoch, read once
+    /// per finalized block for the execution context. The sequencer
+    /// has no header to sign under, but the context is the same
+    /// protocol model: execution observes the engine's stamp, and a
+    /// deterministic test/sim can inject a fixed clock via
+    /// [`SequencerEngine::with_clock`].
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl SequencerEngine {
     /// Construct a fresh engine with the given app at genesis.
     pub fn new(app: Arc<dyn AppInterface>) -> Self {
-        Self { app, next_height: Height::new(0), finalized: BTreeMap::new() }
+        Self {
+            app,
+            next_height: Height::new(0),
+            finalized: BTreeMap::new(),
+            clock: Arc::new(types::system_time_ms),
+        }
+    }
+
+    /// Set the block clock (same role as [`OxideBft::with_clock`]):
+    /// tests and deterministic sims inject a fixed/scripted clock so
+    /// the finalized execution context is reproducible.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 
     /// Access the embedded app for post-run inspection (conformance,
@@ -121,9 +142,21 @@ impl ports::ConsensusEngine for SequencerEngine {
                 }
             }
             // Sequencer mode has one signer (itself) — attendance
-            // tracking is meaningless; empty = no data.
-            let block =
-                FinalizedBlock { height: proposal.height, txs: proposal.txs, signers: Vec::new() };
+            // tracking is meaningless; empty = no data. The context
+            // stamps the sequencer's own clock and the block budget's
+            // gas limit; there is no committee, so `beneficiary` is
+            // the ZERO sentinel ("no proposer attribution").
+            let context = types::BlockContext {
+                timestamp_ms: (self.clock)(),
+                beneficiary: primitives::Address::ZERO,
+                gas_limit: BUDGET.max_gas,
+            };
+            let block = FinalizedBlock {
+                height: proposal.height,
+                txs: proposal.txs,
+                signers: Vec::new(),
+                context,
+            };
             self.app.finalize_block(&block);
             self.finalized.insert(block.height.value(), block);
             self.next_height = Height::new(self.next_height.value() + 1);
@@ -148,7 +181,11 @@ mod tests {
     use std::sync::Arc;
 
     fn make_engine() -> SequencerEngine {
-        SequencerEngine::new(Arc::new(MockApp::new()))
+        // Fixed clock: the conformance determinism gate compares
+        // finalized blocks byte-for-byte across two runs, and the
+        // execution context carries the block timestamp — a wall
+        // clock would make identical runs differ.
+        SequencerEngine::new(Arc::new(MockApp::new())).with_clock(|| 1_700_000_000_000)
     }
 
     #[test]
@@ -250,12 +287,27 @@ mod tests {
             .map(|h| seq.finalized_block(Height::new(h)).unwrap())
             .collect();
 
-        // The two engines must produce identical finalized blocks.
-        // This proves the app is engine-agnostic — the seam is real.
+        // The two engines must produce identical consensus outputs —
+        // height, ordering, and attendance. The `context` field is
+        // deliberately excluded: it is the *engine-derived* half of
+        // the block (the mock is clockless so its context is the
+        // zero sentinel; the sequencer stamps its own clock and the
+        // block budget's gas limit), and identical contexts across
+        // different engines is not a property the seam promises.
+        let consensus_view =
+            |blocks: &[FinalizedBlock]| -> Vec<(Height, Vec<TxBytes>, Vec<primitives::Address>)> {
+                blocks.iter().map(|b| (b.height, b.txs.clone(), b.signers.clone())).collect()
+            };
         assert_eq!(
-            mock_blocks, seq_blocks,
-            "MockEngine and SequencerEngine must produce identical finalized blocks \
-             for the same tx sequence — the app must be engine-agnostic"
+            consensus_view(&mock_blocks),
+            consensus_view(&seq_blocks),
+            "MockEngine and SequencerEngine must produce identical height/tx/signer \
+             sequences for the same tx sequence — the app must be engine-agnostic"
         );
+        // …but the contexts must differ exactly as designed: the
+        // mock's is the all-zero sentinel, the sequencer's carries a
+        // gas limit derived from the block budget.
+        assert!(mock_blocks.iter().all(|b| b.context == types::BlockContext::default()));
+        assert!(seq_blocks.iter().all(|b| b.context.gas_limit == BUDGET.max_gas));
     }
 }

@@ -43,6 +43,20 @@ use types::{FinalizedBlock, TxBytes};
 /// Source: plan.md §13 (Phase 1 gate: 200k tx/s sim).
 const GENESIS_BALANCE: u64 = 1_000_000_000_000; // 10^12
 
+/// Deterministic block-clock base, milliseconds since the Unix
+/// epoch — the counter every engine's injected clock starts from.
+/// The value is arbitrary but realistic-looking (Nov 2023); what
+/// matters is that it is *fixed*, so two runs with the same inputs
+/// stamp identical header timestamps and the module-level
+/// determinism contract ("identical finalized block sequences")
+/// survives the header timestamp becoming a real field. Shared
+/// across engines as a single `AtomicU64` counter rather than a
+/// per-engine counter: every `propose` draws the next tick from
+/// the same source, so timestamps increase monotonically across
+/// leaders and the engine's parent-timestamp rule can never see a
+/// regression it would have to reject.
+const SIM_CLOCK_BASE_MS: u64 = 1_700_000_000_000;
+
 /// A multi-node devnet: N validators running oxideBFT with the real
 /// app stack.
 ///
@@ -109,6 +123,10 @@ impl MultiNodeDevnet {
 
         let mut engines = Vec::with_capacity(n);
         let mut apps = Vec::with_capacity(n);
+        // One clock counter shared by every engine — see
+        // `SIM_CLOCK_BASE_MS` for why a single source (not
+        // per-engine counters) is required.
+        let block_clock = Arc::new(std::sync::atomic::AtomicU64::new(SIM_CLOCK_BASE_MS));
         for (i, key) in secret_keys.iter().cloned().enumerate() {
             let mut executor = Executor::new(max_mempool_entries);
             executor.register_module(Arc::new(oxide_core::CoreModule::new()));
@@ -144,8 +162,13 @@ impl MultiNodeDevnet {
             executor.register_module(Arc::new(staking_mod));
             let app: Arc<Executor> = Arc::new(executor);
             let app_dyn: Arc<dyn AppInterface> = app.clone();
+            // Shared sim clock: all engines draw proposal timestamps
+            // from one counter so stamps increase across leaders and
+            // identical schedules reproduce identical blocks.
+            let clock = std::sync::Arc::clone(&block_clock);
             let engine = OxideBft::with_index(app_dyn, vs.clone(), u16::try_from(i).unwrap())
-                .with_secret_key(key);
+                .with_secret_key(key)
+                .with_clock(move || clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
             engines.push(engine);
             apps.push(app);
         }

@@ -2183,6 +2183,36 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   must be exactly the canonical encoding or the transaction is
   malformed everywhere.
 
+- **Blocks carry real consensus context:** `FinalizedBlock` now
+  records a `BlockContext` — the header's commit timestamp
+  (milliseconds), the proposer's staking address as fee
+  beneficiary, and the consensus block-budget gas limit — so
+  execution and journal replay consume identical inputs. oxideBFT
+  stamps a real clock on proposals (injectable for deterministic
+  tests) and validators reject a proposal whose timestamp goes
+  backwards relative to its committed parent. Mock/clockless
+  engines and old journal entries use the all-zero sentinel,
+  which preserves the previous derived behavior field-by-field.
+- **The EVM runs a live EIP-1559 fee market:** the fixed
+  constructor-time base fee is replaced by `BaseFeeState`, which
+  `end_block_ctx` advances once per finalized block from the
+  block's measured gas usage — congestion raises the fee, empty
+  blocks let it fall. `block.timestamp`, `block.coinbase`, and
+  `block.gas_limit` in the revm environment, admission
+  validation, receipts, and `eth_getBlock*` all reflect the
+  committed context. Restart rehydrates the fee by replaying the
+  last sealed block's update — which also fixed a latent bug
+  where a backend holding only empty blocks never restored its
+  block history or undo window.
+- **In plain words:** blocks used to report a fake timestamp
+  derived from the block number, nobody was credited as the fee
+  recipient, and the gas price floor never moved no matter how
+  full blocks were. Now the chain stamps real time (and refuses
+  time-traveling proposals), the block proposer is recorded as
+  the fee beneficiary, the block gas limit comes from consensus,
+  and the EIP-1559 base fee actually breathes with demand —
+  surviving restarts so every node computes the same fee.
+
 ### Benchmark Results (M2 MacBook Pro, release profile)
 
 - **Matching engine: 56.27M orders/s** (raw engine, single-thread).

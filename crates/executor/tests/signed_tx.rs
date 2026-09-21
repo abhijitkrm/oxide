@@ -81,6 +81,7 @@ fn signed_delegate_executes_and_settles() {
     let proposal = executor.prepare_proposal(&budget);
     assert_eq!(proposal.txs.len(), 1);
     executor.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
         height: Height::new(0),
         txs: proposal.txs,
         signers: Vec::new(),
@@ -132,6 +133,7 @@ fn unsigned_forgery_rejected_when_signatures_required() {
     // Even if a foreign proposer injects it into a block, execution
     // skips it deterministically.
     executor.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
         height: Height::new(0),
         txs: vec![forged],
         signers: Vec::new(),
@@ -156,6 +158,7 @@ fn foreign_signed_tx_executes_without_ingest() {
     evm.mint(&sender, 1_000);
 
     executor.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
         height: Height::new(0),
         txs: vec![tx],
         signers: Vec::new(),
@@ -178,6 +181,7 @@ fn unsigned_tx_executes_under_compat_policy() {
     let budget = BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
     let proposal = executor.prepare_proposal(&budget);
     executor.finalize_block(&FinalizedBlock {
+        context: types::BlockContext::default(),
         height: Height::new(0),
         txs: proposal.txs,
         signers: Vec::new(),
