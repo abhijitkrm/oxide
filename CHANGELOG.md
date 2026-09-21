@@ -1102,6 +1102,44 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **The synchronous executor path could silently double-apply a
+  half-executed block after a module panic** (`crates/executor`)
+  - The exec lane already refuses to replay a block whose execution
+    panicked mid-mutation (`in_flight` marker with no recorded root),
+    but the default synchronous path set no marker — the panic
+    propagated, earlier transactions' mutations survived, and the
+    next `finalize_block` re-executed on top of them, double-applying
+    fees, nonces, and module state.
+  - The synchronous path now marks `in_flight` around `execute_block`
+    and fails closed on the next commit when a poisoned height is
+    found — the same contract the lane drain enforces. Recovery is
+    restart-from-durable-state, exactly as before.
+  - **In plain words:** if a transaction module crashed halfway
+    through a block, the default execution path could quietly run the
+    block *again* on top of the half-finished state — charging fees
+    twice and corrupting balances. Now the executor halts instead of
+    guessing, and recovery happens from the durable journal.
+  - Regression: `sync_path_panic_mid_mutation_poisons_executor`.
+
+- **A byzantine vote naming a phantom block could anchor a whole
+  view's quorum** (`crates/consensus`)
+  - `collect_vote` fixed the quorum's `(view, block_hash)` reference
+    to whatever arrived first. A vote for a block the collector never
+    stored — landing before the leader's self-vote — would anchor the
+    buffer to garbage and `ConflictingVote`-reject every honest vote:
+    one message per view, a permanent stall. No current caller exposed
+    the ordering, but the engine API is now robust to it.
+  - A vote may only establish the reference for a block stored with a
+    matching view; votes for unknown hashes are dropped, and the
+    conflict rule still arbitrates every later vote unchanged.
+  - **In plain words:** the validator used to treat the first vote it
+    saw as the answer everyone had to agree with — even if the block
+    it named didn't exist. A single junk message could freeze the
+    round. Now junk votes are ignored and honest votes still form the
+    quorum.
+  - Regressions: `phantom_block_vote_does_not_block_honest_quorum`,
+    `hidden_qc_arriving_after_tc_still_commits_its_chain`.
+
 - **A torn consensus-WAL tail silently discarded every vote written
   after it** (`crates/consensus`)
   - `Wal::open` appended past whatever suffix recovery had stopped at.

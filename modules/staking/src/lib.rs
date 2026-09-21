@@ -4875,6 +4875,43 @@ mod tests {
         assert_eq!(dst.delegation(&addr(3), &addr(2)), 200);
     }
 
+    /// A jailed validator must survive state sync: the jail marker
+    /// AND its jail height are canonical state — losing either would
+    /// let a slashed offender rejoin the active set early (the
+    /// `MIN_JAIL_BLOCKS` clock is measured from `jailed_at`).
+    #[test]
+    fn state_snapshot_preserves_jailed_validator() {
+        let src = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        src.genesis_set_bls_key(v, key.public_key().as_bytes());
+        src.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+        // `jailed_at` records `current_height` — begin a block so the
+        // jail lands at height 42, not the module's initial 0.
+        src.begin_block(Height::new(42));
+        src.handle(&ctx(), &signed_evidence(v, &key, 7, 0)).unwrap();
+        assert!(src.is_jailed(&v), "offender jailed before export");
+        src.end_block(Height::new(42));
+
+        let snapshot = src.export_state().expect("staking exports state");
+        assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
+
+        let dst = StakingModule::new();
+        dst.import_state(&snapshot).unwrap();
+        assert_eq!(dst.state_root(), src.state_root());
+        assert!(dst.is_jailed(&v), "jail marker must survive import");
+        assert_eq!(dst.stake(&v), 900, "post-slash stake must survive import");
+
+        // The jail clock must not reset: unjailing before
+        // `jailed_at + MIN_JAIL_BLOCKS` stays rejected even though
+        // the imported module's *import height* is later.
+        dst.begin_block(Height::new(42 + MIN_JAIL_BLOCKS - 1));
+        assert!(
+            dst.handle(&ctx_with_sender(1), &msg::unjail(v)).is_err(),
+            "unjail must still be inside the jail period — the clock survived import"
+        );
+    }
+
     /// A truncated blob must fail inspection and import — the
     /// claimed root is never trusted over the bytes.
     #[test]

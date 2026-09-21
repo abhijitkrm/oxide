@@ -2748,6 +2748,29 @@ impl OxideBft {
                 .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
         }
 
+        // Phantom-block guard: the first buffered vote fixes the
+        // (view, block_hash) reference every later vote is checked
+        // against below. If that first vote could name a block this
+        // node never stored, a single byzantine vote arriving before
+        // the leader's self-vote would anchor the quorum to garbage
+        // and `ConflictingVote` every honest vote — a one-message
+        // liveness DoS on the view, the same class as the future-view
+        // poison above. A QC we emit is only useful if it certifies a
+        // block we can actually serve to the commit walk, so a vote
+        // for an unknown (or stale-view) block is dropped, not
+        // anchored. Once a reference exists, the conflict check
+        // arbitrates every later vote — including votes for unknown
+        // hashes, which still surface as `ConflictingVote`.
+        if self.vote_count == 0 {
+            let stored_for_view = self
+                .blocks
+                .get(&vote.block_hash)
+                .is_some_and(|(stored_header, _)| stored_header.view == vote.view);
+            if !stored_for_view {
+                return Ok(());
+            }
+        }
+
         // Hardening: check that this vote agrees with the first vote
         // collected for this view. All votes in a QC must be for the
         // same (view, block_hash) — otherwise the QC does not
@@ -6694,7 +6717,12 @@ mod tests {
         let leader = &mut engines[0];
         let height = Height::new(7);
         let root = Hash([0x77; 32]);
-        let block_hash = Hash([0xAB; 32]);
+        // The votes must name a block the leader actually stored —
+        // the phantom-block guard drops first-votes for unknown
+        // hashes — so the leader proposes for real.
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, _proposal) = leader.propose().expect("leader proposes");
+        let block_hash = OxideBft::block_hash(&header);
 
         for i in 1u16..=3 {
             let att = StateAttestation { height, root };
@@ -6731,7 +6759,9 @@ mod tests {
         // attestation is a best-effort signal, not a vote defect).
         let (mut engines, keys) = signed_committee();
         let leader = &mut engines[0];
-        let block_hash = Hash([0xCD; 32]);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, _proposal) = leader.propose().expect("leader proposes");
+        let block_hash = OxideBft::block_hash(&header);
 
         // Attestation for (7, root) signed by validator 0's key but
         // claimed as validator 1's — fails verification.
@@ -7265,15 +7295,19 @@ mod tests {
     #[test]
     fn collect_vote_rejects_conflicting_vote_for_different_block() {
         // 4 validators, conformance mode (no BLS). The leader collects
-        // a vote for block A, then receives a vote for block B at the
-        // same view. The conflicting vote must be rejected.
+        // a vote for its real proposal, then receives a vote for a
+        // different hash at the same view. The conflicting vote must
+        // be rejected.
         let mut leader = make_multi_engine(0);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, _proposal) = leader.propose().expect("leader proposes");
+        let block_hash = OxideBft::block_hash(&header);
 
-        // First vote: for block hash A.
+        // First vote: for the proposed block.
         let vote_a = Vote {
-            view: View::new(0),
+            view: header.view,
             phase: VotePhase::Prepare,
-            block_hash: Hash([0xAA; 32]),
+            block_hash,
             signature: Signature::ZERO,
             attestation: None,
             attestation_sig: None,
@@ -7305,11 +7339,14 @@ mod tests {
         // single future-view vote must not become the "first vote"
         // and block all real current-view votes.
         let mut leader = make_multi_engine(0);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, _proposal) = leader.propose().expect("leader proposes");
+        let block_hash = OxideBft::block_hash(&header);
 
         let vote_v0 = Vote {
-            view: View::new(0),
+            view: header.view,
             phase: VotePhase::Prepare,
-            block_hash: Hash::ZERO,
+            block_hash,
             signature: Signature::ZERO,
             attestation: None,
             attestation_sig: None,
@@ -7319,7 +7356,7 @@ mod tests {
         let vote_v1 = Vote {
             view: View::new(1),
             phase: VotePhase::Prepare,
-            block_hash: Hash::ZERO,
+            block_hash,
             signature: Signature::ZERO,
             attestation: None,
             attestation_sig: None,
@@ -7338,12 +7375,15 @@ mod tests {
     #[test]
     fn collect_vote_future_view_does_not_block_current_view_votes() {
         let mut leader = make_multi_engine(0);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, _proposal) = leader.propose().expect("leader proposes");
+        let block_hash = OxideBft::block_hash(&header);
 
         // Byzantine voter sends a vote for view 1 (future).
         let future_vote = Vote {
             view: View::new(1),
             phase: VotePhase::Prepare,
-            block_hash: Hash::ZERO,
+            block_hash,
             signature: Signature::ZERO,
             attestation: None,
             attestation_sig: None,
@@ -7352,9 +7392,9 @@ mod tests {
 
         // Real votes for view 0 (current) must still be accepted.
         let real_vote = Vote {
-            view: View::new(0),
+            view: header.view,
             phase: VotePhase::Prepare,
-            block_hash: Hash::ZERO,
+            block_hash,
             signature: Signature::ZERO,
             attestation: None,
             attestation_sig: None,
@@ -7363,6 +7403,54 @@ mod tests {
             .collect_vote(2, real_vote)
             .expect("current-view vote accepted after future-view drop");
         assert!(leader.votes[2].is_some(), "current-view vote must be stored");
+    }
+
+    /// A vote naming a block the collector never stored must not
+    /// become the quorum's reference. The first buffered vote fixes
+    /// the `(view, block_hash)` every later vote is compared
+    /// against — so a byzantine voter racing a phantom-hash vote in
+    /// before the leader's self-vote used to poison the whole view:
+    /// every honest vote failed `ConflictingVote` and the round
+    /// stalled until timeout. The phantom vote is now dropped, the
+    /// voter's slot stays free, and the honest QC still forms.
+    #[test]
+    fn phantom_block_vote_does_not_block_honest_quorum() {
+        let mut leader = make_multi_engine(0);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header, proposal) = leader.propose().expect("leader proposes");
+        let block_hash = OxideBft::block_hash(&header);
+
+        // Byzantine voter 2's vote for a never-proposed block lands
+        // FIRST — before the leader's own vote is collected.
+        let phantom = Vote {
+            view: header.view,
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0xEE; 32]),
+            signature: Signature::ZERO,
+            attestation: None,
+            attestation_sig: None,
+        };
+        leader.collect_vote(2, phantom).expect("phantom vote is dropped, not an error");
+        assert!(leader.votes[2].is_none(), "phantom vote must not be stored");
+        assert_eq!(leader.vote_count, 0, "phantom vote must not anchor the quorum");
+
+        // The honest path is unaffected: the self-vote establishes
+        // the real reference and voter 2's honest vote still counts —
+        // its slot was never consumed.
+        let leader_idx = leader.validator_index;
+        if let Some(v) = leader.vote(&header, &proposal) {
+            leader.collect_vote(leader_idx, v).expect("self-vote accepted");
+        }
+        if let Some(v) = f1.vote(&header, &proposal) {
+            leader.collect_vote(1, v).expect("honest vote accepted");
+        }
+        if let Some(v) = f2.vote(&header, &proposal) {
+            leader.collect_vote(2, v).expect("honest vote from the phantom voter still counts");
+        }
+        let qc = leader.try_form_qc().expect("quorum forms despite the phantom vote");
+        assert_eq!(qc.block_hash, block_hash, "QC certifies the real proposal");
     }
 
     #[test]
@@ -7614,6 +7702,70 @@ mod tests {
         );
     }
 
+    /// Hidden-QC interleave: a QC formed in view v is withheld from a
+    /// validator while it times out and a TC(v) pushes it to v+1.
+    /// When the QC finally arrives its view is *behind* the current
+    /// view but ahead of `high_qc` — it must still be honored:
+    /// `high_qc` adopts it and the commit walk finalizes the chain it
+    /// certifies. Timing out of a view must never make its QC
+    /// unreachable — the timeout only says "quorum was not observed
+    /// in time", not "the block can never commit".
+    #[test]
+    fn hidden_qc_arriving_after_tc_still_commits_its_chain() {
+        let mut leader = make_multi_engine(0);
+        let mut f1 = make_multi_engine(1);
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+
+        // Round 0: QC(0) delivered to everyone — f3's high_qc.
+        drive_round(&mut leader, &mut [&mut f1, &mut f2, &mut f3], Some(TxBytes::new(vec![0])));
+
+        // Round 1: the leader proposes h1 and QC(1) forms — but f3
+        // never receives it (the hidden QC). f3 still votes, so it
+        // stores h1 for the eventual commit walk.
+        leader.submit_tx(TxBytes::new(vec![1]));
+        let (header1, proposal1) = leader.propose().expect("leader proposes h1");
+        let leader_idx = leader.validator_index;
+        if let Some(v) = leader.vote(&header1, &proposal1) {
+            leader.collect_vote(leader_idx, v).expect("self-vote");
+        }
+        for (i, f) in [&mut f1, &mut f2, &mut f3].iter_mut().enumerate() {
+            if let Some(v) = f.vote(&header1, &proposal1) {
+                let idx = u16::try_from(i + 1).expect("validator index fits u16");
+                leader.collect_vote(idx, v).expect("follower vote");
+            }
+        }
+        let qc1 = leader.try_form_qc().expect("QC(1) forms");
+        for e in [&mut leader, &mut f1, &mut f2] {
+            e.deliver_qc(qc1.clone()).expect("deliver");
+            e.advance_view();
+        }
+
+        // f3 times out of view 1: a quorum-signed TC(1) advances it
+        // to view 2 while its high_qc is still QC(0).
+        let tc1 = TimeoutCertificate {
+            view: View::new(1),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0111], // 3 signers (quorum)
+            aggregate_signature: AggregateSignature::ZERO,
+        };
+        f3.on_timeout_certificate(&tc1).expect("TC(1) accepted");
+        assert_eq!(f3.current_view().value(), 2, "TC advances f3 past the hidden QC's view");
+        assert!(f3.finalized_block(Height::new(0)).is_none(), "h0 is not committed at f3 yet");
+
+        // The hidden QC(1) finally arrives: qc.view(1) < current_view
+        // (2) but > high_qc(0). It must be accepted — high_qc adopts
+        // it and the commit walk finalizes h0 (2-chain: QC(1)
+        // certifies h1, whose embedded justify certifies h0).
+        f3.deliver_qc(qc1.clone()).expect("hidden QC must be accepted");
+        assert_eq!(f3.current_view().value(), 2, "the view must not regress behind the TC");
+        assert_eq!(f3.high_qc().map(|q| q.view.value()), Some(1), "high_qc adopts the revealed QC");
+        assert!(
+            f3.finalized_block(Height::new(0)).is_some(),
+            "the hidden QC's chain commits on arrival"
+        );
+    }
+
     // ---- Bounded view catch-up (DiemBFT v4 timeout evidence) ----
     //
     // A remote timeout signature may not pull a node to an arbitrary
@@ -7835,12 +7987,15 @@ mod tests {
     #[test]
     fn sync_to_view_clears_stale_votes() {
         let mut engine = make_multi_engine(0);
+        engine.submit_tx(TxBytes::new(vec![1]));
+        let (header, _proposal) = engine.propose().expect("engine proposes");
+        let block_hash = OxideBft::block_hash(&header);
 
         // Manually collect a vote to populate vote state.
         let vote = Vote {
-            view: View::new(0),
+            view: header.view,
             phase: VotePhase::Prepare,
-            block_hash: Hash::ZERO,
+            block_hash,
             signature: Signature::ZERO,
             attestation: None,
             attestation_sig: None,
@@ -7993,12 +8148,15 @@ mod tests {
     #[test]
     fn on_timeout_certificate_clears_per_view_state() {
         let mut engine = make_multi_engine(0);
+        engine.submit_tx(TxBytes::new(vec![1]));
+        let (header, _proposal) = engine.propose().expect("engine proposes");
+        let block_hash = OxideBft::block_hash(&header);
 
         // Populate vote and timeout signature state for view 0.
         let vote = Vote {
-            view: View::new(0),
+            view: header.view,
             phase: VotePhase::Prepare,
-            block_hash: Hash::ZERO,
+            block_hash,
             signature: Signature::ZERO,
             attestation: None,
             attestation_sig: None,

@@ -4681,6 +4681,64 @@ mod tests {
         assert_eq!(perps.position(&addr(1), mid).size, 0);
     }
 
+    /// Closing capacity is allocated once across ALL of an account's
+    /// resting opposing orders (`cover_booked` at admission): two
+    /// reduce-only orders on one position may share the cover, but
+    /// their sum may never exceed it — otherwise every successive
+    /// order would spend the same cover and a fill storm could flip
+    /// the account into unbacked exposure. Admission must reject the
+    /// over-allocation, not leave it to the match-time cap.
+    #[test]
+    fn reduce_only_orders_share_one_positions_cover() {
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        for b in [1u8, 8, 9] {
+            ledger.mint(&addr(b), 1_000_000);
+        }
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        for b in [1u8, 8, 9] {
+            perps.handle(&ctx(b), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        }
+
+        // Owner 1 opens +10 long against owner 9.
+        perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 10, 9))).unwrap();
+        perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 10, 1))).unwrap();
+        assert_eq!(perps.position(&addr(1), mid).size, 10_000);
+
+        // First reduce-only sells 6 lots at a non-crossing price —
+        // admitted (6 <= 10 reducible) and rests, booking 6 cover.
+        perps.handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 700, 6, 1))).unwrap();
+
+        // Second reduce-only of 5 lots: reducible is now 10 - 6 = 4,
+        // so 5 over-allocates the position — rejected at admission.
+        let err = perps
+            .handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 700, 5, 1)))
+            .unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "over-cover must reject: {err:?}");
+
+        // Exactly the remaining capacity — 4 lots — rests; the two
+        // orders now book the position's full cover (6 + 4 = 10).
+        perps.handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 700, 4, 1))).unwrap();
+
+        // A third reduce-only now finds zero reducible cover — even
+        // a 1-lot close is rejected while both resting orders hold
+        // the entire position.
+        let err = perps
+            .handle(&ctx(1), &msg::place_reduce_only(mid, limit(Side::Sell, 700, 1, 1)))
+            .unwrap_err();
+        assert!(matches!(err, ExecError::ModuleRejected(_)), "no cover left: {err:?}");
+
+        // A taker sweeps both resting orders: the position closes to
+        // exactly zero — never negative — and owner 8 takes +10.
+        perps.handle(&ctx(8), &msg::place(mid, limit(Side::Buy, 700, 10, 8))).unwrap();
+        assert_eq!(
+            perps.position(&addr(1), mid).size,
+            0,
+            "shared-cover fills must close to zero, not flip short"
+        );
+        assert_eq!(perps.position(&addr(8), mid).size, 10_000);
+    }
+
     /// A reduce-only order on the WRONG side of the book (no
     /// reducible position) is rejected outright — there is nothing
     /// it could reduce.

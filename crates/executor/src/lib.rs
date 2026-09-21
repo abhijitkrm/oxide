@@ -3474,13 +3474,50 @@ impl AppInterface for Executor {
                 self.execute_committed_backlog();
             }
         } else {
-            // Synchronous execution (default): execute the block
-            // immediately and store the state root.
+            // Synchronous execution (default): fail closed on a
+            // partially applied block BEFORE executing, exactly as
+            // the backlog drain does — a `Some(h)` marker with no
+            // recorded root means a previous `execute_block` panicked
+            // mid-mutation, and replaying over surviving writes would
+            // double-apply fees/nonces/module effects.
+            let poisoned = {
+                let (lock, _cv) = &*self.exec_sync;
+                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight.filter(
+                    |h| {
+                        !self
+                            .state_roots
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains_key(h)
+                    },
+                )
+            };
+            if let Some(h) = poisoned {
+                panic!(
+                    "executor: synchronous execution of committed block {h} panicked \
+                     mid-mutation; the block may be partially applied (fees/nonces/module \
+                     state already mutated) and cannot be safely replayed in-process — \
+                     halting; restart to recover from durable state"
+                );
+            }
+            // Mark the height in-flight around `execute_block` exactly
+            // as the backlog drain does: if the panic propagates, the
+            // marker stays set and the NEXT `finalize_block` meets the
+            // fail-closed check above instead of silently replaying.
+            {
+                let (lock, _cv) = &*self.exec_sync;
+                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight =
+                    Some(block.height.value());
+            }
             let root = self.execute_block(block);
             self.state_roots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert_retained(block.height.value(), root, self.history_retention);
+            {
+                let (lock, _cv) = &*self.exec_sync;
+                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight = None;
+            }
             // Keep the watermark honest in synchronous mode too:
             // the block was just executed, and `insert_finalized`
             // evicts only at-or-below it.
@@ -5841,6 +5878,65 @@ mod tests {
             *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             1,
             "a refused replay must not run the mutation a second time"
+        );
+    }
+
+    /// The synchronous dispatch path must enforce the same
+    /// fail-closed contract as the exec lane: a module panic that
+    /// lands after earlier mutations leaves `in_flight` set with no
+    /// root, so the next `finalize_block` refuses to execute on top
+    /// of the half-applied block — replay belongs to durable-state
+    /// recovery at restart, not to in-process retry.
+    #[test]
+    fn sync_path_panic_mid_mutation_poisons_executor() {
+        let mut executor = test_executor(100);
+        let module = Arc::new(MutateThenPanicModule {
+            calls: Mutex::new(0),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+        executor.register_module(module.clone() as Arc<dyn Module>);
+        // No exec lane — the default synchronous path.
+
+        // Block 0: mutation lands, then the panic propagates through
+        // `finalize_block` to the caller.
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.finalize_block(&FinalizedBlock {
+                context: types::BlockContext::default(),
+                height: Height::new(0),
+                txs: vec![make_tx_with_nonce(3, &[1], 0)],
+                signers: vec![],
+            });
+        }));
+        assert!(first.is_err(), "the module panic must propagate to the committer");
+        assert_eq!(
+            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "the pre-panic mutation landed — the block is partially applied"
+        );
+
+        // Block 1 must fail closed: replaying block 0 on top of the
+        // surviving mutation would double-apply it. (The module is
+        // disarmed, so a blind retry would even SUCCEED — silently
+        // returning a root computed over double-applied state.)
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.finalize_block(&FinalizedBlock {
+                context: types::BlockContext::default(),
+                height: Height::new(1),
+                txs: vec![make_tx_with_nonce(3, &[2], 1)],
+                signers: vec![],
+            });
+        }));
+        let payload = second.expect_err("the sync path must fail closed on a partial apply");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("partially applied"), "halt message must name the cause, got: {msg}");
+        assert_eq!(
+            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "no mutation may replay on the poisoned executor"
         );
     }
 

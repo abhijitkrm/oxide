@@ -17916,3 +17916,55 @@ sells' `reserved`). 387k runs, zero violations, coverage climbed to
 
 Both corpora minimized and committed; the nightly fuzz list now runs
 10 targets including `exchange-settlement`.
+
+## Regression batch: panic-poison on the sync path, phantom-vote anchoring, hidden-QC commit, shared reduce-cover
+
+Closing out the audit's regression-scenario list (§8.5). Most
+scenarios were already pinned (torn-tail rewrite, forged senders,
+STP escrow, ring exhaustion, slow-consumer eviction, invalid
+votes/TCs, mixed committed order, precompile entry-point breadth);
+the batch filled the real gaps and fixed two latent issues the
+review surfaced:
+
+- **Sync `finalize_block` now fails closed on partial apply.** The
+  exec lane already refuses replay after a mid-block panic
+  (`in_flight` marker with no recorded root), but the default
+  synchronous path set no marker — a second `finalize_block` would
+  re-execute over surviving mutations and double-apply fees/nonces/
+  module state. The sync path now marks `in_flight` around
+  `execute_block` and panics on the next commit if a poisoned height
+  is found — same contract, same recovery story (restart replays
+  durable state). Regression: `sync_path_panic_mid_mutation_poisons_executor`.
+
+- **`collect_vote` drops first-votes for blocks it never stored.**
+  The quorum's `(view, block_hash)` reference was "whatever arrived
+  first" — a byzantine vote for a phantom hash landing before the
+  leader's self-vote would have anchored the buffer and
+  `ConflictingVote`-rejected every honest vote: a one-message
+  liveness DoS on the view (the same class C2 fixed for future-view
+  votes). All current callers happen to collect the self-vote first,
+  so this was unreachable — but the API is now robust to ordering
+  regardless: a vote can only establish the reference for a block
+  stored with a matching view; later votes keep arbitrating through
+  `ConflictingVote` exactly as before. Regression:
+  `phantom_block_vote_does_not_block_honest_quorum`. Six existing
+  tests that collected votes for fabricated hashes now propose a
+  real block first — same assertions, honest setup.
+
+- **Hidden-QC/TC interleave pinned.** A QC formed in view v but
+  withheld past the timeout must still be honored when it arrives:
+  `deliver_qc` adopts it into `high_qc` and the commit walk
+  finalizes its chain even though a TC already advanced the view —
+  `hidden_qc_arriving_after_tc_still_commits_its_chain` proves the
+  view never regresses and the certified ancestors commit.
+
+- **Jail state survives snapshots.** `state_snapshot_preserves_jailed_validator`
+  exports a jailed validator, imports it, and proves both the marker
+  and the `jailed_at` clock survive — an early unjail stays rejected
+  after import, and the post-slash stake is intact.
+
+- **Reduce-only cover is allocated once, at admission.**
+  `reduce_only_orders_share_one_positions_cover` places two
+  reduce-only orders against one position: the second is rejected at
+  admission when it over-allocates `cover_booked`, the pair fills to
+  exactly zero — no flip into unbacked exposure.
