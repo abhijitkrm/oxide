@@ -18135,3 +18135,21 @@ One test needed `pays_own_fee() -> true`:
 ingest-cache→preverified-dispatch wiring, which now only serves
 self-funded modules. Semantically transparent: the test configures
 no fee collector, so its charges were no-ops.
+
+## Supply chain: the ≥7-day dependency rule is now a machine check
+
+AGENTS.md has always required dependency versions to be published
+≥7 days before adoption — but nothing enforced it; a dep bump to
+a day-old release would sail through review if nobody looked at
+crates.io. `scripts/check-dep-age.py` closes that: it parses every
+`registry+` package out of `Cargo.lock` (workspace/path deps carry
+no `source` line and aren't publish-date checked), asks crates.io
+for each version's `created_at`, and exits nonzero listing any dep
+younger than the cutoff. Unverifiable ages (API error, missing
+version) fail closed too — an unchecked dep is a hole, not a pass.
+
+Wired as a step in the `supply-chain` CI job alongside cargo-deny:
+license/advisory/source policy was already gated there; release
+age is the same class of policy. 8-way parallel fetch keeps it to
+~20s. `OXIDE_DEP_MIN_AGE_DAYS` overrides the floor for testing.
+Current lockfile: 460 registry deps, all ≥7 days old.

@@ -67,8 +67,15 @@ jobs:
         run: cargo +1.91 check --workspace --all-targets --locked
 
   supply-chain:
-    name: cargo-deny
+    name: cargo-deny + dep-age
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Dependency release-age gate
+        # AGENTS.md requires every dependency version to be ≥7 days
+        # old — fresh releases are unvetted and supply-chain attacks
+        # are usually yanked within days. The script checks every
+        # registry package in Cargo.lock against crates.io; a dep
+        # bump to a too-new version fails this job.
+        run: python3 scripts/check-dep-age.py
