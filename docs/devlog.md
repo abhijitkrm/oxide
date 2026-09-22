@@ -18951,3 +18951,35 @@ honest budget: a venue's cancel-latency claim cannot beat its
 signature-verification cost. One setup trap worth recording:
 matcher order ids are 0-based, so `order_id > 0` is not a valid
 "rested" check — `!resp.rejected` is.
+
+## §7.4 — workload-vs-state benches measure the real slopes
+
+`block_pipeline`'s new `state_scaling` group holds the block fixed
+(100 delegate txs) and grows committed state on three axes —
+answering the audit's "small warmed state hides eventual costs"
+correction with numbers. Two setup subtleties mattered:
+
+- **Flush after minting.** Newly minted accounts sit in `touched`;
+  without a warm-up finalize the measured block pays the one-time
+  O(population) trie build. Setup finalizes a genesis block first
+  so measurement hits the incremental path production runs.
+- **Isolating the nonce axis.** Skipped txs never bump
+  `executed_nonces`, but a tx that reaches a module and fails
+  *does* (the bump is at plan time; only a fee-charge failure
+  rewinds). `nonce_history` therefore delegates to an unregistered
+  validator — fee charged, nonce consumed, zero staking state —
+  separating nonce-map growth from delegation-record growth.
+
+Measured (dev Mac, p50, 100-tx block): `accounts` 0.65/1.18/13.9 ms
+at 1k/10k/100k — the EVM trie's residual O(total-accounts) assembly,
+by design. `nonce_history` 2.1/5.4/33 ms — the delta overlay holds
+O(touched), the residual is the same trie plus per-nonce-entry
+bookkeeping. `delegated_history` 2.5/11/**193 ms** — the +160 ms at
+100k is staking's `state_root` serializing every delegation record
+per block (~1.6 µs/record). That generalizes the audit's exchange
+observation: every module canonical root is a full-state walk;
+`state_root_vs_book` in the settlement bench pins the named one at
+26/99/693 µs for 100/1k/10k resting orders (~66 ns/order).
+
+No gates — these rows exist to report scaling, and they are the
+baseline a Merkle-ized committed-state redesign must beat.

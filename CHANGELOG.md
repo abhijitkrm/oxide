@@ -12,6 +12,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **State-scaling benchmarks** (`crates/executor`,
+  `modules/exchange`): `block_pipeline`'s `state_scaling` group
+  measures a fixed 100-tx block against growing committed state —
+  idle accounts, consumed nonces, and full delegation history as
+  separate axes — and `settlement`'s `state_root_vs_book` measures
+  block commitment over 100–10k resting orders. The measured truth:
+  per-block cost grows with total state (~0.14 µs per account,
+  ~1.6 µs per staking delegation record, ~66 ns per book order),
+  because module canonical roots serialize full state every block.
+  - **In plain words:** we now measure whether the chain gets slower
+    as it accumulates history — and it does, mainly because every
+    module rewrites its whole state hash each block. These
+    benchmarks are the yardstick a future incremental-commitment
+    redesign must beat.
+
 - **Cancel/amend workload benchmark** (`crates/matcher`): the
   `cancel_amend` group in `matcher_throughput` measures the full
   authenticated action path — Ed25519 verify, owner binding, nonce

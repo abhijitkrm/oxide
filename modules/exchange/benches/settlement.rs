@@ -67,7 +67,7 @@
 //!   [$10, $20] (1000 levels), 5-lot orders at tick 500 ($15.00).
 //!   Notional per fill = 5_000 × 1.5B / 1e8 = 75_000 quote units.
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use executor::{Module, TxContext};
 use framework::Balances;
 use primitives::Address;
@@ -451,6 +451,48 @@ fn batch_settle_16k_clustered_pairs(c: &mut Criterion) {
     });
 }
 
+/// Build an exchange whose book holds `n_orders` resting sells
+/// spread across the 1000-level band and 8 seller accounts (each
+/// with a pooled base deposit covering its whole ladder).
+fn exchange_with_book(n_orders: usize) -> ExchangeModule {
+    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    let ex = ExchangeModule::with_ledger(ledger.clone());
+    let mid = ex.list_market(cfg()).expect("market config valid");
+    for s in 0..8u8 {
+        ledger.mint(&addr(10 + s), u64::MAX / 4);
+        ex.handle(&ctx(10 + s), &exchange::msg::deposit_base(mid, u64::MAX / 8))
+            .expect("base deposit");
+    }
+    for i in 0..n_orders {
+        let owner = 10 + u8::try_from(i % 8).unwrap_or(0);
+        let order = limit(Side::Sell, (i % 1_000) as u64, 5, owner);
+        ex.handle(&ctx(owner), &exchange::msg::place(mid, order)).expect("resting sell");
+    }
+    ex
+}
+
+/// No gate — this bench REPORTS the cost the audit's 7.4 entry
+/// names: `state_root` re-serializes the entire committed book every
+/// block, so per-block commitment cost scales with resting orders,
+/// not with touched state. Rows measure `Module::state_root` over
+/// 100 / 1k / 10k resting sells — the baseline any incremental
+/// (Merkle-ized book) redesign must beat.
+fn state_root_vs_book(c: &mut Criterion) {
+    let mut group = c.benchmark_group("state_root_vs_book");
+    for &n in &[100usize, 1_000, 10_000] {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_batched(
+                || exchange_with_book(n),
+                |ex| {
+                    black_box(ex.state_root());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     settlement_single_fill,
@@ -458,6 +500,7 @@ criterion_group!(
     raw_engine_single_fill,
     batch_settle_1k_distinct_pairs,
     batch_settle_1k_same_pair,
-    batch_settle_16k_clustered_pairs
+    batch_settle_16k_clustered_pairs,
+    state_root_vs_book
 );
 criterion_main!(benches);

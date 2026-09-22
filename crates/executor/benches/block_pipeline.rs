@@ -58,7 +58,20 @@ use types::{BlockBudget, FinalizedBlock, TxBytes};
 /// Delegation exercises the real ledger path (an EVM account
 /// transfer into the bonded pool) — the heaviest native-module op.
 fn make_delegate_tx(sender: Address, nonce: u64, fee: u64, amount: u64) -> TxBytes {
-    let payload = staking::msg::delegate(sender, amount);
+    make_delegate_to_tx(sender, sender, nonce, fee, amount)
+}
+
+/// Same envelope as [`make_delegate_tx`] but the delegation target is
+/// explicit — the history-growth setup needs many distinct senders
+/// delegating to the one genesis validator.
+fn make_delegate_to_tx(
+    sender: Address,
+    validator: Address,
+    nonce: u64,
+    fee: u64,
+    amount: u64,
+) -> TxBytes {
+    let payload = staking::msg::delegate(validator, amount);
     let mut bytes = Vec::with_capacity(37 + payload.len());
     bytes.extend_from_slice(&sender.0);
     bytes.extend_from_slice(&nonce.to_le_bytes());
@@ -190,5 +203,193 @@ fn bench_execute_only(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_full_pipeline, bench_propose_only, bench_execute_only);
+/// Deterministic address from an index (distinct funded accounts).
+fn addr_from_index(i: u32) -> Address {
+    let mut a = [0u8; 20];
+    a[..4].copy_from_slice(&i.to_le_bytes());
+    Address(a)
+}
+
+/// The fixed measured workload for the state-scaling rows:
+/// `finalize_block` + `attest_state` on a block already pulled from
+/// the mempool — the state-touching half of the pipeline (mempool
+/// selection does not depend on committed state).
+fn run_execute_attest(executor: &Executor, height: u64) {
+    let proposal = executor.prepare_proposal(&BUDGET);
+    let block = FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(height),
+        txs: proposal.txs,
+        signers: Vec::new(),
+    };
+    let ack = executor.finalize_block(&block);
+    black_box(&ack);
+    let attestation = executor.attest_state(Height::new(height));
+    black_box(&attestation);
+}
+
+/// Executor with `n_accounts` funded-but-idle accounts in the EVM
+/// ledger plus `n_txs` delegate txs queued from a single sender.
+///
+/// The genesis finalize at height 1 is setup, not measurement: the
+/// EVM `state_root` leaf map builds on first use (O(population)) and
+/// `touched` clears per block — minting the population without a
+/// flush would charge the whole trie build to the measured block.
+/// The measured block at height 2 hits the incremental path a
+/// production chain actually runs (O(touched + total_accounts)).
+fn setup_executor_with_accounts(n_txs: usize, n_accounts: usize) -> Executor {
+    let mut executor =
+        Executor::new(n_txs + 100).with_unsigned_tx_policy(executor::UnsignedTxPolicy::Allow);
+    let evm = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    let sender = Address([0u8; 20]);
+    framework::Balances::mint(evm.as_ref(), &sender, u64::MAX / 4);
+    executor.register_module(evm.clone());
+    executor.set_fee_module(framework::module_id::EVM);
+    let staking_module = staking::StakingModule::new();
+    staking_module.set_ledger(evm.clone());
+    staking_module.genesis_register_validator(sender, 1);
+    executor.register_module(Arc::new(staking_module));
+    for i in 0..n_accounts {
+        let a = addr_from_index(u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1));
+        framework::Balances::mint(evm.as_ref(), &a, 1);
+    }
+    // Warm-up block flushes the minted population into the trie and
+    // consumes nonce 0 of the bench sender.
+    let warmup = FinalizedBlock {
+        context: types::BlockContext::default(),
+        height: Height::new(1),
+        txs: vec![make_delegate_tx(sender, 0, 100, 1)],
+        signers: Vec::new(),
+    };
+    executor.finalize_block(&warmup);
+    for i in 0..n_txs {
+        let tx = make_delegate_tx(sender, (i + 1) as u64, 100, 1);
+        let ack = executor.ingest_tx(tx);
+        assert_eq!(ack, types::MempoolAck::Accepted, "tx {i} must be accepted");
+    }
+    executor
+}
+
+/// Executor whose committed history holds `n_history` distinct
+/// senders, plus `n_txs` queued from fresh senders. `delegations`
+/// selects what each historical tx wrote:
+///
+/// - `false` (nonce-only growth): every historical tx delegates to an
+///   UNREGISTERED validator — the charge succeeds and the nonce is
+///   consumed at plan time, but the module rejects before writing
+///   any delegation record. This isolates `executed_nonces` + sender
+///   accounts from module-state growth — the population the delta
+///   overlay and nonce root must stay O(touched) against.
+/// - `true` (full history): every historical tx delegates to the
+///   genesis validator — each writes a staking delegation record on
+///   top of the nonce + account entries, so the difference vs the
+///   `false` axis attributes the module `state_root` walk.
+fn setup_executor_with_history(n_txs: usize, n_history: usize, delegations: bool) -> Executor {
+    let mut executor = Executor::new(n_history + n_txs + 100)
+        .with_unsigned_tx_policy(executor::UnsignedTxPolicy::Allow);
+    let evm = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+    let validator = Address([0u8; 20]);
+    // Never registered — the nonce-history txs target this and fail
+    // inside the module (fee charged, nonce consumed, nothing written).
+    let ghost = Address([0xEE; 20]);
+    framework::Balances::mint(evm.as_ref(), &validator, u64::MAX / 4);
+    executor.register_module(evm.clone());
+    executor.set_fee_module(framework::module_id::EVM);
+    let staking_module = staking::StakingModule::new();
+    staking_module.set_ledger(evm.clone());
+    staking_module.genesis_register_validator(validator, 1);
+    executor.register_module(Arc::new(staking_module));
+    // History: `n_history` distinct funded senders, one tx each.
+    // Batched into ~2k-tx blocks (delegate txs are ~45 B against the
+    // 1 MB budget).
+    let mut height = 0u64;
+    for chunk in (0..n_history).collect::<Vec<_>>().chunks(2_000) {
+        height += 1;
+        let target = if delegations { validator } else { ghost };
+        let txs: Vec<TxBytes> = chunk
+            .iter()
+            .map(|&i| {
+                let sender =
+                    addr_from_index(u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1));
+                framework::Balances::mint(evm.as_ref(), &sender, u64::MAX / 4);
+                make_delegate_to_tx(sender, target, 0, 100, 1)
+            })
+            .collect();
+        let block = FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(height),
+            txs,
+            signers: Vec::new(),
+        };
+        executor.finalize_block(&block);
+    }
+    // Measured block: `n_txs` fresh senders (nonce 0 each) — the
+    // workload stays constant while committed history grows behind it.
+    for i in 0..n_txs {
+        let sender = addr_from_index(u32::try_from(n_history + i + 1).unwrap_or(u32::MAX));
+        framework::Balances::mint(evm.as_ref(), &sender, u64::MAX / 4);
+        let tx = make_delegate_to_tx(sender, validator, 0, 100, 1);
+        let ack = executor.ingest_tx(tx);
+        assert_eq!(ack, types::MempoolAck::Accepted, "tx {i} must be accepted");
+    }
+    executor
+}
+
+/// Bench: a fixed transaction workload against growing committed
+/// state — the audit-7.4 "eventual scaling cost" measurement. The
+/// block is held constant (100 delegate txs, ~4.5 kB); the axes are
+/// the populations behind it:
+///
+/// - `accounts/*`: funded-but-idle EVM accounts — the state-trie
+///   population `state_root` assembles over (O(touched + total) by
+///   design; these rows measure the residual O(total) term).
+/// - `nonce_history/*`: senders whose single tx was consumed but
+///   rejected in-module — committed `executed_nonces` + accounts
+///   grow, delegation state does not. The delta vs `accounts`
+///   attributes the nonce-map term.
+/// - `delegated_history/*`: senders whose delegate tx executed —
+///   nonces + accounts + one staking delegation each. The delta vs
+///   `nonce_history` attributes the canonical module `state_root`
+///   serialization (staking rewrites every delegation record).
+///
+/// No gate: this bench exists to *report* scaling, so a headline
+/// claim can cite the measured slope rather than a warmed-small-state
+/// number.
+fn bench_state_scaling(c: &mut Criterion) {
+    const TXS: usize = 100;
+    let mut group = c.benchmark_group("state_scaling");
+    group.throughput(Throughput::Elements(TXS as u64));
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(10));
+
+    for &n in &[1_000usize, 10_000, 100_000] {
+        group.bench_with_input(BenchmarkId::new("accounts", n), &n, |b, &n| {
+            b.iter_batched(
+                || setup_executor_with_accounts(TXS, n),
+                |executor| run_execute_attest(&executor, 2),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    for &(name, delegations) in &[("nonce_history", false), ("delegated_history", true)] {
+        for &n in &[1_000usize, 10_000, 100_000] {
+            group.bench_with_input(BenchmarkId::new(name, n), &n, |b, &n| {
+                b.iter_batched(
+                    || setup_executor_with_history(TXS, n, delegations),
+                    |executor| run_execute_attest(&executor, 1 + (n as u64).div_ceil(2_000)),
+                    criterion::BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_full_pipeline,
+    bench_propose_only,
+    bench_execute_only,
+    bench_state_scaling
+);
 criterion_main!(benches);
