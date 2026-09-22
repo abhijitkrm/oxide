@@ -19215,3 +19215,32 @@ Verdict for §7.5: no live hot-path allocation problem. If the FIX/
 WS parse surfaces ever matter, the fix is a borrowed-slice tag
 iterator — and now there's a measured 25–31 allocs/msg baseline to
 beat. §7.5's named measurement list is complete.
+## Session N+18 — exchange custody quantities become unit types
+
+§9.B's largest remaining leg: the exchange's base-asset custody was
+raw `u64` everywhere — the same integer type as quote ledger units,
+prices, and wire fields — so nothing stopped a base quantity from
+being summed into a quote map or compared against a price.
+
+`base_balances` and `base_holds` now map to `Qty` (scale-6 base
+asset — the denomination was already correct: deposits bridge
+1 native unit == 1 base micro-unit and fills write `qty.0` into the
+same map). `Reserved::Base` carries a `Qty`, and `RegisteredOrder`'s
+`limit_price`/`remaining` are `Price`/`Qty`, finishing the
+registered-order surface the `Reserved` enum started. Settlement
+internals follow: `TakerCtx.base`, `LegPlan.qty`,
+`OrderDelta.consumed`, and the delivery/consumed maps are all `Qty`
+— a settlement leg can no longer hand a price or a quote amount
+into the base-delivery path without an explicit `.0` boundary.
+
+Two deliberate non-changes: `fee_vault` stays raw `u64` — it is
+quote-denominated like `framework::Balances`, not a base quantity —
+and the canonical wire format is byte-identical (encode emits `.0`,
+decode wraps the raw `u64`), so committed state and snapshot hashes
+don't move. `Qty` gained the `PartialEq<u64>` parity convention
+`SignedQty` already carries so conservation asserts still read as
+plain unit arithmetic.
+
+Remaining §9.B: `MarketConfig`'s tick/lot fields (price ticks vs
+`Price`, base lots vs `Qty`) and the wei↔native↔quote seam at the
+EVM boundary.

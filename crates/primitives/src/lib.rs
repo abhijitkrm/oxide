@@ -556,6 +556,23 @@ pub mod fixed {
         a.0.checked_add(b.0).map(Qty)
     }
 
+    /// `PartialEq` against `u64` so assertions and literal
+    /// comparisons (`assert_eq!(bal, 20_000)`) stay readable — the
+    /// same convention [`SignedQty`] uses for `i64` literals.
+    /// Deliberately NOT `PartialOrd`: ordering a typed quantity
+    /// against an untyped raw would hide the denomination bridge
+    /// (`free < Qty(amount)` should be written, not `free < amount`).
+    impl PartialEq<u64> for Qty {
+        fn eq(&self, other: &u64) -> bool {
+            self.0 == *other
+        }
+    }
+    impl PartialEq<Qty> for u64 {
+        fn eq(&self, other: &Qty) -> bool {
+            *self == other.0
+        }
+    }
+
     /// A scale-6 **signed** quantity — the unit of positions and fill
     /// deltas, where the sign carries direction (positive = long /
     /// bought, negative = short / sold).

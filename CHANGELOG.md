@@ -94,6 +94,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     cannot exist, so settlement can't misroute value between the
     ledger and base custody.
 
+- **Exchange custody quantities are unit types** (`exchange`):
+  `base_balances`/`base_holds` map values, `Reserved::Base` escrow,
+  `RegisteredOrder::limit_price`/`remaining`, and the settlement
+  delivery/consumed maps are now `Price`/`Qty` instead of bare
+  `u64`. The quote-denominated `fee_vault` deliberately stays
+  `u64`, and canonical wire/snapshot bytes are unchanged.
+  - **In plain words:** base-asset amounts can no longer mix with
+    prices or quote money anywhere in settlement — the compiler
+    rejects the combination instead of a bad arithmetic site
+    quietly crediting the wrong unit.
+
 ### Added
 
 - **Contention and interference benchmarks** (`crates/matcher`,

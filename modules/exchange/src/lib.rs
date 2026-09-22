@@ -84,7 +84,7 @@ use std::sync::{Arc, Mutex};
 
 use executor::{Event, ExecError, Module, TxContext};
 use framework::{KVStore, module_id, subtree_root};
-use primitives::fixed::{Price, Qty};
+use primitives::fixed::{Price, Qty, qty_add, qty_sub};
 use primitives::{Address, Hash, Height};
 use trading::{
     CanceledOrder, DenseBook, FillEvent, MarketConfig, MatchingEngine, NewOrder, OrderId,
@@ -164,11 +164,11 @@ pub struct BatchFillEntry {
 struct RegisteredOrder {
     /// Market the order is authorized on (must be listed).
     market: u16,
-    /// The owner's limit price (scale-8): the maximum a buy pays,
-    /// the minimum a sell accepts.
-    limit_price: u64,
-    /// Unfilled authorized quantity (scale-6).
-    remaining: u64,
+    /// The owner's limit price: the maximum a buy pays, the minimum
+    /// a sell accepts.
+    limit_price: Price,
+    /// Unfilled authorized quantity of the market's base asset.
+    remaining: Qty,
     /// The escrowed obligation, carrying its denomination in the
     /// variant — the side is *derived* from it (`RegisteredOrder::
     /// side`), so the escrow's unit can never disagree with the
@@ -191,9 +191,9 @@ enum Reserved {
     /// quote units, released per fill at the limit price.
     Quote(u64),
     /// The full base quantity moved out of the owner's free base
-    /// custody at registration — scale-6 base units, consumed
-    /// qty-for-qty per fill.
-    Base(u64),
+    /// custody at registration — a `Qty` of the market's base asset,
+    /// consumed qty-for-qty per fill.
+    Base(Qty),
 }
 
 impl Reserved {
@@ -213,7 +213,8 @@ impl Reserved {
     /// denomination — from `side()` or by matching the variant.
     const fn get(self) -> u64 {
         match self {
-            Self::Quote(v) | Self::Base(v) => v,
+            Self::Quote(v) => v,
+            Self::Base(v) => v.0,
         }
     }
 }
@@ -393,7 +394,7 @@ struct Inner {
     /// into `base_holds` (book path) or `RegisteredOrder::reserved`
     /// (registered path); fills deliver out of those holds into the
     /// buyer's entry here. Committed state.
-    base_balances: BTreeMap<(Address, u8), u64>,
+    base_balances: BTreeMap<(Address, u8), Qty>,
     /// Base locked by this account's resting sell orders on the
     /// book path: `(owner, market) → Σ unfilled sell qty`. A resting
     /// sell contributes its full remaining qty at rest; fills
@@ -401,7 +402,7 @@ struct Inner {
     /// non-fill book removals release back to `base_balances`. The
     /// invariant `holds[(o,m)] == Σ unfilled qty of o's resting sells
     /// on m` is maintained at every mutation point. Committed state.
-    base_holds: BTreeMap<(Address, u8), u64>,
+    base_holds: BTreeMap<(Address, u8), Qty>,
     /// Accrued protocol fees per market, in quote units — the
     /// committed sink every fill's `FEE_BPS` slice lands in. A
     /// governance withdrawal path is a deliberate residual; until it
@@ -418,8 +419,8 @@ type CommittedState = (
     Vec<Option<MatchingEngine>>,
     framework::Endorsements,
     BTreeMap<OrderKey, RegisteredOrder>,
-    BTreeMap<(Address, u8), u64>,
-    BTreeMap<(Address, u8), u64>,
+    BTreeMap<(Address, u8), Qty>,
+    BTreeMap<(Address, u8), Qty>,
     BTreeMap<u8, u64>,
 );
 
@@ -584,8 +585,12 @@ impl ExchangeModule {
     ///
     /// # Panics
     /// Panics if the inner mutex is poisoned.
-    pub fn base_balance(&self, owner: Address, market: u8) -> u64 {
-        framework::lock_state(&self.inner).base_balances.get(&(owner, market)).copied().unwrap_or(0)
+    pub fn base_balance(&self, owner: Address, market: u8) -> Qty {
+        framework::lock_state(&self.inner)
+            .base_balances
+            .get(&(owner, market))
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The account's base locked by resting sells on a market.
@@ -593,8 +598,12 @@ impl ExchangeModule {
     ///
     /// # Panics
     /// Panics if the inner mutex is poisoned.
-    pub fn base_hold(&self, owner: Address, market: u8) -> u64 {
-        framework::lock_state(&self.inner).base_holds.get(&(owner, market)).copied().unwrap_or(0)
+    pub fn base_hold(&self, owner: Address, market: u8) -> Qty {
+        framework::lock_state(&self.inner)
+            .base_holds
+            .get(&(owner, market))
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Protocol fees accrued to a market's vault (quote units).
@@ -658,7 +667,7 @@ impl ExchangeModule {
             .values()
             .filter(|o| o.market == u16::from(market))
             .fold(0u64, |acc, o| match o.reserved {
-                Reserved::Base(q) => acc.saturating_add(q),
+                Reserved::Base(q) => acc.saturating_add(q.0),
                 Reserved::Quote(_) => acc,
             })
     }

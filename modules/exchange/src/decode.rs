@@ -8,8 +8,8 @@
 //! proves the bytes hash.
 
 use super::{
-    BTreeMap, CommittedState, DenseBook, ExchangeModule, MatchingEngine, OrderKey, RegisteredOrder,
-    Reserved, Side, subtree_root,
+    BTreeMap, CommittedState, DenseBook, ExchangeModule, MatchingEngine, OrderKey, Price, Qty,
+    RegisteredOrder, Reserved, Side, subtree_root,
 };
 use crate::codec::{decode_side, encode_market_config, encode_side, market_config_key};
 
@@ -58,8 +58,8 @@ impl ExchangeModule {
             w.put_u64(key.client_id);
             w.put_u16(order.market);
             w.put_u8(encode_side(order.side()));
-            w.put_u64(order.limit_price);
-            w.put_u64(order.remaining);
+            w.put_u64(order.limit_price.0);
+            w.put_u64(order.remaining.0);
             w.put_u64(order.reserved.get());
         }
         // Base-asset custody state — committed because it decides
@@ -72,13 +72,13 @@ impl ExchangeModule {
         for ((owner, market), amount) in &inner.base_balances {
             w.put_addr(owner);
             w.put_u8(*market);
-            w.put_u64(*amount);
+            w.put_u64(amount.0);
         }
         w.put_count(inner.base_holds.len());
         for ((owner, market), amount) in &inner.base_holds {
             w.put_addr(owner);
             w.put_u8(*market);
-            w.put_u64(*amount);
+            w.put_u64(amount.0);
         }
         w.put_count(inner.fee_vault.len());
         for (market, amount) in &inner.fee_vault {
@@ -160,11 +160,11 @@ impl ExchangeModule {
                 let side = decode_side(r.get_u8()?)?;
                 let order = RegisteredOrder {
                     market,
-                    limit_price: r.get_u64()?,
-                    remaining: r.get_u64()?,
+                    limit_price: Price(r.get_u64()?),
+                    remaining: Qty(r.get_u64()?),
                     reserved: match side {
                         Side::Buy => Reserved::Quote(r.get_u64()?),
-                        Side::Sell => Reserved::Base(r.get_u64()?),
+                        Side::Sell => Reserved::Base(Qty(r.get_u64()?)),
                     },
                 };
                 if registered.insert(key, order).is_some() {
@@ -187,14 +187,14 @@ impl ExchangeModule {
             let count = r.get_count()?;
             for _ in 0..count {
                 let key = (r.get_addr()?, r.get_u8()?);
-                if base_balances.insert(key, r.get_u64()?).is_some() {
+                if base_balances.insert(key, Qty(r.get_u64()?)).is_some() {
                     return None; // Duplicate key — non-canonical.
                 }
             }
             let count = r.get_count()?;
             for _ in 0..count {
                 let key = (r.get_addr()?, r.get_u8()?);
-                if base_holds.insert(key, r.get_u64()?).is_some() {
+                if base_holds.insert(key, Qty(r.get_u64()?)).is_some() {
                     return None; // Duplicate key — non-canonical.
                 }
             }

@@ -10,8 +10,8 @@
 use super::{
     Address, BTreeMap, CANCEL_REGISTERED_BODY_LEN, CUSTODY_BODY_LEN, Event, ExchangeModule,
     ExecError, FILL_ENTRY_LEN, Inner, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig,
-    OrderKey, OrderType, PRICE_SCALE, REGISTER_BODY_LEN, RegisteredOrder, Reserved, Side,
-    TradingError, TxContext,
+    OrderKey, OrderType, PRICE_SCALE, Price, Qty, REGISTER_BODY_LEN, RegisteredOrder, Reserved,
+    Side, TradingError, TxContext, qty_add, qty_sub,
 };
 use crate::codec::{
     cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event, removal_event,
@@ -80,10 +80,12 @@ impl ExchangeModule {
                     Side::Sell => {
                         let key = (canceled.owner, market);
                         let release =
-                            base_holds.get(&key).copied().unwrap_or(0).min(canceled.qty.0);
-                        if release > 0 {
-                            *base_holds.get_mut(&key).ok_or(ExecError::Malformed)? -= release;
-                            *base_balances.entry(key).or_insert(0) += release;
+                            base_holds.get(&key).copied().unwrap_or_default().min(canceled.qty);
+                        if release.0 > 0 {
+                            let held = base_holds.get_mut(&key).ok_or(ExecError::Malformed)?;
+                            *held = qty_sub(*held, release).ok_or(ExecError::Malformed)?;
+                            let free = base_balances.entry(key).or_default();
+                            *free = qty_add(*free, release).ok_or(ExecError::Malformed)?;
                         }
                     }
                 }
@@ -150,7 +152,7 @@ impl ExchangeModule {
         // escrowed at rest time, so settlement below cannot fail on
         // insolvency.
         let mut reservation = 0u64;
-        let mut taker_base = 0u64;
+        let mut taker_base = Qty(0);
         if self.ledger.is_some() {
             match order.side {
                 Side::Buy => {
@@ -181,15 +183,16 @@ impl ExchangeModule {
                     // inside `self.ledger.is_some()` a zero entry is
                     // an honest rejection, not a test-mode artifact.
                     let key = (ctx.sender, market);
-                    let free = base_balances.get(&key).copied().unwrap_or(0);
-                    if free < order.qty.0 {
+                    let free = base_balances.get(&key).copied().unwrap_or_default();
+                    if free < order.qty {
                         return Err(ExecError::ModuleRejected(
                             "insufficient base custody for sell order".to_string(),
                         ));
                     }
                     // `free >= qty` was just proven — cannot underflow.
-                    *base_balances.get_mut(&key).ok_or(ExecError::Malformed)? -= order.qty.0;
-                    taker_base = order.qty.0;
+                    let bal = base_balances.get_mut(&key).ok_or(ExecError::Malformed)?;
+                    *bal = qty_sub(*bal, order.qty).ok_or(ExecError::Malformed)?;
+                    taker_base = order.qty;
                 }
             }
         }
@@ -221,8 +224,9 @@ impl ExchangeModule {
                         ExecError::ModuleRejected("engine-reject refund failed".to_string())
                     })?;
                 }
-                if taker_base > 0 {
-                    *base_balances.entry((ctx.sender, market)).or_insert(0) += taker_base;
+                if taker_base.0 > 0 {
+                    let free = base_balances.entry((ctx.sender, market)).or_default();
+                    *free = qty_add(*free, taker_base).ok_or(ExecError::Malformed)?;
                 }
                 return Err(ExecError::ModuleRejected(format!("engine: {e}")));
             }
@@ -297,8 +301,8 @@ impl ExchangeModule {
         &self,
         market: u8,
         removed: &[trading::MakerRemoval],
-        base_balances: &mut BTreeMap<(Address, u8), u64>,
-        base_holds: &mut BTreeMap<(Address, u8), u64>,
+        base_balances: &mut BTreeMap<(Address, u8), Qty>,
+        base_holds: &mut BTreeMap<(Address, u8), Qty>,
         events: &mut Vec<Event>,
     ) -> Result<(), ExecError> {
         if let Some(ledger) = &self.ledger {
@@ -321,10 +325,13 @@ impl ExchangeModule {
         for r in removed {
             if r.side == Side::Sell && r.removed_qty > 0 {
                 let key = (r.owner, market);
-                let release = base_holds.get(&key).copied().unwrap_or(0).min(r.removed_qty);
-                if release > 0 {
-                    *base_holds.get_mut(&key).ok_or(ExecError::Malformed)? -= release;
-                    *base_balances.entry(key).or_insert(0) += release;
+                let release =
+                    base_holds.get(&key).copied().unwrap_or_default().min(Qty(r.removed_qty));
+                if release.0 > 0 {
+                    let held = base_holds.get_mut(&key).ok_or(ExecError::Malformed)?;
+                    *held = qty_sub(*held, release).ok_or(ExecError::Malformed)?;
+                    let free = base_balances.entry(key).or_default();
+                    *free = qty_add(*free, release).ok_or(ExecError::Malformed)?;
                 }
             }
             events.push(removal_event(market, *r));
@@ -434,19 +441,22 @@ impl ExchangeModule {
                     ExecError::ModuleRejected("register: market out of range".to_string())
                 })?;
                 let key = (ctx.sender, m);
-                let free = base_balances.get(&key).copied().unwrap_or(0);
-                if free < qty {
+                let free = base_balances.get(&key).copied().unwrap_or_default();
+                if free < Qty(qty) {
                     return Err(ExecError::ModuleRejected(
                         "register: insufficient base custody for sell".to_string(),
                     ));
                 }
-                *base_balances.get_mut(&key).ok_or(ExecError::Malformed)? -= qty;
-                Reserved::Base(qty)
+                let bal = base_balances.get_mut(&key).ok_or(ExecError::Malformed)?;
+                *bal = qty_sub(*bal, Qty(qty)).ok_or(ExecError::Malformed)?;
+                Reserved::Base(Qty(qty))
             }
         };
 
-        registered
-            .insert(key, RegisteredOrder { market, limit_price: price, remaining: qty, reserved });
+        registered.insert(
+            key,
+            RegisteredOrder { market, limit_price: Price(price), remaining: Qty(qty), reserved },
+        );
         Ok(vec![Event {
             module: "exchange",
             kind: "order_registered",
@@ -504,12 +514,13 @@ impl ExchangeModule {
             // free base balance on the order's market, not the
             // ledger. `u8` conversion is safe: registration rejected
             // any market beyond the 256-slot engine space.
-            Reserved::Base(_) => {
-                if refund > 0 {
+            Reserved::Base(residue) => {
+                if residue.0 > 0 {
                     let market = u8::try_from(order.market).map_err(|_| {
                         ExecError::ModuleRejected("cancel: market out of range".to_string())
                     })?;
-                    *inner.base_balances.entry((ctx.sender, market)).or_insert(0) += refund;
+                    let free = inner.base_balances.entry((ctx.sender, market)).or_default();
+                    *free = qty_add(*free, residue).ok_or(ExecError::Malformed)?;
                 }
             }
         }
@@ -561,8 +572,12 @@ impl ExchangeModule {
         ledger
             .debit(&ctx.sender, amount)
             .map_err(|_| ExecError::ModuleRejected("deposit: insufficient balance".to_string()))?;
-        let entry = inner.base_balances.entry((ctx.sender, market)).or_insert(0);
-        if let Some(v) = entry.checked_add(amount) {
+        let entry = inner.base_balances.entry((ctx.sender, market)).or_default();
+        // The 1:1 denomination bridge: `amount` native base units
+        // become `amount` scale-6 base micro-units of custody — the
+        // module's documented backing choice (the base asset trades
+        // in the native unit's own granularity).
+        if let Some(v) = qty_add(*entry, Qty(amount)) {
             *entry = v;
         } else {
             // Unreachable while total native supply < u64::MAX
@@ -616,8 +631,10 @@ impl ExchangeModule {
         let ledger = self.ledger.as_ref().ok_or_else(|| {
             ExecError::ModuleRejected("withdraw requires ledger wiring".to_string())
         })?;
-        let free = inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or(0);
-        if free < amount {
+        let free = inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
+        // Same 1:1 bridge as the deposit: `amount` native units
+        // equals `amount` base micro-units of custody.
+        if free < Qty(amount) {
             return Err(ExecError::ModuleRejected("withdraw: insufficient free base".to_string()));
         }
         ledger
@@ -625,7 +642,8 @@ impl ExchangeModule {
             .map_err(|_| ExecError::ModuleRejected("withdraw: credit failed".to_string()))?;
         // `free >= amount` was just proven — the decrement cannot
         // underflow.
-        *inner.base_balances.get_mut(&(ctx.sender, market)).ok_or(ExecError::Malformed)? -= amount;
+        let bal = inner.base_balances.get_mut(&(ctx.sender, market)).ok_or(ExecError::Malformed)?;
+        *bal = qty_sub(*bal, Qty(amount)).ok_or(ExecError::Malformed)?;
         Ok(vec![Event {
             module: "exchange",
             kind: "base_withdrawn",
@@ -760,7 +778,7 @@ impl ExchangeModule {
         // batches avoid ~16 realloc copies.
         let mut entries: Vec<((Address, Address), u64)> = Vec::with_capacity(fill_count);
         let mut plans: Vec<LegPlan> = Vec::with_capacity(fill_count);
-        let mut consumed: BTreeMap<OrderKey, u64> = BTreeMap::new();
+        let mut consumed: BTreeMap<OrderKey, Qty> = BTreeMap::new();
         let mut events = Vec::new();
         for i in 0..fill_count {
             match settle_leg(body, 4 + i * FILL_ENTRY_LEN, &configs, registered, &mut consumed)? {

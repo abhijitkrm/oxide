@@ -1376,8 +1376,8 @@ fn registered_orders_survive_snapshot() {
 /// conservation invariant.
 fn total_base_custody(ex: &ExchangeModule) -> u64 {
     let inner = framework::lock_state(&ex.inner);
-    let free: u64 = inner.base_balances.values().sum();
-    let held: u64 = inner.base_holds.values().sum();
+    let free: u64 = inner.base_balances.values().map(|q| q.0).sum();
+    let held: u64 = inner.base_holds.values().map(|q| q.0).sum();
     let escrowed: u64 = inner
         .registered
         .values()
@@ -1483,7 +1483,7 @@ fn sell_rejected_without_base_custody() {
 fn cancel_resting_sell_releases_base_hold() {
     let (_ledger, ex) = ledger_and_exchange();
     let mid = 0;
-    let free_before = ex.base_balance(addr(9), mid);
+    let free_before = ex.base_balance(addr(9), mid).0;
 
     let events = ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 2, 9))).unwrap();
     let order_id = OrderId(u64::from_le_bytes(events[0].data[1..9].try_into().unwrap()));
@@ -1503,8 +1503,8 @@ fn cancel_resting_sell_releases_base_hold() {
 fn book_fill_is_delivery_versus_payment() {
     let (ledger, ex) = ledger_and_exchange();
     let mid = 0;
-    let seller_free = ex.base_balance(addr(9), mid);
-    let buyer_free = ex.base_balance(addr(1), mid);
+    let seller_free = ex.base_balance(addr(9), mid).0;
+    let buyer_free = ex.base_balance(addr(1), mid).0;
 
     // Maker sell 4 lots, taker buy fills 3, remainder rests.
     ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 4, 9))).unwrap();
@@ -1542,8 +1542,8 @@ fn taker_sell_delivers_reserved_base() {
     let mid = 0;
 
     ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
-    let taker_free = ex.base_balance(addr(9), mid);
-    let maker_free = ex.base_balance(addr(1), mid);
+    let taker_free = ex.base_balance(addr(9), mid).0;
+    let maker_free = ex.base_balance(addr(1), mid).0;
     let seller_quote = ledger.balance(&addr(9));
 
     // IOC sell 3 lots vs a 1-lot bid: 1 fills, 2 die unfilled.
@@ -1572,7 +1572,7 @@ fn taker_sell_delivers_reserved_base() {
 fn gtc_sell_remainder_becomes_hold() {
     let (_ledger, ex) = ledger_and_exchange();
     let mid = 0;
-    let free_before = ex.base_balance(addr(9), mid);
+    let free_before = ex.base_balance(addr(9), mid).0;
 
     ex.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
     ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 3, 9))).unwrap();
@@ -1772,11 +1772,11 @@ fn pre_custody_sell_orders_cannot_settle() {
         crate::OrderKey { owner: addr(9), client_id: 9 },
         crate::RegisteredOrder {
             market: 0,
-            limit_price: 1_000_000_000,
-            remaining: 5_000,
+            limit_price: Price(1_000_000_000),
+            remaining: Qty(5_000),
             // Zero-escrow sell — the pre-custody shape this test
             // exercises: unfillable but still cancelable.
-            reserved: crate::Reserved::Base(0),
+            reserved: crate::Reserved::Base(Qty(0)),
         },
     );
     let mut w = framework::CanonicalState::new();
@@ -1804,8 +1804,8 @@ fn pre_custody_sell_orders_cannot_settle() {
         w.put_u64(key.client_id);
         w.put_u16(order.market);
         w.put_u8(encode_side(order.side()));
-        w.put_u64(order.limit_price);
-        w.put_u64(order.remaining);
+        w.put_u64(order.limit_price.0);
+        w.put_u64(order.remaining.0);
         w.put_u64(order.reserved.get());
     }
     // No custody tail — the pre-upgrade blob shape.

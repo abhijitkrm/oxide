@@ -10,7 +10,8 @@
 
 use super::{
     Address, Arc, BPS_DENOM, BTreeMap, Event, ExecError, FEE_BPS, FillEvent, MarketConfig,
-    OrderKey, OrderOutcome, PRICE_SCALE, Price, RegisteredOrder, Reserved, Side,
+    OrderKey, OrderOutcome, PRICE_SCALE, Price, Qty, RegisteredOrder, Reserved, Side, qty_add,
+    qty_sub,
 };
 use crate::codec::{w32, w64};
 
@@ -23,8 +24,9 @@ pub(crate) struct TakerCtx {
     pub(crate) owner: Address,
     /// Quote units reserved at admission (buys only; 0 for sells).
     pub(crate) reservation: u64,
-    /// Base units reserved at admission (sells only; 0 for buys).
-    pub(crate) base: u64,
+    /// Base quantity reserved at admission (sells only; `Qty::ZERO`
+    /// for buys).
+    pub(crate) base: Qty,
 }
 
 /// The mutable settlement surfaces a book-path place touches,
@@ -34,9 +36,9 @@ pub(crate) struct BookSettlement<'a> {
     /// The native ledger — quote credits and reservation refunds.
     pub(crate) ledger: &'a Arc<dyn framework::Balances + Send + Sync>,
     /// Free base custody (buyer deliveries land here).
-    pub(crate) base_balances: &'a mut BTreeMap<(Address, u8), u64>,
+    pub(crate) base_balances: &'a mut BTreeMap<(Address, u8), Qty>,
     /// Resting-sell base holds (maker deliveries draw from here).
-    pub(crate) base_holds: &'a mut BTreeMap<(Address, u8), u64>,
+    pub(crate) base_holds: &'a mut BTreeMap<(Address, u8), Qty>,
     /// Per-market protocol-fee sink (quote units).
     pub(crate) fee_vault: &'a mut BTreeMap<u8, u64>,
     /// The event sink every settlement-visible mutation appends to.
@@ -91,14 +93,15 @@ impl BookSettlement<'_> {
             // admission); a maker sell must still hold the fill
             // qty in `base_holds`.
             let maker_covered = f.taker_side == Side::Sell
-                || self.base_holds.get(&(f.maker_owner, market)).copied().unwrap_or(0) >= f.qty.0;
+                || self.base_holds.get(&(f.maker_owner, market)).copied().unwrap_or_default()
+                    >= f.qty;
             if !maker_covered {
                 self.events.push(unbacked_sell_fill_event(market, *f));
                 continue;
             }
             let bkey = (buyer, market);
             let Some(buyer_next) =
-                self.base_balances.get(&bkey).copied().unwrap_or(0).checked_add(f.qty.0)
+                qty_add(self.base_balances.get(&bkey).copied().unwrap_or_default(), f.qty)
             else {
                 // Unreachable while Σ custody < u64::MAX (custody is
                 // native-backed). Void rather than mint.
@@ -108,16 +111,17 @@ impl BookSettlement<'_> {
             if f.taker_side == Side::Buy {
                 // `maker_covered` proved the entry exists with
                 // enough held.
-                *self
+                let held = self
                     .base_holds
                     .get_mut(&(f.maker_owner, market))
-                    .ok_or(ExecError::Malformed)? -= f.qty.0;
+                    .ok_or(ExecError::Malformed)?;
+                *held = qty_sub(*held, f.qty).ok_or(ExecError::Malformed)?;
             } else {
                 // Admission reserved `qty`; Σ fills ≤ qty by engine
-                // contract — `checked_sub` documents it.
-                taker_base = taker_base.checked_sub(f.qty.0).ok_or(ExecError::Malformed)?;
+                // contract — `qty_sub` documents it.
+                taker_base = qty_sub(taker_base, f.qty).ok_or(ExecError::Malformed)?;
             }
-            *self.base_balances.entry(bkey).or_insert(0) = buyer_next;
+            *self.base_balances.entry(bkey).or_default() = buyer_next;
             if f.taker_side == Side::Buy {
                 taker_paid = taker_paid.saturating_add(quote_amount);
             }
@@ -179,17 +183,19 @@ impl BookSettlement<'_> {
         // engine's reported remainder; any STP-consumed slice
         // (`taker_base − resting_qty`) books no fill and is
         // released free.
-        if taker_base > 0 {
+        if taker_base.0 > 0 {
             let resting = match outcome {
-                OrderOutcome::Resting { resting_qty, .. } => resting_qty.0,
-                _ => 0,
+                OrderOutcome::Resting { resting_qty, .. } => resting_qty,
+                _ => Qty(0),
             };
-            if resting > 0 {
-                *self.base_holds.entry((taker.owner, market)).or_insert(0) += resting;
+            if resting.0 > 0 {
+                let hold = self.base_holds.entry((taker.owner, market)).or_default();
+                *hold = qty_add(*hold, resting).ok_or(ExecError::Malformed)?;
             }
-            let release = taker_base.saturating_sub(resting);
-            if release > 0 {
-                *self.base_balances.entry((taker.owner, market)).or_insert(0) += release;
+            let release = Qty(taker_base.0.saturating_sub(resting.0));
+            if release.0 > 0 {
+                let free = self.base_balances.entry((taker.owner, market)).or_default();
+                *free = qty_add(*free, release).ok_or(ExecError::Malformed)?;
             }
         }
         Ok(())
@@ -229,7 +235,7 @@ pub(crate) fn consume_and_release(
     plans: &[LegPlan],
     failed_pairs: &std::collections::BTreeSet<(Address, Address)>,
     registered: &mut BTreeMap<OrderKey, RegisteredOrder>,
-    base_balances: &mut BTreeMap<(Address, u8), u64>,
+    base_balances: &mut BTreeMap<(Address, u8), Qty>,
     fee_vault: &mut BTreeMap<u8, u64>,
     ledger: &Arc<dyn framework::Balances + Send + Sync>,
     events: &mut Vec<Event>,
@@ -242,22 +248,24 @@ pub(crate) fn consume_and_release(
     // total fee to accrue.
     let mut deltas: BTreeMap<OrderKey, OrderDelta> = BTreeMap::new();
     let mut rebates: BTreeMap<Address, u64> = BTreeMap::new();
-    let mut deliveries: BTreeMap<(Address, u8), u64> = BTreeMap::new();
+    let mut deliveries: BTreeMap<(Address, u8), Qty> = BTreeMap::new();
     let mut fees: BTreeMap<u8, u64> = BTreeMap::new();
     for plan in plans {
         if failed_pairs.contains(&(plan.buyer, plan.seller)) {
             continue;
         }
         let buy = deltas.entry(plan.buy).or_default();
-        buy.consumed += plan.qty;
+        buy.consumed = qty_add(buy.consumed, plan.qty).unwrap_or(Qty(u64::MAX));
         buy.released += plan.release;
         buy.rebate += plan.release - plan.pays;
-        deltas.entry(plan.sell).or_default().consumed += plan.qty;
+        let sell = deltas.entry(plan.sell).or_default();
+        sell.consumed = qty_add(sell.consumed, plan.qty).unwrap_or(Qty(u64::MAX));
         let rebate = plan.release - plan.pays;
         if rebate > 0 {
             *rebates.entry(plan.buyer).or_default() += rebate;
         }
-        *deliveries.entry((plan.buyer, plan.market)).or_default() += plan.qty;
+        let delivery = deliveries.entry((plan.buyer, plan.market)).or_default();
+        *delivery = qty_add(*delivery, plan.qty).unwrap_or(Qty(u64::MAX));
         *fees.entry(plan.market).or_default() += plan.fee;
     }
 
@@ -288,7 +296,7 @@ pub(crate) fn consume_and_release(
     let mut completed: Vec<(OrderKey, Reserved, u16)> = Vec::new();
     for (key, delta) in &deltas {
         let Some(order) = registered.get_mut(key) else { continue };
-        order.remaining = order.remaining.saturating_sub(delta.consumed);
+        order.remaining = Qty(order.remaining.0.saturating_sub(delta.consumed.0));
         match &mut order.reserved {
             // Buys: release the escrow slice, minus any withheld
             // rebate that stays escrowed for the residue refund.
@@ -299,10 +307,10 @@ pub(crate) fn consume_and_release(
             // Sells: the escrow IS the remaining base custody — it
             // shrinks qty-for-qty with consumption.
             Reserved::Base(escrow) => {
-                *escrow = escrow.saturating_sub(delta.consumed);
+                *escrow = Qty(escrow.0.saturating_sub(delta.consumed.0));
             }
         }
-        if order.remaining == 0 {
+        if order.remaining == Qty(0) {
             completed.push((*key, order.reserved, order.market));
         }
     }
@@ -324,7 +332,7 @@ pub(crate) fn consume_and_release(
             // is safe (registration bounded markets to 256 slots);
             // the add-back cannot overflow (the units came from
             // this same custody pool).
-            Reserved::Base(_) => {
+            Reserved::Base(residue_qty) => {
                 let Ok(m) = u8::try_from(market) else {
                     // Unreachable: registration bounds markets to
                     // the 256-slot engine space. Stranding the
@@ -332,7 +340,8 @@ pub(crate) fn consume_and_release(
                     // market — and the order is already removed.
                     continue;
                 };
-                *base_balances.entry((key.owner, m)).or_insert(0) += residue;
+                let entry = base_balances.entry((key.owner, m)).or_default();
+                *entry = qty_add(*entry, residue_qty).unwrap_or(Qty(u64::MAX));
             }
         }
         events.push(Event {
@@ -368,8 +377,8 @@ pub(crate) struct LegPlan {
     /// custody credit and the fee vault. `u8`-bounded: validation
     /// rejects any market outside the 256-slot engine space.
     pub(crate) market: u8,
-    /// Filled quantity (scale-6).
-    pub(crate) qty: u64,
+    /// Filled quantity of the market's base asset.
+    pub(crate) qty: Qty,
     /// The seller's gross payment: `floor(price × qty / PRICE_SCALE)`.
     pub(crate) pays: u64,
     /// The protocol fee carved out of `pays`:
@@ -387,8 +396,8 @@ pub(crate) struct LegPlan {
 /// seller-credit drain.
 #[derive(Default)]
 pub(crate) struct OrderDelta {
-    /// Total quantity consumed (scale-6).
-    pub(crate) consumed: u64,
+    /// Total base quantity consumed.
+    pub(crate) consumed: Qty,
     /// Total escrow released by those legs (buys only).
     pub(crate) released: u64,
     /// The rebate portion of `released` — tracked separately so a
@@ -470,7 +479,7 @@ pub(crate) fn settle_leg(
     off: usize,
     configs: &[Option<MarketConfig>],
     registered: &BTreeMap<OrderKey, RegisteredOrder>,
-    consumed: &mut BTreeMap<OrderKey, u64>,
+    consumed: &mut BTreeMap<OrderKey, Qty>,
 ) -> Result<Option<LegPlan>, ExecError> {
     let market = u16::from_le_bytes(
         body.get(off..off + 2)
@@ -478,18 +487,18 @@ pub(crate) fn settle_leg(
             .try_into()
             .map_err(|_| ExecError::Malformed)?,
     );
-    let price = u64::from_le_bytes(
+    let price = Price(u64::from_le_bytes(
         body.get(off + 2..off + 10)
             .ok_or(ExecError::Malformed)?
             .try_into()
             .map_err(|_| ExecError::Malformed)?,
-    );
-    let qty = u64::from_le_bytes(
+    ));
+    let qty = Qty(u64::from_le_bytes(
         body.get(off + 10..off + 18)
             .ok_or(ExecError::Malformed)?
             .try_into()
             .map_err(|_| ExecError::Malformed)?,
-    );
+    ));
     let buy = leg_key(body, off + 18)?;
     let sell = leg_key(body, off + 46)?;
 
@@ -519,11 +528,11 @@ pub(crate) fn settle_leg(
     // Market config: listed market, positive lot-aligned qty,
     // on-tick price inside the band.
     let cfg_ok = configs.get(usize::from(market)).copied().flatten().is_some_and(|c| {
-        qty > 0
-            && qty % c.lot_size == 0
-            && price >= c.min_price
-            && price <= c.max_price
-            && price % c.tick_size == 0
+        qty.0 > 0
+            && qty.0.is_multiple_of(c.lot_size)
+            && price.0 >= c.min_price
+            && price.0 <= c.max_price
+            && price.0.is_multiple_of(c.tick_size)
     });
     if !cfg_ok {
         return Ok(None);
@@ -533,10 +542,10 @@ pub(crate) fn settle_leg(
     // legs already took from each order must fit its `remaining`.
     // `consumed` is updated only for valid legs, so a rejected leg
     // consumes nothing.
-    let buy_used = consumed.get(&buy).copied().unwrap_or(0);
-    let sell_used = consumed.get(&sell).copied().unwrap_or(0);
-    let Some(buy_total) = buy_used.checked_add(qty) else { return Ok(None) };
-    let Some(sell_total) = sell_used.checked_add(qty) else { return Ok(None) };
+    let buy_used = consumed.get(&buy).copied().unwrap_or_default();
+    let sell_used = consumed.get(&sell).copied().unwrap_or_default();
+    let Some(buy_total) = qty_add(buy_used, qty) else { return Ok(None) };
+    let Some(sell_total) = qty_add(sell_used, qty) else { return Ok(None) };
     if buy_total > buy_order.remaining || sell_total > sell_order.remaining {
         return Ok(None);
     }
@@ -547,7 +556,7 @@ pub(crate) fn settle_leg(
     // a pre-custody registered sell (zero escrow), which is now
     // unfillable but still cancelable. The `side()` check above
     // already proved the `Base` denomination.
-    if sell_total > sell_order.reserved.get() {
+    if sell_total.0 > sell_order.reserved.get() {
         return Ok(None);
     }
 
@@ -556,8 +565,8 @@ pub(crate) fn settle_leg(
     // is `pays`-bounded (`FEE_BPS < BPS_DENOM`), so `pays − fee` can
     // never underflow.
     let (Some(pays), Some(release)) = (
-        u64::try_from(u128::from(price) * u128::from(qty) / PRICE_SCALE).ok(),
-        u64::try_from(u128::from(buy_order.limit_price) * u128::from(qty) / PRICE_SCALE).ok(),
+        u64::try_from(u128::from(price.0) * u128::from(qty.0) / PRICE_SCALE).ok(),
+        u64::try_from(u128::from(buy_order.limit_price.0) * u128::from(qty.0) / PRICE_SCALE).ok(),
     ) else {
         return Ok(None);
     };
@@ -620,13 +629,13 @@ pub(crate) fn credit_or_stranded(
 /// overflow, which is unreachable while Σ custody < `u64::MAX`; the
 /// event keeps it visible regardless.
 pub(crate) fn deliver_base(
-    deliveries: &BTreeMap<(Address, u8), u64>,
-    base_balances: &mut BTreeMap<(Address, u8), u64>,
+    deliveries: &BTreeMap<(Address, u8), Qty>,
+    base_balances: &mut BTreeMap<(Address, u8), Qty>,
     events: &mut Vec<Event>,
 ) {
     for ((buyer, market), qty) in deliveries {
-        let entry = base_balances.entry((*buyer, *market)).or_insert(0);
-        if let Some(v) = entry.checked_add(*qty) {
+        let entry = base_balances.entry((*buyer, *market)).or_default();
+        if let Some(v) = qty_add(*entry, *qty) {
             *entry = v;
             events.push(Event {
                 module: "exchange",
@@ -635,7 +644,7 @@ pub(crate) fn deliver_base(
                     let mut d = Vec::with_capacity(20 + 1 + 8);
                     d.extend_from_slice(&buyer.0);
                     d.push(*market);
-                    d.extend_from_slice(&qty.to_le_bytes());
+                    d.extend_from_slice(&qty.0.to_le_bytes());
                     d
                 },
             });
@@ -647,7 +656,7 @@ pub(crate) fn deliver_base(
                     let mut d = Vec::with_capacity(20 + 1 + 8);
                     d.extend_from_slice(&buyer.0);
                     d.push(*market);
-                    d.extend_from_slice(&qty.to_le_bytes());
+                    d.extend_from_slice(&qty.0.to_le_bytes());
                     d
                 },
             });
