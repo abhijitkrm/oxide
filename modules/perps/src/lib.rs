@@ -291,11 +291,34 @@ fn imr_rate(cfg: &PerpsMarketConfig) -> u128 {
 
 // ── Position ────────────────────────────────────────────────────────
 
+/// Which margin wallet backs a position. [`Position::margin_class`]
+/// is the ONLY interpretation of `isolated_margin` — never compare
+/// the raw field against zero at a call site.
+///
+/// The drain rule (the "nonzero balance implies isolated mode"
+/// convention made explicit): a position is [`Self::Isolated`] while
+/// it carries any isolated margin; when the wallet drains to zero,
+/// funding debits and PnL credits route to the cross pool — an
+/// empty isolated wallet *demotes* rather than leaves a
+/// zero-capacity bucket every path must special-case. The sentinel
+/// stays inside this enum's constructor so the demotion rule lives
+/// in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarginClass {
+    /// `isolated_margin > 0`: margin lives on the position.
+    Isolated,
+    /// `isolated_margin == 0`: margin lives in the account's
+    /// cross-margin pool.
+    Cross,
+}
+
 /// A perpetual position: signed size (positive = long, negative =
 /// short), volume-weighted entry price, and isolated margin balance.
 ///
 /// For cross-margin positions, `isolated_margin` is 0 and the margin
-/// lives in the account's cross-margin pool.
+/// lives in the account's cross-margin pool. Read [`Position::margin_class`]
+/// instead of comparing the field — the zero-balance demotion rule
+/// is part of the type's contract, not a call-site convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Position {
     /// Signed position size in raw qty units (scale-6). Positive =
@@ -305,7 +328,9 @@ pub struct Position {
     /// position.
     pub entry_price: u64,
     /// Isolated margin held against this position (scale-6). Zero for
-    /// cross-margin positions.
+    /// cross-margin positions — and for an isolated wallet that has
+    /// drained, which thereafter routes like cross (see
+    /// [`MarginClass`]).
     pub isolated_margin: u64,
 }
 
@@ -313,6 +338,13 @@ impl Position {
     /// Whether this position is open (non-zero size).
     const fn is_open(&self) -> bool {
         self.size != 0
+    }
+
+    /// Which margin wallet backs this position — the single
+    /// interpretation of `isolated_margin` (see [`MarginClass`]).
+    /// `pub(crate)`: the funding debit and PnL routes read it.
+    pub(crate) const fn margin_class(&self) -> MarginClass {
+        if self.isolated_margin > 0 { MarginClass::Isolated } else { MarginClass::Cross }
     }
 
     /// Notional value at mark price: `|size| * mark` (scale-14).
@@ -1062,7 +1094,7 @@ impl PerpsModule {
             };
             // Debit the same bucket the old code used: isolated
             // margin when present, else the cross pool.
-            let bucket = if pos_entry.isolated_margin > 0 {
+            let bucket = if pos_entry.margin_class() == MarginClass::Isolated {
                 &mut pos_entry.isolated_margin
             } else {
                 &mut account.cross_margin
@@ -1107,7 +1139,7 @@ impl PerpsModule {
             let Some(pos_entry) = account.positions.get_mut(&market) else {
                 continue;
             };
-            let bucket = if pos_entry.isolated_margin > 0 {
+            let bucket = if pos_entry.margin_class() == MarginClass::Isolated {
                 &mut pos_entry.isolated_margin
             } else {
                 &mut account.cross_margin
@@ -3267,7 +3299,10 @@ impl PerpsModule {
             let mut bad_debt: u64 = 0;
             {
                 let acct = Self::account_mut(inner, account);
-                let iso_backed = acct.positions.get(&market).is_some_and(|p| p.isolated_margin > 0);
+                let iso_backed = acct
+                    .positions
+                    .get(&market)
+                    .is_some_and(|p| p.margin_class() == MarginClass::Isolated);
                 if realized_scale6 > 0 {
                     let gain = u64::try_from(realized_scale6).unwrap_or(u64::MAX);
                     if iso_backed {
@@ -3587,9 +3622,9 @@ fn encode_perps_config(cfg: &PerpsMarketConfig) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLEARING_ACCOUNT, CROSS_MARGIN_MARKET, FUNDING_PERIOD_BLOCKS, MarketConfig, NewOrder,
-        OrderId, OrderType, PRICE_SCALE, PerpsMarketConfig, PerpsModule, Position, Side, StpMode,
-        TimeInForce, encode_reject_reason, mark_price_deviation_bps, msg,
+        CLEARING_ACCOUNT, CROSS_MARGIN_MARKET, FUNDING_PERIOD_BLOCKS, MarginClass, MarketConfig,
+        NewOrder, OrderId, OrderType, PRICE_SCALE, PerpsMarketConfig, PerpsModule, Position, Side,
+        StpMode, TimeInForce, encode_reject_reason, mark_price_deviation_bps, msg,
     };
     use executor::{ExecError, Module, TxContext};
     use framework::{Balances, module_id};
@@ -3955,6 +3990,67 @@ mod tests {
         // Long's margin decreases by 1500; short's increases by 1500.
         assert_eq!(perps.cross_margin(&addr(1)), 500_000_000 - 1_500);
         assert_eq!(perps.cross_margin(&addr(2)), 500_000_000 + 1_500);
+    }
+
+    /// The `isolated_margin == 0` demotion rule is a named contract
+    /// (`MarginClass`), not a call-site convention: an isolated
+    /// wallet that drains to zero routes the NEXT funding debit to
+    /// the cross pool. Pin both halves — the classification and the
+    /// behavioral consequence — so a refactor can't silently flip an
+    /// empty isolated wallet's routing.
+    #[test]
+    fn drained_isolated_wallet_demotes_to_cross_routing() {
+        assert_eq!(
+            Position { isolated_margin: 0, ..Position::default() }.margin_class(),
+            MarginClass::Cross
+        );
+        assert_eq!(
+            Position { isolated_margin: 1, ..Position::default() }.margin_class(),
+            MarginClass::Isolated
+        );
+
+        let ledger = Arc::new(framework::MemoryBalances::new());
+        ledger.mint(&addr(1), 1_000_000_000);
+        ledger.mint(&addr(2), 1_000_000_000);
+        let perps = PerpsModule::with_ledger(ledger.clone());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(mid, 1_500)).unwrap();
+        perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
+        perps.handle(&ctx(2), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
+        {
+            let mut inner = framework::lock_state(&perps.inner);
+            let acct1 = PerpsModule::account_mut(&mut inner, &addr(1));
+            acct1.positions.insert(
+                mid,
+                Position { size: 1_000_000, entry_price: 1_500_000_000, isolated_margin: 1_500 },
+            );
+            let acct2 = PerpsModule::account_mut(&mut inner, &addr(2));
+            acct2.positions.insert(
+                mid,
+                Position { size: -1_000_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+        }
+
+        // Round 1: long owes 1_500 — exactly drains the isolated
+        // wallet (bucket.min(owed) collects 1_500, nothing spills
+        // to cross in the same pass).
+        perps.apply_funding(mid, 1).unwrap();
+        {
+            let inner = framework::lock_state(&perps.inner);
+            let pos = inner.accounts[&addr(1)].positions[&mid];
+            assert_eq!(pos.isolated_margin, 0, "wallet drained exactly");
+            assert_eq!(pos.margin_class(), MarginClass::Cross, "drained wallet demotes");
+        }
+        assert_eq!(perps.cross_margin(&addr(1)), 500_000_000, "no cross dip on the drain pass");
+
+        // Round 2: the SAME debit now comes out of the cross pool —
+        // the demotion rule, observable.
+        perps.apply_funding(mid, 1).unwrap();
+        assert_eq!(
+            perps.cross_margin(&addr(1)),
+            500_000_000 - 1_500,
+            "post-demotion funding debits the cross pool"
+        );
     }
 
     #[test]
