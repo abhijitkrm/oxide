@@ -19193,3 +19193,25 @@ dial to turn if a TLS peer ever needs sustained > ~50 frames/s.
 
 Still open in §7.5: string/event allocation accounting (needs an
 allocator-counting shim, not a wall-clock bench).
+
+## Session N+17 — allocation accounting: the heap is in the parsers
+
+Final named §7.5 measurement. Wall-clock benches can't see the
+heap, so `alloc_accounting` installs a counting `GlobalAlloc` in its
+own bench binary (two relaxed atomics per alloc; kept out of the
+timing benches entirely) and runs the production shapes inside it.
+
+The answer flips the audit's worry: the authenticated server paths
+are already ~allocation-free — cancel 1.00 alloc (79 B), amend
+1.08 (99 B), crossing-fill 1.03 (73 B) per op. The string-alloc
+cost lives exactly where suspected but only there: FIX inbound
+parsing is 25 allocs / ~1.7 KB per message (`parse_fix_tags` builds
+a `HashMap<String, String>` — two owned `String`s per tag pair plus
+buckets) and WS/JSON parsing is 31 allocs / 407 B (`extract_str`
+hands out owned `String`s per field). The formatters are already
+tight — one `String::with_capacity` per response.
+
+Verdict for §7.5: no live hot-path allocation problem. If the FIX/
+WS parse surfaces ever matter, the fix is a borrowed-slice tag
+iterator — and now there's a measured 25–31 allocs/msg baseline to
+beat. §7.5's named measurement list is complete.

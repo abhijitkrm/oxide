@@ -56,3 +56,10 @@ harness = false
 [[bench]]
 name = "nonce_contention"
 harness = false
+
+# Per-op allocation accounting on the action/match/API surfaces
+# (audit001 §7.5). Dedicated binary: its counting GlobalAlloc must
+# never skew the timing benches.
+[[bench]]
+name = "alloc_accounting"
+harness = false

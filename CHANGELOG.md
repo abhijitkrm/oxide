@@ -12,6 +12,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Measured
 
+- **Per-operation heap allocations** (`matcher`): the new
+  `alloc_accounting` bench counts allocations through the
+  production paths. The authenticated server paths are already
+  ~allocation-free (cancel 1.00 alloc/79 B, amend 1.08, fill 1.03
+  per op); the string-alloc cost is confined to inbound FIX/WS
+  parsing (~25–31 allocs per message from owned-`String` tag maps)
+  and formatters are single-alloc.
+  - **In plain words:** we counted every heap allocation per order
+    action and per parsed message — the hot path allocates once or
+    less; the parsers are the only alloc-heavy surface.
+
 - **TLS peer-write contention** (`p2p`, `tls` feature): the new
   `tls_contention` bench measures a `write_frame` caller queueing
   behind the reader thread on the production `SharedStream`
