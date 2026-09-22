@@ -66,6 +66,9 @@ fn dst(domain: Domain) -> &'static [u8] {
         // via BLAKE3, not this DST) — the arm exists only because the
         // match is exhaustive over `Domain`.
         Domain::Ed25519Owner => b"oxide/ed25519-owner",
+        // Never signed either — nonce-leaf hashes are BLAKE3, not
+        // BLS. Present for exhaustiveness.
+        Domain::ExecutedNonceLeaf => b"oxide/executed-nonce-leaf",
     }
 }
 

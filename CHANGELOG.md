@@ -1159,6 +1159,57 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Real trading accounts contended on a single global balance
+  lock** (`crates/matcher`)
+  - Production addresses are Ed25519-derived hashes, which failed
+    the flat-array fast path — every balance check, reservation, and
+    fill for every real account on every market serialized through
+    one `Mutex<HashMap>`. `AtomicBalanceCache` now registers
+    hash-shaped addresses into per-account atomic slots through a
+    lock-free insert-only registry (`RegTable`), so real-account ops
+    scale like the canonical test accounts did. The mutex survives
+    only as capacity-exhaustion overflow, still keyed by the full
+    20-byte address (no aliasing). Measured ~17× faster than the old
+    path at 4–8 threads; a `RwLock` variant was tried first and
+    measured strictly worse than the mutex it replaced.
+  - **In plain words:** the balance cache's published throughput
+    only described synthetic benchmark addresses; real signed-in
+    accounts now get that speed too.
+- **Per-block work scaled with total accounts, not touched
+  accounts** (`crates/executor`, `crates/mempool`, `modules/evm`,
+  `crates/crypto`)
+  - The executed-nonce commitment sorted and re-hashed every sender
+    ever seen on each block, and `execute_block` cloned the whole
+    nonce map to plan against. The commitment is now an
+    order-independent XOR fold of domain-separated per-account leaf
+    hashes — updated incrementally per touched sender — and block
+    execution plans against a delta overlay on a shared committed
+    map instead of a copy. Snapshot import rejects duplicate
+    addresses (XOR would cancel what `HashMap` dedupes), and export
+    still recomputes the root authoritatively. In the EVM parallel
+    path a live `Arc` snapshot forced `Arc::make_mut` to clone the
+    entire database on commit; it is now dropped first.
+  - **In plain words:** block cost used to grow with chain history;
+    it now grows only with what the block actually touches.
+- **Cancel/amend/replace blocked async workers and was assumed
+  rare** (`crates/matcher`)
+  - Order actions waited on a synchronous channel inside async
+    handlers — on an HFT venue cancel/replace is the dominant
+    message class. The submission now runs on `spawn_blocking`.
+  - **In plain words:** a burst of cancels can no longer stall the
+    connection-handling tasks.
+- **Published throughput claims cited a scheduler simulation**
+  (`README.md`, `crates/executor/benches/uniswap_transfer.rs`,
+  `crates/devnet/tests/settle_tps.rs`)
+  - The "12.96 GG/s" EVM figure ran synthetic work loops, not revm;
+    the README now credits the §13 gate to real signed-transaction
+    execution (~2.5 GG/s parallel, ~0.62 GG/s sequential measured)
+    and labels the old rows as scheduler-model numbers. The
+    settlement bench's derived "orders/s" is relabeled
+    "equiv orders/s (fills×2)" with the five metric classes spelled
+    out.
+  - **In plain words:** the numbers now say what they actually
+    measured.
 - **Staking rewards could under-pay large validators** (`modules/staking`)
   - The per-validator reward share multiplied `total_reward × stake`
     in `u64` before dividing — at real token scale (a `1e12` reward

@@ -18273,3 +18273,70 @@ mid-sweep is a consensus halt); governance deposit/tally
 accumulators are escrow-/power-bounded. The remaining asks —
 checked arithmetic *everywhere* and atomic rejection plumbing —
 stay open under the methodology program.
+
+## Measurement honesty + production-address balance path (audit §7)
+
+**7.1 — the GG/s headline was a scheduler model.** `uniswap_transfer`
+assigns synthetic gas costs to artificial access sets and burns a
+calibrated `NS_PER_GAS` CPU loop — it measures the OCC scheduler, not
+revm. It now says so at the top, and the README splits the claims: the
+§13 ≥1 GG/s gate is credited to `modules/evm/benches/tps_rw.rs` (real
+signed txs through `transact_commit`) — ~29.3k tx/s ≈ 0.62 GG/s
+sequential, ~118k tx/s ≈ 2.5 GG/s parallel on this dev machine. The
+4.83/12.96 GG-equivalent rows stay as scheduler-scaling baselines.
+
+**7.2 — settlement ≠ order throughput.** `settle_tps` now opens with
+the five metric classes (raw book ops / authenticated admission /
+matching+accounting / fill settlement / durable order-to-final), says
+which one it measures, and relabels its derived column `orders/s` →
+`equiv orders/s (fills×2)`.
+
+**7.3 — real addresses serialized on one mutex.** Every production
+(Ed25519-derived) address failed the canonical flat-array check and
+landed on a single `Mutex<HashMap>` — one global lock for all
+accounts on all markets. `AtomicBalanceCache` now has a third tier:
+`RegTable`, a fixed-capacity insert-only open-addressing
+`address → slot` map. Cells are immutable after a claim→publish
+sequence (CAS `EMPTY→CLAIMING`, write key+slot, release-store
+`state|key_hi=READY`), so the hot read path is a Fibonacci-mixed hash
+plus one or two acquire loads — zero RMW, zero locks. First sighting
+claims a `reg` slot under a claim mutex (cold path, once per address);
+exhaustion falls back to the sparse map, still keyed by all 20 bytes
+so nothing aliases. A `RwLock<HashMap>` registry was tried first and
+*regressed* past the mutex it replaced — `RwLock::read` is an RMW on
+one shared word, every thread pinged the same cache line per op
+(1.48 µs/pair at 4t). Measured (`balance_contention`, new `prod_*`/
+`sparse_*` rows): registered spread 55.8→56.4→87.1 ns/pair at
+1/4/8 threads vs sparse 53→973→1444 ns — ~17× at 4–8t — and
+`prod_hot64` tracks flat `hot64` within ~30% (CAS contention on the
+account word bounds both). Regression tests cover slot-vs-sparse
+routing, no-aliasing, registry exhaustion, cross-tier transfers,
+concurrent same-account debit, and concurrent registration.
+
+**7.4 — O(total-state) per block.** `compute_nonce_root` was
+sort+hash over every sender each block, and `execute_block` cloned
+the whole map. The nonce commitment is now an order-independent XOR
+fold of `Domain::ExecutedNonceLeaf` hashes: updating one sender
+removes its old leaf and adds the new one — O(touched) per block. The
+map is kept as `ExecutedNonces{map, root}`; blocks plan and execute
+against a `BlockNonces` delta overlay over an `Arc`-shared committed
+map (no clone), and `refresh_anchors` takes a lookup closure so the
+mempool reads the effective view without materializing it. Snapshot
+import rejects duplicate addresses (XOR would cancel them where
+`HashMap` dedupes), and `export_snapshot` still recomputes the root
+authoritatively and asserts the incremental value agrees. In the EVM
+parallel path the `snapshot` `Arc` is dropped before Phase 5's
+`Arc::make_mut` — it was held live through the commit phase, forcing
+a full `CacheDB` clone per parallel batch. Still open: the exchange
+book commitment walks all levels/orders per block (needs a
+Merkle-ized book — larger design), and the workload-vs-state-size
+benchmark ask.
+
+**7.5 — blocking actions off the async path.** Cancel/amend/replace
+aren't rare on an HFT venue (cancel-to-order ≥10:1 is normal), but
+`submit_action` blocked the async worker on a synchronous
+`std::sync::mpsc` recv. `submit_action_ring` now wraps it in
+`tokio::task::spawn_blocking` — the wait occupies the blocking pool.
+The doc comment states the workload reality. Remaining: a
+cancel-dominant workload bench and measured budgets for the other
+listed costs (sender recovery, TLS, safety fsync).

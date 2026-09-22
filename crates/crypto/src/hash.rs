@@ -64,6 +64,7 @@ use primitives::Hash;
 /// | `ExecAttest` | 14 | execution attestation signing (Phase 5) |
 /// | `BlsPop` | 15 | BLS proof-of-possession (validator key admission) |
 /// | `Ed25519Owner` | 16 | matcher account derivation from Ed25519 key |
+/// | `ExecutedNonceLeaf` | 17 | executed-nonce map leaf (executor state root) |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -127,6 +128,12 @@ pub enum Domain {
     /// Distinct from `ValidatorAddress` so a consensus identity can
     /// never alias a trading account (and vice versa).
     Ed25519Owner = 16,
+    /// One leaf of the executor's executed-nonce commitment:
+    /// `H(tag ‖ address ‖ nonce_le)`. The nonce root is the XOR-fold
+    /// of these leaves — an incrementally updatable set commitment —
+    /// so leaf bytes must never collide with any other domain's
+    /// preimage. Appended after `Ed25519Owner` — never renumber.
+    ExecutedNonceLeaf = 17,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

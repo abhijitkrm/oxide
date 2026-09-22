@@ -2994,6 +2994,17 @@ impl EvmModule {
             })
             .collect();
 
+        // Release the shared snapshot before Phase 5's
+        // `Arc::make_mut` on the main DB: while `snapshot` (or any
+        // per-group `SharedCacheDB` clone of it — those die with
+        // their closures) is alive, the outer Arc's refcount is >1
+        // and `make_mut` deep-clones the entire CacheDB — O(total
+        // state) on every parallel batch. The snapshot's last use
+        // is inside the parallel closures, so dropping it here is
+        // free and restores the in-place mutation the Arc wrapping
+        // was designed for.
+        drop(snapshot);
+
         // Phase 5: commit in canonical transaction order.
         //
         // Speculation ran per-sender groups — for `A0, B0, A1` the

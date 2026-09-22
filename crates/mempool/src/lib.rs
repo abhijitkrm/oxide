@@ -600,22 +600,27 @@ impl Mempool {
     /// bounded by pool occupancy rather than growing forever with
     /// every account ever executed.
     ///
+    /// `next_expected` is a lookup, not a map: the executor's
+    /// post-block nonce state is a delta over the committed map
+    /// (never materialized as one `HashMap`), so the pool queries
+    /// the effective value per pooled sender — O(pool occupancy),
+    /// never O(accounts).
+    ///
     /// Pruning drops queued entries with `nonce < next_expected`:
     /// their nonce slot is already spent (a different tx consumed
     /// it — e.g. a same-nonce replacement that won in a competing
     /// block), so they can never execute and would otherwise occupy
     /// pool space until a size-cap eviction reached them.
-    pub fn refresh_anchors(&mut self, next_expected: &HashMap<Address, u64>) {
+    pub fn refresh_anchors(&mut self, next_expected: impl Fn(&Address) -> Option<u64>) {
         self.executed_nonces = self
             .by_sender
             .keys()
             .filter_map(|sender| {
-                next_expected
-                    .get(sender)
+                next_expected(sender)
                     // `next - 1` = last executed. A `next` of 0 is
                     // corrupt (a consumed nonce is at least 1) —
                     // skip the anchor rather than underflow.
-                    .and_then(|&next| next.checked_sub(1))
+                    .and_then(|next| next.checked_sub(1))
                     .map(|last| (*sender, last))
             })
             .collect();
@@ -623,7 +628,7 @@ impl Mempool {
         // while its queues are borrowed for the range scan.
         let mut stale: Vec<Hash> = Vec::new();
         for (sender, queue) in &self.by_sender {
-            if let Some(&next) = next_expected.get(sender) {
+            if let Some(next) = next_expected(sender) {
                 stale.extend(queue.range(..next).map(|(_, &hash)| hash));
             }
         }
@@ -1278,7 +1283,7 @@ mod tests {
         // A block consumed addr(1) nonces 0 and 1 — the executor's
         // map reports the *next* expected nonce (2).
         let next_expected = HashMap::from([(addr(1), 2u64)]);
-        pool.refresh_anchors(&next_expected);
+        pool.refresh_anchors(|a| next_expected.get(a).copied());
         assert_eq!(pool.len(), 2, "nonces 0 and 1 are pruned");
         // The next selection starts at nonce 2 — the consumed
         // entries can't be re-proposed.
@@ -1299,7 +1304,8 @@ mod tests {
         pool.submit(build_tx(addr(1), 5, 100, &[0])).unwrap();
         pool.set_executed_nonce(addr(1), 4);
         pool.set_executed_nonce(addr(9), 10); // not pooled
-        pool.refresh_anchors(&HashMap::from([(addr(1), 4u64), (addr(9), 10u64)]));
+        let next_expected = HashMap::from([(addr(1), 4u64), (addr(9), 10u64)]);
+        pool.refresh_anchors(|a| next_expected.get(a).copied());
         assert_eq!(pool.executed_nonces.len(), 1, "only pooled senders keep an anchor");
         assert!(pool.executed_nonces.contains_key(&addr(1)));
     }

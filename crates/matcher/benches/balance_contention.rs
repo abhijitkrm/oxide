@@ -9,13 +9,19 @@
 //! both against accounts that market threads may share. This bench
 //! isolates that shared-state cost from matching itself:
 //!
-//! - `spread_{n}t`: N threads each hammering disjoint account ranges —
-//!   measures the *uncontended* op cost (Mutex acquire vs atomic
-//!   read-modify-write).
-//! - `hot64_{n}t`: N threads all hitting the same 64 accounts —
-//!   measures the *contended* case, where per-shard locking
-//!   serializes threads that only collide on a shard (1/64 of
-//!   accounts) rather than on the actual account.
+//! - `spread_{n}t`: N threads each hammering disjoint canonical
+//!   account ranges — measures the *uncontended* op cost (Mutex
+//!   acquire vs atomic read-modify-write).
+//! - `hot64_{n}t`: N threads all hitting the same 64 canonical
+//!   accounts — measures the *contended* case.
+//! - `prod_spread_{n}t` / `prod_hot64_{n}t`: the same shapes but on
+//!   hash-shaped addresses — the form every production
+//!   (Ed25519-derived) account actually takes. These resolve through
+//!   the address registry into per-account atomic slots.
+//! - `sparse_{n}t`: hash addresses beyond registry capacity —
+//!   forced onto the global `Mutex<HashMap>` overflow. This is the
+//!   only remaining serialized path, and stands in for what *all*
+//!   production traffic paid before the registry tier existed.
 //!
 //! Each op pair is `check_and_debit(a, 1)` + `credit(a, 1)` — net
 //! zero, so balances never drain and the loop runs indefinitely.
@@ -28,7 +34,10 @@
 //!
 //! ## Measured results (M-series dev Mac, criterion p50)
 //!
-//! Mutex-per-shard `HashMap` → per-account `AtomicU64` flat array:
+//! Figures below are per debit+credit pair — lower is better.
+//!
+//! Mutex-per-shard `HashMap` → per-account `AtomicU64` flat array
+//! (historical, canonical addresses):
 //!
 //! | Bench | Mutex impl | Atomic impl | Speedup |
 //! |-------|-----------|-------------|---------|
@@ -39,9 +48,28 @@
 //! | `spread_8t` | 22.2M ops/s | 670M ops/s | ~30× |
 //! | `hot64_8t` | 28.4M ops/s | ~89M ops/s | ~3× |
 //!
+//! Registry tier (`prod_*`, hash-shaped addresses) vs the global
+//! `Mutex<HashMap>` overflow (`sparse_*`) — the path all production
+//! traffic took before registration existed:
+//!
+//! | Bench | sparse (mutex) | registered (lock-free) | flat ref | reg vs sparse |
+//! |-------|---------------|------------------------|----------|---------------|
+//! | `spread_1t` | 53.0 ns | 55.8 ns | 11.0 ns | ~1× |
+//! | `spread_4t` | 972.9 ns | 56.4 ns | 11.6 ns | ~17× |
+//! | `spread_8t` | 1444 ns | 87.1 ns | 16.1 ns | ~17× |
+//! | `hot64_4t` | — | 103.2 ns | 81.2 ns | — |
+//! | `hot64_8t` | — | 279.3 ns | 258.4 ns | — |
+//!
+//! The sparse path serializes globally — it cannot scale past ~20M
+//! ops/s aggregate however many threads run. The registered path
+//! costs ~45 ns/pair of probe overhead over flat at 1 thread but
+//! scales identically (~140M→184M ops/s at 4t→8t), and on the
+//! contended `hot64` shape it tracks the flat tier within ~30% —
+//! CAS retries on the account words dominate both.
+//!
 //! `hot64_*` (all threads on the same 64 accounts) is the real-
 //! contention case — CAS retries on the same cache lines bound it,
-//! not lock convoys. Even there the atomic version wins ~3–4×.
+//! not lock convoys.
 //!
 //! # Running
 //!
@@ -73,14 +101,29 @@ fn addr_idx(i: u32) -> primitives::Address {
     primitives::Address(a)
 }
 
+/// Hash-shaped address — the form production accounts take
+/// (Ed25519-pubkey-derived). Index bytes from `i`, tail non-zero so
+/// the canonical flat-array check rejects it and the address routes
+/// through the registry tier (or the sparse overflow once `reg` is
+/// exhausted).
+fn hash_addr(i: u32) -> primitives::Address {
+    let mut a = [0xABu8; 20];
+    a[..4].copy_from_slice(&i.to_le_bytes());
+    a[4..8].copy_from_slice(&i.rotate_left(13).to_le_bytes());
+    primitives::Address(a)
+}
+
 /// Run `threads` workers, each doing `iters` debit+credit pairs on
-/// accounts chosen by `pick(thread_id, op_index)`. Returns wall time.
+/// accounts chosen by `pick(thread_id, op_index)`, built by
+/// `mk_addr`. Returns wall time.
 fn run_contended(
     cache: &Arc<ShardedBalanceCache>,
     threads: usize,
     iters: u64,
+    mk_addr: impl Fn(u32) -> primitives::Address + Sync,
     pick: impl Fn(usize, u64) -> u32 + Sync,
 ) -> Duration {
+    let mk_addr = &mk_addr;
     let pick = &pick;
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(threads);
@@ -88,7 +131,7 @@ fn run_contended(
             let cache = Arc::clone(cache);
             handles.push(s.spawn(move || {
                 for i in 0..iters {
-                    let a = addr_idx(pick(t, i));
+                    let a = mk_addr(pick(t, i));
                     // Debit then refund — net zero, both hot ops hit.
                     black_box(cache.check_and_debit(&a, 1));
                     cache.credit(&a, 1);
@@ -121,7 +164,7 @@ fn balance_contention(c: &mut Criterion) {
             }
             let stride = ACCOUNTS as usize / threads;
             b.iter_custom(|iters| {
-                run_contended(&cache, threads, iters, |t, i| {
+                run_contended(&cache, threads, iters, addr_idx, |t, i| {
                     (t * stride + (i as usize % stride)) as u32
                 })
             });
@@ -136,7 +179,65 @@ fn balance_contention(c: &mut Criterion) {
                 cache.set(&addr_idx(i), u64::MAX / 4);
             }
             b.iter_custom(|iters| {
-                run_contended(&cache, threads, iters, |_t, i| (i % u64::from(HOT_ACCOUNTS)) as u32)
+                run_contended(&cache, threads, iters, addr_idx, |_t, i| {
+                    (i % u64::from(HOT_ACCOUNTS)) as u32
+                })
+            });
+        });
+
+        // Production-address spread: hash-shaped accounts on
+        // disjoint ranges — the uncontended form of what real
+        // traffic costs now (registry read-lock + atomic op).
+        group.throughput(Throughput::Elements(2 * threads as u64));
+        group.bench_function(format!("prod_spread_{threads}t"), |b| {
+            let cache = Arc::new(ShardedBalanceCache::new(ACCOUNTS as usize));
+            for i in 0..ACCOUNTS {
+                cache.set(&hash_addr(i), u64::MAX / 4);
+            }
+            let stride = ACCOUNTS as usize / threads;
+            b.iter_custom(|iters| {
+                run_contended(&cache, threads, iters, hash_addr, |t, i| {
+                    (t * stride + (i as usize % stride)) as u32
+                })
+            });
+        });
+
+        // Production-address hot set: same 64 hash accounts across
+        // all threads — registered-slot CAS contention.
+        group.throughput(Throughput::Elements(2 * threads as u64));
+        group.bench_function(format!("prod_hot64_{threads}t"), |b| {
+            let cache = Arc::new(ShardedBalanceCache::new(ACCOUNTS as usize));
+            for i in 0..HOT_ACCOUNTS {
+                cache.set(&hash_addr(i), u64::MAX / 4);
+            }
+            b.iter_custom(|iters| {
+                run_contended(&cache, threads, iters, hash_addr, |_t, i| {
+                    (i % u64::from(HOT_ACCOUNTS)) as u32
+                })
+            });
+        });
+
+        // Sparse overflow: registry deliberately exhausted (64-slot
+        // cache, 64 pre-registered accounts) so every bench address
+        // lands on the global `Mutex<HashMap>` — the serialized path
+        // ALL production traffic took before the registry tier.
+        group.throughput(Throughput::Elements(2 * threads as u64));
+        group.bench_function(format!("sparse_{threads}t"), |b| {
+            let cap = HOT_ACCOUNTS as usize;
+            let cache = Arc::new(ShardedBalanceCache::new(cap));
+            // Fill every reg slot so nothing new can register.
+            for i in 0..cap as u32 {
+                cache.set(&hash_addr(i), 0);
+            }
+            // The bench accounts: 64 more hash addresses — all
+            // forced to the sparse map.
+            for i in cap as u32..(cap as u32 + HOT_ACCOUNTS) {
+                cache.set(&hash_addr(i), u64::MAX / 4);
+            }
+            b.iter_custom(|iters| {
+                run_contended(&cache, threads, iters, hash_addr, |_t, i| {
+                    (cap + (i as usize % HOT_ACCOUNTS as usize)) as u32
+                })
             });
         });
     }

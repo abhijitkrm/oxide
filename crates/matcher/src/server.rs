@@ -166,24 +166,31 @@ async fn submit_one_ring(
 }
 
 /// Submit an order action (cancel/amend/replace) through the ring
-/// matcher's control channel. Actions are less frequent than new
-/// orders, so the control-channel path (serviced between ring polls)
-/// is the right seam — it reaches THE SAME order book the rings
-/// write to, with no second book.
-fn submit_action_ring(
-    ring: &crate::RingMatcher,
+/// matcher's control channel. The control channel reaches THE SAME
+/// order book the rings write to — there is no second book — and the
+/// matcher thread services it between ring polls, so an action's
+/// latency is bounded by poll cadence plus queue depth.
+///
+/// Cancel/replace traffic is NOT rare on an HFT venue — it is
+/// frequently the dominant message class (cancel-to-order ratios of
+/// 10:1+ are normal), so this path is load-bearing, not a corner.
+/// The `recv` is still synchronous (`std::sync::mpsc` — the matcher
+/// thread is not async), but it runs on `spawn_blocking`: the wait
+/// occupies a blocking-pool thread instead of stalling the async
+/// worker that owns the client connection. Book work itself stays
+/// single-writer inside the matcher thread — contention is the
+/// channel, not a lock.
+async fn submit_action_ring(
+    ring: &Arc<crate::RingMatcher>,
     req: crate::protocol::ActionRequest,
 ) -> OrderResponse {
-    // The control channel is synchronous (std::sync::mpsc); the
-    // matcher thread services it between ring polls. We send and
-    // recv — the recv blocks the tokio task, but actions are rare
-    // (cancel/amend/replace), so this is acceptable. For a hot-path
-    // action stream, a dedicated ring would be added.
-    //
     // The wire `ActionRequest` crosses the channel intact — the
     // matching server authenticates it (signature + owner binding +
     // nonce) inside `submit_action` before dispatching.
-    ring.submit_action(req)
+    let ring = Arc::clone(ring);
+    tokio::task::spawn_blocking(move || ring.submit_action(req))
+        .await
+        .unwrap_or_else(|_| OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
 }
 
 // ── TxSubmitter / TxConfirmer traits ─────────────────────────────────
@@ -1063,7 +1070,7 @@ async fn handle_connection(
             // binding + nonce) as the mandatory boundary before
             // dispatching. The verify above is only an early reject.
             let action_resp = if let Some(rm) = &ring_matcher {
-                submit_action_ring(rm, action_req)
+                submit_action_ring(rm, action_req).await
             } else {
                 matcher.submit_action(&action_req)
             };
@@ -1198,7 +1205,7 @@ async fn run_jsonrpc_tcp_server_impl(
                     // Submit the wire `ActionRequest` intact — the
                     // core re-authenticates before dispatch.
                     let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action_req)
+                        submit_action_ring(rm, action_req).await
                     } else {
                         matcher.submit_action(&action_req)
                     };
@@ -1362,7 +1369,7 @@ async fn run_fix_server_impl(
                     // Submit the wire `ActionRequest` intact — the
                     // core re-authenticates before dispatch.
                     let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action_req)
+                        submit_action_ring(rm, action_req).await
                     } else {
                         matcher.submit_action(&action_req)
                     };
@@ -1487,7 +1494,7 @@ async fn run_websocket_server_impl(
                     // Submit the wire `ActionRequest` intact — the
                     // core re-authenticates before dispatch.
                     let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action_req)
+                        submit_action_ring(rm, action_req).await
                     } else {
                         matcher.submit_action(&action_req)
                     };

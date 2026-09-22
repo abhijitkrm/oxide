@@ -219,6 +219,13 @@ pub enum SnapshotImportError {
         /// The recomputed root from the `executed_nonces`.
         actual: Hash,
     },
+    /// The snapshot's `executed_nonces` lists a sender twice. The
+    /// fold commitment is over a set — a duplicated leaf XORs out
+    /// while the installed map dedupes — so the imported root would
+    /// diverge from the fold of the imported map. Rejected rather
+    /// than silently reconciled: a sender appears at most once in a
+    /// well-formed export.
+    DuplicateNonceEntry,
     /// The snapshot's format `version` is newer than this binary's
     /// [`SNAPSHOT_FORMAT_VERSION`] — it was written by a newer
     /// binary and cannot be safely interpreted.
@@ -290,6 +297,9 @@ impl std::fmt::Display for SnapshotImportError {
             }
             Self::NonceRootMismatch { expected, actual } => {
                 write!(f, "nonce root mismatch: expected {expected}, got {actual}")
+            }
+            Self::DuplicateNonceEntry => {
+                write!(f, "executed_nonces lists a sender more than once")
             }
             Self::UnsupportedVersion { snapshot, supported } => {
                 write!(f, "snapshot format v{snapshot} exceeds supported v{supported}")
@@ -436,18 +446,133 @@ impl<'a> codec::Decode<'a> for ExecutorSnapshot {
 /// `state_root` so a crafted snapshot cannot tamper with
 /// replay-protection nonces without detection.
 ///
-/// The root is `keccak256(concat(address || nonce_le))` over all
-/// entries sorted by address. Sorting ensures determinism regardless
-/// of `HashMap` iteration order.
+/// The root is the **XOR-fold of per-leaf hashes**
+/// `⊕ H(ExecutedNonceLeaf ‖ address ‖ nonce_le)` — a set
+/// commitment, not a sequence commitment. That construction is
+/// deliberate: the previous sorted-concatenation hash was O(map) to
+/// recompute, so every block paid a full scan of every sender that
+/// had ever transacted (7.4). The XOR-fold is order-independent
+/// (deterministic across `HashMap` iteration order, no sort, no
+/// concatenated buffer) and — the point — incrementally updatable:
+/// a nonce change folds out the old leaf and folds in the new one
+/// in O(1), so a block pays O(touched senders), not O(all senders).
+///
+/// Strength note: against a *consensus-pinned* expected root (the
+/// only way this value is trusted — it is recomputed from the
+/// snapshot's own bytes and compared), finding a different nonce
+/// set with the same fold is a subset-XOR problem over 256-bit
+/// leaf hashes — ~2^128-class work, the same order as generic
+/// collision search on the prior sequential hash. The leaf hash
+/// keeps an attacker from folding chosen bytes directly.
 fn compute_nonce_root(nonces: &[(primitives::Address, u64)]) -> Hash {
-    let mut sorted = nonces.to_vec();
-    sorted.sort_by_key(|a| a.0);
-    let mut data = Vec::with_capacity(sorted.len() * 28);
-    for (addr, nonce) in &sorted {
-        data.extend_from_slice(&addr.0);
-        data.extend_from_slice(&nonce.to_le_bytes());
+    let mut root = Hash::ZERO;
+    for (addr, nonce) in nonces {
+        xor_fold(&mut root, nonce_leaf(addr, *nonce));
     }
-    Hasher::hash_one(Domain::Block, &data)
+    root
+}
+
+/// One leaf of the nonce commitment: `H(ExecutedNonceLeaf ‖ addr ‖
+/// nonce_le)`. Hashing the leaf is what makes the fold a commitment
+/// to a *set of preimages* rather than to raw XOR-able bytes.
+fn nonce_leaf(addr: &primitives::Address, nonce: u64) -> Hash {
+    let mut preimage = [0u8; 20 + 8];
+    preimage[..20].copy_from_slice(&addr.0);
+    preimage[20..].copy_from_slice(&nonce.to_le_bytes());
+    Hasher::hash_one(Domain::ExecutedNonceLeaf, &preimage)
+}
+
+/// `*acc ^= leaf`, byte-wise. XOR is the fold operation: adding a
+/// leaf and later removing the *same* leaf returns the accumulator
+/// to its prior value, which is what makes the root incrementally
+/// maintainable.
+fn xor_fold(acc: &mut Hash, leaf: Hash) {
+    for (a, b) in acc.0.iter_mut().zip(leaf.0.iter()) {
+        *a ^= *b;
+    }
+}
+
+/// The executed-nonce map paired with its commitment.
+///
+/// `root` is maintained incrementally — every mutation goes through
+/// [`ExecutedNonces::bump`], which folds the leaf change into the
+/// root in O(1). The invariant `root == compute_nonce_root(map)` is
+/// therefore upheld by construction rather than recomputed per
+/// block: a block that advances K senders' nonces pays K leaf
+/// hashes, not a scan of every account that ever transacted.
+#[derive(Clone, Default)]
+struct ExecutedNonces {
+    /// sender → next-expected nonce (replay protection state).
+    map: HashMap<primitives::Address, u64>,
+    /// `⊕ nonce_leaf(addr, nonce)` over `map` — kept in lockstep.
+    root: Hash,
+}
+
+impl ExecutedNonces {
+    /// Set `addr`'s next-expected nonce to `next`, folding the leaf
+    /// change into `root`: the old leaf (if any) is XOR'd out and
+    /// the new leaf XOR'd in. An unchanged value folds out and back
+    /// in — a net no-op — so callers need not pre-check.
+    fn bump(&mut self, addr: primitives::Address, next: u64) {
+        if let Some(&old) = self.map.get(&addr) {
+            xor_fold(&mut self.root, nonce_leaf(&addr, old));
+        }
+        self.map.insert(addr, next);
+        xor_fold(&mut self.root, nonce_leaf(&addr, next));
+    }
+}
+
+/// Per-block speculative overlay on the committed nonce map.
+///
+/// `execute_block` reads through `delta` first, then the committed
+/// `base`; `bump` writes only the delta and folds each leaf change
+/// into `root` — so a block that touches K senders allocates O(K)
+/// and hashes O(K), never cloning or scanning the committed map.
+/// At block end `finish` hands back the delta and the post-block
+/// root; applying the delta into the committed map preserves the
+/// invariant `root == fold(map)` by induction (each bump folds out
+/// the sender's effective leaf — delta value if present, else the
+/// committed one — and folds in the new leaf).
+struct BlockNonces<'a> {
+    /// The committed map+root this block builds on (an `Arc` clone —
+    /// O(1) snapshot, never copied).
+    base: &'a ExecutedNonces,
+    /// Provisional `sender → next-expected` writes from this block.
+    delta: HashMap<primitives::Address, u64>,
+    /// `base.root` folded forward by every `bump` so far.
+    root: Hash,
+}
+
+impl<'a> BlockNonces<'a> {
+    fn new(base: &'a ExecutedNonces) -> Self {
+        Self { base, delta: HashMap::new(), root: base.root }
+    }
+
+    /// The sender's effective next-expected nonce: this block's
+    /// provisional advance if present, else the committed value.
+    fn next_expected(&self, addr: &primitives::Address) -> Option<u64> {
+        self.delta.get(addr).or_else(|| self.base.map.get(addr)).copied()
+    }
+
+    /// Set `addr`'s effective next-expected nonce to `next`: fold
+    /// out the current effective leaf (delta value wins over the
+    /// committed one) and fold in the new leaf. Folding out the
+    /// delta's value on a re-bump is what makes the fee-charge
+    /// rewind (`bump` back to the failed nonce) algebraically exact.
+    fn bump(&mut self, addr: primitives::Address, next: u64) {
+        if let Some(old) = self.next_expected(&addr) {
+            xor_fold(&mut self.root, nonce_leaf(&addr, old));
+        }
+        self.delta.insert(addr, next);
+        xor_fold(&mut self.root, nonce_leaf(&addr, next));
+    }
+
+    /// The block's touched entries plus the folded post-block root —
+    /// applying the delta to the committed map yields a map whose
+    /// fold equals `root`.
+    fn finish(self) -> (HashMap<primitives::Address, u64>, Hash) {
+        (self.delta, self.root)
+    }
 }
 
 /// C8: THE canonical aggregate state root — the single definition
@@ -1414,7 +1539,13 @@ pub struct Executor {
     ///
     /// The map is restored from snapshots via `import_snapshot` so
     /// replay protection survives restarts.
-    executed_nonce: Mutex<HashMap<primitives::Address, u64>>,
+    ///
+    /// Carries its commitment alongside the map (`ExecutedNonces`):
+    /// the root is folded per nonce change so `execute_block` pays
+    /// O(touched senders) rather than re-hashing every account each
+    /// block. The `Arc` lets a block take an O(1) snapshot of the
+    /// committed map instead of cloning it — see `BlockNonces`.
+    executed_nonce: Mutex<Arc<ExecutedNonces>>,
     /// Finalized per-tx outcomes — the submitter-facing confirmation
     /// surface. Written once per proposed tx inside `execute_block`;
     /// read by `tx_outcome` from any thread (e.g. the matcher's
@@ -1510,7 +1641,7 @@ impl Executor {
             recorder: None,
             mempool_intake_tx: intake_tx,
             mempool_intake_rx: Mutex::new(intake_rx),
-            executed_nonce: Mutex::new(HashMap::new()),
+            executed_nonce: Mutex::new(Arc::new(ExecutedNonces::default())),
             block_gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
             fee_module: None,
             min_fee: 0,
@@ -1910,6 +2041,7 @@ impl Executor {
         self.executed_nonce
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map
             .get(sender)
             .copied()
             .unwrap_or(0)
@@ -2011,8 +2143,8 @@ impl Executor {
         /// 8-byte LE.
         const PREFIX: &[u8] = b"exec_nonce";
         let nonces = self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut ops: Vec<storage::Op> = Vec::with_capacity(nonces.len());
-        for (addr, nonce) in nonces.iter() {
+        let mut ops: Vec<storage::Op> = Vec::with_capacity(nonces.map.len());
+        for (addr, nonce) in &nonces.map {
             let mut key_bytes = [0u8; 32];
             key_bytes[..PREFIX.len()].copy_from_slice(PREFIX);
             key_bytes[PREFIX.len()..PREFIX.len() + 20].copy_from_slice(&addr.0);
@@ -2034,6 +2166,7 @@ impl Executor {
         let entries = backend.range(PREFIX);
         let mut nonces =
             self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonces = Arc::make_mut(&mut nonces);
         for (key, value) in entries {
             let addr_bytes = &key.0[PREFIX.len()..PREFIX.len() + 20];
             let mut addr_arr = [0u8; 20];
@@ -2041,7 +2174,10 @@ impl Executor {
             let addr = primitives::Address(addr_arr);
             if value.len() >= 8 {
                 let nonce = u64::from_le_bytes(value[..8].try_into().unwrap_or([0u8; 8]));
-                nonces.insert(addr, nonce);
+                // `bump` (not a bare map insert) keeps the folded
+                // root in lockstep — restore is O(entries) once, a
+                // cold path.
+                nonces.bump(addr, nonce);
             }
         }
     }
@@ -2100,14 +2236,18 @@ impl Executor {
         // been executed yet (async execution), and the nonce root
         // binds `executed_nonces` into the commitment.
         let _ = state_root; // stored root may be stale; we recompute below
-        let executed_nonces: Vec<(primitives::Address, u64)> = self
-            .executed_nonce
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .map(|(addr, nonce)| (*addr, *nonce))
-            .collect();
+        let (executed_nonces, maintained_root) = {
+            let en = self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (en.map.iter().map(|(addr, nonce)| (*addr, *nonce)).collect::<Vec<_>>(), en.root)
+        };
+        // Recompute from the bytes being exported — the snapshot's
+        // `nonce_root` must commit to its own `executed_nonces`
+        // payload. It must equal the incrementally-maintained root;
+        // the assert makes any bookkeeping drift a test-visible bug
+        // rather than a silent divergence between the live path and
+        // the snapshot path.
         let nonce_root = compute_nonce_root(&executed_nonces);
+        debug_assert_eq!(nonce_root, maintained_root, "nonce root drifted from its map");
         let state_root =
             canonical_state_root(module_roots.iter().map(|(_, root)| *root), nonce_root);
         ExecutorSnapshot {
@@ -2170,6 +2310,18 @@ impl Executor {
         // catches corrupted or tampered snapshots without requiring
         // the local modules to have the same state (the snapshot is
         // from a peer, not local).
+        // The nonce root is an XOR-fold over *set* semantics — a
+        // duplicated `(addr, nonce)` pair folds out entirely while a
+        // `HashMap::collect` silently dedupes it, so the installed
+        // root would no longer match the fold of the installed map.
+        // Reject duplicates explicitly: a sender appears at most
+        // once in a well-formed snapshot.
+        {
+            let mut seen = std::collections::HashSet::with_capacity(snapshot.executed_nonces.len());
+            if snapshot.executed_nonces.iter().any(|(addr, _)| !seen.insert(addr)) {
+                return Err(SnapshotImportError::DuplicateNonceEntry);
+            }
+        }
         let recomputed_nonce_root = compute_nonce_root(&snapshot.executed_nonces);
         if recomputed_nonce_root != snapshot.nonce_root {
             return Err(SnapshotImportError::NonceRootMismatch {
@@ -2229,7 +2381,13 @@ impl Executor {
         // that restarts from a snapshot would accept already-executed
         // txs (replay attack).
         *self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            snapshot.executed_nonces.iter().copied().collect();
+            Arc::new(ExecutedNonces {
+                map: snapshot.executed_nonces.iter().copied().collect(),
+                // Verified above to equal both the fold of this map
+                // and the snapshot's committed `nonce_root` — reuse
+                // it rather than re-folding.
+                root: recomputed_nonce_root,
+            });
 
         Ok(())
     }
@@ -2515,7 +2673,7 @@ impl Executor {
     fn plan_block_runs<'b>(
         &self,
         txs: &'b [TxBytes],
-        local_nonce: &mut HashMap<primitives::Address, u64>,
+        local_nonce: &mut BlockNonces<'_>,
         preverify_cache: &HashMap<Hash, [u8; 20]>,
         skipped: &mut Vec<(Hash, TxSkipReason)>,
     ) -> Vec<(u8, Vec<GroupedTx<'b>>)> {
@@ -2558,7 +2716,7 @@ impl Executor {
             // here keeps `expected + 1` below overflow-free (a MAX
             // nonce would wrap the counter to 0 and reopen the
             // sender's whole nonce range to replay).
-            let expected = local_nonce.get(&ctx.sender).copied().unwrap_or(0);
+            let expected = local_nonce.next_expected(&ctx.sender).unwrap_or(0);
             if !self_authenticating && (ctx.nonce != expected || ctx.nonce == u64::MAX) {
                 skipped.push((tx_hash, TxSkipReason::StaleNonce));
                 continue;
@@ -2599,7 +2757,7 @@ impl Executor {
             // nonce (enforced inside the module), so the executor
             // tracks nothing for them.
             if !self_authenticating {
-                local_nonce.insert(ctx.sender, expected + 1);
+                local_nonce.bump(ctx.sender, expected + 1);
             }
             cumulative_gas = cumulative_gas.saturating_add(gas);
             // Zero-copy: the payload is borrowed from the block tx
@@ -2647,7 +2805,7 @@ impl Executor {
         &self,
         run: Vec<GroupedTx<'b>>,
         module: &dyn Module,
-        local_nonce: &mut HashMap<primitives::Address, u64>,
+        local_nonce: &mut BlockNonces<'_>,
         broken_nonce: &mut HashMap<primitives::Address, u64>,
         dispatch_skipped: &mut Vec<(Hash, TxSkipReason)>,
     ) -> (Vec<GroupedTx<'b>>, Vec<Result<Vec<Event>, ExecError>>) {
@@ -2668,7 +2826,7 @@ impl Executor {
                 dispatch_skipped.push((entry.2, TxSkipReason::FeeCharge));
                 broken_nonce.entry(ctx.sender).or_insert(ctx.nonce);
                 if !self_authenticating {
-                    local_nonce.insert(ctx.sender, ctx.nonce);
+                    local_nonce.bump(ctx.sender, ctx.nonce);
                 }
                 continue;
             }
@@ -2771,14 +2929,17 @@ impl Executor {
         // — a tx with a stale nonce from a previous block is rejected
         // here, not just in the mempool.
         //
-        // We snapshot the executed_nonce map into a local copy so we
-        // can update it as we process txs in this block without
-        // holding the lock for the entire block execution.
-        let mut local_nonce: HashMap<primitives::Address, u64> = {
+        // We snapshot the committed nonce state as an `Arc` clone —
+        // O(1), no map copy — and apply this block's advances into a
+        // `BlockNonces` delta so a block pays O(touched senders), not
+        // O(every account that ever transacted). The folded root
+        // travels with the delta and lands committed at block end.
+        let nonce_base: Arc<ExecutedNonces> = {
             let executed =
                 self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            executed.clone()
+            Arc::clone(&executed)
         };
+        let mut local_nonce = BlockNonces::new(&nonce_base);
 
         // begin_block for all modules — via `begin_block_ctx` so the
         // consensus-committed execution context (timestamp,
@@ -2890,10 +3051,9 @@ impl Executor {
         // root — the same definition `export_snapshot` /
         // `import_snapshot` use, so block, snapshot, and replay
         // roots always agree. `local_nonce` already holds the
-        // post-block map (advanced as each tx passed continuity).
-        let post_block_nonces: Vec<(primitives::Address, u64)> =
-            local_nonce.iter().map(|(a, n)| (*a, *n)).collect();
-        let nonce_root = compute_nonce_root(&post_block_nonces);
+        // post-block root (folded incrementally by `bump`), so this
+        // block pays O(touched senders), not a full scan of every
+        // account that ever transacted.
         let mut module_roots = Vec::new();
         for module in self.modules.iter().flatten() {
             module_roots.push(module.state_root());
@@ -2904,19 +3064,29 @@ impl Executor {
         // built for. `refresh_anchors` also prunes pooled entries
         // whose nonce this block consumed (a losing same-nonce
         // candidate can never execute), so stale entries don't
-        // linger until a size-cap eviction reaches them.
+        // linger until a size-cap eviction reaches them. The lookup
+        // reads through the block's delta — the effective post-block
+        // value for every pooled sender.
         self.mempool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .refresh_anchors(&local_nonce);
+            .refresh_anchors(|sender| local_nonce.next_expected(sender));
 
-        // H4/H5: persist the updated nonce map. `local_nonce` was
-        // advanced as each tx passed the continuity check. We write
-        // it back in a single lock acquisition so the next block's
-        // `execute_block` and the mempool's `ingest_tx` see the
-        // updated state.
-        *self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            local_nonce;
+        // H4/H5: persist the updated nonce map. The delta applies in
+        // place (`Arc::make_mut` — the base snapshot is dropped first
+        // so the committed map is uniquely owned and the update is
+        // O(delta), not a copy) in a single lock acquisition so the
+        // next block's `execute_block` and the mempool's `ingest_tx`
+        // see the updated state.
+        let (nonce_delta, nonce_root) = local_nonce.finish();
+        drop(nonce_base);
+        {
+            let mut committed =
+                self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let committed = Arc::make_mut(&mut committed);
+            committed.map.extend(nonce_delta);
+            committed.root = nonce_root;
+        }
 
         canonical_state_root(module_roots, nonce_root)
     }
@@ -2986,7 +3156,7 @@ impl AppInterface for Executor {
         {
             let executed =
                 self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let next_expected = executed.get(&ctx.sender).copied().unwrap_or(0);
+            let next_expected = executed.map.get(&ctx.sender).copied().unwrap_or(0);
             if ctx.nonce < next_expected {
                 return MempoolAck::Rejected {
                     reason: format!("replay: nonce {} < next expected {next_expected}", ctx.nonce),
@@ -3138,7 +3308,7 @@ impl AppInterface for Executor {
             {
                 let executed =
                     self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let next_expected = executed.get(&ctx.sender).copied().unwrap_or(0);
+                let next_expected = executed.map.get(&ctx.sender).copied().unwrap_or(0);
                 if ctx.nonce < next_expected {
                     results.push(MempoolAck::Rejected {
                         reason: format!(
@@ -4868,6 +5038,142 @@ mod tests {
         // Nonce 2 should be accepted (next expected).
         let tx2 = make_tx_with_nonce(1, &[2], 2);
         assert!(matches!(executor2.ingest_tx(tx2), MempoolAck::Accepted));
+    }
+
+    /// The nonce commitment is a set commitment: the XOR-fold must
+    /// be order-independent, `ExecutedNonces::bump` must keep
+    /// `root == fold(map)` after every mutation, and removing-then-
+    /// re-adding a leaf (the rewind path) must cancel cleanly.
+    /// Before this construction the root was a sorted-concatenation
+    /// hash recomputed over the whole map every block — O(accounts)
+    /// per block regardless of how many senders actually executed.
+    #[test]
+    fn nonce_root_fold_is_order_free_and_incremental() {
+        let a = primitives::Address([0xAA; 20]);
+        let b = primitives::Address([0xBB; 20]);
+        let c = primitives::Address([0xCC; 20]);
+
+        // Empty map commits to ZERO (no leaves folded).
+        assert_eq!(compute_nonce_root(&[]), Hash::ZERO);
+
+        // Order does not matter — same set, same root.
+        let forward = compute_nonce_root(&[(a, 1), (b, 2), (c, 3)]);
+        let reverse = compute_nonce_root(&[(c, 3), (a, 1), (b, 2)]);
+        assert_eq!(forward, reverse, "fold must be order-independent");
+        // A different set commits differently.
+        assert_ne!(forward, compute_nonce_root(&[(a, 1), (b, 2)]), "extra leaf moves the root");
+
+        // `bump` maintains the invariant incrementally: insert,
+        // advance, rewind (fee-failure path), then check against a
+        // from-scratch fold after every step.
+        let mut local = ExecutedNonces::default();
+        let check = |local: &ExecutedNonces| {
+            let v: Vec<_> = local.map.iter().map(|(k, v)| (*k, *v)).collect();
+            assert_eq!(local.root, compute_nonce_root(&v), "root must track the map");
+        };
+        check(&local);
+        local.bump(a, 1); // new sender
+        check(&local);
+        local.bump(a, 2); // advance
+        check(&local);
+        local.bump(a, 1); // rewind — old leaf folds out, new folds in
+        check(&local);
+        local.bump(b, 7);
+        local.bump(c, 4);
+        check(&local);
+        // Idempotent bump is a net no-op (fold out == fold in).
+        local.bump(a, 1);
+        check(&local);
+
+        // The per-block overlay: reads see delta-then-base, bumps
+        // fold the *effective* leaf out (delta wins over committed),
+        // and `finish` returns a delta whose application yields a
+        // map whose fold equals the carried root.
+        let base = local.clone();
+        let mut overlay = BlockNonces::new(&base);
+        assert_eq!(overlay.next_expected(&a), Some(1), "base value visible");
+        overlay.bump(a, 5); // advance over committed 1
+        assert_eq!(overlay.next_expected(&a), Some(5), "delta wins over base");
+        overlay.bump(a, 4); // rewind — folds out 5, in 4
+        overlay.bump(c, 9); // new sender over committed 4
+        let (delta, root) = overlay.finish();
+        let mut post = base.clone();
+        post.map.extend(delta);
+        post.root = root;
+        check(&post);
+        assert_eq!(post.map.get(&a), Some(&4));
+        assert_eq!(post.map.get(&c), Some(&9));
+        assert_ne!(post.root, base.root, "touched senders move the root");
+    }
+
+    /// The fold is over set semantics: a crafted snapshot that lists
+    /// one sender twice would XOR the pair out of the recomputed
+    /// root while `HashMap::collect` dedupes it — installing a root
+    /// that no longer matches the installed map (and silently
+    /// changing the sender's next-expected nonce). Import must
+    /// reject duplicates outright.
+    #[test]
+    fn snapshot_import_rejects_duplicate_nonce_entry() {
+        let mut executor = test_executor(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        let tx = make_tx_with_nonce(1, &[0], 0);
+        executor.ingest_tx(tx);
+        let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+        let proposal = executor.prepare_proposal(&budget);
+        executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: proposal.txs,
+            signers: Vec::new(),
+        });
+        let mut snapshot = executor.export_snapshot();
+        assert_eq!(snapshot.executed_nonces.len(), 1);
+        // Duplicate the one entry — the pair XORs out of the fold,
+        // so `nonce_root` still verifies against a naive importer.
+        let dup = snapshot.executed_nonces[0];
+        snapshot.executed_nonces.push(dup);
+        let mut executor2 = test_executor(100);
+        executor2.register_module(Arc::new(CounterModule::new()));
+        assert!(
+            matches!(
+                executor2.import_snapshot(&snapshot),
+                Err(SnapshotImportError::DuplicateNonceEntry)
+            ),
+            "duplicated nonce entry must be rejected"
+        );
+    }
+
+    /// After real blocks execute, the incrementally-maintained root
+    /// must equal a from-scratch fold of the stored map — the whole
+    /// point of carrying it is that `execute_block` never recomputes
+    /// it by scanning.
+    #[test]
+    fn executed_nonce_root_tracks_map_across_blocks() {
+        let mut executor = test_executor(100);
+        executor.register_module(Arc::new(CounterModule::new()));
+        for n in 0..3u64 {
+            // Two senders in the same block: one insert, one advance.
+            for sender in 1..=2u8 {
+                let tx = make_tx_with_nonce(sender, &[u8::try_from(n).unwrap_or(0xff)], n);
+                executor.ingest_tx(tx);
+            }
+            let budget = types::BlockBudget { max_bytes: 1 << 20, max_gas: 1 << 30 };
+            let proposal = executor.prepare_proposal(&budget);
+            executor.finalize_block(&FinalizedBlock {
+                context: types::BlockContext::default(),
+                height: Height::new(n),
+                txs: proposal.txs,
+                signers: Vec::new(),
+            });
+            let en =
+                executor.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let v: Vec<_> = en.map.iter().map(|(a, n)| (*a, *n)).collect();
+            assert_eq!(
+                en.root,
+                compute_nonce_root(&v),
+                "maintained root diverged from the map after block {n}"
+            );
+        }
     }
 
     /// Regression test: `process_proposal` must reject a block whose
