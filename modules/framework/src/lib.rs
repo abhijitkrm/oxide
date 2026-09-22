@@ -730,6 +730,12 @@ impl<K: Ord, V> CommittedMap<K, V> {
         self.map.iter()
     }
 
+    /// Values in key order — read-only aggregation probes
+    /// (conservation sums, escrow audits).
+    pub fn values(&self) -> std::collections::btree_map::Values<'_, K, V> {
+        self.map.values()
+    }
+
     /// Read-only access to the raw map — serialization and read-only
     /// probes. Mutation is impossible through `&BTreeMap`, so the
     /// fold cannot desync.

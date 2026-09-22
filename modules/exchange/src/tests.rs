@@ -1121,6 +1121,73 @@ fn state_snapshot_rejects_corruption() {
     assert!(ExchangeModule::new().import_state(&snapshot).is_err());
 }
 
+/// Every committed map's maintained fold must equal the
+/// authoritative recompute (`recomputed_root`) after real handler
+/// traffic — a mutation site that escaped the fold API would
+/// desync the incremental root, and this test is the net that
+/// catches it. Exercises every folded map: `store` (market list),
+/// `registered` (register + settle consumption), `base_balances`
+/// (deposit + delivery + withdraw), `base_holds` (rest + cancel
+/// release), `fee_vault` (fill accrual).
+#[test]
+fn committed_folds_stay_in_lockstep_after_mutations() {
+    let ledger = Arc::new(framework::MemoryBalances::new());
+    for a in [1u8, 2, 9] {
+        ledger.mint(&addr(a), 10_000_000_000);
+    }
+    let mut ex = ExchangeModule::with_ledger(ledger.clone());
+    ex.set_settlement_operator(addr(1));
+    let mid = ex.list_market(test_cfg()).unwrap();
+    deposit(&ex, 9, 500_000);
+    register(&ex, 1, 1, Side::Buy, 1_000_000_000, 100_000);
+    register(&ex, 9, 1, Side::Sell, 1_000_000_000, 100_000);
+    // One leg consumes both orders' registered state, delivers
+    // base to the buyer's custody, and accrues the market fee.
+    let fill = leg(0, 1_000_000_000, 50_000, 1, 1, 9, 1);
+    ex.handle(&ctx(1), &msg::batch_settle(&[fill])).unwrap();
+    // A resting sell locks `base_holds`; its cancel releases back
+    // into `base_balances`.
+    ex.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 2, 9))).unwrap();
+    ex.handle(&ctx(9), &msg::cancel(mid, OrderId(0))).unwrap();
+    ex.handle(&ctx(9), &msg::withdraw_base(0, 10_000)).unwrap();
+
+    // Guards bound to locals — a `lock_state(...)` temporary lives
+    // to the end of its enclosing statement, so two locks on one
+    // map inside a single expression would deadlock.
+    let inner = framework::lock_state(&ex.inner);
+    assert_eq!(
+        inner.registered.root(),
+        inner.registered.recomputed_root(),
+        "registered fold desynced"
+    );
+    assert_eq!(
+        inner.base_balances.root(),
+        inner.base_balances.recomputed_root(),
+        "base_balances fold desynced"
+    );
+    assert_eq!(
+        inner.base_holds.root(),
+        inner.base_holds.recomputed_root(),
+        "base_holds fold desynced"
+    );
+    assert_eq!(
+        inner.fee_vault.root(),
+        inner.fee_vault.recomputed_root(),
+        "fee_vault fold desynced"
+    );
+    drop(inner);
+    let store = framework::lock_state(&ex.store);
+    assert_eq!(store.root(), store.recomputed_root(), "store fold desynced");
+    drop(store);
+
+    // The incremental preimage is a different construction from
+    // the legacy full-serialization root — the same state must not
+    // accidentally produce the old digest.
+    let mut legacy = framework::CanonicalState::new();
+    ex.write_committed(&mut legacy);
+    assert_ne!(ex.state_root(), legacy.root());
+}
+
 // ── Registered-order authorization (batch settlement) ─────────
 
 /// Registration escrows the buy's worst-case cost up front and

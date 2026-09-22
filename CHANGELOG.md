@@ -136,6 +136,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     a running hash of its own contents, so the same block costs
     ~31 ms — and none of the remaining cost is staking's.
 
+- **Exchange state root is incremental over its flat maps**
+  (`exchange`): `registered`, `base_balances`, `base_holds`,
+  `fee_vault`, and the KV store are `CommittedMap`s whose fold
+  roots update per mutation, so `state_root` no longer
+  re-serializes every registration and custody record per block.
+  The order-book section still walks resting orders (measured
+  ~37 ns/order — the next slice). `state_root` halved: ~13.9/
+  47.3/375 µs at 100/1k/10k resting orders, down from ~26/99/
+  693 µs. Snapshot blobs are byte-identical; the root preimage is
+  the new agreed construction.
+  - **In plain words:** the exchange used to re-hash every
+    registered order and custody balance on every block — now it
+    keeps running hashes instead, cutting that bookkeeping cost
+    in half. Hashing the live order book itself is the remaining
+    piece.
+
 ### Added
 
 - **Contention and interference benchmarks** (`crates/matcher`,

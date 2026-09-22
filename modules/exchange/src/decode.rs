@@ -9,34 +9,95 @@
 
 use super::{
     BTreeMap, CommittedState, DenseBook, ExchangeModule, MatchingEngine, OrderKey, Price, Qty,
-    RegisteredOrder, Reserved, Side, subtree_root,
+    RegisteredOrder, Reserved, Side,
 };
 use crate::codec::{decode_side, encode_market_config, encode_side, market_config_key};
+use primitives::Hash;
+
+/// Borrowed view over every committed field — built either from the
+/// live module's locked `Inner` or from a staged snapshot decode, so
+/// [`write_root_preimage`] defines the root schema exactly once for
+/// both `state_root` and `inspect_state`.
+///
+/// Trader-scale maps arrive as fold roots (`CommittedMap::root`
+/// live, `fold_map` over the staged `BTreeMap`): the preimage is a
+/// `put_root` per map rather than a serialization of every record —
+/// the 7.4 fix. The market engines still serialize per engine: the
+/// book's resting-order walk is a separate residual (the fold would
+/// have to live inside the matcher's hot mutation path).
+pub(crate) struct RootView<'a> {
+    /// The KV subtree's fold root.
+    pub store_fold: Hash,
+    /// One engine per market slot — serialized as in `write_committed`.
+    pub markets: &'a [Option<MatchingEngine>],
+    /// Pending list-market endorsements — serialized via its writer.
+    pub endorsements: &'a framework::Endorsements,
+    /// `registered`'s fold root — registration-scale.
+    pub registered_fold: Hash,
+    /// `base_balances`'s fold root — trader-scale.
+    pub base_balances_fold: Hash,
+    /// `base_holds`'s fold root — trader-scale.
+    pub base_holds_fold: Hash,
+    /// `fee_vault`'s fold root — market-scale (folded anyway: the
+    /// map participates in the same incremental contract).
+    pub fee_vault_fold: Hash,
+}
+
+/// The markets section shared by `write_committed` (snapshot blob)
+/// and [`write_root_preimage`] (`state_root`): identical bytes from
+/// one definition — a market added to one cannot drift from the
+/// other.
+fn write_markets_section(markets: &[Option<MatchingEngine>], w: &mut framework::CanonicalState) {
+    let mut entries = Vec::new();
+    let mut book_bytes = Vec::new();
+    w.put_count(markets.len());
+    for engine in markets {
+        match engine {
+            Some(e) => {
+                w.put_u8(1);
+                book_bytes.clear();
+                e.write_canonical_state(&mut book_bytes, &mut entries);
+                w.put_bytes(&book_bytes);
+            }
+            None => {
+                w.put_u8(0);
+            }
+        }
+    }
+}
+
+/// The incremental `state_root` preimage (7.4): every committed
+/// field appears exactly once, in the same section order
+/// `write_committed` uses — but trader-scale maps contribute their
+/// maintained fold root (`put_root`) instead of a serialization of
+/// every record.
+///
+/// This preimage is a NEW root format: `canon_root` of it differs
+/// from `canon_root` of `write_committed`'s bytes for the same
+/// state. The canonical stream remains the snapshot *install*
+/// payload; the root is what `state_root`/`inspect_state` agree on.
+/// KEEP IN SYNC with `write_committed`: a field added there must
+/// land here in the same position (serialized) or as a fold — a
+/// missed field is a silent root divergence.
+pub(crate) fn write_root_preimage(v: &RootView<'_>, w: &mut framework::CanonicalState) {
+    w.put_root(&v.store_fold);
+    write_markets_section(v.markets, w);
+    v.endorsements.write_canonical(w);
+    w.put_root(&v.registered_fold);
+    w.put_root(&v.base_balances_fold);
+    w.put_root(&v.base_holds_fold);
+    w.put_root(&v.fee_vault_fold);
+}
 
 impl ExchangeModule {
     /// Write the module's committed state into `w` — shared by
-    /// `state_root` and `export_state` so the snapshot blob's
-    /// canonical section is provably the same bytes `state_root`
-    /// hashes.
+    /// `state_root` (as section reference) and `export_state` so the
+    /// snapshot blob's canonical section is provably the same bytes
+    /// the root schema serializes.
     pub(crate) fn write_committed(&self, w: &mut framework::CanonicalState) {
-        w.put_root(&subtree_root(&self.store));
+        w.put_root(&framework::subtree_root_map(framework::lock_state(&self.store).inner()));
         let inner = framework::lock_state(&self.inner);
-        let mut entries = Vec::new();
-        let mut book_bytes = Vec::new();
-        w.put_count(inner.markets.len());
-        for engine in &inner.markets {
-            match engine {
-                Some(e) => {
-                    w.put_u8(1);
-                    book_bytes.clear();
-                    e.write_canonical_state(&mut book_bytes, &mut entries);
-                    w.put_bytes(&book_bytes);
-                }
-                None => {
-                    w.put_u8(0);
-                }
-            }
-        }
+        write_markets_section(&inner.markets, w);
         // Pending list-market endorsements are future-affecting
         // state: the tally decides whether the next endorsement
         // lists a market, so replicas holding different tallies must

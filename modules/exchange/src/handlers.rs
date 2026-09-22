@@ -82,10 +82,12 @@ impl ExchangeModule {
                         let release =
                             base_holds.get(&key).copied().unwrap_or_default().min(canceled.qty);
                         if release.0 > 0 {
-                            let held = base_holds.get_mut(&key).ok_or(ExecError::Malformed)?;
-                            *held = qty_sub(*held, release).ok_or(ExecError::Malformed)?;
-                            let free = base_balances.entry(key).or_default();
-                            *free = qty_add(*free, release).ok_or(ExecError::Malformed)?;
+                            let held = base_holds.get(&key).copied().ok_or(ExecError::Malformed)?;
+                            base_holds
+                                .insert(key, qty_sub(held, release).ok_or(ExecError::Malformed)?);
+                            let free = base_balances.get(&key).copied().unwrap_or_default();
+                            base_balances
+                                .insert(key, qty_add(free, release).ok_or(ExecError::Malformed)?);
                         }
                     }
                 }
@@ -190,8 +192,8 @@ impl ExchangeModule {
                         ));
                     }
                     // `free >= qty` was just proven — cannot underflow.
-                    let bal = base_balances.get_mut(&key).ok_or(ExecError::Malformed)?;
-                    *bal = qty_sub(*bal, order.qty).ok_or(ExecError::Malformed)?;
+                    let bal = base_balances.get(&key).copied().ok_or(ExecError::Malformed)?;
+                    base_balances.insert(key, qty_sub(bal, order.qty).ok_or(ExecError::Malformed)?);
                     taker_base = order.qty;
                 }
             }
@@ -225,8 +227,12 @@ impl ExchangeModule {
                     })?;
                 }
                 if taker_base.0 > 0 {
-                    let free = base_balances.entry((ctx.sender, market)).or_default();
-                    *free = qty_add(*free, taker_base).ok_or(ExecError::Malformed)?;
+                    let free =
+                        base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
+                    base_balances.insert(
+                        (ctx.sender, market),
+                        qty_add(free, taker_base).ok_or(ExecError::Malformed)?,
+                    );
                 }
                 return Err(ExecError::ModuleRejected(format!("engine: {e}")));
             }
@@ -301,8 +307,8 @@ impl ExchangeModule {
         &self,
         market: u8,
         removed: &[trading::MakerRemoval],
-        base_balances: &mut BTreeMap<(Address, u8), Qty>,
-        base_holds: &mut BTreeMap<(Address, u8), Qty>,
+        base_balances: &mut framework::CommittedMap<(Address, u8), Qty>,
+        base_holds: &mut framework::CommittedMap<(Address, u8), Qty>,
         events: &mut Vec<Event>,
     ) -> Result<(), ExecError> {
         if let Some(ledger) = &self.ledger {
@@ -328,10 +334,10 @@ impl ExchangeModule {
                 let release =
                     base_holds.get(&key).copied().unwrap_or_default().min(Qty(r.removed_qty));
                 if release.0 > 0 {
-                    let held = base_holds.get_mut(&key).ok_or(ExecError::Malformed)?;
-                    *held = qty_sub(*held, release).ok_or(ExecError::Malformed)?;
-                    let free = base_balances.entry(key).or_default();
-                    *free = qty_add(*free, release).ok_or(ExecError::Malformed)?;
+                    let held = base_holds.get(&key).copied().ok_or(ExecError::Malformed)?;
+                    base_holds.insert(key, qty_sub(held, release).ok_or(ExecError::Malformed)?);
+                    let free = base_balances.get(&key).copied().unwrap_or_default();
+                    base_balances.insert(key, qty_add(free, release).ok_or(ExecError::Malformed)?);
                 }
             }
             events.push(removal_event(market, *r));
@@ -447,8 +453,8 @@ impl ExchangeModule {
                         "register: insufficient base custody for sell".to_string(),
                     ));
                 }
-                let bal = base_balances.get_mut(&key).ok_or(ExecError::Malformed)?;
-                *bal = qty_sub(*bal, Qty(qty)).ok_or(ExecError::Malformed)?;
+                let bal = base_balances.get(&key).copied().ok_or(ExecError::Malformed)?;
+                base_balances.insert(key, qty_sub(bal, Qty(qty)).ok_or(ExecError::Malformed)?);
                 Reserved::Base(Qty(qty))
             }
         };
@@ -519,8 +525,12 @@ impl ExchangeModule {
                     let market = u8::try_from(order.market).map_err(|_| {
                         ExecError::ModuleRejected("cancel: market out of range".to_string())
                     })?;
-                    let free = inner.base_balances.entry((ctx.sender, market)).or_default();
-                    *free = qty_add(*free, residue).ok_or(ExecError::Malformed)?;
+                    let free =
+                        inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
+                    inner.base_balances.insert(
+                        (ctx.sender, market),
+                        qty_add(free, residue).ok_or(ExecError::Malformed)?,
+                    );
                 }
             }
         }
@@ -572,13 +582,13 @@ impl ExchangeModule {
         ledger
             .debit(&ctx.sender, amount)
             .map_err(|_| ExecError::ModuleRejected("deposit: insufficient balance".to_string()))?;
-        let entry = inner.base_balances.entry((ctx.sender, market)).or_default();
+        let entry = inner.base_balances.get(&(ctx.sender, market)).copied().unwrap_or_default();
         // The 1:1 denomination bridge: `amount` native base units
         // become `amount` scale-6 base micro-units of custody — the
         // module's documented backing choice (the base asset trades
         // in the native unit's own granularity).
-        if let Some(v) = qty_add(*entry, Qty(amount)) {
-            *entry = v;
+        if let Some(v) = qty_add(entry, Qty(amount)) {
+            inner.base_balances.insert((ctx.sender, market), v);
         } else {
             // Unreachable while total native supply < u64::MAX
             // (custody is native-backed). Refund the debit so the
@@ -642,8 +652,11 @@ impl ExchangeModule {
             .map_err(|_| ExecError::ModuleRejected("withdraw: credit failed".to_string()))?;
         // `free >= amount` was just proven — the decrement cannot
         // underflow.
-        let bal = inner.base_balances.get_mut(&(ctx.sender, market)).ok_or(ExecError::Malformed)?;
-        *bal = qty_sub(*bal, Qty(amount)).ok_or(ExecError::Malformed)?;
+        let bal =
+            inner.base_balances.get(&(ctx.sender, market)).copied().ok_or(ExecError::Malformed)?;
+        inner
+            .base_balances
+            .insert((ctx.sender, market), qty_sub(bal, Qty(amount)).ok_or(ExecError::Malformed)?);
         Ok(vec![Event {
             module: "exchange",
             kind: "base_withdrawn",

@@ -19316,3 +19316,31 @@ twice in one call's arguments.
 Still open for 7.4: exchange book root, perps positions, EVM
 account trie — `CommittedMap` is the migration; staking is the
 template.
+
+§7.4 exchange leg: the flat committed maps followed the staking
+template — `registered`, `base_balances`, `base_holds`,
+`fee_vault`, and the KV store are `CommittedMap`s now, with leaf
+encoders mirroring each `write_committed` record's field order.
+`write_root_preimage` + `RootView` in `decode.rs` keeps one schema
+for live `state_root` (maintained folds) and staged `inspect_state`
+(`fold_map` over the staged `BTreeMap`s); `import_state` rebuilds
+folds via `from_map`; the snapshot blob is byte-identical.
+
+The mutation-site rewrite was smaller than staking's but hit the
+same APIs — `entry`/`get_mut` don't exist on `CommittedMap` by
+design, so every settlement mutation became read-compute-insert
+(`BookSettlement::apply` shed its tail into `release_taker_base`
+to stay under the function-length gate). The fold-lockstep test
+drives deposit, register, batch-settle, rest, cancel, and
+withdraw through the real handlers then asserts
+`root() == recomputed_root()` on all five maps.
+
+Measured `state_root_vs_book`: 13.9/47.3/375 µs at 100/1k/10k
+resting orders vs 26/99/693 µs — roughly halved. The residual is
+the book's own resting-entry serialization; folding THAT means a
+root maintained inside `trading`'s hot mutation path (insert,
+unlink, fill-qty updates), a separate slice with a hot-path bench
+gate. Perps `accounts` is also not a mechanical swap: its values
+are nested `AccountState`s (positions + open-order maps inside),
+so the fold needs per-position leaf granularity or a flattened
+map — next slice's design question.

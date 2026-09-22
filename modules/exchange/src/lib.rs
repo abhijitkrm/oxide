@@ -83,7 +83,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use executor::{Event, ExecError, Module, TxContext};
-use framework::{KVStore, module_id, subtree_root};
+use framework::module_id;
 use primitives::fixed::{Price, Qty, qty_add, qty_sub};
 use primitives::{Address, Hash, Height};
 use trading::{
@@ -348,7 +348,10 @@ type L1 = (Option<(Price, Qty)>, Option<(Price, Qty)>);
 /// has matched.
 pub struct ExchangeModule {
     inner: Mutex<Inner>,
-    store: KVStore,
+    /// The module's KV subtree — market configs and the
+    /// next-order-id counter. `CommittedStore` keeps its subtree
+    /// fold maintained per write; `state_root` reads the fold.
+    store: Mutex<framework::CommittedStore>,
     /// Optional balance-ledger handle for settlement — the EVM
     /// account store behind `framework::Balances`. `None` = fills
     /// are recorded as events but no balances move (the v0
@@ -377,6 +380,67 @@ pub struct ExchangeModule {
     endorsements: framework::Endorsements,
 }
 
+/// Per-map domain separation for the committed-map leaf preimages —
+/// a `(key, value)` encoding can never alias into another map's
+/// fold even when two maps share field types. Module-local
+/// numbering: folds never mix across modules.
+const MAP_TAG_STORE: u64 = 1;
+const MAP_TAG_REGISTERED: u64 = 2;
+const MAP_TAG_BASE_BALANCES: u64 = 3;
+const MAP_TAG_BASE_HOLDS: u64 = 4;
+const MAP_TAG_FEE_VAULT: u64 = 5;
+
+/// The committed KV-subtree leaf — the same record shape
+/// `subtree_root_map` folds sequentially.
+// The `fn(&K, &V) -> Hash` signature is fixed by `CommittedMap`'s
+// leaf slot — borrowing `Vec<u8>` is the uniform shape, not a
+// style choice.
+#[allow(clippy::ptr_arg)]
+fn store_leaf(k: &Vec<u8>, v: &Vec<u8>) -> Hash {
+    framework::committed_store_leaf(MAP_TAG_STORE, k, v)
+}
+
+/// `(owner ‖ client_id ‖ market ‖ side ‖ limit ‖ remaining ‖
+/// reserved)` — the same field order `write_committed` writes into
+/// the canonical stream, so the fold commits the same information
+/// the serialized section does.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn registered_leaf(k: &OrderKey, v: &RegisteredOrder) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(&k.owner)
+        .put_u64(k.client_id)
+        .put_u16(v.market)
+        .put_u8(codec::encode_side(v.side()))
+        .put_u64(v.limit_price.0)
+        .put_u64(v.remaining.0)
+        .put_u64(v.reserved.get());
+    framework::committed_leaf(MAP_TAG_REGISTERED, w.as_bytes())
+}
+
+/// `(owner ‖ market ‖ qty_le)` — mirrors `base_balances`'s record.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn base_balances_leaf(k: &(Address, u8), v: &Qty) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(&k.0).put_u8(k.1).put_u64(v.0);
+    framework::committed_leaf(MAP_TAG_BASE_BALANCES, w.as_bytes())
+}
+
+/// `(owner ‖ market ‖ qty_le)` — mirrors `base_holds`'s record.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn base_holds_leaf(k: &(Address, u8), v: &Qty) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(&k.0).put_u8(k.1).put_u64(v.0);
+    framework::committed_leaf(MAP_TAG_BASE_HOLDS, w.as_bytes())
+}
+
+/// `(market ‖ amount_le)` — mirrors `fee_vault`'s record.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn fee_vault_leaf(k: &u8, v: &u64) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_u8(*k).put_u64(*v);
+    framework::committed_leaf(MAP_TAG_FEE_VAULT, w.as_bytes())
+}
+
 struct Inner {
     /// One engine per market, indexed by `MarketId` (a `u8`).
     markets: Vec<Option<MatchingEngine>>,
@@ -386,7 +450,10 @@ struct Inner {
     /// `(owner, client_id)`. Every batch-settle leg consumes from two
     /// of these — the operator can only settle fills the owners
     /// themselves signed for. Committed state (canonical section).
-    registered: BTreeMap<OrderKey, RegisteredOrder>,
+    /// `CommittedMap` keeps the map's root fold in lockstep with the
+    /// contents — `state_root` reads the fold instead of
+    /// re-serializing every registration.
+    registered: framework::CommittedMap<OrderKey, RegisteredOrder>,
     /// Free base-asset custody: `(owner, market) → unreserved base
     /// qty` (scale-6). Units enter via `TAG_DEPOSIT_BASE` — each one
     /// backed 1:1 by a native-token ledger debit the module holds —
@@ -394,7 +461,7 @@ struct Inner {
     /// into `base_holds` (book path) or `RegisteredOrder::reserved`
     /// (registered path); fills deliver out of those holds into the
     /// buyer's entry here. Committed state.
-    base_balances: BTreeMap<(Address, u8), Qty>,
+    base_balances: framework::CommittedMap<(Address, u8), Qty>,
     /// Base locked by this account's resting sell orders on the
     /// book path: `(owner, market) → Σ unfilled sell qty`. A resting
     /// sell contributes its full remaining qty at rest; fills
@@ -402,14 +469,14 @@ struct Inner {
     /// non-fill book removals release back to `base_balances`. The
     /// invariant `holds[(o,m)] == Σ unfilled qty of o's resting sells
     /// on m` is maintained at every mutation point. Committed state.
-    base_holds: BTreeMap<(Address, u8), Qty>,
+    base_holds: framework::CommittedMap<(Address, u8), Qty>,
     /// Accrued protocol fees per market, in quote units — the
     /// committed sink every fill's `FEE_BPS` slice lands in. A
     /// governance withdrawal path is a deliberate residual; until it
     /// exists the vault only grows (bounded by cumulative volume, so
     /// `checked_add` guards are honored rather than assumed).
     /// Committed state.
-    fee_vault: BTreeMap<u8, u64>,
+    fee_vault: framework::CommittedMap<u8, u64>,
 }
 
 /// The committed state a snapshot decodes into — the per-market
@@ -442,12 +509,12 @@ impl ExchangeModule {
             inner: Mutex::new(Inner {
                 markets: (0..=u8::MAX).map(|_| None).collect(),
                 fills: Vec::with_capacity(64),
-                registered: BTreeMap::new(),
-                base_balances: BTreeMap::new(),
-                base_holds: BTreeMap::new(),
-                fee_vault: BTreeMap::new(),
+                registered: framework::CommittedMap::new(registered_leaf),
+                base_balances: framework::CommittedMap::new(base_balances_leaf),
+                base_holds: framework::CommittedMap::new(base_holds_leaf),
+                fee_vault: framework::CommittedMap::new(fee_vault_leaf),
             }),
-            store: Mutex::new(BTreeMap::new()),
+            store: Mutex::new(framework::CommittedStore::new(store_leaf)),
             ledger: None,
             settlement_operator: None,
             committee: None,
