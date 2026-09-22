@@ -1309,7 +1309,11 @@ const SIGNED_PAYLOAD_OFFSET: usize = ENVELOPE_SIG_OFFSET + ENVELOPE_SIG_LEN; // 
 /// zero-copy slice into the original tx bytes (no per-tx Vec
 /// allocation). The hash is the full tx hash (used for preverify
 /// cache lookup).
-type GroupedTx<'a> = (TxContext, &'a [u8], Hash);
+///
+/// Kept as a named type alias for `exec::PlannedTx` — the real
+/// type lives in `exec.rs`, where private fields make
+/// `plan_block_runs` the only mint site.
+type GroupedTx<'a> = exec::PlannedTx<'a>;
 
 /// Parse the dispatch module ID from a tx's payload section.
 ///

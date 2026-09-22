@@ -17,6 +17,31 @@ use super::{
     module_payload, parse_module_id, parse_tx_context,
 };
 
+/// A transaction that cleared every admission gate in
+/// [`Executor::plan_block_runs`]: envelope parse, known module,
+/// nonce continuity, signature verification (or a documented
+/// bypass — self-authenticating module / `UnsignedTxPolicy::Allow`),
+/// block-gas limit, and the fee floor.
+///
+/// The fields are private to this module — `plan_block_runs` is the
+/// only mint site, after all gates pass — so a `PlannedTx` reaching
+/// `dispatch_run`/`charge_and_execute_run` *is* the proof that
+/// admission ran. Nothing downstream may be fed an unplanned tuple:
+/// this type is what stops a future code path from dispatching a
+/// parsed-but-unauthenticated context straight to `Module::handle`.
+pub(crate) struct PlannedTx<'a> {
+    /// The parsed envelope context — authenticated for
+    /// envelope-signed txs; an ordering hint only for
+    /// self-authenticating modules (they recover sender+nonce from
+    /// their own payload during execution).
+    ctx: TxContext,
+    /// Zero-copy module payload borrowed from the block bytes.
+    payload: &'a [u8],
+    /// `Domain::Transaction` hash of the full envelope — the
+    /// preverify-cache key `ingest_tx` used.
+    tx_hash: Hash,
+}
+
 impl Executor {
     /// Check the envelope authentication of a tx routed to `module`.
     ///
@@ -257,9 +282,9 @@ impl Executor {
             // used for the preverify cache.
             match runs.last_mut() {
                 Some((run_module, run)) if *run_module == module_id => {
-                    run.push((ctx, payload, tx_hash));
+                    run.push(PlannedTx { ctx, payload, tx_hash });
                 }
-                _ => runs.push((module_id, vec![(ctx, payload, tx_hash)])),
+                _ => runs.push((module_id, vec![PlannedTx { ctx, payload, tx_hash }])),
             }
         }
         runs
@@ -306,23 +331,23 @@ impl Executor {
         let mut executed = Vec::with_capacity(run.len());
         let mut results = Vec::with_capacity(run.len());
         for entry in run {
-            let ctx = entry.0;
+            let ctx = entry.ctx;
             if let Some(&broken) = broken_nonce.get(&ctx.sender)
                 && ctx.nonce >= broken
             {
-                dispatch_skipped.push((entry.2, TxSkipReason::StaleNonce));
+                dispatch_skipped.push((entry.tx_hash, TxSkipReason::StaleNonce));
                 continue;
             }
             let charged = fee_module.is_none_or(|m| m.charge_fee(&ctx).is_ok());
             if !charged {
-                dispatch_skipped.push((entry.2, TxSkipReason::FeeCharge));
+                dispatch_skipped.push((entry.tx_hash, TxSkipReason::FeeCharge));
                 broken_nonce.entry(ctx.sender).or_insert(ctx.nonce);
                 if !self_authenticating {
                     local_nonce.bump(ctx.sender, ctx.nonce);
                 }
                 continue;
             }
-            results.push(module.handle(&ctx, entry.1));
+            results.push(module.handle(&ctx, entry.payload));
             executed.push(entry);
         }
         (executed, results)
@@ -346,27 +371,25 @@ impl Executor {
         group: &[GroupedTx<'_>],
         preverify_cache: &mut HashMap<Hash, [u8; 20]>,
     ) -> Vec<Result<Vec<Event>, ExecError>> {
-        let all_cached =
-            group.iter().all(|(_ctx, _payload, tx_hash)| preverify_cache.contains_key(tx_hash));
+        let all_cached = group.iter().all(|t| preverify_cache.contains_key(&t.tx_hash));
         if !all_cached {
-            let batch: Vec<(TxContext, &[u8])> =
-                group.iter().map(|(ctx, payload, _tx_hash)| (*ctx, *payload)).collect();
+            let batch: Vec<(TxContext, &[u8])> = group.iter().map(|t| (t.ctx, t.payload)).collect();
             return module.handle_batch(&batch);
         }
         // All senders are pre-recovered — build borrowed
         // `PreverifiedTx`s straight from the block bytes.
         let preverified: Vec<PreverifiedTx<'_>> = group
             .iter()
-            .map(|(_ctx, payload, tx_hash)| PreverifiedTx {
-                raw: payload,
-                sender: preverify_cache.remove(tx_hash).unwrap_or([0u8; 20]),
+            .map(|t| PreverifiedTx {
+                raw: t.payload,
+                sender: preverify_cache.remove(&t.tx_hash).unwrap_or([0u8; 20]),
             })
             .collect();
         // Each tx keeps its own authenticated envelope context —
         // `ctxs[i]` pairs with `preverified[i]`. Passing `group[0].0`
         // here previously executed the whole group under the first
         // tx's identity.
-        let ctxs: Vec<TxContext> = group.iter().map(|(ctx, _, _)| *ctx).collect();
+        let ctxs: Vec<TxContext> = group.iter().map(|t| t.ctx).collect();
         if group.len() >= self.parallel_threshold {
             module.handle_batch_parallel_preverified(&ctxs, &preverified)
         } else {
@@ -589,7 +612,7 @@ impl Executor {
         block_events: &mut Vec<Event>,
     ) {
         let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
-        for ((_ctx, _payload, tx_hash), result) in group.iter().zip(results) {
+        for (t, result) in group.iter().zip(results) {
             let outcome = match result {
                 Ok(events) => {
                     block_events.extend(events.iter().cloned());
@@ -597,7 +620,7 @@ impl Executor {
                 }
                 Err(e) => TxOutcome::Executed { events: Vec::new(), error: Some(format!("{e:?}")) },
             };
-            outcomes.record(*tx_hash, outcome);
+            outcomes.record(t.tx_hash, outcome);
         }
     }
 }

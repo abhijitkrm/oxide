@@ -18703,3 +18703,15 @@ governance), `validators.rs` (membership lifecycle — PoP-gated
 add, remove, pending-set sweeps), `rewards.rs` (u128 pro-rata
 distribution + the only reward payout path). `lib.rs` is ~1.4k
 lines of types and accessors.
+
+## §9.A — admission as a type: `PlannedTx`
+
+`GroupedTx` was a tuple alias — any code could mint one and feed
+dispatch. It's now `exec::PlannedTx`, a struct with module-private
+fields: `plan_block_runs` is the only mint site, after every gate
+(parse, known module, nonce continuity, envelope auth or its
+documented bypass, gas limit, fee floor). A `PlannedTx` reaching
+`dispatch_run`/`charge_and_execute_run` is the proof that
+admission ran — a future path can't dispatch a parsed-but-
+unauthenticated context to `Module::handle`. The `GroupedTx`
+alias in lib.rs forwards to it so signatures stay readable.
