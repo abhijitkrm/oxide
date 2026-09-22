@@ -18670,3 +18670,12 @@ function that turns an admitted order plus fills into ledger
 movement; `LegPlan`/`OrderDelta`/`TakerCtx` carry the per-leg
 accounting), `module_impl.rs` (Module + ParameterSink lifecycle).
 `lib.rs` is ~780 lines of types, ctor, accessors, and `msg`.
+
+## §9.E — RPC endpoint surface split
+
+All `eth_*`/`net_*`/`web3_*`/`txpool_*`/`debug_*` handlers (~1300
+lines) moved to `endpoints.rs` — the read-surface invariant: each
+is a leaf that reads module state and formats a response, and the
+dispatcher in `lib.rs` is the only caller. `lib.rs` is ~1.9k
+lines of types (subscriptions, filters, providers) and server
+plumbing.
