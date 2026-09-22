@@ -1159,6 +1159,44 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Oracle marks moved on a feeder-count majority instead of
+  staked power** (`modules/oracle`)
+  - Publication required `eligible/2 + 1` submissions — a *count*
+  majority — and registered external feeds counted as feeders
+    despite carrying no stake. A majority of low- or zero-stake
+    feeders could move the marks that drive liquidations while
+    holding far less than the two-thirds of bonded power that
+    finality itself requires.
+  - Quorum is now `submitting_power · 3 > total_power · 2` over the
+    validator committee — the same BFT bar consensus uses — and the
+    mark is the power-weighted median of submissions, so the
+    published price is provably one an honest-weight majority
+    attested. External feeds are advisory (recorded, weight 0) and
+    a committee-less build fails closed instead of falling back to
+    counting.
+  - **In plain words:** the price oracle used to count hands; now
+    it weighs stake, like the consensus it feeds. A swarm of tiny
+    or unstaked reporters can no longer move the prices that
+    trigger liquidations.
+
+- **Perps funding rates applied instantly whenever the last vote
+  landed** (`modules/perps`)
+  - `TAG_APPLY_FUNDING` applied a quorum-endorsed rate mid-block at
+    an arbitrary height — funding timing was effectively chosen by
+    vote order, and there was no funding *period* at all.
+  - Endorsed rates are now staged and applied only on the
+    `FUNDING_PERIOD_BLOCKS` grid (3_600 blocks ≈ hourly), before
+    the block's liquidation sweep so margin checks see post-funding
+    state. A stale oracle mark at the boundary consumes the rate
+    without applying it — an outage skips the period instead of
+    funding on untrusted prices — and a same-period re-endorsement
+    replaces the staged rate.
+  - **In plain words:** funding used to hit accounts at whatever
+    random moment the last validator vote arrived; now it settles
+    on a predictable hourly schedule like every other venue — and
+    if the price feed is down when funding comes due, the period is
+    skipped rather than charged on stale data.
+
 - **A transaction's fee no longer ignores same-run predecessors**
   (`crates/executor`)
   - Within a contiguous same-module run, all fees were charged

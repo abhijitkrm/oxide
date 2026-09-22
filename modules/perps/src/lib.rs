@@ -39,7 +39,7 @@
 //! | 3   | Deposit margin | `[market:1][amount:8]` (isolated) or `[market:0xFF][amount:8]` (cross) |
 //! | 4   | Withdraw margin | `[market:1][amount:8]` (isolated) or `[market:0xFF][amount:8]` (cross) |
 //! | 5   | Set mark price | `[market:1][mark:8]` (oracle/governance path) |
-//! | 6   | Apply funding | `[market:1][rate:8]` (oracle/governance path, signed i64 as u64) |
+//! | 6   | Apply funding | `[market:1][rate:8]` (oracle/governance path, signed i64 as u64 — quorum-endorsed, applies at the next `FUNDING_PERIOD_BLOCKS` boundary) |
 //!
 //! The sender (from the tx envelope) is the account owner.
 
@@ -187,6 +187,20 @@ const BACKSTOP_UNWIND_SLIPPAGE_BPS: u64 = 100;
 /// 5%/period is far above honest funding (venues clamp near ±2%)
 /// yet converts "unbounded transfer" into "bounded loss".
 const MAX_FUNDING_RATE_BPS: i64 = 500;
+
+/// The funding period, in blocks: endorsed rates apply only at
+/// block heights divisible by this value — one application per
+/// market per period, at a boundary every participant can
+/// predict. A quorum-endorsed `TAG_APPLY_FUNDING` records
+/// `pending_funding[market]` (bounded by [`MAX_FUNDING_RATE_BPS`]
+/// at record time); the next boundary applies it once and clears
+/// it, so funding never lands mid-block at quorum-chosen timing
+/// and a stale rate cannot charge forever — each period needs a
+/// fresh endorsement. `3_600` blocks ≈ 1h at the ~1s block cadence
+/// (venue convention is hourly funding). A boundary during an
+/// oracle outage skips the period entirely — `apply_funding`
+/// rejects stale marks and the consumed rate must be re-endorsed.
+const FUNDING_PERIOD_BLOCKS: u64 = 3_600;
 
 /// The module-owned clearing account — the counterparty of last
 /// resort in the clearing model (audit 5.1).
@@ -607,6 +621,12 @@ struct Inner {
     /// consensus-visible state (two nodes sweeping different
     /// windows produce different liquidation sets).
     liquidation_cursor: Option<Address>,
+    /// Quorum-endorsed funding rates awaiting the next period
+    /// boundary (`TAG_APPLY_FUNDING` records; `end_block` applies
+    /// at `height % FUNDING_PERIOD_BLOCKS == 0`). Committed — the
+    /// pending set decides what applies at the next boundary, so
+    /// two nodes disagreeing on it would diverge there.
+    pending_funding: BTreeMap<u8, i64>,
 }
 
 /// [`MakerCap`] gate enforcing reduce-only at the match decision:
@@ -699,6 +719,7 @@ impl PerpsModule {
                 current_height: 0,
                 mark_updated_at: BTreeMap::new(),
                 liquidation_cursor: None,
+                pending_funding: BTreeMap::new(),
             }),
             store: Mutex::new(BTreeMap::new()),
             ledger: None,
@@ -1570,6 +1591,12 @@ struct StagedPerps {
     /// module emitted the same losses as events and forgot them;
     /// there is no honest non-zero default to reconstruct).
     unfunded_bad_debt: u64,
+    /// Trailing section (v4): quorum-endorsed funding rates
+    /// awaiting the next [`FUNDING_PERIOD_BLOCKS`] boundary.
+    /// Absent in pre-upgrade blobs — `empty` = nothing pending
+    /// (the pre-upgrade path applied at endorsement time, so no
+    /// queued rate can be lost to the upgrade).
+    pending_funding: BTreeMap<u8, i64>,
 }
 
 impl PerpsModule {
@@ -1672,6 +1699,15 @@ impl PerpsModule {
         // retiring it and growing the fund, so two nodes disagreeing
         // on it would diverge on the next funding round.
         w.put_u64(inner.unfunded_bad_debt);
+        // ── Trailing section (v4) ── the pending funding set is
+        // consensus-visible: it decides what applies at the next
+        // period boundary, so disagreement there diverges the
+        // moment the boundary lands.
+        w.put_count(inner.pending_funding.len());
+        for (market, rate) in &inner.pending_funding {
+            w.put_u8(*market);
+            w.put_i64(*rate);
+        }
     }
 
     /// Decode the canonical fields following the leading store root —
@@ -1724,6 +1760,7 @@ impl PerpsModule {
         let mut mark_updated_at = BTreeMap::new();
         let mut liquidation_cursor = None;
         let mut unfunded_bad_debt = 0;
+        let mut pending_funding = BTreeMap::new();
         if r.remaining() != 0 {
             let n = r.get_count()?;
             for _ in 0..n {
@@ -1748,6 +1785,28 @@ impl PerpsModule {
             if r.remaining() != 0 {
                 unfunded_bad_debt = r.get_u64()?;
             }
+            // Trailing v4: pre-v4 blobs end at the debt. Empty is
+            // the only honest default — the pre-upgrade path applied
+            // funding at endorsement time, so nothing could be
+            // queued. A pending rate outside the bound is
+            // non-canonical: the record-time check makes such state
+            // unproducible.
+            if r.remaining() != 0 {
+                let n = r.get_count()?;
+                for _ in 0..n {
+                    let market = r.get_u8()?;
+                    let rate = r.get_i64()?;
+                    if !configs.contains_key(&market) {
+                        return None; // pending funding for an unlisted market is dead state
+                    }
+                    if rate.unsigned_abs() > u64::try_from(MAX_FUNDING_RATE_BPS).unwrap_or(0) {
+                        return None;
+                    }
+                    if pending_funding.insert(market, rate).is_some() {
+                        return None;
+                    }
+                }
+            }
         }
         // A mark with no recorded age — pre-upgrade blobs — is
         // seeded at height 0: stale at any real chain height until
@@ -1769,6 +1828,7 @@ impl PerpsModule {
             mark_updated_at,
             liquidation_cursor,
             unfunded_bad_debt,
+            pending_funding,
         })
     }
 
@@ -2178,42 +2238,8 @@ impl Module for PerpsModule {
                 }
             }
             TAG_APPLY_FUNDING => {
-                let (market, rate_bits) = Self::parse_funding(body).ok_or(ExecError::Malformed)?;
-                let rate = i64::from_le_bytes(rate_bits);
-                // Same pre-endorsement existence check as
-                // `TAG_SET_MARK` — the bounded pending set must
-                // never carry an action that cannot apply.
-                if !inner.marks.contains_key(&market) {
-                    return Err(ExecError::ModuleRejected("market does not exist".to_string()));
-                }
                 drop(inner);
-                // Same quorum gate as `TAG_SET_MARK` — an
-                // unauthenticated funding rate is an
-                // unauthenticated balance transfer between every
-                // long and short on the market, so it takes the
-                // same two-thirds endorsement to apply.
-                let Some(committee) = self.committee.clone() else {
-                    return Err(ExecError::ModuleRejected(
-                        "apply_funding: no committee wired".to_string(),
-                    ));
-                };
-                match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
-                    framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
-                        module: "perps",
-                        kind: "apply_funding_endorse",
-                        data: vec![market],
-                    }]),
-                    framework::EndorsementOutcome::Quorum => {
-                        match self.apply_funding(market, rate) {
-                            Ok(events) => Ok(events),
-                            Err(_) => Ok(vec![Event {
-                                module: "perps",
-                                kind: "apply_funding_stale",
-                                data: vec![market],
-                            }]),
-                        }
-                    }
-                }
+                self.handle_apply_funding(ctx, msg, body)
             }
             TAG_LIQUIDATE => {
                 // `[account: 20B]` — permissionless trigger: the
@@ -2244,7 +2270,40 @@ impl Module for PerpsModule {
     /// mark is the best estimate available. Freezing the sweep on
     /// staleness would strand underwater accounts exactly when they
     /// need closing.
-    fn end_block(&self, _height: Height) -> Vec<Event> {
+    fn end_block(&self, height: Height) -> Vec<Event> {
+        // Funding boundary: on `FUNDING_PERIOD_BLOCKS` multiples,
+        // apply every quorum-endorsed pending rate — one application
+        // per market per period, at a schedule every participant can
+        // predict, before the sweep so this block's liquidations see
+        // post-funding margin. A stale mark consumes the rate
+        // without applying it (`apply_funding_stale`) — an oracle
+        // outage at the boundary skips the period rather than
+        // funding on prices nobody trusts.
+        let mut events = Vec::new();
+        if height.value().is_multiple_of(FUNDING_PERIOD_BLOCKS) {
+            let due: Vec<(u8, i64)> = {
+                let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.pending_funding.iter().map(|(m, r)| (*m, *r)).collect()
+            };
+            if !due.is_empty() {
+                for (market, rate) in due {
+                    match self.apply_funding(market, rate) {
+                        Ok(applied) => events.extend(applied),
+                        Err(_) => events.push(Event {
+                            module: "perps",
+                            kind: "apply_funding_stale",
+                            data: vec![market],
+                        }),
+                    }
+                }
+                self.inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending_funding
+                    .clear();
+            }
+        }
+
         // Collect this block's sweep window under a short lock:
         // `liquidation_check` takes the same mutex internally, so
         // the address list must be materialized first.
@@ -2261,7 +2320,6 @@ impl Module for PerpsModule {
             }
         };
 
-        let mut events = Vec::new();
         for account in &batch {
             // The only error the check produces is
             // `ModuleRejected("account not found")` — the account
@@ -2348,6 +2406,7 @@ impl Module for PerpsModule {
         inner.mark_updated_at = staged.mark_updated_at;
         inner.liquidation_cursor = staged.liquidation_cursor;
         inner.unfunded_bad_debt = staged.unfunded_bad_debt;
+        inner.pending_funding = staged.pending_funding;
         // Block-transient: refreshed by the next `begin_block`.
         inner.current_height = 0;
         // `fills` is per-call scratch — clear it so a buffer left
@@ -2418,6 +2477,70 @@ impl PerpsModule {
                     data: body.to_vec(),
                 }]),
             },
+        }
+    }
+
+    /// Handle an apply-funding message (extracted from `handle` to
+    /// keep the dispatch under the line-count gate). Quorum-endorsed
+    /// rates are staged, not applied — `end_block` applies them at
+    /// the next [`FUNDING_PERIOD_BLOCKS`] boundary.
+    fn handle_apply_funding(
+        &self,
+        ctx: &TxContext,
+        msg: &[u8],
+        body: &[u8],
+    ) -> Result<Vec<Event>, ExecError> {
+        let (market, rate_bits) = Self::parse_funding(body).ok_or(ExecError::Malformed)?;
+        let rate = i64::from_le_bytes(rate_bits);
+        // Same pre-endorsement existence check as `TAG_SET_MARK` —
+        // the bounded pending set must never carry an action that
+        // cannot apply.
+        if !self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .marks
+            .contains_key(&market)
+        {
+            return Err(ExecError::ModuleRejected("market does not exist".to_string()));
+        }
+        // Same quorum gate as `TAG_SET_MARK` — an unauthenticated
+        // funding rate is an unauthenticated balance transfer
+        // between every long and short on the market, so it takes
+        // the same two-thirds endorsement to schedule.
+        let Some(committee) = self.committee.clone() else {
+            return Err(ExecError::ModuleRejected("apply_funding: no committee wired".to_string()));
+        };
+        match self.endorsements.record(msg, &ctx.sender, committee.as_ref())? {
+            framework::EndorsementOutcome::Pending { .. } => Ok(vec![Event {
+                module: "perps",
+                kind: "apply_funding_endorse",
+                data: vec![market],
+            }]),
+            framework::EndorsementOutcome::Quorum => {
+                // Bound-check at record time — committed state must
+                // never carry a rate that could not apply (the
+                // decode path enforces the same bound as a
+                // canonicity rule).
+                if rate.unsigned_abs() > u64::try_from(MAX_FUNDING_RATE_BPS).unwrap_or(0) {
+                    return Err(ExecError::ModuleRejected(format!(
+                        "funding rate {rate} bps exceeds bound ±{MAX_FUNDING_RATE_BPS} bps"
+                    )));
+                }
+                // Scheduled, not immediate: the rate waits in
+                // `pending_funding` for the next
+                // `FUNDING_PERIOD_BLOCKS` boundary, where
+                // `end_block` applies it. A later endorsement
+                // before the boundary replaces it — the committee
+                // can correct a fat-fingered rate inside the same
+                // period.
+                self.inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending_funding
+                    .insert(market, rate);
+                Ok(vec![Event { module: "perps", kind: "funding_scheduled", data: vec![market] }])
+            }
         }
     }
 
@@ -3460,9 +3583,9 @@ fn encode_perps_config(cfg: &PerpsMarketConfig) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLEARING_ACCOUNT, CROSS_MARGIN_MARKET, MarketConfig, NewOrder, OrderId, OrderType,
-        PRICE_SCALE, PerpsMarketConfig, PerpsModule, Position, Side, StpMode, TimeInForce,
-        encode_reject_reason, mark_price_deviation_bps, msg,
+        CLEARING_ACCOUNT, CROSS_MARGIN_MARKET, FUNDING_PERIOD_BLOCKS, MarketConfig, NewOrder,
+        OrderId, OrderType, PRICE_SCALE, PerpsMarketConfig, PerpsModule, Position, Side, StpMode,
+        TimeInForce, encode_reject_reason, mark_price_deviation_bps, msg,
     };
     use executor::{ExecError, Module, TxContext};
     use framework::{Balances, module_id};
@@ -3657,7 +3780,79 @@ mod tests {
         );
 
         let events = perps.handle(&ctx(2), &msg::apply_funding(mid, 1)).unwrap();
-        assert_eq!(events[0].kind, "funding", "quorum applies the rate");
+        assert_eq!(
+            events[0].kind, "funding_scheduled",
+            "quorum schedules the rate — it applies at the next period boundary"
+        );
+        // The rate lands at the funding boundary, not at quorum.
+        let events = perps.end_block(Height::new(FUNDING_PERIOD_BLOCKS));
+        assert!(
+            events.iter().any(|e| e.kind == "funding"),
+            "the boundary applies the endorsed rate"
+        );
+    }
+
+    /// Regression: the endorsed rate must NOT apply before the
+    /// funding boundary — funding timing is a predictable schedule,
+    /// not a quorum-chosen instant (a committee could otherwise land
+    /// funding at the exact block that benefits its own positions).
+    #[test]
+    fn funding_applies_only_at_period_boundary() {
+        let perps = PerpsModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        let mid = perps.list_market(test_cfg()).unwrap();
+        perps.handle(&ctx(3), &msg::deposit(CROSS_MARGIN_MARKET, 500_000)).unwrap();
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &addr(3));
+            acct.positions.insert(
+                mid,
+                Position { size: 1_000_000, entry_price: 1_500_000_000, isolated_margin: 0 },
+            );
+        }
+        for v in 1..=2u8 {
+            perps.handle(&ctx(v), &msg::apply_funding(mid, 1)).unwrap();
+        }
+        // Off-boundary heights never apply — no funding event.
+        for h in [1u64, 100, FUNDING_PERIOD_BLOCKS - 1] {
+            let events = perps.end_block(Height::new(h));
+            assert!(
+                !events.iter().any(|e| e.kind == "funding"),
+                "height {h} is not a boundary — the pending rate must wait"
+            );
+        }
+        // The boundary applies it exactly once — the pending entry
+        // is consumed, so the next boundary does not re-charge.
+        let events = perps.end_block(Height::new(FUNDING_PERIOD_BLOCKS));
+        assert!(events.iter().any(|e| e.kind == "funding"));
+        let events = perps.end_block(Height::new(FUNDING_PERIOD_BLOCKS * 2));
+        assert!(
+            !events.iter().any(|e| e.kind == "funding"),
+            "consumed — a stale rate cannot charge forever"
+        );
+    }
+
+    /// A rate beyond `MAX_FUNDING_RATE_BPS` must be rejected at
+    /// record time — committed state can never carry a rate that
+    /// could not apply.
+    #[test]
+    fn funding_rate_over_bound_rejected_at_quorum() {
+        let perps = PerpsModule::new().with_committee(Arc::new(TwoValidatorCommittee));
+        let mid = perps.list_market(test_cfg()).unwrap();
+        perps.handle(&ctx(1), &msg::apply_funding(mid, 501)).unwrap();
+        let err = perps.handle(&ctx(2), &msg::apply_funding(mid, 501)).unwrap_err();
+        assert!(
+            matches!(err, ExecError::ModuleRejected(_)),
+            "over-bound rate must not be recorded"
+        );
+        assert!(
+            perps
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_funding
+                .is_empty(),
+            "the rejected rate must not sit in pending_funding"
+        );
     }
 
     /// The emergency mark/funding tx path must reject non-committee
@@ -5713,5 +5908,122 @@ mod tests {
         assert_eq!(dst.state_root(), src.state_root());
         assert_eq!(dst.unfunded_bad_debt(), 42_000);
         assert_eq!(dst.position(&CLEARING_ACCOUNT, mid).size, 7_000);
+    }
+
+    /// System scenario: an oracle outage and an extreme move through
+    /// the REAL oracle → `MarkSink` → perps pipeline — not a mocked
+    /// sink. Covers the three guarantees an outage must preserve:
+    ///
+    /// 1. Stale marks put the market in reduce-only mode (new
+    ///    exposure refused, closing still admitted).
+    /// 2. The liquidation sweep keeps running on the last accepted
+    ///    mark — freezing risk-reduction during a feed outage would
+    ///    strand underwater accounts.
+    /// 3. Recovery publishes again, and an extreme single-block
+    ///    move is rejected at the perps deviation cap (fail-closed)
+    ///    while a moderate move lands EMA-dampened.
+    ///
+    /// Four validators at uniform power: the oracle's stake-weighted
+    /// quorum needs three submissions per block.
+    #[test]
+    fn oracle_outage_and_recovery_through_real_pipeline() {
+        struct FourValidators;
+        impl framework::Committee for FourValidators {
+            fn is_active_validator(&self, a: &Address) -> bool {
+                (1..=4).any(|b| *a == addr(b))
+            }
+            fn active_validator_count(&self) -> usize {
+                4
+            }
+            fn power(&self, a: &Address) -> u64 {
+                u64::from(self.is_active_validator(a))
+            }
+            fn total_power(&self) -> u64 {
+                4
+            }
+        }
+
+        let perps = Arc::new(PerpsModule::new());
+        let mid = perps.list_market(test_cfg()).unwrap();
+        let oracle = oracle::OracleModule::new().with_committee(Arc::new(FourValidators));
+        oracle.with_sink(perps.clone());
+
+        // An account that will be underwater at any sane mark:
+        // entered long near the top of the price band with dust
+        // margin.
+        let victim = addr(9);
+        {
+            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let acct = PerpsModule::account_mut(&mut inner, &victim);
+            acct.positions.insert(
+                mid,
+                Position { size: 50_000, entry_price: 1_900_000_000, isolated_margin: 100_000 },
+            );
+        }
+
+        // ── Healthy: three validators submit → quorum → the mark
+        // lands on perps through the real sink.
+        perps.begin_block(Height::new(1));
+        for v in 1..=3u8 {
+            oracle.handle(&ctx(v), &oracle::msg::submit_price(mid, 1_500_000_000)).unwrap();
+        }
+        oracle.end_block(Height::new(1));
+        assert_eq!(perps.mark_price(mid), Some(1_500_000_000));
+        assert!(!perps.mark_is_stale(mid));
+
+        // ── Outage: no submissions for STALE_AFTER+ blocks. The
+        // mark goes stale → new exposure refused…
+        let outage_height = 1 + 61;
+        perps.begin_block(Height::new(outage_height));
+        assert!(perps.mark_is_stale(mid), "61+ blocks silent is stale");
+        let err = perps.handle(&ctx(5), &msg::place(mid, limit(Side::Buy, 500, 1, 5))).unwrap_err();
+        match err {
+            ExecError::ModuleRejected(reason) => {
+                assert!(reason.contains("stale"), "expected stale rejection, got: {reason}");
+            }
+            _ => panic!("expected ModuleRejected, got {err:?}"),
+        }
+        // …closing is still admitted…
+        assert!(
+            perps
+                .handle(&ctx(9), &msg::place_reduce_only(mid, limit(Side::Sell, 500, 1, 9)))
+                .is_ok(),
+            "reduce-only must pass the stale gate during an outage"
+        );
+        // …and the end-block sweep still liquidates the underwater
+        // account at the last accepted mark.
+        let events = perps.end_block(Height::new(outage_height));
+        assert!(
+            events.iter().any(|e| e.kind == "liquidated"),
+            "sweep must still run during an outage: {events:?}"
+        );
+        assert_eq!(perps.position(&victim, mid).size, 0);
+
+        // ── Extreme move rejected: a 10× submission is dampened by
+        // the oracle EMA (×1/4 weight) but still lands >10% off the
+        // last accepted mark → the perps cap refuses it and BOTH
+        // sides honestly stay stale.
+        perps.begin_block(Height::new(outage_height + 1));
+        for v in 1..=3u8 {
+            oracle.handle(&ctx(v), &oracle::msg::submit_price(mid, 15_000_000_000)).unwrap();
+        }
+        oracle.end_block(Height::new(outage_height + 1));
+        assert_eq!(
+            perps.mark_price(mid),
+            Some(1_500_000_000),
+            "deviation-capped update must not move the mark"
+        );
+        assert!(perps.mark_is_stale(mid), "rejected update must not refresh staleness");
+
+        // ── Recovery: a moderate move (+27% raw) is EMA-dampened to
+        // (1.5e9·3 + 1.9e9)/4 = 1.6e9 → +6.7% < 10% cap → published,
+        // staleness cleared, trading restored.
+        perps.begin_block(Height::new(outage_height + 2));
+        for v in 1..=3u8 {
+            oracle.handle(&ctx(v), &oracle::msg::submit_price(mid, 1_900_000_000)).unwrap();
+        }
+        oracle.end_block(Height::new(outage_height + 2));
+        assert_eq!(perps.mark_price(mid), Some(1_600_000_000));
+        assert!(!perps.mark_is_stale(mid), "accepted update clears staleness");
     }
 }

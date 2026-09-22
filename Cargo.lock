@@ -3033,6 +3033,7 @@ dependencies = [
  "evm",
  "executor",
  "framework",
+ "oracle",
  "primitives",
  "proptest",
  "storage",

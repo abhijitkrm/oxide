@@ -29,6 +29,9 @@ proptest = "1.11.0"
 # production `Balances` impl) — dev-dep cycle with the precompile
 # dep is legal.
 evm = { workspace = true }
+# oracle: the outage/large-move system scenario drives the real
+# oracle → MarkSink → perps pipeline rather than mocking the sink.
+oracle = { workspace = true }
 
 [[bench]]
 name = "perps_settlement"

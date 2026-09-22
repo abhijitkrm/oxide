@@ -26,13 +26,20 @@
 //!    a feeder can correct a fat-fingered submission within the same
 //!    block but cannot stuff the ballot.
 //! 2. At `end_block`, for every market that received submissions the
-//!    module counts them against a quorum of
-//!    `eligible/2 + 1` (strict majority), where `eligible` is the
-//!    number of active (non-jailed) validators plus registered
-//!    external feeds. Markets below quorum are skipped — their marks
-//!    go stale rather than track a minority of feeds.
-//! 3. The median of a market's submissions (lower median for even
-//!    counts — deterministic, no averaging) is smoothed through an
+//!    module weighs them against a quorum of **strictly more than
+//!    two-thirds of the committee's bonded power** — the BFT bar.
+//!    Marks drive liquidations and funding, so their trust
+//!    assumption is the same stake the consensus engine requires
+//!    for finality, not a feeder count that a low-stake majority
+//!    could satisfy. Markets below quorum are skipped — their marks
+//!    go stale rather than track a minority of stake.
+//! 3. A market's submissions aggregate to the **power-weighted
+//!    lower median**: submissions sort by price and the mark is the
+//!    first price whose cumulative submitted power reaches half the
+//!    submitted total. Any quorum set is honest-majority by weight
+//!    under the bounded-byzantine assumption, so the crossing lands
+//!    on an honest feeder; for uniform power it reduces to the
+//!    ordinary lower median. The result is smoothed through an
 //!    exponential moving average:
 //!    `ema_next = (ema_prev · (EMA_SPAN−1) + median) / EMA_SPAN`.
 //!    The first accepted median seeds the EMA directly.
@@ -56,8 +63,10 @@
 //! Validators are implicit feeders. Committee-gated
 //! `TAG_REGISTER_FEED`/`TAG_UNREGISTER_FEED` messages whitelist
 //! additional feed addresses (e.g. a dedicated price-service signer)
-//! — they submit through the same `TAG_SUBMIT` path and count toward
-//! the same quorum denominator.
+//! — they submit through the same `TAG_SUBMIT` path but carry no
+//! bonded stake, so they are **advisory**: recorded for
+//! observability yet weight 0 in quorum and median. Stake is the
+//! only trust unit that decides a mark.
 //!
 //! # Message format
 //!
@@ -266,22 +275,53 @@ impl OracleModule {
         self.committee.as_ref().is_some_and(|c| c.is_active_validator(addr))
     }
 
-    /// The number of feeders eligible to submit right now — active
-    /// validators plus registered external feeds. The submission
-    /// quorum is a strict majority of this count, so a minority of
-    /// feeders can never move a mark on their own.
-    fn eligible_feeders(&self) -> usize {
-        let external = self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
-        let validators = self.committee.as_ref().map_or(0, |c| c.active_validator_count());
-        validators + external
+    /// Whether a market's submissions meet the publication quorum:
+    /// the submitting feeders' bonded power must strictly exceed
+    /// two-thirds of the committee's total power. The bar is the
+    /// BFT quorum, not a feeder count — under the bounded-byzantine
+    /// assumption (attacker ≤ 1/3 of stake) every quorum-meeting set
+    /// is honest-majority *by weight*, which is what makes the
+    /// power-weighted median below land on an honest price. A
+    /// count-majority would let low-stake feeders — including
+    /// committee-registered external feeds, which carry no stake at
+    /// all — move the marks that drive liquidations while holding
+    /// far less stake than finality requires. External feeds are
+    /// therefore advisory under a wired committee: recorded for
+    /// observability but weight 0 in quorum and median alike.
+    fn quorum_met(&self, feeds: &BTreeMap<Address, u64>) -> bool {
+        let Some(committee) = self.committee.as_ref() else {
+            return false; // nothing can be weighed without a committee — fail closed
+        };
+        let submitted_power: u64 = feeds.keys().map(|f| committee.power(f)).sum();
+        submitted_power.saturating_mul(3) > committee.total_power().saturating_mul(2)
     }
 
-    /// Minimum submissions a market needs this block for its median
-    /// to be published: strict majority of eligible feeders
-    /// (`eligible/2 + 1`). At one eligible feeder the quorum is 1 —
-    /// a single-validator devnet still works.
-    fn quorum(&self) -> usize {
-        self.eligible_feeders() / 2 + 1
+    /// The power-weighted lower median: sort by price, walk
+    /// cumulative submitted power, and take the first price whose
+    /// cumulative share reaches half the submitted total. For
+    /// uniform power this is exactly the count lower-median; under
+    /// skewed stake a big-stake feeder's price dominates, which is
+    /// correct — the mark should reflect what the stake actually
+    /// attested. Weight-0 feeders (external feeds) are excluded.
+    fn weighted_median(&self, feeds: &BTreeMap<Address, u64>) -> Option<u64> {
+        let committee = self.committee.as_ref()?;
+        let mut weighted: Vec<(u64, u64)> = feeds
+            .iter()
+            .filter_map(|(f, p)| {
+                let w = committee.power(f);
+                (w > 0).then_some((*p, w))
+            })
+            .collect();
+        weighted.sort_unstable();
+        let total: u64 = weighted.iter().map(|(_, w)| *w).sum();
+        let mut cum = 0u64;
+        for (price, w) in &weighted {
+            cum = cum.saturating_add(*w);
+            if cum.saturating_mul(2) >= total {
+                return Some(*price);
+            }
+        }
+        None
     }
 
     /// Write the module's committed state into `w` — shared by
@@ -360,16 +400,6 @@ impl OracleModule {
         Some(StagedOracle { marks, last_update, feeds, submissions, endorsements })
     }
 
-    /// The lower median of `prices` (element at index `(n−1)/2`
-    /// after sorting). For an even count this picks the lower of the
-    /// two middle values — deterministic without any averaging, so
-    /// there is no u64-mean overflow path and no rounding ambiguity
-    /// between replicas.
-    fn median(prices: &mut [u64]) -> u64 {
-        prices.sort_unstable();
-        prices[(prices.len() - 1) / 2]
-    }
-
     /// Persist one market's mark + update height into the store so
     /// the state root reflects the published price.
     fn store_mark(&self, market: u8, mark: u64, height: u64) {
@@ -386,21 +416,21 @@ impl OracleModule {
         if submissions.is_empty() {
             return;
         }
-        let quorum = self.quorum();
         let sink = self.sink.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let mut marks = self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut last_update =
             self.last_update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (market, feeds) in submissions.iter() {
-            if feeds.len() < quorum {
-                // Minority of feeders — do not publish. The mark
-                // keeps its previous value and goes stale via
+            if !self.quorum_met(feeds) {
+                // Below 2/3 of bonded power — do not publish. The
+                // mark keeps its previous value and goes stale via
                 // `last_update` rather than tracking a potentially
                 // compromised subset.
                 continue;
             }
-            let mut prices: Vec<u64> = feeds.values().copied().collect();
-            let median = Self::median(&mut prices);
+            let Some(median) = self.weighted_median(feeds) else {
+                continue; // unreachable past the quorum gate — defensive
+            };
             // EMA in u128: `prev·(SPAN−1) + median` cannot overflow —
             // both operands are u64 and SPAN is tiny — and the result
             // divided by SPAN fits u64 by construction (weighted mean
@@ -721,6 +751,28 @@ mod tests {
         }
     }
 
+    /// A committee with configurable per-validator power — pins the
+    /// stake-weighted quorum and weighted median against the
+    /// skewed-stake case a count-majority would fail.
+    struct WeightedCommittee {
+        powers: BTreeMap<Address, u64>,
+    }
+
+    impl framework::Committee for WeightedCommittee {
+        fn is_active_validator(&self, addr: &Address) -> bool {
+            self.powers.contains_key(addr)
+        }
+        fn active_validator_count(&self) -> usize {
+            self.powers.len()
+        }
+        fn power(&self, addr: &Address) -> u64 {
+            self.powers.get(addr).copied().unwrap_or(0)
+        }
+        fn total_power(&self) -> u64 {
+            self.powers.values().sum()
+        }
+    }
+
     fn addr(b: u8) -> Address {
         Address([b; 20])
     }
@@ -867,8 +919,11 @@ mod tests {
         assert_eq!(oracle.last_update_height(0), Some(1));
     }
 
+    /// External feeds submit through the same path but carry no
+    /// bonded stake — advisory only: they cannot help reach the
+    /// two-thirds-of-power quorum and cannot move the median.
     #[test]
-    fn external_feed_can_submit_after_registration() {
+    fn external_feed_is_advisory_never_decisive() {
         let sink = Arc::new(TestSink { pushed: Mutex::new(BTreeMap::new()), reject: false });
         let oracle = setup(4, Some(sink.clone()));
         // Non-validator registers a feed — rejected (not committee).
@@ -880,13 +935,27 @@ mod tests {
         for v in 0..3u8 {
             oracle.handle(&ctx(v), &msg::register_feed(addr(77))).unwrap();
         }
-        // Now 5 eligible feeders (4 validators + 1 external) → quorum
-        // still 3. External feed's submission counts.
+        // The external feed's submission is accepted — it is an
+        // authorized feeder — but counts for nothing: two validators
+        // + the external = power 2 of 4, below the 2/3 quorum.
         oracle.handle(&ctx(0), &msg::submit_price(0, 1_000)).unwrap();
         oracle.handle(&ctx(1), &msg::submit_price(0, 1_000)).unwrap();
         oracle.handle(&ctx(77), &msg::submit_price(0, 1_000)).unwrap();
         oracle.end_block(Height::new(1));
-        assert_eq!(oracle.mark(0), Some(1_000));
+        assert_eq!(oracle.mark(0), None, "weight-0 feeds cannot reach quorum");
+
+        // Add a third validator and the quorum publishes — and the
+        // external's extreme price must not move the weighted median.
+        oracle.handle(&ctx(0), &msg::submit_price(0, 1_000)).unwrap();
+        oracle.handle(&ctx(1), &msg::submit_price(0, 1_000)).unwrap();
+        oracle.handle(&ctx(2), &msg::submit_price(0, 1_100)).unwrap();
+        oracle.handle(&ctx(77), &msg::submit_price(0, 999_999_999)).unwrap();
+        oracle.end_block(Height::new(2));
+        assert_eq!(
+            oracle.mark(0),
+            Some(1_000),
+            "the weighted median excludes the weight-0 external's extreme"
+        );
     }
 
     #[test]
@@ -900,9 +969,49 @@ mod tests {
         assert!(matches!(err, ExecError::ModuleRejected(_)));
     }
 
-    /// C9: registering a price feed grants it a vote in every
-    /// market's median — one validator must not grant that power
-    /// alone. Feed registry changes are committee-quorum actions.
+    /// The audit's feeder-count gap: a majority of feeders by COUNT
+    /// holding a minority of STAKE must not publish a mark. Four
+    /// validators at power [70,10,10,10]: the three small stakers
+    /// are 75% of the validator count but only 30% of power — under
+    /// the old count-quorum (eligible/2+1) they published alone.
+    /// Under the 2/3-of-power quorum they cannot, and under the
+    /// power-weighted median the 70-power feeder's price dominates
+    /// when it does submit.
+    #[test]
+    fn skewed_stake_count_majority_cannot_publish() {
+        let sink = Arc::new(TestSink { pushed: Mutex::new(BTreeMap::new()), reject: false });
+        let powers: BTreeMap<Address, u64> =
+            (0..4u8).map(|b| (addr(b), if b == 0 { 70 } else { 10 })).collect();
+        let oracle = OracleModule::new().with_committee(Arc::new(WeightedCommittee { powers }));
+        oracle.with_sink(sink.clone());
+
+        // The three 10-power validators all submit — 30 of 100
+        // bonded power, below 2/3: no publish despite being a
+        // count-majority of eligible feeders.
+        for v in 1..=3u8 {
+            oracle.handle(&ctx(v), &msg::submit_price(0, 5_000)).unwrap();
+        }
+        oracle.end_block(Height::new(1));
+        assert_eq!(oracle.mark(0), None, "30% of stake is not a quorum");
+
+        // The 70-power validator alone exceeds 2/3 — its price is
+        // the mark, and the three dissenting small stakers cannot
+        // move the weighted median off it.
+        oracle.handle(&ctx(0), &msg::submit_price(0, 1_000)).unwrap();
+        oracle.handle(&ctx(1), &msg::submit_price(0, 9_000)).unwrap();
+        oracle.handle(&ctx(2), &msg::submit_price(0, 9_000)).unwrap();
+        oracle.end_block(Height::new(2));
+        assert_eq!(
+            oracle.mark(0),
+            Some(1_000),
+            "the weighted median follows the power, not the count"
+        );
+    }
+
+    /// C9: registering a price feed grants it a submission channel
+    /// on every market — one validator must not grant that channel
+    /// alone even though feeds are advisory (weight-0). Feed
+    /// registry changes are committee-quorum actions.
     #[test]
     fn register_feed_requires_committee_quorum() {
         let oracle = setup(4, None);

@@ -18153,3 +18153,50 @@ license/advisory/source policy was already gated there; release
 age is the same class of policy. 8-way parallel fetch keeps it to
 ~20s. `OXIDE_DEP_MIN_AGE_DAYS` overrides the floor for testing.
 Current lockfile: 460 registry deps, all ≥7 days old.
+
+## Perps/oracle: scheduled funding + stake-weighted marks (5.4 residuals closed)
+
+Three leftovers from the staleness/liquidation work, closed together:
+
+**Funding cadence.** `TAG_APPLY_FUNDING` used to apply the
+quorum-endorsed rate at whatever height the last endorsement tx
+landed — funding timing was effectively chosen by vote order, and
+any endorsed rate charged *immediately*. Now a quorum stages the
+rate in `pending_funding`; `end_block` applies staged rates only
+on the `FUNDING_PERIOD_BLOCKS = 3_600` grid (≈ hourly, the venue
+convention), before the liquidation sweep so margin checks see
+post-funding state. A stale mark at the boundary consumes the rate
+with an `apply_funding_stale` event — an outage skips the period
+rather than funding on untrusted prices. Re-endorsement inside a
+period replaces the staged rate, which doubles as the committee's
+fat-finger correction path. Pending rates ride a trailing v4 codec
+section; pre-upgrade blobs decode with an empty pending set.
+
+**Feeder count → stake.** The oracle's publish quorum was
+`eligible_feeders/2 + 1` — a *count* majority on a chain whose
+consensus is stake-weighted, and the eligible set included
+zero-stake external feeds. Three low-stake validators + one
+external feed could move the marks that drive liquidations while
+holding far less stake than finality requires. Now: quorum is
+`submitting_power · 3 > total_power · 2` over the wired
+`framework::Committee` (the BFT two-thirds bar), and the mark is
+the power-weighted median — sort by price, take the first price
+whose cumulative submitted power reaches half the submitted total.
+Under the bounded-byzantine assumption every quorum-meeting set is
+honest-majority *by weight*, so the weighted median lands on an
+honest price — the count median couldn't say that. External feeds
+carry weight 0: still recorded for observability, never counted.
+Committee-less builds now fail closed (previously they published
+on count-majority). `skewed_stake_count_majority_cannot_publish`
+pins it: [70,10,10,10] power, the three small stakers are 75% of
+the validator count but can't publish without the whale.
+
+**System scenario.** `oracle_outage_and_recovery_through_real_
+pipeline` wires a real `OracleModule` to a real `PerpsModule` sink
+(no mock): quorum publish → 61-block silence goes stale → new
+exposure refused while reduce-only and the liquidation sweep still
+run at the last accepted mark → a 10× resubmission is rejected at
+the perps `MAX_MARK_CHANGE_BPS` cap (EMA dampens it 4× and it still
+overshoots — fail-closed, neither side records it) → a moderate
+move recovers EMA-dampened ((1.5e9·3+1.9e9)/4 = 1.6e9) and clears
+staleness.
