@@ -351,6 +351,30 @@ impl NonceTracker {
     }
 }
 
+/// Why a nonce checkpoint failed to decode — the structural
+/// violations are enumerated so `attach_store`'s fail-closed panic
+/// distinguishes "disk error" from "corrupt/hostile bytes" (the
+/// replay gate must never silently reset).
+#[derive(Debug)]
+pub(crate) enum NonceCheckpointError {
+    /// The file could not be read (permissions, disappearing fs).
+    Io(std::io::Error),
+    /// The bytes violate the checkpoint format — the payload names
+    /// the violated rule.
+    Corrupt(String),
+}
+
+impl std::fmt::Display for NonceCheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "read failed: {e}"),
+            Self::Corrupt(e) => write!(f, "corrupt checkpoint: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for NonceCheckpointError {}
+
 /// A file-backed checkpoint of consumed nonces — bounds the
 /// restart replay window to the flush interval instead of forever.
 ///
@@ -380,28 +404,36 @@ impl NonceStore {
     /// Read the checkpoint. Missing file = empty state (first run).
     /// Returns `Err` on ANY structural violation — the caller fails
     /// closed rather than resetting the replay gate.
-    pub(crate) fn load(path: &std::path::Path) -> Result<Vec<(primitives::Address, u64)>, String> {
+    pub(crate) fn load(
+        path: &std::path::Path,
+    ) -> Result<Vec<(primitives::Address, u64)>, NonceCheckpointError> {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("read failed: {e}")),
+            Err(e) => return Err(NonceCheckpointError::Io(e)),
         };
         if bytes.len() < Self::HEADER {
-            return Err(format!("truncated header ({} bytes)", bytes.len()));
+            return Err(NonceCheckpointError::Corrupt(format!(
+                "truncated header ({} bytes)",
+                bytes.len()
+            )));
         }
         if &bytes[0..4] != Self::MAGIC {
-            return Err("bad magic".to_string());
+            return Err(NonceCheckpointError::Corrupt("bad magic".to_string()));
         }
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or_default());
         if version != Self::VERSION {
-            return Err(format!("unsupported version {version}"));
+            return Err(NonceCheckpointError::Corrupt(format!("unsupported version {version}")));
         }
         let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap_or_default()) as usize;
         if count > Self::MAX_ENTRIES {
-            return Err(format!("count {count} exceeds bound"));
+            return Err(NonceCheckpointError::Corrupt(format!("count {count} exceeds bound")));
         }
         if bytes.len() != Self::HEADER + count * Self::ENTRY {
-            return Err(format!("size mismatch: {} bytes for {count} entries", bytes.len()));
+            return Err(NonceCheckpointError::Corrupt(format!(
+                "size mismatch: {} bytes for {count} entries",
+                bytes.len()
+            )));
         }
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
