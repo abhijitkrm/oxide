@@ -28,6 +28,7 @@ use crate::protocol::{
 pub use crate::settler::{BatchSettler, TxConfirmer, TxSubmitter};
 use crate::{MatchingServer, SharedMatcher};
 use futures_util::{SinkExt, StreamExt};
+use primitives::fixed::{Price, Qty};
 use std::sync::Arc;
 use trading::MarketConfig;
 
@@ -1024,10 +1025,10 @@ pub async fn run_server_ring(
     let dummy = Arc::new(SharedMatcher::new(MatchingServer::new(
         trading::MarketConfig {
             market_id: 0,
-            tick_size: 1_000_000,
-            lot_size: 1_000,
-            min_price: 1_000_000_000,
-            max_price: 2_000_000_000,
+            tick_size: Price(1_000_000),
+            lot_size: Qty(1_000),
+            min_price: Price(1_000_000_000),
+            max_price: Price(2_000_000_000),
             max_resting: 1 << 16,
         },
         1,

@@ -1,15 +1,16 @@
 use super::*;
 use crate::book::DenseBook;
 
+use primitives::fixed::{Price, Qty};
 // Fixture market: tick 0.01 raw 1e6, lot 0.001 raw 1e3,
 // band [10.00, 10.64] → 65 levels, small arena for tests.
 fn cfg() -> MarketConfig {
     MarketConfig {
         market_id: 1,
-        tick_size: 1_000_000,
-        lot_size: 1_000,
-        min_price: 1_000_000_000,
-        max_price: 1_064_000_000,
+        tick_size: Price(1_000_000),
+        lot_size: Qty(1_000),
+        min_price: Price(1_000_000_000),
+        max_price: Price(1_064_000_000),
         max_resting: 64,
     }
 }

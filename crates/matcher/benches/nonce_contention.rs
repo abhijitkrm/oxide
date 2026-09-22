@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trading::MarketConfig;
 
+use primitives::fixed::{Price, Qty};
 /// Owners each thread cycles through — wide enough that the tracker's
 /// `last_seen` map reaches a production-realistic population (8
 /// threads × 64k = 512k entries) instead of a degenerate handful of
@@ -98,10 +99,10 @@ fn nonce_contention(c: &mut Criterion) {
         group.bench_function(format!("consume_{threads}t"), |b| {
             let cfg = MarketConfig {
                 market_id: 0,
-                tick_size: 1_000_000,
-                lot_size: 1_000,
-                min_price: 1_000_000_000,
-                max_price: 2_000_000_000,
+                tick_size: Price(1_000_000),
+                lot_size: Qty(1_000),
+                min_price: Price(1_000_000_000),
+                max_price: Price(2_000_000_000),
                 max_resting: 1 << 10,
             };
             let matcher = Arc::new(MultiMarketMatcher::new(

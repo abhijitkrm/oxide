@@ -162,14 +162,14 @@ impl NewOrder {
     /// rejection messages are deterministic across validators.
     pub fn validate(
         &self,
-        tick: u64,
-        lot: u64,
-        min_price: u64,
-        max_price: u64,
+        tick: Price,
+        lot: Qty,
+        min_price: Price,
+        max_price: Price,
     ) -> Result<(), RejectReason> {
         // Quantity: positive and a whole number of lots. Zero-qty and
         // sub-lot orders can never produce a well-formed fill.
-        if self.qty.0 == 0 || !self.qty.0.is_multiple_of(lot) {
+        if self.qty.0 == 0 || !self.qty.0.is_multiple_of(lot.0) {
             return Err(RejectReason::InvalidQty);
         }
         // Type/TIF coherence: market orders never rest (Ioc only);
@@ -185,13 +185,12 @@ impl NewOrder {
         }
         // Price band + grid, only for priced order types.
         if self.order_type != OrderType::Market {
-            let p = self.price.0;
-            if p < min_price || p > max_price {
+            if self.price < min_price || self.price > max_price {
                 return Err(RejectReason::PriceOutOfRange);
             }
             // Off-grid check relative to the band's floor: a price is
             // on-grid iff (p - min) is a whole number of ticks.
-            if !(p - min_price).is_multiple_of(tick) {
+            if !(self.price.0 - min_price.0).is_multiple_of(tick.0) {
                 return Err(RejectReason::PriceOffTick);
             }
         }
@@ -205,10 +204,10 @@ mod tests {
 
     // A market-shaped fixture: tick 0.01 (raw 1e6), lot 0.001 (raw
     // 1e3), band [10.00, 20.00] raw → 10e8..20e8.
-    const TICK: u64 = 1_000_000;
-    const LOT: u64 = 1_000;
-    const MIN_P: u64 = 1_000_000_000;
-    const MAX_P: u64 = 2_000_000_000;
+    const TICK: Price = Price(1_000_000);
+    const LOT: Qty = Qty(1_000);
+    const MIN_P: Price = Price(1_000_000_000);
+    const MAX_P: Price = Price(2_000_000_000);
 
     fn base_order() -> NewOrder {
         NewOrder {

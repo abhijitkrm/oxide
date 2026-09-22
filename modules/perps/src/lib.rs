@@ -828,7 +828,7 @@ impl PerpsModule {
         // fresh mark, so the market trades for its first
         // [`MAX_MARK_STALENESS_BLOCKS`] blocks even before the
         // first oracle update lands.
-        let initial_mark = cfg.base.min_price.midpoint(cfg.base.max_price);
+        let initial_mark = cfg.base.min_price.0.midpoint(cfg.base.max_price.0);
         inner.marks.insert(id_u8, initial_mark);
         let h = inner.current_height;
         inner.mark_updated_at.insert(id_u8, h);
@@ -1502,7 +1502,7 @@ impl PerpsModule {
                 // leaving the remainder untradeable on either side.
                 // A claw that floors to zero contributes nothing and
                 // the shortfall moves to the next candidate.
-                let lot = i128::from(configs.get(&market).map_or(1, |c| c.base.lot_size.max(1)));
+                let lot = i128::from(configs.get(&market).map_or(1, |c| c.base.lot_size.0.max(1)));
                 let capped = close_qty_i128.min(size_abs);
                 let close_qty = if capped >= size_abs {
                     SignedQty(i64::try_from(capped).unwrap_or(0))
@@ -1710,10 +1710,10 @@ pub mod msg {
     pub fn list_market(cfg: PerpsMarketConfig) -> Vec<u8> {
         let mut msg = Vec::with_capacity(1 + LIST_MARKET_BODY_LEN);
         msg.push(super::TAG_LIST_MARKET);
-        msg.extend_from_slice(&cfg.base.tick_size.to_le_bytes());
-        msg.extend_from_slice(&cfg.base.lot_size.to_le_bytes());
-        msg.extend_from_slice(&cfg.base.min_price.to_le_bytes());
-        msg.extend_from_slice(&cfg.base.max_price.to_le_bytes());
+        msg.extend_from_slice(&cfg.base.tick_size.0.to_le_bytes());
+        msg.extend_from_slice(&cfg.base.lot_size.0.to_le_bytes());
+        msg.extend_from_slice(&cfg.base.min_price.0.to_le_bytes());
+        msg.extend_from_slice(&cfg.base.max_price.0.to_le_bytes());
         msg.extend_from_slice(&cfg.base.max_resting.to_le_bytes());
         msg.extend_from_slice(&cfg.max_leverage.to_le_bytes());
         msg.extend_from_slice(&cfg.mmr_base_bps.to_le_bytes());
@@ -1911,10 +1911,10 @@ fn market_config_key(market: u8) -> Vec<u8> {
 
 fn encode_perps_config(cfg: &PerpsMarketConfig) -> Vec<u8> {
     let mut v = Vec::with_capacity(46);
-    v.extend_from_slice(&cfg.base.tick_size.to_le_bytes());
-    v.extend_from_slice(&cfg.base.lot_size.to_le_bytes());
-    v.extend_from_slice(&cfg.base.min_price.to_le_bytes());
-    v.extend_from_slice(&cfg.base.max_price.to_le_bytes());
+    v.extend_from_slice(&cfg.base.tick_size.0.to_le_bytes());
+    v.extend_from_slice(&cfg.base.lot_size.0.to_le_bytes());
+    v.extend_from_slice(&cfg.base.min_price.0.to_le_bytes());
+    v.extend_from_slice(&cfg.base.max_price.0.to_le_bytes());
     v.extend_from_slice(&cfg.base.max_resting.to_le_bytes());
     v.extend_from_slice(&cfg.max_leverage.to_le_bytes());
     v.extend_from_slice(&cfg.mmr_base_bps.to_le_bytes());

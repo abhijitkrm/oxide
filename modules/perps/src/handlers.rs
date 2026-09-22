@@ -580,7 +580,7 @@ impl PerpsModule {
             let Some(cfg) = inner.configs.get(&market) else { continue };
             // `lot_size` is validated nonzero at listing; `max(1)`
             // keeps the division total for hand-built states.
-            let lot = cfg.base.lot_size.max(1);
+            let lot = cfg.base.lot_size.0.max(1);
             let qty = size.abs_qty().0 - (size.abs_qty().0 % lot);
             if qty == 0 {
                 continue;
@@ -595,7 +595,7 @@ impl PerpsModule {
             // rounds UP (less depth allowed), a buy cap rounds DOWN —
             // the fund can never pay beyond the allowance just to hit
             // the tick grid.
-            let tick = cfg.base.tick_size.max(1);
+            let tick = cfg.base.tick_size.0.max(1);
             let raw_limit = if size.is_long() {
                 u64::try_from(
                     u128::from(mark) * u128::from(10_000u64 - BACKSTOP_UNWIND_SLIPPAGE_BPS)
@@ -610,9 +610,9 @@ impl PerpsModule {
                 .unwrap_or(u64::MAX)
             };
             let limit_price = if size.is_long() {
-                raw_limit.div_ceil(tick).saturating_mul(tick).max(cfg.base.min_price)
+                raw_limit.div_ceil(tick).saturating_mul(tick).max(cfg.base.min_price.0)
             } else {
-                (raw_limit / tick).saturating_mul(tick).min(cfg.base.max_price)
+                (raw_limit / tick).saturating_mul(tick).min(cfg.base.max_price.0)
             };
             let order = NewOrder {
                 side: if size.is_long() { Side::Sell } else { Side::Buy },

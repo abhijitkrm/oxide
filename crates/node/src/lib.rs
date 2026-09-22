@@ -51,6 +51,7 @@ use consensus::{OxideBft, SequencerEngine};
 use executor::Executor;
 use ports::{AppInterface, ConsensusEngine};
 use primitives::Address;
+use primitives::fixed::{Price, Qty};
 
 pub mod cli;
 pub mod devnet;
@@ -651,10 +652,10 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     exchange
         .list_market(trading::MarketConfig {
             market_id: 0,
-            tick_size: 1_000_000,
-            lot_size: 1_000,
-            min_price: 1_000_000_000,
-            max_price: 2_000_000_000,
+            tick_size: Price(1_000_000),
+            lot_size: Qty(1_000),
+            min_price: Price(1_000_000_000),
+            max_price: Price(2_000_000_000),
             max_resting: 64,
         })
         .expect("default market config is valid");
@@ -670,10 +671,10 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
         .list_market(perps::PerpsMarketConfig {
             base: trading::MarketConfig {
                 market_id: 0,
-                tick_size: 1_000_000,
-                lot_size: 1_000,
-                min_price: 1_000_000_000,
-                max_price: 2_000_000_000,
+                tick_size: Price(1_000_000),
+                lot_size: Qty(1_000),
+                min_price: Price(1_000_000_000),
+                max_price: Price(2_000_000_000),
                 max_resting: 64,
             },
             max_leverage: 10,

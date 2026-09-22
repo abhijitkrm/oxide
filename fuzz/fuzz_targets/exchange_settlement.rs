@@ -49,18 +49,18 @@ const MINT: u64 = 1_000_000_000_000_000;
 const CONFIGS: [trading::MarketConfig; 2] = [
     trading::MarketConfig {
         market_id: 0,
-        tick_size: 1_000_000,
-        lot_size: 1_000,
-        min_price: 1_000_000_000,
-        max_price: 1_064_000_000,
+        tick_size: Price(1_000_000),
+        lot_size: Qty(1_000),
+        min_price: Price(1_000_000_000),
+        max_price: Price(1_064_000_000),
         max_resting: 64,
     },
     trading::MarketConfig {
         market_id: 0,
-        tick_size: 1_000,
-        lot_size: 1,
-        min_price: 10_000_000,
-        max_price: 10_128_000,
+        tick_size: Price(1_000),
+        lot_size: Qty(1),
+        min_price: Price(10_000_000),
+        max_price: Price(10_128_000),
         max_resting: 128,
     },
 ];
@@ -94,8 +94,8 @@ fn assert_conservation(
         total += u128::from(ex.escrowed_quote(m));
         total += u128::from(ex.escrowed_base(m));
         for o in owners {
-            total += u128::from(ex.base_balance(*o, m));
-            total += u128::from(ex.base_hold(*o, m));
+            total += u128::from(ex.base_balance(*o, m).0);
+            total += u128::from(ex.base_hold(*o, m).0);
         }
     }
     assert_eq!(total, minted, "money conservation broke");
@@ -154,7 +154,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
             // Place: book order — loosely validated fields.
             0 => {
                 let side = if chunk[2] & 1 == 0 { Side::Buy } else { Side::Sell };
-                let band = CONFIGS[(market as usize) % 2].min_price;
+                let band = CONFIGS[(market as usize) % 2].min_price.0;
                 let price = band + (u64_at(chunk, 3) % 200) * 1_000;
                 let qty = (u64_at(chunk, 11) % 1_000_000).max(1);
                 let order = NewOrder {
@@ -196,7 +196,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
                 if reg_keys.len() > 128 {
                     reg_keys.drain(..64);
                 }
-                let band = CONFIGS[(market as usize) % 2].min_price;
+                let band = CONFIGS[(market as usize) % 2].min_price.0;
                 msg::register_order(
                     u16::from(market),
                     side,
@@ -227,7 +227,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
                     fills.push(BatchFillEntry {
                         market: u16::from(market),
                         price: Price(
-                            CONFIGS[(market as usize) % 2].min_price
+                            CONFIGS[(market as usize) % 2].min_price.0
                                 + (u64_at(chunk, 3 + l) % 200) * 1_000,
                         ),
                         qty: Qty((u64_at(chunk, 11 + l) % 1_000_000).max(1)),

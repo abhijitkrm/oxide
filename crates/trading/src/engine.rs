@@ -544,10 +544,10 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// market. The match path never runs it.
     pub fn write_canonical_state(&self, out: &mut Vec<u8>, entries: &mut Vec<RestingEntry>) {
         out.extend_from_slice(&self.cfg.market_id.to_le_bytes());
-        out.extend_from_slice(&self.cfg.tick_size.to_le_bytes());
-        out.extend_from_slice(&self.cfg.lot_size.to_le_bytes());
-        out.extend_from_slice(&self.cfg.min_price.to_le_bytes());
-        out.extend_from_slice(&self.cfg.max_price.to_le_bytes());
+        out.extend_from_slice(&self.cfg.tick_size.0.to_le_bytes());
+        out.extend_from_slice(&self.cfg.lot_size.0.to_le_bytes());
+        out.extend_from_slice(&self.cfg.min_price.0.to_le_bytes());
+        out.extend_from_slice(&self.cfg.max_price.0.to_le_bytes());
         out.extend_from_slice(&self.cfg.max_resting.to_le_bytes());
         out.extend_from_slice(&self.next_id.to_le_bytes());
         out.extend_from_slice(&self.resting.to_le_bytes());
@@ -1089,10 +1089,10 @@ pub fn decode_canonical_state(data: &[u8]) -> Option<DecodedBook> {
     let mut r = CanonReader::new(data);
     let cfg = MarketConfig {
         market_id: r.u16()?,
-        tick_size: r.u64()?,
-        lot_size: r.u64()?,
-        min_price: r.u64()?,
-        max_price: r.u64()?,
+        tick_size: Price(r.u64()?),
+        lot_size: Qty(r.u64()?),
+        min_price: Price(r.u64()?),
+        max_price: Price(r.u64()?),
         max_resting: r.u32()?,
     };
     let next_id = r.u64()?;

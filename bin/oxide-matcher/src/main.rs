@@ -26,6 +26,7 @@
 
 #![allow(clippy::cast_precision_loss)]
 
+use primitives::fixed::{Price, Qty};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,10 +183,10 @@ fn build_market_configs(n: usize) -> Vec<trading::MarketConfig> {
     (0..u8::try_from(n).unwrap_or(u8::MAX))
         .map(|m| trading::MarketConfig {
             market_id: u16::from(m),
-            tick_size: 1_000_000,
-            lot_size: 1_000,
-            min_price: 1_000_000_000,
-            max_price: 2_000_000_000,
+            tick_size: Price(1_000_000),
+            lot_size: Qty(1_000),
+            min_price: Price(1_000_000_000),
+            max_price: Price(2_000_000_000),
             max_resting: 1 << 16,
         })
         .collect()
@@ -195,10 +196,10 @@ fn build_market_configs(n: usize) -> Vec<trading::MarketConfig> {
 fn single_market_config() -> trading::MarketConfig {
     trading::MarketConfig {
         market_id: 0,
-        tick_size: 1_000_000,
-        lot_size: 1_000,
-        min_price: 1_000_000_000,
-        max_price: 2_000_000_000,
+        tick_size: Price(1_000_000),
+        lot_size: Qty(1_000),
+        min_price: Price(1_000_000_000),
+        max_price: Price(2_000_000_000),
         max_resting: 1 << 16,
     }
 }

@@ -105,6 +105,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     rejects the combination instead of a bad arithmetic site
     quietly crediting the wrong unit.
 
+- **Market configuration is denominated in the type** (`trading`,
+  `exchange`, `perps`): `MarketConfig`'s `tick_size`/`min_price`/
+  `max_price` are `Price` and `lot_size` is `Qty`, so order
+  validation compares `Price` against `Price` and a quantity can
+  never be wired into a price field. Book internals keep raw
+  tick-indexed arithmetic; wire and storage bytes are unchanged.
+  - **In plain words:** a market listing can no longer
+    accidentally carry a quantity where a price belongs — the
+    denomination error is a compile failure, not a mis-gridded
+    book discovered after trades execute.
+
 ### Added
 
 - **Contention and interference benchmarks** (`crates/matcher`,

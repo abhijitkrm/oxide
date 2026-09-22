@@ -719,10 +719,10 @@ pub mod msg {
     pub fn list_market(cfg: MarketConfig) -> Vec<u8> {
         let mut msg = Vec::with_capacity(1 + LIST_MARKET_BODY_LEN);
         msg.push(super::TAG_LIST_MARKET);
-        msg.extend_from_slice(&cfg.tick_size.to_le_bytes());
-        msg.extend_from_slice(&cfg.lot_size.to_le_bytes());
-        msg.extend_from_slice(&cfg.min_price.to_le_bytes());
-        msg.extend_from_slice(&cfg.max_price.to_le_bytes());
+        msg.extend_from_slice(&cfg.tick_size.0.to_le_bytes());
+        msg.extend_from_slice(&cfg.lot_size.0.to_le_bytes());
+        msg.extend_from_slice(&cfg.min_price.0.to_le_bytes());
+        msg.extend_from_slice(&cfg.max_price.0.to_le_bytes());
         msg.extend_from_slice(&cfg.max_resting.to_le_bytes());
         msg
     }

@@ -529,10 +529,10 @@ pub(crate) fn settle_leg(
     // on-tick price inside the band.
     let cfg_ok = configs.get(usize::from(market)).copied().flatten().is_some_and(|c| {
         qty.0 > 0
-            && qty.0.is_multiple_of(c.lot_size)
-            && price.0 >= c.min_price
-            && price.0 <= c.max_price
-            && price.0.is_multiple_of(c.tick_size)
+            && qty.0.is_multiple_of(c.lot_size.0)
+            && price >= c.min_price
+            && price <= c.max_price
+            && price.0.is_multiple_of(c.tick_size.0)
     });
     if !cfg_ok {
         return Ok(None);

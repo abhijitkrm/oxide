@@ -69,10 +69,10 @@ impl PerpsModule {
         Some(PerpsMarketConfig {
             base: MarketConfig {
                 market_id: 0,
-                tick_size,
-                lot_size,
-                min_price,
-                max_price,
+                tick_size: Price(tick_size),
+                lot_size: Qty(lot_size),
+                min_price: Price(min_price),
+                max_price: Price(max_price),
                 max_resting,
             },
             max_leverage,

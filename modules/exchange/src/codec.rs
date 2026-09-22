@@ -67,7 +67,14 @@ impl ExchangeModule {
         let min_price = u64::from_le_bytes(msg[16..24].try_into().ok()?);
         let max_price = u64::from_le_bytes(msg[24..32].try_into().ok()?);
         let max_resting = u32::from_le_bytes(msg[32..36].try_into().ok()?);
-        Some(MarketConfig { market_id: 0, tick_size, lot_size, min_price, max_price, max_resting })
+        Some(MarketConfig {
+            market_id: 0,
+            tick_size: Price(tick_size),
+            lot_size: Qty(lot_size),
+            min_price: Price(min_price),
+            max_price: Price(max_price),
+            max_resting,
+        })
     }
 }
 
@@ -240,10 +247,10 @@ pub(crate) fn market_config_key(market: u8) -> Vec<u8> {
 /// Encode a `MarketConfig` into a storage blob (for state-root replay).
 pub(crate) fn encode_market_config(cfg: &MarketConfig) -> Vec<u8> {
     let mut v = Vec::with_capacity(36);
-    v.extend_from_slice(&cfg.tick_size.to_le_bytes());
-    v.extend_from_slice(&cfg.lot_size.to_le_bytes());
-    v.extend_from_slice(&cfg.min_price.to_le_bytes());
-    v.extend_from_slice(&cfg.max_price.to_le_bytes());
+    v.extend_from_slice(&cfg.tick_size.0.to_le_bytes());
+    v.extend_from_slice(&cfg.lot_size.0.to_le_bytes());
+    v.extend_from_slice(&cfg.min_price.0.to_le_bytes());
+    v.extend_from_slice(&cfg.max_price.0.to_le_bytes());
     v.extend_from_slice(&cfg.max_resting.to_le_bytes());
     v
 }

@@ -383,10 +383,10 @@ impl ExchangeModule {
         // rules a fill leg enforces, applied at authorization time so
         // an off-book order can never be registered.
         if qty == 0
-            || qty % cfg.lot_size != 0
-            || price < cfg.min_price
-            || price > cfg.max_price
-            || price % cfg.tick_size != 0
+            || !qty.is_multiple_of(cfg.lot_size.0)
+            || price < cfg.min_price.0
+            || price > cfg.max_price.0
+            || !price.is_multiple_of(cfg.tick_size.0)
         {
             return Err(ExecError::ModuleRejected(
                 "register: price/qty outside market config".to_string(),

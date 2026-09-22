@@ -50,10 +50,10 @@ fn parse_config(h: &[u8]) -> MarketConfig {
     let max_price = min_price.saturating_add(levels.saturating_mul(tick));
     MarketConfig {
         market_id: u16::from(h[4]),
-        tick_size: tick,
-        lot_size: lot,
-        min_price,
-        max_price,
+        tick_size: Price(tick),
+        lot_size: Qty(lot),
+        min_price: Price(min_price),
+        max_price: Price(max_price),
         max_resting,
     }
 }
@@ -111,13 +111,13 @@ fn parse_op(chunk: &[u8], live: &[u64], owners: u8, cfg: &MarketConfig) -> Optio
     let raw_qty = u64::from_le_bytes([chunk[18], chunk[19], chunk[20], chunk[21], chunk[22], 0, 0, 0]);
     // Clamp to the band; ~1/4 of ops skip tick alignment so
     // `place`'s own validation is fuzzed too.
-    let mut price = raw_price.max(cfg.min_price).min(cfg.max_price);
+    let mut price = raw_price.max(cfg.min_price.0).min(cfg.max_price.0);
     if raw_sel & 3 != 0 {
-        price -= price % cfg.tick_size;
+        price -= price % cfg.tick_size.0;
     }
     // 40-bit quantities — big enough to overflow naive accounting,
     // small enough for lots of lots.
-    let qty = if raw_qty == 0 { cfg.lot_size } else { raw_qty };
+    let qty = if raw_qty == 0 { cfg.lot_size.0 } else { raw_qty };
     Some(FuzzOp::Place(NewOrder { side, order_type, tif, price: Price(price), qty: Qty(qty), owner, stp }))
 }
 
@@ -152,11 +152,15 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     }
     let cfg = parse_config(&data[..8]);
     let owners = OWNERS[(data[5] % 4) as usize];
-    let book = match DenseBook::new(cfg) {
+    let vcfg = match cfg.validated() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let book = match DenseBook::new(vcfg) {
         Ok(b) => b,
         Err(_) => return,
     };
-    let mut engine = match MatchingEngine::<DenseBook>::new(cfg, book) {
+    let mut engine = match MatchingEngine::<DenseBook>::new(vcfg, book) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -168,7 +172,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         side: Side::Buy,
         order_type: OrderType::Limit,
         tif: TimeInForce::Gtc,
-        price: Price(cfg.min_price),
+        price: cfg.min_price,
         qty: Qty(0),
         owner: primitives::Address([0; 20]),
         stp: StpMode::None,

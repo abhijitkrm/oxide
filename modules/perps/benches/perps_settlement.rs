@@ -78,10 +78,10 @@ use perps::{PerpsMarketConfig, PerpsModule};
 fn base_cfg() -> MarketConfig {
     MarketConfig {
         market_id: 0,
-        tick_size: 1_000_000,
-        lot_size: 1_000,
-        min_price: 1_000_000_000,
-        max_price: 2_000_000_000,
+        tick_size: Price(1_000_000),
+        lot_size: Qty(1_000),
+        min_price: Price(1_000_000_000),
+        max_price: Price(2_000_000_000),
         max_resting: 1 << 16,
     }
 }

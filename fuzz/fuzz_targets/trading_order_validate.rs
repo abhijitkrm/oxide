@@ -10,10 +10,10 @@ use primitives::fixed::{Price, Qty};
 use trading::{NewOrder, OrderType, RejectReason, Side, StpMode, TimeInForce};
 
 /// Fixed market parameters for validation.
-const TICK: u64 = 1_000_000;
-const LOT: u64 = 1_000;
-const MIN_PRICE: u64 = 1_000_000_000;
-const MAX_PRICE: u64 = 2_000_000_000;
+const TICK: Price = Price(1_000_000);
+const LOT: Qty = Qty(1_000);
+const MIN_PRICE: Price = Price(1_000_000_000);
+const MAX_PRICE: Price = Price(2_000_000_000);
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     // Fuzz fix: need at least 19 bytes to safely slice data[11..19].

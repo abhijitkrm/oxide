@@ -10,10 +10,10 @@ use trading::TimeInForce;
 fn cfg() -> MarketConfig {
     MarketConfig {
         market_id: 0,
-        tick_size: 1_000_000,
-        lot_size: 1_000,
-        min_price: 1_000_000_000,
-        max_price: 2_000_000_000,
+        tick_size: Price(1_000_000),
+        lot_size: Qty(1_000),
+        min_price: Price(1_000_000_000),
+        max_price: Price(2_000_000_000),
         max_resting: 1 << 16,
     }
 }
@@ -412,10 +412,10 @@ fn ring_lease_exhaustion_waits() {
 fn cfg_for(market_id: u8) -> MarketConfig {
     MarketConfig {
         market_id: u16::from(market_id),
-        tick_size: 1_000_000,
-        lot_size: 1_000,
-        min_price: 1_000_000_000,
-        max_price: 2_000_000_000,
+        tick_size: Price(1_000_000),
+        lot_size: Qty(1_000),
+        min_price: Price(1_000_000_000),
+        max_price: Price(2_000_000_000),
         max_resting: 1 << 16,
     }
 }
@@ -759,11 +759,11 @@ fn multi_market_batch_routes_by_each_orders_market() {
     // overlap, so a market-1 order landing on market 0's engine
     // is rejected by price-band validation.
     let mut cfg0 = cfg_for(0);
-    cfg0.min_price = 1_000_000_000;
-    cfg0.max_price = 2_000_000_000;
+    cfg0.min_price = Price(1_000_000_000);
+    cfg0.max_price = Price(2_000_000_000);
     let mut cfg1 = cfg_for(1);
-    cfg1.min_price = 3_000_000_000;
-    cfg1.max_price = 4_000_000_000;
+    cfg1.min_price = Price(3_000_000_000);
+    cfg1.max_price = Price(4_000_000_000);
     let matcher = MultiMarketMatcher::new(vec![cfg0, cfg1], balances);
 
     // One mixed batch: market-1 orders INTERLEAVED after the

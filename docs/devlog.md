@@ -19244,3 +19244,29 @@ plain unit arithmetic.
 Remaining §9.B: `MarketConfig`'s tick/lot fields (price ticks vs
 `Price`, base lots vs `Qty`) and the wei↔native↔quote seam at the
 EVM boundary.
+## Session N+19 — market geometry becomes typed units
+
+§9.B's last named units: `MarketConfig` carried `tick_size`,
+`lot_size`, `min_price`, `max_price` as bare `u64` — four raw
+integers spanning two denominations, so a listing transaction could
+wire a quantity into a price field and nothing compiled against it.
+
+`tick_size`/`min_price`/`max_price` are now `Price` (scale-8) and
+`lot_size` is `Qty` (scale-6). `NewOrder::validate` takes the typed
+fields so the band check compares `Price` to `Price` directly, and
+the exchange's register-admission and batch-settle leg checks do
+the same. The dense book's level indexing stays raw `u64` — `.0`
+extracted at the arithmetic site, per the documented hot-path
+choice — and every wire/storage boundary is unchanged: canonical
+encode emits `.0`, `parse_list_market` and `decode_canonical_state`
+wrap raw `u64`s into the newtypes. ~30 construction sites across
+tests, benches, devnet, sim, and the two fuzz targets moved to the
+typed fields (the fuzz targets also gained the `ValidatedMarketConfig`
+token at engine construction — they'd drifted behind the
+`cfg.validated()` gate).
+
+The wei↔native seam turned out to already be the right shape:
+`U256`↔`u64` converts through `units_to_wei`/`wei_to_units` at
+exactly two seams with `WEI_PER_UNIT` as the single constant, and
+exchange "quote units" literally are `framework::Balances` native
+units — same denomination, nothing to confuse. §9.B is closed.

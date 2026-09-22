@@ -39,6 +39,7 @@ use crate::bitboard::{Bitboard, MAX_DENSE_LEVELS};
 use crate::error::TradingError;
 use crate::order::Side;
 use crate::pool::{NIL, OrderPool};
+use primitives::fixed::{Price, Qty};
 
 /// One price level: an intrusive FIFO of resting orders.
 ///
@@ -78,22 +79,26 @@ pub const MAX_RESTING_LIMIT: u32 = 1 << 20;
 
 /// Per-market parameters fixed at genesis (plan.md §9.1/§9.2).
 ///
-/// All raw values: prices in scale-8 units, quantities in scale-6
-/// units (see `primitives::fixed`). Raw units keep the hot path free
-/// of conversion; the `Price`/`Qty` newtypes appear only at the
-/// engine's public boundary.
+/// Price-space fields carry [`Price`] (scale-8) and the
+/// quantity-space field carries [`Qty`] (scale-6) — the
+/// denominations are compile-time distinct so a listing transaction
+/// cannot wire a lot size into the tick field, and an off-by-unit
+/// comparison is a type error rather than a silently off-grid book.
+/// The book's level-indexed internals still index in raw `u64`
+/// (extracted via `.0` at the arithmetic site) so the hot path
+/// performs no conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketConfig {
     /// Stable market identifier (wire constant; module-layer scope).
     pub market_id: u16,
-    /// Raw price units per tick (e.g. a 0.01 price step equals `1_000_000`).
-    pub tick_size: u64,
-    /// Raw qty units per lot (minimum quantity increment).
-    pub lot_size: u64,
-    /// Lowest price on the grid, raw (inclusive).
-    pub min_price: u64,
-    /// Highest price on the grid, raw (inclusive).
-    pub max_price: u64,
+    /// Price units per tick (e.g. a 0.01 price step equals `Price(1_000_000)`).
+    pub tick_size: Price,
+    /// Quantity units per lot (minimum quantity increment).
+    pub lot_size: Qty,
+    /// Lowest price on the grid (inclusive).
+    pub min_price: Price,
+    /// Highest price on the grid (inclusive).
+    pub max_price: Price,
     /// Maximum simultaneously-resting orders. Sizes the order pool and
     /// the id map at construction (plan default 2^20; tests use
     /// small values). Bounded above by [`MAX_RESTING_LIMIT`] — the
@@ -130,16 +135,16 @@ impl MarketConfig {
     /// number of ticks, or a level count beyond the dense backend's
     /// capacity.
     pub fn validate(&self) -> Result<(), TradingError> {
-        if self.tick_size == 0 {
+        if self.tick_size.0 == 0 {
             return Err(TradingError::InvalidConfig("tick_size must be > 0"));
         }
-        if self.lot_size == 0 {
+        if self.lot_size.0 == 0 {
             return Err(TradingError::InvalidConfig("lot_size must be > 0"));
         }
         if self.min_price >= self.max_price {
             return Err(TradingError::InvalidConfig("min_price must be < max_price"));
         }
-        if !(self.max_price - self.min_price).is_multiple_of(self.tick_size) {
+        if !(self.max_price.0 - self.min_price.0).is_multiple_of(self.tick_size.0) {
             return Err(TradingError::InvalidConfig("price band must be a whole number of ticks"));
         }
         if self.level_count() > MAX_DENSE_LEVELS {
@@ -162,7 +167,7 @@ impl MarketConfig {
     /// Number of tick levels in the band (inclusive of both ends).
     #[must_use]
     pub fn level_count(&self) -> usize {
-        ((self.max_price - self.min_price) / self.tick_size + 1) as usize
+        ((self.max_price.0 - self.min_price.0) / self.tick_size.0 + 1) as usize
     }
 }
 
@@ -321,12 +326,12 @@ impl DenseBook {
     /// not crash the validator (DoS-safe).
     #[inline]
     fn level_index(&self, price_raw: u64) -> usize {
-        let offset = price_raw.saturating_sub(self.cfg.min_price);
+        let offset = price_raw.saturating_sub(self.cfg.min_price.0);
         debug_assert!(
-            price_raw >= self.cfg.min_price,
+            price_raw >= self.cfg.min_price.0,
             "price below band: validation precondition violated"
         );
-        let idx = offset / self.cfg.tick_size;
+        let idx = offset / self.cfg.tick_size.0;
         debug_assert!(
             idx < self.levels.len() as u64,
             "price above band: validation precondition violated"
@@ -373,12 +378,12 @@ impl BookBackend for DenseBook {
     #[inline]
     fn best_bid_price(&self) -> Option<u64> {
         // Highest active bid level → its price.
-        self.bids.highest().map(|idx| self.cfg.min_price + u64::from(idx) * self.cfg.tick_size)
+        self.bids.highest().map(|idx| self.cfg.min_price.0 + u64::from(idx) * self.cfg.tick_size.0)
     }
 
     #[inline]
     fn best_ask_price(&self) -> Option<u64> {
-        self.asks.lowest().map(|idx| self.cfg.min_price + u64::from(idx) * self.cfg.tick_size)
+        self.asks.lowest().map(|idx| self.cfg.min_price.0 + u64::from(idx) * self.cfg.tick_size.0)
     }
 
     fn append(&mut self, slot: u32, pool: &mut OrderPool) {
@@ -596,7 +601,7 @@ impl BookBackend for DenseBook {
 
     #[inline]
     fn level_price(&self, idx: u32) -> u64 {
-        self.cfg.min_price + u64::from(idx) * self.cfg.tick_size
+        self.cfg.min_price.0 + u64::from(idx) * self.cfg.tick_size.0
     }
 }
 
@@ -613,10 +618,10 @@ mod tests {
     fn cfg() -> MarketConfig {
         MarketConfig {
             market_id: 1,
-            tick_size: 1_000_000,
-            lot_size: 1_000,
-            min_price: 1_000_000_000,
-            max_price: 1_064_000_000,
+            tick_size: Price(1_000_000),
+            lot_size: Qty(1_000),
+            min_price: Price(1_000_000_000),
+            max_price: Price(1_064_000_000),
             max_resting: 64,
         }
     }
@@ -647,11 +652,11 @@ mod tests {
         assert_eq!(cfg().validate(), Ok(()));
 
         let mut c = cfg();
-        c.tick_size = 0;
+        c.tick_size = Price(0);
         assert_eq!(c.validate(), Err(TradingError::InvalidConfig("tick_size must be > 0")));
 
         let mut c = cfg();
-        c.lot_size = 0;
+        c.lot_size = Qty(0);
         assert_eq!(c.validate(), Err(TradingError::InvalidConfig("lot_size must be > 0")));
 
         let mut c = cfg();
@@ -660,7 +665,7 @@ mod tests {
 
         // Band not a whole number of ticks.
         let mut c = cfg();
-        c.max_price += 1;
+        c.max_price.0 += 1;
         assert_eq!(
             c.validate(),
             Err(TradingError::InvalidConfig("price band must be a whole number of ticks"))
