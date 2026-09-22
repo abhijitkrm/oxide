@@ -71,6 +71,7 @@ pub mod protocol;
 pub mod ring;
 pub mod risk;
 pub mod server;
+pub mod settler;
 pub mod ws;
 
 pub use balance::{AtomicBalanceCache, BalanceCache, DEFAULT_SHARD_COUNT, ShardedBalanceCache};
