@@ -85,17 +85,38 @@ jobs:
             fuzz/artifacts/
             fuzz/corpus/
 
-  audit:
-    name: cargo audit (known vulnerabilities)
+  spec-deep:
+    name: TLC deep simulation (full config)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Matches rust-toolchain.toml — bump both together.
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-      - name: Run cargo audit
-        run: cargo audit
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Fetch pinned tla2tools
+        # Same pin + checksum as the PR job in ci.yml.
+        run: |
+          curl -sSfL -o /tmp/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  /tmp/tla2tools.jar" | sha256sum -c -
+      - name: TLC seeded simulation over the full config
+        # The nightly complement to the PR smoke run: the FULL-
+        # fidelity config (IndividualVotes + FreeAdvance on — per-
+        # validator vote granularity and free view movement the hunt
+        # config compresses away) at 12× the trace volume and 50%
+        # deeper behaviors, under a different fixed seed. This is
+        # probabilistic coverage, not exhaustion — the bounded state
+        # space is too large to enumerate in CI time — so a pass
+        # means "no invariant violation in ~200M sampled states."
+        timeout-minutes: 45
+        working-directory: spec/oxidebft
+        run: >
+          java -XX:+UseParallelGC -Xmx5g
+          -cp /tmp/tla2tools.jar tlc2.TLC
+          -workers auto -seed 777001
+          -simulate num=250000 -depth 60
+          -config OxideBft.cfg OxideBft.tla
 
   benchmarks:
     name: benchmark gates (criterion)

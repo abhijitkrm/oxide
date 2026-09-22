@@ -1159,6 +1159,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **The consensus spec and the real vote budget were not gated or
+  measured** (`spec/oxidebft`, `crates/consensus`,
+  `.github/workflows/*`)
+  - The oxideBFT TLA+ model had no CI invocation — a spec or engine
+    edit could silently diverge from it. A new `spec` job runs a
+    seeded TLC simulation (20k behaviors × 40 steps over the hunt
+    config, ~16M states against all six safety invariants) on every
+    PR, and nightly runs 250k × 60 over the full-fidelity config;
+    `tla2tools` is pinned and sha256-verified. Exhaustive checking
+    was measured and honestly ruled out for CI — the README states
+    what a green run actually covers.
+  - The consensus bench measured the conformance path (no
+    signatures, no WAL), so "vote ≈ 1 µs" was the number on record.
+    New `*_signed_wal` benches wire the engine as production does —
+    real BLS keys, verification on, WAL fsyncs — and measure the
+    durable per-view cost: **~5.7 ms** to vote, **~6.3 ms** to form
+    and adopt a QC, **~5.7 ms** to receive one. The WAL fsync
+    dominates.
+  - **In plain words:** the safety model is now checked on every
+    change instead of only when someone remembers to run it, and we
+    finally measured what a consensus vote really costs in
+    production — about six milliseconds, not one microsecond,
+    because the honest number includes writing it to disk before
+    the vote is allowed to leave the machine.
+
 - **Oracle marks moved on a feeder-count majority instead of
   staked power** (`modules/oracle`)
   - Publication required `eligible/2 + 1` submissions — a *count*

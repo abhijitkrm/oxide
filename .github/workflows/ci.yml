@@ -79,3 +79,38 @@ jobs:
         # registry package in Cargo.lock against crates.io; a dep
         # bump to a too-new version fails this job.
         run: python3 scripts/check-dep-age.py
+
+  spec:
+    name: TLC model check (oxideBFT)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Fetch pinned tla2tools
+        # Pinned version + sha256: the model checker is a
+        # verification dependency — it gets the same supply-chain
+        # treatment as Cargo deps (release is from 2024-08).
+        run: |
+          curl -sSfL -o /tmp/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  /tmp/tla2tools.jar" | sha256sum -c -
+      - name: TLC seeded simulation over the hunt config
+        # Exhaustive checking of even the smallest interesting bound
+        # is hours (the state space explodes past depth ~10), so the
+        # PR gate is a seeded random simulation: 20k behaviors × 40
+        # steps over the hunt config — ~16M states evaluated against
+        # all six safety invariants in ~1 minute on a laptop. The
+        # fixed seed makes the sampled paths reproducible; a spec
+        # change that alters enabledness shifts the sample, which is
+        # expected — the nightly job covers the deeper exhaustive
+        # pass.
+        working-directory: spec/oxidebft
+        run: >
+          java -XX:+UseParallelGC -Xmx4g
+          -cp /tmp/tla2tools.jar tlc2.TLC
+          -workers auto -seed 424242
+          -simulate num=20000 -depth 40
+          -config OxideBftSmall.cfg OxideBft.tla

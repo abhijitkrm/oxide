@@ -18200,3 +18200,40 @@ the perps `MAX_MARK_CHANGE_BPS` cap (EMA dampens it 4× and it still
 overshoots — fail-closed, neither side records it) → a moderate
 move recovers EMA-dampened ((1.5e9·3+1.9e9)/4 = 1.6e9) and clears
 staleness.
+
+## Consensus gates: TLC in CI + the real (signed, durable) vote budget
+
+Two residuals from the formal-verification item, both about
+closing the gap between "we have a spec/bench" and "it's a gate."
+
+**TLC in CI.** `OxideBft.tla` has existed for a while and has
+already caught three real safety bugs, but nothing ran it in CI —
+a spec edit or an engine change could silently diverge from the
+model. Wiring it in forced an honest coverage decision: exhaustive
+checking is not PR-viable — I measured the smallest interesting
+bound (new `OxideBftSmoke.cfg`: MaxView=3, MaxHeight=2,
+MaxVariants=1) still open past depth 15 with tens of millions of
+states. So the gate is seeded random simulation, reported as what
+it is: PR CI runs 20k behaviors × 40 steps over the hunt config
+(~16M states, ~1 min on this machine), nightly runs 250k × 60 over
+the full-fidelity config under a different seed. `tla2tools.jar`
+is pinned at v1.7.4 with a sha256 check — the model checker is a
+verification dependency and gets the same supply-chain treatment
+as Cargo deps. README documents exactly what a green run means.
+
+**Production vote budget.** The engine benches measured the
+conformance path — `Signature::ZERO`, no WAL — so "vote costs
+~1 µs" was the number on record. The new `*_signed_wal` benches
+wire the engine the way `oxide-validator` does: real BLS keys,
+verification at production defaults, a real `Wal` whose append
+ends in `sync_data`. Results on the dev Mac (M-series, NVMe):
+
+  vote_signed_wal        5.74 ms   (auth + lock + fsync + sign)
+  form_qc_signed_wal     6.31 ms   (3×collect + aggregate +
+                                    self-verify + high_qc fsync)
+  deliver_qc_signed_wal  5.69 ms   (aggregate verify + fsync)
+
+The durable vote budget is ~6 ms per view — ~5,800× the
+conformance figure — and the WAL fsync is the dominant term, with
+BLS second. Any view-latency or throughput-per-view claim must now
+cite these numbers, not the conformance bench.
