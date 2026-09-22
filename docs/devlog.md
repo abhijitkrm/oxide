@@ -18784,3 +18784,47 @@ The binary's `run_node` lost ~120 lines of setup; snapshot
 import/export shrank to one-line helper calls. Three new tests pin
 the seam contract (clock reaches proposal timestamps, both
 membership-gate failures).
+
+## Consensus safety: hidden-QC/TC fork — reproduced (2.1)
+
+**Finding confirmed with an executable counterexample:**
+`engine::tests::hidden_qc_timeout_release_forks_finality` scripts the
+audit schedule against four real engines with real BLS signatures.
+One Byzantine validator + message-ordering control produce a
+same-height finalized fork across honest validators.
+
+The mechanism, distilled:
+
+- The per-height lock releases on a bare TC — the TC proves a quorum
+  *timed out*, not that the view produced no QC. A withheld QC makes
+  the release premise false.
+- The flipper: an honest validator votes `X`@h1 (v1), then `X'`@h1
+  (v2, TC(1) legitimately releases its lock), then *adopts* the
+  hidden `QC(X)`@1 (still fresh vs its highQC), votes the hidden
+  branch's child `c` (v3), adopts `QC(X')`@2 (monotonic hop across
+  conflicting branches), votes `c'` (v4). `QC(c)` commits `X` for
+  it; a peer holding only the public branch commits `X'`.
+
+Why each cheap fix fails (verified by construction, not guessed):
+
+- *Consecutive-view commit alone*: the attacker places the hidden QC
+  just before a byz-led view and builds a consecutive pair per branch.
+- *Proposal QC must dominate the locked vote's view*: wedges the
+  height whenever a QC is withheld — liveness break.
+- *Adoption must not conflict with the current lock*: locks are
+  legitimately rewritten by TC release; the rule breaks post-timeout
+  re-convergence.
+- *Existing timeout evidence* (`high_qc`+`last_tc` on the wire, the
+  2.2 fix): carries the signer's *adopted* QC — honest TC(1) signers
+  genuinely held `P`; the hidden QC is invisible to them.
+
+The fix that matches the standard argument: timeout evidence must
+carry the voter's **latest locked vote** (block + view), and a
+TC-entered proposal must extend the maximum-view lock among the
+evidence quorum — `X'` would have been forced to extend `X`. Wire
+format + vote-rule change; the counterexample test inverts into the
+regression gate when it lands.
+
+TLC corroboration not run locally (no JRE on this box — the CI
+runner fetches tla2tools); the Rust counterexample is the stronger
+evidence regardless.

@@ -4876,3 +4876,241 @@ fn recover_from_wal_reseats_index_by_key() {
     assert_eq!(engine.validator_set().n(), 3);
     assert_eq!(engine.validator_index(), 2, "re-seated by BLS key match");
 }
+
+// ---- Hidden-QC / timeout-release fork COUNTEREXAMPLE ----
+//
+// This test demonstrates a live safety violation, not an
+// invariant: two honest validators finalize different blocks at
+// the same height. A correct protocol makes this schedule
+// infeasible — when the fix lands, invert the final assertions
+// into a regression gate.
+//
+// The gap: the per-height vote lock releases on a bare TC — the
+// TC carries no evidence about what its signers had voted, so it
+// cannot prove the timed-out view produced no QC. The safety
+// argument in `vote_if_eligible` ("QC adoption is view-monotonic,
+// so the later-view rival always wins") is incomplete: adoption
+// order is per-validator, and a validator can adopt conflicting
+// QCs in ascending view order, voting children on both branches
+// serially.
+//
+// This test scripts the schedule against real engines with real
+// BLS signatures. n=4, quorum=3, validator 3 byzantine; equal
+// stakes give round-robin leaders (leader(v) = v % 4).
+//
+//   v0 (leader 0): P @ h0. Votes {0,1,2} -> QC(P). All adopt.
+//   v1 (leader 1): X @ h1 (prev=P). Votes {0,1,3} -> QC(X).
+//       The QC is WITHHELD — the byz leader-collector never
+//       broadcasts it. All honest sign timeout(1) -> TC(1).
+//   v2 (leader 2): X' @ h1 (prev=P, TC(1)). e0's h1 lock is
+//       released by the TC even though QC(X) already exists —
+//       that is the point: the TC does not prove v1 ended
+//       undecided. Votes {0,2,3} -> QC(X').
+//   Selective adoption: QC(X) -> {e0,e1}; QC(X') -> {e2}. The
+//   hidden branch now has two honest highQC holders; the public
+//   branch has one.
+//   TC(2) lifts e0,e1,e2 to v3.
+//   v3 (leader 3, byz): c @ h2 (prev=X, justify=QC(X)). Votes
+//       {0,1,3} -> QC(c). Held back.
+//   e0 flips: adopts QC(X')@2 (2 > 1 — monotonic adoption hops
+//   branches). TC(3) lifts e0,e2 to v4.
+//   v4 (leader 0): e0, now holding X', proposes c' @ h2
+//       (prev=X', TC(3)). Votes {0,2,3} -> QC(c').
+//   Deliver QC(c)@3 to e0 -> commits X @ h1.
+//   Deliver QC(c')@4 to e2 -> commits X' @ h1.
+//   e0 and e2 are both honest and finalized different blocks at
+//   height 1 — a user-visible fork.
+// Scripted multi-view schedule — paired names (vc0/vc1, e0/e1)
+// read by their validator index; a one-shot counterexample is a
+// single long action sequence.
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+#[test]
+fn hidden_qc_timeout_release_forks_finality() {
+    let (keys, vs) = bls_validator_set();
+    // Equal stakes => round-robin leader schedule 0,1,2,3.
+    for (v, want) in [(0u64, 0u16), (1, 1), (2, 2), (3, 3), (4, 0)] {
+        assert_eq!(vs.leader(View::new(v)), want, "round-robin leader at v{v}");
+    }
+    let mk = |i: u16| {
+        OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), i)
+            .with_secret_key(keys[i as usize].clone())
+    };
+    let (mut e0, mut e1, mut e2) = (mk(0), mk(1), mk(2));
+    let byz = &keys[3];
+
+    // A vote signed by the byz key for an arbitrary block.
+    let byz_vote = |engine: &OxideBft, view: View, hash: Hash| -> Vote {
+        let msg = engine.vote_signing_message(view, 0, &hash);
+        Vote {
+            view,
+            phase: VotePhase::Prepare,
+            block_hash: hash,
+            signature: byz.sign(crypto::hash::Domain::Vote, &msg),
+            attestation: None,
+            attestation_sig: None,
+        }
+    };
+    // A timeout signature by the byz key for an arbitrary view.
+    let byz_timeout = |view: u64| -> Signature {
+        let mut msg = Vec::with_capacity(16);
+        msg.extend_from_slice(&view.to_le_bytes());
+        msg.extend_from_slice(&0u64.to_le_bytes());
+        byz.sign(crypto::hash::Domain::Timeout, &msg)
+    };
+
+    // ---- v0: P at height 0; everyone adopts QC(P) ----
+    e0.submit_tx(TxBytes::new(vec![0xA0]));
+    let (h_par, p_par) = e0.propose().expect("leader 0 proposes P");
+    let hash_par = OxideBft::block_hash(&h_par);
+    for (i, v) in [e0.vote(&h_par, &p_par), e1.vote(&h_par, &p_par), e2.vote(&h_par, &p_par)]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, v)| v.map(|v| (i, v)))
+    {
+        e0.collect_vote(u16::try_from(i).expect("idx"), v).expect("collect P vote");
+    }
+    let qc_par = e0.try_form_qc().expect("QC(P)@0");
+    for e in [&mut e0, &mut e1, &mut e2] {
+        e.deliver_qc(qc_par.clone()).expect("adopt QC(P)");
+        // Same-view adoption does not bump the view (catch-up is
+        // strict-greater); the driver advances after the round.
+        e.advance_view();
+    }
+
+    // ---- v1: X at height 1 — the hidden QC ----
+    e1.submit_tx(TxBytes::new(vec![0xB0]));
+    let (h_hid, p_hid) = e1.propose().expect("leader 1 proposes X");
+    let hash_hid = OxideBft::block_hash(&h_hid);
+    let vx1 = e1.vote(&h_hid, &p_hid).expect("e1 votes X");
+    let vx0 = e0.vote(&h_hid, &p_hid).expect("e0 votes X");
+    // e1 collects {self, e0, byz} and forms the QC — but the QC is
+    // never broadcast: it stays hidden from the honest network.
+    e1.collect_vote(1, vx1).expect("collect");
+    e1.collect_vote(0, vx0).expect("collect");
+    e1.collect_vote(3, byz_vote(&e1, View::new(1), hash_hid)).expect("byz vote X");
+    let qc_hid = e1.try_form_qc().expect("QC(X)@1 — exists but is withheld");
+
+    // ---- TC(1): all honest time out view 1 ----
+    let t0_1 = e0.on_timeout().expect("e0 timeout(1)");
+    let t1_1 = e1.on_timeout().expect("e1 timeout(1)");
+    let t2_1 = e2.on_timeout().expect("e2 timeout(1)");
+    e2.collect_timeout_signature(2, t2_1).expect("collect t2");
+    e2.collect_timeout_signature(0, t0_1).expect("collect t0");
+    let tc1 = e2
+        .collect_timeout_signature(1, t1_1)
+        .expect("collect t1")
+        .expect("TC(1) forms — e2 advances to v2");
+    e0.on_timeout_certificate(&tc1).expect("e0 -> v2");
+    e1.on_timeout_certificate(&tc1).expect("e1 -> v2");
+
+    // ---- v2: X' at height 1 — the sibling, via TC release ----
+    e2.submit_tx(TxBytes::new(vec![0xC0]));
+    let (h_sib, p_sib) = e2.propose().expect("leader 2 proposes X'");
+    let hash_sib = OxideBft::block_hash(&h_sib);
+    assert_eq!(h_sib.prev_block, hash_par, "X' extends P — same parent as X");
+    assert_eq!(h_sib.height, h_hid.height, "X' conflicts with X at height 1");
+    // e0's h1 lock (voted X) is released by the embedded TC(1)
+    // despite QC(X) existing — the TC carries no evidence of it.
+    let vx2p = e2.vote(&h_sib, &p_sib).expect("e2 votes X'");
+    e2.collect_vote(2, vx2p).expect("collect");
+    e2.collect_vote(0, e0.vote(&h_sib, &p_sib).expect("e0 votes X' (lock released)"))
+        .expect("collect");
+    e2.collect_vote(3, byz_vote(&e2, View::new(2), hash_sib)).expect("byz vote X'");
+    let qc_sib = e2.try_form_qc().expect("QC(X')@2 — conflicting QC at h1");
+
+    // ---- Selective adoption: the fork's split brain ----
+    // The hidden QC(X) reaches e0,e1 — they now hold X as highQC.
+    e0.deliver_qc(qc_hid.clone()).expect("e0 adopts X@1");
+    e1.deliver_qc(qc_hid.clone()).expect("e1 adopts X@1");
+    // QC(X') reaches e2 — it holds X'. (e0 must NOT see it yet:
+    // it needs highQC=X to vote the hidden branch's child.)
+    e2.deliver_qc(qc_sib.clone()).expect("e2 adopts X'@2");
+
+    // ---- TC(2): lift everyone to v3 ----
+    let t0_2 = e0.on_timeout().expect("e0 timeout(2)");
+    let t1_2 = e1.on_timeout().expect("e1 timeout(2)");
+    let t2_2 = e2.on_timeout().expect("e2 timeout(2)");
+    e1.collect_timeout_signature(1, t1_2).expect("collect");
+    e1.collect_timeout_signature(0, t0_2).expect("collect");
+    let tc2 = e1
+        .collect_timeout_signature(2, t2_2)
+        .expect("collect")
+        .expect("TC(2) forms — e1 advances to v3");
+    e0.on_timeout_certificate(&tc2).expect("e0 -> v3");
+    e2.on_timeout_certificate(&tc2).expect("e2 -> v3");
+
+    // ---- v3: byz proposes c on the HIDDEN branch (prev=X) ----
+    let prop_c =
+        Proposal { height: Height::new(2), txs: vec![TxBytes::new(vec![0xD0])], attestation: None };
+    let mut body_bytes = Vec::new();
+    prop_c.encode(&mut body_bytes);
+    let k = types::shard::erasure_params(&[1, 1, 1, 1], vs.quorum_stake()).0;
+    let mut h_child1 = BlockHeader {
+        height: Height::new(2),
+        view: View::new(3),
+        epoch: Epoch::new(0),
+        prev_block: hash_hid,
+        tx_root: OxideBft::tx_root(&prop_c.txs),
+        high_qc: Some(qc_hid.clone()),
+        timeout_cert: Some(tc2.clone()),
+        proposer: proposer_hash(3),
+        timestamp: h_hid.timestamp.saturating_add(1),
+        proposer_signature: None,
+        exec_cert: None,
+        body_commitment: types::shard::commitment(&body_bytes, 4, k),
+    };
+    h_child1.proposer_signature = Some(byz.sign(
+        crypto::hash::Domain::Proposal,
+        OxideBft::proposal_signing_hash(&h_child1).as_bytes(),
+    ));
+    let hash_child1 = OxideBft::block_hash(&h_child1);
+    // e0,e1 hold X: c.prev == their highQC block — they vote it.
+    let vc0 = e0.vote(&h_child1, &prop_c).expect("e0 votes c");
+    e0.collect_vote(0, vc0).expect("collect");
+    let vc1 = e1.vote(&h_child1, &prop_c).expect("e1 votes c");
+    e0.collect_vote(1, vc1).expect("collect");
+    e0.collect_vote(3, byz_vote(&e0, View::new(3), hash_child1)).expect("byz vote c");
+    let qc_child1 = e0.try_form_qc().expect("QC(c)@3 — hidden branch is 2-deep");
+
+    // ---- The flip: e0 adopts QC(X')@2 — monotonic adoption hops
+    // across the conflicting branches (2 > 1). ----
+    e0.deliver_qc(qc_sib.clone()).expect("e0 adopts X'@2 — branch hop");
+
+    // ---- TC(3): lift e0,e2 to v4 ----
+    let u0 = e0.on_timeout().expect("e0 timeout(3)");
+    let u2 = e2.on_timeout().expect("e2 timeout(3)");
+    e0.collect_timeout_signature(0, u0).expect("collect");
+    e0.collect_timeout_signature(2, u2).expect("collect");
+    let tc3 = e0
+        .collect_timeout_signature(3, byz_timeout(3))
+        .expect("collect")
+        .expect("TC(3) forms — e0 advances to v4");
+    e2.on_timeout_certificate(&tc3).expect("e2 -> v4");
+
+    // ---- v4: e0 (leader) proposes c' on the X' branch ----
+    e0.submit_tx(TxBytes::new(vec![0xE0]));
+    let (h_child2, p_child2) = e0.propose().expect("e0 proposes c' extending X'");
+    let hash_child2 = OxideBft::block_hash(&h_child2);
+    assert_eq!(h_child2.prev_block, hash_sib, "c' extends the competing parent");
+    let vcp0 = e0.vote(&h_child2, &p_child2).expect("e0 votes c'");
+    e0.collect_vote(0, vcp0).expect("collect");
+    let vcp2 = e2.vote(&h_child2, &p_child2).expect("e2 votes c'");
+    e0.collect_vote(2, vcp2).expect("collect");
+    e0.collect_vote(3, byz_vote(&e0, View::new(4), hash_child2)).expect("byz vote c'");
+    let qc_child2 = e0.try_form_qc().expect("QC(c')@4 — public branch is 2-deep");
+
+    // ---- The fork: both branches complete a commit walk ----
+    // e0 adopts QC(c)@3 first (its highQC is X'@2 — 3 > 2): the
+    // walk commits X at h1. Then QC(c')@4 arrives — the walk on
+    // the c' chain stops at the already-committed height.
+    e0.deliver_qc(qc_child1.clone()).expect("e0 adopts QC(c)@3 -> commits X");
+    e0.deliver_qc(qc_child2.clone()).expect("e0 adopts QC(c')@4 — X' blocked by committed h1");
+    // e2 only ever sees the public branch's grandchild QC.
+    e2.deliver_qc(qc_child2).expect("e2 adopts QC(c')@4 -> commits X'");
+
+    let f0 = e0.finalized_block(Height::new(1)).expect("e0 committed height 1");
+    let f2 = e2.finalized_block(Height::new(1)).expect("e2 committed height 1");
+    assert_eq!(f0.txs[0].as_bytes(), [0xB0], "e0 committed X");
+    assert_eq!(f2.txs[0].as_bytes(), [0xC0], "e2 committed X'");
+    assert_ne!(f0, f2, "two honest validators finalized different blocks at the same height");
+}
