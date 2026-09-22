@@ -18509,3 +18509,19 @@ port contract — the mempool's rejection text is legitimately
 opaque and the lane never branches on it. `SettleReport`'s
 `batch_rejected`/`dead_lettered` fields likewise keep the chain's
 rejection strings (they are report payloads, not error types).
+
+## §9.E — staking snapshot-decode split
+
+The ~430-line decode block (`StagedStaking` plus `decode_committed`
+and its four section decoders + the `check_replica_mirrors` /
+`check_store_binding` invariant checks) moved from
+`modules/staking/src/lib.rs` into `decode.rs`. The decoders were
+already `Self::`-namespaced free functions in all but name — they
+take `(&mut CanonicalReader, &mut StagedStaking)` and touch no
+module state — so the split needed no field-visibility surgery:
+`StagedStaking`'s fields went `pub(crate)` for `import_state`'s
+install loop and the functions became `pub(crate) fn` in the new
+module. `lib.rs` drops to ~4.6k lines; the module header states
+the invariant it guards — decode is the single schema owner shared
+by `inspect_state` and `import_state` so verify-only and install
+can never disagree about the wire format.
