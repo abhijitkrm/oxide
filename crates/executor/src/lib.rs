@@ -2615,37 +2615,46 @@ impl Executor {
         runs
     }
 
-    /// Charge the fee for every tx in one contiguous run, in run
-    /// order, and return the survivors for dispatch. The charge
-    /// lives at dispatch time — not in `plan_block_runs` — because it
-    /// debits the shared ledger and must observe every earlier tx's
-    /// effects. Cross-module ordering is exact; within a run, a tx's
-    /// fee does not see earlier same-run txs (the documented
-    /// residual — closing it would need per-tx charge/execute
-    /// interleaving and lose batching entirely).
+    /// Charge each tx's fee and execute it, interleaved per tx, in
+    /// run order. The charge lives at dispatch time — not in
+    /// `plan_block_runs` — because it debits the shared ledger and
+    /// must observe every earlier tx's effects; within a run the
+    /// charge→execute interleave extends that guarantee to same-run
+    /// predecessors, so a tx whose sender's balance was consumed by
+    /// an earlier same-run tx (e.g. a fill that debited the maker)
+    /// is fee-rejected rather than executed on a stale balance.
+    /// This is exact sequential semantics for every module that
+    /// pays an executor fee. It costs nothing in practice: the only
+    /// module with a real batch dispatch path (EVM: parallel sender
+    /// recovery) is self-funded and never enters this path — for
+    /// every other module `handle_batch` is the serial `handle`
+    /// loop this loop performs anyway. A module that later adds a
+    /// genuine batch override still gets it — but only for
+    /// self-funded runs, where no executor fee interleaves.
     ///
-    /// `broken_nonce` records the first failed-charge nonce per
-    /// sender: under sequential semantics a failed charge consumes
-    /// no nonce, so that sender's later txs are unreachable this
-    /// block — they're skipped `StaleNonce` rather than executed
-    /// with a gap. `local_nonce` is rewound to the failed nonce so
+    /// Returns the executed txs plus their results, index-aligned
+    /// for `record_group_outcomes`. `broken_nonce` records the
+    /// first failed-charge nonce per sender: under sequential
+    /// semantics a failed charge consumes no nonce, so that
+    /// sender's later txs are unreachable this block — they're
+    /// skipped `StaleNonce` rather than executed with a gap.
+    /// `local_nonce` is rewound to the failed nonce so
     /// `executed_nonce` reflects the last consumed nonce + 1 and
     /// the failed tx stays retryable. Self-funded modules (EVM:
-    /// gas is the fee) skip charging entirely.
-    fn charge_run_fees<'b>(
+    /// gas is the fee) skip charging entirely — the caller
+    /// dispatches them as one batch.
+    fn charge_and_execute_run<'b>(
         &self,
         run: Vec<GroupedTx<'b>>,
         module: &dyn Module,
         local_nonce: &mut HashMap<primitives::Address, u64>,
         broken_nonce: &mut HashMap<primitives::Address, u64>,
         dispatch_skipped: &mut Vec<(Hash, TxSkipReason)>,
-    ) -> Vec<GroupedTx<'b>> {
-        if module.pays_own_fee() {
-            return run;
-        }
+    ) -> (Vec<GroupedTx<'b>>, Vec<Result<Vec<Event>, ExecError>>) {
         let fee_module = self.fee_module.and_then(|id| self.modules[usize::from(id)].as_ref());
         let self_authenticating = module.authenticates_sender();
-        let mut survivors = Vec::with_capacity(run.len());
+        let mut executed = Vec::with_capacity(run.len());
+        let mut results = Vec::with_capacity(run.len());
         for entry in run {
             let ctx = entry.0;
             if let Some(&broken) = broken_nonce.get(&ctx.sender)
@@ -2663,9 +2672,10 @@ impl Executor {
                 }
                 continue;
             }
-            survivors.push(entry);
+            results.push(module.handle(&ctx, entry.1));
+            executed.push(entry);
         }
-        survivors
+        (executed, results)
     }
 
     /// Dispatch one run to its module and return per-tx results.
@@ -2723,10 +2733,13 @@ impl Executor {
     /// granularity: a new run starts when the module id changes, so
     /// a tx always observes the ledger effects of every earlier
     /// cross-module tx — and of its own fee charge, which happens at
-    /// dispatch time rather than during planning. Contiguous
-    /// same-module txs still batch in one `handle_batch*` call, so
-    /// modules with batch-optimized paths (EVM parallel sender
-    /// recovery, pre-verified senders) amortize per-tx overhead.
+    /// dispatch time rather than during planning. Fee-paying runs
+    /// execute charge→handle per tx (`charge_and_execute_run`), so
+    /// the same-run guarantee is exact: each tx's fee observes all
+    /// earlier effects, same module or not. Self-funded runs keep
+    /// the module's batch dispatch (`handle_batch*`), preserving
+    /// batch-optimized paths (EVM parallel sender recovery,
+    /// pre-verified senders) where no executor fee interleaves.
     /// This replaces the old sort-by-module grouping, which was
     /// deterministic but not faithful to committed order — modules
     /// share one balance ledger, so "group then execute" was not
@@ -2802,9 +2815,9 @@ impl Executor {
         }
 
         // Execute each contiguous same-module run in committed block
-        // order — sequential cross-module semantics. Fee charging
-        // happens inside `charge_run_fees`, immediately before each
-        // run's dispatch.
+        // order — sequential cross-module semantics. Fee-paying runs
+        // interleave charge→execute per tx (`charge_and_execute_run`);
+        // self-funded runs dispatch as one batch.
         let mut block_events: Vec<Event> = Vec::new();
         let mut broken_nonce: HashMap<primitives::Address, u64> = HashMap::new();
         let mut dispatch_skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
@@ -2814,20 +2827,30 @@ impl Executor {
                 continue; // unknown module — skip
             };
 
-            // Charge each tx's fee through the configured collector
-            // (the EVM ledger), in run order — see `charge_run_fees`.
-            let group: Vec<GroupedTx<'_>> = self.charge_run_fees(
-                std::mem::take(run),
-                module.as_ref(),
-                &mut local_nonce,
-                &mut broken_nonce,
-                &mut dispatch_skipped,
-            );
-            if group.is_empty() {
-                continue;
+            if module.pays_own_fee() {
+                // Self-funded module (EVM: gas is the fee) — no
+                // executor charge interleaves, so the run takes the
+                // module's real batch dispatch (preverified /
+                // parallel sender recovery).
+                let group: Vec<GroupedTx<'_>> = std::mem::take(run);
+                if group.is_empty() {
+                    continue;
+                }
+                let results = self.dispatch_run(module.as_ref(), &group, &mut preverify_cache);
+                self.record_group_outcomes(&group, results, &mut block_events);
+            } else {
+                // Fee-paying module — charge each tx and execute it
+                // immediately so the next tx's charge observes this
+                // tx's ledger effects (exact sequential semantics).
+                let (group, results) = self.charge_and_execute_run(
+                    std::mem::take(run),
+                    module.as_ref(),
+                    &mut local_nonce,
+                    &mut broken_nonce,
+                    &mut dispatch_skipped,
+                );
+                self.record_group_outcomes(&group, results, &mut block_events);
             }
-            let results = self.dispatch_run(module.as_ref(), &group, &mut preverify_cache);
-            self.record_group_outcomes(&group, results, &mut block_events);
         }
         if !dispatch_skipped.is_empty() {
             let mut outcomes =
@@ -4000,6 +4023,148 @@ mod tests {
         );
     }
 
+    /// A shared-ledger fee collector: `charge_fee` debits the
+    /// sender's balance, so fee affordability is observable and a
+    /// drain can make a charge fail.
+    struct LedgerFeeModule {
+        balances: Mutex<HashMap<primitives::Address, u64>>,
+        charged_total: Mutex<u64>,
+    }
+
+    impl Module for LedgerFeeModule {
+        fn id(&self) -> u8 {
+            9
+        }
+        fn name(&self) -> &'static str {
+            "ledgerfee"
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            Ok(vec![])
+        }
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
+            let mut balances =
+                self.balances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let balance = balances.entry(ctx.sender).or_insert(0);
+            if *balance < ctx.fee {
+                return Err(ExecError::ModuleRejected("insufficient fee balance".to_string()));
+            }
+            *balance -= ctx.fee;
+            *self.charged_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                ctx.fee;
+            Ok(())
+        }
+    }
+
+    /// A module whose `handle` zeroes a target ledger account — the
+    /// earlier same-run effect that must be visible to the next
+    /// tx's fee charge under sequential semantics.
+    struct DrainModule {
+        ledger: Arc<LedgerFeeModule>,
+        calls: Mutex<u64>,
+    }
+
+    impl Module for DrainModule {
+        fn id(&self) -> u8 {
+            1
+        }
+        fn name(&self) -> &'static str {
+            "drain"
+        }
+        fn begin_block(&self, _height: Height) {}
+        fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
+            if msg.len() >= 20 {
+                let victim =
+                    primitives::Address(<[u8; 20]>::try_from(&msg[..20]).unwrap_or([0u8; 20]));
+                self.ledger
+                    .balances
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(victim, 0);
+            }
+            *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            Ok(vec![])
+        }
+        fn end_block(&self, _height: Height) -> Vec<Event> {
+            Vec::new()
+        }
+        fn state_root(&self) -> Hash {
+            Hash::ZERO
+        }
+    }
+
+    /// Regression test for the within-run fee residual: under
+    /// sequential semantics a tx's fee charge must observe the
+    /// ledger effects of earlier same-run txs. Sender S2 can afford
+    /// its fee at run start, but an earlier same-run tx drains S2's
+    /// balance — the charge must then fail and the tx must be
+    /// skipped `FeeCharge`, not executed on a stale balance.
+    /// `broken_nonce` also makes S2's *later* txs unreachable this
+    /// block (a failed charge consumes no nonce, so they would run
+    /// with a gap) — the second S2 tx must skip `StaleNonce`.
+    #[test]
+    fn same_run_fee_observes_earlier_tx_effects() {
+        let mut executor = test_executor(100);
+        let drain = Arc::new(DrainModule {
+            ledger: Arc::new(LedgerFeeModule {
+                balances: Mutex::new(HashMap::new()),
+                charged_total: Mutex::new(0),
+            }),
+            calls: Mutex::new(0),
+        });
+        let ledger = drain.ledger.clone();
+        ledger.balances.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend([
+            (Address([7u8; 20]), 1_000), // drainer — can pay
+            (Address([8u8; 20]), 60),    // victim — can pay 50, until drained
+        ]);
+        executor.register_module(drain.clone());
+        executor.register_module(ledger.clone());
+        executor.set_fee_module(9);
+
+        // Run order matters, so build the block directly rather than
+        // round-tripping the mempool: tx1 drains S2's balance; tx2
+        // (S2, fee 50) then cannot pay under sequential semantics;
+        // tx3 (S2, nonce 1) is unreachable behind the broken chain.
+        let drain_tx = make_tx_with_fee_and_sender(1, &Address([8u8; 20]).0, 0, 10, 7);
+        let victim_tx = make_tx_with_fee_and_sender(1, &[0xAA], 0, 50, 8);
+        let victim_tx_hash = Hasher::hash_one(Domain::Transaction, &victim_tx.0);
+        let follower_tx = make_tx_with_fee_and_sender(1, &[0xBB], 1, 50, 8);
+        let follower_tx_hash = Hasher::hash_one(Domain::Transaction, &follower_tx.0);
+        executor.finalize_block(&FinalizedBlock {
+            context: types::BlockContext::default(),
+            height: Height::new(0),
+            txs: vec![drain_tx, victim_tx, follower_tx],
+            signers: Vec::new(),
+        });
+
+        assert_eq!(
+            executor.tx_outcome(&victim_tx_hash),
+            Some(TxOutcome::Skipped { reason: TxSkipReason::FeeCharge }),
+            "the drained sender's fee must be charged post-effects — and fail"
+        );
+        assert_eq!(
+            executor.tx_outcome(&follower_tx_hash),
+            Some(TxOutcome::Skipped { reason: TxSkipReason::StaleNonce }),
+            "the failed charge consumes no nonce — the follower is unreachable"
+        );
+        assert_eq!(
+            *drain.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "only the drain tx executed"
+        );
+        assert_eq!(
+            *ledger.charged_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            10,
+            "only the drain tx's fee was collected"
+        );
+    }
+
     // ---- M2 fix: process_proposal validation tests ----
 
     #[test]
@@ -4093,6 +4258,12 @@ mod tests {
         }
         fn state_root(&self) -> Hash {
             Hash::ZERO
+        }
+        // Self-funded so the run takes `dispatch_run` — fee-paying
+        // runs interleave charge→handle per tx and never reach the
+        // batch/preverified paths this test is observing.
+        fn pays_own_fee(&self) -> bool {
+            true
         }
         fn preverify_batch<'a>(
             &self,

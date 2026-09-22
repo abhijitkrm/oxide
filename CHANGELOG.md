@@ -1159,6 +1159,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **A transaction's fee no longer ignores same-run predecessors**
+  (`crates/executor`)
+  - Within a contiguous same-module run, all fees were charged
+    before any tx executed — a tx could execute on a balance an
+    earlier same-run tx had already consumed (e.g. a fill debiting
+    the maker). Fee-paying runs now interleave charge→execute per
+    tx, the exact sequential semantics; self-funded modules (EVM)
+    keep their batch dispatch, which is the only real batch path —
+    every other module's `handle_batch` was a serial loop anyway,
+    so the fix costs nothing.
+  - **In plain words:** fees are now checked at the moment a
+    transaction actually runs, not optimistically up front — a
+    transaction whose sender went broke mid-block is rejected
+    instead of executing on money it no longer has.
+
 - **The advertised minimum Rust version was false, and builds
   were not reproducible** (`Cargo.toml`, `rust-toolchain.toml`,
   `.github/workflows/*`)

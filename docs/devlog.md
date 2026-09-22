@@ -18098,3 +18098,40 @@ the decode now maps `Hash(*c)` directly off `&[u8; 32]`).
 Still open from the finding: dependency release-age is a review
 convention, not a machine check (`cargo vet` or a deny age gate
 would close it).
+
+## Executor: within-run fee ordering is exact — charge→execute interleave (1.3 residual closed)
+
+The 1.3 residual said exact within-run fee semantics "cost
+batching". False — the premise was wrong. Only EVM overrides the
+batch dispatch methods (`handle_batch_preverified`,
+`handle_batch_parallel_preverified`, `preverify_batch`), and EVM
+`pays_own_fee` — it exits fee charging before any charge happens.
+Every fee-paying module's `handle_batch` is the trait default: a
+serial `handle` loop. The interleave performs the same loop with
+the charge moved inside it — zero throughput loss.
+
+`charge_run_fees` (charge all upfront, then batch) is replaced by
+`charge_and_execute_run` (charge tx[i] → `handle` tx[i] → charge
+tx[i+1] → ...). `execute_block`'s run loop now branches on
+`pays_own_fee`: self-funded runs keep `dispatch_run` (the real
+batch paths — EVM parallel recovery is untouched), fee-paying runs
+take the interleave. `dispatch_run` now only ever serves
+self-funded modules — the preverified path there used to be
+reachable-but-pointless for native modules (their `preverify_batch`
+returns zero senders; the default `handle_batch_preverified`
+ignores the sender anyway).
+
+The semantic change: a tx whose sender's balance was consumed by an
+earlier same-run tx — a fill debiting the maker, a transfer — now
+fee-fails (`Skipped{FeeCharge}`) instead of executing on a stale
+balance, and the `broken_nonce` rule still makes that sender's
+later txs `StaleNonce`-skip rather than run with a gap. New
+regression `same_run_fee_observes_earlier_tx_effects` pins all
+three (drain-then-underpaying-tx in one run; charge fails;
+follower unreachable).
+
+One test needed `pays_own_fee() -> true`:
+`PreverifyTrackingModule` — its whole purpose is proving the
+ingest-cache→preverified-dispatch wiring, which now only serves
+self-funded modules. Semantically transparent: the test configures
+no fee collector, so its charges were no-ops.
