@@ -40,7 +40,7 @@
 use primitives::Address;
 use primitives::fixed::{Price, Qty};
 
-use crate::book::{BookBackend, DenseBook, MarketConfig};
+use crate::book::{BookBackend, DenseBook, MarketConfig, ValidatedMarketConfig};
 use crate::error::{RejectReason, TradingError};
 use crate::idmap::IdMap;
 use crate::order::{NewOrder, OrderId, OrderType, Side, StpMode, TimeInForce};
@@ -270,16 +270,19 @@ pub struct MatchingEngine<B: BookBackend = DenseBook> {
 
 impl<B: BookBackend> MatchingEngine<B> {
     /// Build an engine with a fresh backend from a validated config.
+    /// The [`ValidatedMarketConfig`] proof makes the admission-side
+    /// check mandatory — no caller can construct an engine on an
+    /// unchecked config.
     ///
     /// # Errors
-    /// [`TradingError::InvalidConfig`] propagated from backend
-    /// construction.
-    pub fn new(cfg: MarketConfig, book: B) -> Result<Self, TradingError> {
-        cfg.validate()?;
+    /// [`TradingError::InvalidConfig`] is not reachable — validation
+    /// ran before the proof existed. `Result` is retained for the
+    /// construction shape.
+    pub fn new(cfg: ValidatedMarketConfig, book: B) -> Result<Self, TradingError> {
         Ok(MatchingEngine {
             pool: OrderPool::with_capacity(cfg.max_resting),
             ids: IdMap::with_capacity(cfg.max_resting),
-            cfg,
+            cfg: *cfg,
             book,
             next_id: 0,
             resting: 0,
@@ -574,6 +577,9 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// `make_book` builds the fresh [`BookBackend`] for the decoded
     /// config (e.g. `DenseBook::new`) — the engine cannot construct
     /// `B` itself because backend construction is backend-specific.
+    /// The decoded config is re-validated here and the proof is
+    /// handed to the builder, so a corrupted snapshot cannot smuggle
+    /// an unchecked config into a restored engine.
     ///
     /// # Errors
     /// [`TradingError::CorruptState`] on malformed bytes, a config or
@@ -582,10 +588,14 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// if the entry count exceeds `max_resting`.
     pub fn from_canonical_state(
         data: &[u8],
-        make_book: impl FnOnce(&MarketConfig) -> Result<B, TradingError>,
+        make_book: impl FnOnce(&ValidatedMarketConfig) -> Result<B, TradingError>,
     ) -> Result<Self, TradingError> {
         let decoded = decode_canonical_state(data).ok_or(TradingError::CorruptState("decode"))?;
-        let mut engine = Self::new(decoded.cfg, make_book(&decoded.cfg)?)?;
+        let cfg = decoded
+            .cfg
+            .validated()
+            .map_err(|_| TradingError::CorruptState("config fails market rules"))?;
+        let mut engine = Self::new(cfg, make_book(&cfg)?)?;
         for e in &decoded.entries {
             engine.restore_resting(e)?;
         }
@@ -1136,8 +1146,8 @@ mod tests {
     }
 
     fn engine() -> MatchingEngine {
-        let book = DenseBook::new(cfg()).unwrap();
-        MatchingEngine::new(cfg(), book).unwrap()
+        let book = DenseBook::new(cfg().validated().unwrap()).unwrap();
+        MatchingEngine::new(cfg().validated().unwrap(), book).unwrap()
     }
 
     fn order(

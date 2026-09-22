@@ -47,7 +47,11 @@ fn cfg() -> MarketConfig {
 }
 
 fn engine() -> MatchingEngine {
-    MatchingEngine::new(cfg(), DenseBook::new(cfg()).unwrap()).unwrap()
+    MatchingEngine::new(
+        cfg().validated().unwrap(),
+        DenseBook::new(cfg().validated().unwrap()).unwrap(),
+    )
+    .unwrap()
 }
 
 /// A deterministic op in the generated stream.

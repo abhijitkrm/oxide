@@ -55,7 +55,9 @@ pub mod idmap;
 pub mod order;
 pub mod pool;
 
-pub use book::{BookBackend, DenseBook, MAX_RESTING_LIMIT, MarketConfig, PriceLevel};
+pub use book::{
+    BookBackend, DenseBook, MAX_RESTING_LIMIT, MarketConfig, PriceLevel, ValidatedMarketConfig,
+};
 pub use engine::{
     CanceledOrder, FillEvent, MakerCap, MakerRemoval, MatchingEngine, NoCap, ObserveRemovals,
     OrderOutcome, RemovalReason, RestingEntry,

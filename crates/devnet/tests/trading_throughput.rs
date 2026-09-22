@@ -105,8 +105,11 @@ fn run_raw_engine(n_trades: usize) {
     eprintln!("\n--- Raw Matching Engine Throughput ---");
     eprintln!("raw engine: {n_trades} maker sells + {n_trades} taker buys = {n_trades} fills");
 
-    let mut engine = MatchingEngine::new(cfg(), DenseBook::new(cfg()).expect("book creation"))
-        .expect("engine creation");
+    let mut engine = MatchingEngine::new(
+        cfg().validated().unwrap(),
+        DenseBook::new(cfg().validated().unwrap()).expect("book creation"),
+    )
+    .expect("engine creation");
     let maker_addr = primitives::Address([0x09; 20]);
     let taker_addr = primitives::Address([0x01; 20]);
     let mut fills = Vec::with_capacity(64);

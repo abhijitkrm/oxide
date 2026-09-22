@@ -103,7 +103,26 @@ pub struct MarketConfig {
 }
 
 impl MarketConfig {
+    /// Validate configuration self-consistency and return the proof
+    /// wrapper every market constructor requires. This is the only
+    /// way to obtain a [`ValidatedMarketConfig`]: a later path cannot
+    /// build a book or engine on an unchecked config by construction.
+    ///
+    /// # Errors
+    /// [`TradingError::InvalidConfig`] naming the first broken field:
+    /// nonpositive tick/lot, empty or inverted band, band not a whole
+    /// number of ticks, or a level count beyond the dense backend's
+    /// capacity.
+    pub fn validated(self) -> Result<ValidatedMarketConfig, TradingError> {
+        self.validate()?;
+        Ok(ValidatedMarketConfig(self))
+    }
+
     /// Validate configuration self-consistency.
+    ///
+    /// Prefer [`Self::validated`] — it returns the proof type the
+    /// constructors require. This bare check remains for call sites
+    /// that only need to reject a bad config early.
     ///
     /// # Errors
     /// [`TradingError::InvalidConfig`] naming the first broken field:
@@ -144,6 +163,34 @@ impl MarketConfig {
     #[must_use]
     pub fn level_count(&self) -> usize {
         ((self.max_price - self.min_price) / self.tick_size + 1) as usize
+    }
+}
+
+/// A [`MarketConfig`] that has passed [`MarketConfig::validate`] —
+/// the authority token every market constructor requires. The only
+/// way to obtain one is `cfg.validated()`; [`DenseBook::new`] and
+/// `MatchingEngine::new` take it by value so an unchecked config can
+/// never reach an engine, and the one-time check is shared by the
+/// book/engine pair instead of each constructor re-validating.
+///
+/// `Copy` and `Deref` keep validated configs as cheap to pass and
+/// read as the raw struct — `vcfg.tick_size` just works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedMarketConfig(MarketConfig);
+
+impl ValidatedMarketConfig {
+    /// The underlying validated configuration.
+    #[must_use]
+    pub fn config(&self) -> &MarketConfig {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ValidatedMarketConfig {
+    type Target = MarketConfig;
+
+    fn deref(&self) -> &MarketConfig {
+        &self.0
     }
 }
 
@@ -249,16 +296,17 @@ pub struct DenseBook {
 }
 
 impl DenseBook {
-    /// Build an empty ladder from a validated config.
+    /// Build an empty ladder from a validated config — the proof
+    /// type makes the check mandatory rather than a convention.
     ///
     /// # Errors
-    /// [`TradingError::InvalidConfig`] propagated from
-    /// [`MarketConfig::validate`].
-    pub fn new(cfg: MarketConfig) -> Result<Self, TradingError> {
-        cfg.validate()?;
+    /// [`TradingError::InvalidConfig`] is not reachable here —
+    /// validation ran before the `ValidatedMarketConfig` existed.
+    /// `Result` is retained for the backend-construction shape.
+    pub fn new(cfg: ValidatedMarketConfig) -> Result<Self, TradingError> {
         let n = cfg.level_count();
         Ok(DenseBook {
-            cfg,
+            cfg: *cfg,
             levels: vec![PriceLevel::EMPTY; n],
             bids: Bitboard::new(n),
             asks: Bitboard::new(n),
@@ -645,7 +693,7 @@ mod tests {
 
     #[test]
     fn append_then_best_prices_track_extremes() {
-        let mut book = DenseBook::new(cfg()).unwrap();
+        let mut book = DenseBook::new(cfg().validated().unwrap()).unwrap();
         let mut pool = OrderPool::with_capacity(16);
 
         place_at(&mut book, &mut pool, 1, Side::Buy, 1_010_000_000, 5_000);
@@ -662,7 +710,7 @@ mod tests {
 
     #[test]
     fn fifo_order_within_level_is_preserved() {
-        let mut book = DenseBook::new(cfg()).unwrap();
+        let mut book = DenseBook::new(cfg().validated().unwrap()).unwrap();
         let mut pool = OrderPool::with_capacity(16);
 
         let a = place_at(&mut book, &mut pool, 1, Side::Buy, 1_010_000_000, 5_000);
@@ -682,7 +730,7 @@ mod tests {
 
     #[test]
     fn pop_front_removes_in_arrival_order() {
-        let mut book = DenseBook::new(cfg()).unwrap();
+        let mut book = DenseBook::new(cfg().validated().unwrap()).unwrap();
         let mut pool = OrderPool::with_capacity(16);
 
         let a = place_at(&mut book, &mut pool, 1, Side::Sell, 1_020_000_000, 4_000);
@@ -701,7 +749,7 @@ mod tests {
 
     #[test]
     fn unlink_removes_middle_node_o1() {
-        let mut book = DenseBook::new(cfg()).unwrap();
+        let mut book = DenseBook::new(cfg().validated().unwrap()).unwrap();
         let mut pool = OrderPool::with_capacity(16);
 
         let a = place_at(&mut book, &mut pool, 1, Side::Buy, 1_010_000_000, 1_000);
@@ -719,7 +767,7 @@ mod tests {
 
     #[test]
     fn reduce_total_tracks_fills() {
-        let mut book = DenseBook::new(cfg()).unwrap();
+        let mut book = DenseBook::new(cfg().validated().unwrap()).unwrap();
         let mut pool = OrderPool::with_capacity(16);
         place_at(&mut book, &mut pool, 1, Side::Sell, 1_020_000_000, 10_000);
 
@@ -730,7 +778,7 @@ mod tests {
 
     #[test]
     fn level_price_round_trips_index() {
-        let book = DenseBook::new(cfg()).unwrap();
+        let book = DenseBook::new(cfg().validated().unwrap()).unwrap();
         for idx in [0u32, 1, 32, 64] {
             let p = book.level_price(idx);
             assert_eq!(book.level_index(p) as u32, idx);
@@ -739,7 +787,7 @@ mod tests {
 
     #[test]
     fn fillable_qty_sums_opposite_side_within_limit() {
-        let mut book = DenseBook::new(cfg()).unwrap();
+        let mut book = DenseBook::new(cfg().validated().unwrap()).unwrap();
         let mut pool = OrderPool::with_capacity(16);
 
         // Ask ladder: 10.20 (3k), 10.21 (2k), 10.30 (5k).
@@ -779,7 +827,7 @@ mod tests {
     /// check relies on.
     #[test]
     fn sweep_cost_walks_best_first_and_caps_at_qty() {
-        let mut book = DenseBook::new(cfg()).unwrap();
+        let mut book = DenseBook::new(cfg().validated().unwrap()).unwrap();
         let mut pool = OrderPool::with_capacity(16);
 
         // Ask ladder: 10.20 (3k), 10.21 (2k), 10.30 (5k).
@@ -811,7 +859,7 @@ mod tests {
         assert_eq!(cost, 5_045_000_000_000u128);
 
         // Empty-side sweep costs nothing.
-        let empty = DenseBook::new(cfg()).unwrap();
+        let empty = DenseBook::new(cfg().validated().unwrap()).unwrap();
         assert_eq!(empty.sweep_cost(Side::Buy, 1_000, None), 0);
     }
 }

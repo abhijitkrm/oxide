@@ -476,16 +476,21 @@ impl ExchangeModule {
         // u8 market id space: position is 0..=255, fits u8.
         #[allow(clippy::cast_possible_truncation)]
         let id_u8 = id as u8;
-        let book = DenseBook::new(cfg)
+        // Apply-time revalidation: the quorum path already rejected
+        // invalid configs, but the decoded bytes are checked again so
+        // a corrupted store cannot pair an unchecked config with an
+        // engine — the proof type makes the check structural.
+        let vcfg = cfg
+            .validated()
+            .map_err(|e| ExecError::ModuleRejected(format!("market config: {e}")))?;
+        let book = DenseBook::new(vcfg)
             .map_err(|e| ExecError::ModuleRejected(format!("book init: {e}")))?;
-        let engine = MatchingEngine::new(cfg, book)
+        let engine = MatchingEngine::new(vcfg, book)
             .map_err(|e| ExecError::ModuleRejected(format!("engine init: {e}")))?;
         inner.markets[id] = Some(engine);
         // Persist the market config for state-root replay.
         let key = market_config_key(id_u8);
-        self.store
-            .lock()
-            .unwrap()
+        framework::lock_state(&self.store)
             .insert(key, encode_market_config(inner.markets[id].as_ref().unwrap().config()));
         Ok(id_u8)
     }
@@ -508,9 +513,7 @@ impl ExchangeModule {
     /// # Panics
     /// Panics if the inner mutex is poisoned.
     pub fn resting_count(&self, market: u8) -> u32 {
-        self.inner
-            .lock()
-            .unwrap()
+        framework::lock_state(&self.inner)
             .markets
             .get(usize::from(market))
             .and_then(|m| m.as_ref())
@@ -4339,7 +4342,7 @@ mod tests {
     /// assert this equals deposits minus withdrawals — the custody
     /// conservation invariant.
     fn total_base_custody(ex: &ExchangeModule) -> u64 {
-        let inner = ex.inner.lock().unwrap();
+        let inner = framework::lock_state(&ex.inner);
         let free: u64 = inner.base_balances.values().sum();
         let held: u64 = inner.base_holds.values().sum();
         let escrowed: u64 =
@@ -4653,10 +4656,7 @@ mod tests {
         // quote holds remain.
         let ledger_total: u64 = [addr(1), addr(3), addr(9)].iter().map(|a| ledger.balance(a)).sum();
         let custody = total_base_custody(&ex);
-        let buy_escrow: u64 = ex
-            .inner
-            .lock()
-            .unwrap()
+        let buy_escrow: u64 = framework::lock_state(&ex.inner)
             .registered
             .values()
             .filter(|o| o.side == Side::Buy)

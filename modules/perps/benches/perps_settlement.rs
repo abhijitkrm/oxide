@@ -248,8 +248,13 @@ fn perps_liquidation_check(c: &mut Criterion) {
 /// comparison point — the difference between this and
 /// `perps_place_with_margin` is the perps overhead.
 fn raw_perps_engine_place(c: &mut Criterion) {
-    let e =
-        RefCell::new(MatchingEngine::new(base_cfg(), DenseBook::new(base_cfg()).unwrap()).unwrap());
+    let e = RefCell::new(
+        MatchingEngine::new(
+            base_cfg().validated().unwrap(),
+            DenseBook::new(base_cfg().validated().unwrap()).unwrap(),
+        )
+        .unwrap(),
+    );
     let fills = RefCell::new(Vec::with_capacity(64));
     let maker = limit(Side::Sell, 500, 5, 9);
     let taker = limit(Side::Buy, 500, 5, 1);

@@ -2265,13 +2265,13 @@ mod tests {
         }
 
         fn count(&self) -> usize {
-            self.submissions.lock().unwrap().len()
+            primitives::sync::lock_state(&self.submissions).len()
         }
     }
 
     impl TxSubmitter for MockSubmitter {
         fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
-            self.submissions.lock().unwrap().push(tx);
+            primitives::sync::lock_state(&self.submissions).push(tx);
             Ok(())
         }
     }
@@ -2301,14 +2301,14 @@ mod tests {
         /// Inject a finalized outcome for `tx` (as a block executing
         /// it would), and set the post-execution expected nonce.
         fn execute(&self, tx: &TxBytes, outcome: executor::TxOutcome, next_nonce: u64) {
-            self.outcomes.lock().unwrap().insert(Self::hash_of(tx), outcome);
+            primitives::sync::lock_state(&self.outcomes).insert(Self::hash_of(tx), outcome);
             self.nonce.store(next_nonce, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     impl TxConfirmer for MockConfirmer {
         fn tx_outcome(&self, tx_hash: &primitives::Hash) -> Option<executor::TxOutcome> {
-            self.outcomes.lock().unwrap().get(tx_hash).cloned()
+            primitives::sync::lock_state(&self.outcomes).get(tx_hash).cloned()
         }
 
         fn executed_nonce(&self, _sender: &primitives::Address) -> u64 {
@@ -2374,7 +2374,7 @@ mod tests {
 
         // The batch executes — the outcome confirms it and the
         // nonce resyncs to the executor's post-execution value.
-        let tx = counter.submissions.lock().unwrap()[0].clone();
+        let tx = primitives::sync::lock_state(&counter.submissions)[0].clone();
         confirmer.execute(&tx, clean_outcome(1), 1);
         let report = settler.settle_now().expect("confirm");
         assert_eq!(report.confirmed, 1, "executed batch confirms");
@@ -2399,8 +2399,8 @@ mod tests {
 
     impl TxSubmitter for FlakySubmitter {
         fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
-            self.submissions.lock().unwrap().push(tx);
-            let mut remaining = self.fail_remaining.lock().unwrap();
+            primitives::sync::lock_state(&self.submissions).push(tx);
+            let mut remaining = primitives::sync::lock_state(&self.fail_remaining);
             if *remaining > 0 {
                 *remaining -= 1;
                 return Err("mempool full".to_string());
@@ -2443,7 +2443,7 @@ mod tests {
         // First submission fails — the fills must be kept in
         // `pending`, not dropped.
         assert!(settler.settle_now().is_err());
-        assert_eq!(flaky.submissions.lock().unwrap().len(), 1);
+        assert_eq!(primitives::sync::lock_state(&flaky.submissions).len(), 1);
 
         // The retry resubmits the SAME envelope (same nonce — the
         // executor still expects it) and is accepted into the
@@ -2451,7 +2451,7 @@ mod tests {
         let report = settler.settle_now().expect("retry must succeed");
         assert_eq!(report.submitted, 1);
         assert_eq!(report.confirmed, 0);
-        let subs = flaky.submissions.lock().unwrap();
+        let subs = primitives::sync::lock_state(&flaky.submissions);
         assert_eq!(subs.len(), 2, "one original + one retry");
         assert_eq!(
             subs[0].as_bytes(),
@@ -2473,7 +2473,7 @@ mod tests {
         server_refill(&shared);
         let report = settler.settle_now().expect("second batch");
         assert_eq!(report.submitted, 1);
-        let subs = flaky.submissions.lock().unwrap();
+        let subs = primitives::sync::lock_state(&flaky.submissions);
         assert_eq!(subs.len(), 3);
         assert_ne!(subs[1].as_bytes(), subs[2].as_bytes(), "the next batch carries the next nonce");
     }
@@ -2529,7 +2529,7 @@ mod tests {
         // One more call: pending is still there, so the SAME envelope
         // is retried (not a new batch). The nonce is NOT advanced.
         assert!(settler.settle_now().is_err());
-        let subs = flaky.submissions.lock().unwrap();
+        let subs = primitives::sync::lock_state(&flaky.submissions);
         // All submissions carry the same nonce (the same envelope
         // is retried, never dropped).
         let first_nonce = &subs[0].as_bytes()[20..28];
@@ -2565,7 +2565,7 @@ mod tests {
 
         let report = settler.settle_now().expect("submit");
         assert_eq!(report.submitted, 1);
-        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        let tx = primitives::sync::lock_state(&submitter.submissions)[0].clone();
         assert_eq!(envelope_nonce(&tx), 0);
 
         // The block executes but the tx is gate-skipped — e.g. an
@@ -2585,7 +2585,7 @@ mod tests {
         server_refill(&shared);
         let report = settler.settle_now().expect("next batch");
         assert_eq!(report.submitted, 1);
-        let subs = submitter.submissions.lock().unwrap();
+        let subs = primitives::sync::lock_state(&submitter.submissions);
         assert_eq!(envelope_nonce(&subs[1]), 0, "dead-lettered batch must not burn a nonce");
     }
 
@@ -2599,7 +2599,7 @@ mod tests {
         let (settler, submitter, confirmer) = settler_harness(&shared);
 
         settler.settle_now().expect("submit");
-        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        let tx = primitives::sync::lock_state(&submitter.submissions)[0].clone();
         confirmer.execute(
             &tx,
             executor::TxOutcome::Executed {
@@ -2615,7 +2615,7 @@ mod tests {
         // The nonce WAS consumed — the next batch carries nonce 1.
         server_refill(&shared);
         settler.settle_now().expect("next batch");
-        let subs = submitter.submissions.lock().unwrap();
+        let subs = primitives::sync::lock_state(&submitter.submissions);
         assert_eq!(envelope_nonce(&subs[1]), 1, "executed batch consumed its nonce");
     }
 
@@ -2628,7 +2628,7 @@ mod tests {
         let (settler, submitter, confirmer) = settler_harness(&shared);
 
         settler.settle_now().expect("submit");
-        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        let tx = primitives::sync::lock_state(&submitter.submissions)[0].clone();
         confirmer.execute(
             &tx,
             executor::TxOutcome::Executed {
@@ -2655,7 +2655,7 @@ mod tests {
         let (settler, submitter, confirmer) = settler_harness(&shared);
 
         settler.settle_now().expect("submit");
-        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        let tx = primitives::sync::lock_state(&submitter.submissions)[0].clone();
         confirmer.execute(
             &tx,
             executor::TxOutcome::Skipped { reason: executor::TxSkipReason::GasLimit },
@@ -2684,7 +2684,7 @@ mod tests {
         let settler = settler.with_outbox(dir.clone());
 
         settler.settle_now().expect("submit");
-        let tx = submitter.submissions.lock().unwrap()[0].clone();
+        let tx = primitives::sync::lock_state(&submitter.submissions)[0].clone();
         drop(settler); // simulate a restart: in-memory state is gone
 
         // Rebuild with the same outbox — the pending batch resumes.
@@ -2720,7 +2720,7 @@ mod tests {
         let settler = settler.with_signing(privkey, 777);
 
         settler.settle_now().expect("submit signed");
-        let subs = submitter.submissions.lock().unwrap();
+        let subs = primitives::sync::lock_state(&submitter.submissions);
         let env = subs[0].as_bytes();
         // v1 layout: sender(20) nonce(8) fee(8) module|0x80 sig(65) payload.
         assert_eq!(env[36] & 0x80, 0x80, "signed flag on the module byte");

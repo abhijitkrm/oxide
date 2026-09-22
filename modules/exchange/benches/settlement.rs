@@ -258,7 +258,13 @@ fn settlement_sweep_10_levels(c: &mut Criterion) {
 /// Uses `RefCell` so the engine outlives the setup closure (same
 /// pattern as `crates/trading/benches/matching.rs`).
 fn raw_engine_single_fill(c: &mut Criterion) {
-    let e = RefCell::new(MatchingEngine::new(cfg(), DenseBook::new(cfg()).unwrap()).unwrap());
+    let e = RefCell::new(
+        MatchingEngine::new(
+            cfg().validated().unwrap(),
+            DenseBook::new(cfg().validated().unwrap()).unwrap(),
+        )
+        .unwrap(),
+    );
     let fills = RefCell::new(Vec::with_capacity(64));
     let maker = limit(Side::Sell, 500, 5, 9);
     let taker = limit(Side::Buy, 500, 5, 1);

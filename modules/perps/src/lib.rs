@@ -775,9 +775,13 @@ impl PerpsModule {
             })?;
         #[allow(clippy::cast_possible_truncation)]
         let id_u8 = id as u8;
-        let book = DenseBook::new(cfg.base)
+        let vbase = cfg
+            .base
+            .validated()
+            .map_err(|e| ExecError::ModuleRejected(format!("market config: {e}")))?;
+        let book = DenseBook::new(vbase)
             .map_err(|e| ExecError::ModuleRejected(format!("book init: {e}")))?;
-        let engine = MatchingEngine::new(cfg.base, book)
+        let engine = MatchingEngine::new(vbase, book)
             .map_err(|e| ExecError::ModuleRejected(format!("engine init: {e}")))?;
         inner.markets[id] = Some(engine);
         inner.configs.insert(id_u8, cfg);
@@ -5418,19 +5422,19 @@ mod tests {
         // Block 1: first 32 accounts checked.
         perps.end_block(Height::new(1));
         assert_eq!(
-            perps.inner.lock().unwrap().liquidation_cursor,
+            framework::lock_state(&perps.inner).liquidation_cursor,
             Some(addr(32)),
             "cursor lands on the last checked account"
         );
         // Block 2: the 33rd.
         perps.end_block(Height::new(2));
-        assert_eq!(perps.inner.lock().unwrap().liquidation_cursor, Some(addr(33)));
+        assert_eq!(framework::lock_state(&perps.inner).liquidation_cursor, Some(addr(33)));
         // Block 3: past the end — wrap to restart coverage.
         perps.end_block(Height::new(3));
-        assert_eq!(perps.inner.lock().unwrap().liquidation_cursor, None);
+        assert_eq!(framework::lock_state(&perps.inner).liquidation_cursor, None);
         // Block 4: coverage restarts from the first account.
         perps.end_block(Height::new(4));
-        assert_eq!(perps.inner.lock().unwrap().liquidation_cursor, Some(addr(32)));
+        assert_eq!(framework::lock_state(&perps.inner).liquidation_cursor, Some(addr(32)));
     }
 
     /// The funding-rate bound: ±500 bps applies, ±501 and `i64::MIN`
