@@ -204,18 +204,18 @@ impl<S: Read + Write + Send> Clone for SharedStream<S> {
 #[cfg(feature = "tls")]
 impl<S: Read + Write + Send> Read for SharedStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).read(buf)
+        primitives::sync::lock_state(&self.inner).read(buf)
     }
 }
 
 #[cfg(feature = "tls")]
 impl<S: Read + Write + Send> Write for SharedStream<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).write(buf)
+        primitives::sync::lock_state(&self.inner).write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).flush()
+        primitives::sync::lock_state(&self.inner).flush()
     }
 }
 
@@ -226,12 +226,12 @@ impl<S: Read + Write + Send> PeerStream for SharedStream<S> {
         state: &mut FrameReader,
         max_message_bytes: u64,
     ) -> io::Result<Option<Vec<u8>>> {
-        let mut stream = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stream = primitives::sync::lock_state(&self.inner);
         state.poll(&mut *stream, max_message_bytes)
     }
 
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut stream = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stream = primitives::sync::lock_state(&self.inner);
         write_frame(&mut *stream, bytes)
     }
 
@@ -240,7 +240,7 @@ impl<S: Read + Write + Send> PeerStream for SharedStream<S> {
         // the per-frame path took the lock and flushed per frame,
         // which also let a competing writer interleave frames
         // mid-batch.
-        let mut stream = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stream = primitives::sync::lock_state(&self.inner);
         write_frames(&mut *stream, frames)
     }
 }
@@ -763,16 +763,11 @@ impl TcpTransport {
                             // new connection. The old reader thread
                             // will exit when the read timeout expires
                             // or the peer closes the connection.
-                            let _ = accept_shutdown_streams
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            let _ = primitives::sync::lock_state(&accept_shutdown_streams)
                                 .insert(peer_id.clone(), shutdown_stream);
                         }
                         let slot = spawn_writer(write_stream, &accept_shutdown);
-                        accept_streams
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(peer_id.clone(), slot);
+                        primitives::sync::lock_state(&accept_streams).insert(peer_id.clone(), slot);
                         // Spawn a reader thread for this connection.
                         let tx = accept_tx.clone();
                         let queued = accept_queued.clone();
@@ -893,15 +888,11 @@ impl TcpTransport {
                                 // channel sender for outbound sends.
                                 // Duplicate handling: see accept path.
                                 if let Some(shutdown_stream) = shutdown_stream {
-                                    let _ = css
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    let _ = primitives::sync::lock_state(&css)
                                         .insert(pid.clone(), shutdown_stream);
                                 }
                                 let slot = spawn_writer(write_stream, &rshut);
-                                cs.lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .insert(pid.clone(), slot);
+                                primitives::sync::lock_state(&cs).insert(pid.clone(), slot);
                                 // Reader loop for this connection.
                                 reader_loop(
                                     reader_stream,
@@ -921,12 +912,8 @@ impl TcpTransport {
                                 if let Some(ref ac) = cac {
                                     ac.release_connection();
                                 }
-                                cs.lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .remove(&pid);
-                                css.lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .remove(&pid);
+                                primitives::sync::lock_state(&cs).remove(&pid);
+                                primitives::sync::lock_state(&css).remove(&pid);
                                 thread::sleep(Duration::from_millis(500));
                                 continue;
                             }
@@ -953,15 +940,11 @@ impl TcpTransport {
                         // channel sender for outbound sends.
                         // Duplicate handling: see accept path.
                         if let Some(shutdown_stream) = shutdown_stream {
-                            let _ = css
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            let _ = primitives::sync::lock_state(&css)
                                 .insert(pid.clone(), shutdown_stream);
                         }
                         let slot = spawn_writer(write_stream, &rshut);
-                        cs.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(pid.clone(), slot);
+                        primitives::sync::lock_state(&cs).insert(pid.clone(), slot);
                         // Reader loop for this connection.
                         reader_loop(
                             reader_stream,
@@ -981,8 +964,8 @@ impl TcpTransport {
                         if let Some(ref ac) = cac {
                             ac.release_connection();
                         }
-                        cs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pid);
-                        css.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pid);
+                        primitives::sync::lock_state(&cs).remove(&pid);
+                        primitives::sync::lock_state(&css).remove(&pid);
                         thread::sleep(Duration::from_millis(500));
                     }
                 });
@@ -1031,8 +1014,7 @@ impl TcpTransport {
         // to get an immediate error on their next `read` call (instead
         // of waiting up to `read_timeout` seconds), and writer threads
         // to get an immediate error on their next `write` call.
-        let streams =
-            self.shutdown_streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let streams = primitives::sync::lock_state(&self.shutdown_streams);
         for stream in streams.values() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
@@ -1047,7 +1029,7 @@ impl TcpTransport {
         }
         // Drop all writer senders — this causes writer threads to exit
         // on their next `recv_timeout` (within 100ms).
-        self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        primitives::sync::lock_state(&self.streams).clear();
     }
 
     /// Returns `true` if the transport has been shut down.
@@ -1071,12 +1053,7 @@ impl TcpTransport {
     /// address is not a valid `SocketAddr`.
     pub fn add_peer(&self, peer_id: PeerId, addr: TcpAddr) {
         // Check if already connected.
-        if self
-            .streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&peer_id)
-        {
+        if primitives::sync::lock_state(&self.streams).contains_key(&peer_id) {
             return;
         }
         if self.shutdown.load(Ordering::Relaxed) {
@@ -1193,14 +1170,11 @@ fn install_connected_peer(
 ) {
     // Duplicate handling: see accept path.
     if let Some(shutdown_stream) = shutdown_stream {
-        let _ = ctx
-            .shutdown_streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let _ = primitives::sync::lock_state(&ctx.shutdown_streams)
             .insert(pid.clone(), shutdown_stream);
     }
     let slot = spawn_writer(write_stream, &ctx.shutdown);
-    ctx.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(pid.clone(), slot);
+    primitives::sync::lock_state(&ctx.streams).insert(pid.clone(), slot);
     reader_loop(
         reader_stream,
         pid,
@@ -1220,7 +1194,7 @@ impl Transport for TcpTransport {
         // Look up the per-peer send channel and send bytes into it.
         // The lock is held only for the lookup, not during I/O —
         // the writer thread handles the actual write asynchronously.
-        let streams = self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let streams = primitives::sync::lock_state(&self.streams);
         let Some(slot) = streams.get(peer) else {
             return Err(TransportError::UnknownPeer);
         };
@@ -1266,12 +1240,7 @@ impl Transport for TcpTransport {
             return None;
         }
         loop {
-            let msg = match self
-                .inbound_rx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .try_recv()
-            {
+            let msg = match primitives::sync::lock_state(&self.inbound_rx).try_recv() {
                 Ok(msg) => msg,
                 Err(
                     std::sync::mpsc::TryRecvError::Empty
@@ -2568,10 +2537,7 @@ mod tests {
             while !self.release.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(2));
             }
-            self.written
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(bytes.to_vec());
+            primitives::sync::lock_state(&self.written).push(bytes.to_vec());
             Ok(())
         }
     }

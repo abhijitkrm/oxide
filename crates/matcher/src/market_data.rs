@@ -204,7 +204,7 @@ impl MarketDataPublisher {
     pub fn subscribe(&self, feeds: Vec<FeedType>, markets: Vec<u8>) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel(SUB_QUEUE_DEPTH);
         let sub = Subscription { feeds, markets, tx };
-        self.subscribers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(sub);
+        primitives::sync::lock_state(&self.subscribers).push(sub);
         rx
     }
 
@@ -253,7 +253,7 @@ impl MarketDataPublisher {
     /// market. Serializes once, sends the same string to all.
     fn broadcast<T: Serialize>(&self, market: u8, feed: FeedType, msg: &T) {
         let json = serde_json::to_string(msg).unwrap_or_default();
-        let mut subs = self.subscribers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut subs = primitives::sync::lock_state(&self.subscribers);
         let mut evict = 0usize;
         // `retain` walks the list once; `true` keeps the slot. The
         // eviction count doubles as an index-shift-free way to count
@@ -298,7 +298,7 @@ impl MarketDataPublisher {
     /// Get the current subscriber count (for monitoring).
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
-        self.subscribers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        primitives::sync::lock_state(&self.subscribers).len()
     }
 }
 

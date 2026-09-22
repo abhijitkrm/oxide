@@ -393,9 +393,7 @@ impl SubscriptionManager {
         sink: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> String {
         let id = format!("0x{:x}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        primitives::sync::lock_state(&self.active)
             .insert(id.clone(), ActiveSubscription { conn_id, kind, filter, sink });
         id
     }
@@ -403,21 +401,18 @@ impl SubscriptionManager {
     /// Cancel a subscription by ID. Returns `true` if it existed
     /// (geth returns `false` — not an error — for unknown IDs).
     fn unregister(&self, id: &str) -> bool {
-        self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id).is_some()
+        primitives::sync::lock_state(&self.active).remove(id).is_some()
     }
 
     /// Remove every subscription owned by a closed connection.
     fn drop_connection(&self, conn_id: u64) {
-        self.active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|_, sub| sub.conn_id != conn_id);
+        primitives::sync::lock_state(&self.active).retain(|_, sub| sub.conn_id != conn_id);
     }
 
     /// Cheap gate so the per-block publish path exits without
     /// touching the EVM history lock when nobody is subscribed.
     fn has_subscriptions(&self) -> bool {
-        !self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+        !primitives::sync::lock_state(&self.active).is_empty()
     }
 
     /// Fan out a finalized block to all subscribers: the header to
@@ -455,7 +450,7 @@ impl SubscriptionManager {
     fn for_each_sub(&self, mut f: impl FnMut(&ActiveSubscription, &mut dyn FnMut(Value))) {
         let mut dead = Vec::new();
         {
-            let active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let active = primitives::sync::lock_state(&self.active);
             for (id, sub) in active.iter() {
                 let mut failed = false;
                 let mut send = |result: Value| {
@@ -484,7 +479,7 @@ impl SubscriptionManager {
             }
         }
         if !dead.is_empty() {
-            let mut active = self.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut active = primitives::sync::lock_state(&self.active);
             for id in dead {
                 active.remove(&id);
             }
@@ -745,8 +740,7 @@ impl RpcServer {
         &self,
         refresh: bool,
     ) -> Result<std::sync::MutexGuard<'_, Option<CachedSnapshot>>, String> {
-        let mut guard =
-            self.snapshot_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = primitives::sync::lock_state(&self.snapshot_cache);
         if refresh || guard.is_none() {
             let provider = self
                 .snapshot_provider
@@ -1383,7 +1377,7 @@ impl RpcServer {
     /// `-32000 "filter limit reached"` once [`MAX_FILTERS`] live
     /// filters are registered — the `filter-cap` guard.
     fn register_filter(&self, kind: FilterKind) -> Result<String, RpcError> {
-        let mut filters = self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut filters = primitives::sync::lock_state(&self.filters);
         let now = std::time::Instant::now();
         filters.retain(|_, e| now.duration_since(e.last_poll) < FILTER_TIMEOUT);
         if filters.len() >= MAX_FILTERS {
@@ -1426,8 +1420,7 @@ impl RpcServer {
     /// poll.
     ///
     fn eth_new_pending_transaction_filter(&self) -> Result<Value, RpcError> {
-        let next_seq =
-            self.pending_txs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next_seq;
+        let next_seq = primitives::sync::lock_state(&self.pending_txs).next_seq;
         Ok(json!(self.register_filter(FilterKind::PendingTx { next_seq })?))
     }
 
@@ -1435,12 +1428,7 @@ impl RpcServer {
     /// `true` if it existed (geth returns `false` for unknown IDs).
     fn eth_uninstall_filter(&self, params: &[Value]) -> Result<Value, RpcError> {
         let id = parse_filter_id(params.first())?;
-        let removed = self
-            .filters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id)
-            .is_some();
+        let removed = primitives::sync::lock_state(&self.filters).remove(&id).is_some();
         Ok(json!(removed))
     }
 
@@ -1687,7 +1675,7 @@ impl RpcServer {
     /// Expired or unknown IDs produce geth's `filter not found`
     /// error (-32000).
     fn take_filter(&self, id: &str) -> Result<FilterEntry, RpcError> {
-        let mut filters = self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut filters = primitives::sync::lock_state(&self.filters);
         let not_found =
             || RpcError { code: -32_000, message: "filter not found".to_string(), data: None };
         let entry = filters.get_mut(id).ok_or_else(not_found)?;
@@ -1740,10 +1728,7 @@ impl RpcServer {
                             ),
                             data: None,
                         });
-                        self.filters
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(id.clone(), entry);
+                        primitives::sync::lock_state(&self.filters).insert(id.clone(), entry);
                         return result;
                     }
                     matches.iter().map(log_json).collect()
@@ -1768,8 +1753,7 @@ impl RpcServer {
                 Value::Array(hashes)
             }
             FilterKind::PendingTx { next_seq } => {
-                let ring =
-                    self.pending_txs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ring = primitives::sync::lock_state(&self.pending_txs);
                 let hashes: Vec<Value> = ring
                     .entries
                     .iter()
@@ -1781,7 +1765,7 @@ impl RpcServer {
                 Value::Array(hashes)
             }
         };
-        self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, entry);
+        primitives::sync::lock_state(&self.filters).insert(id, entry);
         Ok(result)
     }
 
@@ -1797,10 +1781,7 @@ impl RpcServer {
         let FilterKind::Log { filter, .. } = &entry.kind else {
             // Re-insert before erroring so a block/pending filter
             // survives an erroneous `getFilterLogs` call.
-            self.filters
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(id, entry);
+            primitives::sync::lock_state(&self.filters).insert(id, entry);
             return Err(not_found());
         };
         let evm = self.require_evm()?;
@@ -1816,7 +1797,7 @@ impl RpcServer {
         } else {
             Ok(Value::Array(matches.iter().map(log_json).collect()))
         };
-        self.filters.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, entry);
+        primitives::sync::lock_state(&self.filters).insert(id, entry);
         result
     }
 
@@ -1826,8 +1807,7 @@ impl RpcServer {
     /// not the envelope hash.
     pub fn record_pending_tx(&self, hash: B256) {
         {
-            let mut ring =
-                self.pending_txs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut ring = primitives::sync::lock_state(&self.pending_txs);
             if ring.entries.len() >= PENDING_RING_CAP {
                 ring.entries.pop_front();
             }
@@ -3823,25 +3803,20 @@ mod tests {
         }
 
         fn count(&self) -> usize {
-            self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+            primitives::sync::lock_state(&self.submissions).len()
         }
 
         fn last(&self) -> TxBytes {
-            self.submissions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .last()
-                .cloned()
-                .unwrap_or_default()
+            primitives::sync::lock_state(&self.submissions).last().cloned().unwrap_or_default()
         }
     }
 
     impl TxSubmitter for MockSubmitter {
         fn submit_tx(&self, tx: TxBytes) -> Result<(), String> {
-            if *self.reject_next.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            if *primitives::sync::lock_state(&self.reject_next) {
                 return Err("mock rejection".to_string());
             }
-            self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(tx);
+            primitives::sync::lock_state(&self.submissions).push(tx);
             Ok(())
         }
     }
@@ -3946,7 +3921,7 @@ mod tests {
 
         let mut s = make_server();
         let submitter = Arc::new(MockSubmitter::new());
-        *submitter.reject_next.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        *primitives::sync::lock_state(&submitter.reject_next) = true;
         s.set_tx_submitter(submitter.clone());
 
         let privkey = [0x02u8; 32];
@@ -4753,7 +4728,7 @@ mod tests {
         assert!(s.handle(&req).error.is_some());
 
         // Submitter rejection surfaces as -32003 (transaction rejected).
-        *submitter.reject_next.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        *primitives::sync::lock_state(&submitter.reject_next) = true;
         let req = make_request("oxide_sendRawTransaction", vec![json!("0xdeadbeef")], json!(3));
         let resp = s.handle(&req);
         assert!(resp.error.is_some(), "rejection must surface as error");

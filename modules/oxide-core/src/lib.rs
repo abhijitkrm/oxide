@@ -41,7 +41,7 @@ impl CoreModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn current_height(&self) -> u64 {
-        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *framework::lock_state(&self.current_height)
     }
 
     /// The current epoch.
@@ -50,7 +50,7 @@ impl CoreModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn current_epoch(&self) -> u64 {
-        *self.current_epoch.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *framework::lock_state(&self.current_epoch)
     }
 
     /// Write the module's committed state into `w` — shared by
@@ -59,8 +59,8 @@ impl CoreModule {
     /// hashes.
     fn write_committed(&self, w: &mut framework::CanonicalState) {
         w.put_root(&subtree_root(&self.store));
-        w.put_u64(*self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-        w.put_u64(*self.current_epoch.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        w.put_u64(*framework::lock_state(&self.current_height));
+        w.put_u64(*framework::lock_state(&self.current_epoch));
     }
 
     /// Decode the canonical fields following the leading store root —
@@ -89,7 +89,7 @@ impl Module for CoreModule {
 
     fn begin_block(&self, height: Height) {
         // Record the block height in the store.
-        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = framework::lock_state(&self.store);
         store.insert(b"height".to_vec(), height.value().to_le_bytes().to_vec());
     }
 
@@ -99,8 +99,7 @@ impl Module for CoreModule {
     }
 
     fn end_block(&self, height: Height) -> Vec<Event> {
-        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            height.value();
+        *framework::lock_state(&self.current_height) = height.value();
         Vec::new()
     }
 
@@ -144,9 +143,9 @@ impl Module for CoreModule {
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let (_canon, (height, epoch), store) =
             framework::stage_blob_snapshot(snapshot, |r, _store| Self::decode_committed(r))?;
-        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
-        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = height;
-        *self.current_epoch.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = epoch;
+        *framework::lock_state(&self.store) = store;
+        *framework::lock_state(&self.current_height) = height;
+        *framework::lock_state(&self.current_epoch) = epoch;
         Ok(())
     }
 }

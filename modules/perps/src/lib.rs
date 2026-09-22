@@ -768,7 +768,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn list_market(&self, cfg: PerpsMarketConfig) -> Result<u8, ExecError> {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         let id =
             inner.markets.iter().position(Option::is_none).ok_or_else(|| {
                 ExecError::ModuleRejected("all 256 market slots taken".to_string())
@@ -791,10 +791,7 @@ impl PerpsModule {
         inner.mark_updated_at.insert(id_u8, h);
         // Persist config for state-root replay.
         let key = market_config_key(id_u8);
-        self.store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, encode_perps_config(&cfg));
+        framework::lock_state(&self.store).insert(key, encode_perps_config(&cfg));
         Ok(id_u8)
     }
 
@@ -804,12 +801,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn mark_price(&self, market: u8) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .marks
-            .get(&market)
-            .copied()
+        framework::lock_state(&self.inner).marks.get(&market).copied()
     }
 
     /// Set the mark price for a market (oracle/governance path).
@@ -833,7 +825,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn set_mark_price(&self, market: u8, mark: u64) -> Result<(), ExecError> {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         if !inner.configs.contains_key(&market) {
             return Err(ExecError::ModuleRejected("market does not exist".to_string()));
         }
@@ -882,7 +874,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn set_mark_price_unchecked(&self, market: u8, mark: u64) -> Result<(), ExecError> {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         if !inner.configs.contains_key(&market) {
             return Err(ExecError::ModuleRejected("market does not exist".to_string()));
         }
@@ -906,7 +898,7 @@ impl PerpsModule {
     /// Panics if the inner mutex is poisoned.
     #[must_use]
     pub fn mark_is_stale(&self, market: u8) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
         match inner.mark_updated_at.get(&market) {
             // No accepted update on record — an untracked mark
             // cannot be proven fresh, so fail closed. (Snapshot
@@ -926,7 +918,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn position(&self, account: &Address, market: u8) -> Position {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
         inner
             .accounts
             .get(account)
@@ -941,7 +933,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn cross_margin(&self, account: &Address) -> u64 {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
         inner.accounts.get(account).map_or(0, |a| a.cross_margin)
     }
 
@@ -951,7 +943,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn insurance_fund(&self) -> u64 {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insurance_fund
+        framework::lock_state(&self.inner).insurance_fund
     }
 
     /// Unpaid-loss liability the margin→insurance→ADL cascade could
@@ -961,7 +953,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn unfunded_bad_debt(&self) -> u64 {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).unfunded_bad_debt
+        framework::lock_state(&self.inner).unfunded_bad_debt
     }
 
     /// Get or create an account state entry.
@@ -984,7 +976,7 @@ impl PerpsModule {
     ///
     /// Panics if the inner mutex is poisoned.
     pub fn apply_funding(&self, market: u8, rate_i64: i64) -> Result<Vec<Event>, ExecError> {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         let mark = *inner
             .marks
             .get(&market)
@@ -1159,7 +1151,7 @@ impl PerpsModule {
         if account == &CLEARING_ACCOUNT {
             return Ok(vec![]);
         }
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
 
         // Phase 1 — read-only solvency check: the old code cloned
         // `marks`, `configs`, and the whole account (every position)
@@ -1624,7 +1616,7 @@ impl PerpsModule {
     /// hashes.
     fn write_committed(&self, w: &mut framework::CanonicalState) {
         w.put_root(&subtree_root(&self.store));
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
         // Live books: market config + order-id sequence + every
         // resting order (canonical order inside the engine encoding).
         let mut entries = Vec::new();
@@ -1697,7 +1689,7 @@ impl PerpsModule {
         // mark ages + the liquidation-sweep cursor. Both are
         // consensus-visible state — staleness decisions and the
         // sweep window must agree across nodes.
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
         w.put_count(inner.mark_updated_at.len());
         for (market, updated) in &inner.mark_updated_at {
             w.put_u8(*market);
@@ -2164,7 +2156,7 @@ impl Module for PerpsModule {
         // M4 fix: reset the per-block oracle update counter at the
         // start of each block. Each market gets a fresh budget of
         // [`MAX_ORACLE_UPDATES_PER_BLOCK`] updates per block.
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         inner.oracle_updates_this_block.clear();
         // The executing height drives mark-staleness decisions
         // (`mark_is_stale`) for every tx this block.
@@ -2179,7 +2171,7 @@ impl Module for PerpsModule {
         let tag = msg[0];
         let body = &msg[1..];
 
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
 
         match tag {
             TAG_PLACE => {
@@ -2300,7 +2292,7 @@ impl Module for PerpsModule {
         let mut events = Vec::new();
         if height.value().is_multiple_of(FUNDING_PERIOD_BLOCKS) {
             let due: Vec<(u8, i64)> = {
-                let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let inner = framework::lock_state(&self.inner);
                 inner.pending_funding.iter().map(|(m, r)| (*m, *r)).collect()
             };
             if !due.is_empty() {
@@ -2314,11 +2306,7 @@ impl Module for PerpsModule {
                         }),
                     }
                 }
-                self.inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pending_funding
-                    .clear();
+                framework::lock_state(&self.inner).pending_funding.clear();
             }
         }
 
@@ -2326,7 +2314,7 @@ impl Module for PerpsModule {
         // `liquidation_check` takes the same mutex internally, so
         // the address list must be materialized first.
         let batch: Vec<Address> = {
-            let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inner = framework::lock_state(&self.inner);
             match inner.liquidation_cursor {
                 Some(cursor) => inner
                     .accounts
@@ -2347,7 +2335,7 @@ impl Module for PerpsModule {
                 events.extend(ev);
             }
         }
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         // Exit path for the backstop: sell this block's seized
         // inventory (and anything carried over) into the book at
         // mark before advancing the cursor.
@@ -2397,8 +2385,7 @@ impl Module for PerpsModule {
     /// internal invariants enforced, then hash the canonical
     /// preimage.
     fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
-        let slots =
-            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
+        let slots = framework::lock_state(&self.inner).markets.len();
         let (canon, _staged, _store) = framework::stage_blob_snapshot(snapshot, |r, store| {
             Self::decode_committed(r, store, slots)
         })?;
@@ -2409,12 +2396,11 @@ impl Module for PerpsModule {
     /// the same staged decode runs again, then the fields swap in
     /// atomically (decode first, mutate second).
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
-        let slots =
-            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
+        let slots = framework::lock_state(&self.inner).markets.len();
         let (_canon, staged, store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
-        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *framework::lock_state(&self.store) = store;
+        let mut inner = framework::lock_state(&self.inner);
         inner.markets = staged.markets;
         inner.configs = staged.configs;
         inner.marks = staged.marks;
@@ -2513,13 +2499,7 @@ impl PerpsModule {
         // Same pre-endorsement existence check as `TAG_SET_MARK` —
         // the bounded pending set must never carry an action that
         // cannot apply.
-        if !self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .marks
-            .contains_key(&market)
-        {
+        if !framework::lock_state(&self.inner).marks.contains_key(&market) {
             return Err(ExecError::ModuleRejected("market does not exist".to_string()));
         }
         // Same quorum gate as `TAG_SET_MARK` — an unauthenticated
@@ -2552,11 +2532,7 @@ impl PerpsModule {
                 // before the boundary replaces it — the committee
                 // can correct a fat-fingered rate inside the same
                 // period.
-                self.inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pending_funding
-                    .insert(market, rate);
+                framework::lock_state(&self.inner).pending_funding.insert(market, rate);
                 Ok(vec![Event { module: "perps", kind: "funding_scheduled", data: vec![market] }])
             }
         }
@@ -2569,7 +2545,7 @@ impl PerpsModule {
         order.owner = ctx.sender;
         let reduce_only = flags & FLAG_REDUCE_ONLY != 0;
 
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
 
         // ── Initial-margin gate (plan.md §9.3, C7) ──
         // An order must leave `equity >= total initial margin` after
@@ -2773,7 +2749,7 @@ impl PerpsModule {
     /// Handle a cancel-order message (extracted from `handle`).
     fn handle_cancel(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (market, order_id) = Self::parse_cancel(body).ok_or(ExecError::Malformed)?;
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         let Inner { markets, .. } = &mut *inner;
         let Some(engine) = markets[usize::from(market)].as_mut() else {
             return Err(ExecError::ModuleRejected(format!("market {market} does not exist")));
@@ -2822,7 +2798,7 @@ impl PerpsModule {
     /// margin than was deposited (silent value destruction).
     fn handle_deposit(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (market, amount) = Self::parse_margin(body).ok_or(ExecError::Malformed)?;
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         let acct = Self::account_mut(&mut inner, &ctx.sender);
         let balance = if market == CROSS_MARGIN_MARKET {
             &mut acct.cross_margin
@@ -2854,7 +2830,7 @@ impl PerpsModule {
     /// margin when the ledger credit failed.
     fn handle_withdraw(&self, ctx: &TxContext, body: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (market, amount) = Self::parse_margin(body).ok_or(ExecError::Malformed)?;
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
 
         // ── Solvency gate (C7): the check is required-margin-AFTER,
         // not stored-balance-before. The old code let an account
@@ -3789,7 +3765,7 @@ mod tests {
         // events at quorum.
         perps.handle(&ctx(3), &msg::deposit(CROSS_MARGIN_MARKET, 500_000)).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(3));
             acct.positions.insert(
                 mid,
@@ -3826,7 +3802,7 @@ mod tests {
         let mid = perps.list_market(test_cfg()).unwrap();
         perps.handle(&ctx(3), &msg::deposit(CROSS_MARGIN_MARKET, 500_000)).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(3));
             acct.positions.insert(
                 mid,
@@ -3869,12 +3845,7 @@ mod tests {
             "over-bound rate must not be recorded"
         );
         assert!(
-            perps
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_funding
-                .is_empty(),
+            framework::lock_state(&perps.inner).pending_funding.is_empty(),
             "the rejected rate must not sit in pending_funding"
         );
     }
@@ -3958,7 +3929,7 @@ mod tests {
         // Manually set positions: long 1_000_000 @ 1.5B, short -1_000_000 @ 1.5B.
         // (1_000_000 qty units = 1 base unit in scale-6.)
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct1 = PerpsModule::account_mut(&mut inner, &addr(1));
             acct1.positions.insert(
                 mid,
@@ -3992,7 +3963,7 @@ mod tests {
         // Deposit small margin and open a position.
         perps.handle(&ctx(1), &msg::deposit(mid, 100_000)).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(1));
             acct.positions.insert(
                 mid,
@@ -4013,7 +3984,7 @@ mod tests {
 
         // Now set a much larger position (100_000 qty = 0.1 base units).
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(1));
             acct.positions.insert(
                 mid,
@@ -4171,8 +4142,7 @@ mod tests {
         let perps = PerpsModule::new();
         perps.list_market(test_cfg()).unwrap();
         let root0 = perps.state_root();
-        perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insurance_fund =
-            1_000;
+        framework::lock_state(&perps.inner).insurance_fund = 1_000;
         let root1 = perps.state_root();
         assert_ne!(root0, root1, "the insurance fund must be committed");
     }
@@ -4199,7 +4169,7 @@ mod tests {
         let mid = perps.list_market(test_cfg()).unwrap();
         let acct_addr = addr(1);
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &acct_addr);
             acct.positions
                 .insert(mid, Position { size, entry_price: entry, isolated_margin: margin });
@@ -4308,7 +4278,7 @@ mod tests {
             let (perps, mid, acct) = setup_with_position(margin, size, 1_500_000_000);
             // Set the insurance fund to a known initial value.
             {
-                let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut inner = framework::lock_state(&perps.inner);
                 inner.insurance_fund = initial_fund;
             }
             perps.set_mark_price_unchecked(mid, mark).unwrap();
@@ -4340,7 +4310,7 @@ mod tests {
         // Long at 1.5B, mark drops to 1.0B → loses money.
         perps.handle(&ctx(1), &msg::deposit(mid, 100_000)).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(1));
             acct.positions.insert(
                 mid,
@@ -4352,7 +4322,7 @@ mod tests {
         // Short at 1.5B, mark drops to 1.0B → profits.
         perps.handle(&ctx(2), &msg::deposit(mid, 100_000)).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(2));
             acct.positions.insert(
                 mid,
@@ -4362,7 +4332,7 @@ mod tests {
 
         // Set insurance fund to 0 so any shortfall triggers ADL.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             inner.insurance_fund = 0;
         }
 
@@ -4387,7 +4357,7 @@ mod tests {
 
         // Account 1: underwater long (will be liquidated).
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(1));
             acct.positions.insert(
                 mid,
@@ -4397,7 +4367,7 @@ mod tests {
 
         // Account 2: slightly profitable short.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(2));
             acct.positions.insert(
                 mid,
@@ -4407,7 +4377,7 @@ mod tests {
 
         // Account 3: more profitable short (larger position, same entry).
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(3));
             acct.positions.insert(
                 mid,
@@ -4417,7 +4387,7 @@ mod tests {
 
         // Zero insurance fund.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             inner.insurance_fund = 0;
         }
 
@@ -4440,7 +4410,7 @@ mod tests {
 
         // Setup: underwater long + profitable short counterparty.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct1 = PerpsModule::account_mut(&mut inner, &addr(1));
             acct1.positions.insert(
                 mid,
@@ -4597,7 +4567,7 @@ mod tests {
 
         // Push cross margin near u64::MAX directly.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &addr(1)).cross_margin = u64::MAX - 100;
         }
 
@@ -4657,7 +4627,7 @@ mod tests {
         perps.handle(&ctx(2), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
 
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
                 mid,
                 Position { size: 1_000_000, entry_price: 1_500_000_000, isolated_margin: 0 },
@@ -4680,7 +4650,7 @@ mod tests {
 
         // Conservation: total user margin + insurance == deposits.
         let insurance = {
-            let inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inner = framework::lock_state(&perps.inner);
             inner.insurance_fund
         };
         let total = perps.cross_margin(&addr(1)) + perps.cross_margin(&addr(2)) + insurance;
@@ -4915,7 +4885,7 @@ mod tests {
         // 100 lots long from entry 2.0e9, mark at 1.0e9 → equity
         // far below maintenance → liquidation must fire.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(1));
             acct.positions.insert(
                 mid,
@@ -5221,7 +5191,7 @@ mod tests {
 
         // +10-lot long at the mark — no PnL, isolated margin 0.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &addr(1));
             acct.positions.insert(
                 mid,
@@ -5254,7 +5224,7 @@ mod tests {
         let perps = PerpsModule::new();
         let mid = perps.list_market(test_cfg()).unwrap();
         let im = {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let configs = inner.configs.clone();
             let acct = PerpsModule::account_mut(&mut inner, &addr(1));
             acct.positions.insert(
@@ -5428,7 +5398,7 @@ mod tests {
         assert_eq!(perps.position(&acct, mid).size, 0);
         // The cursor advanced past the checked accounts — addr(1)
         // and addr(2) were both in this block's window.
-        let inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&perps.inner);
         assert_eq!(inner.liquidation_cursor, Some(addr(2)));
     }
 
@@ -5440,7 +5410,7 @@ mod tests {
     fn end_block_sweep_cursor_advances_and_wraps() {
         let perps = PerpsModule::new();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             for n in 1u8..=33 {
                 PerpsModule::account_mut(&mut inner, &addr(n));
             }
@@ -5498,10 +5468,8 @@ mod tests {
         dst.import_state(&snapshot).unwrap();
         assert_eq!(dst.state_root(), src.state_root());
         assert_eq!(dst.mark_is_stale(mid), src.mark_is_stale(mid));
-        let src_cursor =
-            src.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).liquidation_cursor;
-        let dst_cursor =
-            dst.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).liquidation_cursor;
+        let src_cursor = framework::lock_state(&src.inner).liquidation_cursor;
+        let dst_cursor = framework::lock_state(&dst.inner).liquidation_cursor;
         assert_eq!(dst_cursor, src_cursor);
     }
 
@@ -5511,7 +5479,7 @@ mod tests {
     /// clearing account included — for one market. The clearing
     /// model's central invariant: zero net position per market.
     fn net_position(perps: &PerpsModule, market: u8) -> i128 {
-        let inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&perps.inner);
         inner
             .accounts
             .values()
@@ -5529,7 +5497,7 @@ mod tests {
         let mid = perps.list_market(test_cfg()).unwrap();
         // Long + short counterparties — the book nets to zero.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
                 mid,
                 Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
@@ -5566,7 +5534,7 @@ mod tests {
         let perps = PerpsModule::new();
         let mid = perps.list_market(test_cfg()).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
                 mid,
                 Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 50_000 },
@@ -5599,7 +5567,7 @@ mod tests {
         let perps = PerpsModule::new();
         let mid = perps.list_market(test_cfg()).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
                 mid,
                 Position { size: 1_000, entry_price: 1_500_000_000, isolated_margin: 10 },
@@ -5610,7 +5578,7 @@ mod tests {
         // counterparty to claw — the full remainder is booked.
         let mut events = Vec::new();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::settle_realized(&mut inner, &addr(1), mid, -50_000, &mut events);
         }
         assert_eq!(perps.unfunded_bad_debt(), 50_000 - 10);
@@ -5624,7 +5592,7 @@ mod tests {
     fn fund_inflow_retires_bad_debt_before_fund() {
         let perps = PerpsModule::new();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             inner.unfunded_bad_debt = 30_000;
             PerpsModule::fund_inflow(&mut inner, 50_000);
             assert_eq!(inner.unfunded_bad_debt, 0, "inflow retires the debt first");
@@ -5643,7 +5611,7 @@ mod tests {
         let perps = PerpsModule::new();
         let mid = perps.list_market(test_cfg()).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             inner.insurance_fund = 1_000;
             // A gain flows into the fund.
             let mut events = Vec::new();
@@ -5685,7 +5653,7 @@ mod tests {
         let perps = PerpsModule::new();
         let mid = perps.list_market(test_cfg()).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
                 mid,
                 Position { size: 100_000, entry_price: 1_500_000_000, isolated_margin: 0 },
@@ -5712,7 +5680,7 @@ mod tests {
         // A short counterparty balances the book: in the live flow
         // the seized long's original counterparty is still short.
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
                 mid,
                 Position { size: 5_000, entry_price: 1_500_000_000, isolated_margin: 0 },
@@ -5738,7 +5706,7 @@ mod tests {
         assert_eq!(buyer.size, 5_000, "buyer took the other side");
         // The maker's reservation for the filled order is released.
         {
-            let inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inner = framework::lock_state(&perps.inner);
             let acct2 = inner.accounts.get(&addr(2)).expect("buyer exists");
             assert!(acct2.open_orders.is_empty(), "filled reservation released");
         }
@@ -5760,7 +5728,7 @@ mod tests {
         let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
                 mid,
                 Position { size: 5_000, entry_price: 1_500_000_000, isolated_margin: 0 },
@@ -5802,7 +5770,7 @@ mod tests {
         let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
                 mid,
                 Position { size: 5_000, entry_price: 1_500_000_000, isolated_margin: 0 },
@@ -5836,7 +5804,7 @@ mod tests {
         let perps = PerpsModule::with_ledger(ledger.clone());
         let mid = perps.list_market(test_cfg()).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
                 mid,
                 Position { size: -5_000, entry_price: 1_500_000_000, isolated_margin: 0 },
@@ -5875,7 +5843,7 @@ mod tests {
         let perps = PerpsModule::new();
         let mid = perps.list_market(test_cfg()).unwrap();
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             // Long 100 lots at 1.5B with 480k margin; short
             // counterparty at the same entry.
             PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
@@ -5918,7 +5886,7 @@ mod tests {
         let src = PerpsModule::new();
         let mid = src.list_market(test_cfg()).unwrap();
         {
-            let mut inner = src.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&src.inner);
             inner.unfunded_bad_debt = 42_000;
             PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
                 mid,
@@ -5977,7 +5945,7 @@ mod tests {
         // margin.
         let victim = addr(9);
         {
-            let mut inner = perps.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = framework::lock_state(&perps.inner);
             let acct = PerpsModule::account_mut(&mut inner, &victim);
             acct.positions.insert(
                 mid,

@@ -457,7 +457,7 @@ impl GovernanceModule {
     /// Panics if the proposals mutex is poisoned.
     #[must_use]
     pub fn proposal(&self, id: u64) -> Option<Proposal> {
-        self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id).cloned()
+        framework::lock_state(&self.proposals).get(&id).cloned()
     }
 
     /// Write the module's committed state into `w` — shared by
@@ -466,8 +466,8 @@ impl GovernanceModule {
     /// hashes.
     fn write_committed(&self, w: &mut framework::CanonicalState) {
         w.put_root(&subtree_root(&self.store));
-        w.put_u64(*self.next_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-        let proposals = self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        w.put_u64(*framework::lock_state(&self.next_id));
+        let proposals = framework::lock_state(&self.proposals);
         w.put_count(proposals.len());
         for (id, p) in proposals.iter() {
             w.put_u64(*id);
@@ -504,7 +504,7 @@ impl GovernanceModule {
             w.put_u64(p.deposit_deadline);
             w.put_u64(p.apply_height);
         }
-        let deposits = self.deposits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deposits = framework::lock_state(&self.deposits);
         w.put_count(deposits.len());
         for (id, records) in deposits.iter() {
             w.put_u64(*id);
@@ -691,7 +691,7 @@ impl GovernanceModule {
     /// Panics if the proposals mutex is poisoned.
     #[must_use]
     pub fn num_proposals(&self) -> usize {
-        self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        framework::lock_state(&self.proposals).len()
     }
 
     /// Parse a propose message.
@@ -795,12 +795,7 @@ impl GovernanceModule {
     /// that record's funds in escrow — reachable, never lost, but
     /// no longer owed by this proposal.
     fn settle_deposits(&self, id: u64, refund: bool) {
-        let records = self
-            .deposits
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id)
-            .unwrap_or_default();
+        let records = framework::lock_state(&self.deposits).remove(&id).unwrap_or_default();
         if records.is_empty() {
             return;
         }
@@ -829,15 +824,14 @@ impl GovernanceModule {
     /// creation is attacker-writable state growth otherwise.
     fn handle_propose(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
         let (key, val) = Self::parse_propose(&msg[1..]).ok_or(ExecError::Malformed)?;
-        let height = *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut proposals =
-            self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let height = *framework::lock_state(&self.current_height);
+        let mut proposals = framework::lock_state(&self.proposals);
         let open = proposals.values().filter(|p| !p.status.is_terminal()).count();
         if open >= MAX_OPEN_PROPOSALS {
             return Err(ExecError::ModuleRejected("too many open proposals".to_string()));
         }
         let id = {
-            let mut next = self.next_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut next = framework::lock_state(&self.next_id);
             let id = *next;
             *next += 1;
             id
@@ -866,10 +860,7 @@ impl GovernanceModule {
             },
         );
         drop(proposals);
-        self.store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.to_le_bytes().to_vec(), msg.to_vec());
+        framework::lock_state(&self.store).insert(id.to_le_bytes().to_vec(), msg.to_vec());
         Ok(vec![Event { module: "governance", kind: "propose", data: msg.to_vec() }])
     }
 
@@ -903,9 +894,8 @@ impl GovernanceModule {
             .ledger
             .as_ref()
             .ok_or_else(|| ExecError::ModuleRejected("deposits: no ledger wired".to_string()))?;
-        let height = *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut proposals =
-            self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let height = *framework::lock_state(&self.current_height);
+        let mut proposals = framework::lock_state(&self.proposals);
         let proposal = proposals
             .get_mut(&id)
             .ok_or(ExecError::ModuleRejected("unknown proposal".to_string()))?;
@@ -916,8 +906,7 @@ impl GovernanceModule {
             return Err(ExecError::ModuleRejected("deposit period ended".to_string()));
         }
         {
-            let mut deposits =
-                self.deposits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut deposits = framework::lock_state(&self.deposits);
             let records = deposits.entry(id).or_default();
             let known_idx = records.iter().position(|(a, _)| *a == ctx.sender);
             if known_idx.is_none() && records.len() >= MAX_DEPOSITORS_PER_PROPOSAL {
@@ -975,9 +964,8 @@ impl GovernanceModule {
         if power == 0 {
             return Err(ExecError::ModuleRejected("voter has no voting power".to_string()));
         }
-        let height = *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut proposals =
-            self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let height = *framework::lock_state(&self.current_height);
+        let mut proposals = framework::lock_state(&self.proposals);
         let proposal = proposals
             .get_mut(&id)
             .ok_or(ExecError::ModuleRejected("unknown proposal".to_string()))?;
@@ -1003,7 +991,7 @@ impl GovernanceModule {
         // cast under call-counted semantics).
         let vote_key = [id.to_le_bytes().as_slice(), ctx.sender.0.as_slice()].concat();
         let prior = {
-            let store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let store = framework::lock_state(&self.store);
             match store.get(&vote_key).map(Vec::as_slice) {
                 None => None,
                 Some([b]) => Vote::from_byte(*b).map(|v| (v, power)),
@@ -1034,7 +1022,7 @@ impl GovernanceModule {
         let mut rec = Vec::with_capacity(9);
         rec.push(vote as u8);
         rec.extend_from_slice(&power.to_le_bytes());
-        self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(vote_key, rec);
+        framework::lock_state(&self.store).insert(vote_key, rec);
         Ok(vec![Event { module: "governance", kind: "vote", data: msg.to_vec() }])
     }
 }
@@ -1088,8 +1076,7 @@ impl Module for GovernanceModule {
     fn begin_block(&self, height: Height) {
         // The executing height drives vote-window and finalization
         // checks for every tx this block.
-        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            height.value();
+        *framework::lock_state(&self.current_height) = height.value();
     }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
@@ -1119,8 +1106,7 @@ impl Module for GovernanceModule {
         //     sink → Applied / ApplyFailed (terminal either way).
         let height = height.value();
         let total_power = self.committee.as_ref().map_or(0, |c| c.total_power());
-        let mut proposals =
-            self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut proposals = framework::lock_state(&self.proposals);
         let mut events = Vec::new();
         for proposal in proposals.values_mut() {
             let id = proposal.id;
@@ -1214,12 +1200,12 @@ impl Module for GovernanceModule {
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let (_canon, (next_id, proposals, deposits), store) =
             framework::stage_blob_snapshot(snapshot, |r, _store| Self::decode_committed(r))?;
-        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
-        *self.proposals.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = proposals;
-        *self.deposits.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = deposits;
-        *self.next_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next_id;
+        *framework::lock_state(&self.store) = store;
+        *framework::lock_state(&self.proposals) = proposals;
+        *framework::lock_state(&self.deposits) = deposits;
+        *framework::lock_state(&self.next_id) = next_id;
         // Block-transient — the next `begin_block` refreshes it.
-        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
+        *framework::lock_state(&self.current_height) = 0;
         Ok(())
     }
 }
@@ -1669,10 +1655,7 @@ mod tests {
             if self.fail {
                 return Err(ExecError::ModuleRejected("sink rejected value".to_string()));
             }
-            self.applied
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((key.to_vec(), value.to_vec()));
+            framework::lock_state(&self.applied).push((key.to_vec(), value.to_vec()));
             Ok(())
         }
     }

@@ -507,10 +507,9 @@ impl BatchSettler {
             .unwrap_or_else(|e| panic!("settlement outbox at {} is corrupt: {e}", path.display()));
         self.nonce.store(state.next_nonce, std::sync::atomic::Ordering::Relaxed);
         if let Some(p) = state.pending {
-            *self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(p);
+            *primitives::sync::lock_state(&self.pending) = Some(p);
         }
-        *self.outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(SettlementOutbox { path });
+        *primitives::sync::lock_state(&self.outbox) = Some(SettlementOutbox { path });
         self
     }
 
@@ -519,7 +518,7 @@ impl BatchSettler {
     /// write is best-effort (the in-memory lane keeps working — the
     /// restart window just widens).
     fn persist(&self, pending: Option<&PendingBatch>) {
-        let mut guard = self.outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = primitives::sync::lock_state(&self.outbox);
         if let Some(store) = guard.as_mut() {
             let _ = store.save(self.nonce.load(std::sync::atomic::Ordering::Relaxed), pending);
         }
@@ -595,8 +594,7 @@ impl BatchSettler {
     pub fn settle_now(&self) -> Result<SettleReport, String> {
         let mut report = SettleReport::default();
         {
-            let mut pending =
-                self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pending = primitives::sync::lock_state(&self.pending);
             if let Some(p) = pending.as_mut() {
                 // The outcome check runs before ANY (re)submission:
                 // a batch that executed during a matcher restart —
@@ -671,8 +669,7 @@ impl BatchSettler {
         match self.submitter.submit_tx(TxBytes::new(envelope.clone())) {
             Ok(()) => {
                 report.submitted = pair_count;
-                let mut pending =
-                    self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pending = primitives::sync::lock_state(&self.pending);
                 *pending = Some(PendingBatch {
                     envelope,
                     tx_hash,
@@ -684,8 +681,7 @@ impl BatchSettler {
                 self.persist(pending.as_ref());
             }
             Err(e) => {
-                let mut pending =
-                    self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pending = primitives::sync::lock_state(&self.pending);
                 *pending = Some(PendingBatch {
                     envelope,
                     tx_hash,
@@ -741,7 +737,7 @@ impl BatchSettler {
     /// tests and operator introspection.
     #[must_use]
     pub fn has_pending(&self) -> bool {
-        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
+        primitives::sync::lock_state(&self.pending).is_some()
     }
 
     /// Run the batch settler loop. Seals and submits batches every

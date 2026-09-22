@@ -298,7 +298,7 @@ impl DatabaseRef for StateView<'_> {
     }
 
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        let history = self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history = framework::lock_state(self.history);
         Ok(history.block(number).map_or(B256::ZERO, |b| b.hash))
     }
 }

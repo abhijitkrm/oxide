@@ -222,7 +222,7 @@ impl OracleModule {
     /// oracle before registering it behind an `Arc` — the sink is the
     /// last wire to connect.
     pub fn with_sink(&self, sink: Arc<dyn framework::MarkSink + Send + Sync>) {
-        *self.sink.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+        *framework::write_state(&self.sink) = Some(sink);
     }
 
     /// The current published EMA mark for `market`, if any.
@@ -232,7 +232,7 @@ impl OracleModule {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn mark(&self, market: u8) -> Option<u64> {
-        self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&market).copied()
+        framework::lock_state(&self.marks).get(&market).copied()
     }
 
     /// The height of the last successful publish for `market`.
@@ -242,11 +242,7 @@ impl OracleModule {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn last_update_height(&self, market: u8) -> Option<u64> {
-        self.last_update
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&market)
-            .copied()
+        framework::lock_state(&self.last_update).get(&market).copied()
     }
 
     /// `true` if `market`'s mark is older than
@@ -269,7 +265,7 @@ impl OracleModule {
     /// `true` if `addr` may submit price observations: an active
     /// (non-jailed) validator or a registered external feed.
     fn is_feeder(&self, addr: &Address) -> bool {
-        if self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(addr) {
+        if framework::lock_state(&self.feeds).contains(addr) {
             return true;
         }
         self.committee.as_ref().is_some_and(|c| c.is_active_validator(addr))
@@ -331,23 +327,22 @@ impl OracleModule {
     fn write_committed(&self, w: &mut framework::CanonicalState) {
         w.put_root(&subtree_root(&self.store));
         {
-            let marks = self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let marks = framework::lock_state(&self.marks);
             w.put_count(marks.len());
             for (m, p) in marks.iter() {
                 w.put_u8(*m).put_u64(*p);
             }
-            let updates =
-                self.last_update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let updates = framework::lock_state(&self.last_update);
             w.put_count(updates.len());
             for (m, h) in updates.iter() {
                 w.put_u8(*m).put_u64(*h);
             }
-            let feeds = self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let feeds = framework::lock_state(&self.feeds);
             w.put_count(feeds.len());
             for f in feeds.iter() {
                 w.put_addr(f);
             }
-            let subs = self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let subs = framework::lock_state(&self.submissions);
             w.put_count(subs.len());
             for (m, feeders) in subs.iter() {
                 w.put_u8(*m).put_count(feeders.len());
@@ -403,7 +398,7 @@ impl OracleModule {
     /// Persist one market's mark + update height into the store so
     /// the state root reflects the published price.
     fn store_mark(&self, market: u8, mark: u64, height: u64) {
-        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = framework::lock_state(&self.store);
         store.insert([b"mark/".as_slice(), &[market]].concat(), mark.to_le_bytes().to_vec());
         store.insert([b"upd/".as_slice(), &[market]].concat(), height.to_le_bytes().to_vec());
     }
@@ -411,15 +406,13 @@ impl OracleModule {
     /// Aggregate this block's submissions and push the result to the
     /// sink. Runs at `end_block`; see the module-level pipeline docs.
     fn aggregate(&self, height: Height) {
-        let mut submissions =
-            self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut submissions = framework::lock_state(&self.submissions);
         if submissions.is_empty() {
             return;
         }
-        let sink = self.sink.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let mut marks = self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut last_update =
-            self.last_update.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sink = framework::read_state(&self.sink).clone();
+        let mut marks = framework::lock_state(&self.marks);
+        let mut last_update = framework::lock_state(&self.last_update);
         for (market, feeds) in submissions.iter() {
             if !self.quorum_met(feeds) {
                 // Below 2/3 of bonded power — do not publish. The
@@ -548,8 +541,7 @@ impl Module for OracleModule {
                         "submit: sender is not an authorized price feed".to_string(),
                     ));
                 }
-                let mut submissions =
-                    self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut submissions = framework::lock_state(&self.submissions);
                 // Last-write-wins per feeder per market: a feeder may
                 // correct itself within the block but still only
                 // contributes one observation to the median.
@@ -583,10 +575,8 @@ impl Module for OracleModule {
                         let mut feed = [0u8; 20];
                         feed.copy_from_slice(body);
                         let feed_addr = Address(feed);
-                        let mut feeds =
-                            self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let mut store =
-                            self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut feeds = framework::lock_state(&self.feeds);
+                        let mut store = framework::lock_state(&self.store);
                         let key = [b"feed/".as_slice(), &feed].concat();
                         if tag == TAG_REGISTER_FEED {
                             feeds.insert(feed_addr);
@@ -661,13 +651,11 @@ impl Module for OracleModule {
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let (_canon, staged, store) =
             framework::stage_blob_snapshot(snapshot, |r, _store| Self::decode_committed(r))?;
-        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
-        *self.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = staged.marks;
-        *self.last_update.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.last_update;
-        *self.feeds.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = staged.feeds;
-        *self.submissions.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.submissions;
+        *framework::lock_state(&self.store) = store;
+        *framework::lock_state(&self.marks) = staged.marks;
+        *framework::lock_state(&self.last_update) = staged.last_update;
+        *framework::lock_state(&self.feeds) = staged.feeds;
+        *framework::lock_state(&self.submissions) = staged.submissions;
         self.endorsements.replace_with(staged.endorsements);
         Ok(())
     }
@@ -743,10 +731,7 @@ mod tests {
             if self.reject {
                 return Err(ExecError::ModuleRejected("sink rejected".to_string()));
             }
-            self.pushed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(market, mark);
+            framework::lock_state(&self.pushed).insert(market, mark);
             Ok(())
         }
     }

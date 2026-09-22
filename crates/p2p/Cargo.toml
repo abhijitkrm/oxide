@@ -19,6 +19,7 @@ tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
 
 [dependencies]
 ports = { workspace = true }
+primitives = { workspace = true }
 thiserror = { workspace = true }
 # TLS dependencies (only active with the `tls` feature).
 # rustls: pure-Rust TLS implementation (Apache-2.0/MIT/ISC, GPL-3.0-compatible).

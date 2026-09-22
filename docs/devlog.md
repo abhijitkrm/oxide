@@ -18340,3 +18340,43 @@ aren't rare on an HFT venue (cancel-to-order ≥10:1 is normal), but
 The doc comment states the workload reality. Remaining: a
 cancel-dominant workload bench and measured budgets for the other
 listed costs (sender recovery, TLS, safety fsync).
+
+## §9.D — panic-on-poison for state mutexes (~450 sites)
+
+The audit's point: `lock().unwrap_or_else(PoisonError::into_inner)`
+obtains the guard but never re-establishes the invariant — fine for
+a per-key cache, wrong for a multi-field state section. The new
+policy lives in `primitives::sync` (below `framework` so
+`crates/*` can reach it; framework re-exports the same names):
+
+- `lock_state` / `read_state` / `write_state` / `into_inner_state`
+  panic on poison with a message naming the invariant. Consensus
+  and financial state halts; a validator rebuilds from durable
+  state — the same recovery path as a power loss.
+- Recovery stays legitimate — with the invariant written down at
+  the field — where each guarded entry is independently meaningful
+  and every op touches it atomically. Applied to: the matcher's
+  `sparse` balance overflow (worst case a mid-transfer panic
+  strands a debit; nothing mints) and the dep-free `runtime` sim
+  executor (std-only by design; per-task queues are independent).
+
+Converted: all module state sections (exchange/perps/staking/
+governance/oracle/oxide-core and the EVM's ~15-lock section),
+the executor's mempool/finalized/nonce/outcome state, framework's
+`Endorsements`/`KVStore`, matcher settlement lifecycle
+(`pending`/`outbox`), p2p admission control + shared stream locks,
+RPC subscription/cache/filter tables, devnet harness state. The
+EVM is the sharpest case — `db`, `pending_flush`, `touched`,
+`fee_state`, … are separate mutexes forming one logical section,
+so a panic mid-transaction can tear across them; panic-on-poison
+is the only response that doesn't run on unverifiable invariants.
+
+Two conversion hazards worth recording: (1) the bulk regex split
+multi-line receivers (`self\n.sched\n.ready`) — every emitted line
+was rechecked against the type system after each pass; (2) bare
+identifier receivers that are already `&Mutex` (`lock`, `store`,
+`history`, `v`) produce `&&Mutex` and trip `needless_borrow` —
+fixed per clippy's report. No test relied on recovery; the whole
+workspace suite passes unchanged. The typed-error-boundary half of
+the item (storage/snapshot/settlement returning typed errors with
+defined state effects) is a separate refactor and stays open.

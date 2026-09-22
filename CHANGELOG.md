@@ -1159,6 +1159,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Poisoned state mutexes were silently recovered** — every module
+  (`modules/*`), `crates/executor`, `crates/matcher`,
+  `crates/p2p`, `crates/rpc`, and `crates/devnet` used
+  `PoisonError::into_inner` on lock acquisition: a thread panicking
+  mid-mutation left the lock "poisoned", and the next accessor just
+  took the guard and kept running on possibly-torn state. Consensus
+  and financial state now go through
+  `primitives::sync::{lock_state,read_state,write_state,
+  into_inner_state}`, which panic instead — a validator halts and
+  rebuilds from durable state rather than continue on invariants
+  nobody can re-establish. Documented exceptions where recovery is
+  sound: the matcher's sparse balance-overflow map (per-account
+  entries are independently meaningful) and the dependency-free
+  simulation runtime.
+  - In plain words: previously, if a bug crashed a thread while it
+    was updating chain state, other threads would pick up the
+    half-finished state and keep going. Now the node stops loudly
+    and rebuilds from disk — the same way it recovers from a power
+    loss.
 - **Real trading accounts contended on a single global balance
   lock** (`crates/matcher`)
   - Production addresses are Ed25519-derived hashes, which failed

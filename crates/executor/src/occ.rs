@@ -343,7 +343,7 @@ where
                 for idx in chunk.clone() {
                     local.push(f_ref(idx));
                 }
-                *results.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = local;
+                *primitives::sync::lock_state(results) = local;
             });
         }
     });
@@ -351,9 +351,7 @@ where
     // Flatten the results in order.
     let mut out = Vec::with_capacity(total);
     for chunk_results in &results {
-        out.extend(
-            chunk_results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned(),
-        );
+        out.extend(primitives::sync::lock_state(chunk_results).iter().cloned());
     }
     out
 }

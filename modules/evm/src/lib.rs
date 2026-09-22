@@ -738,7 +738,7 @@ impl EvmModule {
         // install the backend for future flushes.
         let mut backend = backend;
         module.load_from_storage(backend.as_mut());
-        *module.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(backend);
+        *framework::lock_state(&module.backend) = Some(backend);
         module
     }
 
@@ -760,7 +760,7 @@ impl EvmModule {
     /// the buffered blocks' writes.
     #[must_use]
     pub fn storage_error(&self) -> Option<storage::ApplyError> {
-        self.storage_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        framework::lock_state(&self.storage_error).clone()
     }
 
     /// Wire native exchange and perps modules for read-only EVM
@@ -777,8 +777,8 @@ impl EvmModule {
         exchange: Option<Arc<exchange::ExchangeModule>>,
         perps: Option<Arc<perps::PerpsModule>>,
     ) {
-        *self.exchange.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = exchange;
-        *self.perps.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = perps;
+        *framework::lock_state(&self.exchange) = exchange;
+        *framework::lock_state(&self.perps) = perps;
     }
 
     /// Wire the staking module for the `0x0C_*` mutating
@@ -791,7 +791,7 @@ impl EvmModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn set_staking(&self, staking: Arc<staking::StakingModule>) {
-        *self.staking.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(staking);
+        *framework::lock_state(&self.staking) = Some(staking);
     }
 
     /// Set the envelope-fee recipient: every `charge_fee` transfers
@@ -810,9 +810,8 @@ impl EvmModule {
     /// perps modules. Returns an empty reader if no modules are
     /// wired (all precompile reads return empty/zero).
     fn build_reader(&self) -> precompiles::native::NativeMarketReader {
-        let exchange =
-            self.exchange.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let perps = self.perps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let exchange = framework::lock_state(&self.exchange).clone();
+        let perps = framework::lock_state(&self.perps).clone();
         precompiles::native::NativeMarketReader::new(exchange, perps)
     }
 
@@ -1021,9 +1020,7 @@ impl EvmModule {
             std::rc::Rc::new(std::cell::RefCell::new(native_journal::NativeJournal::new()));
         let mut precompiles =
             precompiles::NativePrecompiles::new(self.spec, reader, journal.clone());
-        if let Some(staking) =
-            self.staking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
-        {
+        if let Some(staking) = framework::lock_state(&self.staking).clone() {
             precompiles = precompiles.with_staking(staking);
         }
         if sim || spec_ro {
@@ -1152,7 +1149,7 @@ impl EvmModule {
     /// acquired once per call and never held across work; the update
     /// itself happens once per block in `end_block_ctx`.
     fn current_base_fee(&self) -> u64 {
-        self.fee_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).base_fee()
+        framework::lock_state(&self.fee_state).base_fee()
     }
 
     /// The EVM block gas limit the module enforces — the cap
@@ -1185,7 +1182,7 @@ impl EvmModule {
     ///
     /// Panics if the coinbase mutex is poisoned.
     pub fn set_coinbase(&self, coinbase: revm::primitives::Address) {
-        *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = coinbase;
+        *framework::lock_state(&self.coinbase) = coinbase;
     }
 
     /// Get the coinbase / fee recipient for the current block.
@@ -1195,7 +1192,7 @@ impl EvmModule {
     /// Panics if the coinbase mutex is poisoned.
     #[must_use]
     pub fn coinbase(&self) -> revm::primitives::Address {
-        *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *framework::lock_state(&self.coinbase)
     }
 
     /// Execute a signed EVM transaction. The `msg` is a raw RLP-encoded
@@ -1256,13 +1253,11 @@ impl EvmModule {
         //   1. Charges `gas_used * gas_price` from the sender.
         //   2. Burns `gas_used * base_fee` (removes from supply).
         //   3. Tips `gas_used * (gas_price - base_fee)` to the coinbase.
-        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut db_guard = framework::lock_state(&self.db);
         let db = Arc::make_mut(&mut *db_guard);
-        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let block_number =
-            *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let block_timestamp =
-            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let coinbase = *framework::lock_state(&self.coinbase);
+        let block_number = *framework::lock_state(&self.block_height);
+        let block_timestamp = *framework::lock_state(&self.block_timestamp);
         let mut evm = self.build_evm(db, coinbase, block_number, block_timestamp);
 
         // `transact` (not `transact_commit`) so we get the complete
@@ -1293,16 +1288,14 @@ impl EvmModule {
         // semantics to `transact_commit` but with the state
         // available for tracking first.
         {
-            let mut touched =
-                self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut touched = framework::lock_state(&self.touched);
             touched.extend(result_and_state.state.keys().copied());
         }
         // Capture every account the commit is about to overwrite —
         // the undo entry must hold the pre-block value, so it reads
         // the map before `commit` lands.
         {
-            let mut undo =
-                self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut undo = framework::lock_state(&self.block_undo);
             for addr in result_and_state.state.keys() {
                 undo.capture(*addr, evm.ctx.journaled_state.database.cache.accounts.get(addr));
             }
@@ -2240,13 +2233,11 @@ impl EvmModule {
         let mut results = Vec::with_capacity(decoded.len());
 
         // Acquire the DB lock once for the entire batch.
-        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut db_guard = framework::lock_state(&self.db);
         let db = Arc::make_mut(&mut *db_guard);
-        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let block_number =
-            *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let block_timestamp =
-            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let coinbase = *framework::lock_state(&self.coinbase);
+        let block_number = *framework::lock_state(&self.block_height);
+        let block_timestamp = *framework::lock_state(&self.block_timestamp);
 
         // Accumulate touched accounts in a local set to avoid
         // locking the mutex per tx. Merge once at the end.
@@ -2381,13 +2372,11 @@ impl EvmModule {
 
         // Merge local touched set into the global one (single lock).
         {
-            let mut touched =
-                self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut touched = framework::lock_state(&self.touched);
             touched.extend(local_touched);
         }
         {
-            let mut undo =
-                self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut undo = framework::lock_state(&self.block_undo);
             for (addr, entry) in local_undo.accounts {
                 undo.accounts.entry(addr).or_insert(entry);
             }
@@ -2682,12 +2671,10 @@ impl EvmModule {
         // `CacheDB<SharedCacheDB>` backed by the shared snapshot via
         // `DatabaseRef`. Reads fall through to the parent on cache
         // miss; writes stay local.
-        let snapshot = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let block_number =
-            *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let block_timestamp =
-            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = framework::lock_state(&self.db).clone();
+        let coinbase = *framework::lock_state(&self.coinbase);
+        let block_number = *framework::lock_state(&self.block_height);
+        let block_timestamp = *framework::lock_state(&self.block_timestamp);
 
         // Phase 4: execute each group in parallel on its own COW
         // nested cache. Within a group txs run sequentially (nonce
@@ -3025,7 +3012,7 @@ impl EvmModule {
         // to the first re-execution: once a tx re-executes, its
         // same-group successors speculated on its speculative
         // outcome, so they re-execute too (`broken`).
-        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut db_guard = framework::lock_state(&self.db);
         let db = Arc::make_mut(&mut *db_guard);
 
         // Flatten speculative records and signed txs into index
@@ -3318,13 +3305,11 @@ impl EvmModule {
 
         // Merge touched accounts into the module-level set.
         {
-            let mut touched =
-                self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut touched = framework::lock_state(&self.touched);
             touched.extend(all_touched);
         }
         {
-            let mut undo =
-                self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut undo = framework::lock_state(&self.block_undo);
             for (addr, entry) in committed_undo.accounts {
                 undo.accounts.entry(addr).or_insert(entry);
             }
@@ -3390,7 +3375,7 @@ impl EvmModule {
                 let tx_type = meta.as_ref().map_or(0, |m| m.0.tx_type);
                 let receipt = receipts::Receipt::from_execution_result(&r, tx_type);
                 if let Some((stored, raw, call_trace)) = meta {
-                    self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(
+                    framework::lock_state(&self.history).record(
                         stored,
                         receipt.clone(),
                         &raw,
@@ -3602,9 +3587,8 @@ impl Module for EvmModule {
         // this same logic and then overlays the header-committed
         // timestamp, so real blocks always carry consensus time.
         let h = height.value();
-        *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = h;
-        *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            h.saturating_mul(BLOCK_TIME_SECS);
+        *framework::lock_state(&self.block_height) = h;
+        *framework::lock_state(&self.block_timestamp) = h.saturating_mul(BLOCK_TIME_SECS);
 
         // `touched` is deliberately NOT cleared here: marks made
         // before the first block (genesis `alloc`, preinstalls,
@@ -3619,7 +3603,7 @@ impl Module for EvmModule {
         // Start a fresh undo accumulator — any residue here means a
         // previous block never sealed, which is a bug, but dropping
         // it is safer than mixing two blocks' pre-values.
-        self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner).accounts.clear();
+        framework::lock_state(&self.block_undo).accounts.clear();
 
         // EIP-2935: record the parent block's hash in the
         // history-storage contract's ring buffer. Geth performs this
@@ -3633,17 +3617,11 @@ impl Module for EvmModule {
         // gate: a pre-Prague spec must not mutate this storage or the
         // state root diverges from the real fork.
         if h > 0 && self.spec.is_enabled_in(SpecId::PRAGUE) {
-            let parent_hash = self
-                .history
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .block(h - 1)
-                .map(|b| b.hash);
+            let parent_hash = framework::lock_state(&self.history).block(h - 1).map(|b| b.hash);
             if let Some(parent_hash) = parent_hash {
-                let mut db_guard =
-                    self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut db_guard = framework::lock_state(&self.db);
                 let db = Arc::make_mut(&mut *db_guard);
-                self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner).capture(
+                framework::lock_state(&self.block_undo).capture(
                     HISTORY_STORAGE_ADDRESS,
                     db.cache.accounts.get(&HISTORY_STORAGE_ADDRESS),
                 );
@@ -3669,10 +3647,7 @@ impl Module for EvmModule {
                 );
                 account.account_state = revm::database::AccountState::Touched;
                 drop(db_guard);
-                self.touched
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(HISTORY_STORAGE_ADDRESS);
+                framework::lock_state(&self.touched).insert(HISTORY_STORAGE_ADDRESS);
             }
         }
     }
@@ -3694,15 +3669,14 @@ impl Module for EvmModule {
         if ctx.timestamp_ms != 0 {
             // The header stamps milliseconds; `block.timestamp` is
             // seconds-granularity (Ethereum semantics) — truncate.
-            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                ctx.timestamp_secs();
+            *framework::lock_state(&self.block_timestamp) = ctx.timestamp_secs();
         }
         if ctx.beneficiary != primitives::Address::ZERO {
             // The proposer's staking address is the fee recipient:
             // priority-fee tips land with the validator that built
             // the block, matching every other module's identity
             // space (the attendance `signers` use the same set).
-            *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            *framework::lock_state(&self.coinbase) =
                 revm::primitives::Address::from(ctx.beneficiary.0);
         }
         if ctx.gas_limit != 0 {
@@ -3729,7 +3703,7 @@ impl Module for EvmModule {
     fn end_block_ctx(&self, height: Height, ctx: &types::BlockContext) -> Vec<Event> {
         self.end_block(height);
         let gas_used = {
-            let history = self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let history = framework::lock_state(&self.history);
             history.block(height.value()).map(|b| b.gas_used)
         };
         // The sealed block is written by `end_block` immediately
@@ -3737,8 +3711,7 @@ impl Module for EvmModule {
         // which case there is no measured usage to update from and
         // the fee must stay put rather than drift toward the floor.
         if let Some(gas_used) = gas_used {
-            let mut fee_state =
-                self.fee_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut fee_state = framework::lock_state(&self.fee_state);
             if ctx.gas_limit != 0 && ctx.gas_limit != fee_state.max_gas() {
                 fee_state.set_max_gas(ctx.gas_limit);
             }
@@ -3977,7 +3950,7 @@ impl Module for EvmModule {
         // `eth_getLogs`). `record` assigns the tx_index from the
         // pending-block position; `msg` (the raw signed RLP) is kept
         // until `seal_block` computes `transactionsRoot`.
-        self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(
+        framework::lock_state(&self.history).record(
             history::stored_tx(&signed, caller, tx_hash, 0),
             receipt.clone(),
             msg,
@@ -4142,12 +4115,10 @@ impl Module for EvmModule {
         // (`leaves_ready && touched.is_empty()`), so sealing adds no
         // extra trie work per block.
         let root = self.state_root();
-        let timestamp =
-            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let timestamp = *framework::lock_state(&self.block_timestamp);
+        let coinbase = *framework::lock_state(&self.coinbase);
         let (sealed_block, evicted) = {
-            let mut history =
-                self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut history = framework::lock_state(&self.history);
             let evicted = history.seal_block(
                 height.value(),
                 timestamp,
@@ -4168,20 +4139,16 @@ impl Module for EvmModule {
         // `history` so the two stay aligned. Reads at heights below
         // the floor fail closed ("state not available") — see
         // `versioned.rs`.
-        let undo = std::mem::take(
-            &mut *self.block_undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let undo = std::mem::take(&mut *framework::lock_state(&self.block_undo));
         // Serialize the undo blob only when a backend will consume
         // it — pointless work otherwise (per-block, cold path, but
         // free is better).
-        let has_backend =
-            self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some();
+        let has_backend = framework::lock_state(&self.backend).is_some();
         let undo_blob = has_backend.then(|| persist::serialize_undo(&undo));
         let pruned_undo = {
-            let mut versioned =
-                self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut versioned = framework::lock_state(&self.versioned);
             versioned.push(height.value(), undo);
-            let history = self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let history = framework::lock_state(&self.history);
             history.blocks_floor().map_or_else(Vec::new, |floor| versioned.prune_below(floor))
         };
 
@@ -4191,8 +4158,7 @@ impl Module for EvmModule {
         // the history write would otherwise leave durable state at
         // height N with durable history at N-1 — on restart the node
         // would then serve state-N answers labelled as height N-1.
-        let mut backend_guard =
-            self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut backend_guard = framework::lock_state(&self.backend);
         if let Some(ref mut backend) = *backend_guard {
             let mut ops = self.account_flush_ops();
             if let Some(block) = sealed_block {
@@ -4223,7 +4189,7 @@ impl Module for EvmModule {
         }
         drop(backend_guard);
 
-        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        framework::lock_state(&self.touched).clear();
         Vec::new()
     }
 
@@ -4253,12 +4219,10 @@ impl Module for EvmModule {
         //
         // Panics if the DB mutex is poisoned (a thread panicked while
         // holding the lock). This is unrecoverable and indicates a bug.
-        let touched = self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut leaves = self.trie_leaves.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut leaves_ready =
-            self.trie_leaves_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut retained =
-            self.retained_branches.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let touched = framework::lock_state(&self.touched);
+        let mut leaves = framework::lock_state(&self.trie_leaves);
+        let mut leaves_ready = framework::lock_state(&self.trie_leaves_ready);
+        let mut retained = framework::lock_state(&self.retained_branches);
 
         // Fast path: if the leaf map is built and nothing was
         // touched since the last computation, return the cached
@@ -4266,15 +4230,13 @@ impl Module for EvmModule {
         // intervening execution O(1).
         if *leaves_ready
             && touched.is_empty()
-            && let Some(cached) =
-                *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            && let Some(cached) = *framework::lock_state(&self.cached_state_root)
         {
             return Hash(cached.0);
         }
 
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut storage_root_cache =
-            self.storage_root_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
+        let mut storage_root_cache = framework::lock_state(&self.storage_root_cache);
 
         if *leaves_ready {
             // Incremental patch — only `touched` accounts are
@@ -4480,8 +4442,7 @@ impl Module for EvmModule {
         }
 
         // Cache the state root for the next call's fast path.
-        *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(root);
+        *framework::lock_state(&self.cached_state_root) = Some(root);
 
         // Convert the alloy B256 root to Oxide's Hash type.
         Hash(root.0)
@@ -4504,13 +4465,13 @@ impl Module for EvmModule {
     /// schema meta — RPC data, not committed to the trie) are copied
     /// from the backend verbatim.
     fn export_state(&self) -> Option<storage::Snapshot> {
-        let backend = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let backend = framework::lock_state(&self.backend);
         let mut snap = backend.as_ref()?.snapshot_export();
         // Drop the backend's account entries — the cache is
         // authoritative for committed state and may hold accounts
         // the backend has not seen yet.
         snap.entries.retain(|(k, _)| k.0[0] != persist::NS_ACCOUNT);
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
         snap.entries.reserve(db.cache.accounts.len());
         for evm_addr in db.cache.accounts.keys() {
             if let Some(value) = Self::serialize_committed_account(evm_addr, &db) {
@@ -4582,8 +4543,7 @@ impl Module for EvmModule {
         // happens before consensus starts, so there are no pending
         // changes).
         {
-            let mut backend =
-                self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut backend = framework::lock_state(&self.backend);
             if let Some(ref mut b) = *backend {
                 self.flush_to_storage(b.as_mut())
                     .map_err(|_| storage::SnapshotError::BackendError)?;
@@ -4593,7 +4553,7 @@ impl Module for EvmModule {
             }
         }
         // Reload the in-memory cache from the backend.
-        let mut backend = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut backend = framework::lock_state(&self.backend);
         if let Some(ref mut b) = *backend {
             self.load_from_storage(b.as_mut());
         }
@@ -4603,11 +4563,11 @@ impl Module for EvmModule {
         // the next `state_root` rebuilds from scratch and the next
         // `end_block` flush must not re-emit ops for accounts the
         // snapshot already installed.
-        *self.trie_leaves_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
-        self.trie_leaves.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-        self.retained_branches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-        *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        *framework::lock_state(&self.trie_leaves_ready) = false;
+        framework::lock_state(&self.trie_leaves).clear();
+        framework::lock_state(&self.retained_branches).clear();
+        *framework::lock_state(&self.cached_state_root) = None;
+        framework::lock_state(&self.touched).clear();
         Ok(())
     }
 }
@@ -4694,7 +4654,7 @@ impl EvmModule {
     /// holding the lock). This is unrecoverable and indicates a bug.
     #[must_use]
     pub fn balance(&self, addr: &Address) -> u128 {
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
         let evm_addr = alloy_primitives_address(addr.0);
         // `to::<u128>` panics on balances above u128::MAX — reachable
         // via crafted state (e.g. snapshot import). Saturate instead:
@@ -4716,7 +4676,7 @@ impl EvmModule {
     /// holding the lock). This is unrecoverable and indicates a bug.
     #[must_use]
     pub fn nonce(&self, addr: &Address) -> u64 {
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
         let evm_addr = alloy_primitives_address(addr.0);
         db.cache.accounts.get(&evm_addr).map_or(0, |a| a.info.nonce)
     }
@@ -4734,7 +4694,7 @@ impl EvmModule {
     /// Panics if the DB mutex is poisoned.
     #[must_use]
     pub fn code(&self, addr: &Address) -> Vec<u8> {
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
         let evm_addr = alloy_primitives_address(addr.0);
         let Some(account) = db.cache.accounts.get(&evm_addr) else {
             return Vec::new();
@@ -4763,7 +4723,7 @@ impl EvmModule {
         addr: &Address,
         slot: &revm::primitives::U256,
     ) -> revm::primitives::U256 {
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
         let evm_addr = alloy_primitives_address(addr.0);
         db.cache
             .accounts
@@ -5036,12 +4996,10 @@ impl EvmModule {
             .build()
             .map_err(|_| CallError::Rejected(ExecError::Malformed))?;
 
-        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let block_number =
-            *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let block_timestamp =
-            *self.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut db_guard = framework::lock_state(&self.db);
+        let coinbase = *framework::lock_state(&self.coinbase);
+        let block_number = *framework::lock_state(&self.block_height);
+        let block_timestamp = *framework::lock_state(&self.block_timestamp);
 
         match at_height {
             None if ovr.is_empty() => {
@@ -5090,8 +5048,7 @@ impl EvmModule {
                 // sealed record at `h` (the env a tx in that block
                 // actually ran under).
                 let env = {
-                    let history =
-                        self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let history = framework::lock_state(&self.history);
                     history.block(h).map(|b| (b.timestamp, b.coinbase, b.number))
                 };
                 let Some((ts, cb, num)) = env else {
@@ -5099,8 +5056,7 @@ impl EvmModule {
                         "state for block {h} unavailable"
                     ))));
                 };
-                let versioned =
-                    self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let versioned = framework::lock_state(&self.versioned);
                 let view = versioned::StateView::new(&db_guard, &versioned, &self.history, h);
                 let mut cache = CacheDB::new(overrides::OverrideView::new(view, ovr));
                 let mut evm = self.build_sim_evm(&mut cache, cb, num, ts, deadline);
@@ -5294,7 +5250,7 @@ impl EvmModule {
         let caller =
             req.from.map_or(revm::primitives::Address::ZERO, |a| alloy_primitives_address(a.0));
         let to = req.to.map(|a| alloy_primitives_address(a.0));
-        let coinbase = *self.coinbase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let coinbase = *framework::lock_state(&self.coinbase);
         let mut excluded = precompiles::NativePrecompiles::warm_addresses_for(self.spec);
         excluded.insert(caller);
         excluded.insert(coinbase);
@@ -5357,19 +5313,15 @@ impl EvmModule {
     ///   height; otherwise [`StateError::Pruned`] ("missing trie
     ///   node", geth's non-archive behavior).
     fn check_state_height(&self, h: u64) -> Result<u64, StateError> {
-        let latest = self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .latest()
-            .unwrap_or_else(|| self.current_height());
+        let latest =
+            framework::lock_state(&self.history).latest().unwrap_or_else(|| self.current_height());
         if h > latest {
             return Err(StateError::TooNew { requested: h, latest });
         }
         if h == latest {
             return Ok(h);
         }
-        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let versioned = framework::lock_state(&self.versioned);
         // `floor - 1` is the oldest servable height; an empty index
         // means nothing is retained — only `latest` answers.
         let min = versioned.floor().map_or(latest, |f| f.saturating_sub(1));
@@ -5384,12 +5336,8 @@ impl EvmModule {
     /// historical overlay.
     fn resolve_at(&self, h: u64) -> Result<Option<u64>, StateError> {
         let h = self.check_state_height(h)?;
-        let latest = self
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .latest()
-            .unwrap_or_else(|| self.current_height());
+        let latest =
+            framework::lock_state(&self.history).latest().unwrap_or_else(|| self.current_height());
         Ok(if h == latest { None } else { Some(h) })
     }
 
@@ -5420,8 +5368,8 @@ impl EvmModule {
     /// [`StateError`] when `h` is outside the retained window.
     pub fn balance_at(&self, addr: &Address, h: u64) -> Result<u128, StateError> {
         self.check_state_height(h)?;
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
         let view = Self::state_view(&db, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
         Ok(view
@@ -5437,8 +5385,8 @@ impl EvmModule {
     /// [`StateError`] when `h` is outside the retained window.
     pub fn nonce_at(&self, addr: &Address, h: u64) -> Result<u64, StateError> {
         self.check_state_height(h)?;
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
         let view = Self::state_view(&db, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
         Ok(view.basic_ref(evm_addr).unwrap_or_default().map_or(0, |a| a.nonce))
@@ -5452,8 +5400,8 @@ impl EvmModule {
     /// [`StateError`] when `h` is outside the retained window.
     pub fn code_at(&self, addr: &Address, h: u64) -> Result<Vec<u8>, StateError> {
         self.check_state_height(h)?;
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
         let view = Self::state_view(&db, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
         let Some(info) = view.basic_ref(evm_addr).unwrap_or_default() else {
@@ -5477,8 +5425,8 @@ impl EvmModule {
         h: u64,
     ) -> Result<revm::primitives::U256, StateError> {
         self.check_state_height(h)?;
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
         let view = Self::state_view(&db, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
         Ok(view.storage_ref(evm_addr, *slot).unwrap_or_default())
@@ -5530,8 +5478,8 @@ impl EvmModule {
                 e.requested()
             )))
         })?;
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let versioned = self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
         let view = Self::state_view(&db, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
 
@@ -5543,8 +5491,7 @@ impl EvmModule {
             std::collections::BTreeMap::new();
         let addrs: std::collections::BTreeSet<revm::primitives::Address> =
             db.cache.accounts.keys().copied().chain(versioned.known_accounts().copied()).collect();
-        let mut storage_root_cache =
-            self.storage_root_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut storage_root_cache = framework::lock_state(&self.storage_root_cache);
         for a in addrs {
             let Some(info) = view.info_at(&a) else { continue };
             // Storage root at `h`: the undo map when the account was
@@ -5665,7 +5612,7 @@ impl EvmModule {
     ///
     /// Panics if the history mutex is poisoned.
     pub fn history(&self) -> std::sync::MutexGuard<'_, history::History> {
-        self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        framework::lock_state(&self.history)
     }
 
     /// The height the module is currently executing (or last
@@ -5677,7 +5624,7 @@ impl EvmModule {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn current_height(&self) -> u64 {
-        *self.block_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *framework::lock_state(&self.block_height)
     }
 
     /// The latest sealed block's base fee — geth's `head.BaseFee`,
@@ -5720,7 +5667,7 @@ impl EvmModule {
     /// `with_storage`).
     #[doc(hidden)]
     pub fn backend_for_test(&self) -> Box<dyn storage::StorageBackend + Send> {
-        let mut guard = self.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = framework::lock_state(&self.backend);
         guard.take().expect("backend_for_test: no storage backend attached")
     }
 
@@ -5735,7 +5682,7 @@ impl EvmModule {
     /// Panics if the DB mutex is poisoned.
     #[doc(hidden)]
     pub fn fund_account_for_test(&self, addr: &Address, balance: u128) {
-        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut db_guard = framework::lock_state(&self.db);
         let db = Arc::make_mut(&mut *db_guard);
         let evm_addr = alloy_primitives_address(addr.0);
         let empty_code = revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new());
@@ -5762,7 +5709,7 @@ impl EvmModule {
         // would lose the account. `Node::assemble` uses this path for
         // genesis faucet funding, so the hole is not test-only.
         drop(db_guard);
-        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(evm_addr);
+        framework::lock_state(&self.touched).insert(evm_addr);
     }
 
     /// Insert an account with full state — the genesis `alloc` path.
@@ -5791,7 +5738,7 @@ impl EvmModule {
         let evm_addr = alloy_primitives_address(addr.0);
         let bytecode = revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from(code));
         let code_hash = bytecode.hash_slow();
-        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut db_guard = framework::lock_state(&self.db);
         let db = Arc::make_mut(&mut *db_guard);
         let account =
             db.cache.accounts.entry(evm_addr).or_insert_with(|| revm::database::DbAccount {
@@ -5813,7 +5760,7 @@ impl EvmModule {
             account.storage.insert(slot, value);
         }
         drop(db_guard);
-        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(evm_addr);
+        framework::lock_state(&self.touched).insert(evm_addr);
     }
 
     /// Install the canonical preinstalled contracts (CREATE2 factory,
@@ -5865,10 +5812,7 @@ impl EvmModule {
     /// Panics if the touched mutex is poisoned.
     #[doc(hidden)]
     pub fn mark_touched_for_test(&self, addr: &Address) {
-        self.touched
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(alloy_primitives_address(addr.0));
+        framework::lock_state(&self.touched).insert(alloy_primitives_address(addr.0));
     }
 
     /// Reset the leaf cache so the next `state_root` call performs
@@ -5881,10 +5825,10 @@ impl EvmModule {
     /// Panics if any mutex is poisoned.
     #[doc(hidden)]
     pub fn reset_leaf_cache_for_test(&self) {
-        *self.trie_leaves_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
-        self.trie_leaves.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-        self.retained_branches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-        *self.cached_state_root.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *framework::lock_state(&self.trie_leaves_ready) = false;
+        framework::lock_state(&self.trie_leaves).clear();
+        framework::lock_state(&self.retained_branches).clear();
+        *framework::lock_state(&self.cached_state_root) = None;
     }
 
     /// Flush the current `CacheDB` state to the `StorageBackend`.
@@ -5940,8 +5884,7 @@ impl EvmModule {
         backend: &mut (dyn storage::StorageBackend + Send),
         extra: Vec<storage::Op>,
     ) -> Result<(), storage::ApplyError> {
-        let mut pending =
-            self.pending_flush.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending = framework::lock_state(&self.pending_flush);
         pending.extend(extra);
         if pending.is_empty() {
             return Ok(());
@@ -5955,18 +5898,15 @@ impl EvmModule {
                 // latched but not buffered — the ops ARE written, and
                 // the next successful sync covers them (same file).
                 if let Err(e) = backend.sync() {
-                    *self.storage_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(e.clone());
+                    *framework::lock_state(&self.storage_error) = Some(e.clone());
                     return Err(e);
                 }
-                *self.storage_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    None;
+                *framework::lock_state(&self.storage_error) = None;
                 Ok(())
             }
             Err(e) => {
                 drop(pending);
-                *self.storage_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(e.clone());
+                *framework::lock_state(&self.storage_error) = Some(e.clone());
                 Err(e)
             }
         }
@@ -5979,8 +5919,8 @@ impl EvmModule {
     /// leave state ahead of history, or a restarted node would serve
     /// newer state under an older height label).
     fn account_flush_ops(&self) -> Vec<storage::Op> {
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let touched = self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
+        let touched = framework::lock_state(&self.touched);
 
         let mut ops = Vec::with_capacity(touched.len());
         for evm_addr in touched.iter() {
@@ -6092,7 +6032,7 @@ impl EvmModule {
         // version marker, and skipping their restore would silently
         // drop durable state that exists.
         if !entries.is_empty() {
-            let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut db_guard = framework::lock_state(&self.db);
             let db = Arc::make_mut(&mut *db_guard);
             for (key, value) in &entries {
                 let Some(oxide_addr) = persist::key_to_address(key) else { continue };
@@ -6159,8 +6099,7 @@ impl EvmModule {
         // indexes as they insert.
         let mut stale: Vec<Hash> = Vec::new();
         let floor = {
-            let mut history =
-                self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut history = framework::lock_state(&self.history);
             for (_key, value) in backend.range(&persist::block_prefix()) {
                 let Some(block) = persist::deserialize_block(&value) else {
                     continue; // Malformed record — a storage bug, skip it.
@@ -6185,18 +6124,16 @@ impl EvmModule {
         // without the restart. A fresh backend (no sealed blocks)
         // keeps the constructor seed, matching a cold start.
         {
-            let history = self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let history = framework::lock_state(&self.history);
             if let Some(last) = history.latest().and_then(|h| history.block(h)) {
                 let mut fee_state = fee::BaseFeeState::new(last.base_fee, last.gas_limit);
                 fee_state.update(last.gas_used);
-                *self.fee_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    fee_state;
+                *framework::lock_state(&self.fee_state) = fee_state;
             }
         }
 
         {
-            let mut versioned =
-                self.versioned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut versioned = framework::lock_state(&self.versioned);
             for (key, value) in backend.range(&persist::undo_prefix()) {
                 let Some(height) = persist::key_to_height(&key) else { continue };
                 if floor.is_some_and(|f| height < f) {
@@ -8407,10 +8344,7 @@ mod tests {
         m.handle(&dummy_ctx(), &call).expect("call must succeed");
 
         assert!(
-            m.touched
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&beneficiary),
+            framework::lock_state(&m.touched).contains(&beneficiary),
             "selfdestruct beneficiary must be tracked as touched"
         );
         m.end_block(Height::new(1));
@@ -8433,7 +8367,7 @@ mod tests {
         // Insert an account with a U256::MAX balance directly —
         // beyond what `fund_account_for_test` (u128) can express.
         {
-            let mut db_guard = m.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut db_guard = framework::lock_state(&m.db);
             let db = Arc::make_mut(&mut *db_guard);
             db.cache.accounts.insert(
                 evm_addr,
@@ -9855,7 +9789,7 @@ mod tests {
         // seconds — 1_700_000_000_500 ms truncates to …000 s, not
         // the height-derived `10 * BLOCK_TIME_SECS = 150`.
         assert_eq!(
-            *m.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *framework::lock_state(&m.block_timestamp),
             1_700_000_000,
             "block.timestamp must be the consensus timestamp in seconds"
         );
@@ -9888,7 +9822,7 @@ mod tests {
         let m = make_module();
         m.begin_block_ctx(Height::new(4), &types::BlockContext::default());
         assert_eq!(
-            *m.block_timestamp.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *framework::lock_state(&m.block_timestamp),
             4 * BLOCK_TIME_SECS,
             "zero context falls back to the height-derived timestamp"
         );

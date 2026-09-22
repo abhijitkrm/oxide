@@ -467,7 +467,7 @@ impl ExchangeModule {
     /// # Panics
     /// Panics if the inner mutex is poisoned.
     pub fn list_market(&self, cfg: MarketConfig) -> Result<u8, ExecError> {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         // Find the first empty slot.
         let id =
             inner.markets.iter().position(Option::is_none).ok_or_else(|| {
@@ -497,7 +497,7 @@ impl ExchangeModule {
     /// # Panics
     /// Panics if the inner mutex is poisoned.
     pub fn l1(&self, market: u8) -> Option<L1> {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
         let engine = inner.markets[usize::from(market)].as_ref()?;
         Some((engine.best_bid(), engine.best_ask()))
     }
@@ -524,13 +524,7 @@ impl ExchangeModule {
     /// # Panics
     /// Panics if the inner mutex is poisoned.
     pub fn base_balance(&self, owner: Address, market: u8) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .base_balances
-            .get(&(owner, market))
-            .copied()
-            .unwrap_or(0)
+        framework::lock_state(&self.inner).base_balances.get(&(owner, market)).copied().unwrap_or(0)
     }
 
     /// The account's base locked by resting sells on a market.
@@ -539,13 +533,7 @@ impl ExchangeModule {
     /// # Panics
     /// Panics if the inner mutex is poisoned.
     pub fn base_hold(&self, owner: Address, market: u8) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .base_holds
-            .get(&(owner, market))
-            .copied()
-            .unwrap_or(0)
+        framework::lock_state(&self.inner).base_holds.get(&(owner, market)).copied().unwrap_or(0)
     }
 
     /// Protocol fees accrued to a market's vault (quote units).
@@ -553,13 +541,7 @@ impl ExchangeModule {
     /// # Panics
     /// Panics if the inner mutex is poisoned.
     pub fn fee_vault(&self, market: u8) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .fee_vault
-            .get(&market)
-            .copied()
-            .unwrap_or(0)
+        framework::lock_state(&self.inner).fee_vault.get(&market).copied().unwrap_or(0)
     }
 
     /// Quote escrow held on `market`: the implied `price × qty /
@@ -579,7 +561,7 @@ impl ExchangeModule {
     /// Panics if the inner mutex is poisoned.
     #[doc(hidden)]
     pub fn escrowed_quote(&self, market: u8) -> u64 {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
         let mut total = 0u64;
         if let Some(Some(engine)) = inner.markets.get(usize::from(market)) {
             let mut entries = Vec::new();
@@ -608,9 +590,7 @@ impl ExchangeModule {
     /// Panics if the inner mutex is poisoned.
     #[doc(hidden)]
     pub fn escrowed_base(&self, market: u8) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        framework::lock_state(&self.inner)
             .registered
             .values()
             .filter(|o| o.market == u16::from(market) && o.side == Side::Sell)
@@ -678,7 +658,7 @@ impl ExchangeModule {
     /// hashes.
     fn write_committed(&self, w: &mut framework::CanonicalState) {
         w.put_root(&subtree_root(&self.store));
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = framework::lock_state(&self.inner);
         let mut entries = Vec::new();
         let mut book_bytes = Vec::new();
         w.put_count(inner.markets.len());
@@ -1028,7 +1008,7 @@ impl Module for ExchangeModule {
         let tag = msg[0];
         let body = &msg[1..];
 
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
 
         match tag {
             TAG_PLACE => self.handle_place(ctx, body, &mut inner),
@@ -1136,8 +1116,7 @@ impl Module for ExchangeModule {
     /// committed subtree root, fully decode the fields, then hash
     /// the canonical preimage.
     fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
-        let slots =
-            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
+        let slots = framework::lock_state(&self.inner).markets.len();
         let (canon, _decoded, _store) = framework::stage_blob_snapshot(snapshot, |r, store| {
             Self::decode_committed(r, store, slots)
         })?;
@@ -1148,12 +1127,11 @@ impl Module for ExchangeModule {
     /// the same staged decode runs again, then the fields swap in
     /// atomically (decode first, mutate second).
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
-        let slots =
-            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).markets.len();
+        let slots = framework::lock_state(&self.inner).markets.len();
         let (_canon, (markets, endorsements, registered, balances, holds, fees), store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
-        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *framework::lock_state(&self.store) = store;
+        let mut inner = framework::lock_state(&self.inner);
         inner.markets = markets;
         inner.registered = registered;
         inner.base_balances = balances;
@@ -1212,7 +1190,7 @@ impl framework::ParameterSink for ExchangeModule {
         let ledger = self.ledger.as_ref().ok_or_else(|| {
             ExecError::ModuleRejected("fee_vault.withdraw: no ledger wired".to_string())
         })?;
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = framework::lock_state(&self.inner);
         let vault = inner.fee_vault.get(&market).copied().unwrap_or(0);
         if vault < amount {
             return Err(ExecError::ModuleRejected(

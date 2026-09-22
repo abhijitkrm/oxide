@@ -481,11 +481,7 @@ impl StakingModule {
     /// Panics if a mutex is poisoned.
     #[doc(hidden)]
     pub fn register_validator(&self, validator: Address) {
-        self.validators
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(validator)
-            .or_insert(0);
+        framework::lock_state(&self.validators).entry(validator).or_insert(0);
     }
 
     /// Register a validator at genesis — sets stake directly without
@@ -518,10 +514,7 @@ impl StakingModule {
     /// Panics if `key` is not 48 bytes or the mutex is poisoned.
     pub fn genesis_set_bls_key(&self, validator: Address, key: &[u8]) {
         assert_eq!(key.len(), crypto::bls::PublicKey::LEN, "BLS key must be 48 bytes");
-        self.bls_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(validator, key.to_vec());
+        framework::lock_state(&self.bls_keys).insert(validator, key.to_vec());
     }
 
     /// Whether `addr` is currently jailed (excluded from consensus
@@ -533,7 +526,7 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn is_jailed(&self, addr: &Address) -> bool {
-        self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(addr)
+        framework::lock_state(&self.jailed).contains_key(addr)
     }
 
     /// `true` if `addr` is in the current validator set, not
@@ -556,20 +549,11 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn is_active_validator(&self, addr: &Address) -> bool {
-        let in_set = self
-            .validators
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(addr);
+        let in_set = framework::lock_state(&self.validators).contains_key(addr);
         if !in_set || self.is_jailed(addr) {
             return false;
         }
-        !self
-            .pending_validator_adds
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .any(|(a, _)| a == addr)
+        !framework::lock_state(&self.pending_validator_adds).iter().any(|(a, _)| a == addr)
     }
 
     /// `true` if `addr` is registered as a validator — an active
@@ -582,7 +566,7 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn is_registered(&self, addr: &Address) -> bool {
-        self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(addr)
+        framework::lock_state(&self.validators).contains_key(addr)
     }
 
     /// `addr`'s current voting power: bonded stake if the address
@@ -598,12 +582,7 @@ impl StakingModule {
         if !self.is_active_validator(addr) {
             return 0;
         }
-        self.validators
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(addr)
-            .copied()
-            .unwrap_or(0)
+        framework::lock_state(&self.validators).get(addr).copied().unwrap_or(0)
     }
 
     /// Total voting power across the active committee — the
@@ -616,10 +595,9 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn total_power(&self) -> u64 {
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending =
-            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
+        let jailed = framework::lock_state(&self.jailed);
+        let pending = framework::lock_state(&self.pending_validator_adds);
         validators
             .iter()
             .filter(|(a, _)| !jailed.contains_key(*a) && !pending.iter().any(|(p, _)| p == *a))
@@ -636,10 +614,9 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn active_validator_count(&self) -> usize {
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending =
-            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
+        let jailed = framework::lock_state(&self.jailed);
+        let pending = framework::lock_state(&self.pending_validator_adds);
         validators
             .keys()
             .filter(|v| !jailed.contains_key(*v) && !pending.iter().any(|(p, _)| p == *v))
@@ -672,12 +649,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn stake(&self, addr: &Address) -> u64 {
-        *self
-            .validators
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(addr)
-            .unwrap_or(&0)
+        *framework::lock_state(&self.validators).get(addr).unwrap_or(&0)
     }
 
     /// The account's claimable rewards *as if it settled now* —
@@ -689,23 +661,12 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn claimable(&self, addr: &Address) -> u64 {
-        let rpts = self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let debts = self.reward_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut total = *self
-            .pending_rewards
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(addr)
-            .unwrap_or(&0);
-        let delegator_vs = self
-            .delegator_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(addr)
-            .cloned()
-            .unwrap_or_default();
-        let delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rpts = framework::lock_state(&self.reward_per_token);
+        let debts = framework::lock_state(&self.reward_debt);
+        let mut total = *framework::lock_state(&self.pending_rewards).get(addr).unwrap_or(&0);
+        let delegator_vs =
+            framework::lock_state(&self.delegator_index).get(addr).cloned().unwrap_or_default();
+        let delegations = framework::lock_state(&self.delegations);
         for v in &delegator_vs {
             let amount = delegations.get(&(*addr, *v)).copied().unwrap_or(0);
             let rpt = rpts.get(v).copied().unwrap_or(0);
@@ -716,24 +677,13 @@ impl StakingModule {
             }
         }
         drop(delegations);
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
         if let Some(&stake) = validators.get(addr) {
-            let delegated = self
-                .delegated_total
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(addr)
-                .copied()
-                .unwrap_or(0);
+            let delegated =
+                framework::lock_state(&self.delegated_total).get(addr).copied().unwrap_or(0);
             let self_share = Self::self_share_of(stake, delegated);
             let rpt = rpts.get(addr).copied().unwrap_or(0);
-            let debt = self
-                .self_debt
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(addr)
-                .copied()
-                .unwrap_or(0);
+            let debt = framework::lock_state(&self.self_debt).get(addr).copied().unwrap_or(0);
             if rpt > debt && self_share > 0 {
                 let accrued = u128::from(self_share).saturating_mul(rpt - debt) / RPT_SCALE;
                 total = total.saturating_add(u64::try_from(accrued).unwrap_or(u64::MAX));
@@ -748,7 +698,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn top_validators(&self, n: usize) -> Vec<Validator> {
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
         let mut sorted: Vec<(Address, u64)> = validators
             .iter()
             .filter(|&(_, &stake)| stake > 0)
@@ -764,7 +714,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn pending_unbonding(&self) -> Vec<UnbondingEntry> {
-        self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        framework::lock_state(&self.unbonding).clone()
     }
 
     /// Take all pending key changes, clearing the queue. Called by
@@ -783,15 +733,11 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
-        let changes: Vec<(Address, Vec<u8>)> = std::mem::take(
-            &mut *self
-                .pending_key_changes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-        .into_iter()
-        .collect();
-        let mut bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changes: Vec<(Address, Vec<u8>)> =
+            std::mem::take(&mut *framework::lock_state(&self.pending_key_changes))
+                .into_iter()
+                .collect();
+        let mut bls_keys = framework::lock_state(&self.bls_keys);
         for (addr, key) in &changes {
             if let Some(old) = bls_keys.insert(*addr, key.clone())
                 && old != *key
@@ -811,8 +757,7 @@ impl StakingModule {
     /// rotation, and lapse paths from silently dropping the one
     /// key a pending proof needs.
     fn retire_key(&self, validator: Address, old_key: Vec<u8>) {
-        let mut retired =
-            self.retired_bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retired = framework::lock_state(&self.retired_bls_keys);
         let keys = retired.entry(validator).or_default();
         keys.push(old_key);
         if keys.len() > EVIDENCE_KEY_HISTORY {
@@ -841,29 +786,17 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn take_validator_changes(&self) -> executor::ValidatorChanges {
-        let removes: std::collections::BTreeSet<Address> = std::mem::take(
-            &mut *self
-                .pending_validator_removes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-        .into_iter()
-        .chain(std::mem::take(
-            &mut *self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-        ))
-        .collect();
-        let pending_adds = std::mem::take(
-            &mut *self
-                .pending_validator_adds
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let removes: std::collections::BTreeSet<Address> =
+            std::mem::take(&mut *framework::lock_state(&self.pending_validator_removes))
+                .into_iter()
+                .chain(std::mem::take(&mut *framework::lock_state(&self.pending_jails)))
+                .collect();
+        let pending_adds =
+            std::mem::take(&mut *framework::lock_state(&self.pending_validator_adds));
         let mut adds = Vec::with_capacity(pending_adds.len());
         {
-            let mut validators =
-                self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut bls_keys =
-                self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut validators = framework::lock_state(&self.validators);
+            let mut bls_keys = framework::lock_state(&self.bls_keys);
             for (addr, key) in pending_adds {
                 let bonded = validators.get(&addr).copied().unwrap_or(0);
                 if bonded == 0 {
@@ -888,13 +821,10 @@ impl StakingModule {
                 adds.push((addr, key, bonded));
             }
         }
-        let unjails = std::mem::take(
-            &mut *self.pending_unjails.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let unjails = std::mem::take(&mut *framework::lock_state(&self.pending_unjails));
         if !unjails.is_empty() {
-            let bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let validators =
-                self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bls_keys = framework::lock_state(&self.bls_keys);
+            let validators = framework::lock_state(&self.validators);
             for addr in unjails {
                 // `handle_unjail` already required both — a missing
                 // entry here means the validator was removed between
@@ -914,10 +844,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn has_key_change(&self, addr: &Address) -> bool {
-        self.pending_key_changes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(addr)
+        framework::lock_state(&self.pending_key_changes).contains_key(addr)
     }
 
     /// Get completed unbonding entries (for withdrawal).
@@ -926,8 +853,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn completed_unbonding(&self) -> Vec<UnbondingEntry> {
-        let current =
-            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = *framework::lock_state(&self.current_height);
         self.unbonding
             .lock()
             .unwrap()
@@ -1166,8 +1092,7 @@ impl Module for StakingModule {
     }
 
     fn begin_block(&self, height: Height) {
-        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            height.value();
+        *framework::lock_state(&self.current_height) = height.value();
     }
 
     fn handle(&self, ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
@@ -1205,9 +1130,8 @@ impl Module for StakingModule {
         // (entries were dropped with no payout — the bonded pool kept
         // tokens nobody could reclaim).
         let current = height.value();
-        let ledger = self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let mut unbonding =
-            self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ledger = framework::lock_state(&self.ledger).clone();
+        let mut unbonding = framework::lock_state(&self.unbonding);
         unbonding.retain(|entry| {
             if entry.completion_height > current {
                 return true;
@@ -1255,14 +1179,10 @@ impl Module for StakingModule {
             return;
         }
         let signer_set: std::collections::BTreeSet<Address> = signers.iter().copied().collect();
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending_removes = self
-            .pending_validator_removes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut attendance =
-            self.attendance.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
+        let pending_removes = framework::lock_state(&self.pending_validator_removes);
+        let jailed = framework::lock_state(&self.jailed);
+        let mut attendance = framework::lock_state(&self.attendance);
 
         let mut newly_jailed = Vec::new();
         for (addr, stake) in validators.iter() {
@@ -1295,9 +1215,8 @@ impl Module for StakingModule {
         drop(jailed);
 
         if !newly_jailed.is_empty() {
-            let mut jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut pending_jails =
-                self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut jailed = framework::lock_state(&self.jailed);
+            let mut pending_jails = framework::lock_state(&self.pending_jails);
             for addr in newly_jailed {
                 jailed.insert(addr, height.value());
                 pending_jails.push(addr);
@@ -1309,7 +1228,7 @@ impl Module for StakingModule {
     /// `SCHEDULE_HALT` (a tx, so every replica schedules the same
     /// halt deterministically — including on journal replay).
     fn scheduled_halt_height(&self) -> Option<u64> {
-        *self.scheduled_halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *framework::lock_state(&self.scheduled_halt)
     }
 
     fn state_root(&self) -> Hash {
@@ -1364,47 +1283,28 @@ impl Module for StakingModule {
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let (_canon, staged, store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s))?;
-        *self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = store;
-        *self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.validators;
-        *self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.delegations;
-        *self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.unbonding;
-        *self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.pending_rewards;
-        *self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.reward_per_token;
-        *self.reward_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.reward_debt;
-        *self.self_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.self_debt;
-        *self.delegator_index.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.delegator_index;
-        *self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.delegated_total;
-        *self.pending_key_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.pending_key_changes;
-        *self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.pending_validator_adds;
-        *self.pending_validator_removes.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.pending_validator_removes;
-        *self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = staged.bls_keys;
-        *self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = staged.jailed;
-        *self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.pending_jails;
-        *self.pending_unjails.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.pending_unjails;
-        *self.scheduled_halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.scheduled_halt;
-        *self.seen_evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.seen_evidence;
-        *self.retired_bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.retired_bls_keys;
-        *self.attendance.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.attendance;
-        *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            staged.current_height;
+        *framework::lock_state(&self.store) = store;
+        *framework::lock_state(&self.validators) = staged.validators;
+        *framework::lock_state(&self.delegations) = staged.delegations;
+        *framework::lock_state(&self.unbonding) = staged.unbonding;
+        *framework::lock_state(&self.pending_rewards) = staged.pending_rewards;
+        *framework::lock_state(&self.reward_per_token) = staged.reward_per_token;
+        *framework::lock_state(&self.reward_debt) = staged.reward_debt;
+        *framework::lock_state(&self.self_debt) = staged.self_debt;
+        *framework::lock_state(&self.delegator_index) = staged.delegator_index;
+        *framework::lock_state(&self.delegated_total) = staged.delegated_total;
+        *framework::lock_state(&self.pending_key_changes) = staged.pending_key_changes;
+        *framework::lock_state(&self.pending_validator_adds) = staged.pending_validator_adds;
+        *framework::lock_state(&self.pending_validator_removes) = staged.pending_validator_removes;
+        *framework::lock_state(&self.bls_keys) = staged.bls_keys;
+        *framework::lock_state(&self.jailed) = staged.jailed;
+        *framework::lock_state(&self.pending_jails) = staged.pending_jails;
+        *framework::lock_state(&self.pending_unjails) = staged.pending_unjails;
+        *framework::lock_state(&self.scheduled_halt) = staged.scheduled_halt;
+        *framework::lock_state(&self.seen_evidence) = staged.seen_evidence;
+        *framework::lock_state(&self.retired_bls_keys) = staged.retired_bls_keys;
+        *framework::lock_state(&self.attendance) = staged.attendance;
+        *framework::lock_state(&self.current_height) = staged.current_height;
         self.endorsements.replace_with(staged.endorsements);
         Ok(())
     }
@@ -1489,7 +1389,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn set_ledger(&self, ledger: std::sync::Arc<dyn Balances + Send + Sync>) {
-        *self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ledger);
+        *framework::lock_state(&self.ledger) = Some(ledger);
     }
 
     /// Commit `validators`, `delegations`, and the `unbonding` queue
@@ -1497,24 +1397,21 @@ impl StakingModule {
     /// voting power and future unbond payouts.
     fn commit_stake_state(&self, w: &mut framework::CanonicalState) {
         {
-            let validators =
-                self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let validators = framework::lock_state(&self.validators);
             w.put_count(validators.len());
             for (a, s) in validators.iter() {
                 w.put_addr(a).put_u64(*s);
             }
         }
         {
-            let delegations =
-                self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let delegations = framework::lock_state(&self.delegations);
             w.put_count(delegations.len());
             for ((d, v), amt) in delegations.iter() {
                 w.put_addr(d).put_addr(v).put_u64(*amt);
             }
         }
         {
-            let unbonding =
-                self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let unbonding = framework::lock_state(&self.unbonding);
             w.put_count(unbonding.len());
             for e in unbonding.iter() {
                 w.put_addr(&e.delegator)
@@ -1535,33 +1432,29 @@ impl StakingModule {
     /// the root.
     fn commit_reward_state(&self, w: &mut framework::CanonicalState) {
         {
-            let pending =
-                self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pending = framework::lock_state(&self.pending_rewards);
             w.put_count(pending.len());
             for (a, r) in pending.iter() {
                 w.put_addr(a).put_u64(*r);
             }
         }
         {
-            let rpt =
-                self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rpt = framework::lock_state(&self.reward_per_token);
             w.put_count(rpt.len());
             for (a, r) in rpt.iter() {
                 w.put_addr(a).put_u128(*r);
             }
-            let debt = self.reward_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let debt = framework::lock_state(&self.reward_debt);
             w.put_count(debt.len());
             for ((d, v), r) in debt.iter() {
                 w.put_addr(d).put_addr(v).put_u128(*r);
             }
-            let self_debt =
-                self.self_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let self_debt = framework::lock_state(&self.self_debt);
             w.put_count(self_debt.len());
             for (a, r) in self_debt.iter() {
                 w.put_addr(a).put_u128(*r);
             }
-            let index =
-                self.delegator_index.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let index = framework::lock_state(&self.delegator_index);
             w.put_count(index.len());
             for (d, validators) in index.iter() {
                 w.put_addr(d).put_count(validators.len());
@@ -1569,8 +1462,7 @@ impl StakingModule {
                     w.put_addr(v);
                 }
             }
-            let totals =
-                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let totals = framework::lock_state(&self.delegated_total);
             w.put_count(totals.len());
             for (a, t) in totals.iter() {
                 w.put_addr(a).put_u64(*t);
@@ -1583,44 +1475,37 @@ impl StakingModule {
     /// pending jail/unjail queues — everything the next epoch
     /// rotation will act on.
     fn commit_set_state(&self, w: &mut framework::CanonicalState) {
-        let pending_keys =
-            self.pending_key_changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_keys = framework::lock_state(&self.pending_key_changes);
         w.put_count(pending_keys.len());
         for (a, k) in pending_keys.iter() {
             w.put_addr(a).put_bytes(k);
         }
-        let adds =
-            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let adds = framework::lock_state(&self.pending_validator_adds);
         w.put_count(adds.len());
         for (a, k) in adds.iter() {
             w.put_addr(a).put_bytes(k);
         }
-        let removes = self
-            .pending_validator_removes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removes = framework::lock_state(&self.pending_validator_removes);
         w.put_count(removes.len());
         for a in removes.iter() {
             w.put_addr(a);
         }
-        let keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keys = framework::lock_state(&self.bls_keys);
         w.put_count(keys.len());
         for (a, k) in keys.iter() {
             w.put_addr(a).put_bytes(k);
         }
-        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let jailed = framework::lock_state(&self.jailed);
         w.put_count(jailed.len());
         for (a, h) in jailed.iter() {
             w.put_addr(a).put_u64(*h);
         }
-        let pending_jails =
-            self.pending_jails.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_jails = framework::lock_state(&self.pending_jails);
         w.put_count(pending_jails.len());
         for a in pending_jails.iter() {
             w.put_addr(a);
         }
-        let pending_unjails =
-            self.pending_unjails.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_unjails = framework::lock_state(&self.pending_unjails);
         w.put_count(pending_unjails.len());
         for a in pending_unjails.iter() {
             w.put_addr(a);
@@ -1636,7 +1521,7 @@ impl StakingModule {
     /// seen-evidence replay set, per-validator attendance rings,
     /// and the current height marker.
     fn commit_consensus_state(&self, w: &mut framework::CanonicalState) {
-        match *self.scheduled_halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        match *framework::lock_state(&self.scheduled_halt) {
             Some(h) => {
                 w.put_u8(1).put_u64(h);
             }
@@ -1645,13 +1530,12 @@ impl StakingModule {
             }
         }
         {
-            let seen = self.seen_evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seen = framework::lock_state(&self.seen_evidence);
             w.put_count(seen.len());
             for h in seen.iter() {
                 w.put_root(h);
             }
-            let attendance =
-                self.attendance.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let attendance = framework::lock_state(&self.attendance);
             w.put_count(attendance.len());
             for (a, ring) in attendance.iter() {
                 w.put_addr(a).put_count(ring.len());
@@ -1660,7 +1544,7 @@ impl StakingModule {
                 }
             }
         }
-        w.put_u64(*self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        w.put_u64(*framework::lock_state(&self.current_height));
         // ── Trailing section (v2): retired consensus keys ──
         // Evidence verification consults the retired set for
         // proofs spanning a key rotation — committed because two
@@ -1668,8 +1552,7 @@ impl StakingModule {
         // verifies. Appended last so pre-upgrade blobs decode
         // with the empty-history default.
         {
-            let retired =
-                self.retired_bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let retired = framework::lock_state(&self.retired_bls_keys);
             w.put_count(retired.len());
             for (a, keys) in retired.iter() {
                 w.put_addr(a).put_count(keys.len());
@@ -2061,9 +1944,7 @@ impl StakingModule {
     ///
     /// Panics if the mutex is poisoned.
     pub fn delegation(&self, delegator: &Address, validator: &Address) -> u64 {
-        self.delegations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        framework::lock_state(&self.delegations)
             .get(&(*delegator, *validator))
             .copied()
             .unwrap_or(0)
@@ -2080,7 +1961,7 @@ impl StakingModule {
         stake: u64,
         delegation: u64,
     ) {
-        let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = framework::lock_state(&self.store);
         store.insert(validator.0.to_vec(), stake.to_le_bytes().to_vec());
         let mut key = Vec::with_capacity(4 + 40);
         key.extend_from_slice(b"del/");
@@ -2094,13 +1975,11 @@ impl StakingModule {
     /// An unbacked delegation is an accounting hole — never run the
     /// debit path without a ledger.
     fn require_ledger(&self) -> Result<std::sync::Arc<dyn Balances + Send + Sync>, ExecError> {
-        self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().ok_or_else(
-            || {
-                ExecError::ModuleRejected(
-                    "staking: balance ledger not wired (cannot settle delegation)".to_string(),
-                )
-            },
-        )
+        framework::lock_state(&self.ledger).clone().ok_or_else(|| {
+            ExecError::ModuleRejected(
+                "staking: balance ledger not wired (cannot settle delegation)".to_string(),
+            )
+        })
     }
 
     /// Handle a delegate message: move `amount` from the sender's
@@ -2155,8 +2034,7 @@ impl StakingModule {
         ledger: &dyn Balances,
     ) -> Result<(), ExecError> {
         {
-            let validators =
-                self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let validators = framework::lock_state(&self.validators);
             if !validators.contains_key(&validator) {
                 return Err(ExecError::ModuleRejected(
                     "delegate: validator not registered".to_string(),
@@ -2166,10 +2044,8 @@ impl StakingModule {
         // Debit first: if the transfer fails nothing is recorded.
         ledger.transfer(&delegator, &BONDED_POOL, amount)?;
 
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut validators = framework::lock_state(&self.validators);
+        let mut delegations = framework::lock_state(&self.delegations);
         // Reward accounting must settle on the *pre-mutation*
         // position: the delegation earns rewards accrued while it
         // existed, and the validator's self-share shrinks as
@@ -2177,17 +2053,14 @@ impl StakingModule {
         let current_delegation = delegations.get(&(delegator, validator)).copied().unwrap_or(0);
         self.settle_delegation(delegator, validator, current_delegation);
         {
-            let mut totals =
-                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut totals = framework::lock_state(&self.delegated_total);
             let stake_now = validators.get(&validator).copied().unwrap_or(0);
             let self_share =
                 Self::self_share_of(stake_now, totals.get(&validator).copied().unwrap_or(0));
             self.settle_self_share(validator, self_share);
             *totals.entry(validator).or_insert(0) += amount;
         }
-        self.delegator_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        framework::lock_state(&self.delegator_index)
             .entry(delegator)
             .or_default()
             .insert(validator);
@@ -2224,10 +2097,8 @@ impl StakingModule {
         validator: Address,
         amount: u64,
     ) -> Result<(), ExecError> {
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut validators = framework::lock_state(&self.validators);
+        let mut delegations = framework::lock_state(&self.delegations);
         let delegation = delegations
             .get_mut(&(delegator, validator))
             .ok_or(ExecError::ModuleRejected("undo_delegate: no delegation".to_string()))?;
@@ -2240,18 +2111,11 @@ impl StakingModule {
         let new_delegation = *delegation;
         if new_delegation == 0 {
             delegations.remove(&(delegator, validator));
-            self.delegator_index
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            framework::lock_state(&self.delegator_index)
                 .get_mut(&delegator)
                 .map(|set| set.remove(&validator));
         }
-        if let Some(t) = self
-            .delegated_total
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(&validator)
-        {
+        if let Some(t) = framework::lock_state(&self.delegated_total).get_mut(&validator) {
             *t = t.saturating_sub(amount);
         }
         let stake = validators
@@ -2279,10 +2143,8 @@ impl StakingModule {
         validator: Address,
         amount: u64,
     ) -> Result<u64, ExecError> {
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut validators = framework::lock_state(&self.validators);
+        let mut delegations = framework::lock_state(&self.delegations);
         let delegation = delegations.get_mut(&(delegator, validator)).ok_or_else(|| {
             ExecError::ModuleRejected(
                 "undelegate: no delegation from this sender to this validator".to_string(),
@@ -2299,8 +2161,7 @@ impl StakingModule {
         let old_delegation = *delegation;
         self.settle_delegation(delegator, validator, old_delegation);
         {
-            let mut totals =
-                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut totals = framework::lock_state(&self.delegated_total);
             let stake_now = validators.get(&validator).copied().unwrap_or(0);
             let self_share =
                 Self::self_share_of(stake_now, totals.get(&validator).copied().unwrap_or(0));
@@ -2313,9 +2174,7 @@ impl StakingModule {
         let new_delegation = *delegation;
         if new_delegation == 0 {
             delegations.remove(&(delegator, validator));
-            self.delegator_index
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            framework::lock_state(&self.delegator_index)
                 .get_mut(&delegator)
                 .map(|set| set.remove(&validator));
         }
@@ -2327,13 +2186,14 @@ impl StakingModule {
         drop(delegations);
         drop(validators);
 
-        let current =
-            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = *framework::lock_state(&self.current_height);
         let completion = current.saturating_add(self.unbonding_period);
-        self.unbonding
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(UnbondingEntry { delegator, validator, amount, completion_height: completion });
+        framework::lock_state(&self.unbonding).push(UnbondingEntry {
+            delegator,
+            validator,
+            amount,
+            completion_height: completion,
+        });
         Ok(completion)
     }
 
@@ -2352,8 +2212,7 @@ impl StakingModule {
         amount: u64,
     ) -> Result<(), ExecError> {
         {
-            let mut unbonding =
-                self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut unbonding = framework::lock_state(&self.unbonding);
             // Remove the *last* matching entry — journal undos run in
             // reverse order of mutation within the frame.
             let pos = unbonding
@@ -2366,10 +2225,8 @@ impl StakingModule {
                 ))?;
             unbonding.remove(pos);
         }
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut validators = framework::lock_state(&self.validators);
+        let mut delegations = framework::lock_state(&self.delegations);
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("undo_undelegate: validator gone".to_string()))?;
@@ -2380,15 +2237,8 @@ impl StakingModule {
         *delegation = delegation
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("delegation overflow on undo".to_string()))?;
-        *self
-            .delegated_total
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(validator)
-            .or_insert(0) += amount;
-        self.delegator_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *framework::lock_state(&self.delegated_total).entry(validator).or_insert(0) += amount;
+        framework::lock_state(&self.delegator_index)
             .entry(delegator)
             .or_default()
             .insert(validator);
@@ -2432,12 +2282,7 @@ impl StakingModule {
         // The action must name a live validator before it can
         // collect endorsements — slashing an unknown address is
         // never meaningful.
-        if !self
-            .validators
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&validator)
-        {
+        if !framework::lock_state(&self.validators).contains_key(&validator) {
             return Err(ExecError::ModuleRejected("slash: validator not found".to_string()));
         }
         match self.endorsements.record(msg, &ctx.sender, self)? {
@@ -2474,10 +2319,8 @@ impl StakingModule {
         amount: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let mut validators =
-            self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut validators = framework::lock_state(&self.validators);
+        let mut delegations = framework::lock_state(&self.delegations);
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("slash: validator not found".to_string()))?;
@@ -2489,8 +2332,7 @@ impl StakingModule {
         // the self-share settles before it shrinks. (Slash must not
         // confiscate already-earned rewards.)
         {
-            let totals =
-                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let totals = framework::lock_state(&self.delegated_total);
             let self_share =
                 Self::self_share_of(stake_before, totals.get(&validator).copied().unwrap_or(0));
             drop(totals);
@@ -2538,9 +2380,7 @@ impl StakingModule {
             for (d, a) in affected {
                 if a == 0 {
                     delegations.remove(&(d, validator));
-                    self.delegator_index
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    framework::lock_state(&self.delegator_index)
                         .get_mut(&d)
                         .map(|set| set.remove(&validator));
                 } else {
@@ -2548,12 +2388,7 @@ impl StakingModule {
                 }
                 self.store_delegation_state(validator, d, new_stake, a);
             }
-            if let Some(t) = self
-                .delegated_total
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_mut(&validator)
-            {
+            if let Some(t) = framework::lock_state(&self.delegated_total).get_mut(&validator) {
                 *t = t.saturating_sub(applied);
             }
             burned_from_pool = applied;
@@ -2565,8 +2400,7 @@ impl StakingModule {
         // unattributed stake (genesis self-stake) was never in the
         // pool, so burning it would overdraw.
         if burned_from_pool > 0
-            && let Some(ledger) =
-                self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+            && let Some(ledger) = framework::lock_state(&self.ledger).clone()
         {
             // Burn = debit the pool with no credit — supply
             // shrinks (Ethereum burn semantics; cleaner than
@@ -2642,14 +2476,13 @@ impl StakingModule {
         // signature impossible to fake.
         let mut candidates: Vec<Vec<u8>> = Vec::new();
         {
-            let bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bls_keys = framework::lock_state(&self.bls_keys);
             if let Some(k) = bls_keys.get(&validator) {
                 candidates.push(k.clone());
             }
         }
         {
-            let retired =
-                self.retired_bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let retired = framework::lock_state(&self.retired_bls_keys);
             if let Some(keys) = retired.get(&validator) {
                 candidates.extend(keys.iter().cloned());
             }
@@ -2675,7 +2508,7 @@ impl StakingModule {
         offense.extend_from_slice(&epoch.to_le_bytes());
         let offense_id = crypto::hash::Hasher::hash_one(crypto::hash::Domain::Vote, &offense);
         {
-            let seen = self.seen_evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seen = framework::lock_state(&self.seen_evidence);
             if seen.contains(&offense_id) {
                 return Err(ExecError::ModuleRejected("evidence: already applied".to_string()));
             }
@@ -2719,23 +2552,13 @@ impl StakingModule {
         let slash_amount = msg::double_sign_slash_amount(self.stake(&validator));
         let mut events = self.apply_slash(validator, slash_amount, msg)?;
 
-        let height = *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let already_jailed = self
-            .jailed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(validator, height)
-            .is_some();
+        let height = *framework::lock_state(&self.current_height);
+        let already_jailed =
+            framework::lock_state(&self.jailed).insert(validator, height).is_some();
         if !already_jailed {
-            self.pending_jails
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(validator);
+            framework::lock_state(&self.pending_jails).push(validator);
         }
-        self.seen_evidence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(offense_id);
+        framework::lock_state(&self.seen_evidence).insert(offense_id);
 
         events.push(Event { module: "staking", kind: "evidence", data: msg.to_vec() });
         Ok(events)
@@ -2760,14 +2583,11 @@ impl StakingModule {
                 "unjail: only the validator can unjail itself".to_string(),
             ));
         }
-        let jailed_at = self
-            .jailed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let jailed_at = framework::lock_state(&self.jailed)
             .get(&validator)
             .copied()
             .ok_or(ExecError::ModuleRejected("unjail: validator is not jailed".to_string()))?;
-        let height = *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let height = *framework::lock_state(&self.current_height);
         if height.saturating_sub(jailed_at) < MIN_JAIL_BLOCKS {
             return Err(ExecError::ModuleRejected(format!(
                 "unjail: {MIN_JAIL_BLOCKS}-block jail period not elapsed"
@@ -2776,22 +2596,14 @@ impl StakingModule {
         if self.stake(&validator) == 0 {
             return Err(ExecError::ModuleRejected("unjail: validator has no stake".to_string()));
         }
-        if !self
-            .bls_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&validator)
-        {
+        if !framework::lock_state(&self.bls_keys).contains_key(&validator) {
             return Err(ExecError::ModuleRejected(
                 "unjail: no consensus key on record".to_string(),
             ));
         }
 
-        self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&validator);
-        self.pending_unjails
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(validator);
+        framework::lock_state(&self.jailed).remove(&validator);
+        framework::lock_state(&self.pending_unjails).push(validator);
 
         Ok(vec![Event { module: "staking", kind: "unjail", data: msg.to_vec() }])
     }
@@ -2815,8 +2627,7 @@ impl StakingModule {
         halt_height: u64,
         msg: &[u8],
     ) -> Result<Vec<Event>, ExecError> {
-        let current =
-            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = *framework::lock_state(&self.current_height);
         if halt_height != 0 && halt_height <= current {
             return Err(ExecError::ModuleRejected(format!(
                 "schedule_halt: height {halt_height} is not in the future (current {current})"
@@ -2836,8 +2647,7 @@ impl StakingModule {
                 data: msg.to_vec(),
             }]),
             framework::EndorsementOutcome::Quorum => {
-                let now =
-                    *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let now = *framework::lock_state(&self.current_height);
                 let events = if halt_height != 0 && halt_height <= now {
                     vec![Event {
                         module: "staking",
@@ -2845,10 +2655,7 @@ impl StakingModule {
                         data: msg.to_vec(),
                     }]
                 } else {
-                    *self
-                        .scheduled_halt
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    *framework::lock_state(&self.scheduled_halt) =
                         if halt_height == 0 { None } else { Some(halt_height) };
                     vec![Event { module: "staking", kind: "schedule_halt", data: msg.to_vec() }]
                 };
@@ -2897,8 +2704,7 @@ impl StakingModule {
         self.settle_all(validator);
 
         let claim_amount = {
-            let mut pending =
-                self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pending = framework::lock_state(&self.pending_rewards);
             let accumulated = pending.get(&validator).copied().unwrap_or(0);
             let claim_amount = if amount == 0 { accumulated } else { amount.min(accumulated) };
             if claim_amount == 0 {
@@ -2952,7 +2758,7 @@ impl StakingModule {
             ));
         }
         // The validator must exist (have non-zero stake).
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
         if !validators.contains_key(&validator) {
             return Err(ExecError::ModuleRejected("key_change: validator not found".to_string()));
         }
@@ -2970,10 +2776,7 @@ impl StakingModule {
         // rotating to a key another member already holds would
         // collide identities at the rotation's duplicate check
         // (same gate `validator_add` applies at admission).
-        if self
-            .bls_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        if framework::lock_state(&self.bls_keys)
             .iter()
             .any(|(a, k)| *a != validator && *k == new_key)
         {
@@ -2983,10 +2786,7 @@ impl StakingModule {
         }
         drop(validators); // release lock before acquiring pending_key_changes
 
-        self.pending_key_changes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(validator, new_key);
+        framework::lock_state(&self.pending_key_changes).insert(validator, new_key);
 
         Ok(vec![Event { module: "staking", kind: "key_change", data: msg.to_vec() }])
     }
@@ -3094,28 +2894,20 @@ impl StakingModule {
                         data: msg.to_vec(),
                     }]
                 } else {
-                    self.validators
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(new_validator, 0);
+                    framework::lock_state(&self.validators).insert(new_validator, 0);
                     // Record the consensus key immediately — evidence
                     // submitted before the rotation still needs it
                     // for verification. A re-admission overwrites
                     // the previous live key — retire it rather
                     // than dropping the one a pending proof needs.
-                    let displaced = self
-                        .bls_keys
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    let displaced = framework::lock_state(&self.bls_keys)
                         .insert(new_validator, bls_key.clone());
                     if let Some(old) = displaced
                         && old != bls_key
                     {
                         self.retire_key(new_validator, old);
                     }
-                    self.pending_validator_adds
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    framework::lock_state(&self.pending_validator_adds)
                         .push((new_validator, bls_key));
                     vec![Event { module: "staking", kind: "validator_add", data: msg.to_vec() }]
                 };
@@ -3134,20 +2926,19 @@ impl StakingModule {
     /// recorded and again when the action reaches quorum — the
     /// committee may have changed in between.
     fn validate_add_action(&self, candidate: &Address, key: &[u8]) -> Result<(), ExecError> {
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
         if validators.contains_key(candidate) {
             return Err(ExecError::ModuleRejected(
                 "validator_add: validator already exists".to_string(),
             ));
         }
-        let pending_adds =
-            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_adds = framework::lock_state(&self.pending_validator_adds);
         if pending_adds.iter().any(|(a, _)| a == candidate) {
             return Err(ExecError::ModuleRejected(
                 "validator_add: validator already pending".to_string(),
             ));
         }
-        let bls_keys = self.bls_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bls_keys = framework::lock_state(&self.bls_keys);
         if bls_keys.iter().any(|(a, k)| a != candidate && k == key) {
             return Err(ExecError::ModuleRejected(
                 "validator_add: consensus key already in use".to_string(),
@@ -3211,16 +3002,13 @@ impl StakingModule {
     /// Check that `validator` may be removed right now — run before
     /// an endorsement is recorded and again at quorum.
     fn validate_remove_action(&self, validator: &Address) -> Result<(), ExecError> {
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
         if !validators.contains_key(validator) {
             return Err(ExecError::ModuleRejected(
                 "validator_remove: validator not found".to_string(),
             ));
         }
-        let pending_removes = self
-            .pending_validator_removes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending_removes = framework::lock_state(&self.pending_validator_removes);
         if pending_removes.contains(validator) {
             return Err(ExecError::ModuleRejected(
                 "validator_remove: validator already pending removal".to_string(),
@@ -3231,16 +3019,13 @@ impl StakingModule {
         // to powered members. Count powered members not already
         // queued for removal: removing the last one would leave the
         // chain with no committee.
-        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let jailed = framework::lock_state(&self.jailed);
         let staying_powered = validators
             .iter()
             .filter(|(a, s)| **s > 0 && !pending_removes.contains(*a) && !jailed.contains_key(*a))
             .count();
         if staying_powered <= 1
-            && self
-                .pending_validator_adds
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && framework::lock_state(&self.pending_validator_adds)
                 .iter()
                 .all(|(a, _)| a != validator)
         {
@@ -3255,8 +3040,7 @@ impl StakingModule {
     /// admission outright, or queue an active member for the next
     /// epoch rotation.
     fn apply_validator_remove(&self, validator: &Address) {
-        let mut pending_adds =
-            self.pending_validator_adds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending_adds = framework::lock_state(&self.pending_validator_adds);
         if let Some(pos) = pending_adds.iter().position(|(a, _)| a == validator) {
             pending_adds.remove(pos);
             drop(pending_adds);
@@ -3264,10 +3048,7 @@ impl StakingModule {
             return;
         }
         drop(pending_adds);
-        self.pending_validator_removes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(*validator);
+        framework::lock_state(&self.pending_validator_removes).push(*validator);
     }
 
     /// Unwind a pending-add candidate that never seated: drop the
@@ -3281,21 +3062,17 @@ impl StakingModule {
     /// candidate never entered the consensus set, so it accrued
     /// nothing.
     fn cancel_pending_add(&self, validator: &Address) {
-        let current =
-            *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = *framework::lock_state(&self.current_height);
         let completion = current.saturating_add(self.unbonding_period);
-        let mut delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut delegations = framework::lock_state(&self.delegations);
         let affected: Vec<(Address, u64)> = delegations
             .iter()
             .filter(|((_, v), _)| v == validator)
             .map(|((d, _), amount)| (*d, *amount))
             .collect();
         {
-            let mut unbonding =
-                self.unbonding.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut delegator_index =
-                self.delegator_index.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut unbonding = framework::lock_state(&self.unbonding);
+            let mut delegator_index = framework::lock_state(&self.delegator_index);
             for (delegator, amount) in &affected {
                 delegations.remove(&(*delegator, *validator));
                 if let Some(set) = delegator_index.get_mut(delegator) {
@@ -3309,26 +3086,19 @@ impl StakingModule {
                 });
             }
         }
-        self.delegated_total
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(validator);
-        self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(validator);
+        framework::lock_state(&self.delegated_total).remove(validator);
+        framework::lock_state(&self.validators).remove(validator);
         // Retire rather than drop: the cancelled candidate's key
         // never went live, but a previous incarnation's key may be
         // what this entry held — the uniform retire rule applies.
-        let removed_key = self
-            .bls_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(validator);
+        let removed_key = framework::lock_state(&self.bls_keys).remove(validator);
         if let Some(old) = removed_key {
             self.retire_key(*validator, old);
         }
         // Clear the store mirror so queries cannot report a phantom
         // stake or delegation for the cancelled candidate.
         {
-            let mut store = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut store = framework::lock_state(&self.store);
             store.remove(&validator.0.to_vec());
             for (delegator, _) in &affected {
                 let mut key = Vec::with_capacity(4 + 40);
@@ -3390,10 +3160,7 @@ impl StakingModule {
                     return false;
                 }
                 let Ok(addr) = <[u8; 20]>::try_from(&action[1..21]) else { return false };
-                self.validators
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains_key(&Address(addr))
+                framework::lock_state(&self.validators).contains_key(&Address(addr))
             }
             // [type][height: 8B] — dead once the tip passes the
             // target height (height 0 = "cancel halt" never dies).
@@ -3403,8 +3170,7 @@ impl StakingModule {
                 }
                 let Ok(bits) = <[u8; 8]>::try_from(&action[1..9]) else { return false };
                 let halt = u64::from_le_bytes(bits);
-                let current =
-                    *self.current_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let current = *framework::lock_state(&self.current_height);
                 halt == 0 || halt > current
             }
             // Unknown payloads are kept — conservatively assume a
@@ -3435,19 +3201,13 @@ impl StakingModule {
     /// this only takes `reward_per_token`, `reward_debt`,
     /// `pending_rewards` — always in that order.
     fn settle_delegation(&self, delegator: Address, validator: Address, delegation: u64) {
-        let rpt = *self
-            .reward_per_token
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&validator)
-            .unwrap_or(&0);
-        let mut debts = self.reward_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rpt = *framework::lock_state(&self.reward_per_token).get(&validator).unwrap_or(&0);
+        let mut debts = framework::lock_state(&self.reward_debt);
         let debt = debts.entry((delegator, validator)).or_insert(0);
         if rpt > *debt && delegation > 0 {
             let accrued = u128::from(delegation).saturating_mul(rpt - *debt) / RPT_SCALE;
             if accrued > 0 {
-                let mut pending =
-                    self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pending = framework::lock_state(&self.pending_rewards);
                 let current = pending.get(&delegator).copied().unwrap_or(0);
                 pending.insert(
                     delegator,
@@ -3462,19 +3222,13 @@ impl StakingModule {
     /// `pending_rewards[validator]`. Same settle-before-mutate rule
     /// as [`Self::settle_delegation`].
     fn settle_self_share(&self, validator: Address, self_share: u64) {
-        let rpt = *self
-            .reward_per_token
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&validator)
-            .unwrap_or(&0);
-        let mut debts = self.self_debt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rpt = *framework::lock_state(&self.reward_per_token).get(&validator).unwrap_or(&0);
+        let mut debts = framework::lock_state(&self.self_debt);
         let debt = debts.entry(validator).or_insert(0);
         if rpt > *debt && self_share > 0 {
             let accrued = u128::from(self_share).saturating_mul(rpt - *debt) / RPT_SCALE;
             if accrued > 0 {
-                let mut pending =
-                    self.pending_rewards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pending = framework::lock_state(&self.pending_rewards);
                 let current = pending.get(&validator).copied().unwrap_or(0);
                 pending.insert(
                     validator,
@@ -3489,24 +3243,19 @@ impl StakingModule {
     /// `delegator_index[account]` plus the self-share if the account
     /// is a registered validator. Called by `claim_reward`.
     fn settle_all(&self, account: Address) {
-        let delegator_vs: Vec<Address> = self
-            .delegator_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let delegator_vs: Vec<Address> = framework::lock_state(&self.delegator_index)
             .get(&account)
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
-        let delegations =
-            self.delegations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let delegations = framework::lock_state(&self.delegations);
         for v in delegator_vs {
             let amount = delegations.get(&(account, v)).copied().unwrap_or(0);
             self.settle_delegation(account, v, amount);
         }
         drop(delegations);
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
         if let Some(&stake) = validators.get(&account) {
-            let delegated =
-                self.delegated_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let delegated = framework::lock_state(&self.delegated_total);
             let self_share =
                 Self::self_share_of(stake, delegated.get(&account).copied().unwrap_or(0));
             self.settle_self_share(account, self_share);
@@ -3561,14 +3310,11 @@ impl StakingModule {
         if total_reward == 0 {
             return;
         }
-        let validators = self.validators.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending_removes = self
-            .pending_validator_removes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let validators = framework::lock_state(&self.validators);
+        let pending_removes = framework::lock_state(&self.pending_validator_removes);
         // Jailed validators stop earning too — jailing is exclusion
         // from consensus and rewards, not just consensus.
-        let jailed = self.jailed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let jailed = framework::lock_state(&self.jailed);
         let is_eligible =
             |a: &Address, s: u64| s > 0 && !pending_removes.contains(a) && !jailed.contains_key(a);
         let eligible: u64 =
@@ -3576,8 +3322,7 @@ impl StakingModule {
         if eligible == 0 {
             return;
         }
-        let mut rpt =
-            self.reward_per_token.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rpt = framework::lock_state(&self.reward_per_token);
         for (addr, stake) in validators.iter() {
             if !is_eligible(addr, *stake) {
                 continue;

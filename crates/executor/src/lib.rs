@@ -1436,7 +1436,7 @@ impl Drop for LaneDeath {
     fn drop(&mut self) {
         let (lock, cv) = &*self.sync;
         let in_flight = {
-            let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = primitives::sync::lock_state(lock);
             s.lane_dead = true;
             s.in_flight
         };
@@ -1816,20 +1816,19 @@ impl Executor {
                     // applied, never blindly replayed.
                     {
                         let (lock, _cv) = &*sync;
-                        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight =
-                            Some(height);
+                        primitives::sync::lock_state(lock).in_flight = Some(height);
                     }
                     let root = executor.execute_block(&block);
-                    executor
-                        .state_roots
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert_retained(height, root, executor.history_retention);
+                    primitives::sync::lock_state(&executor.state_roots).insert_retained(
+                        height,
+                        root,
+                        executor.history_retention,
+                    );
                     // Blocks arrive in commit order, so the newest
                     // height is always the watermark.
                     let (lock, cv) = &*sync;
                     {
-                        let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut s = primitives::sync::lock_state(lock);
                         s.in_flight = None;
                         s.executed = Some(height);
                     }
@@ -1883,9 +1882,9 @@ impl Executor {
     fn insert_finalized(&self, height: u64, block: FinalizedBlock) {
         let executed = {
             let (lock, _cv) = &*self.exec_sync;
-            lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).executed
+            primitives::sync::lock_state(lock).executed
         };
-        let mut f = self.finalized.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut f = primitives::sync::lock_state(&self.finalized);
         f.insert(height, block);
         while f.len() > self.history_retention {
             let evictable =
@@ -1904,15 +1903,8 @@ impl Executor {
         // `Some(h)` + no root = the worker died mid-mutation.
         let poisoned = {
             let (lock, _cv) = &*self.exec_sync;
-            let in_flight =
-                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight;
-            in_flight.filter(|h| {
-                !self
-                    .state_roots
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains_key(h)
-            })
+            let in_flight = primitives::sync::lock_state(lock).in_flight;
+            in_flight.filter(|h| !primitives::sync::lock_state(&self.state_roots).contains_key(h))
         };
         if let Some(h) = poisoned {
             panic!(
@@ -1929,24 +1921,13 @@ impl Executor {
             // no lock-order contract between the block log and the
             // root map.
             let next = {
-                let heights: Vec<u64> = self
-                    .finalized
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .keys()
-                    .copied()
-                    .collect();
-                let roots =
-                    self.state_roots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let heights: Vec<u64> =
+                    primitives::sync::lock_state(&self.finalized).keys().copied().collect();
+                let roots = primitives::sync::lock_state(&self.state_roots);
                 heights.into_iter().find(|h| !roots.contains_key(h))
             };
             let Some(height) = next else { break };
-            let Some(block) = self
-                .finalized
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&height)
-                .cloned()
+            let Some(block) = primitives::sync::lock_state(&self.finalized).get(&height).cloned()
             else {
                 // The entry was found moments ago and this thread is
                 // the only pruner — unreachable, but bail rather
@@ -1961,32 +1942,27 @@ impl Executor {
             // retrying a block this drain partially applied.
             {
                 let (lock, _cv) = &*self.exec_sync;
-                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight =
-                    Some(height);
+                primitives::sync::lock_state(lock).in_flight = Some(height);
             }
             let root = self.execute_block(&block);
-            self.state_roots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert_retained(height, root, self.history_retention);
+            primitives::sync::lock_state(&self.state_roots).insert_retained(
+                height,
+                root,
+                self.history_retention,
+            );
             {
                 let (lock, _cv) = &*self.exec_sync;
-                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight = None;
+                primitives::sync::lock_state(lock).in_flight = None;
             }
         }
         // Advance the executed watermark to the newest recorded
         // root: heights the dead lane owed have now been executed
         // inline, and `attest_state` waiters must observe that.
-        let newest = self
-            .state_roots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .next_back()
-            .map(|(h, _)| *h);
+        let newest =
+            primitives::sync::lock_state(&self.state_roots).iter().next_back().map(|(h, _)| *h);
         if let Some(h) = newest {
             let (lock, cv) = &*self.exec_sync;
-            let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = primitives::sync::lock_state(lock);
             s.executed = Some(s.executed.map_or(h, |e| e.max(h)));
             cv.notify_all();
         }
@@ -1997,8 +1973,7 @@ impl Executor {
     /// Returns 0 if no blocks have been finalized yet (genesis state).
     #[must_use]
     pub fn current_height(&self) -> u64 {
-        let next =
-            *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = *primitives::sync::lock_state(&self.next_proposal_height);
         next.saturating_sub(1)
     }
 
@@ -2007,12 +1982,7 @@ impl Executor {
     /// Returns `Hash::ZERO` if the height is not finalized or unknown.
     #[must_use]
     pub fn state_root_at(&self, height: u64) -> Hash {
-        self.state_roots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&height)
-            .copied()
-            .unwrap_or(Hash::ZERO)
+        primitives::sync::lock_state(&self.state_roots).get(&height).copied().unwrap_or(Hash::ZERO)
     }
 
     /// The finalized execution outcome for a proposed transaction,
@@ -2024,12 +1994,7 @@ impl Executor {
     /// wait — `None` is ambiguous between "in flight" and "aged out".
     #[must_use]
     pub fn tx_outcome(&self, tx_hash: &Hash) -> Option<TxOutcome> {
-        self.tx_outcomes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .outcomes
-            .get(tx_hash)
-            .cloned()
+        primitives::sync::lock_state(&self.tx_outcomes).outcomes.get(tx_hash).cloned()
     }
 
     /// The next nonce the executor expects from `sender` — the count
@@ -2038,13 +2003,7 @@ impl Executor {
     /// nonce may have drifted (restart, dead-lettered batch).
     #[must_use]
     pub fn executed_nonce_of(&self, sender: &primitives::Address) -> u64 {
-        self.executed_nonce
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map
-            .get(sender)
-            .copied()
-            .unwrap_or(0)
+        primitives::sync::lock_state(&self.executed_nonce).map.get(sender).copied().unwrap_or(0)
     }
 
     /// The latest state root (at the current chain height).
@@ -2109,7 +2068,7 @@ impl Executor {
     /// tx bytes, so it must never appear on the block path.
     #[must_use]
     pub fn txpool_snapshot(&self) -> Vec<(Address, u64, TxBytes, bool)> {
-        self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).txpool_snapshot()
+        primitives::sync::lock_state(&self.mempool).txpool_snapshot()
     }
 
     /// Pending mempool entry count — cold-path diagnostic for the
@@ -2117,7 +2076,7 @@ impl Executor {
     /// accepted into the pool but never selected for a proposal).
     #[must_use]
     pub fn mempool_len(&self) -> usize {
-        self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        primitives::sync::lock_state(&self.mempool).len()
     }
 
     /// Save executed nonces to a storage backend (C10 fix).
@@ -2142,7 +2101,7 @@ impl Executor {
         /// is keyed by `prefix || addr` and valued by the nonce as
         /// 8-byte LE.
         const PREFIX: &[u8] = b"exec_nonce";
-        let nonces = self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonces = primitives::sync::lock_state(&self.executed_nonce);
         let mut ops: Vec<storage::Op> = Vec::with_capacity(nonces.map.len());
         for (addr, nonce) in &nonces.map {
             let mut key_bytes = [0u8; 32];
@@ -2164,8 +2123,7 @@ impl Executor {
     pub fn load_executed_nonces(&self, backend: &(dyn storage::StorageBackend + Send)) {
         const PREFIX: &[u8] = b"exec_nonce";
         let entries = backend.range(PREFIX);
-        let mut nonces =
-            self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut nonces = primitives::sync::lock_state(&self.executed_nonce);
         let nonces = Arc::make_mut(&mut nonces);
         for (key, value) in entries {
             let addr_bytes = &key.0[PREFIX.len()..PREFIX.len() + 20];
@@ -2191,9 +2149,11 @@ impl Executor {
     fn wait_exec_idle(&self) {
         if self.exec_lane_tx.get().is_some() {
             let (lock, cv) = &*self.exec_sync;
-            let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = primitives::sync::lock_state(lock);
             while s.enqueued != s.executed {
-                s = cv.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
+                s = cv.wait(s).unwrap_or_else(|_| {
+                    panic!("state mutex poisoned: a holder panicked mid-mutation")
+                });
             }
         }
     }
@@ -2237,7 +2197,7 @@ impl Executor {
         // binds `executed_nonces` into the commitment.
         let _ = state_root; // stored root may be stale; we recompute below
         let (executed_nonces, maintained_root) = {
-            let en = self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let en = primitives::sync::lock_state(&self.executed_nonce);
             (en.map.iter().map(|(addr, nonce)| (*addr, *nonce)).collect::<Vec<_>>(), en.root)
         };
         // Recompute from the bytes being exported — the snapshot's
@@ -2369,25 +2329,22 @@ impl Executor {
         // included it). We set the chain height so consensus can
         // resume from the correct position, and we store the trusted
         // state root for attestation.
-        self.state_roots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        primitives::sync::lock_state(&self.state_roots)
             .insert(snapshot.height, snapshot.state_root);
-        *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        *primitives::sync::lock_state(&self.next_proposal_height) =
             snapshot.height.saturating_add(1); // M2 fix
 
         // H4/H5: restore the executed-nonce map so replay protection
         // survives restarts and state sync. Without this, a node
         // that restarts from a snapshot would accept already-executed
         // txs (replay attack).
-        *self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Arc::new(ExecutedNonces {
-                map: snapshot.executed_nonces.iter().copied().collect(),
-                // Verified above to equal both the fold of this map
-                // and the snapshot's committed `nonce_root` — reuse
-                // it rather than re-folding.
-                root: recomputed_nonce_root,
-            });
+        *primitives::sync::lock_state(&self.executed_nonce) = Arc::new(ExecutedNonces {
+            map: snapshot.executed_nonces.iter().copied().collect(),
+            // Verified above to equal both the fold of this map
+            // and the snapshot's committed `nonce_root` — reuse
+            // it rather than re-folding.
+            root: recomputed_nonce_root,
+        });
 
         Ok(())
     }
@@ -2921,7 +2878,7 @@ impl Executor {
         // and we don't want to hold the lock during that time. The
         // clear is here only to discard stale events from a previous
         // block; the extend publishes this block's events.
-        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        primitives::sync::lock_state(&self.events).clear();
 
         // H5 fix: cross-block nonce continuity. Verify that each
         // sender's first tx in this block continues from the last
@@ -2935,8 +2892,7 @@ impl Executor {
         // O(every account that ever transacted). The folded root
         // travels with the delta and lands committed at block end.
         let nonce_base: Arc<ExecutedNonces> = {
-            let executed =
-                self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let executed = primitives::sync::lock_state(&self.executed_nonce);
             Arc::clone(&executed)
         };
         let mut local_nonce = BlockNonces::new(&nonce_base);
@@ -2954,9 +2910,8 @@ impl Executor {
         // admission, and the dispatch loop below consumes it.
         // (`mem::take` swaps in an empty map — zero-copy, one lock
         // acquisition for the whole block.)
-        let mut preverify_cache = std::mem::take(
-            &mut *self.preverify_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let mut preverify_cache =
+            std::mem::take(&mut *primitives::sync::lock_state(&self.preverify_cache));
 
         let mut skipped: Vec<(Hash, TxSkipReason)> = Vec::new();
         let mut runs =
@@ -2968,8 +2923,7 @@ impl Executor {
         // (it was proposed), so without this record a skipped tx is
         // indistinguishable from "still in flight" forever.
         {
-            let mut outcomes =
-                self.tx_outcomes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
             for (hash, reason) in skipped {
                 outcomes.record(hash, TxOutcome::Skipped { reason });
             }
@@ -3014,14 +2968,13 @@ impl Executor {
             }
         }
         if !dispatch_skipped.is_empty() {
-            let mut outcomes =
-                self.tx_outcomes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
             for (hash, reason) in dispatch_skipped {
                 outcomes.record(hash, TxOutcome::Skipped { reason });
             }
         }
         // Publish all events from this block in one lock acquisition.
-        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(block_events);
+        primitives::sync::lock_state(&self.events).extend(block_events);
 
         // end_block for all modules — same context as begin_block.
         // Module scheduled effects (liquidation sweeps, epoch work)
@@ -3034,10 +2987,7 @@ impl Executor {
             .flat_map(|module| module.end_block_ctx(block.height, &block.context))
             .collect();
         if !end_block_events.is_empty() {
-            self.events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(end_block_events);
+            primitives::sync::lock_state(&self.events).extend(end_block_events);
         }
 
         // Attendance delivery, inside execute_block so journal
@@ -3067,9 +3017,7 @@ impl Executor {
         // linger until a size-cap eviction reaches them. The lookup
         // reads through the block's delta — the effective post-block
         // value for every pooled sender.
-        self.mempool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        primitives::sync::lock_state(&self.mempool)
             .refresh_anchors(|sender| local_nonce.next_expected(sender));
 
         // H4/H5: persist the updated nonce map. The delta applies in
@@ -3081,8 +3029,7 @@ impl Executor {
         let (nonce_delta, nonce_root) = local_nonce.finish();
         drop(nonce_base);
         {
-            let mut committed =
-                self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut committed = primitives::sync::lock_state(&self.executed_nonce);
             let committed = Arc::make_mut(&mut committed);
             committed.map.extend(nonce_delta);
             committed.root = nonce_root;
@@ -3106,8 +3053,7 @@ impl Executor {
         results: Vec<Result<Vec<Event>, ExecError>>,
         block_events: &mut Vec<Event>,
     ) {
-        let mut outcomes =
-            self.tx_outcomes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut outcomes = primitives::sync::lock_state(&self.tx_outcomes);
         for ((_ctx, _payload, tx_hash), result) in group.iter().zip(results) {
             let outcome = match result {
                 Ok(events) => {
@@ -3154,8 +3100,7 @@ impl AppInterface for Executor {
         // mempool after block selection can be re-submitted and
         // re-executed — a replay attack.
         {
-            let executed =
-                self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let executed = primitives::sync::lock_state(&self.executed_nonce);
             let next_expected = executed.map.get(&ctx.sender).copied().unwrap_or(0);
             if ctx.nonce < next_expected {
                 return MempoolAck::Rejected {
@@ -3263,10 +3208,7 @@ impl AppInterface for Executor {
                     // Only the sender is cached — the payload is
                     // re-borrowed from the block's tx at execution
                     // time.
-                    self.preverify_cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(tx_hash, sender);
+                    primitives::sync::lock_state(&self.preverify_cache).insert(tx_hash, sender);
                 }
                 MempoolAck::Accepted
             }
@@ -3306,8 +3248,7 @@ impl AppInterface for Executor {
             // selection could be re-submitted via the batch path and
             // re-executed.
             {
-                let executed =
-                    self.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let executed = primitives::sync::lock_state(&self.executed_nonce);
                 let next_expected = executed.map.get(&ctx.sender).copied().unwrap_or(0);
                 if ctx.nonce < next_expected {
                     results.push(MempoolAck::Rejected {
@@ -3393,8 +3334,7 @@ impl AppInterface for Executor {
         // Batch-submit all accepted txs to the mempool in one lock
         // acquisition.
         if !accepted_txs.is_empty() {
-            let mut mempool =
-                self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut mempool = primitives::sync::lock_state(&self.mempool);
             // `result_idx` is the tx's index in the *caller's*
             // batch — `accepted_txs` is filtered, so a positional
             // `enumerate()` would write pool rejections into the
@@ -3407,9 +3347,7 @@ impl AppInterface for Executor {
                         // Admitted — now the preverified sender may
                         // be cached.
                         if let Some((tx_hash, sender)) = cacheable {
-                            self.preverify_cache
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            primitives::sync::lock_state(&self.preverify_cache)
                                 .insert(tx_hash, sender);
                         }
                     }
@@ -3430,9 +3368,8 @@ impl AppInterface for Executor {
         // the mempool before selection, eliminating the per-tx
         // mempool lock on the ingestion hot path.
         {
-            let rx =
-                self.mempool_intake_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut pool = self.mempool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rx = primitives::sync::lock_state(&self.mempool_intake_rx);
+            let mut pool = primitives::sync::lock_state(&self.mempool);
             while let Ok(tx) = rx.try_recv() {
                 let _ = pool.submit(tx);
             }
@@ -3448,10 +3385,7 @@ impl AppInterface for Executor {
         let candidates = if past_halt {
             Vec::new()
         } else {
-            self.mempool
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .select(budget.max_bytes)
+            primitives::sync::lock_state(&self.mempool).select(budget.max_bytes)
         };
         // Enforce the block gas limit at proposal time. The binding
         // constraint is `min(budget.max_gas, block_gas_limit)` —
@@ -3487,9 +3421,7 @@ impl AppInterface for Executor {
             total_gas += gas;
             txs.push(tx);
         }
-        let height = Height::new(
-            *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let height = Height::new(*primitives::sync::lock_state(&self.next_proposal_height));
         if let Some(recorder) = &self.recorder {
             recorder.record("prepare_proposal", start.elapsed());
         }
@@ -3635,10 +3567,7 @@ impl AppInterface for Executor {
         // inside `execute_block`) also covers the async lane: a
         // committed tx can never be re-proposed by a `prepare` that
         // runs while the worker is still draining the backlog.
-        self.mempool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove_committed(&block.txs);
+        primitives::sync::lock_state(&self.mempool).remove_committed(&block.txs);
         if let Some(tx) = self.exec_lane_tx.get() {
             // Async execution lane: `finalized` and the proposal
             // height advance now — they record *ordering* finality,
@@ -3648,11 +3577,11 @@ impl AppInterface for Executor {
             // BEFORE the send so the backlog drain can see this
             // block too.
             self.insert_finalized(block.height.value(), block.clone());
-            *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            *primitives::sync::lock_state(&self.next_proposal_height) =
                 block.height.value().saturating_add(1); // M2 fix
             let lane_dead = {
                 let (lock, cv) = &*self.exec_sync;
-                let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut s = primitives::sync::lock_state(lock);
                 s.enqueued = Some(block.height.value());
                 cv.notify_all();
                 s.lane_dead
@@ -3675,15 +3604,9 @@ impl AppInterface for Executor {
             // double-apply fees/nonces/module effects.
             let poisoned = {
                 let (lock, _cv) = &*self.exec_sync;
-                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight.filter(
-                    |h| {
-                        !self
-                            .state_roots
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .contains_key(h)
-                    },
-                )
+                primitives::sync::lock_state(lock)
+                    .in_flight
+                    .filter(|h| !primitives::sync::lock_state(&self.state_roots).contains_key(h))
             };
             if let Some(h) = poisoned {
                 panic!(
@@ -3699,29 +3622,29 @@ impl AppInterface for Executor {
             // fail-closed check above instead of silently replaying.
             {
                 let (lock, _cv) = &*self.exec_sync;
-                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight =
-                    Some(block.height.value());
+                primitives::sync::lock_state(lock).in_flight = Some(block.height.value());
             }
             let root = self.execute_block(block);
-            self.state_roots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert_retained(block.height.value(), root, self.history_retention);
+            primitives::sync::lock_state(&self.state_roots).insert_retained(
+                block.height.value(),
+                root,
+                self.history_retention,
+            );
             {
                 let (lock, _cv) = &*self.exec_sync;
-                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).in_flight = None;
+                primitives::sync::lock_state(lock).in_flight = None;
             }
             // Keep the watermark honest in synchronous mode too:
             // the block was just executed, and `insert_finalized`
             // evicts only at-or-below it.
             {
                 let (lock, _cv) = &*self.exec_sync;
-                let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut s = primitives::sync::lock_state(lock);
                 s.enqueued = Some(block.height.value());
                 s.executed = Some(block.height.value());
             }
             self.insert_finalized(block.height.value(), block.clone());
-            *self.next_proposal_height.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            *primitives::sync::lock_state(&self.next_proposal_height) =
                 block.height.value().saturating_add(1); // M2 fix
         }
         if let Some(recorder) = &self.recorder {
@@ -3740,20 +3663,17 @@ impl AppInterface for Executor {
         // instead of hanging every attester.
         if self.exec_lane_tx.get().is_some() {
             let (lock, cv) = &*self.exec_sync;
-            let mut s = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = primitives::sync::lock_state(lock);
             while !s.lane_dead
                 && s.enqueued.is_some_and(|e| height.value() <= e)
                 && s.executed.is_none_or(|x| x < height.value())
             {
-                s = cv.wait(s).unwrap_or_else(std::sync::PoisonError::into_inner);
+                s = cv.wait(s).unwrap_or_else(|_| {
+                    panic!("state mutex poisoned: a holder panicked mid-mutation")
+                });
             }
         }
-        let root = self
-            .state_roots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&height.value())
-            .copied();
+        let root = primitives::sync::lock_state(&self.state_roots).get(&height.value()).copied();
         if let Some(recorder) = &self.recorder {
             recorder.record("attest_state", start.elapsed());
         }
@@ -3766,9 +3686,7 @@ impl AppInterface for Executor {
         // on the execution lane. A stale attestation certifies an
         // older height — never a wrong one. `None` before the first
         // execution: there is no attestation to make.
-        self.state_roots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        primitives::sync::lock_state(&self.state_roots)
             .iter()
             .next_back()
             .map(|(h, root)| StateAttestation { height: Height::new(*h), root: *root })
@@ -3845,7 +3763,7 @@ mod tests {
         fn begin_block(&self, _height: Height) {}
 
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-            let mut c = self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut c = primitives::sync::lock_state(&self.count);
             *c += 1;
             Ok(vec![Event { module: "counter", kind: "increment", data: vec![] }])
         }
@@ -3855,7 +3773,7 @@ mod tests {
         }
 
         fn state_root(&self) -> Hash {
-            let c = *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = *primitives::sync::lock_state(&self.count);
             let byte = u8::try_from(c).unwrap_or(0xff);
             Hash([byte; 32])
         }
@@ -3863,7 +3781,7 @@ mod tests {
         // The counter is committed state: export/import/inspect it
         // so strict snapshot verification exercises the real path.
         fn export_state(&self) -> Option<storage::Snapshot> {
-            let c = *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = *primitives::sync::lock_state(&self.count);
             Some(storage::Snapshot {
                 height: 0,
                 entries: vec![(self.key, c.to_le_bytes().to_vec())],
@@ -3881,7 +3799,7 @@ mod tests {
 
         fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
             let c = self.decode_count(snapshot)?;
-            *self.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = c;
+            *primitives::sync::lock_state(&self.count) = c;
             Ok(())
         }
     }
@@ -4056,7 +3974,7 @@ mod tests {
         }
 
         // The counter should have been called 3 times.
-        let count = *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = *primitives::sync::lock_state(&counter.count);
         assert_eq!(count, 3, "counter should have been incremented 3 times");
 
         // Each block should have a different state root.
@@ -4090,7 +4008,7 @@ mod tests {
             Hash::ZERO
         }
         fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
-            *self.charged.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += ctx.fee;
+            *primitives::sync::lock_state(&self.charged) += ctx.fee;
             Ok(())
         }
     }
@@ -4143,12 +4061,12 @@ mod tests {
         });
 
         assert_eq!(
-            *collector.charged.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&collector.charged),
             50,
             "the counter tx's fee must be charged through the collector"
         );
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             1,
             "the tx must still execute after paying"
         );
@@ -4182,12 +4100,12 @@ mod tests {
         });
 
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             1,
             "only the adequately-paid tx executes"
         );
         assert_eq!(
-            *collector.charged.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&collector.charged),
             100,
             "only the 100-fee tx is charged"
         );
@@ -4219,15 +4137,13 @@ mod tests {
             Hash::ZERO
         }
         fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
-            let mut balances =
-                self.balances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut balances = primitives::sync::lock_state(&self.balances);
             let balance = balances.entry(ctx.sender).or_insert(0);
             if *balance < ctx.fee {
                 return Err(ExecError::ModuleRejected("insufficient fee balance".to_string()));
             }
             *balance -= ctx.fee;
-            *self.charged_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner) +=
-                ctx.fee;
+            *primitives::sync::lock_state(&self.charged_total) += ctx.fee;
             Ok(())
         }
     }
@@ -4252,13 +4168,9 @@ mod tests {
             if msg.len() >= 20 {
                 let victim =
                     primitives::Address(<[u8; 20]>::try_from(&msg[..20]).unwrap_or([0u8; 20]));
-                self.ledger
-                    .balances
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(victim, 0);
+                primitives::sync::lock_state(&self.ledger.balances).insert(victim, 0);
             }
-            *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            *primitives::sync::lock_state(&self.calls) += 1;
             Ok(vec![])
         }
         fn end_block(&self, _height: Height) -> Vec<Event> {
@@ -4289,7 +4201,7 @@ mod tests {
             calls: Mutex::new(0),
         });
         let ledger = drain.ledger.clone();
-        ledger.balances.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend([
+        primitives::sync::lock_state(&ledger.balances).extend([
             (Address([7u8; 20]), 1_000), // drainer — can pay
             (Address([8u8; 20]), 60),    // victim — can pay 50, until drained
         ]);
@@ -4323,13 +4235,9 @@ mod tests {
             Some(TxOutcome::Skipped { reason: TxSkipReason::StaleNonce }),
             "the failed charge consumes no nonce — the follower is unreachable"
         );
+        assert_eq!(*primitives::sync::lock_state(&drain.calls), 1, "only the drain tx executed");
         assert_eq!(
-            *drain.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-            1,
-            "only the drain tx executed"
-        );
-        assert_eq!(
-            *ledger.charged_total.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&ledger.charged_total),
             10,
             "only the drain tx's fee was collected"
         );
@@ -4449,13 +4357,11 @@ mod tests {
             _ctxs: &[TxContext],
             txs: &[PreverifiedTx<'_>],
         ) -> Vec<Result<Vec<Event>, ExecError>> {
-            *self.preverified_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) +=
-                txs.len();
+            *primitives::sync::lock_state(&self.preverified_calls) += txs.len();
             (0..txs.len()).map(|_| Ok(vec![])).collect()
         }
         fn handle_batch(&self, batch: &[(TxContext, &[u8])]) -> Vec<Result<Vec<Event>, ExecError>> {
-            *self.fallback_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) +=
-                batch.len();
+            *primitives::sync::lock_state(&self.fallback_calls) += batch.len();
             (0..batch.len()).map(|_| Ok(vec![])).collect()
         }
     }
@@ -4490,10 +4396,8 @@ mod tests {
 
         // The preverified path should have been taken (cache hit),
         // not the fallback path (cache miss).
-        let preverified =
-            *tracker.preverified_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let fallback =
-            *tracker.fallback_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let preverified = *primitives::sync::lock_state(&tracker.preverified_calls);
+        let fallback = *primitives::sync::lock_state(&tracker.fallback_calls);
         assert_eq!(preverified, 1, "preverified path should have been used (cache hit)");
         assert_eq!(fallback, 0, "fallback path should not have been used (no cache miss)");
     }
@@ -4524,7 +4428,7 @@ mod tests {
         }
         fn begin_block(&self, _height: Height) {}
         fn handle(&self, ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-            self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(*ctx);
+            primitives::sync::lock_state(&self.seen).push(*ctx);
             Ok(vec![])
         }
         fn end_block(&self, _height: Height) -> Vec<Event> {
@@ -4566,10 +4470,7 @@ mod tests {
         }
         fn begin_block(&self, _height: Height) {}
         fn begin_block_ctx(&self, height: Height, ctx: &types::BlockContext) {
-            self.seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((height, *ctx));
+            primitives::sync::lock_state(&self.seen).push((height, *ctx));
         }
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             Ok(vec![])
@@ -4600,7 +4501,7 @@ mod tests {
             FinalizedBlock { height: Height::new(3), txs: vec![], signers: vec![], context: ctx };
         executor.finalize_block(&block);
 
-        let seen = recorder.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = primitives::sync::lock_state(&recorder.seen);
         assert_eq!(seen.as_slice(), &[(Height::new(3), ctx)]);
     }
 
@@ -4639,7 +4540,7 @@ mod tests {
         };
         executor.finalize_block(&block);
 
-        let seen = recorder.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = primitives::sync::lock_state(&recorder.seen);
         assert_eq!(seen.len(), 2, "both txs should have executed");
         // The mempool may reorder txs, so don't assume group order —
         // the property is that *each* tx ran under its own context:
@@ -4818,7 +4719,7 @@ mod tests {
             signers: Vec::new(),
         };
         executor.finalize_block(&block0);
-        assert_eq!(*counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
+        assert_eq!(*primitives::sync::lock_state(&counter.count), 1);
 
         // Try to execute nonce 0 again in block 1 — must be skipped.
         let tx0_again = make_tx_with_nonce(1, &[0], 0);
@@ -4832,7 +4733,7 @@ mod tests {
 
         // Counter should still be 1 — the stale tx was skipped.
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             1,
             "stale nonce tx must be skipped during execution"
         );
@@ -4867,7 +4768,7 @@ mod tests {
         };
         executor.finalize_block(&block);
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             0,
             "reserved nonce must not execute"
         );
@@ -4883,7 +4784,7 @@ mod tests {
         };
         executor.finalize_block(&block1);
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             1,
             "nonce 0 must still execute after a smuggled MAX nonce"
         );
@@ -4914,7 +4815,7 @@ mod tests {
             signers: Vec::new(),
         };
         executor.finalize_block(&block0);
-        assert_eq!(*counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
+        assert_eq!(*primitives::sync::lock_state(&counter.count), 1);
 
         // Try to ingest nonce 0 again (stale) — must be rejected.
         let tx0_stale = make_tx_with_nonce(1, &[0], 0);
@@ -5165,8 +5066,7 @@ mod tests {
                 txs: proposal.txs,
                 signers: Vec::new(),
             });
-            let en =
-                executor.executed_nonce.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let en = primitives::sync::lock_state(&executor.executed_nonce);
             let v: Vec<_> = en.map.iter().map(|(a, n)| (*a, *n)).collect();
             assert_eq!(
                 en.root,
@@ -5355,7 +5255,7 @@ mod tests {
             txs: proposal.txs,
             signers: Vec::new(),
         });
-        assert_eq!(*counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
+        assert_eq!(*primitives::sync::lock_state(&counter.count), 1);
     }
 
     /// A corrupted signature is rejected at mempool admission.
@@ -5425,7 +5325,7 @@ mod tests {
             signers: Vec::new(),
         });
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             0,
             "unsigned tx must not execute under Reject"
         );
@@ -5447,7 +5347,7 @@ mod tests {
             signers: Vec::new(),
         });
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             1,
             "foreign signed tx must execute"
         );
@@ -5475,7 +5375,7 @@ mod tests {
             signers: Vec::new(),
         });
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             0,
             "tampered payload must not execute"
         );
@@ -5602,19 +5502,19 @@ mod tests {
             self.version
         }
         fn migrate(&self, from: u32) -> Result<u32, ExecError> {
-            self.migrate_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(from);
+            primitives::sync::lock_state(&self.migrate_calls).push(from);
             if self.migrate_fails {
                 return Err(ExecError::ModuleRejected("boom".to_string()));
             }
             Ok(self.version)
         }
         fn scheduled_halt_height(&self) -> Option<u64> {
-            *self.halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            *primitives::sync::lock_state(&self.halt)
         }
         fn export_state(&self) -> Option<storage::Snapshot> {
             Some(storage::Snapshot {
                 height: 0,
-                entries: self.kv.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+                entries: primitives::sync::lock_state(&self.kv).clone(),
             })
         }
         fn inspect_state(
@@ -5633,8 +5533,7 @@ mod tests {
             Ok(self.state_root())
         }
         fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
-            *self.kv.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                snapshot.entries.clone();
+            *primitives::sync::lock_state(&self.kv) = snapshot.entries.clone();
             Ok(())
         }
     }
@@ -5743,7 +5642,7 @@ mod tests {
         executor2.register_module(module as Arc<dyn Module>);
         executor2.import_snapshot(&snapshot).expect("import + migrate must succeed");
         assert_eq!(
-            *spy.migrate_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&spy.migrate_calls),
             vec![1],
             "migrate must be called with the snapshot's recorded version"
         );
@@ -5959,12 +5858,12 @@ mod tests {
             "a malformed payload must fail the import"
         );
         assert_eq!(
-            *d1.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&d1.count),
             0,
             "module 0 must not be mutated while module 1's payload is unproven"
         );
         assert_eq!(
-            *d2.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&d2.count),
             0,
             "module 1 must not be mutated by a malformed payload"
         );
@@ -5999,7 +5898,7 @@ mod tests {
         let counter = Arc::new(CounterModule::new());
         executor.register_module(counter.clone());
         let halter = VersionedModule::new(1);
-        *halter.halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(1);
+        *primitives::sync::lock_state(&halter.halt) = Some(1);
         executor.register_module(halter as Arc<dyn Module>);
 
         // Height 1 executes normally (halt = last live height).
@@ -6014,7 +5913,7 @@ mod tests {
             signers: Vec::new(),
         });
         let live_root = executor.current_state_root();
-        let live_count = *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live_count = *primitives::sync::lock_state(&counter.count);
 
         // Height 2 is past the halt: state must not change even
         // though the block carries a tx.
@@ -6027,7 +5926,7 @@ mod tests {
         executor.finalize_block(&block2);
         assert_eq!(executor.current_state_root(), live_root, "state must freeze at halt");
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             live_count,
             "no handlers run past the halt"
         );
@@ -6041,7 +5940,7 @@ mod tests {
         let mut executor = test_executor(100);
         executor.register_module(Arc::new(CounterModule::new()));
         let halter = VersionedModule::new(1);
-        *halter.halt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(0);
+        *primitives::sync::lock_state(&halter.halt) = Some(0);
         executor.register_module(halter as Arc<dyn Module>);
 
         executor.ingest_tx(make_tx(1, &[0]));
@@ -6177,7 +6076,7 @@ mod tests {
                 !self.armed.swap(false, std::sync::atomic::Ordering::SeqCst),
                 "panic-once: injected execution fault"
             );
-            *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            *primitives::sync::lock_state(&self.calls) += 1;
             Ok(vec![Event { module: "panic-once", kind: "call", data: vec![] }])
         }
         fn end_block(&self, _height: Height) -> Vec<Event> {
@@ -6185,7 +6084,7 @@ mod tests {
         }
         fn state_root(&self) -> Hash {
             // Non-zero once any call has landed (count 1 → byte 1).
-            let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = *primitives::sync::lock_state(&self.calls);
             Hash([u8::try_from(c.max(1)).unwrap_or(0xff); 32])
         }
     }
@@ -6253,7 +6152,7 @@ mod tests {
         fn handle(&self, _ctx: &TxContext, _msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             // Mutation FIRST — the moment this lands the block is
             // partially applied, and replaying it would repeat it.
-            *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            *primitives::sync::lock_state(&self.calls) += 1;
             assert!(
                 !self.armed.swap(false, std::sync::atomic::Ordering::SeqCst),
                 "mutate-then-panic: injected mid-mutation fault"
@@ -6264,7 +6163,7 @@ mod tests {
             Vec::new()
         }
         fn state_root(&self) -> Hash {
-            let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = *primitives::sync::lock_state(&self.calls);
             Hash([u8::try_from(c.max(1)).unwrap_or(0xff); 32])
         }
     }
@@ -6337,7 +6236,7 @@ mod tests {
         // The mutation landed before the panic — the block WAS
         // partially applied.
         assert_eq!(
-            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&module.calls),
             1,
             "the pre-panic mutation must have landed exactly once"
         );
@@ -6352,7 +6251,7 @@ mod tests {
             });
         }));
         assert_eq!(
-            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&module.calls),
             1,
             "a refused replay must not run the mutation a second time"
         );
@@ -6386,7 +6285,7 @@ mod tests {
         }));
         assert!(first.is_err(), "the module panic must propagate to the committer");
         assert_eq!(
-            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&module.calls),
             1,
             "the pre-panic mutation landed — the block is partially applied"
         );
@@ -6411,7 +6310,7 @@ mod tests {
             .unwrap_or("");
         assert!(msg.contains("partially applied"), "halt message must name the cause, got: {msg}");
         assert_eq!(
-            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&module.calls),
             1,
             "no mutation may replay on the poisoned executor"
         );
@@ -6440,14 +6339,14 @@ mod tests {
             while !self.gate.load(std::sync::atomic::Ordering::SeqCst) {
                 std::hint::spin_loop();
             }
-            *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            *primitives::sync::lock_state(&self.calls) += 1;
             Ok(vec![Event { module: "gated", kind: "call", data: vec![] }])
         }
         fn end_block(&self, _height: Height) -> Vec<Event> {
             Vec::new()
         }
         fn state_root(&self) -> Hash {
-            let c = *self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = *primitives::sync::lock_state(&self.calls);
             Hash([u8::try_from(c.max(1)).unwrap_or(0xff); 32])
         }
     }
@@ -6539,7 +6438,7 @@ mod tests {
         join.join().expect("finalize thread must not panic");
         executor.wait_exec_idle();
         assert_eq!(
-            *module.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&module.calls),
             6,
             "every committed block executed exactly once"
         );
@@ -6783,8 +6682,7 @@ mod tests {
         fn begin_block(&self, _height: Height) {}
         fn handle(&self, _ctx: &TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
             if msg.len() >= 2 {
-                let mut ledger =
-                    self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut ledger = primitives::sync::lock_state(&self.ledger);
                 *ledger.entry(Address([msg[0]; 20])).or_insert(0) += u64::from(msg[1]);
             }
             Ok(vec![Event { module: "funder", kind: "funded", data: vec![] }])
@@ -6822,7 +6720,7 @@ mod tests {
             Hash::ZERO
         }
         fn charge_fee(&self, ctx: &TxContext) -> Result<(), ExecError> {
-            let mut ledger = self.ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut ledger = primitives::sync::lock_state(&self.ledger);
             let balance = ledger.entry(ctx.sender).or_insert(0);
             if *balance < ctx.fee {
                 return Err(ExecError::ModuleRejected("insufficient fee balance".to_string()));
@@ -6876,12 +6774,12 @@ mod tests {
         run_block(&executor, vec![funder, counter_tx]);
 
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             1,
             "the counter tx must execute — its sender was funded earlier in the block"
         );
         assert_eq!(
-            ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[&Address([9u8; 20])],
+            primitives::sync::lock_state(&ledger)[&Address([9u8; 20])],
             0,
             "the 100-unit fee was charged against the funding"
         );
@@ -6903,12 +6801,12 @@ mod tests {
         run_block(&executor, vec![counter_tx, funder]);
 
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             0,
             "the counter tx must be skipped — its fee preceded the funding"
         );
         assert_eq!(
-            ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[&Address([9u8; 20])],
+            primitives::sync::lock_state(&ledger)[&Address([9u8; 20])],
             100,
             "the funder still executed — its own fee was 0"
         );
@@ -6930,7 +6828,7 @@ mod tests {
         run_block(&executor, vec![head, next]);
 
         assert_eq!(
-            *counter.count.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *primitives::sync::lock_state(&counter.count),
             0,
             "neither tx executes — the chain broke at nonce 0"
         );

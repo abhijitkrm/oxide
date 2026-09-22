@@ -579,10 +579,7 @@ impl TcpMultiNodeDevnet {
             let commit_seq = commit_seqs[i].clone();
             let mut engine = engine;
             engine.set_commit_listener(Box::new(move |block| {
-                committed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(block.clone());
+                primitives::sync::lock_state(&committed).push(block.clone());
                 // Release so a reader that observes the bump is
                 // guaranteed to see the push that caused it.
                 commit_seq.fetch_add(1, Ordering::Release);
@@ -1492,8 +1489,7 @@ impl TcpMultiNodeDevnet {
                 }
             }
             let drained: VecDeque<(u8, Vec<u8>)> = {
-                let mut guard =
-                    inboxes[me].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = primitives::sync::lock_state(&inboxes[me]);
                 std::mem::take(&mut *guard)
             };
             for (from, bytes) in drained {
@@ -1695,7 +1691,7 @@ impl TcpMultiNodeDevnet {
                     shard_sets.len(),
                     proposed_views.len(),
                     voted_views.len(),
-                    committed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
+                    primitives::sync::lock_state(&committed).len(),
                 );
             }
             // Done = every submitted tx finalized. Gated on the
@@ -1714,7 +1710,7 @@ impl TcpMultiNodeDevnet {
                 // next iteration instead of being folded invisibly.
                 let seq_now = commit_seq.load(Ordering::Acquire);
                 if seq_now != last_commit_seq {
-                    let guard = committed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let guard = primitives::sync::lock_state(&committed);
                     let new_txs: u64 = guard[counted_blocks..]
                         .iter()
                         .map(|b| u64::try_from(b.txs.len()).unwrap_or(u64::MAX))
@@ -1947,9 +1943,7 @@ impl TcpMultiNodeDevnet {
         bytes: &[u8],
     ) {
         if transport.send(&vec![to], bytes).is_err() {
-            inboxes[usize::from(to)]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            primitives::sync::lock_state(&inboxes[usize::from(to)])
                 .push_back((from, bytes.to_vec()));
         }
     }
@@ -2395,11 +2389,8 @@ impl TcpMultiNodeDevnet {
     /// `MAX_RETAINED_FINALIZED` (4096), so iterating `0..=height`
     /// misses pruned blocks on long-running tests.
     fn collect_result(&self) -> TcpDevnetResult {
-        let finalized = self
-            .committed_blocks
-            .iter()
-            .map(|v| v.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
-            .collect();
+        let finalized =
+            self.committed_blocks.iter().map(|v| primitives::sync::lock_state(v).clone()).collect();
         TcpDevnetResult { finalized }
     }
 

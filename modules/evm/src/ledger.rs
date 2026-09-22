@@ -63,12 +63,9 @@ impl EvmModule {
     /// other site (`begin_block`, `genesis_insert_account`), so lock
     /// ordering is uniform and deadlock-free.
     fn set_balance(&self, evm_addr: revm::primitives::Address, next: U256) {
-        let mut db_guard = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut db_guard = framework::lock_state(&self.db);
         let db = Arc::make_mut(&mut *db_guard);
-        self.block_undo
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .capture(evm_addr, db.cache.accounts.get(&evm_addr));
+        framework::lock_state(&self.block_undo).capture(evm_addr, db.cache.accounts.get(&evm_addr));
         let account =
             db.cache.accounts.entry(evm_addr).or_insert_with(|| revm::database::DbAccount {
                 info: revm::database::state::AccountInfo {
@@ -90,14 +87,14 @@ impl EvmModule {
         }
         account.account_state = revm::database::AccountState::Touched;
         drop(db_guard);
-        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(evm_addr);
+        framework::lock_state(&self.touched).insert(evm_addr);
     }
 
     /// Current balance of `evm_addr` in wei — `ZERO` for accounts
     /// absent from the cache (never-funded, or loaded lazily from an
     /// empty backend: either way the spendable balance is zero).
     fn balance_wei(&self, evm_addr: revm::primitives::Address) -> U256 {
-        let db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = framework::lock_state(&self.db);
         db.cache.accounts.get(&evm_addr).map_or(U256::ZERO, |a| a.info.balance)
     }
 }

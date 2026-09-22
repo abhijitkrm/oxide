@@ -257,6 +257,16 @@ pub struct AtomicBalanceCache {
     /// Overflow when `reg` is exhausted (registered accounts >
     /// capacity). Full 20-byte key, so arbitrary addresses can
     /// never alias a flat or reg slot.
+    ///
+    /// Poison policy: this mutex *recovers* (`PoisonError::into_
+    /// inner`) — legitimately, per the `primitives::sync` policy:
+    /// every locked section mutates each touched entry atomically
+    /// (one `entry()` + one infallible assignment), and the only
+    /// multi-key section (`transfer` sparse↔sparse) holds the lock
+    /// across the whole debit+credit so it can't tear. A panic
+    /// inside a section — itself unreachable: no fallible ops — can
+    /// at worst strand a debit without its credit: a conservative
+    /// burn, never a mint.
     sparse: std::sync::Mutex<HashMap<[u8; 20], u64>>,
 }
 
@@ -426,7 +436,13 @@ impl RegTable {
         // Cold path: serialize claimants, then re-check (another
         // thread may have registered the same address while we
         // waited — the registry must stay a bijection).
-        let _guard = self.claim_mu.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        //
+        // Poison policy: panic, don't recover. An abandoned claim
+        // would leave a cell stuck `CLAIMING` (readers spin on it
+        // forever) — halting beats silently continuing past a torn
+        // claim. Unreachable in practice: the claim sequence between
+        // CAS and the `READY` publish has no unwind point.
+        let _guard = primitives::sync::lock_state(&self.claim_mu);
         if let Some(slot) = self.get(addr) {
             return Some(slot);
         }

@@ -557,6 +557,100 @@ pub mod fixed {
     }
 }
 
+/// Synchronization policy helpers — the project's poisoned-mutex
+/// contract (audit 9.D).
+///
+/// `Mutex::lock` returns `Err(PoisonError)` when another thread
+/// panicked while holding the guard. Recovering the guard
+/// (`PoisonError::into_inner`) is only sound when every value the
+/// mutex protects is *independently consistent* — e.g. a map where
+/// each key's entry is written by a single infallible assignment.
+/// State-machine mutexes do not meet that bar:
+///
+/// - `Inner`-style mutexes guard many fields updated across one
+///   handler; a panic mid-handler can leave the fields torn.
+/// - Field-per-mutex state (staking, oracle, executor's
+///   mempool/finalized/outcomes) is no better: invariants span
+///   several mutexes, so a panic while holding any of them tears
+///   the section.
+/// - `KVStore`-style maps are per-key, but a panic mid-*batch* can
+///   leave a multi-key write half-applied.
+///
+/// In all those cases the torn state is financial or
+/// consensus-relevant: continuing risks producing a divergent
+/// result that looks valid. Halting is the only safe response — a
+/// validator restarts and reconstructs from durable state. These
+/// accessors therefore panic on poison instead of recovering the
+/// guard, and are the required accessors for shared state mutexes.
+///
+/// Recovery remains legitimate — with the per-key/per-entry
+/// invariant documented at the type — for structures like the
+/// matcher's sparse balance overflow (each account word is
+/// independently meaningful and every op touches it atomically).
+pub mod sync {
+    /// Lock a mutex guarding shared state, panicking if poisoned.
+    ///
+    /// # Panics
+    ///
+    /// Panics naming the invariant if the mutex is poisoned — a
+    /// panic occurred while a thread held the guard, so the guarded
+    /// state may be torn.
+    pub fn lock_state<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|_| {
+            panic!(
+                "state mutex poisoned: a holder panicked mid-mutation; \
+                 the guarded state may be torn — halting rather than \
+                 recovering a possibly-inconsistent guard"
+            )
+        })
+    }
+
+    /// Read-lock an `RwLock` guarding shared state — same poison
+    /// policy as [`lock_state`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned.
+    pub fn read_state<T>(m: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+        m.read().unwrap_or_else(|_| {
+            panic!(
+                "state lock poisoned: a writer panicked mid-mutation; \
+                 the guarded state may be torn — halting rather than recovering"
+            )
+        })
+    }
+
+    /// Write-lock an `RwLock` guarding shared state — same poison
+    /// policy as [`lock_state`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned.
+    pub fn write_state<T>(m: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+        m.write().unwrap_or_else(|_| {
+            panic!(
+                "state lock poisoned: a writer panicked mid-mutation; \
+                 the guarded state may be torn — halting rather than recovering"
+            )
+        })
+    }
+
+    /// Consume a mutex guarding shared state — same poison policy
+    /// as [`lock_state`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
+    pub fn into_inner_state<T>(m: std::sync::Mutex<T>) -> T {
+        m.into_inner().unwrap_or_else(|_| {
+            panic!(
+                "state mutex poisoned: a holder panicked mid-mutation; \
+                 the guarded state may be torn — halting rather than recovering"
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::fixed::{self, FixedError, PRICE_ONE, Price, QTY_ONE, Qty};

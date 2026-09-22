@@ -223,43 +223,40 @@ impl SharedAdmissionControl {
     /// Check whether a new connection from `peer` should be admitted.
     /// See [`AdmissionControl::admit_connection`].
     pub fn admit_connection(&self, peer: &PeerId) -> bool {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).admit_connection(peer)
+        primitives::sync::lock_state(&self.0).admit_connection(peer)
     }
 
     /// Check whether an inbound message should be admitted.
     /// See [`AdmissionControl::admit_message`].
     pub fn admit_message(&self, peer: &PeerId, bytes: usize) -> bool {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).admit_message(peer, bytes)
+        primitives::sync::lock_state(&self.0).admit_message(peer, bytes)
     }
 
     /// Record a misbehavior event. See
     /// [`AdmissionControl::record_misbehavior`].
     pub fn record_misbehavior(&self, peer: &PeerId, event: ReputationEvent) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_misbehavior(peer, event)
+        primitives::sync::lock_state(&self.0).record_misbehavior(peer, event)
     }
 
     /// Release a connection slot. See
     /// [`AdmissionControl::release_connection`].
     pub fn release_connection(&self) {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).release_connection();
+        primitives::sync::lock_state(&self.0).release_connection();
     }
 
     /// The current number of active connections.
     pub fn current_connections(&self) -> usize {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).current_connections()
+        primitives::sync::lock_state(&self.0).current_connections()
     }
 
     /// Check if a peer is banned.
     pub fn is_banned(&self, peer: &PeerId) -> bool {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_banned(peer)
+        primitives::sync::lock_state(&self.0).is_banned(peer)
     }
 
     /// Get a peer's reputation score.
     pub fn peer_score(&self, peer: &PeerId) -> i64 {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).peer_score(peer)
+        primitives::sync::lock_state(&self.0).peer_score(peer)
     }
 }
 

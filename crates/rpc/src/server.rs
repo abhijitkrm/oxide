@@ -284,7 +284,7 @@ impl RateLimiter {
     /// the request is within the rate limit, `false` if it exceeds
     /// it.
     fn allow(&self, ip: IpAddr) -> bool {
-        let mut buckets = self.buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut buckets = primitives::sync::lock_state(&self.buckets);
         let now = Instant::now();
         if let Some((window_start, count)) = buckets.get_mut(&ip) {
             if now.duration_since(*window_start) >= Duration::from_secs(1) {

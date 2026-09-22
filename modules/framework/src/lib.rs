@@ -272,7 +272,7 @@ impl Endorsements {
                 "governance: sender has no committee voting power".to_string(),
             ));
         }
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = lock_state(&self.inner);
         if !inner.contains_key(action) && inner.len() >= MAX_PENDING_ACTIONS {
             return Err(ExecError::ModuleRejected(format!(
                 "governance: {MAX_PENDING_ACTIONS} pending actions already tracked"
@@ -306,7 +306,7 @@ impl Endorsements {
     /// Panics if the mutex is poisoned.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        lock_state(&self.inner).len()
     }
 
     /// Drop every pending action for which `keep` returns `false`.
@@ -326,7 +326,7 @@ impl Endorsements {
     /// module must only drop actions that can *never* apply again,
     /// never merely ones that fail a transient precondition.
     pub fn retain(&self, keep: impl Fn(&[u8]) -> bool) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = lock_state(&self.inner);
         inner.retain(|action, _| keep(action));
     }
 
@@ -335,7 +335,7 @@ impl Endorsements {
     /// applies), so two replicas must diverge on different tallies.
     /// Deterministic order comes free from `BTreeMap`/`BTreeSet`.
     pub fn write_canonical(&self, w: &mut CanonicalState) {
-        let inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = lock_state(&self.inner);
         w.put_count(inner.len());
         for (action, endorsers) in inner.iter() {
             w.put_bytes(action);
@@ -388,8 +388,8 @@ impl Endorsements {
     ///
     /// Panics if a mutex is poisoned.
     pub fn replace_with(&self, other: Endorsements) {
-        let mut dst = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let src = other.inner.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut dst = lock_state(&self.inner);
+        let src = into_inner_state(other.inner);
         *dst = src;
     }
 }
@@ -438,16 +438,11 @@ impl MemoryBalances {
 
 impl Balances for MemoryBalances {
     fn balance(&self, addr: &Address) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(addr)
-            .copied()
-            .unwrap_or(0)
+        lock_state(&self.inner).get(addr).copied().unwrap_or(0)
     }
 
     fn debit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
-        let mut m = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = lock_state(&self.inner);
         let bal = m
             .get_mut(addr)
             .ok_or_else(|| ExecError::ModuleRejected(format!("debit: {addr:?} has no account")))?;
@@ -458,7 +453,7 @@ impl Balances for MemoryBalances {
     }
 
     fn credit(&self, addr: &Address, amount: u64) -> Result<(), ExecError> {
-        let mut m = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = lock_state(&self.inner);
         let bal = m.entry(*addr).or_insert(0);
         *bal = bal.checked_add(amount).ok_or_else(|| {
             ExecError::ModuleRejected(format!("credit: {addr:?} balance overflows u64"))
@@ -467,7 +462,7 @@ impl Balances for MemoryBalances {
     }
 
     fn transfer(&self, from: &Address, to: &Address, amount: u64) -> Result<(), ExecError> {
-        let mut m = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = lock_state(&self.inner);
         if from == to {
             // Self-transfer: solvency check only — no state change.
             let bal = m.get(from).copied().unwrap_or(0);
@@ -497,7 +492,7 @@ impl Balances for MemoryBalances {
     }
 
     fn mint(&self, addr: &Address, amount: u64) {
-        let mut m = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = lock_state(&self.inner);
         // `mint` is infallible; saturate on the unreachable u64
         // overflow rather than panic.
         *m.entry(*addr).or_insert(0) = m.get(addr).copied().unwrap_or(0).saturating_add(amount);
@@ -515,6 +510,13 @@ pub type KVStore = Mutex<BTreeMap<Vec<u8>, Vec<u8>>>;
 /// The unlocked form of a module's KV subtree — the decoded store
 /// section of a canonical state blob (see [`decode_state_blob`]).
 pub type StoreMap = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// The poisoned-mutex accessors — defined in `primitives::sync`
+/// (the base crate, so non-module crates share the same policy) and
+/// re-exported here for module code. See `primitives::sync` for the
+/// policy rationale: module state mutexes panic on poison because a
+/// panic mid-mutation can tear cross-field financial invariants.
+pub use primitives::sync::{into_inner_state, lock_state, read_state, write_state};
 
 /// A module router: registers modules and provides lookup.
 pub struct ModuleRouter {
@@ -562,7 +564,7 @@ impl Default for ModuleRouter {
 /// Panics if the `KVStore` mutex is poisoned (a thread panicked while
 /// holding the lock).
 pub fn subtree_root(store: &KVStore) -> Hash {
-    let locked = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let locked = lock_state(store);
     subtree_root_map(&locked)
 }
 
@@ -882,7 +884,7 @@ pub fn state_blob_key() -> Hash {
 /// Panics if the `KVStore` mutex is poisoned.
 #[must_use]
 pub fn encode_state_blob(canon: &[u8], store: &KVStore) -> Vec<u8> {
-    let locked = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let locked = lock_state(store);
     #[allow(clippy::cast_possible_truncation)]
     let mut out = Vec::with_capacity(8 + canon.len() + 8 + locked.len() * 16);
     out.extend_from_slice(&(canon.len() as u64).to_le_bytes());
@@ -992,10 +994,7 @@ mod tests {
         }
         fn begin_block(&self, _h: Height) {}
         fn handle(&self, _ctx: &executor::TxContext, msg: &[u8]) -> Result<Vec<Event>, ExecError> {
-            self.store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(b"last".to_vec(), msg.to_vec());
+            lock_state(&self.store).insert(b"last".to_vec(), msg.to_vec());
             Ok(vec![])
         }
         fn end_block(&self, _h: Height) -> Vec<Event> {
@@ -1019,10 +1018,7 @@ mod tests {
     fn subtree_root_changes_with_state() {
         let store: KVStore = Mutex::new(BTreeMap::new());
         let root0 = subtree_root(&store);
-        store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(b"k".to_vec(), b"v".to_vec());
+        lock_state(&store).insert(b"k".to_vec(), b"v".to_vec());
         let root1 = subtree_root(&store);
         assert_ne!(root0, root1, "state root must change when state changes");
     }
@@ -1034,11 +1030,11 @@ mod tests {
     fn subtree_root_map_matches_locked_store() {
         let store: KVStore = Mutex::new(BTreeMap::new());
         {
-            let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = lock_state(&store);
             s.insert(b"alpha".to_vec(), vec![1, 2, 3]);
             s.insert(b"beta".to_vec(), vec![]);
         }
-        let map = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let map = lock_state(&store).clone();
         assert_eq!(subtree_root(&store), subtree_root_map(&map));
     }
 
@@ -1110,7 +1106,7 @@ mod tests {
     fn state_blob_round_trip() {
         let store: KVStore = Mutex::new(BTreeMap::new());
         {
-            let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut s = lock_state(&store);
             s.insert(b"m/1".to_vec(), vec![9; 4]);
             s.insert(b"m/2".to_vec(), b"x".to_vec());
         }
@@ -1219,7 +1215,7 @@ mod tests {
     fn endorsements_canonical_round_trip() {
         let e = Endorsements::new();
         {
-            let mut inner = e.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = lock_state(&e.inner);
             inner
                 .insert(b"halt@100".to_vec(), BTreeSet::from([Address([1; 20]), Address([2; 20])]));
             inner.insert(b"admit-x".to_vec(), BTreeSet::from([Address([3; 20])]));
