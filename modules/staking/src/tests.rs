@@ -400,7 +400,7 @@ fn unjail_readmits_after_period() {
     let changes = staking.take_validator_changes();
     assert_eq!(changes.adds.len(), 1, "unjailed validator re-admitted");
     assert_eq!(changes.adds[0].0, v);
-    assert_eq!(changes.adds[0].1, key.public_key().as_bytes(), "re-adds with current key");
+    assert_eq!(changes.adds[0].1.public_key(), key.public_key(), "re-adds with current key");
     assert_eq!(changes.adds[0].2, 900, "re-adds with post-slash stake");
 }
 
@@ -781,7 +781,7 @@ fn key_change_stores_pending_key() {
     let changes = staking.take_key_changes();
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].0, v);
-    assert_eq!(changes[0].1, new_key);
+    assert_eq!(changes[0].1.as_bytes(), new_key.as_slice());
     // After take, the pending map is empty.
     assert!(!staking.has_key_change(&v), "key change must be drained");
 }
@@ -871,7 +871,7 @@ fn validator_add_with_valid_pop_succeeds() {
     let changes = staking.take_validator_changes();
     assert_eq!(changes.adds.len(), 1, "one pending add");
     assert_eq!(changes.adds[0].0, new_addr);
-    assert_eq!(changes.adds[0].1, new_sk.public_key().as_bytes().to_vec());
+    assert_eq!(changes.adds[0].1.public_key(), new_sk.public_key());
     assert_eq!(changes.adds[0].2, 500);
 }
 
@@ -1210,7 +1210,7 @@ fn endorsements_are_per_action() {
 
     let changes = staking.take_validator_changes();
     assert_eq!(changes.adds.len(), 1);
-    assert_eq!(changes.adds[0].1, sk1.public_key().as_bytes().to_vec(), "K1 won admission");
+    assert_eq!(changes.adds[0].1.public_key(), sk1.public_key(), "K1 won admission");
 }
 
 /// Removing a quorum-admitted candidate before it seats cancels
@@ -1554,7 +1554,7 @@ fn retired_key_history_is_bounded() {
     let keys = retired.get(&v).expect("history exists");
     assert_eq!(keys.len(), EVIDENCE_KEY_HISTORY, "history capped");
     // The oldest (key 0) was evicted; the newest (key 8) kept.
-    assert_eq!(keys.last().unwrap().as_slice(), bls_key(8).public_key().as_bytes());
+    assert_eq!(keys.last().unwrap().as_bytes(), bls_key(8).public_key().as_bytes());
 }
 
 /// Retired keys are committed state — they must survive a

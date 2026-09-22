@@ -996,6 +996,13 @@ fn bls_key(byte: u8) -> crypto::BlsSecretKey {
     crypto::BlsSecretKey::from_ikm(&ikm).expect("key gen")
 }
 
+/// Mint the admission-proof token for a real key — the shape
+/// `EpochChanges`/`apply_*` now require: only a point + subgroup
+/// member can cross the module → engine seam.
+fn vpk(sk: &crypto::BlsSecretKey) -> crypto::bls_signer::ValidatedPublicKey {
+    crypto::bls_signer::ValidatedPublicKey::new(sk.public_key()).expect("real key validates")
+}
+
 /// Sign a timeout claim exactly as `collect_timeout_signature`
 /// verifies it: `(view, epoch, qc_high)` under `Domain::Timeout`.
 fn sign_timeout_claim(
@@ -4758,9 +4765,9 @@ fn key_change_rotates_validator_key() {
     // The staking address of validator 0 is derived from pk(1).
     let addr = vs.validator_addresses()[0];
 
-    // Submit a key change: validator 0 rotates to pk(0xFF).
-    let new_key = crypto::bls::PublicKey([0xFF; crypto::bls::PublicKey::LEN]);
-    let changes = vec![(addr, new_key.0.to_vec())];
+    // Submit a key change: validator 0 rotates to a fresh real key.
+    let new_key = bls_key(9).public_key();
+    let changes = vec![(addr, vpk(&bls_key(9)))];
     let applied = engine.apply_key_changes(&changes).expect("apply key changes");
     assert_eq!(applied, 1, "one key change applied");
 
@@ -4793,25 +4800,31 @@ fn key_change_unknown_address_skipped() {
 
     // An address not in the validator set — no index_of match.
     let unknown = primitives::Address([0xAA; 20]);
-    let changes = vec![(unknown, vec![0xBB; 48])];
+    let changes = vec![(unknown, vpk(&bls_key(0x0B)))];
     let applied = engine.apply_key_changes(&changes).expect("apply key changes");
     assert_eq!(applied, 0, "unknown address produces no change");
     assert!(!engine.rotation_pending(), "no rotation scheduled");
 }
 
-/// `apply_key_changes` with an invalid key length returns an error.
+/// Malformed key bytes are unrepresentable past the seam —
+/// `ValidatedPublicKey::from_bytes` is the only way to mint the
+/// token `apply_key_changes` accepts, and it rejects both wrong
+/// length and non-point encodings. This replaces the old
+/// length-check error the engine returned at the boundary.
 #[test]
-fn key_change_invalid_key_length() {
-    let pks: Vec<crypto::bls::PublicKey> = (1..=4u8).map(pk).collect();
-    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
-
-    let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
-        .without_signature_verification();
-
-    let addr = vs.validator_addresses()[0];
-    let changes = vec![(addr, vec![0xBB; 47])]; // 47 bytes — not 48
-    let result = engine.apply_key_changes(&changes);
-    assert!(result.is_err(), "invalid key length must be rejected");
+fn validated_key_rejects_malformed_bytes() {
+    // Wrong length.
+    assert!(
+        crypto::bls_signer::ValidatedPublicKey::from_bytes(&[0xBB; 47]).is_err(),
+        "47 bytes cannot be a compressed BLS key"
+    );
+    // Right length, not a curve point.
+    assert!(
+        crypto::bls_signer::ValidatedPublicKey::from_bytes(&[0xBB; 48]).is_err(),
+        "48 arbitrary bytes must not decode to a subgroup member"
+    );
+    // A real key mints fine.
+    assert_eq!(vpk(&bls_key(1)).as_bytes(), bls_key(1).public_key().as_bytes());
 }
 
 /// `ValidatorSet::index_of` finds the right index for a derived
@@ -4859,11 +4872,7 @@ fn drive_epoch_changes_rotates_committee() {
     let (new_keys, _) = bls_validator_set();
     app.queue_epoch_changes(types::EpochChanges {
         key_changes: Vec::new(),
-        adds: vec![(
-            primitives::Address([0x09; 20]),
-            new_keys[0].public_key().as_bytes().to_vec(),
-            1,
-        )],
+        adds: vec![(primitives::Address([0x09; 20]), vpk(&new_keys[0]), 1)],
         removes: Vec::new(),
     });
     assert_eq!(engine.drive_epoch_changes().expect("drive"), 1);
@@ -4886,12 +4895,8 @@ fn drive_epoch_changes_combines_key_add_remove() {
     let rotate_key_addr = vs.validator_addresses()[1];
     let fresh = bls_key(9);
     app.queue_epoch_changes(types::EpochChanges {
-        key_changes: vec![(rotate_key_addr, fresh.public_key().as_bytes().to_vec())],
-        adds: vec![(
-            primitives::Address([0x0A; 20]),
-            bls_key(10).public_key().as_bytes().to_vec(),
-            1,
-        )],
+        key_changes: vec![(rotate_key_addr, vpk(&fresh))],
+        adds: vec![(primitives::Address([0x0A; 20]), vpk(&bls_key(10)), 1)],
         removes: vec![old_addr],
     });
     let applied = engine.drive_epoch_changes().expect("drive");
@@ -4917,11 +4922,7 @@ fn drive_epoch_changes_dedups_replayed_transition() {
         OxideBft::new(app.clone(), single_validator_set()).without_signature_verification();
     let change = types::EpochChanges {
         key_changes: Vec::new(),
-        adds: vec![(
-            primitives::Address([0x09; 20]),
-            bls_key(9).public_key().as_bytes().to_vec(),
-            1,
-        )],
+        adds: vec![(primitives::Address([0x09; 20]), vpk(&bls_key(9)), 1)],
         removes: Vec::new(),
     };
     app.queue_epoch_changes(change.clone());

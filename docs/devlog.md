@@ -18983,3 +18983,34 @@ observation: every module canonical root is a full-state walk;
 
 No gates — these rows exist to report scaling, and they are the
 baseline a Merkle-ized committed-state redesign must beat.
+
+## §9.A — key material crosses the seam as a proof token
+
+`crypto::bls_signer::ValidatedPublicKey` closes the "validated
+consensus keys" residual the audit left open. The gap it removes
+was concrete, not stylistic: `crypto::bls::PublicKey::from_slice`
+checks length only, so `apply_key_changes`/`apply_validator_changes`
+accepted `Vec<u8>` keys whose only validation was whatever the
+producer happened to run — staking's PoP/validate_point gates
+covered every *existing* path, but nothing in the type stopped a
+future path from pushing unchecked bytes into `ValidatorSet` and
+wedging every QC mapped to a non-point key at signature time.
+
+The token is constructible only through `validate_point` (decode +
+subgroup): PoP admission mints through `verify_key_pop`, genesis
+and snapshot decode mint through `from_bytes`, and all four stored
+collections (`bls_keys`, `retired_bls_keys`, `pending_key_changes`,
+`pending_validator_adds`) hold tokens. `types::EpochChanges` and
+`executor::ValidatorChanges` carry them, so `build_next_set` reads
+`key.public_key()` with no decode — `KeyChangeError::InvalidKeyLength`
+is unrepresentable and deleted. A side benefit: the evidence
+verify loop in slashing dropped its per-candidate `from_slice`
+(stored keys are points by construction).
+
+Scope note: `ValidatorSet` itself keeps bare `PublicKey` members —
+a node's own WAL/snapshot is the trust interior, matching how
+WAL-decoded `high_qc` re-enters without re-verification. The
+verified-certificate token (`VerifiedQc`/`VerifiedTc`) remains the
+open half of this audit item; the same "proof on the stored type"
+pattern applies but stored certs escape into `BlockHeader`s and
+the WAL, which is a larger refactor.

@@ -225,17 +225,17 @@ impl StakingModule {
         // the validator's own keys is a real signature by that
         // validator — BLS unforgeability makes a foreign key's
         // signature impossible to fake.
-        let mut candidates: Vec<Vec<u8>> = Vec::new();
+        let mut candidates: Vec<crypto::bls_signer::ValidatedPublicKey> = Vec::new();
         {
             let bls_keys = framework::lock_state(&self.bls_keys);
             if let Some(k) = bls_keys.get(&validator) {
-                candidates.push(k.clone());
+                candidates.push(*k);
             }
         }
         {
             let retired = framework::lock_state(&self.retired_bls_keys);
             if let Some(keys) = retired.get(&validator) {
-                candidates.extend(keys.iter().cloned());
+                candidates.extend(keys.iter().copied());
             }
         }
         if candidates.is_empty() {
@@ -284,11 +284,12 @@ impl StakingModule {
         vote_msg_b[9..41].copy_from_slice(hash_b);
         vote_msg_b[41..49].copy_from_slice(&epoch.to_le_bytes());
         let verifies = |sig: &crypto::bls::Signature, vote_msg: &[u8; 49]| {
+            // Stored keys are `ValidatedPublicKey` tokens — the
+            // `from_slice` decode this closure used to pay per
+            // candidate is gone: a stored key is always a real
+            // point by construction.
             candidates.iter().any(|key| {
-                crypto::bls::PublicKey::from_slice(key).is_ok_and(|pk| {
-                    crypto::bls_signer::verify(sig, crypto::hash::Domain::Vote, vote_msg, &pk)
-                        .is_ok()
-                })
+                crypto::bls_signer::verify(sig, crypto::hash::Domain::Vote, vote_msg, key).is_ok()
             })
         };
         if !verifies(&sig_a, &vote_msg_a) || !verifies(&sig_b, &vote_msg_b) {

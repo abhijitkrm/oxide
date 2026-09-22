@@ -52,8 +52,11 @@ impl StakingModule {
                 msg.len().saturating_sub(21)
             )));
         }
-        let new_key = msg[21..69].to_vec();
-        Self::verify_key_pop(&new_key, &msg[69..165], "key_change")?;
+        // PoP verification mints the validated-key token — the
+        // pending queue and `bls_keys` store the proof, so the key
+        // the epoch boundary hands to consensus cannot be an
+        // unchecked byte string.
+        let new_key = Self::verify_key_pop(&msg[21..69], &msg[69..165], "key_change")?;
         // A consensus key identifies exactly one staking address —
         // rotating to a key another member already holds would
         // collide identities at the rotation's duplicate check
@@ -89,13 +92,27 @@ impl StakingModule {
     /// `ExecError::ModuleRejected` if `key` is not a 48-byte
     /// compressed public key, `pop` is not a 96-byte signature, or
     /// the `PoP` fails verification.
-    pub(crate) fn verify_key_pop(key: &[u8], pop: &[u8], op: &str) -> Result<(), ExecError> {
+    ///
+    /// Returns the [`ValidatedPublicKey`] proof token — the key has
+    /// both a verified `PoP` and a passing point + subgroup decode, so
+    /// the caller stores the token rather than the raw bytes.
+    pub(crate) fn verify_key_pop(
+        key: &[u8],
+        pop: &[u8],
+        op: &str,
+    ) -> Result<crypto::bls_signer::ValidatedPublicKey, ExecError> {
         let pk = crypto::bls::PublicKey::from_slice(key)
             .map_err(|_| ExecError::ModuleRejected(format!("{op}: malformed BLS public key")))?;
         let pop_sig = crypto::bls::Signature::from_slice(pop)
             .map_err(|_| ExecError::ModuleRejected(format!("{op}: malformed PoP signature")))?;
         crypto::bls_signer::pop_verify(&pk, &pop_sig).map_err(|_| {
             ExecError::ModuleRejected(format!("{op}: proof-of-possession verification failed"))
+        })?;
+        // `pop_verify` already decoded the point; `new` runs the
+        // subgroup check so the token's contract does not depend on
+        // what the verify path happened to cover.
+        crypto::bls_signer::ValidatedPublicKey::new(pk).map_err(|_| {
+            ExecError::ModuleRejected(format!("{op}: BLS key is not a valid group element"))
         })
     }
 
@@ -143,8 +160,7 @@ impl StakingModule {
                 msg.len()
             )));
         }
-        let bls_key = msg[21..69].to_vec();
-        Self::verify_key_pop(&bls_key, &msg[69..165], "validator_add")?;
+        let bls_key = Self::verify_key_pop(&msg[21..69], &msg[69..165], "validator_add")?;
 
         // Validate the action before recording: the candidate must
         // not already be registered or pending, and its consensus
@@ -182,8 +198,8 @@ impl StakingModule {
                     // for verification. A re-admission overwrites
                     // the previous live key — retire it rather
                     // than dropping the one a pending proof needs.
-                    let displaced = framework::lock_state(&self.bls_keys)
-                        .insert(new_validator, bls_key.clone());
+                    let displaced =
+                        framework::lock_state(&self.bls_keys).insert(new_validator, bls_key);
                     if let Some(old) = displaced
                         && old != bls_key
                     {
@@ -210,7 +226,7 @@ impl StakingModule {
     pub(crate) fn validate_add_action(
         &self,
         candidate: &Address,
-        key: &[u8],
+        key: &crypto::bls_signer::ValidatedPublicKey,
     ) -> Result<(), ExecError> {
         let validators = framework::lock_state(&self.validators);
         if validators.contains_key(candidate) {
@@ -425,7 +441,13 @@ impl StakingModule {
                     return false;
                 }
                 let Ok(addr) = <[u8; 20]>::try_from(&action[1..21]) else { return false };
-                self.validate_add_action(&Address(addr), &action[21..69]).is_ok()
+                // A key that no longer decodes to a valid point can
+                // never apply — the action is dead.
+                let Ok(key) = crypto::bls_signer::ValidatedPublicKey::from_bytes(&action[21..69])
+                else {
+                    return false;
+                };
+                self.validate_add_action(&Address(addr), &key).is_ok()
             }
             // [type][validator: 20B] — dead once the target is
             // unremovable (gone, already queued, or last powered

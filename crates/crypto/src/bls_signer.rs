@@ -262,6 +262,100 @@ pub fn validate_point(pk: &PublicKey) -> Result<(), BlsError> {
     blst_pk.validate().map_err(|_| BlsError::InvalidKeyMaterial)
 }
 
+/// A BLS12-381 public key proven to decode to a group element in
+/// the correct subgroup — "validated on admission" encoded in the
+/// type system.
+///
+/// [`PublicKey`] is a bare 48-byte wire blob: [`PublicKey::from_slice`]
+/// checks length only, so a raw `PublicKey` value proves nothing
+/// about the point it encodes. That distinction matters at the
+/// module → executor → consensus seam: validator-set deltas travel
+/// through `types::EpochChanges` and `executor::ValidatorChanges`,
+/// and before this type existed they crossed as `Vec<u8>` that the
+/// engine decoded with the length-only check — a non-point key
+/// admitted that way would wedge every QC mapped to it only when
+/// signatures began failing.
+///
+/// Every constructor runs [`validate_point`], so a
+/// `ValidatedPublicKey` reaching `OxideBft::apply_key_changes` /
+/// `apply_validator_changes` *is* the proof that admission ran —
+/// a future code path cannot push an unchecked key across the
+/// seam without the type complaining. PoP-verified admissions
+/// additionally prove key ownership; this token proves the weaker
+/// (but necessary) property every stored key needs: the bytes are
+/// a real group element.
+///
+/// The token is deliberately scoped to the live admission seam.
+/// A node's own durable state (WAL, snapshots) is the trust
+/// interior — decode paths re-validate via [`Self::from_bytes`]
+/// as defense in depth, but `ValidatorSet` itself keeps bare
+/// `PublicKey` members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValidatedPublicKey(PublicKey);
+
+impl ValidatedPublicKey {
+    /// Validate `pk` (curve-point decode + subgroup check) and wrap
+    /// it in the proof token.
+    ///
+    /// This is the only constructor — the signature *is* the
+    /// contract that the stored key is a real group element.
+    ///
+    /// # Errors
+    /// [`BlsError::InvalidKeyMaterial`] if `pk` does not decode to
+    /// a subgroup member.
+    pub fn new(pk: PublicKey) -> Result<Self, BlsError> {
+        validate_point(&pk)?;
+        Ok(Self(pk))
+    }
+
+    /// Validate compressed key bytes (length + curve-point decode +
+    /// subgroup check). The decode-boundary constructor for state
+    /// restore paths that hold raw bytes — snapshot decode, genesis
+    /// JSON, wire payloads.
+    ///
+    /// # Errors
+    /// [`BlsError::InvalidKeyMaterial`] if `bytes` is not exactly
+    /// 48 bytes or does not decode to a subgroup member.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlsError> {
+        let pk = PublicKey::from_slice(bytes).map_err(|_| BlsError::InvalidKeyMaterial)?;
+        Self::new(pk)
+    }
+
+    /// The validated key as the wire [`PublicKey`] — for consumers
+    /// (validator sets, signature verification) that store and use
+    /// the compressed form.
+    #[must_use]
+    pub fn public_key(&self) -> PublicKey {
+        self.0
+    }
+
+    /// The compressed 48-byte encoding.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::ops::Deref for ValidatedPublicKey {
+    type Target = PublicKey;
+
+    /// Deref to the inner [`PublicKey`] — a validated key can be
+    /// used anywhere the wire type is expected, but not the
+    /// reverse.
+    fn deref(&self) -> &PublicKey {
+        &self.0
+    }
+}
+
+impl From<ValidatedPublicKey> for PublicKey {
+    /// Unwrap the proof — the wire type forgets validation status,
+    /// which is fine for storage inside a boundary that already
+    /// checked it.
+    fn from(key: ValidatedPublicKey) -> Self {
+        key.0
+    }
+}
+
 /// Errors from BLS operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlsError {

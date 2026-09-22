@@ -373,10 +373,14 @@ pub fn system_time_ms() -> u64 {
 #[derive(Debug, Clone, Default)]
 pub struct EpochChanges {
     /// Consensus-key replacements for existing validators:
-    /// `(staking_address, new_bls_public_key)`.
-    pub key_changes: Vec<(Address, Vec<u8>)>,
+    /// `(staking_address, new_bls_public_key)` — a
+    /// [`ValidatedPublicKey`](crypto::bls_signer::ValidatedPublicKey)
+    /// proving the module ran point + subgroup validation at
+    /// admission (previously bare `Vec<u8>` that the engine decoded
+    /// with a length-only check at the epoch boundary).
+    pub key_changes: Vec<(Address, crypto::bls_signer::ValidatedPublicKey)>,
     /// Validators to add: `(staking_address, bls_public_key, stake)`.
-    pub adds: Vec<(Address, Vec<u8>, u64)>,
+    pub adds: Vec<(Address, crypto::bls_signer::ValidatedPublicKey, u64)>,
     /// Validator staking addresses to remove.
     pub removes: Vec<Address>,
 }

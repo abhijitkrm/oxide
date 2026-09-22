@@ -130,25 +130,30 @@ impl OxideBft {
     /// Apply pending validator key changes and schedule an epoch
     /// rotation (staking `KEY_CHANGE` → `schedule_rotation` bridge).
     ///
-    /// For each `(address, new_key_bytes)` in `changes`, finds the
+    /// For each `(address, new_key)` in `changes`, finds the
     /// validator index via `validator_set.index_of(address)`,
     /// replaces the BLS key, and builds an updated `ValidatorSet`
     /// preserving stakes and addresses. The updated set is scheduled
     /// via `schedule_rotation` — the two-phase handoff completes at
     /// the epoch boundary when `complete_rotation` swaps it in.
     ///
+    /// Each key arrives as a
+    /// [`ValidatedPublicKey`](crypto::bls_signer::ValidatedPublicKey):
+    /// the admitting module already proved the bytes decode to a
+    /// subgroup element, so the engine does not re-decode here — the
+    /// token type is what makes that skip safe.
+    ///
     /// Returns the number of key changes applied. Returns `Ok(0)` if
     /// `changes` is empty.
     ///
     /// # Errors
-    /// - `KeyChangeError::InvalidKeyLength` — a key is not 48 bytes.
     /// - `KeyChangeError::InvalidSet` — the updated set failed
     ///   construction.
     /// - `KeyChangeError::RotationAlreadyPending` — a rotation is
     ///   already scheduled.
     pub fn apply_key_changes(
         &mut self,
-        changes: &[(primitives::Address, Vec<u8>)],
+        changes: &[(primitives::Address, crypto::bls_signer::ValidatedPublicKey)],
     ) -> Result<usize, KeyChangeError> {
         self.apply_epoch_changes(changes, &[], &[])
     }
@@ -157,8 +162,10 @@ impl OxideBft {
     /// schedule the result for the next epoch rotation.
     ///
     /// `changes.adds` is a list of `(staking_address, bls_public_key,
-    /// stake)` tuples for new validators. `changes.removes` is a list
-    /// of staking addresses to remove.
+    /// stake)` tuples for new validators — each key a
+    /// [`ValidatedPublicKey`](crypto::bls_signer::ValidatedPublicKey)
+    /// proven at module admission. `changes.removes` is a list of
+    /// staking addresses to remove.
     ///
     /// Removes are applied first (in descending index order to avoid
     /// index shifting), then adds are appended at the end. The
@@ -169,8 +176,6 @@ impl OxideBft {
     ///
     /// # Errors
     ///
-    /// - [`KeyChangeError::InvalidKeyLength`] if a `bls_public_key` is
-    ///   not exactly 48 bytes.
     /// - [`KeyChangeError::InvalidSet`] if the resulting set would be
     ///   invalid (empty, zero stake, etc.).
     /// - [`KeyChangeError::RotationAlreadyPending`] if a rotation is
@@ -181,7 +186,7 @@ impl OxideBft {
     /// The number of changes applied (adds + removes).
     pub fn apply_validator_changes(
         &mut self,
-        adds: &[(primitives::Address, Vec<u8>, u64)],
+        adds: &[(primitives::Address, crypto::bls_signer::ValidatedPublicKey, u64)],
         removes: &[primitives::Address],
     ) -> Result<usize, KeyChangeError> {
         self.apply_epoch_changes(&[], adds, removes)
@@ -203,8 +208,8 @@ impl OxideBft {
     /// is skipped, not counted).
     fn build_next_set(
         &self,
-        key_changes: &[(primitives::Address, Vec<u8>)],
-        adds: &[(primitives::Address, Vec<u8>, u64)],
+        key_changes: &[(primitives::Address, crypto::bls_signer::ValidatedPublicKey)],
+        adds: &[(primitives::Address, crypto::bls_signer::ValidatedPublicKey, u64)],
         removes: &[primitives::Address],
     ) -> Result<(ValidatorSet, usize), KeyChangeError> {
         let mut keys = self.validator_set.public_keys().to_vec();
@@ -212,12 +217,13 @@ impl OxideBft {
         let mut addresses = self.validator_set.validator_addresses().to_vec();
         let mut applied = 0usize;
 
-        // 1. Key replacements — against the original indices.
-        for (addr, key_bytes) in key_changes {
-            let new_key = crypto::bls::PublicKey::from_slice(key_bytes)
-                .map_err(|_| KeyChangeError::InvalidKeyLength)?;
+        // 1. Key replacements — against the original indices. The
+        //    token carries the proof: the admitting module already
+        //    ran point + subgroup validation, so no decode can fail
+        //    here.
+        for (addr, key) in key_changes {
             if let Some(idx) = self.validator_set.index_of(addr) {
-                keys[usize::from(idx)] = new_key;
+                keys[usize::from(idx)] = key.public_key();
                 applied += 1;
             }
         }
@@ -252,16 +258,14 @@ impl OxideBft {
         //    dropped it from `remaining`, so the add applies.
         let mut remaining: std::collections::HashSet<primitives::Address> =
             addresses.iter().copied().collect();
-        for (addr, key_bytes, stake) in adds {
+        for (addr, key, stake) in adds {
             if !remaining.insert(*addr) {
                 continue;
             }
-            let new_key = crypto::bls::PublicKey::from_slice(key_bytes)
-                .map_err(|_| KeyChangeError::InvalidKeyLength)?;
             if *stake == 0 {
                 return Err(KeyChangeError::InvalidSet);
             }
-            keys.push(new_key);
+            keys.push(key.public_key());
             stakes.push(*stake);
             addresses.push(*addr);
             applied += 1;
@@ -290,8 +294,8 @@ impl OxideBft {
     /// [`KeyChangeError::RotationAlreadyPending`].
     pub fn apply_epoch_changes(
         &mut self,
-        key_changes: &[(primitives::Address, Vec<u8>)],
-        adds: &[(primitives::Address, Vec<u8>, u64)],
+        key_changes: &[(primitives::Address, crypto::bls_signer::ValidatedPublicKey)],
+        adds: &[(primitives::Address, crypto::bls_signer::ValidatedPublicKey, u64)],
         removes: &[primitives::Address],
     ) -> Result<usize, KeyChangeError> {
         if key_changes.is_empty() && adds.is_empty() && removes.is_empty() {

@@ -109,12 +109,12 @@ impl std::error::Error for EpochRotationError {}
 /// Key changes are submitted as transactions and stored in the
 /// staking module's `pending_key_changes`. At epoch boundary, the
 /// caller drains them and passes them to `apply_key_changes`, which
-/// builds an updated `ValidatorSet` and schedules a rotation.
+/// builds an updated `ValidatorSet` and schedules a rotation. Keys
+/// arrive as `ValidatedPublicKey` tokens — point + subgroup validity
+/// was proven at module admission, so malformed key bytes are
+/// unrepresentable here rather than a runtime error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyChangeError {
-    /// A key in the change list is not exactly 48 bytes (BLS12-381
-    /// compressed public key length).
-    InvalidKeyLength,
     /// The updated `ValidatorSet` failed construction (e.g. a key
     /// change produced an invalid set — should not happen in
     /// practice since `apply_key_change` preserves stakes and
@@ -128,7 +128,6 @@ pub enum KeyChangeError {
 impl std::fmt::Display for KeyChangeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidKeyLength => write!(f, "key change key is not 48 bytes"),
             Self::InvalidSet => write!(f, "updated validator set failed construction"),
             Self::RotationAlreadyPending => write!(f, "epoch rotation already pending"),
         }

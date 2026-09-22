@@ -327,15 +327,17 @@ pub struct StakingModule {
     /// Pending BLS key changes per validator address. The new key
     /// takes effect at the next epoch rotation — the consensus
     /// engine reads these via `take_key_changes` at the epoch
-    /// boundary.
-    pending_key_changes: Mutex<BTreeMap<Address, Vec<u8>>>,
+    /// boundary. Stored as `ValidatedPublicKey`: admission already
+    /// proved point + subgroup validity, so the token that crosses
+    /// to the engine is that proof.
+    pending_key_changes: Mutex<BTreeMap<Address, crypto::bls_signer::ValidatedPublicKey>>,
     /// Pending validator additions: `(address, bls_public_key)`.
     /// The new validator joins the set at the next epoch rotation —
     /// and only if it has *bonded* stake by then (delegations to the
     /// registered candidate): admission authorizes membership, the
     /// ledger debit proves collateral. The consensus engine reads
     /// these via `take_validator_changes`.
-    pending_validator_adds: Mutex<Vec<(Address, Vec<u8>)>>,
+    pending_validator_adds: Mutex<Vec<(Address, crypto::bls_signer::ValidatedPublicKey)>>,
     /// Pending validator removals: addresses to remove at the next
     /// epoch rotation. The consensus engine reads these via
     /// `take_validator_changes`.
@@ -348,16 +350,18 @@ pub struct StakingModule {
     /// committee's total bonded power (C9: one validator's
     /// signature is a vote, never a command).
     endorsements: framework::Endorsements,
-    /// The *current* BLS consensus key per validator — 48-byte
-    /// BLS12-381 compressed public key. Unlike
-    /// `pending_key_changes` (drained each rotation), this map
-    /// persists so `handle_evidence` can verify vote signatures
-    /// against the key the validator is known by. Set at
-    /// `VALIDATOR_ADD` / `genesis_set_bls_key`, updated when
-    /// `take_key_changes` applies a rotation, never deleted — a
-    /// stale key is harmless (evidence requires the validator to
-    /// still exist) and re-adds overwrite it.
-    bls_keys: Mutex<BTreeMap<Address, Vec<u8>>>,
+    /// The *current* BLS consensus key per validator — held as
+    /// `ValidatedPublicKey`, the proof that every stored key passed
+    /// point + subgroup validation at admission (`PoP` paths) or
+    /// decode (snapshot/genesis). Unlike `pending_key_changes`
+    /// (drained each rotation), this map persists so
+    /// `handle_evidence` can verify vote signatures against the key
+    /// the validator is known by. Set at `VALIDATOR_ADD` /
+    /// `genesis_set_bls_key`, updated when `take_key_changes`
+    /// applies a rotation, never deleted — a stale key is harmless
+    /// (evidence requires the validator to still exist) and
+    /// re-adds overwrite it.
+    bls_keys: Mutex<BTreeMap<Address, crypto::bls_signer::ValidatedPublicKey>>,
     /// Recently displaced consensus keys per validator, oldest
     /// first, capped at [`EVIDENCE_KEY_HISTORY`]. A rotation or
     /// re-admission moves the previous key here: the key can no
@@ -367,7 +371,7 @@ pub struct StakingModule {
     /// (the v1 bound: evidence died the moment keys changed).
     /// Committed state: two replicas disagreeing on the retired
     /// set disagree on whether a proof verifies.
-    retired_bls_keys: Mutex<BTreeMap<Address, Vec<Vec<u8>>>>,
+    retired_bls_keys: Mutex<BTreeMap<Address, Vec<crypto::bls_signer::ValidatedPublicKey>>>,
     /// Jailed validators: address → height jailed. Jailed
     /// validators are emitted as `removes` at the next epoch
     /// rotation (out of consensus), stop earning rewards, and keep
@@ -519,18 +523,16 @@ impl StakingModule {
     ///
     /// # Panics
     ///
-    /// Panics if `key` is not 48 bytes or the mutex is poisoned.
+    /// Panics if `key` is not a valid compressed BLS12-381 key or
+    /// the mutex is poisoned.
     pub fn genesis_set_bls_key(&self, validator: Address, key: &[u8]) {
-        assert_eq!(key.len(), crypto::bls::PublicKey::LEN, "BLS key must be 48 bytes");
-        // Genesis has no PoP to check — the group-element validation
-        // is the only thing keeping a typo'd key from wedging the
-        // validator's votes for the chain's whole life.
-        let pk = crypto::bls::PublicKey::from_slice(key).expect("length checked above");
-        assert!(
-            crypto::bls_signer::validate_point(&pk).is_ok(),
-            "genesis BLS key for {validator:?} is not a valid group element"
-        );
-        framework::lock_state(&self.bls_keys).insert(validator, key.to_vec());
+        // Genesis has no PoP to check — the point validation inside
+        // the token constructor is the only thing keeping a typo'd
+        // key from wedging the validator's votes for the chain's
+        // whole life.
+        let pk = crypto::bls_signer::ValidatedPublicKey::from_bytes(key)
+            .expect("genesis BLS key must decode to a valid group element");
+        framework::lock_state(&self.bls_keys).insert(validator, pk);
     }
 
     /// Whether `addr` is currently jailed (excluded from consensus
@@ -748,14 +750,14 @@ impl StakingModule {
     /// # Panics
     ///
     /// Panics if the mutex is poisoned.
-    pub fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
-        let changes: Vec<(Address, Vec<u8>)> =
+    pub fn take_key_changes(&self) -> Vec<(Address, crypto::bls_signer::ValidatedPublicKey)> {
+        let changes: Vec<(Address, crypto::bls_signer::ValidatedPublicKey)> =
             std::mem::take(&mut *framework::lock_state(&self.pending_key_changes))
                 .into_iter()
                 .collect();
         let mut bls_keys = framework::lock_state(&self.bls_keys);
         for (addr, key) in &changes {
-            if let Some(old) = bls_keys.insert(*addr, key.clone())
+            if let Some(old) = bls_keys.insert(*addr, *key)
                 && old != *key
             {
                 self.retire_key(*addr, old);
@@ -772,7 +774,7 @@ impl StakingModule {
     /// must still verify — the uniform rule keeps re-admission,
     /// rotation, and lapse paths from silently dropping the one
     /// key a pending proof needs.
-    fn retire_key(&self, validator: Address, old_key: Vec<u8>) {
+    fn retire_key(&self, validator: Address, old_key: crypto::bls_signer::ValidatedPublicKey) {
         let mut retired = framework::lock_state(&self.retired_bls_keys);
         let keys = retired.entry(validator).or_default();
         keys.push(old_key);
@@ -847,7 +849,7 @@ impl StakingModule {
                 // unjail and rotation; skip rather than re-add a
                 // phantom.
                 if let (Some(key), Some(stake)) = (bls_keys.get(&addr), validators.get(&addr)) {
-                    adds.push((addr, key.clone(), *stake));
+                    adds.push((addr, *key, *stake));
                 }
             }
         }
@@ -1324,7 +1326,7 @@ impl Module for StakingModule {
         Ok(())
     }
 
-    fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
+    fn take_key_changes(&self) -> Vec<(Address, crypto::bls_signer::ValidatedPublicKey)> {
         StakingModule::take_key_changes(self)
     }
 

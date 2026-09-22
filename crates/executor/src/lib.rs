@@ -1071,15 +1071,16 @@ pub trait Module: Send + Sync {
     ///
     /// Called by the consensus layer at epoch boundary to collect
     /// key rotations submitted via `KEY_CHANGE` transactions. Each
-    /// entry is `(staking_address, new_bls_key_bytes)` — the staking
-    /// module records them; the consensus engine applies them to
-    /// the validator set.
+    /// entry is `(staking_address, new_bls_key)` where the key is a
+    /// [`ValidatedPublicKey`] — the token proves the module
+    /// validated the point at admission, so the engine folds it
+    /// without a re-check and an unchecked key cannot cross.
     ///
     /// # Default
     ///
     /// Returns empty — most modules don't track key changes. Only
     /// the staking module overrides this.
-    fn take_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
+    fn take_key_changes(&self) -> Vec<(Address, crypto::bls_signer::ValidatedPublicKey)> {
         Vec::new()
     }
 
@@ -1105,11 +1106,14 @@ pub trait Module: Send + Sync {
 ///
 /// `adds` is a list of `(staking_address, bls_public_key, stake)`
 /// tuples for new validators. `removes` is a list of staking
-/// addresses to remove.
+/// addresses to remove. The key in each add is a
+/// [`ValidatedPublicKey`](crypto::bls_signer::ValidatedPublicKey):
+/// proof that the admitting module ran point + subgroup
+/// validation, not just a 48-byte length check.
 #[derive(Debug, Clone, Default)]
 pub struct ValidatorChanges {
     /// Validators to add: `(address, bls_public_key, stake)`.
-    pub adds: Vec<(Address, Vec<u8>, u64)>,
+    pub adds: Vec<(Address, crypto::bls_signer::ValidatedPublicKey, u64)>,
     /// Validator addresses to remove.
     pub removes: Vec<Address>,
 }
@@ -1818,12 +1822,15 @@ impl Executor {
     /// registered modules and collects their pending key changes —
     /// only the staking module produces non-empty results.
     ///
-    /// Returns `Vec<(staking_address, new_bls_key_bytes)>`. The
-    /// caller passes these to `OxideBft::apply_key_changes` which
-    /// builds the updated `ValidatorSet` and schedules an epoch
-    /// rotation.
+    /// Returns `Vec<(staking_address, new_bls_key)>` — each key a
+    /// [`ValidatedPublicKey`](crypto::bls_signer::ValidatedPublicKey)
+    /// proven at module admission. The caller passes these to
+    /// `OxideBft::apply_key_changes` which builds the updated
+    /// `ValidatorSet` and schedules an epoch rotation.
     #[must_use]
-    pub fn take_pending_key_changes(&self) -> Vec<(Address, Vec<u8>)> {
+    pub fn take_pending_key_changes(
+        &self,
+    ) -> Vec<(Address, crypto::bls_signer::ValidatedPublicKey)> {
         self.modules.iter().flatten().flat_map(|m| m.take_key_changes()).collect()
     }
 

@@ -10,6 +10,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ## [Unreleased]
 
+### Changed
+
+- **Validator keys cross into consensus as proof tokens**
+  (`crypto`, `types`, `executor`, `staking`, `consensus`): the new
+  `ValidatedPublicKey` type is constructible only by running point
+  decode + subgroup validation. Staking stores it for live, retired,
+  and pending keys; `EpochChanges`/`ValidatorChanges` carry it;
+  `apply_key_changes`/`apply_validator_changes` consume it — the
+  engine no longer decodes raw bytes at the epoch boundary, and the
+  `InvalidKeyLength` error path is unrepresentable. Snapshot decode
+  mints tokens through the same gate, preserving fail-closed blob
+  handling.
+  - **In plain words:** a validator's consensus key is now proven
+    well-formed when staking admits it, and that proof is what
+    crosses into the consensus engine — malformed key bytes can't
+    reach the validator set at all, instead of being caught by a
+    length check that happened to sit at the boundary.
+
 ### Added
 
 - **State-scaling benchmarks** (`crates/executor`,

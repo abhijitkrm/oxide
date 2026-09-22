@@ -49,18 +49,20 @@ pub(crate) struct StagedStaking {
     /// Total delegated into each validator.
     pub(crate) delegated_total: BTreeMap<Address, u64>,
     /// Pending consensus-key rotations.
-    pub(crate) pending_key_changes: BTreeMap<Address, Vec<u8>>,
+    pub(crate) pending_key_changes: BTreeMap<Address, crypto::bls_signer::ValidatedPublicKey>,
     /// Endorsed validator admissions awaiting the epoch rotation.
-    pub(crate) pending_validator_adds: Vec<(Address, Vec<u8>)>,
+    pub(crate) pending_validator_adds: Vec<(Address, crypto::bls_signer::ValidatedPublicKey)>,
     /// Endorsed removals awaiting the epoch rotation.
     pub(crate) pending_validator_removes: Vec<Address>,
     /// Pending governance endorsements (C9).
     pub(crate) endorsements: framework::Endorsements,
-    /// Live BLS consensus keys.
-    pub(crate) bls_keys: BTreeMap<Address, Vec<u8>>,
+    /// Live BLS consensus keys — `ValidatedPublicKey` tokens: decode
+    /// mints each through `from_bytes`, so the staged map itself is
+    /// the proof that every key passed point + subgroup validation.
+    pub(crate) bls_keys: BTreeMap<Address, crypto::bls_signer::ValidatedPublicKey>,
     /// Retired BLS consensus keys per validator (bounded history —
     /// [`EVIDENCE_KEY_HISTORY`]). Empty in pre-upgrade blobs.
-    pub(crate) retired_bls_keys: BTreeMap<Address, Vec<Vec<u8>>>,
+    pub(crate) retired_bls_keys: BTreeMap<Address, Vec<crypto::bls_signer::ValidatedPublicKey>>,
     /// Jailed validators: address → height jailed.
     pub(crate) jailed: BTreeMap<Address, u64>,
     /// Jail events awaiting the next validator-set broadcast.
@@ -222,7 +224,12 @@ pub(crate) fn decode_set_state(
         if !out.validators.contains_key(&a) {
             return None;
         }
-        if out.pending_key_changes.insert(a, r.get_bytes()?.to_vec()).is_some() {
+        // The pending key crosses to consensus verbatim — decode
+        // must mint the same validated token admission produced,
+        // or a crafted blob could smuggle a non-point key past the
+        // epoch boundary.
+        let key = crypto::bls_signer::ValidatedPublicKey::from_bytes(r.get_bytes()?).ok()?;
+        if out.pending_key_changes.insert(a, key).is_some() {
             return None;
         }
     }
@@ -230,7 +237,7 @@ pub(crate) fn decode_set_state(
     out.pending_validator_adds.reserve(n.min(r.remaining() / 20));
     for _ in 0..n {
         let a = r.get_addr()?;
-        let key = r.get_bytes()?.to_vec();
+        let key = crypto::bls_signer::ValidatedPublicKey::from_bytes(r.get_bytes()?).ok()?;
         // `validate_add_action` seats the candidate in
         // `validators` (0 stake) and records its key in
         // `bls_keys` at quorum time — both must hold.
@@ -252,25 +259,19 @@ pub(crate) fn decode_set_state(
     let n = r.get_count()?;
     for _ in 0..n {
         let a = r.get_addr()?;
-        let key = r.get_bytes()?.to_vec();
-        // Consensus keys are fixed-size BLS12-381 compressed
-        // public keys — every writer enforces 48 bytes.
-        if key.len() != crypto::bls::PublicKey::LEN {
-            return None;
-        }
-        // Re-validate the group element: the PoP gate ran at
-        // admission, but a crafted or corrupted snapshot blob
-        // must not lodge a point that can never verify — that
-        // would wedge every QC the key maps to.
-        let pk = crypto::bls::PublicKey::from_slice(&key).ok()?;
-        crypto::bls_signer::validate_point(&pk).ok()?;
+        // The token constructor enforces everything at once:
+        // 48-byte length, curve-point decode, subgroup membership.
+        // The PoP gate ran at admission, but a crafted or corrupted
+        // snapshot blob must not lodge a point that can never
+        // verify — that would wedge every QC the key maps to.
+        let key = crypto::bls_signer::ValidatedPublicKey::from_bytes(r.get_bytes()?).ok()?;
         if out.bls_keys.insert(a, key).is_some() {
             return None;
         }
     }
     for (a, key) in &out.pending_validator_adds {
         match out.bls_keys.get(a) {
-            Some(k) if *k == *key => {}
+            Some(k) if k == key => {}
             _ => return None,
         }
     }
@@ -341,15 +342,11 @@ pub(crate) fn decode_consensus_state(
             }
             let mut keys = Vec::with_capacity(kn);
             for _ in 0..kn {
-                let k = r.get_bytes()?.to_vec();
-                if k.len() != crypto::bls::PublicKey::LEN {
-                    return None;
-                }
                 // Same re-validation as the live map — a retired
-                // key must still verify historical evidence.
-                let pk = crypto::bls::PublicKey::from_slice(&k).ok()?;
-                crypto::bls_signer::validate_point(&pk).ok()?;
-                keys.push(k);
+                // key must still verify historical evidence, so a
+                // non-point blob entry is rejected rather than
+                // lodged.
+                keys.push(crypto::bls_signer::ValidatedPublicKey::from_bytes(r.get_bytes()?).ok()?);
             }
             if out.retired_bls_keys.insert(a, keys).is_some() {
                 return None;

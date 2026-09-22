@@ -95,12 +95,12 @@ impl StakingModule {
         let pending_keys = framework::lock_state(&self.pending_key_changes);
         w.put_count(pending_keys.len());
         for (a, k) in pending_keys.iter() {
-            w.put_addr(a).put_bytes(k);
+            w.put_addr(a).put_bytes(k.as_bytes());
         }
         let adds = framework::lock_state(&self.pending_validator_adds);
         w.put_count(adds.len());
         for (a, k) in adds.iter() {
-            w.put_addr(a).put_bytes(k);
+            w.put_addr(a).put_bytes(k.as_bytes());
         }
         let removes = framework::lock_state(&self.pending_validator_removes);
         w.put_count(removes.len());
@@ -110,7 +110,7 @@ impl StakingModule {
         let keys = framework::lock_state(&self.bls_keys);
         w.put_count(keys.len());
         for (a, k) in keys.iter() {
-            w.put_addr(a).put_bytes(k);
+            w.put_addr(a).put_bytes(k.as_bytes());
         }
         let jailed = framework::lock_state(&self.jailed);
         w.put_count(jailed.len());
@@ -174,7 +174,7 @@ impl StakingModule {
             for (a, keys) in retired.iter() {
                 w.put_addr(a).put_count(keys.len());
                 for k in keys {
-                    w.put_bytes(k);
+                    w.put_bytes(k.as_bytes());
                 }
             }
         }
