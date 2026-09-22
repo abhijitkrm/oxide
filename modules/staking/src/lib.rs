@@ -3582,7 +3582,18 @@ impl StakingModule {
             if !is_eligible(addr, *stake) {
                 continue;
             }
-            let reward = total_reward.saturating_mul(*stake) / eligible;
+            // Money math in u128, not u64 saturation: at realistic
+            // token scale `total_reward * stake` overflows u64
+            // (1e10 units × 1e10 stake = 1e20 > u64::MAX), and
+            // saturating there under-pays a large validator to
+            // `u64::MAX / eligible` — a silent obligation change,
+            // exactly what saturation-as-error-handling hides. The
+            // u128 product cannot overflow (two u64s), and since
+            // `stake <= eligible` the quotient is ≤ `total_reward`,
+            // so the narrowing is provably lossless.
+            let reward =
+                u64::try_from(u128::from(total_reward) * u128::from(*stake) / u128::from(eligible))
+                    .unwrap_or(u64::MAX);
             if reward > 0 {
                 *rpt.entry(*addr).or_insert(0) +=
                     u128::from(reward).saturating_mul(RPT_SCALE).saturating_div(u128::from(*stake));
@@ -4091,6 +4102,30 @@ mod tests {
         // addr(0)'s delegation, so they accrue nothing directly.
         assert_eq!(staking.claimable(&v1), 0, "validator self-share is zero");
         assert_eq!(staking.claimable(&v2), 0, "validator self-share is zero");
+    }
+
+    /// The reward share is money math — its intermediate must not
+    /// saturate. `total_reward * stake` in `u64` overflows at real
+    /// token scale (`1e12` pool × `1e10` stake = `1e22` > `u64::MAX`),
+    /// and the old `saturating_mul` clamped the product, paying the
+    /// validator `u64::MAX / eligible` instead of its share — an
+    /// under-payment of ~500× that no test caught because every
+    /// reward test used small numbers. `u128` intermediates make the
+    /// overflow impossible rather than clamped.
+    #[test]
+    fn reward_share_does_not_saturate_at_token_scale() {
+        let staking = setup(&[]).with_block_reward(1_000_000_000_000); // 1e12
+        // Two genesis validators, 25%/75% of bonded stake — both
+        // large enough that reward × stake overflows u64.
+        staking.genesis_register_validator(addr(1), 10_000_000_000); // 1e10
+        staking.genesis_register_validator(addr(2), 30_000_000_000); // 3e10
+        staking.begin_block(Height::new(1));
+        staking.end_block(Height::new(1));
+        // Exact pro-rata shares of the 1e12 pool — the u64 product
+        // (1e22) exceeds u64::MAX ≈ 1.8e19, so a saturating u64
+        // intermediate would pay ~4.6e8, not these:
+        assert_eq!(staking.claimable(&addr(1)), 250_000_000_000, "25% of the pool");
+        assert_eq!(staking.claimable(&addr(2)), 750_000_000_000, "75% of the pool");
     }
 
     #[test]

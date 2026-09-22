@@ -2190,6 +2190,12 @@ impl BookSettlement<'_> {
         // for the cancel path, and dead remainders
         // (IOC/FOK/Killed/Rejected) come back in full.
         if taker.reservation > 0 {
+            // `held` is the resting remainder's quote requirement at
+            // the limit price — computed in u128 and clamped to
+            // u64::MAX, which errs toward holding *more* than the
+            // remainder needs (refund shrinks, nothing is created).
+            // The clamp needs `price × qty > u64::MAX × PRICE_SCALE`
+            // — beyond the u64 money supply for any funded order.
             let held = match outcome {
                 OrderOutcome::Resting { resting_qty, .. } => u64::try_from(
                     u128::from(taker.price.0) * u128::from(resting_qty.0) / PRICE_SCALE,
@@ -2197,6 +2203,9 @@ impl BookSettlement<'_> {
                 .unwrap_or(u64::MAX),
                 _ => 0,
             };
+            // The floor at zero is the same direction: a `paid +
+            // held` total above the reservation retains the excess
+            // in custody rather than minting a refund.
             let refund = taker.reservation.saturating_sub(taker_paid.saturating_add(held));
             if refund > 0 {
                 self.ledger.credit(&taker.owner, refund).map_err(|_| {

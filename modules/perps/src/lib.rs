@@ -1242,6 +1242,14 @@ impl PerpsModule {
                 }
                 let mark = marks.get(market).copied().unwrap_or(pos.entry_price);
                 let pnl = pos.unrealized_pnl(mark); // scale-14
+                // i128 accumulators: saturation needs cumulative PnL
+                // beyond ±1.7e38 — past any funded position's reach.
+                // If it ever fired, the clamp drives `net` to the
+                // extreme and the residual lands in
+                // `unfunded_bad_debt` — the named deficit account —
+                // so the terminal state is "everything is owed",
+                // which is the honest reading of an
+                // unrepresentable loss.
                 total_loss_scale14 = total_loss_scale14.saturating_add(pnl);
                 total_margin_recovered = total_margin_recovered.saturating_add(pos.isolated_margin);
                 // Record the transfer BEFORE zeroing — `size` is the
@@ -1533,6 +1541,11 @@ impl PerpsModule {
         let (mut adl_events, remaining) = Self::auto_deleverage(inner, excluded, shortfall);
         events.append(&mut adl_events);
         if remaining > 0 {
+            // The debt counter is a u64 like every balance — its
+            // sum cannot exceed total losses ever realized, which
+            // real (u64-bounded) money keeps below the clamp. At
+            // the unreachable cap the semantics stay honest:
+            // everything is owed.
             inner.unfunded_bad_debt = inner.unfunded_bad_debt.saturating_add(remaining);
             let mut data = Vec::with_capacity(8);
             data.extend_from_slice(&remaining.to_le_bytes());
@@ -1550,6 +1563,11 @@ impl PerpsModule {
     fn fund_inflow(inner: &mut Inner, amount: u64) {
         let repay = inner.unfunded_bad_debt.min(amount);
         inner.unfunded_bad_debt -= repay;
+        // The fund only ever receives real inflows — bounded by the
+        // u64 money supply — so the saturating add cannot fire in a
+        // consistent ledger. It stays as the defensive bound because
+        // a clamped fund is "holds everything," which is the
+        // direction a receiver-side overflow must err toward.
         inner.insurance_fund = inner.insurance_fund.saturating_add(amount - repay);
     }
 }
@@ -3166,6 +3184,12 @@ impl PerpsModule {
             let acct = Self::account_mut(inner, account);
             let pos = acct.positions.entry(market).or_default();
             let old_size = pos.size;
+            // Saturating is a deliberate bound, not error handling:
+            // |size| exceeding i64::MAX needs ~9.2e18 lots against
+            // u64-bounded margin — unreachable for funded positions.
+            // If it ever fired, clamping is the least-bad terminal
+            // (a panic mid-liquidation is a consensus halt; a
+            // rejection here would strand the sweep half-applied).
             let new_size = old_size.saturating_add(delta);
 
             // Realized PnL on the closed portion (scale-14 → scale-6

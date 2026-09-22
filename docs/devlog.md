@@ -18237,3 +18237,39 @@ The durable vote budget is ~6 ms per view — ~5,800× the
 conformance figure — and the WAL fsync is the dominant term, with
 BLS second. Any view-latency or throughput-per-view claim must now
 cite these numbers, not the conformance bench.
+
+## Saturation-as-error-handling audit: one real bug, honest bounds
+
+A site-by-site pass over `saturating_*` in the money modules
+(staking, perps, exchange, governance, evm) — the audit's point
+that a reflexive clamp on an obligation silently changes what is
+owed. Classification rule applied: does the clamp ever fire on a
+reachable input, and if it does, which direction does the error go?
+
+**The bug.** `StakingModule::distribute_rewards` computed each
+validator's share as `total_reward.saturating_mul(stake) /
+eligible` — a `u64` intermediate on money math. At real token
+scale (1e12 reward pool × 1e10 stake) the product is 1e22, ~550×
+past `u64::MAX`; the clamp paid `u64::MAX / eligible` ≈ 4.6e8
+instead of 2.5e11 — under-paying large validators by ~500×. The
+reward-per-token accumulator two lines below already did the same
+computation in `u128`, so the fix is alignment, not invention:
+`u128` product → `u64::try_from` whose bound is provably lossless
+(`stake ≤ eligible` ⇒ quotient ≤ `total_reward`). The regression
+test drives a pool/stake pair whose `u64` product overflows and
+asserts exact pro-rata payout — it pays 4.6e8 on the old code,
+2.5e11 on the new.
+
+**What the rest of the pass confirmed.** Every other `saturating_*`
+on an obligation path is either unreachable or clamps toward the
+safe direction, and the code now says so at the site: admission
+margin clamps reject harder; the exchange refund floor retains the
+excess in custody (never mints); the liquidation accumulator's
+i128 bound routes the residual into `unfunded_bad_debt` — already
+the named deficit account the audit asks for; the position-size
+clamp at `i64::MAX` needs ~9.2e18 lots against `u64`-bounded
+margin and is documented as the least-bad terminal (a panic
+mid-sweep is a consensus halt); governance deposit/tally
+accumulators are escrow-/power-bounded. The remaining asks —
+checked arithmetic *everywhere* and atomic rejection plumbing —
+stay open under the methodology program.

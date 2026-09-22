@@ -1159,6 +1159,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Staking rewards could under-pay large validators** (`modules/staking`)
+  - The per-validator reward share multiplied `total_reward × stake`
+    in `u64` before dividing — at real token scale (a `1e12` reward
+    pool against `1e10` stake) the product saturates past
+    `u64::MAX` and the validator receives ~`u64::MAX / eligible`
+    instead of its pro-rata share, an under-payment of hundreds of
+    times. The share is now computed in `u128` (the same widening
+    the reward-per-token accumulator already used) and a regression
+    test drives values whose `u64` product overflows.
+  - In plain words: on chains with large-denomination token units,
+    big validators were being paid a small fraction of the block
+    rewards they were owed.
 - **The consensus spec and the real vote budget were not gated or
   measured** (`spec/oxidebft`, `crates/consensus`,
   `.github/workflows/*`)

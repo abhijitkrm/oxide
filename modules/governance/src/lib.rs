@@ -926,6 +926,11 @@ impl GovernanceModule {
             // Move the funds first — if the debit fails nothing has
             // been recorded and the proposal's tally is untouched.
             ledger.transfer(&ctx.sender, &GOVERNANCE_ESCROW, amount)?;
+            // Deposits escrow real balance — cumulative deposits are
+            // bounded by the u64 money supply, so the saturating adds
+            // cannot fire in a consistent ledger. The bound is kept
+            // anyway: a clamped tally is "fully funded," and the
+            // escrow already holds every recorded unit.
             match known_idx {
                 Some(i) => records[i].1 = records[i].1.saturating_add(amount),
                 None => records.push((ctx.sender, amount)),
