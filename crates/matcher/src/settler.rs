@@ -24,6 +24,67 @@ use exchange::BatchFillEntry;
 use primitives::fixed::{Price, Qty};
 use types::TxBytes;
 
+/// The settlement lane's failure classes — a typed boundary so a
+/// caller (or an operator alert) can tell *what kind* of failure
+/// stopped a tick instead of matching on message text.
+///
+/// Each variant names the state effect the caller must assume:
+/// - [`Submission`](Self::Submission): the envelope stayed pending —
+///   the lane retries next tick; nothing settled, nothing lost.
+/// - [`AggregateOverflow`](Self::AggregateOverflow): the sealed fills
+///   were NOT cleared — the sealer re-seals them next tick; a code
+///   bug or impossible volume, not a transient.
+/// - [`Sign`](Self::Sign): envelope encoding failed before
+///   submission — nothing was sent, the nonce was not consumed.
+#[derive(Debug)]
+pub enum SettleError {
+    /// The mempool rejected the envelope. The reason is opaque port
+    /// text — the lane never branches on it, only logs it.
+    Submission(String),
+    /// A fill-qty sum exceeded `u64::MAX` during aggregation —
+    /// unreachable at real volumes; fail loudly rather than clamp.
+    AggregateOverflow,
+    /// secp256k1 signing failed (malformed key material — a config
+    /// bug, not a transient).
+    Sign(String),
+}
+
+impl std::fmt::Display for SettleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Submission(e) => write!(f, "mempool rejected envelope: {e}"),
+            Self::AggregateOverflow => write!(f, "fill qty aggregation overflow"),
+            Self::Sign(e) => write!(f, "sign settlement envelope: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SettleError {}
+
+/// Why a settlement-outbox checkpoint failed to decode — the
+/// structural violations are enumerated so `with_outbox`'s
+/// fail-closed panic message distinguishes "disk error" from
+/// "corrupt/hostile bytes".
+#[derive(Debug)]
+pub(crate) enum OutboxError {
+    /// The file could not be read (permissions, disappearing fs).
+    Io(std::io::Error),
+    /// The bytes violate the checkpoint format — each payload
+    /// names the violated rule.
+    Corrupt(String),
+}
+
+impl std::fmt::Display for OutboxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "read failed: {e}"),
+            Self::Corrupt(e) => write!(f, "corrupt checkpoint: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OutboxError {}
+
 // ── TxSubmitter / TxConfirmer traits ─────────────────────────────────
 
 /// A handle that submits transactions to the consensus mempool.
@@ -172,7 +233,9 @@ pub(crate) fn is_retryable_skip(reason: executor::TxSkipReason) -> bool {
 /// sum to exactly the leg's `floor(price × Σqty / SCALE)` — the
 /// cache's accounting is bit-identical to the chain's, not just
 /// bounded-dust close.
-pub(crate) fn aggregate_fills(fills: &[crate::SettledFill]) -> Result<Vec<BatchFillEntry>, String> {
+pub(crate) fn aggregate_fills(
+    fills: &[crate::SettledFill],
+) -> Result<Vec<BatchFillEntry>, SettleError> {
     let mut aggregated: std::collections::BTreeMap<
         (u16, Price, exchange::OrderKey, exchange::OrderKey),
         Qty,
@@ -189,10 +252,7 @@ pub(crate) fn aggregate_fills(fills: &[crate::SettledFill]) -> Result<Vec<BatchF
                 // A qty sum above u64::MAX is unreachable in practice
                 // (would require ~1.8e13 lots traded in one batch);
                 // fail loudly rather than saturate.
-                *q = Qty(q
-                    .0
-                    .checked_add(f.qty.0)
-                    .ok_or_else(|| "fill qty aggregation overflow".to_string())?);
+                *q = Qty(q.0.checked_add(f.qty.0).ok_or(SettleError::AggregateOverflow)?);
             }
             None => {
                 aggregated.insert(key, f.qty);
@@ -422,7 +482,7 @@ impl BatchSettler {
     ///
     /// Panics if the underlying sealer's mutex/control channel is
     /// poisoned or disconnected.
-    pub fn settle_now(&self) -> Result<SettleReport, String> {
+    pub fn settle_now(&self) -> Result<SettleReport, SettleError> {
         let mut report = SettleReport::default();
         {
             let mut pending = primitives::sync::lock_state(&self.pending);
@@ -466,7 +526,7 @@ impl BatchSettler {
                                     "batch settler: CRITICAL — batch of {pair_count} pairs failed {attempts} submissions, keeping pending: {e}"
                                 );
                             }
-                            return Err(e);
+                            return Err(SettleError::Submission(e));
                         }
                     }
                 }
@@ -522,7 +582,7 @@ impl BatchSettler {
                     wait_ticks: 0,
                 });
                 self.persist(pending.as_ref());
-                return Err(e);
+                return Err(SettleError::Submission(e));
             }
         }
         Ok(report)
@@ -536,7 +596,7 @@ impl BatchSettler {
         nonce: u64,
         fee: u64,
         module_payload: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, SettleError> {
         let signed = self.signing.is_some();
         let mut envelope = Vec::with_capacity(37 + usize::from(signed) * 65 + module_payload.len());
         envelope.extend_from_slice(&self.sender.0);
@@ -552,7 +612,7 @@ impl BatchSettler {
                 framework::module_id::EXCHANGE,
                 module_payload,
             )
-            .map_err(|e| format!("sign settlement envelope: {e:?}"))?;
+            .map_err(|e| SettleError::Sign(format!("{e:?}")))?;
             envelope.push(framework::module_id::EXCHANGE | 0x80);
             envelope.extend_from_slice(&sig.sig);
             envelope.push(sig.recid.as_u8());
@@ -634,51 +694,61 @@ impl SettlementOutbox {
 
     /// Read the checkpoint. Missing file = empty state (first run).
     /// `Err` on ANY structural violation — the caller fails closed.
-    fn load(path: &std::path::Path) -> Result<SettlementOutboxState, String> {
+    fn load(path: &std::path::Path) -> Result<SettlementOutboxState, OutboxError> {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(SettlementOutboxState { next_nonce: 0, pending: None });
             }
-            Err(e) => return Err(format!("read failed: {e}")),
+            Err(e) => return Err(OutboxError::Io(e)),
         };
         // Header: magic(4) + version(4) + next_nonce(8) +
         // pending_flag(1) = 17 bytes.
         if bytes.len() < 17 {
-            return Err(format!("truncated header ({} bytes)", bytes.len()));
+            return Err(OutboxError::Corrupt(format!("truncated header ({} bytes)", bytes.len())));
         }
         if &bytes[0..4] != Self::MAGIC {
-            return Err("bad magic".to_string());
+            return Err(OutboxError::Corrupt("bad magic".to_string()));
         }
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or_default());
         if version != Self::VERSION {
-            return Err(format!("unsupported version {version}"));
+            return Err(OutboxError::Corrupt(format!("unsupported version {version}")));
         }
         let next_nonce = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default());
         let has_pending = bytes[16] != 0;
         if !has_pending {
             if bytes.len() != 17 {
-                return Err(format!("trailing bytes without pending: {}", bytes.len()));
+                return Err(OutboxError::Corrupt(format!(
+                    "trailing bytes without pending: {}",
+                    bytes.len()
+                )));
             }
             return Ok(SettlementOutboxState { next_nonce, pending: None });
         }
         // Pending section: envelope_len(4) + envelope + pair_count(8)
         // + attempts(4) + submitted(1).
         if bytes.len() < 21 {
-            return Err(format!("truncated pending header ({} bytes)", bytes.len()));
+            return Err(OutboxError::Corrupt(format!(
+                "truncated pending header ({} bytes)",
+                bytes.len()
+            )));
         }
         let env_len = u32::from_le_bytes(bytes[17..21].try_into().unwrap_or_default()) as usize;
         if env_len > Self::MAX_ENVELOPE_LEN {
-            return Err(format!("envelope len {env_len} exceeds bound"));
+            return Err(OutboxError::Corrupt(format!("envelope len {env_len} exceeds bound")));
         }
         let end = 21 + env_len;
         if bytes.len() != end + 13 {
-            return Err(format!("size mismatch: {} bytes, expected {}", bytes.len(), end + 13));
+            return Err(OutboxError::Corrupt(format!(
+                "size mismatch: {} bytes, expected {}",
+                bytes.len(),
+                end + 13
+            )));
         }
         let envelope = bytes[21..end].to_vec();
         let pair_count =
             usize::try_from(u64::from_le_bytes(bytes[end..end + 8].try_into().unwrap_or_default()))
-                .map_err(|_| "pair count overflows usize".to_string())?;
+                .map_err(|_| OutboxError::Corrupt("pair count overflows usize".to_string()))?;
         let attempts = u32::from_le_bytes(bytes[end + 8..end + 12].try_into().unwrap_or_default());
         let submitted = bytes[end + 12] != 0;
         let tx_hash = crypto::Hasher::hash_one(crypto::Domain::Transaction, &envelope);

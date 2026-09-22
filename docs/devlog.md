@@ -18493,3 +18493,19 @@ skipped the durability checkpoint (worse — the settler keeps
 sealing on a torn replay gate while the restart-replay window
 widens). All three now use `lock_state`: a torn replay gate halts
 loudly, matching the repo-wide policy.
+
+## §9.D — typed errors at the settlement boundary
+
+`settler.rs` returned `Result<_, String>` at every failure point —
+`settle_now`, `aggregate_fills`, `encode_envelope`, and
+`SettlementOutbox::load` all produced message text a caller could
+only match on substrings. Added `SettleError`
+(`Submission`/`AggregateOverflow`/`Sign`) and `OutboxError`
+(`Io`/`Corrupt`), each variant documenting the state effect the
+caller must assume — whether the envelope stayed pending, whether
+fills were re-sealable, whether the nonce was consumed.
+`TxSubmitter::submit_tx` keeps its `String` reason: that is the
+port contract — the mempool's rejection text is legitimately
+opaque and the lane never branches on it. `SettleReport`'s
+`batch_rejected`/`dead_lettered` fields likewise keep the chain's
+rejection strings (they are report payloads, not error types).
