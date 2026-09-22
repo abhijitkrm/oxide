@@ -43,14 +43,38 @@
 //!   cargo test -p devnet --test settle_tps --release -- --ignored --nocapture
 //! ```
 //!
+//! # Metric classes (do not conflate)
+//!
+//! The order pipeline has five separately-measurable stages; this
+//! test exercises exactly one. Quoting its "orders/s" as order-book
+//! throughput would be wrong:
+//!
+//! 1. **Raw book ops** (place/cancel/amend against the matcher,
+//!    no auth, no settlement) — `oxide-matcher` benches: ~15M ops/s.
+//! 2. **Authenticated admission** (signed order → verified →
+//!    risk/reservation) — `trading_tps` exercises this on-chain.
+//! 3. **Matching + accounting** — engine benches +
+//!    `trading_tps` (72.5k tx/s chain-wide, matching included).
+//! 4. **Fill settlement** — *this test*: pre-matched legs through
+//!    consensus + ledger transfers. ~1.4–1.9M fills/s.
+//! 5. **Durable multi-host order-to-final** — orders in →
+//!    authenticated → matched → settled → finalized, end to end —
+//!    is `trading_tps`'s number, not this one.
+//!
+//! "orders/s" below means *equivalent* orders: fills × 2 (each fill
+//! is one maker + one taker leg). It measures settlement capacity
+//! for already-matched volume — order authentication, book
+//! maintenance, cancels/amends, and matcher durability are all
+//! upstream of it.
+//!
 //! # Measured results (4 validators, TCP loopback, release)
 //!
-//! | fills/tx | tx/s | fills/s | orders/s | 1M fills/s |
-//! |----------|------|---------|----------|------------|
-//! | 1,024    | 347  | 355K    | 711K     | no — per-tx overhead bound |
-//! | 8,192    | 123  | 1.01M   | 2.01M    | ✅ |
-//! | 16,384   | 87   | 1.41M   | 2.81M    | ✅ |
-//! | 65,536   | 29   | 1.85M   | 3.71M    | ✅ |
+//! | fills/tx | tx/s | fills/s | equiv orders/s (fills×2) | 1M fills/s |
+//! |----------|------|---------|--------------------------|------------|
+//! | 1,024    | 347  | 355K    | 711K                     | no — per-tx overhead bound |
+//! | 8,192    | 123  | 1.01M   | 2.01M                    | ✅ |
+//! | 16,384   | 87   | 1.41M   | 2.81M                    | ✅ |
+//! | 65,536   | 29   | 1.85M   | 3.71M                    | ✅ |
 //!
 //! Throughput scales with batch size: at 1k fills/tx the pipeline is
 //! per-tx-overhead-bound (~350 tx/s), at 65k fills/tx it is
