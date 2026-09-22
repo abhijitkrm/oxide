@@ -12,6 +12,19 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Cancel/amend workload benchmark** (`crates/matcher`): the
+  `cancel_amend` group in `matcher_throughput` measures the full
+  authenticated action path — Ed25519 verify, owner binding, nonce
+  consume, authorization, engine dispatch — over a live multi-level
+  book: pure cancels, pure amends, and a 4:1 cancel-dominant mix,
+  each with a zero-rejection honesty gate. Measured ~11.5–12.3K
+  actions/s (~80–87 µs each), signature-verification bound.
+  - **In plain words:** we now measure how fast the trading server
+    cancels and re-quotes real signed orders — the workload that
+    actually dominates an exchange — instead of only measuring new
+    order entry. The honest answer is ~80µs per action, almost all
+    of it signature checking.
+
 - **Unified ledger: the EVM account store is now the single
   native-token ledger** (`modules/framework`, `modules/evm`,
   `modules/staking`, `modules/exchange`, `modules/perps`,

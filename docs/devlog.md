@@ -18933,3 +18933,21 @@ config may need a smaller bound (or stays a longer local run, with
 CI remaining the seeded gate).
 
 
+## §7.5 — cancel/amend-dominant workload bench
+
+`matcher_throughput`'s new `cancel_amend` group closes the "cancels
+are rare" correction's measurement half: `cancel_resting`,
+`amend_resting`, and `cancel_amend_4to1` drive signed
+`ActionRequest`s through `submit_action` over a 64-level live book
+(orders spread across ≥1 account per 1000 resting — the per-account
+cap — with monotonic per-owner nonces continuing into the action
+stream). Post-batch assertions require zero auth/engine rejections,
+so the rows time real work, not rejection fast paths.
+
+Measured (dev Mac, 2k resting over 100 accounts): ~11.5K cancel,
+~12.1K amend, ~12.1K mixed actions/s — ~80–87 µs per action,
+dominated by the Ed25519 verify every action must pass. That is the
+honest budget: a venue's cancel-latency claim cannot beat its
+signature-verification cost. One setup trap worth recording:
+matcher order ids are 0-based, so `order_id > 0` is not a valid
+"rested" check — `!resp.rejected` is.

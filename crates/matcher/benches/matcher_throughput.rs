@@ -35,7 +35,7 @@
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use crypto::ed25519::{Ed25519SecretKey, owner_address};
-use matcher::protocol::sign_order;
+use matcher::protocol::{ActionRequest, ActionType, sign_action, sign_order};
 use matcher::{MatchingServer, OrderRequest};
 use primitives::fixed::{Price, Qty};
 use std::hint::black_box;
@@ -222,5 +222,133 @@ fn bench_balance_cache(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_order_entry, bench_protocol_codec, bench_balance_cache);
+/// Build a server with `n_resting` live sell orders spread across
+/// `n_accounts` (the per-account resting cap is 1000 — risk.rs — so
+/// a real book needs real spread), then pre-sign one cancel or amend
+/// per resting order. `amend_every` selects the mix: 0 = all cancels,
+/// 1 = all amends, 5 = four cancels per amend. Each account's nonces
+/// continue sequentially from its order flow — orders and actions
+/// share the replay gate, so the setup is the honest interleaving.
+fn cancel_amend_setup(
+    n_resting: usize,
+    n_accounts: usize,
+    amend_every: usize,
+) -> (MatchingServer, Vec<ActionRequest>) {
+    let keys: Vec<Ed25519SecretKey> =
+        (0..u32::try_from(n_accounts).unwrap_or(u32::MAX)).map(account_key).collect();
+    let mut next_nonce = vec![0u64; n_accounts];
+    let mut server = MatchingServer::new(cfg(), n_accounts);
+    for k in &keys {
+        server.fund_account(&owner_address(&k.verifying_key()), u64::MAX / 4);
+    }
+    // Resting sell ladder across 64 tick-aligned levels inside the
+    // market's [$10, $20] band — a multi-level book, not a stack at
+    // one price.
+    let mut resting_ids = Vec::with_capacity(n_resting);
+    for k in 0..n_resting {
+        let a = k % n_accounts;
+        let mut req = OrderRequest {
+            market: 0,
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price(1_500_000_000 + (k as u64 % 64) * 1_000_000),
+            qty: Qty(1_000),
+            nonce: next_nonce[a],
+            owner: addr_from_index(0),
+            pubkey: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        sign_order(&mut req, &keys[a]);
+        next_nonce[a] += 1;
+        let resp = server.submit_order(&req);
+        assert!(!resp.rejected, "setup order {k} rejected: {:?}", resp.reject_reason);
+        resting_ids.push(resp.order_id);
+    }
+    // Pre-sign the action workload — Ed25519 signing is client-side,
+    // so it stays out of the measured region exactly as for orders.
+    let actions = resting_ids
+        .iter()
+        .enumerate()
+        .map(|(k, &oid)| {
+            let a = k % n_accounts;
+            let amend = amend_every != 0 && k % amend_every == amend_every - 1;
+            let mut req = ActionRequest {
+                action_type: if amend { ActionType::Amend } else { ActionType::Cancel },
+                order_id: oid,
+                new_price: Price(if amend {
+                    1_600_000_000 + (k as u64 % 64) * 1_000_000
+                } else {
+                    0
+                }),
+                new_qty: Qty(if amend { 2_000 } else { 0 }),
+                side: Side::Sell,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                nonce: next_nonce[a],
+                owner: addr_from_index(0),
+                pubkey: [0u8; 32],
+                signature: [0u8; 64],
+            };
+            next_nonce[a] += 1;
+            sign_action(&mut req, &keys[a]);
+            req
+        })
+        .collect();
+    (server, actions)
+}
+
+/// Benchmark the cancel/amend-dominant workload — the message class
+/// that actually dominates an HFT venue (audit 7.5: resting orders
+/// churn via cancel/re-quote far more often than fresh flow arrives;
+/// the "actions are rare" assumption was wrong). Every action crosses
+/// the full admission boundary: Ed25519 verify + owner binding +
+/// nonce consume + authorization + engine dispatch.
+///
+/// - `cancel_resting`: terminal cancels on live orders (id unbind +
+///   reserve refund path).
+/// - `amend_resting`: cancel + resubmit at a new price — the market
+///   maker's re-quote, the most frequent control message.
+/// - `cancel_amend_4to1`: four cancels per amend on disjoint order
+///   sets, so every action lands on a live order.
+fn bench_cancel_amend(c: &mut Criterion) {
+    let n_resting = env_usize("BENCH_RESTING", 10_000);
+    let n_accounts = env_usize("BENCH_ACCOUNTS", 1_000).max(n_resting / 1_000 + 1);
+
+    let mut group = c.benchmark_group("cancel_amend");
+    group.throughput(Throughput::Elements(n_resting as u64));
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(20));
+
+    for (name, amend_every) in
+        [("cancel_resting", 0usize), ("amend_resting", 1), ("cancel_amend_4to1", 5)]
+    {
+        group.bench_function(name, |bencher| {
+            bencher.iter_with_setup(
+                || cancel_amend_setup(n_resting, n_accounts, amend_every),
+                |(mut server, actions)| {
+                    for req in &actions {
+                        let _ = server.submit_action(black_box(req));
+                    }
+                    // Honesty gate: every action must have landed —
+                    // otherwise the row is timing rejection fast
+                    // paths, not the real workload.
+                    assert_eq!(server.auth_rejections(), 0, "auth rejects");
+                    assert_eq!(server.engine_rejections(), 0, "engine rejects");
+                    black_box(server.orders_processed());
+                },
+            );
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_order_entry,
+    bench_protocol_codec,
+    bench_balance_cache,
+    bench_cancel_amend
+);
 criterion_main!(benches);
