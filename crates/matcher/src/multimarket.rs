@@ -305,15 +305,13 @@ impl MultiMarketMatcher {
         for (i, req) in orders.into_iter().enumerate() {
             match protocol::VerifiedOrder::with_chain_id(req, self.chain_id) {
                 Some(vo) => {
-                    let ok = match self.nonces.lock() {
-                        Ok(mut tracker) => {
-                            tracker.check_and_consume(&vo.request().owner, vo.request().nonce)
-                        }
-                        // A poisoned nonce mutex means a worker panicked
-                        // mid-check — fail closed rather than admit a
-                        // possible replay.
-                        Err(_) => false,
-                    };
+                    // The nonce tracker is the replay gate: a panic
+                    // mid-`check_and_consume` can leave `last_seen`
+                    // and `dirty` torn. Panic on poison (loud halt)
+                    // rather than reject — a poisoned gate must not
+                    // keep looking alive while refusing orders.
+                    let ok = primitives::sync::lock_state(&self.nonces)
+                        .check_and_consume(&vo.request().owner, vo.request().nonce);
                     if ok {
                         positions.push(i);
                         verified.push(vo);
@@ -457,9 +455,11 @@ impl MultiMarketMatcher {
     /// Also checkpoints the shared consumed-nonce state — the same
     /// settler-cadence durability point the single-market path uses.
     pub fn seal_batch(&self) -> Vec<SettledFill> {
-        if let Ok(mut tracker) = self.nonces.lock() {
-            tracker.flush();
-        }
+        // Same panic-on-poison rule as admission: sealing fills while
+        // skipping the durability checkpoint would keep the settler
+        // running on a torn replay gate with a silently widening
+        // restart-replay window.
+        primitives::sync::lock_state(&self.nonces).flush();
         let mut all_fills = Vec::new();
         for tx in &self.market_senders {
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -665,13 +665,9 @@ impl MarketWorker {
     /// Check the shared nonce for `owner`/`nonce` — returns `false`
     /// on replay. One lock acquisition per admission.
     pub(crate) fn check_nonce(&self, owner: &primitives::Address, nonce: u64) -> bool {
-        match self.nonces.lock() {
-            Ok(mut tracker) => tracker.check_and_consume(owner, nonce),
-            // A poisoned nonce mutex means a worker panicked
-            // mid-check — the tracker may be inconsistent. Fail
-            // closed: reject rather than admit a possible replay.
-            Err(_) => false,
-        }
+        // Panic-on-poison, matching `submit_batch`: a torn replay
+        // gate halts loudly rather than looking alive-but-refusing.
+        primitives::sync::lock_state(&self.nonces).check_and_consume(owner, nonce)
     }
 
     /// Submit one authenticated, nonce-consumed order: risk →
