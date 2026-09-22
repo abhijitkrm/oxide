@@ -1,0 +1,32 @@
+[package]
+name = "oxide-devnet"
+description = "Development multi-validator node — the devnet launcher binary, separated from the production oxide-validator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+[[bin]]
+name = "oxide-devnet"
+path = "src/main.rs"
+[dependencies]
+node = { workspace = true }
+primitives = { workspace = true }
+types = { workspace = true }
+ports = { workspace = true }
+framework = { workspace = true }
+config = { workspace = true }
+crypto = { workspace = true }
+consensus = { workspace = true }
+executor = { workspace = true }
+p2p = { workspace = true, features = ["tls"] }
+staking = { workspace = true }
+evm = { workspace = true }
+rpc = { workspace = true }
+codec = { workspace = true }
+alloy-primitives = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+[lints]
+workspace = true

@@ -5954,3 +5954,53 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     for it. Now a timeout only counts if it comes with cryptographic
     proof that a quorum actually reached that view — catching up is
     bounded by what the network really did.
+
+### Changed — `oxide-devnet` binary split from `oxide-validator`
+
+- **Multi-validator devnet mode is now its own binary.**
+  `oxide-validator`'s `--devnet-node` flag is gone; the same launch
+  is `oxide-devnet --node <i> --num-nodes <N> --base-port <P>`.
+  `MultiProcessDevnet`, the Dockerfile, docker-compose, and
+  `inject-latency.sh` all spawn `oxide-devnet`, so `oxide-validator`
+  ships as the production validator only. Shared startup machinery
+  (config loading, hex/key helpers, signed-envelope builder, the
+  unsigned-tx external-bind refusal) moved to `node::cli`, and the
+  executor→RPC adapters to `node::rpc_adapters`, so both binaries
+  assemble the identical config path and RPC surface.
+  - **In plain words:** the production validator binary used to
+    carry a second, development-only network mode inside it — now
+    that's a separate tool, and the validator binary only does the
+    production job.
+
+- **Devnet harnesses run the production module graph.** Both the
+  in-memory `MultiNodeDevnet` and the TCP `TcpMultiNodeDevnet`
+  assemble through `node::assemble_executor` — the same core/EVM/
+  staking/exchange/perps/oracle/governance graph and always-on
+  execution lane the shipped binaries run — instead of maintaining
+  their own narrower graphs and optional module switches.
+  - **In plain words:** the test network now runs exactly the
+    modules production runs, so a green devnet test means the real
+    thing behaves the same — not a lookalike.
+
+### Fixed — executor gas cap now follows the block budget
+
+- The executor's declared-gas admission cap is
+  `block_budget.max_gas` — the same value consensus packs proposals
+  against. Previously the executor silently defaulted to 30M gas
+  while the block budget allowed 10G, so a maximally packed
+  proposal would have its tail `GasLimit`-skipped on every replica
+  — deterministic, but an invisible constant no config could reach.
+  - **In plain words:** two different parts of the node disagreed
+    about how much gas fits in a block; now they read the same
+    number, and it's the one in the config.
+
+### Fixed — devnet runs drain execution before returning
+
+- `run_*` methods on both devnets wait for every validator's async
+  execution lane to apply the last committed block
+  (`attest_state`), so post-run balance, nonce, and book-state
+  assertions observe executed state instead of racing the lane.
+  A dead lane fails loudly rather than returning a stale read.
+  - **In plain words:** tests used to be able to check balances a
+    heartbeat before the chain had actually applied the block; now
+    the run isn't over until execution catches up.

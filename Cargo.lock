@@ -2624,6 +2624,7 @@ dependencies = [
  "perps",
  "ports",
  "primitives",
+ "rpc",
  "staking",
  "storage",
  "tracing",
@@ -2815,6 +2816,30 @@ name = "oxide-deploy"
 version = "0.1.0"
 dependencies = [
  "node",
+]
+
+[[package]]
+name = "oxide-devnet"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "codec",
+ "config",
+ "consensus",
+ "crypto",
+ "evm",
+ "executor",
+ "framework",
+ "node",
+ "p2p",
+ "ports",
+ "primitives",
+ "rpc",
+ "staking",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "types",
 ]
 
 [[package]]

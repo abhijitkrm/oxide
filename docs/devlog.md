@@ -18715,3 +18715,42 @@ documented bypass, gas limit, fee floor). A `PlannedTx` reaching
 admission ran — a future path can't dispatch a parsed-but-
 unauthenticated context to `Module::handle`. The `GroupedTx`
 alias in lib.rs forwards to it so signatures stay readable.
+
+## §6.5 — one assembly path, separated dev launcher
+
+**Single executor assembly, everywhere.** `MultiNodeDevnet` and
+`TcpMultiNodeDevnet` now call `node::assemble_executor` — the same
+production module graph the shipped binaries run (core, evm,
+staking, exchange, perps, oracle, governance) with the async exec
+lane always on. The TCP devnet's hand-rolled `assemble_executor`
+(narrower graph, optional exchange, `DEVNET_EXEC_LANE` A/B gate) is
+deleted; harnesses vary only what production legitimately varies —
+genesis balances, mempool sizing, settlement operator.
+`AssembledExecutor` gained `exchange_module` so harnesses keep
+book/settlement inspection.
+
+**One gas source.** The executor's declared-gas admission cap is
+now `config.block_budget.max_gas` — the same value consensus packs
+proposals against. Previously the executor silently defaulted to
+`DEFAULT_BLOCK_GAS_LIMIT` (30M) while the budget allowed 10G; a
+maximally packed proposal would `GasLimit`-skip its tail on every
+replica — deterministic, but unreachable from config.
+
+**Execution drain before assertion.** `run_*` methods on both
+devnets now call `drain_execution` (in `collect_result`) —
+`attest_state(finalized_height)` on each validator — so post-run
+balance/book reads observe applied state instead of racing the
+async lane. A dead lane fails loudly.
+
+**`oxide-devnet` split from `oxide-validator`.** The production
+binary's `--devnet-node` mode (~800 lines of multi-node startup,
+TCP/mTLS transport, gossip, WAL, snapshot import) moved into a new
+`bin/oxide-devnet` crate. Shared machinery went to `node::cli`
+(`load_config`, `parse_cli_flag`, hex helpers, `bls_key`,
+`build_signed_tx`/`build_signed_tx_with`, the unsigned-tx bind
+refusal) and executor→RPC adapters to `node::rpc_adapters`, so both
+binaries build the identical config path and RPC surface.
+`MultiProcessDevnet`, Dockerfile, compose, and `inject-latency.sh`
+spawn `oxide-devnet`; `oxide-validator` is production-only. Genesis
+`evm.alloc` stayed in the devnet binary — its 256-bit slot parsing
+is the only alloy dependency, kept out of `node` deliberately.

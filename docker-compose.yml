@@ -1,7 +1,7 @@
 # Oxide 4-validator Docker testnet with induced latency.
 #
 # This compose file launches 4 validator containers, each running
-# oxide-validator in devnet-node mode. The containers are on a
+# oxide-devnet (the development launcher binary). The containers are on a
 # shared Docker network and communicate over TCP. The
 # inject-latency.sh entrypoint applies `tc netem` to add 20ms RTT
 # between nodes, simulating WAN conditions.
@@ -21,7 +21,7 @@ services:
     build: .
     container_name: oxide-validator-0
     command:
-      - "--devnet-node"
+      - "--node"
       - "0"
       - "--num-nodes"
       - "4"
@@ -48,7 +48,7 @@ services:
     build: .
     container_name: oxide-validator-1
     command:
-      - "--devnet-node"
+      - "--node"
       - "1"
       - "--num-nodes"
       - "4"
@@ -75,7 +75,7 @@ services:
     build: .
     container_name: oxide-validator-2
     command:
-      - "--devnet-node"
+      - "--node"
       - "2"
       - "--num-nodes"
       - "4"
@@ -102,7 +102,7 @@ services:
     build: .
     container_name: oxide-validator-3
     command:
-      - "--devnet-node"
+      - "--node"
       - "3"
       - "--num-nodes"
       - "4"

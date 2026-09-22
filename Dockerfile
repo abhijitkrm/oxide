@@ -1,12 +1,13 @@
 # Oxide multi-host testnet Dockerfile.
 #
-# Builds a release binary of oxide-validator and exposes the
-# devnet-node mode for docker-compose orchestration. Each container
-# runs one validator node; the compose file wires them together with
-# induced latency via the `tc` (traffic control) netem qdisc.
+# Builds a release binary of oxide-devnet (the development
+# multi-validator launcher) for docker-compose orchestration. Each
+# container runs one devnet node; the compose file wires them
+# together with induced latency via the `tc` (traffic control)
+# netem qdisc.
 #
 # Build:
-#   docker build -t oxide-validator .
+#   docker build -t oxide-devnet .
 #
 # Run (4-node testnet with 20ms latency):
 #   docker compose up --abort-on-container-exit
@@ -25,8 +26,8 @@ COPY modules/ modules/
 COPY bin/ bin/
 COPY sim/ sim/
 
-# Build the validator binary in release mode.
-RUN cargo build --release -p oxide-validator
+# Build the devnet binary in release mode.
+RUN cargo build --release -p oxide-devnet
 
 # ── Runtime image ──────────────────────────────────────────────────
 
@@ -38,9 +39,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the release binary.
-COPY --from=builder /oxide/target/release/oxide-validator /usr/local/bin/oxide-validator
+COPY --from=builder /oxide/target/release/oxide-devnet /usr/local/bin/oxide-devnet
 
 # Default: run as devnet node 0 with 4 nodes.
 # Override via docker-compose environment variables.
-ENTRYPOINT ["oxide-validator"]
-CMD ["--devnet-node", "0", "--num-nodes", "4", "--base-port", "22000"]
+ENTRYPOINT ["oxide-devnet"]
+CMD ["--node", "0", "--num-nodes", "4", "--base-port", "22000"]

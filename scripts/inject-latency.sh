@@ -1,8 +1,8 @@
 #!/bin/bash
-# inject-latency.sh — entrypoint for oxide-validator Docker containers.
+# inject-latency.sh — entrypoint for oxide-devnet Docker containers.
 #
 # This script optionally injects network latency via `tc netem` and
-# then runs the oxide-validator binary. The latency is applied to the
+# then runs the oxide-devnet binary. The latency is applied to the
 # container's eth0 interface, affecting all outbound traffic.
 #
 # Environment variables:
@@ -10,7 +10,7 @@
 #   JITTER_MS   — jitter in ms (default: 0)
 #   LOSS_PERCENT — packet loss percentage (default: 0)
 #
-# After applying latency, the script execs oxide-validator with the
+# After applying latency, the script execs oxide-devnet with the
 # command-line arguments passed via CMD.
 
 set -e
@@ -27,5 +27,5 @@ else
     echo "inject-latency: no latency injection (LATENCY_MS=0)"
 fi
 
-# Exec the validator with the provided arguments.
-exec /usr/local/bin/oxide-validator "$@"
+# Exec the devnet node with the provided arguments.
+exec /usr/local/bin/oxide-devnet "$@"

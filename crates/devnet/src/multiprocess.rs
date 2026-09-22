@@ -3,9 +3,14 @@
 //!
 //! # What this is
 //!
-//! A launcher that spawns N `oxide-validator` processes, each
-//! running a single validator node. The processes communicate over
-//! TCP, simulating a real network deployment.
+//! A launcher that spawns N `oxide-devnet` processes, each running
+//! a single validator node. The processes communicate over TCP,
+//! simulating a real network deployment.
+//!
+//! The spawned binary is `oxide-devnet`, not `oxide-validator`:
+//! development launchers are separate binaries from the production
+//! validator — the production binary carries no dev-only network
+//! mode (6.5).
 //!
 //! # Why this exists
 //!
@@ -25,13 +30,12 @@
 //!
 //! ```sh
 //! # Launch a 4-node devnet (each node is a separate process)
-//! oxide-devnet-launch --num-nodes 4 --base-port 22000
 //!
 //! # Each node runs:
-//! oxide-validator --devnet-node 0 --num-nodes 4 --base-port 22000
-//! oxide-validator --devnet-node 1 --num-nodes 4 --base-port 22000
-//! oxide-validator --devnet-node 2 --num-nodes 4 --base-port 22000
-//! oxide-validator --devnet-node 3 --num-nodes 4 --base-port 22000
+//! oxide-devnet --node 0 --num-nodes 4 --base-port 22000
+//! oxide-devnet --node 1 --num-nodes 4 --base-port 22000
+//! oxide-devnet --node 2 --num-nodes 4 --base-port 22000
+//! oxide-devnet --node 3 --num-nodes 4 --base-port 22000
 //! ```
 
 use std::path::PathBuf;
@@ -46,9 +50,9 @@ pub struct MultiProcessDevnetConfig {
     pub num_nodes: usize,
     /// Base TCP port. Node `i` listens on `127.0.0.1:{base_port + i}`.
     pub base_port: u16,
-    /// Path to the `oxide-validator` binary. If `None`, uses the
+    /// Path to the `oxide-devnet` binary. If `None`, uses the
     /// current executable's directory.
-    pub validator_binary: Option<PathBuf>,
+    pub devnet_binary: Option<PathBuf>,
     /// How long to wait for all processes to start before returning.
     pub startup_wait: Duration,
 }
@@ -58,7 +62,7 @@ impl Default for MultiProcessDevnetConfig {
         Self {
             num_nodes: 4,
             base_port: 22000,
-            validator_binary: None,
+            devnet_binary: None,
             startup_wait: Duration::from_secs(2),
         }
     }
@@ -66,7 +70,7 @@ impl Default for MultiProcessDevnetConfig {
 
 /// A multi-process devnet: N validator processes communicating over TCP.
 ///
-/// Each process runs `oxide-validator --devnet-node <i> --num-nodes <N>
+/// Each process runs `oxide-devnet --node <i> --num-nodes <N>
 /// --base-port <port>`. The launcher spawns all processes, waits for
 /// them to start, and provides methods to check their status.
 ///
@@ -89,20 +93,20 @@ impl MultiProcessDevnet {
     /// process cannot be spawned.
     #[must_use]
     pub fn launch(config: MultiProcessDevnetConfig) -> Self {
-        let binary = config.validator_binary.unwrap_or_else(|| {
-            // Try to find oxide-validator in the same directory as
-            // the current executable, or in the target directory.
+        let binary = config.devnet_binary.unwrap_or_else(|| {
+            // Try to find oxide-devnet in the same directory as the
+            // current executable, or in the target directory.
             let current = std::env::current_exe().expect("current exe path");
             let dir = current.parent().expect("parent dir");
-            dir.join("oxide-validator")
+            dir.join("oxide-devnet")
         });
 
-        assert!(binary.exists(), "oxide-validator binary not found at {}", binary.display());
+        assert!(binary.exists(), "oxide-devnet binary not found at {}", binary.display());
 
         let mut children = Vec::with_capacity(config.num_nodes);
         for i in 0..config.num_nodes {
             let child = Command::new(&binary)
-                .arg("--devnet-node")
+                .arg("--node")
                 .arg(i.to_string())
                 .arg("--num-nodes")
                 .arg(config.num_nodes.to_string())
@@ -194,7 +198,7 @@ mod tests {
         let config = MultiProcessDevnetConfig::default();
         assert_eq!(config.num_nodes, 4);
         assert_eq!(config.base_port, 22000);
-        assert!(config.validator_binary.is_none());
+        assert!(config.devnet_binary.is_none());
     }
 
     /// Node address derivation is correct.

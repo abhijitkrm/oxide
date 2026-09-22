@@ -815,7 +815,7 @@ async fn snapshot_chunk_handler(
 /// `{address, public_key, stake}` objects. A new validator joining
 /// mid-epoch queries this endpoint on an existing validator to
 /// discover the current set + peer addresses, then connects via
-/// `--devnet-node` with the updated `ValidatorSet`.
+/// `oxide-devnet` with the updated `ValidatorSet`.
 ///
 /// Returns 404 if no validator-set provider is attached.
 async fn validator_set_handler(
