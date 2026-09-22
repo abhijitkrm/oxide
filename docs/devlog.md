@@ -18525,3 +18525,15 @@ module. `lib.rs` drops to ~4.6k lines; the module header states
 the invariant it guards — decode is the single schema owner shared
 by `inspect_state` and `import_state` so verify-only and install
 can never disagree about the wire format.
+
+## §9.E — EVM trie-walk helpers join `trie.rs`
+
+Four pure functions — `encode_trie_leaf`, `prefix_range`,
+`sparse_walk`, `feed_leaves_under` (~200 lines) — lived at the
+bottom of `evm/src/lib.rs` while the crate's `trie` module already
+owned `build_trie_account`/`state_root`/`storage_root`. They moved
+to `trie.rs` where the rest of the trie logic lives, so the file's
+invariant (byte-identical leaf encodings for full-build vs
+incremental-patch state roots) is co-located with the code that
+defines it. `lib.rs` drops under 9.7k lines; call sites import
+`crate::trie::{encode_trie_leaf, sparse_walk}`.
