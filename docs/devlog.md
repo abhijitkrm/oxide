@@ -18656,3 +18656,17 @@ merge; the only code that may mutate state for a committed
 block), `app_iface.rs` (the consensus↔executor port — the only
 surface consensus calls). `lib.rs` is ~1.9k lines of types,
 constructor, and accessors.
+
+## §9.E — exchange split by invariant
+
+The exchange's `impl` blocks and free helpers split:
+`codec.rs` (the wire format — every `parse_*`/`encode_*` and
+`*_event` helper in one file, so handlers and settlement never
+build bytes or events ad hoc), `decode.rs` (snapshot write+read
+schema side by side), `handlers.rs` (the single mutation entry
+point per message type — escrow held at admission, released
+exactly once), `settle.rs` (`BookSettlement::apply` — the only
+function that turns an admitted order plus fills into ledger
+movement; `LegPlan`/`OrderDelta`/`TakerCtx` carry the per-leg
+accounting), `module_impl.rs` (Module + ParameterSink lifecycle).
+`lib.rs` is ~780 lines of types, ctor, accessors, and `msg`.

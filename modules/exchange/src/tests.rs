@@ -1,7 +1,8 @@
 use super::{
     BatchFillEntry, ExchangeModule, MarketConfig, NewOrder, OrderId, OrderType, Side, StpMode,
-    TAG_PLACE, TimeInForce, encode_reject_reason, encode_side, msg,
+    TAG_PLACE, TimeInForce, msg,
 };
+use crate::codec::{encode_reject_reason, encode_side};
 use executor::{ExecError, Module, TxContext};
 use framework::{Balances, module_id};
 use primitives::Address;
