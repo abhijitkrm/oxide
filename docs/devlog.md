@@ -18579,3 +18579,20 @@ The test modules are children of their implementation modules, so
 mechanical. What remains inside each file is the production code
 the audit wants readable: every `pub fn` an attacker can reach,
 every `fn` the entry points call.
+
+## §9.D/9.E — nonce-checkpoint typed error + spec-exec records
+
+**9.D**: `NonceStore::load` returned `Result<_, String>` — same
+boundary-class gap as the settlement outbox. Added
+`NonceCheckpointError` (`Io`/`Corrupt`) so `attach_store`'s
+fail-closed panic names whether the disk lied or the bytes did.
+
+**9.E**: the speculative-execution record types —
+`SharedCacheDB`, `SpecTx`, `CoinbaseObs`, `GroupExecResult`
+(~160 lines) — moved from `evm/src/lib.rs` into `parallel.rs`,
+split around the speculation invariant: a `SpecTx` carries
+everything canonical-order commit needs to prove or disprove the
+speculation (read/write sets, merge payload, re-execution flags),
+and `SharedCacheDB` is the read-only parent all worker groups
+share. `TracedResult` went `pub(crate)`; `SpecTx`'s fields are
+`pub(crate)` for the merge path. `evm/lib.rs` is now ~6.0k lines.
