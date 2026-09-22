@@ -19442,3 +19442,46 @@ Still open for 7.4: only the EVM account trie's once-per-process
 O(population) leaf-map cold-build — per-block roots were already
 incremental; the ~14 ms at 100k accounts in `block_pipeline`'s
 `accounts` row is the residual.
+
+## Session N+21 — the residual linear term was a bench artifact
+
+Went in expecting to shrink the EVM cold build; came out having
+disproven the per-block linear term entirely.
+
+First check: does the `accounts` row even measure cold-build? The
+warm-up `finalize_block` runs `end_block`→`state_root`, so
+`leaves_ready` is true before the measured block — the row
+measures the incremental path, yet read 13.9 ms at 100k. A scratch
+harness (same fixture: 100k minted accounts, warm block, then
+looped 100-tx delegate blocks + attest) ran ~0.55–0.69 ms per
+block flat across 200 heights. Ten-fold discrepancy vs the bench.
+
+The difference: `iter_batched` semantics. Criterion times only
+`routine(input)` — `drop(black_box(output))` lands in the untimed
+section. Every `state_scaling` routine consumed its executor and
+returned `()`, so the executor's destruction — ~100k `DbAccount`s,
+~100k `trie_leaves` `Vec<u8>`s, retained branches — ran INSIDE the
+timed call. ~58 ns/account of allocator teardown: ~5 ms at 100k,
+the "O(total) residual". `settlement.rs`/`matching.rs` document
+this exact hazard in their headers; the block_pipeline benches
+predated the lesson.
+
+Fix: every consuming routine returns its input (executor,
+`(executor, snap)` for the export row) so teardown drops untimed.
+Re-measured: `accounts` 521/540/592 µs at 1k/10k/100k — flat;
+`nonce_history` 0.92/1.27/1.49 ms and `delegated_history`
+0.97/1.43/1.71 ms — mild sublinear slopes from hash-map locality
+on larger committed sets, not serialization walks.
+
+The genuine cold build measured directly: ~187 ms at 100k
+accounts, once per construction and once per `import_state`,
+dominated by the serial nibble-ordered `HashBuilder` feed.
+Parallelizing the leaf-encoding half saves maybe a quarter —
+against a state sync that transfers and decodes the same
+population, not worth the complexity. Eliminating it outright
+means a durable persisted trie (reth-style hashed-state tables) —
+a storage-layer project, logged as future work.
+
+§7.4 is closed: every per-block commitment path is incremental;
+the only O(total-state) work runs once per process or per import,
+never per block.

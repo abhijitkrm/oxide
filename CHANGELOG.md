@@ -226,6 +226,14 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     module rewrites its whole state hash each block. These
     benchmarks are the yardstick a future incremental-commitment
     redesign must beat.
+  - **Correction (later):** the per-account/per-delegation slopes
+    above were inflated by a measurement artifact — the timed
+    routine consumed the executor, so its O(population) teardown
+    (~5 ms at 100k accounts) was charged to the measured block. With
+    routines returning their inputs for untimed drop, the same rows
+    read ~0.52–0.59 ms flat at 1k→100k accounts and ~0.97–1.71 ms
+    across the history axes — see the incremental-commitment entries
+    above for the redesign these rows yardsticked.
 
 - **Cancel/amend workload benchmark** (`crates/matcher`): the
   `cancel_amend` group in `matcher_throughput` measures the full

@@ -142,8 +142,14 @@ fn bench_full_pipeline(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n_txs), &n_txs, |b, &n| {
             b.iter_batched(
                 || setup_executor(n),
+                // The routine returns the executor so criterion drops
+                // it in the untimed `drop(black_box(output))` section —
+                // consuming it inside the routine would charge its
+                // teardown (per-account/per-leaf frees) to the
+                // measured call.
                 |executor| {
                     run_full_pipeline(&executor, 1);
+                    executor
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -163,6 +169,7 @@ fn bench_propose_only(c: &mut Criterion) {
                 |executor| {
                     let proposal = executor.prepare_proposal(&BUDGET);
                     black_box(&proposal);
+                    executor
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -195,6 +202,7 @@ fn bench_execute_only(c: &mut Criterion) {
                     black_box(&ack);
                     let attestation = executor.attest_state(Height::new(1));
                     black_box(&attestation);
+                    executor
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -232,11 +240,14 @@ fn run_execute_attest(executor: &Executor, height: u64) {
 /// ledger plus `n_txs` delegate txs queued from a single sender.
 ///
 /// The genesis finalize at height 1 is setup, not measurement: the
-/// EVM `state_root` leaf map builds on first use (O(population)) and
-/// `touched` clears per block — minting the population without a
-/// flush would charge the whole trie build to the measured block.
-/// The measured block at height 2 hits the incremental path a
-/// production chain actually runs (O(touched + total_accounts)).
+/// EVM `state_root` leaf map builds on first use (O(population),
+/// once per construction/import) and `touched` clears per block —
+/// minting the population without a flush would charge the whole
+/// trie build to the measured block. The measured block at height 2
+/// hits the incremental path a production chain actually runs —
+/// O(touched) leaf patches plus an O(touched·log n) sparse
+/// retained-branch walk; the only population-scale cost left is the
+/// once-per-process cold build inside setup.
 fn setup_executor_with_accounts(n_txs: usize, n_accounts: usize) -> Executor {
     let mut executor =
         Executor::new(n_txs + 100).with_unsigned_tx_policy(executor::UnsignedTxPolicy::Allow);
@@ -341,8 +352,8 @@ fn setup_executor_with_history(n_txs: usize, n_history: usize, delegations: bool
 /// the populations behind it:
 ///
 /// - `accounts/*`: funded-but-idle EVM accounts — the state-trie
-///   population `state_root` assembles over (O(touched + total) by
-///   design; these rows measure the residual O(total) term).
+///   population `state_root` assembles over. The per-block path is
+///   O(touched); these rows verify it stays flat in population.
 /// - `nonce_history/*`: senders whose single tx was consumed but
 ///   rejected in-module — committed `executed_nonces` + accounts
 ///   grow, delegation state does not. The delta vs `accounts`
@@ -366,7 +377,15 @@ fn bench_state_scaling(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("accounts", n), &n, |b, &n| {
             b.iter_batched(
                 || setup_executor_with_accounts(TXS, n),
-                |executor| run_execute_attest(&executor, 2),
+                // Returning the executor keeps its teardown (the
+                // per-account `DbAccount` and per-leaf `Vec<u8>`
+                // frees — O(population), ~5 ms at 100k) in criterion's
+                // untimed output-drop section instead of the measured
+                // call.
+                |executor| {
+                    run_execute_attest(&executor, 2);
+                    executor
+                },
                 criterion::BatchSize::SmallInput,
             );
         });
@@ -376,7 +395,10 @@ fn bench_state_scaling(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(name, n), &n, |b, &n| {
                 b.iter_batched(
                     || setup_executor_with_history(TXS, n, delegations),
-                    |executor| run_execute_attest(&executor, 1 + (n as u64).div_ceil(2_000)),
+                    |executor| {
+                        run_execute_attest(&executor, 1 + (n as u64).div_ceil(2_000));
+                        executor
+                    },
                     criterion::BatchSize::SmallInput,
                 );
             });
@@ -439,7 +461,10 @@ fn bench_snapshot_export(c: &mut Criterion) {
                 || setup_executor_for_snapshot(0, n).0,
                 |executor| {
                     let snap = executor.export_snapshot();
-                    black_box(&snap);
+                    // Same drop-exclusion: the export's cost is
+                    // producing the blob; executor and blob teardown
+                    // are the consumer's problem, not the export's.
+                    (executor, snap)
                 },
                 criterion::BatchSize::SmallInput,
             );
