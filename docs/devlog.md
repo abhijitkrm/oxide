@@ -18558,3 +18558,24 @@ the aggregate verifies over the full domain-separated message.
 Making them free functions is the point, not a side effect — a
 verifier that cannot see mutable engine fields cannot be
 influenced by them. `engine.rs` drops to ~8.7k lines.
+
+## §9.E — test modules move out of the giant files
+
+`#[cfg(test)] mod tests` blocks are dead code in production builds
+but made up roughly half the remaining giant files — reviewers
+scrolling for entry-point enforcement had to hold the test bulk in
+their heads. Extracted to sibling test files (`mod tests;`
+declarations stay, pointing at `engine/tests.rs`, `tests.rs`, or
+`server/tests.rs` per Rust's file-module rules):
+
+- `consensus/engine.rs`: 8.7k → 3.8k production lines
+- `evm/lib.rs`: 9.7k → 6.2k
+- `staking/lib.rs`: 4.6k → 2.9k
+- `matcher/lib.rs`: 2.5k → 1.4k
+- `matcher/server.rs`: 2.1k → 1.5k
+
+The test modules are children of their implementation modules, so
+`use super::*` still sees private items — the move is purely
+mechanical. What remains inside each file is the production code
+the audit wants readable: every `pub fn` an attacker can reach,
+every `fn` the entry points call.
