@@ -14,9 +14,10 @@
 
 use super::{
     AggregateSignature, BlockBody, BlockHeader, ConsensusError, Encode, ExecCertificate, Hash,
-    Height, OxideBft, Proposal, QuorumCertificate, Signature, StateAttestation, TimeoutCertificate,
-    ValidatorIndex, Verdict, View, Vote, VotePhase, proposer_hash,
+    Height, OxideBft, Proposal, QuorumCertificate, Signature, StateAttestation, ValidatorIndex,
+    Verdict, View, Vote, VotePhase, proposer_hash,
 };
+use crate::verify::VerifiedTc;
 
 impl OxideBft {
     /// Validator: vote on a proposal. Returns the vote, or `None` if
@@ -179,18 +180,16 @@ impl OxideBft {
     fn tc_evidence_floor_ok(
         &mut self,
         header: &BlockHeader,
-        entry_tc: Option<&TimeoutCertificate>,
+        entry_tc: Option<&VerifiedTc>,
     ) -> bool {
         let Some(tc) = entry_tc else { return true };
-        let Some(max_qc) =
-            tc.signers.iter().filter_map(|s| s.high_qc.as_ref()).max_by_key(|qc| qc.view.value())
-        else {
+        let Some(max_qc) = tc.max_evidence() else {
             // No evidence at all: a TC of `None` claims is legal
             // (view 0 timeouts carry no QCs) — any QC clears the
             // floor.
             return true;
         };
-        if self.high_qc.as_ref().is_none_or(|h| h.view < max_qc.view) {
+        if self.high_qc.as_ref().is_none_or(|h| h.view() < max_qc.view) {
             let _ = self.deliver_qc(max_qc.clone());
         }
         matches!(&header.high_qc, Some(prop_qc) if prop_qc.view >= max_qc.view)
@@ -240,11 +239,11 @@ impl OxideBft {
     fn extends_locked_chain(&self, header: &BlockHeader) -> bool {
         if let Some(our_high_qc) = &self.high_qc {
             match &header.high_qc {
-                Some(prop_qc) if prop_qc.view < our_high_qc.view => return false,
+                Some(prop_qc) if prop_qc.view < our_high_qc.view() => return false,
                 None => return false,
                 _ => {}
             }
-            if header.prev_block != our_high_qc.block_hash {
+            if header.prev_block != our_high_qc.block_hash() {
                 return false;
             }
             let Some((parent_header, _)) = self.blocks.get(&header.prev_block) else {
@@ -344,7 +343,7 @@ impl OxideBft {
         // a TC carrying a QC we never saw is precisely the withheld-
         // QC case this mechanism exists for, and the proposer of a
         // legitimate continuation builds on exactly that block.
-        if !self.tc_evidence_floor_ok(header, entry_tc) {
+        if !self.tc_evidence_floor_ok(header, entry_tc.as_ref()) {
             return None;
         }
         // Structural rule (spec §2): a block extends exactly the

@@ -40,6 +40,7 @@ use super::{
     BlockHeader, ConsensusError, Epoch, OxideBft, QuorumCertificate, Signature, TimeoutCertificate,
     ValidatorIndex, View,
 };
+use crate::verify::{VerifiedQc, VerifiedTc};
 
 impl OxideBft {
     /// The certificate evidence that justifies our presence at
@@ -61,10 +62,13 @@ impl OxideBft {
     /// verified independently at ingestion.
     pub fn timeout_evidence(&self) -> (Option<QuorumCertificate>, Option<TimeoutCertificate>) {
         let needs_tc = match &self.high_qc {
-            Some(qc) => qc.view.saturating_next() != self.current_view,
+            Some(qc) => qc.view().saturating_next() != self.current_view,
             None => true,
         };
-        (self.high_qc.clone(), if needs_tc { self.last_tc.clone() } else { None })
+        (
+            self.high_qc.as_ref().map(|v| v.qc().clone()),
+            if needs_tc { self.last_tc.as_ref().map(|v| v.tc().clone()) } else { None },
+        )
     }
 
     /// Process the certificate evidence attached to a remote
@@ -148,7 +152,7 @@ impl OxideBft {
                 let msg = crate::verify::timeout_signing_message(
                     self.current_view,
                     self.epoch,
-                    self.high_qc.as_ref(),
+                    self.high_qc.as_ref().map(VerifiedQc::qc),
                 );
                 Some(sk.sign(crypto::hash::Domain::Timeout, &msg))
             }
@@ -301,12 +305,30 @@ impl OxideBft {
             self.current_view = self.pacemaker.current_view();
             // Record the TC that brought us into this view — the
             // next proposal we make must embed it (spec §view-
-            // changes: legitimate-successor evidence).
-            self.last_tc = Some(tc.clone());
-            // Adopt the TC's max `qc_high` evidence so a proposal
-            // we make (or evaluate) in the new view extends the
-            // highest locked chain — the Jolteon entry rule.
-            self.adopt_tc_evidence(tc);
+            // changes: legitimate-successor evidence). `last_tc`
+            // holds `VerifiedTc`, so mint through the same
+            // verification inbound TCs get: the records were
+            // screened at collection, and this re-asserts quorum +
+            // structure over the assembled certificate rather than
+            // trusting the pacemaker's formation condition.
+            if let Ok(verified) = self.verify_tc_signature(tc) {
+                self.last_tc = Some(verified);
+                // Adopt the TC's max `qc_high` evidence so a
+                // proposal we make (or evaluate) in the new view
+                // extends the highest locked chain — the Jolteon
+                // entry rule.
+                self.adopt_tc_evidence(tc);
+            } else {
+                // A TC assembled from records that each screened
+                // clean at collection should always re-verify —
+                // failure means pacemaker state and the verified
+                // buffer disagree, which is a bug. Fail closed:
+                // the view still advances (liveness is the
+                // pacemaker's job) but we store no successor
+                // evidence and adopt nothing from it.
+                self.last_tc = None;
+                debug_assert!(false, "self-collected TC failed re-verification");
+            }
         }
         Ok(tc)
     }
@@ -345,10 +367,12 @@ impl OxideBft {
         // Structural + quorum + per-signer verification in one
         // pass — see `crate::verify::verify_tc_signature` for the
         // exact checks. Enforced unconditionally: a TC is only a
-        // certificate at quorum with well-formed records.
-        self.verify_tc_signature(tc)?;
+        // certificate at quorum with well-formed records. The token
+        // is what `last_tc` stores — a view we entered via TC only
+        // ever re-embeds a certificate that passed verification.
+        let verified = self.verify_tc_signature(tc)?;
         if let Some(crate::pacemaker::PacemakerEvent::AdvanceView { new_view, .. }) =
-            self.pacemaker.on_timeout_certificate(tc)
+            self.pacemaker.on_timeout_certificate(verified.tc())
         {
             self.current_view = new_view;
             // Clear stale per-view state. Votes collected for the
@@ -360,7 +384,7 @@ impl OxideBft {
             self.clear_per_view_state();
             // Record the TC that brought us into this view so the
             // next proposal embeds it as successor evidence.
-            self.last_tc = Some(tc.clone());
+            self.last_tc = Some(verified);
             // Adopt the TC's max evidence before it can constrain
             // (or be ignored by) the next vote — see
             // [`adopt_tc_evidence`](Self::adopt_tc_evidence).
@@ -395,16 +419,12 @@ impl OxideBft {
     /// == header.view`, and fully verified. `None` for absent,
     /// mismatched, or unverifiable TCs — a TC that isn't the
     /// legitimate entry proof has no protocol effect.
-    pub(crate) fn valid_entry_tc<'h>(
-        &self,
-        header: &'h BlockHeader,
-    ) -> Option<&'h TimeoutCertificate> {
+    pub(crate) fn valid_entry_tc(&self, header: &BlockHeader) -> Option<VerifiedTc> {
         let tc = header.timeout_cert.as_ref()?;
         if tc.epoch != self.epoch || tc.view.saturating_next() != header.view {
             return None;
         }
-        self.verify_tc_signature(tc).ok()?;
-        Some(tc)
+        self.verify_tc_signature(tc).ok()
     }
 
     /// Verify a TC's per-signer evidence records: distinct in-bounds
@@ -420,7 +440,7 @@ impl OxideBft {
     /// [`ConsensusError::InsufficientQuorum`] if the signers' voting
     /// power is below quorum, or [`ConsensusError::InvalidTcSignature`]
     /// if a signature or record does not verify.
-    fn verify_tc_signature(&self, tc: &TimeoutCertificate) -> Result<(), ConsensusError> {
+    fn verify_tc_signature(&self, tc: &TimeoutCertificate) -> Result<VerifiedTc, ConsensusError> {
         crate::verify::verify_tc_signature(&self.validator_set, self.verify_signatures, tc)
     }
 }

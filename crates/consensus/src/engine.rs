@@ -58,6 +58,7 @@ use types::{
 };
 
 use crate::validator::{ValidatorIndex, ValidatorSet};
+use crate::verify::{VerifiedQc, VerifiedTc};
 
 /// Convert a `ValidatorIndex` to a `Hash` for the proposer field.
 /// The proposer is identified by the hash of its public key; stage 5
@@ -339,7 +340,14 @@ pub struct OxideBft {
     pacemaker: crate::pacemaker::Pacemaker,
     /// The highest QC the engine has seen. Carried in the next
     /// proposal's `high_qc` field (the pipeline's chain-link).
-    high_qc: Option<QuorumCertificate>,
+    ///
+    /// The [`VerifiedQc`] token is the audit-9.A boundary: this is
+    /// the engine's safety anchor, so it can only hold a certificate
+    /// that cleared quorum+signature verification (`deliver_qc`) or
+    /// came back from our own durable state (`from_trusted` at
+    /// WAL/snapshot decode — self-authored bytes written only after
+    /// verification, the same trust basis as `voted_at_height`).
+    high_qc: Option<VerifiedQc>,
     /// The highest view the engine has voted in (prevents double-
     /// voting; a safety invariant). `None` = never voted.
     last_voted_view: Option<View>,
@@ -483,7 +491,11 @@ pub struct OxideBft {
     /// (only one notarization can gather commit momentum — QC
     /// adoption is view-monotonic, so all honest voters converge on
     /// the newest notarization's chain).
-    last_tc: Option<TimeoutCertificate>,
+    ///
+    /// Carried as a [`VerifiedTc`]: every assignment passes through
+    /// `verify_tc_signature`, so the proposal path re-embeds a
+    /// certificate that provably cleared per-signer verification.
+    last_tc: Option<VerifiedTc>,
     /// Collected timeout signatures for the current view (TC safety).
     /// `None` = no timeout signature from that validator. Indexed by
     /// `ValidatorIndex`. Used to aggregate the TC's signature when
@@ -805,7 +817,7 @@ impl OxideBft {
     /// this QC as `prev_block`).
     #[must_use]
     pub fn high_qc(&self) -> Option<&QuorumCertificate> {
-        self.high_qc.as_ref()
+        self.high_qc.as_ref().map(VerifiedQc::qc)
     }
 
     /// Current vote count collected for the current view (diagnostic).
@@ -1071,7 +1083,7 @@ impl OxideBft {
                     "propose() idle: view={:?} next_height={:?} highqc={:?} has_txs={has_pending_txs} work_outstanding={work_outstanding}",
                     self.current_view,
                     self.next_height,
-                    self.high_qc.as_ref().map(|q| q.view.value()),
+                    self.high_qc.as_ref().map(|q| q.view().value()),
                 );
             }
             return None;
@@ -1107,18 +1119,18 @@ impl OxideBft {
         // valid height — stay idle until gossip delivers the block.
         let (height, prev_block) = match &self.high_qc {
             Some(qc) => {
-                let Some((parent, _)) = self.blocks.get(&qc.block_hash) else {
+                let Some((parent, _)) = self.blocks.get(&qc.block_hash()) else {
                     if std::env::var_os("OXIDE_DEBUG_PROPOSE").is_some() {
                         eprintln!(
                             "propose() blocked: view={:?} highqc_view={:?} highqc_block={:?} unknown — waiting for block",
                             self.current_view,
-                            qc.view.value(),
-                            qc.block_hash,
+                            qc.view().value(),
+                            qc.block_hash(),
                         );
                     }
                     return None;
                 };
-                (parent.height.saturating_next(), qc.block_hash)
+                (parent.height.saturating_next(), qc.block_hash())
             }
             // No highQC: extend the committed anchor — genesis at
             // height 0, or the last committed block across an epoch
@@ -1146,7 +1158,7 @@ impl OxideBft {
             prev_block,
             tx_root,
             body_commitment,
-            high_qc: self.high_qc.clone(),
+            high_qc: self.high_qc.as_ref().map(|v| v.qc().clone()),
             // Embed the TC that brought us into this view, if any
             // (spec §view-changes: "the next leader embeds the TC in
             // its proposal, proving it is the legitimate successor").
@@ -1155,7 +1167,7 @@ impl OxideBft {
             // from an earlier view or epoch is not evidence for this
             // succession. Voters use it to release same-height vote
             // locks left over from the timed-out view.
-            timeout_cert: self.last_tc.clone().filter(|tc| {
+            timeout_cert: self.last_tc.as_ref().map(|v| v.tc().clone()).filter(|tc| {
                 tc.epoch == self.epoch && tc.view.saturating_next() == self.current_view
             }),
             proposer: proposer_hash(self.validator_set.leader(self.current_view)),
@@ -1266,7 +1278,7 @@ impl OxideBft {
         }
         *body = BlockBody::Complete(proposal.clone());
         if let Some(qc) = self.high_qc.clone()
-            && let Some((tip, _)) = self.blocks.get(&qc.block_hash).cloned()
+            && let Some((tip, _)) = self.blocks.get(&qc.block_hash()).cloned()
         {
             self.commit_walk(&tip);
         }
@@ -1317,11 +1329,11 @@ impl OxideBft {
         // Exception: the first QC (when high_qc is None) is always
         // accepted.
         if let Some(current_high_qc) = &self.high_qc
-            && qc.view.value() <= current_high_qc.view.value()
+            && qc.view.value() <= current_high_qc.view().value()
         {
             return Err(ConsensusError::StaleQc {
                 qc_view: qc.view,
-                high_qc_view: current_high_qc.view,
+                high_qc_view: current_high_qc.view(),
             });
         }
 
@@ -1340,13 +1352,21 @@ impl OxideBft {
         // C1 fix: verify the QC's aggregate signature against the
         // signer bitmap + validator set. The signed message is the
         // block hash (32 bytes) under Domain::Vote — the same domain
-        // used by `sign_vote` and verified in `collect_vote`.
-        if self.verify_signatures {
-            self.verify_qc_signature(&qc)?;
-        }
+        // used by `sign_vote` and verified in `collect_vote`. The
+        // verifier returns the `VerifiedQc` token — `high_qc` holds
+        // the proof, not just the bytes, so no future adoption path
+        // can store an unchecked certificate here.
+        let verified = if self.verify_signatures {
+            self.verify_qc_signature(&qc)?
+        } else {
+            // Conformance mode: crypto is deliberately compiled out,
+            // so the structural quorum check above is the entire
+            // admission — `from_trusted` records that it ran.
+            VerifiedQc::from_trusted(qc.clone())
+        };
 
         // Update the highest QC.
-        self.high_qc = Some(qc.clone());
+        self.high_qc = Some(verified);
         // C9 fix: persist the updated high_qc to the WAL. A
         // restarted validator must propose from the correct
         // high_qc; without persistence, it could propose a stale
@@ -1430,7 +1450,7 @@ impl OxideBft {
     /// power is below the stake quorum, or
     /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
     /// not verify.
-    fn verify_qc_signature(&self, qc: &QuorumCertificate) -> Result<(), ConsensusError> {
+    fn verify_qc_signature(&self, qc: &QuorumCertificate) -> Result<VerifiedQc, ConsensusError> {
         crate::verify::verify_qc_signature(&self.validator_set, self.epoch, qc)
     }
 

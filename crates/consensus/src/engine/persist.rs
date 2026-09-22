@@ -33,7 +33,13 @@ impl OxideBft {
             self.last_voted_view = entry.last_voted_view;
             self.timeout_signed_view = entry.timeout_signed_view;
             self.voted_at_height = entry.voted_at_height;
-            self.high_qc = entry.high_qc;
+            // Own-WAL state is the trust interior: the certificate
+            // was verified before it was persisted (the only writer
+            // is `deliver_qc`'s verified adoption), so the token
+            // re-wraps it without re-verification — the same basis
+            // on which `voted_at_height`/`timeout_signed_view`
+            // decode unverified.
+            self.high_qc = entry.high_qc.map(crate::verify::VerifiedQc::from_trusted);
             self.current_view = entry.current_view;
             self.next_height = entry.next_height;
             self.epoch = entry.epoch;
@@ -106,7 +112,7 @@ impl OxideBft {
             last_voted_view: self.last_voted_view,
             timeout_signed_view: self.timeout_signed_view,
             voted_at_height: self.voted_at_height.clone(),
-            high_qc: self.high_qc.clone(),
+            high_qc: self.high_qc.as_ref().map(|v| v.qc().clone()),
             current_view: self.current_view,
             next_height: self.next_height,
             epoch: self.epoch,
@@ -158,7 +164,7 @@ impl OxideBft {
             last_voted_view: self.last_voted_view,
             timeout_signed_view: self.timeout_signed_view,
             voted_at_height: self.voted_at_height.clone(),
-            high_qc: self.high_qc.clone(),
+            high_qc: self.high_qc.as_ref().map(|v| v.qc().clone()),
             current_view: self.current_view,
             next_height: self.next_height,
             epoch: self.epoch,
@@ -231,7 +237,7 @@ impl OxideBft {
         match &self.high_qc {
             Some(qc) => {
                 buf.push(1);
-                qc.encode(&mut buf);
+                qc.qc().encode(&mut buf);
             }
             None => buf.push(0),
         }
@@ -303,9 +309,13 @@ impl OxideBft {
 
         if qc_present == 1 {
             let mut reader = codec::Reader::new(&bytes[offset..]);
-            self.high_qc = Some(
+            // `save_state`/`restore_state` are the local restart
+            // path — the bytes are our own post-verification state
+            // (see the WAL recover site for the trust-interior
+            // argument), so decode mints the token via `from_trusted`.
+            self.high_qc = Some(crate::verify::VerifiedQc::from_trusted(
                 QuorumCertificate::decode(&mut reader).map_err(|_| ConsensusError::InvalidState)?,
-            );
+            ));
             offset = bytes.len() - reader.remaining();
         }
 

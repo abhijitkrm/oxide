@@ -23,6 +23,96 @@ use types::{ExecCertificate, QuorumCertificate, TimeoutCertificate};
 use crate::engine::ConsensusError;
 use crate::validator::{ValidatorIndex, ValidatorSet};
 
+/// A [`QuorumCertificate`] that has cleared quorum-stake + aggregate
+/// signature verification against a known [`ValidatorSet`] — or was
+/// loaded from the node's own durable state, which was written only
+/// after verification.
+///
+/// This is the certificate analogue of
+/// [`crypto::bls_signer::ValidatedPublicKey`]: the *value* proves its
+/// admission check ran, so engine state that anchors consensus safety
+/// (`high_qc`, the commit chain's certificate references) cannot hold
+/// a certificate that merely *looks* structured — it either passed
+/// `verify_qc_signature` or came back from our own WAL/snapshot via
+/// [`VerifiedQc::from_trusted`]. Wire and stored types keep the bare
+/// `QuorumCertificate`: headers carry unverified claims until
+/// admitted, and a certificate embedded in a stored block was
+/// verified before it was stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedQc {
+    qc: QuorumCertificate,
+}
+
+impl VerifiedQc {
+    /// The verified certificate, for embedding in wire types
+    /// (proposal `high_qc` fields, timeout evidence claims) — the
+    /// token authenticates *this node's* adoption; a peer must
+    /// verify the bytes itself.
+    pub(crate) fn qc(&self) -> &QuorumCertificate {
+        &self.qc
+    }
+
+    /// The view the certificate certifies.
+    pub(crate) fn view(&self) -> View {
+        self.qc.view
+    }
+
+    /// The block the certificate certifies.
+    pub(crate) fn block_hash(&self) -> Hash {
+        self.qc.block_hash
+    }
+
+    /// Wrap a certificate the caller guarantees was already verified.
+    ///
+    /// Trusted interiors only: own-WAL/`save_state` decode (that
+    /// state was written post-verification — the same trust basis as
+    /// `voted_at_height` and `timeout_signed_view`, which decode
+    /// unverified because a node that cannot trust its own disk
+    /// cannot operate at all), conformance-mode mints where
+    /// signature checks are deliberately compiled out, and TC
+    /// evidence claims that `verify_tc_signature` already screened.
+    /// Never use this on a value arriving from the network or a
+    /// module — those mint through `verify_qc_signature`.
+    pub(crate) fn from_trusted(qc: QuorumCertificate) -> Self {
+        Self { qc }
+    }
+}
+
+/// A [`TimeoutCertificate`] that cleared per-signer record
+/// verification: distinct in-bounds voters, quorum stake, each
+/// timeout signature verified over its own `(view, epoch, qc_high)`
+/// claim, and each carried QC itself quorum+signature checked.
+///
+/// Same role as [`VerifiedQc`] for the view-change seam: `last_tc`
+/// is the evidence a proposal re-embeds, and `valid_entry_tc`
+/// returns the token so the vote path's floor check cannot
+/// accidentally read an *unverified* TC's evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedTc {
+    tc: TimeoutCertificate,
+}
+
+impl VerifiedTc {
+    /// The verified certificate, for embedding into the next
+    /// proposal's `timeout_cert` field.
+    pub(crate) fn tc(&self) -> &TimeoutCertificate {
+        &self.tc
+    }
+
+    /// The timed-out view the certificate covers.
+    #[cfg(test)]
+    pub(crate) fn view(&self) -> View {
+        self.tc.view
+    }
+
+    /// The highest-view `qc_high` evidence any signer reported —
+    /// already quorum+signature screened per claim during
+    /// verification, so the floor derived from it is sound.
+    pub(crate) fn max_evidence(&self) -> Option<&QuorumCertificate> {
+        self.tc.signers.iter().filter_map(|s| s.high_qc.as_ref()).max_by_key(|qc| qc.view.value())
+    }
+}
+
 /// Resolve a certificate's signer bitmap into the signers' public
 /// keys plus their combined voting power.
 ///
@@ -189,7 +279,7 @@ pub(crate) fn verify_qc_signature(
     vset: &ValidatorSet,
     epoch: Epoch,
     qc: &QuorumCertificate,
-) -> Result<(), ConsensusError> {
+) -> Result<VerifiedQc, ConsensusError> {
     // Resolve the bitmap into signer keys + voting power.
     let (signer_pks, voting_power) = signer_keys_and_power(vset, &qc.signer_bitmap)?;
     if signer_pks.is_empty() {
@@ -209,8 +299,14 @@ pub(crate) fn verify_qc_signature(
     // C3 fix: verify against the full (view, phase, block_hash,
     // epoch) message, not just the block hash.
     let msg = vote_signing_message(epoch, qc.view, qc.phase as u8, &qc.block_hash);
-    crypto::aggregate_verify(&qc.aggregate_signature, crypto::hash::Domain::Vote, &msg, &signer_pks)
-        .map_err(|_| ConsensusError::InvalidQcSignature)
+    crypto::aggregate_verify(
+        &qc.aggregate_signature,
+        crypto::hash::Domain::Vote,
+        &msg,
+        &signer_pks,
+    )
+    .map_err(|_| ConsensusError::InvalidQcSignature)?;
+    Ok(VerifiedQc { qc: qc.clone() })
 }
 
 /// Verify a peer's timeout signature for an explicit `(view, epoch)`
@@ -345,7 +441,7 @@ pub(crate) fn verify_tc_signature(
     vset: &ValidatorSet,
     verify_signatures: bool,
     tc: &TimeoutCertificate,
-) -> Result<(), ConsensusError> {
+) -> Result<VerifiedTc, ConsensusError> {
     if tc.signers.is_empty() {
         return Err(ConsensusError::InvalidTcSignature);
     }
@@ -387,5 +483,5 @@ pub(crate) fn verify_tc_signature(
     if voting_power < required {
         return Err(ConsensusError::InsufficientQuorum { voting_power, required });
     }
-    Ok(())
+    Ok(VerifiedTc { tc: tc.clone() })
 }

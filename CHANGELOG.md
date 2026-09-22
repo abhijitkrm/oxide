@@ -12,6 +12,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **Consensus certificates carry proof of verification**
+  (`consensus`): the engine's two safety-anchoring fields —
+  `high_qc` (the QC every proposal extends) and `last_tc` (the
+  timeout certificate a view-change proposal re-embeds) — now hold
+  `VerifiedQc`/`VerifiedTc` tokens that can only be produced by
+  running the real quorum + aggregate-signature verification, or by
+  decoding the node's own WAL/snapshot state (written only after
+  verification). Certificates arriving from the network remain raw
+  until admitted.
+  - **In plain words:** the consensus engine can no longer hold a
+    forged or unverified certificate in the slots that decide what
+    to vote for — the type system requires verification to have
+    run before a QC or timeout certificate can occupy them.
+
 - **Validator keys cross into consensus as proof tokens**
   (`crypto`, `types`, `executor`, `staking`, `consensus`): the new
   `ValidatedPublicKey` type is constructible only by running point

@@ -19055,3 +19055,40 @@ Still open on this list: TLS contention (needs a TLS transport
 harness — §6.4 residual) and string/event allocation accounting
 (wall-clock benches can't see allocation counts; needs an
 instrumented allocator before claims are quotable).
+
+## §9.A — certificates cross the safety boundary as proof tokens
+
+`VerifiedQc`/`VerifiedTc` close the second half of the audit's
+proof-carrying-type residual — the certificate side, after
+`ValidatedPublicKey` took the key side. The engine's two
+security-anchoring fields now hold tokens instead of raw wire
+structs:
+
+- `high_qc: Option<VerifiedQc>` — minted only inside
+  `verify_qc_signature` (quorum stake + aggregate signature) or by
+  `from_trusted` at WAL/snapshot decode. `deliver_qc` mints in
+  production and `from_trusted`s in conformance mode after the
+  structural quorum check — the conformance mint documents that the
+  *structural* admission ran even where crypto is compiled out.
+- `last_tc: Option<VerifiedTc>` — minted by `verify_tc_signature`,
+  which verifies every per-signer record (sig-bound claim, quorum,
+  per-claim QC verify). `valid_entry_tc` returns the token, so the
+  Jolteon floor check in the vote path consumes verified evidence
+  by construction — it cannot read an unverified TC's claims even
+  if a future edit drops the call-site check.
+
+The self-formed TC path got stricter on the way through: the TC the
+engine assembles from its own collection buffer now re-verifies
+before storing, instead of trusting the pacemaker's formation
+condition — fail-closed with a `debug_assert`, since screened
+records should always re-verify.
+
+The boundary story matches the key token exactly: wire types
+(`BlockHeader.timeout_cert`, proposal `high_qc`, `TimeoutSigner`
+claims) stay raw because they carry *unverified claims*; stored
+state (WAL entry, `save_state` blob) stays raw because it is
+self-authored post-verification bytes — the same interior trust
+`voted_at_height` and `timeout_signed_view` already rely on. What
+the tokens remove is the silent-adoption hazard: a future code
+path cannot assign into `high_qc`/`last_tc` without the type
+proving the check ran.

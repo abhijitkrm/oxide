@@ -9,6 +9,7 @@
 //! the internal state (block hash, `tx_root`, view advancement).
 
 use super::*;
+use crate::verify::VerifiedQc;
 use ports::conformance;
 use ports::mock::MockApp;
 use types::ExecCertificate;
@@ -427,7 +428,7 @@ fn vote_lock_rejects_conflicting_block_at_same_height() {
     // The child must justify with QC(A) — a proposal without a
     // high_qc is refused while the voter holds one.
     header_c.high_qc = Some(qc_a.clone());
-    follower.high_qc = Some(qc_a);
+    follower.high_qc = Some(VerifiedQc::from_trusted(qc_a));
     // current_view already set to header_c.view above.
     assert!(
         follower.vote(&header_c, &prop_a).is_some(),
@@ -1089,7 +1090,7 @@ fn bls_signed_vote_verifies() {
 
     // The engine should have formed a QC with a real aggregate
     // signature (not ZERO).
-    let qc = engine.high_qc.as_ref().expect("high_qc");
+    let qc = engine.high_qc.as_ref().map(VerifiedQc::qc).expect("high_qc");
     assert_ne!(
         qc.aggregate_signature,
         AggregateSignature::ZERO,
@@ -2211,7 +2212,7 @@ fn tail_fork_rejects_proposal_with_wrong_high_qc() {
     let mut engine = make_engine();
     engine.submit_tx(TxBytes::new(vec![1]));
     engine.run_until_idle();
-    let our_high_qc = engine.high_qc.clone().expect("high_qc set");
+    let our_high_qc = engine.high_qc.clone().map(|v| v.qc().clone()).expect("high_qc set");
 
     // Craft a fake QC over a different block.
     let fake_qc = QuorumCertificate {
@@ -2254,7 +2255,7 @@ fn tail_fork_accepts_proposal_extending_high_qc() {
     let mut engine = make_engine();
     engine.submit_tx(TxBytes::new(vec![1]));
     engine.run_until_idle();
-    let our_high_qc = engine.high_qc.clone().expect("high_qc set");
+    let our_high_qc = engine.high_qc.clone().map(|v| v.qc().clone()).expect("high_qc set");
 
     // The stamped height must be the parent's height + 1 —
     // vote() now enforces height continuity, so derive it from
@@ -2301,7 +2302,7 @@ fn tail_fork_accepts_proposal_with_newer_high_qc() {
     let mut engine = make_engine();
     engine.submit_tx(TxBytes::new(vec![1]));
     engine.run_until_idle();
-    let our_high_qc = engine.high_qc.clone().expect("high_qc set");
+    let our_high_qc = engine.high_qc.clone().map(|v| v.qc().clone()).expect("high_qc set");
 
     // Craft a QC one view newer than ours, over a different block
     // (simulating a view-change leader that built on a fresher QC).
@@ -2345,7 +2346,7 @@ fn tail_fork_accepts_proposal_with_newer_high_qc() {
     let stamped_height = parent_height.saturating_next();
     let proposal_view = View::new(our_high_qc.view.value() + 2);
     engine.current_view = proposal_view;
-    engine.high_qc = Some(newer_qc.clone());
+    engine.high_qc = Some(VerifiedQc::from_trusted(newer_qc.clone()));
     let proposal =
         Proposal { height: stamped_height, txs: vec![TxBytes::new(vec![2])], attestation: None };
     let header = BlockHeader {
@@ -2378,7 +2379,7 @@ fn tail_fork_rejects_proposal_with_older_high_qc() {
     let mut engine = make_engine();
     engine.submit_tx(TxBytes::new(vec![1]));
     engine.run_until_idle();
-    let our_high_qc = engine.high_qc.clone().expect("high_qc set");
+    let our_high_qc = engine.high_qc.clone().map(|v| v.qc().clone()).expect("high_qc set");
     // Only meaningful once we've advanced past view 0.
     assert!(our_high_qc.view.value() > 0, "high_qc should be past view 0 after a round");
 
@@ -4002,7 +4003,7 @@ fn timeout_evidence_tc_advances_view() {
     assert_eq!(engine.current_view().value(), 5, "TC(4) evidence moves the validator to view 5");
     // And the TC is recorded as the view's successor evidence.
     assert_eq!(
-        engine.last_tc.as_ref().map(|t| t.view.value()),
+        engine.last_tc.as_ref().map(|t| t.view().value()),
         Some(4),
         "the carried TC becomes last_tc — the next proposal embeds it"
     );
