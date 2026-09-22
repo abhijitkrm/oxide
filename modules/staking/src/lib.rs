@@ -514,6 +514,14 @@ impl StakingModule {
     /// Panics if `key` is not 48 bytes or the mutex is poisoned.
     pub fn genesis_set_bls_key(&self, validator: Address, key: &[u8]) {
         assert_eq!(key.len(), crypto::bls::PublicKey::LEN, "BLS key must be 48 bytes");
+        // Genesis has no PoP to check — the group-element validation
+        // is the only thing keeping a typo'd key from wedging the
+        // validator's votes for the chain's whole life.
+        let pk = crypto::bls::PublicKey::from_slice(key).expect("length checked above");
+        assert!(
+            crypto::bls_signer::validate_point(&pk).is_ok(),
+            "genesis BLS key for {validator:?} is not a valid group element"
+        );
         framework::lock_state(&self.bls_keys).insert(validator, key.to_vec());
     }
 
@@ -1754,6 +1762,12 @@ impl StakingModule {
             if key.len() != crypto::bls::PublicKey::LEN {
                 return None;
             }
+            // Re-validate the group element: the PoP gate ran at
+            // admission, but a crafted or corrupted snapshot blob
+            // must not lodge a point that can never verify — that
+            // would wedge every QC the key maps to.
+            let pk = crypto::bls::PublicKey::from_slice(&key).ok()?;
+            crypto::bls_signer::validate_point(&pk).ok()?;
             if out.bls_keys.insert(a, key).is_some() {
                 return None;
             }
@@ -1835,6 +1849,10 @@ impl StakingModule {
                     if k.len() != crypto::bls::PublicKey::LEN {
                         return None;
                     }
+                    // Same re-validation as the live map — a retired
+                    // key must still verify historical evidence.
+                    let pk = crypto::bls::PublicKey::from_slice(&k).ok()?;
+                    crypto::bls_signer::validate_point(&pk).ok()?;
                     keys.push(k);
                 }
                 if out.retired_bls_keys.insert(a, keys).is_some() {
@@ -4981,5 +4999,38 @@ mod tests {
         let evidence = signed_evidence(v, &key, 7, 0);
         dst.handle(&ctx(), &evidence).unwrap();
         assert_eq!(dst.stake(&v), 900);
+    }
+
+    /// A snapshot blob carrying a 48-byte BLS key that is not a
+    /// well-formed group element must fail import — the PoP gate ran
+    /// at admission, so restore re-validates the point itself rather
+    /// than trusting the bytes. Without this a crafted blob lodges a
+    /// key that can never verify, wedging every QC that maps to it.
+    #[test]
+    fn snapshot_rejects_malformed_bls_key() {
+        let src = setup(&[1]);
+        let v = addr(1);
+        let key = bls_key(1);
+        src.genesis_set_bls_key(v, key.public_key().as_bytes());
+        src.handle(&ctx(), &msg::delegate(v, 1000)).unwrap();
+
+        let mut snapshot = src.export_state().unwrap();
+        let blob = &mut snapshot.entries[0].1;
+        let pk_bytes = key.public_key().as_bytes().to_vec();
+        let off = blob
+            .windows(pk_bytes.len())
+            .position(|w| w == pk_bytes.as_slice())
+            .expect("the committed key is in the canon");
+        // `0xFF…` is not a valid compressed BLS12-381 point.
+        for b in &mut blob[off..off + pk_bytes.len()] {
+            *b = 0xFF;
+        }
+
+        let dst = StakingModule::new();
+        dst.set_ledger(std::sync::Arc::new(framework::MemoryBalances::new()));
+        assert!(
+            dst.import_state(&snapshot).is_err(),
+            "a malformed group element must fail import, not lodge"
+        );
     }
 }

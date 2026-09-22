@@ -241,6 +241,27 @@ pub fn aggregate_verify(
     if result == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::InvalidSignature) }
 }
 
+/// Validate that a compressed [`PublicKey`] decodes to a well-formed
+/// BLS12-381 group element in the correct subgroup.
+///
+/// Admission paths prove more than this — [`pop_verify`] implies it —
+/// but state-restore and genesis paths install keys without a `PoP` in
+/// hand; this is the check that keeps a crafted snapshot blob or a
+/// typo'd genesis entry from lodging a point that can never verify,
+/// which would wedge every QC that maps to it.
+///
+/// Cold path only — decode/genesis boundaries, never the vote loop.
+///
+/// # Errors
+/// Returns `BlsError::InvalidKeyMaterial` if the bytes do not decode
+/// to a subgroup member.
+pub fn validate_point(pk: &PublicKey) -> Result<(), BlsError> {
+    let blst_pk = BlstPk::from_bytes(pk.as_bytes())?;
+    // `from_bytes` proves the encoding is a curve point; `validate`
+    // adds the subgroup check — both halves are required.
+    blst_pk.validate().map_err(|_| BlsError::InvalidKeyMaterial)
+}
+
 /// Errors from BLS operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlsError {
