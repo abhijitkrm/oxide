@@ -10,7 +10,7 @@
 
 use super::{
     Address, Arc, BPS_DENOM, BTreeMap, Event, ExecError, FEE_BPS, FillEvent, MarketConfig,
-    OrderKey, OrderOutcome, PRICE_SCALE, Price, RegisteredOrder, Side,
+    OrderKey, OrderOutcome, PRICE_SCALE, Price, RegisteredOrder, Reserved, Side,
 };
 use crate::codec::{w32, w64};
 
@@ -285,38 +285,38 @@ pub(crate) fn consume_and_release(
     accrue_fees(&fees, fee_vault, events);
 
     // ── Consumption + residue refunds ───────────────────────────
-    let mut completed: Vec<(OrderKey, Side, u16, u64)> = Vec::new();
+    let mut completed: Vec<(OrderKey, Reserved, u16)> = Vec::new();
     for (key, delta) in &deltas {
         let Some(order) = registered.get_mut(key) else { continue };
         order.remaining = order.remaining.saturating_sub(delta.consumed);
-        match order.side {
+        match &mut order.reserved {
             // Buys: release the escrow slice, minus any withheld
             // rebate that stays escrowed for the residue refund.
-            Side::Buy => {
+            Reserved::Quote(escrow) => {
                 let withheld = if failed_rebates.contains(&key.owner) { delta.rebate } else { 0 };
-                order.reserved =
-                    order.reserved.saturating_sub(delta.released.saturating_sub(withheld));
+                *escrow = escrow.saturating_sub(delta.released.saturating_sub(withheld));
             }
-            // Sells: `reserved` IS the remaining base escrow — it
+            // Sells: the escrow IS the remaining base custody — it
             // shrinks qty-for-qty with consumption.
-            Side::Sell => {
-                order.reserved = order.reserved.saturating_sub(delta.consumed);
+            Reserved::Base(escrow) => {
+                *escrow = escrow.saturating_sub(delta.consumed);
             }
         }
         if order.remaining == 0 {
-            completed.push((*key, order.side, order.market, order.reserved));
+            completed.push((*key, order.reserved, order.market));
         }
     }
-    for (key, side, market, residue) in completed {
+    for (key, reserved, market) in completed {
         registered.remove(&key);
+        let residue = reserved.get();
         if residue == 0 {
             continue;
         }
-        match side {
+        match reserved {
             // The order is dead; a refund failure strands its
             // residue. Impossible while supply stays below
             // `u64::MAX` — the event keeps it visible.
-            Side::Buy => {
+            Reserved::Quote(_) => {
                 credit_or_stranded(ledger, key.owner, residue, events);
             }
             // Sell residue is base escrow — it returns to the
@@ -324,7 +324,7 @@ pub(crate) fn consume_and_release(
             // is safe (registration bounded markets to 256 slots);
             // the add-back cannot overflow (the units came from
             // this same custody pool).
-            Side::Sell => {
+            Reserved::Base(_) => {
                 let Ok(m) = u8::try_from(market) else {
                     // Unreachable: registration bounds markets to
                     // the 256-slot engine space. Stranding the
@@ -500,8 +500,8 @@ pub(crate) fn settle_leg(
     // Role + market binding: the buy key must be a buy order, the
     // sell key a sell order, both on this leg's market — and never
     // the same account on both sides.
-    if buy_order.side != Side::Buy
-        || sell_order.side != Side::Sell
+    if buy_order.side() != Side::Buy
+        || sell_order.side() != Side::Sell
         || buy_order.market != market
         || sell_order.market != market
         || buy.owner == sell.owner
@@ -541,12 +541,13 @@ pub(crate) fn settle_leg(
         return Ok(None);
     }
     // Delivery-versus-payment: the sell order must still hold enough
-    // escrowed base — `reserved` on a sell is its base custody, which
+    // escrowed base — a `Reserved::Base` is its base custody, which
     // registration filled qty-for-qty with `remaining`. This is what
     // stops a leg from paying a seller who cannot deliver — including
-    // a pre-custody registered sell (`reserved == 0`), which is now
-    // unfillable but still cancelable.
-    if sell_total > sell_order.reserved {
+    // a pre-custody registered sell (zero escrow), which is now
+    // unfillable but still cancelable. The `side()` check above
+    // already proved the `Base` denomination.
+    if sell_total > sell_order.reserved.get() {
         return Ok(None);
     }
 

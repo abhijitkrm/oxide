@@ -56,6 +56,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     balance is expected — the compiler rejects the mix instead of
     it silently inverting or mis-scaling a trader's exposure.
 
+- **Registered-order escrow carries its denomination in the type**
+  (`exchange`): a registered order's `reserved` is now
+  `Reserved::Quote` (buy escrow, ledger-held) or `Reserved::Base`
+  (sell escrow, custody-held) instead of a bare `u64` whose units
+  depended on a separate `side` field — which now derives from the
+  variant. Refunds and settlement consumption match on the
+  denomination itself.
+  - **In plain words:** an escrowed amount can never be refunded or
+    spent as the wrong asset — a sell order holding "quote units"
+    cannot exist, so settlement can't misroute value between the
+    ledger and base custody.
+
 ### Added
 
 - **Contention and interference benchmarks** (`crates/matcher`,

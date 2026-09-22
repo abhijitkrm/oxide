@@ -1378,8 +1378,12 @@ fn total_base_custody(ex: &ExchangeModule) -> u64 {
     let inner = framework::lock_state(&ex.inner);
     let free: u64 = inner.base_balances.values().sum();
     let held: u64 = inner.base_holds.values().sum();
-    let escrowed: u64 =
-        inner.registered.values().filter(|o| o.side == Side::Sell).map(|o| o.reserved).sum();
+    let escrowed: u64 = inner
+        .registered
+        .values()
+        .filter(|o| o.side() == Side::Sell)
+        .map(|o| o.reserved.get())
+        .sum();
     free + held + escrowed
 }
 
@@ -1691,8 +1695,8 @@ fn base_custody_conserves_across_mixed_ops() {
     let buy_escrow: u64 = framework::lock_state(&ex.inner)
         .registered
         .values()
-        .filter(|o| o.side == Side::Buy)
-        .map(|o| o.reserved)
+        .filter(|o| o.side() == Side::Buy)
+        .map(|o| o.reserved.get())
         .sum();
     assert_eq!(
         minted,
@@ -1768,10 +1772,11 @@ fn pre_custody_sell_orders_cannot_settle() {
         crate::OrderKey { owner: addr(9), client_id: 9 },
         crate::RegisteredOrder {
             market: 0,
-            side: Side::Sell,
             limit_price: 1_000_000_000,
             remaining: 5_000,
-            reserved: 0,
+            // Zero-escrow sell — the pre-custody shape this test
+            // exercises: unfillable but still cancelable.
+            reserved: crate::Reserved::Base(0),
         },
     );
     let mut w = framework::CanonicalState::new();
@@ -1798,10 +1803,10 @@ fn pre_custody_sell_orders_cannot_settle() {
         w.put_addr(&key.owner);
         w.put_u64(key.client_id);
         w.put_u16(order.market);
-        w.put_u8(encode_side(order.side));
+        w.put_u8(encode_side(order.side()));
         w.put_u64(order.limit_price);
         w.put_u64(order.remaining);
-        w.put_u64(order.reserved);
+        w.put_u64(order.reserved.get());
     }
     // No custody tail — the pre-upgrade blob shape.
     let kv: framework::KVStore = std::sync::Mutex::new(store_map);

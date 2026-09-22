@@ -9,7 +9,7 @@
 
 use super::{
     BTreeMap, CommittedState, DenseBook, ExchangeModule, MatchingEngine, OrderKey, RegisteredOrder,
-    subtree_root,
+    Reserved, Side, subtree_root,
 };
 use crate::codec::{decode_side, encode_market_config, encode_side, market_config_key};
 
@@ -57,10 +57,10 @@ impl ExchangeModule {
             w.put_addr(&key.owner);
             w.put_u64(key.client_id);
             w.put_u16(order.market);
-            w.put_u8(encode_side(order.side));
+            w.put_u8(encode_side(order.side()));
             w.put_u64(order.limit_price);
             w.put_u64(order.remaining);
-            w.put_u64(order.reserved);
+            w.put_u64(order.reserved.get());
         }
         // Base-asset custody state — committed because it decides
         // every future sell's admissibility and every fill's delivery:
@@ -152,12 +152,20 @@ impl ExchangeModule {
             let count = r.get_count()?;
             for _ in 0..count {
                 let key = OrderKey { owner: r.get_addr()?, client_id: r.get_u64()? };
+                let market = r.get_u16()?;
+                // The side byte selects the escrow's denomination —
+                // buys escrow quote, sells escrow base — so the
+                // stored `reserved` units are read with the same
+                // meaning they were written under.
+                let side = decode_side(r.get_u8()?)?;
                 let order = RegisteredOrder {
-                    market: r.get_u16()?,
-                    side: decode_side(r.get_u8()?)?,
+                    market,
                     limit_price: r.get_u64()?,
                     remaining: r.get_u64()?,
-                    reserved: r.get_u64()?,
+                    reserved: match side {
+                        Side::Buy => Reserved::Quote(r.get_u64()?),
+                        Side::Sell => Reserved::Base(r.get_u64()?),
+                    },
                 };
                 if registered.insert(key, order).is_some() {
                     return None; // Duplicate key — non-canonical.

@@ -164,16 +164,66 @@ pub struct BatchFillEntry {
 struct RegisteredOrder {
     /// Market the order is authorized on (must be listed).
     market: u16,
-    /// Buy or sell — a fill leg must name a buy key and a sell key.
-    side: Side,
     /// The owner's limit price (scale-8): the maximum a buy pays,
     /// the minimum a sell accepts.
     limit_price: u64,
     /// Unfilled authorized quantity (scale-6).
     remaining: u64,
-    /// Escrowed units of the side's obligation asset (scale-6):
-    /// quote for buys, base for sells.
-    reserved: u64,
+    /// The escrowed obligation, carrying its denomination in the
+    /// variant — the side is *derived* from it (`RegisteredOrder::
+    /// side`), so the escrow's unit can never disagree with the
+    /// direction it secures.
+    reserved: Reserved,
+}
+
+/// The escrowed obligation of a [`RegisteredOrder`], denominated in
+/// the side's obligation asset — quote units for buys (ledger-held
+/// worst-case cost), base qty for sells (custody-held delivery).
+/// Carrying the denomination in the type makes `side: Sell` paired
+/// with quote-denominated escrow unrepresentable, and every release/
+/// refund site matches on the denomination rather than trusting a
+/// separate `side` field to agree (audit §9.B, available-vs-reserved
+/// and side-denominated units).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reserved {
+    /// Worst-case quote cost (`limit × qty / PRICE_SCALE`), debited
+    /// from the owner's ledger balance at registration — scale-6
+    /// quote units, released per fill at the limit price.
+    Quote(u64),
+    /// The full base quantity moved out of the owner's free base
+    /// custody at registration — scale-6 base units, consumed
+    /// qty-for-qty per fill.
+    Base(u64),
+}
+
+impl Reserved {
+    /// The side this escrow secures — buys escrow quote, sells
+    /// escrow base. `RegisteredOrder::side` delegates here, so the
+    /// denomination and the direction are one fact, not two fields
+    /// that could diverge.
+    const fn side(self) -> Side {
+        match self {
+            Self::Quote(_) => Side::Buy,
+            Self::Base(_) => Side::Sell,
+        }
+    }
+
+    /// The escrowed amount in the denomination's own units. The raw
+    /// `u64` is only meaningful to a caller that knows the
+    /// denomination — from `side()` or by matching the variant.
+    const fn get(self) -> u64 {
+        match self {
+            Self::Quote(v) | Self::Base(v) => v,
+        }
+    }
+}
+
+impl RegisteredOrder {
+    /// Buy or sell — derived from the escrow's denomination, so the
+    /// answer can never disagree with the units `reserved` holds.
+    const fn side(&self) -> Side {
+        self.reserved.side()
+    }
 }
 
 // ── Wire tags ────────────────────────────────────────────────────────
@@ -583,8 +633,10 @@ impl ExchangeModule {
             }
         }
         for o in inner.registered.values() {
-            if o.market == u16::from(market) && o.side == Side::Buy {
-                total = total.saturating_add(o.reserved);
+            if o.market == u16::from(market)
+                && let Reserved::Quote(q) = o.reserved
+            {
+                total = total.saturating_add(q);
             }
         }
         total
@@ -604,8 +656,11 @@ impl ExchangeModule {
         framework::lock_state(&self.inner)
             .registered
             .values()
-            .filter(|o| o.market == u16::from(market) && o.side == Side::Sell)
-            .fold(0u64, |acc, o| acc.saturating_add(o.reserved))
+            .filter(|o| o.market == u16::from(market))
+            .fold(0u64, |acc, o| match o.reserved {
+                Reserved::Base(q) => acc.saturating_add(q),
+                Reserved::Quote(_) => acc,
+            })
     }
 }
 

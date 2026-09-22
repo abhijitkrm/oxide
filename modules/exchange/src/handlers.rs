@@ -10,8 +10,8 @@
 use super::{
     Address, BTreeMap, CANCEL_REGISTERED_BODY_LEN, CUSTODY_BODY_LEN, Event, ExchangeModule,
     ExecError, FILL_ENTRY_LEN, Inner, MAX_BATCH_FILLS, MAX_REGISTERED_ORDERS, MarketConfig,
-    OrderKey, OrderType, PRICE_SCALE, REGISTER_BODY_LEN, RegisteredOrder, Side, TradingError,
-    TxContext,
+    OrderKey, OrderType, PRICE_SCALE, REGISTER_BODY_LEN, RegisteredOrder, Reserved, Side,
+    TradingError, TxContext,
 };
 use crate::codec::{
     cancel_event, decode_side, encode_side, fill_event, outcome_event, pair_event, removal_event,
@@ -424,7 +424,7 @@ impl ExchangeModule {
                         "register: insufficient balance for buy escrow".to_string(),
                     )
                 })?;
-                amount
+                Reserved::Quote(amount)
             }
             Side::Sell => {
                 // `u8` conversion cannot fail: the market-existence
@@ -441,14 +441,12 @@ impl ExchangeModule {
                     ));
                 }
                 *base_balances.get_mut(&key).ok_or(ExecError::Malformed)? -= qty;
-                qty
+                Reserved::Base(qty)
             }
         };
 
-        registered.insert(
-            key,
-            RegisteredOrder { market, side, limit_price: price, remaining: qty, reserved },
-        );
+        registered
+            .insert(key, RegisteredOrder { market, limit_price: price, remaining: qty, reserved });
         Ok(vec![Event {
             module: "exchange",
             kind: "order_registered",
@@ -487,10 +485,12 @@ impl ExchangeModule {
         let Some(order) = inner.registered.get(&key) else {
             return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
         };
-        let refund = order.reserved;
-        match order.side {
+        // The denomination carries the routing: quote escrow returns
+        // to the ledger, base escrow returns to free base custody.
+        let refund = order.reserved.get();
+        match order.reserved {
             // Buy escrow is ledger quote — refund to the ledger.
-            Side::Buy => {
+            Reserved::Quote(_) => {
                 if refund > 0 {
                     let ledger = self.ledger.as_ref().ok_or_else(|| {
                         ExecError::ModuleRejected("cancel requires ledger wiring".to_string())
@@ -504,7 +504,7 @@ impl ExchangeModule {
             // free base balance on the order's market, not the
             // ledger. `u8` conversion is safe: registration rejected
             // any market beyond the 256-slot engine space.
-            Side::Sell => {
+            Reserved::Base(_) => {
                 if refund > 0 {
                     let market = u8::try_from(order.market).map_err(|_| {
                         ExecError::ModuleRejected("cancel: market out of range".to_string())

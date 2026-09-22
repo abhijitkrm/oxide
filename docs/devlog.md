@@ -19130,3 +19130,30 @@ Still open in §9.B: wei vs native base units, quote units, ticks vs
 (exchange already separates `base_balances`/`base_holds`/`fee_vault`
 into distinct committed maps — the residual is typing
 `RegisteredOrder::reserved`'s side-denominated units).
+
+## Session N+15 — side-denominated escrow becomes a variant
+
+Second §9.B slice. `RegisteredOrder::reserved` was one `u64` that
+meant *quote units* for buys and *base qty* for sells — the field's
+doc said so, but nothing stopped a code path from reading the wrong
+denomination (or from constructing `side: Sell` with quote units).
+Now `Reserved::{Quote(u64), Base(u64)}` carries the denomination in
+the variant, and `RegisteredOrder::side` is *derived* from it — the
+escrow's unit and the direction it secures are one fact, not two
+fields that could diverge.
+
+The mechanical payoff: every site that used to `match order.side`
+and then interpret `reserved` now matches on `order.reserved`
+directly — cancel refunds route by variant (quote → ledger, base →
+custody), batch-settle consumption subtracts the right unit from
+the right variant, and the `completed` residue pipe carries the
+whole `Reserved` instead of a `(side, residue)` pair that could be
+assembled wrong. The conservation probes (`escrowed_quote`/
+`escrowed_base`) filter on the variant itself. Decode mints the
+variant from the side byte it just read, so stored bytes are
+byte-for-byte unchanged.
+
+67 exchange tests + full workspace green. Still open in §9.B: wei
+vs native base units, quote units, ticks vs `Price`, lots vs `Qty`
+— the custody-map `u64` values (`base_balances`/`base_holds`) are
+the exchange's remaining raw-unit surface.
