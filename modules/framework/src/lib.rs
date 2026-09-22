@@ -588,6 +588,229 @@ pub fn subtree_root_map(store: &StoreMap) -> Hash {
     Hasher::hash_one(Domain::Block, &data)
 }
 
+/// `*acc ^= leaf`, byte-wise. XOR is the fold operation for every
+/// [`CommittedMap`] root: adding a leaf and later removing the
+/// *same* leaf returns the accumulator to its prior value, which is
+/// what makes the root incrementally maintainable (the same
+/// construction `ExecutedNonces` uses in the executor).
+pub fn xor_fold(acc: &mut Hash, leaf: Hash) {
+    for (a, b) in acc.0.iter_mut().zip(leaf.0.iter()) {
+        *a ^= *b;
+    }
+}
+
+/// Hash one [`CommittedMap`] leaf: `H(CommittedLeaf ‖ map_tag_le ‖
+/// preimage)`. `map_tag` separates leaves of different committed
+/// maps so a (key, value) encoding can never alias across maps;
+/// `preimage` is the map's canonical (key ‖ value) encoding —
+/// hashing the leaf is what makes the fold a commitment to a *set
+/// of preimages* rather than to raw XOR-able bytes.
+#[must_use]
+pub fn committed_leaf(map_tag: u64, preimage: &[u8]) -> Hash {
+    use crypto::hash::{Domain, Hasher};
+    let mut h = Hasher::new(Domain::CommittedLeaf);
+    h.update(&map_tag.to_le_bytes());
+    h.update(preimage);
+    h.finalize()
+}
+
+/// A `BTreeMap` whose set-commitment root is maintained
+/// incrementally on every mutation — the generalization of the
+/// executor's `ExecutedNonces` pair to arbitrary committed module
+/// state (7.4).
+///
+/// `root` is `⊕ leaf(k, v)` over the map — an order-independent
+/// XOR-fold of domain-separated leaf hashes, where `leaf` is the
+/// per-map function supplied at construction (typically
+/// [`committed_leaf`] over a canonical key‖value encoding). Every
+/// mutation goes through [`Self::insert`]/[`Self::remove`], which
+/// fold out the old leaf and fold in the new one in O(1): a block
+/// that touches K records pays K leaf hashes, not a re-serialization
+/// of every record ever committed. `entry`, `get_mut`, and
+/// `iter_mut` are deliberately absent — a mutation the map cannot
+/// observe would desync the fold.
+///
+/// Strength note (same argument as the nonce commitment): the root
+/// is trusted only by comparison against a consensus-pinned value,
+/// so finding a different set with the same fold is a subset-XOR
+/// problem over 256-bit leaf hashes — ~2^128-class work.
+pub struct CommittedMap<K, V> {
+    map: BTreeMap<K, V>,
+    root: Hash,
+    leaf: fn(&K, &V) -> Hash,
+}
+
+impl<K: Ord, V> CommittedMap<K, V> {
+    /// An empty map with the identity fold (`Hash::ZERO`).
+    /// `leaf` computes each record's leaf hash — it must be
+    /// deterministic and domain-separated per map (see
+    /// [`committed_leaf`]).
+    #[must_use]
+    pub fn new(leaf: fn(&K, &V) -> Hash) -> Self {
+        Self { map: BTreeMap::new(), root: Hash::ZERO, leaf }
+    }
+
+    /// Wrap an existing map, folding every leaf once — O(n), the
+    /// cost paid at snapshot install where a full walk already
+    /// happens. The maintained root then equals
+    /// [`Self::recomputed_root`] by construction.
+    #[must_use]
+    pub fn from_map(map: BTreeMap<K, V>, leaf: fn(&K, &V) -> Hash) -> Self {
+        let mut root = Hash::ZERO;
+        for (k, v) in &map {
+            xor_fold(&mut root, leaf(k, v));
+        }
+        Self { map, root, leaf }
+    }
+
+    /// The maintained root — O(1).
+    #[must_use]
+    pub fn root(&self) -> Hash {
+        self.root
+    }
+
+    /// The authoritative root, recomputed from the map — O(n).
+    /// Tests and snapshot verification assert this equals
+    /// [`Self::root`]; a divergence means a mutation escaped the
+    /// fold (which the API makes impossible — so a divergence is a
+    /// bug, not a state).
+    #[must_use]
+    pub fn recomputed_root(&self) -> Hash {
+        let mut root = Hash::ZERO;
+        for (k, v) in &self.map {
+            xor_fold(&mut root, (self.leaf)(k, v));
+        }
+        root
+    }
+
+    /// Look up `k` — the read side of the committed map.
+    #[must_use]
+    pub fn get(&self, k: &K) -> Option<&V> {
+        self.map.get(k)
+    }
+
+    /// Whether `k` is present.
+    #[must_use]
+    pub fn contains_key(&self, k: &K) -> bool {
+        self.map.contains_key(k)
+    }
+
+    /// Insert `v` at `k`, folding out the replaced leaf (if any) and
+    /// folding in the new one. Returns the previous value.
+    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
+        if let Some(old) = self.map.get(&k) {
+            xor_fold(&mut self.root, (self.leaf)(&k, old));
+        }
+        xor_fold(&mut self.root, (self.leaf)(&k, &v));
+        self.map.insert(k, v)
+    }
+
+    /// Remove `k`, folding its leaf out. Returns the removed value.
+    pub fn remove(&mut self, k: &K) -> Option<V> {
+        let prev = self.map.remove(k)?;
+        xor_fold(&mut self.root, (self.leaf)(k, &prev));
+        Some(prev)
+    }
+
+    /// Number of committed records.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the map has no records.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Sorted iteration — the canonical serialization order
+    /// `commit_*` writers already rely on.
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, K, V> {
+        self.map.iter()
+    }
+
+    /// Read-only access to the raw map — serialization and read-only
+    /// probes. Mutation is impossible through `&BTreeMap`, so the
+    /// fold cannot desync.
+    #[must_use]
+    pub fn inner(&self) -> &BTreeMap<K, V> {
+        &self.map
+    }
+
+    /// Consume the wrapper — the decode/install path hands the plain
+    /// map back where a `StoreMap`-shaped value is expected.
+    #[must_use]
+    pub fn into_inner(self) -> BTreeMap<K, V> {
+        self.map
+    }
+
+    /// The fold of an entire borrowed map — the authoritative root
+    /// a staged (not yet installed) store or map produces without
+    /// constructing a wrapper. O(n); staging already walks the
+    /// records.
+    #[must_use]
+    pub fn fold_map(map: &BTreeMap<K, V>, leaf: fn(&K, &V) -> Hash) -> Hash {
+        let mut root = Hash::ZERO;
+        for (k, v) in map {
+            xor_fold(&mut root, leaf(k, v));
+        }
+        root
+    }
+}
+
+impl<'a, K: Ord, V> IntoIterator for &'a CommittedMap<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::collections::btree_map::Iter<'a, K, V>;
+
+    /// Delegates to [`CommittedMap::iter`] — canonical sorted order.
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+impl<K: Ord, V> Clone for CommittedMap<K, V>
+where
+    K: Clone,
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        Self { map: self.map.clone(), root: self.root, leaf: self.leaf }
+    }
+}
+
+impl<K: Ord + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for CommittedMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommittedMap")
+            .field("map", &self.map)
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The committed form of [`KVStore`] — the byte-keyed module
+/// subtree with its root maintained incrementally.
+///
+/// The leaf encoding deliberately mirrors [`subtree_root_map`]'s
+/// record shape (`key ‖ u64-le vlen ‖ value`) so the fold commits
+/// the same information the sequential subtree root does — under a
+/// different construction (XOR-fold of hashed leaves rather than
+/// one hash over the concatenation).
+pub type CommittedStore = CommittedMap<Vec<u8>, Vec<u8>>;
+
+/// The [`CommittedStore`] leaf function: `committed_leaf(map_tag,
+/// key ‖ u64-le vlen ‖ value)` — the same record preimage shape
+/// [`subtree_root_map`] folds sequentially. `map_tag` is the
+/// module-chosen per-store salt.
+#[must_use]
+pub fn committed_store_leaf(map_tag: u64, k: &[u8], v: &[u8]) -> Hash {
+    let mut preimage = Vec::with_capacity(k.len() + v.len() + 8);
+    preimage.extend_from_slice(k);
+    preimage.extend_from_slice(&(v.len() as u64).to_le_bytes());
+    preimage.extend_from_slice(v);
+    committed_leaf(map_tag, &preimage)
+}
+
 /// Canonical module-state serializer for state roots (C8).
 ///
 /// A module's [`Module::state_root`] must commit **every field that
@@ -870,27 +1093,26 @@ pub fn state_blob_key() -> Hash {
 /// Pack committed state into a module's single snapshot value:
 /// `u64(canon_len) ‖ canon ‖ store`.
 ///
-/// `canon` is the module's [`CanonicalState`] preimage — the bytes
-/// `state_root` hashes — and `store` serializes the module's KV
-/// subtree as `u64(count) ‖ (u64 klen ‖ key ‖ u64 vlen ‖ val)*` in
-/// `BTreeMap` (sorted) key order. The two sections stay separate
-/// because `canon` commits `subtree_root(store)` — a 32-byte digest,
-/// not the entries — so `canon_root(canon)` still equals the
-/// module's `state_root` while the blob carries enough information
-/// to rebuild the store on a peer.
+/// `canon` is the module's [`CanonicalState`] install payload — the
+/// same bytes `write_committed` emits — and `store` serializes the
+/// module's KV subtree as `u64(count) ‖ (u64 klen ‖ key ‖ u64 vlen
+/// ‖ val)*` in `BTreeMap` (sorted) key order. The two sections stay
+/// separate because `canon` commits the store's subtree root — a
+/// 32-byte digest, not the entries — so the blob carries enough
+/// information to rebuild the store on a peer while `canon` stays
+/// the authoritative field set.
 ///
-/// # Panics
-///
-/// Panics if the `KVStore` mutex is poisoned.
+/// The store arrives already locked so both `KVStore` and
+/// [`CommittedStore`] callers pass their map (`lock_state(...)` →
+/// `&BTreeMap` / `.inner()`).
 #[must_use]
-pub fn encode_state_blob(canon: &[u8], store: &KVStore) -> Vec<u8> {
-    let locked = lock_state(store);
+pub fn encode_state_blob(canon: &[u8], store: &StoreMap) -> Vec<u8> {
     #[allow(clippy::cast_possible_truncation)]
-    let mut out = Vec::with_capacity(8 + canon.len() + 8 + locked.len() * 16);
+    let mut out = Vec::with_capacity(8 + canon.len() + 8 + store.len() * 16);
     out.extend_from_slice(&(canon.len() as u64).to_le_bytes());
     out.extend_from_slice(canon);
-    out.extend_from_slice(&(locked.len() as u64).to_le_bytes());
-    for (k, v) in locked.iter() {
+    out.extend_from_slice(&(store.len() as u64).to_le_bytes());
+    for (k, v) in store {
         out.extend_from_slice(&(k.len() as u64).to_le_bytes());
         out.extend_from_slice(k);
         out.extend_from_slice(&(v.len() as u64).to_le_bytes());
@@ -1116,7 +1338,7 @@ mod tests {
         let canon = w.as_bytes().to_vec();
         let claimed = w.root();
 
-        let blob = encode_state_blob(&canon, &store);
+        let blob = encode_state_blob(&canon, &lock_state(&store));
         let snapshot = storage::Snapshot { height: 0, entries: vec![(state_blob_key(), blob)] };
 
         let (canon_back, fields, store_back) = stage_blob_snapshot(&snapshot, |r, _store| {
@@ -1142,7 +1364,7 @@ mod tests {
         let mut w = CanonicalState::new();
         w.put_root(&subtree_root(&store));
         let canon = w.as_bytes().to_vec();
-        let blob = encode_state_blob(&canon, &store);
+        let blob = encode_state_blob(&canon, &lock_state(&store));
 
         let key = state_blob_key();
         let ok = |entries: Vec<(Hash, Vec<u8>)>| storage::Snapshot { height: 0, entries };
@@ -1168,7 +1390,7 @@ mod tests {
         // Store content that doesn't match the committed subtree root:
         // rebuild a blob whose store section holds an extra entry.
         let tampered_store: KVStore = Mutex::new(BTreeMap::from([(b"x".to_vec(), vec![1])]));
-        let bad = encode_state_blob(&canon, &tampered_store);
+        let bad = encode_state_blob(&canon, &lock_state(&tampered_store));
         assert!(
             stage_blob_snapshot(&ok(vec![(key, bad)]), |_, _| Some(())).is_err(),
             "store disagreeing with the committed subtree root must be rejected"
@@ -1179,7 +1401,7 @@ mod tests {
         let mut w2 = CanonicalState::new();
         w2.put_root(&subtree_root(&store));
         w2.put_u8(0xEE); // stray trailing field the parse won't read
-        let stray = encode_state_blob(w2.as_bytes(), &store);
+        let stray = encode_state_blob(w2.as_bytes(), &lock_state(&store));
         assert!(
             stage_blob_snapshot(&ok(vec![(key, stray)]), |_, _| Some(())).is_err(),
             "trailing canonical bytes are malformed"

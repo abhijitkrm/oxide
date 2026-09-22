@@ -57,7 +57,7 @@ impl StakingModule {
                     "claim_reward: no rewards to claim".to_string(),
                 ));
             }
-            *pending.entry(validator).or_insert(0) -= claim_amount;
+            pending.insert(validator, accumulated - claim_amount);
             claim_amount
         };
 
@@ -102,9 +102,9 @@ impl StakingModule {
     ) {
         let rpt = *framework::lock_state(&self.reward_per_token).get(&validator).unwrap_or(&0);
         let mut debts = framework::lock_state(&self.reward_debt);
-        let debt = debts.entry((delegator, validator)).or_insert(0);
-        if rpt > *debt && delegation > 0 {
-            let accrued = u128::from(delegation).saturating_mul(rpt - *debt) / RPT_SCALE;
+        let debt = debts.get(&(delegator, validator)).copied().unwrap_or(0);
+        if rpt > debt && delegation > 0 {
+            let accrued = u128::from(delegation).saturating_mul(rpt - debt) / RPT_SCALE;
             if accrued > 0 {
                 let mut pending = framework::lock_state(&self.pending_rewards);
                 let current = pending.get(&delegator).copied().unwrap_or(0);
@@ -114,7 +114,7 @@ impl StakingModule {
                 );
             }
         }
-        *debt = rpt;
+        debts.insert((delegator, validator), rpt);
     }
 
     /// Settle a validator's self-share position into

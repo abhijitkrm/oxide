@@ -1814,7 +1814,7 @@ fn pre_custody_sell_orders_cannot_settle() {
         height: 0,
         entries: vec![(
             framework::state_blob_key(),
-            framework::encode_state_blob(w.as_bytes(), &kv),
+            framework::encode_state_blob(w.as_bytes(), &framework::lock_state(&kv)),
         )],
     };
 

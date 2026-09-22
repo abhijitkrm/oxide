@@ -243,7 +243,7 @@ impl Module for PerpsModule {
             height: 0,
             entries: vec![(
                 framework::state_blob_key(),
-                framework::encode_state_blob(w.as_bytes(), &self.store),
+                framework::encode_state_blob(w.as_bytes(), &framework::lock_state(&self.store)),
             )],
         })
     }

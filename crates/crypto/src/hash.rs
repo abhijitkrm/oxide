@@ -134,6 +134,15 @@ pub enum Domain {
     /// so leaf bytes must never collide with any other domain's
     /// preimage. Appended after `Ed25519Owner` — never renumber.
     ExecutedNonceLeaf = 17,
+    /// One leaf of a [`framework::CommittedMap`] set commitment:
+    /// `H(tag ‖ map_tag_le ‖ key_bytes ‖ value_bytes)`. The map's
+    /// root is the XOR-fold of these leaves — an incrementally
+    /// updatable set commitment over canonical (key, value) encodings.
+    /// The `map_tag` inside the preimage separates leaves of
+    /// different committed maps so a (key, value) pair can never
+    /// alias across maps even when their encodings coincide.
+    /// Appended after `ExecutedNonceLeaf` — never renumber.
+    CommittedLeaf = 18,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

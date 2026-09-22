@@ -116,6 +116,26 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     denomination error is a compile failure, not a mis-gridded
     book discovered after trades execute.
 
+- **Staking state root is incremental** (`framework`, `staking`):
+  delegator-scale committed maps (`delegations`, `pending_rewards`,
+  `reward_debt`, `delegator_index`, `delegated_total`, the KV
+  store) are now `CommittedMap`s that maintain an XOR-folded root
+  per mutation instead of re-serializing every record into the
+  canonical preimage per block. `state_root` reads the maintained
+  folds through a schema shared with `inspect_state`, snapshot
+  blobs are byte-identical to before, and imported state rebuilds
+  the folds from staged maps. Measured block cost with a grown
+  delegation history: ~1.25/3.9/31.3 ms at 1k/10k/100k records —
+  48–84% cheaper, with the residual now the EVM trie's population
+  walk rather than staking. The root preimage is a new
+  construction: identical state produces a different (agreed)
+  digest than the old flat serialization hash.
+  - **In plain words:** the chain used to re-hash every
+    delegation ever made on every block — with a large staking
+    history that alone cost ~193 ms per block. Now each map keeps
+    a running hash of its own contents, so the same block costs
+    ~31 ms — and none of the remaining cost is staking's.
+
 ### Added
 
 - **Contention and interference benchmarks** (`crates/matcher`,

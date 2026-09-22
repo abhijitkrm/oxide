@@ -88,7 +88,7 @@ impl StakingModule {
                 Self::self_share_of(stake_before, totals.get(&validator).copied().unwrap_or(0));
             drop(totals);
             self.settle_self_share(validator, self_share);
-            for ((d, v), a) in delegations.range(..).filter(|((_, v), _)| *v == validator) {
+            for ((d, v), a) in delegations.iter().filter(|((_, v), _)| *v == validator) {
                 self.settle_delegation(*d, *v, *a);
             }
         }
@@ -101,7 +101,7 @@ impl StakingModule {
             // floor-share each delegation, then hand out the remainder
             // one unit at a time in BTreeMap (sorted) order.
             let mut affected: Vec<(Address, u64)> = delegations
-                .range(..)
+                .iter()
                 .filter(|((_, v), _)| *v == validator)
                 .map(|((d, _), a)| (*d, *a))
                 .collect();
@@ -131,16 +131,21 @@ impl StakingModule {
             for (d, a) in affected {
                 if a == 0 {
                     delegations.remove(&(d, validator));
-                    framework::lock_state(&self.delegator_index)
-                        .get_mut(&d)
-                        .map(|set| set.remove(&validator));
+                    let mut index = framework::lock_state(&self.delegator_index);
+                    if let Some(mut set) = index.get(&d).cloned() {
+                        set.remove(&validator);
+                        index.insert(d, set);
+                    }
                 } else {
                     delegations.insert((d, validator), a);
                 }
                 self.store_delegation_state(validator, d, new_stake, a);
             }
-            if let Some(t) = framework::lock_state(&self.delegated_total).get_mut(&validator) {
-                *t = t.saturating_sub(applied);
+            {
+                let mut totals = framework::lock_state(&self.delegated_total);
+                if let Some(t) = totals.get(&validator).copied() {
+                    totals.insert(validator, t.saturating_sub(applied));
+                }
             }
             burned_from_pool = applied;
         }

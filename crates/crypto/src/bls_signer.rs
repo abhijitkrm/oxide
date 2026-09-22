@@ -69,6 +69,8 @@ fn dst(domain: Domain) -> &'static [u8] {
         // Never signed either — nonce-leaf hashes are BLAKE3, not
         // BLS. Present for exhaustiveness.
         Domain::ExecutedNonceLeaf => b"oxide/executed-nonce-leaf",
+        // Same — committed-map leaves are BLAKE3, never a BLS DST.
+        Domain::CommittedLeaf => b"oxide/committed-leaf",
     }
 }
 

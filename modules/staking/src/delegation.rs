@@ -121,23 +121,29 @@ impl StakingModule {
             let self_share =
                 Self::self_share_of(stake_now, totals.get(&validator).copied().unwrap_or(0));
             self.settle_self_share(validator, self_share);
-            *totals.entry(validator).or_insert(0) += amount;
+            let total = totals.get(&validator).copied().unwrap_or(0);
+            totals.insert(validator, total + amount);
         }
-        framework::lock_state(&self.delegator_index)
-            .entry(delegator)
-            .or_default()
-            .insert(validator);
+        {
+            let mut index = framework::lock_state(&self.delegator_index);
+            let mut set = index.get(&delegator).cloned().unwrap_or_default();
+            set.insert(validator);
+            index.insert(delegator, set);
+        }
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("delegate: validator vanished".to_string()))?;
         *stake = stake
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("stake overflow".to_string()))?;
-        let delegation = delegations.entry((delegator, validator)).or_insert(0);
-        *delegation = delegation
+        let delegation = delegations
+            .get(&(delegator, validator))
+            .copied()
+            .unwrap_or(0)
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("delegation overflow".to_string()))?;
-        self.store_delegation_state(validator, delegator, *stake, *delegation);
+        delegations.insert((delegator, validator), delegation);
+        self.store_delegation_state(validator, delegator, *stake, delegation);
         Ok(())
     }
 
@@ -163,23 +169,30 @@ impl StakingModule {
         let mut validators = framework::lock_state(&self.validators);
         let mut delegations = framework::lock_state(&self.delegations);
         let delegation = delegations
-            .get_mut(&(delegator, validator))
+            .get(&(delegator, validator))
+            .copied()
             .ok_or(ExecError::ModuleRejected("undo_delegate: no delegation".to_string()))?;
-        if *delegation < amount {
+        if delegation < amount {
             return Err(ExecError::ModuleRejected(
                 "undo_delegate: delegation smaller than undo amount".to_string(),
             ));
         }
-        *delegation -= amount;
-        let new_delegation = *delegation;
+        let new_delegation = delegation - amount;
         if new_delegation == 0 {
             delegations.remove(&(delegator, validator));
-            framework::lock_state(&self.delegator_index)
-                .get_mut(&delegator)
-                .map(|set| set.remove(&validator));
+            let mut index = framework::lock_state(&self.delegator_index);
+            if let Some(mut set) = index.get(&delegator).cloned() {
+                set.remove(&validator);
+                index.insert(delegator, set);
+            }
+        } else {
+            delegations.insert((delegator, validator), new_delegation);
         }
-        if let Some(t) = framework::lock_state(&self.delegated_total).get_mut(&validator) {
-            *t = t.saturating_sub(amount);
+        {
+            let mut totals = framework::lock_state(&self.delegated_total);
+            if let Some(t) = totals.get(&validator).copied() {
+                totals.insert(validator, t.saturating_sub(amount));
+            }
         }
         let stake = validators
             .get_mut(&validator)
@@ -208,12 +221,12 @@ impl StakingModule {
     ) -> Result<u64, ExecError> {
         let mut validators = framework::lock_state(&self.validators);
         let mut delegations = framework::lock_state(&self.delegations);
-        let delegation = delegations.get_mut(&(delegator, validator)).ok_or_else(|| {
+        let delegation = delegations.get(&(delegator, validator)).copied().ok_or_else(|| {
             ExecError::ModuleRejected(
                 "undelegate: no delegation from this sender to this validator".to_string(),
             )
         })?;
-        if *delegation < amount {
+        if delegation < amount {
             return Err(ExecError::ModuleRejected(
                 "undelegate: insufficient delegation".to_string(),
             ));
@@ -221,7 +234,7 @@ impl StakingModule {
         // Settle on the pre-mutation amounts: the full delegation
         // earned rewards up to now; the validator's self-share grows
         // as `delegated_total` shrinks.
-        let old_delegation = *delegation;
+        let old_delegation = delegation;
         self.settle_delegation(delegator, validator, old_delegation);
         {
             let mut totals = framework::lock_state(&self.delegated_total);
@@ -229,17 +242,20 @@ impl StakingModule {
             let self_share =
                 Self::self_share_of(stake_now, totals.get(&validator).copied().unwrap_or(0));
             self.settle_self_share(validator, self_share);
-            if let Some(t) = totals.get_mut(&validator) {
-                *t = t.saturating_sub(amount);
+            if let Some(t) = totals.get(&validator).copied() {
+                totals.insert(validator, t.saturating_sub(amount));
             }
         }
-        *delegation -= amount;
-        let new_delegation = *delegation;
+        let new_delegation = delegation - amount;
         if new_delegation == 0 {
             delegations.remove(&(delegator, validator));
-            framework::lock_state(&self.delegator_index)
-                .get_mut(&delegator)
-                .map(|set| set.remove(&validator));
+            let mut index = framework::lock_state(&self.delegator_index);
+            if let Some(mut set) = index.get(&delegator).cloned() {
+                set.remove(&validator);
+                index.insert(delegator, set);
+            }
+        } else {
+            delegations.insert((delegator, validator), new_delegation);
         }
         let stake = validators
             .get_mut(&validator)
@@ -296,16 +312,25 @@ impl StakingModule {
         *stake = stake
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("stake overflow on undo".to_string()))?;
-        let delegation = delegations.entry((delegator, validator)).or_insert(0);
-        *delegation = delegation
+        let delegation = delegations
+            .get(&(delegator, validator))
+            .copied()
+            .unwrap_or(0)
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("delegation overflow on undo".to_string()))?;
-        *framework::lock_state(&self.delegated_total).entry(validator).or_insert(0) += amount;
-        framework::lock_state(&self.delegator_index)
-            .entry(delegator)
-            .or_default()
-            .insert(validator);
-        self.store_delegation_state(validator, delegator, *stake, *delegation);
+        delegations.insert((delegator, validator), delegation);
+        {
+            let mut totals = framework::lock_state(&self.delegated_total);
+            let total = totals.get(&validator).copied().unwrap_or(0);
+            totals.insert(validator, total + amount);
+        }
+        {
+            let mut index = framework::lock_state(&self.delegator_index);
+            let mut set = index.get(&delegator).cloned().unwrap_or_default();
+            set.insert(validator);
+            index.insert(delegator, set);
+        }
+        self.store_delegation_state(validator, delegator, *stake, delegation);
         Ok(())
     }
 

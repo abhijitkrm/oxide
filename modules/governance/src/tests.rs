@@ -405,7 +405,7 @@ fn pre_upgrade_blob_decodes_and_finalizes() {
     w.put_u64(0); // no_votes
     w.put_bool(false); // finalized
     w.put_bool(false); // passed
-    let blob = framework::encode_state_blob(w.as_bytes(), &Mutex::new(store_map));
+    let blob = framework::encode_state_blob(w.as_bytes(), &store_map);
     let snapshot =
         storage::Snapshot { height: 0, entries: vec![(framework::state_blob_key(), blob)] };
 

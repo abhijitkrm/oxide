@@ -19270,3 +19270,49 @@ The wei↔native seam turned out to already be the right shape:
 exactly two seams with `WEI_PER_UNIT` as the single constant, and
 exchange "quote units" literally are `framework::Balances` native
 units — same denomination, nothing to confuse. §9.B is closed.
+
+§7.4's open piece: every module `state_root` was a full-state walk
+— staking serialized all six delegator-scale maps (plus the KV
+store) into a canonical buffer per block, ~1.6 µs/record, ~193 ms
+of a 100k-delegation history's block. The `ExecutedNonces` XOR-fold
+was the proven in-tree incremental pattern; this generalizes it.
+
+`framework::CommittedMap<K, V>` wraps a `BTreeMap` with a maintained
+XOR-fold `root`: `insert`/`remove` fold the domain-separated
+`committed_leaf(map_tag, preimage)` of the affected record in or out,
+so the root is always the fold of exactly the live map — proven by a
+per-map `recomputed_root()` and a staking test asserting lockstep
+after real handler mutations. `CommittedStore` does the same for the
+KV store via `committed_store_leaf`. `fold_map` recomputes the fold
+over a plain staged `BTreeMap` — that's what keeps `inspect_state`
+able to verify a peer-served root before install.
+
+The staking migration was the real work: `entry`/`get_mut`/`range`
+would have bypassed the fold, so ~30 mutation sites in delegation,
+rewards, and slashing were rewritten to get+insert/remove through
+the fold-safe API (the types make a bypassing mutation
+unrepresentable — `CommittedMap` exposes no `entry` or `get_mut`).
+`RootView`/`write_root_preimage` in `commit.rs` defines the root
+schema once: `state_root` feeds it maintained fold roots,
+`inspect_state` feeds it `fold_map` results over the staged maps —
+same bytes, one schema, no drift. `export_state`'s blob format is
+unchanged: the canon payload is still `write_committed`'s full
+serialization, so snapshots decode identically and the
+`subtree_root_map` store-consistency check inside the blob still
+verifies. The incremental preimage is a NEW root construction —
+identical state produces a different (correct, agreed) digest than
+the old flat hash; pre-release, no compat shim.
+
+Measured `state_scaling/delegated_history` after the change:
+1.25/3.9/31.3 ms at 1k/10k/100k delegations — −48%/−67%/−84% vs
+2.5/11/193 ms, ~6× at the largest. The residual linear term is the
+EVM trie's O(population) assembly, not staking: the staking walk is
+gone. One subtlety found by the test suite, not the compiler: two
+`lock_state` calls on the same map inside one expression deadlock —
+`MutexGuard` temporaries live to end of statement. The test binds
+guards to locals; worth remembering wherever `lock_state` appears
+twice in one call's arguments.
+
+Still open for 7.4: exchange book root, perps positions, EVM
+account trie — `CommittedMap` is the migration; staking is the
+template.

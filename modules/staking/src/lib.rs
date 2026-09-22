@@ -65,7 +65,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use executor::{Event, ExecError, Module, TxContext};
-use framework::{Balances, module_id, subtree_root};
+use framework::{Balances, module_id};
 use primitives::{Address, Hash, Height};
 
 /// Message type byte for staking messages.
@@ -265,10 +265,11 @@ const RPT_SCALE: u128 = 1_000_000_000_000_000_000;
 
 /// The staking module: delegation, unbonding, slashing, rewards.
 pub struct StakingModule {
-    /// The KV store for state root computation.
-    /// `KVStore` is `Mutex<BTreeMap<Vec<u8>, Vec<u8>>>` — already
-    /// thread-safe, no extra `Mutex` needed.
-    store: framework::KVStore,
+    /// The KV store for state root computation, with its
+    /// set-commitment root maintained incrementally (7.4): every
+    /// `insert`/`remove` folds the record's leaf hash in O(1) instead
+    /// of `subtree_root` re-walking every entry per block.
+    store: Mutex<framework::CommittedStore>,
     /// Validator stakes, keyed by address.
     validators: Mutex<BTreeMap<Address, u64>>,
     /// Live delegations: `(delegator, validator) → bonded amount`.
@@ -280,7 +281,7 @@ pub struct StakingModule {
     /// unbacked stake inflation (any tx could grow any validator's
     /// stake for free) and `undelegate` let any account unbond any
     /// validator's stake.
-    delegations: Mutex<BTreeMap<(Address, Address), u64>>,
+    delegations: Mutex<framework::CommittedMap<(Address, Address), u64>>,
     /// The balance ledger used for bond/unbond settlement — the
     /// EVM account store behind `framework::Balances`. `None` in
     /// bare unit tests only — `delegate`/`unbond_immediate` fail
@@ -300,7 +301,7 @@ pub struct StakingModule {
     /// delegators alike). Lazy accrual lives in
     /// `reward_per_token`/`reward_debt`; this map is only topped up
     /// when a position settles (delegation mutation or claim).
-    pending_rewards: Mutex<BTreeMap<Address, u64>>,
+    pending_rewards: Mutex<framework::CommittedMap<Address, u64>>,
     /// Cumulative reward units per bonded stake unit per validator,
     /// scaled by [`RPT_SCALE`] — the "reward-per-token" accumulator.
     /// `end_block` grows it by `block_reward_v × SCALE / stake_v`.
@@ -308,7 +309,7 @@ pub struct StakingModule {
     /// The `reward_per_token` value at which each delegation last
     /// settled — `(delegator, validator) → debt`. Pending reward =
     /// `delegation × (rpt − debt) / SCALE`.
-    reward_debt: Mutex<BTreeMap<(Address, Address), u128>>,
+    reward_debt: Mutex<framework::CommittedMap<(Address, Address), u128>>,
     /// The `reward_per_token` value at which each validator's
     /// *self-share* last settled. A validator's reward splits two
     /// ways: delegations accrue through `reward_debt`, and the
@@ -319,11 +320,11 @@ pub struct StakingModule {
     /// Delegator → validators index: which validators each account
     /// delegates to, so `claim_reward` can settle all of a sender's
     /// positions without scanning the full delegation map.
-    delegator_index: Mutex<BTreeMap<Address, std::collections::BTreeSet<Address>>>,
+    delegator_index: Mutex<framework::CommittedMap<Address, std::collections::BTreeSet<Address>>>,
     /// Sum of live delegations per validator — `stake −
     /// delegated_total` is the validator's self-share that accrues
     /// through `self_debt`.
-    delegated_total: Mutex<BTreeMap<Address, u64>>,
+    delegated_total: Mutex<framework::CommittedMap<Address, u64>>,
     /// Pending BLS key changes per validator address. The new key
     /// takes effect at the next epoch rotation — the consensus
     /// engine reads these via `take_key_changes` at the epoch
@@ -418,6 +419,77 @@ pub struct StakingModule {
     current_height: Mutex<u64>,
 }
 
+/// Per-map salts inside [`Domain::CommittedLeaf`](crypto::hash::Domain)
+/// preimages — the separation that keeps a (key, value) encoding from
+/// aliasing across committed maps. Module-local constants; distinct
+/// numbers are the only requirement, and they are append-only (a new
+/// committed map takes the next value; an existing tag never changes —
+/// the leaf hash is part of the state-root preimage).
+const MAP_TAG_STORE: u64 = 1;
+const MAP_TAG_DELEGATIONS: u64 = 2;
+const MAP_TAG_REWARD_DEBT: u64 = 3;
+const MAP_TAG_DELEGATOR_INDEX: u64 = 4;
+const MAP_TAG_DELEGATED_TOTAL: u64 = 5;
+const MAP_TAG_PENDING_REWARDS: u64 = 6;
+
+/// The committed KV-subtree leaf: `key ‖ u64-le vlen ‖ value` — the
+/// same record shape `subtree_root_map` folds sequentially, so the
+/// fold commits the same information under an incremental
+/// construction.
+// The `fn(&K, &V) -> Hash` signature is fixed by `CommittedMap`'s
+// leaf slot — borrowing `Vec<u8>`/`u64` is the uniform shape, not a
+// style choice.
+#[allow(clippy::ptr_arg)]
+fn store_leaf(k: &Vec<u8>, v: &Vec<u8>) -> Hash {
+    framework::committed_store_leaf(MAP_TAG_STORE, k, v)
+}
+
+/// `(delegator ‖ validator ‖ amount_le)` — the same field order
+/// `commit_stake_state` writes into the canonical stream.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn delegations_leaf(k: &(Address, Address), v: &u64) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(&k.0).put_addr(&k.1).put_u64(*v);
+    framework::committed_leaf(MAP_TAG_DELEGATIONS, w.as_bytes())
+}
+
+/// `(delegator ‖ validator ‖ u128 debt_le)` — mirrors
+/// `commit_reward_state`'s `reward_debt` record.
+fn reward_debt_leaf(k: &(Address, Address), v: &u128) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(&k.0).put_addr(&k.1).put_u128(*v);
+    framework::committed_leaf(MAP_TAG_REWARD_DEBT, w.as_bytes())
+}
+
+/// `(delegator ‖ count ‖ sorted validator addrs)` — mirrors the
+/// `delegator_index` record: the value is the whole validator set,
+/// so a membership change re-encodes that one set (bounded by a
+/// delegator's validator count, not the map's).
+fn delegator_index_leaf(k: &Address, v: &std::collections::BTreeSet<Address>) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(k).put_count(v.len());
+    for validator in v {
+        w.put_addr(validator);
+    }
+    framework::committed_leaf(MAP_TAG_DELEGATOR_INDEX, w.as_bytes())
+}
+
+/// `(validator ‖ total_le)` — mirrors `delegated_total`'s record.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn delegated_total_leaf(k: &Address, v: &u64) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(k).put_u64(*v);
+    framework::committed_leaf(MAP_TAG_DELEGATED_TOTAL, w.as_bytes())
+}
+
+/// `(account ‖ reward_le)` — mirrors `pending_rewards`' record.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn pending_rewards_leaf(k: &Address, v: &u64) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(k).put_u64(*v);
+    framework::committed_leaf(MAP_TAG_PENDING_REWARDS, w.as_bytes())
+}
+
 mod commit;
 mod delegation;
 mod rewards;
@@ -429,17 +501,17 @@ impl StakingModule {
     /// default parameters.
     pub fn new() -> Self {
         Self {
-            store: Mutex::new(BTreeMap::new()),
+            store: Mutex::new(framework::CommittedStore::new(store_leaf)),
             validators: Mutex::new(BTreeMap::new()),
-            delegations: Mutex::new(BTreeMap::new()),
+            delegations: Mutex::new(framework::CommittedMap::new(delegations_leaf)),
             ledger: Mutex::new(None),
             unbonding: Mutex::new(Vec::new()),
-            pending_rewards: Mutex::new(BTreeMap::new()),
+            pending_rewards: Mutex::new(framework::CommittedMap::new(pending_rewards_leaf)),
             reward_per_token: Mutex::new(BTreeMap::new()),
-            reward_debt: Mutex::new(BTreeMap::new()),
+            reward_debt: Mutex::new(framework::CommittedMap::new(reward_debt_leaf)),
             self_debt: Mutex::new(BTreeMap::new()),
-            delegator_index: Mutex::new(BTreeMap::new()),
-            delegated_total: Mutex::new(BTreeMap::new()),
+            delegator_index: Mutex::new(framework::CommittedMap::new(delegator_index_leaf)),
+            delegated_total: Mutex::new(framework::CommittedMap::new(delegated_total_leaf)),
             pending_key_changes: Mutex::new(BTreeMap::new()),
             pending_validator_adds: Mutex::new(Vec::new()),
             pending_validator_removes: Mutex::new(Vec::new()),
@@ -1248,28 +1320,76 @@ impl Module for StakingModule {
     }
 
     fn state_root(&self) -> Hash {
-        // C8: commit EVERY field that can affect future execution.
-        // The KV store mirrors only stake/delegation pairs — the
-        // unbonding queue, reward accumulators, pending validator
-        // changes, jails, attendance rings, and the scheduled halt
-        // all decide future consensus set membership and payouts,
-        // so identical roots across validators must prove identical
-        // staking state. Field order is fixed and consensus-
-        // critical (struct-declaration order).
+        // C8: commit EVERY field that can affect future execution —
+        // via the incremental root preimage (7.4): delegator-scale
+        // maps contribute their maintained fold root, so a block
+        // costs O(validator-scale state) rather than re-serializing
+        // every delegation record ever written. The serialized
+        // sections are byte-identical to `write_committed`'s, and
+        // `write_root_preimage` is its schema pair — a field added
+        // there must land here too.
         //
         // Excluded: `ledger` (assembly wiring), `unbonding_period` /
         // `block_reward` (construction config, never tx-mutated).
-        // Locks are taken one at a time and released before the
-        // next — no lock-order interaction with handlers.
+        // Guards are all taken before the view is built — consistent
+        // lock order with handlers (each field locked once).
+        let store = framework::lock_state(&self.store);
+        let validators = framework::lock_state(&self.validators);
+        let delegations = framework::lock_state(&self.delegations);
+        let unbonding = framework::lock_state(&self.unbonding);
+        let pending_rewards = framework::lock_state(&self.pending_rewards);
+        let reward_per_token = framework::lock_state(&self.reward_per_token);
+        let reward_debt = framework::lock_state(&self.reward_debt);
+        let self_debt = framework::lock_state(&self.self_debt);
+        let delegator_index = framework::lock_state(&self.delegator_index);
+        let delegated_total = framework::lock_state(&self.delegated_total);
+        let pending_key_changes = framework::lock_state(&self.pending_key_changes);
+        let pending_validator_adds = framework::lock_state(&self.pending_validator_adds);
+        let pending_validator_removes = framework::lock_state(&self.pending_validator_removes);
+        let bls_keys = framework::lock_state(&self.bls_keys);
+        let retired_bls_keys = framework::lock_state(&self.retired_bls_keys);
+        let jailed = framework::lock_state(&self.jailed);
+        let pending_jails = framework::lock_state(&self.pending_jails);
+        let pending_unjails = framework::lock_state(&self.pending_unjails);
+        let scheduled_halt = framework::lock_state(&self.scheduled_halt);
+        let seen_evidence = framework::lock_state(&self.seen_evidence);
+        let attendance = framework::lock_state(&self.attendance);
+        let current_height = framework::lock_state(&self.current_height);
+        let view = commit::RootView {
+            store_fold: store.root(),
+            validators: &validators,
+            delegations_fold: delegations.root(),
+            unbonding: &unbonding,
+            pending_rewards_fold: pending_rewards.root(),
+            reward_per_token: &reward_per_token,
+            reward_debt_fold: reward_debt.root(),
+            self_debt: &self_debt,
+            delegator_index_fold: delegator_index.root(),
+            delegated_total_fold: delegated_total.root(),
+            pending_key_changes: &pending_key_changes,
+            pending_validator_adds: &pending_validator_adds,
+            pending_validator_removes: &pending_validator_removes,
+            endorsements: &self.endorsements,
+            bls_keys: &bls_keys,
+            retired_bls_keys: &retired_bls_keys,
+            jailed: &jailed,
+            pending_jails: &pending_jails,
+            pending_unjails: &pending_unjails,
+            scheduled_halt: *scheduled_halt,
+            seen_evidence: &seen_evidence,
+            attendance: &attendance,
+            current_height: *current_height,
+        };
         let mut w = framework::CanonicalState::new();
-        self.write_committed(&mut w);
+        commit::write_root_preimage(&view, &mut w);
         w.root()
     }
 
     /// Export the committed state as one canonical blob —
-    /// `canon ‖ store`. The canon section is the `state_root`
-    /// preimage, so a peer can verify the claimed root before
-    /// installing anything (audit 3.2).
+    /// `canon ‖ store`. The canon section is the snapshot's install
+    /// payload (the `write_committed` bytes); a peer verifies the
+    /// claimed root by decoding it and recomputing the incremental
+    /// root over the staged state (`inspect_state`).
     fn export_state(&self) -> Option<storage::Snapshot> {
         let mut w = framework::CanonicalState::new();
         self.write_committed(&mut w);
@@ -1277,7 +1397,10 @@ impl Module for StakingModule {
             height: 0,
             entries: vec![(
                 framework::state_blob_key(),
-                framework::encode_state_blob(w.as_bytes(), &self.store),
+                framework::encode_state_blob(
+                    w.as_bytes(),
+                    framework::lock_state(&self.store).inner(),
+                ),
             )],
         })
     }
@@ -1285,13 +1408,58 @@ impl Module for StakingModule {
     /// Verify a staged snapshot's claimed root without mutating:
     /// decode the blob, check the store section hashes to the
     /// committed subtree root, fully decode every field with all
-    /// internal invariants enforced, then hash the canonical
-    /// preimage.
+    /// internal invariants enforced, then recompute the incremental
+    /// root over the staged state — folded maps fold over the staged
+    /// `BTreeMap`s (`fold_map`), serialized sections serialize the
+    /// staged fields, so the result equals the `state_root` this
+    /// state would produce once installed.
     fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
-        let (canon, _staged, _store) = framework::stage_blob_snapshot(snapshot, |r, store| {
+        let (_canon, staged, store) = framework::stage_blob_snapshot(snapshot, |r, store| {
             decode::decode_committed(r, store)
         })?;
-        Ok(framework::canon_root(canon))
+        let view = commit::RootView {
+            store_fold: framework::CommittedStore::fold_map(&store, store_leaf),
+            validators: &staged.validators,
+            delegations_fold: framework::CommittedMap::fold_map(
+                &staged.delegations,
+                delegations_leaf,
+            ),
+            unbonding: &staged.unbonding,
+            pending_rewards_fold: framework::CommittedMap::fold_map(
+                &staged.pending_rewards,
+                pending_rewards_leaf,
+            ),
+            reward_per_token: &staged.reward_per_token,
+            reward_debt_fold: framework::CommittedMap::fold_map(
+                &staged.reward_debt,
+                reward_debt_leaf,
+            ),
+            self_debt: &staged.self_debt,
+            delegator_index_fold: framework::CommittedMap::fold_map(
+                &staged.delegator_index,
+                delegator_index_leaf,
+            ),
+            delegated_total_fold: framework::CommittedMap::fold_map(
+                &staged.delegated_total,
+                delegated_total_leaf,
+            ),
+            pending_key_changes: &staged.pending_key_changes,
+            pending_validator_adds: &staged.pending_validator_adds,
+            pending_validator_removes: &staged.pending_validator_removes,
+            endorsements: &staged.endorsements,
+            bls_keys: &staged.bls_keys,
+            retired_bls_keys: &staged.retired_bls_keys,
+            jailed: &staged.jailed,
+            pending_jails: &staged.pending_jails,
+            pending_unjails: &staged.pending_unjails,
+            scheduled_halt: staged.scheduled_halt,
+            seen_evidence: &staged.seen_evidence,
+            attendance: &staged.attendance,
+            current_height: staged.current_height,
+        };
+        let mut w = framework::CanonicalState::new();
+        commit::write_root_preimage(&view, &mut w);
+        Ok(w.root())
     }
 
     /// Install staged state after `inspect_state` has proven it —
@@ -1300,16 +1468,22 @@ impl Module for StakingModule {
     fn import_state(&self, snapshot: &storage::Snapshot) -> Result<(), storage::SnapshotError> {
         let (_canon, staged, store) =
             framework::stage_blob_snapshot(snapshot, |r, s| decode::decode_committed(r, s))?;
-        *framework::lock_state(&self.store) = store;
+        *framework::lock_state(&self.store) =
+            framework::CommittedStore::from_map(store, store_leaf);
         *framework::lock_state(&self.validators) = staged.validators;
-        *framework::lock_state(&self.delegations) = staged.delegations;
+        *framework::lock_state(&self.delegations) =
+            framework::CommittedMap::from_map(staged.delegations, delegations_leaf);
         *framework::lock_state(&self.unbonding) = staged.unbonding;
-        *framework::lock_state(&self.pending_rewards) = staged.pending_rewards;
+        *framework::lock_state(&self.pending_rewards) =
+            framework::CommittedMap::from_map(staged.pending_rewards, pending_rewards_leaf);
         *framework::lock_state(&self.reward_per_token) = staged.reward_per_token;
-        *framework::lock_state(&self.reward_debt) = staged.reward_debt;
+        *framework::lock_state(&self.reward_debt) =
+            framework::CommittedMap::from_map(staged.reward_debt, reward_debt_leaf);
         *framework::lock_state(&self.self_debt) = staged.self_debt;
-        *framework::lock_state(&self.delegator_index) = staged.delegator_index;
-        *framework::lock_state(&self.delegated_total) = staged.delegated_total;
+        *framework::lock_state(&self.delegator_index) =
+            framework::CommittedMap::from_map(staged.delegator_index, delegator_index_leaf);
+        *framework::lock_state(&self.delegated_total) =
+            framework::CommittedMap::from_map(staged.delegated_total, delegated_total_leaf);
         *framework::lock_state(&self.pending_key_changes) = staged.pending_key_changes;
         *framework::lock_state(&self.pending_validator_adds) = staged.pending_validator_adds;
         *framework::lock_state(&self.pending_validator_removes) = staged.pending_validator_removes;

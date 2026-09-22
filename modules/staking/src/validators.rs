@@ -377,8 +377,9 @@ impl StakingModule {
             let mut delegator_index = framework::lock_state(&self.delegator_index);
             for (delegator, amount) in &affected {
                 delegations.remove(&(*delegator, *validator));
-                if let Some(set) = delegator_index.get_mut(delegator) {
+                if let Some(mut set) = delegator_index.get(delegator).cloned() {
                     set.remove(validator);
+                    delegator_index.insert(*delegator, set);
                 }
                 unbonding.push(UnbondingEntry {
                     delegator: *delegator,

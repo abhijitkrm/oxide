@@ -1295,6 +1295,50 @@ fn state_snapshot_round_trips() {
     assert_eq!(dst.delegation(&addr(3), &addr(2)), 200);
 }
 
+/// Every `CommittedMap`'s maintained fold must equal the
+/// authoritative recompute (`recomputed_root`) after real handler
+/// mutations — a mutation site that escaped the fold API would
+/// desync the incremental root, and this test is the net that
+/// catches it. Also asserts the incremental root differs from the
+/// legacy full-serialization root: the format change is real, not
+/// a no-op wrapper.
+#[test]
+fn committed_folds_stay_in_lockstep_after_mutations() {
+    let (staking, _ledger) = setup_with_ledger(&[1, 2]);
+    let (v1, v2) = (addr(1), addr(2));
+    staking.handle(&ctx_with_sender(3), &msg::delegate(v1, 500)).unwrap();
+    staking.handle(&ctx_with_sender(4), &msg::delegate(v1, 300)).unwrap();
+    staking.handle(&ctx_with_sender(4), &msg::delegate(v2, 700)).unwrap();
+    staking.begin_block(Height::new(1));
+    staking.end_block(Height::new(1));
+    staking.handle(&ctx_with_sender(4), &msg::undelegate(v1, 100)).unwrap();
+    staking.handle(&ctx_with_sender(1), &msg::slash(v1, 50)).unwrap();
+
+    // Bind each guard to a local first: a `lock_state(...)` temporary
+    // lives until the end of its enclosing statement, so calling
+    // `lock_state` twice on one map inside a single expression would
+    // deadlock on the second `lock`.
+    macro_rules! assert_fold_locked {
+        ($name:literal, $map:expr) => {{
+            let guard = framework::lock_state(&$map);
+            assert_eq!(guard.root(), guard.recomputed_root(), "{} fold desynced", $name);
+        }};
+    }
+    assert_fold_locked!("store", staking.store);
+    assert_fold_locked!("delegations", staking.delegations);
+    assert_fold_locked!("pending_rewards", staking.pending_rewards);
+    assert_fold_locked!("reward_debt", staking.reward_debt);
+    assert_fold_locked!("delegator_index", staking.delegator_index);
+    assert_fold_locked!("delegated_total", staking.delegated_total);
+
+    // The incremental preimage is a different construction from the
+    // legacy full-serialization root — the same state must not
+    // accidentally produce the old digest.
+    let mut legacy = framework::CanonicalState::new();
+    staking.write_committed(&mut legacy);
+    assert_ne!(staking.state_root(), legacy.root());
+}
+
 /// A jailed validator must survive state sync: the jail marker
 /// AND its jail height are canonical state — losing either would
 /// let a slashed offender rejoin the active set early (the
