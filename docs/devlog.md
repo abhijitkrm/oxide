@@ -18421,3 +18421,50 @@ mocks) were already panic-on-poison semantically — converted to the
 state lock in the tree shares the same fail-closed path and panic
 message. `runtime/tests/echo.rs` keeps `.unwrap()` — the crate is
 dependency-free by design.
+
+## §9.E/9.B/9.A — matcher orchestration split, margin class, BLS key gate
+
+**9.E — split the matcher around the concurrency invariant.** The
+~940-line multi-market orchestration block moved out of
+`matcher/src/lib.rs` into `crates/matcher/src/multimarket.rs`:
+`MarketMessage`/`MarketWork`/`ActionWork`/`WorkerStats`,
+`MultiMarketMatcher`, and `MarketWorker` with its batch-sealing
+logic. The module header states the invariant it guards: each
+worker owns its `MatchingServer` (single-threaded matching per
+market); markets communicate only through the shared
+`AtomicBalanceCache` and the per-worker `mpsc` control channels, on
+which `Work`/`Action`/`Seal`/`Stats` multiplex so a control command
+never queues behind order flow. `lib.rs` is now ~2.5k lines
+(protocol-agnostic core + `MatchingServer`), with `settlement.rs`
+and `multimarket.rs` flanking it. `matcher::MultiMarketMatcher` is
+re-exported so `server.rs` and the e2e test paths are unchanged.
+
+**9.B — `MarginClass`: the isolated/cross sentinel, named.** Perps
+positions used `isolated_margin > 0` as the implicit mode flag at
+three funding/PnL sites — a reader could not tell whether zero
+meant "cross position" or "drained isolated wallet", and the two
+behave identically *by convention only*. `Position::margin_class()`
+now returns a `MarginClass::{Isolated, Cross}` enum; the drain rule
+(an empty isolated wallet demotes to cross routing for the NEXT
+debit) is documented on the type and pinned by
+`drained_isolated_wallet_demotes_to_cross_routing`, which funds a
+long whose isolated wallet drains to exactly zero and asserts the
+following debit leaves the cross pool. This is the audit's
+"nonzero balance implies isolated mode" item made explicit — the
+field stays a `u64` (wire/snapshot compat), the interpretation is
+now a named contract.
+
+**9.A — validated consensus keys at restore boundaries.** Key
+admission already requires a proof of possession; the gap was
+*restore*: `import_state` and `genesis_set_bls_key` checked a key's
+48-byte length but never that it decodes to a BLS12-381 group
+element in the correct subgroup — a crafted snapshot blob could
+lodge a point that can never verify and wedge every QC that maps
+to it. `crypto::bls_signer::validate_point` (decode + subgroup
+check, cold path only) now gates live `bls_keys`, `retired_bls_keys`
+(a retired key must still verify historical evidence), and the
+genesis install path. `snapshot_rejects_malformed_bls_key` exports
+a committed state, overwrites the embedded key with `0xFF…`, and
+asserts import fails. The full `ValidatedConsensusKey` wrapper —
+making the type itself carry the proof rather than the decode
+sites — is the remaining half of this item.
