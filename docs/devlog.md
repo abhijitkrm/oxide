@@ -18468,3 +18468,28 @@ a committed state, overwrites the embedded key with `0xFF…`, and
 asserts import fails. The full `ValidatedConsensusKey` wrapper —
 making the type itself carry the proof rather than the decode
 sites — is the remaining half of this item.
+
+## §9.E/9.D — settler extraction + nonce-gate poison consistency
+
+**9.E — the settlement pipeline leaves `server.rs`.** The ~700-line
+submission lane (`TxSubmitter`/`TxConfirmer` ports, `BatchSettler`,
+`SettleReport`, `PendingBatch`, `SettlementOutbox`, signing config)
+moved to `crates/matcher/src/settler.rs`, split around the
+accounting invariant it guards: the settler is the only writer of
+settlement envelopes and every outcome lands in a `SettleReport`
+bucket — submitted, confirmed, rejected-leg, failed-pair,
+batch-rejected, dead-lettered — because the off-chain cache already
+reflects fills at `seal_batch` time and an unlanded envelope is
+divergence, never a no-op. `matcher::server::TxSubmitter` and
+`TxConfirmer` are re-exported so `oxide-matcher`'s port impls are
+unchanged; `server.rs` drops to ~2.1k lines of pure protocol
+endpoints.
+
+**9.D tail — nonce-gate poison handling made loud.** Three sites in
+`multimarket.rs` handled a poisoned `NonceTracker` mutex ad hoc:
+admission rejected via `Err→false` (fails closed but the process
+looks alive while refusing every order) and `seal_batch` silently
+skipped the durability checkpoint (worse — the settler keeps
+sealing on a torn replay gate while the restart-replay window
+widens). All three now use `lock_state`: a torn replay gate halts
+loudly, matching the repo-wide policy.
