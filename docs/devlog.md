@@ -18596,3 +18596,21 @@ speculation (read/write sets, merge payload, re-execution flags),
 and `SharedCacheDB` is the read-only parent all worker groups
 share. `TracedResult` went `pub(crate)`; `SpecTx`'s fields are
 `pub(crate)` for the merge path. `evm/lib.rs` is now ~6.0k lines.
+
+## §9.E — read/history/persist seams + Module adapter + test sweep
+
+The EVM's third `impl` block split three ways: the read/simulate
+surface (~660 lines, never commits — scratch views only) into
+`read.rs`; the height-indexed `*_at` queries into the existing
+`history.rs` (same RPC surface the module exists for); snapshot
+decode + flush/load into `persist.rs` (write schema and read
+schema side by side — they can never drift apart). The
+`framework::Module` adapter (~1000 lines: lifecycle ordering is
+the audit boundary) moved to `module_impl.rs`. Since `EvmModule`
+lives at crate root, descendant modules see its private fields —
+no `pub(crate)` field surgery needed. `lib.rs` is now ~3.7k lines
+(from ~10k).
+
+Also swept the remaining in-file test modules out to sibling
+`tests.rs` files: executor (3.1k), perps (2.5k), exchange (2.1k),
+rpc (1.5k), trading/engine (731), governance (787), node (984).

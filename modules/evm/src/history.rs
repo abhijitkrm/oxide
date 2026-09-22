@@ -777,6 +777,317 @@ pub fn effective_gas_price(stx: &StoredTx, base_fee: u64) -> u128 {
     }
 }
 
+use super::{
+    AccountProof, CacheDB, CallError, CallOutcome, CallRequest, DatabaseRef, EmptyDB, EvmModule,
+    ExecError, Mutex, StateError, StorageProof, alloy_primitives_address, history, overrides, trie,
+    versioned,
+};
+
+// ── Height-indexed state queries ────────────────────────────
+// `impl EvmModule` lives here because these methods serve the
+// same RPC surface this module exists for: historical reads.
+impl EvmModule {
+    // ── Historical state reads (undo-log window) ────────────────
+
+    /// Validate `h` against the servable window.
+    ///
+    /// - `h > latest` → [`StateError::TooNew`] ("header not found").
+    /// - `h == latest` → always servable (live `CacheDB`).
+    /// - `h < latest` → servable iff the undo log covers `(h, latest]`,
+    ///   i.e. `h >= floor - 1` where `floor` is the oldest retained
+    ///   height; otherwise [`StateError::Pruned`] ("missing trie
+    ///   node", geth's non-archive behavior).
+    pub(crate) fn check_state_height(&self, h: u64) -> Result<u64, StateError> {
+        let latest =
+            framework::lock_state(&self.history).latest().unwrap_or_else(|| self.current_height());
+        if h > latest {
+            return Err(StateError::TooNew { requested: h, latest });
+        }
+        if h == latest {
+            return Ok(h);
+        }
+        let versioned = framework::lock_state(&self.versioned);
+        // `floor - 1` is the oldest servable height; an empty index
+        // means nothing is retained — only `latest` answers.
+        let min = versioned.floor().map_or(latest, |f| f.saturating_sub(1));
+        if h < min {
+            return Err(StateError::Pruned { requested: h, floor: min });
+        }
+        Ok(h)
+    }
+
+    /// Map a requested height onto the `simulate` `at_height` arg:
+    /// `None` for `latest` (the live-db fast path), `Some(h)` for a
+    /// historical overlay.
+    pub(crate) fn resolve_at(&self, h: u64) -> Result<Option<u64>, StateError> {
+        let h = self.check_state_height(h)?;
+        let latest =
+            framework::lock_state(&self.history).latest().unwrap_or_else(|| self.current_height());
+        Ok(if h == latest { None } else { Some(h) })
+    }
+
+    /// [`StateError`] → [`CallError`] for the simulation entry
+    /// points (which surface height errors through `Rejected`).
+    pub(crate) fn state_as_call_err(e: StateError) -> CallError {
+        CallError::Rejected(ExecError::ModuleRejected(format!(
+            "state for block {} unavailable: {e:?}",
+            e.requested()
+        )))
+    }
+
+    /// A [`versioned::StateView`] at `h` over the live db and undo
+    /// index. Callers hold both guards for the view's lifetime.
+    pub(crate) fn state_view<'a>(
+        db: &'a CacheDB<EmptyDB>,
+        versioned: &'a versioned::VersionedState,
+        history: &'a Mutex<history::History>,
+        h: u64,
+    ) -> versioned::StateView<'a> {
+        versioned::StateView::new(db, versioned, history, h)
+    }
+
+    /// `eth_getBalance` at height `h`.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] when `h` is outside the retained window.
+    pub fn balance_at(&self, addr: &primitives::Address, h: u64) -> Result<u128, StateError> {
+        self.check_state_height(h)?;
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+        Ok(view
+            .basic_ref(evm_addr)
+            .unwrap_or_default()
+            .map_or(0, |a| u128::try_from(a.balance).unwrap_or(u128::MAX)))
+    }
+
+    /// `eth_getTransactionCount` at height `h`.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] when `h` is outside the retained window.
+    pub fn nonce_at(&self, addr: &primitives::Address, h: u64) -> Result<u64, StateError> {
+        self.check_state_height(h)?;
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+        Ok(view.basic_ref(evm_addr).unwrap_or_default().map_or(0, |a| a.nonce))
+    }
+
+    /// `eth_getCode` at height `h`. Old bytecode is always servable —
+    /// `cache.contracts` retains every deployed blob keyed by hash.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] when `h` is outside the retained window.
+    pub fn code_at(&self, addr: &primitives::Address, h: u64) -> Result<Vec<u8>, StateError> {
+        self.check_state_height(h)?;
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+        let Some(info) = view.basic_ref(evm_addr).unwrap_or_default() else {
+            return Ok(Vec::new());
+        };
+        if let Some(code) = &info.code {
+            return Ok(code.original_bytes().to_vec());
+        }
+        Ok(view.code_by_hash_ref(info.code_hash).unwrap_or_default().original_bytes().to_vec())
+    }
+
+    /// `eth_getStorageAt` at height `h`.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] when `h` is outside the retained window.
+    pub fn storage_at_height(
+        &self,
+        addr: &primitives::Address,
+        slot: &revm::primitives::U256,
+        h: u64,
+    ) -> Result<revm::primitives::U256, StateError> {
+        self.check_state_height(h)?;
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+        Ok(view.storage_ref(evm_addr, *slot).unwrap_or_default())
+    }
+
+    /// `eth_call` at height `h` — the historical form of
+    /// [`call_read`](Self::call_read). The simulation runs over a
+    /// `CacheDB<StateView>`: identical code path to `latest`, with
+    /// reads served by the undo overlay and the block env taken from
+    /// `h`'s sealed record.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when `h` is outside the retained
+    /// window or the block record is missing; otherwise the same
+    /// [`CallError`] variants as `call_read`.
+    pub fn call_read_at(&self, req: &CallRequest, h: u64) -> Result<CallOutcome, CallError> {
+        let at = self.resolve_at(h).map_err(Self::state_as_call_err)?;
+        self.call_read_impl(req, at, &overrides::StateOverrides::new())
+    }
+
+    /// `eth_getProof` (EIP-1186): the account's Merkle-Patricia proof
+    /// plus one proof per requested storage key, all at height `h`.
+    ///
+    /// The state trie is not persisted — the proof is produced by
+    /// rebuilding the trie from the state at `h` while a
+    /// [`alloy_trie::proof::ProofRetainer`] keeps the nodes on the
+    /// target path. This is `O(accounts + touched_since_h)` per call —
+    /// expensive, but bounded, and proofs are a cold-path archive
+    /// query (bridges/light clients hit `latest` almost always).
+    ///
+    /// Absent accounts/slots return proofs of non-inclusion (geth
+    /// parity), not errors.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when `h` is outside the retained
+    /// window.
+    #[allow(clippy::too_many_lines)]
+    pub fn account_proof(
+        &self,
+        addr: &primitives::Address,
+        slots: &[revm::primitives::B256],
+        h: u64,
+    ) -> Result<AccountProof, CallError> {
+        let h = self.check_state_height(h).map_err(|e| {
+            CallError::Rejected(ExecError::ModuleRejected(format!(
+                "state for block {} unavailable: {e:?}",
+                e.requested()
+            )))
+        })?;
+        let db = framework::lock_state(&self.db);
+        let versioned = framework::lock_state(&self.versioned);
+        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let evm_addr = alloy_primitives_address(addr.0);
+
+        // ── Account-trie proof ──────────────────────────────────
+        // Materialize every account at `h`: latest map ∪ undo-known
+        // addresses (the union covers accounts deleted since `h`).
+        // Each entry contributes `keccak(addr) → rlp(TrieAccount)`.
+        let mut leaves: std::collections::BTreeMap<revm::primitives::B256, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let addrs: std::collections::BTreeSet<revm::primitives::Address> =
+            db.cache.accounts.keys().copied().chain(versioned.known_accounts().copied()).collect();
+        let mut storage_root_cache = framework::lock_state(&self.storage_root_cache);
+        for a in addrs {
+            let Some(info) = view.info_at(&a) else { continue };
+            // Storage root at `h`: the undo map when the account was
+            // rewritten above `h`, else the latest map. The cached
+            // root is only reused on the untouched path.
+            let storage_map = view.storage_map_at(&a).unwrap_or_default();
+            let sroot = if storage_map.is_empty() {
+                trie::EMPTY_ROOT
+            } else if versioned.entry_at(&a, h).is_none() {
+                // Untouched since `h` — the cached root is valid.
+                if let Some(r) = storage_root_cache.get(&a) {
+                    *r
+                } else {
+                    let r = trie::storage_root(
+                        storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+                    );
+                    storage_root_cache.insert(a, r);
+                    r
+                }
+            } else {
+                trie::storage_root(
+                    storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+                )
+            };
+            let trie_account =
+                trie::build_trie_account(info.nonce, info.balance, sroot, info.code_hash);
+            let mut leaf = Vec::with_capacity(80);
+            alloy_rlp::Encodable::encode(&trie_account, &mut leaf);
+            leaves.insert(alloy_primitives::keccak256(a), leaf);
+        }
+        drop(storage_root_cache);
+
+        let target = alloy_trie::Nibbles::unpack(alloy_primitives::keccak256(evm_addr));
+        let retainer = alloy_trie::proof::ProofRetainer::new(vec![target]);
+        let mut hb = alloy_trie::hash_builder::HashBuilder::default().with_proof_retainer(retainer);
+        for (hashed, leaf) in &leaves {
+            hb.add_leaf(alloy_trie::Nibbles::unpack(*hashed), leaf);
+        }
+        hb.root();
+        let account_proof: Vec<revm::primitives::Bytes> = hb
+            .take_proof_nodes()
+            .matching_nodes_sorted(&target)
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect();
+
+        // ── Account fields at `h` ───────────────────────────────
+        let info = view.info_at(&evm_addr);
+        let storage_map = view.storage_map_at(&evm_addr).unwrap_or_default();
+        let storage_hash = if storage_map.is_empty() {
+            trie::EMPTY_ROOT
+        } else {
+            trie::storage_root(
+                storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+            )
+        };
+
+        // ── Storage proofs ──────────────────────────────────────
+        // One storage trie serves all requested keys — build it
+        // once with every requested slot as a retainer target.
+        let mut storage_proofs = Vec::with_capacity(slots.len());
+        if !slots.is_empty() {
+            let targets: Vec<alloy_trie::Nibbles> = slots
+                .iter()
+                .map(|s| alloy_trie::Nibbles::unpack(alloy_primitives::keccak256(*s)))
+                .collect();
+            let retainer = alloy_trie::proof::ProofRetainer::new(targets.clone());
+            let mut shb =
+                alloy_trie::hash_builder::HashBuilder::default().with_proof_retainer(retainer);
+            // Storage leaves: hashed_slot → rlp(value) — zero slots
+            // are never stored (EVM sparse-storage convention).
+            let mut sleaves: std::collections::BTreeMap<revm::primitives::B256, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for (slot, value) in &storage_map {
+                if value.is_zero() {
+                    continue;
+                }
+                let mut leaf = Vec::with_capacity(40);
+                alloy_rlp::Encodable::encode(&alloy_primitives::U256::from(*value), &mut leaf);
+                sleaves
+                    .insert(alloy_primitives::keccak256(revm::primitives::B256::from(*slot)), leaf);
+            }
+            for (hashed, leaf) in &sleaves {
+                shb.add_leaf(alloy_trie::Nibbles::unpack(*hashed), leaf);
+            }
+            shb.root();
+            let nodes = shb.take_proof_nodes();
+            for (slot, target) in slots.iter().zip(targets.iter()) {
+                let proof: Vec<revm::primitives::Bytes> =
+                    nodes.matching_nodes_sorted(target).into_iter().map(|(_, n)| n).collect();
+                let slot_u256 = revm::primitives::U256::from_be_bytes(slot.0);
+                storage_proofs.push(StorageProof {
+                    key: *slot,
+                    value: storage_map.get(&slot_u256).copied().unwrap_or_default(),
+                    proof,
+                });
+            }
+        }
+
+        Ok(AccountProof {
+            address: evm_addr,
+            balance: info.as_ref().map_or(revm::primitives::U256::ZERO, |i| i.balance),
+            code_hash: info.as_ref().map_or(revm::primitives::KECCAK_EMPTY, |i| i.code_hash),
+            nonce: info.as_ref().map_or(0, |i| i.nonce),
+            storage_hash,
+            account_proof,
+            storage_proofs,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -273,6 +273,8 @@ pub(crate) fn key_to_height(key: &Hash) -> Option<u64> {
     Some(u64::from_be_bytes(key.0[1..9].try_into().ok()?))
 }
 
+use super::{Arc, CacheDB, EmptyDB, EvmModule, Module, alloy_primitives_address, fee, persist};
+
 // ── Cursor reader ───────────────────────────────────────────────
 //
 // The account codec above hand-rolls offsets because the layout is
@@ -826,4 +828,432 @@ pub(crate) fn deserialize_undo(data: &[u8]) -> Option<BlockUndo> {
         return None;
     }
     Some(undo)
+}
+
+// ── Module↔storage orchestration ────────────────────────────
+// `impl EvmModule` lives here so flush and load sit beside the
+// key scheme they serialize through — the write schema and the
+// read schema can never drift apart.
+impl EvmModule {
+    /// Strictly parse a snapshot's entries, returning the staged
+    /// account set keyed by address.
+    ///
+    /// Enforces, before any state is touched:
+    ///
+    /// - `Snapshot.entries` sorted ascending with no duplicate keys
+    ///   (the `Snapshot` contract — verified, not assumed).
+    /// - `0x01` account keys in canonical form
+    ///   (`[0x01][addr:20][0x00:11]` — the zero padding matters: a
+    ///   key with non-zero tail bytes would alias the same address
+    ///   under a second encoding) and values that satisfy
+    ///   [`persist::deserialize_account_strict`].
+    /// - `0x02` block records / `0x03` undo blobs: canonical key
+    ///   padding and a fully-parsing value (RPC-window data — not
+    ///   committed to the trie, but malformed records must not be
+    ///   installed).
+    /// - `0x04`: exactly the schema-version slot with a 4-byte value.
+    /// - Any other namespace byte is rejected outright.
+    pub(crate) fn parse_snapshot_entries(
+        snapshot: &storage::Snapshot,
+    ) -> Result<
+        std::collections::BTreeMap<Address, persist::DeserializedAccount>,
+        storage::SnapshotError,
+    > {
+        if snapshot.entries.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err(storage::SnapshotError::Malformed);
+        }
+        let mut accounts = std::collections::BTreeMap::new();
+        for (key, value) in &snapshot.entries {
+            match key.0[0] {
+                persist::NS_ACCOUNT => {
+                    if key.0[21..].iter().any(|b| *b != 0) {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                    let addr =
+                        persist::key_to_address(key).ok_or(storage::SnapshotError::Malformed)?;
+                    let acct = persist::deserialize_account_strict(value)
+                        .ok_or(storage::SnapshotError::Malformed)?;
+                    if accounts.insert(addr, acct).is_some() {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                }
+                persist::NS_BLOCK => {
+                    if key.0[9..].iter().any(|b| *b != 0)
+                        || persist::key_to_height(key).is_none()
+                        || persist::deserialize_block(value).is_none()
+                    {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                }
+                persist::NS_UNDO => {
+                    if key.0[9..].iter().any(|b| *b != 0)
+                        || persist::key_to_height(key).is_none()
+                        || persist::deserialize_undo(value).is_none()
+                    {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                }
+                persist::NS_META => {
+                    if *key != persist::state_version_key() || value.len() != 4 {
+                        return Err(storage::SnapshotError::Malformed);
+                    }
+                }
+                _ => return Err(storage::SnapshotError::Malformed),
+            }
+        }
+        Ok(accounts)
+    }
+
+    /// Flush the current `CacheDB` state to the `StorageBackend`.
+    ///
+    /// Phase D: incremental flush. Only accounts touched in the
+    /// current block are flushed. This is O(touched) instead of
+    /// O(N) — a major improvement for large states where each
+    /// block modifies only a few accounts.
+    ///
+    /// If no accounts were touched (e.g., empty block), this is a
+    /// no-op.
+    ///
+    /// # Self-destructed accounts
+    ///
+    /// Accounts that became `NotExisting` (self-destructed) or were
+    /// removed from the cache emit a `Delete` op so the storage
+    /// backend removes the stale entry. Without this, a
+    /// self-destructed account would reappear on reload.
+    ///
+    /// # Deterministic serialization
+    ///
+    /// Storage slots are sorted by slot key before serialization so
+    /// the persisted blob is byte-identical across all validators
+    /// with the same logical state. Without this, `HashMap`
+    /// iteration order would make the raw `StorageBackend` value
+    /// non-deterministic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DB mutex is poisoned.
+    pub(crate) fn flush_to_storage(
+        &self,
+        backend: &mut (dyn storage::StorageBackend + Send),
+    ) -> Result<(), storage::ApplyError> {
+        let ops = self.account_flush_ops();
+        self.flush_pending(backend, ops)
+    }
+
+    /// Attempt `apply_batch` over `pending_flush + extra` as ONE
+    /// batch — a failed earlier flush retries inside the next one,
+    /// so no account update, sealed-block record, or undo blob is
+    /// ever dropped on a transient storage failure.
+    ///
+    /// On `Ok`: the buffer clears, the error latch resets, and the
+    /// batch is synced (the per-block durability point — `Ok` from
+    /// `apply_batch` is "written", `sync` is "durable"). On `Err`:
+    /// the ops stay in `pending_flush` and the error is latched into
+    /// `storage_error` — the in-memory state remains correct, but
+    /// callers can observe degraded persistence via
+    /// [`Self::storage_error`].
+    pub(crate) fn flush_pending(
+        &self,
+        backend: &mut (dyn storage::StorageBackend + Send),
+        extra: Vec<storage::Op>,
+    ) -> Result<(), storage::ApplyError> {
+        let mut pending = framework::lock_state(&self.pending_flush);
+        pending.extend(extra);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        match backend.apply_batch(&pending) {
+            Ok(()) => {
+                pending.clear();
+                drop(pending);
+                // Per-block durability point: `apply_batch` is
+                // "written", `sync` is "durable". A sync failure is
+                // latched but not buffered — the ops ARE written, and
+                // the next successful sync covers them (same file).
+                if let Err(e) = backend.sync() {
+                    *framework::lock_state(&self.storage_error) = Some(e.clone());
+                    return Err(e);
+                }
+                *framework::lock_state(&self.storage_error) = None;
+                Ok(())
+            }
+            Err(e) => {
+                drop(pending);
+                *framework::lock_state(&self.storage_error) = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    /// Build the account write ops for the block's `touched` set —
+    /// the pure form of [`flush_to_storage`], split out so
+    /// `end_block` can commit accounts, the sealed history record,
+    /// and the undo blob in one `apply_batch` (a crash must never
+    /// leave state ahead of history, or a restarted node would serve
+    /// newer state under an older height label).
+    pub(crate) fn account_flush_ops(&self) -> Vec<storage::Op> {
+        let db = framework::lock_state(&self.db);
+        let touched = framework::lock_state(&self.touched);
+
+        let mut ops = Vec::with_capacity(touched.len());
+        for evm_addr in touched.iter() {
+            let oxide_addr = Address(evm_addr.0.into());
+            let key = persist::account_key(&oxide_addr);
+
+            // Handle self-destructed / removed accounts: emit a
+            // Delete op so the stale entry is removed from storage.
+            // Without this, a self-destructed account reappears on
+            // reload because the old persisted value is still there.
+            // `serialize_committed_account` returns `None` for both
+            // cases (missing entry or `NotExisting` tombstone) —
+            // exactly the accounts absent from committed state.
+            match Self::serialize_committed_account(evm_addr, &db) {
+                Some(value) => ops.push(storage::Op::Set { key, value }),
+                None => ops.push(storage::Op::Delete { key }),
+            }
+        }
+        // The schema version rides every flush batch: one extra op
+        // per block keeps the `0x04` meta slot in lockstep with the
+        // binary that last wrote state — a downgraded binary's
+        // `state_version` would rewrite it honestly instead of
+        // inheriting a newer label it can't interpret.
+        ops.push(storage::Op::Set {
+            key: persist::state_version_key(),
+            value: self.state_version().to_le_bytes().to_vec(),
+        });
+        ops
+    }
+
+    /// Serialize one committed cache account into its canonical
+    /// value blob — the single encoding shared by the incremental
+    /// flush ([`Self::account_flush_ops`]) and the snapshot export
+    /// ([`Module::export_state`]). Keeping both on one serializer is
+    /// the audit-3.2 invariant: the bytes that reach durable storage
+    /// and the bytes a snapshot carries can never drift apart.
+    ///
+    /// Returns `None` when the address is absent from committed
+    /// state — no cache entry, or an `AccountState::NotExisting`
+    /// tombstone (self-destructed this block, or a `basic()` miss
+    /// revm cached). Tombstones are not part of the state trie, so
+    /// they must never serialize as live accounts.
+    ///
+    /// The blob layout is `persist::serialize_account`'s: balance,
+    /// nonce, `code_hash`, code bytes, then storage slots sorted
+    /// ascending by slot key. `DbAccount.storage` is a `U256Map`
+    /// (hash map) — sorting makes the blob deterministic across
+    /// validators with the same logical state.
+    pub(crate) fn serialize_committed_account(
+        evm_addr: &revm::primitives::Address,
+        db: &CacheDB<EmptyDB>,
+    ) -> Option<Vec<u8>> {
+        let account = db.cache.accounts.get(evm_addr)?;
+        if account.account_state == revm::database::AccountState::NotExisting {
+            return None;
+        }
+        let code_bytes: Vec<u8> = if account.info.code_hash == revm::primitives::KECCAK_EMPTY {
+            Vec::new()
+        } else {
+            // `original_byte_slice`, not `bytes_slice`: once revm has
+            // analyzed a contract (first execution) `bytes_slice`
+            // returns the padded buffer, whose keccak no longer
+            // matches the committed `code_hash` — persisting it
+            // would reinstall divergent bytecode on restart
+            // (`extcodesize`/`extcodecopy` observe the padding).
+            match &account.info.code {
+                Some(bc) => bc.original_byte_slice().to_vec(),
+                // A balance/nonce-touched contract may never have
+                // loaded bytecode into `info.code` (e.g. a contract
+                // coinbase receiving fees — `basic()` doesn't
+                // populate `code`). Fall back to the contracts map:
+                // writing `code_len=0` under a real `code_hash`
+                // would silently strip the contract's code on
+                // reload/snapshot.
+                None => db
+                    .cache
+                    .contracts
+                    .get(&account.info.code_hash)
+                    .map_or_else(Vec::new, |bc| bc.original_byte_slice().to_vec()),
+            }
+        };
+        let mut storage_slots: Vec<(revm::primitives::U256, revm::primitives::U256)> =
+            account.storage.iter().map(|(slot, val)| (*slot, *val)).collect();
+        storage_slots.sort_by_key(|a| a.0);
+        Some(persist::serialize_account(
+            account.info.balance,
+            account.info.nonce,
+            account.info.code_hash,
+            &code_bytes,
+            &storage_slots,
+        ))
+    }
+
+    /// Load EVM state from the `StorageBackend` into the `CacheDB`.
+    ///
+    /// Reads all account entries (namespace prefix `0x01`) and
+    /// populates the cache with balances, nonces, code, and storage.
+    /// Called from `with_storage` on construction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DB mutex is poisoned.
+    pub(crate) fn load_from_storage(&self, backend: &mut (dyn storage::StorageBackend + Send)) {
+        let entries = backend.range(&persist::account_prefix());
+        // Only the *account* section is skipped on an empty range —
+        // block history, the undo window, stale-record cleanup, and
+        // the schema-version check still run: a backend can hold
+        // sealed blocks (empty blocks write no accounts) or only a
+        // version marker, and skipping their restore would silently
+        // drop durable state that exists.
+        if !entries.is_empty() {
+            let mut db_guard = framework::lock_state(&self.db);
+            let db = Arc::make_mut(&mut *db_guard);
+            for (key, value) in &entries {
+                let Some(oxide_addr) = persist::key_to_address(key) else { continue };
+                let Some(account) = persist::deserialize_account(value) else {
+                    continue;
+                };
+                let evm_addr = alloy_primitives_address(oxide_addr.0);
+
+                // Insert account info into the cache.
+                let info = revm::database::state::AccountInfo {
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.code_hash,
+                    account_id: None,
+                    // revm's `Bytecode::default()` contains a STOP opcode,
+                    // which makes `is_empty()` return false and triggers
+                    // EIP-3607 `RejectCallerWithCode`. Use `new_raw` with
+                    // empty bytes to create a truly empty bytecode.
+                    code: if account.code.is_empty() {
+                        Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::new()))
+                    } else {
+                        Some(revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
+                            account.code.iter().copied(),
+                        )))
+                    },
+                };
+                db.cache.accounts.insert(
+                    evm_addr,
+                    revm::database::DbAccount {
+                        info,
+                        // `None` = account exists in cache but EVM hasn't
+                        // interacted with it in this block. This is correct
+                        // for loaded state — revm will read storage from
+                        // the `DbAccount.storage` field. `StorageCleared`
+                        // would incorrectly zero out the storage.
+                        account_state: revm::database::AccountState::None,
+                        storage: account.storage.into_iter().collect(),
+                    },
+                );
+                // HIGH fix: also populate `cache.contracts` (the code
+                // hash → Bytecode map). revm looks up contract code by
+                // hash via `cache.contracts`, not via the account's
+                // `info.code` field. Without this, after a storage
+                // reload, the EVM can't find contract code by hash —
+                // calling a reloaded contract would behave as if it
+                // has no code (a silent no-op call).
+                if !account.code.is_empty() {
+                    db.cache.contracts.insert(
+                        account.code_hash,
+                        revm::bytecode::Bytecode::new_raw(revm::primitives::Bytes::from_iter(
+                            account.code.iter().copied(),
+                        )),
+                    );
+                }
+            }
+            drop(db_guard);
+        }
+
+        // Restore the sealed-block history (`0x02` records) and the
+        // undo window (`0x03` blobs) so historical state reads, log
+        // queries, receipts, and `debug_trace*` survive restart.
+        // Both scans come back height-ascending (the key layout is
+        // height-major); `restore_block`/`push` rebuild the in-memory
+        // indexes as they insert.
+        let mut stale: Vec<Hash> = Vec::new();
+        let floor = {
+            let mut history = framework::lock_state(&self.history);
+            for (_key, value) in backend.range(&persist::block_prefix()) {
+                let Some(block) = persist::deserialize_block(&value) else {
+                    continue; // Malformed record — a storage bug, skip it.
+                };
+                for evicted in history.restore_block(block) {
+                    // Restored-then-evicted records are stale on disk
+                    // (the configured window shrank since the records
+                    // were written). Delete them below.
+                    stale.push(persist::block_key(evicted));
+                }
+            }
+            history.blocks_floor()
+        };
+
+        // Rehydrate the EIP-1559 fee state from the newest sealed
+        // block. `end_block_ctx` evolves the fee as
+        // `BaseFeeState::new(block.base_fee, block.gas_limit)
+        //   .update(block.gas_used)`
+        // — replaying that transition on the last sealed record
+        // reproduces the exact in-memory state a crash dropped, so
+        // the next block charges the same base fee it would have
+        // without the restart. A fresh backend (no sealed blocks)
+        // keeps the constructor seed, matching a cold start.
+        {
+            let history = framework::lock_state(&self.history);
+            if let Some(last) = history.latest().and_then(|h| history.block(h)) {
+                let mut fee_state = fee::BaseFeeState::new(last.base_fee, last.gas_limit);
+                fee_state.update(last.gas_used);
+                *framework::lock_state(&self.fee_state) = fee_state;
+            }
+        }
+
+        {
+            let mut versioned = framework::lock_state(&self.versioned);
+            for (key, value) in backend.range(&persist::undo_prefix()) {
+                let Some(height) = persist::key_to_height(&key) else { continue };
+                if floor.is_some_and(|f| height < f) {
+                    stale.push(key); // Below the restored window.
+                    continue;
+                }
+                let Some(undo) = persist::deserialize_undo(&value) else { continue };
+                versioned.push(height, undo);
+            }
+        }
+
+        // One cleanup batch for stale records discovered during
+        // restore (over-capacity or below-floor entries). Routed
+        // through the pending buffer: a failure latches into
+        // `storage_error` and retries inside the next block's flush
+        // — the records are housekeeping, so a delayed cleanup is
+        // harmless, but a silently dropped write is not.
+        if !stale.is_empty() {
+            let ops: Vec<storage::Op> =
+                stale.into_iter().map(|key| storage::Op::Delete { key }).collect();
+            let _ = self.flush_pending(backend, ops);
+        }
+
+        // Schema version check: the backend records the layout
+        // version it was last written at (`0x04` meta namespace,
+        // absent = v1 pre-versioning). Older than this binary's
+        // declared `state_version` → run `migrate` on the freshly
+        // loaded state and persist the new version. A failed
+        // migration leaves the stored version untouched — the next
+        // restart retries it.
+        let stored_version = backend
+            .get(&persist::state_version_key())
+            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok().map(u32::from_le_bytes))
+            .unwrap_or(1);
+        if stored_version < self.state_version()
+            && let Ok(new_version) = self.migrate(stored_version)
+        {
+            // Schema-version write through the pending buffer — a
+            // failure latches and retries rather than leaving the
+            // recorded version silently behind the migrated state.
+            let _ = self.flush_pending(
+                backend,
+                vec![storage::Op::Set {
+                    key: persist::state_version_key(),
+                    value: new_version.to_le_bytes().to_vec(),
+                }],
+            );
+        }
+    }
 }
