@@ -444,6 +444,19 @@ impl MultiMarketMatcher {
         response_rx.recv().unwrap_or_else(|_| OrderResponse::rejected(RejectReason::EngineError))
     }
 
+    /// `#[doc(hidden)]` — bench seam, not an admission path. Runs the
+    /// exact production replay gate (shared `Mutex<NonceTracker>`
+    /// acquire + `check_and_consume`) so the contention bench
+    /// measures the lock every `submit_batch` order and every worker
+    /// `submit_action` takes, without confounding it with signature
+    /// verification or channel dispatch. Callers must not rely on the
+    /// return value for admission decisions — this consumes the
+    /// nonce exactly as production does.
+    #[doc(hidden)]
+    pub fn bench_consume_nonce(&self, owner: &primitives::Address, nonce: u64) -> bool {
+        primitives::sync::lock_state(&self.nonces).check_and_consume(owner, nonce)
+    }
+
     /// Seal the settlement batch across ALL markets. Sends a `Seal`
     /// message to every worker, collects all fills, and concatenates
     /// them. This is the `BatchSealer` implementation for the

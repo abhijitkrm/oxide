@@ -67,7 +67,7 @@
 //!   [$10, $20] (1000 levels), 5-lot orders at tick 500 ($15.00).
 //!   Notional per fill = 5_000 × 1.5B / 1e8 = 75_000 quote units.
 
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use executor::{Module, TxContext};
 use framework::Balances;
 use primitives::Address;
@@ -202,52 +202,73 @@ fn settlement_single_fill(c: &mut Criterion) {
     });
 }
 
-/// Gate: p50 < 10 µs (≥100k sweeps/s/core).
+/// Gate: p50 < 10 µs for the 10-level row (≥100k sweeps/s/core).
+/// The 100/500-level rows exist to measure growth, not to gate —
+/// see below.
 ///
-/// Measures the full `handle()` path for a 10-level sweep: 10 resting
-/// makers at ticks 500–509, one marketable taker buy that fills all
-/// 10. Each fill triggers a separate `ledger.transfer()`, so settlement
-/// cost scales linearly with fill count.
-fn settlement_sweep_10_levels(c: &mut Criterion) {
-    let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
-    ledger.mint(&addr(1), 1_000_000_000_000_000);
-    ledger.mint(&addr(9), 1_000_000_000_000_000);
-    let ex = ExchangeModule::with_ledger(ledger);
-    let mid = ex.list_market(cfg()).expect("market config valid");
-    // Seller base custody: each iteration rests 10 lots of sells —
-    // 1e12 units covers ~100M iterations of 10_000-unit escrows.
-    ex.handle(&ctx(9), &exchange::msg::deposit_base(mid, 1_000_000_000_000)).unwrap();
-    let taker = NewOrder {
-        side: Side::Buy,
-        order_type: OrderType::Limit,
-        tif: TimeInForce::Ioc,
-        price: Price(1_509_000_000),
-        qty: Qty(10_000),
-        owner: addr(1),
-        stp: StpMode::None,
-    };
+/// Measures the full `handle()` path for a D-level sweep: D resting
+/// makers at consecutive ticks, one marketable taker buy that fills
+/// all D. Each fill triggers a separate `ledger.transfer()` plus a
+/// pushed fill event, so settlement cost should scale linearly with
+/// fill count — and the fill/event `Vec` must grow by amortized
+/// doubling, not per-push reallocation. The depth axis
+/// {10, 100, 500} reports per-fill cost (`throughput` = fills/s), so
+/// any superlinear fill-vector or event-alloc growth shows as a
+/// falling fills/s slope (audit residual: "fill-vector growth during
+/// deep sweeps"). Depth is capped at 500 because the fixture band is
+/// 1000 ticks wide and the taker must price above the top swept
+/// level.
+fn settlement_sweep(c: &mut Criterion) {
+    for depth in [10u64, 100, 500] {
+        let ledger = Arc::new(evm::EvmModule::new(1, 7_000_000_000));
+        ledger.mint(&addr(1), 1_000_000_000_000_000);
+        ledger.mint(&addr(9), 1_000_000_000_000_000);
+        let ex = ExchangeModule::with_ledger(ledger);
+        let mid = ex.list_market(cfg()).expect("market config valid");
+        // Seller base custody: each iteration rests `depth` lots of
+        // sells — 1e15 units covers ~2M iterations at depth 500.
+        ex.handle(&ctx(9), &exchange::msg::deposit_base(mid, 1_000_000_000_000_000)).unwrap();
+        // The taker prices at the deepest swept tick (500 + depth − 1)
+        // and sizes for the full ladder.
+        let taker = NewOrder {
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Ioc,
+            price: Price(1_000_000_000 + (500 + depth - 1) * 1_000_000),
+            qty: Qty(depth * 1_000),
+            owner: addr(1),
+            stp: StpMode::None,
+        };
 
-    c.bench_function("settlement_sweep_10_levels", |b| {
-        b.iter_batched(
-            || {
-                // Setup (excluded): rest 10 maker sells at ticks 500..509.
-                for i in 0..10u64 {
-                    let maker = limit(Side::Sell, 500 + i, 1, 9);
-                    ex.handle(&ctx(9), &exchange::msg::place(mid, maker)).unwrap();
-                }
-            },
-            |_setup| {
-                // Measured: taker buy 10 lots at tick 509, sweeps all.
-                let events = ex
-                    .handle(black_box(&ctx(1)), black_box(&exchange::msg::place(mid, taker)))
-                    .unwrap();
-                // 10 fills + 1 outcome.
-                assert_eq!(events.len(), 11, "10 fills + 1 outcome");
-                black_box(events);
-            },
-            BatchSize::PerIteration,
-        );
-    });
+        let mut group = c.benchmark_group("settlement_sweep");
+        group.throughput(Throughput::Elements(depth));
+        group.bench_function(format!("{depth}_levels"), |b| {
+            b.iter_batched(
+                || {
+                    // Setup (excluded): rest `depth` maker sells at
+                    // consecutive ticks.
+                    for i in 0..depth {
+                        let maker = limit(Side::Sell, 500 + i, 1, 9);
+                        ex.handle(&ctx(9), &exchange::msg::place(mid, maker)).unwrap();
+                    }
+                },
+                |_setup| {
+                    // Measured: taker buy sweeps the whole ladder.
+                    let events = ex
+                        .handle(black_box(&ctx(1)), black_box(&exchange::msg::place(mid, taker)))
+                        .unwrap();
+                    assert_eq!(
+                        events.len(),
+                        usize::try_from(depth).unwrap_or(usize::MAX) + 1,
+                        "{depth} fills + 1 outcome"
+                    );
+                    black_box(events);
+                },
+                BatchSize::PerIteration,
+            );
+        });
+        group.finish();
+    }
 }
 
 /// Baseline: raw `MatchingEngine::place()` for a single fill (no
@@ -496,7 +517,7 @@ fn state_root_vs_book(c: &mut Criterion) {
 criterion_group!(
     benches,
     settlement_single_fill,
-    settlement_sweep_10_levels,
+    settlement_sweep,
     raw_engine_single_fill,
     batch_settle_1k_distinct_pairs,
     batch_settle_1k_same_pair,

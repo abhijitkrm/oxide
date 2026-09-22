@@ -30,6 +30,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Contention and interference benchmarks** (`crates/matcher`,
+  `crates/executor`, `modules/exchange`): `nonce_contention`
+  measures the matcher's shared nonce-mutex admission gate in
+  isolation (~63 ns/op uncontended, ~2.3–2.6M consumes/s aggregate
+  ceiling under multi-threaded contention); `settlement_sweep` now
+  runs a depth axis (10/100/500 levels, ~144/~183/~402 ns per fill);
+  and `snapshot_export`/`snapshot_vs_exec` measure state-sync export
+  cost (~60 ns/account — 47 µs at 1k to 6.0 ms at 100k accounts)
+  plus block-latency impact while exports run (+32% at 10k state,
+  ~noise at 100k).
+  - **In plain words:** the remaining "how expensive is this in
+    production" questions now have measured answers instead of
+    assumptions — the nonce replay gate has ~200× headroom over the
+    measured order workload, deep order-book sweeps degrade
+    gracefully, and serving state-sync snapshots slows block
+    production by at most a third on mid-size state.
+
 - **State-scaling benchmarks** (`crates/executor`,
   `modules/exchange`): `block_pipeline`'s `state_scaling` group
   measures a fixed 100-tx block against growing committed state —

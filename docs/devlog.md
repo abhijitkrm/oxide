@@ -19014,3 +19014,44 @@ verified-certificate token (`VerifiedQc`/`VerifiedTc`) remains the
 open half of this audit item; the same "proof on the stored type"
 pattern applies but stored certs escape into `BlockHeader`s and
 the WAL, which is a larger refactor.
+
+## §7.5 — the remaining workload costs are measured, not assumed
+
+Three more named costs now have benches instead of estimates — the
+audit asked for measured budgets, and "the cost is probably fine"
+was doing the work a number should do.
+
+**Nonce mutex** (`nonce_tracker_contention`): every admission — each
+`submit_batch` order on the dispatcher and each `submit_action` on
+its worker — acquires the shared `Mutex<NonceTracker>`. Measured via
+the new `#[doc(hidden)] bench_consume_nonce` seam (the production
+lock + `check_and_consume`, minus signature-verify noise): ~63 ns/op
+uncontended, but the *aggregate* ceiling collapses to ~5.2M ops/s at
+2 threads and ~2.3–2.6M ops/s at 4–8 — lock convoy, not data
+contention (owners are disjoint). Against the measured ~12K
+actions/s authenticated workload that's ~200× headroom: the gate is
+a scaling ceiling worth noting, not a live bottleneck worth a
+per-account-shard rewrite (which `submit_batch`'s ordered
+consumption deliberately complicates anyway).
+
+**Fill-vector growth** (`settlement_sweep` depth axis 10/100/500):
+1.44 / 18.3 / 201 µs per sweep ⇒ ~144 / ~183 / ~402 ns per fill —
+mildly superlinear (event-vec growth + deeper touched-state work),
+not quadratic. Deep sweeps degrade gracefully to ~2.5M fills/s.
+
+**Snapshot export** (`snapshot_export` + `snapshot_vs_exec`): export
+serializes every module's full KV at ~60 ns/account — 47 µs at 1k,
+431 µs at 10k, 6.0 ms at 100k committed accounts. Interference rows
+run the lane-installed block path against a back-to-back export loop
+(export completions asserted nonzero, so a starved export can't
+produce a fake "no contention" row): +32% block latency at 10k
+state, +8% at 100k — bounded by one export read, never a stall.
+The honest trade-off the numbers expose: `wait_exec_idle` +
+unlocked-after-quiesce reads keep correctness simple and the cost is
+real but modest; incremental/Merkle-ized export is the design item
+that removes it.
+
+Still open on this list: TLS contention (needs a TLS transport
+harness — §6.4 residual) and string/event allocation accounting
+(wall-clock benches can't see allocation counts; needs an
+instrumented allocator before claims are quotable).
