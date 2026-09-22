@@ -18679,3 +18679,15 @@ is a leaf that reads module state and formats a response, and the
 dispatcher in `lib.rs` is the only caller. `lib.rs` is ~1.9k
 lines of types (subscriptions, filters, providers) and server
 plumbing.
+
+## §9.E — EVM core engine split
+
+The remaining `impl EvmModule` block split three ways:
+`build.rs` (the only place a revm instance is assembled — spec
+gates, precompile reader, block env all converge here),
+`fastpath.rs` (native-transfer/empty-call shortcuts that must
+produce identical state to the interpreter — kept together so
+the equivalence is auditable), `batch.rs` (the parallel
+speculation engine — ~1400 lines: a `SpecTx` is proved or
+disproved at canonical-order commit, never trusted). `lib.rs` is
+now ~1.1k lines: struct, ctor, accessors, and module wiring.
