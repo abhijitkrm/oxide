@@ -63,6 +63,33 @@ fn engine() -> MatchingEngine {
     .unwrap()
 }
 
+/// The module's `book_resting_leaf` replicated exactly — the same
+/// `Domain::CommittedLeaf` hash over the same `(map_tag ‖ id ‖
+/// side ‖ price ‖ qty ‖ owner)` preimage the exchange folds — so
+/// the `_folded` rows measure the production leaf cost, not a toy
+/// mixer. `crypto` is dev-only; the engine takes the leaf as a
+/// function pointer and stays dependency-free.
+fn bench_leaf(e: &trading::RestingEntry) -> [u8; 32] {
+    let mut h = crypto::hash::Hasher::new(crypto::hash::Domain::CommittedLeaf);
+    h.update(&6u64.to_le_bytes()); // MAP_TAG_BOOK (exchange)
+    h.update(&e.id.0.to_le_bytes());
+    h.update(&[e.side as u8]);
+    h.update(&e.price.0.to_le_bytes());
+    h.update(&e.qty.0.to_le_bytes());
+    h.update(&e.owner.0);
+    h.finalize().0
+}
+
+/// An engine wired as the exchange wires it: the resting fold is
+/// what `state_root` reads per block, so every resting mutation
+/// pays one `committed_leaf` hash. This is the consensus-relevant
+/// engine configuration — the `_folded` rows are the honest gate.
+fn folded_engine() -> MatchingEngine {
+    let mut e = engine();
+    e.enable_resting_fold(bench_leaf);
+    e
+}
+
 /// A limit order at `ticks` above the band floor.
 fn limit(side: Side, ticks: u64, lots: u64, owner: u8, tif: TimeInForce) -> NewOrder {
     NewOrder {
@@ -295,11 +322,116 @@ fn mixed_workload(c: &mut Criterion) {
     });
 }
 
+/// Fold-enabled variant of `rest_cancel_pair` — same gate (pair
+/// p50 < 400ns) against the consensus engine shape. Every rest +
+/// cancel now pays one `committed_leaf` hash each, so this row
+/// prices the 7.4 fold on the two most common book mutations.
+fn rest_cancel_pair_folded(c: &mut Criterion) {
+    let mut e = folded_engine();
+    let mut fills = Vec::with_capacity(64);
+    let order = limit(Side::Buy, 10, 5, 1, TimeInForce::Gtc);
+    c.bench_function("rest_cancel_pair_folded", |b| {
+        b.iter(|| {
+            let out = black_box(&mut e).place(black_box(order), black_box(&mut fills)).unwrap();
+            match out {
+                OrderOutcome::Resting { order_id, .. } => {
+                    black_box(black_box(&mut e).cancel(order_id).unwrap());
+                }
+                other => panic!("bench invariant broken: {other:?}"),
+            }
+        });
+    });
+}
+
+/// Fold-enabled variant of `mixed_workload` — same ≥1M ops/s gate.
+/// Taker fills exercise the `fold_replace` path (out old qty, in
+/// new) plus maker removals — the heaviest per-op fold density the
+/// book can produce.
+fn mixed_workload_folded(c: &mut Criterion) {
+    let mut e = folded_engine();
+    let mut fills = Vec::with_capacity(256);
+    let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+    let mut live: Vec<OrderId> = Vec::with_capacity(512);
+    for i in 0..50u64 {
+        let bid = e
+            .place(limit(Side::Buy, 400 + i % 40, 1 + i % 5, 7, TimeInForce::Gtc), &mut fills)
+            .unwrap();
+        let ask = e
+            .place(limit(Side::Sell, 500 + i % 40, 1 + i % 5, 8, TimeInForce::Gtc), &mut fills)
+            .unwrap();
+        if let OrderOutcome::Resting { order_id, .. } = bid {
+            live.push(order_id);
+        }
+        if let OrderOutcome::Resting { order_id, .. } = ask {
+            live.push(order_id);
+        }
+    }
+
+    c.bench_function("mixed_workload_folded", |b| {
+        b.iter(|| {
+            for _ in 0..256 {
+                let r = black_box(&mut rng).next();
+                match r % 100 {
+                    0..=54 => {
+                        let side = if r & 0x100 == 0 { Side::Buy } else { Side::Sell };
+                        let ticks = match side {
+                            Side::Buy => 350 + (r >> 9) % 90,
+                            Side::Sell => 500 + (r >> 9) % 90,
+                        };
+                        let lots = 1 + (r >> 16) % 5;
+                        let out = e
+                            .place(
+                                limit(side, ticks, lots, 1, TimeInForce::Gtc),
+                                black_box(&mut fills),
+                            )
+                            .unwrap();
+                        if let OrderOutcome::Resting { order_id, .. } = out {
+                            live.push(order_id);
+                        }
+                    }
+                    55..=84 => {
+                        let (side, ticks) =
+                            if r & 0x200 == 0 { (Side::Buy, 600) } else { (Side::Sell, 400) };
+                        let lots = 1 + (r >> 20) % 3;
+                        let out = e
+                            .place(
+                                NewOrder {
+                                    side,
+                                    order_type: OrderType::Limit,
+                                    tif: TimeInForce::Ioc,
+                                    price: Price(1_000_000_000 + ticks * 1_000_000),
+                                    qty: Qty(lots * 1_000),
+                                    owner: Address([2; 20]),
+                                    stp: StpMode::None,
+                                },
+                                black_box(&mut fills),
+                            )
+                            .unwrap();
+                        black_box(&out);
+                    }
+                    _ => {
+                        if !live.is_empty() {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let idx = ((r >> 24) as usize) % live.len();
+                            let id = live.swap_remove(idx);
+                            if let Ok(canceled) = e.cancel(id) {
+                                black_box(&canceled);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
     rest_cancel_pair,
     match_single_level,
     match_sweep_10_levels,
-    mixed_workload
+    mixed_workload,
+    rest_cancel_pair_folded,
+    mixed_workload_folded
 );
 criterion_main!(benches);

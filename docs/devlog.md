@@ -19344,3 +19344,39 @@ gate. Perps `accounts` is also not a mechanical swap: its values
 are nested `AccountState`s (positions + open-order maps inside),
 so the fold needs per-position leaf granularity or a flattened
 map — next slice's design question.
+
+§7.4 exchange book leg: the resting-order book is incrementally
+committed too. `MatchingEngine` gained an opt-in `resting_fold` —
+`⊕ leaf(entry)` over the live resting set, maintained at the six
+mutation points (`place`/`restore_resting` appends, `cancel`,
+`remove_maker` — which every sweep/STP/cap removal funnels through —
+and the two `pool[head].qty` partial-fill writes via a
+fold-out-old/fold-in-new `fold_replace`). The leaf is injected as
+`fn(&RestingEntry) -> [u8; 32]` via `enable_resting_fold`, so
+`trading` keeps its primitives-only dependency rule and unfolder
+engines (matcher, tests) pay exactly nothing — the fold is an
+`Option` check on the hot path.
+
+The exchange wires `book_resting_leaf` — a `Domain::CommittedLeaf`
+`MAP_TAG_BOOK` hash over the same `(id ‖ side ‖ price ‖ qty ‖
+owner)` record `write_canonical_state` emits — and the root
+preimage's markets section now writes `write_canonical_header`
+(extracted shared definition, so header fields can't drift) +
+`put_root(resting_fold)` instead of the O(resting) entry list.
+`write_committed`'s blob still carries full entries for install;
+staged decode enables the fold after `from_canonical_state` so
+`inspect_state` and `state_root` read `resting_fold()` identically.
+
+Measured both directions. `state_root_vs_book`: 4.7/5.5/14.4 µs at
+100/1k/10k resting orders — −68%/−87%/−96% vs the flat-map-fold
+numbers, the book term is gone (the residual slope is the
+committed-map root reads, not the book). Hot-path cost with the
+production leaf replicated from `crypto` (dev-dep only):
+`rest_cancel_pair_folded` ~360 ns (< 400 ns gate),
+`mixed_workload_folded` ~45.8 µs/256 ops ≈ 5.6M ops/s (≥ 1M gate)
+— ~160 ns per resting mutation, inside the match gates.
+
+Perps is the remaining book consumer: its `state_root` still
+hashes `write_committed` whole (no `RootView` split yet), and its
+`accounts` values are nested `AccountState`s — both pieces of its
+migration are a separate slice.

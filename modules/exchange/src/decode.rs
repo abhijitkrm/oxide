@@ -43,10 +43,9 @@ pub(crate) struct RootView<'a> {
     pub fee_vault_fold: Hash,
 }
 
-/// The markets section shared by `write_committed` (snapshot blob)
-/// and [`write_root_preimage`] (`state_root`): identical bytes from
-/// one definition — a market added to one cannot drift from the
-/// other.
+/// The markets section for `write_committed` (the snapshot blob):
+/// full canonical engine serialization — the blob must carry every
+/// resting order so an importer can rebuild the book.
 fn write_markets_section(markets: &[Option<MatchingEngine>], w: &mut framework::CanonicalState) {
     let mut entries = Vec::new();
     let mut book_bytes = Vec::new();
@@ -58,6 +57,34 @@ fn write_markets_section(markets: &[Option<MatchingEngine>], w: &mut framework::
                 book_bytes.clear();
                 e.write_canonical_state(&mut book_bytes, &mut entries);
                 w.put_bytes(&book_bytes);
+            }
+            None => {
+                w.put_u8(0);
+            }
+        }
+    }
+}
+
+/// The markets section for [`write_root_preimage`]: each market
+/// contributes the same canonical header `write_markets_section`
+/// emits — `write_canonical_header` is the shared definition — but
+/// the O(resting) entry list is replaced by the engine's
+/// maintained `resting_fold`, so the book costs O(1) per market in
+/// the root while the blob still carries the full serialization.
+fn write_markets_root_section(
+    markets: &[Option<MatchingEngine>],
+    w: &mut framework::CanonicalState,
+) {
+    let mut header = Vec::new();
+    w.put_count(markets.len());
+    for engine in markets {
+        match engine {
+            Some(e) => {
+                w.put_u8(1);
+                header.clear();
+                e.write_canonical_header(&mut header);
+                w.put_bytes(&header);
+                w.put_root(&Hash(e.resting_fold()));
             }
             None => {
                 w.put_u8(0);
@@ -81,7 +108,7 @@ fn write_markets_section(markets: &[Option<MatchingEngine>], w: &mut framework::
 /// missed field is a silent root divergence.
 pub(crate) fn write_root_preimage(v: &RootView<'_>, w: &mut framework::CanonicalState) {
     w.put_root(&v.store_fold);
-    write_markets_section(v.markets, w);
+    write_markets_root_section(v.markets, w);
     v.endorsements.write_canonical(w);
     w.put_root(&v.registered_fold);
     w.put_root(&v.base_balances_fold);
@@ -170,8 +197,13 @@ impl ExchangeModule {
                 0 => markets.push(None),
                 1 => {
                     let bytes = r.get_bytes()?;
-                    let engine =
+                    let mut engine =
                         MatchingEngine::from_canonical_state(bytes, |c| DenseBook::new(*c)).ok()?;
+                    // Enable the resting fold after decode so the
+                    // staged view's `resting_fold()` equals the live
+                    // engine's — the O(resting) re-fold is already
+                    // the cost profile of decode+re-encode here.
+                    engine.enable_resting_fold(crate::book_resting_leaf);
                     // Store↔engine binding: a listed market must carry
                     // its byte-identical config under `m/{id}`. Without
                     // this check a crafted blob could pair engines with

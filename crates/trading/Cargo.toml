@@ -28,6 +28,12 @@ criterion = "0.7.0"
 # Property-based oracle-equivalence testing (testing-standards skill,
 # layer 2: matching ops == sequential model oracle).
 proptest = "1.11.0"
+# Bench-only: the fold-enabled rows replicate the module's real
+# `committed_leaf` (Domain::CommittedLeaf + map tag + record bytes)
+# so the measured fold cost is the production leaf hash, not a toy
+# function. Runtime deps stay primitives-only — the engine takes
+# the leaf as a function pointer and never sees the hasher.
+crypto = { workspace = true }
 
 [[bench]]
 name = "matching"

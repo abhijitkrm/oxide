@@ -389,6 +389,7 @@ const MAP_TAG_REGISTERED: u64 = 2;
 const MAP_TAG_BASE_BALANCES: u64 = 3;
 const MAP_TAG_BASE_HOLDS: u64 = 4;
 const MAP_TAG_FEE_VAULT: u64 = 5;
+const MAP_TAG_BOOK: u64 = 6;
 
 /// The committed KV-subtree leaf — the same record shape
 /// `subtree_root_map` folds sequentially.
@@ -439,6 +440,23 @@ fn fee_vault_leaf(k: &u8, v: &u64) -> Hash {
     let mut w = framework::CanonicalState::new();
     w.put_u8(*k).put_u64(*v);
     framework::committed_leaf(MAP_TAG_FEE_VAULT, w.as_bytes())
+}
+
+/// `(id ‖ side ‖ price ‖ qty ‖ owner)` — the same record shape
+/// `write_canonical_state` appends per resting order, folded into
+/// the engine's incremental `resting_fold` instead of being
+/// re-serialized per block. Returns the raw leaf bytes for the
+/// engine's `fn(&RestingEntry) -> [u8; 32]` slot — `trading` is a
+/// dependency-free hot-path crate, so the hash itself stays in the
+/// module.
+fn book_resting_leaf(e: &trading::RestingEntry) -> [u8; 32] {
+    let mut w = framework::CanonicalState::new();
+    w.put_u64(e.id.0)
+        .put_u8(codec::encode_side(e.side))
+        .put_u64(e.price.0)
+        .put_u64(e.qty.0)
+        .put_addr(&e.owner);
+    framework::committed_leaf(MAP_TAG_BOOK, w.as_bytes()).0
 }
 
 struct Inner {
@@ -609,8 +627,13 @@ impl ExchangeModule {
             .map_err(|e| ExecError::ModuleRejected(format!("market config: {e}")))?;
         let book = DenseBook::new(vcfg)
             .map_err(|e| ExecError::ModuleRejected(format!("book init: {e}")))?;
-        let engine = MatchingEngine::new(vcfg, book)
+        let mut engine = MatchingEngine::new(vcfg, book)
             .map_err(|e| ExecError::ModuleRejected(format!("engine init: {e}")))?;
+        // Committed engines always carry the incremental book fold —
+        // `state_root` reads `resting_fold()` instead of re-walking
+        // the book. Enabled before any orders rest, so the fold is
+        // ZERO until the first placement.
+        engine.enable_resting_fold(book_resting_leaf);
         inner.markets[id] = Some(engine);
         // Persist the market config for state-root replay.
         let key = crate::codec::market_config_key(id_u8);

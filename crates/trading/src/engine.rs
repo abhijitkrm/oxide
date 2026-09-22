@@ -266,6 +266,19 @@ pub struct MatchingEngine<B: BookBackend = DenseBook> {
     ids: IdMap,
     next_id: u64,
     resting: u32,
+    /// Caller-supplied leaf hash for the incremental resting
+    /// commitment (7.4): `Some` means every resting-order mutation
+    /// folds its `RestingEntry` leaf into `resting_fold`, so the
+    /// committed-state root costs O(1) per book instead of
+    /// re-serializing every resting order per block. `None`
+    /// disables the fold — matcher and test engines pay nothing.
+    /// The function pointer keeps this crate dependency-free.
+    fold_leaf: Option<fn(&RestingEntry) -> [u8; 32]>,
+    /// `⊕ fold_leaf(entry)` over all resting orders — insertion and
+    /// removal are the same operation under XOR, so the fold is
+    /// maintained in O(1) per mutation and always equals the fold
+    /// of exactly the live resting set.
+    resting_fold: [u8; 32],
 }
 
 impl<B: BookBackend> MatchingEngine<B> {
@@ -286,7 +299,75 @@ impl<B: BookBackend> MatchingEngine<B> {
             book,
             next_id: 0,
             resting: 0,
+            fold_leaf: None,
+            resting_fold: [0; 32],
         })
+    }
+
+    /// Enable the incremental resting commitment with `leaf` —
+    /// the module wires its domain-separated `committed_leaf`
+    /// hash once at assembly (or after snapshot decode). Any
+    /// already-resting entries are folded in one pass — O(resting),
+    /// the same cost the walk it replaces already pays.
+    ///
+    /// Measured budget: the fold costs ~one domain-separated hash
+    /// per resting-order mutation — ~160 ns on the dev bench, a
+    /// real but bounded hot-path tax gated by the
+    /// `rest_cancel_pair_folded`/`mixed_workload_folded` rows
+    /// (both inside the match gates).
+    pub fn enable_resting_fold(&mut self, leaf: fn(&RestingEntry) -> [u8; 32]) {
+        self.fold_leaf = Some(leaf);
+        self.resting_fold = [0; 32];
+        // Fold the already-resting set once — snapshot installs
+        // arrive populated, and an enabled fold must equal the
+        // fold of exactly the live set.
+        let mut entries = Vec::with_capacity(self.resting as usize);
+        self.resting_entries(&mut entries);
+        for e in &entries {
+            self.fold_entry(e);
+        }
+    }
+
+    /// The maintained resting-fold — `⊕ leaf(entry)` over every
+    /// resting order (`[0; 32]` while the fold is disabled).
+    #[must_use]
+    pub fn resting_fold(&self) -> [u8; 32] {
+        self.resting_fold
+    }
+
+    /// The pool node's committed view — the same `(id, side,
+    /// price, qty, owner)` shape `resting_entries` serializes.
+    fn node_entry(&self, slot: u32) -> RestingEntry {
+        let node = &self.pool[slot];
+        RestingEntry {
+            id: node.id,
+            side: node.side,
+            price: node.price,
+            qty: node.qty,
+            owner: node.owner,
+        }
+    }
+
+    /// XOR `leaf(entry)` into `resting_fold` — insertion and
+    /// removal are the same operation under XOR. No-op while the
+    /// fold is disabled.
+    #[inline]
+    fn fold_entry(&mut self, e: &RestingEntry) {
+        if let Some(leaf) = self.fold_leaf {
+            let h = leaf(e);
+            for (a, b) in self.resting_fold.iter_mut().zip(h.iter()) {
+                *a ^= *b;
+            }
+        }
+    }
+
+    /// Replace `old`'s leaf with `new`'s in one call — the
+    /// partial-fill/STP-decrement path where a resting order keeps
+    /// its slot but changes quantity.
+    #[inline]
+    fn fold_replace(&mut self, old: &RestingEntry, new: &RestingEntry) {
+        self.fold_entry(old);
+        self.fold_entry(new);
     }
 
     /// The market's configuration (tick/lot/band rules).
@@ -470,6 +551,11 @@ impl<B: BookBackend> MatchingEngine<B> {
                     req.tif,
                 ));
                 self.book.append(slot, &mut self.pool);
+                // Fold right after append: the fold tracks book
+                // membership — `resting_entries` (what staged verify
+                // re-folds) emits whatever the book holds, even if a
+                // later step below returns early.
+                self.fold_entry(&self.node_entry(slot));
                 // IdMap is sized ≥ max_resting at ≤0.5 load, so insert
                 // cannot fail after the capacity check above.
                 self.ids.insert(taker_id.0, slot)?;
@@ -494,6 +580,7 @@ impl<B: BookBackend> MatchingEngine<B> {
             let node = &self.pool[slot];
             (node.side, node.price, node.qty, node.owner)
         };
+        self.fold_entry(&self.node_entry(slot));
         self.book.unlink(slot, &mut self.pool);
         self.pool.release(slot);
         self.resting = self.resting.saturating_sub(1);
@@ -540,17 +627,11 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// scratch reused across markets so a module's per-block
     /// state-root pass stays allocation-light.
     ///
-    /// Cold path only: O(resting) per call, once per block per
-    /// market. The match path never runs it.
+    /// Cold path only: O(resting) per call — now the snapshot
+    /// blob path only; `state_root` reads [`Self::resting_fold`]
+    /// instead of this walk. The match path never runs it.
     pub fn write_canonical_state(&self, out: &mut Vec<u8>, entries: &mut Vec<RestingEntry>) {
-        out.extend_from_slice(&self.cfg.market_id.to_le_bytes());
-        out.extend_from_slice(&self.cfg.tick_size.0.to_le_bytes());
-        out.extend_from_slice(&self.cfg.lot_size.0.to_le_bytes());
-        out.extend_from_slice(&self.cfg.min_price.0.to_le_bytes());
-        out.extend_from_slice(&self.cfg.max_price.0.to_le_bytes());
-        out.extend_from_slice(&self.cfg.max_resting.to_le_bytes());
-        out.extend_from_slice(&self.next_id.to_le_bytes());
-        out.extend_from_slice(&self.resting.to_le_bytes());
+        self.write_canonical_header(out);
         self.resting_entries(entries);
         #[allow(clippy::cast_possible_truncation)]
         out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
@@ -561,6 +642,26 @@ impl<B: BookBackend> MatchingEngine<B> {
             out.extend_from_slice(&e.qty.0.to_le_bytes());
             out.extend_from_slice(&e.owner.0);
         }
+    }
+
+    /// Append the canonical header — everything `write_canonical_state`
+    /// commits ahead of the entry list: the market config, `next_id`,
+    /// and the resting count.
+    ///
+    /// The module's incremental root preimage writes this same header
+    /// followed by [`Self::resting_fold`] in place of the entry list,
+    /// so both encodings share one field-order definition — a header
+    /// field added here lands in both the snapshot bytes and the root
+    /// preimage automatically.
+    pub fn write_canonical_header(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.cfg.market_id.to_le_bytes());
+        out.extend_from_slice(&self.cfg.tick_size.0.to_le_bytes());
+        out.extend_from_slice(&self.cfg.lot_size.0.to_le_bytes());
+        out.extend_from_slice(&self.cfg.min_price.0.to_le_bytes());
+        out.extend_from_slice(&self.cfg.max_price.0.to_le_bytes());
+        out.extend_from_slice(&self.cfg.max_resting.to_le_bytes());
+        out.extend_from_slice(&self.next_id.to_le_bytes());
+        out.extend_from_slice(&self.resting.to_le_bytes());
     }
 
     /// Rebuild an engine from `write_canonical_state` bytes —
@@ -651,6 +752,7 @@ impl<B: BookBackend> MatchingEngine<B> {
         let slot =
             self.pool.alloc(fresh_node(e.id, e.side, e.price, e.qty, e.owner, TimeInForce::Gtc));
         self.book.append(slot, &mut self.pool);
+        self.fold_entry(&self.node_entry(slot));
         self.ids.insert(e.id.0, slot)?;
         self.resting += 1;
         Ok(())
@@ -757,8 +859,13 @@ impl<B: BookBackend> MatchingEngine<B> {
                     taker_owner: req.owner,
                     taker_side: req.side,
                 });
-                self.pool[head].qty = Qty(m_qty - fill);
-                self.book.reduce_total(opp, fill);
+                {
+                    let old = self.node_entry(head);
+                    self.pool[head].qty = Qty(m_qty - fill);
+                    self.book.reduce_total(opp, fill);
+                    let new = self.node_entry(head);
+                    self.fold_replace(&old, &new);
+                }
                 *rem -= fill;
 
                 if fill == m_qty {
@@ -859,8 +966,13 @@ impl<B: BookBackend> MatchingEngine<B> {
                         remaining: new_qty,
                         reason: RemovalReason::SelfTrade,
                     });
-                    self.pool[head].qty = Qty(new_qty);
-                    self.book.reduce_total(opp, *rem);
+                    {
+                        let old = self.node_entry(head);
+                        self.pool[head].qty = Qty(new_qty);
+                        self.book.reduce_total(opp, *rem);
+                        let new = self.node_entry(head);
+                        self.fold_replace(&old, &new);
+                    }
                     *rem = 0;
                     StpAction::TakerConsumed
                 }
@@ -883,6 +995,7 @@ impl<B: BookBackend> MatchingEngine<B> {
     /// state) rather than panicking — a panic here would let a
     /// corrupted `IdMap` kill the validator (`DoS` vector).
     fn remove_maker(&mut self, slot: u32, id: OrderId) {
+        self.fold_entry(&self.node_entry(slot));
         self.book.unlink(slot, &mut self.pool);
         match self.ids.remove(id.0) {
             Ok(unmapped) => {

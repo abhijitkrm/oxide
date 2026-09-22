@@ -152,6 +152,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     in half. Hashing the live order book itself is the remaining
     piece.
 
+- **Exchange order book is incrementally committed** (`trading`,
+  `exchange`): `MatchingEngine` maintains `resting_fold` — an
+  XOR-fold of per-entry leaf hashes over every resting order —
+  updated at each book mutation (rest, cancel, partial fill, STP
+  decrement, maker removal, snapshot restore). The leaf hash is
+  injected by the module (`enable_resting_fold`), so the engine
+  stays dependency-free and unfolder engines pay nothing; the
+  exchange's `state_root` now writes each market's canonical
+  header plus its fold instead of serializing every resting
+  order. `state_root_vs_book` measured ~4.7/5.5/14.4 µs at
+  100/1k/10k resting orders — 68–96% cheaper than the prior
+  incremental flat-map root — and the match gates still pass with
+  the fold live (`rest_cancel_pair_folded` ~360 ns < 400 ns;
+  `mixed_workload_folded` ~5.6M ops/s ≥ 1M). Snapshot blobs are
+  byte-identical; the root preimage is again a new agreed
+  construction.
+  - **In plain words:** the chain no longer re-serializes the
+    whole order book every block — each resting order updates a
+    running hash when it changes, so the per-block bookkeeping is
+    near-constant while order matching stays within its speed
+    gates.
+
 ### Added
 
 - **Contention and interference benchmarks** (`crates/matcher`,

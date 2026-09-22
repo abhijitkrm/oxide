@@ -721,3 +721,103 @@ fn canonical_state_decode_rejects_malformed() {
     bad[58..66].copy_from_slice(&nid.to_le_bytes());
     assert!(decode_canonical_state(&bad).is_none(), "id ≥ next_id must be rejected");
 }
+
+/// Test leaf: pack the committed fields into 32 bytes — no crypto
+/// needed, the fold contract only requires a deterministic
+/// per-entry value to XOR.
+fn test_leaf(e: &RestingEntry) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    h[0..8].copy_from_slice(&e.id.0.to_le_bytes());
+    h[8..16].copy_from_slice(&e.price.0.to_le_bytes());
+    h[16..24].copy_from_slice(&e.qty.0.to_le_bytes());
+    h[24] = e.side as u8;
+    h[25..32].copy_from_slice(&e.owner.0[..7]);
+    h
+}
+
+/// Recompute the fold authoritatively from `resting_entries` —
+/// the reference every maintained-fold assertion compares against.
+fn recompute_fold(e: &MatchingEngine) -> [u8; 32] {
+    let mut entries = Vec::new();
+    e.resting_entries(&mut entries);
+    let mut f = [0u8; 32];
+    for en in &entries {
+        let h = test_leaf(en);
+        for (a, b) in f.iter_mut().zip(h.iter()) {
+            *a ^= *b;
+        }
+    }
+    f
+}
+
+/// The maintained resting fold must equal the XOR of the leaf
+/// over `resting_entries` after every mutation — place, cancel,
+/// partial fill (qty replace), STP decrement, full fill, and
+/// snapshot restore all update the fold in lockstep. This is the
+/// invariant `state_root`'s O(1) book commitment relies on (7.4).
+#[test]
+fn resting_fold_tracks_every_mutation() {
+    let mut e = engine();
+    let mut fills = Vec::new();
+
+    // Disabled: no maintenance, fold stays ZERO.
+    e.place(
+        order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 5_000, 1),
+        &mut fills,
+    )
+    .unwrap();
+    assert_eq!(e.resting_fold(), [0; 32], "disabled fold must not move");
+
+    // Enabling folds the already-resting set once.
+    e.enable_resting_fold(test_leaf);
+    assert_eq!(e.resting_fold(), recompute_fold(&e));
+
+    // Place inserts.
+    e.place(
+        order(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 1_051_000_000, 2_000, 2),
+        &mut fills,
+    )
+    .unwrap();
+    e.place(
+        order(Side::Buy, OrderType::Limit, TimeInForce::Gtc, 1_010_000_000, 7_000, 3),
+        &mut fills,
+    )
+    .unwrap();
+    assert_eq!(e.resting_fold(), recompute_fold(&e));
+
+    // Partial fill: the maker's qty change folds out-then-in.
+    e.place(
+        order(Side::Buy, OrderType::Limit, TimeInForce::Gtc, 1_050_000_000, 1_000, 4),
+        &mut fills,
+    )
+    .unwrap();
+    assert_eq!(e.resting_fold(), recompute_fold(&e));
+
+    // Full fill: the exhausted maker leaves the fold entirely.
+    e.place(
+        order(Side::Buy, OrderType::Limit, TimeInForce::Gtc, 1_051_000_000, 2_000, 5),
+        &mut fills,
+    )
+    .unwrap();
+    assert_eq!(e.resting_fold(), recompute_fold(&e));
+
+    // STP decrement: the self-maker's qty shrinks in place.
+    let mut stp_req = order(Side::Buy, OrderType::Limit, TimeInForce::Gtc, 1_010_000_000, 1_000, 3);
+    stp_req.stp = StpMode::DecrementAndCancel;
+    e.place(stp_req, &mut fills).unwrap();
+    assert_eq!(e.resting_fold(), recompute_fold(&e));
+
+    // Cancel removes.
+    e.cancel(OrderId(0)).unwrap();
+    assert_eq!(e.resting_fold(), recompute_fold(&e));
+
+    // Snapshot restore: a re-decoded engine folds to the same
+    // value once enabled (the staged-verify path).
+    let mut bytes = Vec::new();
+    let mut scratch = Vec::new();
+    e.write_canonical_state(&mut bytes, &mut scratch);
+    let mut restored =
+        MatchingEngine::from_canonical_state(&bytes, |c| DenseBook::new(*c)).unwrap();
+    restored.enable_resting_fold(test_leaf);
+    assert_eq!(restored.resting_fold(), e.resting_fold());
+}
