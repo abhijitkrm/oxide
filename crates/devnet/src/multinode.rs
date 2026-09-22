@@ -172,18 +172,27 @@ impl MultiNodeDevnet {
             ..node::NodeConfig::default()
         };
         for (i, key) in secret_keys.iter().cloned().enumerate() {
-            let assembled = node::assemble_executor(&config);
-            let app = assembled.app;
-            let app_dyn: Arc<dyn AppInterface> = app.clone();
-            // Shared sim clock: all engines draw proposal timestamps
-            // from one counter so stamps increase across leaders and
+            // The same startup the `oxide-devnet` binary boots —
+            // engine wired with the configured pacemaker timeouts
+            // and block budget, membership gate enforced. The clock
+            // seam is the difference the sim exists for: all engines
+            // draw proposal timestamps from one deterministic
+            // counter so stamps increase across leaders and
             // identical schedules reproduce identical blocks.
             let clock = std::sync::Arc::clone(&block_clock);
-            let engine = OxideBft::with_index(app_dyn, vs.clone(), u16::try_from(i).unwrap())
-                .with_secret_key(key)
-                .with_clock(move || clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-            engines.push(engine);
-            apps.push(app);
+            let node = node::devnet::assemble_devnet_node(node::devnet::DevnetNodeSpec {
+                index: i,
+                validator_set: vs.clone(),
+                secret_key: key,
+                config: config.clone(),
+                clock: Some(std::sync::Arc::new(move || {
+                    clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                })),
+                wal_path: None,
+            })
+            .expect("devnet node assembles — deterministic keys are committee members");
+            engines.push(node.engine);
+            apps.push(node.app);
         }
 
         Self { engines, apps, validator_set: vs, secret_keys, n, network: None }

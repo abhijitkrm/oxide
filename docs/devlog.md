@@ -18754,3 +18754,33 @@ binaries build the identical config path and RPC surface.
 spawn `oxide-devnet`; `oxide-validator` is production-only. Genesis
 `evm.alloc` stayed in the devnet binary — its 256-bit slot parsing
 is the only alloy dependency, kept out of `node` deliberately.
+
+## §6.5 — seam-injected node startup: `node::devnet`
+
+`assemble_devnet_node` is now the single multi-validator startup —
+`oxide-devnet`, `TcpMultiNodeDevnet`, and `MultiNodeDevnet` all
+boot through it. What was three copies of engine construction is
+one: `OxideBft` gets the configured pacemaker timeouts and block
+budget (the TCP harness silently skipped both — compiled defaults
+happened to match `NodeConfig`'s, so the fix is behavior-
+preserving at defaults but closes the propagation hole), the WAL
+attaches and recovers in one place, and the committee-membership
+gate is a typed `DevnetStartError` (NotInCommittee /
+WrongValidatorSlot / Wal) instead of `exit(1)` — the binary maps
+it to exit, harnesses assert it.
+
+The audit's three seams are explicit `DevnetNodeSpec` fields:
+clock (`with_clock` — `None` = wall clock, the sim injects its
+deterministic counter), storage (`wal_path` + `storage_path` +
+shared `import_snapshot_if_present`/`export_snapshot`, which the
+binary's `--data-dir` persistence now calls), and I/O — transports
+were never part of node assembly; the pump drives whatever
+`ports::Transport` the caller injects (real TCP vs mesh). The pump
+loops stay caller-owned deliberately: deterministic stepping and
+the process loop are different drivers over the same engine API,
+and unifying them would destroy the sim's schedule control.
+
+The binary's `run_node` lost ~120 lines of setup; snapshot
+import/export shrank to one-line helper calls. Three new tests pin
+the seam contract (clock reaches proposal timestamps, both
+membership-gate failures).

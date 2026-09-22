@@ -979,3 +979,70 @@ fn governance_applies_fee_vault_withdrawal_end_to_end() {
     let got = framework::Balances::balance(evm, &dest);
     assert_eq!(got, 50, "governance-enacted withdrawal paid dest 50 units");
 }
+
+// ── devnet-node seam assembly ──────────────────────────────────
+//
+// `assemble_devnet_node` is the ONE multi-validator startup path —
+// `oxide-devnet`, `TcpMultiNodeDevnet`, and `MultiNodeDevnet` all
+// call it. These tests pin the seam contract: injected clock,
+// membership gate, and WAL option.
+
+fn devnet_spec(index: usize, key_byte: u8) -> devnet::DevnetNodeSpec {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=2u8).map(crate::cli::bls_key).collect();
+    let vs = consensus::ValidatorSet::new(
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect(),
+        vec![1; keys.len()],
+    )
+    .expect("validator set");
+    devnet::DevnetNodeSpec {
+        index,
+        validator_set: vs,
+        secret_key: crate::cli::bls_key(key_byte),
+        config: NodeConfig::default(),
+        clock: None,
+        wal_path: None,
+    }
+}
+
+#[test]
+fn devnet_node_assembles_with_injected_clock() {
+    // The clock seam: a deterministic counter reaches the engine —
+    // the in-memory sim's identical-schedule determinism contract.
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_700_000_000_000));
+    let clock2 = std::sync::Arc::clone(&clock);
+    let mut spec = devnet_spec(0, 1);
+    spec.clock =
+        Some(std::sync::Arc::new(move || clock2.load(std::sync::atomic::Ordering::Relaxed)));
+    let mut node = devnet::assemble_devnet_node(spec).expect("assembles");
+    assert!(!node.recovered, "no WAL — no recovery");
+    assert_eq!(node.engine.validator_index(), 0);
+    // The leader at view 0 is validator 0 in a 2-node set —
+    // propose and check the injected timestamp lands on the header.
+    let (header, _proposal) = node.engine.propose().expect("leader proposes");
+    assert_eq!(header.timestamp, 1_700_000_000_000);
+}
+
+#[test]
+fn devnet_node_rejects_key_outside_committee() {
+    // A key not in the validator set must refuse to start — its
+    // signatures would only ever be rejected noise.
+    let spec = devnet_spec(0, 7); // key 7 is not in the {1,2} committee
+    match devnet::assemble_devnet_node(spec) {
+        Err(devnet::DevnetStartError::NotInCommittee { epoch }) => assert_eq!(epoch, 0),
+        other => panic!("expected NotInCommittee, got {:?}", other.map(|_| "Ok")),
+    }
+}
+
+#[test]
+fn devnet_node_rejects_wrong_slot_on_fresh_start() {
+    // Key 2's slot is index 1 — asking for index 0 means the key
+    // file belongs to a different validator.
+    let spec = devnet_spec(0, 2);
+    match devnet::assemble_devnet_node(spec) {
+        Err(devnet::DevnetStartError::WrongValidatorSlot { expected, resolved }) => {
+            assert_eq!(expected, 0);
+            assert_eq!(resolved, Some(1));
+        }
+        other => panic!("expected WrongValidatorSlot, got {:?}", other.map(|_| "Ok")),
+    }
+}

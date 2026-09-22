@@ -550,14 +550,28 @@ impl TcpMultiNodeDevnet {
             ..node::NodeConfig::default()
         };
         for (i, key) in secret_keys.iter().cloned().enumerate() {
-            let assembled = node::assemble_executor(&config);
+            // The same startup the `oxide-devnet` binary boots —
+            // engine wired with the configured pacemaker timeouts
+            // and block budget, membership gate enforced. The
+            // transport stays harness-side (the threaded pump drives
+            // it); the clock seam stays at the production default
+            // (wall clock — TCP timing is deliberately real).
+            let node = node::devnet::assemble_devnet_node(node::devnet::DevnetNodeSpec {
+                index: i,
+                validator_set: vs.clone(),
+                secret_key: key,
+                config: config.clone(),
+                clock: None,
+                wal_path: None,
+            })
+            .expect("devnet node assembles — deterministic keys are committee members");
             // Register the power-0 committee member: the sole
             // endorsement quorum (see the genesis comment above).
-            assembled.staking_module.register_validator(txs::identity_addr(0));
-            let app = assembled.app;
-            evm_modules.push(assembled.evm_module);
-            exchange_modules.push(assembled.exchange_module);
-            let app_dyn: Arc<dyn AppInterface> = app.clone();
+            node.staking_module.register_validator(txs::identity_addr(0));
+            let app = node.app;
+            let mut engine = node.engine;
+            evm_modules.push(node.evm_module);
+            exchange_modules.push(node.exchange_module);
 
             // Build the peer list (all peers except self).
             let peers: Vec<(Vec<u8>, String)> = peer_addrs
@@ -575,9 +589,6 @@ impl TcpMultiNodeDevnet {
                 tcp_config.clone(),
             );
 
-            let engine = OxideBft::with_index(app_dyn, vs.clone(), u16::try_from(i).unwrap())
-                .with_secret_key(key);
-
             // Wire a commit listener that pushes each committed block
             // into the shared `committed_blocks` vector. The engine's
             // `finalized` map prunes at `MAX_RETAINED_FINALIZED` (4096),
@@ -585,7 +596,6 @@ impl TcpMultiNodeDevnet {
             // check on tests > 4096 blocks.
             let committed = committed_blocks[i].clone();
             let commit_seq = commit_seqs[i].clone();
-            let mut engine = engine;
             engine.set_commit_listener(Box::new(move |block| {
                 primitives::sync::lock_state(&committed).push(block.clone());
                 // Release so a reader that observes the bump is

@@ -53,6 +53,7 @@ use ports::{AppInterface, ConsensusEngine};
 use primitives::Address;
 
 pub mod cli;
+pub mod devnet;
 pub mod rpc_adapters;
 
 /// The consensus engine selection.

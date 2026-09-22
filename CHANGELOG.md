@@ -6004,3 +6004,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** tests used to be able to check balances a
     heartbeat before the chain had actually applied the block; now
     the run isn't over until execution catches up.
+
+### Changed — harnesses boot through `node::devnet`
+
+- **One multi-validator startup path.** `oxide-devnet`, the TCP
+  devnet, and the in-memory sim now construct their consensus
+  engines through `node::devnet::assemble_devnet_node` — same
+  executor graph, same configured pacemaker timeouts and block
+  budget, same WAL recovery and committee-membership gate. The TCP
+  harness previously skipped the configured timeout/budget wiring
+  entirely (its compiled defaults happened to match, so no
+  behavior change at defaults). Clock, WAL, and storage are
+  injected seams on `DevnetNodeSpec`; startup failures are a typed
+  `DevnetStartError` rather than process exits.
+  - **In plain words:** the simulated network used to build its
+    validators a slightly different way than the real launcher —
+    now there's literally one function, so a test can't silently
+    drift from what ships.

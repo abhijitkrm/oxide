@@ -127,7 +127,6 @@ fn run_node(node_index_str: &str) {
     // Load base config (TOML + env vars + CLI overrides), validated
     // and emitted as the effective config.
     let cfg = node::cli::load_config(node::NodeMode::Devnet, "oxide-devnet");
-    let node_config = &cfg.node;
     let rpc_config = &cfg.rpc;
     let genesis_config = &cfg.genesis_cfg;
 
@@ -172,19 +171,40 @@ fn run_node(node_index_str: &str) {
 
     println!("oxide-devnet[{node_index}]: listening on {listen_addr}, {} peers", peers.len());
 
-    // Assemble the executor through the ONE shared production path
-    // (`node::assemble_executor`) — the same module graph and exec
-    // lane `Node::assemble` produces. If --genesis-file was given,
-    // the staking validators and native balances are already applied
-    // via `node.genesis`; `evm.alloc` is applied on the module
-    // handle below.
-    let assembled = node::assemble_executor(&cfg.node);
-    let app: Arc<executor::Executor> = assembled.app.clone();
-    let evm_module = assembled.evm_module.clone();
+    // Assemble the node through the ONE shared production path —
+    // `node::devnet::assemble_devnet_node` runs the same executor
+    // graph, engine wiring (configured timeouts/budget), WAL
+    // recovery, and membership gate the harnesses consume. If
+    // --genesis-file was given, the staking validators and native
+    // balances are already applied via `node.genesis`; `evm.alloc`
+    // is applied on the module handle below.
+    let wal_path = node::cli::parse_cli_flag("--wal-file").map(PathBuf::from);
+    let node::devnet::DevnetNode {
+        mut engine,
+        app,
+        evm_module,
+        staking_module: _,
+        exchange_module: _,
+        recovered: _,
+    } = node::devnet::assemble_devnet_node(node::devnet::DevnetNodeSpec {
+        index: node_index,
+        validator_set: validator_set.clone(),
+        secret_key: our_key.clone(),
+        config: cfg.node.clone(),
+        clock: None, // production wall clock
+        wal_path: wal_path.clone(),
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("oxide-devnet[{node_index}]: {e} — exiting");
+        std::process::exit(1);
+    });
+    let app: Arc<executor::Executor> = app;
     if let Some(genesis) = &cfg.genesis_file {
         apply_evm_alloc(&evm_module, genesis);
     }
-    let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
+    if let Some(ref wal_path) = wal_path {
+        println!("oxide-devnet[{node_index}]: WAL loaded from {}", wal_path.display());
+    }
 
     // Create the TCP transport: --tls-dir for mTLS, plain TCP
     // otherwise. `[network]` timeouts and the frame bound flow into
@@ -195,61 +215,7 @@ fn run_node(node_index_str: &str) {
     // longer than plain TCP — 2s gives all peers time to connect
     // and complete the handshake before the first proposal.
     thread::sleep(Duration::from_millis(2000));
-
-    // Create the consensus engine — with the configured pacemaker
-    // timeouts and block budget, not the compiled defaults.
     let validator_set_clone = validator_set.clone();
-    let mut engine = consensus::OxideBft::with_index(
-        app_dyn,
-        validator_set,
-        u16::try_from(node_index).expect("index fits in u16"),
-    )
-    .with_secret_key(our_key.clone())
-    .with_pacemaker_timeouts(node_config.base_timeout_ms, node_config.max_timeout_ms)
-    .with_block_budget(node_config.block_budget);
-
-    // WAL persistence: --wal-file. Recovery may return a *rotated*
-    // validator set — the WAL records the committed committee, not
-    // just the epoch — and `recover_from_wal` re-seats our index by
-    // matching our BLS key against it.
-    let recovered = if let Some(wal_path) = node::cli::parse_cli_flag("--wal-file") {
-        let wal = consensus::wal::Wal::open(&wal_path).expect("wal open");
-        engine = engine.with_wal(wal);
-        engine.recover_from_wal().expect("wal recover");
-        println!("oxide-devnet[{node_index}]: WAL loaded from {wal_path}");
-        true
-    } else {
-        false
-    };
-
-    // Membership gate: our BLS key must resolve to a slot in the
-    // committee the engine is actually running (post-recovery, not
-    // necessarily the genesis set). `None` means we were rotated
-    // out (or the key file doesn't match this node's config) — a
-    // validator that cannot produce verifiable votes must not run:
-    // its signatures would only ever be rejected noise.
-    let our_index = engine.validator_set().index_of_key(&our_key.public_key());
-    if our_index.is_none() {
-        eprintln!(
-            "oxide-devnet[{node_index}]: our BLS key is not in the active validator set \
-             (epoch {}) — exiting; this node is no longer a committee member",
-            engine.epoch().value()
-        );
-        std::process::exit(1);
-    }
-    // Fresh start (no recovery): the engine was constructed as
-    // validator `node_index`, so our key must occupy that exact
-    // slot — landing elsewhere means the key file belongs to a
-    // different validator, and signing under `node_index` would
-    // emit only invalid votes.
-    if !recovered && our_index != Some(u16::try_from(node_index).unwrap_or(u16::MAX)) {
-        eprintln!(
-            "oxide-devnet[{node_index}]: our BLS key resolves to validator index \
-             {our_index:?}, not {node_index} — the key file does not match this node's \
-             identity; exiting",
-        );
-        std::process::exit(1);
-    }
 
     // Data directory: `--data-dir` or `[storage] data_dir` enables
     // auto-snapshot persistence — on startup, if
@@ -266,21 +232,12 @@ fn run_node(node_index_str: &str) {
     if let Some(ref dir) = data_dir {
         std::fs::create_dir_all(dir)
             .unwrap_or_else(|e| panic!("failed to create data dir {}: {e}", dir.display()));
-        let snap_path = dir.join("snapshot.bin");
-        if snap_path.exists() {
-            let bytes = std::fs::read(&snap_path)
-                .unwrap_or_else(|e| panic!("failed to read snapshot {}: {e}", snap_path.display()));
-            let mut reader = codec::Reader::new(&bytes);
-            let snap = executor::ExecutorSnapshot::decode(&mut reader).unwrap_or_else(|e| {
-                panic!("failed to decode snapshot {}: {e}", snap_path.display())
-            });
-            app.import_snapshot(&snap).unwrap_or_else(|e| {
-                panic!("failed to import snapshot {}: {e}", snap_path.display())
-            });
+        if let Some(height) =
+            node::devnet::import_snapshot_if_present(&app, dir).unwrap_or_else(|e| panic!("{e}"))
+        {
             println!(
-                "oxide-devnet[{node_index}]: imported snapshot from {} (height {})",
-                snap_path.display(),
-                snap.height
+                "oxide-devnet[{node_index}]: imported snapshot from {} (height {height})",
+                dir.join("snapshot.bin").display(),
             );
         }
     }
@@ -376,16 +333,10 @@ fn run_node(node_index_str: &str) {
     // state to `<dir>/snapshot.bin` so a restart can resume with
     // the full chain state (not just the WAL).
     if let Some(ref dir) = data_dir {
-        let snap = app.export_snapshot();
-        let mut buf = Vec::new();
-        snap.encode(&mut buf);
-        let snap_path = dir.join("snapshot.bin");
-        std::fs::write(&snap_path, &buf)
-            .unwrap_or_else(|e| panic!("failed to write snapshot {}: {e}", snap_path.display()));
+        let height = node::devnet::export_snapshot(&app, dir).unwrap_or_else(|e| panic!("{e}"));
         println!(
-            "oxide-devnet[{node_index}]: exported snapshot to {} (height {})",
-            snap_path.display(),
-            snap.height
+            "oxide-devnet[{node_index}]: exported snapshot to {} (height {height})",
+            dir.join("snapshot.bin").display(),
         );
     }
     println!("oxide-devnet[{node_index}]: shutdown complete");
