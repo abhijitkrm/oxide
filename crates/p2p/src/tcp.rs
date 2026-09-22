@@ -2598,7 +2598,7 @@ mod tests {
         }
         // The write is still blocked (release is unset), yet the
         // budget is already free — proving release-on-dequeue.
-        assert!(written.lock().unwrap().is_empty(), "frame must still be in-flight");
+        assert!(primitives::sync::lock_state(&written).is_empty(), "frame must still be in-flight");
         assert!(try_reserve_bytes(&slot.queued, budget, 100), "budget must recover");
 
         release.store(true, Ordering::Relaxed);

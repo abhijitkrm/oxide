@@ -6374,7 +6374,7 @@ mod tests {
             executor.insert_finalized(h, finalized_block(h, 1, h));
         }
         assert_eq!(
-            executor.finalized.lock().unwrap().len(),
+            primitives::sync::lock_state(&executor.finalized).len(),
             4,
             "unexecuted heights must never be evicted"
         );
@@ -6383,10 +6383,11 @@ mod tests {
         // become evictable; 3 and the new 4 stay pinned.
         {
             let (lock, _cv) = &*executor.exec_sync;
-            lock.lock().unwrap().executed = Some(2);
+            primitives::sync::lock_state(lock).executed = Some(2);
         }
         executor.insert_finalized(4, finalized_block(4, 1, 4));
-        let kept: Vec<u64> = executor.finalized.lock().unwrap().keys().copied().collect();
+        let kept: Vec<u64> =
+            primitives::sync::lock_state(&executor.finalized).keys().copied().collect();
         assert_eq!(kept, vec![3, 4], "only executed heights may be evicted");
     }
 

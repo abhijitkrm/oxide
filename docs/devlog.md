@@ -18380,3 +18380,44 @@ fixed per clippy's report. No test relied on recovery; the whole
 workspace suite passes unchanged. The typed-error-boundary half of
 the item (storage/snapshot/settlement returning typed errors with
 defined state effects) is a separate refactor and stays open.
+
+## §9.E/9.A — matcher settlement split + validated-config proof
+
+**9.E — split the matcher around the settlement invariant.** The
+~420-line block of fill-accounting and nonce-durability code moved
+out of `matcher/src/lib.rs` into `crates/matcher/src/settlement.rs`
+as `pub(crate)` items: `LegId`/`LegCostAcc` (marginal per-leg cost —
+the merged on-chain floor telescopes exactly), `SettledFill`,
+`NonceTracker`/`NonceStore` (the replay gate and its checkpoint),
+and the sweep helpers (`gone_makers`, `fill_parties`,
+`evict_gone_client_ids`, `buy_reservation_refund`). The file now
+states the invariant it guards: a fill must settle to the same
+quote the chain computes, and a consumed nonce must survive a
+restart. lib.rs drops ~420 lines to ~3.5k; the orchestration half
+(`MatchingServer`, rings, `MultiMarketMatcher`, workers) stays —
+deeper splits are a later pass. Extraction hazard: fields whose
+types contain commas (`BTreeMap<LegId, (u64, u64)>`) defeated the
+first visibility-lifting regex — fixed by hand and caught by the
+compiler.
+
+**9.A — `ValidatedMarketConfig`.** `MarketConfig::validate` was
+implicit: `DenseBook::new` and `MatchingEngine::new` each called it
+internally, so the check ran twice per engine and nothing stopped
+a new construction path from forgetting it. Now
+`MarketConfig::validated()` returns a `Copy`+`Deref` newtype that
+is the *only* input the two constructors accept — no engine can
+exist on an unchecked config by construction, and the check runs
+once per boundary. `from_canonical_state` validates the decoded
+config and hands the proof to the book-builder closure, so a
+corrupted snapshot can no longer smuggle an unchecked config into
+a restored engine. Apply-time revalidation added at the exchange
+and perps `list_market` paths (defense in depth past the quorum
+check). ~25 call sites updated; tests/benches unwrap the proof.
+
+**Lock normalization tail.** The remaining `.lock().unwrap()` /
+`.read().unwrap()` / `.write().unwrap()` sites (~60, incl. test
+mocks) were already panic-on-poison semantically — converted to the
+`lock_state`/`read_state`/`write_state` helpers anyway so every
+state lock in the tree shares the same fail-closed path and panic
+message. `runtime/tests/echo.rs` keeps `.unwrap()` — the crate is
+dependency-free by design.

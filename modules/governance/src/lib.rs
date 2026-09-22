@@ -1813,7 +1813,7 @@ mod tests {
         assert!(p.passed && p.finalized);
         assert!(events.iter().any(|e| e.kind == "proposal_finalized"));
         assert_eq!(ledger.balance(&addr(2)), 10_000_000, "refunded at decision");
-        assert!(sink.applied.lock().unwrap().is_empty(), "timelock has not elapsed");
+        assert!(framework::lock_state(&sink.applied).is_empty(), "timelock has not elapsed");
         // Inside the timelock the proposal waits.
         assert!(gov.end_block(Height::new(6)).is_empty());
         assert_eq!(gov.proposal(0).unwrap().status, ProposalStatus::Passed);
@@ -1821,7 +1821,7 @@ mod tests {
         let events = gov.end_block(Height::new(7));
         assert_eq!(gov.proposal(0).unwrap().status, ProposalStatus::Applied);
         assert!(events.iter().any(|e| e.kind == "proposal_applied"));
-        let applied = sink.applied.lock().unwrap();
+        let applied = framework::lock_state(&sink.applied);
         assert_eq!(applied.as_slice(), &[(b"test.param".to_vec(), b"42".to_vec())]);
     }
 
@@ -1861,7 +1861,7 @@ mod tests {
         assert!(events.iter().any(|e| e.kind == "proposal_apply_failed"));
         // No retry: the next end_block touches nothing.
         assert!(gov.end_block(Height::new(8)).is_empty());
-        assert_eq!(sink.applied.lock().unwrap().len(), 0);
+        assert_eq!(framework::lock_state(&sink.applied).len(), 0);
     }
 
     /// Fail-closed deposit path: no ledger wired → deposits cannot
@@ -1993,7 +1993,7 @@ mod tests {
         dst.end_block(Height::new(13));
         assert_eq!(dst.proposal(2).unwrap().status, ProposalStatus::Applied);
         // Both applied proposals delivered their exact key/value.
-        let applied = sink.applied.lock().unwrap();
+        let applied = framework::lock_state(&sink.applied);
         assert_eq!(
             applied.as_slice(),
             &[(b"test.p2".to_vec(), b"7".to_vec()), (b"test.p3".to_vec(), b"9".to_vec())]

@@ -499,7 +499,7 @@ impl StakingModule {
     /// likely a genesis bug.
     pub fn genesis_register_validator(&self, validator: Address, stake: u64) {
         assert!(stake > 0, "genesis validator {validator:?} has zero stake");
-        self.validators.lock().unwrap().insert(validator, stake);
+        framework::lock_state(&self.validators).insert(validator, stake);
     }
 
     /// Register a genesis validator's BLS consensus key — the
@@ -854,9 +854,7 @@ impl StakingModule {
     /// Panics if the mutex is poisoned.
     pub fn completed_unbonding(&self) -> Vec<UnbondingEntry> {
         let current = *framework::lock_state(&self.current_height);
-        self.unbonding
-            .lock()
-            .unwrap()
+        framework::lock_state(&self.unbonding)
             .iter()
             .filter(|e| e.completion_height <= current)
             .copied()
@@ -4502,7 +4500,7 @@ mod tests {
     #[test]
     fn jailed_validator_cannot_endorse() {
         let staking = setup_powered(&[1, 2, 3, 4], 100);
-        staking.jailed.lock().unwrap().insert(addr(4), 1);
+        framework::lock_state(&staking.jailed).insert(addr(4), 1);
         let result = staking.handle(&ctx_with_sender(4), &msg::validator_remove(addr(3)));
         assert!(result.is_err(), "jailed validators hold no committee vote");
     }
@@ -4914,7 +4912,7 @@ mod tests {
                 .unwrap();
             staking.take_key_changes();
         }
-        let retired = staking.retired_bls_keys.lock().unwrap();
+        let retired = framework::lock_state(&staking.retired_bls_keys);
         let keys = retired.get(&v).expect("history exists");
         assert_eq!(keys.len(), EVIDENCE_KEY_HISTORY, "history capped");
         // The oldest (key 0) was evicted; the newest (key 8) kept.
@@ -4979,7 +4977,7 @@ mod tests {
         dst.inspect_state(&v1_snapshot).unwrap();
         dst.import_state(&v1_snapshot).unwrap();
         // Empty retired history — but live-key evidence works.
-        assert!(dst.retired_bls_keys.lock().unwrap().is_empty());
+        assert!(framework::lock_state(&dst.retired_bls_keys).is_empty());
         let evidence = signed_evidence(v, &key, 7, 0);
         dst.handle(&ctx(), &evidence).unwrap();
         assert_eq!(dst.stake(&v), 900);

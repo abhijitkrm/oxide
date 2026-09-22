@@ -72,7 +72,7 @@ impl MockApp {
     /// When the staging queue's mutex is poisoned — the same
     /// fail-loud policy as every other `MockApp` lock.
     pub fn queue_epoch_changes(&self, changes: types::EpochChanges) {
-        self.pending_epoch_changes.lock().unwrap().push(changes);
+        primitives::sync::lock_state(&self.pending_epoch_changes).push(changes);
     }
 }
 
@@ -84,13 +84,13 @@ impl Default for MockApp {
 
 impl AppInterface for MockApp {
     fn ingest_tx(&self, tx: TxBytes) -> MempoolAck {
-        self.mempool.lock().unwrap().push(tx);
+        primitives::sync::lock_state(&self.mempool).push(tx);
         MempoolAck::Accepted
     }
 
     fn prepare_proposal(&self, budget: &BlockBudget) -> Proposal {
-        let mut mempool = self.mempool.lock().unwrap();
-        let next_height = self.next_proposal_height.lock().unwrap();
+        let mut mempool = primitives::sync::lock_state(&self.mempool);
+        let next_height = primitives::sync::lock_state(&self.next_proposal_height);
 
         // Drain the mempool into the proposal, respecting the byte
         // budget. A real app applies gas/nonce/fee selection here; the
@@ -121,7 +121,7 @@ impl AppInterface for MockApp {
     }
 
     fn has_queued_txs(&self) -> bool {
-        !self.mempool.lock().unwrap().is_empty()
+        !primitives::sync::lock_state(&self.mempool).is_empty()
     }
 
     fn process_proposal(&self, proposal: &Proposal) -> Verdict {
@@ -141,12 +141,12 @@ impl AppInterface for MockApp {
         // this from execution; the mock uses a height-derived placeholder
         // so attest_state is stable and inspectable.
         let root = mock_state_root(block.height);
-        self.state_roots.lock().unwrap().insert(block.height.value(), root);
+        primitives::sync::lock_state(&self.state_roots).insert(block.height.value(), root);
         // Advance the proposal counter now that this height is
         // committed. This is the only place the counter moves, keeping
         // it in lockstep with the engine's `next_height` (which advances
         // on the same finalization event).
-        *self.next_proposal_height.lock().unwrap() = block.height.value() + 1;
+        *primitives::sync::lock_state(&self.next_proposal_height) = block.height.value() + 1;
         CommitAck { height: block.height }
     }
 
@@ -156,10 +156,7 @@ impl AppInterface for MockApp {
         // without driving finalization first. A real app returns
         // `None` for unexecuted heights; engine tests that need the
         // `None` path use a dedicated stub.
-        let root = self
-            .state_roots
-            .lock()
-            .unwrap()
+        let root = primitives::sync::lock_state(&self.state_roots)
             .get(&height.value())
             .copied()
             .unwrap_or_else(|| mock_state_root(height));
@@ -169,7 +166,7 @@ impl AppInterface for MockApp {
     /// One staged transition per call — mirroring a real app's
     /// destructive drain: once consumed, a record is gone.
     fn take_epoch_changes(&self) -> types::EpochChanges {
-        self.pending_epoch_changes.lock().unwrap().pop().unwrap_or_default()
+        primitives::sync::lock_state(&self.pending_epoch_changes).pop().unwrap_or_default()
     }
 
     fn attest_latest(&self) -> Option<StateAttestation> {
@@ -177,9 +174,7 @@ impl AppInterface for MockApp {
         // finalized block, so the max key is the execution tip.
         // `None` before the first block, matching the real
         // executor's "nothing executed" signal.
-        self.state_roots
-            .lock()
-            .unwrap()
+        primitives::sync::lock_state(&self.state_roots)
             .iter()
             .next_back()
             .map(|(h, root)| StateAttestation { height: Height::new(*h), root: *root })

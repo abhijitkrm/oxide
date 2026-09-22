@@ -219,7 +219,7 @@ impl PeerReputationStore {
     /// Panics if the reputations mutex is poisoned.
     #[must_use]
     pub fn is_banned(&self, peer_id: &PeerId) -> bool {
-        let reputations = self.reputations.lock().unwrap();
+        let reputations = primitives::sync::lock_state(&self.reputations);
         reputations.get(peer_id).is_some_and(PeerReputation::is_banned)
     }
 
@@ -230,7 +230,7 @@ impl PeerReputationStore {
     /// Panics if the reputations mutex is poisoned.
     #[must_use]
     pub fn can_connect(&self, peer_id: &PeerId) -> bool {
-        let mut reputations = self.reputations.lock().unwrap();
+        let mut reputations = primitives::sync::lock_state(&self.reputations);
         let rep = reputations.entry(peer_id.clone()).or_default();
         // If the ban has expired, allow connection.
         if rep.ban_expired() {
@@ -247,7 +247,7 @@ impl PeerReputationStore {
     ///
     /// Panics if the reputations mutex is poisoned.
     pub fn record_event(&self, peer_id: &PeerId, event: ReputationEvent) -> bool {
-        let mut reputations = self.reputations.lock().unwrap();
+        let mut reputations = primitives::sync::lock_state(&self.reputations);
         let rep = reputations.entry(peer_id.clone()).or_default();
         let delta = event.score_delta();
         if event.is_positive() {
@@ -265,7 +265,7 @@ impl PeerReputationStore {
     /// Panics if the reputations mutex is poisoned.
     #[must_use]
     pub fn score(&self, peer_id: &PeerId) -> i64 {
-        let reputations = self.reputations.lock().unwrap();
+        let reputations = primitives::sync::lock_state(&self.reputations);
         reputations.get(peer_id).map_or(0, PeerReputation::score)
     }
 
@@ -275,7 +275,7 @@ impl PeerReputationStore {
     ///
     /// Panics if the reputations mutex is poisoned.
     pub fn ban_peer(&self, peer_id: &PeerId, duration: Duration) {
-        let mut reputations = self.reputations.lock().unwrap();
+        let mut reputations = primitives::sync::lock_state(&self.reputations);
         let rep = reputations.entry(peer_id.clone()).or_default();
         rep.ban(duration);
     }
@@ -286,7 +286,7 @@ impl PeerReputationStore {
     ///
     /// Panics if the reputations mutex is poisoned.
     pub fn unban_peer(&self, peer_id: &PeerId) {
-        let mut reputations = self.reputations.lock().unwrap();
+        let mut reputations = primitives::sync::lock_state(&self.reputations);
         if let Some(rep) = reputations.get_mut(peer_id) {
             rep.unban();
         }
@@ -299,7 +299,7 @@ impl PeerReputationStore {
     /// Panics if the reputations mutex is poisoned.
     #[must_use]
     pub fn num_peers(&self) -> usize {
-        self.reputations.lock().unwrap().len()
+        primitives::sync::lock_state(&self.reputations).len()
     }
 
     /// Returns the number of currently banned peers.
@@ -309,7 +309,10 @@ impl PeerReputationStore {
     /// Panics if the reputations mutex is poisoned.
     #[must_use]
     pub fn num_banned(&self) -> usize {
-        self.reputations.lock().unwrap().values().filter(|rep| rep.is_banned()).count()
+        primitives::sync::lock_state(&self.reputations)
+            .values()
+            .filter(|rep| rep.is_banned())
+            .count()
     }
 }
 

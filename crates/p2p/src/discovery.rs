@@ -197,7 +197,7 @@ impl PeerStore {
     ///
     /// Panics if the known-peers mutex is poisoned.
     pub fn add_peer(&self, peer_id: PeerId, addr: TcpAddr) {
-        self.known.lock().unwrap().entry(peer_id).or_insert(addr);
+        primitives::sync::lock_state(&self.known).entry(peer_id).or_insert(addr);
     }
 
     /// Mark a peer as connected.
@@ -206,7 +206,7 @@ impl PeerStore {
     ///
     /// Panics if the connected-peers mutex is poisoned.
     pub fn mark_connected(&self, peer_id: &PeerId) {
-        self.connected.lock().unwrap().insert(peer_id.clone());
+        primitives::sync::lock_state(&self.connected).insert(peer_id.clone());
     }
 
     /// Mark a peer as disconnected.
@@ -215,7 +215,7 @@ impl PeerStore {
     ///
     /// Panics if the connected-peers mutex is poisoned.
     pub fn mark_disconnected(&self, peer_id: &PeerId) {
-        self.connected.lock().unwrap().remove(peer_id);
+        primitives::sync::lock_state(&self.connected).remove(peer_id);
     }
 
     /// Returns the peers that are known but not yet connected.
@@ -226,8 +226,8 @@ impl PeerStore {
     ///
     /// Panics if either mutex is poisoned.
     pub fn unconnected_peers(&self) -> Vec<(PeerId, TcpAddr)> {
-        let known = self.known.lock().unwrap();
-        let connected = self.connected.lock().unwrap();
+        let known = primitives::sync::lock_state(&self.known);
+        let connected = primitives::sync::lock_state(&self.connected);
         known
             .iter()
             .filter(|(id, _)| !connected.contains(id.as_slice()))
@@ -241,7 +241,10 @@ impl PeerStore {
     ///
     /// Panics if the known-peers mutex is poisoned.
     pub fn all_peers(&self) -> Vec<(PeerId, TcpAddr)> {
-        self.known.lock().unwrap().iter().map(|(id, addr)| (id.clone(), addr.clone())).collect()
+        primitives::sync::lock_state(&self.known)
+            .iter()
+            .map(|(id, addr)| (id.clone(), addr.clone()))
+            .collect()
     }
 
     /// Returns the number of known peers.
@@ -250,7 +253,7 @@ impl PeerStore {
     ///
     /// Panics if the known-peers mutex is poisoned.
     pub fn len(&self) -> usize {
-        self.known.lock().unwrap().len()
+        primitives::sync::lock_state(&self.known).len()
     }
 
     /// Returns `true` if the store has no known peers.
@@ -259,7 +262,7 @@ impl PeerStore {
     ///
     /// Panics if the known-peers mutex is poisoned.
     pub fn is_empty(&self) -> bool {
-        self.known.lock().unwrap().is_empty()
+        primitives::sync::lock_state(&self.known).is_empty()
     }
 }
 

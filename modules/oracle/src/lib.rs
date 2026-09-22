@@ -798,7 +798,7 @@ mod tests {
         oracle.handle(&ctx(0), &msg::submit_price(0, 1_000)).unwrap();
         oracle.handle(&ctx(1), &msg::submit_price(0, 1_100)).unwrap();
         oracle.end_block(Height::new(1));
-        assert!(sink.pushed.lock().unwrap().is_empty());
+        assert!(framework::lock_state(&sink.pushed).is_empty());
         assert!(oracle.mark(0).is_none());
         assert!(oracle.is_stale(0, 1));
     }
@@ -813,7 +813,7 @@ mod tests {
         oracle.handle(&ctx(2), &msg::submit_price(0, 900)).unwrap();
         oracle.end_block(Height::new(1));
         assert_eq!(oracle.mark(0), Some(1_000));
-        assert_eq!(sink.pushed.lock().unwrap()[&0], 1_000);
+        assert_eq!(framework::lock_state(&sink.pushed)[&0], 1_000);
         assert!(!oracle.is_stale(0, 1));
     }
 
