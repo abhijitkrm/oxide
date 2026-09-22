@@ -818,6 +818,7 @@ fn run_consensus_loop(
                                     voter_idx,
                                     primitives::View::new(sig_view),
                                     primitives::Epoch::new(sig_epoch),
+                                    qc_ev.as_ref(),
                                     &sig,
                                 )
                                 .is_err()
@@ -838,7 +839,7 @@ fn run_consensus_loop(
                             // can. After this, a collectible sig
                             // must claim exactly our current view.
                             let view_before = engine.current_view().value();
-                            engine.deliver_timeout_evidence(qc_ev, tc_ev);
+                            engine.deliver_timeout_evidence(qc_ev.clone(), tc_ev);
                             // If the sig is for a past view, ignore it
                             // (stale — the sender is behind us); if it
                             // is for a view the evidence didn't reach,
@@ -857,7 +858,7 @@ fn run_consensus_loop(
                                 view_start = std::time::Instant::now();
                                 timeout_sent_for_view = None;
                             }
-                            match engine.collect_timeout_signature(voter_idx, sig) {
+                            match engine.collect_timeout_signature(voter_idx, sig, qc_ev) {
                                 Ok(Some(tc)) => {
                                     // TC formed — broadcast to all peers.
                                     eprintln!(
@@ -1032,9 +1033,11 @@ fn run_consensus_loop(
                 }
                 // Self-collect: feed our own timeout signature to the
                 // engine so it counts toward the quorum.
-                if let Ok(Some(tc)) =
-                    engine.collect_timeout_signature(engine.validator_index(), sig)
-                {
+                if let Ok(Some(tc)) = engine.collect_timeout_signature(
+                    engine.validator_index(),
+                    sig,
+                    high_qc_ev.clone(),
+                ) {
                     // TC formed immediately (unlikely with 1/4, but
                     // handle it). Broadcast the TC to all peers.
                     eprintln!(

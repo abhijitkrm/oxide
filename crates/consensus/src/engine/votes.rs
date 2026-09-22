@@ -14,8 +14,8 @@
 
 use super::{
     AggregateSignature, BlockBody, BlockHeader, ConsensusError, Encode, ExecCertificate, Hash,
-    Height, OxideBft, Proposal, QuorumCertificate, Signature, StateAttestation, ValidatorIndex,
-    Verdict, View, Vote, VotePhase, proposer_hash,
+    Height, OxideBft, Proposal, QuorumCertificate, Signature, StateAttestation, TimeoutCertificate,
+    ValidatorIndex, Verdict, View, Vote, VotePhase, proposer_hash,
 };
 
 impl OxideBft {
@@ -161,6 +161,107 @@ impl OxideBft {
             .map(|block| block.context.timestamp_ms)
     }
 
+    /// The Jolteon timeout-path predicate (arXiv:2106.10362 §3,
+    /// Figure 2): a proposal entering through `TC(v−1)` must carry a
+    /// QC at least as recent as the maximum `qc_high` evidence the
+    /// TC reports — `B.qc.r >= max{qc_high.r | qc_high ∈ B.tc}`.
+    ///
+    /// The max evidence is adopted first, so the parent-binding
+    /// check in `vote_if_eligible` evaluates against the locked
+    /// chain rather than our (possibly staler) high QC — a TC
+    /// carrying a QC we never saw is precisely the withheld-QC case
+    /// this mechanism exists for, and the proposer of a legitimate
+    /// continuation builds on exactly that block.
+    ///
+    /// Returns `false` when the proposal's embedded QC is absent or
+    /// below the evidence floor; `true` when there is no entry TC
+    /// (the happy path has no floor) or the floor is met.
+    fn tc_evidence_floor_ok(
+        &mut self,
+        header: &BlockHeader,
+        entry_tc: Option<&TimeoutCertificate>,
+    ) -> bool {
+        let Some(tc) = entry_tc else { return true };
+        let Some(max_qc) =
+            tc.signers.iter().filter_map(|s| s.high_qc.as_ref()).max_by_key(|qc| qc.view.value())
+        else {
+            // No evidence at all: a TC of `None` claims is legal
+            // (view 0 timeouts carry no QCs) — any QC clears the
+            // floor.
+            return true;
+        };
+        if self.high_qc.as_ref().is_none_or(|h| h.view < max_qc.view) {
+            let _ = self.deliver_qc(max_qc.clone());
+        }
+        matches!(&header.high_qc, Some(prop_qc) if prop_qc.view >= max_qc.view)
+    }
+
+    /// Tail-fork resistance: a proposal is votable only if it
+    /// extends the chain our `high_qc` points at.
+    ///
+    /// A proposal extends our highest QC when its `high_qc` is at
+    /// least as recent as ours (`prop_qc.view >= our_high_qc.view`).
+    /// This covers three legitimate cases:
+    ///   1. The proposal's QC *is* our `high_qc` (happy path: the
+    ///      leader built on the same QC — views are equal).
+    ///   2. The proposal's QC is *newer* than ours (view change:
+    ///      the new leader saw a QC we missed and built on it —
+    ///      `prop_qc.view > our_high_qc.view`). Accepting this is
+    ///      what lets the chain advance after a view change and is
+    ///      the core of tail-fork *resistance*: a validator on a
+    ///      stalling fork must still vote for a proposal that
+    ///      extends the highest QC it has seen, even if that QC
+    ///      arrived via a proposal rather than directly.
+    ///   3. The proposal's block chain traces back to our
+    ///      `high_qc`'s block (transitively). The view-ordering
+    ///      check is the cheap, sound over-approximation of this:
+    ///      any chain extending our `high_qc` carries a QC with
+    ///      view >= ours, so the view test admits all extending
+    ///      chains while rejecting stale forks.
+    ///
+    /// A leader with a *lower* `high_qc` view is forking away from
+    /// a more recent notarized block — reject it.
+    ///
+    /// Beyond the view check, `prev_block` must equal our `high_qc`'s
+    /// block hash (binds the parent to the notarized block we hold —
+    /// otherwise a leader could pair a valid QC view with an
+    /// unrelated `prev`, creating a phantom chain), and the stamped
+    /// height must be the parent's + 1 (a forged future height would
+    /// commit at a gap and per-height-lock the voters the honest
+    /// chain still needs). If we adopted a QC for a block whose
+    /// header we never saw, continuity can't be verified — refuse
+    /// until the block arrives via catch-up gossip.
+    ///
+    /// With no `high_qc`, the only votable proposal extends the
+    /// committed anchor: genesis (height 0, zero parent) or the
+    /// post-rotation `last_committed` block. Anything else is a
+    /// forged chain — without the anchor check a Byzantine leader
+    /// could attach a made-up parent hash and stamp any height.
+    fn extends_locked_chain(&self, header: &BlockHeader) -> bool {
+        if let Some(our_high_qc) = &self.high_qc {
+            match &header.high_qc {
+                Some(prop_qc) if prop_qc.view < our_high_qc.view => return false,
+                None => return false,
+                _ => {}
+            }
+            if header.prev_block != our_high_qc.block_hash {
+                return false;
+            }
+            let Some((parent_header, _)) = self.blocks.get(&header.prev_block) else {
+                return false;
+            };
+            header.height == parent_header.height.saturating_next()
+        } else {
+            match self.last_committed {
+                Some((anchor_hash, anchor_height)) => {
+                    header.prev_block == anchor_hash
+                        && header.height == anchor_height.saturating_next()
+                }
+                None => header.height == Height::new(0) && header.prev_block == Hash::ZERO,
+            }
+        }
+    }
+
     /// Shared vote-eligibility chain for both vote paths. `body` is
     /// `Some` for the complete-proposal path (`vote`) and `None` for
     /// the commitment path (`vote_header`): the app's static
@@ -189,6 +290,24 @@ impl OxideBft {
         if self.last_voted_view.is_some_and(|v| v >= header.view) {
             return None;
         }
+        // Jolteon evidence integrity (arXiv:2106.10362 §3): a view we
+        // signed a timeout for is unvotable. The timeout signature
+        // bound the `qc_high` we held *at signing time*; voting in
+        // that view afterward would mean the TC quorum contains an
+        // entry that underreports the lock our vote created — and
+        // once a consecutive pair commits, that underreporting is
+        // exactly what would let a later proposal skip the committed
+        // chain. The bar is one-directional by design: a voter that
+        // already voted can (and must) still time out, reporting the
+        // lock; a signer that timed out can never vote that view.
+        if self.timeout_signed_view.is_some_and(|v| v == header.view) {
+            return None;
+        }
+        // Validate the proposal's entry TC once — it feeds both the
+        // per-height lock release below and the Jolteon evidence
+        // floor. `None` means absent, mismatched, or unverifiable —
+        // in each case it carries no protocol weight.
+        let entry_tc = self.valid_entry_tc(header);
         // Per-height vote lock: never vote for a *different* block at
         // a height we already voted. The view check alone does not
         // cover this: after a timeout, a new leader can propose a
@@ -200,24 +319,32 @@ impl OxideBft {
         //
         // Release (spec §view-changes): the lock yields when the
         // proposal carries a valid TC for the immediately preceding
-        // view. A TC proves quorum-certified that the view ended
-        // undecided — the only way a same-height conflict can exist
-        // at all (a formed QC would have moved `high_qc` forward,
-        // changing the required `prev_block`/`height`). Without the
-        // release, one equivocating leader could split the vote and
-        // permanently wedge the height: neither side could gather a
-        // quorum again. Safety is preserved because QC adoption is
-        // view-monotonic (`deliver_qc` rejects stale views): if a
-        // hidden QC for the locked block exists, its later-view
-        // rival's adoption still wins, so only one of the two
-        // notarizations can gather the child-chain votes needed to
-        // commit.
+        // view — quorum-certified evidence that the timed-out view
+        // is past. Under the Jolteon evidence rule the TC also proves
+        // *what the quorum was locked on*, so the release alone no
+        // longer suffices for safety — the proposal must additionally
+        // extend the highest lock the TC reports (the floor check
+        // below), which is what makes a conflicting same-height
+        // successor unvotable once a chain is committed.
         if self
             .voted_at_height
             .get(&header.height.value())
             .is_some_and(|voted| *voted != block_hash)
-            && !self.proposal_tc_releases_lock(header)
+            && entry_tc.is_none()
         {
+            return None;
+        }
+        // Jolteon timeout-path predicate (arXiv:2106.10362 §3,
+        // Figure 2): a proposal entering through TC(v−1) must carry
+        // a QC at least as recent as the maximum `qc_high` evidence
+        // the TC reports — `B.qc.r >= max{qc_high.r | qc_high ∈
+        // B.tc}`. We additionally adopt that max evidence first, so
+        // the parent-binding check below evaluates against the
+        // locked chain rather than our (possibly staler) high QC —
+        // a TC carrying a QC we never saw is precisely the withheld-
+        // QC case this mechanism exists for, and the proposer of a
+        // legitimate continuation builds on exactly that block.
+        if !self.tc_evidence_floor_ok(header, entry_tc) {
             return None;
         }
         // Structural rule (spec §2): a block extends exactly the
@@ -260,98 +387,10 @@ impl OxideBft {
         // Tail-fork resistance / extends-highest-QC rule
         // (docs/oxidebft-spec.md §4): reject proposals that don't
         // extend our highest QC. A leader that forks away a notarized
-        // block must be bypassed, not rewarded.
-        //
-        // A proposal extends our highest QC when its `high_qc` is at
-        // least as recent as ours (`prop_qc.view >= our_high_qc.view`).
-        // This covers three legitimate cases:
-        //   1. The proposal's QC *is* our `high_qc` (happy path: the
-        //      leader built on the same QC — views are equal).
-        //   2. The proposal's QC is *newer* than ours (view change:
-        //      the new leader saw a QC we missed and built on it —
-        //      `prop_qc.view > our_high_qc.view`). Accepting this is
-        //      what lets the chain advance after a view change and is
-        //      the core of tail-fork *resistance*: a validator on a
-        //      stalling fork must still vote for a proposal that
-        //      extends the highest QC it has seen, even if that QC
-        //      arrived via a proposal rather than directly.
-        //   3. The proposal's block chain traces back to our
-        //      `high_qc`'s block (transitively). The view-ordering
-        //      check below is the cheap, sound over-approximation of
-        //      this: any chain extending our `high_qc` carries a QC
-        //      with view >= ours, so the view test admits all
-        //      extending chains while rejecting stale forks.
-        //
-        // A leader with a *lower* `high_qc` view is forking away from
-        // a more recent notarized block — reject it.
-        //
-        // Exception: at genesis (no high_qc yet), any proposal is
-        // accepted.
-        if let Some(our_high_qc) = &self.high_qc {
-            match &header.high_qc {
-                // Proposal carries a QC older than ours: it extends a
-                // stale fork, not our highest QC. Reject.
-                Some(prop_qc) if prop_qc.view < our_high_qc.view => {
-                    return None;
-                }
-                // Proposal has no high_qc but we have one: the
-                // leader is proposing a fork that ignores our QC.
-                None => return None,
-                // prop_qc.view >= our_high_qc.view: the proposal
-                // extends or advances our highest QC — accept.
-                _ => {}
-            }
-            // HIGH fix: bind the proposal's parent to our high QC.
-            // The proposal's `prev_block` must equal the block hash
-            // in our `high_qc` — the leader must build on the same
-            // notarized block we hold. Without this, a byzantine
-            // leader could propose a block with a valid high_qc view
-            // but a `prev_block` that doesn't match, creating a
-            // phantom chain that doesn't extend any real block.
-            // Exception: at genesis (prev_block = ZERO, no high_qc
-            // yet), this is the expected case.
-            if header.prev_block != our_high_qc.block_hash {
-                return None;
-            }
-            // Height continuity: the stamped height must be exactly
-            // the parent's height + 1. `header.height` is a
-            // proposer-chosen field — without this check a Byzantine
-            // leader can stamp an arbitrary future height, get the
-            // block committed at that height (creating a finalized
-            // gap and divergent `finalized_height()` across nodes),
-            // and — worse — the voters who signed it become
-            // per-height-locked at the height the honest chain still
-            // needs, permanently wedging quorum there. The parent is
-            // our highQC block (enforced above), so its height must
-            // be known: if we adopted a QC for a block whose header
-            // we never saw, we cannot verify continuity and must
-            // refuse until the block arrives via catch-up gossip.
-            let (parent_header, _) = self.blocks.get(&header.prev_block)?;
-            if header.height != parent_header.height.saturating_next() {
-                return None;
-            }
-        } else {
-            // No highQC: the only voteable proposal extends the
-            // committed anchor — height 0 / zero-hash parent at true
-            // genesis, or the last committed block at the
-            // post-rotation boundary (rotation resets `high_qc` but
-            // heights continue). Anything else is a forged chain:
-            // without an anchor check, a Byzantine leader could
-            // attach a made-up parent hash and stamp any height.
-            match self.last_committed {
-                Some((anchor_hash, anchor_height)) => {
-                    if header.prev_block != anchor_hash
-                        || header.height != anchor_height.saturating_next()
-                    {
-                        return None;
-                    }
-                }
-                None => {
-                    if header.height != Height::new(0) || header.prev_block != Hash::ZERO {
-                        return None;
-                    }
-                }
-            }
+        // block must be bypassed, not rewarded. See
+        // `extends_locked_chain` for the full rule.
+        if !self.extends_locked_chain(header) {
+            return None;
         }
         // The embedded QC is commit evidence — its bitmap becomes the
         // committed parent's attendance record — so it must be a real

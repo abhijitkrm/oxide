@@ -344,6 +344,20 @@ pub struct OxideBft {
     /// The highest view the engine has voted in (prevents double-
     /// voting; a safety invariant). `None` = never voted.
     last_voted_view: Option<View>,
+    /// The latest view this engine signed a timeout for (Jolteon
+    /// evidence integrity, arXiv:2106.10362 §3). A timeout
+    /// signature binds the `qc_high` we held at signing time; if we
+    /// could still vote in that view afterward, our TC entry would
+    /// underreport the lock our vote created — a quorum of such
+    /// stale entries lets a proposal skip the committed chain.
+    /// `vote_if_eligible` rejects any proposal at this view. The
+    /// asymmetry is required by the lock-persistence proof:
+    /// vote-then-timeout is legal (the timeout then reports the
+    /// lock), timeout-then-vote is not.
+    ///
+    /// Persisted in the WAL — a restart that forgot it could emit
+    /// both signatures for one view.
+    timeout_signed_view: Option<View>,
     /// The block hash this validator voted for at each height — the
     /// per-height vote lock (docs/oxidebft-spec.md §4). The view
     /// check alone is insufficient: after a timeout the new leader
@@ -475,7 +489,7 @@ pub struct OxideBft {
     /// `None` = no timeout signature from that validator. Indexed by
     /// `ValidatorIndex`. Used to aggregate the TC's signature when
     /// quorum is reached.
-    timeout_signatures: Vec<Option<Signature>>,
+    timeout_signatures: Vec<Option<types::TimeoutSigner>>,
     /// Whether to verify BLS signatures on votes and QCs (C1 fix).
     ///
     /// `true` (production): every vote's signature is verified in
@@ -589,6 +603,7 @@ impl OxideBft {
             next_height: Height::new(0),
             current_view: initial_view,
             epoch,
+            timeout_signed_view: None,
             votes: vec![None; n],
             vote_count: 0,
             vote_stake: 0,

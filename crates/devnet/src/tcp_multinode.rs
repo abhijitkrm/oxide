@@ -2230,10 +2230,15 @@ impl TcpMultiNodeDevnet {
             .iter_mut()
             .map(|e| e.on_timeout().unwrap_or(crypto::bls::Signature::ZERO))
             .collect();
+        let evidences: Vec<Option<types::QuorumCertificate>> =
+            self.engines.iter().map(|e| e.high_qc().cloned()).collect();
         for collector in 0..self.n {
             for (signer, sig) in sigs.iter().enumerate() {
-                let _ = self.engines[collector]
-                    .collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig);
+                let _ = self.engines[collector].collect_timeout_signature(
+                    u16::try_from(signer).unwrap_or(0),
+                    *sig,
+                    evidences[signer].clone(),
+                );
             }
         }
         let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);

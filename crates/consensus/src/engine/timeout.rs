@@ -1,13 +1,40 @@
 //! Timeout and view-change path for oxideBFT.
 //!
 //! Split from `engine.rs` around the liveness invariant: when the
-//! pacemaker fires, [`OxideBft::on_timeout`] signs a timeout vote;
-//! [`OxideBft::collect_timeout_signature`] aggregates 2f+1 of them
-//! into a [`TimeoutCertificate`]; and
-//! [`OxideBft::on_timeout_certificate`] advances the view. A TC is
-//! the *only* evidence that releases a validator locked on a
-//! proposal — [`OxideBft::proposal_tc_releases_lock`] enforces that
-//! the TC must be for a strictly later view than the lock.
+//! pacemaker fires, [`OxideBft::on_timeout`] signs a timeout claim;
+//! [`OxideBft::collect_timeout_signature`] gathers 2f+1 of them into
+//! a [`TimeoutCertificate`]; and
+//! [`OxideBft::on_timeout_certificate`] advances the view.
+//!
+//! # The Jolteon evidence rule
+//!
+//! A timeout signature binds `(view, epoch, qc_high)` — the signer's
+//! highest *adopted* QC at signing time — and a TC carries each
+//! signer's evidence verbatim ([`types::TimeoutSigner`]). This is
+//! the mechanism arXiv:2106.10362 §3 calls the "view-change
+//! protocol": because every later quorum TC intersects the honest
+//! validators locked on a committed chain, the TC provably contains
+//! a `qc_high` at least as recent as the committed block's QC, and
+//! the vote predicate ([`OxideBft::vote_if_eligible`]) forces the
+//! next proposal to extend it. The two invariants the proof needs:
+//!
+//! - **Evidence is signature-bound.** Each entry's signature covers
+//!   its own claim, so an aggregator cannot drop or weaken the max
+//!   `qc_high` without losing that signer — and losing a signer can
+//!   only shrink the TC below quorum, never launder it.
+//! - **Timeout-signed views cannot also be voted.** If a validator
+//!   could sign `timeout(v)` and then vote in `v`, its TC evidence
+//!   would underreport the lock its vote created. The asymmetric
+//!   rule ([`OxideBft::on_timeout`] records `timeout_signed_view`;
+//!   the vote path refuses a view we timed out on) keeps every TC
+//!   entry honest *at the moment it was signed* — a vote cast after
+//!   the timeout is exactly the lock the evidence must report, so
+//!   the bar must apply in only this direction.
+//!
+//! A TC is also the *only* evidence that releases a validator locked
+//! on a proposal — [`OxideBft::valid_entry_tc`] enforces that the TC
+//! must be the verified successor certificate for the proposal's
+//! view.
 
 use super::{
     BlockHeader, ConsensusError, Epoch, OxideBft, QuorumCertificate, Signature, TimeoutCertificate,
@@ -27,12 +54,11 @@ impl OxideBft {
     /// `TimeoutMsg` carries (`high_qc` + `last_round_tc` when
     /// `high_qc.view ≠ view − 1`).
     ///
-    /// The evidence is self-authenticating (each certificate
-    /// carries its own aggregate signature), so it is not bound
-    /// into the timeout signature — a relay swapping it for another
-    /// real certificate can only attach evidence that itself
-    /// verifies, which justifies the same view regardless of
-    /// carrier.
+    /// The `high_qc` leg is *also* the Jolteon `qc_high` evidence:
+    /// the timeout signature binds it (see [`OxideBft::on_timeout`]),
+    /// so what a sender attests here is exactly what its TC entry
+    /// will claim. `last_tc` is unbound — it is view-sync evidence,
+    /// verified independently at ingestion.
     pub fn timeout_evidence(&self) -> (Option<QuorumCertificate>, Option<TimeoutCertificate>) {
         let needs_tc = match &self.high_qc {
             Some(qc) => qc.view.saturating_next() != self.current_view,
@@ -89,57 +115,79 @@ impl OxideBft {
     /// (no one to timeout). In multi-validator mode, the simulation
     /// collects these and forms a TC.
     ///
-    /// The signed message binds `(view, epoch)` to prevent replay
-    /// across epochs (M1 fix). The domain is `Timeout`.
+    /// The signed message binds `(view, epoch, qc_high)` — see
+    /// [`crate::verify::timeout_signing_message`]. Signing records
+    /// `timeout_signed_view` (WAL-persisted before the signature is
+    /// emitted): a validator that timed out on view *v* must not
+    /// vote in *v*, or its TC entry would underreport the lock the
+    /// vote created — the evidence a TC carries must be what the
+    /// signer held when it signed, never less.
+    ///
+    /// Vote-then-timeout stays legal (and required): a validator
+    /// that voted in *v* and still hasn't seen a QC must be able to
+    /// time out, and its signature then reports exactly the lock
+    /// its vote produced.
     pub fn on_timeout(&mut self) -> Option<Signature> {
-        // C10: refuse to sign while the WAL latch is set. Timeout
-        // signatures are deterministic per (view, epoch) — a re-sign
-        // can never equivocate — but a validator that cannot trust
-        // its durability layer must not participate at all.
+        // C10: refuse to sign while the WAL latch is set. A timeout
+        // signature pins our evidence claim; a validator that cannot
+        // trust its durability layer must not participate at all.
         if self.wal_failed {
             return None;
         }
         let _ = self.pacemaker.on_local_timeout();
+        // Persist the signed view BEFORE the signature leaves the
+        // engine — a restart that forgot it could emit both the
+        // timeout and a vote for the same view, which is exactly the
+        // equivocation the Jolteon evidence rule forbids.
+        self.timeout_signed_view = Some(self.current_view);
+        if self.append_wal().is_err() {
+            return None;
+        }
         match &self.secret_key {
             Some(sk) => {
-                // M1 fix: bind epoch into the timeout message so a
-                // timeout signature from epoch 0 cannot be replayed
-                // in epoch 1 (views reset to 0 on epoch rotation).
-                let mut msg = Vec::with_capacity(16);
-                msg.extend_from_slice(&self.current_view.value().to_le_bytes());
-                msg.extend_from_slice(&self.epoch.value().to_le_bytes());
+                let msg = crate::verify::timeout_signing_message(
+                    self.current_view,
+                    self.epoch,
+                    self.high_qc.as_ref(),
+                );
                 Some(sk.sign(crypto::hash::Domain::Timeout, &msg))
             }
             None => Some(Signature::ZERO),
         }
     }
 
-    /// Verify a peer's timeout signature for an explicit `(view, epoch)`
-    /// **without mutating any state**.
+    /// Verify a peer's timeout signature for an explicit `(view,
+    /// epoch, high_qc)` **without mutating any state**.
     ///
-    /// The node's message pump needs to authenticate timeout evidence
-    /// *before* acting on it. `collect_timeout_signature` verifies
-    /// against the engine's *current* view, so the pump previously had
-    /// to call `sync_to_view(sig_view)` first — which meant an
-    /// unauthenticated peer could move the view, reset the pacemaker
-    /// timer, and clear the vote buffer simply by claiming a high view
-    /// and attaching garbage. A forged timeout must change nothing.
+    /// The node's message pump needs to authenticate timeout
+    /// evidence *before* acting on it. `collect_timeout_signature`
+    /// verifies against the engine's *current* view, so the pump
+    /// previously had to call `sync_to_view(sig_view)` first — which
+    /// meant an unauthenticated peer could move the view, reset the
+    /// pacemaker timer, and clear the vote buffer simply by claiming
+    /// a high view and attaching garbage. A forged timeout must
+    /// change nothing.
     ///
-    /// This entry point breaks that ordering: authenticate here, then
-    /// (only if it verifies) let the caller sync and collect. The
-    /// signature binds `(view, epoch)` under [`Domain::Timeout`], so a
-    /// signature is only ever valid for the view it was cast for.
+    /// This entry point breaks that ordering: authenticate here,
+    /// then (only if it verifies) let the caller sync and collect.
+    /// The signature binds `(view, epoch)` plus the claimed
+    /// `qc_high` under [`Domain::Timeout`] — `high_qc` must be the
+    /// exact certificate the sender attached, so a relay cannot
+    /// swap in a different (even valid) QC without breaking the
+    /// signature.
     ///
     /// # Errors
     ///
-    /// [`ConsensusError::SignerOutOfBounds`] if `voter` is past the end
-    /// of the set, or [`ConsensusError::InvalidVoteSignature`] if the
-    /// signature does not verify for this `(view, epoch)`.
+    /// [`ConsensusError::SignerOutOfBounds`] if `voter` is past the
+    /// end of the set, or [`ConsensusError::InvalidVoteSignature`]
+    /// if the signature does not verify for this
+    /// `(view, epoch, high_qc)`.
     pub fn verify_timeout_signature_for(
         &self,
         voter: ValidatorIndex,
         view: View,
         epoch: Epoch,
+        high_qc: Option<&QuorumCertificate>,
         signature: &Signature,
     ) -> Result<(), ConsensusError> {
         crate::verify::verify_timeout_signature_for(
@@ -148,14 +196,20 @@ impl OxideBft {
             voter,
             view,
             epoch,
+            high_qc,
             signature,
         )
     }
 
     /// Validator: collect a timeout signature from `voter` for the
-    /// current view. If this brings the pacemaker to a quorum, a TC
-    /// is formed and the view advances internally. Returns the TC
-    /// if one was formed.
+    /// current view. `qc_high` is the evidence the signature binds —
+    /// it is stored into the TC's per-signer record verbatim, so a
+    /// TC built from these signatures provably reports what every
+    /// signer actually held.
+    ///
+    /// If this brings the pacemaker to a quorum, a TC is formed and
+    /// the view advances internally. Returns the TC if one was
+    /// formed.
     ///
     /// This is the multi-node simulation's view-change path: when
     /// the leader is faulty, followers collect timeout signatures
@@ -165,38 +219,67 @@ impl OxideBft {
     /// # Signature verification (TC safety fix)
     ///
     /// When `verify_signatures` is `true` (production), the timeout
-    /// signature is verified against the voter's public key from the
-    /// validator set. A forged timeout signature is rejected with
-    /// [`ConsensusError::InvalidVoteSignature`]. The signed message
-    /// is the view's little-endian bytes, signed with
-    /// `Domain::Timeout`.
+    /// signature is verified against the voter's public key over
+    /// `(view, epoch, qc_high)` — the claimed evidence is part of
+    /// the signed message, so a forged or evidence-swapped timeout
+    /// is rejected with [`ConsensusError::InvalidVoteSignature`].
     ///
     /// # Errors
     ///
     /// Returns [`ConsensusError::InvalidVoteSignature`] if the
-    /// signature does not verify, or [`ConsensusError::SignerOutOfBounds`]
-    /// if the voter index is out of bounds.
+    /// signature does not verify, or
+    /// [`ConsensusError::SignerOutOfBounds`] if the voter index is
+    /// out of bounds.
     pub fn collect_timeout_signature(
         &mut self,
         voter: ValidatorIndex,
         signature: Signature,
+        qc_high: Option<QuorumCertificate>,
     ) -> Result<Option<TimeoutCertificate>, ConsensusError> {
-        // Verify the timeout signature before collecting (TC safety).
-        // M1 fix: verify against (view, epoch), not just view.
+        // Verify the timeout signature over its evidence claim
+        // before collecting (TC safety): the bound `qc_high` is what
+        // makes the TC's per-signer records unfalsifiable.
         if self.verify_signatures {
             let pk = self
                 .validator_set
                 .validator(voter)
                 .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-            let mut msg = Vec::with_capacity(16);
-            msg.extend_from_slice(&self.current_view.value().to_le_bytes());
-            msg.extend_from_slice(&self.epoch.value().to_le_bytes());
+            let msg = crate::verify::timeout_signing_message(
+                self.current_view,
+                self.epoch,
+                qc_high.as_ref(),
+            );
             crypto::bls_signer::verify(&signature, crypto::hash::Domain::Timeout, &msg, pk)
                 .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+            // Screen the claimed QC itself: the signature binds the
+            // claim, but a byzantine signer can legitimately sign a
+            // claim carrying a *forged* QC — the entry would then
+            // fail TC verification and poison every TC it lands in
+            // (a one-message liveness DoS on the view change). A
+            // valid signature over garbage evidence must die here.
+            // Same checks as `verify_tc_signature`'s structural pass:
+            // same epoch, view at-or-below the timed-out view — a
+            // signer can legitimately hold a QC formed *in* the view
+            // it times out on (it adopted the QC, then timed out
+            // still at that view), but evidence from a *later* view
+            // is unreachable: adopting it would have advanced the
+            // signer past the view it claims to be timing out on.
+            if let Some(qc) = &qc_high {
+                if qc.epoch != self.epoch || qc.view > self.current_view {
+                    return Err(ConsensusError::InvalidVoteSignature { voter });
+                }
+                crate::verify::verify_qc_signature(&self.validator_set, self.epoch, qc)
+                    .map_err(|_| ConsensusError::InvalidVoteSignature { voter })?;
+            }
         }
-        // Store the verified signature so the pacemaker can aggregate
-        // it when forming the TC.
-        self.timeout_signatures[usize::from(voter)] = Some(signature);
+        // Store the verified record so the TC carries the signer's
+        // evidence verbatim when it forms.
+        let idx = usize::from(voter);
+        if idx >= self.timeout_signatures.len() {
+            return Err(ConsensusError::SignerOutOfBounds);
+        }
+        self.timeout_signatures[idx] =
+            Some(types::TimeoutSigner { voter, high_qc: qc_high, signature });
         let events = self.pacemaker.on_timeout_signature(voter, signature);
         let mut tc = events.iter().find_map(|e| {
             if let crate::pacemaker::PacemakerEvent::TimeoutCertificateFormed(tc) = e {
@@ -205,18 +288,12 @@ impl OxideBft {
                 None
             }
         });
-        // If a TC was formed, aggregate the collected signatures and
-        // replace the placeholder aggregate in the TC.
+        // If a TC was formed, fill its per-signer records from the
+        // verified collection — the pacemaker's placeholder TC only
+        // carries the view/epoch; the evidence lives here, where the
+        // signatures were authenticated.
         if let Some(ref mut tc) = tc {
-            if self.secret_key.is_some() {
-                let sigs: Vec<Signature> =
-                    self.timeout_signatures.iter().filter_map(|s| *s).collect();
-                if !sigs.is_empty()
-                    && let Ok(agg) = crypto::aggregate(&sigs)
-                {
-                    tc.aggregate_signature = agg;
-                }
-            }
+            tc.signers = self.timeout_signatures.iter().filter_map(Option::clone).collect();
             // Clear per-view state for the new view. The TC
             // formation advances the view; stale votes from the
             // old view must not pollute the new view.
@@ -226,6 +303,10 @@ impl OxideBft {
             // next proposal we make must embed it (spec §view-
             // changes: legitimate-successor evidence).
             self.last_tc = Some(tc.clone());
+            // Adopt the TC's max `qc_high` evidence so a proposal
+            // we make (or evaluate) in the new view extends the
+            // highest locked chain — the Jolteon entry rule.
+            self.adopt_tc_evidence(tc);
         }
         Ok(tc)
     }
@@ -236,35 +317,36 @@ impl OxideBft {
     ///
     /// # Signature verification (TC safety fix)
     ///
-    /// When `verify_signatures` is `true` (production), the TC's
-    /// aggregate signature is verified against the signer bitmap +
-    /// validator set public keys. A forged TC is rejected with
+    /// The TC's per-signer records are always structurally checked
+    /// (distinct in-bounds voters, quorum stake, evidence sanity);
+    /// with `verify_signatures` on, every entry's signature is
+    /// verified over its own `(view, epoch, qc_high)` claim and each
+    /// carried QC is verified — a forged TC or a TC whose evidence
+    /// was tampered with is rejected with
     /// [`ConsensusError::InvalidTcSignature`].
+    ///
+    /// On acceptance, the max `qc_high` evidence is adopted via the
+    /// ordinary QC path: the TC is proof that a quorum held those
+    /// locks, so our `high_qc` must reflect them before we evaluate
+    /// (or build) the next proposal.
     ///
     /// # Errors
     ///
-    /// Returns [`ConsensusError::InvalidTcSignature`] if the TC's
-    /// aggregate signature does not verify, or
-    /// [`ConsensusError::SignerOutOfBounds`] if the bitmap references
-    /// an out-of-bounds validator.
+    /// Returns [`ConsensusError::InvalidTcSignature`] if a record is
+    /// malformed or unverifiable,
+    /// [`ConsensusError::SignerOutOfBounds`] if a record references
+    /// an out-of-bounds validator, or
+    /// [`ConsensusError::InsufficientQuorum`] if the signers' voting
+    /// power is below the quorum threshold.
     pub fn on_timeout_certificate(
         &mut self,
         tc: &TimeoutCertificate,
     ) -> Result<(), ConsensusError> {
-        // Hardening: enforce quorum threshold regardless of whether
-        // signature verification is enabled. A TC backed by less
-        // than quorum voting power is not a valid view-change
-        // certificate.
-        let voting_power = self.validator_set.signer_stake(&tc.signer_bitmap);
-        let required = self.validator_set.quorum_stake();
-        if voting_power < required {
-            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
-        }
-
-        // Verify the TC's aggregate signature (TC safety).
-        if self.verify_signatures {
-            self.verify_tc_signature(tc)?;
-        }
+        // Structural + quorum + per-signer verification in one
+        // pass — see `crate::verify::verify_tc_signature` for the
+        // exact checks. Enforced unconditionally: a TC is only a
+        // certificate at quorum with well-formed records.
+        self.verify_tc_signature(tc)?;
         if let Some(crate::pacemaker::PacemakerEvent::AdvanceView { new_view, .. }) =
             self.pacemaker.on_timeout_certificate(tc)
         {
@@ -274,61 +356,71 @@ impl OxideBft {
             // accounting (they would cause ConflictingVote errors
             // when the new view's real votes arrive). Timeout
             // signatures collected for the old view must not leak
-            // into the new view's TC aggregation (they would
-            // produce an aggregate that fails verification because
-            // the signatures were for a different view).
+            // into the new view's TC records.
             self.clear_per_view_state();
             // Record the TC that brought us into this view so the
             // next proposal embeds it as successor evidence.
             self.last_tc = Some(tc.clone());
+            // Adopt the TC's max evidence before it can constrain
+            // (or be ignored by) the next vote — see
+            // [`adopt_tc_evidence`](Self::adopt_tc_evidence).
+            self.adopt_tc_evidence(tc);
         }
         Ok(())
     }
 
-    /// Whether the proposal's embedded timeout certificate releases
-    /// our per-height vote lock for this view.
+    /// Adopt the highest `qc_high` carried in a verified TC.
     ///
-    /// The TC must be the exact certificate that justified the
-    /// leader's entry into `header.view` — `tc.view + 1 ==
-    /// header.view` (the legitimate-successor shape, spec
-    /// §view-changes). Because `header.view > last_voted_view` is
-    /// already enforced, `tc.view` is always >= the view in which
-    /// the conflicting earlier vote was cast, so this check alone
-    /// proves the locked vote's view timed out.
-    ///
-    /// The TC is fully validated here (epoch, quorum, aggregate
-    /// signature) — a forged TC must not release the lock.
-    pub(crate) fn proposal_tc_releases_lock(&self, header: &BlockHeader) -> bool {
-        let Some(tc) = &header.timeout_cert else {
-            return false;
+    /// This is the receiver half of the Jolteon entry rule: the
+    /// TC proves a quorum reported these locks, so the max evidence
+    /// is the chain the next proposal must extend. Adoption goes
+    /// through `deliver_qc` — the QC is already verified inside the
+    /// TC, and the ordinary path handles monotonicity, WAL, and the
+    /// commit walk if the evidence completes a certified chain.
+    fn adopt_tc_evidence(&mut self, tc: &TimeoutCertificate) {
+        let Some(max_qc) =
+            tc.signers.iter().filter_map(|s| s.high_qc.as_ref()).max_by_key(|qc| qc.view.value())
+        else {
+            return;
         };
-        if tc.epoch != self.epoch || tc.view.saturating_next() != header.view {
-            return false;
-        }
-        if !self.bitmap_meets_quorum(&tc.signer_bitmap) {
-            return false;
-        }
-        !self.verify_signatures || self.verify_tc_signature(tc).is_ok()
+        // `StaleQc` (evidence at or below our own high QC) and any
+        // verification re-check failure are both safe to ignore:
+        // the TC is still a valid view-change certificate, and the
+        // vote predicate re-derives the floor from the TC itself.
+        let _ = self.deliver_qc(max_qc.clone());
     }
 
-    /// Verify a TC's aggregate signature against the signer bitmap
-    /// and the validator set's public keys. The signed message is
-    /// the TC's view as little-endian bytes, signed with
-    /// `Domain::Timeout`.
-    ///
-    /// The quorum threshold check is performed by the caller
-    /// ([`on_timeout_certificate`](Self::on_timeout_certificate)) via
-    /// [`ValidatorSet::signer_stake`], so it is enforced regardless
-    /// of whether signature verification is enabled.
+    /// The header's timeout certificate iff it is the legitimate
+    /// successor evidence for this view: same epoch, `tc.view + 1
+    /// == header.view`, and fully verified. `None` for absent,
+    /// mismatched, or unverifiable TCs — a TC that isn't the
+    /// legitimate entry proof has no protocol effect.
+    pub(crate) fn valid_entry_tc<'h>(
+        &self,
+        header: &'h BlockHeader,
+    ) -> Option<&'h TimeoutCertificate> {
+        let tc = header.timeout_cert.as_ref()?;
+        if tc.epoch != self.epoch || tc.view.saturating_next() != header.view {
+            return None;
+        }
+        self.verify_tc_signature(tc).ok()?;
+        Some(tc)
+    }
+
+    /// Verify a TC's per-signer evidence records: distinct in-bounds
+    /// voters, quorum stake, each signature over its own
+    /// `(view, epoch, qc_high)` claim, each carried QC verified.
+    /// Structural checks apply even in conformance mode — see
+    /// [`crate::verify::verify_tc_signature`].
     ///
     /// # Errors
     ///
-    /// Returns [`ConsensusError::SignerOutOfBounds`] if the bitmap
-    /// references an out-of-bounds validator,
+    /// Returns [`ConsensusError::SignerOutOfBounds`] if an entry
+    /// references an out-of-bounds or duplicate validator,
     /// [`ConsensusError::InsufficientQuorum`] if the signers' voting
     /// power is below quorum, or [`ConsensusError::InvalidTcSignature`]
-    /// if the aggregate does not verify.
+    /// if a signature or record does not verify.
     fn verify_tc_signature(&self, tc: &TimeoutCertificate) -> Result<(), ConsensusError> {
-        crate::verify::verify_tc_signature(&self.validator_set, tc)
+        crate::verify::verify_tc_signature(&self.validator_set, self.verify_signatures, tc)
     }
 }

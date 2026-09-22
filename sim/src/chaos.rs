@@ -680,10 +680,17 @@ fn timeout_all(devnet: &mut MultiNodeDevnet, scenario: &ChaosScenario, round: us
     let sigs: Vec<crypto::bls::Signature> = (0..n)
         .map(|i| devnet.engines_mut()[i].on_timeout().unwrap_or(crypto::bls::Signature::ZERO))
         .collect();
+    // Each signature binds its signer's `qc_high` claim — collect
+    // the evidence alongside so TCs carry real per-signer records.
+    let evidences: Vec<Option<types::QuorumCertificate>> =
+        devnet.engines().iter().map(|e| e.high_qc().cloned()).collect();
     for collector in round_order(n, scenario.schedule_seed, round, 2) {
         for signer in round_order(n, scenario.schedule_seed, round, 3) {
-            let _ = devnet.engines_mut()[collector]
-                .collect_timeout_signature(u16::try_from(signer).unwrap_or(0), sigs[signer]);
+            let _ = devnet.engines_mut()[collector].collect_timeout_signature(
+                u16::try_from(signer).unwrap_or(0),
+                sigs[signer],
+                evidences[signer].clone(),
+            );
         }
     }
     let max_height = devnet.engines().iter().map(OxideBft::next_height_value).max().unwrap_or(0);

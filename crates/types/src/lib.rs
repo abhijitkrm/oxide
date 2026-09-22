@@ -20,7 +20,7 @@ pub mod rs;
 pub mod shard;
 
 use codec::{Decode, DecodeError, Encode, Reader, write};
-use crypto::bls::{AggregateSignature, Signature};
+use crypto::bls::{AggregateSignature, Signature, ValidatorIndex};
 use primitives::{Address, Epoch, Hash, Height, View};
 
 /// Read a length/count varint as `usize`. A varint larger than
@@ -825,6 +825,66 @@ impl<'a> Decode<'a> for QuorumCertificate {
     }
 }
 
+/// One signer's contribution to a [`TimeoutCertificate`]: its timeout
+/// signature together with the high-QC evidence it held when it
+/// signed (the Jolteon `qc_high` carried in every timeout message,
+/// arXiv:2106.10362 §3).
+///
+/// The signature binds `(view, epoch, has_qc, qc_high.view,
+/// qc_high.block_hash)` — the evidence is *inside* the signed
+/// payload, not attached alongside it. That binding is load-bearing:
+/// a TC is assembled by one replica from timeout messages it
+/// collected, and the safety argument needs every signer in the
+/// quorum to be accountable for the exact `qc_high` it reported.
+/// With the claim inside the signature, the aggregator cannot weaken
+/// a locked validator's evidence (it would have to forge the
+/// signature), and any quorum-sized signer subset is guaranteed to
+/// intersect the locked set — the property the two-chain commit
+/// rule leans on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeoutSigner {
+    /// The validator index that produced this timeout signature.
+    pub voter: ValidatorIndex,
+    /// The signer's high QC at the moment it signed — the highest
+    /// certified block it had adopted, which bounds what it can
+    /// honestly vote to extend next. `None` only before the first
+    /// QC exists (genesis or the post-rotation boundary).
+    ///
+    /// Carried as the certificate itself rather than a bare
+    /// `(view, hash)` claim so the evidence is verifiable in place:
+    /// a bogus claim needs a bogus QC, which fails verification —
+    /// a byzantine signer can at worst refuse to sign, never poison
+    /// the evidence a TC reports.
+    pub high_qc: Option<QuorumCertificate>,
+    /// BLS signature over the timeout claim — see
+    /// [`TimeoutCertificate`] for the payload layout.
+    pub signature: Signature,
+}
+
+impl Encode for TimeoutSigner {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.voter.to_le_bytes());
+        match &self.high_qc {
+            Some(qc) => {
+                write::bool(buf, true);
+                qc.encode(buf);
+            }
+            None => write::bool(buf, false),
+        }
+        self.signature.encode(buf);
+    }
+}
+
+impl<'a> Decode<'a> for TimeoutSigner {
+    fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
+        let voter = u16::from_le_bytes(reader.read_fixed::<2>()?);
+        let high_qc =
+            if reader.read_bool()? { Some(QuorumCertificate::decode(reader)?) } else { None };
+        let signature = Signature::decode(reader)?;
+        Ok(Self { voter, high_qc, signature })
+    }
+}
+
 /// A timeout certificate: validators holding a strict two-thirds
 /// supermajority of voting power (`⌊2·total_stake/3⌋+1`) signed a
 /// timeout for view `v`, proving the view should advance
@@ -834,11 +894,23 @@ impl<'a> Decode<'a> for QuorumCertificate {
 /// tail-fork resistance. The next leader (view *v+1*) embeds the TC in
 /// its proposal, proving it is the legitimate successor.
 ///
+/// Unlike a bare aggregate signature, the TC carries the per-signer
+/// [`TimeoutSigner`] records — including each signer's `high_qc`.
+/// The Jolteon vote predicate then requires a timeout-entered
+/// proposal to extend a QC at least as recent as the maximum
+/// evidence view here ([`Self::max_high_qc_view`]): the quorum that
+/// locked a certified chain reports it in every later TC, so no
+/// post-timeout proposal can legitimately extend around it. This is
+/// the condition that makes the consecutive-view two-chain commit
+/// safe (the evidence a TC carries is verifiable, so an aggregator
+/// can neither fabricate nor downplay it — dropping entries only
+/// shrinks the quorum it can claim).
+///
 /// Wire form (pinned by `timeout_certificate_wire` test):
 /// ```text
 /// [view u64 LE][epoch u64 LE]
-/// [signer_bitmap_len varint][signer_bitmap bytes]
-/// [aggregate_signature 96B]
+/// [signer_count varint]
+/// per signer: [voter u16 LE][has_qc u8][qc ... if present][sig 96B]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutCertificate {
@@ -846,18 +918,34 @@ pub struct TimeoutCertificate {
     pub view: View,
     /// The epoch the TC belongs to.
     pub epoch: Epoch,
-    /// Bitmap of which validators signed the timeout.
-    pub signer_bitmap: Vec<u8>,
-    /// Aggregate BLS signature over the timeout messages.
-    pub aggregate_signature: AggregateSignature,
+    /// Per-signer timeout records. `signers.len()` ≤ the validator
+    /// count and each `voter` must be distinct — checked at
+    /// verification, which also enforces the quorum stake threshold.
+    pub signers: Vec<TimeoutSigner>,
+}
+
+impl TimeoutCertificate {
+    /// The maximum `high_qc` view reported by the TC's signers —
+    /// the Jolteon evidence bound a timeout-entered proposal must
+    /// satisfy (`prop_qc.view >= max`). `View::new(0)` when no
+    /// signer reported a QC (fresh-epoch timeouts).
+    pub fn max_high_qc_view(&self) -> View {
+        self.signers
+            .iter()
+            .filter_map(|s| s.high_qc.as_ref().map(|qc| qc.view))
+            .max()
+            .unwrap_or_else(|| View::new(0))
+    }
 }
 
 impl Encode for TimeoutCertificate {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.view.encode(buf);
         self.epoch.encode(buf);
-        write::bytes(buf, &self.signer_bitmap);
-        self.aggregate_signature.encode(buf);
+        write::varint(buf, self.signers.len() as u64);
+        for signer in &self.signers {
+            signer.encode(buf);
+        }
     }
 }
 
@@ -865,9 +953,21 @@ impl<'a> Decode<'a> for TimeoutCertificate {
     fn decode(reader: &mut Reader<'a>) -> Result<Self, DecodeError> {
         let view = View::decode(reader)?;
         let epoch = Epoch::decode(reader)?;
-        let signer_bitmap = reader.read_bytes()?.to_vec();
-        let aggregate_signature = AggregateSignature::decode(reader)?;
-        Ok(Self { view, epoch, signer_bitmap, aggregate_signature })
+        let count = read_count(reader)?;
+        // Bound the allocation: each signer entry is at least
+        // voter(2) + flag(1) + sig(96) = 99 bytes, so a count beyond
+        // what the remaining bytes could hold is malformed.
+        if u64::try_from(count).unwrap_or(u64::MAX) > reader.remaining() as u64 / 99 {
+            return Err(DecodeError::LengthPrefixTooLarge {
+                claimed: count as u64,
+                remaining: reader.remaining() as u64,
+            });
+        }
+        let mut signers = Vec::with_capacity(count);
+        for _ in 0..count {
+            signers.push(TimeoutSigner::decode(reader)?);
+        }
+        Ok(Self { view, epoch, signers })
     }
 }
 
@@ -1303,20 +1403,41 @@ mod tests {
 
     #[test]
     fn timeout_certificate_wire() {
+        let qc = QuorumCertificate {
+            view: View::new(1),
+            phase: VotePhase::Prepare,
+            block_hash: Hash([0x44; 32]),
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0111],
+            aggregate_signature: AggregateSignature([0x55; 96]),
+        };
         let tc = TimeoutCertificate {
             view: View::new(3),
             epoch: Epoch::new(0),
-            signer_bitmap: vec![0b1111_1111, 0b0000_0001], // 9 signers
-            aggregate_signature: AggregateSignature([0x33; 96]),
+            signers: vec![
+                TimeoutSigner { voter: 0, high_qc: Some(qc), signature: Signature([0x33; 96]) },
+                TimeoutSigner { voter: 1, high_qc: None, signature: Signature([0x77; 96]) },
+            ],
         };
         let mut expected = Vec::new();
         expected.extend_from_slice(&3u64.to_le_bytes()); // view
         expected.extend_from_slice(&0u64.to_le_bytes()); // epoch
-        // signer_bitmap: varint length (2) + 2 bytes
-        expected.push(2);
-        expected.push(0b1111_1111);
-        expected.push(0b0000_0001);
-        expected.extend_from_slice(&[0x33; 96]); // aggregate_signature
+        expected.push(2); // signer count varint
+        // signer 0: voter u16 + has_qc + qc + sig
+        expected.extend_from_slice(&0u16.to_le_bytes());
+        expected.push(1); // has_qc
+        expected.extend_from_slice(&1u64.to_le_bytes()); // qc.view
+        expected.push(0); // qc.phase
+        expected.extend_from_slice(&[0x44; 32]); // qc.block_hash
+        expected.extend_from_slice(&0u64.to_le_bytes()); // qc.epoch
+        expected.push(1); // qc.signer_bitmap varint len
+        expected.push(0b0000_0111); // qc.signer_bitmap
+        expected.extend_from_slice(&[0x55; 96]); // qc.aggregate_signature
+        expected.extend_from_slice(&[0x33; 96]); // signer sig
+        // signer 1: voter u16 + no qc + sig
+        expected.extend_from_slice(&1u16.to_le_bytes());
+        expected.push(0); // no high_qc
+        expected.extend_from_slice(&[0x77; 96]);
         roundtrip(&tc, &expected);
     }
 
@@ -1394,8 +1515,11 @@ mod tests {
         let tc = TimeoutCertificate {
             view: View::new(4),
             epoch: Epoch::new(0),
-            signer_bitmap: vec![0xFF],
-            aggregate_signature: AggregateSignature([0x77; 96]),
+            signers: vec![TimeoutSigner {
+                voter: 0,
+                high_qc: None,
+                signature: Signature([0x77; 96]),
+            }],
         };
         let header = BlockHeader {
             height: Height::new(1),

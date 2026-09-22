@@ -45,7 +45,7 @@
 //! the Jolteon pattern: leader fault isolation in exactly one timeout
 //! delay, then responsive recovery.
 
-use crypto::bls::{AggregateSignature, Signature, ValidatorIndex};
+use crypto::bls::{Signature, ValidatorIndex};
 use primitives::{Epoch, View};
 use types::TimeoutCertificate;
 
@@ -425,21 +425,19 @@ impl Pacemaker {
         self.own_timeout_sent = false;
     }
 
-    /// Form a timeout certificate from the collected signatures.
+    /// Form a timeout certificate marker for the collected quorum.
     ///
-    /// Stage 2: the aggregate signature is a placeholder (all-zeros).
-    /// Stage 5 will replace this with real BLS aggregation over the
-    /// collected individual signatures.
+    /// The pacemaker is a pure state machine — it tracks *who* timed
+    /// out (the bitmap) but not what they signed. The per-signer
+    /// evidence records live in the engine's verified signature
+    /// buffer, which fills `signers` when the
+    /// `TimeoutCertificateFormed` event is handled — this TC's
+    /// empty `signers` marks "quorum reached, evidence pending".
     fn form_timeout_certificate(&self) -> TimeoutCertificate {
         TimeoutCertificate {
             view: self.current_view,
             epoch: self.current_epoch,
-            signer_bitmap: self.timeout_signers.clone(),
-            // Phase 1 stage 5: aggregate the collected signatures via
-            // blst. For now, the all-zero placeholder is syntactically
-            // valid but will fail BLS verification — the pacemaker's
-            // job (stage 2) is the state machine, not the crypto.
-            aggregate_signature: AggregateSignature::ZERO,
+            signers: Vec::new(),
         }
     }
 }
@@ -563,13 +561,12 @@ mod tests {
     #[test]
     fn external_tc_advances_view() {
         let mut pm = Pacemaker::new(vs4(), View::new(5), Epoch::new(0));
-        // A TC formed by another replica for view 5.
-        let tc = TimeoutCertificate {
-            view: View::new(5),
-            epoch: Epoch::new(0),
-            signer_bitmap: vec![0b0000_0111], // 3 signers
-            aggregate_signature: AggregateSignature::ZERO,
-        };
+        // A TC formed by another replica for view 5. The pacemaker
+        // is a pure state machine — it never inspects `signers`
+        // (the engine fills/verifies them), so a bare marker with
+        // the right view/epoch is sufficient here.
+        let tc =
+            TimeoutCertificate { view: View::new(5), epoch: Epoch::new(0), signers: Vec::new() };
         let event = pm.on_timeout_certificate(&tc).expect("should advance");
         match event {
             PacemakerEvent::AdvanceView { old_view, new_view, tc } => {
@@ -588,8 +585,7 @@ mod tests {
         let tc = TimeoutCertificate {
             view: View::new(3), // past view
             epoch: Epoch::new(0),
-            signer_bitmap: vec![0xFF],
-            aggregate_signature: AggregateSignature::ZERO,
+            signers: Vec::new(),
         };
         assert!(pm.on_timeout_certificate(&tc).is_none());
         assert_eq!(pm.current_view(), View::new(5), "view must not change");
@@ -601,8 +597,7 @@ mod tests {
         let tc = TimeoutCertificate {
             view: View::new(0),
             epoch: Epoch::new(1), // wrong epoch
-            signer_bitmap: vec![0xFF],
-            aggregate_signature: AggregateSignature::ZERO,
+            signers: Vec::new(),
         };
         assert!(pm.on_timeout_certificate(&tc).is_none());
     }

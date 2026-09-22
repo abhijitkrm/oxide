@@ -118,13 +118,39 @@ rule exists because a concrete attack or wedge was found without it:
   height *h* it votes only that block at *h* — until a proposal
   arrives carrying a valid TC for the immediately preceding view.
   The TC is quorum-certified proof that the earlier view ended
-  undecided, so re-voting the height cannot produce two commits:
-  QC adoption is view-monotonic, and only the *newest* notarization
-  can gather the child votes a commit needs. Without the release,
-  a single equivocating leader could split the vote and wedge a
-  height forever.
+  undecided, so re-voting the height cannot produce two commits —
+  *provided* the proposal also clears the TC's evidence floor
+  (below): the release and the floor are the two halves of one
+  rule, and the floor is what makes the release safe. Without the
+  release, a single equivocating leader could split the vote and
+  wedge a height forever.
+- **TC evidence floor (Jolteon vote predicate).** A proposal that
+  enters through `TC(v−1)` must carry a QC at least as recent as
+  the highest `qc_high` any TC signer reported —
+  `prop_qc.view ≥ max{qc_high.view ∈ TC}`. Every timeout signature
+  binds the signer's adopted QC at signing time (the evidence is
+  inside the signed message), so the floor is unfalsifiable: an
+  aggregator cannot omit or downgrade a signer's claim. This is
+  the load-bearing half of lock release — a bare "quorum timed
+  out" TC only proves the view ended undecided *for its signers*;
+  it says nothing about QCs that were formed but withheld. The
+  floor forces the next proposal to extend the newest lock the
+  quorum actually reported, so a hidden QC can never be
+  leapfrogged by a conflicting sibling. (The hidden-QC fork
+  counterexample — a withheld QC plus a bare TC release letting
+  two honest validators commit conflicting blocks at one height —
+  is a regression test in `engine::tests`.)
+- **Timeout/vote asymmetry.** A validator that signs `timeout(v)`
+  must not vote in *v* — the signature already pinned the
+  `qc_high` it held, and a later vote would create a lock the TC
+  entry doesn't report. The reverse direction is required for
+  liveness and stays legal: a validator that voted in *v* and
+  still hasn't seen a QC must be able to time out, and its
+  signature then reports exactly the lock its vote produced. The
+  signed view is persisted to the WAL before the signature is
+  emitted (a restart that forgot it could equivocate).
 
-### The commit rule (recursive)
+### The commit rule (recursive, consecutive-view link)
 
 Adopting QC(*b*) for a stored block *b* finalizes **the whole
 certified ancestor chain beneath it**, not just the single pending
@@ -134,6 +160,23 @@ stored ancestor is itself certified with a certified child. The
 engine walks `prev` links from *b*'s parent back to the finalized
 prefix (or an unstored block — storage is prefix-closed, so a gap
 means "already finalized") and commits in height order.
+
+The *committing link* — the QC'd child over its embedded-QC
+parent — must be **view-consecutive**: `child.view ==
+parent.view + 1`. This is not a liveness nicety; it is what makes
+the safety proof close. When the pair is consecutive, no TC for
+the child's view can exist (a quorum voted instead of timing out),
+so the first TC above the pair is guaranteed to carry evidence
+from the quorum that locked the committed block — every later
+proposal's evidence floor then sits at or above the commit. A
+nonconsecutive link leaves a view gap where a TC can form *before*
+the lock existed, letting a conflicting QC be certified in the
+gap: the hidden-QC counterexample committed exactly such a link.
+Ancestors below the committing pair need no consecutive links of
+their own — a block certified at *v* whose view *v+1* timed out
+commits transitively when a later consecutive pair lands above it
+(the recursive walk), which is where liveness comes from after a
+timeout.
 
 A single-link "commit the pending block when a child QC arrives"
 rule is *incomplete*: if a QC is adopted before its block is stored,
@@ -218,6 +261,17 @@ a height; views advance on timeout or on a timeout certificate.
   the timed-out view, so a split view can be retried at the same
   height. A TC is the "force a view change without the leader"
   mechanism — tail-fork resistance.
+- **TCs carry per-signer evidence.** A timeout signature binds
+  `(view, epoch, qc_high)` — the signer's adopted QC at signing
+  time — and the TC carries one record per signer: index, the
+  claimed QC, the individual signature. Same-message aggregate
+  verification cannot cover distinct claims, so the records are
+  individually signed (TCs exist only on view change — the rare
+  path — so per-signer verification is affordable). Each claim is
+  verified at collection *and* at TC verification: an entry whose
+  bound QC is itself forged is rejected before it can poison the
+  TC, and a relay that swaps or strips an entry's evidence breaks
+  that entry's signature.
 - **Continuous.** The pacemaker does not stop on finality; it
   advances views as long as there is work, which (with pipelining)
   is always.

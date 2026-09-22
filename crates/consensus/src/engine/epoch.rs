@@ -60,6 +60,10 @@ impl OxideBft {
         self.epoch = self.epoch.saturating_next();
         self.current_view = View::new(0);
         self.last_voted_view = None;
+        // The timeout-signed view bar is epoch-scoped like the vote
+        // bar above it: the new epoch restarts views at 0, so a stale
+        // record would block a legitimate vote at that view.
+        self.timeout_signed_view = None;
         self.high_qc = None;
         // Per-height vote locks are evidence of the old epoch's
         // consensus instance: heights continue across the boundary

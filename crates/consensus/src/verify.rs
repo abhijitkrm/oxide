@@ -234,12 +234,68 @@ pub(crate) fn verify_qc_signature(
 /// [`ConsensusError::SignerOutOfBounds`] if `voter` is past the end
 /// of the set, or [`ConsensusError::InvalidVoteSignature`] if the
 /// signature does not verify for this `(view, epoch)`.
+/// The message a validator signs when its pacemaker timer fires:
+/// `(view, epoch, has_qc, qc_high_view, qc_high_hash)` — 57 bytes.
+///
+/// Binding the signer's `qc_high` into the signature is the Jolteon
+/// view-change mechanism (arXiv:2106.10362 §3): a TC built from these
+/// signatures carries, for every signer, *exactly* the evidence it
+/// reported — an aggregator cannot weaken it (the claim is signed)
+/// and cannot substitute another certificate for it. That is what
+/// makes `prop_qc.view >= max(TC evidence)` a sound entry rule for
+/// the next view: once a consecutive pair commits, every later TC's
+/// quorum provably contains a locked voter reporting the committed
+/// chain's QC.
+///
+/// `None` evidence encodes as `has_qc = 0, view = 0, hash = ZERO`.
+/// The flag disambiguates "no QC held" from a QC at view 0 — a real
+/// certificate's view is always meaningful.
+pub(crate) fn timeout_signing_message(
+    view: View,
+    epoch: Epoch,
+    high_qc: Option<&QuorumCertificate>,
+) -> [u8; 57] {
+    let mut msg = [0u8; 57];
+    msg[..8].copy_from_slice(&view.value().to_le_bytes());
+    msg[8..16].copy_from_slice(&epoch.value().to_le_bytes());
+    if let Some(qc) = high_qc {
+        msg[16] = 1;
+        msg[17..25].copy_from_slice(&qc.view.value().to_le_bytes());
+        msg[25..57].copy_from_slice(qc.block_hash.as_bytes());
+    }
+    msg
+}
+
+/// Verify a peer's timeout signature for an explicit `(view, epoch)`
+/// **without mutating any state**.
+///
+/// The node's message pump needs to authenticate timeout evidence
+/// *before* acting on it. `collect_timeout_signature` verifies
+/// against the engine's *current* view, so the pump previously had
+/// to call `sync_to_view(sig_view)` first — which meant an
+/// unauthenticated peer could move the view, reset the pacemaker
+/// timer, and clear the vote buffer simply by claiming a high view
+/// and attaching garbage. A forged timeout must change nothing.
+///
+/// This entry point breaks that ordering: authenticate here, then
+/// (only if it verifies) let the caller sync and collect. The
+/// signature binds `(view, epoch)` plus the signer's claimed
+/// `qc_high` under [`Domain::Timeout`] — `high_qc` must be the exact
+/// certificate the sender attached, so a relay cannot swap in a
+/// different (even valid) QC without breaking the signature.
+///
+/// # Errors
+///
+/// [`ConsensusError::SignerOutOfBounds`] if `voter` is past the end
+/// of the set, or [`ConsensusError::InvalidVoteSignature`] if the
+/// signature does not verify for this `(view, epoch, high_qc)`.
 pub fn verify_timeout_signature_for(
     vset: &ValidatorSet,
     verify_signatures: bool,
     voter: ValidatorIndex,
     view: View,
     epoch: Epoch,
+    high_qc: Option<&QuorumCertificate>,
     signature: &Signature,
 ) -> Result<(), ConsensusError> {
     // Conformance mode carries no real keys, so there is nothing to
@@ -249,55 +305,87 @@ pub fn verify_timeout_signature_for(
         return Ok(());
     }
     let pk = vset.validator(voter).map_err(|_| ConsensusError::SignerOutOfBounds)?;
-    let mut msg = Vec::with_capacity(16);
-    msg.extend_from_slice(&view.value().to_le_bytes());
-    msg.extend_from_slice(&epoch.value().to_le_bytes());
+    let msg = timeout_signing_message(view, epoch, high_qc);
     crypto::bls_signer::verify(signature, crypto::hash::Domain::Timeout, &msg, pk)
         .map_err(|_| ConsensusError::InvalidVoteSignature { voter })
 }
 
-/// Verify a TC's aggregate signature against the signer bitmap
-/// and the validator set's public keys. The signed message is
-/// the TC's view as little-endian bytes, signed with
-/// `Domain::Timeout`.
+/// Verify a TC's per-signer evidence records against the validator
+/// set: every entry's signature must verify over its own claimed
+/// `(view, epoch, high_qc)`, voters must be distinct and in bounds,
+/// the combined stake must reach quorum, and every carried QC must
+/// itself verify.
 ///
-/// The quorum threshold check is performed by the caller
-/// ([`on_timeout_certificate`](Self::on_timeout_certificate)) via
-/// [`ValidatorSet::signer_stake`], so it is enforced regardless
-/// of whether signature verification is enabled.
+/// The per-signer shape (rather than one aggregate signature) is
+/// forced by the evidence binding: each signer reports a potentially
+/// different `qc_high`, and BLS same-message aggregation cannot
+/// cover distinct payloads. The cost is `q` individual verifies per
+/// TC — acceptable because TCs exist only on view changes, the rare
+/// path by construction.
+///
+/// Structural checks that hold even in conformance mode
+/// (`verify_signatures = false`): distinct in-bounds voters, quorum
+/// stake, `qc_high.view <= tc.view` (a signer can hold a QC formed
+/// in the view it times out on — it adopted the QC, then timed out
+/// still at that view — but evidence from a *later* view is
+/// unreachable: adopting it would have advanced the signer past
+/// the view it claims to be timing out on), and each carried QC's
+/// epoch matching the TC's.
 ///
 /// # Errors
 ///
-/// Returns [`ConsensusError::SignerOutOfBounds`] if the bitmap
-/// references an out-of-bounds validator,
+/// Returns [`ConsensusError::SignerOutOfBounds`] if an entry
+/// references an out-of-bounds or duplicate validator,
 /// [`ConsensusError::InsufficientQuorum`] if the signers' voting
-/// power is below quorum, or [`ConsensusError::InvalidTcSignature`]
-/// if the aggregate does not verify.
+/// power is below quorum, [`ConsensusError::InvalidTcSignature`] if
+/// a signature does not verify or an entry is malformed, or
+/// [`ConsensusError::InvalidQcSignature`] if a carried high-QC is
+/// itself unverifiable.
 pub(crate) fn verify_tc_signature(
     vset: &ValidatorSet,
+    verify_signatures: bool,
     tc: &TimeoutCertificate,
 ) -> Result<(), ConsensusError> {
-    let (signer_pks, voting_power) = signer_keys_and_power(vset, &tc.signer_bitmap)?;
-    if signer_pks.is_empty() {
+    if tc.signers.is_empty() {
         return Err(ConsensusError::InvalidTcSignature);
     }
-    // Same defense-in-depth as `verify_qc_signature`: a TC is
-    // only a certificate at quorum (voting power), enforced here
-    // too so no call site can accept a validly-signed sub-quorum
-    // bitmap.
+    let mut seen = std::collections::HashSet::with_capacity(tc.signers.len());
+    let mut voting_power = 0u64;
+    // Carried QCs are deduplicated for verification: honest quorum
+    // members overwhelmingly report the *same* high QC (the chain's
+    // tip), so the common case verifies one certificate regardless
+    // of signer count.
+    let mut verified_qcs: std::collections::HashSet<(u64, Hash)> = std::collections::HashSet::new();
+    for entry in &tc.signers {
+        if !seen.insert(entry.voter) {
+            return Err(ConsensusError::InvalidTcSignature);
+        }
+        let pk = vset.validator(entry.voter).map_err(|_| ConsensusError::SignerOutOfBounds)?;
+        voting_power = voting_power.saturating_add(
+            vset.stake(entry.voter).map_err(|_| ConsensusError::SignerOutOfBounds)?,
+        );
+        if let Some(qc) = &entry.high_qc {
+            // Evidence from a view *after* the timed-out view is
+            // impossible honestly — adopting it would have advanced
+            // the signer past this view — so it marks a malformed
+            // record. A QC from the timed-out view itself is legal:
+            // the signer adopted it mid-view, then timed out.
+            if qc.view.value() > tc.view.value() || qc.epoch != tc.epoch {
+                return Err(ConsensusError::InvalidTcSignature);
+            }
+            if verify_signatures && verified_qcs.insert((qc.view.value(), qc.block_hash)) {
+                verify_qc_signature(vset, tc.epoch, qc)?;
+            }
+        }
+        if verify_signatures {
+            let msg = timeout_signing_message(tc.view, tc.epoch, entry.high_qc.as_ref());
+            crypto::bls_signer::verify(&entry.signature, crypto::hash::Domain::Timeout, &msg, pk)
+                .map_err(|_| ConsensusError::InvalidTcSignature)?;
+        }
+    }
     let required = vset.quorum_stake();
     if voting_power < required {
         return Err(ConsensusError::InsufficientQuorum { voting_power, required });
     }
-    // M1 fix: verify against (view, epoch), not just view.
-    let mut msg = Vec::with_capacity(16);
-    msg.extend_from_slice(&tc.view.value().to_le_bytes());
-    msg.extend_from_slice(&tc.epoch.value().to_le_bytes());
-    crypto::aggregate_verify(
-        &tc.aggregate_signature,
-        crypto::hash::Domain::Timeout,
-        &msg,
-        &signer_pks,
-    )
-    .map_err(|_| ConsensusError::InvalidTcSignature)
+    Ok(())
 }

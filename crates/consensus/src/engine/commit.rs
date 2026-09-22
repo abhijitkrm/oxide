@@ -48,10 +48,17 @@ impl OxideBft {
         // vote path; only a future import seam could create one)
         // would otherwise commit an *uncertified* parent: the
         // embedded QC certifies `justify`, not `prev`.
-        let mut chain: Vec<(Hash, Vec<u8>, u64)> = Vec::new();
+        //
+        // Each collected entry carries the committing pair it would
+        // close: `(cursor hash, certifying bitmap, cursor height,
+        // cursor view, certifier view)` — where the certifier is the
+        // stored child carrying the cursor's QC (`header` for the
+        // first link, the previous cursor thereafter).
+        let mut chain: Vec<(Hash, Vec<u8>, u64, u64, u64)> = Vec::new();
         if header.high_qc.as_ref().is_some_and(|qc| qc.block_hash == header.prev_block) {
             let mut cursor_hash = header.prev_block;
             let mut certifying = header.high_qc.clone();
+            let mut certifier_view = header.view;
             while let Some(bitmap) = certifying.as_ref().map(|qc| qc.signer_bitmap.clone()) {
                 let Some((cursor_header, cursor_body)) = self.blocks.get(&cursor_hash) else {
                     break;
@@ -62,11 +69,40 @@ impl OxideBft {
                 if self.finalized.contains_key(&cursor_header.height.value()) {
                     break;
                 }
-                chain.push((cursor_hash, bitmap, cursor_header.height.value()));
+                chain.push((
+                    cursor_hash,
+                    bitmap,
+                    cursor_header.height.value(),
+                    cursor_header.view.value(),
+                    certifier_view.value(),
+                ));
+                certifier_view = cursor_header.view;
                 certifying.clone_from(&cursor_header.high_qc);
                 cursor_hash = cursor_header.prev_block;
             }
         }
+        // Jolteon two-chain commit (arXiv:2106.10362 §3): a block
+        // commits only through a *consecutive* certified pair —
+        // its certifying child must be exactly one view later
+        // (`child.view == cursor.view + 1`). The lock-persistence
+        // proof depends on adjacency: when the pair is consecutive,
+        // no TC for the child's view can exist, so the first TC
+        // above the pair is guaranteed to carry evidence from the
+        // locked quorum. A nonconsecutive link leaves a gap where a
+        // TC could form before the lock existed — the hidden-QC fork
+        // this change fixes committed exactly such a link.
+        //
+        // Committing a block finalizes its whole certified prefix —
+        // ancestors need no pair of their own — so the commit point
+        // is the *newest* collected block whose link is consecutive;
+        // everything below it commits with it. Entries above stay
+        // uncommitted (they close only through their own future
+        // consecutive pair, or as ancestors of a later commit).
+        let commit_from = chain
+            .iter()
+            .position(|(_, _, _, cursor_view, certifier_view)| *certifier_view == *cursor_view + 1)
+            .unwrap_or(chain.len());
+        let chain = &chain[commit_from..];
         // Contiguity guard: commit only when the collected chain's
         // oldest block is the direct child of the commit tip.
         // A gap means an ancestor proposal is still in flight —
@@ -80,11 +116,11 @@ impl OxideBft {
         let expected_next =
             self.last_committed.map_or(0, |(_, committed_height)| committed_height.value() + 1);
         let contiguous =
-            chain.last().is_none_or(|(_, _, oldest_height)| *oldest_height == expected_next);
+            chain.last().is_none_or(|(_, _, oldest_height, _, _)| *oldest_height == expected_next);
         // Commit oldest-first so `finalize_block` sees a
         // contiguous ascending prefix.
         if contiguous {
-            for (hash, bitmap, _) in chain.iter().rev() {
+            for (hash, bitmap, _, _, _) in chain.iter().rev() {
                 self.commit_block(*hash, bitmap);
             }
         }

@@ -1159,6 +1159,43 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **oxideBFT: hidden-QC fork — conflicting blocks could finalize at
+  the same height** (`crates/consensus`, `crates/types`,
+  `bin/oxide-devnet`, `crates/devnet`, `sim`, `spec/oxidebft`)
+  - A withheld quorum certificate plus a bare timeout certificate
+    could release a same-height vote lock and let two honest
+    validators finalize different blocks at the same height —
+    reproduced end-to-end with real BLS signatures before the fix
+    (one Byzantine validator plus message ordering, inside the
+    n=4/f=1 threat model).
+  - Timeout signatures now bind the signer's actual high-QC, and a
+    timeout certificate carries one signed evidence record per
+    signer — so a TC provably reports what its quorum was locked on,
+    and an aggregator cannot omit or downgrade a claim. A proposal
+    entered through a TC must extend a QC at least as recent as the
+    TC's highest reported evidence (the Jolteon floor), and voters
+    adopt that evidence before judging the proposal — withheld QCs
+    now pull the whole honest set onto the same branch.
+  - The two-chain commit rule now requires the committing pair to
+    be in consecutive views; ancestors below it still commit
+    transitively, so liveness is preserved — a block whose
+    successor view timed out commits when the next consecutive pair
+    lands above it.
+  - A validator that signs a timeout for a view may not vote in
+    that view (WAL-persisted before the signature is emitted);
+    voting first and timing out later stays legal, which is what
+    lets honest locks reach the evidence floor.
+  - The TLA+ model (`spec/oxidebft/OxideBft.tla`) and the protocol
+    spec (`docs/oxidebft-spec.md`) now describe the evidence-bound
+    TC, the floor, and the consecutive commit link.
+  - **In plain words:** previously, if a block won enough votes but
+    the certificate proving it got delayed, the network could
+    quietly start building on a rival block — and both could end up
+    "final" for different validators, i.e. a real fork in finalized
+    history. Now, when a view times out, the timeout certificate
+    must reveal the newest certified block its signers had seen,
+    and the next block must build on it — so a hidden certificate
+    can no longer split finalized history.
 - **Poisoned state mutexes were silently recovered** — every module
   (`modules/*`), `crates/executor`, `crates/matcher`,
   `crates/p2p`, `crates/rpc`, and `crates/devnet` used

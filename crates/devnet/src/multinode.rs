@@ -511,18 +511,22 @@ impl MultiNodeDevnet {
                 if signer_i == collector_i {
                     continue;
                 }
+                let evidence = self.engines[signer_i].high_qc().cloned();
                 if let Ok(Some(tc)) = self.engines[collector_i].collect_timeout_signature(
                     u16::try_from(signer_i).unwrap(),
                     timeout_sigs[signer_idx],
+                    evidence,
                 ) {
                     formed_tc = Some(tc);
                 }
             }
             // Self-signature (the validator that timed out also
             // signs its own timeout).
+            let self_evidence = self.engines[collector_i].high_qc().cloned();
             if let Ok(Some(tc)) = self.engines[collector_i].collect_timeout_signature(
                 u16::try_from(collector_i).unwrap(),
                 timeout_sigs[collector_idx],
+                self_evidence,
             ) {
                 formed_tc = Some(tc);
             }
@@ -553,10 +557,15 @@ impl MultiNodeDevnet {
             .iter_mut()
             .map(|e| e.on_timeout().unwrap_or(crypto::bls::Signature::ZERO))
             .collect();
+        let evidences: Vec<Option<types::QuorumCertificate>> =
+            self.engines.iter().map(|e| e.high_qc().cloned()).collect();
         for collector in 0..self.n {
             for (signer, sig) in sigs.iter().enumerate() {
-                let _ = self.engines[collector]
-                    .collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig);
+                let _ = self.engines[collector].collect_timeout_signature(
+                    u16::try_from(signer).unwrap_or(0),
+                    *sig,
+                    evidences[signer].clone(),
+                );
             }
         }
         let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
@@ -1203,9 +1212,14 @@ mod tests {
         devnet.partition(5);
         devnet.partition(6);
 
-        // Run 2 rounds during partition. The remaining 5 validators
-        // (≥ 2f+1 = 5 for n=7, f=2) can still reach quorum.
-        let (result, _) = devnet.run_batch_transport(2, 10);
+        // Run 6 rounds during partition. The remaining 5 validators
+        // (≥ 2f+1 = 5 for n=7, f=2) still reach quorum every online-
+        // led view, but commits now require a CONSECUTIVE view pair:
+        // the rounds at views 5-6 are led by the partitioned
+        // validators (their stale-view proposals are rejected), so
+        // the first committable link is (v7, v8) — both online-led —
+        // which finalizes the whole suspended prefix transitively.
+        let (result, _) = devnet.run_batch_transport(6, 10);
         let blocks_during = result.finalized[0].len();
         assert!(blocks_during > blocks_before, "should finalize during partition");
 

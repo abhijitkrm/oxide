@@ -31,6 +31,7 @@ impl OxideBft {
         };
         if let Some(entry) = wal.recover()? {
             self.last_voted_view = entry.last_voted_view;
+            self.timeout_signed_view = entry.timeout_signed_view;
             self.voted_at_height = entry.voted_at_height;
             self.high_qc = entry.high_qc;
             self.current_view = entry.current_view;
@@ -103,6 +104,7 @@ impl OxideBft {
     pub(crate) fn wal_entry(&self, include_set: bool) -> crate::wal::WalEntry {
         crate::wal::WalEntry {
             last_voted_view: self.last_voted_view,
+            timeout_signed_view: self.timeout_signed_view,
             voted_at_height: self.voted_at_height.clone(),
             high_qc: self.high_qc.clone(),
             current_view: self.current_view,
@@ -154,6 +156,7 @@ impl OxideBft {
         // the WAL is mutably borrowed.
         let entry = crate::wal::WalEntry {
             last_voted_view: self.last_voted_view,
+            timeout_signed_view: self.timeout_signed_view,
             voted_at_height: self.voted_at_height.clone(),
             high_qc: self.high_qc.clone(),
             current_view: self.current_view,
@@ -249,6 +252,13 @@ impl OxideBft {
             None => buf.push(0),
         }
 
+        // Optional trailer: `timeout_signed_view` (8-byte view;
+        // 0 = none, matching `last_voted_view`'s sentinel).
+        // Buffers written before the field existed decode as None.
+        buf.extend_from_slice(
+            &self.timeout_signed_view.map_or(0u64, primitives::Id::value).to_le_bytes(),
+        );
+
         buf
     }
 
@@ -339,6 +349,15 @@ impl OxideBft {
                     Height::new(height),
                 ));
             }
+        }
+
+        // Optional trailer: `timeout_signed_view` (8-byte view,
+        // 0 = none). Buffers written before the field existed end
+        // here — decode as `None`.
+        self.timeout_signed_view = None;
+        if offset + 8 <= bytes.len() {
+            let ts_val = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            self.timeout_signed_view = if ts_val == 0 { None } else { Some(View::new(ts_val)) };
         }
 
         Ok(())

@@ -120,6 +120,18 @@ pub struct WalEntry {
     /// forward, so the returned entry always reflects the set that
     /// was committed when the last record was written.
     pub validator_set: Option<crate::validator::ValidatorSet>,
+    /// The latest view this engine signed a timeout for. Safety-
+    /// critical under the Jolteon evidence rule: a validator that
+    /// signed `timeout(v)` must not also vote in `v` — its TC
+    /// entry asserts a fixed `qc_high` that predates any later
+    /// vote, and voting after signing would let a TC underreport
+    /// the quorum's real locks (arXiv:2106.10362 §3). Without
+    /// persistence, a restart forgets the signed view and can
+    /// emit both signatures for the same view.
+    ///
+    /// Encoded as an optional trailer (1-byte flag + 8-byte view)
+    /// so entries written by older binaries still decode.
+    pub timeout_signed_view: Option<View>,
 }
 
 impl Encode for WalEntry {
@@ -176,6 +188,15 @@ impl Encode for WalEntry {
                     codec::write::u64(buf, vs.stakes()[i]);
                     buf.extend_from_slice(&vs.validator_addresses()[i].0);
                 }
+            }
+            None => buf.push(0),
+        }
+        // Optional trailer #3: the timeout-signed view (1-byte
+        // flag + 8-byte view). Absent on old files — decoded `None`.
+        match self.timeout_signed_view {
+            Some(v) => {
+                buf.push(1);
+                v.encode(buf);
             }
             None => buf.push(0),
         }
@@ -252,6 +273,14 @@ impl<'a> Decode<'a> for WalEntry {
         } else {
             None
         };
+        // Optional trailer #3: timeout-signed view. Entries written
+        // before it existed end at or before the flag byte —
+        // decode `None`.
+        let timeout_signed_view = if reader.remaining() > 0 && reader.read_u8()? == 1 {
+            Some(View::decode(reader)?)
+        } else {
+            None
+        };
         Ok(Self {
             last_voted_view,
             voted_at_height,
@@ -261,6 +290,7 @@ impl<'a> Decode<'a> for WalEntry {
             epoch,
             last_committed,
             validator_set,
+            timeout_signed_view,
         })
     }
 }
@@ -612,6 +642,7 @@ mod tests {
             epoch: Epoch::new(0),
             last_committed: None,
             validator_set: None,
+            timeout_signed_view: None,
         }
     }
 
@@ -628,6 +659,7 @@ mod tests {
             epoch: Epoch::new(0),
             last_committed: Some((Hash([0xBB; 32]), Height::new(2))),
             validator_set: None,
+            timeout_signed_view: Some(View::new(5)),
         }
     }
 

@@ -18828,3 +18828,108 @@ regression gate when it lands.
 TLC corroboration not run locally (no JRE on this box — the CI
 runner fetches tla2tools); the Rust counterexample is the stronger
 evidence regardless.
+
+## Consensus safety: hidden-QC fork — fixed (2.1)
+
+The counterexample became the regression
+(`hidden_qc_timeout_release_cannot_fork`): same schedule, fork now
+impossible. Implemented the full Jolteon evidence rule
+(arXiv:2106.10362 §3, Figure 2):
+
+- **Sig-bound TC evidence.** `TimeoutCertificate` now carries one
+  `TimeoutSigner` record per signer — index, claimed `qc_high`,
+  individual signature — instead of a bitmap + aggregate. The
+  timeout message signs `(view, epoch, qc_high.view,
+  qc_high.block_hash)`: the evidence is inside the signature, so
+  an aggregator cannot drop or downgrade a claim, and a relay that
+  swaps it breaks that entry's verification. Per-signer records
+  (not one aggregate) because BLS same-message aggregation cannot
+  cover distinct claims; affordable because TCs are rare-path.
+- **Evidence floor in the vote predicate.** A proposal entered via
+  `TC(v−1)` is votable only if its embedded QC is at least as
+  recent as the TC's max signer evidence. The voter adopts the max
+  evidence first (`adopt_tc_evidence` through `deliver_qc`), so
+  the parent-binding check evaluates against the locked chain —
+  this is what drags every honest validator onto the same branch
+  after a timeout, even if the QC was withheld from them.
+- **Collection-time evidence screening.** A byz signer can sign a
+  timeout claiming a *forged* QC — its own signature verifies, but
+  the entry would fail TC verification later and poison every TC
+  it lands in. `collect_timeout_signature` now rejects a bound
+  claim whose QC doesn't verify (same-epoch, view ≤ timed-out
+  view, aggregate verifies). A same-view QC claim is legal: a
+  signer adopts a QC formed in its current view, then times out.
+- **Consecutive-view committing link.** `commit_walk` commits only
+  through a link where `child.view == parent.view + 1`. Adjacency
+  is what the lock-persistence proof needs: a consecutive pair
+  means the child's view produced a QC, so no TC(v_child) exists
+  and the first TC above the pair provably carries the locked
+  quorum's evidence. Ancestors below the pair commit transitively
+  — a block certified at v whose v+1 timed out still commits when
+  a later consecutive pair lands above it (liveness preserved; the
+  partition-recovery devnet test now spans enough views for a
+  consecutive pair to land in-window).
+- **Timeout/vote asymmetry.** `timeout_signed_view` is set and
+  WAL-appended *before* the signature leaves `on_timeout`; the
+  vote predicate refuses same-view votes afterward. Vote-then-
+  timeout stays legal — the timeout then reports exactly the lock
+  the vote created, which is what the safety proof requires.
+
+One design subtlety that fell out of the implementation: the
+"lock" Jolteon's `Lock` sets is `qc_high` — which our vote rule
+already guarantees, because `prev == high_qc.block_hash` binding
+means a vote is always for a proposal extending our adopted QC.
+The voted-block lock and the adopted-QC lock coincide here, so
+evidence = adopted highQC suffices (no separate locked-vote
+tracking needed).
+
+The devnet wire format already carried `high_qc`/`last_tc`; the
+fields are now signature-bound and collected into the TC.
+`oxide-devnet`, `multinode`, `tcp_multinode`, and the sim's chaos
+driver pass the claim through `verify_timeout_signature_for` /
+`collect_timeout_signature`.
+
+Tests: the inverted counterexample (hidden QC, selective delivery,
+TC evidence floor, consecutive commit, transitive prefix commit)
+plus focused unit tests — vote-after-timeout rejected,
+timeout-after-vote reports the lock, evidence swap/strip breaks
+the signature, forged bound evidence rejected at collection,
+evidence substitution rejected. 185 consensus tests, 33 devnet,
+38 sim — all green. TLA+ model updated to the fixed rules
+(`timeoutSigs` carry evidence, `TCFloors`/`TCFloorOK`,
+`NotTimedOut`, consecutive-link commit, `DeliverTC` adopts the max
+evidence); TLC runs in CI.
+
+Gates: `cargo fmt --check`, workspace `clippy -D warnings`,
+`cargo test --workspace` all clean.
+
+## TLA+ spec validated locally — smoke config exhaustive-run finding
+
+Found brew openjdk (`/opt/homebrew/opt/openjdk/bin/java`) after the
+2.1 spec rewrite, so the pinned `tla2tools` v1.7.4 ran locally for
+the first time. It caught two real spec bugs SANY/TLC surface but
+eyeball review missed:
+
+- **Same-level bound dependencies are illegal.** `TCOptions`,
+  `ByzPropose`, and `ByzTimeout` wrote `f \in TCFloors(t)` /
+  `x.view <= v` inside bound lists where `t`/`v` were bound at the
+  same level — SANY reports "Unknown operator". Restructured: the
+  floor maps nest inside `UNION {… : t \in S}`, and `ByzTimeout`'s
+  evidence choice nests under its view `\E`.
+- **TLC refuses cross-type equality.** `tcv = -1` threw at runtime
+  when `tcv` was a record — replaced the bare `-1` option with a
+  sentinel record `[view |-> -1, floor |-> -1]` so `tcv.view` /
+  `tcv.floor` read uniformly. (Side effect: the encoding is cleaner
+  — no `IF` needed at all.)
+
+The CI gate invocation (seeded sim, hunt config: 20k × 40 steps,
+seed 424242) then passed clean — ~15M states, no invariant hits.
+The `OxideBftSmoke` *exhaustive* pass is still running as of this
+entry — 190M+ states generated at depth 14 and still queued. The
+new spec's state space is materially larger: per-signer timeout
+evidence multiplies `timeoutSigs` × achievable-TC-floor branching.
+That is an honest cost of modeling evidence faithfully — the smoke
+config may need a smaller bound (or stays a longer local run, with
+CI remaining the seeded gate).
+
+

@@ -20,19 +20,30 @@
 (*    current highQC block while the attached justify QC has view >= its     *)
 (*    own (`tail-fork resistance`). A Byzantine proposal may carry a         *)
 (*    justify QC for a DIFFERENT block than its claimed parent — voters      *)
-(*    see both fields, so both are modeled independently.                    *)
-(*  * Commit rule (engine.rs `deliver_qc()`): a validator tracks `pending`,  *)
-(*    the block of the most recently ADOPTED QC. Adopting QC(x) commits      *)
-(*    justifyBlock(x) iff that block equals pending — i.e. two consecutively *)
-(*    adopted QCs linked by a justify edge commit the inner block. Stamped   *)
-(*    height, not chain depth, keys the finalized map. Committing prunes     *)
-(*    the voter's per-height locks at-or-below the committed height          *)
-(*    (`voted_at_height.retain(h > committed)`).                             *)
+(*    see both fields, so both are modeled independently. Two Jolteon        *)
+(*    rules close the hidden-QC fork: a timeout signature binds the          *)
+(*    signer's qc_high, a TC carries every signer's claim, and a             *)
+(*    TC-entered proposal's justify must clear the TC's max evidence         *)
+(*    view (TCFloorOK); a validator that signed timeout(v) cannot vote       *)
+(*    in v (NotTimedOut) — vote-then-timeout stays legal.                    *)
+(*  * Commit rule (engine.rs `deliver_qc()`): adopting QC(x) commits the    *)
+(*    justify chain under x's parent — but only through a CONSECUTIVE        *)
+(*    committing link (x.view = x.justify.view + 1). Adjacency is            *)
+(*    load-bearing: a consecutive pair means no TC could have formed for     *)
+(*    the child's view, so the first TC above it carries the locked          *)
+(*    quorum's evidence. Ancestors below the pair commit transitively        *)
+(*    without their own adjacency — that is where liveness comes from        *)
+(*    after a timeout. Stamped height, not chain depth, keys the             *)
+(*    finalized map. Committing prunes the voter's per-height locks          *)
+(*    at-or-below the committed height (`voted_at_height.retain`).           *)
 (*  * View sync (pacemaker.rs): a TC needs a quorum of timeout signatures;   *)
-(*    receiving TC(v) with v >= current view jumps the validator to v+1.     *)
-(*    Honest validators sign only their current view; Byzantine ones sign    *)
-(*    any view. QC adoption past current view also jumps the view forward    *)
-(*    (QC catch-up in `deliver_qc`).                                          *)
+(*    each binds the signer's qc_high and delivering the TC adopts its       *)
+(*    max evidence. Receiving TC(v) with v >= current view jumps the         *)
+(*    validator to v+1. Honest validators sign only their current view;      *)
+(*    Byzantine ones sign any view and may under-report evidence (claim a    *)
+(*    real-but-older or absent QC — anything forgeable). QC adoption past    *)
+(*    current view also jumps the view forward (QC catch-up in               *)
+(*    `deliver_qc`).                                                         *)
 (*  * Quorums abstract cryptography: a QC exists iff >= Quorum votes exist   *)
 (*    for a block at its own view; honest validators never double-vote a     *)
 (*    view, Byzantine validators sign anything.                              *)
@@ -94,13 +105,21 @@ Leader(v) == v % N          \* equal-stake round robin (validator.rs:283)
 (* stamps height 0 (matching the engine's `last_committed` anchor rule).     *)
 (***************************************************************************)
 
-Genesis == [view |-> -1, height |-> -1, prev |-> -1, justify |-> -1, tcView |-> -1]
-NoVal   == [view |-> -2, height |-> -2, prev |-> -2, justify |-> -2, tcView |-> -2]
+Genesis == [view |-> -1, height |-> -1, prev |-> -1, justify |-> -1, tcView |-> -1,
+            tcFloor |-> -1]
+NoVal   == [view |-> -2, height |-> -2, prev |-> -2, justify |-> -2, tcView |-> -2,
+            tcFloor |-> -2]
 
 VARIABLES
     proposals,      \* set of proposed blocks (Genesis not included)
     castVotes,      \* SUBSET (Validators \X proposals): all votes ever cast
-    timeoutSigs,    \* SUBSET (Validators \X Views): timeout sigs ever cast
+    timeoutSigs,    \* SUBSET (Validators \X Views \X Ints): timeout sigs
+                    \*   ever cast — <<i, v, qv>> where qv is the VIEW of
+                    \*   the signer's qc_high at signing time (-1 = none).
+                    \*   The signature binds the claim (the Jolteon fix):
+                    \*   an aggregator cannot omit or downgrade it, and a
+                    \*   claim can only name a QC that actually formed
+                    \*   (forged evidence is rejected at collection).
     view,           \* view[i] — validator i's current view
     highQC,         \* highQC[i] — block of i's highest adopted QC
     pending,        \* pending[i] — block of i's most recently adopted QC
@@ -123,7 +142,20 @@ VoteCount(b) == Cardinality({i \in Validators : <<i, b>> \in castVotes})
 Notarized(b) == b = Genesis \/ VoteCount(b) >= Quorum
 HasQC(b)     == b # Genesis /\ VoteCount(b) >= Quorum
 
-TCExists(v) == Cardinality({i \in Validators : <<i, v>> \in timeoutSigs}) >= Quorum
+TimeoutSigners(v) ==
+    {i \in Validators : \E s \in timeoutSigs : s[1] = i /\ s[2] = v}
+TCExists(v) == Cardinality(TimeoutSigners(v)) >= Quorum
+
+\* The floors a TC(v) can carry: any quorum-sized subset of v's timeout
+\* signers determines one — its members' max evidence view. The record
+\* set is a protocol artifact (which sigs the aggregator saw); the set
+\* of achievable floors is what the adversary can choose among.
+MaxEvidence(Q, v) ==
+    LET evs == {s[3] : s \in {t \in timeoutSigs : t[1] \in Q /\ t[2] = v}}
+    IN  CHOOSE m \in evs \cup {-1} : \A e \in evs : e <= m
+TCFloors(v) ==
+    {MaxEvidence(Q, v) :
+        Q \in {S \in SUBSET TimeoutSigners(v) : Cardinality(S) >= Quorum}}
 
 \* Number of proposals already made for view v (equivocation bound).
 PropCount(v) == Cardinality({b \in proposals : b.view = v})
@@ -131,12 +163,17 @@ PropCount(v) == Cardinality({b \in proposals : b.view = v})
 \* Safe per-height-lock lookup: NoVal when i has no vote recorded at h.
 VotedAt(i, h) == IF h \in DOMAIN votedAt[i] THEN votedAt[i][h] ELSE NoVal
 
-\* The TC options an honest leader can embed at view v: either nothing
-\* (view reached via QC progress), or a TC for v-1 that actually exists
-\* (the quorum of timeout signatures was collected). Over-approximates
-\* the engine's `last_tc` bookkeeping — checking a superset of
-\* attachable evidence is conservative for safety.
-TCOptions(v) == {-1} \cup {t \in Views : TCExists(t) /\ t + 1 = v}
+\* The TC options a leader can embed at view v: either the sentinel
+\* no-TC record (view reached via QC progress), or a TC for v-1 that
+\* actually exists — recorded as [view, floor] where floor is the
+\* max evidence view over *some* quorum of signers (the aggregator
+\* picks the quorum, so every achievable floor is attachable — a
+\* superset of what any single collection produces, conservative
+\* for safety).
+TCOptions(v) ==
+    {[view |-> -1, floor |-> -1]}
+    \cup UNION {{[view |-> t, floor |-> f] : f \in TCFloors(t)}
+                : t \in {x \in Views : TCExists(x) /\ x + 1 = v}}
 
 \* The largest stamped height in a set of blocks — used by the commit
 \* rule to prune per-height locks below the newly committed tip.
@@ -168,6 +205,22 @@ CommitChain(i, b) ==
 \* `votedView[i] < b.view`), so tcView = b.view - 1 automatically
 \* covers it.
 TCReleases(b) == b.tcView >= 0 /\ b.tcView = b.view - 1 /\ TCExists(b.tcView)
+
+\* Jolteon evidence floor (arXiv:2106.10362 §3, Figure 2): a proposal
+\* entering through TC(v-1) must carry a justify QC at least as recent
+\* as the highest qc_high evidence that TC reports. Without it, a bare
+\* TC proves only "a quorum timed out" — nothing about QCs that formed
+\* but were withheld; the floor is what forces the successor proposal
+\* onto the newest chain the quorum actually locked.
+TCFloorOK(b) == b.tcView = b.view - 1 => b.justify.view >= b.tcFloor
+
+\* The timeout/vote asymmetry: a validator that signed timeout(v)
+\* cannot vote in v — its TC entry pins the qc_high it held at
+\* signing time, and a later vote would create a lock the evidence
+\* doesn't report. Vote-then-timeout stays legal (the timeout then
+\* carries the lock the vote created — the evidence the rule needs).
+NotTimedOut(i, v) ==
+    ~\E s \in timeoutSigs : s[1] = i /\ s[2] = v
 
 \* The committed anchor for a voter with no adopted QC: the engine
 \* uses `last_committed` (post-rotation the chain continues), which
@@ -213,7 +266,9 @@ HonestPropose(i) ==
         /\ p = Genesis \/ p \in stored[i]
         /\ \E tcv \in TCOptions(v) :
             LET nb == [view |-> v, height |-> p.height + 1, prev |-> p,
-                       justify |-> p, tcView |-> tcv]
+                       justify |-> p,
+                       tcView  |-> tcv.view,
+                       tcFloor |-> tcv.floor]
             IN  /\ nb \notin proposals
                 /\ proposals' = proposals \cup {nb}
                 /\ stored' = [stored EXCEPT ![i] = @ \cup {nb}]
@@ -234,10 +289,15 @@ ByzPropose(i) ==
         /\ Leader(v) = i
         /\ PropCount(v) < MaxVariants
         /\ \E p \in proposals \cup {Genesis}, j \in proposals \cup {Genesis},
-             h \in Heights, tcv \in ({-1} \cup {t \in Views : TCExists(t)}) :
+             h \in Heights,
+             tcv \in {[view |-> -1, floor |-> -1]}
+                     \cup UNION {{[view |-> t, floor |-> f] :
+                                     f \in TCFloors(t)}
+                                 : t \in Views} :
               /\ Notarized(p) /\ Notarized(j)
               /\ LET nb == [view |-> v, height |-> h, prev |-> p, justify |-> j,
-                            tcView |-> tcv]
+                            tcView  |-> tcv.view,
+                            tcFloor |-> tcv.floor]
                  IN  /\ nb \notin proposals
                     /\ proposals' = proposals \cup {nb}
     /\ UNCHANGED <<castVotes, timeoutSigs, view, highQC, pending,
@@ -265,6 +325,8 @@ HonestVote(i, b) ==
     /\ b \in proposals
     /\ b.view = view[i]
     /\ votedView[i] < b.view
+    /\ NotTimedOut(i, b.view)
+    /\ TCFloorOK(b)
     /\ b.height = b.prev.height + 1
     /\ b.prev = b.justify
     /\ b.prev \in stored[i] \/ b.prev = Genesis
@@ -302,6 +364,8 @@ ByzVote(i) ==
 HonestVoteOK(i, b) ==
     /\ b.view = view[i]
     /\ votedView[i] < b.view
+    /\ NotTimedOut(i, b.view)
+    /\ TCFloorOK(b)
     /\ b.height = b.prev.height + 1
     /\ b.prev = b.justify
     /\ b.prev \in stored[i] \/ b.prev = Genesis
@@ -348,7 +412,7 @@ AdoptQC(i, b) ==
     /\ b.view > highQC[i].view
     /\ highQC' = [highQC EXCEPT ![i] = b]
     /\ view'   = [view EXCEPT ![i] = IF b.view + 1 > @ THEN b.view + 1 ELSE @]
-    /\ IF b \in stored[i]
+    /\ IF b \in stored[i] /\ b.view = b.justify.view + 1
        THEN /\ LET nc == CommitChain(i, b.justify)
                IN  /\ committed' = [committed EXCEPT ![i] = @ \cup nc]
                    /\ votedAt' = [votedAt EXCEPT ![i] =
@@ -360,29 +424,48 @@ AdoptQC(i, b) ==
        ELSE UNCHANGED <<committed, votedAt, pending>>
     /\ UNCHANGED <<proposals, castVotes, timeoutSigs, votedView, stored>>
 
-\* Local timeout: honest validator signs its CURRENT view only.
+\* Local timeout: honest validator signs its CURRENT view only, and
+\* the signature binds its actual qc_high — the evidence the TC will
+\* carry. Honest evidence is exactly `highQC[i].view` (-1 = Genesis);
+\* the signer cannot under-report without breaking its own signature.
 HonestTimeout(i) ==
     /\ i \in Honest
     /\ view[i] <= MaxView
-    /\ timeoutSigs' = timeoutSigs \cup {<<i, view[i]>>}
+    /\ timeoutSigs' = timeoutSigs \cup {<<i, view[i], highQC[i].view>>}
     /\ UNCHANGED <<proposals, castVotes, view, highQC, pending,
                     votedView, votedAt, stored, committed>>
 
-\* Byzantine timeout: sign any view.
+\* Byzantine timeout: sign any view with any *constructible* claim —
+\* evidence must name a real notarized block at view <= v or none
+\* (forged QCs are rejected at collection), but the signer may
+\* under-report freely: claiming Genesis while holding a newer QC is
+\* the adversary's move, and the model must allow it.
 ByzTimeout(i) ==
     /\ i \in Byzantine
-    /\ \E v \in Views : timeoutSigs' = timeoutSigs \cup {<<i, v>>}
+    /\ \E v \in Views :
+        \E qv \in {-1} \cup {b.view : b \in {x \in proposals :
+                                               Notarized(x) /\ x.view <= v}} :
+            timeoutSigs' = timeoutSigs \cup {<<i, v, qv>>}
     /\ UNCHANGED <<proposals, castVotes, view, highQC, pending,
                     votedView, votedAt, stored, committed>>
 
 \* Deliver TC(v): accepted iff v >= view[i] (stale TCs rejected); the
-\* pacemaker syncs to v then advances to v+1.
+\* pacemaker syncs to v then advances to v+1. The TC's evidence is
+\* adopted too — the engine moves highQC to the certificate's max
+\* evidence QC (a quorum reporting a newer QC than ours is exactly
+\* the withheld-QC case), which is what puts every honest validator
+\* on the same branch before the next vote.
 DeliverTC(i, v) ==
     /\ i \in Honest
     /\ TCExists(v)
     /\ v >= view[i]
     /\ view' = [view EXCEPT ![i] = v + 1]
-    /\ UNCHANGED <<proposals, castVotes, timeoutSigs, highQC, pending,
+    /\ \E f \in TCFloors(v) :
+        IF \E nb \in proposals : Notarized(nb) /\ nb.view = f /\ f > highQC[i].view
+        THEN highQC' = [highQC EXCEPT
+               ![i] = CHOOSE nb \in proposals : Notarized(nb) /\ nb.view = f]
+        ELSE UNCHANGED highQC
+    /\ UNCHANGED <<proposals, castVotes, timeoutSigs, pending,
                     votedView, votedAt, stored, committed>>
 
 \* Happy-path advance (the driver calls advance_view after each completed

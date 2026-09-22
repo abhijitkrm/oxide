@@ -9,7 +9,6 @@
 //! the internal state (block hash, `tx_root`, view advancement).
 
 use super::*;
-use crate::pacemaker::PacemakerEvent;
 use ports::conformance;
 use ports::mock::MockApp;
 use types::ExecCertificate;
@@ -561,6 +560,11 @@ fn forged_height_block_cannot_commit_or_wedge_chain() {
     e2.advance_view();
     e3.advance_view();
     drive_round(&mut e0, &mut [&mut e1, &mut e2, &mut e3], Some(TxBytes::new(vec![0xD0])));
+    // View 4's block extends QC(b2)@2 across the dead view — a
+    // nonconsecutive link, so b2 can't commit through it. The
+    // next consecutive pair (view 5 → view 4) commits the whole
+    // stored prefix transitively: liveness via ancestor commit.
+    drive_round(&mut e1, &mut [&mut e0, &mut e2, &mut e3], Some(TxBytes::new(vec![0xE0])));
     assert!(
         e0.finalized_block(Height::new(2)).is_some(),
         "honest chain still finalizes (b2 lands at height 2)"
@@ -614,15 +618,7 @@ fn same_height_lock_releases_on_timeout_certificate() {
     // All four validators time out view 0 and collect each
     // other's signatures — every engine forms TC(0) and advances
     // to view 1 with `last_tc` set.
-    let sigs: Vec<Signature> = [&mut e0, &mut e1, &mut e2, &mut e3]
-        .iter_mut()
-        .map(|e| e.on_timeout().expect("timeout signature"))
-        .collect();
-    for engine in [&mut e0, &mut e1, &mut e2, &mut e3] {
-        for (signer, sig) in sigs.iter().enumerate() {
-            let _ = engine.collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig);
-        }
-    }
+    timeout_round(&mut [&mut e0, &mut e1, &mut e2, &mut e3]);
     assert_eq!(e1.current_view(), View::new(1), "TC(0) advances to view 1");
 
     // View 1: new leader e1 re-proposes at height 0 (its highQC
@@ -742,21 +738,7 @@ fn prev_justify_divergence_cannot_fork_commits() {
     // View 1 times out everywhere: TC(1) forms and advances all
     // engines to view 2 — the release evidence the crafted
     // proposal will carry.
-    let sigs: Vec<Signature> = [&mut e0, &mut e1, &mut e2, &mut e3]
-        .iter_mut()
-        .map(|e| e.on_timeout().expect("timeout signature"))
-        .collect();
-    let mut tc1 = None;
-    for engine in [&mut e0, &mut e1, &mut e2, &mut e3] {
-        for (signer, sig) in sigs.iter().enumerate() {
-            if let Ok(Some(tc)) =
-                engine.collect_timeout_signature(u16::try_from(signer).unwrap_or(0), *sig)
-            {
-                tc1 = Some(tc);
-            }
-        }
-    }
-    let tc1 = tc1.expect("TC(1) formed");
+    let tc1 = timeout_round(&mut [&mut e0, &mut e1, &mut e2, &mut e3]);
     assert_eq!(e0.current_view(), View::new(2), "TC(1) advances to view 2");
 
     // View 2 — Byzantine leader e2 crafts `d`: prev = a (the
@@ -796,14 +778,18 @@ fn prev_justify_divergence_cannot_fork_commits() {
         "prev=a / justify=b divergence must be rejected"
     );
 
-    // The honest chain is unaffected: deliver QC(b) (commits a
-    // via the justify edge on voters that stored b), advance,
-    // and the pipeline keeps committing contiguous heights.
+    // The honest chain is unaffected: deliver QC(b) (commits a —
+    // the (a@0, b@1) link is consecutive), advance, and resume the
+    // pipeline. The first resumed block (view 3) extends QC(b)@1
+    // across the timed-out gap — a *nonconsecutive* link, so b
+    // cannot commit through it; b commits transitively when the
+    // next consecutive pair (view 4 → view 3) lands above it.
     for e in [&mut e0, &mut e1, &mut e2, &mut e3] {
         e.deliver_qc(qc_b.clone()).expect("deliver QC(b)");
         e.advance_view();
     }
     drive_round(&mut e3, &mut [&mut e0, &mut e1, &mut e2], Some(TxBytes::new(vec![0xC0])));
+    drive_round(&mut e0, &mut [&mut e1, &mut e2, &mut e3], Some(TxBytes::new(vec![0xE0])));
 
     // b@1 — not d — commits, and the committed prefix is
     // contiguous from genesis.
@@ -1008,6 +994,77 @@ fn same_height_lock_holds_without_timeout_certificate() {
 fn bls_key(byte: u8) -> crypto::BlsSecretKey {
     let ikm = vec![byte; 32];
     crypto::BlsSecretKey::from_ikm(&ikm).expect("key gen")
+}
+
+/// Sign a timeout claim exactly as `collect_timeout_signature`
+/// verifies it: `(view, epoch, qc_high)` under `Domain::Timeout`.
+fn sign_timeout_claim(
+    sk: &crypto::BlsSecretKey,
+    view: View,
+    epoch: Epoch,
+    high_qc: Option<&QuorumCertificate>,
+) -> Signature {
+    let msg = crate::verify::timeout_signing_message(view, epoch, high_qc);
+    sk.sign(crypto::hash::Domain::Timeout, &msg)
+}
+
+/// Build a real TC for `view`/`epoch` from `(voter, key, qc_high)`
+/// entries — each record signed over its own evidence claim (the
+/// Jolteon per-signer shape).
+fn make_tc(
+    view: u64,
+    epoch: u64,
+    entries: &[(ValidatorIndex, &crypto::BlsSecretKey, Option<QuorumCertificate>)],
+) -> TimeoutCertificate {
+    TimeoutCertificate {
+        view: View::new(view),
+        epoch: Epoch::new(epoch),
+        signers: entries
+            .iter()
+            .map(|(voter, sk, qc)| types::TimeoutSigner {
+                voter: *voter,
+                high_qc: qc.clone(),
+                signature: sign_timeout_claim(sk, View::new(view), Epoch::new(epoch), qc.as_ref()),
+            })
+            .collect(),
+    }
+}
+
+/// Conformance-mode TC: real signer indices, placeholder
+/// signatures, no evidence — for engines running with
+/// `verify_signatures = false`.
+fn conformance_tc(view: u64, epoch: u64, voters: &[u16]) -> TimeoutCertificate {
+    TimeoutCertificate {
+        view: View::new(view),
+        epoch: Epoch::new(epoch),
+        signers: voters
+            .iter()
+            .map(|&voter| types::TimeoutSigner { voter, high_qc: None, signature: Signature::ZERO })
+            .collect(),
+    }
+}
+
+/// Drive a full timeout round over conformance-mode engines: every
+/// engine signs its timeout (with its real `high_qc` claim), then
+/// every engine collects every signature. Returns the TC they all
+/// form. Mirrors what the wire pump does in the devnet binary.
+fn timeout_round(engines: &mut [&mut OxideBft]) -> TimeoutCertificate {
+    let records: Vec<(ValidatorIndex, Signature, Option<QuorumCertificate>)> = engines
+        .iter_mut()
+        .map(|e| {
+            let sig = e.on_timeout().expect("timeout signature");
+            (e.validator_index(), sig, e.high_qc().cloned())
+        })
+        .collect();
+    let mut formed = None;
+    for engine in engines.iter_mut() {
+        for (voter, sig, qc) in &records {
+            if let Ok(Some(tc)) = engine.collect_timeout_signature(*voter, *sig, qc.clone()) {
+                formed = Some(tc);
+            }
+        }
+    }
+    formed.expect("a full timeout round must form a TC")
 }
 
 #[test]
@@ -1580,13 +1637,18 @@ fn on_timeout_certificate_rejects_forged_tc() {
     let mut engine =
         OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
 
-    // Forge a TC: all-zero aggregate signature, but the signer
-    // bitmap claims all 4 validators signed.
+    // Forge a TC: all four signer records carry all-zero
+    // signatures — nothing verifiable behind them.
     let forged_tc = TimeoutCertificate {
         view: View::new(0),
         epoch: Epoch::new(0),
-        signer_bitmap: vec![0b0000_1111], // all 4 validators
-        aggregate_signature: AggregateSignature::ZERO, // forged
+        signers: (0u16..4)
+            .map(|voter| types::TimeoutSigner {
+                voter,
+                high_qc: None,
+                signature: Signature::ZERO, // forged
+            })
+            .collect(),
     };
 
     let err = engine.on_timeout_certificate(&forged_tc).expect_err("forged TC must be rejected");
@@ -1609,13 +1671,11 @@ fn collect_timeout_signature_rejects_forged_signature() {
     let _ = engine.on_timeout();
 
     // Forge a timeout signature: sign with validator 2's key but
-    // claim it's from validator 1. M1 fix: sign with (view, epoch).
-    let mut timeout_msg = Vec::with_capacity(16);
-    timeout_msg.extend_from_slice(&engine.current_view.value().to_le_bytes());
-    timeout_msg.extend_from_slice(&engine.epoch.value().to_le_bytes());
-    let forged_sig = keys[2].sign(crypto::hash::Domain::Timeout, &timeout_msg);
+    // claim it's from validator 1. The claim carries no evidence
+    // (a view-0 timeout before any QC exists).
+    let forged_sig = sign_timeout_claim(&keys[2], engine.current_view(), engine.epoch(), None);
     let err = engine
-        .collect_timeout_signature(1, forged_sig)
+        .collect_timeout_signature(1, forged_sig, None)
         .expect_err("forged timeout signature must be rejected");
     assert_eq!(err, ConsensusError::InvalidVoteSignature { voter: 1 });
 }
@@ -1632,14 +1692,176 @@ fn collect_timeout_signature_accepts_valid_signature() {
     let mut engine =
         OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
 
-    // Validator 1 signs the timeout for view 0. M1 fix: sign
-    // with (view, epoch).
-    let mut timeout_msg = Vec::with_capacity(16);
-    timeout_msg.extend_from_slice(&engine.current_view.value().to_le_bytes());
-    timeout_msg.extend_from_slice(&engine.epoch.value().to_le_bytes());
-    let valid_sig = keys[1].sign(crypto::hash::Domain::Timeout, &timeout_msg);
-    let result = engine.collect_timeout_signature(1, valid_sig);
+    // Validator 1 signs the timeout for view 0 — no evidence yet
+    // (no QC exists at view 0).
+    let valid_sig = sign_timeout_claim(&keys[1], engine.current_view(), engine.epoch(), None);
+    let result = engine.collect_timeout_signature(1, valid_sig, None);
     assert!(result.is_ok(), "valid timeout signature must be accepted");
+}
+
+// ---- Jolteon timeout-evidence tests ----
+//
+// The safety fix's three signatures: the timeout signature binds
+// the signer's `qc_high`; a TC carries each signer's claim
+// verbatim; and a validator that signed `timeout(v)` cannot vote
+// in `v` (vote-then-timeout stays legal — the timeout then
+// reports the lock the vote created).
+
+/// Vote after timeout-signing is refused: the TC entry the
+/// signature produced claims the `qc_high` held at signing time —
+/// a later vote would create a lock the evidence doesn't report.
+#[test]
+fn vote_after_timeout_is_rejected() {
+    let mut e0 = make_multi_engine(0);
+    let mut e1 = make_multi_engine(1);
+
+    // Time out view 0 first, then try to vote in view 0.
+    let _sig = e0.on_timeout().expect("timeout signature");
+
+    e1.submit_tx(TxBytes::new(vec![0x42]));
+    let (h, p) = e1.propose().expect("leader proposes");
+    // e0 already signed timeout(0): a view-0 vote would mean its
+    // TC entry underreports what it actually did.
+    assert!(e0.vote(&h, &p).is_none(), "a view we timed out on is unvotable — evidence integrity");
+}
+
+/// Vote then timeout stays legal, and the timeout signature binds
+/// the voter's `qc_high` — the lock its vote produced.
+#[test]
+fn timeout_after_vote_reports_high_qc() {
+    let (keys, vs) = bls_validator_set();
+    let mut e0 = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+        .with_secret_key(keys[0].clone());
+
+    // Drive one real round so a genuine QC exists to report:
+    // propose, collect three signed votes, adopt the QC.
+    e0.submit_tx(TxBytes::new(vec![0x11]));
+    let (h, p) = e0.propose().expect("propose");
+    let hash = OxideBft::block_hash(&h);
+    let self_vote = e0.vote(&h, &p).expect("self vote");
+    e0.collect_vote(0, self_vote).expect("collect");
+    for i in 1u16..3 {
+        let msg = e0.vote_signing_message(h.view, 0, &hash);
+        let v = Vote {
+            view: h.view,
+            phase: VotePhase::Prepare,
+            block_hash: hash,
+            signature: keys[usize::from(i)].sign(crypto::hash::Domain::Vote, &msg),
+            attestation: None,
+            attestation_sig: None,
+        };
+        e0.collect_vote(i, v).expect("collect peer vote");
+    }
+    let qc = e0.try_form_qc().expect("quorum of real votes forms a QC");
+    e0.deliver_qc(qc).expect("adopt the QC");
+    e0.advance_view();
+
+    // The timeout signature must cover (view, epoch, high_qc):
+    // verify it end-to-end against the adopted high QC.
+    let sig = e0.on_timeout().expect("timeout signature");
+    let claimed = e0.high_qc().cloned();
+    assert!(claimed.is_some(), "a QC was adopted — evidence exists");
+    e0.verify_timeout_signature_for(0, e0.current_view(), e0.epoch(), claimed.as_ref(), &sig)
+        .expect("timeout sig verifies over its qc_high claim");
+
+    // And fails if a relay swaps the evidence claim for a different
+    // (even absent) one — the claim is inside the signed message.
+    assert!(
+        e0.verify_timeout_signature_for(0, e0.current_view(), e0.epoch(), None, &sig).is_err(),
+        "evidence swap must break the signature"
+    );
+}
+
+/// A TC whose per-signer evidence was tampered with — claim
+/// swapped for a different QC after signing — fails verification:
+/// the signature is over the original claim.
+#[test]
+fn tc_with_swapped_evidence_is_rejected() {
+    let (keys, vs) = bls_validator_set();
+    let mut engine =
+        OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+    // Drive the engine to view 5 so a TC(4) advances it.
+    for _ in 0..5 {
+        engine.advance_view();
+    }
+
+    let claimed_qc = QuorumCertificate {
+        view: View::new(2),
+        phase: VotePhase::Prepare,
+        block_hash: Hash([0x11; 32]),
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0111],
+        aggregate_signature: AggregateSignature::ZERO,
+    };
+    let mut tc = make_tc(
+        4,
+        0,
+        &[
+            (0, &keys[0], Some(claimed_qc.clone())),
+            (1, &keys[1], Some(claimed_qc.clone())),
+            (2, &keys[2], Some(claimed_qc)),
+        ],
+    );
+    // Tamper: strip entry 0's evidence — the signature still
+    // covers the original claim, so the TC fails verification.
+    // (A swap to a *forged* QC dies earlier, at the QC check —
+    // stripping isolates the evidence-binding property itself.)
+    tc.signers[0].high_qc = None;
+    let err = engine.on_timeout_certificate(&tc).expect_err("evidence-swapped TC must be rejected");
+    assert_eq!(err, ConsensusError::InvalidTcSignature);
+}
+
+/// A TC entry whose `qc_high` is itself forged — a signed claim
+/// about a certificate that doesn't verify — is rejected at
+/// collection time, so it can never poison a TC's evidence set.
+#[test]
+fn timeout_sig_binding_forged_qc_is_rejected() {
+    let (keys, vs) = bls_validator_set();
+    let mut engine =
+        OxideBft::with_index(Arc::new(MockApp::new()), vs, 0).with_secret_key(keys[0].clone());
+
+    let forged_qc = QuorumCertificate {
+        view: View::new(0),
+        phase: VotePhase::Prepare,
+        block_hash: Hash([0x77; 32]),
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0111],
+        aggregate_signature: AggregateSignature::ZERO, // forged
+    };
+    // Validator 1 signs a timeout claim carrying the forged QC —
+    // its own signature is genuine; the evidence is not.
+    let sig = sign_timeout_claim(&keys[1], engine.current_view(), engine.epoch(), Some(&forged_qc));
+    let err = engine
+        .collect_timeout_signature(1, sig, Some(forged_qc))
+        .expect_err("a bound-but-forged QC claim must be rejected");
+    assert_eq!(err, ConsensusError::InvalidVoteSignature { voter: 1 });
+}
+
+/// A forged timeout signature must not pass with mismatched
+/// evidence: the signature binds the *exact* claim, so collecting
+/// the same signature under a different `qc_high` fails.
+#[test]
+fn timeout_sig_rejects_evidence_substitution() {
+    let (keys, vs) = bls_validator_set();
+    let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+        .with_secret_key(keys[0].clone());
+
+    // Validator 1 signs a timeout claiming `None` evidence.
+    let sig = sign_timeout_claim(&keys[1], engine.current_view(), engine.epoch(), None);
+    // A relay attaches a real-looking QC claim — the signature no
+    // longer covers it.
+    let sub_qc = QuorumCertificate {
+        view: View::new(0),
+        phase: VotePhase::Prepare,
+        block_hash: Hash([0x55; 32]),
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0111],
+        aggregate_signature: AggregateSignature::ZERO,
+    };
+    let err = engine
+        .collect_timeout_signature(1, sig, Some(sub_qc))
+        .expect_err("evidence substitution must break the signature");
+    assert_eq!(err, ConsensusError::InvalidVoteSignature { voter: 1 });
 }
 
 // ---- Epoch rotation tests (stage 6) ----
@@ -3049,46 +3271,21 @@ fn faulty_leader_bypassed_via_timeout() {
     let mut v2 = make_multi_engine(2);
     let mut v3 = make_multi_engine(3);
 
-    // All followers time out for view 0.
-    let _ = v1.on_timeout();
-    let _ = v2.on_timeout();
-    let _ = v3.on_timeout();
+    // All followers time out for view 0 — each emits its real
+    // timeout signature over (view, epoch, qc_high = None).
+    let sig1 = v1.on_timeout().expect("v1 timeout sig");
+    let sig2 = v2.on_timeout().expect("v2 timeout sig");
+    let sig3 = v3.on_timeout().expect("v3 timeout sig");
 
-    // Each follower produces a timeout signature (placeholder
-    // Signature::ZERO — stage 5 would sign the timeout message).
-    // The signatures are gossiped: each validator collects
-    // signatures from the others. v1 collects from itself, v2, v3.
-    let _ = v1.pacemaker.on_timeout_signature(1, Signature::ZERO); // self
-    let events1 = v1.pacemaker.on_timeout_signature(2, Signature::ZERO);
-    let events1b = v1.pacemaker.on_timeout_signature(3, Signature::ZERO);
-
-    // With 3 signatures (quorum = 3 for n=4, f=1), v1 should
-    // form a TC and advance the view.
-    let tc_formed = events1
+    // The signatures are gossiped: v1 collects from itself, v2,
+    // v3 — the engine path stores each signer's evidence record,
+    // so the TC it emits carries real per-signer claims.
+    let tc = [(1u16, sig1), (2, sig2), (3, sig3)]
         .iter()
-        .chain(events1b.iter())
-        .any(|e| matches!(e, PacemakerEvent::TimeoutCertificateFormed(_)));
-    assert!(tc_formed, "v1 should form a TC at quorum");
-
-    // Extract the TC from the events.
-    let tc = events1
-        .iter()
-        .chain(events1b.iter())
-        .find_map(|e| {
-            if let PacemakerEvent::TimeoutCertificateFormed(tc) = e {
-                Some(tc.clone())
-            } else {
-                None
-            }
-        })
-        .expect("TC should be in the events");
+        .find_map(|&(voter, sig)| v1.collect_timeout_signature(voter, sig, None).ok().flatten())
+        .expect("v1 should form a TC at quorum");
     assert_eq!(tc.view, View::new(0), "TC is for view 0");
-
-    // v1's pacemaker already advanced its view internally, but
-    // the engine's `current_view` field is separate. Sync it
-    // from the pacemaker. (In a real system, the engine would
-    // process its own AdvanceView event; here we sync directly.)
-    v1.current_view = v1.pacemaker.current_view();
+    assert_eq!(tc.signers.len(), 3, "TC carries each signer's record");
 
     // All other validators receive the TC and advance the view.
     let _ = v2.on_timeout_certificate(&tc);
@@ -3624,12 +3821,7 @@ fn on_timeout_certificate_rejects_insufficient_quorum() {
     // conformance mode it always does).
     let mut engine = make_multi_engine(0);
 
-    let insufficient_tc = TimeoutCertificate {
-        view: View::new(0),
-        epoch: Epoch::new(0),
-        signer_bitmap: vec![0b0000_0011], // 2 signers
-        aggregate_signature: AggregateSignature::ZERO,
-    };
+    let insufficient_tc = conformance_tc(0, 0, &[0, 1]); // 2 signers < quorum 3
 
     let err = engine
         .on_timeout_certificate(&insufficient_tc)
@@ -3708,12 +3900,7 @@ fn on_timeout_certificate_advances_lagging_validator() {
     assert_eq!(restarted.current_view().value(), 0);
 
     // Construct a TC for the peers' current view with quorum.
-    let tc = TimeoutCertificate {
-        view: View::new(peer_view),
-        epoch: Epoch::new(0),
-        signer_bitmap: vec![0b0000_0111], // 3 signers (quorum)
-        aggregate_signature: AggregateSignature::ZERO,
-    };
+    let tc = conformance_tc(peer_view, 0, &[0, 1, 2]); // 3 signers (quorum)
 
     // Deliver the TC to the restarted validator. Before the fix,
     // the pacemaker would reject this TC because tc.view != current_view.
@@ -3769,12 +3956,7 @@ fn hidden_qc_arriving_after_tc_still_commits_its_chain() {
 
     // f3 times out of view 1: a quorum-signed TC(1) advances it
     // to view 2 while its high_qc is still QC(0).
-    let tc1 = TimeoutCertificate {
-        view: View::new(1),
-        epoch: Epoch::new(0),
-        signer_bitmap: vec![0b0000_0111], // 3 signers (quorum)
-        aggregate_signature: AggregateSignature::ZERO,
-    };
+    let tc1 = conformance_tc(1, 0, &[0, 1, 2]); // 3 signers (quorum)
     f3.on_timeout_certificate(&tc1).expect("TC(1) accepted");
     assert_eq!(f3.current_view().value(), 2, "TC advances f3 past the hidden QC's view");
     assert!(f3.finalized_block(Height::new(0)).is_none(), "h0 is not committed at f3 yet");
@@ -3808,12 +3990,7 @@ fn hidden_qc_arriving_after_tc_still_commits_its_chain() {
 fn timeout_evidence_tc_advances_view() {
     let mut engine = make_multi_engine(0);
     assert_eq!(engine.current_view().value(), 0);
-    let tc = TimeoutCertificate {
-        view: View::new(4),
-        epoch: Epoch::new(0),
-        signer_bitmap: vec![0b0000_0111],
-        aggregate_signature: AggregateSignature::ZERO,
-    };
+    let tc = conformance_tc(4, 0, &[0, 1, 2]);
     engine.deliver_timeout_evidence(None, Some(tc));
     assert_eq!(engine.current_view().value(), 5, "TC(4) evidence moves the validator to view 5");
     // And the TC is recorded as the view's successor evidence.
@@ -3877,12 +4054,7 @@ fn timeout_evidence_forged_qc_moves_nothing() {
 #[test]
 fn timeout_evidence_ignores_foreign_epoch() {
     let mut engine = make_multi_engine(0);
-    let foreign_tc = TimeoutCertificate {
-        view: View::new(4),
-        epoch: Epoch::new(9), // not our epoch
-        signer_bitmap: vec![0b0000_0111],
-        aggregate_signature: AggregateSignature::ZERO,
-    };
+    let foreign_tc = conformance_tc(4, 9, &[0, 1, 2]); // not our epoch
     engine.deliver_timeout_evidence(None, Some(foreign_tc));
     assert_eq!(engine.current_view().value(), 0, "foreign-epoch evidence must be ignored");
 }
@@ -3911,12 +4083,7 @@ fn timeout_evidence_reports_justifying_certificates() {
 
     // Then enter view 10 via TC(9) — high_qc stays at 5, so the
     // TC is the justifying evidence.
-    let tc = TimeoutCertificate {
-        view: View::new(9),
-        epoch: Epoch::new(0),
-        signer_bitmap: vec![0b0000_0111],
-        aggregate_signature: AggregateSignature::ZERO,
-    };
+    let tc = conformance_tc(9, 0, &[0, 1, 2]);
     engine.on_timeout_certificate(&tc).expect("TC accepted");
     assert_eq!(engine.current_view().value(), 10);
     let (qc_ev, tc_ev) = engine.timeout_evidence();
@@ -3945,12 +4112,7 @@ fn on_timeout_certificate_rejects_past_view() {
     assert_eq!(engine.current_view().value(), 5);
 
     // TC for view 3 (past view) — must be rejected.
-    let past_tc = TimeoutCertificate {
-        view: View::new(3),
-        epoch: Epoch::new(0),
-        signer_bitmap: vec![0b0000_0111],
-        aggregate_signature: AggregateSignature::ZERO,
-    };
+    let past_tc = conformance_tc(3, 0, &[0, 1, 2]);
     // The engine accepts the TC (quorum + signature pass) but
     // the pacemaker ignores it (past view) — the view must not
     // change.
@@ -4180,7 +4342,8 @@ fn on_timeout_certificate_clears_per_view_state() {
         attestation_sig: None,
     };
     engine.collect_vote(1, vote).expect("conformance: no verification");
-    engine.timeout_signatures[2] = Some(Signature::ZERO);
+    engine.timeout_signatures[2] =
+        Some(types::TimeoutSigner { voter: 2, high_qc: None, signature: Signature::ZERO });
     assert!(engine.vote_count > 0, "should have collected a vote");
     assert!(
         engine.timeout_signatures.iter().any(Option::is_some),
@@ -4188,12 +4351,7 @@ fn on_timeout_certificate_clears_per_view_state() {
     );
 
     // Process a TC for view 0 with quorum (advances to view 1).
-    let tc = TimeoutCertificate {
-        view: View::new(0),
-        epoch: Epoch::new(0),
-        signer_bitmap: vec![0b0000_0111], // 3 signers (quorum)
-        aggregate_signature: AggregateSignature::ZERO,
-    };
+    let tc = conformance_tc(0, 0, &[0, 1, 2]); // 3 signers (quorum)
     engine.on_timeout_certificate(&tc).expect("TC must be accepted");
 
     // After the view advance, all per-view state must be cleared.
@@ -4214,8 +4372,10 @@ fn sync_to_view_clears_timeout_signatures() {
     let mut engine = make_multi_engine(0);
 
     // Populate timeout signature state for view 0.
-    engine.timeout_signatures[1] = Some(Signature::ZERO);
-    engine.timeout_signatures[2] = Some(Signature::ZERO);
+    engine.timeout_signatures[1] =
+        Some(types::TimeoutSigner { voter: 1, high_qc: None, signature: Signature::ZERO });
+    engine.timeout_signatures[2] =
+        Some(types::TimeoutSigner { voter: 2, high_qc: None, signature: Signature::ZERO });
     assert!(
         engine.timeout_signatures.iter().any(Option::is_some),
         "should have timeout signatures"
@@ -4241,7 +4401,8 @@ fn deliver_qc_catchup_clears_timeout_signatures() {
     let mut engine = make_multi_engine(0);
 
     // Populate timeout signature state for view 0.
-    engine.timeout_signatures[1] = Some(Signature::ZERO);
+    engine.timeout_signatures[1] =
+        Some(types::TimeoutSigner { voter: 1, high_qc: None, signature: Signature::ZERO });
     assert!(
         engine.timeout_signatures.iter().any(Option::is_some),
         "should have a timeout signature"
@@ -4272,7 +4433,8 @@ fn advance_view_clears_timeout_signatures() {
     let mut engine = make_multi_engine(0);
 
     // Populate timeout signature state.
-    engine.timeout_signatures[1] = Some(Signature::ZERO);
+    engine.timeout_signatures[1] =
+        Some(types::TimeoutSigner { voter: 1, high_qc: None, signature: Signature::ZERO });
     assert!(
         engine.timeout_signatures.iter().any(Option::is_some),
         "should have a timeout signature"
@@ -4877,55 +5039,44 @@ fn recover_from_wal_reseats_index_by_key() {
     assert_eq!(engine.validator_index(), 2, "re-seated by BLS key match");
 }
 
-// ---- Hidden-QC / timeout-release fork COUNTEREXAMPLE ----
+// ---- Hidden-QC / timeout-release fork REGRESSION ----
 //
-// This test demonstrates a live safety violation, not an
-// invariant: two honest validators finalize different blocks at
-// the same height. A correct protocol makes this schedule
-// infeasible — when the fix lands, invert the final assertions
-// into a regression gate.
-//
-// The gap: the per-height vote lock releases on a bare TC — the
-// TC carries no evidence about what its signers had voted, so it
-// cannot prove the timed-out view produced no QC. The safety
-// argument in `vote_if_eligible` ("QC adoption is view-monotonic,
-// so the later-view rival always wins") is incomplete: adoption
-// order is per-validator, and a validator can adopt conflicting
-// QCs in ascending view order, voting children on both branches
-// serially.
-//
-// This test scripts the schedule against real engines with real
-// BLS signatures. n=4, quorum=3, validator 3 byzantine; equal
-// stakes give round-robin leaders (leader(v) = v % 4).
-//
-//   v0 (leader 0): P @ h0. Votes {0,1,2} -> QC(P). All adopt.
-//   v1 (leader 1): X @ h1 (prev=P). Votes {0,1,3} -> QC(X).
-//       The QC is WITHHELD — the byz leader-collector never
-//       broadcasts it. All honest sign timeout(1) -> TC(1).
-//   v2 (leader 2): X' @ h1 (prev=P, TC(1)). e0's h1 lock is
-//       released by the TC even though QC(X) already exists —
-//       that is the point: the TC does not prove v1 ended
-//       undecided. Votes {0,2,3} -> QC(X').
-//   Selective adoption: QC(X) -> {e0,e1}; QC(X') -> {e2}. The
-//   hidden branch now has two honest highQC holders; the public
-//   branch has one.
-//   TC(2) lifts e0,e1,e2 to v3.
-//   v3 (leader 3, byz): c @ h2 (prev=X, justify=QC(X)). Votes
-//       {0,1,3} -> QC(c). Held back.
-//   e0 flips: adopts QC(X')@2 (2 > 1 — monotonic adoption hops
-//   branches). TC(3) lifts e0,e2 to v4.
-//   v4 (leader 0): e0, now holding X', proposes c' @ h2
-//       (prev=X', TC(3)). Votes {0,2,3} -> QC(c').
-//   Deliver QC(c)@3 to e0 -> commits X @ h1.
-//   Deliver QC(c')@4 to e2 -> commits X' @ h1.
-//   e0 and e2 are both honest and finalized different blocks at
-//   height 1 — a user-visible fork.
-// Scripted multi-view schedule — paired names (vc0/vc1, e0/e1)
-// read by their validator index; a one-shot counterexample is a
-// single long action sequence.
+/// Regression test for the hidden-QC fork: a withheld QC plus a
+/// bare TC release used to let honest validators finalize
+/// conflicting blocks at the same height. The Jolteon evidence
+/// rule closes it: timeout signatures bind the signer's `qc_high`,
+/// a TC carries every signer's claim, and a TC-entered proposal
+/// must carry a QC at least as recent as the TC's max evidence.
+/// Two-chain commit additionally requires consecutive views, so a
+/// hidden QC can no longer complete a committing pair across a
+/// timeout gap.
+///
+/// Same schedule as the original counterexample — n=4, quorum=3,
+/// validator 3 byzantine; equal stakes give round-robin leaders
+/// (leader(v) = v % 4):
+///
+///   v0 (leader 0): P @ h0. Votes {0,1,2} -> QC(P). All adopt.
+///   v1 (leader 1): X @ h1 (prev=P). Votes {0,1,3} -> QC(X).
+///       The QC is WITHHELD. All honest time out view 1 — their
+///       evidence is QC(P) (votes don't touch the adopted high QC),
+///       so TC(1)'s floor is view 0.
+///   v2 (leader 2): X' @ h1 (prev=P, TC(1)) — the sibling is still
+///       legal: nothing is committed yet, so the floor only
+///       requires extending P. Votes {0,2,3} -> QC(X').
+///   Selective adoption: QC(X) -> {e0,e1}; QC(X') -> {e2}.
+///   TC(2): evidence {X@1, X@1, X'@2} — max is X'@2.
+///   v3 (leader 3, byz): c @ h2 (prev=X, justify=QC(X)@1) —
+///       REJECTED: the floor is X'@2 and the hidden branch is
+///       under it. The legit c' (prev=X', justify=QC(X')@2) is
+///       voted — TC evidence adoption moves e0/e1 onto the X'
+///       branch automatically.
+///   QC(c')@3 is the consecutive pair over X'@2 -> commits X'
+///   (and its prefix P) at h1. X can never commit: a consecutive
+///   pair over X@1 would need a view-2 child extending X, and
+///   view 2 already produced X'.
 #[allow(clippy::similar_names, clippy::too_many_lines)]
 #[test]
-fn hidden_qc_timeout_release_forks_finality() {
+fn hidden_qc_timeout_release_cannot_fork() {
     let (keys, vs) = bls_validator_set();
     // Equal stakes => round-robin leader schedule 0,1,2,3.
     for (v, want) in [(0u64, 0u16), (1, 1), (2, 2), (3, 3), (4, 0)] {
@@ -4949,13 +5100,6 @@ fn hidden_qc_timeout_release_forks_finality() {
             attestation: None,
             attestation_sig: None,
         }
-    };
-    // A timeout signature by the byz key for an arbitrary view.
-    let byz_timeout = |view: u64| -> Signature {
-        let mut msg = Vec::with_capacity(16);
-        msg.extend_from_slice(&view.to_le_bytes());
-        msg.extend_from_slice(&0u64.to_le_bytes());
-        byz.sign(crypto::hash::Domain::Timeout, &msg)
     };
 
     // ---- v0: P at height 0; everyone adopts QC(P) ----
@@ -4991,26 +5135,34 @@ fn hidden_qc_timeout_release_forks_finality() {
     let qc_hid = e1.try_form_qc().expect("QC(X)@1 — exists but is withheld");
 
     // ---- TC(1): all honest time out view 1 ----
-    let t0_1 = e0.on_timeout().expect("e0 timeout(1)");
-    let t1_1 = e1.on_timeout().expect("e1 timeout(1)");
-    let t2_1 = e2.on_timeout().expect("e2 timeout(1)");
-    e2.collect_timeout_signature(2, t2_1).expect("collect t2");
-    e2.collect_timeout_signature(0, t0_1).expect("collect t0");
+    // Each timeout signature binds the signer's adopted high QC —
+    // all three still hold QC(P)@0 (a vote doesn't move it), so
+    // TC(1)'s evidence floor is view 0.
+    let t0_1 = (e0.on_timeout().expect("e0 timeout(1)"), e0.high_qc().cloned());
+    let t1_1 = (e1.on_timeout().expect("e1 timeout(1)"), e1.high_qc().cloned());
+    let t2_1 = (e2.on_timeout().expect("e2 timeout(1)"), e2.high_qc().cloned());
+    e2.collect_timeout_signature(2, t2_1.0, t2_1.1.clone()).expect("collect t2");
+    e2.collect_timeout_signature(0, t0_1.0, t0_1.1.clone()).expect("collect t0");
     let tc1 = e2
-        .collect_timeout_signature(1, t1_1)
+        .collect_timeout_signature(1, t1_1.0, t1_1.1.clone())
         .expect("collect t1")
         .expect("TC(1) forms — e2 advances to v2");
+    assert_eq!(
+        tc1.signers.iter().filter_map(|s| s.high_qc.as_ref()).map(|q| q.view.value()).max(),
+        Some(0),
+        "TC(1) evidence floor is QC(P)@0 — the hidden QC(X) was never adopted"
+    );
     e0.on_timeout_certificate(&tc1).expect("e0 -> v2");
     e1.on_timeout_certificate(&tc1).expect("e1 -> v2");
 
-    // ---- v2: X' at height 1 — the sibling, via TC release ----
+    // ---- v2: X' at height 1 — the sibling is still legal ----
+    // Nothing is committed yet, so the floor only requires
+    // extending P — the conflicting QC can still form.
     e2.submit_tx(TxBytes::new(vec![0xC0]));
     let (h_sib, p_sib) = e2.propose().expect("leader 2 proposes X'");
     let hash_sib = OxideBft::block_hash(&h_sib);
     assert_eq!(h_sib.prev_block, hash_par, "X' extends P — same parent as X");
     assert_eq!(h_sib.height, h_hid.height, "X' conflicts with X at height 1");
-    // e0's h1 lock (voted X) is released by the embedded TC(1)
-    // despite QC(X) existing — the TC carries no evidence of it.
     let vx2p = e2.vote(&h_sib, &p_sib).expect("e2 votes X'");
     e2.collect_vote(2, vx2p).expect("collect");
     e2.collect_vote(0, e0.vote(&h_sib, &p_sib).expect("e0 votes X' (lock released)"))
@@ -5018,28 +5170,42 @@ fn hidden_qc_timeout_release_forks_finality() {
     e2.collect_vote(3, byz_vote(&e2, View::new(2), hash_sib)).expect("byz vote X'");
     let qc_sib = e2.try_form_qc().expect("QC(X')@2 — conflicting QC at h1");
 
-    // ---- Selective adoption: the fork's split brain ----
-    // The hidden QC(X) reaches e0,e1 — they now hold X as highQC.
+    // ---- Selective adoption: QC(X) -> {e0,e1}; QC(X') -> {e2} ----
     e0.deliver_qc(qc_hid.clone()).expect("e0 adopts X@1");
     e1.deliver_qc(qc_hid.clone()).expect("e1 adopts X@1");
-    // QC(X') reaches e2 — it holds X'. (e0 must NOT see it yet:
-    // it needs highQC=X to vote the hidden branch's child.)
     e2.deliver_qc(qc_sib.clone()).expect("e2 adopts X'@2");
 
-    // ---- TC(2): lift everyone to v3 ----
-    let t0_2 = e0.on_timeout().expect("e0 timeout(2)");
-    let t1_2 = e1.on_timeout().expect("e1 timeout(2)");
-    let t2_2 = e2.on_timeout().expect("e2 timeout(2)");
-    e1.collect_timeout_signature(1, t1_2).expect("collect");
-    e1.collect_timeout_signature(0, t0_2).expect("collect");
+    // ---- TC(2): evidence carries the split — {X@1, X@1, X'@2} ----
+    let t0_2 = (e0.on_timeout().expect("e0 timeout(2)"), e0.high_qc().cloned());
+    let t1_2 = (e1.on_timeout().expect("e1 timeout(2)"), e1.high_qc().cloned());
+    let t2_2 = (e2.on_timeout().expect("e2 timeout(2)"), e2.high_qc().cloned());
+    assert_eq!(t0_2.1.as_ref().map(|q| q.view.value()), Some(1), "e0 evidence: QC(X)@1");
+    assert_eq!(t2_2.1.as_ref().map(|q| q.view.value()), Some(2), "e2 evidence: QC(X')@2");
+    e1.collect_timeout_signature(1, t1_2.0, t1_2.1.clone()).expect("collect");
+    e1.collect_timeout_signature(0, t0_2.0, t0_2.1.clone()).expect("collect");
     let tc2 = e1
-        .collect_timeout_signature(2, t2_2)
+        .collect_timeout_signature(2, t2_2.0, t2_2.1.clone())
         .expect("collect")
         .expect("TC(2) forms — e1 advances to v3");
+    assert_eq!(
+        tc2.signers.iter().filter_map(|s| s.high_qc.as_ref()).map(|q| q.view.value()).max(),
+        Some(2),
+        "TC(2) evidence floor is X'@2 — the hidden branch is below it"
+    );
+    // Forming the TC also adopts its max evidence: e1's high QC
+    // moves to X'@2 — the branch hop is now *driven by the
+    // certificate*, not by selective gossip.
+    assert_eq!(
+        e1.high_qc().map(|q| q.view.value()),
+        Some(2),
+        "TC evidence adoption moved e1 onto the X' branch"
+    );
     e0.on_timeout_certificate(&tc2).expect("e0 -> v3");
     e2.on_timeout_certificate(&tc2).expect("e2 -> v3");
 
-    // ---- v3: byz proposes c on the HIDDEN branch (prev=X) ----
+    // ---- v3: the hidden-branch proposal is REJECTED ----
+    // byz (leader 3) proposes c @ h2 extending X (justify=QC(X)@1)
+    // — below TC(2)'s evidence floor of view 2.
     let prop_c =
         Proposal { height: Height::new(2), txs: vec![TxBytes::new(vec![0xD0])], attestation: None };
     let mut body_bytes = Vec::new();
@@ -5063,54 +5229,75 @@ fn hidden_qc_timeout_release_forks_finality() {
         crypto::hash::Domain::Proposal,
         OxideBft::proposal_signing_hash(&h_child1).as_bytes(),
     ));
-    let hash_child1 = OxideBft::block_hash(&h_child1);
-    // e0,e1 hold X: c.prev == their highQC block — they vote it.
-    let vc0 = e0.vote(&h_child1, &prop_c).expect("e0 votes c");
-    e0.collect_vote(0, vc0).expect("collect");
-    let vc1 = e1.vote(&h_child1, &prop_c).expect("e1 votes c");
-    e0.collect_vote(1, vc1).expect("collect");
-    e0.collect_vote(3, byz_vote(&e0, View::new(3), hash_child1)).expect("byz vote c");
-    let qc_child1 = e0.try_form_qc().expect("QC(c)@3 — hidden branch is 2-deep");
+    // Under the old rules e0 and e1 voted c (c.prev matched their
+    // hidden-branch high QC) — the flip that built the fork. Now
+    // every honest engine rejects it at the evidence floor, so
+    // QC(c) can never form.
+    assert!(e0.vote(&h_child1, &prop_c).is_none(), "floor rejects hidden-branch c at e0");
+    assert!(e1.vote(&h_child1, &prop_c).is_none(), "floor rejects hidden-branch c at e1");
+    assert!(e2.vote(&h_child1, &prop_c).is_none(), "floor rejects hidden-branch c at e2");
 
-    // ---- The flip: e0 adopts QC(X')@2 — monotonic adoption hops
-    // across the conflicting branches (2 > 1). ----
-    e0.deliver_qc(qc_sib.clone()).expect("e0 adopts X'@2 — branch hop");
-
-    // ---- TC(3): lift e0,e2 to v4 ----
-    let u0 = e0.on_timeout().expect("e0 timeout(3)");
-    let u2 = e2.on_timeout().expect("e2 timeout(3)");
-    e0.collect_timeout_signature(0, u0).expect("collect");
-    e0.collect_timeout_signature(2, u2).expect("collect");
-    let tc3 = e0
-        .collect_timeout_signature(3, byz_timeout(3))
-        .expect("collect")
-        .expect("TC(3) forms — e0 advances to v4");
-    e2.on_timeout_certificate(&tc3).expect("e2 -> v4");
-
-    // ---- v4: e0 (leader) proposes c' on the X' branch ----
-    e0.submit_tx(TxBytes::new(vec![0xE0]));
-    let (h_child2, p_child2) = e0.propose().expect("e0 proposes c' extending X'");
+    // ---- v3 (legit): c' extends X' — the evidence-max branch ----
+    // The byz leader equivocates a second proposal, this one on the
+    // chain the TC evidence locks in.
+    let prop_cp =
+        Proposal { height: Height::new(2), txs: vec![TxBytes::new(vec![0xE0])], attestation: None };
+    let mut body_bytes = Vec::new();
+    prop_cp.encode(&mut body_bytes);
+    let mut h_child2 = BlockHeader {
+        height: Height::new(2),
+        view: View::new(3),
+        epoch: Epoch::new(0),
+        prev_block: hash_sib,
+        tx_root: OxideBft::tx_root(&prop_cp.txs),
+        high_qc: Some(qc_sib.clone()),
+        timeout_cert: Some(tc2.clone()),
+        proposer: proposer_hash(3),
+        timestamp: h_sib.timestamp.saturating_add(1),
+        proposer_signature: None,
+        exec_cert: None,
+        body_commitment: types::shard::commitment(&body_bytes, 4, k),
+    };
+    h_child2.proposer_signature = Some(byz.sign(
+        crypto::hash::Domain::Proposal,
+        OxideBft::proposal_signing_hash(&h_child2).as_bytes(),
+    ));
     let hash_child2 = OxideBft::block_hash(&h_child2);
-    assert_eq!(h_child2.prev_block, hash_sib, "c' extends the competing parent");
-    let vcp0 = e0.vote(&h_child2, &p_child2).expect("e0 votes c'");
+    // e1 adopted QC(X') from TC(2) evidence but never received
+    // X' itself — catch-up gossip: `vote` stores an authenticated
+    // block even when the vote is stale-view rejected, which is
+    // exactly the "adopted a QC for a block we haven't seen"
+    // case evidence adoption creates.
+    let _ = e1.vote(&h_sib, &p_sib);
+    // e0's high QC is X'@2 (adopted via TC(2) evidence), so
+    // c'.prev binds correctly and the floor passes. e1 votes too —
+    // TC evidence adoption put it on the same branch — so it
+    // stores c' and can run the commit walk when the QC lands.
+    let vcp0 = e0.vote(&h_child2, &prop_cp).expect("e0 votes c' — extends the evidence max");
     e0.collect_vote(0, vcp0).expect("collect");
-    let vcp2 = e2.vote(&h_child2, &p_child2).expect("e2 votes c'");
+    let vcp1 = e1.vote(&h_child2, &prop_cp).expect("e1 votes c' — same adopted branch");
+    e0.collect_vote(1, vcp1).expect("collect");
+    let vcp2 = e2.vote(&h_child2, &prop_cp).expect("e2 votes c' — built on its own branch");
     e0.collect_vote(2, vcp2).expect("collect");
-    e0.collect_vote(3, byz_vote(&e0, View::new(4), hash_child2)).expect("byz vote c'");
-    let qc_child2 = e0.try_form_qc().expect("QC(c')@4 — public branch is 2-deep");
+    e0.collect_vote(3, byz_vote(&e0, View::new(3), hash_child2)).expect("byz vote c'");
+    let qc_child2 = e0.try_form_qc().expect("QC(c')@3 — the consecutive pair over X'@2");
 
-    // ---- The fork: both branches complete a commit walk ----
-    // e0 adopts QC(c)@3 first (its highQC is X'@2 — 3 > 2): the
-    // walk commits X at h1. Then QC(c')@4 arrives — the walk on
-    // the c' chain stops at the already-committed height.
-    e0.deliver_qc(qc_child1.clone()).expect("e0 adopts QC(c)@3 -> commits X");
-    e0.deliver_qc(qc_child2.clone()).expect("e0 adopts QC(c')@4 — X' blocked by committed h1");
-    // e2 only ever sees the public branch's grandchild QC.
-    e2.deliver_qc(qc_child2).expect("e2 adopts QC(c')@4 -> commits X'");
-
-    let f0 = e0.finalized_block(Height::new(1)).expect("e0 committed height 1");
-    let f2 = e2.finalized_block(Height::new(1)).expect("e2 committed height 1");
-    assert_eq!(f0.txs[0].as_bytes(), [0xB0], "e0 committed X");
-    assert_eq!(f2.txs[0].as_bytes(), [0xC0], "e2 committed X'");
-    assert_ne!(f0, f2, "two honest validators finalized different blocks at the same height");
+    // ---- Commit: the consecutive pair commits X' AND its prefix ----
+    // QC(c')@3 certifies c'; c' embeds QC(X')@2 — consecutive
+    // views 2->3 — so X' commits at h1, finalizing its whole
+    // prefix (P at h0) even though X'@2 -> P@0 is itself
+    // nonconsecutive.
+    for e in [&mut e0, &mut e1, &mut e2] {
+        e.deliver_qc(qc_child2.clone()).expect("adopt QC(c')@3");
+    }
+    for (i, e) in [&e0, &e1, &e2].iter().enumerate() {
+        let f1 = e.finalized_block(Height::new(1)).expect("height 1 committed");
+        assert_eq!(
+            f1.txs[0].as_bytes(),
+            [0xC0],
+            "engine {i} committed X' — the evidence-max branch, never the hidden X"
+        );
+        let f0 = e.finalized_block(Height::new(0)).expect("height 0 committed as X' prefix");
+        assert_eq!(f0.txs[0].as_bytes(), [0xA0], "engine {i} committed P at h0");
+    }
 }
