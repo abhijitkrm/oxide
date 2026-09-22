@@ -189,9 +189,26 @@ impl PeerStream for TcpStream {
 /// `set_read_timeout`) before each `read_frame` call, so the mutex
 /// is not held indefinitely. The writer (send path) acquires the
 /// lock only for the duration of a `write_frame` call.
+///
+/// `#[doc(hidden)]`: the type stays crate-private in spirit — the
+/// `pub` exists so the `tls_contention` bench can measure the real
+/// contention primitive rather than a reimplemented replica. Not a
+/// supported API surface.
 #[cfg(feature = "tls")]
-struct SharedStream<S: Read + Write + Send> {
+#[doc(hidden)]
+pub struct SharedStream<S: Read + Write + Send> {
     inner: Arc<Mutex<S>>,
+}
+
+#[cfg(feature = "tls")]
+impl<S: Read + Write + Send> SharedStream<S> {
+    /// `#[doc(hidden)]` bench seam: wrap a stream in the shared
+    /// mutex the transport uses for TLS connections. Production
+    /// constructs this inline at the accept/connect sites.
+    #[doc(hidden)]
+    pub fn wrap(stream: S) -> Self {
+        Self { inner: Arc::new(Mutex::new(stream)) }
+    }
 }
 
 #[cfg(feature = "tls")]
@@ -1712,6 +1729,97 @@ fn accept_tls_connection(
             None
         }
     }
+}
+
+/// `#[doc(hidden)]` bench seam: a cross-trusted `(client, server)`
+/// [`TlsConfig`] pair with generated certs — the expensive part of
+/// a TLS bench setup (rcgen + PEM parse) hoisted out of criterion's
+/// per-iteration path.
+///
+/// # Panics
+///
+/// Panics on cert generation or PEM parse failure — a bench harness
+/// is allowed to be loud.
+#[cfg(feature = "tls")]
+#[doc(hidden)]
+pub fn bench_tls_configs() -> (crate::tls::TlsConfig, crate::tls::TlsConfig) {
+    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+
+    let id_a = vec![0xAA_u8];
+    let id_b = vec![0xBB_u8];
+    let (cert_a, key_a) = crate::tls::generate_ca_cert_pem(&id_a);
+    let (cert_b, key_b) = crate::tls::generate_ca_cert_pem(&id_b);
+    let der_a = rustls_pemfile::certs(&mut cert_a.as_bytes())
+        .next()
+        .and_then(Result::ok)
+        .map(|c| c.as_ref().to_vec())
+        .expect("client cert pem parses");
+    let der_b = rustls_pemfile::certs(&mut cert_b.as_bytes())
+        .next()
+        .and_then(Result::ok)
+        .map(|c| c.as_ref().to_vec())
+        .expect("server cert pem parses");
+    let tls_a =
+        crate::tls::TlsConfig::with_cert_pem(&id_a, &cert_a, &key_a, vec![(id_b.clone(), der_b)]);
+    let tls_b = crate::tls::TlsConfig::with_cert_pem(&id_b, &cert_b, &key_b, vec![(id_a, der_a)]);
+    (tls_a, tls_b)
+}
+
+/// `#[doc(hidden)]` bench seam: open a loopback mTLS connection
+/// `(client, server)` through a [`bench_tls_configs`] pair and drive
+/// the handshake to completion — so a bench measures the production
+/// crypto path and `SharedStream` discipline rather than a
+/// reimplemented replica. The caller owns both stream ends: wrap
+/// `client` in [`SharedStream`] to reproduce the transport's
+/// reader-shares-the-write-mutex shape; drain `server` directly.
+///
+/// # Panics
+///
+/// Panics on socket or handshake failure — a bench harness is
+/// allowed to be loud.
+#[cfg(feature = "tls")]
+#[doc(hidden)]
+pub fn bench_tls_connect(
+    client_cfg: &crate::tls::TlsConfig,
+    server_cfg: &crate::tls::TlsConfig,
+) -> (
+    rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+    let addr = listener.local_addr().expect("loopback addr");
+    let client_cfg = client_cfg.client_config.clone();
+    // The client drives its half of the handshake on its own thread:
+    // rustls `complete_io` blocks until the handshake finishes, so a
+    // single thread cannot write-then-read on one side and then the
+    // other — the two ends must interleave.
+    let client_thread = thread::spawn(move || {
+        let stream = TcpStream::connect(addr).expect("loopback connect");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let conn =
+            rustls::ClientConnection::new(client_cfg, server_name).expect("client connection");
+        let mut stream = rustls::StreamOwned::new(conn, stream);
+        // One app-data byte forces `complete_io` to run the handshake
+        // to completion; the server reads it below.
+        stream.write_all(&[0xAB]).expect("handshake write");
+        stream.flush().expect("handshake flush");
+        stream
+    });
+    let (server_sock, _) = listener.accept().expect("accept");
+    let server_conn =
+        rustls::ServerConnection::new(server_cfg.server_config.clone()).expect("server connection");
+    let mut server = rustls::StreamOwned::new(server_conn, server_sock);
+    let mut one = [0u8; 1];
+    server.read_exact(&mut one).expect("handshake read");
+    assert_eq!(one[0], 0xAB);
+    let client = client_thread.join().expect("client thread");
+
+    // The bench drains `server` on a helper thread — a read timeout
+    // lets that thread notice the stop flag instead of blocking on an
+    // idle connection forever.
+    server.sock.set_read_timeout(Some(Duration::from_millis(50))).expect("server read timeout");
+    (client, server)
 }
 
 #[cfg(test)]

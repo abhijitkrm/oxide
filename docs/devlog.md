@@ -19157,3 +19157,39 @@ byte-for-byte unchanged.
 vs native base units, quote units, ticks vs `Price`, lots vs `Qty`
 — the custody-map `u64` values (`base_balances`/`base_holds`) are
 the exchange's remaining raw-unit surface.
+
+## Session N+16 — TLS shared-stream contention measured
+
+Last named item in §7.5's measurement list. TLS streams can't be
+`try_clone()`d like `TcpStream`, so the transport wraps them in
+`SharedStream` — one `Arc<Mutex<…>>` for the reader thread and every
+writer. The reader polls with `TLS_READER_POLL_TIMEOUT` (500 ms)
+*under* that mutex, yielding 1 ms between polls so writers can slip
+in. The audit's question: what does a writer actually pay?
+
+`tls_contention` (behind `p2p/tls`) reproduces the shape faithfully:
+`#[doc(hidden)]` seams expose `SharedStream::wrap` plus a
+`bench_tls_configs`/`bench_tls_connect` pair that builds a real
+loopback mTLS connection through `TlsConfig` (cert gen hoisted out
+of criterion's per-iteration path; the handshake runs on a client
+thread because `complete_io` blocks until it finishes — a
+single-threaded write-then-read deadlocks). Writers call
+`write_frame` through clones of the `SharedStream`; a reader thread
+runs the production loop (blocking `poll` under the lock, 1 ms yield
+on `Ok(None)`); a drain thread empties the server end so backpressure
+never contaminates the numbers. Plain `TcpStream` baseline isolates
+the crypto cost from the mutex cost.
+
+Measured (dev Mac, criterion p50): at the production 500 ms poll a
+queued writer waits ~3.5 ms solo and ~84 ms/frame at 4 writers —
+~48 writes/s aggregate per peer. At a scaled-down 20 ms poll the
+same shape gives ~36 µs/frame solo and ~7 K writes/s at 4 writers.
+TLS ≈ TCP within ~10% at every row: **the cost is the
+blocking-poll-under-mutex discipline, not encryption**. Verdict for
+§7.5: `SharedStream` is a real per-peer latency ceiling on TLS links
+(multi-writer bursts serialize to tens of writes/s) but far above
+any measured per-peer send rate today — the poll interval is the
+dial to turn if a TLS peer ever needs sustained > ~50 frames/s.
+
+Still open in §7.5: string/event allocation accounting (needs an
+allocator-counting shim, not a wall-clock bench).

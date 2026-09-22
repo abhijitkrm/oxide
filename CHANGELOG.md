@@ -10,6 +10,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ## [Unreleased]
 
+### Measured
+
+- **TLS peer-write contention** (`p2p`, `tls` feature): the new
+  `tls_contention` bench measures a `write_frame` caller queueing
+  behind the reader thread on the production `SharedStream`
+  (`Arc<Mutex<TlsStream>>`). At the production 500 ms reader poll a
+  queued write waits ~3.5 ms solo and ~84 ms per frame under 4
+  writers (~48 writes/s aggregate per peer); at a 20 ms poll the
+  same shape gives ~36 µs solo and ~7 K writes/s. TLS matches the
+  plaintext TCP baseline within ~10% at every row, so the ceiling is
+  the shared-mutex discipline, not encryption.
+  - **In plain words:** writes to a TLS peer can wait behind the
+    reader's blocking poll — we measured the wait. It's a real
+    per-peer latency ceiling, far above today's send rates.
+
 ### Changed
 
 - **Consensus certificates carry proof of verification**
