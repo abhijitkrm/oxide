@@ -298,7 +298,7 @@ fn imr_rate(cfg: &PerpsMarketConfig) -> u128 {
 /// The drain rule (the "nonzero balance implies isolated mode"
 /// convention made explicit): a position is [`Self::Isolated`] while
 /// it carries any isolated margin; when the wallet drains to zero,
-/// funding debits and PnL credits route to the cross pool — an
+/// funding debits and `PnL` credits route to the cross pool — an
 /// empty isolated wallet *demotes* rather than leaves a
 /// zero-capacity bucket every path must special-case. The sentinel
 /// stays inside this enum's constructor so the demotion rule lives
@@ -342,7 +342,7 @@ impl Position {
 
     /// Which margin wallet backs this position — the single
     /// interpretation of `isolated_margin` (see [`MarginClass`]).
-    /// `pub(crate)`: the funding debit and PnL routes read it.
+    /// `pub(crate)`: the funding debit and `PnL` routes read it.
     pub(crate) const fn margin_class(&self) -> MarginClass {
         if self.isolated_margin > 0 { MarginClass::Isolated } else { MarginClass::Cross }
     }

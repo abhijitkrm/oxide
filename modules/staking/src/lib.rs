@@ -5002,7 +5002,7 @@ mod tests {
     }
 
     /// A snapshot blob carrying a 48-byte BLS key that is not a
-    /// well-formed group element must fail import — the PoP gate ran
+    /// well-formed group element must fail import — the `PoP` gate ran
     /// at admission, so restore re-validates the point itself rather
     /// than trusting the bytes. Without this a crafted blob lodges a
     /// key that can never verify, wedging every QC that maps to it.
