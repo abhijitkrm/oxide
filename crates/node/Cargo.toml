@@ -29,6 +29,7 @@ oracle = { workspace = true }
 governance = { workspace = true }
 trading = { workspace = true }
 storage = { workspace = true, features = ["redb"] }
+rpc = { workspace = true }
 # tracing: structured diagnostic logging for node lifecycle events
 # (startup, shutdown, block finalization). Not on the hot path.
 tracing = { workspace = true }

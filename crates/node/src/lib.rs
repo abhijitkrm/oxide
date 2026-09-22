@@ -52,6 +52,9 @@ use executor::Executor;
 use ports::{AppInterface, ConsensusEngine};
 use primitives::Address;
 
+pub mod cli;
+pub mod rpc_adapters;
+
 /// The consensus engine selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusConfig {
@@ -486,6 +489,9 @@ pub struct AssembledExecutor {
     /// The staking module — the committee source wired into
     /// exchange, perps, and oracle.
     pub staking_module: Arc<staking::StakingModule>,
+    /// The exchange module — needed by harnesses that drive
+    /// settlement or inspect book state post-run.
+    pub exchange_module: Arc<exchange::ExchangeModule>,
 }
 
 /// Assemble the executor + full module graph from `config`.
@@ -531,6 +537,16 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     // overhead amortizes at 32+).
     let mut executor = Executor::with_config(config.max_mempool_entries, config.parallel_threshold)
         .with_min_fee(config.min_fee)
+        // One gas source: the executor's declared-gas admission cap is
+        // the same `block_budget.max_gas` consensus packs proposals
+        // against. Previously the executor defaulted to
+        // `DEFAULT_BLOCK_GAS_LIMIT` (30M) while the consensus budget
+        // allowed `CHAIN_BLOCK_GAS_LIMIT` (10G) — a maximally packed
+        // proposal would have its tail silently `GasLimit`-skipped on
+        // every replica. Deterministic, but the effective cap was an
+        // invisible constant no config could reach; devnet had to
+        // hand-set `with_gas_limit` to compensate.
+        .with_gas_limit(config.block_budget.max_gas)
         .with_chain_id(config.chain_id)
         .with_unsigned_tx_policy(if config.require_signed_txs {
             executor::UnsignedTxPolicy::Reject
@@ -683,7 +699,7 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     executor.register_module(Arc::new(gov));
     // Wire the exchange and perps modules into the EVM for
     // read-only precompiles (plan.md §10), then register the EVM.
-    evm_module.set_native_modules(Some(exchange), Some(perps));
+    evm_module.set_native_modules(Some(exchange.clone()), Some(perps));
     executor.register_module(evm_module.clone());
     let app: Arc<Executor> = Arc::new(executor);
     // Spawn the async execution lane (plan.md §13 Phase D):
@@ -693,7 +709,7 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     // multi-validator binary previously ran without it, a second
     // execution pipeline with different backpressure behavior.
     app.spawn_exec_lane();
-    AssembledExecutor { app, evm_module, staking_module }
+    AssembledExecutor { app, evm_module, staking_module, exchange_module: exchange }
 }
 
 /// Run a simple smoke test: assemble a node, submit a tx, finalize a block.
@@ -717,12 +733,13 @@ pub fn run_node_smoke_test() {
     node.fund_evm_account(&sender, 1_000_000_000_000_000_000);
     let validator = Address([0u8; 20]);
     let module_payload = staking::msg::delegate(validator, 100);
-    let tx = build_signed_tx(
+    let tx = cli::build_signed_tx_with(
         &privkey,
         sender,
         config.chain_id,
         framework::module_id::STAKING,
         &module_payload,
+        0,
     );
     node.engine().submit_tx(tx);
     node.metrics().incr_counter("txs_submitted", 1);
@@ -765,34 +782,6 @@ fn build_tx(module_id: u8, module_payload: &[u8]) -> types::TxBytes {
     types::TxBytes::new(bytes)
 }
 
-/// Build a *signed* tx envelope (v1) for `privkey`'s derived sender:
-/// `[sender][nonce][fee][module_id|0x80][sig:65][payload]`. The
-/// signature is the EIP-712 envelope signature wallets produce —
-/// `crypto::eip712::sign_tx` — over the declared fields, so the
-/// executor's `Reject`-default policy accepts it.
-fn build_signed_tx(
-    privkey: &[u8],
-    sender: primitives::Address,
-    chain_id: u64,
-    module_id: u8,
-    module_payload: &[u8],
-) -> types::TxBytes {
-    let nonce = 0u64;
-    let fee = 100u64;
-    let sig =
-        crypto::eip712::sign_tx(privkey, chain_id, &sender, nonce, fee, module_id, module_payload)
-            .expect("test key must sign");
-    let mut bytes = Vec::with_capacity(36 + 1 + 65 + module_payload.len());
-    bytes.extend_from_slice(&sender.0);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
-    bytes.extend_from_slice(&fee.to_le_bytes());
-    bytes.push(module_id | 0x80);
-    bytes.extend_from_slice(&sig.sig);
-    bytes.push(sig.recid.as_u8());
-    bytes.extend_from_slice(module_payload);
-    types::TxBytes::new(bytes)
-}
-
 // ── Parsed-config → assembly conversion ─────────────────────────
 //
 // The functions below are THE mapping between the TOML/env/CLI
@@ -806,14 +795,14 @@ fn build_signed_tx(
 /// Which startup path the configuration is being resolved for.
 ///
 /// The modes consume different config fields — e.g. the TCP
-/// transport only exists in devnet-node mode — so
+/// transport only exists in devnet mode — so
 /// [`validate_effective_config`] needs the mode to decide which
 /// settings are harmless and which are operator-visible lies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeMode {
     /// Single-node mode: in-process engine, no transport.
     Single,
-    /// Multi-validator devnet-node mode: real `OxideBft` over the
+    /// Multi-validator devnet mode (`oxide-devnet`): real `OxideBft` over the
     /// TCP transport.
     Devnet,
 }
@@ -854,7 +843,7 @@ pub struct AssemblyOverrides {
 /// [`validate_effective_config`] rather than silently running the
 /// wrong protocol or failing on a value the operator never set
 /// (`ConsensusEngineKind`'s serde default is `sequencer`, so every
-/// config-less `--devnet-node` launch would otherwise be fatal).
+/// config-less `oxide-devnet` launch would otherwise be fatal).
 ///
 /// # Errors
 ///
@@ -881,7 +870,7 @@ pub fn node_config_from(
         .settlement_operator
         .as_ref()
         .map(|hex| {
-            let bytes = hex_decode(hex)
+            let bytes = cli::hex_decode(hex)
                 .map_err(|e| format!("invalid exchange.settlement_operator address: {e}"))?;
             let arr: [u8; 20] = bytes
                 .try_into()
@@ -942,7 +931,7 @@ pub fn genesis_spec_from_file(genesis: &config::genesis::Genesis) -> Result<Gene
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let addr_bytes = hex_decode(&v.address)
+            let addr_bytes = cli::hex_decode(&v.address)
                 .map_err(|e| format!("genesis validator {i} invalid address: {e}"))?;
             let addr: [u8; 20] = addr_bytes
                 .try_into()
@@ -951,7 +940,7 @@ pub fn genesis_spec_from_file(genesis: &config::genesis::Genesis) -> Result<Gene
                 .public_key
                 .as_ref()
                 .map(|pk_hex| {
-                    hex_decode(pk_hex)
+                    cli::hex_decode(pk_hex)
                         .map_err(|e| format!("genesis validator {i} invalid BLS key: {e}"))
                 })
                 .transpose()?;
@@ -972,7 +961,7 @@ pub fn genesis_spec_from_file(genesis: &config::genesis::Genesis) -> Result<Gene
                 .as_u64()
                 .or_else(|| balance_val.as_str().and_then(|s| s.parse::<u64>().ok()))
                 .ok_or_else(|| format!("genesis bank balance for {addr_hex} is not an integer"))?;
-            let bytes = hex_decode(addr_hex)
+            let bytes = cli::hex_decode(addr_hex)
                 .map_err(|e| format!("genesis bank address {addr_hex}: {e}"))?;
             let addr: [u8; 20] = bytes
                 .try_into()
@@ -1028,7 +1017,7 @@ pub fn validate_effective_config(
     let mut errors = Vec::new();
 
     // The sequencer engine cannot run a multi-validator cluster —
-    // devnet-node mode forces oxideBFT regardless (see
+    // devnet mode forces oxideBFT regardless (see
     // `node_config_from`). A parsed `engine = "sequencer"` is an
     // override, not a fatal error: `ConsensusEngineKind`'s serde
     // default IS sequencer, so the setting is indistinguishable from
@@ -1037,7 +1026,7 @@ pub fn validate_effective_config(
     if mode == NodeMode::Devnet && config.consensus.engine == config::ConsensusEngineKind::Sequencer
     {
         warnings.push(
-            "consensus.engine = \"sequencer\" is overridden in --devnet-node mode — \
+            "consensus.engine = \"sequencer\" is overridden in devnet mode — \
              running oxideBFT (a single-leader engine cannot run a multi-validator cluster)"
                 .to_string(),
         );
@@ -1062,14 +1051,14 @@ pub fn validate_effective_config(
     }
 
     // `network.listen_addr`/`network.peers` are derived per-index in
-    // devnet-node mode and unused entirely in single-node mode — a
+    // devnet mode and unused entirely in single-node mode — a
     // config that sets them is valid TOML but not what the operator
     // expects, so it warns rather than fails.
     let network_addr_set = config.network.listen_addr != "127.0.0.1:20000";
     let network_peers_set = !config.network.peers.is_empty();
     if network_addr_set || network_peers_set {
         let why = match mode {
-            NodeMode::Devnet => "overridden by the --devnet-node/--base-port index derivation",
+            NodeMode::Devnet => "overridden by the --node/--base-port index derivation",
             NodeMode::Single => "no transport runs in single-node mode",
         };
         warnings.push(format!(
@@ -1091,17 +1080,5 @@ pub fn validate_effective_config(
     (warnings, errors)
 }
 
-/// Decode a bare-or-`0x` hex string to bytes (genesis addresses,
-/// keys, operator addresses).
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if !s.len().is_multiple_of(2) {
-        return Err("odd-length hex".to_string());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
-}
 #[cfg(test)]
 mod tests;

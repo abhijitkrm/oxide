@@ -656,7 +656,7 @@ fn genesis_spec_devnet_synthesizes_fallback() {
 
 #[test]
 fn devnet_mode_forces_oxidebft_and_warns_on_sequencer() {
-    // `--devnet-node` with no --engine/--config parses
+    // `oxide-devnet` with no --engine/--config parses
     // `ConsensusEngineKind`'s serde default (sequencer) — the
     // mode must still run oxideBFT, and warn rather than fail
     // on a value indistinguishable from "unset".
@@ -672,7 +672,7 @@ fn devnet_mode_forces_oxidebft_and_warns_on_sequencer() {
     assert_eq!(
         node_config.consensus,
         ConsensusConfig::OxideBft,
-        "devnet-node mode always runs oxideBFT"
+        "devnet mode always runs oxideBFT"
     );
     let (warnings, errors) = validate_effective_config(&config, &node_config, NodeMode::Devnet);
     assert!(errors.is_empty(), "the override warns, never fails: {errors:?}");
@@ -804,12 +804,13 @@ fn committed_block_timestamp_reaches_evm_history() {
     node.fund_evm_account(&sender, 1_000_000_000_000_000_000);
     let validator = Address([0u8; 20]);
     let module_payload = staking::msg::delegate(validator, 100);
-    let tx = build_signed_tx(
+    let tx = crate::cli::build_signed_tx_with(
         &privkey,
         sender,
         config.chain_id,
         framework::module_id::STAKING,
         &module_payload,
+        0,
     );
     node.engine().submit_tx(tx);
     node.engine().run_until_idle();

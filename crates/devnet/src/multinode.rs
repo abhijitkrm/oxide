@@ -59,12 +59,15 @@ const GENESIS_BALANCE: u64 = 1_000_000_000_000; // 10^12
 /// regression it would have to reject.
 const SIM_CLOCK_BASE_MS: u64 = 1_700_000_000_000;
 
-/// A multi-node devnet: N validators running oxideBFT with the real
-/// app stack.
+/// A multi-node devnet: N validators running oxideBFT over the
+/// production app stack.
 ///
-/// Each validator has its own [`Executor`] (with core/evm/staking
-/// modules) and its own [`OxideBft`] engine. The engines share a
-/// single [`ValidatorSet`]. The round loop drives all engines in a
+/// Each validator's executor is assembled by
+/// [`node::assemble_executor`] — the same module graph the shipped
+/// binaries run (core, evm, staking, exchange, perps, oracle,
+/// governance, plus the async execution lane), parameterized only
+/// by genesis state and mempool size. The engines share a single
+/// [`ValidatorSet`]. The round loop drives all engines in a
 /// deterministic order.
 pub struct MultiNodeDevnet {
     /// One engine per validator.
@@ -131,40 +134,46 @@ impl MultiNodeDevnet {
         // `SIM_CLOCK_BASE_MS` for why a single source (not
         // per-engine counters) is required.
         let block_clock = Arc::new(std::sync::atomic::AtomicU64::new(SIM_CLOCK_BASE_MS));
-        for (i, key) in secret_keys.iter().cloned().enumerate() {
-            let mut executor = Executor::new(max_mempool_entries);
-            executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-            // The EVM account store is the single native-token
-            // ledger: genesis-mint to the sender addresses so
-            // staking delegates can bond and fees can debit. The
-            // EVM module is minted into before registration.
-            //
+        // Every validator assembles through `node::assemble_executor`
+        // — THE production module graph (core, evm, staking, exchange,
+        // perps, oracle, governance + exec lane) — so the sim exercises
+        // the same admission/execution pipeline the binaries run. The
+        // harness's only inputs are the ones production legitimately
+        // varies: genesis state, mempool size, and the clock. The
+        // genesis spec is what a `--genesis-file` would carry: the
+        // validator set (stake 1 each, real BLS keys so evidence paths
+        // see the true consensus identities) plus the funded sender
+        // identities. `None` storage_path + `evm_persistence` selects
+        // the Volatile backend — the storage seam's in-memory side.
+        let genesis = node::GenesisSpec {
+            validators: addresses
+                .iter()
+                .zip(secret_keys.iter())
+                .map(|(addr, sk)| node::GenesisValidator {
+                    address: *addr,
+                    stake: 1,
+                    public_key: Some(sk.public_key().as_bytes().to_vec()),
+                })
+                .collect(),
             // M4: mint to a range of sender identities (index 0
             // through 31 — see `txs::identity_addr`) so the
             // multi-sender throughput test can use distinct senders.
-            let evm = Arc::new(
-                evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL),
-            );
-            for sender_idx in 0u8..32 {
-                framework::Balances::mint(
-                    evm.as_ref(),
-                    &txs::identity_addr(sender_idx),
-                    GENESIS_BALANCE,
-                );
-            }
-            executor.register_module(evm.clone());
-            // The EVM ledger collects fees for all native-module txs
-            // — without this the module txs ran free.
-            executor.set_fee_module(framework::module_id::EVM);
-            let staking_mod = staking::StakingModule::new();
-            staking_mod.set_ledger(evm);
-            // Register the devnet validators so delegate txs have a
-            // real bond target. Stake mirrors the consensus set.
-            for addr in &addresses {
-                staking_mod.genesis_register_validator(*addr, 1);
-            }
-            executor.register_module(Arc::new(staking_mod));
-            let app: Arc<Executor> = Arc::new(executor);
+            // Genesis balances are wei; `GENESIS_BALANCE` is base
+            // units (what `Balances::mint` credited before).
+            balances: (0u8..32)
+                .map(|i| {
+                    (txs::identity_addr(i), u128::from(GENESIS_BALANCE) * framework::WEI_PER_UNIT)
+                })
+                .collect(),
+        };
+        let config = node::NodeConfig {
+            max_mempool_entries,
+            genesis: Some(genesis),
+            ..node::NodeConfig::default()
+        };
+        for (i, key) in secret_keys.iter().cloned().enumerate() {
+            let assembled = node::assemble_executor(&config);
+            let app = assembled.app;
             let app_dyn: Arc<dyn AppInterface> = app.clone();
             // Shared sim clock: all engines draw proposal timestamps
             // from one counter so stamps increase across leaders and
@@ -737,7 +746,30 @@ impl MultiNodeDevnet {
     }
 
     /// Collect finalized blocks from each validator into a `DevnetResult`.
+    /// Wait until every validator's execution lane has applied the
+    /// last committed block.
+    ///
+    /// The lane (spawned by `node::assemble_executor`, always on —
+    /// production never runs without it) executes committed blocks
+    /// off the driving thread, so a run can finish with the tail
+    /// block committed but still executing. `attest_state` blocks
+    /// on the executed watermark — the same synchronization the
+    /// production exec-cert path uses. A dead lane surfaces as
+    /// `None` → loud panic rather than a silently stale read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a validator's lane died before executing the last
+    /// committed height.
+    pub fn drain_execution(&self) {
+        for (i, app) in self.apps.iter().enumerate() {
+            let Some(height) = self.engines[i].finalized_height() else { continue };
+            app.attest_state(height).expect("execution lane must apply committed blocks");
+        }
+    }
+
     fn collect_result(&self) -> DevnetResult {
+        self.drain_execution();
         let finalized = self
             .engines
             .iter()

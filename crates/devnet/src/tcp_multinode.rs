@@ -131,13 +131,11 @@ pub struct TcpMultiNodeDevnet {
     /// inspect balances/nonces without downcasting from `dyn Module`.
     evm_modules: Vec<Arc<evm::EvmModule>>,
     /// Exchange module handles (one per validator) for direct state
-    /// access. Only populated when the devnet is built with
-    /// `with_exchange_and_base_port`; empty for the default
-    /// staking-only
-    /// devnet. Each validator gets its own `ExchangeModule` instance
-    /// settling through that validator's `EvmModule` ledger — all validators
-    /// execute the same blocks, so their exchange state converges
-    /// after finality.
+    /// access. The exchange is part of the production module graph —
+    /// always populated, on every constructor. Each validator gets
+    /// its own `ExchangeModule` instance settling through that
+    /// validator's `EvmModule` ledger — all validators execute the
+    /// same blocks, so their exchange state converges after finality.
     exchange_modules: Vec<Arc<exchange::ExchangeModule>>,
     /// Full commit history per validator. The engine's `finalized`
     /// map prunes at `MAX_RETAINED_FINALIZED` (4096), so the devnet
@@ -408,7 +406,6 @@ impl TcpMultiNodeDevnet {
             max_mempool_entries,
             executor::DEFAULT_PARALLEL_THRESHOLD,
             p2p::tcp::TcpTransportConfig::default(),
-            true, // register_exchange
             None, // no settlement operator
         )
     }
@@ -436,7 +433,6 @@ impl TcpMultiNodeDevnet {
             max_mempool_entries,
             executor::DEFAULT_PARALLEL_THRESHOLD,
             p2p::tcp::TcpTransportConfig::default(),
-            true, // register_exchange
             Some(operator),
         )
     }
@@ -459,19 +455,16 @@ impl TcpMultiNodeDevnet {
             max_mempool_entries,
             parallel_threshold,
             tcp_config,
-            false, // do not register exchange
-            None,  // no settlement operator
+            None, // no settlement operator
         )
     }
 
-    /// Internal constructor with all parameters explicit, including
-    /// an optional exchange module registration.
+    /// Internal constructor with all parameters explicit.
     ///
-    /// When `register_exchange` is true, each validator gets an
-    /// `ExchangeModule::with_ledger(evm_clone)` backed by the same
-    /// `EvmModule` that consensus executes. The exchange module
-    /// handles (as `Arc<ExchangeModule>`) are stored in
-    /// `exchange_modules` for post-run inspection.
+    /// Every validator assembles the production module graph via
+    /// [`node::assemble_executor`] — the exchange module is always
+    /// registered (it is part of the shipped graph), and its handles
+    /// are stored in `exchange_modules` for post-run inspection.
     ///
     /// When `settlement_operator` is `Some`, the exchange modules are
     /// additionally configured to accept `batch_settle` txs from that
@@ -485,7 +478,6 @@ impl TcpMultiNodeDevnet {
         max_mempool_entries: usize,
         parallel_threshold: usize,
         tcp_config: p2p::tcp::TcpTransportConfig,
-        register_exchange: bool,
         settlement_operator: Option<primitives::Address>,
     ) -> Self {
         assert!(n > 0, "devnet must have at least one validator");
@@ -527,28 +519,44 @@ impl TcpMultiNodeDevnet {
         let commit_seqs: Vec<Arc<AtomicU64>> =
             (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
 
+        // Every validator assembles through `node::assemble_executor`
+        // — THE production module graph (core, evm, staking, exchange,
+        // perps, oracle, governance) with the async execution lane
+        // always on, exactly as the shipped binaries run. The harness
+        // varies only what production legitimately varies: genesis
+        // balances, mempool/parallel sizing, settlement operator.
+        // `run_*` methods drain the lane before returning so executed
+        // state is observable — see `drain_execution`.
+        let genesis = node::GenesisSpec {
+            // The committee is a single stake-0 member (registered
+            // post-assembly below): every endorsement test relies on
+            // one member's endorsement deciding quorum. Not in the
+            // spec because `GenesisValidator` requires stake > 0.
+            validators: Vec::new(),
+            // Prefunded senders get `genesis_balance` base units
+            // scaled to wei — the same credit `fund_account_for_test`
+            // applied before, expressed as genesis state.
+            balances: (0u8..num_senders)
+                .map(|i| {
+                    (txs::identity_addr(i), u128::from(genesis_balance) * framework::WEI_PER_UNIT)
+                })
+                .collect(),
+        };
+        let config = node::NodeConfig {
+            max_mempool_entries,
+            parallel_threshold,
+            settlement_operator,
+            genesis: Some(genesis),
+            ..node::NodeConfig::default()
+        };
         for (i, key) in secret_keys.iter().cloned().enumerate() {
-            let (executor, evm_module, exchange_module) = Self::assemble_executor(
-                max_mempool_entries,
-                parallel_threshold,
-                genesis_balance,
-                num_senders,
-                register_exchange,
-                settlement_operator,
-            );
-            evm_modules.push(evm_module);
-            if let Some(ex) = exchange_module {
-                exchange_modules.push(ex);
-            }
-            let app: Arc<Executor> = Arc::new(executor);
-            // `DEVNET_EXEC_LANE=1`: run the async execution worker —
-            // `finalize_block` hands each committed block to a
-            // per-validator thread and returns, overlapping block
-            // h's execution with view h+1's consensus. Off by
-            // default so benchmarks can A/B the synchronous path.
-            if std::env::var_os("DEVNET_EXEC_LANE").is_some() {
-                app.spawn_exec_lane();
-            }
+            let assembled = node::assemble_executor(&config);
+            // Register the power-0 committee member: the sole
+            // endorsement quorum (see the genesis comment above).
+            assembled.staking_module.register_validator(txs::identity_addr(0));
+            let app = assembled.app;
+            evm_modules.push(assembled.evm_module);
+            exchange_modules.push(assembled.exchange_module);
             let app_dyn: Arc<dyn AppInterface> = app.clone();
 
             // Build the peer list (all peers except self).
@@ -608,70 +616,28 @@ impl TcpMultiNodeDevnet {
         }
     }
 
-    /// Assemble one validator's executor with the devnet module
-    /// stack (extracted from `build_with_modules` to keep it under
-    /// the clippy line-count gate). Returns the executor plus the
-    /// module handles tests inspect — the EVM ledger always, the
-    /// exchange only when `register_exchange` is set.
-    fn assemble_executor(
-        max_mempool_entries: usize,
-        parallel_threshold: usize,
-        genesis_balance: u64,
-        num_senders: u8,
-        register_exchange: bool,
-        settlement_operator: Option<primitives::Address>,
-    ) -> (Executor, Arc<evm::EvmModule>, Option<Arc<exchange::ExchangeModule>>) {
-        let mut executor = Executor::with_config(max_mempool_entries, parallel_threshold)
-            // Devnet measures throughput, not gas policy — the
-            // block gas cap matches the consensus budget's
-            // `max_gas` (1 gigagas) so large test blocks fit
-            // under the declared-gas proposal check.
-            .with_gas_limit(1 << 30);
-        executor.register_module(Arc::new(oxide_core::CoreModule::new()));
-        // The EVM account store is the single native-token
-        // ledger: it is created first so staking and exchange
-        // settle through it, and it collects native-module fees.
-        // Prefunded senders are credited `genesis_balance` base
-        // units (scaled to wei) so delegation bonds, fills, gas,
-        // and fees all debit the same accounts EVM txs see.
-        let evm_module =
-            Arc::new(evm::EvmModule::new(1, 7_000_000_000).with_fee_recipient(staking::FEE_POOL));
-        let genesis_wei = u128::from(genesis_balance) * framework::WEI_PER_UNIT;
-        for sender_idx in 0u8..num_senders {
-            evm_module.fund_account_for_test(&txs::identity_addr(sender_idx), genesis_wei);
+    /// Wait until every validator's execution lane has applied the
+    /// last committed block.
+    ///
+    /// The lane (spawned by `node::assemble_executor`, always on —
+    /// production never runs without it) executes committed blocks
+    /// off the consensus thread, so run loops can return with block
+    /// h committed but still executing. Tests that read balances,
+    /// nonces, or book state must observe post-execution state:
+    /// `attest_state` blocks on the executed watermark, which is
+    /// exactly the synchronization the production exec-cert path
+    /// uses. A dead lane surfaces as `None` → loud panic rather
+    /// than a silently stale read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a validator's lane died before executing the last
+    /// committed height.
+    pub fn drain_execution(&self) {
+        for (i, app) in self.apps.iter().enumerate() {
+            let Some(height) = self.engines[i].finalized_height() else { continue };
+            app.attest_state(height).expect("execution lane must apply committed blocks");
         }
-        executor.register_module(evm_module.clone());
-        // The EVM ledger collects fees for all native-module txs
-        // — without this the module txs ran free.
-        executor.set_fee_module(framework::module_id::EVM);
-        // EVM-ledger staking: delegation debits the delegator
-        // into the bonded pool (no free stake inflation). The
-        // devnet validator identity `txs::identity_addr(0)` is
-        // registered so the key-change/validator-change keep-alive
-        // delegate has a registered target.
-        let staking_module = staking::StakingModule::new();
-        staking_module.set_ledger(evm_module.clone());
-        staking_module.register_validator(txs::identity_addr(0));
-        let staking_module = Arc::new(staking_module);
-        executor.register_module(staking_module.clone());
-        // Optionally register the exchange module backed by this
-        // validator's EVM ledger, gated on the staking committee —
-        // the same quorum path the production node wires, so a
-        // devnet listing tx exercises the real endorsement flow.
-        // Each validator gets its own exchange instance; state
-        // diverges during proposal but converges after finality
-        // (all validators execute the same block).
-        let exchange_module = register_exchange.then(|| {
-            let mut ex = exchange::ExchangeModule::with_ledger(evm_module.clone())
-                .with_committee(staking_module);
-            if let Some(operator) = settlement_operator {
-                ex.set_settlement_operator(operator);
-            }
-            let ex = Arc::new(ex);
-            executor.register_module(ex.clone());
-            ex
-        });
-        (executor, evm_module, exchange_module)
     }
 
     /// The number of validators.
@@ -2389,6 +2355,10 @@ impl TcpMultiNodeDevnet {
     /// `MAX_RETAINED_FINALIZED` (4096), so iterating `0..=height`
     /// misses pruned blocks on long-running tests.
     fn collect_result(&self) -> TcpDevnetResult {
+        // The async execution lane may still be applying the tail
+        // blocks: drain it so post-run assertions observe executed
+        // state, not just committed state.
+        self.drain_execution();
         let finalized =
             self.committed_blocks.iter().map(|v| primitives::sync::lock_state(v).clone()).collect();
         TcpDevnetResult { finalized }
