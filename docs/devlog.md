@@ -18630,3 +18630,16 @@ QC). `engine.rs` itself is now ~1.6k lines of struct/accessors/
 propose/deliver. Descendant modules see `OxideBft`'s private
 fields — no visibility surgery; only cross-file calls went
 `pub(crate)`.
+
+## §9.E — perps split by invariant
+
+The perps `impl` blocks moved to sibling modules whole:
+`decode.rs` (snapshot codec — write schema beside read schema),
+`handlers.rs` (every user tx enters through a `handle_*` here —
+margin checks and clearing rejection in one auditable place),
+`accounting.rs` (`apply_fill_to_position`/`adjust_position`/
+`settle_realized` — the only three functions that move value, so
+the conservation argument has exactly three functions to audit),
+`parse.rs` (wire decoders — the handle layer never touches raw
+bytes), `module_impl.rs` (the consensus lifecycle adapter).
+`lib.rs` is ~1.9k lines of types and core state.
