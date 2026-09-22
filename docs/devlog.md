@@ -18691,3 +18691,15 @@ the equivalence is auditable), `batch.rs` (the parallel
 speculation engine — ~1400 lines: a `SpecTx` is proved or
 disproved at canonical-order commit, never trusted). `lib.rs` is
 now ~1.1k lines: struct, ctor, accessors, and module wiring.
+
+## §9.E — staking split by invariant
+
+Staking's handler/settlement impl split five ways: `commit.rs`
+(write-side snapshot schema — pairs with decode.rs's read side),
+`delegation.rs` (stake movement + `undo_*` rollback inverses;
+reward checkpoints on every transition), `slashing.rs`
+(`apply_slash` is the only stake-burning fn, gated on evidence or
+governance), `validators.rs` (membership lifecycle — PoP-gated
+add, remove, pending-set sweeps), `rewards.rs` (u128 pro-rata
+distribution + the only reward payout path). `lib.rs` is ~1.4k
+lines of types and accessors.
