@@ -18643,3 +18643,16 @@ the conservation argument has exactly three functions to audit),
 `parse.rs` (wire decoders — the handle layer never touches raw
 bytes), `module_impl.rs` (the consensus lifecycle adapter).
 `lib.rs` is ~1.9k lines of types and core state.
+
+## §9.E — executor split by invariant
+
+`impl Executor` split four ways: `lane.rs` (the offload invariant
+— committed-block execution off the consensus thread; LaneDeath
+fails loudly if the lane dies), `snapshot.rs` (the durability
+boundary — export/import + the executed-nonce journal, which is
+replay protection and must round-trip exactly), `exec.rs` (the
+hot path — plan → authenticate → dispatch → canonical-order
+merge; the only code that may mutate state for a committed
+block), `app_iface.rs` (the consensus↔executor port — the only
+surface consensus calls). `lib.rs` is ~1.9k lines of types,
+constructor, and accessors.
