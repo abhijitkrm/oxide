@@ -18537,3 +18537,24 @@ invariant (byte-identical leaf encodings for full-build vs
 incremental-patch state roots) is co-located with the code that
 defines it. `lib.rs` drops under 9.7k lines; call sites import
 `crate::trie::{encode_trie_leaf, sparse_walk}`.
+
+## §9.E — consensus certificate verification leaves engine.rs
+
+The eight pure verification functions — `signer_keys_and_power`,
+`bitmap_meets_quorum`, `vote_signing_message`,
+`attestation_signing_message`, `verify_qc_signature`,
+`verify_tc_signature`, `verify_exec_cert`,
+`verify_timeout_signature_for` (~300 lines) — moved from the giant
+`impl OxideBft` block into `crates/consensus/src/verify.rs` as free
+functions taking `&ValidatorSet`/`Epoch` explicitly. They were
+already `&self` in signature only — each read just
+`self.validator_set`, `self.epoch`, and `self.verify_signatures` —
+so the split needed no field-visibility changes: thin `&self`
+wrappers keep every call site (`deliver_qc`, embedded-justify, TC
+path, exec-cert gate) unchanged while the logic now lives where
+its invariant is stated: a certificate proves something only if
+its bitmap resolves to quorum power under the current epoch AND
+the aggregate verifies over the full domain-separated message.
+Making them free functions is the point, not a side effect — a
+verifier that cannot see mutable engine fields cannot be
+influenced by them. `engine.rs` drops to ~8.7k lines.

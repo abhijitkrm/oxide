@@ -23,6 +23,7 @@ pub mod engine;
 pub mod pacemaker;
 pub mod sequencer;
 pub mod validator;
+mod verify;
 pub mod wal;
 
 pub use engine::{ConsensusError, EpochRotationError, OxideBft};

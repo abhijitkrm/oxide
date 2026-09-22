@@ -1667,55 +1667,13 @@ impl OxideBft {
         Self::block_hash(&unsigned)
     }
 
-    /// Resolve a certificate's signer bitmap into the signers' public
-    /// keys plus their combined voting power.
-    ///
-    /// Quorum is a stake threshold (oxideBFT spec §3), so every
-    /// certificate check needs both halves: the keys for aggregate
-    /// signature verification and the summed stake for the
-    /// `> 2/3 of total` power check. Returning them together keeps
-    /// the two readings of one bitmap from drifting apart across the
-    /// QC/TC/exec-cert call sites.
-    ///
-    /// # Errors
-    /// [`ConsensusError::SignerOutOfBounds`] if a set bit references
-    /// a validator past the end of the set — an out-of-range bit must
-    /// neither pass verification nor contribute phantom stake.
-    fn signer_keys_and_power(
-        &self,
-        bitmap: &[u8],
-    ) -> Result<(Vec<crypto::bls::PublicKey>, u64), ConsensusError> {
-        let mut signer_pks: Vec<crypto::bls::PublicKey> =
-            Vec::with_capacity(self.validator_set.n());
-        let mut voting_power = 0u64;
-        for (i, byte) in bitmap.iter().enumerate() {
-            for bit in 0..8 {
-                if (byte >> bit) & 1 == 1 {
-                    let idx = u16::try_from(i * 8 + bit)
-                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-                    let pk = self
-                        .validator_set
-                        .validator(idx)
-                        .map_err(|_| ConsensusError::SignerOutOfBounds)?;
-                    voting_power = voting_power.saturating_add(
-                        self.validator_set
-                            .stake(idx)
-                            .map_err(|_| ConsensusError::SignerOutOfBounds)?,
-                    );
-                    signer_pks.push(*pk);
-                }
-            }
-        }
-        Ok((signer_pks, voting_power))
-    }
-
     /// Voting power behind a certificate bitmap, checked against the
     /// stake quorum. A convenience for structural (pre-signature)
     /// checks that need the power without the keys — equivalent to
     /// [`signer_keys_and_power`](Self::signer_keys_and_power) minus
     /// the allocation.
     fn bitmap_meets_quorum(&self, bitmap: &[u8]) -> bool {
-        self.validator_set.signer_stake(bitmap) >= self.validator_set.quorum_stake()
+        crate::verify::bitmap_meets_quorum(&self.validator_set, bitmap)
     }
 
     /// Leader: propose a block. Calls `app.prepare_proposal`, wraps
@@ -2468,12 +2426,7 @@ impl OxideBft {
     /// equivocation/double-vote handling. Production callers should
     /// not need this — the engine signs internally in `vote()`.
     pub fn vote_signing_message(&self, view: View, phase_byte: u8, block_hash: &Hash) -> [u8; 49] {
-        let mut msg = [0u8; 49];
-        msg[..8].copy_from_slice(&view.value().to_le_bytes());
-        msg[8] = phase_byte;
-        msg[9..41].copy_from_slice(block_hash.as_bytes());
-        msg[41..49].copy_from_slice(&self.epoch.value().to_le_bytes());
-        msg
+        crate::verify::vote_signing_message(self.epoch, view, phase_byte, block_hash)
     }
 
     /// Get the current pipeline phase as a byte. In the current
@@ -2520,11 +2473,7 @@ impl OxideBft {
     /// prevents attestation replay across epoch boundaries (same
     /// defense as the vote signing message, C3).
     fn attestation_signing_message(&self, height: Height, root: &Hash) -> [u8; 48] {
-        let mut msg = [0u8; 48];
-        msg[..8].copy_from_slice(&height.value().to_le_bytes());
-        msg[8..40].copy_from_slice(root.as_bytes());
-        msg[40..48].copy_from_slice(&self.epoch.value().to_le_bytes());
-        msg
+        crate::verify::attestation_signing_message(self.epoch, height, root)
     }
 
     /// Build this validator's execution attestation for an outgoing
@@ -2613,34 +2562,7 @@ impl OxideBft {
     /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
     /// not verify.
     fn verify_exec_cert(&self, cert: &ExecCertificate) -> Result<(), ConsensusError> {
-        // The certificate's epoch must equal this engine's epoch:
-        // the signed message binds `(height, root, epoch)` and the
-        // bitmap indexes the *current* validator set — a cert from
-        // any other epoch is unverifiable here (its signers index a
-        // different set and its signatures commit to a different
-        // epoch), not merely stale. Checked before the bitmap walk
-        // so an out-of-epoch bitmap can never index the wrong set.
-        if cert.epoch != self.epoch {
-            return Err(ConsensusError::CertEpochMismatch {
-                cert_epoch: cert.epoch,
-                epoch: self.epoch,
-            });
-        }
-        let (signer_pks, voting_power) = self.signer_keys_and_power(&cert.signer_bitmap)?;
-        if voting_power < self.validator_set.quorum_stake() {
-            return Err(ConsensusError::InsufficientQuorum {
-                voting_power,
-                required: self.validator_set.quorum_stake(),
-            });
-        }
-        let msg = self.attestation_signing_message(cert.height, &cert.state_root);
-        crypto::aggregate_verify(
-            &cert.aggregate_signature,
-            crypto::hash::Domain::ExecAttest,
-            &msg,
-            &signer_pks,
-        )
-        .map_err(|_| ConsensusError::InvalidQcSignature)
+        crate::verify::verify_exec_cert(&self.validator_set, self.epoch, cert)
     }
 
     /// Validate an embedded [`ExecCertificate`] at most once per
@@ -3251,32 +3173,7 @@ impl OxideBft {
     /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
     /// not verify.
     fn verify_qc_signature(&self, qc: &QuorumCertificate) -> Result<(), ConsensusError> {
-        // Resolve the bitmap into signer keys + voting power.
-        let (signer_pks, voting_power) = self.signer_keys_and_power(&qc.signer_bitmap)?;
-        if signer_pks.is_empty() {
-            return Err(ConsensusError::InvalidQcSignature);
-        }
-        // A certificate is only a certificate at quorum. Callers
-        // (deliver_qc, the embedded-justify check) enforce this too,
-        // but the check lives here as well so no future call site can
-        // accept a validly-signed but sub-quorum bitmap — a single
-        // signer's aggregate verifies fine yet proves nothing. The
-        // threshold is voting power: enough low-stake signers to
-        // outnumber the honest set still cannot form a QC.
-        let required = self.validator_set.quorum_stake();
-        if voting_power < required {
-            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
-        }
-        // C3 fix: verify against the full (view, phase, block_hash,
-        // epoch) message, not just the block hash.
-        let msg = self.vote_signing_message(qc.view, qc.phase as u8, &qc.block_hash);
-        crypto::aggregate_verify(
-            &qc.aggregate_signature,
-            crypto::hash::Domain::Vote,
-            &msg,
-            &signer_pks,
-        )
-        .map_err(|_| ConsensusError::InvalidQcSignature)
+        crate::verify::verify_qc_signature(&self.validator_set, self.epoch, qc)
     }
 
     /// Commit `block_hash`: look up the block, create a
@@ -3600,19 +3497,14 @@ impl OxideBft {
         epoch: Epoch,
         signature: &Signature,
     ) -> Result<(), ConsensusError> {
-        // Conformance mode carries no real keys, so there is nothing to
-        // authenticate (the same precedent as every other check gated on
-        // `verify_signatures`).
-        if !self.verify_signatures {
-            return Ok(());
-        }
-        let pk =
-            self.validator_set.validator(voter).map_err(|_| ConsensusError::SignerOutOfBounds)?;
-        let mut msg = Vec::with_capacity(16);
-        msg.extend_from_slice(&view.value().to_le_bytes());
-        msg.extend_from_slice(&epoch.value().to_le_bytes());
-        crypto::bls_signer::verify(signature, crypto::hash::Domain::Timeout, &msg, pk)
-            .map_err(|_| ConsensusError::InvalidVoteSignature { voter })
+        crate::verify::verify_timeout_signature_for(
+            &self.validator_set,
+            self.verify_signatures,
+            voter,
+            view,
+            epoch,
+            signature,
+        )
     }
 
     /// Validator: collect a timeout signature from `voter` for the
@@ -3792,29 +3684,7 @@ impl OxideBft {
     /// power is below quorum, or [`ConsensusError::InvalidTcSignature`]
     /// if the aggregate does not verify.
     fn verify_tc_signature(&self, tc: &TimeoutCertificate) -> Result<(), ConsensusError> {
-        let (signer_pks, voting_power) = self.signer_keys_and_power(&tc.signer_bitmap)?;
-        if signer_pks.is_empty() {
-            return Err(ConsensusError::InvalidTcSignature);
-        }
-        // Same defense-in-depth as `verify_qc_signature`: a TC is
-        // only a certificate at quorum (voting power), enforced here
-        // too so no call site can accept a validly-signed sub-quorum
-        // bitmap.
-        let required = self.validator_set.quorum_stake();
-        if voting_power < required {
-            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
-        }
-        // M1 fix: verify against (view, epoch), not just view.
-        let mut msg = Vec::with_capacity(16);
-        msg.extend_from_slice(&tc.view.value().to_le_bytes());
-        msg.extend_from_slice(&tc.epoch.value().to_le_bytes());
-        crypto::aggregate_verify(
-            &tc.aggregate_signature,
-            crypto::hash::Domain::Timeout,
-            &msg,
-            &signer_pks,
-        )
-        .map_err(|_| ConsensusError::InvalidTcSignature)
+        crate::verify::verify_tc_signature(&self.validator_set, tc)
     }
 
     /// Drive one propose-vote-QC-commit cycle (single-validator mode).
