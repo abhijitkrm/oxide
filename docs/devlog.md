@@ -18614,3 +18614,19 @@ no `pub(crate)` field surgery needed. `lib.rs` is now ~3.7k lines
 Also swept the remaining in-file test modules out to sibling
 `tests.rs` files: executor (3.1k), perps (2.5k), exchange (2.1k),
 rpc (1.5k), trading/engine (731), governance (787), node (984).
+
+## §9.E — consensus engine split by phase
+
+`OxideBft`'s impl split into `engine/` submodules around each
+phase's invariant — `epoch.rs` (rotation is a two-phase commit:
+staged set activates only at a boundary, never mid-view),
+`timeout.rs` (a TC is the only evidence that releases a lock),
+`commit.rs` (the 2-chain walk finalizes the contiguous prefix
+oldest-first — a skipped link must never commit), `persist.rs`
+(the WAL append is the only thing between a vote and
+restart-amnesia double-sign; `wal_failed` latches on failure),
+`votes.rs` (authenticate → eligibility → collect → aggregate →
+QC). `engine.rs` itself is now ~1.6k lines of struct/accessors/
+propose/deliver. Descendant modules see `OxideBft`'s private
+fields — no visibility surgery; only cross-file calls went
+`pub(crate)`.
