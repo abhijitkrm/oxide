@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 
 use executor::{Event, ExecError, Module, TxContext};
 use framework::{KVStore, module_id, subtree_root};
-use primitives::fixed::{Price, Qty};
+use primitives::fixed::{Price, Qty, SignedQty};
 use primitives::{Address, Hash, Height};
 use trading::{
     CanceledOrder, DenseBook, FillEvent, MarketConfig, MatchingEngine, NewOrder, OrderId,
@@ -322,8 +322,9 @@ pub enum MarginClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Position {
     /// Signed position size in raw qty units (scale-6). Positive =
-    /// long, negative = short. Zero = no position.
-    pub size: i64,
+    /// long, negative = short. Zero = no position. [`SignedQty`]
+    /// keeps this from ever being read as an unsigned order qty.
+    pub size: SignedQty,
     /// Volume-weighted average entry price (scale-8). Zero if no
     /// position.
     pub entry_price: u64,
@@ -337,7 +338,7 @@ pub struct Position {
 impl Position {
     /// Whether this position is open (non-zero size).
     const fn is_open(&self) -> bool {
-        self.size != 0
+        !self.size.is_flat()
     }
 
     /// Which margin wallet backs this position — the single
@@ -349,7 +350,7 @@ impl Position {
 
     /// Notional value at mark price: `|size| * mark` (scale-14).
     fn notional(&self, mark: u64) -> u128 {
-        u128::from(self.size.unsigned_abs()) * u128::from(mark)
+        u128::from(self.size.abs_qty().0) * u128::from(mark)
     }
 
     /// Unrealized `PnL` at mark price (scale-14):
@@ -358,13 +359,13 @@ impl Position {
     ///
     /// Returns a signed `i128` in scale-14 units.
     fn unrealized_pnl(&self, mark: u64) -> i128 {
-        if self.size == 0 {
+        if self.size.is_flat() {
             return 0;
         }
-        let size_abs = i128::from(self.size.unsigned_abs());
+        let size_abs = i128::from(self.size.abs_qty().0);
         let mark = i128::from(mark);
         let entry = i128::from(self.entry_price);
-        if self.size > 0 { size_abs * (mark - entry) } else { size_abs * (entry - mark) }
+        if self.size.is_long() { size_abs * (mark - entry) } else { size_abs * (entry - mark) }
     }
 
     /// Maintenance margin requirement at mark price:
@@ -546,8 +547,8 @@ impl AccountState {
             };
             let leverage = u128::from(cfg.max_leverage.max(1));
             let (closing_side, mut cover) = match self.positions.get(market) {
-                Some(p) if p.size > 0 => (Side::Sell, p.size.unsigned_abs()),
-                Some(p) if p.size < 0 => (Side::Buy, p.size.unsigned_abs()),
+                Some(p) if p.size.is_long() => (Side::Sell, p.size.abs_qty().0),
+                Some(p) if p.size.is_short() => (Side::Buy, p.size.abs_qty().0),
                 // No position: every order is pure exposure. The
                 // closing side is irrelevant with cover 0 — pick
                 // either; both branches below charge full qty.
@@ -698,9 +699,9 @@ impl trading::MakerCap for ReduceOnlyCap<'_> {
             // reduce-only — treat as ordinary liquidity.
             return book_qty;
         };
-        let pos_size = acct.positions.get(&self.market).map_or(0, |p| p.size);
-        let opposing =
-            (pos_size > 0 && resv.side == Side::Sell) || (pos_size < 0 && resv.side == Side::Buy);
+        let pos_size = acct.positions.get(&self.market).map_or(SignedQty::ZERO, |p| p.size);
+        let opposing = (pos_size.is_long() && resv.side == Side::Sell)
+            || (pos_size.is_short() && resv.side == Side::Buy);
         if !opposing {
             // A reduce-only order with no reducible position can
             // only open exposure — cap it at zero; the engine then
@@ -709,7 +710,7 @@ impl trading::MakerCap for ReduceOnlyCap<'_> {
         }
         if resv.reduce_only {
             let used = self.spent.get(&owner).copied().unwrap_or(0);
-            let remaining = pos_size.unsigned_abs().saturating_sub(used);
+            let remaining = pos_size.abs_qty().0.saturating_sub(used);
             let cap = remaining.min(book_qty);
             *self.spent.entry(owner).or_insert(0) += cap;
             cap
@@ -1263,7 +1264,7 @@ impl PerpsModule {
         let mut total_loss_scale14: i128 = 0;
         let mut total_margin_recovered: u64 = 0;
         let cross_margin;
-        let mut seized: Vec<(u8, i64, u64)> = Vec::new(); // (market, size, mark)
+        let mut seized: Vec<(u8, SignedQty, u64)> = Vec::new(); // (market, size, mark)
         {
             let Inner { marks, accounts, .. } = &mut *inner;
             let Some(acct_mut) = accounts.get_mut(account) else {
@@ -1291,7 +1292,7 @@ impl PerpsModule {
                 seized.push((*market, pos.size, mark));
                 // Close the position in the same pass — the old code
                 // walked the map a second time to zero these fields.
-                pos.size = 0;
+                pos.size = SignedQty::ZERO;
                 pos.entry_price = 0;
                 pos.isolated_margin = 0;
                 events.push(Event { module: "perps", kind: "liquidated", data: vec![*market] });
@@ -1407,7 +1408,7 @@ impl PerpsModule {
         // candidate and the caller cloned the entire `marks` map to
         // pass it in alongside `&mut Inner`; `inner.marks` is read
         // directly here via shared borrows.
-        let mut candidates: Vec<(Address, u8, i64, u64, i128)> = Vec::new();
+        let mut candidates: Vec<(Address, u8, SignedQty, u64, i128)> = Vec::new();
         for (addr, state) in &inner.accounts {
             // Skip the liquidated account (it is the loss-bearer,
             // not a profitable counterparty) and the clearing
@@ -1437,7 +1438,7 @@ impl PerpsModule {
             // PnL descending.
             b.4.cmp(&a.4)
                 // Size (absolute) descending.
-                .then_with(|| b.2.unsigned_abs().cmp(&a.2.unsigned_abs()))
+                .then_with(|| b.2.abs_qty().0.cmp(&a.2.abs_qty().0))
                 // Address ascending (deterministic tiebreak).
                 .then_with(|| a.0.cmp(&b.0))
         });
@@ -1450,7 +1451,7 @@ impl PerpsModule {
         // Each clawed quantity is collected for transfer to the
         // clearing account — the closed exposure moves to the
         // backstop at mark so net position stays zero.
-        let mut clawed: Vec<(u8, i64, u64)> = Vec::new(); // (market, signed_qty, mark)
+        let mut clawed: Vec<(u8, SignedQty, u64)> = Vec::new(); // (market, signed_qty, mark)
         {
             let Inner { marks, accounts, configs, .. } = &mut *inner;
             for (addr, market, pos_size, pos_entry_price, pnl_scale6) in candidates {
@@ -1491,7 +1492,7 @@ impl PerpsModule {
                 }
                 let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
                 let close_qty_i128 = (i128::from(clawback_target) * price_scale) / pnl_per_unit;
-                let size_abs = i128::from(pos_size.unsigned_abs());
+                let size_abs = i128::from(pos_size.abs_qty().0);
                 // Lot-align partial claws: a sub-lot transfer would
                 // strand untradeable dust on the clearing account —
                 // `unwind_clearing` exits whole lots only — so the
@@ -1504,11 +1505,11 @@ impl PerpsModule {
                 let lot = i128::from(configs.get(&market).map_or(1, |c| c.base.lot_size.max(1)));
                 let capped = close_qty_i128.min(size_abs);
                 let close_qty = if capped >= size_abs {
-                    i64::try_from(capped).unwrap_or(0)
+                    SignedQty(i64::try_from(capped).unwrap_or(0))
                 } else {
-                    i64::try_from(capped - capped % lot).unwrap_or(0)
+                    SignedQty(i64::try_from(capped - capped % lot).unwrap_or(0))
                 };
-                if close_qty == 0 {
+                if close_qty.is_flat() {
                     continue;
                 }
                 // Compute the exact realized PnL (scale-6) from closing
@@ -1527,7 +1528,7 @@ impl PerpsModule {
                 // as a confiscated claim and again as cash — an
                 // over-extraction that silently destroyed value
                 // whenever the margin sufficed.
-                if pos_size > 0 {
+                if pos_size.is_long() {
                     pos_entry.size -= close_qty;
                 } else {
                     pos_entry.size += close_qty;
@@ -1535,7 +1536,7 @@ impl PerpsModule {
                 // The clearing account inherits the closed exposure
                 // in the same direction (long stays long, short
                 // stays short) — transferred at mark below.
-                let signed_qty = if pos_size > 0 { close_qty } else { -close_qty };
+                let signed_qty = if pos_size.is_long() { close_qty } else { -close_qty };
                 clawed.push((market, signed_qty, mark));
                 remaining_shortfall = remaining_shortfall.saturating_sub(realized_scale6);
 

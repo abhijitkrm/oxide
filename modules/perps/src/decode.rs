@@ -11,7 +11,7 @@
 
 use super::{
     AccountState, Address, BTreeMap, DenseBook, MAX_FUNDING_RATE_BPS, MatchingEngine,
-    OpenOrderResv, PerpsMarketConfig, PerpsModule, Position, Side, StagedPerps,
+    OpenOrderResv, PerpsMarketConfig, PerpsModule, Position, Side, SignedQty, StagedPerps,
     encode_perps_config, market_config_key, subtree_root,
 };
 
@@ -63,7 +63,7 @@ impl PerpsModule {
             w.put_count(acct.positions.len());
             for (market, pos) in &acct.positions {
                 w.put_u8(*market);
-                w.put_i64(pos.size);
+                w.put_i64(pos.size.get());
                 w.put_u64(pos.entry_price);
                 w.put_u64(pos.isolated_margin);
             }
@@ -352,7 +352,10 @@ impl PerpsModule {
                 let entry_price = r.get_u64()?;
                 let isolated_margin = r.get_u64()?;
                 if positions
-                    .insert(market, Position { size, entry_price, isolated_margin })
+                    .insert(
+                        market,
+                        Position { size: SignedQty(size), entry_price, isolated_margin },
+                    )
                     .is_some()
                 {
                     return None;

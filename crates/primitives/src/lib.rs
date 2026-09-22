@@ -555,6 +555,178 @@ pub mod fixed {
     pub fn qty_add(a: Qty, b: Qty) -> Option<Qty> {
         a.0.checked_add(b.0).map(Qty)
     }
+
+    /// A scale-6 **signed** quantity — the unit of positions and fill
+    /// deltas, where the sign carries direction (positive = long /
+    /// bought, negative = short / sold).
+    ///
+    /// Same scale as [`Qty`] but a distinct type so a signed exposure
+    /// can never silently pass as an unsigned order quantity, or the
+    /// reverse — the audit's "signed position quantity" unit
+    /// (docs/audit001.md §9.B). Arithmetic saturates rather than
+    /// wrapping: a position exceeding `i64::MAX` needs ~9.2e18 lots
+    /// against `u64`-bounded margin, unreachable for funded accounts,
+    /// and saturation keeps a mid-liquidation overflow from becoming a
+    /// consensus halt (the deliberate clamp documented in
+    /// `perps::accounting::adjust_position`).
+    ///
+    /// `PartialEq`/`PartialOrd` against `i64` are implemented so
+    /// literal comparisons (`pos.size == 0`, `size > 0`) stay readable;
+    /// the confusion the type exists to prevent — signed exposure vs
+    /// unsigned [`Qty`], [`Price`], or balance units — is enforced at
+    /// the type boundary and unaffected by literal ergonomics.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+    pub struct SignedQty(pub i64);
+
+    impl SignedQty {
+        /// The flat/zero position — no exposure in either direction.
+        pub const ZERO: Self = Self(0);
+
+        /// Signed magnitude of an unsigned fill [`Qty`], saturating at
+        /// `i64::MAX`. Market configs bound order quantity far below
+        /// the `i64` range, so the clamp is a bound proof rather than a
+        /// reachable path — and when it does fire it applies equally to
+        /// both sides of a fill, keeping the net position change zero.
+        #[must_use]
+        pub fn saturating_from_qty(qty: Qty) -> Self {
+            Self(i64::try_from(qty.0).unwrap_or(i64::MAX))
+        }
+
+        /// The magnitude as an unsigned [`Qty`] — same scale, direction
+        /// dropped. Returning the typed quantity (not a bare `u64`)
+        /// keeps magnitude math inside the unit lattice; callers that
+        /// genuinely need the raw value take `.0` at the boundary.
+        #[must_use]
+        pub const fn abs_qty(self) -> Qty {
+            // `i64::MIN`'s magnitude is 2^63 — still inside `u64`.
+            Qty(self.0.unsigned_abs())
+        }
+
+        /// Raw `i64` for the wire/storage boundary — codecs stay
+        /// `put_i64`/`get_i64`; the type disciplines in-memory use.
+        #[must_use]
+        pub const fn get(self) -> i64 {
+            self.0
+        }
+
+        /// `self` is a long (positive) exposure.
+        #[must_use]
+        pub const fn is_long(self) -> bool {
+            self.0 > 0
+        }
+
+        /// `self` is a short (negative) exposure.
+        #[must_use]
+        pub const fn is_short(self) -> bool {
+            self.0 < 0
+        }
+
+        /// `self` is zero — no position.
+        #[must_use]
+        pub const fn is_flat(self) -> bool {
+            self.0 == 0
+        }
+
+        /// `self` and `other` point in strictly opposite directions —
+        /// the position-closing predicate: a delta opposing a live
+        /// position realizes `PnL` on the closed portion. A flat side
+        /// never opposes (zero has no direction to oppose).
+        #[must_use]
+        pub const fn opposes(self, other: Self) -> bool {
+            (self.is_long() && other.is_short()) || (self.is_short() && other.is_long())
+        }
+
+        /// `delta` adds exposure in `self`'s direction — the
+        /// entry-price update predicate: a flat position takes the
+        /// fill's price outright, a same-side delta volume-weights the
+        /// entry, and an opposing delta realizes `PnL` instead.
+        #[must_use]
+        pub const fn extends(self, delta: Self) -> bool {
+            self.is_flat() || self.0.signum() == delta.0.signum()
+        }
+
+        /// `−1`/`0`/`+1` direction of the exposure. Kept for the
+        /// sign-flip predicate ("the position changed direction"),
+        /// where comparing directions — including flat — is the
+        /// semantic, not long/short classification.
+        #[must_use]
+        pub fn signum(self) -> i64 {
+            self.0.signum()
+        }
+    }
+
+    /// Negation saturates (`-i64::MIN` clamps to `i64::MAX`) — the
+    /// bound is unreachable for margin-bounded positions, and a wrap
+    /// would silently flip a liquidation's direction.
+    impl std::ops::Neg for SignedQty {
+        type Output = Self;
+        fn neg(self) -> Self {
+            Self(self.0.saturating_neg())
+        }
+    }
+
+    /// Position arithmetic saturates — see the type-level comment for
+    /// why the bound is unreachable and why wrapping would be worse
+    /// than clamping.
+    impl std::ops::Add for SignedQty {
+        type Output = Self;
+        fn add(self, rhs: Self) -> Self {
+            Self(self.0.saturating_add(rhs.0))
+        }
+    }
+
+    impl std::ops::AddAssign for SignedQty {
+        fn add_assign(&mut self, rhs: Self) {
+            self.0 = self.0.saturating_add(rhs.0);
+        }
+    }
+
+    impl std::ops::Sub for SignedQty {
+        type Output = Self;
+        fn sub(self, rhs: Self) -> Self {
+            Self(self.0.saturating_sub(rhs.0))
+        }
+    }
+
+    impl std::ops::SubAssign for SignedQty {
+        fn sub_assign(&mut self, rhs: Self) {
+            self.0 = self.0.saturating_sub(rhs.0);
+        }
+    }
+
+    /// Widening into `i128` for notional/`PnL` math — always exact.
+    impl From<SignedQty> for i128 {
+        fn from(q: SignedQty) -> Self {
+            Self::from(q.0)
+        }
+    }
+
+    /// Literal comparisons stay ergonomic (`pos.size == 0`); see the
+    /// type-level comment for why same-unit `i64` literals are safe
+    /// while cross-unit mixing remains impossible.
+    impl PartialEq<i64> for SignedQty {
+        fn eq(&self, other: &i64) -> bool {
+            self.0 == *other
+        }
+    }
+
+    impl PartialEq<SignedQty> for i64 {
+        fn eq(&self, other: &SignedQty) -> bool {
+            *self == other.0
+        }
+    }
+
+    impl PartialOrd<i64> for SignedQty {
+        fn partial_cmp(&self, other: &i64) -> Option<std::cmp::Ordering> {
+            self.0.partial_cmp(other)
+        }
+    }
+
+    impl PartialOrd<SignedQty> for i64 {
+        fn partial_cmp(&self, other: &SignedQty) -> Option<std::cmp::Ordering> {
+            self.partial_cmp(&other.0)
+        }
+    }
 }
 
 /// Synchronization policy helpers — the project's poisoned-mutex

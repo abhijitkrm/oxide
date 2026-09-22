@@ -688,7 +688,7 @@ fn execute_perps_position(
     let account = Address(input[1..21].try_into().unwrap_or([0u8; 20]));
     let pos = native::perps_position(reader, market, &account).unwrap_or_default();
     let mut output = Vec::with_capacity(24);
-    output.extend_from_slice(&pos.size.to_le_bytes());
+    output.extend_from_slice(&pos.size.get().to_le_bytes());
     output.extend_from_slice(&pos.entry_price.to_le_bytes());
     output.extend_from_slice(&pos.isolated_margin.to_le_bytes());
     PrecompileResult::success(output, GAS_PERPS_POSITION)

@@ -19092,3 +19092,41 @@ self-authored post-verification bytes — the same interior trust
 the tokens remove is the silent-adoption hazard: a future code
 path cannot assign into `high_qc`/`last_tc` without the type
 proving the check ran.
+
+## Session N+14 — signed position quantity becomes a unit type
+
+`docs/audit001.md` §9.B names eight financial units that were raw
+integers at their confusion boundaries; two are now types. The
+margin-mode sentinel closed earlier (`MarginClass`); this session
+lands **signed position quantity** — `primitives::fixed::SignedQty`
+now backs `perps::Position::size` and every fill delta through
+`adjust_position`.
+
+Why a type rather than a convention: `size` was `i64` sharing scale
+with `Qty` (scale-6) but opposite signedness, and the fill boundary
+hand-rolled the conversion —
+`i64::try_from(fill.qty.0).unwrap_or(i64::MAX)`. That clamp now lives
+inside `SignedQty::saturating_from_qty`, direction reads as
+direction (`is_long`/`is_short`/`opposes`/`extends` instead of
+`> 0`/signum arithmetic), and `abs_qty()` returns a typed `Qty` so
+magnitude math stays inside the unit lattice. `Add`/`Sub`/`Neg`
+saturate — the deliberate, documented position semantic (a clamped
+mid-liquidation beats a consensus halt), now enforced by the type
+instead of repeated per-site.
+
+The boundary story matches the cert/key tokens: wire and storage
+stay raw (`put_i64`/`get_i64`, canonical format unchanged; the perps
+EVM precompile reads `.get()` for its ABI). `PartialEq`/`PartialOrd`
+against `i64` keep literal assertions readable — the protection
+that matters is inter-unit, and that boundary is total: passing a
+`Qty`, `Price`, or balance where a `SignedQty` is expected no longer
+compiles. ~30 semantic sites migrated across `lib`/`accounting`/
+`handlers`/`decode` plus the ADL `clawed`/`seized`/`candidates`
+pipelines; 95 perps tests and the trading sim stay green with only
+`Position { size: SignedQty(n) }` literal wraps.
+
+Still open in §9.B: wei vs native base units, quote units, ticks vs
+`Price`, lots vs `Qty`, and the available-vs-reserved balance split
+(exchange already separates `base_balances`/`base_holds`/`fee_vault`
+into distinct committed maps — the residual is typing
+`RegisteredOrder::reserved`'s side-denominated units).

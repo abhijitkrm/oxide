@@ -8,7 +8,8 @@
 //! argument has exactly three functions to audit.
 
 use super::{
-    Address, CLEARING_ACCOUNT, Event, FillEvent, Inner, MarginClass, PRICE_SCALE, PerpsModule, Side,
+    Address, CLEARING_ACCOUNT, Event, FillEvent, Inner, MarginClass, PRICE_SCALE, PerpsModule,
+    Side, SignedQty,
 };
 
 impl PerpsModule {
@@ -28,13 +29,13 @@ impl PerpsModule {
         } else {
             (fill.maker_owner, fill.taker_owner)
         };
-        // HIGH fix: `fill.qty.0` is u64; the position model is i64.
-        // If a fill quantity exceeds i64::MAX (impossible in practice
-        // — market configs bound order qty well below i64::MAX), cap
-        // at i64::MAX. Both buyer and seller get the same capped
-        // magnitude, so the net position change is zero — position
-        // accounting stays consistent.
-        let fill_qty = i64::try_from(fill.qty.0).unwrap_or(i64::MAX);
+        // `SignedQty::saturating_from_qty` is the unit boundary the
+        // old HIGH-fix clamp enforced by hand: a fill qty above
+        // `i64::MAX` (unreachable — market configs bound order qty
+        // far lower) caps at `i64::MAX`. Both buyer and seller get
+        // the same capped magnitude, so the net position change is
+        // zero — position accounting stays consistent.
+        let fill_qty = SignedQty::saturating_from_qty(fill.qty);
 
         // Buyer's position increases (or shorts decrease).
         Self::adjust_position(inner, &buyer, market, fill.price.0, fill_qty, events);
@@ -68,10 +69,10 @@ impl PerpsModule {
                     Some(resv) if resv.reduce_only && resv.qty > 0 => {
                         let covered = match acct.positions.get(&market) {
                             Some(p)
-                                if (p.size > 0 && resv.side == Side::Sell)
-                                    || (p.size < 0 && resv.side == Side::Buy) =>
+                                if (p.size.is_long() && resv.side == Side::Sell)
+                                    || (p.size.is_short() && resv.side == Side::Buy) =>
                             {
-                                p.size.unsigned_abs().min(resv.qty)
+                                p.size.abs_qty().0.min(resv.qty)
                             }
                             _ => 0,
                         };
@@ -114,7 +115,7 @@ impl PerpsModule {
         account: &Address,
         market: u8,
         fill_price: u64,
-        delta: i64,
+        delta: SignedQty,
         events: &mut Vec<Event>,
     ) {
         let mut realized_scale6: i128 = 0;
@@ -128,14 +129,15 @@ impl PerpsModule {
             // If it ever fired, clamping is the least-bad terminal
             // (a panic mid-liquidation is a consensus halt; a
             // rejection here would strand the sweep half-applied).
-            let new_size = old_size.saturating_add(delta);
+            // `SignedQty` arithmetic saturates by construction.
+            let new_size = old_size + delta;
 
             // Realized PnL on the closed portion (scale-14 → scale-6
             // at settle time). Only a delta opposing a live position
             // closes anything.
-            if old_size != 0 && delta != 0 && old_size.signum() != delta.signum() {
-                let closed = i128::from(old_size.unsigned_abs().min(delta.unsigned_abs()));
-                let pnl_per_unit = if old_size > 0 {
+            if old_size.opposes(delta) {
+                let closed = i128::from(old_size.abs_qty().0.min(delta.abs_qty().0));
+                let pnl_per_unit = if old_size.is_long() {
                     i128::from(fill_price) - i128::from(pos.entry_price)
                 } else {
                     i128::from(pos.entry_price) - i128::from(fill_price)
@@ -146,11 +148,11 @@ impl PerpsModule {
 
             // Update entry price (volume-weighted) when increasing the
             // position. When decreasing, entry price stays the same.
-            if delta != 0 && (old_size.signum() == delta.signum() || old_size == 0) {
+            if !delta.is_flat() && old_size.extends(delta) {
                 // Increasing position: weighted average.
-                let old_cost = i128::from(old_size.unsigned_abs()) * i128::from(pos.entry_price);
-                let add_cost = i128::from(delta.unsigned_abs()) * i128::from(fill_price);
-                let new_size_abs = i128::from(new_size.unsigned_abs());
+                let old_cost = i128::from(old_size.abs_qty().0) * i128::from(pos.entry_price);
+                let add_cost = i128::from(delta.abs_qty().0) * i128::from(fill_price);
+                let new_size_abs = i128::from(new_size.abs_qty().0);
                 if new_size_abs > 0 {
                     let new_entry = (old_cost + add_cost) / new_size_abs;
                     pos.entry_price = u64::try_from(new_entry).unwrap_or(u64::MAX);
@@ -158,11 +160,11 @@ impl PerpsModule {
             }
             // If the position flipped sign (e.g. long → short), reset
             // entry to the fill price.
-            if old_size != 0 && old_size.signum() != new_size.signum() {
+            if !old_size.is_flat() && old_size.signum() != new_size.signum() {
                 pos.entry_price = fill_price;
             }
             pos.size = new_size;
-            if new_size == 0 {
+            if new_size.is_flat() {
                 pos.entry_price = 0;
             }
         }

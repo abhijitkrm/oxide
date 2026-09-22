@@ -11,8 +11,8 @@ use super::{
     AccountState, Address, BACKSTOP_UNWIND_SLIPPAGE_BPS, BTreeMap, CLEARING_ACCOUNT,
     CROSS_MARGIN_MARKET, Event, ExecError, FLAG_REDUCE_ONLY, FillEvent, Inner,
     MAX_FUNDING_RATE_BPS, MAX_MARK_STALENESS_BLOCKS, NewOrder, OpenOrderResv, OrderOutcome,
-    OrderType, PRICE_SCALE, PerpsModule, Price, Qty, ReduceOnlyCap, Side, StpMode, TimeInForce,
-    TradingError, TxContext, cancel_event, fill_event, outcome_event,
+    OrderType, PRICE_SCALE, PerpsModule, Price, Qty, ReduceOnlyCap, Side, SignedQty, StpMode,
+    TimeInForce, TradingError, TxContext, cancel_event, fill_event, outcome_event,
 };
 
 impl PerpsModule {
@@ -168,7 +168,7 @@ impl PerpsModule {
         {
             let acct = inner.accounts.get(&ctx.sender);
             let pos = acct.and_then(|a| a.positions.get(&market));
-            let pos_size = pos.map_or(0, |p| p.size);
+            let pos_size = pos.map_or(SignedQty::ZERO, |p| p.size);
             // The position can only close once: closing capacity the
             // account's resting opposing orders in this market have
             // already claimed is not available to this order.
@@ -177,13 +177,13 @@ impl PerpsModule {
                     .iter()
                     .filter(|((m, _), r)| {
                         *m == market
-                            && ((pos_size > 0 && r.side == Side::Sell)
-                                || (pos_size < 0 && r.side == Side::Buy))
+                            && ((pos_size.is_long() && r.side == Side::Sell)
+                                || (pos_size.is_short() && r.side == Side::Buy))
                     })
                     .map(|(_, r)| u128::from(r.qty))
                     .sum()
             });
-            let reducible = u128::from(pos_size.unsigned_abs()).saturating_sub(cover_booked);
+            let reducible = u128::from(pos_size.abs_qty().0).saturating_sub(cover_booked);
             // Reduce-only may only close: a request larger than the
             // reducible size would add exposure, which the flag
             // forbids — reject at admission.
@@ -568,7 +568,7 @@ impl PerpsModule {
     pub(crate) fn unwind_clearing(inner: &mut Inner, events: &mut Vec<Event>) {
         // Collect the backstop's open inventory (market, signed
         // size) under a shared borrow — the order pass mutates.
-        let inventory: Vec<(u8, i64)> =
+        let inventory: Vec<(u8, SignedQty)> =
             inner.accounts.get(&CLEARING_ACCOUNT).map_or_else(Vec::new, |acct| {
                 acct.positions
                     .iter()
@@ -581,7 +581,7 @@ impl PerpsModule {
             // `lot_size` is validated nonzero at listing; `max(1)`
             // keeps the division total for hand-built states.
             let lot = cfg.base.lot_size.max(1);
-            let qty = size.unsigned_abs() - (size.unsigned_abs() % lot);
+            let qty = size.abs_qty().0 - (size.abs_qty().0 % lot);
             if qty == 0 {
                 continue;
             }
@@ -596,7 +596,7 @@ impl PerpsModule {
             // the fund can never pay beyond the allowance just to hit
             // the tick grid.
             let tick = cfg.base.tick_size.max(1);
-            let raw_limit = if size > 0 {
+            let raw_limit = if size.is_long() {
                 u64::try_from(
                     u128::from(mark) * u128::from(10_000u64 - BACKSTOP_UNWIND_SLIPPAGE_BPS)
                         / 10_000,
@@ -609,13 +609,13 @@ impl PerpsModule {
                 )
                 .unwrap_or(u64::MAX)
             };
-            let limit_price = if size > 0 {
+            let limit_price = if size.is_long() {
                 raw_limit.div_ceil(tick).saturating_mul(tick).max(cfg.base.min_price)
             } else {
                 (raw_limit / tick).saturating_mul(tick).min(cfg.base.max_price)
             };
             let order = NewOrder {
-                side: if size > 0 { Side::Sell } else { Side::Buy },
+                side: if size.is_long() { Side::Sell } else { Side::Buy },
                 order_type: OrderType::Limit,
                 tif: TimeInForce::Ioc,
                 price: Price(limit_price),

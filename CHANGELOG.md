@@ -42,6 +42,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     reach the validator set at all, instead of being caught by a
     length check that happened to sit at the boundary.
 
+- **Position sizes are a distinct signed-quantity type**
+  (`primitives`, `perps`, `evm`): `SignedQty` (scale-6, same scale
+  as `Qty` but never interchangeable with it) now backs
+  `Position::size` and every fill delta through `adjust_position`.
+  Direction reads as direction (`is_long`/`is_short`/`opposes`), the
+  magnitude boundary returns a typed `Qty`, and the saturating
+  `i64`-clamp at the fill boundary moved inside
+  `SignedQty::saturating_from_qty`. Stored and wire bytes are
+  unchanged (raw `i64` at the codec and the perps EVM precompile).
+  - **In plain words:** a signed position can no longer be
+    accidentally passed anywhere an unsigned order quantity or a
+    balance is expected — the compiler rejects the mix instead of
+    it silently inverting or mis-scaling a trader's exposure.
+
 ### Added
 
 - **Contention and interference benchmarks** (`crates/matcher`,
