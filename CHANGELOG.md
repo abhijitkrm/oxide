@@ -174,6 +174,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     near-constant while order matching stays within its speed
     gates.
 
+- **Perps state root is incremental over accounts and books**
+  (`perps`): `accounts` is a `CommittedMap` whose leaf commits an
+  account's entire canonical state (margin, positions, order
+  reservations) in one hash — updated whenever a handler rewrites
+  the account through `with_account_mut`; the KV store is a
+  `CommittedStore`; and every per-market engine runs the shared
+  `resting_fold` leaf. Live `state_root`, staged `inspect_state`,
+  and `import_state` read one `RootView` schema, and snapshot
+  blobs keep their full canonical serialization. The new
+  `state_root_vs_accounts` group measures `state_root` flat at
+  ~1.15 µs across 100/1k/10k funded accounts while the displaced
+  full-walk rows scale linearly (~3.2/9.9/64.9 µs) — a 98%
+  reduction at 10k, near-O(1) in committed-state size.
+  - **In plain words:** the perps module used to re-serialize
+    every account and every resting order into the block's state
+    fingerprint; now each change updates a running hash as it
+    happens, so the per-block cost is the same whether the
+    exchange has a hundred accounts or ten thousand.
+
 ### Added
 
 - **Contention and interference benchmarks** (`crates/matcher`,

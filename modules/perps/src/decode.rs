@@ -12,16 +12,136 @@
 use super::{
     AccountState, Address, BTreeMap, DenseBook, MAX_FUNDING_RATE_BPS, MatchingEngine,
     OpenOrderResv, PerpsMarketConfig, PerpsModule, Position, Side, SignedQty, StagedPerps,
-    encode_perps_config, market_config_key, subtree_root,
+    encode_perps_config, market_config_key,
 };
+use framework::subtree_root_map;
+use primitives::Hash;
+
+/// The staged/live field bundle [`write_root_preimage`] consumes
+/// (7.4): folded maps contribute their maintained or recomputed
+/// fold root, serialized sections their fields — one struct for
+/// `state_root` (live `&CommittedMap` roots) and `inspect_state`
+/// (staged `fold_map` results).
+pub(crate) struct RootView<'a> {
+    /// The KV subtree's fold root.
+    pub store_fold: Hash,
+    /// One engine per market slot — header + `resting_fold`.
+    pub markets: &'a [Option<MatchingEngine>],
+    /// Perps market configs — serialized (market-scale).
+    pub configs: &'a BTreeMap<u8, PerpsMarketConfig>,
+    /// Mark prices — serialized (market-scale).
+    pub marks: &'a BTreeMap<u8, u64>,
+    /// `accounts`'s fold root — trader-scale.
+    pub accounts_fold: Hash,
+    /// Insurance fund balance.
+    pub insurance_fund: u64,
+    /// Intra-block oracle-update counters.
+    pub oracle_updates_this_block: &'a BTreeMap<u8, u8>,
+    /// Pending governance endorsements.
+    pub endorsements: &'a framework::Endorsements,
+    /// Last-accepted-mark height per market (v2 tail).
+    pub mark_updated_at: &'a BTreeMap<u8, u64>,
+    /// Liquidation-sweep cursor (v2 tail).
+    pub liquidation_cursor: Option<Address>,
+    /// Unpaid-loss liability (v3 tail).
+    pub unfunded_bad_debt: u64,
+    /// Queued funding rates (v4 tail).
+    pub pending_funding: &'a BTreeMap<u8, i64>,
+}
+
+/// The markets section for [`write_root_preimage`]: each market
+/// contributes the same canonical header `write_committed` emits —
+/// `write_canonical_header` is the shared definition — but the
+/// O(resting) entry list is replaced by the engine's maintained
+/// `resting_fold`.
+fn write_markets_root_section(
+    markets: &[Option<MatchingEngine>],
+    w: &mut framework::CanonicalState,
+) {
+    let mut header = Vec::new();
+    w.put_count(markets.len());
+    for engine in markets {
+        match engine {
+            Some(e) => {
+                w.put_u8(1);
+                header.clear();
+                e.write_canonical_header(&mut header);
+                w.put_bytes(&header);
+                w.put_root(&Hash(e.resting_fold()));
+            }
+            None => {
+                w.put_u8(0);
+            }
+        }
+    }
+}
+
+/// The incremental `state_root` preimage (7.4): every committed
+/// field appears exactly once, in `write_committed`'s section
+/// order — but the store, `accounts`, and the book's resting set
+/// contribute their fold roots instead of serializations.
+///
+/// This preimage is a NEW root format: `canon_root` of it differs
+/// from `canon_root` of `write_committed`'s bytes for the same
+/// state. The canonical stream remains the snapshot *install*
+/// payload; the root is what `state_root`/`inspect_state` agree
+/// on. KEEP IN SYNC with `write_committed`: a field added there
+/// must land here in the same position (serialized) or as a fold —
+/// a missed field is a silent root divergence.
+pub(crate) fn write_root_preimage(v: &RootView<'_>, w: &mut framework::CanonicalState) {
+    w.put_root(&v.store_fold);
+    write_markets_root_section(v.markets, w);
+    // configs / marks / oracle counters / mark ages / pending
+    // funding are market-scale — serialized as in write_committed.
+    w.put_count(v.configs.len());
+    for (market, cfg) in v.configs {
+        w.put_u8(*market);
+        w.put_u16(cfg.max_leverage);
+        w.put_u16(cfg.mmr_base_bps);
+    }
+    w.put_count(v.marks.len());
+    for (market, mark) in v.marks {
+        w.put_u8(*market);
+        w.put_u64(*mark);
+    }
+    w.put_root(&v.accounts_fold);
+    w.put_u64(v.insurance_fund);
+    w.put_count(v.oracle_updates_this_block.len());
+    for (market, n) in v.oracle_updates_this_block {
+        w.put_u8(*market);
+        w.put_u8(*n);
+    }
+    v.endorsements.write_canonical(w);
+    w.put_count(v.mark_updated_at.len());
+    for (market, updated) in v.mark_updated_at {
+        w.put_u8(*market);
+        w.put_u64(*updated);
+    }
+    match v.liquidation_cursor {
+        Some(addr) => {
+            w.put_u8(1);
+            w.put_addr(&addr);
+        }
+        None => {
+            w.put_u8(0);
+        }
+    }
+    w.put_u64(v.unfunded_bad_debt);
+    w.put_count(v.pending_funding.len());
+    for (market, rate) in v.pending_funding {
+        w.put_u8(*market);
+        w.put_i64(*rate);
+    }
+}
 
 impl PerpsModule {
-    /// Write the module's committed state into `w` — shared by
-    /// `state_root` and `export_state` so the snapshot blob's
-    /// canonical section is provably the same bytes `state_root`
-    /// hashes.
+    /// Write the module's committed state into `w` — the snapshot
+    /// blob's canonical section. `state_root` no longer hashes
+    /// this stream: it reads [`write_root_preimage`], which shares
+    /// the section order but folds the trader-scale and book
+    /// sections (7.4).
     pub(crate) fn write_committed(&self, w: &mut framework::CanonicalState) {
-        w.put_root(&subtree_root(&self.store));
+        w.put_root(&subtree_root_map(framework::lock_state(&self.store).inner()));
         let inner = framework::lock_state(&self.inner);
         // Live books: market config + order-id sequence + every
         // resting order (canonical order inside the engine encoding).
@@ -264,9 +384,14 @@ impl PerpsModule {
                 0 => markets.push(None),
                 1 => {
                     let bytes = r.get_bytes()?;
-                    markets.push(Some(
-                        MatchingEngine::from_canonical_state(bytes, |c| DenseBook::new(*c)).ok()?,
-                    ));
+                    let mut engine =
+                        MatchingEngine::from_canonical_state(bytes, |c| DenseBook::new(*c)).ok()?;
+                    // Enable the resting fold after decode so the
+                    // staged view's `resting_fold()` equals the live
+                    // engine's — the O(resting) re-fold is already
+                    // the cost profile of decode+re-encode here.
+                    engine.enable_resting_fold(crate::perps_book_leaf);
+                    markets.push(Some(engine));
                 }
                 _ => return None,
             }

@@ -11,6 +11,7 @@ use super::{
     Module, PerpsModule, TAG_APPLY_FUNDING, TAG_CANCEL, TAG_DEPOSIT, TAG_LIQUIDATE,
     TAG_LIST_MARKET, TAG_PLACE, TAG_SET_MARK, TAG_WITHDRAW, TxContext, module_id,
 };
+use crate::decode;
 
 impl Module for PerpsModule {
     fn name(&self) -> &'static str {
@@ -187,11 +188,14 @@ impl Module for PerpsModule {
             match inner.liquidation_cursor {
                 Some(cursor) => inner
                     .accounts
+                    .inner()
                     .range((std::ops::Bound::Excluded(cursor), std::ops::Bound::Unbounded))
                     .take(LIQUIDATION_SWEEP_BUDGET)
                     .map(|(addr, _)| *addr)
                     .collect(),
-                None => inner.accounts.keys().take(LIQUIDATION_SWEEP_BUDGET).copied().collect(),
+                None => {
+                    inner.accounts.inner().keys().take(LIQUIDATION_SWEEP_BUDGET).copied().collect()
+                }
             }
         };
 
@@ -227,8 +231,29 @@ impl Module for PerpsModule {
         //
         // Excluded: `fills` (per-call scratch), `ledger` /
         // `committee` (assembly wiring, not tx-mutated state).
+        //
+        // The root preimage is `write_root_preimage` (7.4): the
+        // store, `accounts`, and each book's resting set contribute
+        // maintained fold roots instead of serializations —
+        // `write_committed` remains the snapshot blob's payload.
+        let store = framework::lock_state(&self.store);
+        let inner = framework::lock_state(&self.inner);
+        let view = decode::RootView {
+            store_fold: store.root(),
+            markets: &inner.markets,
+            configs: &inner.configs,
+            marks: &inner.marks,
+            accounts_fold: inner.accounts.root(),
+            insurance_fund: inner.insurance_fund,
+            oracle_updates_this_block: &inner.oracle_updates_this_block,
+            endorsements: &self.endorsements,
+            mark_updated_at: &inner.mark_updated_at,
+            liquidation_cursor: inner.liquidation_cursor,
+            unfunded_bad_debt: inner.unfunded_bad_debt,
+            pending_funding: &inner.pending_funding,
+        };
         let mut w = framework::CanonicalState::new();
-        self.write_committed(&mut w);
+        decode::write_root_preimage(&view, &mut w);
         w.root()
     }
 
@@ -243,7 +268,10 @@ impl Module for PerpsModule {
             height: 0,
             entries: vec![(
                 framework::state_blob_key(),
-                framework::encode_state_blob(w.as_bytes(), &framework::lock_state(&self.store)),
+                framework::encode_state_blob(
+                    w.as_bytes(),
+                    framework::lock_state(&self.store).inner(),
+                ),
             )],
         })
     }
@@ -251,14 +279,36 @@ impl Module for PerpsModule {
     /// Verify a staged snapshot's claimed root without mutating:
     /// decode the blob, check the store section hashes to the
     /// committed subtree root, fully decode the fields with all
-    /// internal invariants enforced, then hash the canonical
-    /// preimage.
+    /// internal invariants enforced, then recompute the incremental
+    /// root over the staged state — folded maps fold over the
+    /// staged `BTreeMap`s (`fold_map`), folded books re-fold via
+    /// `decode_engines`, serialized sections serialize the staged
+    /// fields, so the result equals the `state_root` this state
+    /// would produce once installed.
     fn inspect_state(&self, snapshot: &storage::Snapshot) -> Result<Hash, storage::SnapshotError> {
         let slots = framework::lock_state(&self.inner).markets.len();
-        let (canon, _staged, _store) = framework::stage_blob_snapshot(snapshot, |r, store| {
-            Self::decode_committed(r, store, slots)
-        })?;
-        Ok(framework::canon_root(canon))
+        let (_canon, staged, store) =
+            framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
+        let view = decode::RootView {
+            store_fold: framework::CommittedStore::fold_map(&store, crate::perps_store_leaf),
+            markets: &staged.markets,
+            configs: &staged.configs,
+            marks: &staged.marks,
+            accounts_fold: framework::CommittedMap::fold_map(
+                &staged.accounts,
+                crate::accounts_leaf,
+            ),
+            insurance_fund: staged.insurance_fund,
+            oracle_updates_this_block: &staged.oracle_updates_this_block,
+            endorsements: &staged.endorsements,
+            mark_updated_at: &staged.mark_updated_at,
+            liquidation_cursor: staged.liquidation_cursor,
+            unfunded_bad_debt: staged.unfunded_bad_debt,
+            pending_funding: &staged.pending_funding,
+        };
+        let mut w = framework::CanonicalState::new();
+        decode::write_root_preimage(&view, &mut w);
+        Ok(w.root())
     }
 
     /// Install staged state after `inspect_state` has proven it —
@@ -268,12 +318,13 @@ impl Module for PerpsModule {
         let slots = framework::lock_state(&self.inner).markets.len();
         let (_canon, staged, store) =
             framework::stage_blob_snapshot(snapshot, |r, s| Self::decode_committed(r, s, slots))?;
-        *framework::lock_state(&self.store) = store;
+        *framework::lock_state(&self.store) =
+            framework::CommittedStore::from_map(store, crate::perps_store_leaf);
         let mut inner = framework::lock_state(&self.inner);
         inner.markets = staged.markets;
         inner.configs = staged.configs;
         inner.marks = staged.marks;
-        inner.accounts = staged.accounts;
+        inner.accounts = framework::CommittedMap::from_map(staged.accounts, crate::accounts_leaf);
         inner.insurance_fund = staged.insurance_fund;
         inner.oracle_updates_this_block = staged.oracle_updates_this_block;
         inner.mark_updated_at = staged.mark_updated_at;

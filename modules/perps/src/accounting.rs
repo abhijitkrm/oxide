@@ -47,8 +47,7 @@ impl PerpsModule {
         // order's remaining qty, which every fill consumes. The
         // uncovered tail is recomputed lazily at margin-evaluation
         // time, so only `qty` is updated here.
-        let maker_resv_done = {
-            let acct = Self::account_mut(inner, &fill.maker_owner);
+        let maker_resv_done = Self::with_account_mut(inner, &fill.maker_owner, |acct| {
             match acct.open_orders.get_mut(&(market, fill.maker_order_id.0)) {
                 Some(resv) => {
                     resv.qty = resv.qty.saturating_sub(fill.qty.0);
@@ -56,32 +55,32 @@ impl PerpsModule {
                 }
                 None => false,
             }
-        };
+        });
         if maker_resv_done {
-            let (cancel_remainder, keep) = {
-                let acct = Self::account_mut(inner, &fill.maker_owner);
-                let key = (market, fill.maker_order_id.0);
-                match acct.open_orders.get(&key) {
-                    // Reduce-only enforcement: if the remaining qty
-                    // now exceeds what the live position can still
-                    // reduce, the remainder could add exposure —
-                    // cancel it (standard reduce-only semantics).
-                    Some(resv) if resv.reduce_only && resv.qty > 0 => {
-                        let covered = match acct.positions.get(&market) {
-                            Some(p)
-                                if (p.size.is_long() && resv.side == Side::Sell)
-                                    || (p.size.is_short() && resv.side == Side::Buy) =>
-                            {
-                                p.size.abs_qty().0.min(resv.qty)
-                            }
-                            _ => 0,
-                        };
-                        (resv.qty > covered, resv.qty <= covered)
+            let (cancel_remainder, keep) =
+                Self::with_account_mut(inner, &fill.maker_owner, |acct| {
+                    let key = (market, fill.maker_order_id.0);
+                    match acct.open_orders.get(&key) {
+                        // Reduce-only enforcement: if the remaining qty
+                        // now exceeds what the live position can still
+                        // reduce, the remainder could add exposure —
+                        // cancel it (standard reduce-only semantics).
+                        Some(resv) if resv.reduce_only && resv.qty > 0 => {
+                            let covered = match acct.positions.get(&market) {
+                                Some(p)
+                                    if (p.size.is_long() && resv.side == Side::Sell)
+                                        || (p.size.is_short() && resv.side == Side::Buy) =>
+                                {
+                                    p.size.abs_qty().0.min(resv.qty)
+                                }
+                                _ => 0,
+                            };
+                            (resv.qty > covered, resv.qty <= covered)
+                        }
+                        Some(resv) => (false, resv.qty > 0),
+                        None => (false, false),
                     }
-                    Some(resv) => (false, resv.qty > 0),
-                    None => (false, false),
-                }
-            };
+                });
             if cancel_remainder
                 && let Some(engine) =
                     inner.markets.get_mut(usize::from(market)).and_then(Option::as_mut)
@@ -94,8 +93,9 @@ impl PerpsModule {
                 });
             }
             if !keep || cancel_remainder {
-                let acct = Self::account_mut(inner, &fill.maker_owner);
-                acct.open_orders.remove(&(market, fill.maker_order_id.0));
+                Self::with_account_mut(inner, &fill.maker_owner, |acct| {
+                    acct.open_orders.remove(&(market, fill.maker_order_id.0));
+                });
             }
         }
     }
@@ -119,8 +119,7 @@ impl PerpsModule {
         events: &mut Vec<Event>,
     ) {
         let mut realized_scale6: i128 = 0;
-        {
-            let acct = Self::account_mut(inner, account);
+        Self::with_account_mut(inner, account, |acct| {
             let pos = acct.positions.entry(market).or_default();
             let old_size = pos.size;
             // Saturating is a deliberate bound, not error handling:
@@ -167,7 +166,7 @@ impl PerpsModule {
             if new_size.is_flat() {
                 pos.entry_price = 0;
             }
-        }
+        });
 
         // Settle realized PnL into the backing margin bucket — a
         // separate pass because settlement may touch the insurance
@@ -225,8 +224,7 @@ impl PerpsModule {
             }
         } else {
             let mut bad_debt: u64 = 0;
-            {
-                let acct = Self::account_mut(inner, account);
+            Self::with_account_mut(inner, account, |acct| {
                 let iso_backed = acct
                     .positions
                     .get(&market)
@@ -263,7 +261,7 @@ impl PerpsModule {
                     }
                     bad_debt = loss;
                 }
-            }
+            });
             if bad_debt > 0 {
                 // The account's collateral is exhausted — the
                 // insurance fund is the designated backstop. What

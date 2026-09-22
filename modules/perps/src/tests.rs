@@ -182,11 +182,16 @@ fn apply_funding_requires_committee_quorum() {
     perps.handle(&ctx(3), &msg::deposit(CROSS_MARGIN_MARKET, 500_000)).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(3));
-        acct.positions.insert(
-            mid,
-            Position { size: SignedQty(1_000_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(3), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(1_000_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            );
+        });
     }
 
     let events = perps.handle(&ctx(1), &msg::apply_funding(mid, 1)).unwrap();
@@ -216,11 +221,16 @@ fn funding_applies_only_at_period_boundary() {
     perps.handle(&ctx(3), &msg::deposit(CROSS_MARGIN_MARKET, 500_000)).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(3));
-        acct.positions.insert(
-            mid,
-            Position { size: SignedQty(1_000_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(3), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(1_000_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            );
+        });
     }
     for v in 1..=2u8 {
         perps.handle(&ctx(v), &msg::apply_funding(mid, 1)).unwrap();
@@ -340,20 +350,26 @@ fn funding_long_pays_short() {
     // (1_000_000 qty units = 1 base unit in scale-6.)
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct1 = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct1.positions.insert(
-            mid,
-            Position { size: SignedQty(1_000_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
-        let acct2 = PerpsModule::account_mut(&mut inner, &addr(2));
-        acct2.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-1_000_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 0,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct1| {
+            acct1.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(1_000_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            );
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |acct2| {
+            acct2.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-1_000_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            );
+        });
     }
 
     // Apply funding: rate = +1 bps (longs pay shorts).
@@ -394,24 +410,26 @@ fn drained_isolated_wallet_demotes_to_cross_routing() {
     perps.handle(&ctx(2), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000_000)).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct1 = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct1.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(1_000_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 1_500,
-            },
-        );
-        let acct2 = PerpsModule::account_mut(&mut inner, &addr(2));
-        acct2.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-1_000_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 0,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct1| {
+            acct1.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(1_000_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 1_500,
+                },
+            );
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |acct2| {
+            acct2.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-1_000_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            );
+        });
     }
 
     // Round 1: long owes 1_500 — exactly drains the isolated
@@ -420,7 +438,7 @@ fn drained_isolated_wallet_demotes_to_cross_routing() {
     perps.apply_funding(mid, 1).unwrap();
     {
         let inner = framework::lock_state(&perps.inner);
-        let pos = inner.accounts[&addr(1)].positions[&mid];
+        let pos = inner.accounts.inner()[&addr(1)].positions[&mid];
         assert_eq!(pos.isolated_margin, 0, "wallet drained exactly");
         assert_eq!(pos.margin_class(), MarginClass::Cross, "drained wallet demotes");
     }
@@ -447,15 +465,16 @@ fn liquidation_closes_underwater_position() {
     perps.handle(&ctx(1), &msg::deposit(mid, 100_000)).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(1_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(1_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 100_000,
+                },
+            );
+        });
     }
 
     // Mark drops to 1.0B:
@@ -472,15 +491,16 @@ fn liquidation_closes_underwater_position() {
     // Now set a much larger position (100_000 qty = 0.1 base units).
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 100_000,
+                },
+            );
+        });
     }
     // PnL (scale-14) = 100_000 * (1.0B - 1.5B) = -50_000_000_000_000
     // PnL (scale-6)  = -500_000
@@ -661,11 +681,12 @@ fn setup_with_position(margin: u64, size: i64, entry: u64) -> (PerpsModule, u8, 
     let acct_addr = addr(1);
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &acct_addr);
-        acct.positions.insert(
-            mid,
-            Position { size: SignedQty(size), entry_price: entry, isolated_margin: margin },
-        );
+        PerpsModule::with_account_mut(&mut inner, &acct_addr, |acct| {
+            acct.positions.insert(
+                mid,
+                Position { size: SignedQty(size), entry_price: entry, isolated_margin: margin },
+            );
+        });
     }
     (perps, mid, acct_addr)
 }
@@ -804,15 +825,16 @@ fn adl_triggers_on_insurance_fund_depletion() {
     perps.handle(&ctx(1), &msg::deposit(mid, 100_000)).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 100_000,
+                },
+            );
+        });
     }
 
     // Account 2: profitable short (counterparty, will be ADL'd).
@@ -820,15 +842,16 @@ fn adl_triggers_on_insurance_fund_depletion() {
     perps.handle(&ctx(2), &msg::deposit(mid, 100_000)).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(2));
-        acct.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 100_000,
+                },
+            );
+        });
     }
 
     // Set insurance fund to 0 so any shortfall triggers ADL.
@@ -859,43 +882,46 @@ fn adl_ranks_by_profit_descending() {
     // Account 1: underwater long (will be liquidated).
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(200_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 50_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(200_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 50_000,
+                },
+            );
+        });
     }
 
     // Account 2: slightly profitable short.
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(2));
-        acct.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-100_000),
-                entry_price: 1_400_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-100_000),
+                    entry_price: 1_400_000_000,
+                    isolated_margin: 100_000,
+                },
+            );
+        });
     }
 
     // Account 3: more profitable short (larger position, same entry).
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(3));
-        acct.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-200_000),
-                entry_price: 1_400_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(3), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-200_000),
+                    entry_price: 1_400_000_000,
+                    isolated_margin: 100_000,
+                },
+            );
+        });
     }
 
     // Zero insurance fund.
@@ -924,24 +950,26 @@ fn adl_is_deterministic() {
     // Setup: underwater long + profitable short counterparty.
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct1 = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct1.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 50_000,
-            },
-        );
-        let acct2 = PerpsModule::account_mut(&mut inner, &addr(2));
-        acct2.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-100_000),
-                entry_price: 1_400_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct1| {
+            acct1.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 50_000,
+                },
+            );
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |acct2| {
+            acct2.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-100_000),
+                    entry_price: 1_400_000_000,
+                    isolated_margin: 100_000,
+                },
+            );
+        });
         inner.insurance_fund = 0;
     }
 
@@ -1089,7 +1117,7 @@ fn deposit_overflow_rejected_ledger_untouched() {
     // Push cross margin near u64::MAX directly.
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &addr(1)).cross_margin = u64::MAX - 100;
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |a| a.cross_margin = u64::MAX - 100);
     }
 
     // Deposit 500 → margin would overflow → reject, ledger intact.
@@ -1147,18 +1175,26 @@ fn funding_zero_sum_when_payer_insolvent() {
 
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
-            mid,
-            Position { size: SignedQty(1_000_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
-        PerpsModule::account_mut(&mut inner, &addr(2)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-1_000_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 0,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(1_000_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            )
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-1_000_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            )
+        });
     }
 
     // Funding owed by the long = 1_500 (same math as
@@ -1408,11 +1444,16 @@ fn liquidation_cancels_resting_orders() {
     // far below maintenance → liquidation must fire.
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct.positions.insert(
-            mid,
-            Position { size: SignedQty(100_000), entry_price: 2_000_000_000, isolated_margin: 0 },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(100_000),
+                    entry_price: 2_000_000_000,
+                    isolated_margin: 0,
+                },
+            );
+        });
     }
     perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
     let events = perps.liquidation_check(&addr(1)).unwrap();
@@ -1713,11 +1754,16 @@ fn position_cover_is_allocated_once_across_opposing_orders() {
     // +10-lot long at the mark — no PnL, isolated margin 0.
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct.positions.insert(
-            mid,
-            Position { size: SignedQty(10_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(10_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            );
+        });
     }
     // Equity covers the position IM (15_000) with headroom, but
     // not position IM + a fresh 10-lot exposure (≈11_000+).
@@ -1746,23 +1792,28 @@ fn open_order_im_allocates_cover_once() {
     let im = {
         let mut inner = framework::lock_state(&perps.inner);
         let configs = inner.configs.clone();
-        let acct = PerpsModule::account_mut(&mut inner, &addr(1));
-        acct.positions.insert(
-            mid,
-            Position { size: SignedQty(10_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
-        for (oid, ticks) in [(1u64, 100u64), (2, 200)] {
-            acct.open_orders.insert(
-                (mid, oid),
-                super::OpenOrderResv {
-                    qty: 10_000,
-                    price: 1_000_000_000 + ticks * 1_000_000,
-                    side: Side::Sell,
-                    reduce_only: false,
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(10_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
                 },
             );
-        }
-        acct.total_open_order_im(&configs)
+            for (oid, ticks) in [(1u64, 100u64), (2, 200)] {
+                acct.open_orders.insert(
+                    (mid, oid),
+                    super::OpenOrderResv {
+                        qty: 10_000,
+                        price: 1_000_000_000 + ticks * 1_000_000,
+                        side: Side::Sell,
+                        reduce_only: false,
+                    },
+                );
+            }
+        });
+        inner.accounts.get(&addr(1)).unwrap().total_open_order_im(&configs)
     };
     // Cover pool = 10_000 → retires the cheaper sell (1.1e9);
     // exposed tail = 10_000 × 1.2e9 / lev(10) / 1e8 = 12_000.
@@ -1806,6 +1857,53 @@ fn state_snapshot_rejects_corruption() {
     snapshot.entries[0].1.truncate(12);
     assert!(src.inspect_state(&snapshot).is_err());
     assert!(PerpsModule::new().import_state(&snapshot).is_err());
+}
+
+/// Fold lockstep (7.4): `accounts`'s maintained root must equal
+/// the authoritative O(n) recompute after every mutation shape —
+/// deposit, rest (`open_orders`), fill (positions + reservation
+/// decrement), cancel, and margin withdraw — plus the store fold.
+/// A mutation path that skipped `insert` would leave the fold
+/// stale and this test would catch it.
+#[test]
+fn committed_folds_track_account_and_book_mutations() {
+    let perps = PerpsModule::new();
+    let mid = perps.list_market(test_cfg()).unwrap();
+
+    let assert_locked = |perps: &PerpsModule| {
+        let store = framework::lock_state(&perps.store);
+        assert_eq!(store.root(), store.recomputed_root(), "store fold must stay in lockstep");
+        let inner = framework::lock_state(&perps.inner);
+        assert_eq!(
+            inner.accounts.root(),
+            inner.accounts.recomputed_root(),
+            "accounts fold must stay in lockstep"
+        );
+    };
+
+    // Deposits create + credit accounts.
+    perps.handle(&ctx(1), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+    perps.handle(&ctx(9), &msg::deposit(super::CROSS_MARGIN_MARKET, 500_000)).unwrap();
+    assert_locked(&perps);
+
+    // Resting sells write open_order reservations; the crossing
+    // buy fills one and rests nothing.
+    perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 500, 2, 9))).unwrap();
+    perps.handle(&ctx(9), &msg::place(mid, limit(Side::Sell, 700, 3, 9))).unwrap();
+    perps.handle(&ctx(1), &msg::place(mid, limit(Side::Buy, 500, 1, 1))).unwrap();
+    assert_locked(&perps);
+
+    // Cancel the remaining resting order — reservation removal
+    // must fold the account.
+    perps.handle(&ctx(9), &msg::cancel(mid, trading::OrderId(1))).unwrap();
+    assert_locked(&perps);
+
+    // Isolated-margin deposit + withdraw touch nested position
+    // fields — the account-level leaf must still track.
+    perps.handle(&ctx(1), &msg::deposit(mid, 50_000)).unwrap();
+    assert_locked(&perps);
+    perps.handle(&ctx(1), &msg::withdraw(mid, 10_000)).unwrap();
+    assert_locked(&perps);
 }
 
 // ── Live-pipeline liquidation + oracle staleness ─────────────
@@ -1931,7 +2029,7 @@ fn end_block_sweep_cursor_advances_and_wraps() {
     {
         let mut inner = framework::lock_state(&perps.inner);
         for n in 1u8..=33 {
-            PerpsModule::account_mut(&mut inner, &addr(n));
+            PerpsModule::with_account_mut(&mut inner, &addr(n), |_| {});
         }
     }
     // Block 1: first 32 accounts checked.
@@ -2017,22 +2115,26 @@ fn liquidation_transfers_position_to_clearing_account() {
     // Long + short counterparties — the book nets to zero.
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 50_000,
-            },
-        );
-        PerpsModule::account_mut(&mut inner, &addr(2)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 50_000,
+                },
+            )
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 100_000,
+                },
+            )
+        });
         // A funded insurance fund covers the loss outright —
         // no ADL, so the transfer is isolated for the assertion.
         inner.insurance_fund = 1_000_000;
@@ -2062,22 +2164,26 @@ fn adl_clawed_exposure_transfers_to_clearing() {
     let mid = perps.list_market(test_cfg()).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 50_000,
-            },
-        );
-        PerpsModule::account_mut(&mut inner, &addr(2)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 50_000,
+                },
+            )
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 100_000,
+                },
+            )
+        });
         inner.insurance_fund = 0;
     }
     perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
@@ -2103,10 +2209,16 @@ fn bad_debt_residual_becomes_tracked_liability() {
     let mid = perps.list_market(test_cfg()).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
-            mid,
-            Position { size: SignedQty(1_000), entry_price: 1_500_000_000, isolated_margin: 10 },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(1_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 10,
+                },
+            )
+        });
         inner.insurance_fund = 0;
     }
     // Realize a loss far beyond margin with no profitable
@@ -2189,10 +2301,16 @@ fn liquidation_check_noops_on_clearing_account() {
     let mid = perps.list_market(test_cfg()).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
-            mid,
-            Position { size: SignedQty(100_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
+        PerpsModule::with_account_mut(&mut inner, &CLEARING_ACCOUNT, |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            )
+        });
     }
     perps.set_mark_price_unchecked(mid, 1_000_000_000).unwrap();
     let events = perps.liquidation_check(&CLEARING_ACCOUNT).unwrap();
@@ -2216,18 +2334,22 @@ fn end_block_unwinds_clearing_inventory() {
     // the seized long's original counterparty is still short.
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
-            mid,
-            Position { size: SignedQty(5_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
-        PerpsModule::account_mut(&mut inner, &addr(3)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-5_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 50_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &CLEARING_ACCOUNT, |a| {
+            a.positions.insert(
+                mid,
+                Position { size: SignedQty(5_000), entry_price: 1_500_000_000, isolated_margin: 0 },
+            )
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(3), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-5_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 50_000,
+                },
+            )
+        });
     }
     assert_eq!(net_position(&perps, mid), 0);
     // A buyer rests a bid at mark.
@@ -2268,18 +2390,22 @@ fn unwind_pays_bounded_slippage_when_book_gaps() {
     let mid = perps.list_market(test_cfg()).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
-            mid,
-            Position { size: SignedQty(5_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
-        PerpsModule::account_mut(&mut inner, &addr(3)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-5_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 50_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &CLEARING_ACCOUNT, |a| {
+            a.positions.insert(
+                mid,
+                Position { size: SignedQty(5_000), entry_price: 1_500_000_000, isolated_margin: 0 },
+            )
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(3), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-5_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 50_000,
+                },
+            )
+        });
         inner.insurance_fund = 10_000;
     }
     // The bid rests ~0.67% below the 1.5B mark — inside the 1%
@@ -2314,18 +2440,22 @@ fn unwind_does_not_sweep_beyond_the_allowance() {
     let mid = perps.list_market(test_cfg()).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
-            mid,
-            Position { size: SignedQty(5_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
-        PerpsModule::account_mut(&mut inner, &addr(3)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-5_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 50_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &CLEARING_ACCOUNT, |a| {
+            a.positions.insert(
+                mid,
+                Position { size: SignedQty(5_000), entry_price: 1_500_000_000, isolated_margin: 0 },
+            )
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(3), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-5_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 50_000,
+                },
+            )
+        });
     }
     perps.handle(&ctx(2), &msg::deposit(CROSS_MARGIN_MARKET, 10_000_000)).unwrap();
     // Bid at 1.4B — ~6.7% below mark, under the 1.485B floor.
@@ -2352,18 +2482,26 @@ fn unwind_short_inventory_buys_up_to_the_cap() {
     let mid = perps.list_market(test_cfg()).unwrap();
     {
         let mut inner = framework::lock_state(&perps.inner);
-        PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
-            mid,
-            Position { size: SignedQty(-5_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
-        PerpsModule::account_mut(&mut inner, &addr(3)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(5_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 50_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &CLEARING_ACCOUNT, |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-5_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 0,
+                },
+            )
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(3), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(5_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 50_000,
+                },
+            )
+        });
         inner.insurance_fund = 10_000;
     }
     // Ask at 1.51B — ~0.67% above the 1.5B mark, inside the
@@ -2397,22 +2535,26 @@ fn adl_claw_is_lot_aligned() {
         let mut inner = framework::lock_state(&perps.inner);
         // Long 100 lots at 1.5B with 480k margin; short
         // counterparty at the same entry.
-        PerpsModule::account_mut(&mut inner, &addr(1)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 480_000,
-            },
-        );
-        PerpsModule::account_mut(&mut inner, &addr(2)).positions.insert(
-            mid,
-            Position {
-                size: SignedQty(-100_000),
-                entry_price: 1_500_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &addr(1), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 480_000,
+                },
+            )
+        });
+        PerpsModule::with_account_mut(&mut inner, &addr(2), |a| {
+            a.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(-100_000),
+                    entry_price: 1_500_000_000,
+                    isolated_margin: 100_000,
+                },
+            )
+        });
         inner.insurance_fund = 0;
     }
     // Mark 1.01B: the long's loss is 100_000 × 0.49e9 / 1e8 =
@@ -2447,10 +2589,12 @@ fn state_snapshot_round_trips_unfunded_debt_and_clearing() {
     {
         let mut inner = framework::lock_state(&src.inner);
         inner.unfunded_bad_debt = 42_000;
-        PerpsModule::account_mut(&mut inner, &CLEARING_ACCOUNT).positions.insert(
-            mid,
-            Position { size: SignedQty(7_000), entry_price: 1_500_000_000, isolated_margin: 0 },
-        );
+        PerpsModule::with_account_mut(&mut inner, &CLEARING_ACCOUNT, |a| {
+            a.positions.insert(
+                mid,
+                Position { size: SignedQty(7_000), entry_price: 1_500_000_000, isolated_margin: 0 },
+            )
+        });
     }
     let snapshot = src.export_state().expect("perps exports state");
     assert_eq!(src.inspect_state(&snapshot).unwrap(), src.state_root());
@@ -2505,15 +2649,16 @@ fn oracle_outage_and_recovery_through_real_pipeline() {
     let victim = addr(9);
     {
         let mut inner = framework::lock_state(&perps.inner);
-        let acct = PerpsModule::account_mut(&mut inner, &victim);
-        acct.positions.insert(
-            mid,
-            Position {
-                size: SignedQty(50_000),
-                entry_price: 1_900_000_000,
-                isolated_margin: 100_000,
-            },
-        );
+        PerpsModule::with_account_mut(&mut inner, &victim, |acct| {
+            acct.positions.insert(
+                mid,
+                Position {
+                    size: SignedQty(50_000),
+                    entry_price: 1_900_000_000,
+                    isolated_margin: 100_000,
+                },
+            );
+        });
     }
 
     // ── Healthy: three validators submit → quorum → the mark

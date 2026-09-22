@@ -10,9 +10,9 @@
 use super::{
     AccountState, Address, BACKSTOP_UNWIND_SLIPPAGE_BPS, BTreeMap, CLEARING_ACCOUNT,
     CROSS_MARGIN_MARKET, Event, ExecError, FLAG_REDUCE_ONLY, FillEvent, Inner,
-    MAX_FUNDING_RATE_BPS, MAX_MARK_STALENESS_BLOCKS, NewOrder, OpenOrderResv, OrderOutcome,
-    OrderType, PRICE_SCALE, PerpsModule, Price, Qty, ReduceOnlyCap, Side, SignedQty, StpMode,
-    TimeInForce, TradingError, TxContext, cancel_event, fill_event, outcome_event,
+    MAX_FUNDING_RATE_BPS, MAX_MARK_STALENESS_BLOCKS, NewOrder, OpenOrderResv, OrderId,
+    OrderOutcome, OrderType, PRICE_SCALE, PerpsModule, Price, Qty, ReduceOnlyCap, Side, SignedQty,
+    StpMode, TimeInForce, TradingError, TxContext, cancel_event, fill_event, outcome_event,
 };
 
 impl PerpsModule {
@@ -254,10 +254,15 @@ impl PerpsModule {
         // a remainder that outlives its cover is canceled at the next
         // maker fill.
         if let OrderOutcome::Resting { order_id, price, resting_qty } = outcome {
-            let acct = Self::account_mut(&mut inner, &ctx.sender);
-            acct.open_orders.insert(
-                (market, order_id.0),
-                OpenOrderResv { qty: resting_qty.0, price: price.0, side: order.side, reduce_only },
+            Self::record_resting_reservation(
+                &mut inner,
+                market,
+                ctx.sender,
+                order_id,
+                price,
+                resting_qty,
+                order.side,
+                reduce_only,
             );
         }
         let mut events = Vec::with_capacity(fills_owned.len() + 1);
@@ -270,24 +275,34 @@ impl PerpsModule {
             Self::apply_fill_to_position(&mut inner, market, f, &mut events);
         }
 
-        // Post-trade margin check — the taker AND every maker whose
-        // position the fills changed. A maker fill can push the
-        // maker under water (realized loss, or a flip into exposure
-        // it cannot cover); the check is uniform for every account
-        // the trade touched.
-        Self::margin_check(&mut inner, &ctx.sender, market, &mut events);
-        let mut checked: Vec<Address> = Vec::with_capacity(fills_owned.len());
-        for f in &fills_owned {
-            let maker = f.maker_owner;
-            if maker != ctx.sender && !checked.contains(&maker) {
-                checked.push(maker);
-                Self::margin_check(&mut inner, &maker, market, &mut events);
-            }
-        }
+        Self::margin_check_trade_parties(&mut inner, ctx, market, &fills_owned, &mut events);
 
         events.push(outcome_event(market, outcome));
         Self::emit_removal_events(market, &removed, &mut events);
         Ok(events)
+    }
+
+    /// Post-trade margin check — the taker AND every maker whose
+    /// position the fills changed. A maker fill can push the
+    /// maker under water (realized loss, or a flip into exposure
+    /// it cannot cover); the check is uniform for every account
+    /// the trade touched.
+    fn margin_check_trade_parties(
+        inner: &mut Inner,
+        ctx: &TxContext,
+        market: u8,
+        fills_owned: &[FillEvent],
+        events: &mut Vec<Event>,
+    ) {
+        Self::margin_check(inner, &ctx.sender, market, events);
+        let mut checked: Vec<Address> = Vec::with_capacity(fills_owned.len());
+        for f in fills_owned {
+            let maker = f.maker_owner;
+            if maker != ctx.sender && !checked.contains(&maker) {
+                checked.push(maker);
+                Self::margin_check(inner, &maker, market, events);
+            }
+        }
     }
 
     /// Release reservations for makers the sweep removed or
@@ -300,14 +315,38 @@ impl PerpsModule {
         removed: &[trading::MakerRemoval],
     ) {
         for r in removed {
-            if let Some(acct) = inner.accounts.get_mut(&r.owner) {
+            if let Some(mut acct) = inner.accounts.get(&r.owner).cloned() {
                 if r.remaining == 0 {
                     acct.open_orders.remove(&(market, r.order_id.0));
                 } else if let Some(resv) = acct.open_orders.get_mut(&(market, r.order_id.0)) {
                     resv.qty = r.remaining;
                 }
+                inner.accounts.insert(r.owner, acct);
             }
         }
+    }
+
+    /// Record a resting remainder's margin reservation — extracted
+    /// from `handle_place` so the place path stays under the
+    /// function-length gate. The fold-safe `with_account_mut`
+    /// carries the account in and out of the committed map.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_resting_reservation(
+        inner: &mut Inner,
+        market: u8,
+        owner: Address,
+        order_id: OrderId,
+        price: Price,
+        resting_qty: Qty,
+        side: Side,
+        reduce_only: bool,
+    ) {
+        Self::with_account_mut(inner, &owner, |acct| {
+            acct.open_orders.insert(
+                (market, order_id.0),
+                OpenOrderResv { qty: resting_qty.0, price: price.0, side, reduce_only },
+            );
+        });
     }
 
     /// Emit one event per non-fill book change the sweep applied:
@@ -354,8 +393,9 @@ impl PerpsModule {
             // (e.g. an STP-cancelled order the module was never told
             // about), drop it now — the reservation ledger heals
             // itself on contact.
-            if let Some(acct) = inner.accounts.get_mut(&ctx.sender) {
+            if let Some(mut acct) = inner.accounts.get(&ctx.sender).cloned() {
                 acct.open_orders.remove(&(market, order_id.0));
+                inner.accounts.insert(ctx.sender, acct);
             }
             return Err(ExecError::ModuleRejected("cancel: order not found".to_string()));
         }
@@ -364,8 +404,9 @@ impl PerpsModule {
                 // Release the margin reservation — removing the entry
                 // IS the release; `total_open_order_im` recomputes
                 // from live entries.
-                if let Some(acct) = inner.accounts.get_mut(&ctx.sender) {
+                if let Some(mut acct) = inner.accounts.get(&ctx.sender).cloned() {
                     acct.open_orders.remove(&(market, order_id.0));
+                    inner.accounts.insert(ctx.sender, acct);
                 }
                 Ok(vec![cancel_event(market, canceled)])
             }
@@ -394,7 +435,7 @@ impl PerpsModule {
     ) -> Result<Vec<Event>, ExecError> {
         let (market, amount) = Self::parse_margin(body).ok_or(ExecError::Malformed)?;
         let mut inner = framework::lock_state(&self.inner);
-        let acct = Self::account_mut(&mut inner, &ctx.sender);
+        let mut acct = inner.accounts.get(&ctx.sender).cloned().unwrap_or_default();
         let balance = if market == CROSS_MARGIN_MARKET {
             &mut acct.cross_margin
         } else {
@@ -409,6 +450,10 @@ impl PerpsModule {
             ledger.debit(&ctx.sender, amount)?;
         }
         *balance = new_balance;
+        // Fold the credited account back — the `?` exits above
+        // never reach this insert, so a rejected debit leaves the
+        // account untouched exactly as before.
+        inner.accounts.insert(ctx.sender, acct);
         drop(inner);
         Ok(vec![Event { module: "perps", kind: "deposit", data: vec![market] }])
     }
@@ -490,12 +535,13 @@ impl PerpsModule {
         if let Some(ledger) = &self.ledger {
             ledger.credit(&ctx.sender, amount)?;
         }
-        let acct = Self::account_mut(&mut inner, &ctx.sender);
-        if market == CROSS_MARGIN_MARKET {
-            acct.cross_margin -= amount;
-        } else {
-            acct.positions.entry(market).or_default().isolated_margin -= amount;
-        }
+        Self::with_account_mut(&mut inner, &ctx.sender, |acct| {
+            if market == CROSS_MARGIN_MARKET {
+                acct.cross_margin -= amount;
+            } else {
+                acct.positions.entry(market).or_default().isolated_margin -= amount;
+            }
+        });
         drop(inner);
         Ok(vec![Event { module: "perps", kind: "withdraw", data: vec![market] }])
     }

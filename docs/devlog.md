@@ -19380,3 +19380,65 @@ Perps is the remaining book consumer: its `state_root` still
 hashes `write_committed` whole (no `RootView` split yet), and its
 `accounts` values are nested `AccountState`s — both pieces of its
 migration are a separate slice.
+
+## Session N+20 — perps committed state joins the fold
+
+§7.4's perps residual is closed. Two pieces, as predicted: the
+flat swaps (KV store → `CommittedStore`, per-market engines →
+`enable_resting_fold` with a perps-side leaf over the same entry
+record the canonical stream emits) were mechanical; `accounts`
+was the real design point.
+
+`CommittedMap<Address, AccountState>` uses account-granularity
+leaves: `MAP_TAG_ACCOUNTS` over the account's own canonical
+encoding — cross-margin, every position, every order
+reservation. One leaf commits the whole nested `AccountState`,
+which is the right granularity: mutations already funnel through
+`with_account_mut`, now clone-mutate-insert through the
+fold-maintaining API, so the fold can't drift from the map
+contents. Flattening the nested maps into top-level committed
+maps would have widened the mutation surface for no gain — an
+account is written as a unit in every handler anyway.
+
+The `RootView`/`write_root_preimage` schema in `decode.rs` is
+the single definition all three root consumers share: live
+`state_root` feeds maintained fold roots, staged `inspect_state`
+feeds `fold_map` results over the decoded maps, `import_state`
+rebuilds the committed containers via `from_map`. Snapshot blobs
+are unchanged — still `write_committed`'s full canonical
+serialization — so `inspect_state`'s staged decode verifies the
+same root a peer computed live, and install lands the identical
+state with folds already in lockstep. `decode_engines` enables
+the fold on every staged engine, so book folds read identically
+on both views.
+
+Test migration was the bulk of the diff: ~39 test sites touched
+`accounts` through `entry`/`get_mut`/indexing that no longer
+exists — chains went through a scripted transform to
+`with_account_mut(..., |acct| ...)` closures, and `let acct =`
+binding sites became closure bodies plus `get` reads.
+`handle_place` crossed the 100-line clippy gate once the
+reservation writes moved into the closure; the
+reservation-recording tail extracted to a helper.
+
+`committed_folds_track_account_and_book_mutations` pins the
+invariant through real handler flows — deposit, rest, fill,
+cancel, withdraw — asserting every maintained fold equals an
+authoritative `fold_map`/`recomputed_root` recompute after each
+step. The existing snapshot round-trip test (listed market,
+funded accounts, positions, resting orders) covers
+`inspect_state == state_root` end to end on the new schema.
+
+`perps_settlement`'s new `state_root_vs_accounts` group carries
+the scaling gate: `state_root` holds ~1.15 µs flat at
+100/1k/10k funded accounts (+n/10 resting orders) while the
+`{n}_full_walk` sibling rows — `export_state`, the same
+canonical serialization the old root hashed per block — scale
+linearly at ~3.2/9.9/64.9 µs. −98% at 10k and flat in
+population; the kept `_full_walk` rows are the standing
+displaced-baseline comparison.
+
+Still open for 7.4: only the EVM account trie's once-per-process
+O(population) leaf-map cold-build — per-block roots were already
+incremental; the ~14 ms at 100k accounts in `block_pipeline`'s
+`accounts` row is the residual.

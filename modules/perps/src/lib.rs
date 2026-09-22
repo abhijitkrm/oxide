@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use executor::{Event, ExecError, Module, TxContext};
-use framework::{KVStore, module_id, subtree_root};
+use framework::{CommittedStore, module_id};
 use primitives::fixed::{Price, Qty, SignedQty};
 use primitives::{Address, Hash, Height};
 use trading::{
@@ -578,10 +578,67 @@ impl AccountState {
 
 // ── Module ───────────────────────────────────────────────────────────
 
+/// Fold-map tags domain-separating each committed map's leaves
+/// (`Domain::CommittedLeaf ‖ tag ‖ preimage`). Numbering is
+/// per-module — exchange tags live in a different leaf namespace,
+/// so perps numbers its own from 1.
+const MAP_TAG_STORE: u64 = 1;
+const MAP_TAG_ACCOUNTS: u64 = 2;
+const MAP_TAG_BOOK: u64 = 3;
+
+/// The committed KV-subtree leaf — the same record shape
+/// `subtree_root_map` folds sequentially.
+// The `fn(&K, &V) -> Hash` signature is fixed by `CommittedMap`'s
+// leaf slot — borrowing `Vec<u8>` is the uniform shape, not a
+// style choice.
+#[allow(clippy::ptr_arg)]
+fn perps_store_leaf(k: &Vec<u8>, v: &Vec<u8>) -> Hash {
+    framework::committed_store_leaf(MAP_TAG_STORE, k, v)
+}
+
+/// `(owner ‖ cross_margin ‖ positions ‖ open_orders)` — the same
+/// field order `write_committed` serializes per account, so the
+/// fold commits exactly the information the flat section did. The
+/// leaf granularity is the whole `AccountState`: any mutation to a
+/// position or reservation refolds the account — O(markets), the
+/// same order the account's own serialization already costs.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn accounts_leaf(k: &Address, v: &AccountState) -> Hash {
+    let mut w = framework::CanonicalState::new();
+    w.put_addr(k).put_u64(v.cross_margin);
+    w.put_count(v.positions.len());
+    for (market, pos) in &v.positions {
+        w.put_u8(*market)
+            .put_i64(pos.size.get())
+            .put_u64(pos.entry_price)
+            .put_u64(pos.isolated_margin);
+    }
+    w.put_count(v.open_orders.len());
+    for ((market, oid), resv) in &v.open_orders {
+        w.put_u8(*market)
+            .put_u64(*oid)
+            .put_u64(resv.qty)
+            .put_u64(resv.price)
+            .put_u8(resv.side as u8)
+            .put_bool(resv.reduce_only);
+    }
+    framework::committed_leaf(MAP_TAG_ACCOUNTS, w.as_bytes())
+}
+
+/// `(id ‖ side ‖ price ‖ qty ‖ owner)` — the same record shape
+/// `write_canonical_state` appends per resting order, folded into
+/// the engine's `resting_fold` instead of re-serialized per block.
+/// Raw `[u8; 32]` for the engine's dependency-free leaf slot.
+fn perps_book_leaf(e: &trading::RestingEntry) -> [u8; 32] {
+    let mut w = framework::CanonicalState::new();
+    w.put_u64(e.id.0).put_u8(e.side as u8).put_u64(e.price.0).put_u64(e.qty.0).put_addr(&e.owner);
+    framework::committed_leaf(MAP_TAG_BOOK, w.as_bytes()).0
+}
+
 /// The perps module.
 pub struct PerpsModule {
     inner: Mutex<Inner>,
-    store: KVStore,
+    store: Mutex<CommittedStore>,
     /// The balance ledger for margin deposits/withdrawals — the EVM
     /// account store behind `framework::Balances` on a live node.
     /// `None` = margin accounting only (unit-test mode): deposits and
@@ -611,8 +668,11 @@ struct Inner {
     configs: BTreeMap<u8, PerpsMarketConfig>,
     /// Mark prices per market (scale-8).
     marks: BTreeMap<u8, u64>,
-    /// Account states, keyed by address.
-    accounts: BTreeMap<Address, AccountState>,
+    /// Account states, keyed by address — `CommittedMap` so the
+    /// root fold tracks per-account leaves instead of a whole-map
+    /// walk per block. The leaf covers the entire `AccountState`:
+    /// position and reservation mutations refold the account.
+    accounts: framework::CommittedMap<Address, AccountState>,
     /// Insurance fund balance (scale-6 quote).
     insurance_fund: u64,
     /// Losses the margin→insurance→ADL cascade could not allocate
@@ -673,7 +733,7 @@ struct Inner {
 /// that used to run after the fill had already flipped positions.
 struct ReduceOnlyCap<'a> {
     /// Account states (read-only: positions + reservations).
-    accounts: &'a BTreeMap<Address, AccountState>,
+    accounts: &'a framework::CommittedMap<Address, AccountState>,
     /// The market this engine serves.
     market: u8,
     /// Cover already consumed per owner in this sweep. Every
@@ -750,7 +810,7 @@ impl PerpsModule {
                 markets: (0..=u8::MAX).map(|_| None).collect(),
                 configs: BTreeMap::new(),
                 marks: BTreeMap::new(),
-                accounts: BTreeMap::new(),
+                accounts: framework::CommittedMap::new(accounts_leaf),
                 insurance_fund: 0,
                 unfunded_bad_debt: 0,
                 fills: Vec::with_capacity(64),
@@ -760,7 +820,7 @@ impl PerpsModule {
                 liquidation_cursor: None,
                 pending_funding: BTreeMap::new(),
             }),
-            store: Mutex::new(BTreeMap::new()),
+            store: Mutex::new(CommittedStore::new(perps_store_leaf)),
             ledger: None,
             committee: None,
             endorsements: framework::Endorsements::new(),
@@ -820,8 +880,11 @@ impl PerpsModule {
             .map_err(|e| ExecError::ModuleRejected(format!("market config: {e}")))?;
         let book = DenseBook::new(vbase)
             .map_err(|e| ExecError::ModuleRejected(format!("book init: {e}")))?;
-        let engine = MatchingEngine::new(vbase, book)
+        let mut engine = MatchingEngine::new(vbase, book)
             .map_err(|e| ExecError::ModuleRejected(format!("engine init: {e}")))?;
+        // Committed engines carry the resting fold — `state_root`
+        // reads `resting_fold()` instead of re-walking the book.
+        engine.enable_resting_fold(perps_book_leaf);
         inner.markets[id] = Some(engine);
         inner.configs.insert(id_u8, cfg);
         // Initialize mark price to the mid of the price band — a
@@ -999,9 +1062,22 @@ impl PerpsModule {
         framework::lock_state(&self.inner).unfunded_bad_debt
     }
 
-    /// Get or create an account state entry.
-    fn account_mut<'a>(inner: &'a mut Inner, addr: &Address) -> &'a mut AccountState {
-        inner.accounts.entry(*addr).or_default()
+    /// Mutate `addr`'s account through `f`, then fold the result
+    /// back: `CommittedMap` cannot lend `&mut V` (a mutable borrow
+    /// would bypass the fold), so the account is cloned out,
+    /// mutated, and `insert`ed — the old leaf leaves the fold and
+    /// the new one enters. An `Err` return still inserts: the
+    /// account itself is unchanged, so the fold is neutral (same
+    /// leaf out and in) — only the recomputation cost is paid.
+    fn with_account_mut<R>(
+        inner: &mut Inner,
+        addr: &Address,
+        f: impl FnOnce(&mut AccountState) -> R,
+    ) -> R {
+        let mut acct = inner.accounts.get(addr).cloned().unwrap_or_default();
+        let r = f(&mut acct);
+        inner.accounts.insert(*addr, acct);
+        r
     }
 
     /// Apply funding to all open positions in a market. Longs pay
@@ -1095,21 +1171,22 @@ impl PerpsModule {
         // minting margin out of nothing).
         let mut collected: u128 = 0;
         for (addr, owed) in &payers {
-            let account = Self::account_mut(&mut inner, addr);
-            let Some(pos_entry) = account.positions.get_mut(&market) else {
-                continue;
-            };
-            // Debit the same bucket the old code used: isolated
-            // margin when present, else the cross pool.
-            let bucket = if pos_entry.margin_class() == MarginClass::Isolated {
-                &mut pos_entry.isolated_margin
-            } else {
-                &mut account.cross_margin
-            };
-            let actual = (*bucket).min(*owed);
-            *bucket -= actual;
-            collected += u128::from(actual);
-            events.push(Event { module: "perps", kind: "funding", data: vec![market] });
+            Self::with_account_mut(&mut inner, addr, |account| {
+                let Some(pos_entry) = account.positions.get_mut(&market) else {
+                    return;
+                };
+                // Debit the same bucket the old code used: isolated
+                // margin when present, else the cross pool.
+                let bucket = if pos_entry.margin_class() == MarginClass::Isolated {
+                    &mut pos_entry.isolated_margin
+                } else {
+                    &mut account.cross_margin
+                };
+                let actual = (*bucket).min(*owed);
+                *bucket -= actual;
+                collected += u128::from(actual);
+                events.push(Event { module: "perps", kind: "funding", data: vec![market] });
+            });
         }
 
         // ── Pass 3: distribute to receivers, pro-rata ──
@@ -1142,23 +1219,25 @@ impl PerpsModule {
             if credit == 0 {
                 continue;
             }
-            let account = Self::account_mut(&mut inner, addr);
-            let Some(pos_entry) = account.positions.get_mut(&market) else {
-                continue;
-            };
-            let bucket = if pos_entry.margin_class() == MarginClass::Isolated {
-                &mut pos_entry.isolated_margin
-            } else {
-                &mut account.cross_margin
-            };
-            match bucket.checked_add(credit) {
-                Some(v) => *bucket = v,
-                // A bucket at u64::MAX cannot grow — the excess
-                // remains in the funding pool (accrued to insurance
-                // below) rather than silently capping the receiver.
-                None => continue,
-            }
-            events.push(Event { module: "perps", kind: "funding", data: vec![market] });
+            Self::with_account_mut(&mut inner, addr, |account| {
+                let Some(pos_entry) = account.positions.get_mut(&market) else {
+                    return;
+                };
+                let bucket = if pos_entry.margin_class() == MarginClass::Isolated {
+                    &mut pos_entry.isolated_margin
+                } else {
+                    &mut account.cross_margin
+                };
+                match bucket.checked_add(credit) {
+                    Some(v) => *bucket = v,
+                    // A bucket at u64::MAX cannot grow — the excess
+                    // remains in the funding pool (accrued to
+                    // insurance below) rather than silently capping
+                    // the receiver.
+                    None => return,
+                }
+                events.push(Event { module: "perps", kind: "funding", data: vec![market] });
+            });
         }
 
         // Surplus (rounding dust, un-creditable receivers, and any
@@ -1246,8 +1325,9 @@ impl PerpsModule {
                     }
                 }
             }
-            if let Some(acct_mut) = accounts.get_mut(account) {
+            if let Some(mut acct_mut) = accounts.get(account).cloned() {
                 acct_mut.open_orders.clear();
+                accounts.insert(*account, acct_mut);
             }
         }
 
@@ -1267,7 +1347,7 @@ impl PerpsModule {
         let mut seized: Vec<(u8, SignedQty, u64)> = Vec::new(); // (market, size, mark)
         {
             let Inner { marks, accounts, .. } = &mut *inner;
-            let Some(acct_mut) = accounts.get_mut(account) else {
+            let Some(mut acct_mut) = accounts.get(account).cloned() else {
                 return Err(ExecError::ModuleRejected("account not found".to_string()));
             };
             cross_margin = acct_mut.cross_margin;
@@ -1298,6 +1378,9 @@ impl PerpsModule {
                 events.push(Event { module: "perps", kind: "liquidated", data: vec![*market] });
             }
             acct_mut.cross_margin = 0;
+            // Fold the seized account back — `CommittedMap` lent us
+            // no `&mut`, so the drained state re-enters via `insert`.
+            accounts.insert(*account, acct_mut);
         }
 
         // Transfer each seized position to the clearing account at
@@ -1461,9 +1544,10 @@ impl PerpsModule {
                 // Claw back min(remaining_shortfall, counterparty_pnl).
                 let clawback_target =
                     remaining_shortfall.min(u64::try_from(pnl_scale6).unwrap_or(u64::MAX));
-                // The candidate came from a live account — `get_mut`
-                // suffices (no account_mut side effects needed).
-                let Some(acct) = accounts.get_mut(&addr) else {
+                // The candidate came from a live account — clone it
+                // out (`CommittedMap` lends no `&mut`) and fold it
+                // back once the position shrink below lands.
+                let Some(mut acct) = accounts.get(&addr).cloned() else {
                     continue;
                 };
                 let Some(pos_entry) = acct.positions.get_mut(&market) else {
@@ -1533,6 +1617,10 @@ impl PerpsModule {
                 } else {
                     pos_entry.size += close_qty;
                 }
+                // Fold the shrunken position back — `pos_entry`'s
+                // borrow ends here, so the owned account re-enters
+                // the fold.
+                accounts.insert(addr, acct);
                 // The clearing account inherits the closed exposure
                 // in the same direction (long stays long, short
                 // stays short) — transferred at mark below.
