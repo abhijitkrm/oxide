@@ -61,9 +61,14 @@ authenticated, encrypted transport with admission control.
       peer_auth` runs a mutual BLS challenge–response
       (`node::peer_auth::BlsPeerAuth` over the live validator set)
       so a self-claimed ID can neither join nor displace a live
-      slot. Remaining for this gate: per-peer connection cap at
-      the listener, ingress rate limiting on the receive path, and
-      the integration-test bullet above.
+      slot. Peer IDs are the members' staking addresses, resolved
+      against the live committee (and the published pending set
+      during a rotation window), so validator-set changes cannot
+      misroute or misattribute consensus traffic. Per-peer ingress
+      rate limiting is enforced by `SharedAdmissionControl::
+      admit_message` on the receive path. Remaining for this gate:
+      a per-source-IP connection cap at the listener and the
+      integration-test bullet above.
 
 ---
 
@@ -428,10 +433,11 @@ there is no block-sync protocol yet (open item).
    via crash-durable state.** `--data-dir` persists the executor
    journal, atomic snapshots, and the consensus WAL; a restart —
    including a `kill -9` — replays to the last finalized height and
-   resumes there. Remaining gaps: the consensus WAL grows without
-   bound (segmentation + checkpointing open), and blocks finalized
-   while a node is down cannot be fetched without block sync (open
-   item).
+   resumes there. The consensus WAL checkpoints itself once
+   `COMPACT_AFTER_BYTES` of new entries have appended, so file
+   growth is bounded by traffic volume, not uptime. Remaining gap:
+   blocks finalized while a node is down cannot be fetched without
+   block sync (open item).
 6. ~~Governance validator set changes~~ — **resolved.** `VALIDATOR_ADD`
    and `VALIDATOR_REMOVE` message types with governance-by-committee
    validation and epoch-boundary application.

@@ -30,7 +30,7 @@ thesis is that you do not have to choose:
 | Consensus | oxideBFT — pipelined 2-chain HotStuff (Jolteon/DiemBFT/MonadBFT lineage), tail-fork resistant | MonadBFT 600ms finality; HyperBFT (Hyperliquid) |
 | Block cadence | 50–100ms | Hyperliquid ~70ms; Monad 300ms |
 | Full finality | 2 views ≈ 150–250ms (optimistic 1-view ≈ 75–125ms) | Hyperliquid median e2e ~200ms |
-| EVM throughput | 1–5 gigagas/s sustained (16–32 core validators) — **~2.5 GG/s measured in a single-node microbenchmark on an 8-core M1** (real revm, parallel executor, signed 21k-gas transfers — not a sustained network measurement); the 12.96 figure quoted earlier was a scheduler simulation | Sei Giga 5 GG/s (devnet); reth+BAL experiments 10 GG/s ceiling |
+| EVM throughput | 1–5 gigagas/s sustained (16–32 core validators) — **~2.5 GG/s measured in a single-node microbenchmark on an 8-core M1** (real revm, parallel executor, signed 21k-gas transfers — not a sustained network measurement; hot-contract workloads serialise at account granularity today); the 12.96 figure quoted earlier was a scheduler simulation | Sei Giga 5 GG/s (devnet); reth+BAL experiments 10 GG/s ceiling |
 | EVM compatibility | Full equivalence via revm: JSON-RPC, EIP-1559, MetaMask/Foundry/Blockscout | cosmos-evm `x/vm` (Go) |
 | Matching engine | ≥5M ops/s single-core (engine-only), ≥1M orders/s chain-wide, p50 < 200ns per order op | C++ engines ~10–160ns; Hyperliquid 200k orders/s chain-wide |
 | Order flow | Fully on-chain signed orders (no operator trust, no private order flow) | Hyperliquid model |
@@ -299,9 +299,12 @@ Phases 0–2 are complete, Phase 3 (trading core) is in progress. Here's what's 
 - **Indexer/explorer v0**: in-memory block/tx index.
 - **EVM throughput**: ≥1 GG/s gate met on *real revm execution*
   (~2.5 GG/s parallel on signed 21k-gas transfers; ~0.62 GG/s
-  sequential). The 4.83/12.96 GG/s Uniswap rows below are a
-  scheduler simulation with a synthetic gas model — they measure
-  the OCC scheduler, not revm.
+  sequential). The parallel figure is transfer-shaped: conflict
+  detection is account-granular, so hot contracts (tokens, AMMs)
+  serialise — treat ~0.62 GG/s as the honest contract-workload
+  number until slot-level MVCC lands. The 4.83/12.96 GG/s Uniswap
+  rows below are a scheduler simulation with a synthetic gas
+  model — they measure the OCC scheduler, not revm.
 
 ### Audit-driven hardening (post-Phase 2)
 

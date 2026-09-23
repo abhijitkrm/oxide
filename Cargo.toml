@@ -223,7 +223,7 @@ crossbeam-channel = "0.5.14"
 # because perf gates (README.md → Roadmap) are release-profile measurements.
 lto = "thin"
 codegen-units = 1
-panic = "unwind" # keep panics catchable (a panic aborts the actor's thread, not the process); supervision/fail-fast per actor is a tracked gap
+panic = "unwind" # keep panics catchable so `primitives::supervision` can attribute them: a panic on a registered critical actor's thread aborts the process, a non-critical panic is logged and counted instead of dying silently
 # Money arithmetic must never wrap silently: a wrapped u64 balance can mint
 # or destroy ~2^64 units. Overflow panics (caught at the actor boundary via
 # `panic = "unwind"`) fail loudly; the financial paths additionally saturate

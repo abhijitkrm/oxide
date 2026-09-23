@@ -696,19 +696,14 @@ impl EvmModule {
         // skip the speculation bookkeeping entirely for single-group
         // batches by calling `execute_decoded` directly.
 
-        // Phase 3: snapshot the main DB into an `Arc` for
-        // copy-on-write sharing. Each group gets a
+        // Phase 3: snapshot the main DB for copy-on-write sharing.
+        // `self.db` is an `Arc<CacheDB<EmptyDB>>`, so the snapshot
+        // is an O(1) `Arc::clone` — no deep clone. Each group gets a
         // `CacheDB::new(SharedCacheDB(arc_clone))` — a fresh, empty
         // local cache backed by the shared parent via
         // `DatabaseRef`. Reads fall through to the parent on cache
         // miss; writes stay local. Per-group cost is O(1) init +
         // O(touched) memory, vs O(state) for a full clone.
-        //
-        // The snapshot is an O(1) `Arc::clone` — no deep clone of
-        // the CacheDB. Each parallel group gets a fresh empty
-        // `CacheDB<SharedCacheDB>` backed by the shared snapshot via
-        // `DatabaseRef`. Reads fall through to the parent on cache
-        // miss; writes stay local.
         let snapshot = framework::lock_state(&self.db).clone();
         let coinbase = *framework::lock_state(&self.coinbase);
         let block_number = *framework::lock_state(&self.block_height);

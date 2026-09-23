@@ -20551,3 +20551,36 @@ regression (a forged vote from the removed engine's transport over
 TCP must not poison seat 1's slot — under index attribution it
 would have censored a live member), and a live 4-node devnet
 finalizing continuously on address peer ids.
+
+## Session N+39 (cont.) — doc-drift sweep: the docs catch up to the fixes
+
+Reviewers treat docs as premises, so stale claims are defects of
+their own. Six sites lagged the code:
+
+- `docs/production-readiness.md` Gate-1 status said admission was
+  unwired — the handshake pool, `BlsPeerAuth`, and address-based
+  peer IDs all landed since; rewrote it, and cut the "remaining"
+  list to what is actually left (per-source-IP listener cap; the
+  receive-path rate limiter already runs through
+  `SharedAdmissionControl::admit_message`).
+- The persistence item still listed "WAL grows without bound" —
+  `COMPACT_AFTER_BYTES` auto-checkpointing shipped earlier;
+  block sync is the only remaining gap there.
+- `README.md` quoted "~2.5 GG/s parallel" without noting the
+  conflict granularity — the figure is transfer-shaped; hot
+  contracts serialise at account granularity until slot-level MVCC
+  lands, so the contract-workload number is the sequential one.
+- `config/mainnet.toml`'s header said no binary honors peering —
+  `oxide-devnet` now derives peer endpoints from the genesis
+  committee's staking addresses.
+- `Cargo.toml`'s panic comment called supervision "a tracked gap"
+  — `primitives::supervision` has since made critical-actor panics
+  abort and non-critical ones surface via `/health`.
+- `modules/evm/src/batch.rs` explained the COW snapshot mechanism
+  twice in adjacent paragraphs — merged into one.
+
+Also closed three Low findings that earlier sessions had already
+fixed but the tracker still showed open: the env-override seam no
+longer mutates the process environment in tests, validator help
+disclaims the devnet flags, and `observe_block_height` runs after
+authentication inside `authenticate_proposal`.
