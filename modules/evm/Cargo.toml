@@ -47,6 +47,9 @@ rayon = { workspace = true }
 criterion = "0.7.0"
 ports = { workspace = true }
 consensus = { workspace = true }
+# proptest: differential execution properties — every EVM entry
+# path must agree on state roots over generated contract workloads.
+proptest = "1.11.0"
 
 [[bench]]
 name = "fee"

@@ -19485,3 +19485,72 @@ a storage-layer project, logged as future work.
 §7.4 is closed: every per-block commitment path is incremental;
 the only O(total-state) work runs once per process or per import,
 never per block.
+
+## Session N+22 — speculative EVM merges became slot-granular
+
+The second audit (audit002) reproduced a consensus-critical state
+corruption in `handle_batch_parallel`: a contract's storage slots
+vanished when the tx that wrote it ran speculatively. Serial slots
+1 and 2 held 42/43; the parallel leg read 0/0, and the roots split.
+
+Root cause was in the canonical-order commit. `SpecTx` carried
+`write_accounts` — post-commit `DbAccount` clones lifted out of the
+group's COW cache — and the merge did
+`db.cache.accounts.insert(addr, account.clone())` for each. A
+speculative `DbAccount` only contains the slots *that tx's journal
+loaded*; revm's `CacheDB` never materializes untouched entries.
+Inserting it wholesale replaced the canonical account — every slot
+the tx never read evaporated. Same account-granular bug the OCC
+scheduler is supposed to be immune to, one layer down.
+
+The serial path never had the bug because it never copies accounts:
+`inspect_tx` returns the tx's `EvmState` (per-account journal with
+per-slot original/present values) and `evm.commit(state)` runs
+revm's `commit_account`, which extends storage slot-wise and only
+clears on selfdestruct/create. The fix makes the parallel merge do
+exactly that: `SpecTx` now carries the tx's own `EvmState` (cloned
+before commit into the group cache, coinbase entry stripped — tips
+still merge via the additive `coinbase_delta`), and a validated
+speculation lands via `db.commit(st.state)`. Reads are the state
+keys; writes are the `is_touched()` subset — precisely the set
+`commit` will modify, so conflict detection and the merge agree by
+construction. Undo capture moved to the same `is_touched()` filter
+(the old code captured the identical set via `account_state !=
+None` on the group cache). Contract code now lands through
+`insert_contract` inside `commit`, so CREATE payloads no longer
+need the `contracts_before` diff scan that snapshotted the code
+table per tx — that bookkeeping is gone.
+
+The fast paths (`try_native_transfer`, `try_empty_code_call`)
+synthesize equivalent `EvmState` entries — caller and recipient
+`Account`s marked `Touched`, carrying only `info`. They never write
+storage, so the slot-wise merge preserves everything they didn't
+load; `commit` treats them identically to interpreter output.
+
+Verification was layered. First a minimal regression test
+(`handle_batch_parallel_preserves_unread_storage`) reproducing the
+audit case — it failed with the exact 0/0-vs-42/43 symptom before
+the fix. Then `all_execution_paths_match_on_contract_workload` —
+six hand-assembled contracts (parameterized SSTORE writer,
+read/write splitter, slot zeroer, reverter, selfdestructer,
+coinbase BALANCE reader) under a 10-tx three-sender interleaved
+batch, asserting outcome parity, watched-slot parity, nonce parity,
+and identical state roots across `handle`, `handle_batch`,
+`handle_batch_parallel`, and `handle_batch_parallel_preverified`.
+Then `tests/properties.rs` — a 64-case proptest generating
+contract-heavy multi-sender workloads over the same four paths.
+Then a new fuzz target, `evm-parallel-differential`, soaking the
+serial/batch/parallel root-equality claim — 52k executions in the
+smoke run, zero divergences; it joins the nightly fuzz list.
+
+Benchmark gates re-ran on `tps_rw`: the merge-path benches
+(`batch_parallel_multi_sender`, `batch_parallel_conflict`) show no
+statistically significant change at every size. Two
+`preverified_vs_recovery` serial-path cells flagged +8–10% against
+their stored baselines; those code paths share nothing with the
+merge and the run overlapped the fuzz soak — recorded as noise,
+worth a quiet-machine re-check alongside the next change. The one
+new per-tx cost is the `EvmState` clone in the speculative record
+(O(loaded accounts) instead of O(written accounts)); the benches
+say it's in the noise against what the clone replaces (the old
+per-tx `contracts_before` table scan + `DbAccount` clones).

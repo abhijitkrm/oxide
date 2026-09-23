@@ -1395,6 +1395,34 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Parallel EVM execution could erase untouched contract storage**
+  (`modules/evm`): when `handle_batch_parallel` (and the
+  preverified variant) committed a validated speculative
+  transaction, it inserted the worker's `DbAccount` snapshot
+  wholesale into the canonical database. That snapshot only
+  contained the storage slots the transaction's journal had
+  loaded — every other slot the contract held was silently
+  deleted, so serial and parallel validators computed different
+  state roots for the same block.
+  - `SpecTx` now carries the transaction's own `EvmState` journal
+    diff and the merge commits it through revm's
+    `DatabaseCommit::commit` — the same slot-granular merge the
+    serial path runs — so unread slots survive, and create,
+    selfdestruct, and slot-zeroing semantics match sequential
+    execution by construction.
+  - Regression coverage: a minimal unread-slots unit test, a
+    four-path contract-workload equivalence test, a 64-case
+    property test (`tests/properties.rs`), and a new nightly fuzz
+    target (`evm-parallel-differential`) asserting identical state
+    roots across `handle`, `handle_batch`, `handle_batch_parallel`,
+    and `handle_batch_parallel_preverified`.
+  - **In plain words:** running transactions in parallel used to be
+    able to make parts of a smart contract's memory disappear if
+    the transaction never looked at them. Two validators picking
+    different execution modes could disagree about the state of the
+    chain — a consensus break. Parallel and sequential execution
+    now produce identical state, verified by unit, property, and
+    fuzz testing.
 - **oxideBFT: hidden-QC fork — conflicting blocks could finalize at
   the same height** (`crates/consensus`, `crates/types`,
   `bin/oxide-devnet`, `crates/devnet`, `sim`, `spec/oxidebft`)

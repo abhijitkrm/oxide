@@ -684,13 +684,22 @@ impl EvmModule {
 
         let mut writes: std::collections::HashSet<revm::primitives::Address> =
             std::collections::HashSet::with_capacity(2);
-        let mut write_accounts = Vec::with_capacity(2);
+        // The merge payload: `EvmState` entries equivalent to what the
+        // interpreter would record. Fast paths only ever modify `info`
+        // (balance, nonce) — never storage — so the slot-wise `commit`
+        // merge preserves every slot the account holds but this tx
+        // never loaded. (`commit` extends storage; it never truncates
+        // it for a merely-Touched account.)
+        let mut state = revm::state::EvmState::default();
         for addr in [caller, recipient] {
             if addr == coinbase || !writes.insert(addr) {
                 continue;
             }
             if let Some(dba) = db.cache.accounts.get(&addr) {
-                write_accounts.push((addr, dba.clone()));
+                let mut account = revm::state::Account::default();
+                account.info = dba.info.clone();
+                account.mark_touch();
+                state.insert(addr, account);
             }
         }
 
@@ -703,8 +712,7 @@ impl EvmModule {
             result: Ok((result, Some(frame))),
             reads,
             writes,
-            write_accounts,
-            new_contracts: Vec::new(),
+            state,
             coinbase_before,
             coinbase_delta: coinbase_after - coinbase_before,
             coinbase: CoinbaseObs {

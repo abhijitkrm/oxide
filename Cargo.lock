@@ -1736,6 +1736,7 @@ dependencies = [
  "perps",
  "ports",
  "primitives",
+ "proptest",
  "rayon",
  "revm",
  "staking",

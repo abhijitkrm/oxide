@@ -25,8 +25,14 @@ executor = { path = "../crates/executor" }
 evm = { path = "../modules/evm" }
 exchange = { path = "../modules/exchange" }
 framework = { path = "../modules/framework" }
+crypto = { path = "../crates/crypto" }
 p2p = { path = "../crates/p2p" }
 trading = { path = "../crates/trading" }
+# alloy-primitives: the same B256/Address/U256 types revm re-exports
+# (evm pins revm 42, whose primitives are alloy-primitives 1.x).
+# Needed so fuzz targets can build signed EVM txs without taking a
+# direct dependency on revm itself.
+alloy-primitives = { version = "1.7.2", features = ["std"] }
 
 [[bin]]
 name = "codec-decode"
@@ -61,6 +67,12 @@ doc = false
 [[bin]]
 name = "evm-execute"
 path = "fuzz_targets/evm_execute.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "evm-parallel-differential"
+path = "fuzz_targets/evm_parallel_differential.rs"
 test = false
 doc = false
 

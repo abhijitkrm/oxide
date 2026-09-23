@@ -14,6 +14,8 @@ use super::{
     SharedCacheDB, SpecTx, TracedResult, TxContext, alloy_primitives_address, history, receipts,
     trace, tx, versioned,
 };
+use revm::database_interface::DatabaseCommit;
+use revm::state::EvmState;
 
 impl EvmModule {
     /// Execute a batch of signed EVM transactions with **parallel
@@ -685,9 +687,10 @@ impl EvmModule {
 
         // Note: single-group batches (all txs from one sender) are
         // handled correctly by the parallel path — the group executes
-        // sequentially on its own clone. The clone cost (O(n_accounts))
-        // is acceptable; a future optimization can skip the clone for
-        // single-group batches by calling `execute_decoded` directly.
+        // sequentially on its COW cache over the shared `Arc` snapshot
+        // (O(1) setup, O(touched) memory). A future optimization can
+        // skip the speculation bookkeeping entirely for single-group
+        // batches by calling `execute_decoded` directly.
 
         // Phase 3: snapshot the main DB into an `Arc` for
         // copy-on-write sharing. Each group gets a
@@ -841,19 +844,15 @@ impl EvmModule {
                         }
                     };
 
-                    // Snapshot contract-code keys before the tx so the
-                    // per-tx `new_contracts` diff is exact (CREATE is
-                    // the only way code enters the cache).
-                    let contracts_before: std::collections::HashSet<revm::primitives::B256> =
-                        db.cache.contracts.keys().copied().collect();
-
                     // Speculative run: read-only native precompiles
                     // + coinbase-read detection. `transact` (not
                     // `transact_commit`) returns the per-tx `EvmState`
                     // — the exact set of accounts the tx loaded
-                    // (reads) and modified (writes). The state diff is
-                    // committed into the group cache before the EVM is
-                    // dropped so `db` is free for the write-set scan.
+                    // (reads) and modified (writes), with per-slot
+                    // original/present values. A clone of the diff is
+                    // kept in the `SpecTx` as the merge payload; the
+                    // original is committed into the group cache so the
+                    // next same-sender tx sees it.
                     let (result, native_blocked, coinbase_read, call_trace, loaded) = {
                         let mut evm =
                             self.build_spec_evm(&mut db, coinbase, block_number, block_timestamp);
@@ -886,19 +885,23 @@ impl EvmModule {
                                                 || !a.storage.is_empty()
                                                 || a.info.nonce != coinbase_nonce_before)
                                     });
-                                let mut addrs: std::collections::HashSet<
-                                    revm::primitives::Address,
-                                > = std::collections::HashSet::with_capacity(rs.state.len());
-                                for addr in rs.state.keys() {
-                                    addrs.insert(*addr);
-                                }
+                                // The merge payload: the tx's own
+                                // `EvmState` diff. The coinbase entry
+                                // is stripped — its balance change
+                                // merges via the additive
+                                // `coinbase_delta`, so a later
+                                // validator sees the canonical running
+                                // tip total rather than the group's
+                                // speculative one.
+                                let mut spec_state = rs.state.clone();
+                                spec_state.remove(&coinbase);
                                 evm.commit(rs.state);
                                 (
                                     Ok(rs.result),
                                     blocked,
                                     cb_read,
                                     call_trace,
-                                    Some((addrs, accessed_coinbase, coinbase_nontrivial)),
+                                    Some((spec_state, accessed_coinbase, coinbase_nontrivial)),
                                 )
                             }
                             Err(e) => (Err(e), blocked, cb_read, call_trace, None),
@@ -907,7 +910,7 @@ impl EvmModule {
 
                     match result {
                         Ok(exec_result) => {
-                            let (loaded_addrs, accessed_coinbase, coinbase_nontrivial) =
+                            let (spec_state, accessed_coinbase, coinbase_nontrivial) =
                                 loaded.expect("Ok carries the loaded state");
 
                             // The coinbase delta captures the tx's
@@ -920,45 +923,24 @@ impl EvmModule {
                                 .get(&coinbase)
                                 .map_or(parent_coinbase, |a| a.info.balance);
 
-                            // `loaded_addrs` holds every account the
-                            // journal touched — the exact read set.
-                            // Writes are the subset the commit marked
-                            // modified (`account_state != None`),
-                            // matching sequential `commit_account`
-                            // semantics.
+                            // `spec_state` keys are every account the
+                            // journal loaded — the exact read set
+                            // (the coinbase was stripped at capture).
+                            // The write set is the `is_touched()`
+                            // subset: precisely the accounts
+                            // `DatabaseCommit::commit` will modify on
+                            // merge, matching sequential
+                            // `commit_account` semantics.
                             let mut reads: std::collections::HashSet<revm::primitives::Address> =
-                                std::collections::HashSet::with_capacity(loaded_addrs.len());
-                            for addr in &loaded_addrs {
-                                if *addr != coinbase {
-                                    reads.insert(*addr);
-                                }
-                            }
-
+                                std::collections::HashSet::with_capacity(spec_state.len());
                             let mut writes: std::collections::HashSet<revm::primitives::Address> =
                                 std::collections::HashSet::new();
-                            let mut write_accounts: Vec<(
-                                revm::primitives::Address,
-                                revm::database::DbAccount,
-                            )> = Vec::new();
-                            for addr in &reads {
-                                if let Some(dba) = db.cache.accounts.get(addr)
-                                    && dba.account_state != revm::database::AccountState::None
-                                {
+                            for (addr, account) in &spec_state {
+                                reads.insert(*addr);
+                                if account.is_touched() {
                                     writes.insert(*addr);
-                                    write_accounts.push((*addr, dba.clone()));
                                 }
                             }
-
-                            let new_contracts: Vec<(
-                                revm::primitives::B256,
-                                revm::bytecode::Bytecode,
-                            )> = db
-                                .cache
-                                .contracts
-                                .iter()
-                                .filter(|(hash, _)| !contracts_before.contains(*hash))
-                                .map(|(hash, code)| (*hash, code.clone()))
-                                .collect();
 
                             spec_txs.push(SpecTx {
                                 idx,
@@ -966,8 +948,7 @@ impl EvmModule {
                                 result: Ok((exec_result, call_trace)),
                                 reads,
                                 writes,
-                                write_accounts,
-                                new_contracts,
+                                state: spec_state,
                                 coinbase_before,
                                 coinbase_delta: coinbase_after - coinbase_before,
                                 coinbase: CoinbaseObs {
@@ -993,8 +974,7 @@ impl EvmModule {
                                 ))),
                                 reads,
                                 writes: std::collections::HashSet::new(),
-                                write_accounts: Vec::new(),
-                                new_contracts: Vec::new(),
+                                state: EvmState::default(),
                                 coinbase_before,
                                 coinbase_delta: revm::primitives::U256::ZERO,
                                 coinbase: CoinbaseObs {
@@ -1279,15 +1259,22 @@ impl EvmModule {
                 continue;
             }
 
-            // Speculation validated: merge the tx's write set into
-            // the main DB and keep its speculative result.
-            for (addr, account) in &st.write_accounts {
-                committed_undo.capture(*addr, db.cache.accounts.get(addr));
-                db.cache.accounts.insert(*addr, account.clone());
+            // Speculation validated: commit the tx's recorded
+            // `EvmState` through the same `DatabaseCommit::commit`
+            // the serial path runs. The merge is slot-granular —
+            // storage the tx never touched survives — and contract
+            // code (`insert_contract`), create, selfdestruct, and
+            // slot-zeroing semantics match sequential execution by
+            // construction. Replacing whole `DbAccount`s here instead
+            // (the old merge) silently erased every slot the tx had
+            // not loaded — see the `preserves_unread_storage`
+            // regression test.
+            for (addr, account) in &st.state {
+                if account.is_touched() {
+                    committed_undo.capture(*addr, db.cache.accounts.get(addr));
+                }
             }
-            for (hash, bytecode) in &st.new_contracts {
-                db.cache.contracts.entry(*hash).or_insert_with(|| bytecode.clone());
-            }
+            db.commit(st.state);
             // Apply the coinbase delta now — keeping the running
             // balance canonical for every later validation check.
             if st.coinbase_delta != revm::primitives::U256::ZERO {

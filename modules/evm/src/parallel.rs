@@ -3,7 +3,7 @@
 //! Split from `lib.rs` around the speculation invariant: each
 //! [`SpecTx`] captures everything the canonical-order commit needs
 //! to *prove or disprove* the speculation — read/write sets, the
-//! merge payload (`write_accounts`, `new_contracts`,
+//! merge payload (the tx's recorded [`EvmState`] diff and
 //! `coinbase_delta`), and the flags forcing canonical re-execution.
 //! [`SharedCacheDB`] is the read-only parent all worker groups
 //! share (N nested caches over one `Arc`, because `CacheDB::nest`
@@ -86,9 +86,9 @@ impl DatabaseRef for SharedCacheDB {
 /// The parallel executor speculates per-sender groups, then commits
 /// each tx at its canonical index position. A `SpecTx` carries
 /// everything needed for both paths: the read/write sets that prove
-/// (or disprove) the speculation, the merge payload
-/// (`write_accounts`, `new_contracts`, `coinbase_delta`) for the
-/// fast path, and the flags that force canonical re-execution.
+/// (or disprove) the speculation, the merge payload (`state`,
+/// `coinbase_delta`) for a validated speculation, and the flags that
+/// force canonical re-execution.
 pub(crate) struct SpecTx {
     /// Original position of the tx in the batch.
     pub(crate) idx: usize,
@@ -103,13 +103,25 @@ pub(crate) struct SpecTx {
     /// writes it via tips. For the revm path this is `rs.state`'s
     /// keys; for fast paths `{caller, recipient}`.
     pub(crate) reads: std::collections::HashSet<revm::primitives::Address>,
-    /// Accounts the tx modified, excluding the coinbase.
+    /// Accounts the tx modified, excluding the coinbase. Exactly the
+    /// `is_touched()` subset of `state` — the set
+    /// `DatabaseCommit::commit` will write — so conflict detection
+    /// sees the same accounts the merge lands.
     pub(crate) writes: std::collections::HashSet<revm::primitives::Address>,
-    /// Post-execution snapshots of `writes` — the merge payload for
-    /// a validated tx.
-    pub(crate) write_accounts: Vec<(revm::primitives::Address, revm::database::DbAccount)>,
-    /// Code entries the tx deployed (CREATE is the only source).
-    pub(crate) new_contracts: Vec<(revm::primitives::B256, revm::bytecode::Bytecode)>,
+    /// The merge payload for a validated tx: the transaction's own
+    /// `EvmState` — every account the journal loaded, with per-slot
+    /// original/present values. The commit phase feeds it through
+    /// the same `DatabaseCommit::commit` the serial path uses, so a
+    /// validated merge is slot-granular (storage the tx never
+    /// touched survives) and create/selfdestruct/zeroing semantics
+    /// are identical to sequential execution by construction.
+    ///
+    /// The coinbase entry is stripped at capture time: its balance
+    /// change merges via the additive `coinbase_delta` instead, so
+    /// later validators see the canonical running tip total. Fast
+    /// paths synthesize equivalent `Account` entries — they only
+    /// ever modify `info` (balance, nonce), never storage.
+    pub(crate) state: revm::state::EvmState,
     /// The coinbase balance the tx speculated against — pre-block
     /// balance plus own-group tips. Compared against the canonical
     /// running balance at commit when `coinbase.read` is set.
@@ -166,8 +178,7 @@ impl SpecTx {
             result: Err(e),
             reads: std::collections::HashSet::new(),
             writes: std::collections::HashSet::new(),
-            write_accounts: Vec::new(),
-            new_contracts: Vec::new(),
+            state: revm::state::EvmState::default(),
             coinbase_before: revm::primitives::U256::ZERO,
             coinbase_delta: revm::primitives::U256::ZERO,
             coinbase: CoinbaseObs { read: false, accessed: false, nontrivial: false },

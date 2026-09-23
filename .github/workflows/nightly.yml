@@ -66,13 +66,13 @@ jobs:
         run: cargo install cargo-fuzz
       - name: Run fuzz targets (10 min each)
         run: |
-          # Each of the 10 targets gets a 10-minute soak against the
+          # Each of the 11 targets gets a 10-minute soak against the
           # committed corpus (fuzz/corpus/<target>) — the corpus is
           # checked in so coverage accretes across runs instead of
           # starting cold. `-rss_limit_mb` keeps an OOM-prone decode
           # path from starving the runner; a genuine OOM bug still
           # fails the job via the artifact + nonzero exit.
-          for target in codec-decode consensus-msg evm-execute exchange-settlement journal-replay mmr-proof-verify sync-decode trading-engine trading-order-validate types-decode; do
+          for target in codec-decode consensus-msg evm-execute evm-parallel-differential exchange-settlement journal-replay mmr-proof-verify sync-decode trading-engine trading-order-validate types-decode; do
             echo "=== Fuzzing $target ==="
             cargo +nightly fuzz run "$target" -- -max_total_time=600 -rss_limit_mb=4096 -timeout=25
           done

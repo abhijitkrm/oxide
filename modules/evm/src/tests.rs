@@ -49,6 +49,90 @@ fn fund(m: &EvmModule, addr: &Address) {
     m.fund_account_for_test(addr, u128::MAX);
 }
 
+// ── Contract bytecodes for the differential-execution tests ──────
+// Hand-assembled, ≤ 10 instructions each, one merge hazard per
+// contract. Used by `handle_batch_parallel_preserves_unread_storage`
+// and `all_execution_paths_match_on_contract_workload`.
+
+/// SSTORE(slot 3, 5); STOP — never reads slots 1/2.
+const WRITE_SLOT_3: &[u8] = &[0x60, 0x05, 0x60, 0x03, 0x55, 0x00];
+/// SSTORE(slot = calldata[0..32], value = calldata[32..64]); STOP.
+/// CALLDATALOAD(32) pushes the value, CALLDATALOAD(0) pushes the
+/// slot key on top; SSTORE pops key then value.
+const WRITER_RUNTIME: &[u8] = &[0x60, 0x20, 0x35, 0x60, 0x00, 0x35, 0x55, 0x00];
+/// SSTORE(4, SLOAD(1) + 1); STOP — a read-write contract call.
+const READER_WRITER_RUNTIME: &[u8] = &[0x60, 0x01, 0x54, 0x60, 0x01, 0x01, 0x60, 0x04, 0x55, 0x00];
+/// SSTORE(2, 0); STOP — zero a pre-existing slot.
+const ZEROER_RUNTIME: &[u8] = &[0x60, 0x00, 0x60, 0x02, 0x55, 0x00];
+/// REVERT(0, 0) — reverts after paying gas.
+const REVERTER_RUNTIME: &[u8] = &[0x60, 0x00, 0x60, 0x00, 0xfd];
+/// SELFDESTRUCT(beneficiary 0xBB..) — a pre-existing contract, so
+/// post-Cancun it transfers its balance and keeps its storage.
+const SELFDESTRUCTER_RUNTIME: &[u8] = &[
+    0x73, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+    0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xff,
+];
+/// BALANCE(coinbase); STOP — the coinbase in tests is address zero,
+/// so this forces the coinbase-read re-execution path.
+const COINBASE_READER_RUNTIME: &[u8] = &[
+    0x73, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x31, 0x00,
+];
+
+/// Contract addresses for the differential workload, by index.
+fn workload_contract(idx: u8) -> Address {
+    let mut a = [0xC0u8; 20];
+    a[19] = idx;
+    Address(a)
+}
+
+/// Deploy the fixed contract set and fund the three senders —
+/// identical starting state for every execution leg.
+fn setup_contract_workload(senders: [&Address; 3]) -> EvmModule {
+    let m = make_module();
+    let c1 = workload_contract(1);
+    m.genesis_insert_account(
+        &c1,
+        0,
+        1,
+        WRITER_RUNTIME.to_vec(),
+        vec![(U256::from(1), U256::from(42)), (U256::from(2), U256::from(43))],
+    );
+    m.genesis_insert_account(
+        &workload_contract(2),
+        0,
+        1,
+        READER_WRITER_RUNTIME.to_vec(),
+        Vec::new(),
+    );
+    m.genesis_insert_account(
+        &workload_contract(3),
+        0,
+        1,
+        ZEROER_RUNTIME.to_vec(),
+        vec![(U256::from(2), U256::from(77))],
+    );
+    m.genesis_insert_account(&workload_contract(4), 0, 1, REVERTER_RUNTIME.to_vec(), Vec::new());
+    m.genesis_insert_account(
+        &workload_contract(5),
+        7,
+        1,
+        SELFDESTRUCTER_RUNTIME.to_vec(),
+        vec![(U256::from(9), U256::from(99))],
+    );
+    m.genesis_insert_account(
+        &workload_contract(6),
+        0,
+        1,
+        COINBASE_READER_RUNTIME.to_vec(),
+        Vec::new(),
+    );
+    for sender in senders {
+        fund(&m, sender);
+    }
+    m
+}
+
 #[test]
 fn module_id_is_evm() {
     let m = make_module();
@@ -994,6 +1078,180 @@ fn handle_batch_parallel_conflict_matches_serial_state_root() {
 
     assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
     assert_eq!(serial_root, parallel_root, "conflict state roots must match");
+}
+
+/// Regression test for the speculative-merge storage wipe. A
+/// validated speculative tx must merge its recorded `EvmState`
+/// diff through `DatabaseCommit::commit` — the same slot-granular
+/// merge the serial path uses. Replacing the contract's whole
+/// `DbAccount` (the old merge) drops every slot the tx never
+/// loaded: slots 1 and 2 below vanish under the broken merge.
+#[test]
+fn handle_batch_parallel_preserves_unread_storage() {
+    let (pk_a, addr_a) = test_keypair();
+    let (pk_b, addr_b) = test_keypair();
+    let contract = Address([0xC0; 20]);
+    let contract_evm = revm::primitives::Address::from(contract.0);
+
+    let setup = || {
+        let m = make_module();
+        m.genesis_insert_account(
+            &contract,
+            0,
+            1,
+            WRITE_SLOT_3.to_vec(),
+            vec![(U256::from(1), U256::from(42)), (U256::from(2), U256::from(43))],
+        );
+        fund(&m, &addr_a);
+        fund(&m, &addr_b);
+        m
+    };
+
+    let txs = vec![
+        signed_tx(&pk_a, 0, tx::TxKind::Call(contract_evm), &[]),
+        signed_transfer_tx(&pk_b, 0, revm::primitives::Address::from([0x77; 20]), 1),
+    ];
+
+    // Serial reference leg (pure revm, one tx at a time).
+    let m_serial = setup();
+    m_serial.begin_block(Height::new(1));
+    for raw in &txs {
+        m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_serial.end_block(Height::new(1));
+
+    // Parallel leg: the two senders form independent groups, so the
+    // contract write commits from its speculative record.
+    let m_par = setup();
+    m_par.begin_block(Height::new(1));
+    let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+    assert_eq!(m_par.storage_at(&contract, &U256::from(1)), U256::from(42));
+    assert_eq!(m_par.storage_at(&contract, &U256::from(2)), U256::from(43));
+    assert_eq!(m_par.storage_at(&contract, &U256::from(3)), U256::from(5));
+    assert_eq!(m_serial.state_root(), m_par.state_root(), "serial and parallel roots must match");
+}
+
+/// Every EVM entry path must produce identical state on a
+/// contract-heavy multi-sender workload: serial `handle`,
+/// `handle_batch`, `handle_batch_parallel`, and
+/// `handle_batch_parallel_preverified`. The workload exercises
+/// unread-slot preservation, slot zeroing, same-contract
+/// different-slot conflicts (canonical re-execution), CREATE,
+/// REVERT, SELFDESTRUCT, a coinbase `BALANCE` read, and a plain
+/// fast-path transfer — the classes the account-granular OCC
+/// scheduler must interleave correctly.
+#[test]
+fn all_execution_paths_match_on_contract_workload() {
+    let (pk_a, addr_a) = test_keypair();
+    let (pk_b, addr_b) = test_keypair();
+    let (pk_c, addr_c) = test_keypair();
+    let senders = [&addr_a, &addr_b, &addr_c];
+    let c1 = workload_contract(1);
+    let evm = |a: Address| revm::primitives::Address::from(a.0);
+
+    // Calldata helpers for the parameterized WRITER contract.
+    let call = |pk: &[u8], nonce: u64, to: Address, slot: u64, val: u64| {
+        let mut data = [0u8; 64];
+        data[31] = u8::try_from(slot).expect("slot fits u8");
+        data[63] = u8::try_from(val).expect("val fits u8");
+        signed_tx(pk, nonce, tx::TxKind::Call(evm(to)), &data)
+    };
+    let plain_call =
+        |pk: &[u8], nonce: u64, to: Address| signed_tx(pk, nonce, tx::TxKind::Call(evm(to)), &[]);
+
+    // Interleaved so that C1 is written by A (idx 0), then B
+    // (idx 1 — conflict → canonical re-execution), then A again
+    // (idx 9 — multi-writer flag set → re-execution again).
+    let txs = vec![
+        call(&pk_a, 0, c1, 3, 5),
+        call(&pk_b, 0, c1, 4, 6),
+        plain_call(&pk_c, 0, workload_contract(2)),
+        plain_call(&pk_a, 1, workload_contract(3)),
+        signed_transfer_tx(&pk_b, 1, revm::primitives::Address::from([0x77; 20]), 1),
+        signed_tx(&pk_c, 1, tx::TxKind::Create, &[0x60, 0x80, 0x60, 0x40, 0x52]),
+        plain_call(&pk_a, 2, workload_contract(4)),
+        plain_call(&pk_b, 2, workload_contract(5)),
+        plain_call(&pk_c, 2, workload_contract(6)),
+        call(&pk_a, 3, c1, 1, 0),
+    ];
+
+    // Leg 1: serial per-tx `handle` (pure revm).
+    let m_handle = setup_contract_workload(senders);
+    m_handle.begin_block(Height::new(1));
+    for raw in &txs {
+        m_handle.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_handle.end_block(Height::new(1));
+
+    // Leg 2: serial batch (fast paths + revm under one lock).
+    let m_batch = setup_contract_workload(senders);
+    m_batch.begin_block(Height::new(1));
+    let batch_results = m_batch.handle_batch(&dummy_ctx(), &txs);
+    m_batch.end_block(Height::new(1));
+
+    // Leg 3: parallel speculative.
+    let m_par = setup_contract_workload(senders);
+    m_par.begin_block(Height::new(1));
+    let par_results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+
+    // Leg 4: parallel with pre-verified senders.
+    let m_pv = setup_contract_workload(senders);
+    m_pv.begin_block(Height::new(1));
+    let pvs: Vec<_> = m_pv
+        .preverify_batch(&txs)
+        .into_iter()
+        .map(|r| r.expect("preverify must succeed"))
+        .collect();
+    let pv_results = m_pv.handle_batch_parallel_preverified(&dummy_ctx(), &pvs);
+    m_pv.end_block(Height::new(1));
+
+    // Per-position outcome parity across all four legs. A REVERT
+    // is `Ok` with status=false; only intrinsic/validation
+    // failures produce `Err` — and every leg must agree on which.
+    for (i, (b, (p, v))) in
+        batch_results.iter().zip(par_results.iter().zip(pv_results.iter())).enumerate()
+    {
+        assert_eq!(b.is_ok(), p.is_ok(), "tx {i}: batch vs parallel outcome mismatch");
+        assert_eq!(b.is_ok(), v.is_ok(), "tx {i}: batch vs preverified outcome mismatch");
+    }
+
+    // Storage parity for every contract across all legs.
+    let watched = [
+        (c1, 1u64),
+        (c1, 2),
+        (c1, 3),
+        (c1, 4),
+        (workload_contract(2), 4),
+        (workload_contract(3), 2),
+        (workload_contract(5), 9),
+    ];
+    for (contract, slot) in watched {
+        let expected = m_handle.storage_at(&contract, &U256::from(slot));
+        for (name, m) in [("batch", &m_batch), ("parallel", &m_par), ("preverified", &m_pv)] {
+            assert_eq!(
+                m.storage_at(&contract, &U256::from(slot)),
+                expected,
+                "{name}: contract {contract:?} slot {slot} diverged from serial"
+            );
+        }
+    }
+
+    // Sender nonces and the beneficiary's received balance.
+    for sender in senders {
+        let expected = m_handle.nonce(sender);
+        assert_eq!(m_par.nonce(sender), expected, "parallel nonce mismatch");
+        assert_eq!(m_pv.nonce(sender), expected, "preverified nonce mismatch");
+    }
+
+    // The decisive check: identical consensus state roots.
+    let root = m_handle.state_root();
+    assert_eq!(m_batch.state_root(), root, "batch root diverged from serial");
+    assert_eq!(m_par.state_root(), root, "parallel root diverged from serial");
+    assert_eq!(m_pv.state_root(), root, "preverified root diverged from serial");
 }
 
 /// Parallel execution with multiple nonces per sender. Each
