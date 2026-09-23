@@ -4517,6 +4517,134 @@ fn c9_wal_restart_recovery() {
     }
 }
 
+/// Restart continuity: the WAL must restore the uncommitted chain
+/// tail, not just safety metadata. `blocks` is in-memory only, and
+/// the recovered `high_qc` anchors into it — `propose()` stamps
+/// `parent.height + 1` from the stored header, `commit_walk`
+/// finalizes `Complete` bodies it can reach. Without the tail a
+/// restart deadlocks at its committed tip: the QC resolves to a
+/// hash nothing holds and every proposal attempt returns None.
+#[test]
+fn wal_restart_restores_pending_tail_and_resumes_finality() {
+    use crate::wal::Wal;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("consensus.wal");
+
+    let committed_before;
+    let pending_hash;
+    let pending_height;
+    // Phase 1: run a chain with a WAL so the tail is persisted.
+    {
+        let app = Arc::new(MockApp::new());
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(app, single_validator_set())
+            .without_signature_verification()
+            .with_wal(wal);
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+        committed_before = engine.finalized_height().expect("blocks committed").value();
+        // The newest QC'd block is still pending (the 2-chain rule
+        // commits through its children) — it must be the entry the
+        // restart has to resolve.
+        pending_hash = engine.high_qc.as_ref().expect("high_qc set").qc().block_hash;
+        pending_height = engine
+            .blocks
+            .get(&pending_hash)
+            .map(|(header, _)| header.height)
+            .expect("high_qc block stored")
+            .value();
+        assert!(pending_height > committed_before, "tip must be uncommitted");
+    }
+
+    // Phase 2: restart on the same WAL — the recovered engine must
+    // resolve the QC'd tip and resume finalizing over the tail.
+    {
+        let app = Arc::new(MockApp::new());
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(app, single_validator_set())
+            .without_signature_verification()
+            .with_wal(wal);
+        engine.recover_from_wal().expect("recover from WAL");
+
+        let (header, _) =
+            engine.blocks.get(&pending_hash).expect("restored tail must contain the high_qc block");
+        assert_eq!(header.height.value(), pending_height);
+
+        // New work forces proposals; the flush commits through the
+        // restored blocks — if the tail were lost, `propose()` would
+        // return None forever and this stays at the pre-crash tip.
+        engine.submit_tx(TxBytes::new(vec![2]));
+        engine.run_until_idle();
+        let after = engine.finalized_height().expect("finality resumed").value();
+        assert!(
+            after >= pending_height,
+            "the pre-crash pending tip must finalize post-restart: {after} < {pending_height}"
+        );
+        assert!(
+            engine.finalized_block(Height::new(pending_height)).is_some(),
+            "commit walk must reach the restored block"
+        );
+    }
+}
+
+/// The dispersed-broadcast shape: a block voted header-only is
+/// stored `Awaiting`, and the tail must restore it as `Awaiting`
+/// (not `Complete`, not missing) so `supply_body` can still
+/// certify it after restart — the same capability it had live.
+#[test]
+fn wal_restart_restores_awaiting_header() {
+    use crate::wal::Wal;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("consensus.wal");
+    let mut leader = make_multi_engine(0);
+    let header;
+    let proposal;
+    let block_hash;
+    {
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut follower = make_multi_engine(1).with_wal(wal);
+        // Quorum is 3 of 4 — the WAL'd follower votes alongside two
+        // plain followers. `supply_bodies: false` leaves the stored
+        // entry Awaiting at the moment the WAL captures it.
+        let mut f2 = make_multi_engine(2);
+        let mut f3 = make_multi_engine(3);
+        let (h, p, _qc) = drive_round_sharded(
+            &mut leader,
+            &mut [&mut follower, &mut f2, &mut f3],
+            Some(TxBytes::new(vec![5])),
+            false,
+        );
+        header = h;
+        proposal = p;
+        block_hash = OxideBft::block_hash(&header);
+        assert!(
+            matches!(follower.blocks.get(&block_hash).map(|(_, b)| b), Some(BlockBody::Awaiting)),
+            "pre-crash entry must be Awaiting for this test to mean anything"
+        );
+    }
+    {
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut follower = make_multi_engine(1).with_wal(wal);
+        follower.recover_from_wal().expect("recover from WAL");
+        assert!(
+            matches!(follower.blocks.get(&block_hash).map(|(_, b)| b), Some(BlockBody::Awaiting)),
+            "restart must restore the header as Awaiting — dropping it strands the QC'd tip"
+        );
+        follower.supply_body(block_hash, &proposal).expect("certified body must be accepted");
+        assert!(
+            matches!(
+                follower.blocks.get(&block_hash).map(|(_, b)| b),
+                Some(BlockBody::Complete(_))
+            ),
+            "supply_body must upgrade the restored header exactly as live"
+        );
+    }
+}
+
 /// C9 test: an engine without a WAL does not crash when
 /// `append_wal` or `recover_from_wal` is called.
 #[test]

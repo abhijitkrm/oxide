@@ -205,6 +205,7 @@ fn load_config() -> NodeConfig {
     let overrides = node::AssemblyOverrides {
         allow_unsigned_txs: env::args().any(|a| a == "--unsafe-allow-unsigned-txs"),
         data_dir,
+        wal_path: parse_cli_flag("--wal-file").map(PathBuf::from),
         genesis,
     };
     // The shared conversion — the same mapping the validator binary

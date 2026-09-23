@@ -490,6 +490,27 @@ impl AppInterface for Executor {
 
     fn finalize_block(&self, block: &FinalizedBlock) -> CommitAck {
         let start = std::time::Instant::now();
+        // Idempotent re-commit. After a restart the journal replays
+        // to the durable tip while consensus still holds those same
+        // heights as its uncommitted tail — its commit walk will
+        // re-finalize them once new QCs close the links. Heights
+        // below `next_proposal_height` are already journaled AND
+        // executed (replay plants their roots and advances the
+        // watermark past them), so re-running one would double-apply
+        // its effects and append an out-of-order journal record the
+        // next recovery rejects as a gap. Consensus finality makes
+        // two different blocks at one height impossible, so the
+        // watermark is a complete dedup key.
+        if block.height.value() < *primitives::sync::lock_state(&self.next_proposal_height) {
+            return CommitAck { height: block.height };
+        }
+        // Durability first: the block must be journaled before ANY
+        // of its effects exist anywhere — mempool removal, module
+        // state, or a lane hand-off — so a crash can only ever lose
+        // work the journal still holds. The engine calls this before
+        // it WALs its own commit record, keeping the journal a strict
+        // superset of consensus-committed state.
+        self.journal_append(block);
         // Remove the committed txs from the mempool at finality.
         // `select` is a peek — pooled entries outlive proposals — so
         // this is the single point where inclusion becomes permanent
@@ -577,6 +598,11 @@ impl AppInterface for Executor {
             *primitives::sync::lock_state(&self.next_proposal_height) =
                 block.height.value().saturating_add(1); // M2 fix
         }
+        // Checkpoint cadence: every `checkpoint_interval` heights the
+        // journal's replay base advances to `snapshot.bin` and the
+        // covered segments are pruned — bounding both replay length
+        // and journal size.
+        self.maybe_checkpoint(block.height.value());
         if let Some(recorder) = &self.recorder {
             recorder.record("finalize_block", start.elapsed());
         }

@@ -54,14 +54,28 @@ use std::path::PathBuf;
 
 /// Upper bound on one WAL entry's payload.
 ///
-/// Unit: bytes. Origin: a `WalEntry` is the whole consensus safety state
+/// Unit: bytes. Origin: a `WalEntry` carries the consensus safety state
 /// (`last_voted_view`, `voted_at_height`, `high_qc`, `current_view`,
-/// `next_height`, `epoch`, `last_committed`) — roughly 200 bytes even
-/// with a large vote-lock map. 1 MiB is ~5000× headroom. Tradeoff: a
-/// corrupt length field beyond this is treated as a torn tail rather
-/// than allocated, so a damaged file cannot drive a multi-gigabyte
-/// allocation on the recovery path.
-const MAX_WAL_ENTRY_BYTES: usize = 1 << 20;
+/// `next_height`, `epoch`, `last_committed`) — roughly 200 bytes — plus
+/// the `pending` tail: up to [`MAX_PERSISTED_PENDING`] uncommitted
+/// blocks with their full proposal bodies. Bodies are bounded by the
+/// consensus block budget (~1 MiB each), so the entry cap is sized for
+/// the tail, not the safety fields. Tradeoff: a corrupt length field
+/// beyond this is treated as a torn tail rather than allocated, so a
+/// damaged file cannot drive a multi-gigabyte allocation on the
+/// recovery path.
+const MAX_WAL_ENTRY_BYTES: usize = 16 << 20;
+
+/// Maximum uncommitted chain tail persisted in a [`WalEntry`].
+///
+/// Unit: blocks. The restart-continuation invariant requires the
+/// *contiguous* run of uncommitted blocks above `last_committed` —
+/// a gap or a missing body stalls the commit walk (safe, but dead).
+/// Healthy operation commits within ~2 heights of the tip, so 8
+/// covers deep timeout-driven tails with margin; a tail deeper than
+/// the cap means the node fell far behind and needs block sync, not
+/// replay (the walk stops at the first missing body either way).
+pub(crate) const MAX_PERSISTED_PENDING: usize = 8;
 
 /// The safety-critical consensus state persisted to the WAL.
 ///
@@ -132,6 +146,24 @@ pub struct WalEntry {
     /// Encoded as an optional trailer (1-byte flag + 8-byte view)
     /// so entries written by older binaries still decode.
     pub timeout_signed_view: Option<View>,
+    /// The uncommitted chain tail: `(header, body)` for every stored
+    /// block above `last_committed`, ordered by height. `body` is
+    /// `Some` for a `Complete` block and `None` for an `Awaiting`
+    /// header — `propose()` stamps heights from the header alone, so
+    /// restoring header-only entries preserves the exact pre-crash
+    /// resolution capability (the commit walk still waits on the
+    /// body, as it did live). Restart-critical: the engine's
+    /// `blocks` map is in-memory only, and `propose()` /
+    /// `commit_walk` cannot stamp heights or finalize over a QC'd
+    /// block whose header/body was lost — without this field a
+    /// restart with a pending tip deadlocks (the recovered `high_qc`
+    /// resolves to a hash nothing can look up). `voted_at_height`
+    /// keeps the same-height locks honest across the re-run.
+    ///
+    /// Encoded as optional trailer #4 (varint count + per-entry
+    /// header + 1-byte body flag + proposal); absent on old files —
+    /// decoded `[]`. Capped at [`MAX_PERSISTED_PENDING`] when written.
+    pub pending: Vec<(types::BlockHeader, Option<types::Proposal>)>,
 }
 
 impl Encode for WalEntry {
@@ -199,6 +231,22 @@ impl Encode for WalEntry {
                 v.encode(buf);
             }
             None => buf.push(0),
+        }
+        // Optional trailer #4: the uncommitted tail (varint count +
+        // per-entry header + 1-byte body flag + proposal). The count
+        // is always present once the writer is this version — older
+        // decoders stop before it, newer ones read `0` as an empty
+        // tail.
+        codec::write::varint(buf, self.pending.len() as u64);
+        for (header, body) in &self.pending {
+            header.encode(buf);
+            match body {
+                Some(proposal) => {
+                    buf.push(1);
+                    proposal.encode(buf);
+                }
+                None => buf.push(0),
+            }
         }
     }
 }
@@ -281,6 +329,9 @@ impl<'a> Decode<'a> for WalEntry {
         } else {
             None
         };
+        // Optional trailer #4: the uncommitted tail. Entries written
+        // before it existed end here — decode `[]`.
+        let pending = decode_pending_tail(reader)?;
         Ok(Self {
             last_voted_view,
             voted_at_height,
@@ -291,8 +342,43 @@ impl<'a> Decode<'a> for WalEntry {
             last_committed,
             validator_set,
             timeout_signed_view,
+            pending,
         })
     }
+}
+
+/// Decode optional trailer #4: the uncommitted chain tail.
+///
+/// Each entry is a header (~150 B fixed fields) + 1-byte body flag +
+/// proposal, so a claimed count beyond what the remaining bytes could
+/// hold is malformed — the bound runs before the per-entry loop trusts
+/// the wire for `with_capacity`. Returns `[]` when the buffer ends
+/// before the trailer (entries written by older binaries).
+fn decode_pending_tail(
+    reader: &mut Reader<'_>,
+) -> Result<Vec<(types::BlockHeader, Option<types::Proposal>)>, DecodeError> {
+    if reader.remaining() == 0 {
+        return Ok(Vec::new());
+    }
+    let count =
+        u32::try_from(reader.read_varint()?).map_err(|_| DecodeError::LengthPrefixTooLarge {
+            claimed: u64::MAX,
+            remaining: reader.remaining() as u64,
+        })?;
+    if u64::from(count) > reader.remaining() as u64 / 64 {
+        return Err(DecodeError::LengthPrefixTooLarge {
+            claimed: u64::from(count),
+            remaining: reader.remaining() as u64,
+        });
+    }
+    let mut pending = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let header = types::BlockHeader::decode(reader)?;
+        let body =
+            if reader.read_u8()? == 1 { Some(types::Proposal::decode(reader)?) } else { None };
+        pending.push((header, body));
+    }
+    Ok(pending)
 }
 
 /// Errors that can occur during WAL operations.
@@ -643,6 +729,7 @@ mod tests {
             last_committed: None,
             validator_set: None,
             timeout_signed_view: None,
+            pending: Vec::new(),
         }
     }
 
@@ -660,6 +747,7 @@ mod tests {
             last_committed: Some((Hash([0xBB; 32]), Height::new(2))),
             validator_set: None,
             timeout_signed_view: Some(View::new(5)),
+            pending: Vec::new(),
         }
     }
 
@@ -967,5 +1055,88 @@ mod tests {
             Some(rotated),
             "recovery resolves the most recent set-bearing entry"
         );
+    }
+
+    /// A minimal header for tail-persistence tests: only the fields
+    /// that distinguish entries matter; the rest are fixed dummies.
+    fn test_header(height: u64, prev: Hash) -> types::BlockHeader {
+        types::BlockHeader {
+            height: Height::new(height),
+            view: View::new(height),
+            epoch: Epoch::new(0),
+            prev_block: prev,
+            tx_root: Hash::ZERO,
+            high_qc: None,
+            timeout_cert: None,
+            proposer: Hash::ZERO,
+            timestamp: 0,
+            proposer_signature: None,
+            exec_cert: None,
+            body_commitment: Hash::ZERO,
+        }
+    }
+
+    /// The uncommitted tail must round-trip through the codec — a
+    /// restart rebuilds `blocks` from exactly these bytes, so a
+    /// codec skew would strand the recovered `high_qc`.
+    #[test]
+    fn wal_entry_pending_tail_roundtrip() {
+        let mut entry = voted_entry();
+        let h3 = test_header(3, Hash([0xBB; 32]));
+        let h4 = test_header(4, Hash([0xCC; 32]));
+        entry.pending = vec![
+            (
+                h3,
+                Some(types::Proposal {
+                    height: Height::new(3),
+                    txs: vec![types::TxBytes::new(vec![1, 2, 3])],
+                    attestation: None,
+                }),
+            ),
+            // An `Awaiting` block persists header-only: `propose()`
+            // resolves heights from the header, the body still lands
+            // via `supply_body` after restart.
+            (h4, None),
+        ];
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
+        let mut reader = Reader::new(&buf);
+        let decoded = WalEntry::decode(&mut reader).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    /// Entries written before the pending tail existed must still
+    /// decode — the tail is optional trailer #4, so a buffer that
+    /// ends at the timeout-view flag decodes with an empty tail.
+    /// This is the rolling-upgrade contract: an old WAL drives a
+    /// node through block sync, never a decode failure.
+    #[test]
+    fn wal_entry_decodes_legacy_layout_without_tail() {
+        let entry = voted_entry();
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
+        // `pending` encodes as a trailing varint count; an empty
+        // tail is a single `0x00`. Stripping it yields exactly the
+        // pre-tail byte layout.
+        assert_eq!(buf.pop(), Some(0), "empty tail encodes as one zero byte");
+        let mut reader = Reader::new(&buf);
+        let decoded = WalEntry::decode(&mut reader).unwrap();
+        assert!(decoded.pending.is_empty());
+        assert_eq!(decoded.timeout_signed_view, entry.timeout_signed_view);
+        assert_eq!(decoded.last_committed, entry.last_committed);
+    }
+
+    /// A forged pending count must not drive allocation — the bound
+    /// rejects counts the remaining bytes could never satisfy before
+    /// the per-entry loop trusts them.
+    #[test]
+    fn wal_entry_pending_count_is_bounded() {
+        let entry = voted_entry();
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
+        buf.pop(); // strip the real tail count
+        codec::write::varint(&mut buf, 0xFFFF);
+        let mut reader = Reader::new(&buf);
+        assert!(WalEntry::decode(&mut reader).is_err());
     }
 }

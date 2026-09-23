@@ -306,6 +306,20 @@ impl History {
         }
     }
 
+    /// Empty every index, keeping the configured capacity.
+    ///
+    /// Used by snapshot import (`import_state`): the backend was
+    /// wholesale replaced, so a history rebuilt by merging restored
+    /// records onto stale in-memory ones would serve `*_at` reads
+    /// the pre-reset state — the same torn-state class the account
+    /// cache reset prevents.
+    pub fn clear(&mut self) {
+        self.blocks.clear();
+        self.hash_index.clear();
+        self.tx_index.clear();
+        self.pending = Pending::default();
+    }
+
     /// Record one executed transaction + its receipt into the pending
     /// block accumulator. Called once per EVM tx by the module's
     /// execution paths (`handle`, `execute_decoded`,

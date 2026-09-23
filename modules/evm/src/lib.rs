@@ -435,6 +435,14 @@ pub struct EvmModule {
     /// `Module::handle` takes `&self` — it is locked once per
     /// transaction build, matching `block_timestamp`/`coinbase`.
     fee_state: Mutex<fee::BaseFeeState>,
+    /// The constructor's seed base fee — retained so
+    /// `import_state` can reset `fee_state` to genesis conditions
+    /// before `load_from_storage` rehydrates it from the restored
+    /// block history. Without this a snapshot import onto a backend
+    /// that had flushed *ahead* of the checkpoint would keep the
+    /// stale tip's fee curve — sealed-block `baseFee` fields would
+    /// diverge from every peer's replay, corrupting block hashes.
+    initial_base_fee: u64,
     /// The EVM hardfork spec to use for execution.
     /// `SpecId::PRAGUE` is the latest stable mainnet spec in revm 42.
     spec: SpecId,
@@ -626,6 +634,7 @@ impl EvmModule {
             db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
             fee_state: Mutex::new(fee::BaseFeeState::new(base_fee, CHAIN_BLOCK_GAS_LIMIT)),
+            initial_base_fee: base_fee,
             spec: SpecId::PRAGUE,
             backend: Mutex::new(None),
             pending_flush: Mutex::new(Vec::new()),
@@ -659,6 +668,7 @@ impl EvmModule {
             db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
             fee_state: Mutex::new(fee::BaseFeeState::new(base_fee, CHAIN_BLOCK_GAS_LIMIT)),
+            initial_base_fee: base_fee,
             spec,
             backend: Mutex::new(None),
             pending_flush: Mutex::new(Vec::new()),
@@ -719,6 +729,7 @@ impl EvmModule {
             db: Mutex::new(Arc::new(CacheDB::new(EmptyDB::new()))),
             chain_id,
             fee_state: Mutex::new(fee::BaseFeeState::new(base_fee, CHAIN_BLOCK_GAS_LIMIT)),
+            initial_base_fee: base_fee,
             spec: SpecId::PRAGUE,
             backend: Mutex::new(None),
             pending_flush: Mutex::new(Vec::new()),

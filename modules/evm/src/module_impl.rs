@@ -9,10 +9,11 @@
 //! into it.
 
 use super::{
-    Address, Arc, BLOCK_TIME_SECS, Balances, Event, EvmModule, ExecError, HISTORY_SERVE_WINDOW,
-    HISTORY_STORAGE_ADDRESS, Hash, Height, INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx,
-    SpecId, TxContext, alloy_primitives_address, encode_trie_leaf, history, persist, receipts,
-    sparse_walk, trie, tx,
+    Address, Arc, BLOCK_TIME_SECS, Balances, CHAIN_BLOCK_GAS_LIMIT, CacheDB, EmptyDB, Event,
+    EvmModule, ExecError, HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS, Hash, Height,
+    INTRINSIC_GAS_BASE, MODULE_ID, Module, PreverifiedTx, SpecId, TxContext,
+    alloy_primitives_address, encode_trie_leaf, fee, history, persist, receipts, sparse_walk, trie,
+    tx, versioned,
 };
 
 impl Module for EvmModule {
@@ -1034,7 +1035,41 @@ impl Module for EvmModule {
                 return Err(storage::SnapshotError::BackendError);
             }
         }
-        // Reload the in-memory cache from the backend.
+        // Reload the in-memory views from the backend — onto EMPTY
+        // views, not merges. `load_from_storage` inserts
+        // account-by-account and record-by-record, so any entry
+        // present in memory but absent from the snapshot would
+        // survive the import: a restart whose redb backend had
+        // flushed ahead of the checkpoint (crash between an EVM
+        // flush and the snapshot write) would keep stale balances
+        // and stale history, then double-apply on replay. The
+        // backend was wholesale replaced above, so every in-memory
+        // view of it must be wholesale replaced too.
+        {
+            let mut db_guard = framework::lock_state(&self.db);
+            *db_guard = Arc::new(CacheDB::new(EmptyDB::new()));
+        }
+        framework::lock_state(&self.history).clear();
+        *framework::lock_state(&self.versioned) = versioned::VersionedState::default();
+        *framework::lock_state(&self.block_undo) = versioned::BlockUndo::default();
+        framework::lock_state(&self.storage_root_cache).clear();
+        // The EIP-1559 accumulator is in-memory state the snapshot
+        // does not carry — reset it to the constructor seed, then
+        // `load_from_storage` rehydrates it from the newest restored
+        // sealed block exactly as a cold start would. Without this,
+        // a backend that had flushed ahead of the checkpoint leaves
+        // the tip's fee curve installed: replayed blocks would seal
+        // with a different `baseFee`, corrupting every block hash.
+        *framework::lock_state(&self.fee_state) =
+            fee::BaseFeeState::new(self.initial_base_fee, CHAIN_BLOCK_GAS_LIMIT);
+        *framework::lock_state(&self.block_height) = 0;
+        *framework::lock_state(&self.block_timestamp) = 0;
+        *framework::lock_state(&self.coinbase) = revm::primitives::Address::ZERO;
+        self.block_gas_limit.store(CHAIN_BLOCK_GAS_LIMIT, std::sync::atomic::Ordering::Relaxed);
+        // Flush ops queued for the pre-reset backend describe state
+        // the snapshot replaced wholesale — replaying them onto the
+        // fresh backend would resurrect stale records.
+        framework::lock_state(&self.pending_flush).clear();
         let mut backend = framework::lock_state(&self.backend);
         if let Some(ref mut b) = *backend {
             self.load_from_storage(b.as_mut());

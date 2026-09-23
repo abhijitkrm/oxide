@@ -178,6 +178,8 @@ fn run_node(node_index_str: &str) {
     // --genesis-file was given, the staking validators and native
     // balances are already applied via `node.genesis`; `evm.alloc`
     // is applied on the module handle below.
+    // `--wal-file` overrides the derived `<data_dir>/consensus.wal`
+    // path; when neither is set the WAL stays in-memory.
     let wal_path = node::cli::parse_cli_flag("--wal-file").map(PathBuf::from);
     let node::devnet::DevnetNode {
         mut engine,
@@ -186,23 +188,31 @@ fn run_node(node_index_str: &str) {
         staking_module: _,
         exchange_module: _,
         recovered: _,
+        recovery,
+        wal_path: effective_wal_path,
     } = node::devnet::assemble_devnet_node(node::devnet::DevnetNodeSpec {
         index: node_index,
         validator_set: validator_set.clone(),
         secret_key: our_key.clone(),
         config: cfg.node.clone(),
         clock: None, // production wall clock
-        wal_path: wal_path.clone(),
+        wal_path,
     })
     .unwrap_or_else(|e| {
         eprintln!("oxide-devnet[{node_index}]: {e} — exiting");
         std::process::exit(1);
     });
     let app: Arc<executor::Executor> = app;
-    if let Some(genesis) = &cfg.genesis_file {
+    // `evm.alloc` is genesis state: it applies on a fresh start
+    // only. `assemble_executor` already ran durable recovery, so a
+    // restart arrives here holding the replayed tip — overwriting
+    // alloc accounts now would rewind balances the chain moved.
+    let fresh_start =
+        recovery.as_ref().is_none_or(|r| r.snapshot_height.is_none() && r.blocks_replayed == 0);
+    if fresh_start && let Some(genesis) = &cfg.genesis_file {
         apply_evm_alloc(&evm_module, genesis);
     }
-    if let Some(ref wal_path) = wal_path {
+    if let Some(ref wal_path) = effective_wal_path {
         println!("oxide-devnet[{node_index}]: WAL loaded from {}", wal_path.display());
     }
 
@@ -218,11 +228,11 @@ fn run_node(node_index_str: &str) {
     let validator_set_clone = validator_set.clone();
 
     // Data directory: `--data-dir` or `[storage] data_dir` enables
-    // auto-snapshot persistence — on startup, if
-    // `<dir>/snapshot.bin` exists, import it; on shutdown, export
-    // the current state to `<dir>/snapshot.bin`. The EVM state
-    // database at `<dir>/evm.redb` was already wired by
-    // `assemble_executor` via `node.storage_path`.
+    // durable state — `<dir>/block-journal/` records every finalized
+    // block and `<dir>/snapshot.bin` is the periodic checkpoint, both
+    // already replayed by `assemble_executor` above (the `recovery`
+    // report). The EVM state database at `<dir>/evm.redb` was wired
+    // the same way via `node.storage_path`.
     //
     // This gives a restarting validator full state persistence
     // without requiring manual `--export-snapshot` /
@@ -232,13 +242,23 @@ fn run_node(node_index_str: &str) {
     if let Some(ref dir) = data_dir {
         std::fs::create_dir_all(dir)
             .unwrap_or_else(|e| panic!("failed to create data dir {}: {e}", dir.display()));
-        if let Some(height) =
-            node::devnet::import_snapshot_if_present(&app, dir).unwrap_or_else(|e| panic!("{e}"))
-        {
-            println!(
-                "oxide-devnet[{node_index}]: imported snapshot from {} (height {height})",
-                dir.join("snapshot.bin").display(),
-            );
+        if let Some(report) = &recovery {
+            if report.snapshot_height.is_some() || report.blocks_replayed > 0 {
+                println!(
+                    "oxide-devnet[{node_index}]: recovered durable state from {} \
+                     (snapshot {:?}, replayed {} blocks, height {})",
+                    dir.display(),
+                    report.snapshot_height,
+                    report.blocks_replayed,
+                    report.recovered_height,
+                );
+            }
+            if let Some(reason) = &report.snapshot_rejected {
+                eprintln!(
+                    "oxide-devnet[{node_index}]: snapshot.bin rejected ({reason}); \
+                     recovered from the block journal alone"
+                );
+            }
         }
     }
 

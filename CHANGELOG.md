@@ -1457,6 +1457,40 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     snapshot, so they cannot change anything, and the ledger treats
     "storage slot set to zero" exactly like "slot never existed,"
     matching Ethereum.
+- **Crash recovery: a killed node restarted with empty module state
+  and a consensus engine that could not resume** (`crates/executor`,
+  `crates/consensus`, `crates/node`, `bin/*`)
+  - Only the EVM's redb backend was durable; every other module's
+    state lived in memory, so a crash restarted the executor empty
+    while consensus believed blocks behind it were committed. The
+    executor now journals every finalized block (txs, signers, and
+    the committed execution context) to `block-journal/` before any
+    effect lands, seeded by a baseline state checkpoint, and replays
+    it on startup — module state, executed nonces, and state roots
+    all land identically to the live run. Periodic checkpoints write
+    `snapshot.bin` atomically (temp file + fsync + rename) and prune
+    covered journal segments; a corrupt stale snapshot falls back to
+    the journal, while a journal gap fails loudly.
+  - Recovery runs inside shared node assembly, so validator,
+    fullnode, and devnet binaries all get it; genesis balances apply
+    only on a genuinely fresh start. `--data-dir` now also derives
+    the consensus WAL (`consensus.wal`) automatically.
+  - Restart continuation needed two more pieces the first real
+    restart exposed: the WAL now persists the uncommitted chain tail
+    (headers plus bodies, header-only for still-propagating blocks)
+    so the recovered high-QC resolves to a stored block, and the
+    recovered view floors at `high_qc.view + 1` since the recorded
+    view can trail the adopted QC. Re-committed tail heights are
+    deduplicated at `finalize_block`, keeping the journal contiguous
+    across any number of restarts.
+  - **In plain words:** killing a node used to lose most of its
+    state and then leave it stuck — it knew blocks had finalized
+    but had forgotten what they contained. Now a node that is killed
+    mid-run replays its journal back to the exact pre-crash state,
+    remembers the blocks consensus was still working on, and keeps
+    finalizing new blocks from where it left off. Verified by
+    repeatedly `kill -9`-ing a live devnet and watching it resume
+    cleanly each time.
 - **oxideBFT: hidden-QC fork — conflicting blocks could finalize at
   the same height** (`crates/consensus`, `crates/types`,
   `bin/oxide-devnet`, `crates/devnet`, `sim`, `spec/oxidebft`)

@@ -536,6 +536,7 @@ fn node_config_from_propagates_every_field() {
     let overrides = AssemblyOverrides {
         allow_unsigned_txs: true,
         data_dir: Some(data_dir.clone()),
+        wal_path: None,
         genesis: None,
     };
     let node_config = node_config_from(&config, &rpc, &overrides, NodeMode::Single)
@@ -556,6 +557,17 @@ fn node_config_from_propagates_every_field() {
         node_config.storage_path,
         Some(data_dir.join("evm.redb")),
         "data_dir must become the EVM state path"
+    );
+    assert_eq!(
+        node_config.durability_dir,
+        Some(data_dir.clone()),
+        "data_dir must root the block journal"
+    );
+    assert_eq!(
+        node_config.wal_path,
+        Some(data_dir.join("consensus.wal")),
+        "data_dir must derive the consensus WAL — durable executor state without \
+         engine continuity would re-propose covered heights on restart"
     );
     assert_eq!(
         node_config.settlement_operator,

@@ -19626,3 +19626,82 @@ One residual noted for the record: the historical-sim pair
 (snapshot height vs undo index) can disagree by the width of the
 commit→`end_block` push window; it predates this change and is
 unobservable outside a concurrent block boundary.
+
+## Session N+24 — crash-durable executor state and restartable consensus
+
+The executor kept every module's state in memory and only the EVM's
+redb backend ever reached disk — a crash meant restarting from an
+empty executor while consensus believed the chain had committed
+heights behind it. This session built the durability contract end
+to end, then fixed what the first real restart exposed.
+
+**Executor journal + replay** (`crates/executor/src/durability.rs`).
+`finalize_block` now journals the full `FinalizedBlock` (txs,
+signers, committed execution context) into `storage::journal`
+*before* any effect lands — the consensus engine calls
+`finalize_block` before it WALs its own commit, so the journal is a
+strict superset of committed state. The first append writes a
+baseline record: a full `ExecutorSnapshot` tagged with
+`next_block`, the first height that still must replay — necessary
+because `snapshot.height` cannot distinguish "pre-block-0" from
+"post-block-0" (both stamp 0). Recovery imports `snapshot.bin` when
+present, then replays journaled blocks above the covered floor
+through `insert_finalized` + `execute_committed_backlog` — the same
+`execute_block` path the live run used, so roots land identically.
+Snapshot writes are atomic (tmp + fsync + rename + dir fsync);
+checkpoints every `checkpoint_interval` heights seal the journal
+and prune covered segments, bounding replay. A corrupt stale
+`snapshot.bin` is rejected while the journal baseline carries
+recovery; a gap or corrupt record fails loudly.
+
+**The torn-state bug replay exposed.** `import_state` merged into
+caches that were already hydrated by a *newer* durable EVM tip —
+the rebuilt module loaded redb's tip state at construction, then
+the baseline import merged on top, doubling balances and staking
+pool credits. Wholesale import now resets every derived view:
+account cache, history, versioned state, block-undo, and
+`fee_state` (a stale tip's base fee changed replayed block hashes,
+which diverged the EIP-2935 history contract's storage and every
+root above it). `import_state` gained an `initial_base_fee` seed
+for that reset.
+
+**Recovery is an assembly property, not a devnet convenience.**
+`assemble_executor` runs `recover_durable_state` before spawning
+the exec lane and returns a `RecoveryReport`; validator, fullnode,
+and devnet share the path. Genesis `evm.alloc` applies only on a
+fresh start (the report says nothing was recovered) so it cannot
+clobber replayed balances. `NodeConfig` gained `durability_dir`
+and `wal_path`, both auto-derived from `data_dir` (explicit
+`--wal-file` still wins).
+
+**What the first real restart caught.** With the WAL loading and
+the executor replaying cleanly, the node still wedged: the WAL
+restored `high_qc`/`last_committed` but `blocks` — the in-memory
+pending chain — was empty, so `propose()` could not resolve the
+QC'd tip's height and the engine spun in timeout loops. `WalEntry`
+now carries the uncommitted tail (optional trailer #4, height-
+ordered `(header, Option<body>)`, capped at 8): `Awaiting` headers
+persist header-only because `propose()` needs just the header,
+while `commit_walk` still waits on bodies exactly as live.
+`recover_from_wal` reinserts the tail above `last_committed`. A
+second stall hid behind the first: the WAL's `current_view` trails
+`high_qc.view` (deliver_qc appends before its own catch-up, and
+`advance_view` never appends), so recovery floors the restored view
+at `high_qc.view + 1` — the same rule deliver_qc applies on
+adoption. And a third, subtler one: the restored tail is *re-
+committed* by the walk once new QCs close, so `finalize_block` is
+now idempotent — heights below `next_proposal_height` return early
+instead of double-executing and writing an out-of-order journal
+record the next replay would reject as a gap.
+
+**E2E proof.** `oxide-devnet` on a real data dir: killed -9 at
+height 643, restarted — WAL loaded, 644 blocks replayed to 643,
+finalization resumed at 644 with no timeout loop. Killed again at
+1287, restarted — 1288 blocks replayed, resumed at 1288. The second
+restart is the one the re-commit guard exists for.
+
+Regression coverage: 8 executor durability tests (replay fidelity,
+checkpoint bounding, corrupt snapshot/corrupt checkpoint, gap
+rejection, baseline semantics), WAL codec round-trip + legacy
+decode + count-bound tests, and two engine restart tests —
+pending-tail finality resume and `Awaiting` header restore.

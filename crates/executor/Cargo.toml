@@ -32,6 +32,17 @@ framework = { workspace = true }
 # the extern crates against the published lib, so no cycle forms.
 evm = { workspace = true }
 staking = { workspace = true }
+# The `redb` feature gives durability tests a real disk-backed
+# StorageBackend — the "EVM durable ahead of native modules" crash
+# scenario only exists when the EVM's store survives the executor's
+# drop. Features unify with the lib's own `storage` dep, so the lib
+# itself is unaffected outside tests.
+storage = { workspace = true, features = ["redb"] }
+# tempfile: durability tests need real directories — the crash-
+# recovery contract only exists over real filesystem state (the
+# journal segments, snapshot.bin, and the EVM's redb store must
+# survive the executor's drop).
+tempfile = "3.27.0"
 
 [[bench]]
 name = "uniswap_transfer"

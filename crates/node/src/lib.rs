@@ -30,6 +30,8 @@
 //!     parallel_threshold: 32,
 //!     evm_persistence: true,
 //!     storage_path: None,
+//!     durability_dir: None,
+//!     wal_path: None,
 //!     settlement_operator: None,
 //!     min_fee: 0,
 //!     chain_id: 1,
@@ -152,6 +154,27 @@ pub struct NodeConfig {
     /// `Volatile` (in-memory) backend. Default: `None` —
     /// in-memory for devnet; set to a path for production.
     pub storage_path: Option<std::path::PathBuf>,
+    /// Crash-durability root directory. When `Some`, the executor
+    /// journals every finalized block to `<dir>/block-journal/`
+    /// *before* executing it and writes an atomic `snapshot.bin`
+    /// checkpoint every [`executor::DEFAULT_CHECKPOINT_INTERVAL`]
+    /// heights — after a crash, `Executor::recover_durable_state`
+    /// imports the newest checkpoint and replays the journaled
+    /// blocks above it, so native-module state, the EVM, and the
+    /// executed-nonce map restart at one consistent height. `None`
+    /// disables the journal (in-memory only — tests and sims).
+    /// Conventionally the same `data_dir` whose `evm.redb` child is
+    /// `storage_path`.
+    pub durability_dir: Option<std::path::PathBuf>,
+    /// Consensus WAL path — persists `last_voted_view`, `high_qc`,
+    /// `last_committed`, and the vote locks that make restarting
+    /// safe. Conventionally `<data_dir>/consensus.wal`: executor
+    /// durability (`durability_dir`) restores *state* on restart,
+    /// but without the WAL the engine would re-propose at height 0
+    /// on top of a recovered tip — re-committing already-covered
+    /// heights and corrupting the block journal's contiguous-height
+    /// invariant. `None` keeps the WAL in-memory (tests, sims).
+    pub wal_path: Option<std::path::PathBuf>,
     /// The settlement operator address — the only account allowed to
     /// submit exchange `batch_settle` transactions (the off-chain
     /// matching service's tx sender). `None` disables batch
@@ -219,6 +242,8 @@ impl Default for NodeConfig {
             parallel_threshold: executor::DEFAULT_PARALLEL_THRESHOLD,
             evm_persistence: true,
             storage_path: None,
+            durability_dir: None,
+            wal_path: None,
             settlement_operator: None,
             min_fee: 0,
             chain_id: 1,
@@ -308,12 +333,30 @@ impl Node {
                 let pk = key.public_key();
                 let vs =
                     consensus::ValidatorSet::new(vec![pk], vec![1]).expect("single validator set");
-                Box::new(
-                    OxideBft::new(app_dyn.clone(), vs)
-                        .with_secret_key(key)
-                        .with_pacemaker_timeouts(config.base_timeout_ms, config.max_timeout_ms)
-                        .with_block_budget(config.block_budget),
-                )
+                let mut engine = OxideBft::new(app_dyn.clone(), vs)
+                    .with_secret_key(key)
+                    .with_pacemaker_timeouts(config.base_timeout_ms, config.max_timeout_ms)
+                    .with_block_budget(config.block_budget);
+                // Consensus WAL: restores `last_committed`, `high_qc`,
+                // and the per-height vote locks — without it a restart
+                // would re-propose from height 0 over the executor's
+                // recovered tip. The same attach+recover pair the
+                // devnet path runs in `assemble_devnet_node`.
+                if let Some(wal_path) = &config.wal_path {
+                    if let Some(parent) = wal_path.parent() {
+                        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                            panic!("failed to create WAL dir {}: {e}", parent.display())
+                        });
+                    }
+                    let wal = consensus::wal::Wal::open(wal_path).unwrap_or_else(|e| {
+                        panic!("failed to open consensus WAL {}: {e}", wal_path.display())
+                    });
+                    engine = engine.with_wal(wal);
+                    engine.recover_from_wal().unwrap_or_else(|e| {
+                        panic!("consensus WAL recovery failed at {}: {e}", wal_path.display())
+                    });
+                }
+                Box::new(engine)
             }
         };
 
@@ -399,7 +442,11 @@ impl Node {
     /// # Atomicity
     ///
     /// If import fails, the node's state is unchanged (the executor
-    /// validates the snapshot before modifying any state).
+    /// validates the snapshot before modifying any state). A
+    /// `CheckpointFailed` error is the exception: the import itself
+    /// succeeded but persisting it failed — the variant exists so
+    /// callers cannot mistake a non-persisted import for a durable
+    /// one.
     ///
     /// # When to call
     ///
@@ -417,6 +464,17 @@ impl Node {
         if result.is_ok() {
             self.metrics
                 .set_gauge("snapshot_height", i64::try_from(snapshot.height).unwrap_or(i64::MAX));
+            // Persist the imported state under the durability
+            // contract. Without this checkpoint a restart would
+            // replay whatever the journal previously held and
+            // silently rewind below the synced height — the imported
+            // state would exist only until the process exited.
+            // `durable_checkpoint` writes `snapshot.bin` atomically
+            // and prunes journal segments the imported height now
+            // covers; a no-op when durability is not configured.
+            self.app.durable_checkpoint().map_err(|e| {
+                executor::SnapshotImportError::CheckpointFailed { reason: e.to_string() }
+            })?;
         }
         result
     }
@@ -494,6 +552,13 @@ pub struct AssembledExecutor {
     /// The exchange module — needed by harnesses that drive
     /// settlement or inspect book state post-run.
     pub exchange_module: Arc<exchange::ExchangeModule>,
+    /// The crash-durability recovery report, when the config enabled
+    /// a durability directory: how much of the journal was replayed
+    /// and which checkpoint anchored it. `None` when durability is
+    /// not configured (in-memory deployments) — distinct from
+    /// `Some` with an empty report, which means "durability on,
+    /// nothing on disk yet" (a fresh start).
+    pub recovery: Option<executor::RecoveryReport>,
 }
 
 /// Assemble the executor + full module graph from `config`.
@@ -557,6 +622,16 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
         });
     if let Some(n) = config.history_retention {
         executor = executor.with_history_retention(n);
+    }
+    // Crash durability: with a data dir configured, every finalized
+    // block is journaled before execution and periodic atomic
+    // checkpoints bound the replay window. `None` keeps the
+    // in-memory behavior for tests and sims.
+    if let Some(dir) = &config.durability_dir {
+        executor =
+            executor.with_durability(executor::DurabilityConfig::new(dir.clone())).unwrap_or_else(
+                |e| panic!("failed to open block journal under {}: {e}", dir.display()),
+            );
     }
     executor.register_module(Arc::new(oxide_core::CoreModule::new()));
 
@@ -704,6 +779,19 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     evm_module.set_native_modules(Some(exchange.clone()), Some(perps));
     executor.register_module(evm_module.clone());
     let app: Arc<Executor> = Arc::new(executor);
+    // Crash recovery runs here — inside the ONE assembly path — so
+    // every consumer (`Node::assemble`, the multi-validator binary,
+    // the harnesses) restarts from the same durable state. When
+    // `durability_dir` is configured this imports the newest
+    // `snapshot.bin` checkpoint and replays the journaled blocks
+    // above it; with no durability configured it is a `None`
+    // no-op. Recovery must precede the exec-lane spawn: replay
+    // drives `execute_committed_backlog` inline, and the lane must
+    // start from a state whose watermarks already reflect the
+    // recovered tip.
+    let recovery = app
+        .recover_durable_state()
+        .unwrap_or_else(|e| panic!("durable state recovery failed: {e}"));
     // Spawn the async execution lane (plan.md §13 Phase D):
     // `finalize_block` hands each committed block to a worker
     // thread, overlapping execution of block h with consensus
@@ -711,7 +799,7 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     // multi-validator binary previously ran without it, a second
     // execution pipeline with different backpressure behavior.
     app.spawn_exec_lane();
-    AssembledExecutor { app, evm_module, staking_module, exchange_module: exchange }
+    AssembledExecutor { app, evm_module, staking_module, exchange_module: exchange, recovery }
 }
 
 /// Run a simple smoke test: assemble a node, submit a tx, finalize a block.
@@ -822,6 +910,11 @@ pub struct AssemblyOverrides {
     /// `--data-dir` / `[storage] data_dir` — the resolved data
     /// directory; its `evm.redb` child becomes `storage_path`.
     pub data_dir: Option<std::path::PathBuf>,
+    /// `--wal-file` — explicit consensus WAL location. `None` derives
+    /// `<data_dir>/consensus.wal` when a data dir is configured, so
+    /// crash recovery covers engine safety state (vote locks,
+    /// `high_qc`, `last_committed`) without a second flag.
+    pub wal_path: Option<std::path::PathBuf>,
     /// The resolved genesis spec — from `--genesis-file` via
     /// [`genesis_spec_from_file`], or the devnet fallback via
     /// [`genesis_spec_devnet`]. `None` selects `NodeConfig`'s
@@ -890,6 +983,22 @@ pub fn node_config_from(
         // `Volatile` backend keeps the in-memory behavior.
         evm_persistence: true,
         storage_path: overrides.data_dir.as_ref().map(|d| d.join("evm.redb")),
+        // A configured data dir enables the block journal +
+        // checkpoint machinery: `evm.redb` alone only persisted the
+        // EVM's half of the state, leaving native modules one crash
+        // away from a cross-module height tear.
+        durability_dir: overrides.data_dir.clone(),
+        // Executor durability without the consensus WAL is a trap:
+        // the executor would resume at the journaled tip while the
+        // engine re-proposed from height 0, re-committing covered
+        // heights into the journal. `consensus.wal` restores
+        // `last_committed`/`high_qc`/vote locks so the chain
+        // continues at tip + 1. An explicit `--wal-file` overrides
+        // the derived location.
+        wal_path: overrides
+            .wal_path
+            .clone()
+            .or_else(|| overrides.data_dir.as_ref().map(|d| d.join("consensus.wal"))),
         settlement_operator,
         min_fee: config.executor.min_fee,
         // One chain id, one base fee: the executor, the EVM module,

@@ -61,7 +61,9 @@ pub struct DevnetNodeSpec {
     /// `None` = `types::system_time_ms` (production wall clock).
     pub clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     /// Storage seam: the consensus WAL file persisting
-    /// safety-critical state (`last_voted_view`, `high_qc`, …).
+    /// safety-critical state (`last_voted_view`, `high_qc`,
+    /// `last_committed`, vote locks). `None` falls back to
+    /// `config.wal_path` (itself derived from the data dir); both
     /// `None` = no persistence (the in-memory harnesses).
     pub wal_path: Option<PathBuf>,
 }
@@ -84,6 +86,16 @@ pub struct DevnetNode {
     /// *rotated* committee, so the membership gate is relaxed to
     /// presence-only after recovery (see [`DevnetStartError`]).
     pub recovered: bool,
+    /// Crash-durability recovery report from executor assembly —
+    /// `None` when no durability directory is configured, `Some`
+    /// otherwise (an empty report means a fresh start). Callers
+    /// print it and use it to gate genesis-only work that must not
+    /// re-run over recovered state.
+    pub recovery: Option<executor::RecoveryReport>,
+    /// The consensus WAL path actually attached — the spec's
+    /// explicit value or the config-derived `<data_dir>/consensus.wal`
+    /// fallback. `None` = WAL persistence disabled.
+    pub wal_path: Option<PathBuf>,
 }
 
 /// Why [`assemble_devnet_node`] refused to start a node.
@@ -163,7 +175,7 @@ impl std::error::Error for DevnetStartError {}
 /// Panics if `spec.index` exceeds `u16::MAX` — a validator set
 /// that large is a configuration error, not a runtime condition.
 pub fn assemble_devnet_node(spec: DevnetNodeSpec) -> Result<DevnetNode, DevnetStartError> {
-    let AssembledExecutor { app, evm_module, staking_module, exchange_module } =
+    let AssembledExecutor { app, evm_module, staking_module, exchange_module, recovery } =
         crate::assemble_executor(&spec.config);
     let app_dyn: Arc<dyn ports::AppInterface> = app.clone();
 
@@ -181,10 +193,20 @@ pub fn assemble_devnet_node(spec: DevnetNodeSpec) -> Result<DevnetNode, DevnetSt
         engine = engine.with_clock(move || clock());
     }
 
-    // WAL persistence + recovery. Recovery can return a rotated
-    // committee, and re-seats our index by matching our BLS key
-    // against it.
-    let recovered = if let Some(ref wal_path) = spec.wal_path {
+    // WAL persistence + recovery. The explicit spec path wins; the
+    // config's derived `<data_dir>/consensus.wal` is the fallback so
+    // a durable executor always pairs with a durable engine — without
+    // it a restart would re-propose covered heights on top of the
+    // recovered tip. Recovery can return a rotated committee, and
+    // re-seats our index by matching our BLS key against it.
+    let wal_path = spec.wal_path.clone().or_else(|| spec.config.wal_path.clone());
+    let recovered = if let Some(ref wal_path) = wal_path {
+        if let Some(parent) = wal_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| DevnetStartError::Wal {
+                path: wal_path.clone(),
+                source: consensus::wal::WalError::Io(e),
+            })?;
+        }
         let wal = consensus::wal::Wal::open(wal_path)
             .map_err(|source| DevnetStartError::Wal { path: wal_path.clone(), source })?;
         engine = engine.with_wal(wal);
@@ -214,7 +236,16 @@ pub fn assemble_devnet_node(spec: DevnetNodeSpec) -> Result<DevnetNode, DevnetSt
         _ => {}
     }
 
-    Ok(DevnetNode { engine, app, evm_module, staking_module, exchange_module, recovered })
+    Ok(DevnetNode {
+        engine,
+        app,
+        evm_module,
+        staking_module,
+        exchange_module,
+        recovered,
+        recovery,
+        wal_path,
+    })
 }
 
 /// Import `<data_dir>/snapshot.bin` into `app` if it exists.
@@ -249,6 +280,14 @@ pub fn import_snapshot_if_present(app: &Executor, data_dir: &Path) -> Result<Opt
 /// [`import_snapshot_if_present`] — called on shutdown so a
 /// restart resumes the full chain state.
 ///
+/// When the executor has durability configured (`--data-dir` →
+/// `durability_dir`), this is a full [`Executor::durable_checkpoint`]:
+/// the snapshot is written atomically and the block journal's
+/// covered segments are pruned. Otherwise the snapshot is still
+/// written atomically — write to `.tmp`, fsync, rename, fsync the
+/// directory — so a crash mid-write never leaves a torn file that a
+/// restart would fail to decode.
+///
 /// # Errors
 ///
 /// Returns `Err` if the directory cannot be created or the
@@ -256,12 +295,42 @@ pub fn import_snapshot_if_present(app: &Executor, data_dir: &Path) -> Result<Opt
 pub fn export_snapshot(app: &Executor, data_dir: &Path) -> Result<u64, String> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| format!("failed to create data dir {}: {e}", data_dir.display()))?;
+    if let Some(height) =
+        app.durable_checkpoint().map_err(|e| format!("durable checkpoint failed: {e}"))?
+    {
+        return Ok(height);
+    }
+    // No durability configured — write the snapshot atomically by
+    // hand (the durable path above writes the same file). Skip it
+    // entirely when nothing has committed: a height-0 snapshot.bin
+    // cannot distinguish "genesis, nothing executed" from "block 0
+    // executed" on re-import, and an empty node has nothing to
+    // persist anyway.
+    if app.committed_height().is_none() {
+        return Ok(0);
+    }
     let snap = app.export_snapshot();
     let height = snap.height;
     let mut buf = Vec::new();
     snap.encode(&mut buf);
     let snap_path = data_dir.join("snapshot.bin");
-    std::fs::write(&snap_path, &buf)
+    executor::durability::atomic_write(&snap_path, &buf)
         .map_err(|e| format!("failed to write snapshot {}: {e}", snap_path.display()))?;
     Ok(height)
+}
+
+/// Recover a restarting node's state from `data_dir`: import the
+/// newest `snapshot.bin` checkpoint and replay every journaled block
+/// above it. Returns `Ok(None)` when the executor has no durability
+/// configured — callers then fall back to
+/// [`import_snapshot_if_present`], the pre-journal boot path.
+///
+/// # Errors
+///
+/// Returns `Err` when the journal cannot be read, a record is
+/// undecodable, heights are non-contiguous, or a checkpoint fails
+/// verification — recovery that cannot produce a correct state must
+/// stop the boot, not guess.
+pub fn recover_durable_state(app: &Executor) -> Result<Option<executor::RecoveryReport>, String> {
+    app.recover_durable_state().map_err(|e| format!("durable state recovery failed: {e}"))
 }

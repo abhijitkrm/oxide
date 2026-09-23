@@ -29,7 +29,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 pub mod divergence;
+pub mod durability;
 pub mod occ;
+
+pub use durability::{DurabilityConfig, DurabilityError, RecoveryReport};
 
 use ports::AppInterface;
 use primitives::{Address, Hash, Height};
@@ -276,6 +279,17 @@ pub enum SnapshotImportError {
         /// The module's name.
         module: String,
     },
+    /// The snapshot imported and verified, but writing the durable
+    /// checkpoint that should preserve it across restarts failed
+    /// (atomic `snapshot.bin` write, journal seal, or prune). The
+    /// state IS installed — this variant exists so a caller cannot
+    /// mistake a non-persisted import for a durable one: a node
+    /// that continues after this error rewinds below the imported
+    /// height on its next restart.
+    CheckpointFailed {
+        /// The underlying durability error, rendered.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SnapshotImportError {
@@ -321,6 +335,9 @@ impl std::fmt::Display for SnapshotImportError {
             }
             Self::MalformedModuleState { module } => {
                 write!(f, "module '{module}' rejected its snapshot state as malformed")
+            }
+            Self::CheckpointFailed { reason } => {
+                write!(f, "snapshot imported but checkpoint persistence failed: {reason}")
             }
         }
     }
@@ -1604,6 +1621,11 @@ pub struct Executor {
     /// and test harnesses that emit unsigned envelopes opt out
     /// explicitly via [`Executor::with_unsigned_tx_policy`].
     unsigned_tx_policy: UnsignedTxPolicy,
+    /// Crash-durability wiring: the finalized-block journal +
+    /// checkpoint state installed by [`Executor::with_durability`].
+    /// `None` = in-memory only (tests, sims, and throwaway nodes);
+    /// nodes configured with a data directory always install it.
+    durability: Option<durability::Durability>,
 }
 
 mod app_iface;
@@ -1661,6 +1683,7 @@ impl Executor {
             chain_id: 1,
             unsigned_tx_policy: UnsignedTxPolicy::Reject,
             history_retention: MAX_RETAINED_HISTORY,
+            durability: None,
         }
     }
 
@@ -1764,6 +1787,18 @@ impl Executor {
     pub fn current_height(&self) -> u64 {
         let next = *primitives::sync::lock_state(&self.next_proposal_height);
         next.saturating_sub(1)
+    }
+
+    /// The highest height with a recorded state root — `None` when no
+    /// block has executed yet.
+    ///
+    /// Unlike [`Self::current_height`] (which saturates at 0 for the
+    /// empty chain), this distinguishes "nothing committed" from
+    /// "block 0 committed" — the distinction journal replay and
+    /// checkpoint gating need around the genesis boundary.
+    #[must_use]
+    pub fn committed_height(&self) -> Option<u64> {
+        primitives::sync::lock_state(&self.state_roots).keys().next_back().copied()
     }
 
     /// The state root at a given finalized height.

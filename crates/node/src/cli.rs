@@ -202,6 +202,11 @@ pub fn load_config(mode: crate::NodeMode, bin: &str) -> LoadedConfig {
         // for loopback devnets and is refused on external binds.
         allow_unsigned_txs: env::args().any(|a| a == "--unsafe-allow-unsigned-txs"),
         data_dir: data_dir.clone(),
+        // `--wal-file` overrides the derived `<data_dir>/consensus.wal`
+        // location — the consensus WAL is what lets a restart resume
+        // the chain at its committed tip instead of re-proposing
+        // heights the executor already recovered.
+        wal_path: parse_cli_flag("--wal-file").map(PathBuf::from),
         genesis,
     };
     let node_config = crate::node_config_from(&config, &rpc_config, &overrides, mode)

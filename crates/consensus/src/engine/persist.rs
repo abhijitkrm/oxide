@@ -44,6 +44,45 @@ impl OxideBft {
             self.next_height = entry.next_height;
             self.epoch = entry.epoch;
             self.last_committed = entry.last_committed;
+            // The recorded `current_view` lags real progress by up
+            // to one view: `deliver_qc` appends before its own
+            // catch-up and `advance_view` does not append at all, so
+            // the last entry can name a view that already produced a
+            // QC. Re-proposing in that view forms a stale QC
+            // (`view <= high_qc.view`) and the engine never escapes
+            // the timeout loop. The same rule `deliver_qc` applies
+            // on adoption fixes the floor here: a QC at view V proves
+            // view V completed, so participation resumes at V + 1.
+            if let Some(ref qc) = self.high_qc
+                && self.current_view.value() <= qc.view().value()
+            {
+                self.current_view = qc.view().saturating_next();
+            }
+            // Rebuild the uncommitted chain tail. The `blocks` map is
+            // in-memory only, but the recovered `high_qc`/
+            // `last_committed` refer to it: `propose()` stamps
+            // `parent.height + 1` by looking the QC'd block up, and
+            // `commit_walk` finalizes only `Complete` bodies it can
+            // reach. Without this restore a recovered `high_qc`
+            // resolves to a hash nothing holds — the leader goes
+            // silent and the chain stalls at its committed tip.
+            // `None` bodies restore as `Awaiting` — the same state
+            // they held pre-crash, so a later `supply_body` can still
+            // upgrade them exactly as it would have live. Entries at
+            // or below `last_committed` are skipped defensively:
+            // `pending_tail` never writes them, and resurrecting a
+            // committed block would undo the commit-time prune.
+            for (header, body) in entry.pending {
+                if self.last_committed.is_some_and(|(_, committed)| header.height <= committed) {
+                    continue;
+                }
+                let hash = Self::block_hash(&header);
+                let stored = match body {
+                    Some(proposal) => super::BlockBody::Complete(proposal),
+                    None => super::BlockBody::Awaiting,
+                };
+                self.blocks.insert(hash, (header, stored));
+            }
             // Membership is part of the recovered state too: rotation
             // entries carry the committed set, and `Wal::recover`
             // forwards the most recent one. Without this a
@@ -106,7 +145,40 @@ impl OxideBft {
     /// safety-critical state. `include_set` attaches the committed
     /// validator set — used only by epoch transitions, so ordinary
     /// per-vote entries stay ~200 bytes.
-    #[allow(dead_code)]
+    /// Collect the uncommitted chain tail for persistence: every
+    /// stored block above `last_committed`, in height order and
+    /// capped at `MAX_PERSISTED_PENDING` from the bottom (the
+    /// truncation keeps the lowest heights — contiguity from
+    /// `last_committed + 1` is what the commit walk consumes).
+    /// Without it a restart strands the recovered `high_qc`:
+    /// `propose()` looks the QC'd block up in the in-memory `blocks`
+    /// map to stamp `parent.height + 1`, and `commit_walk` needs the
+    /// bodies to finalize — both dead-end on an empty map.
+    /// `Awaiting` entries persist as a bare header (`None` body):
+    /// `propose()` resolves heights from the header alone, so the
+    /// restored map must match the pre-crash resolution capability —
+    /// a header lost on restart is strictly worse than a body still
+    /// in flight.
+    fn pending_tail(&self) -> Vec<(super::BlockHeader, Option<types::Proposal>)> {
+        let mut tail: Vec<(super::BlockHeader, Option<types::Proposal>)> = self
+            .blocks
+            .iter()
+            .filter(|(_, (header, _))| {
+                self.last_committed.is_none_or(|(_, committed)| header.height > committed)
+            })
+            .map(|(_, (header, body))| {
+                let body = match body {
+                    super::BlockBody::Complete(proposal) => Some(proposal.clone()),
+                    super::BlockBody::Awaiting => None,
+                };
+                (header.clone(), body)
+            })
+            .collect();
+        tail.sort_by_key(|(header, _)| header.height.value());
+        tail.truncate(crate::wal::MAX_PERSISTED_PENDING);
+        tail
+    }
+
     pub(crate) fn wal_entry(&self, include_set: bool) -> crate::wal::WalEntry {
         crate::wal::WalEntry {
             last_voted_view: self.last_voted_view,
@@ -118,6 +190,7 @@ impl OxideBft {
             epoch: self.epoch,
             last_committed: self.last_committed,
             validator_set: include_set.then(|| self.validator_set.clone()),
+            pending: self.pending_tail(),
         }
     }
 
@@ -155,22 +228,14 @@ impl OxideBft {
         &mut self,
         include_set: bool,
     ) -> Result<(), crate::wal::WalError> {
-        let Some(ref mut wal) = self.wal else {
+        if self.wal.is_none() {
             return Ok(());
-        };
+        }
         // Build the entry first to avoid borrowing self while
-        // the WAL is mutably borrowed.
-        let entry = crate::wal::WalEntry {
-            last_voted_view: self.last_voted_view,
-            timeout_signed_view: self.timeout_signed_view,
-            voted_at_height: self.voted_at_height.clone(),
-            high_qc: self.high_qc.as_ref().map(|v| v.qc().clone()),
-            current_view: self.current_view,
-            next_height: self.next_height,
-            epoch: self.epoch,
-            last_committed: self.last_committed,
-            validator_set: include_set.then(|| self.validator_set.clone()),
-        };
+        // the WAL is mutably borrowed. `wal_entry` is the single
+        // field list — the pending tail travels with every append.
+        let entry = self.wal_entry(include_set);
+        let wal = self.wal.as_mut().expect("checked above");
         match wal.append(&entry) {
             Ok(()) => Ok(()),
             Err(err) => {
