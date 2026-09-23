@@ -115,7 +115,29 @@ pub trait AppInterface: Send + Sync {
     /// certificate claiming a zero root "match" a height that had
     /// never run. Opaque to the engine — it embeds these bytes
     /// verbatim and never parses them (oai-spec.md §3, rule 5).
+    ///
+    /// Implementations with an async execution lane may wait for
+    /// in-flight execution; callers that cannot afford to block must
+    /// use [`attest_state_bounded`](Self::attest_state_bounded).
     fn attest_state(&self, height: Height) -> Option<StateAttestation>;
+
+    /// [`attest_state`](Self::attest_state) with a ceiling on how
+    /// long the call may wait for the execution lane. `None` means
+    /// "not executed within `max_wait`" — the consensus vote path
+    /// withholds rather than stall the pacemaker behind a lagging
+    /// lane (a withheld vote is recoverable on a later delivery; a
+    /// stalled consensus thread is not).
+    ///
+    /// The default delegates to [`attest_state`](Self::attest_state):
+    /// synchronous apps never wait anyway. Apps with an async lane
+    /// override this with a real timeout.
+    fn attest_state_bounded(
+        &self,
+        height: Height,
+        _max_wait: std::time::Duration,
+    ) -> Option<StateAttestation> {
+        self.attest_state(height)
+    }
 
     /// The newest *executed* state root, without blocking. Returns
     /// `None` when nothing has executed yet.

@@ -2295,6 +2295,70 @@ fn attest_beyond_enqueued_does_not_block() {
     assert!(att.is_none());
 }
 
+/// `attest_state_bounded` must return `None` once `max_wait`
+/// expires while the lane still owes the height — the vote path
+/// withholds rather than stalls behind a lagging worker. The
+/// gated module parks the worker mid-block, so the wait is real.
+#[test]
+fn attest_state_bounded_times_out_on_owed_height() {
+    let mut executor = test_executor(100);
+    let module = Arc::new(GatedModule {
+        gate: std::sync::atomic::AtomicBool::new(false),
+        calls: Mutex::new(0),
+    });
+    executor.register_module(module.clone() as Arc<dyn Module>);
+    let executor = Arc::new(executor);
+    executor.spawn_exec_lane();
+
+    // h0 parks the worker inside the gate — enqueued but not
+    // executed for as long as the gate stays shut.
+    executor.finalize_block(&finalized_block(0, 4, 0));
+
+    let start = std::time::Instant::now();
+    let att = executor.attest_state_bounded(Height::new(0), std::time::Duration::from_millis(100));
+    let elapsed = start.elapsed();
+    assert!(att.is_none(), "an owed-but-unexecuted height times out to None");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the bounded wait must actually return — elapsed {elapsed:?}"
+    );
+
+    // Release the gate so the worker can drain; the next bounded
+    // call returns the real root.
+    module.gate.store(true, std::sync::atomic::Ordering::SeqCst);
+    let att = executor
+        .attest_state_bounded(Height::new(0), std::time::Duration::from_secs(5))
+        .expect("executed after the gate opens");
+    assert_ne!(att.root, Hash::ZERO);
+}
+
+/// A bounded attest that lands mid-wait returns the root — the
+/// timeout is a ceiling, not a fixed delay.
+#[test]
+fn attest_state_bounded_returns_when_execution_lands() {
+    let mut executor = test_executor(100);
+    let module = Arc::new(GatedModule {
+        gate: std::sync::atomic::AtomicBool::new(false),
+        calls: Mutex::new(0),
+    });
+    executor.register_module(module.clone() as Arc<dyn Module>);
+    let executor = Arc::new(executor);
+    executor.spawn_exec_lane();
+    executor.finalize_block(&finalized_block(0, 4, 0));
+
+    // Open the gate shortly after the attest starts waiting.
+    let releaser = module.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        releaser.gate.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let att = executor
+        .attest_state_bounded(Height::new(0), std::time::Duration::from_secs(5))
+        .expect("the root lands inside the wait window");
+    assert_ne!(att.root, Hash::ZERO);
+}
+
 /// A module that panics inside `handle` exactly once — models a
 /// worker-killing execution fault that replays cleanly when the
 /// same committed block is re-executed later.

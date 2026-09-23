@@ -20128,3 +20128,35 @@ counter`, and engine-level
 threshold forced to 1 byte every append checkpoints through real
 `run_until_idle` traffic, the file stays one frame, and a restart
 recovers locks + committee.
+
+## Session N+34 — the vote path no longer waits on the execution lane
+
+M2. `vote_if_eligible` called `app.attest_state(cert.height)` while
+verifying a proposal\'s exec cert — and `attest_state` waits on the
+lane condvar with no ceiling, so a lagging or saturated exec lane
+stalled the consensus thread behind execution: the exact coupling
+async execution exists to break.
+
+`AppInterface` gains `attest_state_bounded(height, max_wait)`: the
+default delegates to `attest_state` (synchronous apps never wait),
+and `Executor` overrides it with a `wait_timeout` loop — the same
+enqueued/executed/lane_dead condition, plus a deadline. The vote
+path calls it with `EXEC_ATTEST_WAIT` = 250 ms (~1/8 of the 2 s
+pacemaker base). On expiry the vote is withheld: always safe, and
+recoverable on re-delivery once the lane catches up.
+
+The other half of the finding — `finalize_block`\'s blocking send on
+the bounded (64-deep) lane queue — is deliberately unchanged: the
+cap IS the explicit budget the audit asks for, and the stall on a
+full queue is one block-execution of honest backpressure. The
+alternatives are strictly worse: `try_send` + inline drain executes
+the *whole* backlog on the consensus thread, and an unbounded queue
+grows a backlog the drain could never replay. Documented rather
+than changed.
+
+Tests: `attest_state_bounded_times_out_on_owed_height` (gated
+module parks the worker mid-block; the call returns `None` well
+inside 5 s instead of hanging), and
+`attest_state_bounded_returns_when_execution_lands` (the gate opens
+mid-wait; the call returns the real root — the timeout is a
+ceiling, not a fixed delay).

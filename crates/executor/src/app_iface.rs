@@ -636,6 +636,46 @@ impl AppInterface for Executor {
         root.map(|root| StateAttestation { height, root })
     }
 
+    fn attest_state_bounded(
+        &self,
+        height: Height,
+        max_wait: std::time::Duration,
+    ) -> Option<StateAttestation> {
+        let start = std::time::Instant::now();
+        // Same wait condition as `attest_state`, but bounded: the
+        // consensus vote path calls this while verifying a proposal's
+        // exec cert, and an unbounded wait there stalls the pacemaker
+        // behind a lagging lane. On expiry the withheld vote is the
+        // honest outcome — the proposal may be re-delivered after the
+        // lane catches up.
+        if self.exec_lane_tx.get().is_some() {
+            let deadline = start + max_wait;
+            let (lock, cv) = &*self.exec_sync;
+            let mut s = primitives::sync::lock_state(lock);
+            loop {
+                let done = s.lane_dead
+                    || s.enqueued.is_none_or(|e| height.value() > e)
+                    || s.executed.is_some_and(|x| x >= height.value());
+                if done {
+                    break;
+                }
+                let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+                else {
+                    break;
+                };
+                let (guard, _timeout) = cv.wait_timeout(s, remaining).unwrap_or_else(|_| {
+                    panic!("state mutex poisoned: a holder panicked mid-mutation")
+                });
+                s = guard;
+            }
+        }
+        let root = primitives::sync::lock_state(&self.state_roots).get(&height.value()).copied();
+        if let Some(recorder) = &self.recorder {
+            recorder.record("attest_state", start.elapsed());
+        }
+        root.map(|root| StateAttestation { height, root })
+    }
+
     fn attest_latest(&self) -> Option<StateAttestation> {
         // Deliberately does NOT flush pending execution: the vote
         // path calls this on every vote and cannot afford to wait

@@ -1395,6 +1395,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Consensus voting could stall behind a lagging execution lane**
+  (`consensus`, `executor`, `ports`): the vote path's exec-cert
+  check called `attest_state` with no wait ceiling, so a saturated
+  execution lane stalled the consensus thread (and the pacemaker)
+  indefinitely. The check now uses `attest_state_bounded` with a
+  250 ms ceiling — on expiry the vote is withheld (always safe;
+  recovered on re-delivery) instead of blocking the view.
+  **In plain words:** a validator whose execution falls behind now
+  skips voting for that block rather than freezing consensus while
+  it catches up.
+
 - **Consensus WAL grew without bound and recovery scanned all of
   it** (`consensus`): the WAL appended every vote/QC/commit forever
   (hundreds of MB per day at target rates) and `recover` replayed

@@ -20,6 +20,21 @@ use super::{
 use crate::verify::VerifiedTc;
 use types::ExecDivergence;
 
+/// Ceiling on how long the vote path may wait for the execution
+/// lane to produce a certified height's local root.
+///
+/// Unit: wall-clock duration. Origin: `vote_if_eligible` compares a
+/// proposal's exec cert against `attest_state(cert.height)`; with
+/// the async lane an unbounded wait stalls the consensus thread
+/// behind execution lag — the exact coupling this bound breaks.
+/// 250 ms is ~1/8 of the default 2 s pacemaker base timeout: long
+/// enough that a nearly-caught-up lane (single-digit-ms executes)
+/// almost always answers, short enough that a saturated lane costs
+/// the view a bounded slice instead of an unbounded stall. On
+/// expiry the vote is withheld — recoverable on re-delivery, never
+/// a safety risk (withholding is always safe).
+const EXEC_ATTEST_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl OxideBft {
     /// Validator: vote on a proposal. Returns the vote, or `None` if
     /// the validator already voted in this view (safety: no double-
@@ -449,11 +464,15 @@ impl OxideBft {
             // certificate, so the vote is withheld. (The old
             // `Hash::ZERO` sentinel here let a forged cert
             // claiming a zero root "match" an unexecuted
-            // height.) A mismatch on a *verified* cert means a
+            // height.) The wait is bounded by `EXEC_ATTEST_WAIT`:
+            // a lagging execution lane must never stall the
+            // consensus thread — a timed-out attestation withholds
+            // the vote, which the next delivery can still recover.
+            // A mismatch on a *verified* cert means a
             // stake supermajority really attested a root we did
             // not compute — confirmed divergence; refuse to
             // extend it.
-            let local = self.app.attest_state(cert.height)?;
+            let local = self.app.attest_state_bounded(cert.height, EXEC_ATTEST_WAIT)?;
             if local.root != cert.state_root {
                 // Confirmed divergence — the cert is fully verified
                 // (quorum + signature), so a supermajority attested
