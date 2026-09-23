@@ -222,6 +222,12 @@ pub(crate) fn deserialize_account_strict(data: &[u8]) -> Option<DeserializedAcco
     if account.storage.windows(2).any(|w| w[0].0 >= w[1].0) {
         return None;
     }
+    // The encoder never emits a zero value — Ethereum's
+    // sparse-storage rule makes zero and absent identical, so a
+    // zero entry is by definition not the encoder's output.
+    if account.storage.iter().any(|(_, value)| value.is_zero()) {
+        return None;
+    }
     if account.code.is_empty() {
         if account.code_hash != crate::trie::KECCAK_EMPTY {
             return None;
@@ -1075,8 +1081,17 @@ impl EvmModule {
                     .map_or_else(Vec::new, |bc| bc.original_byte_slice().to_vec()),
             }
         };
-        let mut storage_slots: Vec<(revm::primitives::U256, revm::primitives::U256)> =
-            account.storage.iter().map(|(slot, val)| (*slot, *val)).collect();
+        // Sparse-storage invariant: zero-valued slots are absent in
+        // Ethereum state — the committed map is swept at commit
+        // (`commit_state` in lib.rs), and the filter here is the
+        // belt to that suspenders: a zero in a persisted blob or a
+        // snapshot would resurrect a slot the MPT cannot encode.
+        let mut storage_slots: Vec<(revm::primitives::U256, revm::primitives::U256)> = account
+            .storage
+            .iter()
+            .filter(|(_, val)| !val.is_zero())
+            .map(|(slot, val)| (*slot, *val))
+            .collect();
         storage_slots.sort_by_key(|a| a.0);
         Some(persist::serialize_account(
             account.info.balance,
@@ -1142,7 +1157,15 @@ impl EvmModule {
                         // the `DbAccount.storage` field. `StorageCleared`
                         // would incorrectly zero out the storage.
                         account_state: revm::database::AccountState::None,
-                        storage: account.storage.into_iter().collect(),
+                        // Drop zero-valued slots on the way in —
+                        // blobs written before the sparse-storage
+                        // invariant may carry them; the committed
+                        // map must hold only nonzero entries.
+                        storage: account
+                            .storage
+                            .into_iter()
+                            .filter(|(_, value)| !value.is_zero())
+                            .collect(),
                     },
                 );
                 // HIGH fix: also populate `cache.contracts` (the code

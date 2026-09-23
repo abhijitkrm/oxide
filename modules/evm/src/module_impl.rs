@@ -90,10 +90,17 @@ impl Module for EvmModule {
                             storage: revm::primitives::HashMap::default(),
                         }
                     });
-                account.storage.insert(
-                    revm::primitives::U256::from((h - 1) % HISTORY_SERVE_WINDOW),
-                    revm::primitives::U256::from_be_bytes(parent_hash.0),
-                );
+                let slot = revm::primitives::U256::from((h - 1) % HISTORY_SERVE_WINDOW);
+                let value = revm::primitives::U256::from_be_bytes(parent_hash.0);
+                // Sparse-storage invariant: a zero write deletes —
+                // "slot = 0" and "slot absent" are the same MPT
+                // state. A parent hash is a keccak output (never
+                // zero in practice), but keep the rule uniform.
+                if value.is_zero() {
+                    account.storage.remove(&slot);
+                } else {
+                    account.storage.insert(slot, value);
+                }
                 account.account_state = revm::database::AccountState::Touched;
                 drop(db_guard);
                 framework::lock_state(&self.touched).insert(HISTORY_STORAGE_ADDRESS);
@@ -713,9 +720,16 @@ impl Module for EvmModule {
                     } else {
                         // Touched → always recompute the
                         // storage root (its slots changed).
-                        let storage_iter = account.storage.iter().map(|(slot, value)| {
-                            (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
-                        });
+                        let storage_iter = account
+                            .storage
+                            .iter()
+                            .filter(|(_, value)| !value.is_zero())
+                            .map(|(slot, value)| {
+                                (
+                                    alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()),
+                                    *value,
+                                )
+                            });
                         let root = trie::storage_root(storage_iter);
                         storage_root_cache.insert(*addr, root);
                         root
@@ -741,18 +755,29 @@ impl Module for EvmModule {
                     trie::EMPTY_ROOT
                 } else if touched.contains(addr) {
                     // Recompute for touched accounts.
-                    let storage_iter = account.storage.iter().map(|(slot, value)| {
-                        (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
-                    });
+                    let storage_iter = account
+                        .storage
+                        .iter()
+                        .filter(|(_, value)| !value.is_zero())
+                        .map(|(slot, value)| {
+                            (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
+                        });
                     let root = trie::storage_root(storage_iter);
                     storage_root_cache.insert(*addr, root);
                     root
                 } else {
                     // Reuse cached storage root for untouched accounts.
                     storage_root_cache.get(addr).copied().unwrap_or_else(|| {
-                        let storage_iter = account.storage.iter().map(|(slot, value)| {
-                            (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
-                        });
+                        let storage_iter = account
+                            .storage
+                            .iter()
+                            .filter(|(_, value)| !value.is_zero())
+                            .map(|(slot, value)| {
+                                (
+                                    alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()),
+                                    *value,
+                                )
+                            });
                         let root = trie::storage_root(storage_iter);
                         storage_root_cache.insert(*addr, root);
                         root
@@ -920,15 +945,21 @@ impl Module for EvmModule {
         // authoritative for committed state and may hold accounts
         // the backend has not seen yet.
         snap.entries.retain(|(k, _)| k.0[0] != persist::NS_ACCOUNT);
-        let db = framework::lock_state(&self.db);
-        snap.entries.reserve(db.cache.accounts.len());
-        for evm_addr in db.cache.accounts.keys() {
-            if let Some(value) = Self::serialize_committed_account(evm_addr, &db) {
+        // Serialize the account set from an `Arc` snapshot taken
+        // under a short lock — the O(accounts) walk must not hold
+        // the db mutex against in-flight commits.
+        let db_snap = {
+            let db = framework::lock_state(&self.db);
+            Arc::clone(&db)
+        };
+        snap.entries.reserve(db_snap.cache.accounts.len());
+        for evm_addr in db_snap.cache.accounts.keys() {
+            if let Some(value) = Self::serialize_committed_account(evm_addr, &db_snap) {
                 let key = persist::account_key(&Address(evm_addr.0.into()));
                 snap.entries.push((key, value));
             }
         }
-        drop(db);
+        drop(db_snap);
         drop(backend);
         // The cache merge broke the backend's ascending key order —
         // `Snapshot` requires strictly sorted entries (verified by
@@ -957,9 +988,11 @@ impl Module for EvmModule {
             let storage_root = if acct.storage.is_empty() {
                 trie::EMPTY_ROOT
             } else {
-                trie::storage_root(acct.storage.iter().map(|(slot, value)| {
-                    (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
-                }))
+                trie::storage_root(acct.storage.iter().filter(|(_, value)| !value.is_zero()).map(
+                    |(slot, value)| {
+                        (alloy_primitives::B256::from_slice(&slot.to_be_bytes::<32>()), *value)
+                    },
+                ))
             };
             (
                 alloy_primitives_address(addr.0),

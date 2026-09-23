@@ -121,7 +121,13 @@ impl EvmModule {
                 undo.capture(*addr, evm.ctx.journaled_state.database.cache.accounts.get(addr));
             }
         }
+        // Collect zero-slot writers before `commit` consumes the
+        // diff — afterwards `prune_zero_slots` sweeps the zeros the
+        // commit installed so the committed map obeys "zero means
+        // absent" (see `commit_state` in lib.rs).
+        let zeroed = Self::zero_slot_writers(&result_and_state.state);
         evm.commit(result_and_state.state);
+        Self::prune_zero_slots(evm.ctx.journaled_state.database, &zeroed);
 
         Ok((result_and_state.result, caller, call_trace))
     }

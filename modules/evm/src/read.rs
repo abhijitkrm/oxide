@@ -313,8 +313,9 @@ impl EvmModule {
     /// nothing) and whether the wall-clock deadline fired
     /// (`timed_out` — the caller maps it to a timeout error).
     ///
-    /// `at_height` selects the state view: `None` runs against the
-    /// live `CacheDB` (latest); `Some(h)` runs against a
+    /// `at_height` selects the state view: `None` runs against an
+    /// `Arc` snapshot of the committed `CacheDB` behind a scratch
+    /// cache (latest); `Some(h)` runs against a
     /// [`versioned::StateView`] at `h` — the undo-log overlay — with
     /// the block env taken from `h`'s sealed history record
     /// (timestamp/coinbase/base fee), matching geth, which evaluates
@@ -323,10 +324,12 @@ impl EvmModule {
     /// `ovr` carries geth's `stateOverride` table — applied through
     /// [`overrides::OverrideView`], a read-only `DatabaseRef`
     /// wrapper, so fake state can never leak into the authoritative
-    /// cache. On the latest path with non-empty overrides the sim
-    /// runs on a `SharedCacheDB`-nested scratch (same trick the
-    /// parallel executor uses) precisely so the live `CacheDB` is
-    /// never borrowed mutably while fake entries exist.
+    /// cache. Every arm runs on a `SharedCacheDB`-nested scratch
+    /// (same trick the parallel executor uses): the authoritative
+    /// `CacheDB` is never borrowed mutably on a read path — revm
+    /// caches read misses into whichever db it executes against, and
+    /// letting those land in the committed map would let RPC traffic
+    /// change the state root and stall commits behind `sim_timeout`.
     fn simulate(
         &self,
         req: &CallRequest,
@@ -369,16 +372,46 @@ impl EvmModule {
             .build()
             .map_err(|_| CallError::Rejected(ExecError::Malformed))?;
 
-        let mut db_guard = framework::lock_state(&self.db);
         let coinbase = *framework::lock_state(&self.coinbase);
         let block_number = *framework::lock_state(&self.block_height);
         let block_timestamp = *framework::lock_state(&self.block_timestamp);
 
         match at_height {
-            None if ovr.is_empty() => {
-                let db = Arc::make_mut(&mut *db_guard);
-                let mut evm =
-                    self.build_sim_evm(&mut *db, coinbase, block_number, block_timestamp, deadline);
+            None => {
+                // Latest-state reads run on a scratch `CacheDB`
+                // layered over an `Arc` snapshot — never on the
+                // authoritative map. revm caches every read miss
+                // into the `CacheDB` it executes against:
+                // `NotExisting` tombstones for missing accounts and
+                // zero-valued entries for unset slots. Executing on
+                // the committed `CacheDB` would therefore mutate
+                // consensus state (the next `state_root` would
+                // include entries a peer without this read traffic
+                // lacks) and would hold the db mutex for the call's
+                // whole duration — up to `sim_timeout` — stalling
+                // every commit in the meantime. So: clone the `Arc`
+                // under a short lock, drop the guard, then simulate
+                // against the snapshot. The snapshot is stable while
+                // shared — commit-path `Arc::make_mut` clones rather
+                // than mutating when a snapshot is alive — and the
+                // scratch cache absorbs every read-miss insert.
+                // `StateOverrides` ride inside `OverrideView`, a
+                // read-only `DatabaseRef` wrapper (a pure passthrough
+                // when empty), so fake state can never reach the
+                // authoritative cache either.
+                let snap = {
+                    let db_guard = framework::lock_state(&self.db);
+                    Arc::clone(&db_guard)
+                };
+                let base = SharedCacheDB(snap);
+                let mut cache = CacheDB::new(overrides::OverrideView::new(base, ovr));
+                let mut evm = self.build_sim_evm(
+                    &mut cache,
+                    coinbase,
+                    block_number,
+                    block_timestamp,
+                    deadline,
+                );
                 // No `commit`: simulation state dies with the
                 // EvmState. The call trace rides out alongside the
                 // result for `debug_traceCall` —
@@ -389,27 +422,6 @@ impl EvmModule {
                 // Inspector is ((NativeJournalInspector,
                 // CallRecorder), DeadlineInspector): trace at `.0.1`,
                 // timeout flag at `.1`.
-                let timed_out = evm.inspector.1.timed_out();
-                let call_trace = evm.inspector.0.1.take_root();
-                evm.precompiles.clear_native_journal();
-                result.map(|rs| (rs, call_trace, timed_out))
-            }
-            None => {
-                // Overrides on latest state: run on a nested
-                // scratch cache — fake entries must never land in
-                // the authoritative `CacheDB`.
-                let base = SharedCacheDB(Arc::clone(&db_guard));
-                let mut cache = CacheDB::new(overrides::OverrideView::new(base, ovr));
-                let mut evm = self.build_sim_evm(
-                    &mut cache,
-                    coinbase,
-                    block_number,
-                    block_timestamp,
-                    deadline,
-                );
-                let result = evm
-                    .inspect_tx(tx_env)
-                    .map_err(|e| CallError::Rejected(ExecError::ModuleRejected(format!("{e:?}"))));
                 let timed_out = evm.inspector.1.timed_out();
                 let call_trace = evm.inspector.0.1.take_root();
                 evm.precompiles.clear_native_journal();
@@ -429,8 +441,23 @@ impl EvmModule {
                         "state for block {h} unavailable"
                     ))));
                 };
+                // Same short-lock discipline: clone the committed
+                // `Arc` under the db lock and release it
+                // immediately. The clone must precede the
+                // `versioned` lock — the undo index only advances,
+                // so locking it after the clone guarantees the
+                // index covers at least the snapshot's height and
+                // the (snapshot, index) pair stays consistent for
+                // the view's lifetime. `versioned` itself stays
+                // locked for the sim — it is held by `end_block`
+                // only for a push, whereas `db` is needed by every
+                // commit in a block.
+                let snap = {
+                    let db_guard = framework::lock_state(&self.db);
+                    Arc::clone(&db_guard)
+                };
                 let versioned = framework::lock_state(&self.versioned);
-                let view = versioned::StateView::new(&db_guard, &versioned, &self.history, h);
+                let view = versioned::StateView::new(&snap, &versioned, &self.history, h);
                 let mut cache = CacheDB::new(overrides::OverrideView::new(view, ovr));
                 let mut evm = self.build_sim_evm(&mut cache, cb, num, ts, deadline);
                 let result = evm

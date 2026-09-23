@@ -19554,3 +19554,75 @@ new per-tx cost is the `EvmState` clone in the speculative record
 (O(loaded accounts) instead of O(written accounts)); the benches
 say it's in the noise against what the clone replaces (the old
 per-tx `contracts_before` table scan + `DbAccount` clones).
+
+## Session N+23 — reads stopped reaching the committed cache
+
+Two related findings landed together because they share one root
+cause: anything that leaves a trace inside the authoritative
+`CacheDB` becomes consensus state.
+
+The first is the read surface. `eth_call`, `eth_estimateGas`,
+`debug_traceCall`, and `eth_createAccessList` all funnel through
+`simulate`, and the no-override latest-state arm ran `inspect_tx`
+on `Arc::make_mut(&mut *db_guard)` — the committed `CacheDB`
+itself, under its mutex, for the whole call. revm caches every
+read miss into whichever db it executes against: missing accounts
+become `NotExisting` tombstones, unset slots become zero-valued
+entries. So a single `eth_call` touching an unused slot changed
+the next `state_root` on the node that served it and nobody else,
+and the account map grew by every missing address anyone ever
+asked about. Worse, the db mutex stayed held for the call's
+duration — up to `sim_timeout` seconds of stalled commits per
+query.
+
+Every read path now follows one shape: clone the db `Arc` under a
+short lock, drop the guard, run on a scratch `CacheDB` over
+`SharedCacheDB` (latest) or `StateView` (historical — the
+`versioned` lock stays held for the view since the index can't be
+`Arc`-cloned cheaply, but it is only contended by `end_block`'s
+push). `OverrideView` already made overrides read-only; it now
+wraps every arm — a pure passthrough when the table is empty, so
+the empty-override fast path no longer touches the live map at
+all. The same clone-then-drop pattern went into the `*_at`
+getters, `account_proof`, and `export_state`, which previously
+held the db mutex across O(accounts) work.
+
+The second finding is zero-slot semantics. Ethereum's MPT encodes
+only nonzero leaves — "slot = 0" and "slot absent" are the same
+state — but revm's `commit` writes zeroes into `DbAccount.storage`
+and every consumer (incremental + full `state_root`,
+`serialize_committed_account`, `export_state`) emitted them.
+The fix makes the invariant structural: committed maps never hold
+zero entries. A post-commit sweep (`commit_state` /
+`zero_slot_writers` + `prune_zero_slots`) removes them at the
+three canonical commit sites — serial `handle`, serial batch,
+canonical re-execution, and the speculative merge — restricted to
+accounts that actually wrote a zero so the sweep is O(tx writes).
+Group scratch caches deliberately keep their zeroes: there a zero
+entry shadows the parent's stale value for later same-sender txs.
+Ingress filters cover `genesis_insert_account`, `load_from_storage`
+(old blobs may carry zeroes), and the `begin_block` parent-hash
+write; `deserialize_account_strict` now *rejects* zero-valued slots
+since they are not encoder output; and the `storage_root`
+iterators filter defensively so the rule holds even if a future
+write path slips.
+
+Regression coverage: `call_read_does_not_mutate_committed_state`
+is the audit's minimal case — two identical modules, only one
+serves a call that SLOADs an unset slot, both must produce the
+same root and the served one's map must not gain the entry.
+`all_read_paths_leave_committed_state_untouched` adds estimate /
+trace / access-list traffic plus missing-account reads.
+`call_read_overrides_do_not_persist` pins override isolation.
+`zeroed_storage_slot_matches_never_written` asserts a zeroed slot
+leaves the account at the empty-trie storage root. A new
+`read_traffic_does_not_change_committed_state` proptest runs a
+full module under random interleaved read traffic against a quiet
+module over the same generated batch — the node-with-RPC-load
+equivalence the audit asked for. `deserialize_account_strict`
+rejects zero slots now too.
+
+One residual noted for the record: the historical-sim pair
+(snapshot height vs undo index) can disagree by the width of the
+commit→`end_block` push window; it predates this change and is
+unobservable outside a concurrent block boundary.

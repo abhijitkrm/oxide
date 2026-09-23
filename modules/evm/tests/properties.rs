@@ -302,4 +302,74 @@ proptest! {
             }
         }
     }
+
+    /// Read traffic must not perturb committed state: two modules
+    /// executing the same batch — one serving interleaved
+    /// `eth_call` / `eth_estimateGas` / `eth_createAccessList` /
+    /// `debug_traceCall` / `eth_getStorageAt` traffic (some aimed at
+    /// accounts that do not exist) — must finish with identical
+    /// roots and identical storage. This is the "node under RPC
+    /// load vs quiet node" equivalence the read-isolation fix
+    /// guarantees: revm caches every read miss into the db it
+    /// executes against, so any path that served reads on the
+    /// authoritative map would leak zero-slot entries and
+    /// `NotExisting` tombstones into consensus state.
+    #[test]
+    fn read_traffic_does_not_change_committed_state(ops in batch_strategy()) {
+        let pool = sender_pool();
+        let sender_addrs: Vec<Address> = pool.iter().map(|(_, a)| *a).collect();
+
+        let mut next_nonce = [0u64; 4];
+        let mut txs = Vec::with_capacity(ops.len());
+        for (sender_idx, op) in &ops {
+            let nonce = next_nonce[*sender_idx];
+            next_nonce[*sender_idx] += 1;
+            txs.push(sign_op(&pool[*sender_idx].0, nonce, op));
+        }
+
+        let quiet = run_serial(&txs, &sender_addrs);
+
+        // Same block, but every tx is preceded by reads — including
+        // calls aimed at an address that does not exist, the miss
+        // pattern that used to install `NotExisting` tombstones.
+        let served = setup(&sender_addrs);
+        let ctx = TxContext { sender: Address([0; 20]), nonce: 0, fee: 0 };
+        served.begin_block(Height::new(1));
+        for (i, raw) in txs.iter().enumerate() {
+            let req = evm::CallRequest {
+                to: Some(if i % 3 == 0 {
+                    Address([0xEE; 20])
+                } else {
+                    contract_address(i % CONTRACTS.len())
+                }),
+                ..evm::CallRequest::default()
+            };
+            match i % 4 {
+                0 => drop(served.call_read(&req)),
+                1 => drop(served.estimate_call_gas(&req)),
+                2 => drop(served.create_access_list(&req)),
+                _ => drop(served.call_read_traced(&req)),
+            }
+            let _ = served.storage_at(&contract_address(i % CONTRACTS.len()), &U256::from(i % 8));
+            let _ = served.handle(&ctx, raw);
+        }
+        served.end_block(Height::new(1));
+
+        prop_assert_eq!(
+            served.state_root(),
+            quiet.state_root(),
+            "read traffic changed the state root"
+        );
+        for (i, (_, _, _)) in CONTRACTS.iter().enumerate() {
+            for slot in 0..8u64 {
+                prop_assert_eq!(
+                    served.storage_at(&contract_address(i), &U256::from(slot)),
+                    quiet.storage_at(&contract_address(i), &U256::from(slot)),
+                    "read traffic changed contract {} slot {}",
+                    i,
+                    slot
+                );
+            }
+        }
+    }
 }

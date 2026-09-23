@@ -99,7 +99,7 @@ use revm::context::TxEnv;
 use revm::context::result::{ExecutionResult, Output, SuccessReason};
 use revm::context_interface::result::ResultGas;
 use revm::database::CacheDB;
-use revm::database_interface::{DatabaseRef, EmptyDB};
+use revm::database_interface::{DatabaseCommit, DatabaseRef, EmptyDB};
 use revm::handler::{ExecuteCommitEvm, MainContext};
 use revm::inspector::InspectEvm;
 use revm::primitives::TxKind;
@@ -1029,7 +1029,12 @@ impl EvmModule {
         account.info.code = Some(bytecode);
         account.info.code_hash = code_hash;
         for (slot, value) in storage {
-            account.storage.insert(slot, value);
+            // Sparse-storage invariant: zero means absent — a
+            // `genesis.json` alloc entry with an explicit 0 must not
+            // create a slot the MPT cannot encode.
+            if !value.is_zero() {
+                account.storage.insert(slot, value);
+            }
         }
         drop(db_guard);
         framework::lock_state(&self.touched).insert(evm_addr);
@@ -1070,6 +1075,57 @@ impl EvmModule {
                 preinstalls::preinstall_code(p),
                 Vec::new(),
             );
+        }
+    }
+
+    /// Commit `state` into the authoritative `CacheDB`, then restore
+    /// Ethereum's sparse-storage invariant: a slot whose present
+    /// value is zero is *absent*. revm's `DatabaseCommit::commit`
+    /// writes the zero into `DbAccount.storage` — harmless to revm
+    /// itself (SLOAD still observes 0) but poison to every
+    /// committed-state consumer: the MPT encodes only nonzero leaves,
+    /// so a surviving zero entry would skew `state_root`, land in the
+    /// backend flush and snapshots, and contradict `eth_getProof`'s
+    /// trie view. The post-commit sweep is restricted to accounts
+    /// that actually wrote a zero this commit — O(tx writes), never
+    /// O(account storage).
+    ///
+    /// Must NOT be applied to speculative/group overlays
+    /// (`CacheDB<SharedCacheDB>`): there a committed zero entry is
+    /// load-bearing — it shadows the parent's stale value for later
+    /// same-sender transactions. Only the canonical cache, whose
+    /// inner db returns zero on every miss, may drop zero entries.
+    fn commit_state(db: &mut CacheDB<EmptyDB>, state: revm::state::EvmState) {
+        let zeroed = Self::zero_slot_writers(&state);
+        db.commit(state);
+        Self::prune_zero_slots(db, &zeroed);
+    }
+
+    /// Collect the accounts in `state` that write a zero-valued
+    /// storage slot. Must run *before* `DatabaseCommit::commit`
+    /// consumes the diff — afterwards the distinction between "set
+    /// to zero" and "already absent" is gone from the journal view.
+    /// See [`commit_state`](Self::commit_state).
+    fn zero_slot_writers(state: &revm::state::EvmState) -> Vec<revm::primitives::Address> {
+        state
+            .iter()
+            .filter(|(_, account)| {
+                account.is_touched()
+                    && account.storage.values().any(|slot| slot.present_value.is_zero())
+            })
+            .map(|(addr, _)| *addr)
+            .collect()
+    }
+
+    /// Delete zero-valued entries a commit just installed in `db`
+    /// for `addrs` — the sweep half of [`commit_state`](Self::commit_state),
+    /// split out for call sites whose db lives inside a built `Evm`
+    /// (`evm.commit` hides the concrete commit call).
+    fn prune_zero_slots(db: &mut CacheDB<EmptyDB>, addrs: &[revm::primitives::Address]) {
+        for addr in addrs {
+            if let Some(account) = db.cache.accounts.get_mut(addr) {
+                account.storage.retain(|_, value| !value.is_zero());
+            }
         }
     }
 

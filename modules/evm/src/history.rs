@@ -778,9 +778,9 @@ pub fn effective_gas_price(stx: &StoredTx, base_fee: u64) -> u128 {
 }
 
 use super::{
-    AccountProof, CacheDB, CallError, CallOutcome, CallRequest, DatabaseRef, EmptyDB, EvmModule,
-    ExecError, Mutex, StateError, StorageProof, alloy_primitives_address, history, overrides, trie,
-    versioned,
+    AccountProof, Arc, CacheDB, CallError, CallOutcome, CallRequest, DatabaseRef, EmptyDB,
+    EvmModule, ExecError, Mutex, StateError, StorageProof, alloy_primitives_address, history,
+    overrides, trie, versioned,
 };
 
 // ── Height-indexed state queries ────────────────────────────
@@ -853,9 +853,17 @@ impl EvmModule {
     /// [`StateError`] when `h` is outside the retained window.
     pub fn balance_at(&self, addr: &primitives::Address, h: u64) -> Result<u128, StateError> {
         self.check_state_height(h)?;
-        let db = framework::lock_state(&self.db);
+        // Pin a committed-state snapshot under a short db lock,
+        // then release it — the undo index is locked next (it only
+        // advances, so it covers at least the snapshot's height) and
+        // the view reads the snapshot instead of holding the db
+        // mutex through the query.
+        let snap = {
+            let db = framework::lock_state(&self.db);
+            Arc::clone(&db)
+        };
         let versioned = framework::lock_state(&self.versioned);
-        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let view = Self::state_view(&snap, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
         Ok(view
             .basic_ref(evm_addr)
@@ -870,9 +878,17 @@ impl EvmModule {
     /// [`StateError`] when `h` is outside the retained window.
     pub fn nonce_at(&self, addr: &primitives::Address, h: u64) -> Result<u64, StateError> {
         self.check_state_height(h)?;
-        let db = framework::lock_state(&self.db);
+        // Pin a committed-state snapshot under a short db lock,
+        // then release it — the undo index is locked next (it only
+        // advances, so it covers at least the snapshot's height) and
+        // the view reads the snapshot instead of holding the db
+        // mutex through the query.
+        let snap = {
+            let db = framework::lock_state(&self.db);
+            Arc::clone(&db)
+        };
         let versioned = framework::lock_state(&self.versioned);
-        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let view = Self::state_view(&snap, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
         Ok(view.basic_ref(evm_addr).unwrap_or_default().map_or(0, |a| a.nonce))
     }
@@ -885,9 +901,17 @@ impl EvmModule {
     /// [`StateError`] when `h` is outside the retained window.
     pub fn code_at(&self, addr: &primitives::Address, h: u64) -> Result<Vec<u8>, StateError> {
         self.check_state_height(h)?;
-        let db = framework::lock_state(&self.db);
+        // Pin a committed-state snapshot under a short db lock,
+        // then release it — the undo index is locked next (it only
+        // advances, so it covers at least the snapshot's height) and
+        // the view reads the snapshot instead of holding the db
+        // mutex through the query.
+        let snap = {
+            let db = framework::lock_state(&self.db);
+            Arc::clone(&db)
+        };
         let versioned = framework::lock_state(&self.versioned);
-        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let view = Self::state_view(&snap, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
         let Some(info) = view.basic_ref(evm_addr).unwrap_or_default() else {
             return Ok(Vec::new());
@@ -910,9 +934,17 @@ impl EvmModule {
         h: u64,
     ) -> Result<revm::primitives::U256, StateError> {
         self.check_state_height(h)?;
-        let db = framework::lock_state(&self.db);
+        // Pin a committed-state snapshot under a short db lock,
+        // then release it — the undo index is locked next (it only
+        // advances, so it covers at least the snapshot's height) and
+        // the view reads the snapshot instead of holding the db
+        // mutex through the query.
+        let snap = {
+            let db = framework::lock_state(&self.db);
+            Arc::clone(&db)
+        };
         let versioned = framework::lock_state(&self.versioned);
-        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let view = Self::state_view(&snap, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
         Ok(view.storage_ref(evm_addr, *slot).unwrap_or_default())
     }
@@ -963,9 +995,17 @@ impl EvmModule {
                 e.requested()
             )))
         })?;
-        let db = framework::lock_state(&self.db);
+        // Pin a committed-state snapshot under a short db lock,
+        // then release it — the undo index is locked next (it only
+        // advances, so it covers at least the snapshot's height) and
+        // the view reads the snapshot instead of holding the db
+        // mutex through the query.
+        let snap = {
+            let db = framework::lock_state(&self.db);
+            Arc::clone(&db)
+        };
         let versioned = framework::lock_state(&self.versioned);
-        let view = Self::state_view(&db, &versioned, &self.history, h);
+        let view = Self::state_view(&snap, &versioned, &self.history, h);
         let evm_addr = alloy_primitives_address(addr.0);
 
         // ── Account-trie proof ──────────────────────────────────
@@ -974,8 +1014,13 @@ impl EvmModule {
         // Each entry contributes `keccak(addr) → rlp(TrieAccount)`.
         let mut leaves: std::collections::BTreeMap<revm::primitives::B256, Vec<u8>> =
             std::collections::BTreeMap::new();
-        let addrs: std::collections::BTreeSet<revm::primitives::Address> =
-            db.cache.accounts.keys().copied().chain(versioned.known_accounts().copied()).collect();
+        let addrs: std::collections::BTreeSet<revm::primitives::Address> = snap
+            .cache
+            .accounts
+            .keys()
+            .copied()
+            .chain(versioned.known_accounts().copied())
+            .collect();
         let mut storage_root_cache = framework::lock_state(&self.storage_root_cache);
         for a in addrs {
             let Some(info) = view.info_at(&a) else { continue };
@@ -991,14 +1036,20 @@ impl EvmModule {
                     *r
                 } else {
                     let r = trie::storage_root(
-                        storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+                        storage_map
+                            .iter()
+                            .filter(|(_, v)| !v.is_zero())
+                            .map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
                     );
                     storage_root_cache.insert(a, r);
                     r
                 }
             } else {
                 trie::storage_root(
-                    storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+                    storage_map
+                        .iter()
+                        .filter(|(_, v)| !v.is_zero())
+                        .map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
                 )
             };
             let trie_account =
@@ -1030,7 +1081,10 @@ impl EvmModule {
             trie::EMPTY_ROOT
         } else {
             trie::storage_root(
-                storage_map.iter().map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
+                storage_map
+                    .iter()
+                    .filter(|(_, v)| !v.is_zero())
+                    .map(|(k, v)| (revm::primitives::B256::from(*k), *v)),
             )
         };
 

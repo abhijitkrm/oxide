@@ -1423,6 +1423,40 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     chain — a consensus break. Parallel and sequential execution
     now produce identical state, verified by unit, property, and
     fuzz testing.
+- **Read-only RPC calls could mutate committed EVM state**
+  (`modules/evm`): `eth_call` (and the gas-estimation, trace, and
+  access-list paths that share `simulate`) executed against the
+  authoritative `CacheDB` under its mutex. revm caches every read
+  miss into the db it runs against — `NotExisting` tombstones for
+  missing accounts, zero entries for unset slots — so a node
+  serving reads accumulated entries its peers lacked, changing the
+  next `state_root` (a consensus divergence) and stalling commits
+  for up to `sim_timeout` per query.
+  - Every read now clones the committed-state `Arc` under a short
+    lock and simulates on a scratch overlay (`SharedCacheDB` for
+    latest state, the undo-log `StateView` for historical);
+    `stateOverride` tables ride inside the read-only
+    `OverrideView`. The db mutex is released before execution, so
+    heavy reads no longer block block production.
+  - Committed storage now obeys Ethereum's sparse-storage rule —
+    a slot written to zero is *absent*: commit paths sweep zero
+    values out of `DbAccount.storage`, genesis/load/snapshot
+    ingress filters them, strict snapshot decoding rejects them,
+    and the trie builders skip them, so storage roots, `eth_getProof`,
+    persistence, and snapshots all agree.
+  - Regression coverage: unit tests pinning root-invariance under
+    `eth_call`/`estimateGas`/`traceCall`/`createAccessList` and
+    missing-account reads, override-isolation and zero-slot tests,
+    and a property test running a module under random read traffic
+    against a quiet module over identical generated batches.
+  - **In plain words:** asking a node a read-only question (like
+    "what would this transaction do?") could silently change its
+    accounting state and briefly freeze block production. Nodes
+    that served lots of API reads could disagree with quiet nodes
+    about the state of the chain. Reads now run against a private
+    snapshot, so they cannot change anything, and the ledger treats
+    "storage slot set to zero" exactly like "slot never existed,"
+    matching Ethereum.
 - **oxideBFT: hidden-QC fork — conflicting blocks could finalize at
   the same height** (`crates/consensus`, `crates/types`,
   `bin/oxide-devnet`, `crates/devnet`, `sim`, `spec/oxidebft`)

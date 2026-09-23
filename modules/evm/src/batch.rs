@@ -14,7 +14,6 @@ use super::{
     SharedCacheDB, SpecTx, TracedResult, TxContext, alloy_primitives_address, history, receipts,
     trace, tx, versioned,
 };
-use revm::database_interface::DatabaseCommit;
 use revm::state::EvmState;
 
 impl EvmModule {
@@ -392,7 +391,12 @@ impl EvmModule {
                     local_undo
                         .capture(*addr, evm.ctx.journaled_state.database.cache.accounts.get(addr));
                 }
+                // Zero-slot sweep after commit — see `commit_state`
+                // in lib.rs for why committed storage must not hold
+                // zero values.
+                let zeroed = Self::zero_slot_writers(&result_and_state.state);
                 evm.commit(result_and_state.state);
+                Self::prune_zero_slots(evm.ctx.journaled_state.database, &zeroed);
                 (result_and_state.result, call_trace)
             };
 
@@ -895,6 +899,13 @@ impl EvmModule {
                                 // speculative one.
                                 let mut spec_state = rs.state.clone();
                                 spec_state.remove(&coinbase);
+                                // Commit into the group scratch cache
+                                // — deliberately WITHOUT the
+                                // canonical zero-slot sweep: a zero
+                                // entry here shadows the parent's
+                                // stale value for later same-sender
+                                // transactions. The canonical merge
+                                // below prunes instead.
                                 evm.commit(rs.state);
                                 (
                                     Ok(rs.result),
@@ -1224,7 +1235,12 @@ impl EvmModule {
                             }
                             evm.precompiles.clear_native_journal();
                             let call_trace = evm.inspector.1.take_root();
+                            // Canonical re-execution commits to the
+                            // authoritative cache — sweep committed
+                            // zero slots (see `commit_state`).
+                            let zeroed = Self::zero_slot_writers(&rs.state);
                             evm.commit(rs.state);
+                            Self::prune_zero_slots(evm.ctx.journaled_state.database, &zeroed);
                             // Mark the tx's actual write set — accounts
                             // the commit marked modified — as written
                             // by this sender.
@@ -1274,7 +1290,7 @@ impl EvmModule {
                     committed_undo.capture(*addr, db.cache.accounts.get(addr));
                 }
             }
-            db.commit(st.state);
+            Self::commit_state(&mut *db, st.state);
             // Apply the coinbase delta now — keeping the running
             // balance canonical for every later validation check.
             if st.coinbase_delta != revm::primitives::U256::ZERO {

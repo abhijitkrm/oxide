@@ -2624,6 +2624,167 @@ fn call_read_never_persists_state() {
     assert_eq!(m.code(&oxide_contract), SSTORE_RUNTIME.to_vec());
 }
 
+/// Runtime: PUSH1 0x07 SLOAD PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1
+/// 0x00 RETURN — reads storage slot 7 and returns the word.
+/// Slot 7 is deliberately left unset so every call is a storage
+/// *miss* — the access pattern that used to leak a zero-valued
+/// entry into the authoritative `CacheDB` (revm caches read misses
+/// into whichever db it executes against).
+const READ_SLOT_7_RUNTIME: [u8; 11] =
+    [0x60, 0x07, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+
+/// Runtime: PUSH1 0x00 PUSH1 0x01 SSTORE STOP — writes slot 1 = 0,
+/// the zero-write whose commit must leave the slot absent.
+const ZERO_SLOT_1_RUNTIME: [u8; 6] = [0x60, 0x00, 0x60, 0x01, 0x55, 0x00];
+
+/// Fresh module with one deployed contract: `READ_SLOT_7` code,
+/// slot 1 = 42, slot 7 unset.
+fn read_probe_module(contract: &Address) -> EvmModule {
+    let m = make_module();
+    m.genesis_insert_account(
+        contract,
+        0,
+        1,
+        READ_SLOT_7_RUNTIME.to_vec(),
+        vec![(U256::from(1), U256::from(42))],
+    );
+    m
+}
+
+/// `eth_call` must not mutate committed state. A read served on the
+/// authoritative map would insert a zero-valued slot-7 entry that a
+/// node without this RPC traffic lacks — two otherwise-identical
+/// modules would then diverge on `state_root`.
+#[test]
+fn call_read_does_not_mutate_committed_state() {
+    let contract = Address([0x77; 20]);
+    let served = read_probe_module(&contract);
+    let quiet = read_probe_module(&contract);
+    let evm_contract = alloy_primitives_address(contract.0);
+
+    served.call_read(&call_req(evm_contract, &[])).expect("read must succeed");
+
+    // A stray cache entry only reaches the root when the account's
+    // leaf is rebuilt — force the recompute on both modules (the
+    // commit path marks the account touched per write).
+    served.mark_touched_for_test(&contract);
+    quiet.mark_touched_for_test(&contract);
+    assert_eq!(
+        served.state_root(),
+        quiet.state_root(),
+        "reading an unset slot must not change the state root"
+    );
+    let db = framework::lock_state(&served.db);
+    let account = db.cache.accounts.get(&evm_contract).expect("contract must exist");
+    assert!(
+        !account.storage.contains_key(&U256::from(7)),
+        "the read miss must not be cached into the authoritative map"
+    );
+}
+
+/// `eth_estimateGas`, `debug_traceCall`, and `eth_createAccessList`
+/// funnel through the same `simulate` overlay — all must leave the
+/// committed map untouched, including reads of *missing* accounts
+/// (cached as `NotExisting` tombstones — unbounded map growth).
+#[test]
+fn all_read_paths_leave_committed_state_untouched() {
+    let contract = Address([0x77; 20]);
+    let missing = Address([0x99; 20]);
+    let served = read_probe_module(&contract);
+    let quiet = read_probe_module(&contract);
+
+    let req = call_req(alloy_primitives_address(contract.0), &[]);
+    served.call_read(&req).expect("eth_call must succeed");
+    served.estimate_call_gas(&req).expect("estimateGas must succeed");
+    served.call_read_traced(&req).expect("traceCall must succeed");
+    served.create_access_list(&req).expect("createAccessList must succeed");
+
+    // A call to an account that does not exist: the miss must not
+    // install a `NotExisting` tombstone into the authoritative map.
+    let missing_req = call_req(alloy_primitives_address(missing.0), &[]);
+    let _ = served.call_read(&missing_req);
+    let _ = served.estimate_call_gas(&missing_req);
+
+    let served_accounts = framework::lock_state(&served.db).cache.accounts.len();
+    let quiet_accounts = framework::lock_state(&quiet.db).cache.accounts.len();
+    assert_eq!(served_accounts, quiet_accounts, "read traffic must not grow the account map");
+
+    served.mark_touched_for_test(&contract);
+    quiet.mark_touched_for_test(&contract);
+    assert_eq!(served.state_root(), quiet.state_root());
+}
+
+/// `stateOverride` entries are scoped to the simulation — a fake
+/// balance or storage slot must never reach the committed map.
+#[test]
+fn call_read_overrides_do_not_persist() {
+    let contract = Address([0x77; 20]);
+    let m = read_probe_module(&contract);
+    let evm_contract = alloy_primitives_address(contract.0);
+
+    let mut ovr = overrides::StateOverrides::new();
+    ovr.insert(
+        evm_contract,
+        overrides::AccountOverride {
+            balance: Some(U256::from(999)),
+            state_diff: Some([(U256::from(9), U256::from(0xbeef))].into_iter().collect()),
+            ..overrides::AccountOverride::default()
+        },
+    );
+    m.call_read_with_overrides(&call_req(evm_contract, &[]), None, &ovr)
+        .expect("override call must succeed");
+
+    let db = framework::lock_state(&m.db);
+    let account = db.cache.accounts.get(&evm_contract).expect("contract must exist");
+    assert_eq!(account.info.balance, U256::ZERO, "override balance must not persist");
+    assert!(!account.storage.contains_key(&U256::from(9)), "override storage must not persist");
+}
+
+/// A slot written to zero must leave the account's storage
+/// identical to never having had the slot — Ethereum's
+/// sparse-storage rule ("zero is absent" — the MPT encodes only
+/// nonzero leaves). The committed map must not retain the entry,
+/// and the account's storage root must be the empty-trie root.
+/// (Cross-module `state_root` comparison can't be used here:
+/// clearing a populated slot earns an EIP-3529 gas refund, so the
+/// caller/coinbase leaves legitimately differ from a module whose
+/// tx wrote zero to an already-empty slot.)
+#[test]
+fn zeroed_storage_slot_matches_never_written() {
+    let (pk, caller) = test_keypair();
+    let contract = Address([0x55; 20]);
+    let m = make_module();
+    fund(&m, &caller);
+    m.genesis_insert_account(
+        &contract,
+        0,
+        1,
+        ZERO_SLOT_1_RUNTIME.to_vec(),
+        vec![(U256::from(1), U256::from(42))],
+    );
+    m.begin_block(Height::new(1));
+    let msg = signed_tx(&pk, 0, tx::TxKind::Call(alloy_primitives_address(contract.0)), &[]);
+    m.handle(&dummy_ctx(), &msg).expect("zeroing call must succeed");
+
+    let evm_contract = alloy_primitives_address(contract.0);
+    {
+        let db = framework::lock_state(&m.db);
+        let account = db.cache.accounts.get(&evm_contract).expect("contract must exist");
+        assert!(
+            !account.storage.contains_key(&U256::from(1)),
+            "committed map must not retain the zeroed slot"
+        );
+    }
+    // The committed storage root for the contract must be the
+    // empty-trie root — same as a contract that never had slot 1.
+    let proof = m.account_proof(&contract, &[], 1).expect("proof at latest height");
+    assert_eq!(
+        proof.storage_hash,
+        crate::trie::EMPTY_ROOT,
+        "zeroing the only slot must yield the empty storage root"
+    );
+}
+
 #[test]
 fn estimate_call_gas_simple_transfer() {
     let (_, caller) = test_keypair();
@@ -3574,6 +3735,19 @@ fn account_deserialize_strict_rejects_noncanonical() {
     // Empty code with a non-empty hash — unverifiable.
     let no_body = persist::serialize_account(U256::ZERO, 0, revm::primitives::B256::ZERO, &[], &[]);
     assert!(persist::deserialize_account_strict(&no_body).is_none());
+
+    // A zero-valued slot — the encoder never emits one (Ethereum's
+    // sparse-storage rule: zero and absent are the same state), so a
+    // blob carrying it is not encoder output.
+    let zero_slot = persist::serialize_account(
+        U256::ZERO,
+        0,
+        revm::primitives::KECCAK_EMPTY,
+        &[],
+        &[(slot_a, U256::ZERO)],
+    );
+    assert!(persist::deserialize_account(&zero_slot).is_some());
+    assert!(persist::deserialize_account_strict(&zero_slot).is_none());
 }
 
 /// A signed legacy transfer with an explicit gas limit — the
