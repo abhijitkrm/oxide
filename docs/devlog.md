@@ -20618,3 +20618,44 @@ One caveat worth naming: cargo feature *unification* means a
 whole-workspace build compiles crypto with the feature on (devnet
 pulls it). The gate's real boundary is per-binary release builds —
 exactly the artifact that ships.
+
+## Session N+39 (cont.) — encrypted keystore: keys stop living as raw hex
+
+`crypto::keystore` (feature `keystore` → `dep:aws-lc-rs`) is an
+87-byte `OXKEY` blob: magic + version + kind + PBKDF2 params +
+salt + random nonce + AES-256-GCM ciphertext||tag. Two deliberate
+choices worth recording:
+
+- **aws-lc-rs, not a new RustCrypto stack.** It is already the
+  TLS provider (rustls's `aws_lc_rs` backend), so pinning the
+  lockfile's exact `=1.18.1` adds zero crates to the graph —
+  PBKDF2-HMAC-SHA256 (600k iters, OWASP 2023) plus
+  `RandomizedNonceKey` (random 96-bit nonce per seal — reuse is
+  structurally impossible). Argon2id's memory-hardness would be
+  better against GPUs but isn't in the tree; the dep review cost
+  of two new crypto crates outweighs it for a cold-path key
+  unlock.
+- **The header is the AAD.** kind/iterations/salt are bound into
+  the GCM tag, so a tampered field fails authentication rather
+  than producing a misparsed key — and `open` refuses a valid
+  decryption whose declared kind doesn't match the flag's
+  expectation (a secp blob fed to `--bls-key-file` fails loudly).
+
+`node::cli::load_secret_key_file` is the one loader: it sniffs the
+magic, decrypts keystores via `OXIDE_KEY_PASSPHRASE` (env only —
+argv shows up in `ps`), and still accepts raw hex/32-byte files.
+Without the feature the magic gets a precise refusal instead of a
+misparse. Consumers:
+
+- `oxide-devnet --bls-key-file` (rewrote its bespoke sniff onto
+  the shared loader),
+- `oxide-validator keygen --encrypt` (writes keystores) and
+  `--signer-key-file`,
+- `oxide-matcher --settlement-key-file`.
+
+Verified live: `keygen --encrypt` → keystore pubkey into a
+`--validator-pubkeys` genesis → `oxide-devnet` decrypted the file
+and finalized with that committee key. Missing env, wrong
+passphrase, and foreign-key cases all fail closed with distinct
+messages. Standalone `cargo check -p node` (no feature) compiles
+with zero aws-lc crates — the C toolchain stays opt-in.

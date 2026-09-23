@@ -34,6 +34,10 @@ pub mod bls_signer;
 pub mod ed25519;
 pub mod eip712;
 pub mod hash;
+/// Passphrase-encrypted key files — behind `keystore` (dep:
+/// aws-lc-rs) so pure-Rust consumers never pull the C toolchain.
+#[cfg(feature = "keystore")]
+pub mod keystore;
 pub mod secp;
 
 pub use bls::{AggregateSignature, PublicKey, Signature, ValidatorIndex};

@@ -36,6 +36,12 @@ sha3 = { workspace = true }
 # (Phase G). Pure Rust, constant-time. BSD-3-Clause. Used for
 # signing native (non-EVM) transactions: staking, exchange, perps.
 ed25519-dalek = { workspace = true }
+# aws-lc-rs: PBKDF2 + AES-256-GCM for the `keystore` module — already
+# the TLS crypto provider (rustls's `aws_lc_rs` feature), so this is
+# a zero-new-crate edge: the version is pinned to the lockfile's.
+# Optional so pure-Rust consumers (sim, fuzz, in-process harnesses)
+# never pull the C toolchain through crypto.
+aws-lc-rs = { version = "=1.18.1", optional = true }
 
 [features]
 # Deterministic test identities (`secp::test_identity_key`,
@@ -47,6 +53,10 @@ ed25519-dalek = { workspace = true }
 # predicate the production startup policy uses to reject these
 # keys.
 dev-identities = []
+# Passphrase-encrypted key files (`keystore` module) — PBKDF2 +
+# AES-256-GCM via aws-lc-rs. Enabled by binaries that load operator
+# key material; off for harnesses that never touch key files.
+keystore = ["dep:aws-lc-rs"]
 
 [lints]
 workspace = true

@@ -15,13 +15,15 @@ name = "oxide-validator"
 path = "src/main.rs"
 
 [dependencies]
-node = { workspace = true }
+# keystore: `keygen --encrypt` writes OXKEY blobs and
+# `--signer-key-file` reads them.
+node = { workspace = true, features = ["keystore"] }
 primitives = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
 framework = { workspace = true }
 config = { workspace = true }
-crypto = { workspace = true }
+crypto = { workspace = true, features = ["keystore"] }
 consensus = { workspace = true }
 executor = { workspace = true }
 # TLS enabled for production validator connections (mTLS per C4).

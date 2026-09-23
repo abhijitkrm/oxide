@@ -510,18 +510,11 @@ fn run_node(node_index_str: &str) {
 /// decoded, or parsed into a valid `BlsSecretKey`.
 fn load_bls_key(index: usize) -> crypto::BlsSecretKey {
     if let Some(path) = node::cli::parse_cli_flag("--bls-key-file") {
-        let raw = std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("failed to read BLS key file {path}: {e}"));
-        // Try hex decode first (64 hex chars, optional 0x prefix).
-        // ASCII whitespace is trimmed — a file written by `echo` or
-        // an editor carries a trailing newline that must not push
-        // the file into the raw-bytes path.
-        let bytes: Vec<u8> = match std::str::from_utf8(&raw).map(str::trim) {
-            Ok(text) if text.len() == 64 || (text.len() == 66 && text.starts_with("0x")) => {
-                node::cli::hex_decode(text).expect("hex decode BLS key")
-            }
-            _ => raw,
-        };
+        // Raw hex, raw bytes, or an encrypted `OXKEY` keystore —
+        // `load_secret_key_file` sniffs the format (keystore needs
+        // `OXIDE_KEY_PASSPHRASE` in the environment).
+        let bytes = node::cli::load_secret_key_file(&path, node::cli::SecretKind::Bls)
+            .unwrap_or_else(|e| panic!("invalid BLS key file: {e}"));
         crypto::BlsSecretKey::from_bytes(&bytes)
             .unwrap_or_else(|e| panic!("invalid BLS secret key in {path}: {e:?}"))
     } else {

@@ -12,8 +12,9 @@ path = "src/main.rs"
 [dependencies]
 # devnet is the development binary — it funds derivable fixture
 # identities and signs smoke transactions as them, so it opts into
-# the dev-identities surface on both `node` and `crypto`.
-node = { workspace = true, features = ["dev-identities"] }
+# the dev-identities surface on both `node` and `crypto`. `keystore`
+# lets `--bls-key-file` accept encrypted operator key files too.
+node = { workspace = true, features = ["dev-identities", "keystore"] }
 primitives = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }

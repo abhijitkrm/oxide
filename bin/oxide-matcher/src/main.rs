@@ -115,12 +115,23 @@ fn parse_cli() -> CliConfig {
         // Durable replay-gate checkpoint — without it, every restart
         // lets any captured signed request replay once.
         nonce_state: parse_flag_opt::<String>("--nonce-state").map(std::path::PathBuf::from),
-        // The settlement operator's secp256k1 secret (64 hex chars).
-        // Batch envelopes are always signed, and there is no default
-        // operator key — a deterministic fallback would wire a public
-        // identity as the settlement gate. `main` refuses to start
-        // without it (and refuses test-identity scalars).
-        settlement_key: parse_flag_opt::<String>("--settlement-key").map(|hex| parse_key_hex(&hex)),
+        // The settlement operator's secp256k1 secret — either
+        // `--settlement-key <64 hex>` on argv or `--settlement-key-file
+        // <path>` holding hex/raw bytes/an OXKEY keystore (the file
+        // form keeps the secret out of `ps`; keystore decrypts with
+        // `OXIDE_KEY_PASSPHRASE`). Batch envelopes are always signed,
+        // and there is no default operator key — a deterministic
+        // fallback would wire a public identity as the settlement
+        // gate. `main` refuses to start without it (and refuses
+        // test-identity scalars).
+        settlement_key: parse_flag_opt::<String>("--settlement-key")
+            .map(|hex| parse_key_hex(&hex))
+            .or_else(|| {
+                parse_flag_opt::<String>("--settlement-key-file").map(|path| {
+                    node::cli::load_secret_key_file(&path, node::cli::SecretKind::Secp256k1)
+                        .unwrap_or_else(|e| panic!("invalid --settlement-key-file: {e}"))
+                })
+            }),
         // Durable settlement-lane checkpoint — without it, a restart
         // forgets an in-flight batch (fills drained, outcome unknown).
         settlement_outbox: parse_flag_opt::<String>("--settlement-outbox")
@@ -135,8 +146,9 @@ fn parse_cli() -> CliConfig {
 fn settlement_key_check(key: Option<[u8; 32]>) -> Result<[u8; 32], String> {
     match key {
         None => {
-            Err("missing --settlement-key: batch envelopes are signed and no default operator \
-             key exists — generate one (e.g. `openssl rand -hex 32`)"
+            Err("missing --settlement-key/--settlement-key-file: batch envelopes are signed and \
+             no default operator key exists — generate one with `oxide-validator keygen --secp` \
+             (add --encrypt for a passphrase-protected keystore file)"
                 .to_string())
         }
         Some(k) if crypto::secp::is_test_identity_key(&k) => {

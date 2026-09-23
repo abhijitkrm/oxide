@@ -16,7 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 matcher = { workspace = true }
-node = { workspace = true }
+# keystore: `--settlement-key-file` accepts encrypted OXKEY blobs.
+node = { workspace = true, features = ["keystore"] }
 primitives = { workspace = true }
 types = { workspace = true }
 trading = { workspace = true }

@@ -63,6 +63,16 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   - **In plain words:** the demo keys everyone can guess are no
     longer compiled into the production binaries — you cannot even
     link them in unless you ask for the dev feature.
+- **Encrypted key files (`OXKEY` keystores).** `oxide-validator
+  keygen --encrypt` writes a passphrase-protected blob
+  (PBKDF2-HMAC-SHA256 @600k + AES-256-GCM, salted, random nonce)
+  instead of raw hex; the passphrase comes from
+  `OXIDE_KEY_PASSPHRASE`, never argv. Every key-file flag accepts
+  one: `--bls-key-file`, `--signer-key-file`, and the new
+  `oxide-matcher --settlement-key-file` (which keeps the secret
+  out of `ps`). Raw hex/raw-binary files still work.
+  - **In plain words:** validator and operator keys can now live
+    on disk encrypted, so a leaked file alone isn't a leaked key.
 - **`oxide-validator keygen` — real key generation.** Generates a
   fresh BLS12-381 consensus key (default) or secp256k1 key
   (`--secp`) from the OS CSPRNG, writes the secret to a mode-0600

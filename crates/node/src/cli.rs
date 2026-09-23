@@ -509,6 +509,90 @@ pub fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+/// Load a 32-byte secret key file in any accepted encoding:
+///
+/// - **Encrypted keystore** (`crypto::keystore` magic): decrypted
+///   with the passphrase from `OXIDE_KEY_PASSPHRASE`; `want_kind`
+///   pins the declared key type so a valid decryption of the wrong
+///   key kind still fails loudly. Requires the crate's `keystore`
+///   feature — without it a keystore file errors precisely rather
+///   than falling back to misparsing.
+/// - **Hex text**: 64 hex chars, optional `0x` prefix, optional
+///   surrounding whitespace (echo-written files carry a newline).
+/// - **Raw binary**: exactly 32 bytes.
+///
+/// `want_kind` is ignored for raw encodings — they carry no type
+/// tag, so the caller's flag name is the only contract.
+///
+/// # Errors
+///
+/// `Err` names the path and the precise failure (read error, bad
+/// hex, wrong length, keystore error verbatim — including the
+/// missing-passphrase hint).
+pub fn load_secret_key_file(path: &str, want_kind: SecretKind) -> Result<[u8; 32], String> {
+    let raw = std::fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    parse_secret_key_bytes(&raw, want_kind).map_err(|e| format!("{path}: {e}"))
+}
+
+/// The key kind a file is expected to hold — mirrors
+/// `crypto::keystore::KeyKind` without requiring the feature for the
+/// raw paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretKind {
+    /// BLS12-381 consensus secret (`--bls-key-file`).
+    Bls,
+    /// secp256k1 secret (`--settlement-key-file`, `--signer-key-file`).
+    Secp256k1,
+}
+
+/// Decode a secret from raw file bytes — the shared sniff used by
+/// [`load_secret_key_file`]. Separated for unit tests.
+fn parse_secret_key_bytes(raw: &[u8], want_kind: SecretKind) -> Result<[u8; 32], String> {
+    #[cfg(feature = "keystore")]
+    if crypto::keystore::is_keystore(raw) {
+        let pass = crypto::keystore::passphrase_from_env().map_err(|e| e.to_string())?;
+        let (kind, secret) = crypto::keystore::open(raw, &pass).map_err(|e| e.to_string())?;
+        let expected = match want_kind {
+            SecretKind::Bls => crypto::keystore::KeyKind::Bls,
+            SecretKind::Secp256k1 => crypto::keystore::KeyKind::Secp256k1,
+        };
+        if kind != expected {
+            return Err(format!("keystore holds a {kind:?} key but {expected:?} was expected"));
+        }
+        return Ok(secret);
+    }
+    #[cfg(not(feature = "keystore"))]
+    {
+        // Without the keystore feature the magic still gets a precise
+        // refusal — never a misparse as a raw 87-byte scalar.
+        const OXKEY: &[u8; 5] = b"OXKEY";
+        if raw.starts_with(OXKEY) {
+            return Err(
+                "encrypted keystore requires a build with the `keystore` feature".to_string()
+            );
+        }
+        let _ = want_kind;
+    }
+    // Hex text: 64 hex chars (optional 0x) with surrounding
+    // whitespace tolerated — `echo`/`$EDITOR` files carry newlines.
+    if let Ok(text) = std::str::from_utf8(raw) {
+        let text = text.trim();
+        let hex = text.strip_prefix("0x").unwrap_or(text);
+        if hex.len() == 64 {
+            let bytes = hex_decode(hex)?;
+            return bytes.try_into().map_err(|_| "expected 32 bytes".to_string());
+        }
+    }
+    if raw.len() == 32 {
+        return Ok(raw.try_into().expect("32-byte slice"));
+    }
+    Err(format!(
+        "expected a 64-char hex key, 32 raw bytes, or an OXKEY keystore \
+         (got {} bytes)",
+        raw.len()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,6 +17,11 @@ repository.workspace = true
 # binaries (`oxide-validator`, `oxide-matcher`, `oxide-fullnode`)
 # do not, so their dependency graph has no derivable signing path.
 dev-identities = ["crypto/dev-identities"]
+# Passphrase-encrypted key files (`crypto::keystore`) — the key-file
+# loaders gain decryption support. Enabled by binaries that read
+# operator key material (`oxide-validator`, `oxide-devnet`,
+# `oxide-matcher`).
+keystore = ["crypto/keystore"]
 
 [dependencies]
 primitives = { workspace = true }

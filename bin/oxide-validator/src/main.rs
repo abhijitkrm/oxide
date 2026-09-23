@@ -394,18 +394,26 @@ fn handle_key_change(node: &mut Node, chain_id: u64) {
         let new_key_bytes = new_sk.public_key().as_bytes().to_vec();
         let pop = new_sk.pop_prove();
 
-        let Some(signer_hex) = node::cli::parse_cli_flag("--signer-key") else {
+        // The signer may come from argv (hex) or a file — the file
+        // form accepts an encrypted OXKEY keystore, so the staking
+        // key never has to sit on a command line.
+        let signer: [u8; 32] = if let Some(file) = node::cli::parse_cli_flag("--signer-key-file") {
+            node::cli::load_secret_key_file(&file, node::cli::SecretKind::Secp256k1)
+                .unwrap_or_else(|e| panic!("invalid --signer-key-file: {e}"))
+        } else if let Some(signer_hex) = node::cli::parse_cli_flag("--signer-key") {
+            let signer_bytes = node::cli::hex_decode(&signer_hex)
+                .unwrap_or_else(|e| panic!("invalid --signer-key hex: {e}"));
+            signer_bytes
+                .try_into()
+                .unwrap_or_else(|_| panic!("--signer-key must be 32 bytes (64 hex chars)"))
+        } else {
             eprintln!(
-                "oxide-validator: --submit-key-change requires --signer-key <secp256k1-hex> — \
-                 the key-change tx must be signed by the staking account it rotates"
+                "oxide-validator: --submit-key-change requires --signer-key <secp256k1-hex> or \
+                 --signer-key-file <path> (hex or OXKEY keystore) — the key-change tx must be \
+                 signed by the staking account it rotates"
             );
             std::process::exit(1);
         };
-        let signer_bytes = node::cli::hex_decode(&signer_hex)
-            .unwrap_or_else(|e| panic!("invalid --signer-key hex: {e}"));
-        let signer: [u8; 32] = signer_bytes
-            .try_into()
-            .unwrap_or_else(|_| panic!("--signer-key must be 32 bytes (64 hex chars)"));
         if crypto::is_test_identity_key(&signer) {
             eprintln!(
                 "oxide-validator: --signer-key is a public test-identity scalar — a known key \
@@ -460,6 +468,7 @@ fn print_help() {
     println!("    genesis      Generate a genesis file");
     println!("    tls-gen      Generate TLS certificates for a multi-node testnet");
     println!("    keygen       Generate a fresh BLS (or --secp) secret key file");
+    println!("                   --encrypt writes an OXKEY passphrase-keystore");
     println!("    version      Print version information");
     println!("    help         Print this help message");
     println!();
@@ -474,6 +483,7 @@ fn print_help() {
     println!("    --import-snapshot <path>  Import state snapshot before starting");
     println!("    --submit-key-change <hex> Submit a BLS key-change transaction (new secret key)");
     println!("    --signer-key <hex>        secp256k1 key signing the key-change tx");
+    println!("    --signer-key-file <path>  same, from a file (hex or OXKEY keystore)");
     println!("    --unsafe-allow-unsigned-txs");
     println!("                            UNSAFE dev mode: admit unsigned native txs");
     println!("    --unsafe-allow-insecure-posture");
@@ -791,6 +801,10 @@ fn run_tls_gen(args: &[String]) {
 ///   operator). Default is BLS12-381 (consensus identity —
 ///   `--bls-key-file` format: 32-byte canonical scalar, hex).
 /// - `--output|-o <path>`: destination file (default `key.hex`).
+/// - `--encrypt`: write a passphrase-encrypted `OXKEY` keystore
+///   instead of raw hex. The passphrase comes from the
+///   `OXIDE_KEY_PASSPHRASE` environment variable — never argv, which
+///   is world-readable in `ps`.
 ///
 /// The file is written owner-only (mode 0600 on Unix) and the
 /// command refuses to overwrite an existing path — keys are not
@@ -800,11 +814,16 @@ fn run_tls_gen(args: &[String]) {
 fn run_keygen(args: &[String]) {
     let mut output = "key.hex".to_string();
     let mut secp = false;
+    let mut encrypt = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--secp" => {
                 secp = true;
+                i += 1;
+            }
+            "--encrypt" => {
+                encrypt = true;
                 i += 1;
             }
             "--output" | "-o" => {
@@ -817,13 +836,14 @@ fn run_keygen(args: &[String]) {
         }
     }
 
-    let (kind, secret_hex, public) = if secp {
+    let (kind_name, kind, secret, public) = if secp {
         let key = crypto::generate_secret_key();
         let addr =
             crypto::signable_pubkey_address(&key).expect("a generated secp256k1 key is valid");
         (
             "secp256k1",
-            node::cli::hex_encode(&key),
+            crypto::keystore::KeyKind::Secp256k1,
+            key,
             format!("address 0x{}", node::cli::hex_encode(&addr.0)),
         )
     } else {
@@ -835,25 +855,52 @@ fn run_keygen(args: &[String]) {
         let pk = key.public_key();
         (
             "BLS12-381",
-            node::cli::hex_encode(&key.to_bytes()),
+            crypto::keystore::KeyKind::Bls,
+            key.to_bytes(),
             format!("public key 0x{}", node::cli::hex_encode(pk.as_bytes())),
         )
     };
 
-    if let Err(e) = write_secret_key_file(&output, &secret_hex) {
+    let file_bytes: Vec<u8> = if encrypt {
+        let pass = match crypto::keystore::passphrase_from_env() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("oxide-validator keygen --encrypt: {e}");
+                std::process::exit(1);
+            }
+        };
+        match crypto::keystore::seal(kind, &secret, &pass) {
+            Ok(blob) => blob,
+            Err(e) => {
+                eprintln!("oxide-validator keygen --encrypt: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        node::cli::hex_encode(&secret).into_bytes()
+    };
+
+    if let Err(e) = write_secret_key_file(&output, &file_bytes) {
         eprintln!("oxide-validator keygen: {e}");
         std::process::exit(1);
     }
-    println!("oxide-validator keygen: wrote {kind} secret to {output}");
+    println!("oxide-validator keygen: wrote {kind_name} secret to {output}");
     println!("  {public}");
-    println!("  (the secret file is mode 0600 — never commit or copy it to another host)");
+    if encrypt {
+        println!(
+            "  (encrypted keystore — unlock with OXIDE_KEY_PASSPHRASE; keep it mode 0600 anyway)"
+        );
+    } else {
+        println!("  (the secret file is mode 0600 — never commit or copy it to another host)");
+        println!("  (tip: --encrypt writes a passphrase-protected OXKEY keystore instead)");
+    }
 }
 
 /// Write a generated secret key file: create-new (never overwrite)
 /// and owner-only permissions. A key file that already exists is a
 /// deliberate operator artifact — silently replacing it could rotate
 /// a validator's identity mid-deployment.
-fn write_secret_key_file(path: &str, contents: &str) -> Result<(), String> {
+fn write_secret_key_file(path: &str, contents: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -863,9 +910,9 @@ fn write_secret_key_file(path: &str, contents: &str) -> Result<(), String> {
         opts.mode(0o600);
     }
     match opts.open(path) {
-        Ok(mut f) => f
-            .write_all(contents.as_bytes())
-            .map_err(|e| format!("failed to write key file {path}: {e}")),
+        Ok(mut f) => {
+            f.write_all(contents).map_err(|e| format!("failed to write key file {path}: {e}"))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(format!("refusing to overwrite existing file {path}"))
         }
@@ -914,8 +961,8 @@ mod tests {
                 .map_or(0, |d| d.as_nanos())
         ));
         let path = path.to_str().expect("temp path is UTF-8").to_string();
-        super::write_secret_key_file(&path, "aa").expect("first write creates the file");
-        let err = super::write_secret_key_file(&path, "bb").expect_err("second write must refuse");
+        super::write_secret_key_file(&path, b"aa").expect("first write creates the file");
+        let err = super::write_secret_key_file(&path, b"bb").expect_err("second write must refuse");
         assert!(err.contains("refusing to overwrite"), "{err}");
         // Contents unchanged — the refusal wrote nothing.
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "aa");
