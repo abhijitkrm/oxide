@@ -65,6 +65,10 @@ fn main() {
                 run_tls_gen(&args[2..]);
                 return;
             }
+            "keygen" => {
+                run_keygen(&args[2..]);
+                return;
+            }
             "help" | "--help" | "-h" => {
                 print_help();
                 return;
@@ -97,22 +101,10 @@ fn run_single_node() {
 
     handle_import_snapshot(&mut node);
 
-    // Submit a smoke-test staking delegate signed by devnet
-    // identity 0 (genesis-funded and validator-registered in the
-    // single-node default — the signed default policy requires it).
-    let module_payload = staking::msg::delegate(
-        crypto::secp::test_identity_address(0).expect("valid devnet identity"),
-        100,
-    );
-    let tx = node::cli::build_signed_tx(
-        cfg.node.chain_id,
-        framework::module_id::STAKING,
-        &module_payload,
-        0,
-    );
-    node.engine().submit_tx(tx);
-
-    // Drive consensus once to finalize the smoke-test block.
+    // Drive consensus once so the startup log reports the recovered
+    // tip and state root. No smoke transaction is submitted — a
+    // validator must not emit transactions signed by the public
+    // devnet identity.
     node.engine().run_until_idle();
     let height = node.engine().finalized_height();
     tracing::info!(?height, "oxide-validator: finalized height");
@@ -129,7 +121,7 @@ fn run_single_node() {
         }
     }
 
-    tracing::info!("oxide-validator: smoke test complete");
+    tracing::info!("oxide-validator: startup check complete");
 
     if handle_export_snapshot(&mut node) {
         return;
@@ -387,6 +379,12 @@ fn handle_export_snapshot(node: &mut Node) -> bool {
 /// rotating to a key it does not possess could never sign votes with
 /// it anyway, so requiring the secret here matches operational
 /// reality and the C3 rogue-key defense.
+/// `--submit-key-change <new-bls-secret-hex>` — rotate this node's
+/// consensus key. The transaction must be signed by the staking
+/// account it rotates: `--signer-key <secp256k1-hex>` names the
+/// operator's key, and the tx's sender recovers to it. Test-identity
+/// scalars are refused — a publicly known signer cannot authorize a
+/// key rotation.
 fn handle_key_change(node: &mut Node, chain_id: u64) {
     if let Some(hex_key) = node::cli::parse_cli_flag("--submit-key-change") {
         let secret_bytes = node::cli::hex_decode(&hex_key)
@@ -395,22 +393,41 @@ fn handle_key_change(node: &mut Node, chain_id: u64) {
             .unwrap_or_else(|e| panic!("invalid BLS secret key: {e:?}"));
         let new_key_bytes = new_sk.public_key().as_bytes().to_vec();
         let pop = new_sk.pop_prove();
-        // The validator address is the tx sender — devnet identity
-        // 0, the key-derived account the single-node genesis funds
-        // and registers (a signed envelope's sender must recover to
-        // its key, so a byte-pattern address cannot do this).
-        let validator_addr =
-            crypto::secp::test_identity_address(0).expect("devnet identity 0 is a valid key");
-        // Ensure the validator has stake (delegate 1 unit if needed)
-        // so the key-change handler accepts the tx.
-        let delegate_msg = staking::msg::delegate(validator_addr, 1);
-        let delegate_tx =
-            node::cli::build_signed_tx(chain_id, framework::module_id::STAKING, &delegate_msg, 0);
-        node.engine().submit_tx(delegate_tx);
-        node.engine().run_until_idle();
+
+        let Some(signer_hex) = node::cli::parse_cli_flag("--signer-key") else {
+            eprintln!(
+                "oxide-validator: --submit-key-change requires --signer-key <secp256k1-hex> — \
+                 the key-change tx must be signed by the staking account it rotates"
+            );
+            std::process::exit(1);
+        };
+        let signer_bytes = node::cli::hex_decode(&signer_hex)
+            .unwrap_or_else(|e| panic!("invalid --signer-key hex: {e}"));
+        let signer: [u8; 32] = signer_bytes
+            .try_into()
+            .unwrap_or_else(|_| panic!("--signer-key must be 32 bytes (64 hex chars)"));
+        if crypto::is_test_identity_key(&signer) {
+            eprintln!(
+                "oxide-validator: --signer-key is a public test-identity scalar — a known key \
+                 cannot authorize a key rotation"
+            );
+            std::process::exit(1);
+        }
+        let validator_addr = crypto::signable_pubkey_address(&signer)
+            .expect("--signer-key must be a valid secp256k1 secret");
+
+        // The account's executed nonce — the tx must carry the
+        // sender's next sequence or the mempool rejects it.
+        let nonce = node.app().executed_nonce_of(&validator_addr);
         let msg_payload = staking::msg::key_change(validator_addr, &new_key_bytes, pop.as_bytes());
-        let tx =
-            node::cli::build_signed_tx(chain_id, framework::module_id::STAKING, &msg_payload, 1);
+        let tx = node::cli::build_signed_tx_with(
+            &signer,
+            validator_addr,
+            chain_id,
+            framework::module_id::STAKING,
+            &msg_payload,
+            nonce,
+        );
         node.engine().submit_tx(tx);
         tracing::info!("oxide-validator: submitted key-change transaction");
         // Drive consensus once more to include the key-change tx.
@@ -442,6 +459,7 @@ fn print_help() {
     println!("    init         Initialize a new node directory with config + genesis");
     println!("    genesis      Generate a genesis file");
     println!("    tls-gen      Generate TLS certificates for a multi-node testnet");
+    println!("    keygen       Generate a fresh BLS (or --secp) secret key file");
     println!("    version      Print version information");
     println!("    help         Print this help message");
     println!();
@@ -455,8 +473,11 @@ fn print_help() {
     println!("    --export-snapshot <path>  Export state snapshot to file and exit");
     println!("    --import-snapshot <path>  Import state snapshot before starting");
     println!("    --submit-key-change <hex> Submit a BLS key-change transaction (new secret key)");
+    println!("    --signer-key <hex>        secp256k1 key signing the key-change tx");
     println!("    --unsafe-allow-unsigned-txs");
     println!("                            UNSAFE dev mode: admit unsigned native txs");
+    println!("    --unsafe-allow-insecure-posture");
+    println!("                            UNSAFE: allow devnet defaults on public binds");
     println!();
     println!("    Multi-node flags (--num-nodes, --base-port, --bind-host,");
     println!("    --peer-host*, --bls-key-file, --tls-dir) belong to the");
@@ -469,6 +490,7 @@ fn print_help() {
     println!("    oxide-validator init --chain-id 1");
     println!("    oxide-validator genesis --chain-id 1 --validators 4");
     println!("    oxide-validator tls-gen --num-nodes 4 --output-dir tls/");
+    println!("    oxide-validator keygen --output node-0.key");
     println!("    oxide-validator --config config/devnet.toml");
     println!("    oxide-validator --engine oxidebft");
     println!("    oxide-validator --export-snapshot snapshot.bin");
@@ -529,10 +551,22 @@ fn run_init() {
 /// - `--chain-id <id>`: chain ID (default: 1)
 /// - `--validators <N>`: number of validators (default: 4)
 /// - `--output <path>`: output file (default: genesis.json)
+/// - `--validator-pubkeys <path>`: file of BLS public keys, one
+///   `0x`-prefixed 96-hex-character line per validator — the source
+///   of truth for the committee's identity. The count must equal
+///   `--validators`.
+/// - `--devnet`: fill `public_key` from the deterministic devnet
+///   derivation instead — the matching secrets are publicly
+///   computable, so this is only for local/testnet genesis.
+///
+/// Without one of the last two the command refuses: a genesis that
+/// silently embeds derivable keys hands anyone the whole committee.
 fn run_genesis(args: &[String]) {
     let mut chain_id: u64 = 1;
     let mut num_validators: usize = 4;
     let mut output = "genesis.json".to_string();
+    let mut devnet_keys = false;
+    let mut pubkeys_path: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -554,6 +588,16 @@ fn run_genesis(args: &[String]) {
                 }
                 i += 2;
             }
+            "--validator-pubkeys" => {
+                if let Some(v) = args.get(i + 1) {
+                    pubkeys_path = Some(v.clone());
+                }
+                i += 2;
+            }
+            "--devnet" => {
+                devnet_keys = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -561,15 +605,45 @@ fn run_genesis(args: &[String]) {
     let mut genesis =
         config::genesis::Genesis::devnet(chain_id, num_validators, 32, 1_000_000_000_000);
 
-    // Generate deterministic BLS keys for each validator and set
-    // `public_key` so `--genesis-file` can build the `ValidatorSet`
-    // without regenerating keys. For production, each validator
-    // generates its own key and provides the public key to the
-    // genesis coordinator.
-    for (idx, validator) in genesis.staking.validators.iter_mut().enumerate() {
-        let key = node::cli::bls_key(u8::try_from(idx + 1).expect("index + 1 fits in u8"));
-        let pk = key.public_key();
-        validator.public_key = Some(format!("0x{}", node::cli::hex_encode(pk.as_bytes())));
+    // `public_key` fills from either the operator-supplied pubkey
+    // file or — explicitly opted in via `--devnet` — the
+    // deterministic derivation whose secrets anyone can recompute.
+    match (pubkeys_path, devnet_keys) {
+        (Some(path), false) => {
+            let pubkeys = read_pubkey_file(&path);
+            assert_eq!(
+                pubkeys.len(),
+                num_validators,
+                "{path}: {} public keys but --validators is {num_validators}",
+                pubkeys.len()
+            );
+            for (validator, pk) in genesis.staking.validators.iter_mut().zip(pubkeys) {
+                validator.public_key = Some(pk);
+            }
+        }
+        (None, true) => {
+            for (idx, validator) in genesis.staking.validators.iter_mut().enumerate() {
+                let key = node::cli::bls_key(u8::try_from(idx + 1).expect("index + 1 fits in u8"));
+                let pk = key.public_key();
+                validator.public_key = Some(format!("0x{}", node::cli::hex_encode(pk.as_bytes())));
+            }
+        }
+        (Some(_), true) => {
+            eprintln!(
+                "oxide-validator genesis: --validator-pubkeys and --devnet are exclusive — \
+                 the pubkeys either come from real keys or the public derivation"
+            );
+            std::process::exit(1);
+        }
+        (None, false) => {
+            eprintln!(
+                "oxide-validator genesis: refusing to embed derivable keys — \
+                 pass --validator-pubkeys <file> (one 0x-prefixed 96-hex BLS public key \
+                 per validator, from `oxide-validator keygen`) or --devnet for the \
+                 public deterministic test set"
+            );
+            std::process::exit(1);
+        }
     }
 
     let path = PathBuf::from(&output);
@@ -578,6 +652,38 @@ fn run_genesis(args: &[String]) {
         "oxide-validator genesis: wrote {} (chain_id={chain_id}, validators={num_validators})",
         path.display()
     );
+}
+
+/// Read a validator public-key file: one `0x`-prefixed 96-hex-char
+/// BLS12-381 public key per non-empty, non-`#`-comment line — the
+/// format `keygen` prints.
+fn read_pubkey_file(path: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read --validator-pubkeys {path}: {e}"));
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .enumerate()
+        .map(|(i, line)| {
+            let bytes = node::cli::hex_decode(line)
+                .unwrap_or_else(|e| panic!("{path} line {}: bad hex: {e}", i + 1));
+            assert_eq!(
+                bytes.len(),
+                48,
+                "{path} line {}: BLS public key must be 48 bytes (96 hex), got {}",
+                i + 1,
+                bytes.len()
+            );
+            // A 48-byte string is only a key if it decodes to a
+            // subgroup member — validate now so a malformed line
+            // fails at genesis time, not at validator boot.
+            crypto::bls_signer::ValidatedPublicKey::from_bytes(&bytes)
+                .unwrap_or_else(|_| panic!("{path} line {}: not a BLS public key", i + 1));
+            // Normalize to the canonical 0x-prefixed form genesis
+            // consumers read.
+            format!("0x{}", node::cli::hex_encode(&bytes))
+        })
+        .collect()
 }
 
 /// `oxide-validator tls-gen` — generate TLS certificates for a
@@ -677,6 +783,96 @@ fn run_tls_gen(args: &[String]) {
     );
 }
 
+/// `oxide-validator keygen` — generate a fresh secret key from the
+/// OS CSPRNG.
+///
+/// Flags:
+/// - `--secp`: secp256k1 secret (transaction signing, settlement
+///   operator). Default is BLS12-381 (consensus identity —
+///   `--bls-key-file` format: 32-byte canonical scalar, hex).
+/// - `--output|-o <path>`: destination file (default `key.hex`).
+///
+/// The file is written owner-only (mode 0600 on Unix) and the
+/// command refuses to overwrite an existing path — keys are not
+/// recyclable config. The public half prints to stdout so it can be
+/// carried into a genesis file without the secret leaving the
+/// machine.
+fn run_keygen(args: &[String]) {
+    let mut output = "key.hex".to_string();
+    let mut secp = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--secp" => {
+                secp = true;
+                i += 1;
+            }
+            "--output" | "-o" => {
+                if let Some(v) = args.get(i + 1) {
+                    output.clone_from(v);
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let (kind, secret_hex, public) = if secp {
+        let key = crypto::generate_secret_key();
+        let addr =
+            crypto::signable_pubkey_address(&key).expect("a generated secp256k1 key is valid");
+        (
+            "secp256k1",
+            node::cli::hex_encode(&key),
+            format!("address 0x{}", node::cli::hex_encode(&addr.0)),
+        )
+    } else {
+        // BLS keygen is HKDF over an IKM — 32 OS-CSPRNG bytes in,
+        // canonical scalar out (`--bls-key-file` reads this format).
+        let mut ikm = [0u8; 32];
+        crypto::fill_random(&mut ikm);
+        let key = crypto::BlsSecretKey::from_ikm(&ikm).expect("32-byte IKM always keygens");
+        let pk = key.public_key();
+        (
+            "BLS12-381",
+            node::cli::hex_encode(&key.to_bytes()),
+            format!("public key 0x{}", node::cli::hex_encode(pk.as_bytes())),
+        )
+    };
+
+    if let Err(e) = write_secret_key_file(&output, &secret_hex) {
+        eprintln!("oxide-validator keygen: {e}");
+        std::process::exit(1);
+    }
+    println!("oxide-validator keygen: wrote {kind} secret to {output}");
+    println!("  {public}");
+    println!("  (the secret file is mode 0600 — never commit or copy it to another host)");
+}
+
+/// Write a generated secret key file: create-new (never overwrite)
+/// and owner-only permissions. A key file that already exists is a
+/// deliberate operator artifact — silently replacing it could rotate
+/// a validator's identity mid-deployment.
+fn write_secret_key_file(path: &str, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(mut f) => f
+            .write_all(contents.as_bytes())
+            .map_err(|e| format!("failed to write key file {path}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(format!("refusing to overwrite existing file {path}"))
+        }
+        Err(e) => Err(format!("failed to create key file {path}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The binary's effective defaults require signed envelopes —
@@ -703,5 +899,32 @@ mod tests {
         // without any policy override must reject unsigned txs.
         let assembled = node::assemble_executor(&node_config);
         drop(assembled);
+    }
+
+    /// `keygen` never clobbers an existing key file — a stale path
+    /// must fail rather than silently rotate an identity, and the
+    /// written file is owner-only.
+    #[test]
+    fn keygen_file_write_refuses_overwrite() {
+        let path = std::env::temp_dir().join(format!(
+            "oxide-keygen-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let path = path.to_str().expect("temp path is UTF-8").to_string();
+        super::write_secret_key_file(&path, "aa").expect("first write creates the file");
+        let err = super::write_secret_key_file(&path, "bb").expect_err("second write must refuse");
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        // Contents unchanged — the refusal wrote nothing.
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "aa");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key file must be owner-only");
+        }
+        std::fs::remove_file(&path).ok();
     }
 }

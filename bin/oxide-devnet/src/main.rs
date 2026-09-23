@@ -182,6 +182,29 @@ fn run_node(node_index_str: &str) {
     // ValidatorSet: --genesis-file or deterministic.
     let validator_set = load_validator_set(num_nodes, node_index);
 
+    // The loaded key authenticates this node *as* committee member
+    // `node_index` — the peer handshake proves key ownership per
+    // index, so a key at any other position (or none) would boot
+    // cleanly and then have every peer reject it. Fail at startup.
+    let our_pk = our_key.public_key();
+    match validator_set.index_of_key(&our_pk) {
+        Some(i) if usize::from(i) == node_index => {}
+        Some(i) => {
+            eprintln!(
+                "oxide-devnet[{node_index}]: refusing to start — --bls-key-file is committee \
+                 member {i}, not index {node_index} (use --node {i} or the matching key file)"
+            );
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!(
+                "oxide-devnet[{node_index}]: refusing to start — --bls-key-file is not in the \
+                 validator set (check --genesis-file / --bls-key-file pairing)"
+            );
+            std::process::exit(1);
+        }
+    }
+
     let listen_port = base_port + u16::try_from(node_index).expect("port fits in u16");
     let listen_addr = format!("{bind_host}:{listen_port}");
 
@@ -329,21 +352,24 @@ fn run_node(node_index_str: &str) {
 
     println!("oxide-devnet[{node_index}]: consensus engine started, waiting for blocks...");
 
-    // Submit a smoke-test transaction: a staking delegate signed by
-    // devnet identity 0 to itself (registered by the single-node
-    // genesis default; a `--genesis-file` deployment must fund and
-    // register it for this tx to land).
-    let module_payload = staking::msg::delegate(
-        crypto::secp::test_identity_address(0).expect("valid devnet identity"),
-        100,
-    );
-    let tx = node::cli::build_signed_tx(
-        cfg.node.chain_id,
-        framework::module_id::STAKING,
-        &module_payload,
-        0,
-    );
-    engine.submit_tx(tx);
+    // Smoke-test transaction, devnet genesis only: a staking
+    // delegate signed by devnet identity 0 to itself. Under a real
+    // `--genesis-file` the node must not emit transactions signed
+    // by a public test identity — the account is not funded there
+    // anyway, so the tx would be skipped work.
+    if cfg.genesis_file.is_none() {
+        let module_payload = staking::msg::delegate(
+            crypto::secp::test_identity_address(0).expect("valid devnet identity"),
+            100,
+        );
+        let tx = node::cli::build_signed_tx(
+            cfg.node.chain_id,
+            framework::module_id::STAKING,
+            &module_payload,
+            0,
+        );
+        engine.submit_tx(tx);
+    }
 
     let height = engine.finalized_height();
     println!("oxide-devnet[{node_index}]: finalized height = {height:?}");
@@ -418,12 +444,15 @@ fn load_bls_key(index: usize) -> crypto::BlsSecretKey {
     if let Some(path) = node::cli::parse_cli_flag("--bls-key-file") {
         let raw = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("failed to read BLS key file {path}: {e}"));
-        // Try hex decode first (64 hex chars), fall back to raw bytes.
-        let bytes: Vec<u8> = if raw.len() == 64 || (raw.len() == 66 && raw.starts_with(b"0x")) {
-            let text = std::str::from_utf8(&raw).expect("hex BLS key is UTF-8");
-            node::cli::hex_decode(text).expect("hex decode BLS key")
-        } else {
-            raw
+        // Try hex decode first (64 hex chars, optional 0x prefix).
+        // ASCII whitespace is trimmed — a file written by `echo` or
+        // an editor carries a trailing newline that must not push
+        // the file into the raw-bytes path.
+        let bytes: Vec<u8> = match std::str::from_utf8(&raw).map(str::trim) {
+            Ok(text) if text.len() == 64 || (text.len() == 66 && text.starts_with("0x")) => {
+                node::cli::hex_decode(text).expect("hex decode BLS key")
+            }
+            _ => raw,
         };
         crypto::BlsSecretKey::from_bytes(&bytes)
             .unwrap_or_else(|e| panic!("invalid BLS secret key in {path}: {e:?}"))

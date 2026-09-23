@@ -44,8 +44,8 @@ pub use ed25519::{
 };
 pub use hash::{Domain, Hasher};
 pub use secp::{
-    RecoverableSignature, RecoveryId, SecpError, generate_keypair_for_test, keccak256,
-    recover_sender, sign, signable_pubkey_address,
+    RecoverableSignature, RecoveryId, SecpError, generate_keypair_for_test, generate_secret_key,
+    is_test_identity_key, keccak256, recover_sender, sign, signable_pubkey_address,
 };
 
 /// Fill `out` with bytes from the OS-seeded thread RNG.

@@ -20426,3 +20426,48 @@ listing all five violations; the opt-out warns and starts; a fully
 provisioned node (key file + mTLS + genesis + private chain ID +
 fee floor) starts on `0.0.0.0` with no refusal; validator on
 `--rpc-listen 0.0.0.0:8545` refuses the three applicable defaults.
+
+## Session N+38 (cont.) — real keys exist now, and nothing signs with a public one
+
+The rest of the C4 key-handling cluster. The root problem was not
+that test identities exist — it is that they were the *only* keys
+the tooling could produce, so every path defaulted to public
+material.
+
+**`oxide-validator keygen`.** OS-CSPRNG key generation for both
+curves: `keygen` writes a BLS12-381 secret (32-byte canonical
+scalar, hex — the `--bls-key-file` format), `keygen --secp` a
+secp256k1 secret for settlement/signing. Files are create-new
+(`AlreadyExists` → refuse, never rotate an identity by accident)
+and mode 0600; the public half prints to stdout for genesis
+coordination. `crypto::generate_secret_key` gives secp256k1 a
+production-named generator — `generate_keypair_for_test` now
+delegates to it rather than owning the entropy path.
+
+**`genesis` can no longer embed derivable keys.** Bare
+`oxide-validator genesis` refuses: a genesis either takes
+`--validator-pubkeys <file>` (one 0x-prefixed 96-hex BLS key per
+line, each decoded and subgroup-checked at genesis time) or
+`--devnet` (the deterministic set, explicitly opted into). The two
+flags are mutually exclusive. Verified: keygen → pubkey file →
+genesis → `--bls-key-file` roundtrips a real committee.
+
+**No production path signs with a public identity.** The
+validator's startup smoke delegate is gone — it logged the
+recovered tip and state root without needing a transaction at all.
+`--submit-key-change` now requires `--signer-key <secp-hex>`: the
+rotation must be authorized by the staking account it rotates
+(test-identity scalars refused), carries the account's executed
+nonce, and the auto-delegate bootstrap that papered over unfunded
+senders is removed. The devnet's smoke delegate now only fires
+under the built-in devnet genesis — a `--genesis-file` deployment
+has no business emitting public-identity transactions.
+
+**Committee-membership check.** A `--bls-key-file` whose public key
+is not at committee position `--node` previously booted cleanly and
+then failed every peer handshake invisibly. Startup now refuses
+with the actual membership position (or "not in the set").
+
+**`--bls-key-file` tolerates a trailing newline** — hex files
+written by `echo` or an editor no longer fall through to the
+raw-bytes path and die on a 65-byte parse.

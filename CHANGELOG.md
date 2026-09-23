@@ -49,7 +49,37 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     propose, the devnet used to freeze forever. Now the others
     vote to skip the dead turn and keep going, as designed.
 
+### Added
+
+- **`oxide-validator keygen` — real key generation.** Generates a
+  fresh BLS12-381 consensus key (default) or secp256k1 key
+  (`--secp`) from the OS CSPRNG, writes the secret to a mode-0600
+  file (`--output`), refuses to overwrite an existing file, and
+  prints the public half for genesis coordination.
+- **`oxide-validator genesis --validator-pubkeys <file>`** builds
+  the committee from real operator public keys — one 0x-prefixed
+  96-hex line per validator, each validated at genesis time.
+
 ### Changed
+
+- **No production path signs with a public test identity.**
+  `oxide-validator genesis` without `--validator-pubkeys` or an
+  explicit `--devnet` refuses instead of embedding the publicly
+  derivable committee keys; `--submit-key-change` now requires
+  `--signer-key <secp256k1-hex>` (the staking account authorizes
+  its own rotation, identity scalars refused) and no longer
+  auto-delegates stake to a test account; the validator's startup
+  smoke transaction is removed; and `oxide-devnet` submits its
+  smoke transaction only under the built-in devnet genesis, never
+  under `--genesis-file`. `oxide-devnet` also refuses a
+  `--bls-key-file` whose public key is not the committee member at
+  `--node`'s position (previously it booted and failed every peer
+  handshake silently), and `--bls-key-file` accepts hex files with
+  a trailing newline.
+  - **In plain words:** every "test key" path that used to quietly
+    run in production-shaped deployments is now either gone or
+    gated behind an explicit dev flag, and there is a real tool
+    for generating actual keys.
 
 - **Insecure defaults are refused on externally reachable binds**
   (`node`, `oxide-devnet`, `oxide-validator`): when the devnet

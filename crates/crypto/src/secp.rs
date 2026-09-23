@@ -349,6 +349,22 @@ pub fn is_test_identity_key(key: &[u8; 32]) -> bool {
     key[..24].iter().all(|b| *b == 0) && (1..=256).contains(&scalar)
 }
 
+/// Generate a fresh secp256k1 secret key from the OS CSPRNG —
+/// production key generation for operator tooling (`keygen`).
+///
+/// # Panics
+///
+/// Panics only if the OS RNG fails — a broken entropy source is a
+/// dead machine, not a recoverable error.
+#[must_use]
+pub fn generate_secret_key() -> [u8; 32] {
+    let mut rng = secp256k1::rand::rng();
+    let (secret, _pubkey) = secp256k1::SECP256K1.generate_keypair(&mut rng);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&secret.secret_bytes());
+    key
+}
+
 /// Generate a random private key for testing. Not for production use.
 ///
 /// # Panics
@@ -356,15 +372,10 @@ pub fn is_test_identity_key(key: &[u8; 32]) -> bool {
 /// Panics if the system RNG fails (indicates a broken test environment).
 #[must_use]
 pub fn generate_keypair_for_test() -> ([u8; 32], Address) {
-    let mut rng = secp256k1::rand::rng();
-    let (secret, pubkey) = secp256k1::SECP256K1.generate_keypair(&mut rng);
-    let serialized = pubkey.serialize_uncompressed();
-    let hash = keccak256(&serialized[1..65]);
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&hash[12..32]);
-    let mut privkey = [0u8; 32];
-    privkey.copy_from_slice(&secret.secret_bytes());
-    (privkey, Address(addr))
+    let privkey = generate_secret_key();
+    let addr =
+        signable_pubkey_address(&privkey).expect("a generated secp256k1 secret is always valid");
+    (privkey, addr)
 }
 
 /// keccak-256 hash. Uses the `sha3` crate's `Keccak256` digest, which
