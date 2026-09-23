@@ -142,18 +142,26 @@ impl PerpsModule {
                     i128::from(pos.entry_price) - i128::from(fill_price)
                 };
                 let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
-                realized_scale6 = closed * pnl_per_unit / price_scale;
+                // u64-range factors can exceed i128 in the
+                // pathological corner (~1e18 lots x ~1e18 price
+                // delta) — saturate rather than wrap: the clamped
+                // product still lands at the u64 bound downstream.
+                realized_scale6 = closed.saturating_mul(pnl_per_unit) / price_scale;
             }
 
             // Update entry price (volume-weighted) when increasing the
             // position. When decreasing, entry price stays the same.
             if !delta.is_flat() && old_size.extends(delta) {
                 // Increasing position: weighted average.
-                let old_cost = i128::from(old_size.abs_qty().0) * i128::from(pos.entry_price);
-                let add_cost = i128::from(delta.abs_qty().0) * i128::from(fill_price);
+                // u64 x u64 products can exceed i128 in the
+                // pathological corner; saturate so the entry price
+                // clamps at u64::MAX below instead of wrapping.
+                let old_cost =
+                    i128::from(old_size.abs_qty().0).saturating_mul(i128::from(pos.entry_price));
+                let add_cost = i128::from(delta.abs_qty().0).saturating_mul(i128::from(fill_price));
                 let new_size_abs = i128::from(new_size.abs_qty().0);
                 if new_size_abs > 0 {
-                    let new_entry = (old_cost + add_cost) / new_size_abs;
+                    let new_entry = old_cost.saturating_add(add_cost) / new_size_abs;
                     pos.entry_price = u64::try_from(new_entry).unwrap_or(u64::MAX);
                 }
             }
@@ -211,9 +219,12 @@ impl PerpsModule {
                 Self::fund_inflow(inner, gain);
             } else {
                 let loss = u64::try_from(realized_scale6.unsigned_abs()).unwrap_or(u64::MAX);
+                // `cover <= min(fund, loss)` bounds both subtractions
+                // — saturating is the same value and fails closed if
+                // the bound ever broke.
                 let cover = inner.insurance_fund.min(loss);
-                inner.insurance_fund -= cover;
-                let residual = loss - cover;
+                inner.insurance_fund = inner.insurance_fund.saturating_sub(cover);
+                let residual = loss.saturating_sub(cover);
                 if residual > 0 {
                     let unpaid = Self::socialize_residual(inner, account, residual, events);
                     let mut data = Vec::with_capacity(1 + 8);
@@ -238,8 +249,11 @@ impl PerpsModule {
                         } else {
                             // Bucket overflow: hold the max and spill
                             // the excess to cross rather than destroy
-                            // value.
-                            let spill = gain - (u64::MAX - pos.isolated_margin);
+                            // value. `gain > u64::MAX - isolated_margin`
+                            // is exactly what the failed `checked_add`
+                            // proved — saturating keeps it total.
+                            let spill =
+                                gain.saturating_sub(u64::MAX.saturating_sub(pos.isolated_margin));
                             pos.isolated_margin = u64::MAX;
                             acct.cross_margin = acct.cross_margin.saturating_add(spill);
                         }
@@ -251,13 +265,16 @@ impl PerpsModule {
                         u64::try_from(realized_scale6.unsigned_abs()).unwrap_or(u64::MAX);
                     if iso_backed {
                         let pos = acct.positions.entry(market).or_default();
+                        // `from <= min(bucket, loss)` bounds both
+                        // subtractions — saturating is identical and
+                        // fails closed.
                         let from = pos.isolated_margin.min(loss);
-                        pos.isolated_margin -= from;
-                        loss -= from;
+                        pos.isolated_margin = pos.isolated_margin.saturating_sub(from);
+                        loss = loss.saturating_sub(from);
                     } else {
                         let from = acct.cross_margin.min(loss);
-                        acct.cross_margin -= from;
-                        loss -= from;
+                        acct.cross_margin = acct.cross_margin.saturating_sub(from);
+                        loss = loss.saturating_sub(from);
                     }
                     bad_debt = loss;
                 }
@@ -271,8 +288,8 @@ impl PerpsModule {
                 // the post-cascade remainder — the amount that
                 // became a tracked liability this transaction.
                 let cover = inner.insurance_fund.min(bad_debt);
-                inner.insurance_fund -= cover;
-                let residual = bad_debt - cover;
+                inner.insurance_fund = inner.insurance_fund.saturating_sub(cover);
+                let residual = bad_debt.saturating_sub(cover);
                 let unpaid = if residual > 0 {
                     Self::socialize_residual(inner, account, residual, events)
                 } else {

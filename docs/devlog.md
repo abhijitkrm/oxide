@@ -19760,3 +19760,80 @@ asserts the latch + detail; a new test proves every signing surface
 refuses post-latch and the first mismatch stays the anchor; forged
 and stale-epoch certs assert the latch stays clear; `/health` gains
 a 503-with-anchor test and keeps the healthy 200.
+
+## Session N+26 — release money arithmetic fails closed
+
+`[profile.release]` now sets `overflow-checks = true`. Until now a
+u64 money-path overflow in a production build wrapped silently —
+a broken invariant could mint or burn ~2^64 units with no signal.
+The flag turns any surviving plain-arithmetic slip into a panic
+(caught at the actor boundary — `panic = "unwind"` was already the
+release policy), while the audited paths themselves now saturate
+or reject at their own obligation sites so the panic is a
+backstop, not the mechanism.
+
+The sweep finished the checked-arithmetic pass across the audited
+financial paths:
+
+- `staking::delegate_for` — the real fix behind the flag: the
+  `delegated_total` insert ran *before* the fallible
+  `stake.checked_add`, and a `ModuleRejected` does not roll back
+  `CommittedMap` writes, so a rejected delegate could leave
+  `delegated_total` diverged from `validators`/`delegations`
+  (corrupting reward-share denominators on every validator that
+  executed the tx). All three adds are now checked before the pool
+  debit and the first insert — a rejected delegate strands nothing
+  and moves nothing. `undo_undelegate` got the same reorder: its
+  `unbonding.remove` used to precede the fallible adds.
+- `staking` dust/slash/undelegate subs and the `reward_per_token`
+  accumulator are saturating — every bound was already proven by a
+  `min` or a guard, so the values are identical and now also
+  panic-free.
+- `perps` — every margin/fund accumulator and cascade subtraction
+  saturates; the i128 entry-price and realized-PnL products
+  (`u64 × u64` can exceed i128 at ~1e18-scale inputs) use
+  `saturating_mul` so the clamp lands on `u64::MAX` downstream
+  instead of wrapping negative.
+- `exchange` — batch-settle accumulators (`released`, `rebate`,
+  per-buyer rebates, per-market fees) saturate; `release − pays`
+  uses `saturating_sub` (`release >= pays` is a leg-validity rule).
+  The seller-credit and vault-withdraw subs are saturating too —
+  both already guarded, now also panic-proof.
+- `evm` fast path — the one place a wrap was *reachable*: a legacy
+  tx with `gas_price` near `u128::MAX` could wrap
+  `base_fee + priority_fee`, `gas_limit × effective_gas_price`,
+  and the gas-cost charge, executing a tx revm's U256 math would
+  reject for insufficient balance — a consensus-vs-spec divergence
+  plus a wrapped coinbase tip. All fee/reserve math is now
+  `checked_*` and defers to revm (the functions return `Option`,
+  so `?` keeps it terse), and the coinbase tip is computed before
+  any account mutation — a post-write `None` would have left the
+  debit applied for the fallback to double-apply.
+
+Benchmark A/B on the same host (`cargo bench -p exchange` with the
+flag vs `RUSTFLAGS="-C overflow-checks=off"`): the per-fill path is
+unchanged (`settlement_single_fill` 2.58 µs vs 2.60 µs — noise;
+`raw_engine_single_fill` 466 vs 463 ns), the arithmetic-dense
+batch path pays ~2-13% worst case (`batch_settle_16k` 2.48 ms vs
+2.19 ms, 16× more arithmetic per iteration than the 1k benches).
+Every documented settlement gate still holds under checks
+(`batch_settle_1k` 530 µs vs the 1 ms gate). Conclusion: checks
+stay on workspace-wide; no crate opts out. Note the bench
+baselines stored in `target/criterion` predate this machine's
+current load profile — absolute numbers vs the doc table drifted
+~3× on both flag settings equally (raw engine unchanged at 462 ns
+vs documented 459 ns is the anchor), so that drift is
+environmental, not this change. The absolute `settlement_single_fill`
+number (~2.6 µs vs the documented 829 ns / <2 µs gate) is real
+drift accumulated from earlier hardening passes — worth a
+dedicated look under the latency program, unrelated to the flag.
+
+Regression coverage: `delegate_stake_overflow_rejects_atomically`
+(stake at u64::MAX, +1 delegate rejects with stake/delegation/
+delegated_total/balances all untouched), `consume_and_release`
+batch-accumulator clamp test (fee overflow event + vault
+unchanged + both rebates credited), `settle_realized` isolated-
+bucket spill and fund-shortfall-bad-debt tests, and a
+`gas_price = u128::MAX` legacy-tx differential proving the
+fast path's deferral matches revm's rejection state root.
+

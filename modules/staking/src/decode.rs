@@ -378,7 +378,8 @@ pub(crate) fn check_replica_mirrors(staged: &StagedStaking) -> Option<()> {
     // never re-derived, so it must match exactly.
     let mut totals = BTreeMap::<Address, u128>::new();
     for ((_, v), amt) in &staged.delegations {
-        *totals.entry(*v).or_default() += u128::from(*amt);
+        let entry = totals.entry(*v).or_default();
+        *entry = entry.saturating_add(u128::from(*amt));
     }
     for (v, expected) in &totals {
         if staged.delegated_total.get(v).copied().unwrap_or(0) != u64::try_from(*expected).ok()? {

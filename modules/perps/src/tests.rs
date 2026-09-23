@@ -691,6 +691,40 @@ fn setup_with_position(margin: u64, size: i64, entry: u64) -> (PerpsModule, u8, 
     (perps, mid, acct_addr)
 }
 
+/// A gain that overflows the isolated bucket must clamp the bucket at
+/// `u64::MAX` and spill the excess into cross margin — value is
+/// conserved, never wrapped or destroyed.
+#[test]
+fn settle_realized_isolated_overflow_spills_to_cross() {
+    let (perps, mid, acct) = setup_with_position(u64::MAX - 10, 1, 1_500_000_000);
+    let mut inner = framework::lock_state(&perps.inner);
+    let mut events = Vec::new();
+    // +100 realized gain against a bucket with 10 units of headroom.
+    PerpsModule::settle_realized(&mut inner, &acct, mid, 100, &mut events);
+    let account = inner.accounts.get(&acct).expect("account exists");
+    let pos = account.positions.get(&mid).expect("position exists");
+    assert_eq!(pos.isolated_margin, u64::MAX, "isolated bucket clamps at the ceiling");
+    assert_eq!(account.cross_margin, 90, "the excess spills to cross margin");
+}
+
+/// A clearing-account loss beyond the insurance fund must drain the
+/// fund to zero and book the residual as `unfunded_bad_debt` — the
+/// cascade cannot wrap the fund balance or lose the deficit.
+#[test]
+fn settle_realized_fund_shortfall_books_bad_debt() {
+    let (perps, mid, _acct) = setup_with_position(1_000, 1, 1_500_000_000);
+    let mut inner = framework::lock_state(&perps.inner);
+    inner.insurance_fund = 1_000;
+    let mut events = Vec::new();
+    PerpsModule::settle_realized(&mut inner, &CLEARING_ACCOUNT, mid, -5_000, &mut events);
+    assert_eq!(inner.insurance_fund, 0, "fund drains to zero, not wraps");
+    assert_eq!(inner.unfunded_bad_debt, 4_000, "residual becomes tracked debt");
+    assert!(
+        events.iter().any(|e| e.kind == "bad_debt"),
+        "a bad_debt event marks the unpaid residual"
+    );
+}
+
 proptest! {
     /// Invariant 1: After applying funding (positive or negative
     /// rate), the account's margin never goes negative. The

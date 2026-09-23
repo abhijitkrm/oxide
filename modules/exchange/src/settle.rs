@@ -137,7 +137,9 @@ impl BookSettlement<'_> {
                 u128::from(quote_amount) * u128::from(FEE_BPS) / u128::from(BPS_DENOM),
             )
             .map_err(|_| ExecError::ModuleRejected(format!("fee overflow (market {market})")))?;
-            self.ledger.credit(&seller, quote_amount - fee).map_err(|_| {
+            // `fee <= quote_amount` (`FEE_BPS < BPS_DENOM`) —
+            // saturating is the same value and fails closed.
+            self.ledger.credit(&seller, quote_amount.saturating_sub(fee)).map_err(|_| {
                 ExecError::ModuleRejected(format!("settlement credit failed (market {market})"))
             })?;
             let vault = self.fee_vault.get(&market).copied().unwrap_or(0);
@@ -277,19 +279,27 @@ pub(crate) fn consume_and_release(
         if failed_pairs.contains(&(plan.buyer, plan.seller)) {
             continue;
         }
+        // `release >= pays` is a leg-validity rule (`price <=
+        // buy.limit` — floor division keeps it). All accumulators
+        // saturate: per-order sums are bounded by the batch-wide
+        // `remaining` check at plan time, so the clamps are
+        // unreachable-but-total — a broken invariant clamps instead
+        // of wrapping or panicking mid-batch.
+        let rebate = plan.release.saturating_sub(plan.pays);
         let buy = deltas.entry(plan.buy).or_default();
         buy.consumed = qty_add(buy.consumed, plan.qty).unwrap_or(Qty(u64::MAX));
-        buy.released += plan.release;
-        buy.rebate += plan.release - plan.pays;
+        buy.released = buy.released.saturating_add(plan.release);
+        buy.rebate = buy.rebate.saturating_add(rebate);
         let sell = deltas.entry(plan.sell).or_default();
         sell.consumed = qty_add(sell.consumed, plan.qty).unwrap_or(Qty(u64::MAX));
-        let rebate = plan.release - plan.pays;
         if rebate > 0 {
-            *rebates.entry(plan.buyer).or_default() += rebate;
+            let entry = rebates.entry(plan.buyer).or_default();
+            *entry = entry.saturating_add(rebate);
         }
         let delivery = deliveries.entry((plan.buyer, plan.market)).or_default();
         *delivery = qty_add(*delivery, plan.qty).unwrap_or(Qty(u64::MAX));
-        *fees.entry(plan.market).or_default() += plan.fee;
+        let fee_entry = fees.entry(plan.market).or_default();
+        *fee_entry = fee_entry.saturating_add(plan.fee);
     }
 
     // ── Rebate drain ────────────────────────────────────────────

@@ -1395,6 +1395,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Release builds could silently wrap financial arithmetic**
+  (workspace `Cargo.toml`, `modules/{staking,perps,exchange,evm}`):
+  `overflow-checks` was off in the release profile, so a broken
+  money-path invariant would wrap a u64 balance — minting or
+  destroying ~2^64 units — with no signal.
+  - `overflow-checks = true` is now set workspace-wide for release
+    builds; any remaining plain-arithmetic slip panics at the actor
+    boundary instead of wrapping. Measured cost on the settlement
+    benches: ~0% on the per-fill path, ≤ ~13% on the most
+    arithmetic-dense batch path — every documented settlement gate
+    still holds, so no crate opts out.
+  - The audited money paths now fail closed at their own obligation
+    sites: staking's delegate/undo paths verify every checked add
+    before the pool debit or any map write (a rejected operation
+    previously could leave `delegated_total` diverged from
+    `validators`); perps margin/fund cascades and exchange
+    batch-settle accumulators saturate at their proven bounds;
+    the EVM fast path's gas-reserve math is `checked_*` and defers
+    to revm on overflow instead of executing with a wrapped reserve.
+  - **In plain words:** an accounting bug in a release build could
+    have silently created or destroyed enormous balances. Arithmetic
+    on money now either clamps at a proven bound or rejects the
+    operation — and the build panics rather than wrap if anything
+    still slips through.
 - **Parallel EVM execution could erase untouched contract storage**
   (`modules/evm`): when `handle_batch_parallel` (and the
   preverified variant) committed a validated speculative

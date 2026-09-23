@@ -224,6 +224,14 @@ crossbeam-channel = "0.5.14"
 lto = "thin"
 codegen-units = 1
 panic = "unwind" # consensus must never abort silently; panics are caught at actor boundaries
+# Money arithmetic must never wrap silently: a wrapped u64 balance can mint
+# or destroy ~2^64 units. Overflow panics (caught at the actor boundary via
+# `panic = "unwind"`) fail loudly; the financial paths additionally saturate
+# or return typed errors at their own obligation sites, so this flag is the
+# defense-in-depth backstop for arithmetic that was not individually proven
+# bounded. Any crate opting out needs a benchmark showing the checks cost
+# real throughput — none currently does.
+overflow-checks = true
 
 [profile.bench]
 debug = true # flamegraphs need symbols

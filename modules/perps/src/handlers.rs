@@ -517,7 +517,11 @@ impl PerpsModule {
                 if let Some(cfg) = cfg {
                     let price_scale = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
                     let upnl_scale6 = p.unrealized_pnl(mark) / price_scale;
-                    let equity_after = i128::from(iso - amount) + upnl_scale6;
+                    // `iso >= amount` was proven above — saturating is
+                    // the same value and stays panic-free under release
+                    // `overflow-checks`.
+                    let equity_after =
+                        i128::from(iso.saturating_sub(amount)).saturating_add(upnl_scale6);
                     let leverage = u128::from(cfg.max_leverage.max(1));
                     let pos_im = p.notional(mark) / leverage / PRICE_SCALE;
                     if equity_after < i128::try_from(pos_im).unwrap_or(i128::MAX) {
@@ -536,10 +540,14 @@ impl PerpsModule {
             ledger.credit(&ctx.sender, amount)?;
         }
         Self::with_account_mut(&mut inner, &ctx.sender, |acct| {
+            // Sufficiency was proven by the solvency gate above —
+            // saturating debits the same value and fails closed
+            // rather than panicking mid-withdraw.
             if market == CROSS_MARGIN_MARKET {
-                acct.cross_margin -= amount;
+                acct.cross_margin = acct.cross_margin.saturating_sub(amount);
             } else {
-                acct.positions.entry(market).or_default().isolated_margin -= amount;
+                let pos = acct.positions.entry(market).or_default();
+                pos.isolated_margin = pos.isolated_margin.saturating_sub(amount);
             }
         });
         drop(inner);

@@ -2137,3 +2137,61 @@ fn fee_vault_sink_rejects_bad_applies() {
     assert_eq!(ex.fee_vault(0), 75);
     assert_eq!(ledger.balance(&dest), before, "rejections moved nothing");
 }
+
+/// Batch accumulation must clamp rather than wrap: two legs on one
+/// market carrying near-ceiling fees saturate the per-market
+/// accumulator, then `accrue_fees`' `checked_add` reports the vault
+/// overflow instead of wrapping the total — the batch keeps a
+/// deterministic, auditable outcome.
+#[test]
+fn batch_accumulators_saturate_instead_of_wrapping() {
+    use crate::settle::{LegPlan, consume_and_release};
+
+    let buyer = addr(3);
+    let seller = addr(4);
+    let market = 0u8;
+    let leg = |client_id: u64| LegPlan {
+        buy: crate::OrderKey { owner: buyer, client_id },
+        sell: crate::OrderKey { owner: seller, client_id: client_id + 100 },
+        buyer,
+        seller,
+        market,
+        qty: Qty(1_000),
+        pays: u64::MAX - 1,
+        fee: u64::MAX - 1,
+        release: u64::MAX,
+    };
+    let plans = [leg(1), leg(2)];
+    let failed = std::collections::BTreeSet::new();
+    let mut registered = framework::CommittedMap::new(crate::registered_leaf);
+    let mut base_balances = framework::CommittedMap::new(crate::base_balances_leaf);
+    let mut fee_vault = framework::CommittedMap::new(crate::fee_vault_leaf);
+    fee_vault.insert(market, 7);
+    let ledger: Arc<dyn Balances + Send + Sync> = Arc::new(framework::MemoryBalances::new());
+    let mut events = Vec::new();
+
+    consume_and_release(
+        &plans,
+        &failed,
+        &mut registered,
+        &mut base_balances,
+        &mut fee_vault,
+        &ledger,
+        &mut events,
+    );
+
+    // Σ fee = (u64::MAX - 1) × 2 clamps at u64::MAX; adding the
+    // vault's existing 7 overflows `checked_add` and reports the
+    // overflow event while the vault keeps its prior balance.
+    assert!(
+        events.iter().any(|e| e.kind == "fee_vault_overflow"),
+        "the vault overflow must be reported, not wrapped"
+    );
+    assert_eq!(
+        fee_vault.get(&market).copied(),
+        Some(7),
+        "the vault keeps its prior balance when accrual overflows"
+    );
+    // Σ rebate = (release - pays) × 2 = 2 — both rebates drain.
+    assert_eq!(ledger.balance(&buyer), 2, "both legs' rebates credited");
+}

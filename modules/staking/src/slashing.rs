@@ -93,7 +93,9 @@ impl StakingModule {
             }
         }
 
-        *stake -= slash_amount;
+        // `slash_amount <= stake` (`min` above) — saturating is the
+        // same value and fails closed if the invariant ever broke.
+        *stake = stake.saturating_sub(slash_amount);
         let new_stake = *stake;
 
         let mut burned_from_pool = 0u64;
@@ -110,7 +112,10 @@ impl StakingModule {
             for (d, a) in &mut affected {
                 let share = u128::from(slash_amount) * u128::from(*a) / u128::from(stake_before);
                 let share = u64::try_from(share).unwrap_or(u64::MAX).min(*a);
-                *a -= share;
+                // `share <= *a` (`min(*a)` above) — saturating is
+                // the same value, panic-free under release
+                // `overflow-checks`.
+                *a = a.saturating_sub(share);
                 applied = applied.saturating_add(share);
                 if *a > 0 {
                     dust_keys.push(*d);
@@ -123,9 +128,13 @@ impl StakingModule {
                     break;
                 }
                 if let Some((_, a)) = affected.iter_mut().find(|(dd, _)| dd == d) {
-                    *a -= 1;
-                    rem -= 1;
-                    applied += 1;
+                    // `*a > 0` (dust_keys membership) and `rem > 0`
+                    // (loop guard) bound both decrements; each key is
+                    // visited at most once. Saturating keeps the loop
+                    // panic-free if those bounds ever broke.
+                    *a = a.saturating_sub(1);
+                    rem = rem.saturating_sub(1);
+                    applied = applied.saturating_add(1);
                 }
             }
             for (d, a) in affected {

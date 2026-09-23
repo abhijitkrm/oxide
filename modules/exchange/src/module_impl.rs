@@ -262,8 +262,9 @@ impl framework::ParameterSink for ExchangeModule {
         ledger.credit(&dest, amount).map_err(|_| {
             ExecError::ModuleRejected("fee_vault.withdraw: credit failed".to_string())
         })?;
-        // `vault >= amount` was just proven — cannot underflow.
-        inner.fee_vault.insert(market, vault - amount);
+        // `vault >= amount` was just proven — saturating is the same
+        // value and cannot panic under release `overflow-checks`.
+        inner.fee_vault.insert(market, vault.saturating_sub(amount));
         Ok(())
     }
 }

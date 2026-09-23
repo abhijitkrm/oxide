@@ -104,6 +104,36 @@ impl StakingModule {
                 ));
             }
         }
+        // Fail closed before the pool debit: `ModuleRejected` does
+        // not roll back `CommittedMap` writes or the transfer, so
+        // every fallible add runs while the handler has written
+        // nothing — a rejected delegate leaves the delegator's funds
+        // in place and all stake maps untouched.
+        let (new_stake, new_delegation, new_total) = {
+            let validators = framework::lock_state(&self.validators);
+            let delegations = framework::lock_state(&self.delegations);
+            let totals = framework::lock_state(&self.delegated_total);
+            (
+                validators
+                    .get(&validator)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(amount)
+                    .ok_or(ExecError::ModuleRejected("stake overflow".to_string()))?,
+                delegations
+                    .get(&(delegator, validator))
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(amount)
+                    .ok_or(ExecError::ModuleRejected("delegation overflow".to_string()))?,
+                totals
+                    .get(&validator)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(amount)
+                    .ok_or(ExecError::ModuleRejected("delegated total overflow".to_string()))?,
+            )
+        };
         // Debit first: if the transfer fails nothing is recorded.
         ledger.transfer(&delegator, &BONDED_POOL, amount)?;
 
@@ -116,34 +146,26 @@ impl StakingModule {
         let current_delegation = delegations.get(&(delegator, validator)).copied().unwrap_or(0);
         self.settle_delegation(delegator, validator, current_delegation);
         {
-            let mut totals = framework::lock_state(&self.delegated_total);
+            let totals = framework::lock_state(&self.delegated_total);
             let stake_now = validators.get(&validator).copied().unwrap_or(0);
             let self_share =
                 Self::self_share_of(stake_now, totals.get(&validator).copied().unwrap_or(0));
             self.settle_self_share(validator, self_share);
-            let total = totals.get(&validator).copied().unwrap_or(0);
-            totals.insert(validator, total + amount);
         }
+        // All three obligations verified — now write them.
+        let stake = validators
+            .get_mut(&validator)
+            .ok_or(ExecError::ModuleRejected("delegate: validator vanished".to_string()))?;
+        *stake = new_stake;
+        delegations.insert((delegator, validator), new_delegation);
+        framework::lock_state(&self.delegated_total).insert(validator, new_total);
         {
             let mut index = framework::lock_state(&self.delegator_index);
             let mut set = index.get(&delegator).cloned().unwrap_or_default();
             set.insert(validator);
             index.insert(delegator, set);
         }
-        let stake = validators
-            .get_mut(&validator)
-            .ok_or(ExecError::ModuleRejected("delegate: validator vanished".to_string()))?;
-        *stake = stake
-            .checked_add(amount)
-            .ok_or(ExecError::ModuleRejected("stake overflow".to_string()))?;
-        let delegation = delegations
-            .get(&(delegator, validator))
-            .copied()
-            .unwrap_or(0)
-            .checked_add(amount)
-            .ok_or(ExecError::ModuleRejected("delegation overflow".to_string()))?;
-        delegations.insert((delegator, validator), delegation);
-        self.store_delegation_state(validator, delegator, *stake, delegation);
+        self.store_delegation_state(validator, delegator, *stake, new_delegation);
         Ok(())
     }
 
@@ -177,7 +199,10 @@ impl StakingModule {
                 "undo_delegate: delegation smaller than undo amount".to_string(),
             ));
         }
-        let new_delegation = delegation - amount;
+        // `delegation >= amount` was proven above — saturating is the
+        // same value and keeps the money path panic-free under
+        // release `overflow-checks` if that invariant ever broke.
+        let new_delegation = delegation.saturating_sub(amount);
         if new_delegation == 0 {
             delegations.remove(&(delegator, validator));
             let mut index = framework::lock_state(&self.delegator_index);
@@ -197,7 +222,10 @@ impl StakingModule {
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("undo_delegate: validator gone".to_string()))?;
-        *stake -= amount;
+        // `amount <= delegation <= delegated_total <= stake` by
+        // construction — saturating clamps the (unreachable)
+        // underflow instead of panicking mid-undo.
+        *stake = stake.saturating_sub(amount);
         self.store_delegation_state(validator, delegator, *stake, new_delegation);
         Ok(())
     }
@@ -246,7 +274,9 @@ impl StakingModule {
                 totals.insert(validator, t.saturating_sub(amount));
             }
         }
-        let new_delegation = delegation - amount;
+        // `delegation >= amount` was proven above — saturating keeps
+        // the money path panic-free under release `overflow-checks`.
+        let new_delegation = delegation.saturating_sub(amount);
         if new_delegation == 0 {
             delegations.remove(&(delegator, validator));
             let mut index = framework::lock_state(&self.delegator_index);
@@ -260,7 +290,7 @@ impl StakingModule {
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("undelegate: validator not found".to_string()))?;
-        *stake -= amount; // delegation ≤ stake by construction
+        *stake = stake.saturating_sub(amount); // delegation ≤ stake by construction
         self.store_delegation_state(validator, delegator, *stake, new_delegation);
         drop(delegations);
         drop(validators);
@@ -290,47 +320,54 @@ impl StakingModule {
         validator: Address,
         amount: u64,
     ) -> Result<(), ExecError> {
-        {
-            let mut unbonding = framework::lock_state(&self.unbonding);
-            // Remove the *last* matching entry — journal undos run in
-            // reverse order of mutation within the frame.
-            let pos = unbonding
+        // Locate the entry first — the *last* matching one, since
+        // journal undos run in reverse order of mutation. Read-only:
+        // `ModuleRejected` does not roll back `CommittedMap` writes,
+        // so every fallible step runs before the first mutation and
+        // a rejected undo leaves all maps consistent.
+        let pos = {
+            let unbonding = framework::lock_state(&self.unbonding);
+            unbonding
                 .iter()
                 .rposition(|e| {
                     e.delegator == delegator && e.validator == validator && e.amount == amount
                 })
                 .ok_or(ExecError::ModuleRejected(
                     "undo_undelegate: no matching unbonding entry".to_string(),
-                ))?;
-            unbonding.remove(pos);
-        }
+                ))?
+        };
         let mut validators = framework::lock_state(&self.validators);
         let mut delegations = framework::lock_state(&self.delegations);
         let stake = validators
             .get_mut(&validator)
             .ok_or(ExecError::ModuleRejected("undo_undelegate: validator gone".to_string()))?;
-        *stake = stake
+        let new_stake = stake
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("stake overflow on undo".to_string()))?;
-        let delegation = delegations
+        let new_delegation = delegations
             .get(&(delegator, validator))
             .copied()
             .unwrap_or(0)
             .checked_add(amount)
             .ok_or(ExecError::ModuleRejected("delegation overflow on undo".to_string()))?;
-        delegations.insert((delegator, validator), delegation);
-        {
-            let mut totals = framework::lock_state(&self.delegated_total);
-            let total = totals.get(&validator).copied().unwrap_or(0);
-            totals.insert(validator, total + amount);
-        }
+        let new_total = framework::lock_state(&self.delegated_total)
+            .get(&validator)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(amount)
+            .ok_or(ExecError::ModuleRejected("delegated total overflow on undo".to_string()))?;
+        // All checks passed — apply the mutation set.
+        framework::lock_state(&self.unbonding).remove(pos);
+        *stake = new_stake;
+        delegations.insert((delegator, validator), new_delegation);
+        framework::lock_state(&self.delegated_total).insert(validator, new_total);
         {
             let mut index = framework::lock_state(&self.delegator_index);
             let mut set = index.get(&delegator).cloned().unwrap_or_default();
             set.insert(validator);
             index.insert(delegator, set);
         }
-        self.store_delegation_state(validator, delegator, *stake, delegation);
+        self.store_delegation_state(validator, delegator, *stake, new_delegation);
         Ok(())
     }
 

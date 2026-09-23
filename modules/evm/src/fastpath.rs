@@ -320,13 +320,26 @@ impl EvmModule {
             Err(_) => return None,
         };
 
-        // Compute effective gas price per EIP-1559.
-        let effective_gas_price = std::cmp::min(max_fee, u128::from(base_fee) + priority_fee);
+        // Compute effective gas price per EIP-1559. The fee cap
+        // fields are user-controlled u128s — a wrapped `base_fee +
+        // priority_fee` would slide under the base-fee check below
+        // and let a tx specify ~2^128 gas prices while paying a
+        // wrapped reserve. revm computes reserves in U256 and
+        // rejects; overflow defers to it.
+        let fee_cap = u128::from(base_fee).checked_add(priority_fee)?;
+        let effective_gas_price = std::cmp::min(max_fee, fee_cap);
 
         // 8. Effective gas price >= base fee.
         if effective_gas_price < u128::from(base_fee) {
             return None; // Let revm handle the error.
         }
+
+        // Tip owed to the coinbase — computed before any account is
+        // mutated. `None` below defers to revm, which re-executes on
+        // the same `db`: a fallible step must not fire after the
+        // sender/recipient writes or the fallback would double-apply.
+        let tip = effective_gas_price.saturating_sub(u128::from(base_fee));
+        let coinbase_tip = u128::from(TX_GAS_TRANSFER).checked_mul(tip)?;
 
         // ── Read + validate sender ─────────────────────────────
         //
@@ -346,9 +359,12 @@ impl EvmModule {
             //    The EVM deducts `gas_limit * effective_gas_price`
             //    upfront as a gas reserve, then refunds the unused
             //    portion. The sender must have enough for both the
-            //    reserve and the value transfer.
-            let gas_reserve = u128::from(gas_limit) * effective_gas_price;
-            let total_needed = value_u128 + gas_reserve;
+            //    reserve and the value transfer. Checked math: a
+            //    wrapped reserve would pass the balance check with a
+            //    near-zero requirement where revm's U256 math rejects
+            //    the tx — divergent execution, so defer instead.
+            let gas_reserve = u128::from(gas_limit).checked_mul(effective_gas_price)?;
+            let total_needed = value_u128.checked_add(gas_reserve)?;
             if sender_account.info.balance < revm::primitives::U256::from(total_needed) {
                 return None;
             }
@@ -357,8 +373,9 @@ impl EvmModule {
             //
             // Net gas cost = gas_used * effective_gas_price
             // (gas_limit - gas_used is refunded).
-            let gas_cost = u128::from(TX_GAS_TRANSFER) * effective_gas_price;
-            sender_account.info.balance -= revm::primitives::U256::from(value_u128 + gas_cost);
+            let gas_cost = u128::from(TX_GAS_TRANSFER).checked_mul(effective_gas_price)?;
+            let charge = value_u128.checked_add(gas_cost)?;
+            sender_account.info.balance -= revm::primitives::U256::from(charge);
             sender_account.info.nonce += 1;
             // Normalize code_hash: revm sets KECCAK_EMPTY for EOAs
             // during execution. Test setup (fund_account_for_test)
@@ -381,9 +398,7 @@ impl EvmModule {
         }
 
         // ── Update coinbase (tip only, base fee is burned) ─────
-        let tip = effective_gas_price - u128::from(base_fee);
-        if tip > 0 {
-            let coinbase_tip = u128::from(TX_GAS_TRANSFER) * tip;
+        if coinbase_tip > 0 {
             let coinbase_account = db.load_account(coinbase).ok()?;
             coinbase_account.info.balance += revm::primitives::U256::from(coinbase_tip);
             if coinbase_account.info.code_hash == revm::primitives::B256::ZERO {
@@ -538,11 +553,20 @@ impl EvmModule {
             Err(_) => return None,
         };
 
-        // 7. Effective gas price >= base fee (EIP-1559).
-        let effective_gas_price = std::cmp::min(max_fee, u128::from(base_fee) + priority_fee);
+        // 7. Effective gas price >= base fee (EIP-1559). The fee-cap
+        // fields are user-controlled u128s — checked math defers to
+        // revm's U256 semantics rather than wrapping the reserve.
+        let fee_cap = u128::from(base_fee).checked_add(priority_fee)?;
+        let effective_gas_price = std::cmp::min(max_fee, fee_cap);
         if effective_gas_price < u128::from(base_fee) {
             return None;
         }
+
+        // Coinbase tip — computed before any account is mutated so
+        // an overflow defers to revm instead of leaving writes
+        // half-applied for the fallback to re-execute.
+        let tip = effective_gas_price.saturating_sub(u128::from(base_fee));
+        let coinbase_tip = u128::from(gas_used).checked_mul(tip)?;
 
         // ── All checks passed — execute natively ───────────────
         //
@@ -555,15 +579,16 @@ impl EvmModule {
             if sender_account.info.nonce != signed.nonce() {
                 return None;
             }
-            let gas_reserve = u128::from(gas_limit) * effective_gas_price;
-            let total_needed = value_u128 + gas_reserve;
+            let gas_reserve = u128::from(gas_limit).checked_mul(effective_gas_price)?;
+            let total_needed = value_u128.checked_add(gas_reserve)?;
             if sender_account.info.balance < revm::primitives::U256::from(total_needed) {
                 return None;
             }
 
             // Deduct gas cost + value, increment nonce.
-            let gas_cost = u128::from(gas_used) * effective_gas_price;
-            sender_account.info.balance -= revm::primitives::U256::from(value_u128 + gas_cost);
+            let gas_cost = u128::from(gas_used).checked_mul(effective_gas_price)?;
+            let charge = value_u128.checked_add(gas_cost)?;
+            sender_account.info.balance -= revm::primitives::U256::from(charge);
             sender_account.info.nonce += 1;
             if sender_account.info.code_hash == revm::primitives::B256::ZERO {
                 sender_account.info.code_hash = revm::primitives::KECCAK_EMPTY;
@@ -586,9 +611,7 @@ impl EvmModule {
         }
 
         // Update coinbase (tip only, base fee is burned).
-        let tip = effective_gas_price - u128::from(base_fee);
-        if tip > 0 {
-            let coinbase_tip = u128::from(gas_used) * tip;
+        if coinbase_tip > 0 {
             let coinbase_account = db.load_account(coinbase).ok()?;
             coinbase_account.info.balance += revm::primitives::U256::from(coinbase_tip);
             if coinbase_account.info.code_hash == revm::primitives::B256::ZERO {

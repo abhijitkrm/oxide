@@ -239,8 +239,10 @@ impl StakingModule {
                 u64::try_from(u128::from(total_reward) * u128::from(*stake) / u128::from(eligible))
                     .unwrap_or(u64::MAX);
             if reward > 0 {
-                *rpt.entry(*addr).or_insert(0) +=
-                    u128::from(reward).saturating_mul(RPT_SCALE).saturating_div(u128::from(*stake));
+                let entry = rpt.entry(*addr).or_insert(0);
+                *entry = entry.saturating_add(
+                    u128::from(reward).saturating_mul(RPT_SCALE).saturating_div(u128::from(*stake)),
+                );
             }
         }
     }

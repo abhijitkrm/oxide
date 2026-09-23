@@ -137,6 +137,40 @@ fn delegate_rejects_insufficient_balance() {
     assert_eq!(ledger.balance(&BONDED_POOL), 0, "pool untouched on failure");
 }
 
+/// Overflow of the validator's aggregate stake must reject the whole
+/// delegate atomically: `ModuleRejected` does not roll back prior
+/// `CommittedMap` writes (or the pool debit), so every fallible add
+/// runs before the first mutation. This pins that ordering — a
+/// wrapped or half-applied delegate would diverge `delegated_total`
+/// from `validators`/`delegations` and corrupt reward accounting on
+/// every validator that executed the tx.
+#[test]
+fn delegate_stake_overflow_rejects_atomically() {
+    let staking = StakingModule::new();
+    let ledger = std::sync::Arc::new(framework::MemoryBalances::new());
+    staking.set_ledger(ledger.clone());
+    let v = addr(1);
+    // Genesis self-stake at the u64 ceiling: any further delegation
+    // overflows `stake + amount`.
+    staking.genesis_register_validator(v, u64::MAX);
+    let d = addr(2);
+    ledger.mint(&d, 1_000_000);
+
+    let result = staking.handle(&ctx_with_sender(2), &msg::delegate(v, 1));
+    assert!(result.is_err(), "stake overflow must reject the delegate");
+    // Nothing may be half-applied: stake, delegation, delegated_total
+    // and the pool debit all read exactly as before the attempt.
+    assert_eq!(staking.stake(&v), u64::MAX, "stake unchanged");
+    assert_eq!(staking.delegation(&d, &v), 0, "no delegation recorded");
+    assert_eq!(
+        framework::lock_state(&staking.delegated_total).get(&v).copied().unwrap_or(0),
+        0,
+        "delegated_total must not gain the phantom unit"
+    );
+    assert_eq!(ledger.balance(&d), 1_000_000, "delegator not debited");
+    assert_eq!(ledger.balance(&BONDED_POOL), 0, "pool not credited");
+}
+
 #[test]
 fn unbonding_refunds_delegator_via_ledger() {
     let (staking, ledger) = setup_with_ledger(&[1]);

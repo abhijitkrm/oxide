@@ -435,16 +435,16 @@ impl AccountState {
         let mut total = i128::from(self.cross_margin);
         for (market, pos) in &self.positions {
             if !pos.is_open() {
-                total += i128::from(pos.isolated_margin);
+                total = total.saturating_add(i128::from(pos.isolated_margin));
                 continue;
             }
             let mark = marks.get(market).copied().unwrap_or(pos.entry_price);
-            total += i128::from(pos.isolated_margin);
+            total = total.saturating_add(i128::from(pos.isolated_margin));
             // PnL is scale-14; convert to scale-6 by dividing by
             // PRICE_SCALE (1e8).
             let pnl_scale6 =
                 pos.unrealized_pnl(mark) / i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
-            total += pnl_scale6;
+            total = total.saturating_add(pnl_scale6);
             let _ = configs;
         }
         total
@@ -466,7 +466,7 @@ impl AccountState {
             if let Some(cfg) = cfg {
                 // maintenance_margin returns scale-14; convert to
                 // scale-6 by dividing by PRICE_SCALE (1e8).
-                total += pos.maintenance_margin(mark, cfg) / PRICE_SCALE;
+                total = total.saturating_add(pos.maintenance_margin(mark, cfg) / PRICE_SCALE);
             }
         }
         total
@@ -490,7 +490,7 @@ impl AccountState {
             if let Some(cfg) = configs.get(market) {
                 let leverage = u128::from(cfg.max_leverage.max(1));
                 // notional is scale-14; convert to scale-6.
-                total += pos.notional(mark) / leverage / PRICE_SCALE;
+                total = total.saturating_add(pos.notional(mark) / leverage / PRICE_SCALE);
             }
         }
         total
@@ -562,14 +562,17 @@ impl AccountState {
             opposing.sort_by_key(|r| r.price);
             for r in opposing {
                 let covered = cover.min(r.qty);
-                cover -= covered;
+                cover = cover.saturating_sub(covered);
                 // notional is scale-14 (qty scale-6 × price scale-8);
                 // divide by PRICE_SCALE to land on scale-6.
-                let exposed = u128::from(r.qty - covered);
-                total += exposed * u128::from(r.price) / leverage / PRICE_SCALE;
+                let exposed = u128::from(r.qty.saturating_sub(covered));
+                total =
+                    total.saturating_add(exposed * u128::from(r.price) / leverage / PRICE_SCALE);
             }
             for r in orders.iter().filter(|r| r.side != closing_side) {
-                total += u128::from(r.qty) * u128::from(r.price) / leverage / PRICE_SCALE;
+                total = total.saturating_add(
+                    u128::from(r.qty) * u128::from(r.price) / leverage / PRICE_SCALE,
+                );
             }
         }
         total
@@ -772,7 +775,8 @@ impl trading::MakerCap for ReduceOnlyCap<'_> {
             let used = self.spent.get(&owner).copied().unwrap_or(0);
             let remaining = pos_size.abs_qty().0.saturating_sub(used);
             let cap = remaining.min(book_qty);
-            *self.spent.entry(owner).or_insert(0) += cap;
+            let used_entry = self.spent.entry(owner).or_insert(0);
+            *used_entry = used_entry.saturating_add(cap);
             cap
         } else {
             // A normal opposing maker burns cover its reduce-only
@@ -780,7 +784,8 @@ impl trading::MakerCap for ReduceOnlyCap<'_> {
             // though the actual fill may be smaller — but a smaller
             // fill means the taker is done, so no later maker ever
             // consults the over-estimate.
-            *self.spent.entry(owner).or_insert(0) += book_qty;
+            let used_entry = self.spent.entry(owner).or_insert(0);
+            *used_entry = used_entry.saturating_add(book_qty);
             book_qty
         }
     }
@@ -1158,7 +1163,7 @@ impl PerpsModule {
                 payers.push((*addr, amount));
             } else {
                 receivers.push((*addr, amount));
-                total_due += u128::from(amount);
+                total_due = total_due.saturating_add(u128::from(amount));
             }
         }
 
@@ -1183,8 +1188,8 @@ impl PerpsModule {
                     &mut account.cross_margin
                 };
                 let actual = (*bucket).min(*owed);
-                *bucket -= actual;
-                collected += u128::from(actual);
+                *bucket = bucket.saturating_sub(actual);
+                collected = collected.saturating_add(u128::from(actual));
                 events.push(Event { module: "perps", kind: "funding", data: vec![market] });
             });
         }
@@ -1215,7 +1220,7 @@ impl PerpsModule {
             let Ok(credit) = u64::try_from(credit_u128) else {
                 continue;
             };
-            distributed += credit_u128;
+            distributed = distributed.saturating_add(credit_u128);
             if credit == 0 {
                 continue;
             }
@@ -1403,7 +1408,10 @@ impl PerpsModule {
         let price_scale_i128 = i128::try_from(PRICE_SCALE).unwrap_or(i128::MAX);
         let total_loss_scale6 = total_loss_scale14 / price_scale_i128;
         let margin_total = i128::from(cross_margin.saturating_add(total_margin_recovered));
-        let net = margin_total + total_loss_scale6; // both scale-6
+        // i128 accumulators of u64-bounded terms — saturating is a
+        // no-op at reachable values and clamps rather than wraps in
+        // the pathological corner.
+        let net = margin_total.saturating_add(total_loss_scale6); // both scale-6
         if net < 0 {
             // Insurance fund covers the shortfall (scale-6); what
             // it cannot pay runs the residual cascade — ADL against
@@ -1412,8 +1420,8 @@ impl PerpsModule {
             let shortfall = u64::try_from(-net).unwrap_or(u64::MAX);
             let fund = inner.insurance_fund;
             let cover = fund.min(shortfall);
-            inner.insurance_fund = fund - cover;
-            let residual = shortfall - cover;
+            inner.insurance_fund = fund.saturating_sub(cover);
+            let residual = shortfall.saturating_sub(cover);
             if residual > 0 {
                 Self::socialize_residual(&mut inner, account, residual, &mut events);
             }
@@ -1599,8 +1607,11 @@ impl PerpsModule {
                 // Compute the exact realized PnL (scale-6) from closing
                 // close_qty units — the destroyed profit claim, and
                 // the amount credited against the shortfall.
+                // u64-range factors can exceed i128 in the
+                // pathological corner — saturate so the realized
+                // amount clamps instead of wrapping.
                 let realized_scale6 =
-                    u64::try_from((i128::from(close_qty) * pnl_per_unit) / price_scale)
+                    u64::try_from(i128::from(close_qty).saturating_mul(pnl_per_unit) / price_scale)
                         .unwrap_or(u64::MAX);
 
                 // Shrink the counterparty's position (preserve sign).
@@ -1685,13 +1696,13 @@ impl PerpsModule {
     /// spoken for.
     fn fund_inflow(inner: &mut Inner, amount: u64) {
         let repay = inner.unfunded_bad_debt.min(amount);
-        inner.unfunded_bad_debt -= repay;
+        inner.unfunded_bad_debt = inner.unfunded_bad_debt.saturating_sub(repay);
         // The fund only ever receives real inflows — bounded by the
         // u64 money supply — so the saturating add cannot fire in a
         // consistent ledger. It stays as the defensive bound because
         // a clamped fund is "holds everything," which is the
         // direction a receiver-side overflow must err toward.
-        inner.insurance_fund = inner.insurance_fund.saturating_add(amount - repay);
+        inner.insurance_fund = inner.insurance_fund.saturating_add(amount.saturating_sub(repay));
     }
 }
 

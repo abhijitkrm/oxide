@@ -921,6 +921,52 @@ fn precompile_call_matches_revm_state_root() {
     assert_eq!(root1, root2, "a precompile call must not be answered by the empty-code fast path");
 }
 
+/// A tx whose gas price approaches `u128::MAX` must not let the native
+/// fast path wrap the reserve math: `gas_limit * price` and
+/// `base_fee + priority_fee` overflow u128 while revm's U256
+/// arithmetic correctly rejects the tx for insufficient balance.
+/// The fast path must defer (return `None`) rather than execute with
+/// wrapped amounts — otherwise it debits a wrapped reserve and tips
+/// the coinbase a wrapped amount, diverging the state root from the
+/// real EVM result.
+#[test]
+fn native_transfer_huge_gas_price_defers_to_revm() {
+    let (pk, addr) = test_keypair();
+    let recipient = revm::primitives::Address::from_slice(&[0x42; 20]);
+
+    let tx = tx::TxLegacy {
+        fields: tx::TxFields {
+            nonce: 0,
+            gas_limit: DEFAULT_GAS_LIMIT,
+            to: tx::TxKind::Call(recipient),
+            value: U256::from(1u64),
+            data: revm::primitives::Bytes::new(),
+            chain_id: 1,
+        },
+        gas_price: U256::from(u128::MAX),
+    };
+    let raw = tx::SignedTx::sign_legacy(tx, &pk).expect("sign").encode_to_bytes();
+
+    // Path 1: handle() — revm for every tx.
+    let m1 = make_module();
+    fund(&m1, &addr);
+    m1.begin_block(Height::new(1));
+    let _ = m1.handle(&dummy_ctx(), &raw);
+    m1.end_block(Height::new(1));
+    let root1 = m1.state_root();
+
+    // Path 2: handle_batch() — the fast path must defer on overflow
+    // and produce the same outcome revm does.
+    let m2 = make_module();
+    fund(&m2, &addr);
+    m2.begin_block(Height::new(1));
+    let _ = m2.handle_batch(&dummy_ctx(), std::slice::from_ref(&raw));
+    m2.end_block(Height::new(1));
+    let root2 = m2.state_root();
+
+    assert_eq!(root1, root2, "wrapped gas math must not diverge from revm");
+}
+
 #[test]
 fn native_transfer_skipped_for_calldata() {
     let (pk, addr) = test_keypair();
