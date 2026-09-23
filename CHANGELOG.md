@@ -51,6 +51,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **Insecure defaults are refused on externally reachable binds**
+  (`node`, `oxide-devnet`, `oxide-validator`): when the devnet
+  transport or RPC listener binds a non-loopback address, startup
+  fails unless the deployment supplies an operator BLS key
+  (`--bls-key-file`), mTLS (`--tls-dir`), a genesis file
+  (`--genesis-file`), a non-public chain ID, and a non-zero
+  `min_fee` — every violation is listed at once. Loopback-only
+  binds are unaffected, and `--unsafe-allow-insecure-posture` is
+  the explicit opt-out for private testnets. `oxide-validator`'s
+  documented `--rpc-listen` flag now actually applies, and
+  `config/mainnet.toml` sets a non-public placeholder chain ID
+  (31338) and `min_fee = 1` instead of silently inheriting
+  Ethereum-mainnet replayability and free transactions.
+  - **In plain words:** the binaries used to happily run a
+    "production-looking" deployment on public interfaces with
+    keys anyone could recompute, no encryption, transactions
+    replayable on Ethereum mainnet, and zero fees. Now they
+    refuse, and tell you everything that needs fixing at once.
+
 - **`oxide-matcher` now requires `--settlement-key`** — there is no
   default settlement operator. The flag is mandatory, and secrets in
   the public test-identity scalar space (`crypto::secp` identity

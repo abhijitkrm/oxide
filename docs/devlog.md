@@ -20395,3 +20395,34 @@ with precise stderr, and a generated key brings all four order-entry
 servers up with the operator address derived from it. The binary's
 `devnet` dependency is gone — it existed only to source the
 insecure default.
+
+## Session N+38 (cont.) — external binds refuse insecure defaults
+
+The refuse-to-start half of C4. `node::cli` already had the loopback
+classification and surface enumeration from the unsigned-tx gate;
+this adds the broader posture check on the same trigger. Off any
+externally reachable listener (devnet transport `--bind-host`, RPC
+`--rpc-listen`/`rpc.listen_addr`), startup now refuses when any
+shipped default is still in place: deterministic BLS consensus key
+(no `--bls-key-file`), plaintext transport (no `--tls-dir`), absent
+`--genesis-file`, a public Ethereum chain ID (1, 5, 17000,
+11155111 + major L2s — EIP-155 makes those replayable both ways),
+or `min_fee = 0`. All violations print at once; loopback binds are
+untouched, and `--unsafe-allow-insecure-posture` is the explicit
+opt-out for private testnets (the compose file's container bridge
+needed it — a wildcard bind inside `10.0.0.0/24` is not public).
+
+Two fixes rode along. `oxide-validator`'s help advertised
+`--rpc-listen` but the flag was never applied — it is now folded
+into `rpc_config.listen_addr` inside `load_config`, so both
+binaries honor it and the gate reads the same value the server
+binds. And `config/mainnet.toml` now sets `chain_id = 31338`
+(placeholder pending the deploy tooling's assignment) and
+`min_fee = 1` instead of silently inheriting Ethereum-mainnet
+replayability and free transactions.
+
+Verified live: bare `oxide-devnet --bind-host 0.0.0.0` exits 1
+listing all five violations; the opt-out warns and starts; a fully
+provisioned node (key file + mTLS + genesis + private chain ID +
+fee floor) starts on `0.0.0.0` with no refusal; validator on
+`--rpc-listen 0.0.0.0:8545` refuses the three applicable defaults.

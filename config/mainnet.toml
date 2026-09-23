@@ -49,6 +49,25 @@ max_block_gas = 1000000000
 max_mempool_entries = 100000
 # Use parallel execution for batches >= 100 txs.
 parallel_threshold = 100
+# Minimum fee (base units) for native-module transactions — a
+# non-zero floor is required on any externally reachable bind;
+# 0 lets anyone spam the mempool and order books for free.
+min_fee = 1
+
+[rpc]
+# Validator RPC stays loopback — validators should not serve public
+# RPC (see docs/divergence-runbook.md); front-ends sit behind a
+# dedicated RPC node instead.
+listen_addr = "127.0.0.1:8545"
+# Placeholder chain ID — the deploy tooling assigns the production
+# value. It must NOT be a public Ethereum-network ID (1, 5, 17000,
+# 11155111, 10, 56, 137, 8453, 42161, 43114): EIP-155 binds the ID
+# into every signature, so reusing one makes transactions replayable
+# across the two chains. The startup gate refuses those IDs on
+# externally reachable binds.
+chain_id = 31338
+# 1 gwei base fee.
+base_fee = 1000000000
 
 [genesis]
 # 1 trillion genesis balance per sender.

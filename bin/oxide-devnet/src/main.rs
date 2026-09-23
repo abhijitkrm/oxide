@@ -101,6 +101,18 @@ const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
 /// | `--export-snapshot <path>` | Export snapshot to file and exit |
 /// | `--import-snapshot <path>` | Import snapshot from file before starting |
 /// | `--submit-key-change <hex>` | Submit a key-change tx (new BLS **secret** key — `PoP` required) |
+/// | `--unsafe-allow-insecure-posture` | Allow devnet defaults on non-loopback binds (private testnets only) |
+///
+/// # External binds
+///
+/// When `--bind-host` or the RPC listener is reachable from other
+/// machines, startup refuses unless the deployment is explicitly
+/// configured: an operator BLS key (`--bls-key-file`), mTLS
+/// (`--tls-dir`), a genesis file (`--genesis-file`), a non-public
+/// chain ID, and a non-zero `min_fee`. The refusal lists every
+/// violation at once. `--unsafe-allow-insecure-posture` is the
+/// opt-out for private testnets (e.g. a container bridge network
+/// whose wildcard bind is not actually public).
 ///
 /// # Key loading
 ///

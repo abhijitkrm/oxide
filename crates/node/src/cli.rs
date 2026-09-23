@@ -76,42 +76,161 @@ pub fn external_bind_surfaces(bind_host: Option<&str>, rpc_listen: Option<&str>)
     external
 }
 
+/// Resolve every listener surface reachable from other machines —
+/// the devnet transport (`--bind-host`, Devnet mode only) and the
+/// JSON-RPC listener (`--rpc-listen` / `rpc.listen_addr`), resolved
+/// the same way the listeners themselves are.
+pub fn external_surfaces(mode: crate::NodeMode, rpc_config: &config::RpcConfig) -> Vec<String> {
+    let bind_host = matches!(mode, crate::NodeMode::Devnet)
+        .then(|| parse_cli_flag("--bind-host").unwrap_or_else(|| "127.0.0.1".to_string()));
+    // `--rpc-listen` is already folded into `rpc_config.listen_addr`
+    // by the loader — an empty address means the RPC server is off.
+    let rpc_listen = if rpc_config.listen_addr.is_empty() {
+        None
+    } else {
+        Some(rpc_config.listen_addr.as_str())
+    };
+    external_bind_surfaces(bind_host.as_deref(), rpc_listen)
+}
+
 /// Refuse to start with unsigned-tx admission on any listener that
 /// is reachable from other machines.
 ///
 /// Unsigned envelopes trust the declared `sender` — acceptable on a
 /// loopback devnet where every submitter is the operator, fatal on a
-/// network-facing bind where it lets anyone spend any account. The
-/// surfaces checked are the devnet transport (`--bind-host`)
-/// and the JSON-RPC listener (`--rpc-listen` / `rpc.listen_addr`),
-/// resolved the same way the listeners themselves are.
-pub fn refuse_unsigned_on_external_binds(
-    node_config: &NodeConfig,
-    rpc_config: &config::RpcConfig,
-    mode: crate::NodeMode,
-    bin: &str,
-) {
-    if node_config.require_signed_txs {
+/// network-facing bind where it lets anyone spend any account.
+pub fn refuse_unsigned_on_external_binds(node_config: &NodeConfig, external: &[String], bin: &str) {
+    if node_config.require_signed_txs || external.is_empty() {
         return;
     }
-    let bind_host = matches!(mode, crate::NodeMode::Devnet)
-        .then(|| parse_cli_flag("--bind-host").unwrap_or_else(|| "127.0.0.1".to_string()));
-    // Same resolution the RPC startup paths use.
-    let rpc_listen = parse_cli_flag("--rpc-listen").or_else(|| {
-        if rpc_config.listen_addr.is_empty() { None } else { Some(rpc_config.listen_addr.clone()) }
-    });
-    let external = external_bind_surfaces(bind_host.as_deref(), rpc_listen.as_deref());
-    if !external.is_empty() {
-        eprintln!(
-            "{bin}: refusing to start — --unsafe-allow-unsigned-txs admits \
-             unauthenticated senders, but these binds are externally reachable:"
-        );
-        for surface in &external {
-            eprintln!("  - {surface}");
-        }
-        eprintln!("run unsigned mode on loopback only, or drop the flag and sign envelopes");
-        std::process::exit(1);
+    eprintln!(
+        "{bin}: refusing to start — --unsafe-allow-unsigned-txs admits \
+         unauthenticated senders, but these binds are externally reachable:"
+    );
+    for surface in external {
+        eprintln!("  - {surface}");
     }
+    eprintln!("run unsigned mode on loopback only, or drop the flag and sign envelopes");
+    std::process::exit(1);
+}
+
+/// Chain IDs claimed by public Ethereum-compatible networks. EIP-155
+/// binds the chain ID into every signature, so an Oxide deployment
+/// reusing one of these is replayable in both directions wherever
+/// nonces align — transactions signed here execute on the public
+/// network and vice versa.
+pub const PUBLIC_CHAIN_IDS: &[u64] = &[
+    1,          // Ethereum mainnet
+    5,          // Goerli
+    17000,      // Holesky
+    11_155_111, // Sepolia
+    10,         // OP Mainnet
+    56,         // BNB Chain
+    137,        // Polygon
+    8453,       // Base
+    42161,      // Arbitrum One
+    43114,      // Avalanche C-Chain
+];
+
+/// Facts a node binary reports about its resolved startup so the
+/// shared gate can decide whether exposing the node on a public
+/// listener is safe. The loader cannot see how each binary sources
+/// its key material — the caller resolves the flags it understands
+/// and reports the outcomes here. Single-node mode has no peer
+/// transport and signs no consensus messages, so it leaves the two
+/// transport/key fields `false`.
+#[derive(Debug, Default)]
+pub struct ExternalPosture {
+    /// Consensus identity is the deterministic devnet derivation —
+    /// no operator-supplied key material (`--bls-key-file` absent).
+    pub deterministic_consensus_key: bool,
+    /// Peer transport would run without TLS (`--tls-dir` absent).
+    pub transport_unencrypted: bool,
+    /// No `--genesis-file` — the validator set and funded accounts
+    /// are the built-in devnet defaults, publicly derivable.
+    pub genesis_file_absent: bool,
+    /// Effective EIP-155 chain ID (`NodeConfig::chain_id`).
+    pub chain_id: u64,
+    /// Effective native-module minimum fee (`NodeConfig::min_fee`).
+    pub min_fee: u64,
+}
+
+/// Collect every reason this posture is unsafe to expose on a
+/// listener reachable from other machines. Empty means safe.
+pub fn insecure_posture_reasons(posture: &ExternalPosture) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if posture.deterministic_consensus_key {
+        reasons.push(
+            "consensus key is the deterministic devnet derivation (--bls-key-file not given) \
+             — the secret is publicly computable"
+                .to_string(),
+        );
+    }
+    if posture.transport_unencrypted {
+        reasons.push("peer transport is unencrypted (--tls-dir not given)".to_string());
+    }
+    if posture.genesis_file_absent {
+        reasons.push(
+            "no --genesis-file — validator set and funded accounts are the public devnet \
+             defaults"
+                .to_string(),
+        );
+    }
+    if PUBLIC_CHAIN_IDS.contains(&posture.chain_id) {
+        reasons.push(format!(
+            "chain_id {} is a public Ethereum-network ID — EIP-155 signatures replay \
+             across the chains",
+            posture.chain_id
+        ));
+    }
+    if posture.min_fee == 0 {
+        reasons.push(
+            "min_fee is 0 — native-module transactions are unmetered (free spam)".to_string(),
+        );
+    }
+    reasons
+}
+
+/// Refuse to start when the node would expose insecure defaults on a
+/// listener reachable from other machines. Every violation is
+/// listed — a deployment fixing one at a time should not need five
+/// restarts to discover the rest. Loopback-only binds skip the gate
+/// entirely: a local devnet is exactly what the defaults are for.
+/// `--unsafe-allow-insecure-posture` is the explicit operator
+/// opt-out for private testnets (for example a container bridge
+/// network whose `0.0.0.0` bind is not actually public).
+pub fn refuse_insecure_posture_on_external_binds(
+    external: &[String],
+    posture: &ExternalPosture,
+    bin: &str,
+) {
+    if external.is_empty() {
+        return;
+    }
+    let reasons = insecure_posture_reasons(posture);
+    if reasons.is_empty() {
+        return;
+    }
+    if env::args().any(|a| a == "--unsafe-allow-insecure-posture") {
+        eprintln!(
+            "{bin}: --unsafe-allow-insecure-posture: starting with {} insecure default(s) on \
+             externally reachable binds",
+            reasons.len()
+        );
+        return;
+    }
+    eprintln!("{bin}: refusing to start — insecure defaults on externally reachable binds:");
+    for surface in external {
+        eprintln!("  - {surface}");
+    }
+    for reason in &reasons {
+        eprintln!("  - {reason}");
+    }
+    eprintln!(
+        "fix the configuration, bind to loopback, or pass --unsafe-allow-insecure-posture \
+         for a private testnet"
+    );
+    std::process::exit(1);
 }
 
 /// Load the node configuration from CLI flags, env vars, and TOML file.
@@ -171,7 +290,14 @@ pub fn load_config(mode: crate::NodeMode, bin: &str) -> LoadedConfig {
     let data_dir =
         parse_cli_flag("--data-dir").map(PathBuf::from).or_else(|| config.storage.data_dir.clone());
 
-    let rpc_config = config.rpc.clone().unwrap_or_default();
+    let mut rpc_config = config.rpc.clone().unwrap_or_default();
+    // `--rpc-listen` overrides the configured RPC bind. Folding it
+    // here — rather than at each server's bind site — keeps the
+    // effective value identical everywhere it is read, including the
+    // external-bind gates below.
+    if let Some(listen) = parse_cli_flag("--rpc-listen") {
+        rpc_config.listen_addr = listen;
+    }
 
     // Genesis chain id must match the RPC chain id — a mismatch means
     // the node's signatures and its advertised chain disagree.
@@ -224,7 +350,21 @@ pub fn load_config(mode: crate::NodeMode, bin: &str) -> LoadedConfig {
         }
         std::process::exit(1);
     }
-    refuse_unsigned_on_external_binds(&node_config, &rpc_config, mode, bin);
+    // Off-loopback, the defaults themselves are the attack surface.
+    // Resolve the reachable surfaces once — both refusal gates read
+    // the same list so they can never disagree about what is public.
+    let external = external_surfaces(mode, &rpc_config);
+    refuse_unsigned_on_external_binds(&node_config, &external, bin);
+    let posture = ExternalPosture {
+        deterministic_consensus_key: matches!(mode, crate::NodeMode::Devnet)
+            && parse_cli_flag("--bls-key-file").is_none(),
+        transport_unencrypted: matches!(mode, crate::NodeMode::Devnet)
+            && parse_cli_flag("--tls-dir").is_none(),
+        genesis_file_absent: genesis_file.is_none(),
+        chain_id: node_config.chain_id,
+        min_fee: node_config.min_fee,
+    };
+    refuse_insecure_posture_on_external_binds(&external, &posture, bin);
 
     // Emit the effective configuration — the values actually running,
     // after every override layer, not the file's literal contents.
@@ -384,5 +524,35 @@ mod tests {
         assert_eq!(external_bind_surfaces(None, Some("0.0.0.0:8545")).len(), 1);
         assert_eq!(external_bind_surfaces(None, Some("[::]:8545")).len(), 1);
         assert_eq!(external_bind_surfaces(None, Some("example.com:8545")).len(), 1);
+    }
+
+    /// Every insecure default is reported, and a fully-configured
+    /// posture reports nothing.
+    #[test]
+    fn insecure_posture_reasons_cover_each_condition() {
+        let insecure = ExternalPosture {
+            deterministic_consensus_key: true,
+            transport_unencrypted: true,
+            genesis_file_absent: true,
+            chain_id: 1,
+            min_fee: 0,
+        };
+        let reasons = insecure_posture_reasons(&insecure);
+        assert_eq!(reasons.len(), 5, "each insecure default is its own reason: {reasons:?}");
+
+        let secure = ExternalPosture { chain_id: 31337, min_fee: 1, ..ExternalPosture::default() };
+        assert!(insecure_posture_reasons(&secure).is_empty());
+    }
+
+    /// The public-ID table must cover at least the named Ethereum
+    /// networks (mainnet + live testnets) — an ID missed there signs
+    /// replayable transactions.
+    #[test]
+    fn public_chain_ids_cover_ethereum() {
+        for id in [1u64, 5, 17000, 11_155_111] {
+            assert!(PUBLIC_CHAIN_IDS.contains(&id), "chain id {id} must be refused");
+        }
+        // A private/dev chain id is not in the table.
+        assert!(!PUBLIC_CHAIN_IDS.contains(&31337));
     }
 }
