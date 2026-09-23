@@ -300,7 +300,8 @@ fn build_single_node_rpc(
     height: Option<primitives::Height>,
     recorder: Arc<metrics::Recorder>,
 ) -> (Arc<rpc::RpcServer>, rpc::server::HttpServer) {
-    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
+    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee)
+        .with_debug_api(rpc_config.enable_debug_api);
     // Wire the executor into the RPC so `eth_sendRawTransaction`
     // decodes, wraps, and submits EVM transactions into the mempool.
     rpc_server.set_tx_submitter(Arc::new(node::rpc_adapters::ExecutorTxSubmitter {

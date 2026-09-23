@@ -1261,6 +1261,30 @@ fn eth_call_state_vs_statediff() {
     assert_eq!(err.code, -32_602);
 }
 
+/// The `debug_*` namespace is opt-in: tracing re-executes blocks,
+/// the heaviest calls on the endpoint, so a default server answers
+/// method-not-found exactly as it would for an unregistered method.
+#[test]
+fn debug_api_off_by_default() {
+    let (s, _evm) = make_evm_server();
+    let req = make_request(
+        "debug_traceCall",
+        vec![json!({"to": "0x0000000000000000000000000000000000000001"}), json!("latest")],
+        json!(1),
+    );
+    let err = s.handle(&req).error.expect("debug must error when disabled");
+    assert_eq!(err.code, -32_601, "disabled debug namespace must read as method-not-found");
+    // And an enabled server dispatches (the call may still fail on
+    // params — but never with method-not-found).
+    let s = s.with_debug_api(true);
+    let resp = s.handle(&req);
+    assert_ne!(
+        resp.error.as_ref().map(|e| e.code),
+        Some(-32_601),
+        "with_debug_api must wire the namespace"
+    );
+}
+
 /// geth nests `stateOverrides` inside the `debug_traceCall`
 /// config object — it must be parsed from there, not param 3.
 #[test]
@@ -1268,6 +1292,7 @@ fn debug_trace_call_applies_nested_state_overrides() {
     use executor::Module;
     use primitives::Height;
     let (s, evm) = make_evm_server();
+    let s = s.with_debug_api(true);
     evm.begin_block(Height::new(1));
     evm.end_block(Height::new(1));
 
@@ -1462,4 +1487,46 @@ fn oxide_send_raw_transaction_error_paths() {
     let req = make_request("oxide_sendRawTransaction", vec![json!("0xdeadbeef")], json!(3));
     let resp = s.handle(&req);
     assert!(resp.error.is_some(), "rejection must surface as error");
+}
+
+/// `cost_of` weights batches per element and methods by weight —
+/// the admission charge must match the real work, not the request
+/// count.
+#[test]
+fn cost_of_weights_batches_and_methods() {
+    let s = make_server();
+    // Single cheap read.
+    let body = json!({"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1});
+    assert_eq!(s.cost_of(&body), 1);
+    // eth_call weighs 10.
+    let call = json!({"jsonrpc": "2.0", "method": "eth_call", "params": [], "id": 1});
+    assert_eq!(s.cost_of(&call), 10);
+    // debug_* weighs 50 (even with the namespace disabled — the
+    // cost check runs before dispatch).
+    let dbg = json!({"jsonrpc": "2.0", "method": "debug_traceCall", "params": [], "id": 1});
+    assert_eq!(s.cost_of(&dbg), 50);
+    // Batch: 2 reads + 1 call = 12.
+    let batch = json!([
+        {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+        {"jsonrpc": "2.0", "method": "eth_call", "params": [], "id": 2},
+        {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 3}
+    ]);
+    assert_eq!(s.cost_of(&batch), 12);
+    // Malformed elements still cost 1 each.
+    let weird = json!(["not a request", 42]);
+    assert_eq!(s.cost_of(&weird), 2);
+}
+
+/// `handle_parsed` must answer identically to `handle_raw` — the
+/// server parses once for costing, then dispatches the same body.
+#[test]
+fn handle_parsed_matches_handle_raw() {
+    let s = make_server();
+    let raw = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":7}"#;
+    let parsed: Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(s.handle_parsed(&parsed), s.handle_raw(raw));
+    // Batch parity too.
+    let raw_batch = r#"[{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1},{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":2}]"#;
+    let parsed: Value = serde_json::from_str(raw_batch).unwrap();
+    assert_eq!(s.handle_parsed(&parsed), s.handle_raw(raw_batch));
 }

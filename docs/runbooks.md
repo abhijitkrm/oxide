@@ -16,6 +16,7 @@ what it does, when to use it, prerequisites, steps, and verification.
 8. [Monitoring and health checks](#8-monitoring-and-health-checks)
 9. [Key rotation](#9-key-rotation)
 10. [Software upgrade](#10-software-upgrade)
+11. [Public RPC exposure](#11-public-rpc-exposure)
 
 ---
 
@@ -516,3 +517,44 @@ If the upgrade causes issues:
   changelog for coordination requirements.
 - If a rollback is needed, restoring from a snapshot ensures the
   node's state is consistent with the pre-upgrade chain.
+## 11. Public RPC exposure
+
+### When to use
+
+A node (typically a fullnode, not a validator) must serve JSON-RPC to
+wallets, indexers, or public internet traffic.
+
+### Guidance
+
+- **Validators should not serve public RPC.** Validator RPC binds to
+  loopback by default; keep it that way so request floods cannot
+  compete with consensus threads. Serve public traffic from a dedicated
+  fullnode that follows the chain via state sync or P2P.
+- The HTTP listener applies layered admission control automatically:
+  a per-source-IP token bucket (IPv6 peers share a /64 bucket),
+  cost-weighted request charging (`eth_call`/`eth_estimateGas`/
+  `eth_getLogs`/`debug_trace*` cost more than cheap reads), a per-IP
+  in-flight cap, a global blocking-work permit pool, and batch limits
+  on both element count and total weight. No tuning is required for a
+  sane default posture.
+- `debug_trace*` methods are disabled unless the operator sets
+  `[rpc] debug_api = true` (env `OXIDE_RPC_DEBUG_API`). Tracing runs a
+  full re-execution per request — enable it only on a node that is not
+  facing untrusted traffic.
+- Put a reverse proxy in front of any public RPC anyway: the in-process
+  controls cap abuse at the node level, but TLS termination and L7
+  filtering belong at the edge.
+
+### Verification
+
+```sh
+# Cheap methods succeed; a flood of expensive calls returns -32005.
+for i in $(seq 1 200); do
+  curl -s -o /dev/null -w '%{http_code} ' \
+    -X POST http://localhost:9000 \
+    -d '{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{}, "latest"]}'
+done; echo
+
+# debug_trace* returns "method not found" unless debug_api = true.
+curl -s -X POST http://localhost:9000 \
+  -d '{"jsonrpc":"2.0","id":1,"method":"debug_traceTransaction","params":["0x..."]}'

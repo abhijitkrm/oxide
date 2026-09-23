@@ -700,6 +700,15 @@ pub struct RpcServer {
     /// rotations) bounds what arrives. `Mutex` on a cold path:
     /// writes are per-pump-tick, reads per sync client.
     exec_certs: std::sync::Mutex<std::collections::BTreeMap<u64, types::ExecCertificate>>,
+    /// Whether the `debug_*` namespace is served. Tracing methods
+    /// re-execute whole blocks — the most expensive calls on the
+    /// endpoint — so they default OFF: operators opt in via
+    /// `rpc.enable_debug_api` rather than paying the exposure by
+    /// default (geth parity: `--http.api` defaults exclude `debug`).
+    /// When off, `debug_trace*` returns method-not-found, exactly
+    /// as an unregistered method would — no oracle for which
+    /// namespace exists.
+    debug_api: bool,
 }
 
 mod endpoints;
@@ -731,7 +740,54 @@ impl RpcServer {
             pending_txs: std::sync::Mutex::new(PendingRing::default()),
             exec_divergence: std::sync::Mutex::new(None),
             exec_certs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            debug_api: false,
         }
+    }
+
+    /// Enable or disable the `debug_*` namespace (default: off).
+    /// Tracing is the most expensive surface on the endpoint —
+    /// operators enable it deliberately on private deployments.
+    #[must_use]
+    pub fn with_debug_api(mut self, enabled: bool) -> Self {
+        self.debug_api = enabled;
+        self
+    }
+
+    /// Cost of a parsed request body in rate-limiter units —
+    /// batch elements count individually and heavy methods weigh
+    /// more ([`method_weight`]). This is what the server charges
+    /// against the caller's per-source budget *before* dispatching,
+    /// so a max-size batch or a trace call spends proportional
+    /// budget rather than one unit.
+    ///
+    /// Malformed elements (non-objects, missing `method`) cost 1 —
+    /// they're answered with Invalid Request without touching state.
+    #[must_use]
+    pub fn cost_of(&self, body: &Value) -> u32 {
+        match body {
+            Value::Array(elements) => {
+                elements.iter().fold(0u32, |acc, e| acc.saturating_add(element_cost(e)))
+            }
+            _ => element_cost(body),
+        }
+    }
+
+    /// Dispatch a body already parsed by the caller (the HTTP/WS
+    /// handlers parse once to compute [`cost_of`](Self::cost_of),
+    /// so re-parsing here would double the serde cost of exactly
+    /// the oversized bodies the cost weighting exists to bound).
+    /// Semantics identical to [`handle_raw`](Self::handle_raw).
+    #[must_use]
+    pub fn handle_parsed(&self, body: &Value) -> String {
+        let response = self.handle_value(body, None);
+        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// [`handle_parsed`](Self::handle_parsed) for the WebSocket
+    /// transport — `eth_subscribe` binds to `conn`'s sink.
+    pub(crate) fn handle_ws_parsed(&self, body: &Value, conn: &WsConn) -> String {
+        let response = self.handle_value(body, Some(conn));
+        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
     }
 
     /// Attach a mempool submitter so `eth_sendRawTransaction` pushes
@@ -1208,10 +1264,20 @@ impl RpcServer {
             "txpool_contentFrom" => self.txpool_content_from(&request.params),
             "txpool_inspect" => self.txpool_inspect(),
             // ---- Debug / tracing ----
-            "debug_traceTransaction" => self.debug_trace_transaction(&request.params),
-            "debug_traceCall" => self.debug_trace_call(&request.params),
-            "debug_traceBlockByNumber" => self.debug_trace_block_by_number(&request.params),
-            "debug_traceBlockByHash" => self.debug_trace_block_by_hash(&request.params),
+            // The namespace is opt-in (`with_debug_api`): tracing
+            // re-executes blocks — the heaviest calls served — so a
+            // public endpoint answers method-not-found by default,
+            // indistinguishable from an unregistered method.
+            "debug_traceTransaction" if self.debug_api => {
+                self.debug_trace_transaction(&request.params)
+            }
+            "debug_traceCall" if self.debug_api => self.debug_trace_call(&request.params),
+            "debug_traceBlockByNumber" if self.debug_api => {
+                self.debug_trace_block_by_number(&request.params)
+            }
+            "debug_traceBlockByHash" if self.debug_api => {
+                self.debug_trace_block_by_hash(&request.params)
+            }
             _ => Err(RpcError::method_not_found(&request.method)),
         };
 
@@ -1409,6 +1475,34 @@ const MAX_FEE_HISTORY_BLOCKS: u64 = 1024;
 /// multicall-style clients that batch hundreds of reads; higher
 /// weakens the `DoS` bound.
 const MAX_BATCH_REQUESTS: usize = 1000;
+
+/// Rate-limiter cost of one parsed request element — the method's
+/// [`method_weight`], or 1 for anything that isn't a request object
+/// (malformed elements answer Invalid Request without state access).
+fn element_cost(element: &Value) -> u32 {
+    element.get("method").and_then(Value::as_str).map_or(1, method_weight)
+}
+
+/// Relative cost of a JSON-RPC method in rate-limiter units.
+///
+/// Weights are rough CPU/state-touch ratios against a cheap read
+/// (~10–50 µs): `debug_trace*` re-executes a whole block (~50×),
+/// `eth_call`/`eth_estimateGas` run a full EVM simulation and
+/// `eth_getProof`/`eth_getLogs` sweep state (~10×),
+/// `eth_sendRawTransaction` pays a ~30 µs signature recovery (~3×).
+/// Everything else — cached reads, chain metadata, subscription
+/// plumbing — costs 1. The weights are deliberately coarse: they
+/// exist to stop cost-asymmetric floods, not to price requests.
+fn method_weight(method: &str) -> u32 {
+    if method.starts_with("debug_") {
+        return 50;
+    }
+    match method {
+        "eth_call" | "eth_estimateGas" | "eth_getProof" | "eth_getLogs" => 10,
+        "eth_sendRawTransaction" => 3,
+        _ => 1,
+    }
+}
 
 /// Map a [`evm::CallError`] onto the Ethereum JSON-RPC error
 /// surface: reverts use code `3` ("execution reverted") with the

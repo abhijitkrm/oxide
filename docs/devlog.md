@@ -20160,3 +20160,67 @@ inside 5 s instead of hanging), and
 `attest_state_bounded_returns_when_execution_lands` (the gate opens
 mid-wait; the call returns the real root — the timeout is a
 ceiling, not a fixed delay).
+
+## Session N+35 — RPC admission control charges what requests cost
+
+H7/M10. The RPC resource controls were bypassable in five ways:
+the blocking-permit semaphore was global-only (one client pinned
+all 64 slots), a 1,000-element batch spent one rate-limit unit
+(~100k calls/s per IP), `debug_trace*` was public by default,
+snapshot export cost the same as `eth_chainId`, and the per-IP
+bucket table itself was an unbounded attacker-controlled map.
+
+Every layer now charges cost, not count:
+
+- **Cost weighting.** `RpcServer::cost_of` prices a parsed body
+  before dispatch: batch elements sum individually (each priced by
+  `method_weight` — `debug_*` 50, `eth_call`/`eth_estimateGas`/
+  `eth_getProof`/`eth_getLogs` 10, `eth_sendRawTransaction` 3,
+  reads 1). A max-size batch spends 1,000+ units against the
+  100/s default; the `MAX_BATCH_REQUESTS` element cap still stands
+  inside dispatch as a second layer. Both handlers parse once and
+  pass the `Value` to `handle_parsed`/`handle_ws_parsed` — no
+  double serde pass on exactly the oversized bodies the weighting
+  exists to bound.
+- **Per-source in-flight cap.** `IpInflight` allows 8 concurrent
+  dispatches per bucket (`RPC_MAX_INFLIGHT_PER_IP`), held as an
+  RAII slot through `spawn_blocking` so the slot lives for the
+  task's real lifetime — one client can pin at most 1/8 of the
+  global pool.
+- **IPv6 /64 buckets.** `BucketKey` maps IPv6 sources to their
+  /64 prefix — SLAAC rotation within a LAN segment buys an
+  attacker nothing and can't grow the table. IPv4 keys per
+  address.
+- **Bounded, LRU-evicted state.** Both the rate table and the
+  in-flight map cap at 64K buckets; on overflow expired/idle
+  entries sweep first, then the least-recently-seen bucket is
+  evicted — an attacker can displace *idle* clients but cannot
+  lock out active ones (the old fail-closed refusal let a full
+  table reject every legitimate newcomer). `IpInflight` counters
+  are `Arc`-shared so an evicted bucket's live slots still
+  decrement on drop.
+- **Debug namespace opt-in.** `debug_trace*` returns
+  method-not-found unless `with_debug_api(true)` — wired from
+  `[rpc] enable_debug_api` (env `OXIDE_RPC_ENABLE_DEBUG_API`),
+  default off in `RpcConfig`, threaded through both binaries.
+  Tracing re-executes whole blocks; geth's `--http.api` excludes
+  `debug` the same way. Off-state errors are identical to
+  unregistered methods — no oracle for which namespaces exist.
+- **Heavy endpoints.** `snapshot_handler` charges weight 10 and
+  takes both a per-IP slot and a global permit — an export is
+  O(state), not O(request).
+
+Waits: none added — every refusal is a fast error (429/`-32005`),
+no queueing. Tests: per-element batch charging, weighted-method
+charging, /64 bucketing, LRU eviction under a full table, per-IP
+in-flight cap + release-on-drop, `cost_of` weighting matrix, debug
+gating on/off, and the 9 parity trace tests now run against an
+explicitly-enabled server. Runbook 11 documents the posture:
+validators keep RPC loopback-only; public traffic belongs on a
+fullnode behind an edge proxy.
+
+Residual: weights are coarse ratios, not measurements — they stop
+asymmetric floods, they don't price CPU. `eth_estimateGas` still
+runs its binary search inside one charge. The connection limiter
+remains global-only (per-IP conn caps would punish NAT'd
+legitimate clients — documented tradeoff).

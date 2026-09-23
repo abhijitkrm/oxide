@@ -112,11 +112,34 @@ pub struct RpcConfig {
     pub chain_id: u64,
     /// The base fee in wei per gas (EIP-1559).
     pub base_fee: u64,
+    /// Serve the `debug_trace*` namespace. Tracing re-executes whole
+    /// blocks — the heaviest calls on the endpoint — so it defaults
+    /// OFF: operators opt in on private deployments rather than pay
+    /// the exposure by default (geth's `--http.api` excludes `debug`
+    /// the same way). `OXIDE_RPC_ENABLE_DEBUG_API` overrides.
+    #[serde(default)]
+    pub enable_debug_api: bool,
 }
 
 impl Default for RpcConfig {
     fn default() -> Self {
-        Self { listen_addr: "127.0.0.1:8545".to_string(), chain_id: 1, base_fee: 1_000_000_000 }
+        Self {
+            listen_addr: "127.0.0.1:8545".to_string(),
+            chain_id: 1,
+            base_fee: 1_000_000_000,
+            enable_debug_api: false,
+        }
+    }
+}
+
+impl RpcConfig {
+    /// Apply overrides from `get` (the process env in production).
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(v) = get("OXIDE_RPC_ENABLE_DEBUG_API")
+            && let Ok(b) = v.parse::<bool>()
+        {
+            self.enable_debug_api = b;
+        }
     }
 }
 
@@ -173,6 +196,10 @@ impl Config {
         self.storage.apply_env(get);
         self.genesis.apply_env(get);
         self.exchange.apply_env(get);
+        // `rpc` is optional in TOML; an env-set RPC variable creates
+        // the section (binaries construct `RpcConfig::default()` when
+        // it's absent anyway, so this only makes env reachable).
+        self.rpc.get_or_insert_default().apply_env(get);
     }
 }
 

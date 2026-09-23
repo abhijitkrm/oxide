@@ -114,16 +114,52 @@ const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// ~8× under tokio's default 512-thread pool ceiling.
 const RPC_BLOCKING_PERMITS: usize = 64;
 
-/// Maximum distinct source IPs tracked by the rate limiter —
-/// now that buckets key on *real* connection IPs, an attacker
-/// rotating source addresses could otherwise grow the map
+/// Maximum distinct source buckets tracked by the rate limiter —
+/// now that buckets key on *real* connection IPs (IPv6 /64s), an
+/// attacker rotating source addresses could otherwise grow the map
 /// without bound (the limiter itself becoming the memory-DoS
-/// vector). On overflow the limiter first evicts expired windows;
-/// a still-full map refuses the request (fail closed — the
-/// attacked node rejects rather than allocates). Units: map
-/// entries. Tradeoff: 65,536 ≈ 64K IPs ≈ a few MB worst case —
+/// vector). On overflow the limiter first evicts expired windows,
+/// then the least-recently-seen bucket — an attacker can evict
+/// *idle* clients but cannot lock out active ones. Units: map
+/// entries. Tradeoff: 65,536 ≈ 64K buckets ≈ a few MB worst case —
 /// generous for real client diversity, bounded for memory.
 const MAX_RATE_BUCKETS: usize = 65_536;
+
+/// Maximum in-flight dispatches one client may hold at once.
+///
+/// The global `RPC_BLOCKING_PERMITS` semaphore bounds total
+/// expensive work; without a per-source cap a single client can
+/// pin every permit and starve all others (the "one IP pins the
+/// pool" half of the coupling finding). Units: in-flight blocking
+/// tasks per source bucket. Tradeoff: 8 leaves headroom for a
+/// legitimate dashboard's concurrent widgets while capping one
+/// client at 1/8 of the global pool.
+const RPC_MAX_INFLIGHT_PER_IP: usize = 8;
+
+/// Rate-limit bucket key: IPv4 addresses count individually; IPv6
+/// sources share their /64 prefix — the LAN segment an attacker
+/// can rotate within trivially (SLAAC/DHCPv6 give a host 2^64
+/// addresses), so per-address buckets there are both useless as
+/// limits and a map-growth vector.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum BucketKey {
+    /// A full IPv4 address.
+    V4(std::net::Ipv4Addr),
+    /// The first 64 bits of an IPv6 address (the /64 prefix).
+    V6(u64),
+}
+
+impl From<IpAddr> for BucketKey {
+    fn from(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Self::V4(v4),
+            IpAddr::V6(v6) => {
+                let octets = v6.octets();
+                Self::V6(u64::from_be_bytes(octets[..8].try_into().unwrap_or([0; 8])))
+            }
+        }
+    }
+}
 
 /// A process-wide cap on open RPC connections.
 ///
@@ -262,57 +298,151 @@ impl Listener for LimitedListener {
     }
 }
 
-/// A simple per-IP fixed-window rate limiter (HIGH fix).
+/// Per-request accounting state for one rate-limit bucket.
+struct Bucket {
+    /// Start of the current 1-second window.
+    window_start: Instant,
+    /// Cost units spent in the current window — requests are
+    /// weighted ([`RpcServer::cost_of`]) so a 100-element batch or a
+    /// `debug_trace*` call spends proportionally more budget than a
+    /// cheap read.
+    spent: u32,
+    /// Last touch — the LRU eviction key when the map is full.
+    last_seen: Instant,
+}
+
+/// A per-source fixed-window cost limiter (HIGH fix).
 ///
-/// Tracks request counts per IP in a `HashMap`. The window resets
-/// every second. This is a cold-path component (RPC, not consensus),
-/// so a `Mutex<HashMap>` is acceptable — the lock is held for a
-/// single `HashMap` lookup/update per request.
+/// Tracks *cost-weighted* spend per source bucket in a `HashMap`
+/// keyed by [`BucketKey`] (IPv4 address or IPv6 /64). The window
+/// resets every second. This is a cold-path component (RPC, not
+/// consensus), so a `Mutex<HashMap>` is acceptable — the lock is
+/// held for a single `HashMap` lookup/update per request.
 struct RateLimiter {
-    /// IP to `(window_start, request_count)`.
-    buckets: std::sync::Mutex<HashMap<IpAddr, (Instant, u32)>>,
-    /// Max requests per second per IP.
+    /// Source bucket to its accounting state.
+    buckets: std::sync::Mutex<HashMap<BucketKey, Bucket>>,
+    /// Max cost units per second per source.
     max_per_sec: u32,
+    /// Map bound — [`MAX_RATE_BUCKETS`] in production; tests lower
+    /// it to exercise eviction without filling 64K entries.
+    max_buckets: usize,
 }
 
 impl RateLimiter {
     fn new(max_per_sec: u32) -> Self {
-        Self { buckets: std::sync::Mutex::new(HashMap::new()), max_per_sec }
+        Self {
+            buckets: std::sync::Mutex::new(HashMap::new()),
+            max_per_sec,
+            max_buckets: MAX_RATE_BUCKETS,
+        }
     }
 
-    /// Check if a request from `ip` is allowed. Returns `true` if
-    /// the request is within the rate limit, `false` if it exceeds
-    /// it.
-    fn allow(&self, ip: IpAddr) -> bool {
+    /// Check if a request costing `cost` units from `ip` is allowed.
+    /// Cost weighting is what makes batches and heavy methods
+    /// honest: a 1000-element batch spends 1000+ units, not one.
+    fn allow_cost(&self, ip: IpAddr, cost: u32) -> bool {
         let mut buckets = primitives::sync::lock_state(&self.buckets);
         let now = Instant::now();
-        if let Some((window_start, count)) = buckets.get_mut(&ip) {
-            if now.duration_since(*window_start) >= Duration::from_secs(1) {
+        let key = BucketKey::from(ip);
+        if let Some(bucket) = buckets.get_mut(&key) {
+            bucket.last_seen = now;
+            if now.duration_since(bucket.window_start) >= Duration::from_secs(1) {
                 // Reset the window.
-                *window_start = now;
-                *count = 1;
-                true
-            } else if *count < self.max_per_sec {
-                *count += 1;
-                true
-            } else {
-                false
+                bucket.window_start = now;
+                bucket.spent = 0;
             }
-        } else {
-            // Bound the map: real per-IP keys mean an attacker
-            // rotating source addresses could otherwise allocate
-            // without limit. Sweep expired windows first; a map
-            // still at cap refuses rather than grows.
-            if buckets.len() >= MAX_RATE_BUCKETS {
-                buckets.retain(|_, (window_start, _)| {
-                    now.duration_since(*window_start) < Duration::from_secs(1)
-                });
-                if buckets.len() >= MAX_RATE_BUCKETS {
-                    return false;
-                }
+            if bucket.spent.saturating_add(cost) <= self.max_per_sec {
+                bucket.spent = bucket.spent.saturating_add(cost);
+                return true;
             }
-            buckets.insert(ip, (now, 1));
-            true
+            return false;
+        }
+        // Bound the map: real per-source keys mean an attacker
+        // rotating source addresses could otherwise allocate
+        // without limit. Sweep expired windows first; a map still
+        // at cap evicts the least-recently-seen bucket — an
+        // attacker can displace idle clients but cannot refuse
+        // service to active ones (the old fail-closed refusal let a
+        // full table lock out every new client).
+        if buckets.len() >= self.max_buckets {
+            buckets.retain(|_, b| now.duration_since(b.window_start) < Duration::from_secs(1));
+            if buckets.len() >= self.max_buckets
+                && let Some(oldest) =
+                    buckets.iter().min_by_key(|(_, b)| b.last_seen).map(|(k, _)| *k)
+            {
+                buckets.remove(&oldest);
+            }
+        }
+        if cost > self.max_per_sec {
+            // A single request costlier than the whole window can
+            // never be served — refuse it without spending a bucket.
+            return false;
+        }
+        buckets.insert(key, Bucket { window_start: now, spent: cost, last_seen: now });
+        true
+    }
+
+    /// Single-unit admission — the common case for non-dispatch
+    /// endpoints (health, manifest, cert) that cost one unit each.
+    fn allow(&self, ip: IpAddr) -> bool {
+        self.allow_cost(ip, 1)
+    }
+}
+
+/// Per-source cap on in-flight dispatches: the per-IP half of the
+/// global `work_permits` bound so one client cannot pin the whole
+/// blocking pool. Counters live behind `Arc` so an evicted bucket's
+/// in-flight entries still decrement correctly — the slot guard
+/// outlives its map entry.
+struct IpInflight {
+    /// Source bucket to its live in-flight counter.
+    counters: std::sync::Mutex<HashMap<BucketKey, Arc<AtomicUsize>>>,
+}
+
+/// RAII guard decrementing the source's in-flight count on drop —
+/// the permit rides through `spawn_blocking` so the slot is held
+/// for the dispatch's real lifetime, not the handler's.
+struct IpSlot {
+    /// The per-source counter this slot holds.
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl IpInflight {
+    fn new() -> Self {
+        Self { counters: std::sync::Mutex::new(HashMap::new()) }
+    }
+
+    /// Try to take one in-flight slot for `ip`. `None` when the
+    /// source already holds [`RPC_MAX_INFLIGHT_PER_IP`] slots.
+    fn try_acquire(&self, ip: IpAddr) -> Option<IpSlot> {
+        let key = BucketKey::from(ip);
+        let mut counters = primitives::sync::lock_state(&self.counters);
+        // Bound the counter map like the rate table: when a new
+        // source would overflow it, evict entries whose count is
+        // zero — idle buckets only, since a live entry's guard
+        // decrements its own `Arc` even after eviction.
+        if !counters.contains_key(&key) && counters.len() >= MAX_RATE_BUCKETS {
+            counters.retain(|_, c| c.load(Ordering::Acquire) > 0);
+            if counters.len() >= MAX_RATE_BUCKETS {
+                return None;
+            }
+        }
+        let counter = counters.entry(key).or_insert_with(|| Arc::new(AtomicUsize::new(0)));
+        let mut cur = counter.load(Ordering::Acquire);
+        loop {
+            if cur >= RPC_MAX_INFLIGHT_PER_IP {
+                return None;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(IpSlot { counter: Arc::clone(counter) }),
+                Err(next) => cur = next,
+            }
         }
     }
 }
@@ -331,6 +461,9 @@ struct RpcState {
     /// Bound on concurrent `spawn_blocking` dispatches — covers
     /// HTTP handlers, WS frames, and snapshot exports.
     work_permits: Arc<Semaphore>,
+    /// Per-source bound on in-flight dispatches — the global
+    /// semaphore's companion so one client can't pin every permit.
+    inflight: Arc<IpInflight>,
 }
 
 /// The HTTP server wrapping an [`RpcServer`] in an axum router.
@@ -442,6 +575,7 @@ impl HttpServer {
             rpc,
             rate_limiter,
             work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
+            inflight: Arc::new(IpInflight::new()),
         };
         Router::new()
             .route("/", post(handle_rpc).get(ws_handler))
@@ -488,12 +622,25 @@ async fn handle_rpc(
     State(state): State<RpcState>,
     body: String,
 ) -> Response<String> {
-    // Rate-limit per REAL connection IP — `ConnectInfo` is the
-    // peer address axum accepted, so one client can no longer
-    // consume the quota other clients share.
-    if !state.rate_limiter.allow(addr.ip()) {
+    // Parse once up front: the request's *cost* (batch size +
+    // per-method weight) is what the rate limiter must charge —
+    // a 1,000-element batch spending one unit was the cheap-CPU
+    // bypass. A body that doesn't parse costs one unit and falls
+    // through to `handle_raw`, which answers the parse error.
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
+    let cost = parsed.as_ref().map_or(1, |v| state.rpc.cost_of(v));
+    // Rate-limit per REAL connection source bucket — `ConnectInfo`
+    // is the peer address axum accepted (IPv6 sources share their
+    // /64), so one client can no longer consume the quota other
+    // clients share or bypass the budget with batching.
+    if !state.rate_limiter.allow_cost(addr.ip(), cost) {
         return rate_limited_response();
     }
+    // Per-source in-flight cap: without it a single client can
+    // pin every global permit and starve everyone else.
+    let Some(ip_slot) = state.inflight.try_acquire(addr.ip()) else {
+        return busy_response();
+    };
     // Bound concurrent expensive dispatches: `spawn_blocking`
     // tasks cannot be cancelled once running (a timed-out request
     // still occupies its slot), so an unbounded spawn rate would
@@ -511,7 +658,11 @@ async fn handle_rpc(
     let rpc2 = Arc::clone(&state.rpc);
     let work = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        rpc2.handle_raw(&body)
+        let _ip_slot = ip_slot;
+        match &parsed {
+            Ok(body) => rpc2.handle_parsed(body),
+            Err(_) => rpc2.handle_raw(&body),
+        }
     });
     let response = match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, work).await {
         Ok(Ok(response)) => response,
@@ -589,9 +740,15 @@ async fn handle_ws_socket(mut socket: WebSocket, state: RpcState, ip: IpAddr) {
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     // Transport-independent budget: a WS frame
-                    // costs the same per-IP quota as an HTTP POST,
-                    // so switching transports buys a client nothing.
-                    if !state.rate_limiter.allow(ip) {
+                    // costs the same per-source quota as an HTTP
+                    // POST — weighted by batch size and method, so
+                    // switching transports or batching buys a
+                    // client nothing.
+                    let parsed: Result<serde_json::Value, _> =
+                        serde_json::from_str(&text);
+                    let cost =
+                        parsed.as_ref().map_or(1, |v| state.rpc.cost_of(v));
+                    if !state.rate_limiter.allow_cost(ip, cost) {
                         if conn.sink.send(
                             r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"rate limit exceeded"},"id":null}"#.to_string()
                         ).is_err() {
@@ -599,6 +756,15 @@ async fn handle_ws_socket(mut socket: WebSocket, state: RpcState, ip: IpAddr) {
                         }
                         continue;
                     }
+                    // Per-source in-flight cap, same as HTTP.
+                    let Some(ip_slot) = state.inflight.try_acquire(ip) else {
+                        if conn.sink.send(
+                            r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"server busy — too many in-flight requests"},"id":null}"#.to_string()
+                        ).is_err() {
+                            break;
+                        }
+                        continue;
+                    };
                     // Same bounded-work rule as HTTP: synchronous
                     // dispatch never runs on the async task, and
                     // the semaphore caps total in-flight work.
@@ -616,7 +782,11 @@ async fn handle_ws_socket(mut socket: WebSocket, state: RpcState, ip: IpAddr) {
                     // subscriptions may be half-bound.
                     let Ok(response) = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
-                        rpc2.handle_ws_raw(&text, &conn2)
+                        let _ip_slot = ip_slot;
+                        match &parsed {
+                            Ok(body) => rpc2.handle_ws_parsed(body, &conn2),
+                            Err(_) => rpc2.handle_ws_raw(&text, &conn2),
+                        }
                     }).await else { break };
                     if conn.sink.send(response).is_err() {
                         break;
@@ -655,17 +825,23 @@ async fn snapshot_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<RpcState>,
 ) -> Response<String> {
-    // A full export serializes the entire state — it costs quota
-    // AND a blocking-pool slot like any other expensive request.
-    if !state.rate_limiter.allow(addr.ip()) {
+    // A full export serializes the entire state — it costs weighted
+    // quota AND a blocking-pool slot like any other expensive
+    // request. Weight 10 (same class as `eth_call`/log sweeps):
+    // an export is O(state size), not O(request).
+    if !state.rate_limiter.allow_cost(addr.ip(), 10) {
         return rate_limited_response();
     }
+    let Some(ip_slot) = state.inflight.try_acquire(addr.ip()) else {
+        return busy_response();
+    };
     let Ok(permit) = state.work_permits.clone().try_acquire_owned() else {
         return busy_response();
     };
     match state.rpc.snapshot_provider().cloned() {
         Some(provider) => match tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _ip_slot = ip_slot;
             provider.export_snapshot()
         })
         .await
@@ -986,6 +1162,7 @@ mod tests {
             rpc: Arc::new(RpcServer::new(1, 1_000_000_000)),
             rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
             work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
+            inflight: Arc::new(IpInflight::new()),
         }
     }
 
@@ -1110,6 +1287,7 @@ mod tests {
             rpc,
             rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
             work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
+            inflight: Arc::new(IpInflight::new()),
         };
         let response = health_check(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1154,6 +1332,7 @@ mod tests {
             rpc,
             rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
             work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
+            inflight: Arc::new(IpInflight::new()),
         };
         let addr: SocketAddr = "127.0.0.1:8545".parse().unwrap();
         let response = metrics_handler(ConnectInfo(addr), State(state)).await;
@@ -1181,6 +1360,7 @@ mod tests {
             rpc: Arc::new(RpcServer::new(1, 1_000_000_000)),
             rate_limiter: Arc::new(RateLimiter::new(max_per_sec)),
             work_permits: Arc::new(Semaphore::new(permits)),
+            inflight: Arc::new(IpInflight::new()),
         }
     }
 
@@ -1274,5 +1454,121 @@ mod tests {
         assert_eq!(limiter.open_count(), 1);
         let _p3 = limiter.try_acquire().expect("slot freed after close");
         drop(p2);
+    }
+
+    /// Batches cost per element now: a 3-element batch spends 3
+    /// units, so a budget of 2 refuses it — the "one thousand
+    /// elements, one hit" bypass is closed.
+    #[tokio::test]
+    async fn batch_requests_charge_per_element() {
+        let state = test_state(2, 8);
+        let a: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+        let batch = r#"[
+            {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1},
+            {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":2},
+            {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":3}
+        ]"#
+        .to_string();
+        let response = handle_rpc(ConnectInfo(a), State(state.clone()), batch).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a 3-element batch must spend 3 units against a budget of 2"
+        );
+        // A 2-element batch fits the same budget.
+        let pair = r#"[
+            {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1},
+            {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":2}
+        ]"#
+        .to_string();
+        let response = handle_rpc(ConnectInfo(a), State(state), pair).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Heavy methods weigh more: `eth_call` spends 10 units, so a
+    /// budget of 5 refuses a single call even though it is one
+    /// request — cost weighting, not request counting.
+    #[tokio::test]
+    async fn heavy_methods_charge_weighted_cost() {
+        let state = test_state(5, 8);
+        let a: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+        let call = r#"{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"0x0000000000000000000000000000000000000000","data":"0x"},"latest"],"id":1}"#
+            .to_string();
+        let response = handle_rpc(ConnectInfo(a), State(state), call).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "eth_call (weight 10) must exceed a budget of 5"
+        );
+    }
+
+    /// IPv6 sources share a /64 bucket: two addresses in the same
+    /// prefix spend one budget (SLAAC rotation buys nothing), while
+    /// a different /64 is independent.
+    #[test]
+    fn rate_limiter_buckets_ipv6_by_64() {
+        let limiter = RateLimiter::new(1);
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::9999".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:ffff::1".parse().unwrap();
+        assert!(limiter.allow(a));
+        assert!(!limiter.allow(b), "same /64 shares the bucket");
+        assert!(limiter.allow(other_prefix), "a different /64 is independent");
+    }
+
+    /// A full table evicts the least-recently-seen bucket instead
+    /// of refusing every new client — the attacked node degrades
+    /// idle entries, never locks out.
+    #[test]
+    fn rate_limiter_evicts_lru_when_full() {
+        let mut limiter = RateLimiter::new(1);
+        limiter.max_buckets = 3;
+        let stale: IpAddr = "10.0.0.9".parse().unwrap();
+        let active_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let active_b: IpAddr = "10.0.0.2".parse().unwrap();
+        let newcomer: IpAddr = "10.0.0.3".parse().unwrap();
+        assert!(limiter.allow(stale));
+        assert!(limiter.allow(active_a));
+        assert!(limiter.allow(active_b));
+        // Make `stale` the LRU entry by backdating its last_seen.
+        {
+            let mut buckets = primitives::sync::lock_state(&limiter.buckets);
+            let b = buckets.get_mut(&BucketKey::from(stale)).unwrap();
+            b.last_seen =
+                Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
+        }
+        // All windows are still live (spent budget intact), so the
+        // expired sweep frees nothing — LRU eviction must pick
+        // `stale`, and the newcomer's own budget then applies.
+        assert!(limiter.allow(newcomer), "a full table evicts LRU, not the newcomer");
+        assert!(!limiter.allow(newcomer), "the newcomer's budget still applies");
+        {
+            let buckets = primitives::sync::lock_state(&limiter.buckets);
+            assert!(
+                !buckets.contains_key(&BucketKey::from(stale)),
+                "the least-recently-seen bucket was evicted"
+            );
+            assert!(buckets.contains_key(&BucketKey::from(active_a)));
+            assert!(buckets.contains_key(&BucketKey::from(active_b)));
+        }
+    }
+
+    /// One source may hold at most `RPC_MAX_INFLIGHT_PER_IP`
+    /// in-flight dispatches; slots release on drop and other
+    /// sources are unaffected.
+    #[test]
+    fn ip_inflight_caps_per_source() {
+        let inflight = IpInflight::new();
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        let slots: Vec<IpSlot> =
+            (0..RPC_MAX_INFLIGHT_PER_IP).map(|_| inflight.try_acquire(a).unwrap()).collect();
+        assert!(
+            inflight.try_acquire(a).is_none(),
+            "the per-IP cap must refuse past {RPC_MAX_INFLIGHT_PER_IP}"
+        );
+        assert!(inflight.try_acquire(b).is_some(), "another source is unaffected");
+        drop(slots);
+        assert!(inflight.try_acquire(a).is_some(), "dropped slots release");
     }
 }

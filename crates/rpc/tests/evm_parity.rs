@@ -119,7 +119,10 @@ fn make_harness() -> Harness {
     }
     evm.end_block(Height::new(1));
 
-    let mut rpc = RpcServer::new(1, 7);
+    // The harness exercises `debug_trace*` — the namespace is
+    // opt-in, so the test enables it the same way an operator's
+    // `rpc.enable_debug_api` would.
+    let mut rpc = RpcServer::new(1, 7).with_debug_api(true);
     rpc.set_evm(evm.clone());
     rpc.set_block_height(1);
     Harness { rpc, evm, sender, log_contract, return_contract, revert_contract, sstore_contract }

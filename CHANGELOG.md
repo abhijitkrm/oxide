@@ -38,6 +38,28 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **RPC admission control is cost-weighted and per-source**
+  (`rpc`, `config`): the per-IP rate limiter now charges each
+  request its real cost — batch elements count individually and
+  heavy methods weigh more (`debug_trace*` 50, `eth_call`/
+  `eth_estimateGas`/`eth_getProof`/`eth_getLogs` 10,
+  `eth_sendRawTransaction` 3, cheap reads 1) — so a 1,000-element
+  batch no longer spends one unit of budget. A new per-source
+  in-flight cap (8 concurrent dispatches) keeps one client from
+  pinning the global blocking-work pool, IPv6 sources share a /64
+  bucket so address rotation buys nothing, and the bucket table is
+  bounded with LRU eviction instead of refusing all newcomers when
+  full. `debug_trace*` is disabled unless `[rpc] enable_debug_api`
+  (env `OXIDE_RPC_ENABLE_DEBUG_API`) is set — tracing re-executes
+  whole blocks, so it is now opt-in like geth's `--http.api`.
+  Runbook 11 documents the posture: validators keep RPC on
+  loopback; public traffic belongs on a fullnode.
+  - **In plain words:** one IP used to be able to run ~100,000
+    calls a second by stuffing a batch, or pin every worker slot,
+    or trace blocks for free. Now every request pays for what it
+    actually costs, one client can't hog the pool, and the
+    heaviest API is off unless you turn it on.
+
 - **Consensus certificates carry proof of verification**
   (`consensus`): the engine's two safety-anchoring fields —
   `high_qc` (the QC every proposal extends) and `last_tc` (the

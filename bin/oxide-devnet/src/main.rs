@@ -592,7 +592,8 @@ fn start_devnet_rpc(
         if rpc_config.listen_addr.is_empty() { None } else { Some(rpc_config.listen_addr.clone()) }
     })?;
 
-    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee);
+    let mut rpc_server = rpc::RpcServer::new(rpc_config.chain_id, rpc_config.base_fee)
+        .with_debug_api(rpc_config.enable_debug_api);
     // Gossip-aware submitter: accepted txs are broadcast to all peers
     // so a tx sent to a non-leader still reaches the current leader.
     rpc_server.set_tx_submitter(Arc::new(node::rpc_adapters::GossipingTxSubmitter {
