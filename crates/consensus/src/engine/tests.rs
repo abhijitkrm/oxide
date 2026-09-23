@@ -5569,6 +5569,11 @@ fn drive_epoch_changes_rotates_committee() {
         removes: Vec::new(),
     });
     assert_eq!(engine.drive_epoch_changes().expect("drive"), 1);
+    // The transition is staged, not yet active: activation waits for
+    // the certified activation height. `rotate_epoch` force-completes
+    // — the test/sim path a production node reaches via the delay.
+    assert!(engine.rotation_pending());
+    engine.rotate_epoch().expect("activate");
     assert_eq!(engine.epoch(), Epoch::new(1));
     assert_eq!(engine.validator_set().n(), 2);
     // A second drain sees nothing — the queues were consumed.
@@ -5594,6 +5599,7 @@ fn drive_epoch_changes_combines_key_add_remove() {
     });
     let applied = engine.drive_epoch_changes().expect("drive");
     assert_eq!(applied, 3, "key change + remove + add");
+    engine.rotate_epoch().expect("activate");
     assert_eq!(engine.epoch(), Epoch::new(1));
     let new_set = engine.validator_set();
     // Original members 0 removed; 1..3 remain, plus the append.
@@ -5620,6 +5626,7 @@ fn drive_epoch_changes_dedups_replayed_transition() {
     };
     app.queue_epoch_changes(change.clone());
     assert_eq!(engine.drive_epoch_changes().expect("drive"), 1);
+    engine.rotate_epoch().expect("activate");
     assert_eq!(engine.epoch(), Epoch::new(1));
     // Replay: the same deltas re-pend after a restart — the
     // candidate equals the current set, so it is a no-op, not
@@ -5647,9 +5654,298 @@ fn rotation_reseats_validator_index() {
         removes: vec![removed_addr],
     });
     engine.drive_epoch_changes().expect("drive");
+    engine.rotate_epoch().expect("activate");
     // Validator 0 removed → our key now sits at index 2.
     assert_eq!(engine.validator_index(), 2);
     assert_eq!(engine.validator_set().index_of_key(&keys[3].public_key()), Some(2));
+}
+
+/// The production drain must not activate membership at the commit
+/// that staged it: the transition schedules at a certified future
+/// height, stays pending until that height finalizes, and completes
+/// there deterministically — the window in which the network layer
+/// admits incoming members' peer connections.
+#[test]
+fn drive_epoch_changes_defers_activation_until_certified_height() {
+    let app = Arc::new(MockApp::new());
+    let mut engine =
+        OxideBft::new(app.clone(), single_validator_set()).without_signature_verification();
+    app.queue_epoch_changes(types::EpochChanges {
+        key_changes: Vec::new(),
+        adds: vec![(primitives::Address([0x09; 20]), vpk(&bls_key(9)), 1)],
+        removes: Vec::new(),
+    });
+    // Nothing committed yet: activation is height 0 + DELAY.
+    assert_eq!(engine.drive_epoch_changes().expect("drive"), 1);
+    assert!(engine.rotation_pending(), "transition must be staged, not applied");
+    assert_eq!(engine.epoch(), Epoch::new(0), "no epoch bump before activation");
+    assert_eq!(engine.rotation_activation_height(), Some(crate::engine::ROTATION_ACTIVATION_DELAY),);
+    assert_eq!(
+        engine.next_validator_set().expect("pending set").n(),
+        2,
+        "the incoming committee is observable during the window"
+    );
+
+    // A second delta queued mid-window is NOT drained — draining
+    // would either lose the record or collide with the pending
+    // schedule; it waits for the next transition instead.
+    app.queue_epoch_changes(types::EpochChanges {
+        key_changes: Vec::new(),
+        adds: vec![(primitives::Address([0x0B; 20]), vpk(&bls_key(10)), 1)],
+        removes: Vec::new(),
+    });
+    engine.last_committed = Some((Hash([0x11; 32]), Height::new(1)));
+    assert_eq!(
+        engine.drive_epoch_changes().expect("drive below activation"),
+        0,
+        "below the activation height the pending set holds"
+    );
+    assert!(engine.rotation_pending());
+    assert_eq!(engine.validator_set().n(), 1, "still the old committee");
+
+    // Reaching the activation height completes the rotation.
+    engine.last_committed = Some((Hash([0x22; 32]), Height::new(2)));
+    assert_eq!(engine.drive_epoch_changes().expect("drive at activation"), 0);
+    assert_eq!(engine.epoch(), Epoch::new(1));
+    assert_eq!(engine.validator_set().n(), 2);
+    assert!(!engine.rotation_pending());
+
+    // The queued delta drains into the NEXT transition — it
+    // survived the window instead of being dropped.
+    assert_eq!(engine.drive_epoch_changes().expect("drive next"), 1);
+    assert_eq!(engine.next_validator_set().expect("second pending set").n(), 3);
+    engine.rotate_epoch().expect("activate second");
+    assert_eq!(engine.epoch(), Epoch::new(2));
+    assert_eq!(engine.validator_set().n(), 3);
+}
+
+/// A node holding the right committee but a stale epoch (joiner
+/// configured with the current committee mid-epoch, or a restart
+/// whose WAL predates the last rotation) adopts the epoch a
+/// verified QC certifies: the aggregate signature binding
+/// `(view, phase, block, epoch)` is the handoff proof.
+#[test]
+fn deliver_qc_adopts_certified_epoch() {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+    // We are key 2 but believe index 0 — adoption must re-seat by key.
+    let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+        .with_secret_key(keys[2].clone());
+    assert_eq!(engine.epoch(), Epoch::new(0));
+
+    // The committee mints a QC at view 5 of epoch 1 — the first
+    // epoch-1 view the joiner can see.
+    let block_hash = Hash([0xAB; 32]);
+    let msg = crate::verify::vote_signing_message(
+        Epoch::new(1),
+        View::new(5),
+        VotePhase::Prepare as u8,
+        &block_hash,
+    );
+    let sigs: Vec<crypto::Signature> =
+        keys.iter().map(|k| k.sign(crypto::hash::Domain::Vote, &msg)).collect();
+    let qc = QuorumCertificate {
+        view: View::new(5),
+        phase: VotePhase::Prepare,
+        block_hash,
+        epoch: Epoch::new(1),
+        signer_bitmap: vec![0b0000_1111],
+        aggregate_signature: crypto::aggregate(&sigs).expect("aggregate"),
+    };
+    engine.deliver_qc(qc).expect("certified epoch must adopt");
+
+    assert_eq!(engine.epoch(), Epoch::new(1), "epoch adopted from the certified QC");
+    assert_eq!(engine.current_view(), View::new(6), "view catch-up runs after adoption");
+    assert_eq!(engine.validator_index(), 2, "index re-seated by key on adoption");
+    assert_eq!(
+        engine.pacemaker.current_epoch(),
+        Epoch::new(1),
+        "pacemaker rebuilt under the adopted epoch — timeouts attest it"
+    );
+}
+
+/// The adoption path is fail-closed: a QC claiming a higher epoch
+/// whose signers are NOT our committee fails verification under the
+/// claimed epoch and is rejected — a node that genuinely missed a
+/// rotation cannot invent membership by accepting it.
+#[test]
+fn deliver_qc_rejects_future_epoch_from_foreign_committee() {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+    let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), vs, 0);
+
+    // A FOREIGN committee (keys 9..12) signs an epoch-1 QC — the
+    // bitmap resolves to OUR keys, so the aggregate must fail.
+    let foreign: Vec<crypto::BlsSecretKey> = (9..=12u8).map(bls_key).collect();
+    let block_hash = Hash([0xCD; 32]);
+    let msg = crate::verify::vote_signing_message(
+        Epoch::new(1),
+        View::new(3),
+        VotePhase::Prepare as u8,
+        &block_hash,
+    );
+    let sigs: Vec<crypto::Signature> =
+        foreign.iter().map(|k| k.sign(crypto::hash::Domain::Vote, &msg)).collect();
+    let qc = QuorumCertificate {
+        view: View::new(3),
+        phase: VotePhase::Prepare,
+        block_hash,
+        epoch: Epoch::new(1),
+        signer_bitmap: vec![0b0000_1111],
+        aggregate_signature: crypto::aggregate(&sigs).expect("aggregate"),
+    };
+    assert!(engine.deliver_qc(qc).is_err(), "foreign-committee QC must not verify");
+    assert_eq!(engine.epoch(), Epoch::new(0), "no adoption on a failed verify");
+    assert!(engine.high_qc().is_none());
+}
+
+/// Backward epochs are never adopted: a QC from an old epoch is
+/// dead evidence — its bitmap indexes a committee we no longer
+/// hold — so it is refused before any state touches it, and the
+/// epoch counter can never roll back.
+#[test]
+fn deliver_qc_rejects_backward_epoch() {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+    let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+        .with_secret_key(keys[0].clone());
+    engine.schedule_rotation(vs).expect("schedule same set");
+    engine.rotate_epoch().expect("rotate to epoch 1");
+    assert_eq!(engine.epoch(), Epoch::new(1));
+
+    // A QC validly signed under epoch 0 arrives late.
+    let block_hash = Hash([0xEF; 32]);
+    let msg = crate::verify::vote_signing_message(
+        Epoch::new(0),
+        View::new(7),
+        VotePhase::Prepare as u8,
+        &block_hash,
+    );
+    let sigs: Vec<crypto::Signature> =
+        keys.iter().map(|k| k.sign(crypto::hash::Domain::Vote, &msg)).collect();
+    let qc = QuorumCertificate {
+        view: View::new(7),
+        phase: VotePhase::Prepare,
+        block_hash,
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_1111],
+        aggregate_signature: crypto::aggregate(&sigs).expect("aggregate"),
+    };
+    assert!(
+        matches!(
+            engine.deliver_qc(qc),
+            Err(ConsensusError::PastEpochQc { qc_epoch, epoch })
+            if qc_epoch == Epoch::new(0) && epoch == Epoch::new(1)
+        ),
+        "a QC signed under a past epoch is refused as dead evidence"
+    );
+    assert_eq!(engine.epoch(), Epoch::new(1));
+}
+
+/// The mid-window restart case: a node that was down across the
+/// activation boundary holds the OLD committee live and the NEW
+/// committee staged (re-derived from the committed transition on
+/// recovery). A QC signed by the staged committee at the new epoch
+/// is certified proof that committee operated — the engine installs
+/// the staged set and adopts the epoch it proved, recovering
+/// membership it could never have verified under the stale set.
+#[test]
+fn deliver_qc_adopts_pending_committee_and_epoch() {
+    let old_keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let old_pks: Vec<crypto::bls::PublicKey> =
+        old_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let old_vs = ValidatorSet::new(old_pks, vec![1u64; 4]).expect("old committee");
+
+    // The staged committee swaps member 0 for key 9 (a remove+add
+    // the old set certified before this node went down).
+    let new_keys: Vec<crypto::BlsSecretKey> = vec![bls_key(9), bls_key(2), bls_key(3), bls_key(4)];
+    let new_pks: Vec<crypto::bls::PublicKey> =
+        new_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let new_vs = ValidatorSet::new(new_pks, vec![1u64; 4]).expect("new committee");
+
+    // We are key 2 in the old committee — still a member of the new
+    // one at the same position. The engine holds old-set + staged
+    // new set at epoch 0.
+    let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), old_vs.clone(), 1)
+        .with_secret_key(old_keys[1].clone());
+    engine.schedule_rotation(new_vs.clone()).expect("stage the certified transition");
+    assert!(engine.rotation_pending());
+
+    // A quorum of the NEW committee signs a QC at epoch 1 — key 9's
+    // signature cannot verify under the old committee (bitmap bit 0
+    // resolves to old key 1), so only the pending-set path admits it.
+    let block_hash = Hash([0x5A; 32]);
+    let msg = crate::verify::vote_signing_message(
+        Epoch::new(1),
+        View::new(0),
+        VotePhase::Prepare as u8,
+        &block_hash,
+    );
+    let sigs: Vec<crypto::Signature> =
+        new_keys.iter().map(|k| k.sign(crypto::hash::Domain::Vote, &msg)).collect();
+    let qc = QuorumCertificate {
+        view: View::new(0),
+        phase: VotePhase::Prepare,
+        block_hash,
+        epoch: Epoch::new(1),
+        signer_bitmap: vec![0b0000_1111],
+        aggregate_signature: crypto::aggregate(&sigs).expect("aggregate"),
+    };
+    engine.deliver_qc(qc).expect("pending-committee QC must adopt");
+
+    assert_eq!(engine.epoch(), Epoch::new(1), "epoch adopted from the staged set's QC");
+    assert_eq!(engine.validator_set(), &new_vs, "the staged committee becomes the live committee");
+    assert!(!engine.rotation_pending(), "adoption consumed the pending rotation");
+    assert_eq!(engine.validator_index(), 1, "index re-seated under the new committee");
+    assert_eq!(engine.pacemaker.current_epoch(), Epoch::new(1));
+}
+
+/// The pending-set path stays fail-closed: a staged rotation plus a
+/// QC signed by keys in NEITHER committee cannot adopt — the bitmap
+/// resolves to real members whose signatures were never produced.
+#[test]
+fn deliver_qc_rejects_pending_committee_mismatch() {
+    let old_keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let old_pks: Vec<crypto::bls::PublicKey> =
+        old_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let old_vs = ValidatorSet::new(old_pks, vec![1u64; 4]).expect("old committee");
+    let new_keys: Vec<crypto::BlsSecretKey> = (5..=8u8).map(bls_key).collect();
+    let new_pks: Vec<crypto::bls::PublicKey> =
+        new_keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let new_vs = ValidatorSet::new(new_pks, vec![1u64; 4]).expect("new committee");
+
+    let mut engine = OxideBft::with_index(Arc::new(MockApp::new()), old_vs, 0);
+    engine.schedule_rotation(new_vs).expect("stage transition");
+
+    // A THIRD committee (keys 20..24) signs — matches neither the
+    // live nor the staged set, so both verifications fail.
+    let foreign: Vec<crypto::BlsSecretKey> = (20..=23u8).map(bls_key).collect();
+    let block_hash = Hash([0x6B; 32]);
+    let msg = crate::verify::vote_signing_message(
+        Epoch::new(1),
+        View::new(0),
+        VotePhase::Prepare as u8,
+        &block_hash,
+    );
+    let sigs: Vec<crypto::Signature> =
+        foreign.iter().map(|k| k.sign(crypto::hash::Domain::Vote, &msg)).collect();
+    let qc = QuorumCertificate {
+        view: View::new(0),
+        phase: VotePhase::Prepare,
+        block_hash,
+        epoch: Epoch::new(1),
+        signer_bitmap: vec![0b0000_1111],
+        aggregate_signature: crypto::aggregate(&sigs).expect("aggregate"),
+    };
+    assert!(engine.deliver_qc(qc).is_err(), "foreign QC must not adopt via pending set");
+    assert_eq!(engine.epoch(), Epoch::new(0));
+    assert!(engine.rotation_pending(), "the staged rotation survives the rejection");
 }
 
 /// Recovery is a full lifecycle restore: the rotated committee,

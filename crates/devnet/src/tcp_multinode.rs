@@ -83,18 +83,20 @@ const MSG_PROPOSAL: u8 = 0x03;
 /// split used by `Commonware` `marshal::coding` and `LayerZero` `Zero`.
 const MSG_SHARD: u8 = 0x04;
 
-/// Per-receiver reliable fallback queue: `(sender_index, frame)`.
+/// Per-receiver reliable fallback queue: `(sender_peer_id, frame)`.
 /// The threaded driver drops frames here when a peer's TCP writer
 /// channel reports `ChannelFull`, preserving the harness's "no
 /// message loss" invariant without blocking the sender's hot loop —
-/// the receiving validator drains its inbox each iteration.
-type Inboxes = Vec<Arc<std::sync::Mutex<VecDeque<(u8, Vec<u8>)>>>>;
+/// the receiving validator drains its inbox each iteration. Peer IDs
+/// are staking addresses (the same bytes the TCP layer proves
+/// ownership of), so attribution survives committee reshuffles.
+type Inboxes = Vec<Arc<std::sync::Mutex<VecDeque<(Vec<u8>, Vec<u8>)>>>>;
 
 /// Mutable per-validator state the inbound dispatcher needs beyond
 /// the engine: future-view headers awaiting vote retry, reassembling
-/// body shards keyed by block hash, the relay out-queue (our
-/// assigned shard for peers), and our own index for the
-/// relay-ownership rule.
+/// body shards keyed by block hash, and the relay out-queue (our
+/// assigned shard for peers — ownership derives from the engine's
+/// live seat, not a stored index).
 struct DispatchState<'a> {
     /// Future-view headers queued for `vote_header` retry.
     pending: &'a mut BTreeMap<u64, types::BlockHeader>,
@@ -102,16 +104,15 @@ struct DispatchState<'a> {
     shard_sets: &'a mut HashMap<primitives::Hash, (types::shard::ShardSet, u64)>,
     /// Shard frames to forward to every peer this pass.
     relays: &'a mut Vec<Vec<u8>>,
-    /// This validator's index — the relay-ownership check.
-    me: u8,
     /// Reconstruction threshold for reassembling bodies — the
     /// committee's `erasure_params` output, identical on every
     /// validator because it derives from the shared stakes.
     shard_k: usize,
     /// Per-sender proposal-verify budget: `(window start, count)`
     /// per peer — mirrors the binary pump's bound so harness floods
-    /// see the same admission behavior as the shipped driver.
-    verify_budget: &'a mut HashMap<u8, (std::time::Instant, u32)>,
+    /// see the same admission behavior as the shipped driver. Keyed
+    /// by the authenticated peer id (staking-address bytes).
+    verify_budget: &'a mut HashMap<Vec<u8>, (std::time::Instant, u32)>,
 }
 
 /// A TCP-based multi-node devnet: N validators running oxideBFT with
@@ -123,6 +124,22 @@ pub struct TcpMultiNodeDevnet {
     apps: Vec<Arc<Executor>>,
     /// One TCP transport per validator.
     transports: Vec<p2p::tcp::TcpTransport>,
+    /// Spawn-order staking addresses — `validator_addrs[i]` is the
+    /// identity of `engines[i]`/`transports[i]`. Committee *index*
+    /// is derived per-lookup via `engine_pos`: a removal reshuffles
+    /// seats, so the position↔index identity that held at genesis
+    /// must never be assumed afterward.
+    validator_addrs: Vec<primitives::Address>,
+    /// Per-validator live committee shared with its `BlsPeerAuth` —
+    /// the rotation methods publish the rotated set into each slot
+    /// so handshakes authenticate against the active committee.
+    live_sets: Vec<Arc<std::sync::RwLock<ValidatorSet>>>,
+    /// Per-validator staged committee slot shared with its
+    /// `BlsPeerAuth` — `None` unless a rotation is mid-window (the
+    /// harness's synchronous `rotate_epoch_with_*` force-completion
+    /// leaves no observable window; production holds it between
+    /// schedule and activation).
+    pending_sets: Vec<Arc<std::sync::RwLock<Option<ValidatorSet>>>>,
     /// The shared validator set.
     validator_set: ValidatorSet,
     /// The BLS secret keys for each validator.
@@ -497,13 +514,16 @@ impl TcpMultiNodeDevnet {
         // (a signed envelope's sender must recover to its key).
         let addresses: Vec<primitives::Address> =
             (0..n).map(|i| txs::identity_addr(u8::try_from(i).unwrap_or(0))).collect();
-        let vs = ValidatorSet::with_addresses(pks, stakes, addresses).expect("validator set");
+        let vs =
+            ValidatorSet::with_addresses(pks, stakes, addresses.clone()).expect("validator set");
 
-        // Build peer addresses for full mesh.
+        // Build peer addresses for full mesh. Peer IDs are staking
+        // addresses — the identity that survives committee reshuffles
+        // (a removal moves seats; the address never does).
         let peer_addrs: Vec<(Vec<u8>, String)> = (0..n)
             .map(|i| {
                 let port = base_port + u16::try_from(i).unwrap();
-                (vec![u8::try_from(i).unwrap()], format!("127.0.0.1:{port}"))
+                (addresses[i].0.to_vec(), format!("127.0.0.1:{port}"))
             })
             .collect();
 
@@ -512,6 +532,13 @@ impl TcpMultiNodeDevnet {
         let mut transports = Vec::with_capacity(n);
         let mut evm_modules = Vec::with_capacity(n);
         let mut exchange_modules = Vec::with_capacity(n);
+        // Per-node committee views shared with its handshake
+        // authenticator — the rotation methods publish each node's
+        // rotated set so auth follows membership live.
+        let live_sets: Vec<Arc<std::sync::RwLock<ValidatorSet>>> =
+            (0..n).map(|_| Arc::new(std::sync::RwLock::new(vs.clone()))).collect();
+        let pending_sets: Vec<Arc<std::sync::RwLock<Option<ValidatorSet>>>> =
+            (0..n).map(|_| Arc::new(std::sync::RwLock::new(None))).collect();
         let committed_blocks: Vec<Arc<std::sync::Mutex<Vec<FinalizedBlock>>>> =
             (0..n).map(|_| Arc::new(std::sync::Mutex::new(Vec::new()))).collect();
         // Commit sequence counters — bumped by the listener on every
@@ -578,30 +605,25 @@ impl TcpMultiNodeDevnet {
             exchange_modules.push(node.exchange_module);
 
             // Build the peer list (all peers except self).
-            let peers: Vec<(Vec<u8>, String)> = peer_addrs
-                .iter()
-                .filter(|(pid, _)| pid[0] != u8::try_from(i).unwrap())
-                .cloned()
-                .collect();
+            let own_id = addresses[i].0.to_vec();
+            let peers: Vec<(Vec<u8>, String)> =
+                peer_addrs.iter().filter(|(pid, _)| *pid != own_id).cloned().collect();
 
             let port = base_port + u16::try_from(i).unwrap();
             let listen_addr = format!("127.0.0.1:{port}");
-            // Authenticate the greeting: peer `i`'s transport ID must
-            // sign with the committee key registered at index `i`.
-            // The harness committee never reorders (added members are
-            // phantoms without transports), so a per-node static view
-            // of the set is faithful here.
+            // Authenticate the greeting: a peer claiming address `a`
+            // must sign with the key registered for `a` in the LIVE
+            // committee — the rotation methods publish each node's
+            // rotated set into `live_sets[i]` so auth follows
+            // membership without a transport restart.
             let mut node_tcp_config = tcp_config.clone();
             node_tcp_config.peer_auth = Some(Arc::new(node::peer_auth::BlsPeerAuth::new(
                 key.clone(),
-                Arc::new(std::sync::RwLock::new(vs.clone())),
+                live_sets[i].clone(),
+                pending_sets[i].clone(),
             )));
-            let transport = p2p::tcp::TcpTransport::with_config(
-                &listen_addr,
-                vec![u8::try_from(i).unwrap()],
-                peers,
-                node_tcp_config,
-            );
+            let transport =
+                p2p::tcp::TcpTransport::with_config(&listen_addr, own_id, peers, node_tcp_config);
 
             // Wire a commit listener that pushes each committed block
             // into the shared `committed_blocks` vector. The engine's
@@ -629,6 +651,9 @@ impl TcpMultiNodeDevnet {
             engines,
             apps,
             transports,
+            validator_addrs: addresses,
+            live_sets,
+            pending_sets,
             validator_set: vs,
             secret_keys,
             n,
@@ -678,6 +703,23 @@ impl TcpMultiNodeDevnet {
     /// `finalize_block` and is the closest proxy for "execution share".
     pub fn phase_timers(&self) -> PhaseTimers {
         self.last_phase_timers
+    }
+
+    /// Map a committee index to the spawn-order position of the
+    /// engine holding that seat — or `None` for a phantom member
+    /// (an added validator with no spawned engine) or an index past
+    /// the committee.
+    ///
+    /// The lookup goes through each engine's OWN validator set and
+    /// the spawn-order staking address, never `position == index`:
+    /// a removal reshuffles seats, so a removed member's stale index
+    /// can collide with a live member's new seat — only the engine
+    /// whose *address* the committee still lists at `idx` counts.
+    fn engine_pos(&self, committee_idx: usize) -> Option<usize> {
+        let idx = consensus::ValidatorIndex::try_from(committee_idx).ok()?;
+        self.engines.iter().enumerate().find_map(|(pos, e)| {
+            (e.validator_set().index_of(&self.validator_addrs[pos]) == Some(idx)).then_some(pos)
+        })
     }
 
     /// Access the engines (mutable) — for Byzantine injection.
@@ -777,10 +819,13 @@ impl TcpMultiNodeDevnet {
             // A phantom member (validator_add without a spawned
             // engine) can't take mempool submissions — skip the
             // submit; its leader slot times out in `run_round_tcp`.
-            if let Some(engine) = self.engines.get_mut(leader_idx) {
+            // `engine_pos` resolves seat → position so a reshuffled
+            // committee can't submit to the member that MOVED into
+            // the leader's old index.
+            if let Some(pos) = self.engine_pos(leader_idx) {
                 for tx_i in 0..txs_per_round {
                     let tx = make_batch_tx(round, tx_i);
-                    engine.submit_tx(tx);
+                    self.engines[pos].submit_tx(tx);
                 }
             }
             self.run_round_tcp();
@@ -845,10 +890,10 @@ impl TcpMultiNodeDevnet {
             // Phantom member (validator_add without a spawned
             // engine): its round's txs can never be proposed —
             // skip them as a crashed leader's would be lost.
-            if let Some(engine) = self.engines.get_mut(leader_idx) {
+            if let Some(pos) = self.engine_pos(leader_idx) {
                 for tx_i in 0..txs_per_round {
                     let tx = make_batch_tx(round, tx_i);
-                    engine.submit_tx(tx);
+                    self.engines[pos].submit_tx(tx);
                 }
             }
         }
@@ -1204,9 +1249,14 @@ impl TcpMultiNodeDevnet {
 
         // Shared mesh: per-receiver fallback inboxes (reliable path
         // for sends the bounded TCP writer channel drops), a done
-        // counter, and a stop flag for deadline exits.
+        // counter, and a stop flag for deadline exits. Inboxes are
+        // keyed by COMMITTEE SEAT, not spawn position — the committee
+        // may exceed the spawned count (phantom members) and seats
+        // reshuffle on removal; each thread drains the inbox of the
+        // seat its engine held at spawn.
+        let committee_n = self.validator_set.n();
         let inboxes: Inboxes =
-            (0..n).map(|_| Arc::new(std::sync::Mutex::new(VecDeque::new()))).collect();
+            (0..committee_n).map(|_| Arc::new(std::sync::Mutex::new(VecDeque::new()))).collect();
         let global_done = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Completion is measured in finalized *transactions*, not
@@ -1245,14 +1295,17 @@ impl TcpMultiNodeDevnet {
             // A phantom member (validator_add without a spawned
             // engine) has no app to ingest into — consume the
             // round's txs without submitting, the same outcome as
-            // a crashed leader losing its round.
-            if leader_idx >= self.apps.len() {
+            // a crashed leader losing its round. `engine_pos`
+            // resolves the seat to the engine actually holding it —
+            // a reshuffled committee's `apps[leader_idx]` would feed
+            // the wrong member's mempool.
+            let Some(leader_pos) = self.engine_pos(leader_idx) else {
                 tx_idx = round_end;
                 next_submit_round += 1;
                 continue;
-            }
+            };
             while tx_idx < round_end {
-                match self.apps[leader_idx].ingest_tx(all_txs[tx_idx].clone()) {
+                match self.apps[leader_pos].ingest_tx(all_txs[tx_idx].clone()) {
                     types::MempoolAck::Accepted => tx_idx += 1,
                     // Intake channel full — stop seeding; the paced
                     // loop continues once the pipeline is draining.
@@ -1276,20 +1329,13 @@ impl TcpMultiNodeDevnet {
             let done = Arc::clone(&global_done);
             let stop = Arc::clone(&stop);
             let view = Arc::clone(&views[i]);
+            // The peer id this thread's transport claimed — its
+            // staking address, used as `from` on the inbox fallback.
+            let my_id = self.validator_addrs[i].0.to_vec();
             handles.push(std::thread::spawn(move || {
                 Self::validator_loop(
-                    engine,
-                    transport,
-                    u8::try_from(i).unwrap_or(0),
-                    n,
-                    vs,
-                    inboxes,
-                    committed,
-                    commit_seq,
-                    done,
-                    stop,
-                    view,
-                    target_txs,
+                    engine, transport, my_id, n, vs, inboxes, committed, commit_seq, done, stop,
+                    view, target_txs,
                 )
             }));
         }
@@ -1317,15 +1363,15 @@ impl TcpMultiNodeDevnet {
                 let view = primitives::View::new(next_submit_round as u64);
                 let leader_idx = usize::from(self.validator_set.leader(view));
                 let round_end = (next_submit_round + 1) * txs_per_round;
-                // Phantom member — no app to ingest into; consume
+                // Phantom member — no engine holds the seat; consume
                 // the round's txs as if the leader were crashed.
-                if leader_idx >= self.apps.len() {
+                let Some(leader_pos) = self.engine_pos(leader_idx) else {
                     tx_idx = round_end;
                     next_submit_round += 1;
                     continue;
-                }
+                };
                 while tx_idx < round_end {
-                    match self.apps[leader_idx].ingest_tx(all_txs[tx_idx].clone()) {
+                    match self.apps[leader_pos].ingest_tx(all_txs[tx_idx].clone()) {
                         types::MempoolAck::Accepted => tx_idx += 1,
                         types::MempoolAck::Rejected { .. } => break,
                     }
@@ -1389,8 +1435,8 @@ impl TcpMultiNodeDevnet {
     fn validator_loop(
         mut engine: OxideBft,
         mut transport: p2p::tcp::TcpTransport,
-        idx: u8,
-        n: usize,
+        my_id: Vec<u8>,
+        n_spawned: usize,
         validator_set: ValidatorSet,
         inboxes: Inboxes,
         committed: Arc<std::sync::Mutex<Vec<FinalizedBlock>>>,
@@ -1400,8 +1446,16 @@ impl TcpMultiNodeDevnet {
         view_out: Arc<std::sync::atomic::AtomicU64>,
         target_txs: u64,
     ) -> (OxideBft, p2p::tcp::TcpTransport) {
-        let me = usize::from(idx);
-        let me_u8 = u8::try_from(me).unwrap_or(0);
+        // Our committee seat is whatever the engine re-seated to —
+        // after a rotation it may differ from spawn order. Broadcast
+        // targets and the inbox key are committee seats; `my_id`
+        // (the staking address) is what peers authenticate us as.
+        // `n_spawned` bounds the done bookkeeping (threads that
+        // exist); `n_committee` bounds the broadcast/inbox keyspace
+        // (seats that exist — possibly more, when phantom members
+        // were added without engines).
+        let me = usize::from(engine.validator_index());
+        let n_committee = validator_set.n();
         // Pending proposals by view — filled by `MSG_PROPOSAL`
         // frames, voted on in view order (BTreeMap keeps the oldest
         // first so a burst of views resolves FIFO).
@@ -1428,9 +1482,9 @@ impl TcpMultiNodeDevnet {
         let mut voted_views: HashSet<u64> = HashSet::new();
         // Per-sender proposal-verify budget — the same bound the
         // binary pump applies (`PROPOSAL_VERIFY_BUDGET_PER_SEC`),
-        // keyed by sender index so a flooding peer can only spend
-        // its own quota.
-        let mut verify_budget: HashMap<u8, (std::time::Instant, u32)> = HashMap::new();
+        // keyed by the sender's authenticated peer id (staking-address
+        // bytes) so a flooding peer can only spend its own quota.
+        let mut verify_budget: HashMap<Vec<u8>, (std::time::Instant, u32)> = HashMap::new();
         let mut marked_done = false;
         let mut finalized_txs = 0u64;
         let mut counted_blocks = 0usize;
@@ -1460,45 +1514,50 @@ impl TcpMultiNodeDevnet {
             let t0 = std::time::Instant::now();
             let mut relays: Vec<Vec<u8>> = Vec::new();
             while let Some(msg) = transport.recv() {
-                let from = msg.from.first().copied().unwrap_or(0);
                 let mut state = DispatchState {
                     pending: &mut pending,
                     shard_sets: &mut shard_sets,
                     relays: &mut relays,
-                    me: me_u8,
                     shard_k,
                     verify_budget: &mut verify_budget,
                 };
-                if let Some((v, vote)) =
-                    Self::dispatch_inbound(&mut engine, &mut state, from, &msg.bytes, &mut t_commit)
-                {
+                if let Some((v, vote)) = Self::dispatch_inbound(
+                    &mut engine,
+                    &mut state,
+                    &msg.from,
+                    &msg.bytes,
+                    &mut t_commit,
+                ) {
                     voted_views.insert(v);
                     Self::send_vote(
                         &mut engine,
                         &mut transport,
                         &inboxes,
                         &validator_set,
-                        idx,
+                        &my_id,
                         v,
                         vote,
                     );
                 }
             }
-            let drained: VecDeque<(u8, Vec<u8>)> = {
-                let mut guard = primitives::sync::lock_state(&inboxes[me]);
-                std::mem::take(&mut *guard)
-            };
+            // A removed member's stale seat can collide with a live
+            // member's inbox, and a phantom seat has no reader at
+            // all — `.get` keeps both from panicking.
+            let mut drained: VecDeque<(Vec<u8>, Vec<u8>)> = VecDeque::new();
+            if let Some(inbox) = inboxes.get(me) {
+                let mut guard = primitives::sync::lock_state(inbox);
+                drained = std::mem::take(&mut *guard);
+            }
             for (from, bytes) in drained {
                 let mut state = DispatchState {
                     pending: &mut pending,
                     shard_sets: &mut shard_sets,
                     relays: &mut relays,
-                    me: me_u8,
                     shard_k,
                     verify_budget: &mut verify_budget,
                 };
                 if let Some((v, vote)) =
-                    Self::dispatch_inbound(&mut engine, &mut state, from, &bytes, &mut t_commit)
+                    Self::dispatch_inbound(&mut engine, &mut state, &from, &bytes, &mut t_commit)
                 {
                     voted_views.insert(v);
                     Self::send_vote(
@@ -1506,7 +1565,7 @@ impl TcpMultiNodeDevnet {
                         &mut transport,
                         &inboxes,
                         &validator_set,
-                        idx,
+                        &my_id,
                         v,
                         vote,
                     );
@@ -1516,13 +1575,14 @@ impl TcpMultiNodeDevnet {
             // goes to every peer once (it arrives back at us only via
             // no path: peers relay their own index only).
             for frame in relays {
-                for peer in 0..n {
+                for peer in 0..n_committee {
                     if peer != me {
                         Self::wire_send(
                             &mut transport,
                             &inboxes,
-                            idx,
-                            u8::try_from(peer).unwrap_or(0),
+                            &validator_set,
+                            &my_id,
+                            peer,
                             &frame,
                         );
                     }
@@ -1548,7 +1608,7 @@ impl TcpMultiNodeDevnet {
                 // the body off the vote critical path.
                 let mut body = Vec::new();
                 proposal.encode(&mut body);
-                let (root, shards) = types::shard::disperse_body(&body, n, shard_k);
+                let (root, shards) = types::shard::disperse_body(&body, n_committee, shard_k);
                 debug_assert_eq!(
                     root, header.body_commitment,
                     "engine and harness must compute the same body commitment"
@@ -1562,8 +1622,9 @@ impl TcpMultiNodeDevnet {
                         Self::wire_send(
                             &mut transport,
                             &inboxes,
-                            idx,
-                            u8::try_from(peer).unwrap_or(0),
+                            &validator_set,
+                            &my_id,
+                            peer,
                             &frame,
                         );
                     }
@@ -1581,13 +1642,14 @@ impl TcpMultiNodeDevnet {
                 own.push(MSG_SHARD);
                 header.encode(&mut own);
                 shards[me].encode(&mut own);
-                for peer in 0..n {
+                for peer in 0..n_committee {
                     if peer != me {
                         Self::wire_send(
                             &mut transport,
                             &inboxes,
-                            idx,
-                            u8::try_from(peer).unwrap_or(0),
+                            &validator_set,
+                            &my_id,
+                            peer,
                             &own,
                         );
                     }
@@ -1598,7 +1660,7 @@ impl TcpMultiNodeDevnet {
                 // exists — the hand-built Vote + collect_vote it
                 // replaces skipped durability entirely.
                 if let Some(leader_vote) = engine.vote(&header, &proposal) {
-                    let _ = engine.collect_vote(u16::from(idx), leader_vote);
+                    let _ = engine.collect_vote(engine.validator_index(), leader_vote);
                     voted_views.insert(view);
                 }
             }
@@ -1633,7 +1695,7 @@ impl TcpMultiNodeDevnet {
                         &mut transport,
                         &inboxes,
                         &validator_set,
-                        idx,
+                        &my_id,
                         v,
                         vote,
                     );
@@ -1648,13 +1710,14 @@ impl TcpMultiNodeDevnet {
                 let mut frame = Vec::with_capacity(1 + 150);
                 frame.push(MSG_QC);
                 qc.encode(&mut frame);
-                for peer in 0..n {
+                for peer in 0..n_committee {
                     if peer != me {
                         Self::wire_send(
                             &mut transport,
                             &inboxes,
-                            idx,
-                            u8::try_from(peer).unwrap_or(0),
+                            &validator_set,
+                            &my_id,
+                            peer,
                             &frame,
                         );
                     }
@@ -1681,7 +1744,7 @@ impl TcpMultiNodeDevnet {
             if debug && last_debug.elapsed() >= std::time::Duration::from_secs(1) {
                 last_debug = std::time::Instant::now();
                 eprintln!(
-                    "  [v{idx}] view={} highqc={:?} pending={} shards={} proposed={} voted={} commits={}",
+                    "  [v{me}] view={} highqc={:?} pending={} shards={} proposed={} voted={} commits={}",
                     engine.current_view().value(),
                     engine.high_qc().map(|q| q.view.value()),
                     pending.len(),
@@ -1729,7 +1792,7 @@ impl TcpMultiNodeDevnet {
                 }
             }
             t_done += t0.elapsed();
-            if global_done.load(Ordering::Relaxed) == n || stop.load(Ordering::Relaxed) {
+            if global_done.load(Ordering::Relaxed) == n_spawned || stop.load(Ordering::Relaxed) {
                 break;
             }
             std::hint::spin_loop();
@@ -1741,7 +1804,7 @@ impl TcpMultiNodeDevnet {
         // fallback); the remainder is idle spin (waiting on peers).
         let total = loop_start.elapsed();
         eprintln!(
-            "  [v{idx}] threaded profile: total={:.1}ms inbound={:.1} commit={:.1} propose={:.1} vote={:.1} qc={:.1} done={:.1} idle={:.1}",
+            "  [v{me}] threaded profile: total={:.1}ms inbound={:.1} commit={:.1} propose={:.1} vote={:.1} qc={:.1} done={:.1} idle={:.1}",
             total.as_secs_f64() * 1e3,
             t_inbound.as_secs_f64() * 1e3,
             t_commit.as_secs_f64() * 1e3,
@@ -1777,10 +1840,20 @@ impl TcpMultiNodeDevnet {
     /// deliver (idempotent — stale QCs are rejected inside
     /// `deliver_qc`). Malformed frames are dropped silently: this is
     /// a devnet harness, not the hardened production ingress path.
+    /// `from` is the sender's authenticated peer id — the 20-byte
+    /// staking address the handshake proved ownership of (or the
+    /// sender id an inbox fallback entry claims — the fallback is
+    /// trusted in-process plumbing, but the same `index_of`
+    /// attribution applies). Vote/timeout attribution resolves it
+    /// against the RECEIVER's live committee — a removed member's
+    /// address resolves to nothing and its frames die here.
+    // The match arms cover five frame types with per-arm rationale
+    // comments — splitting them would scatter the intake contract.
+    #[allow(clippy::too_many_lines)]
     fn dispatch_inbound(
         engine: &mut OxideBft,
         state: &mut DispatchState<'_>,
-        from: u8,
+        from: &[u8],
         bytes: &[u8],
         t_commit: &mut std::time::Duration,
     ) -> Option<(u64, types::Vote)> {
@@ -1805,8 +1878,10 @@ impl TcpMultiNodeDevnet {
                 // one BLS verify, so a flooding peer can only burn
                 // its own quota; the leader's proposal arrives on a
                 // different peer id and always verifies.
-                let budget =
-                    state.verify_budget.entry(from).or_insert((std::time::Instant::now(), 0));
+                let budget = state
+                    .verify_budget
+                    .entry(from.to_vec())
+                    .or_insert((std::time::Instant::now(), 0));
                 if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
                     *budget = (std::time::Instant::now(), 0);
                 }
@@ -1864,7 +1939,11 @@ impl TcpMultiNodeDevnet {
                     return None;
                 }
                 let block_hash = OxideBft::block_hash(&header);
-                let is_mine = shard.index == u32::from(state.me);
+                // The relay-ownership check compares the shard's
+                // committee seat against OUR live seat — the engine's
+                // re-seated index, so a rotation can't make us relay
+                // another member's shard.
+                let is_mine = shard.index == u32::from(engine.validator_index());
                 // On the first shard seen for a block, authenticate
                 // and vote on the commitment — `vote_header` also
                 // stores the header as `Awaiting`, which `supply_body`
@@ -1924,7 +2003,16 @@ impl TcpMultiNodeDevnet {
             }
             MSG_VOTE => {
                 if let Ok(vote) = types::Vote::decode(&mut reader) {
-                    let _ = engine.collect_vote(u16::from(from), vote);
+                    // Attribute by authenticated address → committee
+                    // seat. A peer whose address is not in OUR set
+                    // (removed, or never a member) collects nothing.
+                    let voter = <[u8; 20]>::try_from(from)
+                        .map(primitives::Address)
+                        .ok()
+                        .and_then(|a| engine.validator_set().index_of(&a));
+                    if let Some(voter_idx) = voter {
+                        let _ = engine.collect_vote(voter_idx, vote);
+                    }
                 }
                 None
             }
@@ -1947,50 +2035,62 @@ impl TcpMultiNodeDevnet {
     /// Route a produced vote to the leader of its view — direct
     /// `collect_vote` when we are that leader, else a `MSG_VOTE`
     /// frame over the wire/fallback mesh.
+    ///
+    /// `my_id` is this thread's peer id (its staking-address bytes) —
+    /// the `from` a fallback inbox entry carries. The self-collect
+    /// check compares the leader seat against the engine's own
+    /// re-seated index, so a rotated committee can't strand votes.
     fn send_vote(
         engine: &mut OxideBft,
         transport: &mut p2p::tcp::TcpTransport,
         inboxes: &Inboxes,
         validator_set: &ValidatorSet,
-        idx: u8,
+        my_id: &[u8],
         view: u64,
         vote: types::Vote,
     ) {
         let leader_idx = usize::from(validator_set.leader(primitives::View::new(view)));
-        if leader_idx == usize::from(idx) {
-            let _ = engine.collect_vote(u16::from(idx), vote);
-            return;
-        }
-        // A phantom member (validator_add without a spawned engine)
-        // has no inbox or transport — its votes are dropped, the
-        // same outcome as a crashed validator's peers.
-        if leader_idx >= inboxes.len() {
+        if leader_idx == usize::from(engine.validator_index()) {
+            let _ = engine.collect_vote(engine.validator_index(), vote);
             return;
         }
         let mut frame = Vec::with_capacity(1 + 137);
         frame.push(MSG_VOTE);
         vote.encode(&mut frame);
-        Self::wire_send(transport, inboxes, idx, u8::try_from(leader_idx).unwrap_or(0), &frame);
+        Self::wire_send(transport, inboxes, validator_set, my_id, leader_idx, &frame);
     }
 
-    /// Send one wire frame to a peer: TCP first, fallback queue on
-    /// failure.
+    /// Send one wire frame to a committee seat: TCP first, fallback
+    /// queue on failure.
+    ///
+    /// `to_seat` is a committee index — resolved to its staking
+    /// address (the transport peer id) via `validator_set`, so the
+    /// destination follows the live committee across reshuffles.
+    /// `my_id` is the sender's peer id, recorded in the fallback
+    /// entry as `from`.
     ///
     /// `TcpTransport::send` is `try_send` into a bounded per-peer
     /// writer channel — `ChannelFull`/`ChannelClosed` drop the frame.
     /// Those go into the receiver's shared inbox instead, which its
     /// thread drains every loop. Cross-path reordering is tolerated
     /// by the engine (idempotent delivery + ancestor-walk commit).
+    /// A seat with no inbox (phantom member) and no transport drops
+    /// the frame — the same outcome as a crashed validator's peers.
     fn wire_send(
         transport: &mut p2p::tcp::TcpTransport,
         inboxes: &Inboxes,
-        from: u8,
-        to: u8,
+        validator_set: &ValidatorSet,
+        my_id: &[u8],
+        to_seat: usize,
         bytes: &[u8],
     ) {
-        if transport.send(&vec![to], bytes).is_err() {
-            primitives::sync::lock_state(&inboxes[usize::from(to)])
-                .push_back((from, bytes.to_vec()));
+        let Some(to_addr) = validator_set.validator_addresses().get(to_seat) else {
+            return;
+        };
+        if transport.send(&to_addr.0.to_vec(), bytes).is_err()
+            && let Some(inbox) = inboxes.get(to_seat)
+        {
+            primitives::sync::lock_state(inbox).push_back((my_id.to_vec(), bytes.to_vec()));
         }
     }
 
@@ -2033,14 +2133,15 @@ impl TcpMultiNodeDevnet {
         let mut tx_idx = 0;
         // A phantom member (validator_add without a spawned engine)
         // has no mempool — its round's txs simply never land, which
-        // is the same outcome as a crashed leader. (Indexed per call
-        // rather than a held `get_mut` borrow: the retry loop below
-        // needs `self` mutable again for `pipelined_tick`.)
-        if leader_idx >= self.engines.len() {
+        // is the same outcome as a crashed leader. `engine_pos`
+        // resolves the seat to the engine actually holding it — a
+        // removal reshuffles indices, so the leader seat is no
+        // longer `engines[leader_idx]`.
+        let Some(leader_pos) = self.engine_pos(leader_idx) else {
             return txs_per_round;
-        }
+        };
         while tx_idx < txs_per_round {
-            let ack = self.engines[leader_idx].submit_tx(txs[tx_idx].clone());
+            let ack = self.engines[leader_pos].submit_tx(txs[tx_idx].clone());
             match ack {
                 types::MempoolAck::Accepted => {
                     tx_idx += 1;
@@ -2098,13 +2199,24 @@ impl TcpMultiNodeDevnet {
 
     /// Phase 1: any leader with the `high_qc` that hasn't proposed yet.
     fn propose_phase(&mut self, state: &mut PipelineState, view_cap: u64) {
+        // `propose()` must run on the engine that ADDRESS-VERIFIES
+        // as the seat holder — a removed member keeps a stale index
+        // that can collide with a live member's new seat, and letting
+        // it claim `proposed_views` first would park the view on a
+        // proposal no peer can verify (a self-inflicted censorship).
+        // `seat_holder[seat]` = spawn position of the engine whose
+        // address the committee still lists at `seat` — precomputed
+        // because `engine_pos` borrows `self` while the loop below
+        // holds `self.engines` mutably.
+        let seat_holder: Vec<Option<usize>> =
+            (0..self.validator_set.n()).map(|seat| self.engine_pos(seat)).collect();
         for (i, engine) in self.engines.iter_mut().enumerate() {
             let view = engine.current_view().value();
             if view >= view_cap || state.proposed_views.contains(&view) {
                 continue;
             }
             let leader_idx = usize::from(self.validator_set.leader(engine.current_view()));
-            if i != leader_idx {
+            if seat_holder.get(leader_idx) != Some(&Some(i)) {
                 continue;
             }
             // At genesis (view 0), no `high_qc` is needed. For view > 0,
@@ -2135,45 +2247,59 @@ impl TcpMultiNodeDevnet {
         let mut votes_to_collect: Vec<(usize, u16, types::Vote)> = Vec::new();
 
         for (i, engine) in self.engines.iter_mut().enumerate() {
+            // `my_seat` is this engine's CURRENT committee index —
+            // re-seated by key at each rotation, `u16::MAX`-stale for
+            // a removed member. Role checks compare it, never the
+            // spawn position.
+            let my_seat = usize::from(engine.validator_index());
             for (header, proposal) in &state.proposals {
                 let view = header.view.value();
                 if state.voted.contains(&(i, view)) {
                     continue;
                 }
                 let leader_idx = usize::from(self.validator_set.leader(header.view));
-                if i == leader_idx {
+                if my_seat == leader_idx {
                     // Leader self-votes through `engine.vote()` —
                     // the single signing authority (C10): the vote
                     // locks and WAL append precede the signature,
                     // exactly as for followers.
                     if let Some(leader_vote) = engine.vote(header, proposal) {
-                        let _ = engine.collect_vote(u16::try_from(i).unwrap(), leader_vote);
+                        let _ = engine.collect_vote(engine.validator_index(), leader_vote);
                         state.voted.insert((i, view));
                     }
                 } else if let Some(vote) = engine.vote(header, proposal) {
                     let mut buf = Vec::with_capacity(1 + 137);
                     buf.push(MSG_VOTE);
                     vote.encode(&mut buf);
-                    // Best-effort TCP broadcast. Failures are tolerated
-                    // — the in-process delivery below is authoritative.
-                    let _ = self.transports[i].send(&vec![u8::try_from(leader_idx).unwrap()], &buf);
+                    // Best-effort TCP send to the leader's peer id —
+                    // its staking address under the live committee.
+                    // Failures are tolerated — the in-process delivery
+                    // below is authoritative.
+                    if let Some(leader_addr) =
+                        self.validator_set.validator_addresses().get(leader_idx)
+                    {
+                        let _ = self.transports[i].send(&leader_addr.0.to_vec(), &buf);
+                    }
                     // In-process vote delivery: collect the vote
                     // directly on the leader's engine. This ensures
-                    // the vote is received even if TCP drops it.
-                    votes_to_collect.push((leader_idx, u16::try_from(i).unwrap(), vote));
+                    // the vote is received even if TCP drops it. The
+                    // voter index is the engine's seat — post-rotation
+                    // it is NOT the spawn position.
+                    votes_to_collect.push((leader_idx, engine.validator_index(), vote));
                     state.voted.insert((i, view));
                 }
             }
         }
 
         // In-process vote delivery: collect all votes formed this
-        // tick on their respective leader engines. A phantom member
-        // (validator_add without a spawned engine) has no engine to
-        // collect with — its votes are simply lost, which is the
-        // same outcome as a crashed validator.
+        // tick on their respective leader engines. `engine_pos`
+        // resolves seat → position: a phantom member (validator_add
+        // without a spawned engine) resolves to None — its votes are
+        // simply lost, which is the same outcome as a crashed
+        // validator.
         for (leader_idx, voter_idx, vote) in votes_to_collect {
-            if let Some(engine) = self.engines.get_mut(leader_idx) {
-                let _ = engine.collect_vote(voter_idx, vote);
+            if let Some(pos) = self.engine_pos(leader_idx) {
+                let _ = self.engines[pos].collect_vote(voter_idx, vote);
             }
         }
     }
@@ -2194,8 +2320,17 @@ impl TcpMultiNodeDevnet {
                 match tag {
                     MSG_VOTE => {
                         if let Ok(vote) = types::Vote::decode(&mut reader) {
-                            let voter_idx = u16::from(msg.from[0]);
-                            let _ = self.engines[i].collect_vote(voter_idx, vote);
+                            // Attribute by the authenticated
+                            // staking-address peer id → seat in the
+                            // receiver's live committee. A removed
+                            // member's frames resolve to nothing.
+                            let voter = <[u8; 20]>::try_from(msg.from.as_slice())
+                                .map(primitives::Address)
+                                .ok()
+                                .and_then(|a| self.engines[i].validator_set().index_of(&a));
+                            if let Some(voter_idx) = voter {
+                                let _ = self.engines[i].collect_vote(voter_idx, vote);
+                            }
                         }
                     }
                     MSG_QC => {
@@ -2233,18 +2368,24 @@ impl TcpMultiNodeDevnet {
         // after the loop to avoid borrow conflicts (can't deliver to
         // other engines while iterating `self.engines` mutably).
         let mut qcs_to_deliver: Vec<types::QuorumCertificate> = Vec::new();
+        let committee_addrs = self.validator_set.validator_addresses().to_vec();
+        let my_addrs: Vec<Vec<u8>> = self.validator_addrs.iter().map(|a| a.0.to_vec()).collect();
         for (i, engine) in self.engines.iter_mut().enumerate() {
             if let Some(qc) = engine.try_form_qc() {
                 state.qcs_formed += 1;
                 let mut qc_buf = Vec::with_capacity(1 + 150);
                 qc_buf.push(MSG_QC);
                 qc.encode(&mut qc_buf);
-                for j in 0..self.n {
-                    if j != i {
+                // Broadcast to every committee member except us —
+                // addressed by staking-address peer id, so a rotated
+                // committee's members are reached, not whoever holds
+                // the genesis slots now.
+                for addr in &committee_addrs {
+                    if addr.0.as_slice() != my_addrs[i].as_slice() {
                         // Best-effort TCP broadcast. Failures are
                         // tolerated — the in-process delivery below
                         // is the authoritative path.
-                        let _ = self.transports[i].send(&vec![u8::try_from(j).unwrap()], &qc_buf);
+                        let _ = self.transports[i].send(&addr.0.to_vec(), &qc_buf);
                     }
                 }
                 // Self-deliver: the leader that formed the QC must
@@ -2302,13 +2443,17 @@ impl TcpMultiNodeDevnet {
             .collect();
         let evidences: Vec<Option<types::QuorumCertificate>> =
             self.engines.iter().map(|e| e.high_qc().cloned()).collect();
-        for collector in 0..self.n {
+        // Each signature is collected under its signer's CURRENT seat
+        // — resolved by staking address, so a removed member (whose
+        // address is no longer in the set) contributes nothing rather
+        // than stamping another member's timeout slot with a
+        // signature that cannot verify.
+        let signer_seats: Vec<Option<u16>> =
+            self.validator_addrs.iter().map(|addr| self.validator_set.index_of(addr)).collect();
+        for engine in &mut self.engines {
             for (signer, sig) in sigs.iter().enumerate() {
-                let _ = self.engines[collector].collect_timeout_signature(
-                    u16::try_from(signer).unwrap_or(0),
-                    *sig,
-                    evidences[signer].clone(),
-                );
+                let Some(seat) = signer_seats[signer] else { continue };
+                let _ = engine.collect_timeout_signature(seat, *sig, evidences[signer].clone());
             }
         }
         let max_height = self.engines.iter().map(OxideBft::next_height_value).max().unwrap_or(0);
@@ -2321,18 +2466,23 @@ impl TcpMultiNodeDevnet {
     #[allow(clippy::too_many_lines)]
     fn run_round_tcp(&mut self) {
         let leader_idx = usize::from(self.validator_set.leader(self.engines[0].current_view()));
+        let leader_addr =
+            self.validator_set.validator_addresses().get(leader_idx).map(|a| a.0.to_vec());
 
         // Leader proposes (direct — proposal broadcast is a separate
         // layer). If the leader can't propose, the view times out.
-        // A `None` engine slot means the ValidatorSet grew via
-        // validator_add while no engine was spawned for the new
-        // member — the phantom leader can't propose, so the view
-        // times out and advances to a live one.
-        let Some(engine) = self.engines.get_mut(leader_idx) else {
+        // A `None` position means the seat is a phantom member
+        // (validator_add without a spawned engine) — the phantom
+        // leader can't propose, so the view times out and advances
+        // to a live one. `engine_pos` resolves the seat to the
+        // engine holding it: post-rotation, `engines[leader_idx]`
+        // can name the member that MOVED INTO the leader's old
+        // index or a removed member's stale seat.
+        let Some(leader_pos) = self.engine_pos(leader_idx) else {
             self.timeout_advance_all();
             return;
         };
-        let Some((header, proposal)) = engine.propose() else {
+        let Some((header, proposal)) = self.engines[leader_pos].propose() else {
             self.timeout_advance_all();
             return;
         };
@@ -2341,16 +2491,17 @@ impl TcpMultiNodeDevnet {
         // WAL before the signature exists. If the engine withholds
         // (e.g. WAL failure), the view simply times out — the same
         // outcome as a crashed leader.
-        if let Some(leader_vote) = engine.vote(&header, &proposal) {
-            engine
-                .collect_vote(u16::try_from(leader_idx).unwrap(), leader_vote)
+        if let Some(leader_vote) = self.engines[leader_pos].vote(&header, &proposal) {
+            let seat = self.engines[leader_pos].validator_index();
+            self.engines[leader_pos]
+                .collect_vote(seat, leader_vote)
                 .expect("leader self-vote must verify");
         }
 
         // Followers vote via TCP: each follower encodes its vote and
-        // sends it to the leader.
+        // sends it to the leader's staking-address peer id.
         for (i, engine) in self.engines.iter_mut().enumerate() {
-            if i == leader_idx {
+            if i == leader_pos {
                 continue;
             }
             if let Some(vote) = engine.vote(&header, &proposal) {
@@ -2359,21 +2510,29 @@ impl TcpMultiNodeDevnet {
                 // Tolerate transient send failure (peer mid-reconnect)
                 // — a dropped vote stalls this view into a timeout,
                 // which is the intended fault-injection behavior.
-                let _ = self.transports[i].send(&vec![u8::try_from(leader_idx).unwrap()], &buf);
+                if let Some(ref addr) = leader_addr {
+                    let _ = self.transports[i].send(addr, &buf);
+                }
             }
         }
 
-        // Leader receives votes via TCP, decodes, collects.
-        // Poll until we have n-1 votes or timeout.
+        // Leader receives votes via TCP, decodes, collects —
+        // attributed by the authenticated staking-address peer id
+        // resolved to a seat in the leader's live committee.
         let mut votes_received = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while votes_received < self.n - 1 && std::time::Instant::now() < deadline {
-            if let Some(msg) = self.transports[leader_idx].recv() {
+        while votes_received < self.validator_set.n() - 1 && std::time::Instant::now() < deadline {
+            if let Some(msg) = self.transports[leader_pos].recv() {
                 let mut reader = codec::Reader::new(&msg.bytes);
                 if let Ok(vote) = types::Vote::decode(&mut reader) {
-                    let voter = u16::from(msg.from[0]);
-                    let _ = self.engines[leader_idx].collect_vote(voter, vote);
-                    votes_received += 1;
+                    let voter = <[u8; 20]>::try_from(msg.from.as_slice())
+                        .map(primitives::Address)
+                        .ok()
+                        .and_then(|a| self.engines[leader_pos].validator_set().index_of(&a));
+                    if let Some(voter) = voter {
+                        let _ = self.engines[leader_pos].collect_vote(voter, vote);
+                        votes_received += 1;
+                    }
                 }
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -2383,25 +2542,26 @@ impl TcpMultiNodeDevnet {
         // Leader forms QC. No quorum → the view timed out: run the
         // real TC path so locked voters can re-vote the failed
         // height next view.
-        let Some(qc) = self.engines[leader_idx].try_form_qc() else {
+        let Some(qc) = self.engines[leader_pos].try_form_qc() else {
             self.timeout_advance_all();
             return;
         };
 
-        // Leader broadcasts QC via TCP.
+        // Leader broadcasts QC via TCP — every committee member's
+        // address except the leader's own.
         let mut qc_buf = Vec::new();
         qc.encode(&mut qc_buf);
-        for i in 0..self.n {
-            if i == leader_idx {
-                continue;
+        let leader_own = self.validator_addrs[leader_pos].0.to_vec();
+        for addr in self.validator_set.validator_addresses() {
+            if addr.0.as_slice() != leader_own.as_slice() {
+                // Tolerate transient send failure (peer mid-reconnect).
+                let _ = self.transports[leader_pos].send(&addr.0.to_vec(), &qc_buf);
             }
-            // Tolerate transient send failure (peer mid-reconnect).
-            let _ = self.transports[leader_idx].send(&vec![u8::try_from(i).unwrap()], &qc_buf);
         }
 
         // Followers receive QC via TCP, decode, deliver.
         for (i, engine) in self.engines.iter_mut().enumerate() {
-            if i == leader_idx {
+            if i == leader_pos {
                 engine.deliver_qc(qc.clone()).expect("QC must verify");
                 continue;
             }
@@ -2488,6 +2648,10 @@ impl TcpMultiNodeDevnet {
             // engines' sets were rotated, and `self.validator_set`
             // must match for `leader()` lookups to stay correct.
             self.validator_set = self.engines[0].validator_set().clone();
+            // Publish the rotated committee into every node's live
+            // auth set — a removed member's handshake proofs stop
+            // verifying the moment its address leaves the set.
+            self.publish_auth_sets();
         }
         applied
     }
@@ -2517,8 +2681,31 @@ impl TcpMultiNodeDevnet {
                 let _ = engine.rotate_epoch();
             }
             self.validator_set = self.engines[0].validator_set().clone();
+            self.publish_auth_sets();
         }
         applied
+    }
+
+    /// Push each engine's current validator set into the shared
+    /// `RwLock` its `BlsPeerAuth` reads — handshake verification
+    /// follows the rotated committee without a transport restart.
+    /// Pending slots are cleared — the harness force-completes
+    /// rotations, so post-rotation no schedule→activation window
+    /// exists (the window itself is exercised by the engine unit
+    /// tests and the binary pump).
+    fn publish_auth_sets(&mut self) {
+        for (i, engine) in self.engines.iter().enumerate() {
+            if let Some(live) = self.live_sets.get(i)
+                && let Ok(mut guard) = live.write()
+            {
+                *guard = engine.validator_set().clone();
+            }
+            if let Some(pending) = self.pending_sets.get(i)
+                && let Ok(mut guard) = pending.write()
+            {
+                *guard = None;
+            }
+        }
     }
 }
 
@@ -2708,6 +2895,91 @@ mod tests {
         assert!(
             devnet.validator_set().index_of(&new_addr).is_none(),
             "removed validator must not be in the set",
+        );
+    }
+
+    /// Regression for stale-seat authority: removing a committee
+    /// member leaves its spawned engine holding an index that now
+    /// names a DIFFERENT live member. Removing member 1 of
+    /// {0,1,2,3} yields {0,2,3} — engine 1's stale index collides
+    /// with member 2's new seat. Routing must resolve the seat by
+    /// address so the removed engine can neither claim it nor have
+    /// its signatures collect under it.
+    ///
+    /// The removal is applied at the engine layer directly —
+    /// `apply_validator_changes` + `rotate_epoch` — because the
+    /// staking module's endorsement path only reaches registered
+    /// validators (the module-driven flow is covered by
+    /// [`tcp_multinode_validator_add_remove`]).
+    #[test]
+    fn tcp_multinode_removed_member_cannot_use_stale_seat() {
+        let mut devnet = TcpMultiNodeDevnet::with_base_port(4, 10_000, 21700);
+        let removed_addr = txs::identity_addr(1);
+        let removed_key = devnet.secret_keys[1].public_key();
+
+        for engine in &mut devnet.engines {
+            let applied =
+                engine.apply_validator_changes(&[], &[removed_addr]).expect("removal applies");
+            assert_eq!(applied, 1);
+            engine.rotate_epoch().expect("rotation completes");
+        }
+        devnet.validator_set = devnet.engines[0].validator_set().clone();
+        devnet.publish_auth_sets();
+
+        // Committee is {0,2,3}: seat 1 now belongs to member 2.
+        assert_eq!(devnet.validator_set.n(), 3);
+        assert!(devnet.validator_set.index_of(&removed_addr).is_none());
+        // Seat 1 resolves to spawn position 2 — the engine whose
+        // address the committee lists there — never to the removed
+        // engine's stale position 1.
+        assert_eq!(devnet.engine_pos(1), Some(2));
+
+        // The attack: the removed engine sends a vote for a garbage
+        // block hash to the view-0 leader (seat 0 = member 0 = engine
+        // 0). The frame leaves transport 1, so `msg.from` authenticates
+        // as `identity_addr(1)` — which resolves to NO seat in the
+        // live committee, so the vote must be dropped at attribution.
+        //
+        // If attribution still trusted a positional index, the forged
+        // vote would occupy seat 1's vote slot: member 2's genuine
+        // vote then drops as an idempotent duplicate, and with a
+        // 3-of-3 quorum no QC can ever form for the real proposal —
+        // the removed member would have censored the seat it lost.
+        let view = devnet.engines[0].current_view();
+        let epoch = devnet.engines[0].epoch();
+        let block_hash = primitives::Hash([0x42; 32]);
+        let mut msg = Vec::with_capacity(49);
+        msg.extend_from_slice(&view.value().to_le_bytes());
+        msg.push(types::VotePhase::Prepare as u8);
+        msg.extend_from_slice(block_hash.as_bytes());
+        msg.extend_from_slice(&epoch.value().to_le_bytes());
+        let sig = devnet.secret_keys[1].sign(crypto::hash::Domain::Vote, &msg);
+        let _ = removed_key; // documents which identity signed
+        let vote = types::Vote {
+            view,
+            phase: types::VotePhase::Prepare,
+            block_hash,
+            signature: sig,
+            attestation: None,
+            attestation_sig: None,
+        };
+        let mut frame = Vec::with_capacity(1 + 137);
+        frame.push(MSG_VOTE);
+        vote.encode(&mut frame);
+        let leader_addr = devnet.validator_set.validator_addresses()[0].0.to_vec();
+        devnet.transports_mut()[1].send(&leader_addr, &frame).expect("forged vote send");
+
+        // The rotated committee keeps finalizing: seats resolve to
+        // engines {0,2,3}, the forged frame is dropped at attribution,
+        // and member 2's honest vote collects into seat 1. A poisoned
+        // seat would stall every view — quorum needs all three.
+        // (Nonzero txs: `propose` returns None on an empty mempool —
+        // the harness has no heartbeat path.)
+        let (result, _) = devnet.run_batch(3, 2);
+        assert!(
+            result.finalized[0].len() >= 2,
+            "3-member committee must finalize past the poisoned view: {:?}",
+            result.finalized.iter().map(Vec::len).collect::<Vec<_>>()
         );
     }
 

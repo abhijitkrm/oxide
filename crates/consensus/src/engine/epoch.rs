@@ -10,7 +10,7 @@
 //! file makes it auditable that the validator set can never change
 //! under an in-flight view.
 
-use super::{EpochRotationError, KeyChangeError, OxideBft, ValidatorSet, View};
+use super::{Epoch, EpochRotationError, KeyChangeError, OxideBft, ValidatorSet, View};
 
 impl OxideBft {
     /// Schedule an epoch rotation (stage 6). The new validator set
@@ -18,14 +18,41 @@ impl OxideBft {
     /// current epoch. This is the first phase of the two-phase
     /// handoff: announce the new set, continue with the old set.
     ///
+    /// The activation height defaults to the current committed
+    /// height — callers that do not supply a certified delay (tests,
+    /// simulations, `rotate_epoch` force-completions) keep the
+    /// historical "next drive completes it" semantics. The
+    /// production drain path uses [`Self::schedule_rotation_at`]
+    /// with [`crate::engine::ROTATION_ACTIVATION_DELAY`].
+    ///
     /// # Errors
     /// Returns `EpochRotationError::AlreadyPending` if a rotation is
     /// already pending (the caller must wait for it to complete).
     pub fn schedule_rotation(&mut self, new_set: ValidatorSet) -> Result<(), EpochRotationError> {
+        let committed = self.last_committed.map_or(0, |(_, h)| h.value());
+        self.schedule_rotation_at(new_set, committed)
+    }
+
+    /// Schedule an epoch rotation activating at a specific committed
+    /// height. The pending set is observable via
+    /// [`OxideBft::next_validator_set`] for the whole
+    /// schedule→activation window — the transport layer publishes it
+    /// so an incoming member's handshake is admitted *before* its
+    /// first consensus duty.
+    ///
+    /// # Errors
+    /// Returns `EpochRotationError::AlreadyPending` if a rotation is
+    /// already pending.
+    pub(crate) fn schedule_rotation_at(
+        &mut self,
+        new_set: ValidatorSet,
+        activation_height: u64,
+    ) -> Result<(), EpochRotationError> {
         if self.next_validator_set.is_some() {
             return Err(EpochRotationError::AlreadyPending);
         }
         self.next_validator_set = Some(new_set);
+        self.rotation_activation_height = Some(activation_height);
         Ok(())
     }
 
@@ -41,6 +68,7 @@ impl OxideBft {
         let Some(new_set) = self.next_validator_set.take() else {
             return Err(EpochRotationError::NoPendingRotation);
         };
+        self.rotation_activation_height = None;
         self.validator_set = new_set;
         // Re-seat our own index under the new committee — removals
         // shift positions and the genesis index may now name a
@@ -59,41 +87,7 @@ impl OxideBft {
         // already dead at epoch u64::MAX.
         self.epoch = self.epoch.saturating_next();
         self.current_view = View::new(0);
-        self.last_voted_view = None;
-        // The timeout-signed view bar is epoch-scoped like the vote
-        // bar above it: the new epoch restarts views at 0, so a stale
-        // record would block a legitimate vote at that view.
-        self.timeout_signed_view = None;
-        self.high_qc = None;
-        // Per-height vote locks are evidence of the old epoch's
-        // consensus instance: heights continue across the boundary
-        // (the anchor in `last_committed`), but stale locks must not
-        // constrain the new epoch's proposals at those heights.
-        self.voted_at_height.clear();
-        self.last_tc = None;
-        self.votes = vec![None; self.validator_set.n()];
-        self.vote_count = 0;
-        self.vote_stake = 0;
-        self.timeout_signatures = vec![None; self.validator_set.n()];
-        // Execution certificates, pooled attestations, and cached
-        // cert verifications are all epoch-bound: the signatures
-        // commit to `(height, root, epoch)` and verify against the
-        // signing epoch's validator set, which is gone after this
-        // swap. Stale certs are unverifiable, stale pool entries
-        // could only aggregate into certs that fail verification
-        // (a leader embedding one would withhold every honest
-        // vote), and cached verdicts were computed against the old
-        // set. Drop all of it — the new epoch's attestations
-        // rebuild the pool from scratch.
-        self.exec_attest_pool.clear();
-        self.exec_certs.clear();
-        self.verified_exec_certs.clear();
-        // Rejection memos were computed against the old committee's
-        // leader schedule and keys — a header correctly refused under
-        // epoch N could be authentic under N+1 (rotated-in leader's
-        // first proposal), so the set must not outlive the set it
-        // judged against.
-        self.rejected_headers.clear();
+        self.clear_epoch_scoped_state();
         // Persist the cleared locks: a crash between rotation and the
         // next vote would otherwise restore the old epoch's locks
         // from the WAL and wedge the new epoch's first heights (the
@@ -131,6 +125,101 @@ impl OxideBft {
     /// is pending.
     pub fn rotate_epoch(&mut self) -> Result<(), EpochRotationError> {
         self.complete_rotation()
+    }
+
+    /// Drop every piece of state scoped to the epoch that just ended.
+    ///
+    /// Shared by [`Self::complete_rotation`] (scheduled committee
+    /// swap) and [`Self::adopt_certified_epoch`] (QC-proven epoch
+    /// adoption for a node that already holds the new committee):
+    /// both paths cross an epoch boundary, and everything the old
+    /// epoch produced — vote locks, timeout bars, high-QC, TC
+    /// evidence, attestation pool, rejection memos — is meaningless
+    /// or actively harmful across it. The vote/timeout buffers are
+    /// re-sized (not merely filled) so callers may run this before
+    /// or after the committee changes.
+    ///
+    /// Epoch-scoped state cleared:
+    /// - `last_voted_view`, `timeout_signed_view`: view bars restart
+    ///   at view 0 in the new epoch; a stale record would suppress
+    ///   legitimate signatures.
+    /// - `high_qc`, `last_tc`: certificates from the old epoch.
+    /// - `voted_at_height`: per-height locks — heights continue
+    ///   across the boundary via `last_committed`, but stale locks
+    ///   must not constrain the new epoch's proposals.
+    /// - `votes`, `timeout_signatures`, `vote_count`, `vote_stake`:
+    ///   in-flight collections judged under the old epoch.
+    /// - `exec_attest_pool`, `exec_certs`, `verified_exec_certs`:
+    ///   signatures bind `(height, root, epoch)` and index the
+    ///   signing epoch's committee — unverifiable or harmful after
+    ///   the boundary.
+    /// - `rejected_headers`: a header correctly refused under epoch
+    ///   N may be authentic under N+1 (rotated-in leader's first
+    ///   proposal), so the memo must not outlive its set.
+    pub(crate) fn clear_epoch_scoped_state(&mut self) {
+        self.last_voted_view = None;
+        self.timeout_signed_view = None;
+        self.high_qc = None;
+        self.voted_at_height.clear();
+        self.last_tc = None;
+        self.votes = vec![None; self.validator_set.n()];
+        self.vote_count = 0;
+        self.vote_stake = 0;
+        self.timeout_signatures = vec![None; self.validator_set.n()];
+        self.exec_attest_pool.clear();
+        self.exec_certs.clear();
+        self.verified_exec_certs.clear();
+        self.rejected_headers.clear();
+    }
+
+    /// Adopt a QC-certified epoch when this engine's committee is
+    /// already the one that produced it.
+    ///
+    /// A validator can hold the right committee but a stale epoch —
+    /// e.g. it joined or restarted with a config naming the current
+    /// committee while the chain was already mid-epoch. Votes,
+    /// timeouts, and attestations all sign `(…, epoch)`, so such a
+    /// node is mute until its epoch catches up. The QC itself is
+    /// the certified handoff: a quorum of our validator set signing
+    /// `(view, phase, block, E)` proves that committee operated at
+    /// epoch E — the same committee we hold, so the bitmap resolved
+    /// to the real signers and the aggregate verified under E.
+    ///
+    /// Callers must only invoke this after the QC has verified under
+    /// `epoch` against the *current* validator set — the signature
+    /// is the evidence, the adoption is the consequence. A node
+    /// holding the WRONG committee (it genuinely missed a rotation)
+    /// fails that verification and never reaches here: fail-closed.
+    ///
+    /// Everything epoch-scoped is dropped, the validator index is
+    /// re-seated by key, the pacemaker is rebuilt under the adopted
+    /// epoch (carrying configured timeouts), and the boundary is
+    /// persisted to the WAL — a restart must recover the adopted
+    /// epoch, not the stale one.
+    pub(crate) fn adopt_certified_epoch(&mut self, epoch: Epoch) {
+        self.epoch = epoch;
+        if let Some(ref key) = self.secret_key
+            && let Some(idx) = self.validator_set.index_of_key(&key.public_key())
+        {
+            self.validator_index = idx;
+        }
+        // Views restart per epoch, the same boundary
+        // `complete_rotation` draws: keeping the old epoch's view
+        // would leave a node that stopped at view N stranded above
+        // every view the new epoch produces, since `deliver_qc`'s
+        // catch-up only fires when the QC's view is strictly higher.
+        // The QC that triggered this adoption bumps us to
+        // `qc.view + 1` on the way out.
+        self.current_view = View::new(0);
+        self.clear_epoch_scoped_state();
+        let _ = self.append_wal_full(true);
+        self.pacemaker = crate::pacemaker::Pacemaker::with_config(
+            self.validator_set.clone(),
+            self.current_view,
+            self.epoch,
+            self.pacemaker_base_timeout_ms,
+            self.pacemaker_max_timeout_ms,
+        );
     }
 
     /// Apply pending validator key changes and schedule an epoch
@@ -346,6 +435,30 @@ impl OxideBft {
     /// is consistent; the queues are drained first precisely so a
     /// bad record cannot wedge the loop in a retry cycle.
     pub fn drive_epoch_changes(&mut self) -> Result<usize, KeyChangeError> {
+        // Phase 1: a scheduled rotation completes once the chain has
+        // committed its certified activation height. Checked before
+        // the drain so a due rotation completes even when nothing
+        // new is queued.
+        //
+        // While a rotation is pending, later deltas stay queued:
+        // draining them mid-window would have to either schedule
+        // over the pending transition (rejected — the record is
+        // already consumed, so the change would be silently lost)
+        // or merge sets built against different bases. Deferring is
+        // deterministic on every replica — the pending set drains
+        // identically at the activation height everywhere — and
+        // lossless: the queued deltas fold into the NEXT transition.
+        if self.next_validator_set.is_some() {
+            let committed = self.last_committed.map_or(0, |(_, h)| h.value());
+            let activation = self.rotation_activation_height.unwrap_or(committed);
+            if committed >= activation {
+                // `next_validator_set` is Some — `NoPendingRotation`
+                // is unreachable here.
+                let _ = self.complete_rotation();
+            }
+            return Ok(0);
+        }
+
         let changes = self.app.take_epoch_changes();
         if changes.is_empty() {
             return Ok(0);
@@ -359,11 +472,19 @@ impl OxideBft {
         if applied == 0 || new_set == self.validator_set {
             return Ok(0);
         }
-        self.schedule_rotation(new_set).map_err(|_| KeyChangeError::RotationAlreadyPending)?;
-        // The pending set is already the old committee's committed
-        // output — complete immediately so the transition takes
-        // effect at this height boundary on every node.
-        let _ = self.rotate_epoch();
+        // Membership activates at a certified future height: the
+        // transition is already committed (the block carrying it is
+        // the certification), and the delay is the join window —
+        // the network layer admits the pending set's members to the
+        // peer mesh before they must carry quorum. `saturating_add`
+        // because committed-height u64::MAX is unreachable in
+        // practice but must not wrap.
+        let activation = self
+            .last_committed
+            .map_or(0, |(_, h)| h.value())
+            .saturating_add(crate::engine::ROTATION_ACTIVATION_DELAY);
+        self.schedule_rotation_at(new_set, activation)
+            .map_err(|_| KeyChangeError::RotationAlreadyPending)?;
         Ok(applied)
     }
 }

@@ -87,11 +87,12 @@ const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
 ///
 /// | Flag | Description |
 /// |------|-------------|
-/// | `--node <i>` | This node's validator index (required) |
+/// | `--node <i>` | This node's process slot — the port offset (`base_port + i`); committee seat comes from the key |
 /// | `--num-nodes <N>` | Total validators (default: from genesis/config) |
 /// | `--base-port <p>` | Base TCP port (default: from genesis/config) |
 /// | `--bind-host <h>` | Bind address (default: `127.0.0.1`) |
-/// | `--peer-host-template <fmt>` | Peer hostname template (`{i}` = index) |
+/// | `--peer <addr>=<host:port>` | Explicit peer endpoint, repeatable — `addr` is the member's staking address (hex). Overrides the template for that member; also admits non-committee endpoints (e.g. a scheduled rotation's incoming member) |
+/// | `--peer-host-template <fmt>` | Peer hostname template (`{i}` = committee index) — used when no `--peer` matches |
 /// | `--config <path>` | TOML config file |
 /// | `--genesis-file <path>` | `genesis.json` (validator set + balances) |
 /// | `--bls-key-file <path>` | BLS secret key (hex or raw 32 bytes) |
@@ -133,7 +134,10 @@ const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
 /// `--tls-dir` points to a directory containing:
 /// - `cert.pem` — this node's X.509 certificate (PEM)
 /// - `key.pem` — this node's private key (PEM)
-/// - `peer-{i}.pem` — peer `i`'s certificate (for each peer index)
+/// - `peer-{i}.pem` — the certificate of committee member `i`
+/// - `peer-<addr hex>.pem` — the certificate of a `--peer` endpoint
+///   that is not a genesis committee member (e.g. a pending member
+///   being admitted before its rotation activates)
 ///
 /// mTLS is enforced: both sides of every connection authenticate
 /// via certificates bound to peer IDs (C4).
@@ -182,46 +186,95 @@ fn run_node(node_index_str: &str) {
     // ValidatorSet: --genesis-file or deterministic.
     let validator_set = load_validator_set(num_nodes, node_index);
 
-    // The loaded key authenticates this node *as* committee member
-    // `node_index` — the peer handshake proves key ownership per
-    // index, so a key at any other position (or none) would boot
-    // cleanly and then have every peer reject it. Fail at startup.
+    // The loaded key authenticates this node as whichever committee
+    // member holds it — the peer handshake proves key ownership per
+    // staking address, so a key not in the committee (or one a
+    // rotation has since dropped) would boot cleanly and then have
+    // every peer reject it. Fail at startup. `--node` stays the
+    // process slot (port offset); the committee seat is the key's
+    // position — post-rotation genesis files legitimately pair them
+    // differently.
     let our_pk = our_key.public_key();
-    match validator_set.index_of_key(&our_pk) {
-        Some(i) if usize::from(i) == node_index => {}
-        Some(i) => {
-            eprintln!(
-                "oxide-devnet[{node_index}]: refusing to start — --bls-key-file is committee \
-                 member {i}, not index {node_index} (use --node {i} or the matching key file)"
-            );
-            std::process::exit(1);
-        }
-        None => {
-            eprintln!(
-                "oxide-devnet[{node_index}]: refusing to start — --bls-key-file is not in the \
-                 validator set (check --genesis-file / --bls-key-file pairing)"
-            );
-            std::process::exit(1);
-        }
-    }
+    let Some(our_seat) = validator_set.index_of_key(&our_pk) else {
+        eprintln!(
+            "oxide-devnet[{node_index}]: refusing to start — --bls-key-file is not in the \
+             validator set (check --genesis-file / --bls-key-file pairing)"
+        );
+        std::process::exit(1);
+    };
+    // Peer identity is the validator's staking address — the stable
+    // identity that survives index reshuffles on removal and key
+    // replacement on rotation. Our own address (becomes our
+    // transport peer id) is read from the committee, never derived.
+    let our_addr = validator_set.validator_addresses()[usize::from(our_seat)];
+    let own_id = our_addr.0.to_vec();
 
     let listen_port = base_port + u16::try_from(node_index).expect("port fits in u16");
     let listen_addr = format!("{bind_host}:{listen_port}");
 
-    // Build peer list: all other nodes.
-    let peers: Vec<(Vec<u8>, String)> = (0..num_nodes)
-        .filter(|&i| i != node_index)
-        .map(|i| {
-            let port = base_port + u16::try_from(i).expect("port fits in u16");
+    // Explicit peer endpoints: `--peer <addr_hex>=<host:port>`,
+    // repeatable. These override the port template for the listed
+    // committee members AND admit endpoints beyond the committee —
+    // the pre-activation dial for a scheduled rotation's incoming
+    // member (the transport authenticates membership live, so a
+    // --peer that never joins the committee simply fails auth).
+    let mut peer_overrides: std::collections::HashMap<primitives::Address, String> =
+        std::collections::HashMap::new();
+    for spec in node::cli::parse_cli_flags("--peer") {
+        let Some((addr_hex, hostport)) = spec.split_once('=') else {
+            eprintln!(
+                "oxide-devnet[{node_index}]: invalid --peer '{spec}' — \
+                 expected <addr_hex>=<host:port>"
+            );
+            std::process::exit(1);
+        };
+        let addr_bytes = node::cli::hex_decode(addr_hex).unwrap_or_else(|e| {
+            eprintln!("oxide-devnet[{node_index}]: invalid --peer address '{addr_hex}': {e}");
+            std::process::exit(1);
+        });
+        let Ok(addr_arr): Result<[u8; 20], _> = addr_bytes.try_into() else {
+            eprintln!("oxide-devnet[{node_index}]: --peer address '{addr_hex}' must be 20 bytes");
+            std::process::exit(1);
+        };
+        peer_overrides.insert(primitives::Address(addr_arr), hostport.to_string());
+    }
+
+    // Build peer list: every other committee member, endpoint from
+    // the explicit override else the `base_port + committee index`
+    // template (correct for slot-aligned genesis committees;
+    // post-rotation committees use --peer), then any non-committee
+    // overrides appended so pending members are reachable early.
+    let mut peers: Vec<(Vec<u8>, String)> = Vec::new();
+    // peer-id → TLS cert filename (peer-<i>.pem for committee
+    // members; peer-<addr-hex>.pem for explicit extras) — the
+    // transport consumes it when --tls-dir is set.
+    let mut peer_cert_names: std::collections::HashMap<Vec<u8>, String> =
+        std::collections::HashMap::new();
+    for (i, addr) in validator_set.validator_addresses().iter().enumerate() {
+        if i == usize::from(our_seat) {
+            continue;
+        }
+        let hostport = peer_overrides.remove(addr).unwrap_or_else(|| {
             let host = match &peer_host_template {
                 Some(tmpl) => tmpl.replace("{i}", &i.to_string()),
                 None => "127.0.0.1".to_string(),
             };
-            (vec![u8::try_from(i).expect("peer id fits in u8")], format!("{host}:{port}"))
-        })
-        .collect();
+            let port = base_port + u16::try_from(i).expect("port fits in u16");
+            format!("{host}:{port}")
+        });
+        peer_cert_names.insert(addr.0.to_vec(), format!("peer-{i}.pem"));
+        peers.push((addr.0.to_vec(), hostport));
+    }
+    for (addr, hostport) in peer_overrides {
+        peer_cert_names.insert(addr.0.to_vec(), format!("peer-{}", node::cli::hex_encode(&addr.0)));
+        peers.push((addr.0.to_vec(), hostport));
+    }
 
-    println!("oxide-devnet[{node_index}]: listening on {listen_addr}, {} peers", peers.len());
+    println!(
+        "oxide-devnet[{node_index}]: listening on {listen_addr}, {} peers, seat {our_seat} of {}",
+        peers.len(),
+        validator_set.n()
+    );
 
     // Assemble the node through the ONE shared production path —
     // `node::devnet::assemble_devnet_node` runs the same executor
@@ -243,7 +296,11 @@ fn run_node(node_index_str: &str) {
         recovery,
         wal_path: effective_wal_path,
     } = node::devnet::assemble_devnet_node(node::devnet::DevnetNodeSpec {
-        index: node_index,
+        // The engine seat is the committee position our key holds —
+        // decoupled from `--node` (the process slot) so a
+        // post-rotation genesis can seat a node at a different index
+        // than its port offset.
+        index: usize::from(our_seat),
         validator_set: validator_set.clone(),
         secret_key: our_key.clone(),
         config: cfg.node.clone(),
@@ -274,6 +331,13 @@ fn run_node(node_index_str: &str) {
     // set at each epoch boundary; readers always see the current
     // keys.
     let shared_validator_set = Arc::new(std::sync::RwLock::new(validator_set.clone()));
+    // Shared pending set: while a rotation is scheduled, the
+    // consensus loop publishes `engine.next_validator_set()` here so
+    // `BlsPeerAuth` admits the incoming member's handshake BEFORE
+    // its first consensus duty — a member admitted only at
+    // activation would miss its opening views. `None` otherwise.
+    let shared_next_validator_set =
+        Arc::new(std::sync::RwLock::new(Option::<consensus::ValidatorSet>::None));
 
     // Create the TCP transport: --tls-dir for mTLS, plain TCP
     // otherwise. `[network]` timeouts and the frame bound flow into
@@ -283,10 +347,13 @@ fn run_node(node_index_str: &str) {
     let mut transport = build_transport(
         &listen_addr,
         node_index,
+        own_id,
         peers,
+        peer_cert_names,
         &cfg.network,
         our_key.clone(),
         shared_validator_set.clone(),
+        shared_next_validator_set.clone(),
     );
 
     // Give connections time to establish. TLS handshakes take
@@ -413,10 +480,11 @@ fn run_node(node_index_str: &str) {
         &mut engine,
         &mut transport,
         node_index,
-        num_nodes,
+        our_addr,
         shutdown.as_ref(),
         rpc_handle.as_deref(),
         &shared_validator_set,
+        &shared_next_validator_set,
         &gossip_rx,
     );
 
@@ -536,39 +604,50 @@ fn load_validator_set(num_nodes: usize, _node_index: usize) -> consensus::Valida
 /// Build the TCP transport: `--tls-dir` for mTLS, plain TCP otherwise.
 ///
 /// The `[network]` section supplies the timeouts and frame bound.
-/// `allowed_peer_ids` is pinned to the derived validator set so a
-/// non-validator peer cannot self-claim an ID and join the
-/// consensus traffic (the `TcpTransportConfig` docs mark this as
-/// required in production — it was previously left `None`).
+/// Admission is cryptographic, not list-based: `allowed_peer_ids`
+/// stays `None` because a static set can never follow committee
+/// rotations (a member added post-boot would be refused before the
+/// handshake it must pass). `BlsPeerAuth` resolves each connection's
+/// address-id against the LIVE validator set — plus the staged
+/// `pending` set during a rotation's activation window — and
+/// requires a `Domain::PeerHandshake` signature under that member's
+/// registered key. A self-claimed id can neither join nor displace
+/// a live peer, and a removed member's proofs die the moment the
+/// new set activates.
+///
+/// `peer_cert_names` maps each peer id to its certificate filename
+/// under `--tls-dir` — `peer-<committee index>.pem` for genesis
+/// members, `peer-<addr hex>.pem` for explicit `--peer` endpoints.
+/// A peer without a cert file gets no trusted-peers entry and so
+/// can never complete mTLS.
 ///
 /// # Panics
 ///
 /// Panics if `--tls-dir` is given but the TLS config cannot be built
 /// (missing cert/key files, invalid PEM, etc.).
+#[allow(clippy::too_many_arguments)]
 fn build_transport(
     listen_addr: &str,
     node_index: usize,
+    own_id: Vec<u8>,
     peers: Vec<(Vec<u8>, String)>,
+    peer_cert_names: std::collections::HashMap<Vec<u8>, String>,
     network: &config::NetworkConfig,
     our_key: crypto::BlsSecretKey,
     validators: Arc<std::sync::RwLock<consensus::ValidatorSet>>,
+    pending: Arc<std::sync::RwLock<Option<consensus::ValidatorSet>>>,
 ) -> p2p::tcp::TcpTransport {
-    let own_id = vec![u8::try_from(node_index).expect("peer id fits in u8")];
-    let allowed: std::collections::HashSet<Vec<u8>> =
-        peers.iter().map(|(id, _)| id.clone()).chain([own_id.clone()]).collect();
-    // Signed greeting: peer IDs are bound to committee keys, so a
-    // connection claiming validator `k` must sign with `k`'s BLS
-    // key — the ID can no longer be self-claimed, and a duplicate
-    // connection is a proven-same-identity reconnect, not a
-    // hijack. The shared set means committee rotations take effect
-    // without a transport restart.
+    // Signed greeting: peer IDs are staking addresses bound to
+    // committee keys, so a connection claiming member `a` must sign
+    // with the key registered for `a` — the ID can no longer be
+    // self-claimed, and a duplicate connection is a
+    // proven-same-identity reconnect, not a hijack. The shared sets
+    // mean committee rotations take effect without a transport
+    // restart.
     let auth: Arc<dyn p2p::tcp::PeerAuth> =
-        Arc::new(node::peer_auth::BlsPeerAuth::new(our_key, validators));
-    let transport_config = p2p::tcp::TcpTransportConfig {
-        allowed_peer_ids: Some(allowed),
-        peer_auth: Some(auth),
-        ..to_transport_config(network)
-    };
+        Arc::new(node::peer_auth::BlsPeerAuth::new(our_key, validators, pending));
+    let transport_config =
+        p2p::tcp::TcpTransportConfig { peer_auth: Some(auth), ..to_transport_config(network) };
     // Admission control is always on in the shipped node: connection
     // caps, per-peer ingress rate limits, and reputation bans are not
     // optional defenses. Default limits (256 connections, 10 MiB
@@ -580,9 +659,10 @@ fn build_transport(
         let key_path = format!("{tls_dir}/key.pem");
         let trusted_peers: Vec<(Vec<u8>, String)> = peers
             .iter()
-            .map(|(peer_id, _)| {
-                let peer_num = peer_id[0] as usize;
-                (peer_id.clone(), format!("{tls_dir}/peer-{peer_num}.pem"))
+            .filter_map(|(peer_id, _)| {
+                peer_cert_names
+                    .get(peer_id)
+                    .map(|name| (peer_id.clone(), format!("{tls_dir}/{name}")))
             })
             .collect();
         let trusted_peers_refs: Vec<(Vec<u8>, &str)> =
@@ -708,15 +788,25 @@ fn start_devnet_rpc(
 /// 3. Drain inbound transport messages (proposals, votes, QCs).
 /// 4. Form QC if quorum reached, broadcast to peers.
 /// 5. Advance views and sync heights.
+///
+/// Routing convention: transport peer IDs are staking *addresses*,
+/// not committee indexes. Sends resolve the live committee's
+/// `validator_addresses()` — which follows rotations as soon as the
+/// engine swaps the set — and inbound attribution resolves
+/// `msg.from` (the handshake-authenticated address) back to a
+/// committee index via `index_of`. An index baked into the peer id
+/// would point at a different member the moment a removal reshuffled
+/// the committee; the address cannot.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn run_consensus_loop(
     engine: &mut consensus::OxideBft,
     transport: &mut p2p::tcp::TcpTransport,
     node_index: usize,
-    num_nodes: usize,
+    our_addr: primitives::Address,
     shutdown: &AtomicBool,
     rpc: Option<&rpc::RpcServer>,
     shared_validator_set: &std::sync::RwLock<consensus::ValidatorSet>,
+    shared_next_validator_set: &std::sync::RwLock<Option<consensus::ValidatorSet>>,
     gossip_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     // Gossip dedup cap: tx hashes we've already ingested (ours +
@@ -819,14 +909,16 @@ fn run_consensus_loop(
                         let _ = engine.collect_vote(engine.validator_index(), leader_vote);
                         voted_views.insert(proposal_view);
                     }
-                    // Broadcast proposal to followers.
+                    // Broadcast proposal to followers — every live
+                    // committee member except us, addressed by the
+                    // staking address that IS its peer id.
                     let mut buf = Vec::with_capacity(1 + 512);
                     buf.push(MSG_PROPOSAL);
                     header.encode(&mut buf);
                     proposal.encode(&mut buf);
-                    for i in 0..num_nodes {
-                        if i != node_index {
-                            let _ = transport.send(&vec![u8::try_from(i).unwrap()], &buf);
+                    for addr in engine.validator_set().validator_addresses() {
+                        if *addr != our_addr {
+                            let _ = transport.send(&addr.0.to_vec(), &buf);
                         }
                     }
                 }
@@ -847,7 +939,12 @@ fn run_consensus_loop(
                 let mut buf = Vec::with_capacity(1 + 137);
                 buf.push(MSG_VOTE);
                 vote.encode(&mut buf);
-                let _ = transport.send(&vec![u8::try_from(leader).unwrap()], &buf);
+                // The leader's peer id is its staking address —
+                // `leader` is a committee index into the live set.
+                if let Some(leader_addr) = engine.validator_set().validator_addresses().get(leader)
+                {
+                    let _ = transport.send(&leader_addr.0.to_vec(), &buf);
+                }
                 voted_views.insert(proposal_view);
             }
         }
@@ -919,8 +1016,24 @@ fn run_consensus_loop(
                 }
                 MSG_VOTE => {
                     if let Ok(vote) = types::Vote::decode(&mut reader) {
-                        let voter_idx = u16::from(msg.from[0]);
-                        let _ = engine.collect_vote(voter_idx, vote);
+                        // Attribute by the AUTHENTICATED peer id: the
+                        // handshake proved the sender owns the staking
+                        // address it claims, so `index_of` resolves the
+                        // committee seat the signature must verify
+                        // under. A removed member's address resolves to
+                        // nothing — its vote dies here rather than
+                        // collecting under whatever index it used to
+                        // hold.
+                        let voter = msg
+                            .from
+                            .as_slice()
+                            .try_into()
+                            .map(primitives::Address)
+                            .ok()
+                            .and_then(|a| engine.validator_set().index_of(&a));
+                        if let Some(voter_idx) = voter {
+                            let _ = engine.collect_vote(voter_idx, vote);
+                        }
                     }
                 }
                 MSG_QC => {
@@ -962,17 +1075,33 @@ fn run_consensus_loop(
                 }
                 MSG_TIMEOUT => {
                     // View-change timeout signature from a peer.
-                    // Format: [voter_idx: 1B][view: 8B][epoch: 8B]
+                    // Format: [voter_addr: 20B][view: 8B][epoch: 8B]
                     //         [has_qc: 1B][qc?][has_tc: 1B][tc?]
                     //         [signature: 96B]
                     // The certificate fields are the DiemBFT v4
                     // timeout evidence: entering view v is
                     // legitimate only via QC(v−1) or TC(v−1).
-                    if let Ok(voter_idx_byte) = reader.read_u8()
+                    if let Ok(voter_bytes) = reader.read_slice(20)
                         && let Ok(sig_view) = reader.read_u64()
                         && let Ok(sig_epoch) = reader.read_u64()
                         && let Ok(has_qc) = reader.read_u8()
                     {
+                        // The claimed voter must BE the authenticated
+                        // sender — otherwise a member could attribute
+                        // its timeout signature to any other seat.
+                        let Ok(voter_arr): Result<[u8; 20], _> = voter_bytes.try_into() else {
+                            continue;
+                        };
+                        if voter_arr.as_slice() != msg.from.as_slice() {
+                            continue;
+                        }
+                        // Resolve the sender's address to its seat in
+                        // the live committee; a non-member (or a
+                        // removed member post-activation) collects
+                        // nothing.
+                        let voter_idx =
+                            engine.validator_set().index_of(&primitives::Address(voter_arr));
+                        let Some(voter_idx) = voter_idx else { continue };
                         // The wire interleaves each flag with its
                         // payload — has_qc then the QC bytes, then
                         // has_tc then the TC bytes. Reading both
@@ -993,7 +1122,6 @@ fn run_consensus_loop(
                             None
                         };
                         if let Ok(sig) = crypto::Signature::decode(&mut reader) {
-                            let voter_idx = u16::from(voter_idx_byte);
                             // Authenticate the evidence BEFORE acting
                             // on it. Everything below mutates
                             // consensus state — the pacemaker timer,
@@ -1059,10 +1187,9 @@ fn run_consensus_loop(
                                     let mut tc_buf = Vec::with_capacity(1 + 200);
                                     tc_buf.push(MSG_TC);
                                     tc.encode(&mut tc_buf);
-                                    for i in 0..num_nodes {
-                                        if i != node_index {
-                                            let _ = transport
-                                                .send(&vec![u8::try_from(i).unwrap()], &tc_buf);
+                                    for addr in engine.validator_set().validator_addresses() {
+                                        if *addr != our_addr {
+                                            let _ = transport.send(&addr.0.to_vec(), &tc_buf);
                                         }
                                     }
                                     view_start = std::time::Instant::now();
@@ -1122,9 +1249,9 @@ fn run_consensus_loop(
             let mut buf = Vec::with_capacity(1 + tx_bytes.len());
             buf.push(MSG_TX);
             buf.extend_from_slice(&tx_bytes);
-            for i in 0..num_nodes {
-                if i != node_index {
-                    let _ = transport.send(&vec![u8::try_from(i).unwrap()], &buf);
+            for addr in engine.validator_set().validator_addresses() {
+                if *addr != our_addr {
+                    let _ = transport.send(&addr.0.to_vec(), &buf);
                 }
             }
         }
@@ -1134,9 +1261,9 @@ fn run_consensus_loop(
             let mut qc_buf = Vec::with_capacity(1 + 150);
             qc_buf.push(MSG_QC);
             qc.encode(&mut qc_buf);
-            for i in 0..num_nodes {
-                if i != node_index {
-                    let _ = transport.send(&vec![u8::try_from(i).unwrap()], &qc_buf);
+            for addr in engine.validator_set().validator_addresses() {
+                if *addr != our_addr {
+                    let _ = transport.send(&addr.0.to_vec(), &qc_buf);
                 }
             }
             let _ = engine.deliver_qc(qc);
@@ -1176,29 +1303,22 @@ fn run_consensus_loop(
                 // QC(view−1) or TC(view−1) — a bare signature can no
                 // longer pull a peer to an arbitrary view.
                 let (high_qc_ev, last_tc_ev) = engine.timeout_evidence();
-                let mut buf = Vec::with_capacity(1 + 1 + 8 + 8 + 2 + 96);
+                let mut buf = Vec::with_capacity(1 + 20 + 8 + 8 + 2 + 96);
                 buf.push(MSG_TIMEOUT);
-                // Encode: voter_index (1B) + view (8B) + epoch (8B) +
-                // [has_qc 1B][qc?] + [has_tc 1B][tc?] + sig (96B).
+                // Encode: voter_address (20B) + view (8B) + epoch (8B)
+                // + [has_qc 1B][qc?] + [has_tc 1B][tc?] + sig (96B).
+                // The voter field is our staking address — the same
+                // bytes the transport proves ownership of at
+                // handshake, so the receiver can cross-check the
+                // claimed voter against the authenticated peer id
+                // and resolve the committee seat that must have
+                // signed. (An index here would misattribute the
+                // signature the moment a removal reshuffled seats.)
                 // The view and epoch are included so the receiver can
                 // verify the signature against the correct view and
                 // ignore stale sigs from a different view (e.g., after
                 // a partition when validators may be at different views).
-                // Our voter index comes from the engine — rotation
-                // may have re-seated it, while `node_index` is the
-                // frozen startup slot. The wire field is one byte:
-                // an index that cannot fit must skip the broadcast —
-                // emitting slot 0's number under our signature would
-                // misattribute the timeout.
-                let Ok(voter_byte) = u8::try_from(engine.validator_index()) else {
-                    eprintln!(
-                        "oxide-devnet[{node_index}]: validator index {} exceeds the \
-                         1-byte voter encoding — timeout signature not broadcast",
-                        engine.validator_index()
-                    );
-                    continue;
-                };
-                buf.push(voter_byte);
+                buf.extend_from_slice(&our_addr.0);
                 buf.extend_from_slice(&current_view_now.to_le_bytes());
                 buf.extend_from_slice(&engine.epoch().value().to_le_bytes());
                 // Evidence flags + optional certificates.
@@ -1217,9 +1337,9 @@ fn run_consensus_loop(
                     None => buf.push(0u8),
                 }
                 sig.encode(&mut buf);
-                for i in 0..num_nodes {
-                    if i != node_index {
-                        let _ = transport.send(&vec![u8::try_from(i).unwrap()], &buf);
+                for addr in engine.validator_set().validator_addresses() {
+                    if *addr != our_addr {
+                        let _ = transport.send(&addr.0.to_vec(), &buf);
                     }
                 }
                 // Self-collect: feed our own timeout signature to the
@@ -1237,9 +1357,9 @@ fn run_consensus_loop(
                     let mut tc_buf = Vec::with_capacity(1 + 200);
                     tc_buf.push(MSG_TC);
                     tc.encode(&mut tc_buf);
-                    for i in 0..num_nodes {
-                        if i != node_index {
-                            let _ = transport.send(&vec![u8::try_from(i).unwrap()], &tc_buf);
+                    for addr in engine.validator_set().validator_addresses() {
+                        if *addr != our_addr {
+                            let _ = transport.send(&addr.0.to_vec(), &tc_buf);
                         }
                     }
                     view_start = std::time::Instant::now();
@@ -1304,41 +1424,22 @@ fn run_consensus_loop(
         proposed_views.retain(|v| *v >= keep_from);
         seen_proposals.retain(|(v, _)| *v >= keep_from);
 
-        // Epoch boundary: `commit_block` (called from `deliver_qc`
-        // inside the drain loop and Phase 4) may have swapped the
-        // validator set via `complete_rotation`. Update the shared
-        // set so `GET /validator-set` reflects the new set for new
-        // validators joining mid-epoch.
-        if engine.epoch().value() != last_epoch {
-            last_epoch = engine.epoch().value();
-            if let Ok(mut shared) = shared_validator_set.write() {
-                *shared = engine.validator_set().clone();
-            }
-        }
-
         // Epoch lifecycle: drain the validator-set transition the
         // executor's finalized blocks recorded (staking key changes,
-        // validator adds/removes) and rotate the engine into the new
-        // committee. This is the production half of the epoch
-        // protocol — the queues only fill when a block *executes*,
-        // so polling each pass is the deferred, deterministic
-        // trigger: every node folds the same committed deltas at the
-        // same height boundary.
+        // validator adds/removes) and schedule the epoch rotation.
+        // The drain is deterministic — the queues only fill when a
+        // block *executes*, so every node stages the same committee
+        // at the same committed height — and activation is deferred
+        // to a certified boundary (`ROTATION_ACTIVATION_DELAY`
+        // commits later), never immediate on a local queue.
         match engine.drive_epoch_changes() {
             Ok(0) => {}
             Ok(applied) => {
                 eprintln!(
-                    "oxide-devnet[{node_index}]: epoch rotation applied {applied} \
-                     validator-set change(s) — now epoch {} ({} validators)",
-                    engine.epoch().value(),
-                    engine.validator_set().n()
+                    "oxide-devnet[{node_index}]: epoch rotation scheduled ({applied} \
+                     validator-set change(s)) — activates at committed height {:?}",
+                    engine.rotation_activation_height()
                 );
-                // Reflect the new committee immediately — the
-                // `last_epoch` check above only runs once per pass.
-                last_epoch = engine.epoch().value();
-                if let Ok(mut shared) = shared_validator_set.write() {
-                    *shared = engine.validator_set().clone();
-                }
             }
             Err(e) => {
                 // Deterministic rejection — every replica folds the
@@ -1350,6 +1451,48 @@ fn run_consensus_loop(
                     "oxide-devnet[{node_index}]: epoch transition rejected: {e} — \
                      pending change dropped (re-submit a valid set)"
                 );
+            }
+        }
+
+        // Epoch boundary: `commit_block` (from `deliver_qc` in the
+        // drain loop or Phase 4) and `drive_epoch_changes` (the
+        // activation-height completion above) may both swap the
+        // validator set — as can `adopt_certified_epoch` inside
+        // `deliver_qc` when a verified higher-epoch QC lands. Publish
+        // the live committee whenever the epoch moved so the
+        // authenticator and `GET /validator-set` track it.
+        if engine.epoch().value() != last_epoch {
+            last_epoch = engine.epoch().value();
+            if let Ok(mut shared) = shared_validator_set.write() {
+                *shared = engine.validator_set().clone();
+            }
+            // The pump's view-keyed bookkeeping must die with the
+            // epoch: the new epoch's view space restarts at 0, so a
+            // retained `voted_views`/`proposed_views` entry for view 0
+            // would suppress this node's first vote/proposal of the
+            // epoch, and pending proposals signed under the old epoch
+            // can never become votable. Mirrors the engine's own
+            // `clear_epoch_scoped_state`.
+            pending_proposals.clear();
+            seen_proposals.clear();
+            voted_views.clear();
+            proposed_views.clear();
+            view_start = std::time::Instant::now();
+            timeout_sent_for_view = None;
+        }
+
+        // Publish the staged committee to the transport's handshake
+        // authenticator for the whole schedule→activation window:
+        // an incoming member's first connection must already pass
+        // membership verification before its committee duties start.
+        // `next_validator_set` returns `None` outside the window (and
+        // clears itself at activation), so this is `None` most of the
+        // time — the `!=` guard avoids paying a committee clone on
+        // every pass.
+        if let Ok(mut pending) = shared_next_validator_set.write() {
+            let staged = engine.next_validator_set().cloned();
+            if *pending != staged {
+                *pending = staged;
             }
         }
 

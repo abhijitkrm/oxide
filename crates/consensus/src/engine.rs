@@ -143,6 +143,24 @@ pub const PROPOSAL_VERIFY_BUDGET_PER_SEC: u32 = 50;
 /// re-verification, never a wrong verdict.
 const MAX_REJECTED_HEADERS: usize = 4096;
 
+/// Heights between a validator-set transition being committed and
+/// its activation.
+///
+/// Unit: committed blocks. Origin: the validator-set-change audit
+/// finding — membership must "activate at a certified future
+/// height", and the activation gap is what gives the network layer
+/// a window to admit incoming members' peer connections before they
+/// carry quorum (the pending set is published to the transport
+/// authenticator during it). The change itself is already certified
+/// — the committing block's QC is the certificate — so the delay is
+/// purely a join window, not a safety margin. Tradeoff: 2 heights is
+/// one or two block periods — long enough for a pending member's
+/// reconnect retry to land, short enough that a committee fix (e.g.
+/// ejecting a dead validator) is not meaningfully delayed. Every
+/// replica schedules the transition at the same commit height, so
+/// the activation height is identical everywhere.
+pub const ROTATION_ACTIVATION_DELAY: u64 = 2;
+
 /// A block that has a QC but hasn't been committed yet — waiting for
 /// the 2-chain commit rule to fire.
 ///
@@ -262,6 +280,19 @@ pub enum ConsensusError {
         /// The block hash the conflicting vote was for.
         actual_block: Hash,
     },
+    /// A QC was received from an epoch older than the engine's.
+    /// Its signer bitmap indexes a committee the node no longer
+    /// holds and its view numbers the old epoch's restarted view
+    /// space — neither can be verified or applied safely, so the
+    /// certificate is dead evidence, refused before any state
+    /// change. (Distinguished from [`ConsensusError::StaleQc`],
+    /// which is the same-epoch monotonic-view rejection.)
+    PastEpochQc {
+        /// The epoch the QC was certified under.
+        qc_epoch: Epoch,
+        /// The engine's current epoch.
+        epoch: Epoch,
+    },
     /// A QC was formed or received whose signer voting power is below
     /// the quorum threshold. The aggregate signature may verify, but
     /// the QC does not represent >2/3 of total stake — it cannot be
@@ -343,6 +374,14 @@ impl std::fmt::Display for ConsensusError {
             Self::InsufficientQuorum { voting_power, required } => {
                 write!(f, "insufficient quorum: {voting_power} stake < {required} threshold")
             }
+            Self::PastEpochQc { qc_epoch, epoch } => {
+                write!(
+                    f,
+                    "QC from past epoch {} — engine is at epoch {}",
+                    qc_epoch.value(),
+                    epoch.value()
+                )
+            }
             Self::StaleQc { qc_view, high_qc_view } => {
                 write!(
                     f,
@@ -395,6 +434,15 @@ pub struct OxideBft {
     /// propose/vote/commit, and the new set takes over after the old
     /// set commits the last block of the old epoch.
     next_validator_set: Option<ValidatorSet>,
+    /// The committed height at which a scheduled rotation activates.
+    /// `Some` only while `next_validator_set` is `Some`. Membership
+    /// changes apply at a certified *future* height — never mid-view
+    /// and never at the exact commit that staged them — so the
+    /// incoming committee has a window (the network layer publishes
+    /// the pending set for peer admission during it) before it must
+    /// carry quorum. `drive_epoch_changes` completes the rotation
+    /// once `last_committed` reaches this height.
+    rotation_activation_height: Option<u64>,
     /// This engine's index in the validator set.
     validator_index: ValidatorIndex,
     /// This engine's BLS secret key (stage 5). Used to sign votes and
@@ -690,6 +738,7 @@ impl OxideBft {
             app,
             validator_set,
             next_validator_set: None,
+            rotation_activation_height: None,
             validator_index,
             secret_key: None,
             pacemaker,
@@ -1053,6 +1102,24 @@ impl OxideBft {
     #[must_use]
     pub fn rotation_pending(&self) -> bool {
         self.next_validator_set.is_some()
+    }
+
+    /// The scheduled next-epoch validator set, when a rotation is
+    /// pending. The network layer publishes this to the transport
+    /// authenticator so incoming members' handshakes are admitted
+    /// during the schedule→activation window — an added member must
+    /// be *reachable* before its first leader turn or its own
+    /// activation stalls the chain.
+    #[must_use]
+    pub fn next_validator_set(&self) -> Option<&ValidatorSet> {
+        self.next_validator_set.as_ref()
+    }
+
+    /// The committed height at which a pending rotation activates,
+    /// when a rotation is pending.
+    #[must_use]
+    pub fn rotation_activation_height(&self) -> Option<u64> {
+        self.rotation_activation_height
     }
 
     /// Whether this engine is the leader for the current view.
@@ -1542,12 +1609,36 @@ impl OxideBft {
     /// [`ConsensusError::StaleQc`] if the QC's view is not greater
     /// than the current `high_qc`'s view.
     pub fn deliver_qc(&mut self, qc: QuorumCertificate) -> Result<(), ConsensusError> {
+        // Certified epoch adoption. A QC claiming an epoch beyond
+        // ours is verifiable only if a committee we already hold
+        // produced it: the signed message binds `(view, phase,
+        // block_hash, epoch)`, so a quorum of a KNOWN validator set
+        // certifying epoch E is itself the handoff proof — adopt
+        // E. A node holding neither matching committee fails the
+        // verification (the bitmap resolves to the wrong keys) and
+        // rejects the QC — fail-closed, as before.
+        //
+        // A QC from a PAST epoch is dead evidence: its signer bitmap
+        // indexes a committee we no longer hold, and its view numbers
+        // the old epoch's restarted view space, so it can neither
+        // verify nor safely update `high_qc`. Rejected before any
+        // state touches it.
+        if qc.epoch < self.epoch {
+            return Err(ConsensusError::PastEpochQc { qc_epoch: qc.epoch, epoch: self.epoch });
+        }
+        let adopts_epoch = qc.epoch > self.epoch;
         // Hardening: enforce monotonic view progression. A QC for a
         // view ≤ the current high_qc's view is stale — a byzantine
         // leader could replay it to regress the engine's state.
         // Exception: the first QC (when high_qc is None) is always
         // accepted.
-        if let Some(current_high_qc) = &self.high_qc
+        //
+        // This check runs only for same-epoch QCs: a new epoch's
+        // views restart at 0, so comparing the QC's view against the
+        // old epoch's `high_qc` would reject the new epoch's first
+        // certificate on arrival.
+        if !adopts_epoch
+            && let Some(current_high_qc) = &self.high_qc
             && qc.view.value() <= current_high_qc.view().value()
         {
             return Err(ConsensusError::StaleQc {
@@ -1556,33 +1647,52 @@ impl OxideBft {
             });
         }
 
-        // Hardening: enforce quorum threshold regardless of whether
-        // signature verification is enabled. A QC backed by less
-        // than quorum voting power is not a valid commitment
-        // certificate, even in conformance mode — the signer stake
-        // is a structural property of the QC, not a cryptographic
-        // one.
-        let voting_power = self.validator_set.signer_stake(&qc.signer_bitmap);
-        let required = self.validator_set.quorum_stake();
-        if voting_power < required {
-            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
-        }
-
-        // C1 fix: verify the QC's aggregate signature against the
-        // signer bitmap + validator set. The signed message is the
-        // block hash (32 bytes) under Domain::Vote — the same domain
-        // used by `sign_vote` and verified in `collect_vote`. The
-        // verifier returns the `VerifiedQc` token — `high_qc` holds
-        // the proof, not just the bytes, so no future adoption path
-        // can store an unchecked certificate here.
-        let verified = if self.verify_signatures {
-            self.verify_qc_signature(&qc)?
-        } else {
-            // Conformance mode: crypto is deliberately compiled out,
-            // so the structural quorum check above is the entire
-            // admission — `from_trusted` records that it ran.
-            VerifiedQc::from_trusted(qc.clone())
+        // Committee selection + quorum + signature verification.
+        // A same-epoch QC admits under the current set only. A
+        // higher-epoch QC is tried against the current set first —
+        // that is a node that restarted with the post-rotation
+        // committee but a stale epoch — then against the staged
+        // `next_validator_set`: a node that was down across the
+        // activation boundary re-derived the pending committee from
+        // the committed transition but never ran the boundary
+        // itself, and the pending set is already certified evidence
+        // (a committed block scheduled it), so a QC verifying under
+        // it proves the new committee operated at `qc.epoch`. Both
+        // checks under the chosen set — quorum under its stakes and
+        // the aggregate over the QC's claimed epoch — run inside
+        // `verify_qc_with`; nothing here stores an unchecked
+        // certificate.
+        let mut adopts_pending_set = false;
+        let verified = match self.verify_qc_with(&self.validator_set, &qc) {
+            Ok(v) => v,
+            Err(current_err) => {
+                if !adopts_epoch {
+                    return Err(current_err);
+                }
+                let Some(pending) = self.next_validator_set.clone() else {
+                    return Err(current_err);
+                };
+                match self.verify_qc_with(&pending, &qc) {
+                    Ok(v) => {
+                        adopts_pending_set = true;
+                        v
+                    }
+                    // Report the current-set failure: that committee
+                    // is the one a correctly-synced node holds, so
+                    // its error is the primary diagnosis.
+                    Err(_) => return Err(current_err),
+                }
+            }
         };
+        if adopts_epoch {
+            // The staged committee produced this QC — install it
+            // before the epoch-adoption re-seat reads the live set.
+            if adopts_pending_set && let Some(pending) = self.next_validator_set.take() {
+                self.validator_set = pending;
+                self.rotation_activation_height = None;
+            }
+            self.adopt_certified_epoch(qc.epoch);
+        }
 
         // Update the highest QC.
         self.high_qc = Some(verified);
@@ -1671,6 +1781,41 @@ impl OxideBft {
     /// not verify.
     fn verify_qc_signature(&self, qc: &QuorumCertificate) -> Result<VerifiedQc, ConsensusError> {
         crate::verify::verify_qc_signature(&self.validator_set, self.epoch, qc)
+    }
+
+    /// Verify `qc` against an explicit committee `set`: quorum
+    /// weight under its stakes plus the aggregate signature bound
+    /// to `qc.epoch` — the epoch the signers actually signed for,
+    /// never the local one (for a same-epoch QC they coincide;
+    /// for a higher-epoch QC the claimed epoch is what makes the
+    /// certificate valid handoff evidence). Both checks stay inside
+    /// this helper so every caller — current-set or pending-set —
+    /// pays the same admission bar.
+    ///
+    /// With `verify_signatures` off (conformance mode) the
+    /// structural quorum check is the entire admission —
+    /// `VerifiedQc::from_trusted` records that it ran.
+    ///
+    /// # Errors
+    /// [`ConsensusError::InsufficientQuorum`] if the bitmap's stake
+    /// is below `set`'s quorum, [`ConsensusError::SignerOutOfBounds`]
+    /// if it indexes past `set`, or [`ConsensusError::InvalidQcSignature`]
+    /// if the aggregate does not verify under `qc.epoch`.
+    fn verify_qc_with(
+        &self,
+        set: &ValidatorSet,
+        qc: &QuorumCertificate,
+    ) -> Result<VerifiedQc, ConsensusError> {
+        let voting_power = set.signer_stake(&qc.signer_bitmap);
+        let required = set.quorum_stake();
+        if voting_power < required {
+            return Err(ConsensusError::InsufficientQuorum { voting_power, required });
+        }
+        if self.verify_signatures {
+            crate::verify::verify_qc_signature(set, qc.epoch, qc)
+        } else {
+            Ok(VerifiedQc::from_trusted(qc.clone()))
+        }
     }
 
     /// Advance to the next view (happy path: one view per block).

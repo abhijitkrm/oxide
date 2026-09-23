@@ -20471,3 +20471,83 @@ with the actual membership position (or "not in the set").
 **`--bls-key-file` tolerates a trailing newline** — hex files
 written by `echo` or an editor no longer fall through to the
 raw-bytes path and die on a 65-byte parse.
+
+## Session N+39 — committee identity survives its own rotation
+
+The validator-set change path had a structural flaw that only shows
+up once a rotation actually removes or reorders members: the wire
+layer addressed peers by *committee index*. `oxide-devnet` built
+peer ids as `vec![i]`, timeout frames carried a one-byte voter
+index, and the TCP harness treated `engines[i]` as committee seat
+`i` forever. The moment a removal shifted seats, every one of those
+references named the wrong member — or, worse, the *right-shaped*
+wrong member: a removed validator's stale index silently collides
+with whoever moved into its seat, letting it propose, vote, and
+collect under a seat it no longer holds.
+
+**Identity is the staking address.** Transport peer ids are now the
+20-byte staking address — the identity that survives both index
+reshuffles (removal) and key replacement (rotation), since
+`apply_key_change` preserves the address. `BlsPeerAuth` resolves
+`peer_id → index_of(addr) → key` against a *shared* validator set
+at handshake time, so a rotation the pump publishes takes effect
+with no transport restart: a removed member's proofs die the moment
+the new set activates. During the schedule→activation window the
+pending set is published too — an incoming member's handshake
+verifies against `current ∪ pending`, so it is connected and
+receiving traffic *before* its first consensus duty.
+
+**Rotation is deferred to a certified height.** `drive_epoch_changes`
+used to activate the new committee the moment the staking deltas
+drained — mid-view, mid-height. Now `schedule_rotation_at` stages
+the set for `last_committed + ROTATION_ACTIVATION_DELAY` (2 blocks)
+and `complete_rotation` fires only when that height is itself
+committed — the activation point is chain-certified, so every
+replica crosses the boundary at the same committed height. Queued
+changes that arrive mid-window are *not* drained (they would
+schedule over the pending transition and silently lose); they fold
+into the next epoch's transition. The window is observable through
+`next_validator_set()`/`rotation_activation_height()`.
+
+**Certified epoch adoption.** A node holding the right committee
+but a stale epoch (down across the activation boundary, or a
+restart that re-derived the pending set from committed state) can
+now follow a higher-epoch QC: `deliver_qc` tries the current set
+first, then the pending set — the pending committee is already
+certified evidence, so a QC verifying under it proves the handoff.
+`adopt_certified_epoch` then clears all epoch-scoped state (the
+same reset `complete_rotation` runs — per-view votes, high QC, TC
+state, height locks, exec attestations, rejection memos), re-seats
+`validator_index` by BLS key, persists through the WAL, and rebuilds
+the pacemaker with *configured* timeouts. A QC from a genuinely
+foreign committee still fails verification, and a past-epoch QC is
+now rejected explicitly as `PastEpochQc` rather than surfacing as a
+signature error.
+
+**Removed members fail closed.** `complete_rotation` re-seats by key;
+a member whose key is gone keeps its stale index — its signatures
+verify against nobody, which is silence, not authority. Every wire
+attribution now resolves `msg.from` (the handshake-proven address)
+through `index_of` on the *receiver's live committee*: votes,
+timeout signatures (whose 20-byte voter field is cross-checked
+against the authenticated peer id), and injected frames all die at
+attribution when the sender's address is no longer a member. The
+harness tracks spawn position ↔ committee seat separately
+(`engine_pos`) — a phantom member still resolves to nothing, and a
+removed engine's stale slot can never claim a live seat.
+
+Bug found while testing: the pump kept `voted_views`/`proposed_views`/
+`pending_proposals` keyed by bare view number — after a rotation
+resets the view space to 0, the new epoch's first proposal would
+have been suppressed by the old epoch's retained entries. The
+epoch-boundary publish now clears all pump bookkeeping alongside
+the shared-set update.
+
+Verified: 213 consensus tests (new: deferred activation, queued
+changes mid-window, pending-committee QC adoption, foreign and
+past-epoch rejection, WAL restore of rotated state), 34 devnet
+tests including the new `removed_member_cannot_use_stale_seat`
+regression (a forged vote from the removed engine's transport over
+TCP must not poison seat 1's slot — under index attribution it
+would have censored a live member), and a live 4-node devnet
+finalizing continuously on address peer ids.

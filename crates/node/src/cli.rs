@@ -393,6 +393,21 @@ pub fn parse_cli_flag(flag: &str) -> Option<String> {
     None
 }
 
+/// Parse every `--flag value` pair from CLI args — for repeatable
+/// flags like `--peer`. Values are returned in argument order.
+pub fn parse_cli_flags(flag: &str) -> Vec<String> {
+    let mut args = env::args().skip(1);
+    let mut values = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == flag
+            && let Some(value) = args.next()
+        {
+            values.push(value);
+        }
+    }
+    values
+}
+
 /// Build a signed v1 envelope from devnet identity 0 — the account
 /// every devnet convenience flow (smoke tx, keep-alive delegate,
 /// key-change) submits as. Signing is mandatory: the executor's

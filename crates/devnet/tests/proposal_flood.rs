@@ -187,36 +187,35 @@ fn junk_proposal_flood_keeps_committing() {
     let _guard = scopeguard(children);
     std::thread::sleep(Duration::from_secs(4));
 
-    // The attacker's authenticated transport: peer id 6, committee
-    // member 6's real BLS key. It passes the signed greeting — the
-    // test measures the *consensus* intake path, not the handshake.
+    // The attacker's authenticated transport: peer id = member 6's
+    // staking address, signed with member 6's real BLS key. It
+    // passes the signed greeting — the test measures the
+    // *consensus* intake path, not the handshake.
     let attacker_auth: Arc<dyn p2p::tcp::PeerAuth> = Arc::new(node::peer_auth::BlsPeerAuth::new(
         node::cli::bls_key(7),
         Arc::new(std::sync::RwLock::new(set.clone())),
+        Arc::new(std::sync::RwLock::new(None)),
     ));
-    let allowed: std::collections::HashSet<Vec<u8>> =
-        (0..NUM_NODES).map(|i| vec![u8::try_from(i).unwrap_or(0)]).collect();
+    // Peer ids are staking addresses — member `i` is
+    // `test_identity_address(i)`, matching the binary's derivation.
+    let member_id = |i: usize| -> Vec<u8> {
+        crypto::secp::test_identity_address(u8::try_from(i).unwrap_or(0))
+            .expect("devnet identity")
+            .0
+            .to_vec()
+    };
     let peers: Vec<(Vec<u8>, String)> = (0..LIVE_NODES)
-        .map(|i| {
-            (
-                vec![u8::try_from(i).unwrap_or(0)],
-                format!("127.0.0.1:{}", base_port + u16::try_from(i).unwrap_or(0)),
-            )
-        })
+        .map(|i| (member_id(i), format!("127.0.0.1:{}", base_port + u16::try_from(i).unwrap_or(0))))
         .collect();
     let mut transport = p2p::tcp::TcpTransport::with_config(
         "127.0.0.1:0",
-        vec![6],
+        member_id(6),
         peers,
-        p2p::tcp::TcpTransportConfig {
-            allowed_peer_ids: Some(allowed),
-            peer_auth: Some(attacker_auth),
-            ..Default::default()
-        },
+        p2p::tcp::TcpTransportConfig { peer_auth: Some(attacker_auth), ..Default::default() },
     );
 
-    // Wait for the signed handshake to install the peer-6 slots.
-    let first = vec![0u8];
+    // Wait for the signed handshake to install the member-6 slots.
+    let first = member_id(0);
     let probe = junk_proposal_frame(&set, 1, true, 0);
     let deadline = Instant::now() + Duration::from_secs(5);
     while transport.send(&first, &probe).is_err() {
@@ -242,7 +241,7 @@ fn junk_proposal_flood_keeps_committing() {
     for round in 0..2_000u64 {
         let view = round % 80;
         for peer in 0..LIVE_NODES {
-            let pid = vec![u8::try_from(peer).unwrap_or(0)];
+            let pid = member_id(peer);
             let _ = transport.send(&pid, &junk_proposal_frame(&set, view, true, round));
             let _ = transport.send(&pid, &junk_proposal_frame(&set, 500 + view, true, round));
             let _ = transport.send(&pid, &junk_proposal_frame(&set, view, false, round));

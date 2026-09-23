@@ -207,7 +207,10 @@ impl ByzantineTcpDevnet {
         let mut buf = Vec::with_capacity(1 + 137);
         buf.push(MSG_VOTE);
         vote.encode(&mut buf);
-        let target_peer = vec![u8::try_from(target_idx).unwrap()];
+        // The target's peer id is its staking address — index
+        // byte ids were replaced by address ids so committee
+        // reshuffles can't silently re-target injected frames.
+        let target_peer = self.inner.validator_set().validator_addresses()[target_idx].0.to_vec();
         self.inner.transports_mut()[byzantine_idx]
             .send(&target_peer, &buf)
             .expect("TCP send invalid vote");
@@ -238,7 +241,10 @@ impl ByzantineTcpDevnet {
         let mut buf = Vec::with_capacity(1 + 137);
         buf.push(MSG_VOTE);
         vote.encode(&mut buf);
-        let target_peer = vec![u8::try_from(target_idx).unwrap()];
+        // The target's peer id is its staking address — index
+        // byte ids were replaced by address ids so committee
+        // reshuffles can't silently re-target injected frames.
+        let target_peer = self.inner.validator_set().validator_addresses()[target_idx].0.to_vec();
         self.inner.transports_mut()[byzantine_idx]
             .send(&target_peer, &buf)
             .expect("TCP send forged vote");
@@ -257,7 +263,10 @@ impl ByzantineTcpDevnet {
     pub fn inject_malformed_message(&mut self, byzantine_idx: usize, target_idx: usize) {
         // A truncated vote message: tag + partial vote data.
         let malformed = vec![MSG_VOTE, 0x00, 0x01, 0x02];
-        let target_peer = vec![u8::try_from(target_idx).unwrap()];
+        // The target's peer id is its staking address — index
+        // byte ids were replaced by address ids so committee
+        // reshuffles can't silently re-target injected frames.
+        let target_peer = self.inner.validator_set().validator_addresses()[target_idx].0.to_vec();
         self.inner.transports_mut()[byzantine_idx]
             .send(&target_peer, &malformed)
             .expect("TCP send malformed message");
@@ -273,7 +282,10 @@ impl ByzantineTcpDevnet {
     /// Panics if the TCP send fails or if indices exceed `u8::MAX`.
     pub fn inject_unknown_tag(&mut self, byzantine_idx: usize, target_idx: usize) {
         let unknown = vec![0xFF, 0x00, 0x01, 0x02];
-        let target_peer = vec![u8::try_from(target_idx).unwrap()];
+        // The target's peer id is its staking address — index
+        // byte ids were replaced by address ids so committee
+        // reshuffles can't silently re-target injected frames.
+        let target_peer = self.inner.validator_set().validator_addresses()[target_idx].0.to_vec();
         self.inner.transports_mut()[byzantine_idx]
             .send(&target_peer, &unknown)
             .expect("TCP send unknown tag");
@@ -329,7 +341,10 @@ impl ByzantineTcpDevnet {
         let mut buf2 = Vec::with_capacity(1 + 137);
         buf2.push(MSG_VOTE);
         vote_2.encode(&mut buf2);
-        let target_peer = vec![u8::try_from(target_idx).unwrap()];
+        // The target's peer id is its staking address — index
+        // byte ids were replaced by address ids so committee
+        // reshuffles can't silently re-target injected frames.
+        let target_peer = self.inner.validator_set().validator_addresses()[target_idx].0.to_vec();
         self.inner.transports_mut()[byzantine_idx]
             .send(&target_peer, &buf1)
             .expect("TCP send equivocating vote 1");
@@ -367,8 +382,13 @@ impl ByzantineTcpDevnet {
                 match tag {
                     MSG_VOTE => {
                         if let Ok(vote) = Vote::decode(&mut reader) {
-                            let voter_idx = u16::from(msg.from[0]);
-                            let _ = engines[i].collect_vote(voter_idx, vote);
+                            let voter_idx = <[u8; 20]>::try_from(msg.from.as_slice())
+                                .map(primitives::Address)
+                                .ok()
+                                .and_then(|a| engines[i].validator_set().index_of(&a));
+                            if let Some(voter_idx) = voter_idx {
+                                let _ = engines[i].collect_vote(voter_idx, vote);
+                            }
                         }
                     }
                     MSG_QC => {

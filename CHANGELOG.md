@@ -100,6 +100,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     replayable on Ethereum mainnet, and zero fees. Now they
     refuse, and tell you everything that needs fixing at once.
 
+- **Validator-set changes are now safe against index confusion**
+  (`consensus`, `node`, `oxide-devnet`, `devnet`): transport peer
+  IDs are the members' 20-byte staking addresses instead of
+  committee indexes, and every handshake proves the address's
+  registered BLS key — so a validator that is removed or reseated
+  by a rotation can no longer propose, vote, or be attributed
+  under its old position. Committee changes no longer activate
+  mid-view: a scheduled set activates only at a certified future
+  committed height (`ROTATION_ACTIVATION_DELAY` blocks later), the
+  pending committee is visible to networking for the whole window
+  so an incoming member connects before its first duty, and a node
+  that was down across the boundary adopts the new epoch from a
+  verified QC rather than stalling. `oxide-devnet` gains a
+  repeatable `--peer <addr-hex>=<host:port>` flag for endpoints
+  that the port template cannot express (post-rotation committees,
+  incoming members).
+  - **In plain words:** adding or removing a validator used to
+    scramble which network identity meant which member — a removed
+    validator could keep acting as whoever inherited its slot. Now
+    identities are stable, membership changes take effect at a
+    chain-certified boundary, and a node that missed the handoff
+    catches up from a signed proof instead of staying stuck.
+
 - **`oxide-matcher` now requires `--settlement-key`** — there is no
   default settlement operator. The flag is mandatory, and secrets in
   the public test-identity scalar space (`crypto::secp` identity
