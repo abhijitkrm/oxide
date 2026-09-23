@@ -492,6 +492,12 @@ fn build_transport(
         allowed_peer_ids: Some(allowed),
         ..to_transport_config(network)
     };
+    // Admission control is always on in the shipped node: connection
+    // caps, per-peer ingress rate limits, and reputation bans are not
+    // optional defenses. Default limits (256 connections, 10 MiB
+    // burst / 1 MiB/s per peer) comfortably fit consensus traffic.
+    let admission =
+        p2p::admission::SharedAdmissionControl::new(p2p::admission::AdmissionControl::new());
     if let Some(tls_dir) = node::cli::parse_cli_flag("--tls-dir") {
         let cert_path = format!("{tls_dir}/cert.pem");
         let key_path = format!("{tls_dir}/key.pem");
@@ -508,9 +514,22 @@ fn build_transport(
             p2p::tls::TlsConfig::from_files(&cert_path, &key_path, &trusted_peers_refs)
                 .unwrap_or_else(|e| panic!("failed to build TLS config from {tls_dir}: {e}"));
         println!("oxide-devnet[{node_index}]: mTLS enabled ({tls_dir})");
-        p2p::tcp::TcpTransport::with_tls(listen_addr, own_id, peers, transport_config, tls_config)
+        p2p::tcp::TcpTransport::with_tls_and_admission(
+            listen_addr,
+            own_id,
+            peers,
+            transport_config,
+            tls_config,
+            admission,
+        )
     } else {
-        p2p::tcp::TcpTransport::with_config(listen_addr, own_id, peers, transport_config)
+        p2p::tcp::TcpTransport::with_admission(
+            listen_addr,
+            own_id,
+            peers,
+            transport_config,
+            admission,
+        )
     }
 }
 

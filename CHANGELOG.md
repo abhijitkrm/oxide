@@ -1395,6 +1395,26 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Admission control was compiled but never wired into the shipped
+  node** (`p2p`, `oxide-devnet`): `with_tls` and `with_admission`
+  were mutually exclusive constructors and the launcher picked the
+  no-admission one. New `with_tls_and_admission` composes both;
+  `oxide-devnet` now always builds admission (256-connection cap,
+  per-peer ingress rate limits, reputation bans). While wiring, a
+  counter bug surfaced: inbound connections took a slot but never
+  released it, while outbound connections released a slot they
+  never held — the cap drifted until it either rejected everything
+  or bound nothing. Admit/release is now paired per connection in
+  both directions, `shutdown()`'s bulk release (which under-counted
+  duplicate conns) is gone, and `TcpTransport::admission()` exposes
+  the controller so callers can report misbehavior. Also fixed in
+  passing: the per-peer rate limiter's refill multiply could
+  overflow `u64` on a large configured rate (a panic now that
+  release overflow checks are on) — it saturates instead.
+  **In plain words:** connection caps, rate limits and bans now
+  actually run on a shipped node — and they can't be silently
+  defeated by reconnecting a lot.
+
 - **One idle connection could freeze all inbound peers** (`p2p`):
   the TCP accept loop ran the peer-ID handshake inline *before*
   setting a read timeout, so a socket that never sent its greeting

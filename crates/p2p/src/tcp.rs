@@ -548,9 +548,10 @@ pub struct TcpTransport {
     tls: Option<Arc<TlsConfig>>,
     /// Admission control: reputation checks, connection caps, rate
     /// limiting. `None` disables admission control (devnet mode).
-    /// When set, the accept thread checks `admit_connection` before
-    /// accepting a new peer, and `recv()` checks `admit_message`
-    /// before delivering an inbound message.
+    /// When set, handshake workers check `admit_connection` before
+    /// accepting a new peer, `install_connected_peer` gates outbound
+    /// connections on the same cap, and `recv()` checks
+    /// `admit_message` before delivering an inbound message.
     admission: Option<Arc<SharedAdmissionControl>>,
     /// Clones of the underlying `TcpStream` for each connected peer,
     /// used to forcibly close connections on shutdown. Calling
@@ -710,6 +711,34 @@ impl TcpTransport {
         tls: TlsConfig,
     ) -> Self {
         Self::build(listen_addr, peer_id, peers, config, Some(Arc::new(tls)), None)
+    }
+
+    /// Construct a TCP transport with TLS encryption AND admission
+    /// control — the production composition. `with_tls` and
+    /// `with_admission` each enable only half the defense; a shipped
+    /// node must not have to choose between encryption and `DoS`
+    /// limits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listen address cannot be bound.
+    #[cfg(feature = "tls")]
+    pub fn with_tls_and_admission(
+        listen_addr: &str,
+        peer_id: PeerId,
+        peers: Vec<(PeerId, TcpAddr)>,
+        config: TcpTransportConfig,
+        tls: TlsConfig,
+        admission: SharedAdmissionControl,
+    ) -> Self {
+        Self::build(
+            listen_addr,
+            peer_id,
+            peers,
+            config,
+            Some(Arc::new(tls)),
+            Some(Arc::new(admission)),
+        )
     }
 
     /// Internal constructor shared by `with_config` and `with_tls`.
@@ -873,6 +902,25 @@ impl TcpTransport {
                 // a dead loop loses that peer, not the node.
                 let actor = format!("p2p-peer-{}", peer_tag(&pid));
                 let _ = primitives::supervision::spawn_supervised(&actor, false, move || {
+                    // Shared install context: `install_connected_peer`
+                    // owns the admission admit/release pair, the map
+                    // inserts and the reader loop for both the TLS and
+                    // plain paths.
+                    let ctx = ConnectCtx {
+                        our_id: oid.clone(),
+                        connect_timeout,
+                        read_timeout,
+                        max_message_bytes,
+                        max_inbound_queue_bytes,
+                        streams: cs.clone(),
+                        shutdown_streams: css.clone(),
+                        tx: ct.clone(),
+                        queued: cq.clone(),
+                        shutdown: rshut.clone(),
+                        admission: cac.clone(),
+                        #[cfg(feature = "tls")]
+                        tls: ctls.clone(),
+                    };
                     // Outer reconnect loop: if the connection breaks
                     // (reader loop exits due to I/O error, EOF, or
                     // peer shutdown), retry the connection after a
@@ -935,36 +983,21 @@ impl TcpTransport {
                                     SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
                                 let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
                                 let write_stream = Box::new(shared) as Box<dyn PeerStream>;
-                                // Spawn a writer thread and register its
-                                // channel sender for outbound sends.
-                                // Duplicate handling: see accept path.
-                                if let Some(shutdown_stream) = shutdown_stream {
-                                    let _ = primitives::sync::lock_state(&css)
-                                        .insert(pid.clone(), shutdown_stream);
-                                }
-                                let slot = spawn_writer(write_stream, &rshut, &pid);
-                                primitives::sync::lock_state(&cs).insert(pid.clone(), slot);
-                                // Reader loop for this connection.
-                                reader_loop(
-                                    reader_stream,
+                                // Install and own the connection until
+                                // it dies — the admission admit/release
+                                // pair and reader loop live inside.
+                                install_connected_peer(
+                                    &ctx,
                                     pid.clone(),
-                                    ct.clone(),
-                                    cq.clone(),
-                                    max_message_bytes,
-                                    max_inbound_queue_bytes,
-                                    rshut.clone(),
+                                    reader_stream,
+                                    write_stream,
+                                    shutdown_stream,
                                 );
-                                // Reader loop exited — connection broke.
-                                // Remove the stale writer channel and
-                                // shutdown stream, then retry.
-                                // Release the admission connection slot
-                                // (HIGH fix: prevents connection counter
-                                // leak on disconnect).
-                                if let Some(ref ac) = cac {
-                                    ac.release_connection();
-                                }
-                                primitives::sync::lock_state(&cs).remove(&pid);
-                                primitives::sync::lock_state(&css).remove(&pid);
+                                // Connection over — remove the stale
+                                // writer channel and shutdown stream,
+                                // then retry.
+                                primitives::sync::lock_state(&ctx.streams).remove(&pid);
+                                primitives::sync::lock_state(&ctx.shutdown_streams).remove(&pid);
                                 thread::sleep(Duration::from_millis(500));
                                 continue;
                             }
@@ -994,36 +1027,20 @@ impl TcpTransport {
                         };
                         let write_stream = Box::new(write_raw) as Box<dyn PeerStream>;
                         let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
-                        // Spawn a writer thread and register its
-                        // channel sender for outbound sends.
-                        // Duplicate handling: see accept path.
-                        if let Some(shutdown_stream) = shutdown_stream {
-                            let _ = primitives::sync::lock_state(&css)
-                                .insert(pid.clone(), shutdown_stream);
-                        }
-                        let slot = spawn_writer(write_stream, &rshut, &pid);
-                        primitives::sync::lock_state(&cs).insert(pid.clone(), slot);
-                        // Reader loop for this connection.
-                        reader_loop(
-                            reader_stream,
+                        // Install and own the connection until it dies —
+                        // the admission admit/release pair and reader
+                        // loop live inside.
+                        install_connected_peer(
+                            &ctx,
                             pid.clone(),
-                            ct.clone(),
-                            cq.clone(),
-                            max_message_bytes,
-                            max_inbound_queue_bytes,
-                            rshut.clone(),
+                            reader_stream,
+                            write_stream,
+                            shutdown_stream,
                         );
-                        // Reader loop exited — connection broke.
-                        // Remove the stale writer channel and
-                        // shutdown stream, then retry.
-                        // Release the admission connection slot
-                        // (HIGH fix: prevents connection counter
-                        // leak on disconnect).
-                        if let Some(ref ac) = cac {
-                            ac.release_connection();
-                        }
-                        primitives::sync::lock_state(&cs).remove(&pid);
-                        primitives::sync::lock_state(&css).remove(&pid);
+                        // Connection over — remove the stale writer
+                        // channel and shutdown stream, then retry.
+                        primitives::sync::lock_state(&ctx.streams).remove(&pid);
+                        primitives::sync::lock_state(&ctx.shutdown_streams).remove(&pid);
                         thread::sleep(Duration::from_millis(500));
                     }
                 });
@@ -1077,15 +1094,11 @@ impl TcpTransport {
         for stream in streams.values() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
-        let connection_count = streams.len();
         drop(streams); // release the lock before clearing the senders
-        // Release all admission connection slots (HIGH fix: prevents
-        // connection counter leak on shutdown).
-        if let Some(ref ac) = self.admission {
-            for _ in 0..connection_count {
-                ac.release_connection();
-            }
-        }
+        // Admission slots are released by each connection's own
+        // reader exit (both directions pair admit with release) —
+        // the forced-close above is what drives those exits, so no
+        // bulk release is needed or correct here.
         // Drop all writer senders — this causes writer threads to exit
         // on their next `recv_timeout` (within 100ms).
         primitives::sync::lock_state(&self.streams).clear();
@@ -1094,6 +1107,13 @@ impl TcpTransport {
     /// Returns `true` if the transport has been shut down.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// The admission controller, when enabled — callers use it to
+    /// report peer misbehavior (`record_misbehavior`) and inspect
+    /// connection counts (`current_connections`).
+    pub fn admission(&self) -> Option<&Arc<SharedAdmissionControl>> {
+        self.admission.as_ref()
     }
 
     /// Dynamically add a peer to the transport.
@@ -1129,6 +1149,7 @@ impl TcpTransport {
             tx: self.inbound_tx.clone(),
             queued: self.inbound_queued.clone(),
             shutdown: self.shutdown.clone(),
+            admission: self.admission.clone(),
             #[cfg(feature = "tls")]
             tls: self.tls.clone(),
         };
@@ -1218,6 +1239,10 @@ struct ConnectCtx {
     queued: Arc<AtomicUsize>,
     /// Transport-wide shutdown flag.
     shutdown: Arc<AtomicBool>,
+    /// Admission control. Gated on the outbound side too: a dialed
+    /// connection consumes the same reader/writer/fd budget as an
+    /// accepted one, and a banned peer must not be re-dialed.
+    admission: Option<Arc<SharedAdmissionControl>>,
     /// TLS configuration, when the transport was built with it.
     #[cfg(feature = "tls")]
     tls: Option<Arc<TlsConfig>>,
@@ -1227,6 +1252,10 @@ struct ConnectCtx {
 /// completion — the loop owns the calling thread until the
 /// connection dies. Shared by the TLS and plain connect paths so
 /// neither can drift on the accounting or map bookkeeping.
+///
+/// Owns the outbound admission pair: `admit_connection` before the
+/// maps are touched, `release_connection` after the reader exits.
+/// An admission rejection drops the streams, closing the socket.
 fn install_connected_peer(
     ctx: &ConnectCtx,
     pid: PeerId,
@@ -1234,6 +1263,15 @@ fn install_connected_peer(
     write_stream: Box<dyn PeerStream>,
     shutdown_stream: Option<TcpStream>,
 ) {
+    // Outbound connections count against the same cap as inbound —
+    // `max_connections` bounds total peer connections, not just
+    // accepted ones. Rejection drops the streams, so the socket
+    // closes and the caller's backoff applies.
+    if let Some(ref ac) = ctx.admission
+        && !ac.admit_connection(&pid)
+    {
+        return;
+    }
     // Duplicate handling: see accept path.
     if let Some(shutdown_stream) = shutdown_stream {
         let _ = primitives::sync::lock_state(&ctx.shutdown_streams)
@@ -1243,13 +1281,19 @@ fn install_connected_peer(
     primitives::sync::lock_state(&ctx.streams).insert(pid.clone(), slot);
     reader_loop(
         reader_stream,
-        pid,
+        pid.clone(),
         ctx.tx.clone(),
         ctx.queued.clone(),
         ctx.max_message_bytes,
         ctx.max_inbound_queue_bytes,
         ctx.shutdown.clone(),
     );
+    // Reader exited — the connection is dead; pair the admit. This
+    // is the only release site for outbound connections, so the
+    // counter can't drift regardless of how the connection ended.
+    if let Some(ref ac) = ctx.admission {
+        ac.release_connection();
+    }
 }
 
 impl Transport for TcpTransport {
@@ -1813,13 +1857,23 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
     // non-critical: a dead peer reader loses one connection (the
     // dialer retries), not the node. The name is peer-keyed so a
     // dead reader is attributed to its peer.
+    //
+    // The reader owns the admission slot for the connection's
+    // life: `admit_connection` ran above, and `release_connection`
+    // runs when the loop exits (EOF, error, or shutdown). Without
+    // the release here, reconnect churn would leak slots until the
+    // cap rejected every new inbound peer.
     let actor = format!("p2p-reader-{}", peer_tag(&peer_id));
     let tx = shared.inbound_tx.clone();
     let queued = shared.inbound_queued.clone();
     let reader_shutdown = shared.shutdown.clone();
+    let reader_admission = shared.admission.clone();
     let max_message_bytes = shared.max_message_bytes;
     let max_inbound_queue_bytes = shared.max_inbound_queue_bytes;
-    let _ = primitives::supervision::spawn_supervised(&actor, false, move || {
+    // Cloned for the spawn-failure cleanup below — `peer_id` itself
+    // moves into the reader closure.
+    let cleanup_key = peer_id.clone();
+    let spawned = primitives::supervision::spawn_supervised(&actor, false, move || {
         reader_loop(
             reader_stream,
             peer_id,
@@ -1829,7 +1883,20 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
             max_inbound_queue_bytes,
             reader_shutdown,
         );
+        if let Some(ref ac) = reader_admission {
+            ac.release_connection();
+        }
     });
+    if spawned.is_err() {
+        // Thread spawn failed — the reader will never run, so the
+        // admission slot and map entries would leak. Undo the
+        // install; the peer's dialer retries.
+        primitives::sync::lock_state(&shared.streams).remove(&cleanup_key);
+        primitives::sync::lock_state(&shared.shutdown_streams).remove(&cleanup_key);
+        if let Some(ref ac) = shared.admission {
+            ac.release_connection();
+        }
+    }
 }
 
 /// Accept a plain TCP connection: read the peer's ID, clone the
@@ -2515,6 +2582,85 @@ mod tests {
         // trying to connect, but we verify the transport constructs
         // and shuts down cleanly.
         transport.shutdown();
+    }
+
+    /// The connection cap binds the OUTBOUND dialer too: with cap=0
+    /// the configured peer is never installed, so `send` reports
+    /// `UnknownPeer` forever. Previously outbound connections
+    /// bypassed `admit_connection` yet still released a slot on
+    /// disconnect — the counter drifted whichever way traffic
+    /// flowed.
+    #[test]
+    fn admission_cap_binds_outbound_dialer() {
+        let addr_a = "127.0.0.1:19161";
+        let addr_b = "127.0.0.1:19162";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        let mut transport_a = TcpTransport::with_admission(
+            addr_a,
+            id_a.clone(),
+            vec![(id_b.clone(), addr_b.to_string())],
+            TcpTransportConfig::default(),
+            SharedAdmissionControl::new(AdmissionControl::with_limits(0, 1 << 20, 1 << 20)),
+        );
+        // Give the dialer a few retry rounds to (incorrectly, before
+        // the fix) install the outbound connection.
+        thread::sleep(Duration::from_millis(700));
+        assert!(
+            matches!(transport_a.send(&id_b, b"nope"), Err(TransportError::UnknownPeer)),
+            "cap=0 must keep the outbound slot empty"
+        );
+        assert_eq!(
+            transport_a.admission().expect("admission enabled").current_connections(),
+            0,
+            "rejected admits must not consume slots"
+        );
+    }
+
+    /// The admission slot must be released when the connection
+    /// dies: with `max_connections = 1` a peer that connects,
+    /// drops, and reconnects must be admitted every time. Before
+    /// the fix, the accept side admitted but never released —
+    /// reconnect churn permanently exhausted the cap and every new
+    /// inbound peer was silently rejected.
+    #[test]
+    fn admission_slot_released_on_disconnect() {
+        let addr_a = "127.0.0.1:19163";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        let mut transport_a = TcpTransport::with_admission(
+            addr_a,
+            id_a,
+            vec![],
+            TcpTransportConfig::default(),
+            SharedAdmissionControl::new(AdmissionControl::with_limits(1, u64::MAX, u64::MAX)),
+        );
+
+        for round in 0..3u8 {
+            // Raw client: connect, send the peer-ID frame + a
+            // message, then drop the socket.
+            let mut sock = TcpStream::connect(addr_a).expect("connect");
+            write_frame(&mut sock, &id_b).expect("id frame");
+            let body = format!("round {round}");
+            write_frame(&mut sock, body.as_bytes()).expect("msg frame");
+            let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+            assert_eq!(
+                msg.unwrap_or_else(|| panic!("round {round}: message dropped")).bytes,
+                body.as_bytes()
+            );
+            drop(sock);
+            // Wait for the accept-side reader to observe EOF and
+            // release the slot before reconnecting — deterministic:
+            // we poll the counter, not a fixed sleep.
+            let ac = transport_a.admission().expect("admission enabled");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while ac.current_connections() != 0 && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(ac.current_connections(), 0, "round {round}: slot not released");
+        }
     }
 
     /// Rate limiting: a peer that exceeds the rate limit has its

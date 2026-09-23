@@ -19961,3 +19961,47 @@ holds a greeting-less socket open while a real peer connects and
 delivers — under the old code `poll_recv` would time out. p2p
 suite green on both feature combos (106 tests); devnet suite
 33/33.
+
+## Session N+30 — admission control is wired, and its accounting is exact
+
+Two findings landed together because the wiring exposed the bug.
+
+**Wiring (H3):** the shipped node never enabled admission — the
+constructors were combinatorial (`with_tls` OR `with_admission`,
+never both), and `build_transport` picked `with_tls`/`with_config`.
+`with_tls_and_admission` closes the matrix; `oxide-devnet`'s
+`build_transport` now always builds admission (`AdmissionControl::
+new()` — 256 conn cap, 10 MiB burst / 1 MiB/s per peer) in both
+plain and mTLS modes. `TcpTransport::admission()` returns the
+controller handle — needed by callers to report misbehavior, and
+by tests to observe the counter (an existing test had a comment
+wishing for exactly this).
+
+**Accounting bug found while wiring:** `admit_connection` ran only
+on the accept side, but `release_connection` ran only on the
+*connect* side's reader exit (plus a bulk release in `shutdown()`
+sized by `shutdown_streams.len()` — a per-peer map that under-
+counts duplicate conns). Inbound conns leaked slots forever;
+outbound conns released slots they never held. The cap would have
+rejected everything after enough churn, or never bound at all.
+Now: `install_connected_peer` owns the outbound admit/release pair
+(inside, around its inline `reader_loop`, covering the connect
+driver and `add_peer`), and accept-side readers release on exit
+inside their supervised closure. `shutdown()`'s bulk release is
+gone — forced-close drives the per-connection releases. A
+handshake-worker spawn failure now also unwinds the maps + slot.
+
+**Bonus overflow:** the rate limiter's refill math was plain
+`elapsed * refill_per_sec` — a large configured rate overflowed
+(mid-level `u64` mul panics under the new release overflow
+checks). Saturating now — `.min(capacity)` makes saturation exact.
+
+Regression tests: `admission_cap_binds_outbound_dialer` (cap=0 →
+`send` reports `UnknownPeer` forever), `admission_slot_released_
+on_disconnect` (cap=1, raw-socket churn must re-admit every time —
+polls `current_connections`, no sleeps), `rate_limiter_huge_
+refill_saturates`. p2p 109 tests plain / 116 with TLS; devnet
+33/33 with admission live.
+
+Residual for H2: plaintext peer IDs remain self-claimed — the
+crypto-binding handshake folds into the production-key work.

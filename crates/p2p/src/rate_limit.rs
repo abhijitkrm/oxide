@@ -162,9 +162,14 @@ impl RateLimiter {
             .entry(peer.clone())
             .or_insert(Bucket { tokens: self.capacity, last_update: now });
         // Refill: add tokens for elapsed time, capped at capacity.
+        // Saturating math: a large configured `refill_per_sec` times
+        // an elapsed interval must not wrap (or panic under release
+        // overflow checks) — the `.min(capacity)` clamp below makes
+        // saturation exact, since only reaching the cap matters.
         let elapsed = now.duration_since(bucket.last_update);
-        let refill = elapsed.as_secs() * self.refill_per_sec
-            + u64::from(elapsed.subsec_millis()) * self.refill_per_sec / 1000;
+        let refill = elapsed.as_secs().saturating_mul(self.refill_per_sec).saturating_add(
+            u64::from(elapsed.subsec_millis()).saturating_mul(self.refill_per_sec) / 1000,
+        );
         bucket.tokens = bucket.tokens.saturating_add(refill).min(self.capacity);
         bucket.last_update = now;
         if bucket.tokens >= cost {
@@ -218,6 +223,21 @@ impl Default for RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `refill_per_sec` near `u64::MAX` must saturate, not wrap:
+    /// plain `elapsed * refill` overflowed (panic under release
+    /// overflow checks, wrap in debug — either way the calling
+    /// reader thread died).
+    #[test]
+    fn rate_limiter_huge_refill_saturates() {
+        let mut rl = RateLimiter::with_capacity(u64::MAX, u64::MAX);
+        let peer = vec![1u8];
+        assert!(rl.check(&peer, 1));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The second check triggers a refill multiply that would
+        // have overflowed `u64` before the saturating fix.
+        assert!(rl.check(&peer, 1));
+    }
 
     #[test]
     fn rate_limiter_admits_under_capacity() {
