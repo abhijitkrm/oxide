@@ -1395,6 +1395,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **One idle connection could freeze all inbound peers** (`p2p`):
+  the TCP accept loop ran the peer-ID handshake inline *before*
+  setting a read timeout, so a socket that never sent its greeting
+  blocked the accept thread forever. The accept loop now hands
+  sockets to a bounded pool of 8 supervised handshake workers via
+  `try_send` (full queue = drop; honest peers retry), the greeting
+  read is bounded by a 5s `HANDSHAKE_READ_TIMEOUT`, and per-peer
+  reader/writer threads are registered in the actor registry under
+  peer-keyed names. **In plain words:** an attacker can no longer
+  cut a node off from all inbound peers by opening one connection
+  and going silent.
+
 - **Threads could die silently while the process looked healthy**
   (`primitives`, `crates/p2p`, `crates/executor`, `crates/matcher`,
   `crates/rpc`, node binaries): `panic = "unwind"` meant a panicking

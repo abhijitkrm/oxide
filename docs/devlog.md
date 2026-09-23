@@ -19929,3 +19929,35 @@ registry is process-global).
 E2E: `oxide-devnet --node 0 --num-nodes 1` boots, finalizes blocks,
 RPC serves. Gates: workspace clippy/fmt clean; config, primitives,
 p2p, executor, matcher, devnet, rpc and binary test suites green.
+
+## Session N+29 — inbound accepts can no longer freeze
+
+The TCP accept loop ran the whole accept-side handshake inline:
+`accept()` → `set_nonblocking(false)` → `read_frame` for the
+peer's ID — and `accept_plain_connection` only set the read
+timeout AFTER that read. One connection that never sent its
+greeting blocked the accept thread forever: no other peer could
+ever connect inbound, and nothing observable broke.
+
+The accept loop is now I/O-free. Accepted sockets go through a
+bounded `sync_channel` (`HANDSHAKE_QUEUE` = 64) to a fixed pool of
+8 supervised handshake workers that run the ID read (+ TLS
+handshake), allowlist check, admission check, and writer/reader
+spawn. `try_send` gives backpressure for free — a full queue drops
+the connection and an honest peer's reconnect loop retries.
+`HANDSHAKE_READ_TIMEOUT` (5s) bounds the greeting read on the
+plain path; TLS was already bounded per-read by
+`TLS_READER_POLL_TIMEOUT`. Workers are registered critical (a
+fixed pool is not self-healing) and named `p2p-handshake-N`;
+per-peer readers/writers got peer-keyed actor names
+(`p2p-reader-<tag>`/`p2p-writer-<tag>`) so a respawn can't mask an
+earlier panic in the registry. A post-handshake `shutdown` recheck
+stops half-registered connections landing behind `shutdown()`.
+`accept_plain_connection`'s trailing `try_clone` now uses
+`retry_try_clone` (transient EMFILE shouldn't drop a good conn).
+
+Regression test: `idle_inbound_connection_does_not_starve_accepts`
+holds a greeting-less socket open while a real peer connects and
+delivers — under the old code `poll_recv` would time out. p2p
+suite green on both feature combos (106 tests); devnet suite
+33/33.

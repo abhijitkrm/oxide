@@ -321,6 +321,39 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// assumes the connection is dead and exits.
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Budget for reading a freshly accepted peer's ID frame on the
+/// plain-TCP path, set BEFORE the first `read_frame`. An inbound
+/// peer that connects and never sends otherwise blocks whatever
+/// thread reads its greeting forever — the exact `DoS` the handshake
+/// pool exists to bound. 5s is far above a datacenter RTT (the
+/// greeting frame is tens of bytes) yet short enough that an idle
+/// socket pins a handshake worker only briefly. The TLS path is
+/// already bounded by `TLS_READER_POLL_TIMEOUT` per read attempt.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Number of accept-side handshake workers draining
+/// `HANDSHAKE_QUEUE`. Each worker performs the peer-ID read (+
+/// TLS handshake when enabled) off the accept thread, so the
+/// accept loop itself never touches socket I/O and cannot be
+/// frozen by an idle connection. A slow handshake occupies one
+/// worker for at most `HANDSHAKE_READ_TIMEOUT` — starving all
+/// workers needs a sustained flood, not a single socket.
+const HANDSHAKE_WORKERS: usize = 8;
+
+/// Backlog of accepted sockets waiting for a handshake worker.
+/// Full queue → the accept loop drops the connection via
+/// `try_send` backpressure (an honest peer's reconnect loop
+/// retries). The alternative — an unbounded queue — would let a
+/// flood pin unbounded fds; 64 pending sockets ≈ 128 fds
+/// (stream + shutdown clone), trivial against a validator's fd
+/// budget.
+const HANDSHAKE_QUEUE: usize = 64;
+
+/// Poll interval for the handshake workers' `recv_timeout`, so a
+/// set `shutdown` flag is observed promptly instead of blocking
+/// in `recv` for the whole handshake budget.
+const HANDSHAKE_POLL_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// Configuration for a [`TcpTransport`] instance.
 ///
 /// All values that were previously hardcoded as `const` are now
@@ -709,137 +742,92 @@ impl TcpTransport {
         // can periodically check the shutdown flag.
         listener.set_nonblocking(true).expect("set_nonblocking on listener must succeed");
 
+        // Handshake pool: everything the per-connection accept path
+        // needs, shared by the workers. The accept loop itself must
+        // never block on socket I/O — running the peer-ID read (and
+        // TLS handshake) inline let ONE connection that never sent
+        // its greeting freeze inbound accepts for every peer.
+        let shared = AcceptShared {
+            streams: streams.clone(),
+            shutdown_streams: shutdown_streams.clone(),
+            inbound_tx: inbound_tx.clone(),
+            inbound_queued: inbound_queued.clone(),
+            shutdown: shutdown.clone(),
+            // C4 fix: when present, connections from peers whose
+            // self-claimed ID is not in the set are rejected.
+            allowed_peer_ids: config.allowed_peer_ids.clone(),
+            admission: admission.clone(),
+            #[cfg(feature = "tls")]
+            tls: tls.clone(),
+            max_message_bytes,
+            max_inbound_queue_bytes,
+            read_timeout,
+        };
+        let (handshake_tx, handshake_rx) = mpsc::sync_channel::<PendingAccept>(HANDSHAKE_QUEUE);
+        // `Receiver` isn't `Sync`, so the pool shares it behind a
+        // Mutex. The lock covers only `recv_timeout` — the handshake
+        // itself runs off-lock, so workers stay concurrent.
+        let handshake_rx = Arc::new(Mutex::new(handshake_rx));
+        for idx in 0..HANDSHAKE_WORKERS {
+            let ws = shared.clone();
+            let rx = Arc::clone(&handshake_rx);
+            // Critical: a fixed pool is not self-healing — a dead
+            // worker permanently shrinks inbound handshake capacity,
+            // and all dead means no inbound peer can ever connect.
+            primitives::supervision::spawn_supervised(
+                &format!("p2p-handshake-{idx}"),
+                true,
+                move || loop {
+                    let pending =
+                        primitives::sync::lock_state(&rx).recv_timeout(HANDSHAKE_POLL_TIMEOUT);
+                    match pending {
+                        Ok(pending) => complete_accept(pending, &ws),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if ws.shutdown.load(Ordering::Relaxed) {
+                                return;
+                            }
+                        }
+                        // Senders all dropped → the transport is
+                        // gone; nothing left to handshake.
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                },
+            )
+            .expect("spawn p2p-handshake worker");
+        }
+
         // Spawn the accept thread: accepts incoming connections in
-        // non-blocking mode, checks the shutdown flag between polls.
-        let accept_streams = streams.clone();
-        let accept_shutdown_streams = shutdown_streams.clone();
-        let accept_tx = inbound_tx.clone();
-        let accept_queued = inbound_queued.clone();
+        // non-blocking mode, checks the shutdown flag between polls,
+        // and hands each socket to the handshake pool.
         let accept_shutdown = shutdown.clone();
-        // C4 fix: clone the allowed_peer_ids set for the accept
-        // thread. When present, the accept thread rejects connections
-        // from peers whose self-claimed peer ID is not in the set.
-        let accept_allowed_peer_ids = config.allowed_peer_ids.clone();
-        #[cfg(feature = "tls")]
-        let accept_tls = tls.clone();
-        let accept_admission = admission.clone();
         // Critical: the only inbound path — a dead accept loop means
         // no peer can ever reconnect inbound.
         primitives::supervision::spawn_supervised("p2p-accept", true, move || {
             while !accept_shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        // Switch back to blocking mode for the stream.
+                        // Switch back to blocking mode: the handshake
+                        // worker owning this socket reads on a
+                        // timeout, not non-blocking spin.
                         let _ = stream.set_nonblocking(false);
 
-                        // Clone the stream before it's moved into
-                        // `accept_*_connection`. This clone is stored
-                        // in `shutdown_streams` so `shutdown()` can
-                        // forcibly close the connection, causing the
-                        // reader thread to exit immediately instead
-                        // of waiting for the read timeout.
+                        // Clone the stream while it's still on the
+                        // accept thread. The worker stores the clone
+                        // in `shutdown_streams` (once the peer ID is
+                        // known) so `shutdown()` can forcibly close
+                        // the connection instead of waiting out the
+                        // read timeout.
                         let shutdown_stream = stream.try_clone().ok();
 
-                        // Read the peer's ID and produce two stream
-                        // handles: one for the map (writes), one for
-                        // the reader thread (reads).
-                        #[cfg(feature = "tls")]
-                        let result = if let Some(ref tls_config) = accept_tls {
-                            accept_tls_connection(
-                                stream,
-                                tls_config,
-                                max_message_bytes,
-                                read_timeout,
-                            )
-                        } else {
-                            accept_plain_connection(stream, max_message_bytes, read_timeout)
-                        };
-                        #[cfg(not(feature = "tls"))]
-                        let result =
-                            accept_plain_connection(stream, max_message_bytes, read_timeout);
-
-                        let Some((peer_id, write_stream, reader_stream)) = result else {
-                            continue; // connection closed before ID
-                        };
-
-                        // C4 fix: reject connections from peers whose
-                        // self-claimed peer ID is not in the allowed set.
-                        // This binds peer IDs to the configured validator
-                        // set — a peer cannot self-claim an arbitrary ID
-                        // and impersonate a validator. When
-                        // `allowed_peer_ids` is `None` (test mode), all
-                        // peer IDs are accepted.
-                        if let Some(ref allowed) = accept_allowed_peer_ids
-                            && !allowed.contains(&peer_id)
-                        {
-                            // Drop the streams, closing the connection.
-                            drop(write_stream);
-                            drop(reader_stream);
-                            continue;
+                        match handshake_tx.try_send(PendingAccept { stream, shutdown_stream }) {
+                            // Full queue → drop the socket:
+                            // backpressure under a connection flood;
+                            // an honest peer's reconnect loop retries.
+                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                            // Workers all gone → the transport is
+                            // shutting down; stop accepting.
+                            Err(mpsc::TrySendError::Disconnected(_)) => return,
                         }
-
-                        // Admission control: check reputation and
-                        // connection cap. If rejected, close the
-                        // connection and continue.
-                        if let Some(ref ac) = accept_admission
-                            && !ac.admit_connection(&peer_id)
-                        {
-                            // Connection rejected — the stream
-                            // is dropped, closing the TCP
-                            // connection.
-                            continue;
-                        }
-
-                        // Spawn a writer thread and register its
-                        // channel sender for outbound sends.
-                        //
-                        // Duplicate connection handling: if a
-                        // connection from this peer already exists
-                        // (e.g. both sides connected simultaneously,
-                        // or a reconnect raced with the old
-                        // connection breaking), shut down the old
-                        // connection's stream to force the old
-                        // reader thread to exit, and drop the old
-                        // writer sender to close the old writer's
-                        // channel. This prevents resource leaks from
-                        // duplicate connections.
-                        if let Some(shutdown_stream) = shutdown_stream {
-                            // Replace any existing shutdown stream for
-                            // this peer. We do NOT shut down the old
-                            // stream here — if both peers connected
-                            // simultaneously, the old outbound socket
-                            // is the peer's new inbound socket, and
-                            // shutting it down would kill the peer's
-                            // new connection. The old reader thread
-                            // will exit when the read timeout expires
-                            // or the peer closes the connection.
-                            let _ = primitives::sync::lock_state(&accept_shutdown_streams)
-                                .insert(peer_id.clone(), shutdown_stream);
-                        }
-                        let slot = spawn_writer(write_stream, &accept_shutdown);
-                        primitives::sync::lock_state(&accept_streams).insert(peer_id.clone(), slot);
-                        // Spawn a reader thread for this connection.
-                        // Supervised, non-critical: a dead peer reader
-                        // loses one connection (the dialer retries),
-                        // not the node.
-                        let tx = accept_tx.clone();
-                        let queued = accept_queued.clone();
-                        let reader_shutdown = accept_shutdown.clone();
-                        let _ = primitives::supervision::spawn_supervised(
-                            "p2p-reader",
-                            false,
-                            move || {
-                                reader_loop(
-                                    reader_stream,
-                                    peer_id,
-                                    tx,
-                                    queued,
-                                    max_message_bytes,
-                                    max_inbound_queue_bytes,
-                                    reader_shutdown,
-                                );
-                            },
-                        );
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
@@ -954,7 +942,7 @@ impl TcpTransport {
                                     let _ = primitives::sync::lock_state(&css)
                                         .insert(pid.clone(), shutdown_stream);
                                 }
-                                let slot = spawn_writer(write_stream, &rshut);
+                                let slot = spawn_writer(write_stream, &rshut, &pid);
                                 primitives::sync::lock_state(&cs).insert(pid.clone(), slot);
                                 // Reader loop for this connection.
                                 reader_loop(
@@ -1013,7 +1001,7 @@ impl TcpTransport {
                             let _ = primitives::sync::lock_state(&css)
                                 .insert(pid.clone(), shutdown_stream);
                         }
-                        let slot = spawn_writer(write_stream, &rshut);
+                        let slot = spawn_writer(write_stream, &rshut, &pid);
                         primitives::sync::lock_state(&cs).insert(pid.clone(), slot);
                         // Reader loop for this connection.
                         reader_loop(
@@ -1251,7 +1239,7 @@ fn install_connected_peer(
         let _ = primitives::sync::lock_state(&ctx.shutdown_streams)
             .insert(pid.clone(), shutdown_stream);
     }
-    let slot = spawn_writer(write_stream, &ctx.shutdown);
+    let slot = spawn_writer(write_stream, &ctx.shutdown, &pid);
     primitives::sync::lock_state(&ctx.streams).insert(pid.clone(), slot);
     reader_loop(
         reader_stream,
@@ -1685,8 +1673,14 @@ fn writer_loop(
 ///
 /// The writer thread owns the write stream and drains the channel.
 /// The returned sender is stored in the `streams` map for `send()`
-/// to use.
-fn spawn_writer(write_stream: Box<dyn PeerStream>, shutdown: &Arc<AtomicBool>) -> OutboundSlot {
+/// to use. `pid` keys the supervision actor name so a dead writer
+/// is attributed to the peer it served (a shared name would let a
+/// later respawn mask an earlier panic in the registry).
+fn spawn_writer(
+    write_stream: Box<dyn PeerStream>,
+    shutdown: &Arc<AtomicBool>,
+    pid: &PeerId,
+) -> OutboundSlot {
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOUND_CHANNEL_BOUND);
     // The byte counter is shared between `send()` (reserves) and
     // the writer thread (releases on dequeue). It starts at zero
@@ -1696,7 +1690,8 @@ fn spawn_writer(write_stream: Box<dyn PeerStream>, shutdown: &Arc<AtomicBool>) -
     let shutdown = Arc::clone(shutdown);
     // Supervised, non-critical: a dead writer strands one peer's
     // outbound queue until the reconnect loop replaces the slot.
-    let _ = primitives::supervision::spawn_supervised("p2p-writer", false, move || {
+    let actor = format!("p2p-writer-{}", peer_tag(pid));
+    let _ = primitives::supervision::spawn_supervised(&actor, false, move || {
         writer_loop(write_stream, rx, writer_queued, shutdown);
     });
     OutboundSlot { tx, queued }
@@ -1705,6 +1700,137 @@ fn spawn_writer(write_stream: Box<dyn PeerStream>, shutdown: &Arc<AtomicBool>) -
 /// The result of accepting a connection: the peer's ID, a write
 /// stream (for the map), and a reader stream (for the reader thread).
 type AcceptResult = Option<(PeerId, Box<dyn PeerStream>, Box<dyn PeerStream>)>;
+
+/// An accepted socket waiting for a handshake worker. The
+/// `shutdown_stream` clone is taken on the accept thread (a cheap
+/// `dup`) and stored in `shutdown_streams` by the worker once the
+/// peer ID is known.
+struct PendingAccept {
+    stream: TcpStream,
+    shutdown_stream: Option<TcpStream>,
+}
+
+/// Everything [`complete_accept`] needs, cloned into each handshake
+/// worker. Mirrors [`ConnectCtx`] for the inbound side: `Arc`s are
+/// shared with the transport, the rest are immutable config values.
+#[derive(Clone)]
+struct AcceptShared {
+    /// Live outbound slots keyed by peer id.
+    streams: Arc<Mutex<HashMap<PeerId, OutboundSlot>>>,
+    /// Raw sockets kept for forced-close on shutdown.
+    shutdown_streams: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    /// Shared inbound queue every reader loop feeds.
+    inbound_tx: mpsc::SyncSender<InboundMessage>,
+    /// Aggregate queued inbound payload bytes.
+    inbound_queued: Arc<AtomicUsize>,
+    /// Transport-wide shutdown flag.
+    shutdown: Arc<AtomicBool>,
+    /// When `Some`, peers whose self-claimed ID is not in the set
+    /// are rejected after the handshake.
+    allowed_peer_ids: Option<std::collections::HashSet<PeerId>>,
+    /// Admission control (reputation, connection caps). `None`
+    /// disables it (devnet mode).
+    admission: Option<Arc<SharedAdmissionControl>>,
+    /// TLS configuration, when the transport was built with it.
+    #[cfg(feature = "tls")]
+    tls: Option<Arc<TlsConfig>>,
+    /// Per-message wire size cap enforced by the frame decoder.
+    max_message_bytes: u64,
+    /// Aggregate inbound byte budget enforced at queue time.
+    max_inbound_queue_bytes: usize,
+    /// Read timeout applied to established plain streams.
+    read_timeout: Duration,
+}
+
+/// Run the accept-side handshake for one queued socket, off the
+/// accept thread: read the peer ID (+ TLS handshake when enabled),
+/// enforce the peer allowlist and admission, then register the
+/// connection and spawn its writer/reader pair. Any failure drops
+/// the socket, closing the connection — the peer may retry.
+fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
+    let PendingAccept { stream, shutdown_stream } = pending;
+
+    // Read the peer's ID and produce two stream handles: one for
+    // the map (writes), one for the reader thread (reads).
+    #[cfg(feature = "tls")]
+    let result = if let Some(ref tls_config) = shared.tls {
+        accept_tls_connection(stream, tls_config, shared.max_message_bytes, shared.read_timeout)
+    } else {
+        accept_plain_connection(stream, shared.max_message_bytes, shared.read_timeout)
+    };
+    #[cfg(not(feature = "tls"))]
+    let result = accept_plain_connection(stream, shared.max_message_bytes, shared.read_timeout);
+
+    let Some((peer_id, write_stream, reader_stream)) = result else {
+        return; // connection closed before ID
+    };
+
+    // C4 fix: reject connections from peers whose self-claimed
+    // peer ID is not in the allowed set. This binds peer IDs to
+    // the configured validator set — a peer cannot self-claim an
+    // arbitrary ID and impersonate a validator. When
+    // `allowed_peer_ids` is `None` (test mode), all peer IDs are
+    // accepted.
+    if let Some(ref allowed) = shared.allowed_peer_ids
+        && !allowed.contains(&peer_id)
+    {
+        drop(write_stream);
+        drop(reader_stream);
+        return;
+    }
+
+    // Admission control: check reputation and connection cap. If
+    // rejected, close the connection and return.
+    if let Some(ref ac) = shared.admission
+        && !ac.admit_connection(&peer_id)
+    {
+        return;
+    }
+
+    // The transport may have shut down while this handshake was in
+    // flight — don't register half a connection behind `shutdown()`.
+    if shared.shutdown.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // Duplicate connection handling: if a connection from this peer
+    // already exists (e.g. both sides connected simultaneously, or
+    // a reconnect raced with the old connection breaking), replace
+    // the shutdown-stream slot. We do NOT shut down the old stream
+    // here — if both peers connected simultaneously, the old
+    // outbound socket is the peer's new inbound socket, and
+    // shutting it down would kill the peer's new connection. The
+    // old reader thread exits when its read timeout expires or the
+    // peer closes the connection.
+    if let Some(shutdown_stream) = shutdown_stream {
+        let _ = primitives::sync::lock_state(&shared.shutdown_streams)
+            .insert(peer_id.clone(), shutdown_stream);
+    }
+    let slot = spawn_writer(write_stream, &shared.shutdown, &peer_id);
+    primitives::sync::lock_state(&shared.streams).insert(peer_id.clone(), slot);
+
+    // Spawn a reader thread for this connection. Supervised,
+    // non-critical: a dead peer reader loses one connection (the
+    // dialer retries), not the node. The name is peer-keyed so a
+    // dead reader is attributed to its peer.
+    let actor = format!("p2p-reader-{}", peer_tag(&peer_id));
+    let tx = shared.inbound_tx.clone();
+    let queued = shared.inbound_queued.clone();
+    let reader_shutdown = shared.shutdown.clone();
+    let max_message_bytes = shared.max_message_bytes;
+    let max_inbound_queue_bytes = shared.max_inbound_queue_bytes;
+    let _ = primitives::supervision::spawn_supervised(&actor, false, move || {
+        reader_loop(
+            reader_stream,
+            peer_id,
+            tx,
+            queued,
+            max_message_bytes,
+            max_inbound_queue_bytes,
+            reader_shutdown,
+        );
+    });
+}
 
 /// Accept a plain TCP connection: read the peer's ID, clone the
 /// stream for the map and the reader.
@@ -1722,9 +1848,18 @@ fn accept_plain_connection(
     // ACK to add 25–40ms per round-trip on macOS. TCP_NODELAY sends
     // each write immediately.
     let _ = stream.set_nodelay(true);
+    // Bound the greeting read BEFORE it happens: a peer that
+    // connects and never sends must not pin a handshake worker —
+    // the timeout turns a silent freeze into a dropped socket.
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
     let peer_id = read_frame(&mut stream, max_message_bytes).ok()?;
+    // Greeting received — switch to the steady-state timeout the
+    // reader loop relies on.
     let _ = stream.set_read_timeout(Some(read_timeout));
-    let write_stream = Box::new(stream.try_clone().ok()?) as Box<dyn PeerStream>;
+    // `try_clone` can fail on fd exhaustion — retry briefly, then
+    // drop the connection (the peer's dialer retries) rather than
+    // panicking the worker.
+    let write_stream = Box::new(retry_try_clone(&stream)?) as Box<dyn PeerStream>;
     let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
     Some((peer_id, write_stream, reader_stream))
 }
@@ -2507,6 +2642,40 @@ mod tests {
         assert!(msg.is_none(), "A must not receive from unlisted peer C");
     }
 
+    /// A peer that completes the TCP handshake but never sends its
+    /// peer-ID frame must not stall inbound accepts: a second,
+    /// well-behaved peer still connects and delivers. Before the
+    /// handshake pool, the accept thread blocked in `read_frame` on
+    /// the idle socket — one connection froze inbound accepts for
+    /// every peer.
+    #[test]
+    fn idle_inbound_connection_does_not_starve_accepts() {
+        let addr_a = "127.0.0.1:19150";
+        let addr_b = "127.0.0.1:19151";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        let mut transport_a = TcpTransport::new(addr_a, id_a.clone(), vec![]);
+
+        // The idle connection: TCP-connects to A and never writes.
+        // Held open for the rest of the test — it occupies one
+        // handshake worker for HANDSHAKE_READ_TIMEOUT at most.
+        let _idle = TcpStream::connect(addr_a).expect("idle connect");
+        thread::sleep(Duration::from_millis(200));
+
+        // A real peer must still complete its handshake while the
+        // idle socket sits in a worker.
+        let mut transport_b =
+            TcpTransport::new(addr_b, id_b.clone(), vec![(id_a.clone(), addr_a.to_string())]);
+        thread::sleep(Duration::from_millis(500));
+        transport_b.send(&id_a, b"still reachable").unwrap();
+        let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+        assert_eq!(
+            msg.expect("A must receive from B despite the idle connection").bytes,
+            b"still reachable"
+        );
+    }
+
     /// C4 fix: mutual TLS — two nodes connect with mTLS and exchange
     /// messages. The server verifies the client certificate, and the
     /// peer ID is extracted from the verified certificate (not the
@@ -2748,7 +2917,7 @@ mod tests {
         let written = Arc::new(Mutex::new(Vec::new()));
         let stream = BlockingWriter { release: release.clone(), written: written.clone() };
         let shutdown = Arc::new(AtomicBool::new(false));
-        let slot = spawn_writer(Box::new(stream), &shutdown);
+        let slot = spawn_writer(Box::new(stream), &shutdown, &vec![7u8]);
 
         let budget = 150;
         // Queue a 100-byte frame: reserve, then enqueue.
