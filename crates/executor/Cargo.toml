@@ -26,6 +26,9 @@ storage = { workspace = true }
 consensus = { workspace = true }
 criterion = "0.7.0"
 framework = { workspace = true }
+# Integration tests sign fixtures as deterministic identities —
+# the dev-dep enables crypto's gated surface for test builds only.
+crypto = { workspace = true, features = ["dev-identities"] }
 # Integration tests + benches register the real modules (staking
 # settles through the EVM ledger — the single native-token store).
 # Dev-dep cycles: `evm`/`staking` depend on `executor`; cargo builds

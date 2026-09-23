@@ -317,7 +317,10 @@ pub fn signable_pubkey_address(privkey: &[u8]) -> Option<Address> {
 /// this index space: identity `i` is the same account in every
 /// process, so a signed envelope from `test_identity_key(i)`
 /// authenticates as [`test_identity_address(i)`] everywhere.
-/// Not for production use — the secrets are public.
+/// Gated behind the crate's `dev-identities` feature — the secrets
+/// are public, so a production build's dependency graph must not
+/// contain a derivable signing path at all.
+#[cfg(feature = "dev-identities")]
 #[must_use]
 pub fn test_identity_key(index: u8) -> [u8; 32] {
     let mut key = [0u8; 32];
@@ -328,14 +331,16 @@ pub fn test_identity_key(index: u8) -> [u8; 32] {
 /// The address [`test_identity_key`] `index` authenticates as — the
 /// account a signed envelope carrying that key's signature recovers
 /// to. `None` only if the (always-valid) derived key is rejected by
-/// the secp256k1 backend.
+/// the secp256k1 backend. `dev-identities` feature, same as
+/// [`test_identity_key`].
+#[cfg(feature = "dev-identities")]
 #[must_use]
 pub fn test_identity_address(index: u8) -> Option<Address> {
     signable_pubkey_address(&test_identity_key(index))
 }
 
 /// True if `key` is one of the public test-identity secrets — the
-/// scalar space [`test_identity_key`] derives (`index + 1` for a `u8`
+/// scalar space `test_identity_key` derives (`index + 1` for a `u8`
 /// index, i.e. the integers 1 through 256). A signature under such a
 /// key authenticates as an identity anyone can recompute, so
 /// production startup policy refuses them outright rather than

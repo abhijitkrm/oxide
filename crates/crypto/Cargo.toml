@@ -37,6 +37,17 @@ sha3 = { workspace = true }
 # signing native (non-EVM) transactions: staking, exchange, perps.
 ed25519-dalek = { workspace = true }
 
+[features]
+# Deterministic test identities (`secp::test_identity_key`,
+# `secp::test_identity_address`) — publicly derivable secp256k1
+# secrets shared by devnet/sim/fuzz tooling. Off by default so a
+# production binary's dependency graph contains no derivable
+# signing path; dev tooling and test builds opt in explicitly.
+# `secp::is_test_identity_key` stays ungated — it is the refusal
+# predicate the production startup policy uses to reject these
+# keys.
+dev-identities = []
+
 [lints]
 workspace = true
 

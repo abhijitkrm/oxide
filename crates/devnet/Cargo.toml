@@ -14,7 +14,9 @@ repository.workspace = true
 node = { workspace = true }
 primitives = { workspace = true }
 codec = { workspace = true }
-crypto = { workspace = true }
+# devnet is dev tooling — its whole purpose is deterministic
+# fixtures, so the derivable-identity surface is always on here.
+crypto = { workspace = true, features = ["dev-identities"] }
 types = { workspace = true }
 ports = { workspace = true }
 consensus = { workspace = true }

@@ -10,6 +10,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Forward `crypto`'s deterministic-identity surface for the devnet
+# assembly helpers (`cli::build_signed_tx`, the `None`-genesis
+# funded signer identity). Dev tooling enables it; production
+# binaries (`oxide-validator`, `oxide-matcher`, `oxide-fullnode`)
+# do not, so their dependency graph has no derivable signing path.
+dev-identities = ["crypto/dev-identities"]
+
 [dependencies]
 primitives = { workspace = true }
 codec = { workspace = true }
@@ -43,6 +51,9 @@ criterion = "0.7.0"
 framework = { workspace = true }
 types = { workspace = true }
 primitives = { workspace = true }
+# Unit tests build committees over the deterministic identities —
+# the dev-dep turns the crypto feature on for test builds only.
+crypto = { workspace = true, features = ["dev-identities"] }
 
 [[bench]]
 name = "node_assembly"

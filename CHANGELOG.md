@@ -51,6 +51,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **`crypto/dev-identities` feature — derivable test keys leave
+  production builds.** `secp::test_identity_key` /
+  `test_identity_address` now compile only when a consumer opts
+  into the feature: `devnet` and `oxide-devnet` do (fixtures are
+  their purpose); `oxide-validator`, `oxide-matcher`, and
+  `oxide-fullnode` do not, so a standalone release build of a
+  production binary contains no derivable signing path at all.
+  `secp::is_test_identity_key` — the refusal predicate — remains
+  unconditionally available.
+  - **In plain words:** the demo keys everyone can guess are no
+    longer compiled into the production binaries — you cannot even
+    link them in unless you ask for the dev feature.
 - **`oxide-validator keygen` — real key generation.** Generates a
   fresh BLS12-381 consensus key (default) or secp256k1 key
   (`--secp`) from the OS CSPRNG, writes the secret to a mode-0600

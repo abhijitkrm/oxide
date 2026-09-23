@@ -47,6 +47,9 @@ rayon = { workspace = true }
 criterion = "0.7.0"
 ports = { workspace = true }
 consensus = { workspace = true }
+# Property tests sign generated txs as deterministic identities —
+# the dev-dep enables crypto's gated surface for test builds only.
+crypto = { workspace = true, features = ["dev-identities"] }
 # proptest: differential execution properties — every EVM entry
 # path must agree on state roots over generated contract workloads.
 proptest = "1.11.0"

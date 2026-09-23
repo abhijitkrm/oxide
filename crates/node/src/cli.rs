@@ -417,6 +417,11 @@ pub fn parse_cli_flags(flag: &str) -> Vec<String> {
 ///
 /// Panics only if the built-in devnet identity is malformed or
 /// refuses to sign — both impossible for the fixed test key.
+///
+/// Only exists with the crate's `dev-identities` feature — the
+/// signer is publicly derivable, so production builds must not
+/// contain this path at all.
+#[cfg(feature = "dev-identities")]
 pub fn build_signed_tx(
     chain_id: u64,
     module_id: u8,

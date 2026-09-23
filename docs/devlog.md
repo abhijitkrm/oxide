@@ -20584,3 +20584,37 @@ fixed but the tracker still showed open: the env-override seam no
 longer mutates the process environment in tests, validator help
 disclaims the devnet flags, and `observe_block_height` runs after
 authentication inside `authenticate_proposal`.
+
+## Session N+39 (cont.) — `dev-identities` feature gate: derivable keys leave the production graph
+
+The derivable-identity surface (`secp::test_identity_key`,
+`secp::test_identity_address` — secret = `index + 1`) now lives
+behind `crypto`'s `dev-identities` feature, off by default. The
+refusal predicate `is_test_identity_key` stays ungated: it is the
+*defense*, needed by `oxide-validator`/`oxide-matcher` startup
+checks to reject these keys.
+
+Feature edges follow intent, not convenience:
+
+- `devnet` enables it unconditionally — deterministic fixtures are
+  the crate's purpose.
+- `node` re-exports it as `node/dev-identities`, which gates
+  `cli::build_signed_tx` (the identity-0 envelope helper) and the
+  `None`-genesis funding/registration of `identity0`. A `node`
+  built without the feature still gets the `[0u8;20]` byte-pattern
+  default — but no derivable *signing* identity exists, funded or
+  not.
+- `oxide-devnet` enables both; `oxide-validator`, `oxide-matcher`,
+  `oxide-fullnode` enable neither — verified by compiling them
+  standalone (`cargo check -p …`), where feature unification from
+  devnet's edge cannot leak the symbols in.
+- Test-only consumers (`node`/`executor`/`evm`/`oxide-matcher`
+  tests, the fuzz target) get the feature through dev-dependency
+  edges, so `cargo test --workspace` keeps working while
+  `cargo build --release -p oxide-validator` ships a graph with no
+  derivable key path.
+
+One caveat worth naming: cargo feature *unification* means a
+whole-workspace build compiles crypto with the feature on (devnet
+pulls it). The gate's real boundary is per-binary release builds —
+exactly the artifact that ships.

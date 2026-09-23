@@ -10,13 +10,16 @@ repository.workspace = true
 name = "oxide-devnet"
 path = "src/main.rs"
 [dependencies]
-node = { workspace = true }
+# devnet is the development binary — it funds derivable fixture
+# identities and signs smoke transactions as them, so it opts into
+# the dev-identities surface on both `node` and `crypto`.
+node = { workspace = true, features = ["dev-identities"] }
 primitives = { workspace = true }
 types = { workspace = true }
 ports = { workspace = true }
 framework = { workspace = true }
 config = { workspace = true }
-crypto = { workspace = true }
+crypto = { workspace = true, features = ["dev-identities"] }
 consensus = { workspace = true }
 executor = { workspace = true }
 p2p = { workspace = true, features = ["tls"] }

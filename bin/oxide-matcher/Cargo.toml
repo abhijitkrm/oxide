@@ -28,5 +28,11 @@ ports = { workspace = true }
 crypto = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+# Unit tests generate deterministic identity keys; production code
+# only ever *refuses* them (`is_test_identity_key`), so the feature
+# stays a test-only dependency edge.
+crypto = { workspace = true, features = ["dev-identities"] }
+
 [lints]
 workspace = true

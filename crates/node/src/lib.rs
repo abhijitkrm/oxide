@@ -682,23 +682,28 @@ pub fn assemble_executor(config: &NodeConfig) -> AssembledExecutor {
     let staking_module = staking::StakingModule::new();
     staking_module.set_ledger(evm_module.clone());
     match &config.genesis {
-        // Single-node devnet default: fund and register two
+        // Single-node devnet default: fund and register
         // deterministic identities —
         //   * `[0u8;20]`: the legacy byte-pattern sender/validator,
         //     kept as a delegate target for unsigned test fixtures;
         //   * `test_identity_address(0)`: the key-derived devnet
         //     validator — the only identity that can *sign*
         //     envelopes, so sender-gated flows (key_change,
-        //     endorsements) must run as it.
+        //     endorsements) must run as it. Compiled only under
+        //     `dev-identities`: a production build ships no
+        //     derivable signing identity, funded or not.
         // Development convenience only — production passes an
         // explicit `GenesisSpec`.
         None => {
             evm_module.fund_account_for_test(&primitives::Address([0u8; 20]), u128::MAX);
             staking_module.register_validator(primitives::Address([0u8; 20]));
-            let identity0 = crypto::secp::test_identity_address(0)
-                .expect("devnet identity 0 is a valid secp256k1 key");
-            evm_module.fund_account_for_test(&identity0, u128::MAX);
-            staking_module.register_validator(identity0);
+            #[cfg(feature = "dev-identities")]
+            {
+                let identity0 = crypto::secp::test_identity_address(0)
+                    .expect("devnet identity 0 is a valid secp256k1 key");
+                evm_module.fund_account_for_test(&identity0, u128::MAX);
+                staking_module.register_validator(identity0);
+            }
         }
         Some(spec) => {
             for (addr, wei) in &spec.balances {
