@@ -338,15 +338,26 @@ curl -s http://diverged-host:9000/metrics | grep oxide_exec_diverged
 
 1. **Stop the diverged node** (runbook 2).
 2. **Repair via certified state sync** from a peer that agrees with
-   the certified root, using the anchor from the `/health` body:
+   the certified root. The sync itself now verifies the peer's
+   quorum-signed execution certificate — the operator's job is to
+   supply the validator-set checkpoint it verifies against (weak
+   subjectivity), and the pin pair re-checks the diverged node's
+   certified anchor:
 
    ```sh
-   oxide-validator --config /path/to/oxide.toml \
+   oxide-fullnode --config /path/to/oxide.toml \
      --state-sync <healthy-peer-rpc-host:port> \
+     --trusted-validators /path/to/checkpoint.json \
      --trusted-height <height-from-health-body> \
      --trusted-root 0x<certified-root-from-health-body>
    ```
 
+   `checkpoint.json` is `{"epoch": E, "validators": [{address,
+   public_key, stake}]}` — the committee the operator trusts at the
+   certificate's epoch (the genesis file works when the chain is
+   still in epoch 0 and its validators carry `public_key`). The
+   served certificate is verified against it before any state byte
+   is imported; the pin pair must match the certified values.
    The certified root is quorum-signed — it is the correct trusted
    anchor even when the local root "looks" more plausible. Never
    pass the local root.

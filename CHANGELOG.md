@@ -1395,6 +1395,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **State sync trusted a typed-in root, not the network** (`rpc`,
+  `statesync`, `oxide-fullnode`, `oxide-validator`,
+  `oxide-devnet`): `--state-sync` accepted any operator-supplied
+  `--trusted-root`, so a stale doc page or compromised ops channel
+  could import unattested state. Validators now mirror their
+  quorum-signed execution certificates into a bounded RPC table
+  served at `GET /snapshot/cert/{height}`; the syncing node pins
+  the manifest, polls for the certificate covering that exact
+  height, and verifies it against a weak-subjectivity validator-set
+  checkpoint (`--trusted-validators`, or the `--genesis-file`
+  committee as the epoch-0 checkpoint) — epoch match, bitmap
+  bounds, >2/3 stake, aggregate BLS signature — before downloading
+  a byte of state. `--trusted-height`/`--trusted-root` remain as
+  an optional pin pair checked against the certified values.
+  **In plain words:** joining via state sync now requires
+  cryptographic proof that a validator supermajority attested the
+  snapshot's state root — a peer can lie about everything except
+  that signature. Verified live against a running devnet plus a
+  fail-closed matrix (wrong epoch, foreign committee, missing
+  checkpoint, pin mismatch all refuse).
+
 - **Idle chains churned view timeouts; devnet faked work to avoid
   it** (`consensus`, `oxide-devnet`): a leader with no pending work
   stayed silent, which followers cannot distinguish from a crashed

@@ -31,4 +31,5 @@ pub use pacemaker::{Pacemaker, PacemakerEvent, PacemakerState};
 pub use sequencer::SequencerEngine;
 pub use types::ExecDivergence;
 pub use validator::{ValidatorIndex, ValidatorSet};
+pub use verify::verify_exec_cert;
 pub use wal::{Wal, WalEntry, WalError};

@@ -817,6 +817,34 @@ impl OxideBft {
         self.divergence.as_ref()
     }
 
+    /// The execution certificates this engine holds, keyed by
+    /// certified height — the union of locally formed certs
+    /// (`exec_certs`: aggregated from signature-verified
+    /// attestations this validator collected) and header-carried
+    /// certs this engine fully verified (`verified_exec_certs`).
+    /// Both stores carry only quorum-strength evidence, so either
+    /// is safe to serve; the merge exists because the two fill on
+    /// different triggers (quorum formation vs proposal arrival)
+    /// and a height may be present in only one.
+    ///
+    /// Callers are the state-sync serving path: a syncing node
+    /// verifies a served cert against its own validator-set
+    /// checkpoint, so the *served* bytes need only be authentic —
+    /// which they are by construction here. Retention follows the
+    /// commit-path floor (~2 committee rotations behind the
+    /// committed height): certs older than that are dropped and a
+    /// `/snapshot/cert` request for them 404s.
+    #[must_use]
+    pub fn exec_certificates(&self) -> Vec<ExecCertificate> {
+        self.exec_certs
+            .iter()
+            .chain(self.verified_exec_certs.iter())
+            .map(|(height, cert)| (*height, cert.clone()))
+            .collect::<std::collections::BTreeMap<u64, ExecCertificate>>()
+            .into_values()
+            .collect()
+    }
+
     /// The budget the engine uses when assembling proposals. Ceiling 1:
     /// defaults to the chain-configured limit from
     /// `types::CHAIN_BLOCK_BUDGET` (10 GG/block, 16 MiB) so the
@@ -1658,6 +1686,10 @@ impl ConsensusEngine for OxideBft {
         // by UFCS keeps the trait method a pure mirror rather than
         // duplicating the field read.
         OxideBft::divergence(self).copied()
+    }
+
+    fn exec_certificates(&self) -> Vec<types::ExecCertificate> {
+        OxideBft::exec_certificates(self)
     }
 }
 #[cfg(test)]

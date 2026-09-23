@@ -284,6 +284,14 @@ fn wire_driver_observers(
         rpc_blocks.set_block_height(height);
         rpc_blocks.publish_new_block(height);
     }));
+    // Mirror quorum-signed execution certificates into RPC so
+    // `GET /snapshot/cert/{height}` gives a syncing node a
+    // cryptographic anchor for its snapshot download instead of an
+    // operator-typed root.
+    let rpc_certs = rpc_shared.clone();
+    consensus_driver.set_cert_observer(Arc::new(move |certs| {
+        rpc_certs.record_exec_certificates(certs);
+    }));
 }
 
 fn build_single_node_rpc(

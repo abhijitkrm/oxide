@@ -2850,10 +2850,13 @@ version = "0.1.0"
 dependencies = [
  "codec",
  "config",
+ "consensus",
+ "crypto",
  "executor",
  "node",
  "primitives",
  "statesync",
+ "types",
 ]
 
 [[package]]
@@ -4296,6 +4299,7 @@ dependencies = [
  "codec",
  "crypto",
  "primitives",
+ "types",
 ]
 
 [[package]]

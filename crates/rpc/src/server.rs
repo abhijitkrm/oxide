@@ -450,6 +450,7 @@ impl HttpServer {
             .route("/snapshot", get(snapshot_handler))
             .route("/snapshot/manifest", get(snapshot_manifest_handler))
             .route("/snapshot/chunk/{index}", get(snapshot_chunk_handler))
+            .route("/snapshot/cert/{height}", get(snapshot_cert_handler))
             .route("/validator-set", get(validator_set_handler))
             .with_state(state)
     }
@@ -809,6 +810,33 @@ async fn snapshot_chunk_handler(
     hex_response(result, StatusCode::NOT_FOUND)
 }
 
+/// Execution-certificate endpoint (`GET /snapshot/cert/{height}`).
+///
+/// Returns the codec-encoded `types::ExecCertificate` for `height`
+/// as hex — the quorum-signed `(height, state_root, epoch)` a
+/// state-sync client verifies against its own validator-set
+/// checkpoint before trusting a snapshot. 404 while the cert is
+/// unformed or has aged out of the mirror: a syncing client pins
+/// its manifest first, then polls this path until the certificate
+/// for that height arrives (a live chain certifies a committed
+/// height within a few views).
+async fn snapshot_cert_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<RpcState>,
+    Path(height): Path<u64>,
+) -> Response<String> {
+    if !state.rate_limiter.allow(addr.ip()) {
+        return rate_limited_response();
+    }
+    hex_response(
+        state
+            .rpc
+            .exec_certificate(height)
+            .ok_or_else(|| format!("no execution certificate for height {height}")),
+        StatusCode::NOT_FOUND,
+    )
+}
+
 /// Validator set endpoint (`GET /validator-set`).
 ///
 /// Returns the current validator set as JSON — a list of
@@ -944,7 +972,7 @@ async fn metrics_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RpcRequest;
+    use crate::{EXEC_CERT_MIRROR_CAP, RpcRequest};
 
     /// Serializes tests that read the process-global supervision
     /// registry — a dead critical actor registered by one test would
@@ -967,6 +995,77 @@ mod tests {
         let _guard = HEALTH_LOCK.lock().await;
         let response = health_check(State(health_state())).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `GET /snapshot/cert/{height}` serves the mirrored
+    /// certificate as codec-hex; an unformed/unknown height 404s so
+    /// a syncing client can poll until it appears.
+    #[tokio::test]
+    async fn snapshot_cert_serves_recorded_certificate() {
+        let state = test_state(1_000_000, 8);
+        let addr: SocketAddr = "10.0.0.9:40000".parse().unwrap();
+        let cert = types::ExecCertificate {
+            height: primitives::Height::new(7),
+            state_root: primitives::Hash([0xAB; 32]),
+            epoch: primitives::Epoch::new(0),
+            signer_bitmap: vec![0b0000_1111],
+            aggregate_signature: crypto::AggregateSignature::ZERO,
+        };
+        state.rpc.record_exec_certificates(vec![cert.clone()]);
+
+        let response =
+            snapshot_cert_handler(ConnectInfo(addr), State(state.clone()), Path(7)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.body();
+        let hex = body.trim().strip_prefix("0x").expect("hex response body");
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect::<Vec<u8>>();
+        let mut reader = codec::Reader::new(&bytes);
+        let decoded =
+            <types::ExecCertificate as codec::Decode>::decode(&mut reader).expect("decodes");
+        assert_eq!(decoded, cert, "served bytes must round-trip to the mirrored cert");
+
+        let missing = snapshot_cert_handler(ConnectInfo(addr), State(state), Path(8)).await;
+        assert_eq!(
+            missing.status(),
+            StatusCode::NOT_FOUND,
+            "a height with no formed cert must 404 so clients keep polling"
+        );
+    }
+
+    /// The cert mirror is bounded: once it exceeds the cap the
+    /// oldest heights are evicted (a sync client pinned a recent
+    /// height, so ancient certs are dead weight), and re-recording
+    /// the same height is an idempotent no-op.
+    #[test]
+    fn exec_cert_mirror_is_bounded_and_idempotent() {
+        let rpc = RpcServer::new(1, 1_000_000_000);
+        let cert = |h: u64| types::ExecCertificate {
+            height: primitives::Height::new(h),
+            state_root: primitives::Hash([u8::try_from(h).unwrap_or(0); 32]),
+            epoch: primitives::Epoch::new(0),
+            signer_bitmap: vec![0b1],
+            aggregate_signature: crypto::AggregateSignature::ZERO,
+        };
+        rpc.record_exec_certificates((0..EXEC_CERT_MIRROR_CAP as u64 + 16).map(cert));
+        assert!(
+            rpc.exec_certificate(0).is_none(),
+            "oldest height must be evicted once the cap overflows"
+        );
+        assert!(
+            rpc.exec_certificate(EXEC_CERT_MIRROR_CAP as u64 + 15).is_some(),
+            "newest height must be retained"
+        );
+        // Re-recording a held cert replaces it with identical bytes.
+        let first = cert(5000);
+        rpc.record_exec_certificates(vec![first.clone()]);
+        assert_eq!(rpc.exec_certificate(5000), {
+            let mut buf = Vec::new();
+            codec::Encode::encode(&first, &mut buf);
+            Some(buf)
+        });
     }
 
     /// A dead critical actor must flip `/health` to 503 and name it —

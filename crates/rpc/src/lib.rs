@@ -570,6 +570,20 @@ struct FilterEntry {
 /// feed carried" semantics.
 const PENDING_RING_CAP: usize = 1024;
 
+/// Maximum execution certificates the `/snapshot/cert` mirror
+/// retains (unit: entries; ~200 B each on the wire — bitmap plus
+/// 96-byte aggregate — so the cap is ~800 KiB of memory).
+///
+/// Origin: sync clients pin the snapshot's *committed* height and
+/// poll until its cert exists, so only the recent tail matters.
+/// 4096 heights is ~68 minutes of chain at one block per second —
+/// far beyond any realistic chunk-download window — while still
+/// bounding the map against a pathological cert cadence. Larger =
+/// deeper sync lookback at linear memory cost; smaller = a slow
+/// sync's cert can age out mid-download (client re-pins a fresher
+/// manifest and retries — inconvenient, never unsafe).
+const EXEC_CERT_MIRROR_CAP: usize = 4096;
+
 /// Ring state: monotonically increasing sequence and the retained
 /// `(seq, hash)` window.
 #[derive(Debug, Default)]
@@ -675,6 +689,17 @@ pub struct RpcServer {
     /// terminal) and read per `/health` + `/metrics` probe — both
     /// cold paths, so lock cost is irrelevant.
     exec_divergence: std::sync::Mutex<Option<types::ExecDivergence>>,
+    /// Execution certificates mirrored from the consensus engine,
+    /// keyed by certified height. Served at
+    /// `GET /snapshot/cert/{height}` so a syncing node can anchor a
+    /// snapshot download in a quorum-signed `(height, state_root)`
+    /// instead of an operator-typed root. A mirror rather than a
+    /// live engine read because the RPC layer cannot see the
+    /// consensus thread's engine — the pump pushes each iteration,
+    /// and the engine's own retention window (~2 committee
+    /// rotations) bounds what arrives. `Mutex` on a cold path:
+    /// writes are per-pump-tick, reads per sync client.
+    exec_certs: std::sync::Mutex<std::collections::BTreeMap<u64, types::ExecCertificate>>,
 }
 
 mod endpoints;
@@ -705,6 +730,7 @@ impl RpcServer {
             next_filter_id: AtomicU64::new(1),
             pending_txs: std::sync::Mutex::new(PendingRing::default()),
             exec_divergence: std::sync::Mutex::new(None),
+            exec_certs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -961,6 +987,43 @@ impl RpcServer {
     #[must_use]
     pub fn exec_divergence(&self) -> Option<types::ExecDivergence> {
         *primitives::sync::lock_state(&self.exec_divergence)
+    }
+
+    /// Mirror execution certificates reported by the consensus
+    /// engine into the serving table. Idempotent by construction —
+    /// a height's cert is immutable once formed, so re-recording is
+    /// a no-op write of identical bytes.
+    ///
+    /// The mirror keeps a window, not unbounded history: a sync
+    /// client pins a *recent* committed height (the snapshot is
+    /// always exported at the tip), so certs far behind the newest
+    /// are dead weight. `EXEC_CERT_MIRROR_CAP` bounds memory; a
+    /// client that cannot finish its download within the window
+    /// re-pins a fresher manifest anyway.
+    pub fn record_exec_certificates(
+        &self,
+        certs: impl IntoIterator<Item = types::ExecCertificate>,
+    ) {
+        let mut map = primitives::sync::lock_state(&self.exec_certs);
+        for cert in certs {
+            map.insert(cert.height.value(), cert);
+        }
+        while map.len() > EXEC_CERT_MIRROR_CAP {
+            map.pop_first();
+        }
+    }
+
+    /// The codec-encoded [`types::ExecCertificate`] for `height`, if
+    /// the mirror holds it — the `GET /snapshot/cert/{height}` body
+    /// before hex-encoding.
+    #[must_use]
+    pub fn exec_certificate(&self, height: u64) -> Option<Vec<u8>> {
+        let map = primitives::sync::lock_state(&self.exec_certs);
+        map.get(&height).map(|cert| {
+            let mut buf = Vec::new();
+            codec::Encode::encode(cert, &mut buf);
+            buf
+        })
     }
 
     /// Generate a Prometheus text exposition of all node metrics.

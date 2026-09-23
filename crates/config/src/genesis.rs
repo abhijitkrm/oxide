@@ -195,6 +195,69 @@ pub struct GenesisValidator {
     pub stake: u64,
 }
 
+/// A weak-subjectivity validator-set checkpoint: the `(epoch, set)`
+/// pair a state-sync client trusts to verify the quorum-signed
+/// execution certificate that anchors a downloaded snapshot.
+///
+/// This replaces the bare operator-typed `--trusted-root` as the
+/// sync trust anchor: a certificate is cryptographic evidence that
+/// validators holding >2/3 of the checkpointed stake attested the
+/// root, so the peer serving the snapshot cannot forge it. The
+/// checkpoint itself must come from a source the operator already
+/// trusts (their own genesis, a network-published committee list,
+/// a governance output) — that is the weak-subjectivity assumption.
+///
+/// ```json
+/// {
+///   "epoch": 0,
+///   "validators": [
+///     { "address": "0x<40 hex>", "public_key": "0x<96 hex>", "stake": 1000000 }
+///   ]
+/// }
+/// ```
+///
+/// `epoch` must equal the epoch the served certificate was signed
+/// under: the certificate's aggregate signature binds the epoch, so
+/// a checkpoint naming the wrong epoch fails verification rather
+/// than indexing the wrong set. For a chain still in its genesis
+/// epoch, the genesis file's validator list serves as the epoch-0
+/// checkpoint; after a rotation the operator supplies the newer
+/// set explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidatorSetCheckpoint {
+    /// The epoch this set was live under — compared to the
+    /// certificate's signed epoch at verification time.
+    pub epoch: u64,
+    /// The validator set: same record shape as genesis validators.
+    /// `public_key` is REQUIRED here (unlike genesis, where devnets
+    /// may omit it for deterministic derivation) — a checkpoint
+    /// without keys can verify nothing.
+    pub validators: Vec<GenesisValidator>,
+}
+
+impl ValidatorSetCheckpoint {
+    /// Parse a checkpoint from a JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the JSON is invalid or doesn't match the
+    /// checkpoint schema.
+    pub fn from_json_str(s: &str) -> Result<Self, GenesisError> {
+        serde_json::from_str(s).map_err(|e| GenesisError::Parse(e.to_string()))
+    }
+
+    /// Parse a checkpoint from a JSON file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the file cannot be read or parsed.
+    pub fn from_json_file(path: &std::path::Path) -> Result<Self, GenesisError> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| GenesisError::FileRead(path.display().to_string(), e.to_string()))?;
+        Self::from_json_str(&contents)
+    }
+}
+
 impl Genesis {
     /// Create a new genesis with the given chain ID and defaults.
     #[must_use]
@@ -427,5 +490,32 @@ mod tests {
             assert!(v.stake > 0, "validator stake must be positive");
             assert!(v.address.starts_with("0x"), "address must be hex");
         }
+    }
+
+    /// The weak-subjectivity checkpoint parses the documented JSON
+    /// shape and carries the epoch the served certificate must name.
+    #[test]
+    fn validator_set_checkpoint_parses() {
+        let json = r#"{
+            "epoch": 3,
+            "validators": [
+                {
+                    "address": "0x0101010101010101010101010101010101010101",
+                    "public_key": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "stake": 1000000
+                }
+            ]
+        }"#;
+        let cp = ValidatorSetCheckpoint::from_json_str(json).expect("valid checkpoint");
+        assert_eq!(cp.epoch, 3);
+        assert_eq!(cp.validators.len(), 1);
+        assert_eq!(cp.validators[0].stake, 1_000_000);
+        assert!(cp.validators[0].public_key.is_some());
+        assert!(ValidatorSetCheckpoint::from_json_str("not json").is_err());
+        // A checkpoint with no validators parses but is unusable —
+        // the consumer asserts non-empty at ValidatorSet build time.
+        let empty = ValidatorSetCheckpoint::from_json_str(r#"{"epoch": 0, "validators": []}"#)
+            .expect("empty set still parses");
+        assert!(empty.validators.is_empty());
     }
 }

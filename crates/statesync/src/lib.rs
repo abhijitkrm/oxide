@@ -7,16 +7,22 @@
 //!
 //! 1. `GET /snapshot/manifest` — a small [`Manifest`] describing the
 //!    snapshot: chain height, claimed state root, chunk size, and a
-//!    BLAKE3 hash per fixed-size chunk. The manifest is the trust
-//!    anchor the operator verifies out-of-band (height + root).
-//! 2. `GET /snapshot/chunk/{i}` — each chunk of the codec-encoded
+//!    BLAKE3 hash per fixed-size chunk.
+//! 2. `GET /snapshot/cert/{height}` — the quorum-signed
+//!    [`types::ExecCertificate`] attesting the manifest's
+//!    `(height, state_root)`. The client verifies it against its
+//!    own validator-set checkpoint (weak subjectivity): a
+//!    stake-supermajority signature the serving peer cannot forge.
+//!    This certificate — not an operator-typed root — is the trust
+//!    anchor; the operator pin remains as an optional extra check.
+//! 3. `GET /snapshot/chunk/{i}` — each chunk of the codec-encoded
 //!    [`executor::ExecutorSnapshot`] blob, hex-encoded. The client
 //!    verifies `H(StateSyncChunk ‖ chunk)` against
 //!    `manifest.chunk_hashes[i]` before accepting it — a tampered or
 //!    torn chunk is rejected byte-for-byte, not discovered as a bad
 //!    root after import.
-//! 3. Assemble, decode, `import_snapshot`, then verify the imported
-//!    state root equals the trusted root — fail closed otherwise.
+//! 4. Assemble, decode, `import_snapshot`, then verify the imported
+//!    state root equals the certified root — fail closed otherwise.
 //!
 //! The client is deliberately `std`-only (blocking `TcpStream`):
 //! bootstrap runs once at startup before the async runtime is
@@ -297,13 +303,76 @@ pub fn fetch_hex(addr: &str, path: &str) -> Result<Vec<u8>, SyncError> {
     hex_decode(body.trim()).map_err(|e| SyncError::Decode(format!("hex: {e}")))
 }
 
+/// Fetch `GET /snapshot/manifest` — the first step of every sync.
+/// The returned manifest pins the snapshot height, claimed state
+/// root, and per-chunk hashes; the caller decides how to anchor it
+/// (operator pin, quorum-signed certificate) before downloading.
+///
+/// # Errors
+///
+/// [`SyncError::Transport`] on HTTP failure, [`SyncError::Decode`]
+/// on a malformed manifest.
+pub fn fetch_manifest(addr: &str) -> Result<Manifest, SyncError> {
+    let manifest_bytes = fetch_hex(addr, "/snapshot/manifest")?;
+    let mut reader = codec::Reader::new(&manifest_bytes);
+    <Manifest as codec::Decode>::decode(&mut reader)
+        .map_err(|e| SyncError::Decode(format!("manifest: {e}")))
+}
+
+/// Fetch `GET /snapshot/cert/{height}` — the quorum-signed
+/// [`types::ExecCertificate`] attesting `(height, state_root)`.
+///
+/// The endpoint 404s until the serving validator's engine has
+/// formed the certificate for that height, so callers poll: pin a
+/// manifest first, then retry this until it succeeds or the
+/// deadline passes. The certificate is verified client-side
+/// against a validator-set checkpoint — this function returns
+/// raw bytes + decode only; trusting the peer ends here.
+///
+/// # Errors
+///
+/// [`SyncError::Transport`] on HTTP failure (including the 404
+/// poll response), [`SyncError::Decode`] on a malformed cert.
+pub fn fetch_exec_certificate(
+    addr: &str,
+    height: u64,
+) -> Result<types::ExecCertificate, SyncError> {
+    let bytes = fetch_hex(addr, &format!("/snapshot/cert/{height}"))?;
+    let mut reader = codec::Reader::new(&bytes);
+    <types::ExecCertificate as codec::Decode>::decode(&mut reader)
+        .map_err(|e| SyncError::Decode(format!("exec cert: {e}")))
+}
+
+/// Download and hash-verify every chunk of `manifest`, returning
+/// the assembled snapshot blob — the caller decodes the
+/// [`executor::ExecutorSnapshot`] and imports it.
+///
+/// # Errors
+///
+/// Propagates [`SyncError`] per chunk; `ChunkHashMismatch` means
+/// the peer served bytes the manifest does not describe.
+pub fn fetch_blob(addr: &str, manifest: &Manifest) -> Result<Vec<u8>, SyncError> {
+    let mut chunks = Vec::with_capacity(manifest.chunk_count());
+    for i in 0..manifest.chunk_count() {
+        let chunk = fetch_hex(addr, &format!("/snapshot/chunk/{i}"))?;
+        if !verify_chunk(manifest, i, &chunk) {
+            return Err(SyncError::ChunkHashMismatch { index: i });
+        }
+        chunks.push(chunk);
+    }
+    assemble(manifest, &chunks)
+}
+
 /// Run the full download against a peer's snapshot endpoints.
 /// Returns the assembled, chunk-verified blob — the caller decodes
 /// the [`executor::ExecutorSnapshot`] and imports it.
 ///
 /// `trusted_height`/`trusted_root` anchor the manifest before any
 /// chunk is fetched; `max_version` lets the caller reject a format
-/// its importer predates.
+/// its importer predates. Note this composed helper anchors on the
+/// operator pin only — the certificate-verified path
+/// (`fetch_manifest` → `fetch_exec_certificate` → `fetch_blob`) is
+/// the one that removes operator-typed trust.
 ///
 /// # Errors
 ///
@@ -316,10 +385,7 @@ pub fn fetch_snapshot(
     trusted_root: &Hash,
     max_version: u32,
 ) -> Result<Vec<u8>, SyncError> {
-    let manifest_bytes = fetch_hex(addr, "/snapshot/manifest")?;
-    let mut reader = codec::Reader::new(&manifest_bytes);
-    let manifest = <Manifest as codec::Decode>::decode(&mut reader)
-        .map_err(|e| SyncError::Decode(format!("manifest: {e}")))?;
+    let manifest = fetch_manifest(addr)?;
     check_trusted(&manifest, trusted_height, trusted_root)?;
     if manifest.format_version > max_version {
         return Err(SyncError::Decode(format!(
@@ -327,15 +393,7 @@ pub fn fetch_snapshot(
             manifest.format_version
         )));
     }
-    let mut chunks = Vec::with_capacity(manifest.chunk_count());
-    for i in 0..manifest.chunk_count() {
-        let chunk = fetch_hex(addr, &format!("/snapshot/chunk/{i}"))?;
-        if !verify_chunk(&manifest, i, &chunk) {
-            return Err(SyncError::ChunkHashMismatch { index: i });
-        }
-        chunks.push(chunk);
-    }
-    assemble(&manifest, &chunks)
+    fetch_blob(addr, &manifest)
 }
 
 /// Decode a `0x`-prefixed (or bare) hex string. Local copy so the

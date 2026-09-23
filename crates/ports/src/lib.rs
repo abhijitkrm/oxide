@@ -185,4 +185,18 @@ pub trait ConsensusEngine: Send {
     fn divergence(&self) -> Option<types::ExecDivergence> {
         None
     }
+
+    /// The quorum-signed execution certificates this engine holds,
+    /// for serving to state-sync clients. A syncing node verifies
+    /// each certificate against its own validator-set checkpoint
+    /// (weak subjectivity), so an engine only needs to hand over
+    /// the certificates it has formed or verified — authenticity
+    /// is established client-side, not by trusting the server.
+    ///
+    /// Engines without execution certificates (sequencer, mocks)
+    /// inherit the empty default; their snapshots carry no
+    /// quorum-signed anchor and a verifier must refuse them.
+    fn exec_certificates(&self) -> Vec<types::ExecCertificate> {
+        Vec::new()
+    }
 }

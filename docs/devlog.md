@@ -20037,3 +20037,48 @@ pump's `chain_id` param all deleted.
 Residual: the startup smoke delegate (devnet) and validator
 `--submit-key-change`/smoke paths still use test identities —
 that's C4's feature-gate sweep.
+
+## Session N+32 — state sync anchors in quorum signatures, not typed hex
+
+M8. `--state-sync` used to trust whatever `--trusted-root` the
+operator pasted — a typo, a stale doc page, or a compromised ops
+channel imported state with no proof anyone agreed on it.
+
+The anchor is now the chain's own execution certificate. The
+serving node's pump mirrors the engine's `exec_certs` +
+`verified_exec_certs` into RPC (`record_exec_certificates`, bounded
+4096-entry mirror); a new endpoint `GET /snapshot/cert/{height}`
+serves the codec-encoded `ExecCertificate`, 404ing until the cert
+forms. The client flow: fetch manifest (pins height+root
+server-side) → poll the cert endpoint until the cert for exactly
+that height exists → `consensus::verify_exec_cert` (now pub)
+against a validator-set checkpoint — epoch match, bitmap bounds,
+>2/3 stake quorum, aggregate BLS over `(height, root, epoch)` —
+then chunks, decode, import, recompute. `--trusted-height` +
+`--trusted-root` demoted to an optional pin pair.
+
+The checkpoint is the weak-subjectivity input:
+`config::genesis::ValidatorSetCheckpoint` — `{"epoch", "validators"
+:[{address, public_key, stake}]}` via `--trusted-validators`, or
+the `--genesis-file` set as the implicit epoch-0 checkpoint (its
+validators must carry `public_key`; devnet genesis omits them, so
+devnet syncs need an explicit checkpoint — for testing, the
+peer's `/validator-set` output converts directly).
+
+Verified live: devnet node → checkpoint from `/validator-set` →
+`oxide-fullnode --verify-only` synced height 46/87 with the cert
+verified; negative matrix all fail closed (wrong epoch →
+CertEpochMismatch, foreign committee → InvalidQcSignature, no
+checkpoint → refuse at startup, pin mismatch → refuse at manifest).
+Tests: `exec_certificate_verifies_against_client_checkpoint`
+(checkpoint/epoch/sub-quorum/OOB-bitmap/tampered-root/foreign-set
+matrix on a real formed cert), `exec_cert_over_http` (wire
+round-trip incl. pre-cert 404), mirror boundedness/idempotence,
+checkpoint parse. `fetch_snapshot` keeps its composed pin-anchored
+form for compatibility; `fetch_manifest`/`fetch_blob` split it.
+
+Residual: certs die with the engine's retention floor
+(~2 committee rotations behind the tip) and a halted chain stops
+producing them — both correct fail-closeds (no live quorum, no
+trustworthy sync). Fullnode-as-server doesn't relay certs (no
+engine); a synced node can't yet re-serve the anchor it verified.

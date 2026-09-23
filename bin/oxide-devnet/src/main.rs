@@ -1143,6 +1143,16 @@ fn run_consensus_loop(
             rpc.set_exec_divergence(*d);
         }
 
+        // Mirror the engine's execution certificates into RPC so
+        // `GET /snapshot/cert/{height}` can answer a syncing node's
+        // certificate poll. Pushed every iteration (the mirror
+        // dedups by height); a syncing client verifies the cert
+        // against its own validator-set checkpoint, so serving the
+        // bytes costs this node no trust assumption.
+        if let Some(rpc) = rpc {
+            rpc.record_exec_certificates(engine.exec_certificates());
+        }
+
         // Compact pending proposals (keep last 10 views).
         let current_view = engine.current_view().value();
         pending_proposals.retain(|(h, _)| h.view.value() >= current_view.saturating_sub(10));

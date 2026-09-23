@@ -207,6 +207,13 @@ pub(crate) fn attestation_signing_message(epoch: Epoch, height: Height, root: &H
 /// aggregate over `(height, state_root, epoch)` under
 /// `Domain::ExecAttest`.
 ///
+/// Public so state-sync clients (e.g. `oxide-fullnode
+/// --state-sync`) can verify a served certificate against a
+/// weak-subjectivity validator-set checkpoint: the caller supplies
+/// the epoch whose set it trusts — `epoch` must equal
+/// `cert.epoch`, so a checkpoint for the wrong epoch fails here
+/// rather than silently indexing the wrong signer bitmap.
+///
 /// This check matters for liveness, not just authenticity: the
 /// voter-side divergence check refuses to vote on a cert whose
 /// root disagrees with local state, so a leader embedding a
@@ -223,7 +230,7 @@ pub(crate) fn attestation_signing_message(epoch: Epoch, height: Height, root: &H
 /// power is below quorum, or
 /// [`ConsensusError::InvalidQcSignature`] if the aggregate does
 /// not verify.
-pub(crate) fn verify_exec_cert(
+pub fn verify_exec_cert(
     vset: &ValidatorSet,
     epoch: Epoch,
     cert: &ExecCertificate,

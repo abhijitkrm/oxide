@@ -15,3 +15,7 @@ repository.workspace = true
 primitives = { workspace = true }
 codec = { workspace = true }
 crypto = { workspace = true }
+# types: `fetch_exec_certificate` decodes `types::ExecCertificate`
+# served by `/snapshot/cert/{height}` — the quorum-signed anchor a
+# syncing node verifies against its validator-set checkpoint.
+types = { workspace = true }

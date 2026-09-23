@@ -79,3 +79,47 @@ async fn state_sync_rejects_wrong_trusted_root() {
         "wrong trusted root must abort before downloading, got {result:?}"
     );
 }
+
+/// `/snapshot/cert/{height}` over real HTTP: before the engine
+/// mirrors a cert the endpoint 404s (the client's poll loop keeps
+/// retrying), and once recorded it serves codec bytes that decode
+/// to the identical certificate.
+#[tokio::test]
+async fn exec_cert_over_http() {
+    let blob: Vec<u8> = vec![1, 2, 3];
+    let root = primitives::Hash([7; 32]);
+    let mut rpc = RpcServer::new(1, 1_000_000_000);
+    rpc.set_snapshot_provider(Arc::new(StubProvider { blob, root }));
+    let rpc = Arc::new(rpc);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = HttpServer::from_shared(Arc::clone(&rpc), addr.clone());
+    tokio::spawn(server.serve_on(listener));
+
+    // Nothing mirrored yet → the endpoint 404s (client polls).
+    {
+        let addr = addr.clone();
+        let early =
+            tokio::task::spawn_blocking(move || statesync::fetch_exec_certificate(&addr, 7))
+                .await
+                .expect("client task panicked");
+        assert!(early.is_err(), "no cert mirrored yet must fail");
+    }
+
+    let cert = types::ExecCertificate {
+        height: primitives::Height::new(7),
+        state_root: root,
+        epoch: primitives::Epoch::new(0),
+        signer_bitmap: vec![0b0000_0111],
+        aggregate_signature: crypto::AggregateSignature::ZERO,
+    };
+    rpc.record_exec_certificates(vec![cert.clone()]);
+
+    let fetched = tokio::task::spawn_blocking(move || {
+        statesync::fetch_exec_certificate(&addr, 7).expect("cert must be served once mirrored")
+    })
+    .await
+    .expect("client task panicked");
+    assert_eq!(fetched, cert, "cert must round-trip over the wire unchanged");
+}

@@ -122,6 +122,13 @@ pub struct ConsensusDriver {
     /// exposes the halt — without it the only signal is a stderr
     /// line watchdogs never scrape.
     divergence_observer: Option<Arc<dyn Fn(consensus::ExecDivergence) + Send + Sync>>,
+    /// Optional observer invoked every tick with the engine's
+    /// retained execution certificates. The validator wires this to
+    /// the RPC server so `GET /snapshot/cert/{height}` can answer a
+    /// syncing node's certificate poll — the RPC layer cannot reach
+    /// the engine, so the driver mirrors the certs across. Per-tick
+    /// (not per-cert) so a burst of catch-up certs can't be missed.
+    cert_observer: Option<Arc<dyn Fn(Vec<types::ExecCertificate>) + Send + Sync>>,
 }
 
 impl ConsensusDriver {
@@ -133,6 +140,7 @@ impl ConsensusDriver {
             metrics: Arc::new(DriverMetrics::new()),
             block_observer: None,
             divergence_observer: None,
+            cert_observer: None,
         }
     }
 
@@ -159,6 +167,17 @@ impl ConsensusDriver {
         observer: Arc<dyn Fn(consensus::ExecDivergence) + Send + Sync>,
     ) {
         self.divergence_observer = Some(observer);
+    }
+
+    /// Install a callback fired every tick with the engine's
+    /// retained execution certificates. Fires on the driver task's
+    /// tick; the callback must be cheap — the RPC mirror path is
+    /// (one lock + a handful of map inserts).
+    pub fn set_cert_observer(
+        &mut self,
+        observer: Arc<dyn Fn(Vec<types::ExecCertificate>) + Send + Sync>,
+    ) {
+        self.cert_observer = Some(observer);
     }
 
     /// Get a handle to the shared metrics (for wiring into the RPC
@@ -193,6 +212,7 @@ impl ConsensusDriver {
         let metrics = self.metrics;
         let block_observer = self.block_observer;
         let divergence_observer = self.divergence_observer;
+        let cert_observer = self.cert_observer;
 
         // The last finalized height we saw. Used to detect new
         // finalization events for metrics reporting.
@@ -240,6 +260,14 @@ impl ConsensusDriver {
                         observer(d);
                     }
                     divergence_reported = true;
+                }
+
+                // Mirror execution certificates toward RPC every
+                // tick: `/snapshot/cert/{height}` answers a syncing
+                // node's certificate poll, and the mirror dedups by
+                // height so the push is idempotent.
+                if let Some(observer) = &cert_observer {
+                    observer(node.engine().exec_certificates());
                 }
 
                 // Check for new finalization.

@@ -23,6 +23,13 @@ statesync = { workspace = true }
 codec = { workspace = true }
 executor = { workspace = true }
 primitives = { workspace = true }
+# consensus/types/crypto: certificate-verified state sync — the
+# `--trusted-validators` checkpoint builds a `ValidatorSet` and
+# `consensus::verify_exec_cert` checks the served
+# `types::ExecCertificate`'s quorum signature over it.
+consensus = { workspace = true }
+types = { workspace = true }
+crypto = { workspace = true }
 
 [lints]
 workspace = true

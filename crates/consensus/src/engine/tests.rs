@@ -3153,6 +3153,101 @@ fn exec_cert_forms_from_quorum_attestations() {
     leader.verify_exec_cert(cert).expect("formed cert must verify");
 }
 
+/// The state-sync trust anchor: a certificate served over the wire
+/// must verify against the *client's* checkpointed validator set —
+/// epoch equality, bitmap bounds, quorum power, and the aggregate
+/// signature over `(height, root, epoch)` — so a peer cannot
+/// fabricate the anchor, and a checkpoint naming the wrong epoch
+/// or committee fails closed rather than indexing the wrong set.
+#[test]
+fn exec_certificate_verifies_against_client_checkpoint() {
+    let (mut engines, keys) = signed_committee();
+    let leader = &mut engines[0];
+    let height = Height::new(7);
+    let root = Hash([0x77; 32]);
+    leader.submit_tx(TxBytes::new(vec![1]));
+    let (header, _proposal) = leader.propose().expect("leader proposes");
+    let block_hash = OxideBft::block_hash(&header);
+    for i in 1u16..=3 {
+        let att = StateAttestation { height, root };
+        let msg = leader.attestation_signing_message(height, &root);
+        let att_sig = keys[usize::from(i)].sign(crypto::hash::Domain::ExecAttest, &msg);
+        let vote_msg = leader.vote_signing_message(View::new(0), 0, &block_hash);
+        let vote_sig = keys[usize::from(i)].sign(crypto::hash::Domain::Vote, &vote_msg);
+        leader
+            .collect_vote(
+                i,
+                Vote {
+                    view: View::new(0),
+                    phase: VotePhase::Prepare,
+                    block_hash,
+                    signature: vote_sig,
+                    attestation: Some(att),
+                    attestation_sig: Some(att_sig),
+                },
+            )
+            .expect("vote accepted");
+    }
+    let cert = leader
+        .exec_certificates()
+        .into_iter()
+        .find(|c| c.height == height)
+        .expect("served cert for the attested height");
+
+    // Happy path: the checkpointed set is the committee that signed.
+    let vset = leader.validator_set().clone();
+    crate::verify_exec_cert(&vset, leader.epoch(), &cert).expect("valid cert verifies");
+
+    // A checkpoint naming the wrong epoch: the signed message binds
+    // the epoch, so the same committee at epoch+1 cannot validate
+    // this cert — the mismatch fails before signature verification.
+    assert!(matches!(
+        crate::verify_exec_cert(&vset, Epoch::new(leader.epoch().value() + 1), &cert),
+        Err(ConsensusError::CertEpochMismatch { .. })
+    ));
+
+    // A sub-quorum bitmap: one validator's stake cannot certify,
+    // however valid its signature would be alone.
+    let mut thin = cert.clone();
+    thin.signer_bitmap = vec![0b0000_0010]; // validator index 1 only
+    assert!(matches!(
+        crate::verify_exec_cert(&vset, leader.epoch(), &thin),
+        Err(ConsensusError::InsufficientQuorum { .. })
+    ));
+
+    // A bitmap naming validators past the end of the checkpointed
+    // set — a malicious index can never resolve to real keys.
+    let mut wide = cert.clone();
+    wide.signer_bitmap = vec![0xFF];
+    assert!(matches!(
+        crate::verify_exec_cert(&vset, leader.epoch(), &wide),
+        Err(ConsensusError::SignerOutOfBounds)
+    ));
+
+    // A tampered root: the aggregate was over the honest root, so
+    // claiming a different one fails signature verification.
+    let mut forged = cert.clone();
+    forged.state_root = Hash([0x99; 32]);
+    assert!(matches!(
+        crate::verify_exec_cert(&vset, leader.epoch(), &forged),
+        Err(ConsensusError::InvalidQcSignature)
+    ));
+
+    // A checkpoint built from *different* keys (the attacker's
+    // committee): the real signers' aggregate does not verify under
+    // foreign public keys.
+    let foreign_keys: Vec<crypto::BlsSecretKey> = (0xA0..=0xA3u8).map(bls_key).collect();
+    let foreign_vset = ValidatorSet::new(
+        foreign_keys.iter().map(crypto::BlsSecretKey::public_key).collect(),
+        vec![1u64; 4],
+    )
+    .expect("foreign set");
+    assert!(matches!(
+        crate::verify_exec_cert(&foreign_vset, leader.epoch(), &cert),
+        Err(ConsensusError::InvalidQcSignature)
+    ));
+}
+
 #[test]
 fn forged_attestation_signature_is_dropped_not_fatal() {
     // An attestation signed by the wrong key must be ignored —
