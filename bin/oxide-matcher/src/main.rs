@@ -13,15 +13,17 @@
 //! # Usage
 //!
 //! ```sh
-//! # Start the matching server with defaults
-//! oxide-matcher
+//! # Start the matching server (--settlement-key is required: batch
+//! # envelopes are signed, and no default operator key exists)
+//! oxide-matcher --settlement-key $(openssl rand -hex 32)
 //!
 //! # Custom ports and 10k funded accounts
-//! oxide-matcher --accounts 10000 --tcp-port 36000 --jsonrpc-port 36001 \
+//! oxide-matcher --settlement-key <64-hex> --accounts 10000 \
+//!   --tcp-port 36000 --jsonrpc-port 36001 \
 //!   --fix-port 36002 --ws-port 36003
 //!
 //! # With a specific batch settlement interval (50ms)
-//! oxide-matcher --batch-interval 50
+//! oxide-matcher --settlement-key <64-hex> --batch-interval 50
 //! ```
 
 #![allow(clippy::cast_precision_loss)]
@@ -114,18 +116,48 @@ fn parse_cli() -> CliConfig {
         // lets any captured signed request replay once.
         nonce_state: parse_flag_opt::<String>("--nonce-state").map(std::path::PathBuf::from),
         // The settlement operator's secp256k1 secret (64 hex chars).
-        // Batch envelopes are always signed — without an explicit key
-        // the deterministic devnet identity-0 key is used, and its
-        // derived address is wired as the exchange's settlement
-        // operator.
-        settlement_key: Some(
-            parse_flag_opt::<String>("--settlement-key")
-                .map_or_else(|| devnet::txs::identity_key(0), |hex| parse_key_hex(&hex)),
-        ),
+        // Batch envelopes are always signed, and there is no default
+        // operator key — a deterministic fallback would wire a public
+        // identity as the settlement gate. `main` refuses to start
+        // without it (and refuses test-identity scalars).
+        settlement_key: parse_flag_opt::<String>("--settlement-key").map(|hex| parse_key_hex(&hex)),
         // Durable settlement-lane checkpoint — without it, a restart
         // forgets an in-flight batch (fills drained, outcome unknown).
         settlement_outbox: parse_flag_opt::<String>("--settlement-outbox")
             .map(std::path::PathBuf::from),
+    }
+}
+
+/// Validate the settlement operator key, or explain why the process
+/// cannot start. The key is mandatory — settlement batches are always
+/// signed, so an absent or publicly derivable key would wire a public
+/// identity as the exchange's settlement gate.
+fn settlement_key_check(key: Option<[u8; 32]>) -> Result<[u8; 32], String> {
+    match key {
+        None => {
+            Err("missing --settlement-key: batch envelopes are signed and no default operator \
+             key exists — generate one (e.g. `openssl rand -hex 32`)"
+                .to_string())
+        }
+        Some(k) if crypto::secp::is_test_identity_key(&k) => {
+            Err("--settlement-key is a public test-identity scalar — anyone can recompute it; \
+             generate a real key (e.g. `openssl rand -hex 32`)"
+                .to_string())
+        }
+        Some(k) => Ok(k),
+    }
+}
+
+/// The settlement key or a precise startup failure — an operator
+/// misconfiguration, reported on stderr with exit code 1 (matching the
+/// binary's other fatal-startup convention).
+fn settlement_key_or_exit(key: Option<[u8; 32]>) -> [u8; 32] {
+    match settlement_key_check(key) {
+        Ok(k) => k,
+        Err(reason) => {
+            eprintln!("oxide-matcher: {reason}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -236,10 +268,9 @@ fn main() {
 
     // The settlement operator is always the key-derived secp256k1
     // address — envelopes are signed, so the node keeps the default
-    // `Reject` unsigned policy. The default key is the deterministic
-    // devnet identity 0; `--settlement-key` overrides it for real
-    // deployments.
-    let key = cli.settlement_key.expect("settlement key always set");
+    // `Reject` unsigned policy. The key is mandatory and must not be
+    // a public test-identity scalar.
+    let key = settlement_key_or_exit(cli.settlement_key);
     let sender = crypto::secp::signable_pubkey_address(&key)
         .expect("settlement key must be a valid secp256k1 secret");
     println!("  settlement operator: {sender:?}");
@@ -359,4 +390,34 @@ fn parse_flag_opt<T: std::str::FromStr>(name: &str) -> Option<T> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settlement_key_required() {
+        let err = settlement_key_check(None).expect_err("missing key must fail");
+        assert!(err.contains("--settlement-key"), "error must name the flag: {err}");
+    }
+
+    #[test]
+    fn settlement_key_refuses_test_identities() {
+        // The whole public identity space — scalars 1..=256 — is refused.
+        for idx in 0u8..=255 {
+            let key = crypto::secp::test_identity_key(idx);
+            let err = settlement_key_check(Some(key)).expect_err("test-identity key must fail");
+            assert!(err.contains("test-identity"), "idx {idx}: {err}");
+        }
+    }
+
+    #[test]
+    fn settlement_key_accepts_real_key() {
+        // A scalar outside the identity space (256) passes.
+        let mut key = [0u8; 32];
+        key[31] = 0x01;
+        key[30] = 0x01; // scalar 257
+        settlement_key_check(Some(key)).expect("non-identity scalar must pass");
+    }
 }

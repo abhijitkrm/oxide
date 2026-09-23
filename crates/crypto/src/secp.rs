@@ -334,6 +334,21 @@ pub fn test_identity_address(index: u8) -> Option<Address> {
     signable_pubkey_address(&test_identity_key(index))
 }
 
+/// True if `key` is one of the public test-identity secrets — the
+/// scalar space [`test_identity_key`] derives (`index + 1` for a `u8`
+/// index, i.e. the integers 1 through 256). A signature under such a
+/// key authenticates as an identity anyone can recompute, so
+/// production startup policy refuses them outright rather than
+/// trusting an operator not to pick one.
+#[must_use]
+pub fn is_test_identity_key(key: &[u8; 32]) -> bool {
+    let Ok(tail) = <[u8; 8]>::try_from(&key[24..]) else {
+        return false;
+    };
+    let scalar = u64::from_be_bytes(tail);
+    key[..24].iter().all(|b| *b == 0) && (1..=256).contains(&scalar)
+}
+
 /// Generate a random private key for testing. Not for production use.
 ///
 /// # Panics

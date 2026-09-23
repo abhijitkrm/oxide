@@ -20375,3 +20375,23 @@ a worker pool would free it entirely; deferred to the P2
 performance work where it belongs with the other crypto offload.
 The transport's merged recv queue still has no per-peer fairness
 below the codec layer.
+
+## Session N+38 — the matcher refuses to start on a public settlement key
+
+First slice of the C4 cluster, smallest piece first. `oxide-matcher`
+silently fell back to devnet identity 0 — the scalar `1`, the most
+watched private key on Ethereum — as its settlement operator when
+`--settlement-key` was absent. Batch envelopes are always signed, so
+the derived address is what the exchange's settlement gate trusts:
+the "no flag" default wired a *public* identity as the party allowed
+to settle.
+
+Now the flag is mandatory: absent key → `exit(1)` naming the flag;
+a key inside the public test-identity space (scalars 1..=256 —
+`crypto::secp::is_test_identity_key`, added next to the derivation
+it documents) → `exit(1)` explaining why. Real key proceeds to
+startup as before. Verified live: both refusal paths exit non-zero
+with precise stderr, and a generated key brings all four order-entry
+servers up with the operator address derived from it. The binary's
+`devnet` dependency is gone — it existed only to source the
+insecure default.

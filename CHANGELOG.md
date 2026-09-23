@@ -51,6 +51,17 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **`oxide-matcher` now requires `--settlement-key`** — there is no
+  default settlement operator. The flag is mandatory, and secrets in
+  the public test-identity scalar space (`crypto::secp` identity
+  keys, integers 1–256) are refused at startup. Previously an absent
+  flag silently signed batch envelopes with devnet identity 0 —
+  scalar `1`, a publicly known key — and wired that identity as the
+  exchange's settlement gate.
+  - **In plain words:** the matching server used to sign settlement
+    batches with a key anyone could look up if you didn't provide
+    one. Now it refuses to start without a real key.
+
 - **Proposal intake is flood-hardened** (`consensus`,
   `oxide-devnet`, `devnet`): wire proposals now pass a cheap
   scheduled-leader + view-window check before any cryptographic
