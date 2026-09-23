@@ -119,6 +119,42 @@ pub fn verify_message(
     public.verify_strict(message, signature).map_err(|_| Ed25519Error::InvalidSignature)
 }
 
+/// Batch-verify many `(message, signature, public key)` triples with
+/// one multi-scalar multiplication.
+///
+/// Ed25519 batch verification (Bostic/Struik style, implemented by
+/// `ed25519-dalek`) checks the aggregate group equation over the whole
+/// set: per-item cost falls to roughly a third of a standalone
+/// `verify_strict` because the expensive scalar multiplications share
+/// one Straus pass. All three slices must be the same length; the
+/// result is all-or-nothing — a `false`/error means AT LEAST ONE
+/// triple failed, with no indication which. Callers needing per-item
+/// outcomes fall back to [`verify_message`] on failure.
+///
+/// Semantic difference from [`verify_message`]: the batch equation is
+/// the standard Ed25519 verification equation and does NOT apply
+/// `verify_strict`'s canonical-form checks (non-canonical `R`/`S`
+/// encodings a strict verifier rejects can pass here). For admission
+/// checks whose downstream binding is the account derived from the
+/// public key — not the signature bytes — a malleated-but-valid
+/// signature still binds the same owner, so the weaker criterion is
+/// sound. Do NOT use this for consensus-critical signature checks
+/// where byte-level canonicalization is part of the state machine.
+///
+/// # Errors
+///
+/// Returns `Ed25519Error::InvalidSignature` if the slices differ in
+/// length or any `(message, signature, key)` triple fails the batch
+/// equation.
+pub fn verify_batch(
+    messages: &[&[u8]],
+    verifying_keys: &[Ed25519PublicKey],
+    signatures: &[Ed25519Signature],
+) -> Result<(), Ed25519Error> {
+    ed25519_dalek::verify_batch(messages, signatures, verifying_keys)
+        .map_err(|_| Ed25519Error::InvalidSignature)
+}
+
 /// Derive a public key from a secret key.
 ///
 /// # Arguments

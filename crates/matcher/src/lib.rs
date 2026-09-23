@@ -579,13 +579,30 @@ impl MatchingServer {
     /// fixes the previous gap where a captured action could be
     /// replayed forever.
     pub fn submit_action(&mut self, req: &ActionRequest) -> OrderResponse {
-        self.orders_processed += 1;
         // Authentication gate — identical policy to `submit_order`,
         // including the configured chain ID.
-        if !protocol::verify_action_with_chain_id(req, self.chain_id) {
+        let Some(verified) = protocol::VerifiedAction::with_chain_id(*req, self.chain_id) else {
+            self.orders_processed += 1;
             self.auth_rejections += 1;
             return OrderResponse::rejected(RejectReason::BadSignature);
-        }
+        };
+        self.submit_verified_action(verified)
+    }
+
+    /// Submit a pre-authenticated action — the [`protocol::VerifiedAction`]
+    /// token is proof the signature + owner binding already passed, so
+    /// the sequencer does not pay a second `verify_strict` (~80 µs per
+    /// action on the single writer — the signature-bound throughput
+    /// ceiling). Replay protection is NOT folded into the token: the
+    /// per-owner nonce check still runs here so a captured action is
+    /// consumed exactly once.
+    ///
+    /// Transports construct the token via
+    /// [`protocol::VerifiedAction::with_chain_id`] with the same chain ID
+    /// the server verifies against.
+    pub fn submit_verified_action(&mut self, req: protocol::VerifiedAction) -> OrderResponse {
+        self.orders_processed += 1;
+        let req = req.request();
         // Replay check on the signed action's nonce — this is the
         // nonce the "cancel/amend drops the signed action nonce"
         // finding referred to: it is now consumed here, before any
@@ -870,6 +887,20 @@ impl SharedMatcher {
         }
     }
 
+    /// Submit a pre-authenticated action — see
+    /// [`MatchingServer::submit_verified_action`]. Transports that
+    /// already verified the signature use this so the matcher thread
+    /// does not pay a second `verify_strict`.
+    ///
+    /// Returns an `EngineError` rejection if the internal mutex is
+    /// poisoned.
+    pub fn submit_verified_action(&self, req: protocol::VerifiedAction) -> OrderResponse {
+        match self.inner.lock() {
+            Ok(mut guard) => guard.submit_verified_action(req),
+            Err(_) => OrderResponse::rejected(crate::protocol::RejectReason::EngineError),
+        }
+    }
+
     /// The chain ID the inner server verifies signatures against —
     /// transports use it for their early (pre-dispatch) signature
     /// check so early-reject and the mandatory in-server re-verify
@@ -936,11 +967,11 @@ enum ControlCommand {
     /// channel. Used by monitoring.
     Stats(std::sync::mpsc::Sender<MatcherStats>),
     /// Process an order action (cancel/amend/replace) and send the
-    /// response back via the oneshot channel. The wire
-    /// `ActionRequest` travels to the matcher thread so
-    /// authentication runs inside `MatchingServer::submit_action` —
-    /// the control path can never admit a forged action.
-    Action(ActionRequest, std::sync::mpsc::Sender<OrderResponse>),
+    /// response back via the oneshot channel. The command carries a
+    /// [`protocol::VerifiedAction`] proof — authentication happens at
+    /// the transport boundary, so the matcher thread never pays a
+    /// second signature verification on the control path.
+    Action(protocol::VerifiedAction, std::sync::mpsc::Sender<OrderResponse>),
 }
 
 /// A lock-free matching server using SPSC rings (LMAX Disruptor
@@ -1132,7 +1163,7 @@ impl RingMatcher {
                                 let _ = reply.send(stats);
                             }
                             ControlCommand::Action(action, reply) => {
-                                let resp = server.submit_action(&action);
+                                let resp = server.submit_verified_action(action);
                                 let _ = reply.send(resp);
                             }
                         }
@@ -1263,14 +1294,30 @@ impl RingMatcher {
     }
 
     /// Submit an order action (cancel/amend/replace) via a
-    /// control-channel command to the matcher thread. Takes the wire
-    /// `ActionRequest` so authentication runs inside the server's
-    /// `submit_action` — this reaches THE SAME order book the rings
-    /// write to, and can never admit a forged action.
+    /// control-channel command to the matcher thread. Authenticates
+    /// the wire `ActionRequest` HERE (caller thread) and ships the
+    /// [`protocol::VerifiedAction`] proof to the matcher thread —
+    /// the control path never pays a second signature verification
+    /// and can never admit a forged action.
     ///
     /// Returns an `EngineError` rejection if the control channel is
     /// disconnected (matcher thread died) or the reply fails.
     pub fn submit_action(&self, action: ActionRequest) -> OrderResponse {
+        let Some(verified) = protocol::VerifiedAction::with_chain_id(action, self.chain_id())
+        else {
+            return OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
+        };
+        self.submit_verified_action(verified)
+    }
+
+    /// Submit a pre-authenticated action — the caller constructed the
+    /// [`protocol::VerifiedAction`] token itself (e.g. a transport that
+    /// already verified the signature), so no re-verification happens
+    /// anywhere.
+    ///
+    /// Returns an `EngineError` rejection if the control channel is
+    /// disconnected (matcher thread died) or the reply fails.
+    pub fn submit_verified_action(&self, action: protocol::VerifiedAction) -> OrderResponse {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self.control_tx.send(ControlCommand::Action(action, reply_tx)).is_err() {
             return OrderResponse::rejected(crate::protocol::RejectReason::EngineError);

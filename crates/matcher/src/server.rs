@@ -68,10 +68,15 @@ async fn submit_batch_ring(
     // Verify against the ring's configured chain ID — the embedded
     // server re-checks nothing for `VerifiedOrder`, so the transport
     // MUST use the same domain or valid orders die here as
-    // `BadSignature`.
+    // `BadSignature`. Batch construction shares one multi-scalar
+    // multiplication across the whole batch — ~3× cheaper per order
+    // than per-item `verify_strict` at the batch sizes clients send.
     let chain_id = ring.chain_id();
-    for (i, req) in orders.into_iter().enumerate() {
-        match crate::protocol::VerifiedOrder::with_chain_id(req, chain_id) {
+    for (i, item) in crate::protocol::VerifiedOrder::batch_with_chain_id(&orders, chain_id)
+        .into_iter()
+        .enumerate()
+    {
+        match item {
             Some(vo) => {
                 positions.push(i);
                 verified.push(vo);
@@ -181,15 +186,56 @@ async fn submit_one_ring(
 /// worker that owns the client connection. Book work itself stays
 /// single-writer inside the matcher thread — contention is the
 /// channel, not a lock.
+/// Handle a JSON-RPC `MANAGE_ORDER` request end to end: authenticate
+/// the wire action ONCE into a [`crate::protocol::VerifiedAction`]
+/// proof, dispatch through the ring or the shared matcher, and write
+/// the JSON-RPC response. Keeps the accept loop under the clippy
+/// line cap and the boundary rule in one place.
+async fn handle_jsonrpc_action<W>(
+    writer: &mut W,
+    matcher: &Arc<SharedMatcher>,
+    ring_matcher: Option<&Arc<crate::RingMatcher>>,
+    action_req: crate::protocol::ActionRequest,
+    id: &serde_json::Value,
+) where
+    W: tokio::io::AsyncWriteExt + Unpin + ?Sized,
+{
+    let action_chain_id = transport_chain_id(matcher, ring_matcher);
+    let Some(verified) =
+        crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
+    else {
+        let _ = writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad signature"},"id":null}
+"#,
+            )
+            .await;
+        return;
+    };
+    // Ship the proof token — the core runs the nonce check +
+    // dispatch without re-verifying.
+    let resp = if let Some(rm) = ring_matcher {
+        submit_action_ring(rm, verified).await
+    } else {
+        matcher.submit_verified_action(verified)
+    };
+    let result = crate::jsonrpc::format_jsonrpc_response(&resp);
+    let response = serde_json::json!({ "jsonrpc": "2.0", "result": result, "id": id });
+    let mut response_line = serde_json::to_string(&response).unwrap_or_default();
+    response_line.push('\n');
+    let _ = writer.write_all(response_line.as_bytes()).await;
+}
+
 async fn submit_action_ring(
     ring: &Arc<crate::RingMatcher>,
-    req: crate::protocol::ActionRequest,
+    req: crate::protocol::VerifiedAction,
 ) -> OrderResponse {
-    // The wire `ActionRequest` crosses the channel intact — the
-    // matching server authenticates it (signature + owner binding +
-    // nonce) inside `submit_action` before dispatching.
+    // The `VerifiedAction` proof crosses the channel — the transport
+    // already authenticated the wire request, so the matcher thread
+    // runs only the nonce check + dispatch (no second `verify_strict`
+    // on the single writer).
     let ring = Arc::clone(ring);
-    tokio::task::spawn_blocking(move || ring.submit_action(req))
+    tokio::task::spawn_blocking(move || ring.submit_verified_action(req))
         .await
         .unwrap_or_else(|_| OrderResponse::rejected(crate::protocol::RejectReason::EngineError))
 }
@@ -354,23 +400,22 @@ async fn handle_connection(
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
             };
-            // Signature verification before processing — with the
-            // SAME chain ID the matcher will re-verify against.
+            // Signature verification ONCE at the boundary — the
+            // `VerifiedAction` token proves it; the matcher runs the
+            // nonce check + dispatch but never a second `verify_strict`.
             let action_chain_id =
                 ring_matcher.as_ref().map_or_else(|| matcher.chain_id(), |rm| rm.chain_id());
-            if !crate::protocol::verify_action_with_chain_id(&action_req, action_chain_id) {
+            let Some(verified) =
+                crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
+            else {
                 let rej = OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
-            }
-            // The wire `ActionRequest` is submitted intact — the
-            // matching server re-authenticates it (signature + owner
-            // binding + nonce) as the mandatory boundary before
-            // dispatching. The verify above is only an early reject.
+            };
             let action_resp = if let Some(rm) = &ring_matcher {
-                submit_action_ring(rm, action_req).await
+                submit_action_ring(rm, verified).await
             } else {
-                matcher.submit_action(&action_req)
+                matcher.submit_verified_action(verified)
             };
             if socket.write_all(&encode_response(&action_resp)).await.is_err() {
                 break;
@@ -490,32 +535,14 @@ async fn run_jsonrpc_tcp_server_impl(
                             .await;
                         continue;
                     };
-                    let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
-                    if !crate::protocol::verify_action_with_chain_id(&action_req, action_chain_id) {
-                        let _ = writer
-                            .write_all(
-                                br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad signature"},"id":null}
-"#,
-                            )
-                            .await;
-                        continue;
-                    }
-                    // Submit the wire `ActionRequest` intact — the
-                    // core re-authenticates before dispatch.
-                    let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action_req).await
-                    } else {
-                        matcher.submit_action(&action_req)
-                    };
-                    let result = crate::jsonrpc::format_jsonrpc_response(&resp);
-                    let response = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "result": result,
-                        "id": id,
-                    });
-                    let mut response_line = serde_json::to_string(&response).unwrap_or_default();
-                    response_line.push('\n');
-                    let _ = writer.write_all(response_line.as_bytes()).await;
+                    handle_jsonrpc_action(
+                        &mut writer,
+                        &matcher,
+                        ring_matcher.as_ref(),
+                        action_req,
+                        &id,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -658,18 +685,20 @@ async fn run_fix_server_impl(
                         continue;
                     };
                     let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
-                    if !crate::protocol::verify_action_with_chain_id(&action_req, action_chain_id) {
+                    let Some(verified) =
+                        crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
+                    else {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
                         let _ = socket.write_all(report.as_bytes()).await;
                         continue;
-                    }
-                    // Submit the wire `ActionRequest` intact — the
-                    // core re-authenticates before dispatch.
+                    };
+                    // Ship the proof token — the core runs the nonce
+                    // check + dispatch without re-verifying.
                     let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action_req).await
+                        submit_action_ring(rm, verified).await
                     } else {
-                        matcher.submit_action(&action_req)
+                        matcher.submit_verified_action(verified)
                     };
                     let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
                     let _ = socket.write_all(report.as_bytes()).await;
@@ -783,18 +812,20 @@ async fn run_websocket_server_impl(
                         continue;
                     };
                     let action_chain_id = transport_chain_id(&matcher, ring_matcher.as_ref());
-                    if !crate::protocol::verify_action_with_chain_id(&action_req, action_chain_id) {
+                    let Some(verified) =
+                        crate::protocol::VerifiedAction::with_chain_id(action_req, action_chain_id)
+                    else {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         let response = crate::ws::format_ws_response(&resp, 0);
                         let _ = ws_sender.send(Message::Text(response.into())).await;
                         continue;
-                    }
-                    // Submit the wire `ActionRequest` intact — the
-                    // core re-authenticates before dispatch.
+                    };
+                    // Ship the proof token — the core runs the nonce
+                    // check + dispatch without re-verifying.
                     let resp = if let Some(rm) = &ring_matcher {
-                        submit_action_ring(rm, action_req).await
+                        submit_action_ring(rm, verified).await
                     } else {
-                        matcher.submit_action(&action_req)
+                        matcher.submit_verified_action(verified)
                     };
                     let response = crate::ws::format_ws_response(&resp, 0);
                     if ws_sender.send(Message::Text(response.into())).await.is_err() {
@@ -1188,14 +1219,16 @@ async fn handle_connection_multi(
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
             };
-            if !crate::protocol::verify_action_with_chain_id(&action_req, matcher.chain_id()) {
+            let Some(verified) =
+                crate::protocol::VerifiedAction::with_chain_id(action_req, matcher.chain_id())
+            else {
                 let rej = OrderResponse::rejected(crate::protocol::RejectReason::BadSignature);
                 let _ = socket.write_all(&encode_response(&rej)).await;
                 continue;
-            }
-            // The wire `ActionRequest` is routed intact — the market
-            // worker authenticates it before dispatching.
-            let action_resp = matcher.submit_action(&action_req);
+            };
+            // Ship the proof token — the market worker runs the nonce
+            // check + dispatch without re-verifying.
+            let action_resp = matcher.submit_verified_action(verified);
             if socket.write_all(&encode_response(&action_resp)).await.is_err() {
                 break;
             }
@@ -1256,17 +1289,17 @@ pub async fn run_jsonrpc_tcp_server_multi(
 "#).await;
                         continue;
                     };
-                    if !crate::protocol::verify_action_with_chain_id(
-                        &action_req,
+                    let Some(verified) = crate::protocol::VerifiedAction::with_chain_id(
+                        action_req,
                         matcher.chain_id(),
-                    ) {
+                    ) else {
                         let _ = writer.write_all(br#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bad signature"},"id":null}
 "#).await;
                         continue;
-                    }
-                    // The wire `ActionRequest` is routed intact — the
-                    // market worker authenticates it before dispatch.
-                    let resp = matcher.submit_action(&action_req);
+                    };
+                    // Ship the proof token — the market worker runs the
+                    // nonce check + dispatch without re-verifying.
+                    let resp = matcher.submit_verified_action(verified);
                     let result = crate::jsonrpc::format_jsonrpc_response(&resp);
                     let response =
                         serde_json::json!({ "jsonrpc": "2.0", "result": result, "id": id });
@@ -1347,18 +1380,18 @@ pub async fn run_fix_server_multi(
                         let _ = socket.write_all(report.as_bytes()).await;
                         continue;
                     };
-                    if !crate::protocol::verify_action_with_chain_id(
-                        &action_req,
+                    let Some(verified) = crate::protocol::VerifiedAction::with_chain_id(
+                        action_req,
                         matcher.chain_id(),
-                    ) {
+                    ) else {
                         let resp = OrderResponse::rejected(RejectReason::BadSignature);
                         let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
                         let _ = socket.write_all(report.as_bytes()).await;
                         continue;
-                    }
-                    // The wire `ActionRequest` is routed intact — the
-                    // market worker authenticates it before dispatch.
-                    let resp = matcher.submit_action(&action_req);
+                    };
+                    // Ship the proof token — the market worker runs the
+                    // nonce check + dispatch without re-verifying.
+                    let resp = matcher.submit_verified_action(verified);
                     let report = crate::fix::format_fix_execution_report(&resp, &cl_ord_id);
                     let _ = socket.write_all(report.as_bytes()).await;
                     continue;

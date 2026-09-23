@@ -20659,3 +20659,48 @@ and finalized with that committee key. Missing env, wrong
 passphrase, and foreign-key cases all fail closed with distinct
 messages. Standalone `cargo check -p node` (no feature) compiles
 with zero aws-lc crates — the C toolchain stays opt-in.
+
+## Session N+40 — matcher authentication: proof tokens kill the sequencer-side re-verify
+
+The matcher admission path paid **two** `verify_strict` calls per
+order action (~80 µs each): the transport's early reject, then
+`MatchingServer::submit_action` re-authenticating on the sequencer
+thread. 1/160 µs ≈ the measured ~12K action/s ceiling — the single
+writer was the signature bound, not the book.
+
+Two-part fix:
+
+- **`protocol::VerifiedAction`** — the `VerifiedOrder` proof-token
+  pattern extended to actions. The token is constructible only by
+  passing `verify_action`; `submit_verified_action` (on
+  `MatchingServer`, `SharedMatcher`, `RingMatcher`,
+  `MultiMarketMatcher`) accepts only the token, so the boundary is
+  mandatory *by type* — not convention. Replay protection stays
+  outside the token: the per-owner nonce check still runs inside
+  the sequencer, so a captured action is consumed exactly once.
+  All eight transport call sites (binary TCP, WS, JSON-RPC, FIX)
+  now authenticate once and ship the proof. The dead
+  `MarketWorker::submit_action`/`chain_id` went with it.
+
+- **`VerifiedOrder::batch_with_chain_id` + `crypto::ed25519::
+  verify_batch`** — bulk admission at the two batch seams
+  (`submit_batch_ring`, `MultiMarketMatcher::submit_batch`) shares
+  one multi-scalar multiplication across all parse-valid items.
+  Owner-binding and key/signature parsing stay per-item (the batch
+  equation can't express them); on a batch failure each item falls
+  back to `verify_strict` to isolate the bad signatures. Enabling
+  dalek's `batch` feature pulls `strobe-rs` (MIT/Apache-2.0) and
+  `keccak` (Apache-2.0/MIT) — transitive only, both
+  GPL-3.0-compatible.
+
+  **Semantic caveat (documented in-tree):** the batch equation is
+  the standard Ed25519 equation, not `verify_strict`'s
+  canonical-form checks — a malleated-but-valid signature can pass
+  an all-valid batch yet fail the fallback. Sound here because the
+  binding is owner→account, not signature bytes, and consensus
+  never consumes these signatures. Marked not-for-consensus in the
+  crypto wrapper docs.
+
+Measured (`order_auth` bench, batch=256): per-item 13.17 ms →
+batch 5.28 ms — **19.4K → 48.5K orders/s authenticated (2.5×)**,
+before counting the action path's removed second verify.

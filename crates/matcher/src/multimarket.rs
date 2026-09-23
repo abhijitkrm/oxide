@@ -64,12 +64,14 @@ pub(crate) struct MarketWork {
 }
 
 /// An action work item: a single order action (cancel/amend/replace)
-/// routed to the correct market worker. Carries the wire
-/// `ActionRequest` so the worker authenticates it inside
-/// `MarketWorker::submit_action` — the same boundary as orders.
+/// routed to the correct market worker. Carries a
+/// [`protocol::VerifiedAction`] proof — authentication happens at the
+/// boundary (submitting thread), the same proof-token boundary as
+/// orders' [`protocol::VerifiedOrder`], so the worker never pays a
+/// second signature verification.
 pub(crate) struct ActionWork {
-    /// The wire action request to process.
-    pub(crate) action: ActionRequest,
+    /// The authenticated action to process.
+    pub(crate) action: protocol::VerifiedAction,
     /// One-shot channel for the worker to return the response.
     pub(crate) response_tx: std::sync::mpsc::Sender<OrderResponse>,
 }
@@ -249,7 +251,7 @@ impl MultiMarketMatcher {
             // worker strands one market's book, not the process.
             let actor = format!("market-worker-{}", cfg.market_id);
             let thread = primitives::supervision::spawn_supervised(&actor, false, move || {
-                MarketWorker::run(cfg, balances, nonces, clock, chain_id, rx);
+                MarketWorker::run(cfg, balances, nonces, clock, rx);
             })
             .expect("spawn market worker thread");
             market_senders.push(tx);
@@ -304,10 +306,17 @@ impl MultiMarketMatcher {
         // signature verification runs BEFORE the nonce is consumed —
         // a forged request must never burn the victim's next nonce.
         let mut positions: Vec<usize> = Vec::with_capacity(orders.len());
-        let mut verified: Vec<protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
         let mut responses: Vec<Option<OrderResponse>> = Vec::with_capacity(orders.len());
-        for (i, req) in orders.into_iter().enumerate() {
-            match protocol::VerifiedOrder::with_chain_id(req, self.chain_id) {
+        // Batch authentication: one multi-scalar multiplication across
+        // all parse-valid signatures (~3× cheaper per order than
+        // per-item `verify_strict`). The nonce check still runs
+        // per-item afterwards, in batch order — verification ordering
+        // relative to nonce consumption is unchanged (every signature
+        // is proven before any nonce is consumed).
+        let authenticated = protocol::VerifiedOrder::batch_with_chain_id(&orders, self.chain_id);
+        let mut verified: Vec<protocol::VerifiedOrder> = Vec::with_capacity(orders.len());
+        for (i, item) in authenticated.into_iter().enumerate() {
+            match item {
                 Some(vo) => {
                     // The nonce tracker is the replay gate: a panic
                     // mid-`check_and_consume` can leave `last_seen`
@@ -423,15 +432,32 @@ impl MultiMarketMatcher {
         responses.pop().unwrap_or_else(|| OrderResponse::rejected(RejectReason::EngineError))
     }
 
-    /// Submit an order action (cancel/amend/replace). Takes the wire
-    /// `ActionRequest` so the worker authenticates it inside
-    /// `MarketWorker::submit_action` — the same mandatory boundary as
-    /// order admission. Routes to market 0 (the v0 action protocol
-    /// is single-market; the wire format carries no market field).
+    /// Submit an order action (cancel/amend/replace). Authenticates the
+    /// wire `ActionRequest` HERE (calling thread) and ships the
+    /// [`protocol::VerifiedAction`] proof to the worker — the same
+    /// proof-token boundary as orders' `VerifiedOrder`, so the market
+    /// worker never pays a second signature verification and can never
+    /// admit a forged action. Routes to market 0 (the v0 action
+    /// protocol is single-market; the wire format carries no market
+    /// field).
     ///
     /// Returns an `EngineError` rejection if the market worker thread
     /// has died.
     pub fn submit_action(&self, action: &ActionRequest) -> OrderResponse {
+        let Some(verified) = protocol::VerifiedAction::with_chain_id(*action, self.chain_id) else {
+            return OrderResponse::rejected(RejectReason::BadSignature);
+        };
+        self.submit_verified_action(verified)
+    }
+
+    /// Submit a pre-authenticated action — the caller constructed the
+    /// [`protocol::VerifiedAction`] token itself (a transport that
+    /// already verified the signature), so no verification happens
+    /// again anywhere.
+    ///
+    /// Returns an `EngineError` rejection if the market worker thread
+    /// has died.
+    pub fn submit_verified_action(&self, action: protocol::VerifiedAction) -> OrderResponse {
         // v0: all actions route to market 0 — the wire `ActionRequest`
         // has no market field (multi-market routing is future work).
         let market = 0;
@@ -440,7 +466,7 @@ impl MultiMarketMatcher {
         }
         let (response_tx, response_rx) = std::sync::mpsc::channel();
         if self.market_senders[market]
-            .send(MarketMessage::Action(ActionWork { action: *action, response_tx }))
+            .send(MarketMessage::Action(ActionWork { action, response_tx }))
             .is_err()
         {
             return OrderResponse::rejected(RejectReason::EngineError);
@@ -582,10 +608,6 @@ pub(crate) struct MarketWorker {
     /// point as `MatchingServer`; threaded from the matcher that
     /// spawned this worker.
     pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// The chain ID action signatures are verified against —
-    /// identical to the dispatching matcher's so a verified order
-    /// can never be rejected downstream (and vice versa).
-    pub(crate) chain_id: u64,
     /// Scratch for non-fill book removals the sweep reports.
     pub(crate) removed: Vec<trading::MakerRemoval>,
     /// Book order id → the client order id (request nonce) of the
@@ -604,7 +626,6 @@ impl MarketWorker {
         balances: Arc<AtomicBalanceCache>,
         nonces: Arc<std::sync::Mutex<NonceTracker>>,
         clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-        chain_id: u64,
         rx: std::sync::mpsc::Receiver<MarketMessage>,
     ) {
         let vcfg = cfg.validated().expect("market config must be valid");
@@ -619,7 +640,6 @@ impl MarketWorker {
             settlement_batch: Vec::with_capacity(10_000),
             cost_acc: LegCostAcc::default(),
             clock,
-            chain_id,
             removed: Vec::with_capacity(64),
             order_client_ids: HashMap::with_capacity(65_536),
             orders_processed: 0,
@@ -637,7 +657,7 @@ impl MarketWorker {
                     let _ = work.response_tx.send(responses);
                 }
                 Ok(MarketMessage::Action(action_work)) => {
-                    let resp = worker.submit_action(&action_work.action);
+                    let resp = worker.submit_verified_action(action_work.action);
                     let _ = action_work.response_tx.send(resp);
                 }
                 Ok(MarketMessage::Seal(reply)) => {
@@ -856,16 +876,16 @@ impl MarketWorker {
         }
     }
 
-    /// Submit an order action (cancel/amend/replace). Takes the wire
-    /// `ActionRequest` — the SAME mandatory boundary as
-    /// `MatchingServer::submit_action`: `verify_action` (signature +
-    /// owner binding) → shared nonce check → dispatch.
-    pub(crate) fn submit_action(&mut self, req: &ActionRequest) -> OrderResponse {
+    /// Submit a pre-authenticated action — see
+    /// [`MatchingServer::submit_verified_action`]. The token proves
+    /// signature + owner binding; the shared nonce check still runs
+    /// here so a captured action is consumed exactly once.
+    pub(crate) fn submit_verified_action(
+        &mut self,
+        req: protocol::VerifiedAction,
+    ) -> OrderResponse {
         self.orders_processed += 1;
-        if !protocol::verify_action_with_chain_id(req, self.chain_id) {
-            self.auth_rejections += 1;
-            return OrderResponse::rejected(RejectReason::BadSignature);
-        }
+        let req = req.request();
         if !self.check_nonce(&req.owner, req.nonce) {
             return OrderResponse::rejected(RejectReason::StaleNonce);
         }

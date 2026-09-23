@@ -355,9 +355,123 @@ impl VerifiedOrder {
         if verify_order_with_chain_id(&req, chain_id) { Some(Self(req)) } else { None }
     }
 
+    /// Authenticate a batch of order requests, amortizing the Ed25519
+    /// group operations across all parse-valid items.
+    ///
+    /// Returns one `Option<VerifiedOrder>` per input position: `Some`
+    /// iff that request's signature verifies AND its `owner` matches
+    /// the address derived from its public key — identical admission
+    /// policy to [`Self::with_chain_id`], so a caller can swap the
+    /// per-item loop for this without changing observable outcomes.
+    ///
+    /// Cost profile: the batch equation shares one multi-scalar
+    /// multiplication across the set (~3× cheaper per item at batch
+    /// sizes transports actually send), at the price of all-or-nothing
+    /// granularity — on a batch failure each parse-valid item is
+    /// re-checked with `verify_strict` to isolate the bad signatures.
+    /// That fallback applies the STRICTER per-item criterion: a
+    /// malleated-but-batch-valid signature can pass in an all-valid
+    /// batch yet be rejected when the batch fails and fallback runs.
+    /// Admission accepts the inconsistency — the signed payload still
+    /// binds the same owner account either way — and consensus never
+    /// consumes these signatures.
+    #[must_use]
+    pub fn batch_with_chain_id(reqs: &[OrderRequest], chain_id: u64) -> Vec<Option<Self>> {
+        // Phase 1 — per-item checks that batch verification cannot
+        // express: key parsing, the owner-binding derivation, and
+        // signature parsing. Only parse-valid triples enter the
+        // batch; everything else is a positional `None`.
+        let mut out: Vec<Option<Self>> = Vec::with_capacity(reqs.len());
+        let mut pending: Vec<usize> = Vec::with_capacity(reqs.len());
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(reqs.len());
+        let mut keys: Vec<crypto::ed25519::Ed25519PublicKey> = Vec::with_capacity(reqs.len());
+        let mut signatures: Vec<crypto::ed25519::Ed25519Signature> = Vec::with_capacity(reqs.len());
+        for (i, req) in reqs.iter().enumerate() {
+            let item = (|| {
+                let pubkey = crypto::ed25519::Ed25519PublicKey::from_bytes(&req.pubkey).ok()?;
+                if crypto::ed25519::owner_address(&pubkey) != req.owner {
+                    return None;
+                }
+                let signature =
+                    crypto::ed25519::Ed25519Signature::from_slice(&req.signature).ok()?;
+                Some((pubkey, signature))
+            })();
+            match item {
+                Some((pubkey, signature)) => {
+                    pending.push(i);
+                    messages.push(signing_message_with_chain_id(req, chain_id));
+                    keys.push(pubkey);
+                    signatures.push(signature);
+                    out.push(None);
+                }
+                None => out.push(None),
+            }
+        }
+        if pending.is_empty() {
+            return out;
+        }
+        // Phase 2 — one batch equation over the collected triples.
+        let message_refs: Vec<&[u8]> = messages.iter().map(Vec::as_slice).collect();
+        let all_valid = crypto::ed25519::verify_batch(&message_refs, &keys, &signatures).is_ok();
+        for (slot, &i) in pending.iter().enumerate() {
+            let ok = all_valid
+                || crypto::ed25519::verify_message(
+                    &keys[slot],
+                    message_refs[slot],
+                    &signatures[slot],
+                )
+                .is_ok();
+            if ok {
+                out[i] = Some(Self(reqs[i]));
+            }
+        }
+        out
+    }
+
     /// The authenticated request.
     #[must_use]
     pub fn request(&self) -> &OrderRequest {
+        &self.0
+    }
+}
+
+/// An [`ActionRequest`] that has passed authentication — the
+/// signature verifies AND the `owner` equals the address derived
+/// from the request's public key. The action-side counterpart of
+/// [`VerifiedOrder`].
+///
+/// Constructible ONLY via [`VerifiedAction::with_chain_id`] (which
+/// runs [`verify_action`]); the field is private so the type IS the
+/// proof. Transports authenticate once at the boundary and submit
+/// the token — the matcher never re-verifies a signed action whose
+/// authenticity is already proven, which removes the previous
+/// ~80 µs `verify_strict` the sequencer thread paid per action on
+/// top of the transport's early check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedAction(ActionRequest);
+
+impl VerifiedAction {
+    /// Authenticate an action request. Returns `Some` only if
+    /// [`verify_action_with_chain_id`] passes (signature valid AND
+    /// owner derived from pubkey); `None` otherwise — the caller
+    /// must reject with `BadSignature`.
+    ///
+    /// Verifies against the devnet-default [`CHAIN_ID`]; production
+    /// transports call [`Self::with_chain_id`].
+    #[must_use]
+    pub fn new(req: ActionRequest) -> Option<Self> {
+        Self::with_chain_id(req, CHAIN_ID)
+    }
+
+    /// [`Self::new`] with an explicit chain ID.
+    #[must_use]
+    pub fn with_chain_id(req: ActionRequest, chain_id: u64) -> Option<Self> {
+        if verify_action_with_chain_id(&req, chain_id) { Some(Self(req)) } else { None }
+    }
+
+    /// The authenticated request.
+    #[must_use]
+    pub fn request(&self) -> &ActionRequest {
         &self.0
     }
 }
@@ -1127,6 +1241,65 @@ mod tests {
         let mut req = signed_order(1, 0x42);
         req.price = Price(req.price.0 + 1);
         assert!(!verify_order(&req), "tampered order must not verify");
+    }
+
+    #[test]
+    fn batch_verify_all_valid() {
+        let reqs = vec![signed_order(1, 0x01), signed_order(2, 0x02), signed_order(3, 0x03)];
+        let out = VerifiedOrder::batch_with_chain_id(&reqs, CHAIN_ID);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(Option::is_some), "all valid orders must pass");
+        // Tokens carry the request they authenticated.
+        assert_eq!(out[1].unwrap().request(), &reqs[1]);
+    }
+
+    #[test]
+    fn batch_verify_isolates_failures() {
+        let good0 = signed_order(1, 0x01);
+        let mut forged = signed_order(2, 0x02);
+        forged.price = Price(forged.price.0 + 7); // signature no longer binds
+        let mut wrong_owner = signed_order(3, 0x03);
+        wrong_owner.owner = addr(0xEE); // key doesn't control this account
+        let good3 = signed_order(4, 0x04);
+        let reqs = vec![good0, forged, wrong_owner, good3];
+        let out = VerifiedOrder::batch_with_chain_id(&reqs, CHAIN_ID);
+        assert!(out[0].is_some());
+        assert!(out[1].is_none(), "forged order must be rejected");
+        assert!(out[2].is_none(), "owner mismatch must be rejected");
+        assert!(out[3].is_some());
+    }
+
+    #[test]
+    fn batch_verify_empty_and_all_bad() {
+        assert!(VerifiedOrder::batch_with_chain_id(&[], CHAIN_ID).is_empty());
+        let mut bad = signed_order(1, 0x09);
+        bad.pubkey = [0xFF; 32]; // not a valid curve point encoding
+        let out = VerifiedOrder::batch_with_chain_id(&[bad], CHAIN_ID);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_none());
+    }
+
+    #[test]
+    fn batch_verify_respects_chain_id() {
+        // Signed under CHAIN_ID, verified under a different chain —
+        // the whole batch must fail closed.
+        let reqs = vec![signed_order(1, 0x05), signed_order(2, 0x06)];
+        let out = VerifiedOrder::batch_with_chain_id(&reqs, CHAIN_ID + 1);
+        assert!(out.iter().all(Option::is_none), "wrong chain id must reject");
+    }
+
+    #[test]
+    fn verified_action_authenticates() {
+        let req = signed_cancel(7, 0x42, 100);
+        let verified = VerifiedAction::new(req).expect("authentic action");
+        assert_eq!(verified.request(), &req);
+    }
+
+    #[test]
+    fn verified_action_rejects_tampered() {
+        let mut req = signed_cancel(7, 0x42, 100);
+        req.order_id = 999; // signed order_id was 100
+        assert!(VerifiedAction::new(req).is_none());
     }
 
     #[test]

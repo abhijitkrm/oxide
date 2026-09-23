@@ -141,7 +141,7 @@ alloy-primitives = { version = "1.7.2", features = ["std"] }
 # (GPL-3.0-compatible). This is the native signature scheme for
 # Oxide's non-EVM modules (staking, trading) — faster
 # verification than secp256k1 and no malleability.
-ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0.0", features = ["rand_core", "batch"] }
 # rayon: data-parallelism for batch secp256k1 sender recovery.
 # The EVM tx hot path spends 88% of its time on secp256k1 ECDSA
 # recovery. Recovering N senders in parallel across cores turns

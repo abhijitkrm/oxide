@@ -36,6 +36,20 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     reader's blocking poll — we measured the wait. It's a real
     per-peer latency ceiling, far above today's send rates.
 
+- **Matcher authentication** (`matcher`): two changes to the order
+  admission signature path. Order actions (cancel/amend/replace)
+  were verified twice — once on the transport thread and again on
+  the single-writer sequencer, which made the sequencer the
+  signature bound (~12K actions/s). Transports now hand a
+  `VerifiedAction` proof token to the sequencer, which runs only
+  the nonce check + dispatch. And order batches verify via
+  `ed25519-dalek` batch verification at the admission seams —
+  measured 19.4K → 48.5K orders/s authenticated at batch 256
+  (2.5×) in the new `order_auth` bench.
+  - **In plain words:** cancel/amend throughput roughly doubles
+    because the matching thread no longer re-checks signatures the
+    transport already proved, and bulk orders verify ~2.5× faster.
+
 ### Fixed
 
 - **View changes now recover over real TCP** (`oxide-devnet`): a

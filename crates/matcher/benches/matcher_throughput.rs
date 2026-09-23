@@ -156,6 +156,53 @@ fn bench_order_entry(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark order-batch authentication: per-item `verify_strict`
+/// (the displaced admission path) vs `VerifiedOrder::batch_with_chain_id`
+/// (one multi-scalar multiplication across the whole batch).
+///
+/// Acceptance gate (audit remediation): the batch path must beat the
+/// per-item path at the batch sizes transports actually send — a
+/// negative or flat result means the machinery is dead weight and the
+/// batch seam should revert to per-item verification.
+fn bench_order_auth(c: &mut Criterion) {
+    let batch_size = env_usize("BENCH_BATCH", 256);
+    // Pre-sign a realistic batch: many distinct accounts, all valid.
+    let orders: Vec<OrderRequest> =
+        (0..batch_size).map(|i| signed_order(&account_key(i as u32), Side::Buy, 0)).collect();
+
+    let mut group = c.benchmark_group("order_auth");
+    group.throughput(Throughput::Elements(batch_size as u64));
+
+    group.bench_function("per_item_verify", |bencher| {
+        bencher.iter(|| {
+            let mut ok = 0usize;
+            for req in &orders {
+                if matcher::protocol::VerifiedOrder::with_chain_id(
+                    *req,
+                    matcher::protocol::CHAIN_ID,
+                )
+                .is_some()
+                {
+                    ok += 1;
+                }
+            }
+            black_box(ok)
+        });
+    });
+
+    group.bench_function("batch_verify", |bencher| {
+        bencher.iter(|| {
+            let out = matcher::protocol::VerifiedOrder::batch_with_chain_id(
+                black_box(&orders),
+                matcher::protocol::CHAIN_ID,
+            );
+            black_box(out.iter().filter(|o| o.is_some()).count())
+        });
+    });
+
+    group.finish();
+}
+
 /// Benchmark the binary protocol encode/decode overhead (no matching).
 fn bench_protocol_codec(c: &mut Criterion) {
     let req = OrderRequest {
@@ -347,6 +394,7 @@ fn bench_cancel_amend(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_order_entry,
+    bench_order_auth,
     bench_protocol_codec,
     bench_balance_cache,
     bench_cancel_amend
