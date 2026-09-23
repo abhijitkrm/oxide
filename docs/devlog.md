@@ -20704,3 +20704,35 @@ Two-part fix:
 Measured (`order_auth` bench, batch=256): per-item 13.17 ms →
 batch 5.28 ms — **19.4K → 48.5K orders/s authenticated (2.5×)**,
 before counting the action path's removed second verify.
+
+### Parser allocations — FIX and WS now zero-alloc
+
+The `alloc_accounting` bench pinned the remaining matcher alloc
+surface at inbound parsing: `parse_fix_tags` built a
+`HashMap<String, String>` (~25 allocs/msg — two owned Strings per
+tag), and `extract_str` allocated a `format!("\"{key}\"")` needle
+plus a `String` value per JSON field (~31 allocs/msg with
+`to_lowercase` on the action path).
+
+Both now parse with borrowed slices:
+
+- `fix_tag(body, tag)` linear-rescans fields with `&str` compares
+  (~80 field comparisons on a ~200-byte FIX message beats one
+  `malloc`); `.rev()` preserves the old map's last-duplicate-wins
+  edge case.
+- `extract_str` returns `&str` into the input and finds `"key"`
+  by quote-adjacency scanning instead of a formatted needle;
+  `eq_ignore_ascii_case` replaces `to_lowercase` compares.
+- One shared `protocol::parse_hex_fixed::<N>` (nibble table, no
+  `from_utf8`/`from_str_radix` per byte) serves FIX, WS, and any
+  future adapter.
+- `parse_decimal_to_scaled` dropped `format!` padding for
+  `frac × 10^(scale−len)` — and now REJECTS fractions with more
+  digits than the tick instead of summing a 9-digit fraction into
+  an 8-scale total (a sub-tick misparse the padded string allowed).
+
+Measured (`alloc_accounting`): fix_parse_order 1.9 µs → 1.26 µs
+with **0 allocs/op** (was ~25); ws_parse_order 2.5 µs → 868 ns
+with **0 allocs/op** (was ~31). The whole authenticated request
+path — parse, verify, dispatch — is now allocation-free except
+the one response `String` per message.

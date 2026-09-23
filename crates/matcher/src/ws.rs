@@ -46,18 +46,18 @@ use trading::{OrderType, Side, TimeInForce};
 /// field layout documented above.
 pub fn parse_ws_order(json: &str) -> Option<OrderRequest> {
     let market = extract_u8(json, "market")?;
-    let side = match extract_str(json, "side")?.as_str() {
+    let side = match extract_str(json, "side")? {
         "buy" | "Buy" | "BUY" => Side::Buy,
         "sell" | "Sell" | "SELL" => Side::Sell,
         _ => return None,
     };
-    let order_type = match extract_str(json, "type")?.as_str() {
+    let order_type = match extract_str(json, "type")? {
         "limit" | "Limit" => OrderType::Limit,
         "market" | "Market" => OrderType::Market,
         "postonly" | "PostOnly" => OrderType::PostOnly,
         _ => return None,
     };
-    let tif = match extract_str(json, "tif")?.as_str() {
+    let tif = match extract_str(json, "tif")? {
         "gtc" | "Gtc" => TimeInForce::Gtc,
         "ioc" | "Ioc" => TimeInForce::Ioc,
         "fok" | "Fok" => TimeInForce::Fok,
@@ -66,12 +66,9 @@ pub fn parse_ws_order(json: &str) -> Option<OrderRequest> {
     let price = Price(extract_u64(json, "price")?);
     let qty = Qty(extract_u64(json, "qty")?);
     let nonce = extract_u64(json, "nonce").unwrap_or(0);
-    let owner_str = extract_str(json, "owner")?;
-    let owner = parse_address(&owner_str)?;
-    let pubkey_str = extract_str(json, "pubkey")?;
-    let pubkey = parse_hex_32(&pubkey_str)?;
-    let sig_str = extract_str(json, "signature")?;
-    let signature = parse_hex_64(&sig_str)?;
+    let owner = parse_address(extract_str(json, "owner")?)?;
+    let pubkey = parse_hex_32(extract_str(json, "pubkey")?)?;
+    let signature = parse_hex_64(extract_str(json, "signature")?)?;
     Some(OrderRequest {
         market,
         side,
@@ -107,39 +104,38 @@ pub fn parse_ws_order(json: &str) -> Option<OrderRequest> {
 /// For amend, add `"newPrice"` and `"newQty"`. For replace, add
 /// `"newPrice"`, `"newQty"`, `"side"`, `"type"`, and `"tif"`.
 pub fn parse_ws_action(json: &str) -> Option<ActionRequest> {
-    let action_type = match extract_str(json, "action")?.as_str() {
+    let action_type = match extract_str(json, "action")? {
         "cancel" | "Cancel" | "CANCEL" => ActionType::Cancel,
         "amend" | "Amend" | "AMEND" => ActionType::Amend,
         "replace" | "Replace" | "REPLACE" => ActionType::Replace,
         _ => return None,
     };
     let order_id = extract_u64(json, "orderId")?;
-    let owner_str = extract_str(json, "owner")?;
-    let owner = parse_address(&owner_str)?;
+    let owner = parse_address(extract_str(json, "owner")?)?;
     let nonce = extract_u64(json, "nonce").unwrap_or(0);
     let new_price = Price(extract_u64(json, "newPrice").unwrap_or(0));
     let new_qty = Qty(extract_u64(json, "newQty").unwrap_or(0));
-    let side = match extract_str(json, "side").map(|s| s.to_lowercase()) {
-        Some(ref s) if s == "buy" => Side::Buy,
-        Some(ref s) if s == "sell" => Side::Sell,
+    // Case-insensitive matching via `eq_ignore_ascii_case` — the
+    // protocol tokens are ASCII, so this covers every casing the old
+    // `to_lowercase()` compare did without the String allocation.
+    let side = match extract_str(json, "side") {
+        Some(s) if s.eq_ignore_ascii_case("sell") => Side::Sell,
         _ => Side::Buy, // Default for cancel/amend (ignored).
     };
-    let order_type = match extract_str(json, "type").map(|s| s.to_lowercase()) {
-        Some(ref s) if s == "limit" => OrderType::Limit,
-        Some(ref s) if s == "market" => OrderType::Market,
-        Some(ref s) if s == "postonly" || s == "post_only" => OrderType::PostOnly,
+    let order_type = match extract_str(json, "type") {
+        Some(s) if s.eq_ignore_ascii_case("market") => OrderType::Market,
+        Some(s) if s.eq_ignore_ascii_case("postonly") || s.eq_ignore_ascii_case("post_only") => {
+            OrderType::PostOnly
+        }
         _ => OrderType::Limit, // Default for cancel/amend (ignored).
     };
-    let tif = match extract_str(json, "tif").map(|s| s.to_lowercase()) {
-        Some(ref s) if s == "gtc" => TimeInForce::Gtc,
-        Some(ref s) if s == "ioc" => TimeInForce::Ioc,
-        Some(ref s) if s == "fok" => TimeInForce::Fok,
+    let tif = match extract_str(json, "tif") {
+        Some(s) if s.eq_ignore_ascii_case("ioc") => TimeInForce::Ioc,
+        Some(s) if s.eq_ignore_ascii_case("fok") => TimeInForce::Fok,
         _ => TimeInForce::Gtc, // Default for cancel/amend (ignored).
     };
-    let pubkey_str = extract_str(json, "pubkey")?;
-    let pubkey = parse_hex_32(&pubkey_str)?;
-    let sig_str = extract_str(json, "signature")?;
-    let signature = parse_hex_64(&sig_str)?;
+    let pubkey = parse_hex_32(extract_str(json, "pubkey")?)?;
+    let signature = parse_hex_64(extract_str(json, "signature")?)?;
     Some(ActionRequest {
         action_type,
         order_id,
@@ -188,22 +184,43 @@ fn reject_reason_str(r: RejectReason) -> &'static str {
     }
 }
 
-fn extract_str(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{key}\"");
-    let idx = json.find(&pattern)?;
-    let rest = &json[idx + pattern.len()..];
-    let colon = rest.find(':')?;
-    let rest = &rest[colon + 1..];
-    let rest = rest.trim_start();
-    if let Some(rest) = rest.strip_prefix('"') {
-        // Quoted string value.
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string())
-    } else {
-        // Unquoted value (number, boolean, null) — read until
-        // the next comma, brace, or bracket.
-        let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
-        Some(rest[..end].trim().to_string())
+/// Borrowed-slice field extraction — the old version built an owned
+/// `format!("\"{key}\"")` needle plus a `String` value per field
+/// (~2 allocs × ~10 fields per message). This returns `&str` slices
+/// into the input buffer: zero allocations.
+///
+/// Semantics preserved: the first quoted `"key"` occurrence wins
+/// (same as `find("\"key\"")` on the old needle — including the
+/// edge case where a value string literally contains `"key"`),
+/// then the value runs to the next `,`, `}`, or `]` unquoted or to
+/// the closing quote for string values.
+fn extract_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = json.as_bytes();
+    let mut search_from = 0usize;
+    loop {
+        let pos = json[search_from..].find(key)? + search_from;
+        // Require the match to be exactly `"key"` — the byte before
+        // and after must be the quotes.
+        if pos > 0
+            && bytes[pos - 1] == b'"'
+            && pos + key.len() < bytes.len()
+            && bytes[pos + key.len()] == b'"'
+        {
+            let rest = &json[pos + key.len() + 1..];
+            let colon = rest.find(':')?;
+            let rest = rest[colon + 1..].trim_start();
+            return if let Some(inner) = rest.strip_prefix('"') {
+                // Quoted string value.
+                let end = inner.find('"')?;
+                Some(&inner[..end])
+            } else {
+                // Unquoted value (number, boolean, null) — read until
+                // the next comma, brace, or bracket.
+                let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
+                Some(rest[..end].trim())
+            };
+        }
+        search_from = pos + 1;
     }
 }
 
@@ -221,53 +238,17 @@ fn extract_u8(json: &str, key: &str) -> Option<u8> {
 }
 
 fn parse_address(s: &str) -> Option<primitives::Address> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 40 {
-        return None;
-    }
-    let mut addr = [0u8; 20];
-    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
-        if i >= 20 {
-            return None;
-        }
-        let hex = std::str::from_utf8(byte).ok()?;
-        addr[i] = u8::from_str_radix(hex, 16).ok()?;
-    }
-    Some(primitives::Address(addr))
+    Some(primitives::Address(crate::protocol::parse_hex_fixed::<20>(s)?))
 }
 
 /// Parse a 32-byte hex string (Ed25519 public key).
 fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 64 {
-        return None;
-    }
-    let mut buf = [0u8; 32];
-    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
-        if i >= 32 {
-            return None;
-        }
-        let hex = std::str::from_utf8(byte).ok()?;
-        buf[i] = u8::from_str_radix(hex, 16).ok()?;
-    }
-    Some(buf)
+    crate::protocol::parse_hex_fixed::<32>(s)
 }
 
 /// Parse a 64-byte hex string (Ed25519 signature).
 fn parse_hex_64(s: &str) -> Option<[u8; 64]> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 128 {
-        return None;
-    }
-    let mut buf = [0u8; 64];
-    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
-        if i >= 64 {
-            return None;
-        }
-        let hex = std::str::from_utf8(byte).ok()?;
-        buf[i] = u8::from_str_radix(hex, 16).ok()?;
-    }
-    Some(buf)
+    crate::protocol::parse_hex_fixed::<64>(s)
 }
 
 #[cfg(test)]

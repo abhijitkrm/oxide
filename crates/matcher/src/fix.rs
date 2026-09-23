@@ -48,24 +48,22 @@ pub const MSG_TYPE_CANCEL_REPLACE: &str = "G";
 ///
 /// Returns `None` if required tags are missing or invalid.
 pub fn parse_fix_order(body: &str) -> Option<OrderRequest> {
-    let tags = parse_fix_tags(body);
-
     // Side (tag 54): 1=Buy, 2=Sell.
-    let side = match tags.get("54")?.as_str() {
+    let side = match fix_tag(body, "54")? {
         "1" => Side::Buy,
         "2" => Side::Sell,
         _ => return None,
     };
 
     // OrdType (tag 40): 2=Limit, 1=Market.
-    let order_type = match tags.get("40")?.as_str() {
+    let order_type = match fix_tag(body, "40")? {
         "2" => OrderType::Limit,
         "1" => OrderType::Market,
         _ => return None,
     };
 
     // TimeInForce (tag 59): 0=Day(GTC), 3=IOC, 4=FOK.
-    let tif = match tags.get("59").map_or("0", std::string::String::as_str) {
+    let tif = match fix_tag(body, "59").unwrap_or("0") {
         "0" => TimeInForce::Gtc,
         "3" => TimeInForce::Ioc,
         "4" => TimeInForce::Fok,
@@ -73,30 +71,24 @@ pub fn parse_fix_order(body: &str) -> Option<OrderRequest> {
     };
 
     // Price (tag 44): decimal string → scale-8.
-    let price_str = tags.get("44")?;
-    let price = parse_fix_price(price_str)?;
+    let price = parse_fix_price(fix_tag(body, "44")?)?;
 
     // OrderQty (tag 38): decimal string → scale-6.
-    let qty_str = tags.get("38")?;
-    let qty = parse_fix_qty(qty_str)?;
+    let qty = parse_fix_qty(fix_tag(body, "38")?)?;
 
     // Account (tag 1): 20-byte hex address.
-    let owner_str = tags.get("1")?;
-    let owner = parse_fix_address(owner_str)?;
+    let owner = parse_fix_address(fix_tag(body, "1")?)?;
 
     // Nonce (tag 9666): decimal string → u64.
     // FIX tag 9666 is the standard "AllocNonce" repurposed here for
     // order replay protection.
-    let nonce_str = tags.get("9666")?;
-    let nonce: u64 = nonce_str.parse().ok()?;
+    let nonce: u64 = fix_tag(body, "9666")?.parse().ok()?;
 
     // PubKey (tag 9700): 32-byte hex Ed25519 public key.
-    let pubkey_str = tags.get("9700")?;
-    let pubkey = parse_fix_pubkey(pubkey_str)?;
+    let pubkey = parse_fix_pubkey(fix_tag(body, "9700")?)?;
 
     // Signature (tag 9701): 64-byte hex Ed25519 signature.
-    let sig_str = tags.get("9701")?;
-    let signature = parse_fix_signature(sig_str)?;
+    let signature = parse_fix_signature(fix_tag(body, "9701")?)?;
 
     Some(OrderRequest {
         market: 0,
@@ -126,15 +118,11 @@ pub fn parse_fix_order(body: &str) -> Option<OrderRequest> {
 ///
 /// Returns `None` if required tags are missing or invalid.
 pub fn parse_fix_cancel(body: &str) -> Option<ActionRequest> {
-    let tags = parse_fix_tags(body);
-    let order_id: u64 = tags.get("41")?.parse().ok()?;
-    let owner_str = tags.get("1")?;
-    let owner = parse_fix_address(owner_str)?;
-    let nonce: u64 = tags.get("9666")?.parse().ok()?;
-    let pubkey_str = tags.get("9700")?;
-    let pubkey = parse_fix_pubkey(pubkey_str)?;
-    let sig_str = tags.get("9701")?;
-    let signature = parse_fix_signature(sig_str)?;
+    let order_id: u64 = fix_tag(body, "41")?.parse().ok()?;
+    let owner = parse_fix_address(fix_tag(body, "1")?)?;
+    let nonce: u64 = fix_tag(body, "9666")?.parse().ok()?;
+    let pubkey = parse_fix_pubkey(fix_tag(body, "9700")?)?;
+    let signature = parse_fix_signature(fix_tag(body, "9701")?)?;
     Some(ActionRequest {
         action_type: ActionType::Cancel,
         order_id,
@@ -156,17 +144,13 @@ pub fn parse_fix_cancel(body: &str) -> Option<ActionRequest> {
 ///
 /// Returns `None` if required tags are missing or invalid.
 pub fn parse_fix_cancel_replace(body: &str) -> Option<ActionRequest> {
-    let tags = parse_fix_tags(body);
-    let order_id: u64 = tags.get("41")?.parse().ok()?;
-    let owner_str = tags.get("1")?;
-    let owner = parse_fix_address(owner_str)?;
-    let new_price = parse_fix_price(tags.get("44")?)?;
-    let new_qty = parse_fix_qty(tags.get("38")?)?;
-    let nonce: u64 = tags.get("9666")?.parse().ok()?;
-    let pubkey_str = tags.get("9700")?;
-    let pubkey = parse_fix_pubkey(pubkey_str)?;
-    let sig_str = tags.get("9701")?;
-    let signature = parse_fix_signature(sig_str)?;
+    let order_id: u64 = fix_tag(body, "41")?.parse().ok()?;
+    let owner = parse_fix_address(fix_tag(body, "1")?)?;
+    let new_price = parse_fix_price(fix_tag(body, "44")?)?;
+    let new_qty = parse_fix_qty(fix_tag(body, "38")?)?;
+    let nonce: u64 = fix_tag(body, "9666")?.parse().ok()?;
+    let pubkey = parse_fix_pubkey(fix_tag(body, "9700")?)?;
+    let signature = parse_fix_signature(fix_tag(body, "9701")?)?;
     Some(ActionRequest {
         action_type: ActionType::Amend,
         order_id,
@@ -216,15 +200,22 @@ pub fn format_fix_execution_report(resp: &OrderResponse, cl_ord_id: &str) -> Str
     msg
 }
 
-fn parse_fix_tags(body: &str) -> std::collections::HashMap<String, String> {
-    let mut tags = std::collections::HashMap::new();
-    for field in body.split('\x01') {
-        if let Some(eq) = field.find('=') {
-            let (tag, value) = field.split_at(eq);
-            tags.insert(tag.to_string(), value[1..].to_string());
-        }
-    }
-    tags
+/// Borrowed-slice tag lookup — replaces the per-message
+/// `HashMap<String, String>` that cost ~25 allocations per FIX
+/// message (two owned Strings per tag plus the map itself). A FIX
+/// order carries ~10 tags and the caller reads ~8, so a linear
+/// rescan is ~80 field comparisons on a ~200-byte buffer — cheaper
+/// than one `malloc`.
+///
+/// Semantics match the old map: `HashMap::insert` overwrites, so
+/// duplicate tags resolved to the LAST occurrence — `.rev()`
+/// preserves that for malformed input rather than silently
+/// changing which duplicate wins.
+fn fix_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    body.split('\x01').rev().find_map(|field| {
+        let (name, value) = field.split_once('=')?;
+        (name == tag).then_some(value)
+    })
 }
 
 fn parse_fix_price(s: &str) -> Option<Price> {
@@ -244,14 +235,30 @@ fn parse_fix_qty(s: &str) -> Option<Qty> {
 /// Parse a decimal string (e.g. "15.00") and scale it by `multiplier`
 /// (e.g. `100_000_000` for scale-8). Returns `None` on parse failure.
 /// Uses integer arithmetic to avoid f64 precision loss.
+///
+/// Allocation-free: the old implementation built a right-padded
+/// `String` for the fraction; the equivalent arithmetic is
+/// `frac_digits × 10^(scale_digits − len)`, which rejects fractions
+/// with more digits than the tick instead of mis-scaling them (the
+/// padded-string version silently summed a 9-digit fraction into an
+/// 8-scale total — a sub-tick amount now fails closed).
 fn parse_decimal_to_scaled(s: &str, multiplier: u64) -> Option<u64> {
     let (int_part, frac_part) = s.split_once('.')?;
     let int_val: u64 = int_part.parse().ok()?;
     let frac_trimmed = frac_part.trim_end_matches('0');
-    let multiplier_str = multiplier.to_string();
-    let scale_digits = multiplier_str.len() - 1; // e.g. 1e8 → 8 digits.
-    let frac_padded = format!("{frac_trimmed:0<scale_digits$}");
-    let frac_val: u64 = frac_padded.parse().ok()?;
+    // `multiplier` is always a power of ten (1e8, 1e6) — ilog10 is
+    // exact.
+    let scale_digits = multiplier.ilog10();
+    if frac_trimmed.len() > scale_digits as usize {
+        return None;
+    }
+    let frac_val: u64 = if frac_trimmed.is_empty() {
+        0
+    } else {
+        frac_trimmed.parse::<u64>().ok()?.checked_mul(
+            10u64.checked_pow(scale_digits - u32::try_from(frac_trimmed.len()).ok()?)?,
+        )?
+    };
     // Use u128 intermediate to detect overflow. A malformed FIX
     // message with a huge integer part must not silently wrap.
     let int_scaled = u128::from(int_val) * u128::from(multiplier);
@@ -260,53 +267,17 @@ fn parse_decimal_to_scaled(s: &str, multiplier: u64) -> Option<u64> {
 }
 
 fn parse_fix_address(s: &str) -> Option<primitives::Address> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 40 {
-        return None;
-    }
-    let mut addr = [0u8; 20];
-    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
-        if i >= 20 {
-            return None;
-        }
-        let hex = std::str::from_utf8(byte).ok()?;
-        addr[i] = u8::from_str_radix(hex, 16).ok()?;
-    }
-    Some(primitives::Address(addr))
+    Some(primitives::Address(crate::protocol::parse_hex_fixed::<20>(s)?))
 }
 
 /// Parse a 32-byte hex Ed25519 public key.
 fn parse_fix_pubkey(s: &str) -> Option<[u8; 32]> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 64 {
-        return None;
-    }
-    let mut pubkey = [0u8; 32];
-    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
-        if i >= 32 {
-            return None;
-        }
-        let hex = std::str::from_utf8(byte).ok()?;
-        pubkey[i] = u8::from_str_radix(hex, 16).ok()?;
-    }
-    Some(pubkey)
+    crate::protocol::parse_hex_fixed::<32>(s)
 }
 
 /// Parse a 64-byte hex Ed25519 signature.
 fn parse_fix_signature(s: &str) -> Option<[u8; 64]> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 128 {
-        return None;
-    }
-    let mut sig = [0u8; 64];
-    for (i, byte) in s.as_bytes().chunks(2).enumerate() {
-        if i >= 64 {
-            return None;
-        }
-        let hex = std::str::from_utf8(byte).ok()?;
-        sig[i] = u8::from_str_radix(hex, 16).ok()?;
-    }
-    Some(sig)
+    crate::protocol::parse_hex_fixed::<64>(s)
 }
 
 fn fix_reject_code(r: RejectReason) -> &'static str {

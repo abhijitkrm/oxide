@@ -476,6 +476,37 @@ impl VerifiedAction {
     }
 }
 
+/// One hex nibble → 4-bit value. Accepts upper- and lowercase —
+/// FIX/JSON transports may emit either.
+///
+/// Shared by the FIX and WebSocket adapters so both decode hex the
+/// same way with zero allocations (the old per-byte
+/// `from_utf8` + `from_str_radix` pair cost two UTF-8 checks and a
+/// table lookup per byte on the admission path).
+pub(crate) fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse a hex string (optional `0x` prefix) into exactly `N` bytes.
+/// Allocation-free; `None` on wrong length or non-hex input.
+pub(crate) fn parse_hex_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 2 * N {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; N];
+    for i in 0..N {
+        out[i] = (hex_nibble(bytes[2 * i])? << 4) | hex_nibble(bytes[2 * i + 1])?;
+    }
+    Some(out)
+}
+
 /// Encode an order request to `REQUEST_SIZE` bytes.
 pub fn encode_request(req: &OrderRequest) -> [u8; REQUEST_SIZE] {
     let mut buf = [0u8; REQUEST_SIZE];

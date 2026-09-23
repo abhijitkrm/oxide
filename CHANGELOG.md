@@ -50,6 +50,18 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     because the matching thread no longer re-checks signatures the
     transport already proved, and bulk orders verify ~2.5× faster.
 
+- **FIX and WebSocket order parsing** (`matcher`): both adapters
+  now parse with borrowed slices — `fix_tag` linear-scans fields
+  instead of building a per-message `HashMap<String, String>`,
+  `extract_str` returns `&str` into the input instead of owning a
+  `String` per field. Measured in `alloc_accounting`: FIX order
+  parse dropped ~25 allocs/message to **zero** (1.9 µs → 1.26 µs),
+  WS order parse dropped ~31 to **zero** (2.5 µs → 868 ns). One
+  behavior change: a FIX price/qty with more fraction digits than
+  the tick is now rejected instead of mis-scaled.
+  - **In plain words:** the parsers that used to allocate ~25–31
+    times per message now allocate nothing at all.
+
 ### Fixed
 
 - **View changes now recover over real TCP** (`oxide-devnet`): a
