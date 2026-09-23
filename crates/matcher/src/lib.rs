@@ -1072,80 +1072,85 @@ impl RingMatcher {
         let mut server = server;
         let chain_id = server.chain_id();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<ControlCommand>();
-        let thread = std::thread::spawn(move || {
-            loop {
-                let mut did_work = false;
-                // Round-robin poll all rings.
-                for (i, order_rx) in order_receivers.iter().enumerate() {
-                    while let Some(batch) = order_rx.pop() {
-                        // Process the WHOLE batch: submit every order
-                        // back-to-back (no interleaving from other
-                        // rings — the batch is atomic).
-                        let responses: Vec<OrderResponse> =
-                            batch.iter().map(|req| server.submit_verified(req)).collect();
-                        // Push the batch response to this connection's
-                        // ring. If the ring is full, spin until the
-                        // client drains it. If the client disconnected
-                        // (connection dropped), drop the responses —
-                        // there is nowhere to send them.
-                        let mut pending = responses;
-                        loop {
-                            match response_senders[i].push(pending) {
-                                Ok(()) => break,
-                                Err(crate::ring::PushError::Disconnected(_)) => {
-                                    // Client gone; discard responses.
-                                    break;
+        // Critical: this thread IS the matcher — the single-writer
+        // sequencer for every market's order book. A silent death
+        // leaves clients connected to a server that never responds.
+        let thread =
+            primitives::supervision::spawn_supervised("matcher-sequencer", true, move || {
+                loop {
+                    let mut did_work = false;
+                    // Round-robin poll all rings.
+                    for (i, order_rx) in order_receivers.iter().enumerate() {
+                        while let Some(batch) = order_rx.pop() {
+                            // Process the WHOLE batch: submit every order
+                            // back-to-back (no interleaving from other
+                            // rings — the batch is atomic).
+                            let responses: Vec<OrderResponse> =
+                                batch.iter().map(|req| server.submit_verified(req)).collect();
+                            // Push the batch response to this connection's
+                            // ring. If the ring is full, spin until the
+                            // client drains it. If the client disconnected
+                            // (connection dropped), drop the responses —
+                            // there is nowhere to send them.
+                            let mut pending = responses;
+                            loop {
+                                match response_senders[i].push(pending) {
+                                    Ok(()) => break,
+                                    Err(crate::ring::PushError::Disconnected(_)) => {
+                                        // Client gone; discard responses.
+                                        break;
+                                    }
+                                    Err(crate::ring::PushError::Full(returned)) => {
+                                        pending = returned;
+                                        std::hint::spin_loop();
+                                    }
                                 }
-                                Err(crate::ring::PushError::Full(returned)) => {
-                                    pending = returned;
-                                    std::hint::spin_loop();
-                                }
+                            }
+                            did_work = true;
+                        }
+                    }
+                    // Service control commands (seal/stats) between ring
+                    // polls. These come from the batch settler and
+                    // monitoring — never from the order hot path.
+                    while let Ok(cmd) = control_rx.try_recv() {
+                        match cmd {
+                            ControlCommand::Seal(reply) => {
+                                let batch = server.seal_batch();
+                                let _ = reply.send(batch);
+                            }
+                            ControlCommand::Stats(reply) => {
+                                let stats = MatcherStats {
+                                    orders_processed: server.orders_processed(),
+                                    fills_produced: server.fills_produced(),
+                                    balance_rejections: server.balance_rejections(),
+                                    engine_rejections: server.engine_rejections(),
+                                    risk_rejections: server.risk_rejections(),
+                                    auth_rejections: server.auth_rejections(),
+                                    resting_count: server.resting_count(),
+                                    pending_settlements: server.pending_settlements(),
+                                };
+                                let _ = reply.send(stats);
+                            }
+                            ControlCommand::Action(action, reply) => {
+                                let resp = server.submit_action(&action);
+                                let _ = reply.send(resp);
                             }
                         }
                         did_work = true;
                     }
-                }
-                // Service control commands (seal/stats) between ring
-                // polls. These come from the batch settler and
-                // monitoring — never from the order hot path.
-                while let Ok(cmd) = control_rx.try_recv() {
-                    match cmd {
-                        ControlCommand::Seal(reply) => {
-                            let batch = server.seal_batch();
-                            let _ = reply.send(batch);
-                        }
-                        ControlCommand::Stats(reply) => {
-                            let stats = MatcherStats {
-                                orders_processed: server.orders_processed(),
-                                fills_produced: server.fills_produced(),
-                                balance_rejections: server.balance_rejections(),
-                                engine_rejections: server.engine_rejections(),
-                                risk_rejections: server.risk_rejections(),
-                                auth_rejections: server.auth_rejections(),
-                                resting_count: server.resting_count(),
-                                pending_settlements: server.pending_settlements(),
-                            };
-                            let _ = reply.send(stats);
-                        }
-                        ControlCommand::Action(action, reply) => {
-                            let resp = server.submit_action(&action);
-                            let _ = reply.send(resp);
-                        }
+                    if !did_work {
+                        // No work on any ring — block on the shared wakeup
+                        // signal until a producer pushes or the 1 ms
+                        // timeout elapses. The timeout ensures the control
+                        // channel (seal/stats) is still serviced
+                        // regularly. This replaces the previous
+                        // `std::thread::yield_now()` busy-spin that burned
+                        // a full CPU core at 100% when idle.
+                        order_receivers[0].wait_for_work(std::time::Duration::from_millis(1));
                     }
-                    did_work = true;
                 }
-                if !did_work {
-                    // No work on any ring — block on the shared wakeup
-                    // signal until a producer pushes or the 1 ms
-                    // timeout elapses. The timeout ensures the control
-                    // channel (seal/stats) is still serviced
-                    // regularly. This replaces the previous
-                    // `std::thread::yield_now()` busy-spin that burned
-                    // a full CPU core at 100% when idle.
-                    order_receivers[0].wait_for_work(std::time::Duration::from_millis(1));
-                }
-            }
-        });
+            })
+            .expect("spawn matcher-sequencer thread");
 
         Self {
             order_rings: order_senders,

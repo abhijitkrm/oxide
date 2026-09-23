@@ -245,9 +245,13 @@ impl MultiMarketMatcher {
             let balances = Arc::clone(&balances);
             let nonces = Arc::clone(&nonces);
             let clock = Arc::clone(&clock);
-            let thread = std::thread::spawn(move || {
+            // Supervised per-market worker — non-critical: a dead
+            // worker strands one market's book, not the process.
+            let actor = format!("market-worker-{}", cfg.market_id);
+            let thread = primitives::supervision::spawn_supervised(&actor, false, move || {
                 MarketWorker::run(cfg, balances, nonces, clock, chain_id, rx);
-            });
+            })
+            .expect("spawn market worker thread");
             market_senders.push(tx);
             threads.push(thread);
         }

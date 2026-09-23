@@ -62,48 +62,50 @@ impl Executor {
         self.exec_lane_tx.set(tx).expect("exec lane already spawned");
         let weak = std::sync::Arc::downgrade(self);
         let sync = self.exec_sync.clone();
-        std::thread::Builder::new()
-            .name("exec-lane".to_string())
-            .spawn(move || {
-                // RAII: ANY worker exit — panic unwind or clean
-                // channel disconnect — marks the lane dead and wakes
-                // every waiter. Without this, a panic mid-`execute_block`
-                // left `attest_state` waiting forever on a watermark
-                // that could never advance, and the death surfaced
-                // only as unexplained withheld votes.
-                let _death = LaneDeath { sync: sync.clone() };
-                while let Ok(block) = rx.recv() {
-                    // If the executor is gone there is no one left
-                    // to serve — exit rather than resurrect it.
-                    let Some(executor) = weak.upgrade() else { return };
-                    let height = block.height.value();
-                    // Mark the block in-flight BEFORE executing: if
-                    // `execute_block` panics below, `LaneDeath` fires
-                    // with this set and no root recorded — the state
-                    // the recovery path must treat as partially
-                    // applied, never blindly replayed.
-                    {
-                        let (lock, _cv) = &*sync;
-                        primitives::sync::lock_state(lock).in_flight = Some(height);
-                    }
-                    let root = executor.execute_block(&block);
-                    primitives::sync::lock_state(&executor.state_roots).insert_retained(
-                        height,
-                        root,
-                        executor.history_retention,
-                    );
-                    // Blocks arrive in commit order, so the newest
-                    // height is always the watermark.
-                    let (lock, cv) = &*sync;
-                    {
-                        let mut s = primitives::sync::lock_state(lock);
-                        s.in_flight = None;
-                        s.executed = Some(height);
-                    }
-                    cv.notify_all();
+        // Supervised + critical: this lane is the only path from
+        // finalized block to executed state root. A panic here means
+        // `attest_state`/`drain` can never complete — fail fast so the
+        // supervisor restarts rather than livelock on withheld votes.
+        primitives::supervision::spawn_supervised("exec-lane", true, move || {
+            // RAII: ANY worker exit — panic unwind or clean
+            // channel disconnect — marks the lane dead and wakes
+            // every waiter. Without this, a panic mid-`execute_block`
+            // left `attest_state` waiting forever on a watermark
+            // that could never advance, and the death surfaced
+            // only as unexplained withheld votes.
+            let _death = LaneDeath { sync: sync.clone() };
+            while let Ok(block) = rx.recv() {
+                // If the executor is gone there is no one left
+                // to serve — exit rather than resurrect it.
+                let Some(executor) = weak.upgrade() else { return };
+                let height = block.height.value();
+                // Mark the block in-flight BEFORE executing: if
+                // `execute_block` panics below, `LaneDeath` fires
+                // with this set and no root recorded — the state
+                // the recovery path must treat as partially
+                // applied, never blindly replayed.
+                {
+                    let (lock, _cv) = &*sync;
+                    primitives::sync::lock_state(lock).in_flight = Some(height);
                 }
-            })
-            .expect("spawn exec lane thread");
+                let root = executor.execute_block(&block);
+                primitives::sync::lock_state(&executor.state_roots).insert_retained(
+                    height,
+                    root,
+                    executor.history_retention,
+                );
+                // Blocks arrive in commit order, so the newest
+                // height is always the watermark.
+                let (lock, cv) = &*sync;
+                {
+                    let mut s = primitives::sync::lock_state(lock);
+                    s.in_flight = None;
+                    s.executed = Some(height);
+                }
+                cv.notify_all();
+            }
+        })
+        .expect("spawn exec lane thread");
     }
 
     /// Drive every committed-but-unexecuted height through block

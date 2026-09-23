@@ -19877,3 +19877,55 @@ Four low-severity audit items closed in one pass:
   (no `catch_unwind` exists — actor supervision is tracked).
 
 Gates: `cargo test -p config -p devnet` green, fmt + clippy clean.
+
+## Session N+28 — actor supervision: panics are no longer silent
+
+`panic = "unwind"` meant a panicking actor killed only its own
+thread — the process kept running, looking healthy while the exec
+lane, accept loop, or consensus driver was gone. New
+`primitives::supervision` module: a process-global registry of
+named actors (`register`/`mark_exited`/`mark_panicked`), a
+`spawn_supervised` spawn that names the OS thread so the panic
+hook can map thread → actor, and `install_panic_hook` — installed
+first in every binary's `main` — which counts the panic, marks
+the actor `Panicked`, and **aborts the process when the panicking
+thread is a critical actor**. Fail-fast is deliberate: a validator
+that cannot execute or accept peers is worse than down, because
+it still occupies a committee slot. Clean returns never abort —
+shutdown exits actors legitimately; they surface as `Exited` in
+the registry instead.
+
+Wired critical: `exec-lane`, `p2p-accept`, `p2p-connect`, the
+matcher sequencer, the matcher's settlement pump, and the
+validator's `consensus-driver` task. Per-peer readers/writers/
+dialers, market workers, the RPC task and signal/metrics tasks
+register non-critical — their death is visible in the registry and
+via `/health` (and is self-healing through the reconnect loop)
+without taking the process down.
+
+Tokio tasks needed a different watch: a task panic unwinds into
+its `JoinHandle` on an anonymous runtime-worker thread, so the
+hook can't map it. `ConsensusDriver::start` now returns the
+`JoinHandle` and `oxide-validator` monitors it in a supervisor
+task — panic marks the actor and aborts (critical), cancellation
+marks exited. The RPC server task keeps its `select!` exit path
+and additionally marks the registry on the way out.
+
+Also fixed the audit's concrete example: `stream.try_clone()
+.unwrap()` in the p2p connect paths could panic a dialer thread on
+`EMFILE` and strand the peer. New `retry_try_clone` retries
+briefly (transient fd exhaustion drains as connections close),
+then drops the connection so the reconnect loop retries the peer.
+
+Surfaces: `/health` returns 503 naming the dead critical actors
+(registry-driven, alongside the existing divergence 503);
+`/metrics` gains `oxide_actor_panics_total` (counter) and
+`oxide_actor_dead_critical` (gauge). Tests: registry lifecycle +
+spawn marks exit + thread naming (primitives), and a
+dead-critical-actor → 503 → revive → 200 health test serialized
+against the other health tests via a `tokio::sync::Mutex` (the
+registry is process-global).
+
+E2E: `oxide-devnet --node 0 --num-nodes 1` boots, finalizes blocks,
+RPC serves. Gates: workspace clippy/fmt clean; config, primitives,
+p2p, executor, matcher, devnet, rpc and binary test suites green.

@@ -1005,6 +1005,28 @@ impl RpcServer {
             let _ = writeln!(out, "# TYPE oxide_exec_divergence_height gauge");
             let _ = writeln!(out, "oxide_exec_divergence_height {}", d.height.value());
         }
+        // Actor supervision: `oxide_actor_panics_total` counts every
+        // observed panic; `oxide_actor_dead_critical` is nonzero when
+        // a critical actor (exec lane, accept loop, consensus driver)
+        // has exited or panicked — the pageable liveness signal
+        // matching /health's dead-actor 503.
+        let _ = writeln!(
+            out,
+            "# HELP oxide_actor_panics_total Panics observed by the process supervision hook"
+        );
+        let _ = writeln!(out, "# TYPE oxide_actor_panics_total counter");
+        let _ =
+            writeln!(out, "oxide_actor_panics_total {}", primitives::supervision::panics_total());
+        let _ = writeln!(
+            out,
+            "# HELP oxide_actor_dead_critical Critical actors that have exited or panicked"
+        );
+        let _ = writeln!(out, "# TYPE oxide_actor_dead_critical gauge");
+        let _ = writeln!(
+            out,
+            "oxide_actor_dead_critical {}",
+            primitives::supervision::unhealthy_critical().len()
+        );
         // Append latency histogram metrics if a recorder is attached.
         let latency = self.prometheus();
         if !latency.is_empty() {

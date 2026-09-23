@@ -33,6 +33,11 @@ use codec::{Decode, Encode};
 mod driver;
 
 fn main() {
+    // Supervision before anything can spawn: a panic on a critical
+    // actor's thread aborts the process so the supervisor restarts a
+    // coherent node instead of running half-alive.
+    primitives::supervision::install_panic_hook();
+
     // Initialize the tracing subscriber with `EnvFilter` so log levels
     // can be controlled via the `RUST_LOG` environment variable (e.g.
     // `RUST_LOG=oxide_validator=debug,rpc=info`).
@@ -155,32 +160,22 @@ fn run_single_node() {
         let mut consensus_driver = driver::ConsensusDriver::with_defaults();
         let driver_metrics = consensus_driver.metrics();
         wire_driver_observers(&mut consensus_driver, &rpc_shared);
-        consensus_driver.start(node);
+        let driver_handle = consensus_driver.start(node);
+        // Critical: this task IS the consensus loop — its panic must
+        // abort, not strand a validator that still holds its keys.
+        supervise_task("consensus-driver", true, driver_handle);
         tracing::info!("oxide-validator: consensus driver started (autonomous mode)");
 
-        // Spawn the HTTP server as a background task.
+        // Spawn the HTTP server as a background task. Non-critical:
+        // its death is itself the health signal (connection refused),
+        // and `select!` below exits the process when it resolves.
+        primitives::supervision::register("rpc-http", false);
         let server_handle = tokio::spawn(async move {
             http_server.serve().await;
         });
 
         // Periodically sync driver metrics to the RPC server.
-        let metrics_sync = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                // The driver_metrics handle is used to read the
-                // current block height for logging; the RPC server
-                // has its own atomic counters that are updated via
-                // `set_block_height`. In a future refactor, the
-                // driver and RPC can share the same atomic counters.
-                let height = driver_metrics.block_height();
-                tracing::debug!(
-                    height,
-                    txs = driver_metrics.tx_count(),
-                    "metrics sync: driver stats"
-                );
-            }
-        });
+        let metrics_abort = spawn_metrics_sync(driver_metrics);
 
         // Shutdown signal handler: catches SIGTERM and SIGINT (Ctrl+C).
         let shutdown = async {
@@ -202,17 +197,70 @@ fn run_single_node() {
         };
 
         tokio::select! {
-            _ = server_handle => {
+            r = server_handle => {
+                match &r {
+                    Ok(()) => primitives::supervision::mark_exited("rpc-http"),
+                    Err(_) => primitives::supervision::mark_panicked("rpc-http"),
+                }
                 tracing::info!("RPC server exited");
             }
             () = shutdown => {
                 tracing::info!("shutdown signal received, shutting down gracefully");
             }
         }
-        metrics_sync.abort();
+        metrics_abort.abort();
     });
 
     tracing::info!("oxide-validator: node stopped");
+}
+
+/// Spawn the periodic driver-metrics sync task under supervision.
+/// Returns the `AbortHandle` so shutdown can still cancel the inner
+/// task without owning the monitored `JoinHandle`.
+fn spawn_metrics_sync(driver_metrics: Arc<driver::DriverMetrics>) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            // The driver_metrics handle is used to read the
+            // current block height for logging; the RPC server
+            // has its own atomic counters that are updated via
+            // `set_block_height`. In a future refactor, the
+            // driver and RPC can share the same atomic counters.
+            let height = driver_metrics.block_height();
+            tracing::debug!(height, txs = driver_metrics.tx_count(), "metrics sync: driver stats");
+        }
+    });
+    let abort = handle.abort_handle();
+    supervise_task("metrics-sync", false, handle);
+    abort
+}
+
+/// Monitor a supervised tokio task's `JoinHandle`: the process panic
+/// hook can't map a task panic to an actor (the unwinding thread is
+/// an anonymous runtime worker — the runtime catches the panic into
+/// the `JoinHandle`), so this monitor awaits the handle and reports
+/// the outcome. A panic on a `critical` task aborts the process —
+/// fail-fast for the actors the node cannot run without; a clean
+/// return or cancellation just marks the actor exited.
+fn supervise_task(name: &'static str, critical: bool, handle: tokio::task::JoinHandle<()>) {
+    primitives::supervision::register(name, critical);
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => primitives::supervision::mark_exited(name),
+            Err(e) if e.is_cancelled() => primitives::supervision::mark_exited(name),
+            Err(_) => {
+                primitives::supervision::mark_panicked(name);
+                if critical {
+                    eprintln!(
+                        "critical task '{name}' panicked — aborting so the \
+                         supervisor restarts a coherent process"
+                    );
+                    std::process::abort();
+                }
+            }
+        }
+    });
 }
 
 /// Build the single-node JSON-RPC server: wire the executor and EVM

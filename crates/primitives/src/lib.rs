@@ -840,6 +840,201 @@ pub mod sync {
     }
 }
 
+/// Process-wide actor supervision: a registry of named threads so a
+/// silent death is a *visible* death, plus the panic hook that turns
+/// a critical actor's panic into a process abort.
+///
+/// ## Why it exists
+///
+/// `panic = "unwind"` (workspace release profile) means a panicking
+/// actor kills only its own thread — the process keeps running,
+/// looking healthy while a consensus pump, exec lane, or accept loop
+/// is gone. A validator that cannot observe its own dead actors
+/// cannot be restarted by a supervisor (`systemd`, Kubernetes) that
+/// keys on process exit or a health endpoint.
+///
+/// ## Model
+///
+/// - [`register`] names an actor and whether it is *critical* —
+///   i.e. the node cannot do its job without it (exec lane, accept
+///   loop, consensus driver).
+/// - [`spawn_supervised`] is the standard spawn for supervised
+///   threads: it registers the actor, names the OS thread (so the
+///   panic hook can map thread → actor), and marks the actor
+///   [`ActorState::Exited`] when the body returns.
+/// - [`install_panic_hook`] wraps the default hook: every panic is
+///   counted, registered actors are marked [`ActorState::Panicked`],
+///   and a panic on a *critical* actor's thread aborts the process
+///   so the supervisor restarts it — fail-fast beats half-alive.
+///   A *clean return* never aborts: graceful shutdown exits actors
+///   legitimately; the registry still reports them dead for
+///   `/health`.
+/// - [`unhealthy_critical`] / [`actors`] feed the health surface;
+///   [`panics_total`] feeds metrics.
+///
+/// Tokio tasks are *not* covered by the thread registry — a task
+/// panic unwinds into its `JoinHandle`, and the thread name is the
+/// runtime worker's. Binaries monitor task `JoinHandle`s and report
+/// through [`mark_exited`]/[`mark_panicked`].
+pub mod supervision {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::MutexGuard;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Lifecycle state of a registered actor.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ActorState {
+        /// Registered; the actor has not reported an exit.
+        Alive,
+        /// The actor's body returned — dead, but not by panic.
+        /// Legitimate during shutdown, a failure otherwise.
+        Exited,
+        /// The actor panicked.
+        Panicked,
+    }
+
+    struct ActorEntry {
+        /// Whether the process cannot do its job without this actor.
+        /// A panic on a critical actor's thread aborts the process.
+        critical: bool,
+        state: ActorState,
+    }
+
+    static REGISTRY: OnceLock<Mutex<BTreeMap<String, ActorEntry>>> = OnceLock::new();
+    /// Process-wide panic counter, bumped by the installed hook and
+    /// by [`mark_panicked`]. Exported as `oxide_actor_panics_total`.
+    static PANICS: AtomicU64 = AtomicU64::new(0);
+
+    fn registry() -> &'static Mutex<BTreeMap<String, ActorEntry>> {
+        REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Lock the registry, *recovering* from poison.
+    ///
+    /// Every caller of this module may run inside the panic hook —
+    /// re-panicking there aborts unconditionally. A torn registry
+    /// entry is strictly better than losing the panic report, so
+    /// poison is recovered here (unlike [`sync::lock_state`](
+    /// crate::sync::lock_state), which guards consensus state).
+    fn lock_registry() -> MutexGuard<'static, BTreeMap<String, ActorEntry>> {
+        registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Register `name` as a supervised actor.
+    ///
+    /// Re-registering revives a dead entry — correct for respawned
+    /// actors — and refreshes its criticality.
+    pub fn register(name: &str, critical: bool) {
+        lock_registry().insert(name.to_string(), ActorEntry { critical, state: ActorState::Alive });
+    }
+
+    /// Record that `name`'s body returned (clean exit, closed
+    /// channel, finished loop). Never aborts — shutdown exits
+    /// actors legitimately — but `unhealthy_critical` reports it.
+    pub fn mark_exited(name: &str) {
+        if let Some(e) = lock_registry().get_mut(name) {
+            e.state = ActorState::Exited;
+        }
+    }
+
+    /// Record that `name` panicked. Also bumps [`panics_total`].
+    /// Called by the panic hook (via thread-name lookup) and by
+    /// task monitors observing a `JoinError`.
+    pub fn mark_panicked(name: &str) {
+        PANICS.fetch_add(1, Ordering::Relaxed);
+        if let Some(e) = lock_registry().get_mut(name) {
+            e.state = ActorState::Panicked;
+        }
+    }
+
+    /// Total panics observed since hook install / first report.
+    pub fn panics_total() -> u64 {
+        PANICS.load(Ordering::Relaxed)
+    }
+
+    /// Names of critical actors that are no longer alive — the
+    /// fail-closed input for `/health`: any entry here means the
+    /// node is degraded and the health probe must say so.
+    pub fn unhealthy_critical() -> Vec<String> {
+        lock_registry()
+            .iter()
+            .filter(|(_, e)| e.critical && e.state != ActorState::Alive)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Snapshot of every registered actor: `(name, critical, state)`.
+    /// Diagnostics only — `/health` uses [`unhealthy_critical`].
+    pub fn actors() -> Vec<(String, bool, ActorState)> {
+        lock_registry().iter().map(|(n, e)| (n.clone(), e.critical, e.state)).collect()
+    }
+
+    /// Install the process panic hook: keep the default output,
+    /// count the panic, mark the panicking actor (matched by OS
+    /// thread name, which [`spawn_supervised`] sets), and **abort
+    /// the process when a critical actor's thread panics** — a
+    /// validator that cannot execute or accept peers is worse than
+    /// down, because it still signs (or withholds) on stale state.
+    ///
+    /// Idempotent per process; binaries call it first in `main`.
+    /// Unregistered/unknown threads are counted but never abort —
+    /// a panicking per-peer reader is a logged event, not a fatal
+    /// one.
+    pub fn install_panic_hook() {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default(info);
+            PANICS.fetch_add(1, Ordering::Relaxed);
+            let thread = std::thread::current();
+            let name = thread.name().unwrap_or("<unnamed>");
+            let critical = {
+                let mut reg = lock_registry();
+                match reg.get_mut(name) {
+                    Some(e) => {
+                        e.state = ActorState::Panicked;
+                        e.critical
+                    }
+                    None => false,
+                }
+            };
+            if critical {
+                eprintln!(
+                    "critical actor '{name}' panicked — aborting so the \
+                     supervisor restarts a coherent process"
+                );
+                std::process::abort();
+            }
+        }));
+    }
+
+    /// Spawn a supervised thread: registers `name`, names the OS
+    /// thread (so the panic hook maps panic → actor), runs `f`, and
+    /// marks the actor [`ActorState::Exited`] when it returns.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`std::io::Error`] from [`std::thread::Builder::spawn`]
+    /// (e.g. `EAGAIN` thread exhaustion) — callers decide whether the
+    /// failed spawn is fatal.
+    pub fn spawn_supervised<F>(
+        name: &str,
+        critical: bool,
+        f: F,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        register(name, critical);
+        let actor = name.to_string();
+        std::thread::Builder::new().name(actor.clone()).spawn(move || {
+            f();
+            mark_exited(&actor);
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::fixed::{self, FixedError, PRICE_ONE, Price, QTY_ONE, Qty};
@@ -981,5 +1176,58 @@ mod tests {
     fn test_one_constants() {
         assert_eq!(PRICE_ONE.0, 100_000_000);
         assert_eq!(QTY_ONE.0, 1_000_000);
+    }
+
+    /// Supervision: registered actors report their lifecycle through
+    /// the registry — exit marks dead, panics mark panicked (via
+    /// `mark_panicked`, the same entrypoint the hook and task
+    /// monitors call), and only *critical* dead actors report
+    /// unhealthy.
+    #[test]
+    fn supervision_tracks_lifecycle() {
+        use super::supervision::*;
+        // Unique names — the registry is process-global and tests
+        // run in parallel threads.
+        register("t-crit", true);
+        register("t-aux", false);
+        assert!(unhealthy_critical().is_empty());
+
+        mark_exited("t-crit");
+        assert_eq!(unhealthy_critical(), vec!["t-crit".to_string()]);
+
+        // A dead non-critical actor degrades but does not fail health.
+        mark_panicked("t-aux");
+        assert_eq!(unhealthy_critical(), vec!["t-crit".to_string()]);
+        assert!(
+            actors().iter().any(|(n, c, s)| n == "t-aux"
+                && !c
+                && *s == super::supervision::ActorState::Panicked)
+        );
+
+        // Respawn revives the entry.
+        register("t-crit", true);
+        assert!(unhealthy_critical().is_empty());
+    }
+
+    /// `spawn_supervised` names the OS thread after the actor (the
+    /// panic hook's thread→actor mapping) and marks the actor
+    /// `Exited` when the body returns.
+    #[test]
+    fn supervision_spawn_marks_exit() {
+        use super::supervision::*;
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let handle = spawn_supervised("t-spawn", false, move || {
+            probe_tx
+                .send(std::thread::current().name().unwrap_or("?").to_string())
+                .expect("probe channel");
+        })
+        .expect("spawn");
+        handle.join().expect("supervised thread");
+        assert_eq!(probe_rx.recv().expect("name probe"), "t-spawn");
+        assert!(
+            actors()
+                .iter()
+                .any(|(n, _, s)| n == "t-spawn" && *s == super::supervision::ActorState::Exited)
+        );
     }
 }

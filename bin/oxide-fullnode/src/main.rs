@@ -27,6 +27,11 @@ use std::path::PathBuf;
 use node::{Node, NodeConfig};
 
 fn main() {
+    // Supervision before anything can spawn: a panic on a critical
+    // actor's thread aborts the process so the supervisor restarts a
+    // coherent node instead of running half-alive.
+    primitives::supervision::install_panic_hook();
+
     println!("oxide-fullnode: starting (follower mode)");
 
     let config = load_config();

@@ -405,6 +405,37 @@ struct OutboundSlot {
 /// `false` the counter is left untouched. A CAS loop is required —
 /// check-then-add would let every racing reader overshoot the
 /// budget by a full maximum-size frame each.
+/// Short printable form of a peer id for supervision thread names —
+/// first 4 bytes as hex. Readability only; uniqueness comes from the
+/// registry key, not this tag.
+fn peer_tag(pid: &[u8]) -> String {
+    use std::fmt::Write;
+    pid.iter().take(4).fold(String::with_capacity(8), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// `TcpStream::try_clone` with bounded retry. The failure mode that
+/// matters is transient fd exhaustion (`EMFILE`): the caller's fd
+/// tables drain as connections close, so a short backoff usually
+/// succeeds. Returns `None` after the retry budget — the caller must
+/// drop the connection and let its reconnect loop retry the peer,
+/// never panic: these threads are supervised but per-peer thread
+/// death still strands that peer until the next dial.
+fn retry_try_clone(stream: &TcpStream) -> Option<TcpStream> {
+    const RETRIES: u32 = 5;
+    const BACKOFF: Duration = Duration::from_millis(20);
+    for attempt in 0..RETRIES {
+        match stream.try_clone() {
+            Ok(s) => return Some(s),
+            Err(_) if attempt + 1 < RETRIES => thread::sleep(BACKOFF),
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 fn try_reserve_bytes(counter: &AtomicUsize, budget: usize, len: usize) -> bool {
     let mut cur = counter.load(Ordering::Relaxed);
     loop {
@@ -692,7 +723,9 @@ impl TcpTransport {
         #[cfg(feature = "tls")]
         let accept_tls = tls.clone();
         let accept_admission = admission.clone();
-        thread::spawn(move || {
+        // Critical: the only inbound path — a dead accept loop means
+        // no peer can ever reconnect inbound.
+        primitives::supervision::spawn_supervised("p2p-accept", true, move || {
             while !accept_shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
@@ -786,20 +819,27 @@ impl TcpTransport {
                         let slot = spawn_writer(write_stream, &accept_shutdown);
                         primitives::sync::lock_state(&accept_streams).insert(peer_id.clone(), slot);
                         // Spawn a reader thread for this connection.
+                        // Supervised, non-critical: a dead peer reader
+                        // loses one connection (the dialer retries),
+                        // not the node.
                         let tx = accept_tx.clone();
                         let queued = accept_queued.clone();
                         let reader_shutdown = accept_shutdown.clone();
-                        thread::spawn(move || {
-                            reader_loop(
-                                reader_stream,
-                                peer_id,
-                                tx,
-                                queued,
-                                max_message_bytes,
-                                max_inbound_queue_bytes,
-                                reader_shutdown,
-                            );
-                        });
+                        let _ = primitives::supervision::spawn_supervised(
+                            "p2p-reader",
+                            false,
+                            move || {
+                                reader_loop(
+                                    reader_stream,
+                                    peer_id,
+                                    tx,
+                                    queued,
+                                    max_message_bytes,
+                                    max_inbound_queue_bytes,
+                                    reader_shutdown,
+                                );
+                            },
+                        );
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
@@ -809,7 +849,8 @@ impl TcpTransport {
                     }
                 }
             }
-        });
+        })
+        .expect("spawn p2p-accept thread");
 
         // Connect to each peer in the background. Each connection
         // sends our peer ID as the first frame, then enters the
@@ -823,7 +864,9 @@ impl TcpTransport {
         let connect_admission = admission.clone();
         #[cfg(feature = "tls")]
         let connect_tls = tls.clone();
-        thread::spawn(move || {
+        // Critical: the only outbound path — a dead connect driver
+        // means this node never initiates or re-initiates peer links.
+        primitives::supervision::spawn_supervised("p2p-connect", true, move || {
             for (peer_id, addr) in peers {
                 if connect_shutdown.load(Ordering::Relaxed) {
                     return; // shutting down — don't start new connections
@@ -838,7 +881,10 @@ impl TcpTransport {
                 let cac = connect_admission.clone();
                 #[cfg(feature = "tls")]
                 let ctls = connect_tls.clone();
-                thread::spawn(move || {
+                // One supervised reconnect loop per peer — non-critical:
+                // a dead loop loses that peer, not the node.
+                let actor = format!("p2p-peer-{}", peer_tag(&pid));
+                let _ = primitives::supervision::spawn_supervised(&actor, false, move || {
                     // Outer reconnect loop: if the connection breaks
                     // (reader loop exits due to I/O error, EOF, or
                     // peer shutdown), retry the connection after a
@@ -949,9 +995,16 @@ impl TcpTransport {
                         // Clone the underlying TCP socket for
                         // shutdown handling (see accept path).
                         let shutdown_stream = stream.try_clone().ok();
-                        // Clone for the map; the reader keeps the original.
-                        let write_stream =
-                            Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
+                        // Clone for the map; the reader keeps the
+                        // original. `try_clone` can fail on fd
+                        // exhaustion — retry briefly, then drop the
+                        // connection and let the reconnect loop retry
+                        // the peer rather than panicking this thread.
+                        let Some(write_raw) = retry_try_clone(&stream) else {
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        };
+                        let write_stream = Box::new(write_raw) as Box<dyn PeerStream>;
                         let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
                         // Spawn a writer thread and register its
                         // channel sender for outbound sends.
@@ -987,7 +1040,8 @@ impl TcpTransport {
                     }
                 });
             }
-        });
+        })
+        .expect("spawn p2p-connect thread");
 
         Self {
             streams,
@@ -1091,7 +1145,8 @@ impl TcpTransport {
             tls: self.tls.clone(),
         };
         let pid = peer_id.clone();
-        thread::spawn(move || {
+        let actor = format!("p2p-peer-{}", peer_tag(&pid));
+        let _ = primitives::supervision::spawn_supervised(&actor, false, move || {
             // Retry connection — the peer may not be listening yet.
             let stream = loop {
                 if ctx.shutdown.load(Ordering::Relaxed) {
@@ -1136,7 +1191,13 @@ impl TcpTransport {
             }
             let _ = stream.set_read_timeout(Some(ctx.read_timeout));
             let shutdown_stream = stream.try_clone().ok();
-            let write_stream = Box::new(stream.try_clone().unwrap()) as Box<dyn PeerStream>;
+            // `try_clone` can fail on fd exhaustion (EMFILE): retry
+            // briefly, then drop the connection — the caller's
+            // reconnect loop retries the peer. Never `unwrap`: a
+            // panic here kills the supervised thread and strands the
+            // peer until restart.
+            let Some(write_raw) = retry_try_clone(&stream) else { return };
+            let write_stream = Box::new(write_raw) as Box<dyn PeerStream>;
             let reader_stream = Box::new(stream) as Box<dyn PeerStream>;
             install_connected_peer(&ctx, pid, reader_stream, write_stream, shutdown_stream);
         });
@@ -1633,7 +1694,9 @@ fn spawn_writer(write_stream: Box<dyn PeerStream>, shutdown: &Arc<AtomicBool>) -
     let queued = Arc::new(AtomicUsize::new(0));
     let writer_queued = queued.clone();
     let shutdown = Arc::clone(shutdown);
-    thread::spawn(move || {
+    // Supervised, non-critical: a dead writer strands one peer's
+    // outbound queue until the reconnect loop replaces the slot.
+    let _ = primitives::supervision::spawn_supervised("p2p-writer", false, move || {
         writer_loop(write_stream, rx, writer_queued, shutdown);
     });
     OutboundSlot { tx, queued }

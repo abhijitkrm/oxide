@@ -30,6 +30,11 @@ use types::TxBytes;
 use codec::{Decode, Encode};
 
 fn main() {
+    // Supervision before anything can spawn: a panic on a critical
+    // actor's thread aborts the process so the supervisor restarts a
+    // coherent node instead of running half-alive.
+    primitives::supervision::install_panic_hook();
+
     // Initialize tracing so `RUST_LOG` controls log levels.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -312,7 +317,10 @@ fn run_node(node_index_str: &str) {
     // platforms, only SIGINT (Ctrl+C) is caught.
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
-    std::thread::spawn(move || {
+    // Non-critical: if the signal thread dies, the node keeps running
+    // and only loses graceful-shutdown signaling — visible via the
+    // registry, not fatal.
+    let _ = primitives::supervision::spawn_supervised("signal-handler", false, move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -575,9 +583,11 @@ fn start_devnet_rpc(
     let http_server = rpc::server::HttpServer::from_shared(rpc.clone(), listen.clone());
 
     // Spawn the HTTP server on a dedicated tokio runtime thread so
-    // the consensus loop can run on the main thread.
+    // the consensus loop can run on the main thread. Non-critical:
+    // a dead RPC leaves consensus running; health probes see a
+    // refused connection.
     let rpc_clone = rpc.clone();
-    std::thread::spawn(move || {
+    let _ = primitives::supervision::spawn_supervised("rpc-http", false, move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

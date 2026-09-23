@@ -1395,6 +1395,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Threads could die silently while the process looked healthy**
+  (`primitives`, `crates/p2p`, `crates/executor`, `crates/matcher`,
+  `crates/rpc`, node binaries): `panic = "unwind"` meant a panicking
+  actor killed only its own thread — a dead exec lane, accept loop,
+  or consensus driver left a running but non-functional node.
+  - New `primitives::supervision` registry: named actors report
+    `Alive`/`Exited`/`Panicked`; a panic hook installed by every
+    binary counts panics, marks the panicking actor, and **aborts
+    the process when a critical actor's thread panics** so a
+    supervisor restarts a coherent node.
+  - Critical supervised actors: exec lane, p2p accept/connect
+    loops, matcher sequencer + settlement pump, and the validator's
+    consensus-driver task (monitored through its `JoinHandle`, since
+    tokio task panics bypass the thread-name mapping).
+  - `/health` returns 503 naming dead critical actors; `/metrics`
+    gains `oxide_actor_panics_total` and `oxide_actor_dead_critical`.
+  - The audit's concrete case is fixed: `TcpStream::try_clone().unwrap()`
+    in the connect path could panic a dialer on fd exhaustion — it
+    now retries with backoff and drops the connection for the
+    reconnect loop to retry.
+  - **In plain words:** if a vital background thread crashes, the
+    node now either restarts outright or visibly reports the dead
+    component in `/health` — it no longer pretends to be fine.
+
 - **Misleading operator-facing surfaces** (`oxide-validator`,
   `docs/production-readiness.md`, `README.md`, `config/mainnet.toml`,
   `crates/config`, `bin/oxide-devnet`): `oxide-validator help` no

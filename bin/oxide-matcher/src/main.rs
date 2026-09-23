@@ -205,6 +205,11 @@ fn single_market_config() -> trading::MarketConfig {
 }
 
 fn main() {
+    // Supervision before anything can spawn: a panic on a critical
+    // actor's thread (sequencer, settlement pump) aborts the process
+    // so the supervisor restarts it instead of running half-alive.
+    primitives::supervision::install_panic_hook();
+
     let cli = parse_cli();
     println!("oxide-matcher: starting matching server");
     println!("  mode:            {}", cli.mode);
@@ -272,7 +277,10 @@ fn main() {
     let runtime =
         tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
 
-    std::thread::spawn(move || {
+    // Critical: this pump is the only path from matcher mempool to
+    // finalized settlement batches — a silent death here means orders
+    // fill but never settle.
+    let _ = primitives::supervision::spawn_supervised("settlement-pump", true, move || {
         loop {
             node.engine().run_until_idle();
             std::thread::sleep(Duration::from_millis(10));

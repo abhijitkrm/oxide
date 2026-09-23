@@ -173,13 +173,21 @@ impl ConsensusDriver {
     /// consensus engine continuously until the task is cancelled
     /// (e.g. on shutdown).
     ///
+    /// The returned `JoinHandle` **must be monitored** — a task
+    /// panic unwinds into the handle, and an unwatched handle is a
+    /// silent death (the process keeps running with a dead
+    /// consensus loop). The caller registers it with
+    /// `primitives::supervision` and aborts on panic: a validator
+    /// whose driver died still holds validator keys and occupies a
+    /// committee slot, which is worse than down.
+    ///
     /// # Panics
     ///
     /// The driver task panics if the consensus engine encounters an
     /// internal invariant violation during `run_until_idle()`. This
     /// is intentional — a consensus invariant violation is
     /// unrecoverable and must abort the process.
-    pub fn start(self, mut node: Node) {
+    pub fn start(self, mut node: Node) -> tokio::task::JoinHandle<()> {
         let block_time = Duration::from_millis(self.config.block_time_ms);
         let metrics_interval = Duration::from_millis(self.config.metrics_interval_ms);
         let metrics = self.metrics;
@@ -272,7 +280,7 @@ impl ConsensusDriver {
                     last_metrics_tick = std::time::Instant::now();
                 }
             }
-        });
+        })
     }
 }
 

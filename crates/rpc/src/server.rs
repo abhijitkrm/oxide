@@ -885,8 +885,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// `--state-sync` requires, so the response doubles as the sync
 /// trigger material.
 async fn health_check(State(state): State<RpcState>) -> impl IntoResponse {
-    match state.rpc.exec_divergence() {
-        Some(d) => (
+    if let Some(d) = state.rpc.exec_divergence() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "execution divergence at height {}: local root 0x{}, certified root 0x{}; \
@@ -898,9 +898,20 @@ async fn health_check(State(state): State<RpcState>) -> impl IntoResponse {
                 d.height.value(),
                 hex_encode(d.certified_root.as_bytes()),
             ),
-        ),
-        None => (StatusCode::OK, "ok".to_string()),
+        );
     }
+    // Actor liveness: a dead critical actor (exec lane, accept loop,
+    // consensus driver) means the node is silently degraded — the
+    // process runs but does not function. 503 so watchdogs and
+    // load balancers see it as down.
+    let dead = primitives::supervision::unhealthy_critical();
+    if !dead.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("dead critical actors: {}", dead.join(", ")),
+        );
+    }
+    (StatusCode::OK, "ok".to_string())
 }
 
 /// Prometheus metrics endpoint (`GET /metrics`).
@@ -935,15 +946,51 @@ mod tests {
     use super::*;
     use crate::RpcRequest;
 
-    /// Test the health check endpoint returns 200.
-    #[tokio::test]
-    async fn health_check_returns_ok() {
-        let state = RpcState {
+    /// Serializes tests that read the process-global supervision
+    /// registry — a dead critical actor registered by one test would
+    /// otherwise flip a concurrent `/health` assertion to 503.
+    /// `tokio::sync::Mutex` because the guard is held across `.await`
+    /// (the endpoint call is async).
+    static HEALTH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn health_state() -> RpcState {
+        RpcState {
             rpc: Arc::new(RpcServer::new(1, 1_000_000_000)),
             rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
             work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
-        };
-        let response = health_check(State(state)).await.into_response();
+        }
+    }
+
+    /// Test the health check endpoint returns 200.
+    #[tokio::test]
+    async fn health_check_returns_ok() {
+        let _guard = HEALTH_LOCK.lock().await;
+        let response = health_check(State(health_state())).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A dead critical actor must flip `/health` to 503 and name it —
+    /// a node with a dead exec lane or accept loop looks alive on the
+    /// wire but does not function. Re-registering revives the entry
+    /// so the healthy 200 still holds afterwards (registry is
+    /// process-global; the lock above keeps parallel tests out of the
+    /// dead window).
+    #[tokio::test]
+    async fn health_check_reports_dead_critical_actor() {
+        let _guard = HEALTH_LOCK.lock().await;
+        primitives::supervision::register("hc-critical-test", true);
+        primitives::supervision::mark_exited("hc-critical-test");
+        let response = health_check(State(health_state())).await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("hc-critical-test"), "body must name the dead actor: {text}");
+
+        // Revive — the actor's re-registration is what a real respawn
+        // would do, and it restores the healthy 200.
+        primitives::supervision::register("hc-critical-test", true);
+        let response = health_check(State(health_state())).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -953,6 +1000,7 @@ mod tests {
     /// to expose.
     #[tokio::test]
     async fn health_check_reports_divergence() {
+        let _guard = HEALTH_LOCK.lock().await;
         let rpc = Arc::new(RpcServer::new(1, 1_000_000_000));
         rpc.set_exec_divergence(types::ExecDivergence {
             height: primitives::Height::new(42),
