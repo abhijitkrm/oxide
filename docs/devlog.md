@@ -20005,3 +20005,35 @@ refill_saturates`. p2p 109 tests plain / 116 with TLS; devnet
 
 Residual for H2: plaintext peer IDs remain self-claimed — the
 crypto-binding handshake folds into the production-key work.
+
+## Session N+31 — idle mode is a heartbeat, not a fake transaction
+
+Two M7 halves. The keep-alive: every 50 pump iterations the devnet
+injected a `staking::delegate` signed by test identity 0 — a public
+key in a production path, and fake work so the mempool never
+emptied. The view churn: `propose()`'s liveness gate rightly
+silences a workless leader, but silence is indistinguishable from
+a crashed leader — followers' timers fired, TCs formed, views
+rotated forever without committing.
+
+The designed fix is a slow heartbeat block. `propose()` splits
+into `propose_inner(heartbeat)` — every validity gate (WAL,
+divergence, `process_proposal`, height stamp, signing) identical,
+only the idle early-return differs — and `propose_heartbeat()`
+exposes it. The devnet pump drops Phase 0 entirely; when the
+leader's `propose()` returns None and the view has been idle past
+`IDLE_HEARTBEAT` (1s — half the 2s pacemaker base, so heartbeats
+always beat the timeout), it proposes anyway. Followers stay on
+the QC path: each heartbeat block commits the uncommitted tail
+and resets view timers through the healthy mechanism.
+
+Verified live: 2-node devnet with zero traffic finalized ~1
+block/s, alternating leaders, ZERO view timeouts and ZERO TCs —
+previously the same run would churn timeouts. Single-node: 7
+blocks in ~7s idle. `heartbeat_proposes_empty_block_when_idle`
+covers the engine gate. `iter_count`, `keepalive_nonce`, and the
+pump's `chain_id` param all deleted.
+
+Residual: the startup smoke delegate (devnet) and validator
+`--submit-key-change`/smoke paths still use test identities —
+that's C4's feature-gate sweep.

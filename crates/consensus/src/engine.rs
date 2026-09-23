@@ -1055,6 +1055,33 @@ impl OxideBft {
     /// implementation could trigger this, so panicking would give an
     /// attacker a trivial network-kill vector.
     pub fn propose(&mut self) -> Option<(BlockHeader, Proposal)> {
+        self.propose_inner(false)
+    }
+
+    /// Produce a proposal even when no work is pending — the
+    /// idle-mode heartbeat.
+    ///
+    /// A leader that stays silent when idle is indistinguishable
+    /// from a dead leader: followers' view timers fire, timeout
+    /// certificates form, and views churn forever without
+    /// committing anything. The designed idle mode is a *slow
+    /// heartbeat block*: the driver calls this when the view has
+    /// been idle past its heartbeat interval, producing a normal
+    /// (usually empty) proposal whose QC advances the chain through
+    /// the healthy path — proving liveness and committing the
+    /// uncommitted tail, without fake transactions.
+    ///
+    /// Everything except the idle early-return still applies: the
+    /// WAL/divergence gates, `process_proposal`, height stamping,
+    /// and signing are identical to [`propose`](Self::propose).
+    pub fn propose_heartbeat(&mut self) -> Option<(BlockHeader, Proposal)> {
+        self.propose_inner(true)
+    }
+
+    /// Shared proposal construction. `heartbeat` skips only the
+    /// idle early-return; every other validity and safety gate is
+    /// identical for work and heartbeat blocks.
+    fn propose_inner(&mut self, heartbeat: bool) -> Option<(BlockHeader, Proposal)> {
         // C10: a proposal carries the leader's `proposer_signature` —
         // it is a signature, so a WAL-failed validator must not
         // produce one. Going silent lets the view time out and a
@@ -1102,9 +1129,12 @@ impl OxideBft {
 
         // No work: nothing queued and nothing left to flush. The
         // leader returns None and waits — an idle leader doesn't
-        // produce empty blocks. The 2-chain commit rule only needs a
-        // child block when there's actual work to commit.
-        if !has_pending_txs && !work_outstanding && self.next_height != Height::new(0) {
+        // produce empty blocks *unless* the driver asked for a
+        // heartbeat (`heartbeat == true`, see [`Self::propose_heartbeat`]).
+        // The 2-chain commit rule only needs a child block when
+        // there's actual work to commit.
+        if !heartbeat && !has_pending_txs && !work_outstanding && self.next_height != Height::new(0)
+        {
             if std::env::var_os("OXIDE_DEBUG_PROPOSE").is_some() {
                 eprintln!(
                     "propose() idle: view={:?} next_height={:?} highqc={:?} has_txs={has_pending_txs} work_outstanding={work_outstanding}",

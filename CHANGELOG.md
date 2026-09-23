@@ -1395,6 +1395,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Idle chains churned view timeouts; devnet faked work to avoid
+  it** (`consensus`, `oxide-devnet`): a leader with no pending work
+  stayed silent, which followers cannot distinguish from a crashed
+  leader — views rotated through timeout certificates forever, and
+  the devnet pump injected a keep-alive `staking::delegate` signed
+  by a public test identity every 50 iterations to keep the mempool
+  non-empty. Idle mode is now a designed heartbeat: the engine's
+  `propose_heartbeat()` produces a normal (empty) proposal past the
+  idle gate only, and the pump calls it when a view has been idle
+  for `IDLE_HEARTBEAT` (1s, half the pacemaker base timeout). An
+  idle devnet now finalizes ~1 empty block/s through the healthy
+  QC path — verified live with zero timeouts/TCs — and no test
+  identity signs anything. **In plain words:** a quiet chain now
+  ticks over slowly and honestly instead of burning timeout votes,
+  and nothing impersonates a test key to keep it moving.
+
 - **Admission control was compiled but never wired into the shipped
   node** (`p2p`, `oxide-devnet`): `with_tls` and `with_admission`
   were mutually exclusive constructors and the launcher picked the

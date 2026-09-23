@@ -63,6 +63,18 @@ const MSG_TIMEOUT: u8 = 0x03; // timeout signature (view-change init)
 const MSG_TC: u8 = 0x04; // timeout certificate (view-change proof)
 const MSG_TX: u8 = 0x05; // raw tx envelope gossip (mempool propagation)
 
+/// Idle heartbeat interval for the consensus pump (unit: wall-clock
+/// time). A leader with no pending work still owes the network a
+/// — usually empty — block on this cadence: followers cannot
+/// distinguish "idle" from "dead", so silence would churn views
+/// through timeout certificates forever. Must stay comfortably
+/// below the pacemaker's base timeout (2s default) so a live idle
+/// leader's heartbeats keep follower timers reset; 1s leaves a
+/// full timeout of slack for scheduling jitter. Lower = more empty
+/// blocks (fresher liveness evidence, more I/O); higher = fewer
+/// blocks but closer to timeout churn.
+const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
+
 /// Run a single validator node in a multi-process testnet.
 ///
 /// This is the production deployment path for a validator node. It
@@ -354,7 +366,6 @@ fn run_node(node_index_str: &str) {
         rpc_handle.as_deref(),
         &shared_validator_set,
         &gossip_rx,
-        cfg.node.chain_id,
     );
 
     // Graceful shutdown: if --data-dir is set, export the current
@@ -640,7 +651,6 @@ fn run_consensus_loop(
     rpc: Option<&rpc::RpcServer>,
     shared_validator_set: &std::sync::RwLock<consensus::ValidatorSet>,
     gossip_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
-    chain_id: u64,
 ) {
     // Gossip dedup cap: tx hashes we've already ingested (ours +
     // peers'). 100k entries covers several blocks' worth of txs; a
@@ -653,11 +663,6 @@ fn run_consensus_loop(
     let mut voted_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut proposed_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut last_reported_height: u64 = 0;
-    let mut iter_count: u64 = 0;
-    // H4 fix: the executor now rejects replayed nonces. The keep-alive
-    // tx must use an incrementing nonce so it's not rejected after
-    // the first block finalizes nonce 0.
-    let mut keepalive_nonce: u64 = 0;
     // View-change timeout tracking. The pacemaker has an internal
     // timeout duration (base 2s, exponential backoff). We track when
     // the current view started; if it hasn't advanced within the
@@ -685,26 +690,6 @@ fn run_consensus_loop(
             break;
         }
 
-        iter_count += 1;
-
-        // Phase 0: submit a keep-alive transaction every 50 iterations
-        // to ensure the mempool is never empty (the leader won't propose
-        // empty blocks without pending txs).
-        if iter_count % 50 == 1 {
-            let module_payload = staking::msg::delegate(
-                crypto::secp::test_identity_address(0).expect("valid devnet identity"),
-                1,
-            );
-            let tx = node::cli::build_signed_tx(
-                chain_id,
-                framework::module_id::STAKING,
-                &module_payload,
-                keepalive_nonce,
-            );
-            let _ack = engine.submit_tx(tx);
-            keepalive_nonce += 1;
-        }
-
         // Phase 1: propose (if leader and haven't proposed this view).
         // Leader decisions consult the engine's LIVE committee —
         // `is_leader` reads the current validator set AND our
@@ -714,28 +699,47 @@ fn run_consensus_loop(
         if engine.is_leader() && !proposed_views.contains(&view) {
             if view > 0 && engine.high_qc().is_none() {
                 // Need the previous QC before proposing.
-            } else if let Some((header, proposal)) = engine.propose() {
-                let proposal_view = header.view.value();
-                proposed_views.insert(proposal_view);
-                pending_proposals.push((header.clone(), proposal.clone()));
-                // C10: the leader self-votes through `engine.vote()` —
-                // the single signing authority — which records the
-                // vote locks and appends the WAL BEFORE signing. The
-                // manual sign-then-collect this replaces emitted a
-                // signature whose anti-equivocation state was never
-                // durable: a restart could then double-vote.
-                if let Some(leader_vote) = engine.vote(&header, &proposal) {
-                    let _ = engine.collect_vote(engine.validator_index(), leader_vote);
-                    voted_views.insert(proposal_view);
-                }
-                // Broadcast proposal to followers.
-                let mut buf = Vec::with_capacity(1 + 512);
-                buf.push(MSG_PROPOSAL);
-                header.encode(&mut buf);
-                proposal.encode(&mut buf);
-                for i in 0..num_nodes {
-                    if i != node_index {
-                        let _ = transport.send(&vec![u8::try_from(i).unwrap()], &buf);
+            } else {
+                // Idle mode is an explicit heartbeat, not silence:
+                // `propose()` returns None when no work is pending, but
+                // a silent leader is indistinguishable from a dead one —
+                // followers' view timers would fire and views would
+                // churn through timeout certificates without committing
+                // anything. If this view has been idle past
+                // `IDLE_HEARTBEAT`, propose anyway: the QC advances the
+                // chain on the healthy path and commits the uncommitted
+                // tail. (Replaces the keep-alive transaction, which
+                // needed a funded test identity to fake real work.)
+                let produced = engine.propose().or_else(|| {
+                    if view_start.elapsed() >= IDLE_HEARTBEAT {
+                        engine.propose_heartbeat()
+                    } else {
+                        None
+                    }
+                });
+                if let Some((header, proposal)) = produced {
+                    let proposal_view = header.view.value();
+                    proposed_views.insert(proposal_view);
+                    pending_proposals.push((header.clone(), proposal.clone()));
+                    // C10: the leader self-votes through `engine.vote()` —
+                    // the single signing authority — which records the
+                    // vote locks and appends the WAL BEFORE signing. The
+                    // manual sign-then-collect this replaces emitted a
+                    // signature whose anti-equivocation state was never
+                    // durable: a restart could then double-vote.
+                    if let Some(leader_vote) = engine.vote(&header, &proposal) {
+                        let _ = engine.collect_vote(engine.validator_index(), leader_vote);
+                        voted_views.insert(proposal_view);
+                    }
+                    // Broadcast proposal to followers.
+                    let mut buf = Vec::with_capacity(1 + 512);
+                    buf.push(MSG_PROPOSAL);
+                    header.encode(&mut buf);
+                    proposal.encode(&mut buf);
+                    for i in 0..num_nodes {
+                        if i != node_index {
+                            let _ = transport.send(&vec![u8::try_from(i).unwrap()], &buf);
+                        }
                     }
                 }
             }

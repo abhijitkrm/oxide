@@ -67,6 +67,27 @@ fn one_tx_produces_one_committed_block() {
     assert!(found, "tx must appear in a committed block");
 }
 
+/// Idle mode: with no pending work, `propose()` stays silent but
+/// `propose_heartbeat()` still emits a valid empty block — the
+/// leader's liveness proof that keeps followers' view timers from
+/// churning through timeout certificates when the mempool is empty.
+#[test]
+fn heartbeat_proposes_empty_block_when_idle() {
+    let mut engine = make_engine();
+    // Move past genesis so the idle gate applies.
+    engine.submit_tx(TxBytes::new(vec![1]));
+    engine.run_until_idle();
+    assert!(engine.finalized_height().is_some());
+
+    // Idle: the work gate keeps a quiet leader silent.
+    assert!(engine.propose().is_none(), "idle leader must stay silent");
+    // …but the heartbeat path still produces a normal, votable
+    // proposal — usually empty, extending the committed tip.
+    let (header, proposal) = engine.propose_heartbeat().expect("heartbeat must propose when idle");
+    assert!(proposal.txs.is_empty(), "idle heartbeat carries no txs");
+    assert!(engine.vote(&header, &proposal).is_some(), "heartbeat proposal must be votable");
+}
+
 #[test]
 fn multiple_txs_all_committed() {
     let mut engine = make_engine();
