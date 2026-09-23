@@ -20299,3 +20299,79 @@ validator-set-routing finding (tracked separately); `verify` takes
 the set lock per handshake (cold path, fine). `oxide-validator`
 is single-node today — it gains the authenticator when it grows a
 transport. mTLS-off-loopback stays with the key-infra work.
+
+## Session N+37 — proposal-flood hardening + the wire timeout codec that never verified
+
+Two findings landed together because the flood e2e kept tripping over
+a deeper pre-existing bug.
+
+**The intake hardening (the actual task).** The devnet pump queued
+every decoded proposal for `vote()` to re-authenticate on every loop
+iteration — one Byzantine peer could hold the consensus thread inside
+BLS verification forever. Now, cheapest-first: `proposal_admissible`
+(engine-side, shared by both drivers) rejects out-of-window views
+(`current−10 … +32`) and non-scheduled-leader claims with pure
+compares; `admit_proposal` then authenticates once and stores the
+body, and only a *verified* proposal may claim the `(view, proposer)`
+pending slot. `vote()`/`vote_header()` memoise both verdicts —
+`rejected_headers` (capped 4096, cleared at rotation) for forged
+headers, the `blocks` map itself as the positive memo — so a
+re-delivered frame costs a hash lookup, not a verify.
+
+**Found while testing — first-seen dedupe was censorship.** The
+initial gate deduped `(view, proposer)` on the *claim*: junk that
+raced ahead of the real leader parked the slot and the genuine
+proposal was dropped as a "duplicate" — every flooded view timed out,
+TCs formed, and nothing ever committed. `header.proposer` is a public
+hash, not a proof; only a verified proposal may occupy the slot now.
+The same ambiguity existed in both retry queues (`vote()` returns
+`None` for "forged" and "future view" alike): the binary pump queues
+post-`admit_proposal`, the TCP harness gates its `pending` map on the
+new `proposal_known` predicate. `admit_proposal` also fixes a subtler
+version at the body layer: an authentic header with a corrupt body
+parks `Awaiting` (the signature is real — a bad body indicts the
+relay, not the header) so the genuine body can still complete it;
+previously the header was memoised rejected forever.
+
+**Found by the e2e — wire timeout frames could never verify.** Every
+`MSG_TIMEOUT` signature failed `verify_timeout_signature_for` at every
+peer, so no TC could ever form over real TCP: any view whose leader
+was absent stalled the cluster *permanently*. Root cause was a
+one-line framing bug in the devnet pump's decoder: the wire writes
+`[has_qc][qc?][has_tc][tc?]` interleaved, but the decoder read both
+flag bytes back-to-back — `has_tc` consumed the QC's first byte (the
+view LSB), the QC then decoded misaligned, and the `qc_ev` the sig
+was checked against never matched what the signer bound. The
+in-process harness never exercised this (engines talk in structs, not
+bytes). Fixed the decode order; verified live: a 6-of-7 committee now
+forms TCs and walks through the phantom member's leader turns
+(~2 s each) while committing continuously.
+
+**E2E result.** `crates/devnet/tests/proposal_flood.rs` spawns six
+real `oxide-devnet` processes (7-member committee, f=2, quorum=5) and
+drives an authenticated Byzantine phantom — member 6's own BLS key on
+a real `TcpTransport`, so every junk frame arrives through the
+legitimate signed greeting. Three junk classes (wrong-proposer,
+leader-claimed/bad-sig across 80 views, 200× mass repeats) run while
+the assertion watches: all six honest nodes kept finalizing through
+the flood *and* through the phantom's timeout views.
+
+**The verify-rate bound.** One piece of the audit remedy needed a
+different mechanism than written: a bounded worker *pool* alone
+doesn't satisfy the acceptance gate, because junk would still queue
+ahead of the real leader's proposal inside the pool. The bound that
+matters is per *sender*: post-handshake, `msg.from` is proven, so
+`PROPOSAL_VERIFY_BUDGET_PER_SEC` (50 admissible frames/peer/s —
+~5% of a thread worst case, ~50× honest rates) means a flooding
+peer exhausts only its own quota while the leader's proposal
+arrives on a different peer id and always verifies. Both drivers
+(devnet pump and the TCP harness) apply it identically. Verified
+live at 38 k distinct junk frames / ~2.5 k fps delivered: all six
+honest nodes kept finalizing, through two phantom-leader TC views.
+
+Residual: verification still runs *on* the consensus thread —
+the budget bounds it (≤ ~300 ms/s across a 7-member committee) but
+a worker pool would free it entirely; deferred to the P2
+performance work where it belongs with the other crypto offload.
+The transport's merged recv queue still has no per-peer fairness
+below the codec layer.

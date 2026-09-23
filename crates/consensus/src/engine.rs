@@ -63,7 +63,11 @@ use crate::verify::{VerifiedQc, VerifiedTc};
 /// Convert a `ValidatorIndex` to a `Hash` for the proposer field.
 /// The proposer is identified by the hash of its public key; stage 5
 /// replaces this with the actual public key hash.
-fn proposer_hash(idx: ValidatorIndex) -> Hash {
+///
+/// Public so network drivers can run the cheap intake gate — "is the
+/// claimed `header.proposer` the scheduled leader for `header.view`?"
+/// — before paying the signature verification inside `vote()`.
+pub fn proposer_hash(idx: ValidatorIndex) -> Hash {
     let mut bytes = [0u8; 32];
     let idx_bytes = idx.to_le_bytes();
     bytes[0..2].copy_from_slice(&idx_bytes);
@@ -78,6 +82,66 @@ fn proposer_hash(idx: ValidatorIndex) -> Hash {
 /// beyond any reorg-free query horizon, bounded so a long-lived
 /// validator doesn't grow memory without limit.
 const MAX_RETAINED_FINALIZED: usize = 4096;
+
+/// How far behind the current view a wire proposal may lag and
+/// still be admissible (unit: views) — see
+/// [`OxideBft::proposal_admissible`].
+///
+/// Stale-view proposals are unvotable, but in-window ones are worth
+/// authenticating for their bodies: the commit walk needs a QC'd
+/// block's body when the QC arrived first. 10 matches the devnet
+/// pump's historical retention prune. Raising it widens the junk
+/// surface an authenticated-but-faulty peer can occupy; lowering it
+/// shrinks the reorder horizon the commit walk can recover from.
+pub const PROPOSAL_PAST_VIEWS: u64 = 10;
+
+/// How far ahead of the current view a wire proposal may run and
+/// still be admissible (unit: views).
+///
+/// A future-view proposal becomes votable the moment we reach that
+/// view, so keeping it costs one pending slot — with the leader
+/// check and per-`(view, proposer)` dedupe, a driver's pending
+/// buffer is bounded by `PAST + FUTURE + 1` entries, each verified
+/// at most once. 32 covers a validator resyncing through several
+/// consecutive leader timeouts; raising it only enlarges that
+/// worst case.
+pub const PROPOSAL_FUTURE_VIEWS: u64 = 32;
+
+/// Per-sender ceiling on *admissible* proposal frames accepted for
+/// authentication per rolling second (unit: frames per
+/// authenticated peer per second).
+///
+/// The cheap intake gates reject wrong-window and wrong-leader junk
+/// for free, but every *distinct* admissible frame pays one BLS
+/// proposer-signature verify (~1 ms) inside
+/// [`OxideBft::admit_proposal`] — and a Byzantine committee member
+/// can mint distinct forged headers at link rate. Bounding the rate
+/// per *sender* (the handshake-authenticated peer id, so it cannot
+/// be spoofed) means a flood exhausts only the flood's own budget:
+/// the scheduled leader's proposal arrives on a different peer id
+/// and always gets verified.
+///
+/// 50/s is far above honest rates — a leader proposes once per
+/// ~2 s view, and even catch-up bursts are bounded by the
+/// `PAST + FUTURE` window — while capping one flooding peer at ~5%
+/// of a consensus thread. Legitimate bursts beyond the cap are
+/// dropped and re-sent or superseded by later views.
+pub const PROPOSAL_VERIFY_BUDGET_PER_SEC: u32 = 50;
+
+/// Ceiling on memoised proposal rejections (`rejected_headers`).
+///
+/// Unit: entries (32-byte hashes, ~128 KiB at the cap). Origin: the
+/// intake gates in the network drivers bound how many distinct junk
+/// headers can reach `vote()`, but the engine does not rely on every
+/// driver bounding correctly — this cap is the second line. Tradeoff
+/// of changing it: raising it buys more memo coverage under a flood
+/// of *distinct* well-formed junk (each entry saves one BLS verify +
+/// shard-commitment encode per re-delivery); lowering it saves
+/// memory. Eviction is wholesale clear: re-verifying a re-delivered
+/// junk header is safe (the verdict is a pure function of its bytes)
+/// and merely re-adds it, so the cost of a clear is bounded
+/// re-verification, never a wrong verdict.
+const MAX_REJECTED_HEADERS: usize = 4096;
 
 /// A block that has a QC but hasn't been committed yet — waiting for
 /// the 2-chain commit rule to fire.
@@ -462,6 +526,21 @@ pub struct OxideBft {
     /// the earlier verdict. Cleared at epoch rotation: verification
     /// is only defined against the epoch's validator set.
     verified_exec_certs: std::collections::BTreeMap<u64, ExecCertificate>,
+    /// Negative authentication memo: block hashes that failed
+    /// `authenticate_proposal` or the body-commitment check.
+    ///
+    /// A proposal's authenticity is a pure function of its bytes —
+    /// leader schedule, signature, and commitment either verify or
+    /// they don't — so a rejection is permanent and re-delivering
+    /// the same junk must be free. Drivers retry `vote()` for
+    /// proposals whose *eligibility* was merely pending (e.g. the
+    /// bounded attestation wait timed out); without this set every
+    /// retry of an unauthenticatable header re-paid the BLS verify,
+    /// which is exactly the consensus-thread exhaustion a junk-
+    /// proposal flood aims for. Cleared at epoch rotation — the
+    /// verdict was computed against the old committee's leader
+    /// schedule and keys — and capped by [`MAX_REJECTED_HEADERS`].
+    rejected_headers: std::collections::HashSet<Hash>,
     /// The last attestation this validator signed, cached by
     /// `(height, state_root, epoch)`. Execution attestations only
     /// change
@@ -631,6 +710,7 @@ impl OxideBft {
             exec_attest_pool: std::collections::BTreeMap::new(),
             exec_certs: std::collections::BTreeMap::new(),
             verified_exec_certs: std::collections::BTreeMap::new(),
+            rejected_headers: std::collections::HashSet::new(),
             last_attestation: None,
             last_tc: None,
             timeout_signatures: vec![None; n],
@@ -862,6 +942,44 @@ impl OxideBft {
         self.current_view
     }
 
+    /// Cheap inbound gate for network drivers: could this proposal
+    /// ever be worth an authentication pass?
+    ///
+    /// Two pure checks, cheapest first — a junk proposal must be
+    /// droppable before it costs this single-threaded consensus loop
+    /// a BLS verify:
+    ///
+    /// 1. **View window** — `header.view` must lie within
+    ///    `[current − PROPOSAL_PAST_VIEWS, current +
+    ///    PROPOSAL_FUTURE_VIEWS]`. Stale-view proposals can never be
+    ///    voted (`vote_if_eligible` requires `view == current_view`)
+    ///    but in-window ones are still worth authenticating:
+    ///    `vote()` stores the verified body, which the commit walk
+    ///    needs when a QC outran its proposal. Far-future views are
+    ///    unverifiable churn — a peer racing views ahead is dropped
+    ///    here.
+    /// 2. **Scheduled leader** — `header.proposer` must equal
+    ///    [`proposer_hash`] of `validator_set.leader(header.view)` —
+    ///    a 32-byte compare that rejects every non-leader claim
+    ///    before any signature work. `vote()` re-checks this inside
+    ///    `authenticate_proposal` (the engine never trusts the gate
+    ///    for correctness); the gate exists purely to keep junk off
+    ///    the expensive path.
+    ///
+    /// Drivers should pair this with a per-`(view, proposer)` dedupe
+    /// so pending storage stays bounded by the window itself.
+    #[must_use]
+    pub fn proposal_admissible(&self, header: &BlockHeader) -> bool {
+        let current = self.current_view.value();
+        let view = header.view.value();
+        if view < current.saturating_sub(PROPOSAL_PAST_VIEWS)
+            || view > current.saturating_add(PROPOSAL_FUTURE_VIEWS)
+        {
+            return false;
+        }
+        header.proposer == proposer_hash(self.validator_set.leader(header.view))
+    }
+
     /// The highest QC the engine has seen, if any.
     ///
     /// Used by pipelined drivers to check whether the leader for the
@@ -976,6 +1094,22 @@ impl OxideBft {
     #[must_use]
     pub fn stored_block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Whether `block_hash` resolves to a stored, *authenticated*
+    /// proposal — `Awaiting` (header verified, body pending) or
+    /// `Complete` (header + body verified). Entries enter `blocks`
+    /// only through an authenticated or locally-created path, so
+    /// presence is the positive verdict memo.
+    ///
+    /// Drivers use this to disambiguate a `None` vote: a forged
+    /// proposal is rejected into `rejected_headers` (never stored),
+    /// while a not-yet-eligible one is stored — only the latter may
+    /// claim a retry-queue slot, or a forged first delivery would
+    /// park the slot and censor the genuine proposal behind it.
+    #[must_use]
+    pub fn proposal_known(&self, block_hash: &Hash) -> bool {
+        self.blocks.contains_key(block_hash)
     }
 
     /// Returns the number of timeout signatures collected so far for

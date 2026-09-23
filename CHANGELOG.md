@@ -36,7 +36,35 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     reader's blocking poll — we measured the wait. It's a real
     per-peer latency ceiling, far above today's send rates.
 
+### Fixed
+
+- **View changes now recover over real TCP** (`oxide-devnet`): a
+  wire-framing bug in the timeout decoder read both certificate
+  flags before the certificate bytes, so every peer timeout
+  signature failed verification and no timeout certificate could
+  ever form — a single crashed or absent leader stalled the
+  cluster permanently. The decode now matches the wire order, and
+  committees survive absent-member views in ~2 s.
+  - **In plain words:** if a validator went offline on its turn to
+    propose, the devnet used to freeze forever. Now the others
+    vote to skip the dead turn and keep going, as designed.
+
 ### Changed
+
+- **Proposal intake is flood-hardened** (`consensus`,
+  `oxide-devnet`, `devnet`): wire proposals now pass a cheap
+  scheduled-leader + view-window check before any cryptographic
+  work, authenticate exactly once (verdicts are memoised in both
+  directions), and only a *verified* proposal may occupy the
+  pending slot for its `(view, proposer)` — so a Byzantine peer
+  racing junk ahead of the real leader can no longer censor its
+  proposal behind a first-seen dedupe. Pending storage is bounded
+  by the view window.
+  - **In plain words:** an attacker used to be able to make every
+    validator re-verify an endless stream of fake proposals (and
+    could even block the real leader's proposals entirely). Now
+    junk is dropped for free or verified once and remembered —
+    the real proposals always get through.
 
 - **Peer identity is cryptographically proven at connect time**
   (`p2p`, `node`, `crypto`, `oxide-devnet`): the TCP greeting is now

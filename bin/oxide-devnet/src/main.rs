@@ -686,6 +686,27 @@ fn run_consensus_loop(
     // Track proposals received from the network. Followers vote on
     // these proposals; the leader proposes locally.
     let mut pending_proposals: Vec<(types::BlockHeader, types::Proposal)> = Vec::new();
+    // Admitted-proposal dedupe: `(view, proposer)` pairs that
+    // already occupy a pending slot. The key is claimed only by a
+    // *verified* proposal (the intake runs `admit_proposal` before
+    // inserting), so one entry per view is the honest maximum — an
+    // equivocating leader's second signed body for the same view,
+    // or a re-delivered identical header, is dropped here without
+    // re-running any verification.
+    let mut seen_proposals: std::collections::HashSet<(u64, primitives::Hash)> =
+        std::collections::HashSet::new();
+    // Per-sender budget on proposal *authentication attempts*:
+    // `(last window start, frames admitted this second)` per
+    // authenticated peer id. Every distinct admissible frame costs
+    // one BLS verify inside `admit_proposal`; without a per-peer
+    // bound a flooding member would hold the consensus thread in
+    // verification while the real leader's proposal queues behind
+    // the junk in the transport's merged recv queue. The key is the
+    // handshake-proven peer id — a peer cannot spend another's
+    // budget. Committee-sized map: only `allowed_peer_ids` can hold
+    // a connection at all.
+    let mut proposal_verify_budget: std::collections::HashMap<Vec<u8>, (std::time::Instant, u32)> =
+        std::collections::HashMap::new();
     let mut voted_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut proposed_views: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut last_reported_height: u64 = 0;
@@ -803,13 +824,56 @@ fn run_consensus_loop(
                         types::BlockHeader::decode(&mut reader),
                         types::Proposal::decode(&mut reader),
                     ) {
-                        // No watermark update here: this header is
-                        // decoded but unverified. `vote()` learns
-                        // `next_height` inside `authenticate_proposal`
-                        // *after* the leader+signature check, so a
-                        // forged proposal can't poison the height a
-                        // future leader turn would propose at.
-                        pending_proposals.push((header, proposal));
+                        // Intake gate, cheapest check first: a junk
+                        // proposal must be dropped before it ever
+                        // costs this single-threaded loop a BLS
+                        // verify. `proposal_admissible` applies the
+                        // view window (stale/premature churn) and the
+                        // scheduled-leader compare — both pure, no
+                        // crypto. Without this gate a Byzantine peer
+                        // could push unbounded pending entries and
+                        // have `vote()` re-verify all of them on
+                        // every iteration.
+                        let proposal_view = header.view.value();
+                        if !engine.proposal_admissible(&header) {
+                            continue;
+                        }
+                        // Per-sender verify budget before the one
+                        // expensive step: a distinct admissible
+                        // frame costs one BLS verify in
+                        // `admit_proposal`. Charged per frame rather
+                        // than per fresh verify — memo-hit
+                        // redeliveries are cheap enough that the
+                        // accounting stays simple and honest bursts
+                        // (≤1 proposal per view per leader) sit far
+                        // below the cap.
+                        let budget = proposal_verify_budget
+                            .entry(msg.from.clone())
+                            .or_insert((std::time::Instant::now(), 0));
+                        if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
+                            *budget = (std::time::Instant::now(), 0);
+                        }
+                        if budget.1 >= consensus::PROPOSAL_VERIFY_BUDGET_PER_SEC {
+                            continue;
+                        }
+                        budget.1 += 1;
+                        // Authenticate BEFORE the dedupe slot is
+                        // claimed: `header.proposer` is a public
+                        // claim, so junk can pass the leader compare
+                        // while carrying a forged signature. If an
+                        // unverified frame took the (view, proposer)
+                        // key, junk that races ahead of the real
+                        // leader would park it and the genuine
+                        // proposal would be dropped as a "duplicate"
+                        // — the flood becomes censorship. Only a
+                        // verified proposal may occupy the slot;
+                        // `admit_proposal` memoises both verdicts so
+                        // re-deliveries are free.
+                        if engine.admit_proposal(&header, &proposal)
+                            && seen_proposals.insert((proposal_view, header.proposer))
+                        {
+                            pending_proposals.push((header, proposal));
+                        }
                     }
                 }
                 MSG_VOTE => {
@@ -1188,11 +1252,16 @@ fn run_consensus_loop(
             rpc.record_exec_certificates(engine.exec_certificates());
         }
 
-        // Compact pending proposals (keep last 10 views).
+        // Compact proposal bookkeeping (keep last
+        // PROPOSAL_PAST_VIEWS views — the same bound the intake
+        // gate applies, so a set entry and its pending slot age
+        // out together).
         let current_view = engine.current_view().value();
-        pending_proposals.retain(|(h, _)| h.view.value() >= current_view.saturating_sub(10));
-        voted_views.retain(|v| *v >= current_view.saturating_sub(10));
-        proposed_views.retain(|v| *v >= current_view.saturating_sub(10));
+        let keep_from = current_view.saturating_sub(consensus::PROPOSAL_PAST_VIEWS);
+        pending_proposals.retain(|(h, _)| h.view.value() >= keep_from);
+        voted_views.retain(|v| *v >= keep_from);
+        proposed_views.retain(|v| *v >= keep_from);
+        seen_proposals.retain(|(v, _)| *v >= keep_from);
 
         // Epoch boundary: `commit_block` (called from `deliver_qc`
         // inside the drain loop and Phase 4) may have swapped the

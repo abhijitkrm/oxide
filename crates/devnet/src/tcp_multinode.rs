@@ -108,6 +108,10 @@ struct DispatchState<'a> {
     /// committee's `erasure_params` output, identical on every
     /// validator because it derives from the shared stakes.
     shard_k: usize,
+    /// Per-sender proposal-verify budget: `(window start, count)`
+    /// per peer — mirrors the binary pump's bound so harness floods
+    /// see the same admission behavior as the shipped driver.
+    verify_budget: &'a mut HashMap<u8, (std::time::Instant, u32)>,
 }
 
 /// A TCP-based multi-node devnet: N validators running oxideBFT with
@@ -1422,6 +1426,11 @@ impl TcpMultiNodeDevnet {
             types::shard::erasure_params(validator_set.stakes(), validator_set.quorum_stake()).0;
         let mut proposed_views: HashSet<u64> = HashSet::new();
         let mut voted_views: HashSet<u64> = HashSet::new();
+        // Per-sender proposal-verify budget — the same bound the
+        // binary pump applies (`PROPOSAL_VERIFY_BUDGET_PER_SEC`),
+        // keyed by sender index so a flooding peer can only spend
+        // its own quota.
+        let mut verify_budget: HashMap<u8, (std::time::Instant, u32)> = HashMap::new();
         let mut marked_done = false;
         let mut finalized_txs = 0u64;
         let mut counted_blocks = 0usize;
@@ -1458,6 +1467,7 @@ impl TcpMultiNodeDevnet {
                     relays: &mut relays,
                     me: me_u8,
                     shard_k,
+                    verify_budget: &mut verify_budget,
                 };
                 if let Some((v, vote)) =
                     Self::dispatch_inbound(&mut engine, &mut state, from, &msg.bytes, &mut t_commit)
@@ -1485,6 +1495,7 @@ impl TcpMultiNodeDevnet {
                     relays: &mut relays,
                     me: me_u8,
                     shard_k,
+                    verify_budget: &mut verify_budget,
                 };
                 if let Some((v, vote)) =
                     Self::dispatch_inbound(&mut engine, &mut state, from, &bytes, &mut t_commit)
@@ -1779,7 +1790,41 @@ impl TcpMultiNodeDevnet {
             MSG_PROPOSAL => {
                 let header = types::BlockHeader::decode(&mut reader).ok()?;
                 let proposal = types::Proposal::decode(&mut reader).ok()?;
+                // Intake gate before any crypto: outside the view
+                // window or not the scheduled leader — dropped
+                // without spending a verify. `vote()` re-checks
+                // everything properly; this only keeps junk off the
+                // expensive path (the binary pump applies the same
+                // gate at its intake).
+                if !engine.proposal_admissible(&header) {
+                    return None;
+                }
                 let v = header.view.value();
+                // Per-sender verify budget — same bound as the
+                // binary pump: each distinct admissible frame costs
+                // one BLS verify, so a flooding peer can only burn
+                // its own quota; the leader's proposal arrives on a
+                // different peer id and always verifies.
+                let budget =
+                    state.verify_budget.entry(from).or_insert((std::time::Instant::now(), 0));
+                if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
+                    *budget = (std::time::Instant::now(), 0);
+                }
+                if budget.1 >= consensus::PROPOSAL_VERIFY_BUDGET_PER_SEC {
+                    return None;
+                }
+                budget.1 += 1;
+                // Authenticate before the pending slot is claimed —
+                // `vote()` returns None both for a forged proposal
+                // and for a future view, so a rejected junk header
+                // would otherwise be queued here, parking the view's
+                // retry slot and censoring the real proposal when it
+                // arrives. `admit_proposal` verifies once and stores
+                // the body, so `vote()` below hits the memoised
+                // verdict instead of re-paying the BLS check.
+                if !engine.admit_proposal(&header, &proposal) {
+                    return None;
+                }
                 match engine.vote(&header, &proposal) {
                     Some(vote) => Some((v, vote)),
                     // Future view: queue for the retry phase — the
@@ -1805,7 +1850,14 @@ impl TcpMultiNodeDevnet {
             MSG_SHARD => {
                 let header = types::BlockHeader::decode(&mut reader).ok()?;
                 let shard = types::shard::Shard::decode(&mut reader).ok()?;
-                // Commitment check first — cheap (~4 hashes) and does
+                // Window/leader gate first — free compared to even
+                // the shard hash check, and it bounds `shard_sets`
+                // and `pending` to in-window block hashes so a junk
+                // shard flood cannot grow either map unboundedly.
+                if !engine.proposal_admissible(&header) {
+                    return None;
+                }
+                // Commitment check next — cheap (~4 hashes) and does
                 // not depend on header authenticity; garbage shards
                 // are dropped before any BLS work.
                 if !types::shard::verify_shard(&header.body_commitment, &shard) {
@@ -1824,7 +1876,15 @@ impl TcpMultiNodeDevnet {
                     let v = header.view.value();
                     match engine.vote_header(&header) {
                         Some(vote) => Some((v, vote)),
-                        None if v >= engine.current_view().value() => {
+                        // Queue only if the header actually
+                        // authenticated into `blocks` — `vote_header`
+                        // returns None for a forged header too, and
+                        // queuing that would park the view's retry
+                        // slot, censoring the genuine proposal that
+                        // arrives after it.
+                        None if v >= engine.current_view().value()
+                            && engine.proposal_known(&block_hash) =>
+                        {
                             state.pending.entry(v).or_insert(header.clone());
                             None
                         }

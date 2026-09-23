@@ -1334,6 +1334,285 @@ fn vote_rejects_proposal_with_forged_signature() {
     );
 }
 
+/// Regression test: a rejected proposal is memoised — re-delivering
+/// it must not re-run the proposer-signature verify, and its body
+/// must never enter the block store.
+///
+/// The pump retries `vote()` for pending entries every iteration;
+/// without a negative memo each retry re-paid the full
+/// authentication, which is exactly the exhaustion vector a junk-
+/// proposal flood exploits. The verdict is a pure function of the
+/// header bytes, so `rejected_headers` short-circuits repeats.
+#[test]
+fn vote_memoises_rejected_proposal() {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+    let mut follower = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+        .with_secret_key(keys[1].clone());
+
+    let proposal = Proposal { height: Height::new(0), txs: vec![], attestation: None };
+    // Correct leader claim for view 0 but signed by the wrong key —
+    // it passes the cheap intake checks and fails at the BLS verify.
+    let mut header = BlockHeader {
+        height: Height::new(0),
+        view: View::new(0),
+        epoch: Epoch::new(0),
+        prev_block: Hash::ZERO,
+        tx_root: Hash::ZERO,
+        high_qc: None,
+        timeout_cert: None,
+        proposer: proposer_hash(0),
+        timestamp: 0,
+        proposer_signature: None,
+        exec_cert: None,
+        body_commitment: Hash::ZERO,
+    };
+    let forged_sk = bls_key(3);
+    let signing_hash = OxideBft::proposal_signing_hash(&header);
+    header.proposer_signature =
+        Some(forged_sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+
+    let hash = OxideBft::block_hash(&header);
+    assert!(follower.vote(&header, &proposal).is_none());
+    assert!(follower.rejected_headers.contains(&hash), "a failed authentication must be memoised");
+    assert!(
+        !follower.blocks.contains_key(&hash),
+        "a rejected proposal's body must never be stored"
+    );
+    // Re-delivery: same verdict, and — with the memo — no repeat
+    // verify. The memo also covers a mutated body presented under
+    // the same header hash: still the same rejected identity.
+    let mut junk_body = proposal.clone();
+    junk_body.txs.push(TxBytes::new(vec![0xFF]));
+    assert!(follower.vote(&header, &junk_body).is_none());
+    assert!(follower.rejected_headers.contains(&hash));
+}
+
+/// The positive side of the memo: once a proposal's body is stored
+/// `Complete`, a re-delivery skips re-authentication entirely —
+/// including the body-commitment check. A second, equivocating body
+/// under the same header therefore cannot fail the check (it is
+/// never checked) and cannot replace the verified body.
+#[test]
+fn vote_redelivery_uses_stored_body() {
+    let mut leader = make_multi_engine(0);
+    let mut follower = make_multi_engine(1);
+
+    leader.submit_tx(TxBytes::new(vec![0xA0]));
+    let (header, proposal) = leader.propose().expect("leader proposes");
+    let hash = OxideBft::block_hash(&header);
+    assert!(follower.vote(&header, &proposal).is_some(), "first vote lands");
+    assert!(
+        matches!(follower.blocks.get(&hash), Some((_, BlockBody::Complete(_)))),
+        "authenticated body stored"
+    );
+
+    // Equivocation attempt: same header, different body bytes. The
+    // memoised path must skip the commitment re-check (so the hash
+    // must NOT enter rejected_headers) and must not overwrite the
+    // stored body.
+    let mut equivocated = proposal.clone();
+    equivocated.txs.push(TxBytes::new(vec![0xEE]));
+    assert!(follower.vote(&header, &equivocated).is_none());
+    assert!(
+        !follower.rejected_headers.contains(&hash),
+        "memoised re-delivery must not re-run the commitment check"
+    );
+    assert!(
+        matches!(
+            follower.blocks.get(&hash),
+            Some((_, BlockBody::Complete(stored))) if stored.txs.len() == 1
+        ),
+        "the originally verified body must remain stored"
+    );
+}
+
+/// The censorship fix: an authentic header whose first delivered
+/// body fails the commitment check must park as `Awaiting` — not be
+/// memoised as rejected. A corrupting relay cannot sign the header
+/// itself, so a bad body indicts the *delivery*, not the header;
+/// rejecting the header permanently would let one bad body censor
+/// the genuine proposal behind it.
+#[test]
+fn admit_proposal_bad_body_does_not_poison_header() {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+    let mut leader = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+        .with_secret_key(keys[0].clone());
+    let mut follower = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+        .with_secret_key(keys[1].clone());
+
+    leader.submit_tx(TxBytes::new(vec![0xA0]));
+    let (header, proposal) = leader.propose().expect("leader proposes");
+    let hash = OxideBft::block_hash(&header);
+
+    // A relay swaps in a corrupt body: the header is authentic, the
+    // body is not what the commitment covers.
+    let mut bad_body = proposal.clone();
+    bad_body.txs.push(TxBytes::new(vec![0xEE]));
+    assert!(
+        !follower.admit_proposal(&header, &bad_body),
+        "a body that fails the commitment check must not complete"
+    );
+    assert!(
+        matches!(follower.blocks.get(&hash), Some((_, BlockBody::Awaiting))),
+        "the authentic header must be parked Awaiting, not rejected"
+    );
+    assert!(
+        !follower.rejected_headers.contains(&hash),
+        "a bad body must not poison the header's verdict"
+    );
+    assert!(follower.proposal_known(&hash));
+
+    // The genuine body arrives on a second delivery — it completes
+    // the parked header without re-paying authentication.
+    assert!(
+        follower.admit_proposal(&header, &proposal),
+        "the genuine body must still complete the proposal"
+    );
+    assert!(matches!(follower.blocks.get(&hash), Some((_, BlockBody::Complete(_)))));
+}
+
+/// The driver-side dedupe contract: `proposal_known` is the
+/// authenticated check — true for a stored proposal, false for a
+/// forged one that only claimed the leader slot. Drivers must queue
+/// retries only for the former, or a forged first delivery parks
+/// the `(view, proposer)` slot and censors the genuine proposal.
+#[test]
+fn proposal_known_distinguishes_authentic_from_forged() {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+    let mut leader = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 0)
+        .with_secret_key(keys[0].clone());
+    let mut follower = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+        .with_secret_key(keys[1].clone());
+
+    // Forged: right leader claim, wrong signing key.
+    let mut forged = BlockHeader {
+        height: Height::new(0),
+        view: View::new(0),
+        epoch: Epoch::new(0),
+        prev_block: Hash::ZERO,
+        tx_root: Hash::ZERO,
+        high_qc: None,
+        timeout_cert: None,
+        proposer: proposer_hash(0),
+        timestamp: 0,
+        proposer_signature: None,
+        exec_cert: None,
+        body_commitment: Hash::ZERO,
+    };
+    let signing_hash = OxideBft::proposal_signing_hash(&forged);
+    forged.proposer_signature =
+        Some(bls_key(3).sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+    let forged_hash = OxideBft::block_hash(&forged);
+    let junk = Proposal { height: Height::new(0), txs: vec![], attestation: None };
+    assert!(!follower.admit_proposal(&forged, &junk));
+    assert!(!follower.proposal_known(&forged_hash), "a forged proposal must never report known");
+
+    // Authentic: the real leader's proposal.
+    leader.submit_tx(TxBytes::new(vec![0xA0]));
+    let (header, proposal) = leader.propose().expect("leader proposes");
+    let hash = OxideBft::block_hash(&header);
+    assert!(follower.admit_proposal(&header, &proposal));
+    assert!(follower.proposal_known(&hash));
+}
+
+/// The intake gate: `proposal_admissible` accepts only in-window,
+/// scheduled-leader proposals — the two cheap checks a driver must
+/// run before queueing anything for `vote()`.
+#[test]
+fn proposal_admissible_gates_window_and_leader() {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+    let mut voter = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+        .with_secret_key(keys[1].clone());
+    voter.current_view = View::new(50);
+
+    let mk = |view: u64, proposer: ValidatorIndex| BlockHeader {
+        height: Height::new(view),
+        view: View::new(view),
+        epoch: Epoch::new(0),
+        prev_block: Hash::ZERO,
+        tx_root: Hash::ZERO,
+        high_qc: None,
+        timeout_cert: None,
+        proposer: proposer_hash(proposer),
+        timestamp: 0,
+        proposer_signature: None,
+        exec_cert: None,
+        body_commitment: Hash::ZERO,
+    };
+
+    // In-window edges: [50−10, 50+32] = [40, 82] with the correct
+    // scheduled leader for each view.
+    for v in [40, 50, 82] {
+        assert!(
+            voter.proposal_admissible(&mk(v, vs.leader(View::new(v)))),
+            "view {v} by its scheduled leader must be admissible"
+        );
+    }
+    // Just outside the window on both sides.
+    assert!(!voter.proposal_admissible(&mk(39, vs.leader(View::new(39)))));
+    assert!(!voter.proposal_admissible(&mk(83, vs.leader(View::new(83)))));
+    // Right view, wrong claimant — the free rejection that keeps
+    // non-leader junk off the verify path.
+    let wrong = u16::try_from((usize::from(vs.leader(View::new(50))) + 1) % 4).unwrap_or(0);
+    assert!(!voter.proposal_admissible(&mk(50, wrong)));
+    // Far-future view even with its correct leader.
+    assert!(!voter.proposal_admissible(&mk(10_000, vs.leader(View::new(10_000)))));
+}
+
+/// `vote_header` shares the memoisation contract: rejected headers
+/// short-circuit and stored entries skip re-authentication.
+#[test]
+fn vote_header_memoises_rejected_proposal() {
+    let keys: Vec<crypto::BlsSecretKey> = (1..=4u8).map(bls_key).collect();
+    let pks: Vec<crypto::bls::PublicKey> =
+        keys.iter().map(crypto::BlsSecretKey::public_key).collect();
+    let vs = ValidatorSet::new(pks, vec![1u64; 4]).expect("4 validators");
+
+    let mut follower = OxideBft::with_index(Arc::new(MockApp::new()), vs.clone(), 1)
+        .with_secret_key(keys[1].clone());
+
+    let mut header = BlockHeader {
+        height: Height::new(0),
+        view: View::new(0),
+        epoch: Epoch::new(0),
+        prev_block: Hash::ZERO,
+        tx_root: Hash::ZERO,
+        high_qc: None,
+        timeout_cert: None,
+        proposer: proposer_hash(0),
+        timestamp: 0,
+        proposer_signature: None,
+        exec_cert: None,
+        body_commitment: Hash::ZERO,
+    };
+    let signing_hash = OxideBft::proposal_signing_hash(&header);
+    header.proposer_signature =
+        Some(bls_key(3).sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+
+    let hash = OxideBft::block_hash(&header);
+    assert!(follower.vote_header(&header).is_none());
+    assert!(follower.rejected_headers.contains(&hash));
+    assert!(!follower.blocks.contains_key(&hash));
+    // Repeat delivery — memoised, still refused.
+    assert!(follower.vote_header(&header).is_none());
+}
+
 /// A single forged vote must not stall the view.
 ///
 /// `collect_vote` stores the first vote per validator *without*

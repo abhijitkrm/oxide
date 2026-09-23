@@ -44,7 +44,80 @@ impl OxideBft {
     /// BLS secret key is set (stage 5), the vote is signed with real
     /// BLS; otherwise `Signature::ZERO` is used (conformance mode).
     pub fn vote(&mut self, header: &BlockHeader, proposal: &Proposal) -> Option<Vote> {
-        let block_hash = self.authenticate_proposal(header)?;
+        // Authentication memoisation: a proposal's authenticity is a
+        // pure function of its bytes, so re-deliveries must not
+        // re-pay the proposer BLS verify + shard-commitment encode.
+        // `admit_proposal` owns the verdict stores:
+        //  - `rejected_headers` — the header failed authentication.
+        //    Permanent: reject without work.
+        //  - `blocks[hash]` as `Complete` — only a header+body that
+        //    cleared both checks ever lands there, so its presence
+        //    IS the positive memo; skip straight to eligibility with
+        //    the *stored* body (the verified one — a re-delivered
+        //    equivocating body must not reach `process_proposal`).
+        // Without this, every pump iteration re-verified every
+        // pending proposal — one Byzantine peer could keep the whole
+        // consensus thread inside BLS verification (proposal-flood
+        // exhaustion).
+        let block_hash = Self::block_hash(header);
+        if !self.admit_proposal(header, proposal) {
+            return None;
+        }
+        let stored = match self.blocks.get(&block_hash) {
+            Some((_, BlockBody::Complete(stored))) => stored.clone(),
+            _ => return None,
+        };
+        self.vote_if_eligible(header, block_hash, Some(&stored))
+    }
+
+    /// Authenticate a proposal and store it for later voting — the
+    /// intake half of [`OxideBft::vote`], split out so a network
+    /// driver can verify a wire proposal *before* letting it claim a
+    /// pending slot. Returns `true` iff the block now sits in
+    /// `self.blocks` as `Complete` (stored by this call or an
+    /// earlier one).
+    ///
+    /// Why drivers must call this before dedupe: `header.proposer`
+    /// is a *claim* — `proposer_hash` is a public function of the
+    /// validator index, so a Byzantine peer can mint frames that pass
+    /// the cheap leader-compare while carrying a forged signature.
+    /// If a `(view, proposer)` dedupe slot is claimed on the claim
+    /// alone, junk that races ahead of the real leader parks the key
+    /// and the genuine proposal is dropped as a "duplicate" — the
+    /// flood becomes censorship. Only a *verified* proposal may
+    /// occupy the slot.
+    ///
+    /// Storage semantics:
+    ///  - authentication failure → `rejected_headers` memo, nothing
+    ///    stored (the header itself is forged — permanently junk).
+    ///  - authentic header + body that fails the commitment check →
+    ///    the header is parked `Awaiting`: the signature is real, so
+    ///    the failure indicts the *relay's body*, not the header —
+    ///    memoising the header here would let a corrupting relay
+    ///    censor a genuine leader proposal. A later delivery with
+    ///    the correct body upgrades it to `Complete` without
+    ///    re-verifying the signature.
+    ///  - authentic header + commitment-matching body → `Complete`.
+    pub fn admit_proposal(&mut self, header: &BlockHeader, proposal: &Proposal) -> bool {
+        let block_hash = Self::block_hash(header);
+        if self.rejected_headers.contains(&block_hash) {
+            return false;
+        }
+        if let Some((_, BlockBody::Complete(_))) = self.blocks.get(&block_hash) {
+            return true;
+        }
+        if !self.blocks.contains_key(&block_hash) {
+            if self.authenticate_proposal(header).is_none() {
+                self.reject_header(block_hash);
+                return false;
+            }
+            // Park the verified header (`Awaiting`) before the body
+            // check: the signature is paid once no matter how many
+            // bad bodies a relay attaches, and the dispersed-
+            // broadcast path already treats `Awaiting` as the
+            // "header verified, body pending" state.
+            self.blocks.insert(block_hash, (header.clone(), BlockBody::Awaiting));
+        }
         // Body↔commitment binding: the leader signed a shard
         // commitment into the header — the body it shipped must hash
         // to it. Without this check a byzantine leader could attach
@@ -61,7 +134,7 @@ impl OxideBft {
             if types::shard::commitment(&buf, self.validator_set.n(), self.erasure_k())
                 != header.body_commitment
             {
-                return None;
+                return false;
             }
         }
         // Store the authenticated block body BEFORE the vote-
@@ -78,7 +151,7 @@ impl OxideBft {
         // eligibility — the deciding factor for *commit* order is the
         // QC chain, not local vote timing.
         self.blocks.insert(block_hash, (header.clone(), BlockBody::Complete(proposal.clone())));
-        self.vote_if_eligible(header, block_hash, Some(proposal))
+        true
     }
 
     /// Validator: vote on a block *header* alone — the dispersed-
@@ -93,11 +166,42 @@ impl OxideBft {
     /// (parentage, QC-chain walk) work exactly as with a complete
     /// body — commit still defers until the body lands.
     pub fn vote_header(&mut self, header: &BlockHeader) -> Option<Vote> {
-        let block_hash = self.authenticate_proposal(header)?;
-        // Insert only when vacant: a `Complete` body already stored
-        // must never be downgraded to `Awaiting`.
-        self.blocks.entry(block_hash).or_insert_with(|| (header.clone(), BlockBody::Awaiting));
+        // Same memoisation contract as `vote()`: a stored entry —
+        // `Awaiting` or `Complete` — exists only for an authenticated
+        // header, and `rejected_headers` covers the negative verdict.
+        let block_hash = Self::block_hash(header);
+        if self.rejected_headers.contains(&block_hash) {
+            return None;
+        }
+        if !self.blocks.contains_key(&block_hash) {
+            if self.authenticate_proposal(header).is_none() {
+                self.reject_header(block_hash);
+                return None;
+            }
+            // Insert only when vacant: a `Complete` body already
+            // stored must never be downgraded to `Awaiting`.
+            self.blocks.entry(block_hash).or_insert_with(|| (header.clone(), BlockBody::Awaiting));
+        }
         self.vote_if_eligible(header, block_hash, None)
+    }
+
+    /// Memoise a permanent proposal rejection. Both failure modes
+    /// covered by the callers are pure functions of the header bytes
+    /// (authentication: schedule + signature; commitment: body hash
+    /// vs signed commitment), so the verdict survives for the
+    /// process epoch — it is cleared at rotation alongside the other
+    /// committee-bound verdict caches.
+    ///
+    /// Capacity is bounded by `MAX_REJECTED_HEADERS`; on overflow the
+    /// set is cleared wholesale rather than evicting selectively —
+    /// the worst case is re-verifying junk that floods back in, and
+    /// the intake dedupe in the network drivers makes a genuine
+    /// flood of *distinct* headers the only way to fill it.
+    fn reject_header(&mut self, block_hash: Hash) {
+        if self.rejected_headers.len() >= super::MAX_REJECTED_HEADERS {
+            self.rejected_headers.clear();
+        }
+        self.rejected_headers.insert(block_hash);
     }
 
     /// Shared proposal authentication for both vote paths: sanity

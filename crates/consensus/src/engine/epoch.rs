@@ -88,6 +88,12 @@ impl OxideBft {
         self.exec_attest_pool.clear();
         self.exec_certs.clear();
         self.verified_exec_certs.clear();
+        // Rejection memos were computed against the old committee's
+        // leader schedule and keys — a header correctly refused under
+        // epoch N could be authentic under N+1 (rotated-in leader's
+        // first proposal), so the set must not outlive the set it
+        // judged against.
+        self.rejected_headers.clear();
         // Persist the cleared locks: a crash between rotation and the
         // next vote would otherwise restore the old epoch's locks
         // from the WAL and wedge the new epoch's first heights (the
