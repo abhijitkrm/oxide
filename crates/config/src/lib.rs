@@ -158,12 +158,21 @@ impl Config {
     /// Tests can call it manually after [`from_toml_str`](Self::from_toml_str)
     /// to verify env var override behavior.
     pub fn apply_env_vars(&mut self) {
-        self.network.apply_env_vars();
-        self.consensus.apply_env_vars();
-        self.executor.apply_env_vars();
-        self.storage.apply_env_vars();
-        self.genesis.apply_env_vars();
-        self.exchange.apply_env_vars();
+        self.apply_env(&|k| env::var(k).ok());
+    }
+
+    /// Apply overrides from an arbitrary lookup instead of the
+    /// process environment. `env::set_var` is unsafe in edition 2024
+    /// — mutating the environment races with every other thread's
+    /// `getenv` — so tests inject their values through this seam
+    /// rather than touching `std::env`.
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        self.network.apply_env(get);
+        self.consensus.apply_env(get);
+        self.executor.apply_env(get);
+        self.storage.apply_env(get);
+        self.genesis.apply_env(get);
+        self.exchange.apply_env(get);
     }
 }
 
@@ -243,25 +252,25 @@ impl NetworkConfig {
         Duration::from_secs(self.read_timeout_secs)
     }
 
-    /// Apply env var overrides.
-    fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_NETWORK_LISTEN_ADDR") {
+    /// Apply overrides from `get` (the process env in production).
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(v) = get("OXIDE_NETWORK_LISTEN_ADDR") {
             self.listen_addr = v;
         }
-        if let Ok(v) = env::var("OXIDE_NETWORK_PEERS") {
+        if let Some(v) = get("OXIDE_NETWORK_PEERS") {
             self.peers = v.split(',').map(|s| s.trim().to_string()).collect();
         }
-        if let Ok(v) = env::var("OXIDE_NETWORK_CONNECT_TIMEOUT_SECS")
+        if let Some(v) = get("OXIDE_NETWORK_CONNECT_TIMEOUT_SECS")
             && let Ok(secs) = v.parse()
         {
             self.connect_timeout_secs = secs;
         }
-        if let Ok(v) = env::var("OXIDE_NETWORK_READ_TIMEOUT_SECS")
+        if let Some(v) = get("OXIDE_NETWORK_READ_TIMEOUT_SECS")
             && let Ok(secs) = v.parse()
         {
             self.read_timeout_secs = secs;
         }
-        if let Ok(v) = env::var("OXIDE_NETWORK_MAX_MESSAGE_BYTES")
+        if let Some(v) = get("OXIDE_NETWORK_MAX_MESSAGE_BYTES")
             && let Ok(bytes) = v.parse()
         {
             self.max_message_bytes = bytes;
@@ -360,29 +369,29 @@ impl Default for ConsensusConfig {
 }
 
 impl ConsensusConfig {
-    /// Apply env var overrides.
-    fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_ENGINE")
+    /// Apply overrides from `get` (the process env in production).
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(v) = get("OXIDE_CONSENSUS_ENGINE")
             && let Some(engine) = ConsensusEngineKind::parse(&v)
         {
             self.engine = engine;
         }
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_BASE_TIMEOUT_MS")
+        if let Some(v) = get("OXIDE_CONSENSUS_BASE_TIMEOUT_MS")
             && let Ok(ms) = v.parse()
         {
             self.base_timeout_ms = ms;
         }
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_TIMEOUT_MS")
+        if let Some(v) = get("OXIDE_CONSENSUS_MAX_TIMEOUT_MS")
             && let Ok(ms) = v.parse()
         {
             self.max_timeout_ms = ms;
         }
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_BLOCK_BYTES")
+        if let Some(v) = get("OXIDE_CONSENSUS_MAX_BLOCK_BYTES")
             && let Ok(bytes) = v.parse()
         {
             self.max_block_bytes = bytes;
         }
-        if let Ok(v) = env::var("OXIDE_CONSENSUS_MAX_BLOCK_GAS")
+        if let Some(v) = get("OXIDE_CONSENSUS_MAX_BLOCK_GAS")
             && let Ok(gas) = v.parse()
         {
             self.max_block_gas = gas;
@@ -453,24 +462,24 @@ impl Default for ExecutorConfig {
 }
 
 impl ExecutorConfig {
-    /// Apply env var overrides.
-    fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_EXECUTOR_MAX_MEMPOOL_ENTRIES")
+    /// Apply overrides from `get` (the process env in production).
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(v) = get("OXIDE_EXECUTOR_MAX_MEMPOOL_ENTRIES")
             && let Ok(n) = v.parse()
         {
             self.max_mempool_entries = n;
         }
-        if let Ok(v) = env::var("OXIDE_EXECUTOR_PARALLEL_THRESHOLD")
+        if let Some(v) = get("OXIDE_EXECUTOR_PARALLEL_THRESHOLD")
             && let Ok(n) = v.parse()
         {
             self.parallel_threshold = n;
         }
-        if let Ok(v) = env::var("OXIDE_EXECUTOR_MIN_FEE")
+        if let Some(v) = get("OXIDE_EXECUTOR_MIN_FEE")
             && let Ok(n) = v.parse()
         {
             self.min_fee = n;
         }
-        if let Ok(v) = env::var("OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS") {
+        if let Some(v) = get("OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS") {
             self.allow_unsigned_txs = matches!(v.as_str(), "1" | "true" | "yes");
         }
     }
@@ -534,22 +543,22 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
-    /// Apply env var overrides.
-    fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_JOURNAL_RETAIN_SEGMENTS")
+    /// Apply overrides from `get` (the process env in production).
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(v) = get("OXIDE_JOURNAL_RETAIN_SEGMENTS")
             && let Ok(n) = v.parse()
         {
             self.journal_retain_segments = n;
         }
-        if let Ok(v) = env::var("OXIDE_HISTORY_RETENTION")
+        if let Some(v) = get("OXIDE_HISTORY_RETENTION")
             && let Ok(n) = v.parse()
         {
             self.history_retention = n;
         }
-        if let Ok(v) = env::var("OXIDE_ARCHIVE") {
+        if let Some(v) = get("OXIDE_ARCHIVE") {
             self.archive = matches!(v.as_str(), "1" | "true" | "yes");
         }
-        if let Ok(v) = env::var("OXIDE_STORAGE_DATA_DIR") {
+        if let Some(v) = get("OXIDE_STORAGE_DATA_DIR") {
             self.data_dir = Some(PathBuf::from(v));
         }
     }
@@ -573,9 +582,9 @@ pub struct ExchangeConfig {
 }
 
 impl ExchangeConfig {
-    /// Apply env var overrides.
-    fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR") {
+    /// Apply overrides from `get` (the process env in production).
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(v) = get("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR") {
             self.settlement_operator = if v.is_empty() { None } else { Some(v) };
         }
     }
@@ -637,24 +646,24 @@ impl Default for GenesisConfig {
 }
 
 impl GenesisConfig {
-    /// Apply env var overrides.
-    fn apply_env_vars(&mut self) {
-        if let Ok(v) = env::var("OXIDE_GENESIS_BALANCE")
+    /// Apply overrides from `get` (the process env in production).
+    fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) {
+        if let Some(v) = get("OXIDE_GENESIS_BALANCE")
             && let Ok(b) = v.parse()
         {
             self.genesis_balance = b;
         }
-        if let Ok(v) = env::var("OXIDE_GENESIS_NUM_PREFUNDED_SENDERS")
+        if let Some(v) = get("OXIDE_GENESIS_NUM_PREFUNDED_SENDERS")
             && let Ok(n) = v.parse()
         {
             self.num_prefunded_senders = n;
         }
-        if let Ok(v) = env::var("OXIDE_GENESIS_NUM_VALIDATORS")
+        if let Some(v) = get("OXIDE_GENESIS_NUM_VALIDATORS")
             && let Ok(n) = v.parse()
         {
             self.num_validators = n;
         }
-        if let Ok(v) = env::var("OXIDE_GENESIS_BASE_PORT")
+        if let Some(v) = get("OXIDE_GENESIS_BASE_PORT")
             && let Ok(p) = v.parse()
         {
             self.base_port = p;
@@ -687,7 +696,6 @@ impl std::error::Error for ConfigError {}
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
@@ -771,33 +779,31 @@ engine = "oxidebft"
     }
 
     /// Env vars override TOML values.
+    ///
+    /// The override seam takes an injected lookup so this test never
+    /// mutates the process environment: `env::set_var` is unsafe in
+    /// edition 2024 because it races with every other thread's
+    /// `getenv`, and the cargo harness is multithreaded.
     #[test]
     fn env_vars_override_toml() {
-        // Set env vars. SAFETY: `set_var` is unsafe in Rust 2024
-        // because it can cause data races in multi-threaded tests,
-        // but this test is single-threaded and the env vars are
-        // cleaned up at the end.
-        unsafe {
-            env::set_var("OXIDE_NETWORK_LISTEN_ADDR", "0.0.0.0:9999");
-            env::set_var("OXIDE_EXECUTOR_PARALLEL_THRESHOLD", "500");
-        }
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OXIDE_NETWORK_LISTEN_ADDR" => Some("0.0.0.0:9999".to_string()),
+                "OXIDE_EXECUTOR_PARALLEL_THRESHOLD" => Some("500".to_string()),
+                _ => None,
+            }
+        };
 
         let toml_str = r#"
 [network]
 listen_addr = "127.0.0.1:20000"
 "#;
         let mut config = Config::from_toml_str(toml_str).expect("parse");
-        config.apply_env_vars();
+        config.apply_env(&env);
 
         // Env var overrides TOML.
         assert_eq!(config.network.listen_addr, "0.0.0.0:9999");
         assert_eq!(config.executor.parallel_threshold, 500);
-
-        // Clean up.
-        unsafe {
-            env::remove_var("OXIDE_NETWORK_LISTEN_ADDR");
-            env::remove_var("OXIDE_EXECUTOR_PARALLEL_THRESHOLD");
-        }
     }
 
     /// `ConsensusEngineKind` parses correctly.
@@ -845,22 +851,22 @@ settlement_operator = "0xoperator"
     }
 
     /// Env vars override the fee policy, storage, and exchange
-    /// fields — including the empty-operator clear. One test for all
-    /// of them: `set_var`/`remove_var` are process-global, so two
-    /// tests touching `OXIDE_EXCHANGE_SETTLEMENT_OPERATOR` on
-    /// parallel threads would race each other.
+    /// fields — including the empty-operator clear. Injected through
+    /// `apply_env` so nothing touches the process environment (see
+    /// `env_vars_override_toml` for why that matters).
     #[test]
     fn env_vars_override_fee_storage_exchange() {
-        // SAFETY: the env mutations are serialized inside this one
-        // test body; vars are cleaned up before it returns.
-        unsafe {
-            env::set_var("OXIDE_EXECUTOR_MIN_FEE", "42");
-            env::set_var("OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS", "true");
-            env::set_var("OXIDE_STORAGE_DATA_DIR", "/tmp/oxide-data");
-            env::set_var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR", "0xop");
-        }
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OXIDE_EXECUTOR_MIN_FEE" => Some("42".to_string()),
+                "OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS" => Some("true".to_string()),
+                "OXIDE_STORAGE_DATA_DIR" => Some("/tmp/oxide-data".to_string()),
+                "OXIDE_EXCHANGE_SETTLEMENT_OPERATOR" => Some("0xop".to_string()),
+                _ => None,
+            }
+        };
         let mut config = Config::default();
-        config.apply_env_vars();
+        config.apply_env(&env);
         assert_eq!(config.executor.min_fee, 42);
         assert!(config.executor.allow_unsigned_txs);
         assert_eq!(
@@ -870,18 +876,11 @@ settlement_operator = "0xoperator"
         assert_eq!(config.exchange.settlement_operator.as_deref(), Some("0xop"));
 
         // An empty operator value clears the setting.
-        unsafe {
-            env::set_var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR", "");
-        }
+        let env = |k: &str| -> Option<String> {
+            if k == "OXIDE_EXCHANGE_SETTLEMENT_OPERATOR" { Some(String::new()) } else { None }
+        };
         let mut config = Config::default();
-        config.apply_env_vars();
+        config.apply_env(&env);
         assert_eq!(config.exchange.settlement_operator, None);
-
-        unsafe {
-            env::remove_var("OXIDE_EXECUTOR_MIN_FEE");
-            env::remove_var("OXIDE_EXECUTOR_ALLOW_UNSIGNED_TXS");
-            env::remove_var("OXIDE_STORAGE_DATA_DIR");
-            env::remove_var("OXIDE_EXCHANGE_SETTLEMENT_OPERATOR");
-        }
     }
 }

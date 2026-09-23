@@ -19837,3 +19837,43 @@ bucket spill and fund-shortfall-bad-debt tests, and a
 `gas_price = u128::MAX` legacy-tx differential proving the
 fast path's deferral matches revm's rejection state root.
 
+
+## Session N+27 — hygiene sweep: env-UB test, pump pre-verification mutation, doc drift
+
+Four low-severity audit items closed in one pass:
+
+- **Unsafe env mutation in tests (config):** two config tests
+  mutated the process environment under `unsafe { env::set_var }`
+  with a "single-threaded" SAFETY claim — cargo runs tests
+  multithreaded, so the mutations raced every other thread's
+  `getenv`. `Config::apply_env_vars` now delegates to a private
+  `apply_env(&dyn Fn(&str) -> Option<String>)`; each section method
+  takes the lookup, and the tests inject a closure instead of
+  touching `std::env`. The `#[allow(unsafe_code)]` on the test mod
+  is gone — the crate is again unsafe-free.
+- **Pre-verification watermark mutation (devnet pump):** the
+  `MSG_PROPOSAL` handler called `observe_block_height` on a decoded-
+  but-unverified header — unauthenticated input mutating engine
+  state. The call is removed: `vote()` already updates the
+  watermark inside `authenticate_proposal`, *after* the
+  leader-and-signature check, so verified proposals still sync
+  `next_height` and forged ones can't.
+- **`oxide-validator` help drift:** the FLAGS list advertised
+  devnet-only flags the run path ignores (`--num-nodes`,
+  `--base-port`, `--peer-host*`, `--bind-host`, `--bls-key-file`,
+  `--tls-dir`). Help now lists only what run mode consumes and
+  points multi-node flags at `oxide-devnet`.
+- **Documentation drift:** `production-readiness.md` Gate 1
+  re-opened — `admission.rs`/`with_admission` exist but no binary
+  enables admission (H1–H3 open); the restart claim now says
+  recovery resumes from the last finalized height (catch-up needs
+  the open block-sync item); the persistence bullet reflects the
+  real journal+snapshot+WAL contract plus the unbounded-WAL gap.
+  README's throughput row marks 2.5 GG/s as a single-node
+  microbenchmark, not sustained network throughput.
+  `config/mainnet.toml`'s usage line admits the validator binary
+  ignores `[network]` today. The release `panic = "unwind"`
+  comment no longer claims panics are caught at actor boundaries
+  (no `catch_unwind` exists — actor supervision is tracked).
+
+Gates: `cargo test -p config -p devnet` green, fmt + clippy clean.

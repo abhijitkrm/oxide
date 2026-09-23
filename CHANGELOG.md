@@ -1395,6 +1395,24 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Misleading operator-facing surfaces** (`oxide-validator`,
+  `docs/production-readiness.md`, `README.md`, `config/mainnet.toml`,
+  `crates/config`, `bin/oxide-devnet`): `oxide-validator help` no
+  longer lists devnet-only flags the run path ignores; the
+  production-readiness checklist re-opens the networking gate
+  (admission control exists but no binary enables it) and the
+  persistence item now reflects the real journal+snapshot+WAL crash
+  contract; README marks the 2.5 GG/s figure a single-node
+  microbenchmark; `mainnet.toml` admits `[network]` is not yet
+  consumed. Also fixed: two config tests mutated the process
+  environment under a false "single-threaded" claim (now injected
+  through a lookup seam), and the devnet pump no longer feeds an
+  unverified proposal's height into the engine's proposer watermark
+  (verified proposals still update it inside authentication).
+  - **In plain words:** documentation and help text now match what
+    the binaries actually do, and the test suite no longer contains
+    unsafe environment mutation.
+
 - **Release builds could silently wrap financial arithmetic**
   (workspace `Cargo.toml`, `modules/{staking,perps,exchange,evm}`):
   `overflow-checks` was off in the release profile, so a broken

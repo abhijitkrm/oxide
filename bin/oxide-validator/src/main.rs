@@ -388,17 +388,10 @@ fn print_help() {
     println!("    version      Print version information");
     println!("    help         Print this help message");
     println!();
-    println!("FLAGS:");
+    println!("FLAGS (run mode — this binary runs a single node):");
     println!("    --config <path>          Load config from TOML file");
     println!("    --engine <kind>           Consensus engine (sequencer|oxidebft)");
-    println!("    --num-nodes <N>           Total devnet nodes");
-    println!("    --base-port <port>        Base TCP port for devnet");
-    println!("    --bind-host <host>        Host to bind on (default 127.0.0.1)");
-    println!("    --peer-host <host>        Peer host (default 127.0.0.1)");
-    println!("    --peer-host-template <f>  Peer host template with {{i}} (e.g. validator-{{i}})");
     println!("    --genesis-file <path>     Load genesis.json (validator set + balances)");
-    println!("    --bls-key-file <path>     BLS secret key file (hex or raw 32 bytes)");
-    println!("    --tls-dir <dir>           TLS directory (cert.pem, key.pem, peer-{{i}}.pem)");
     println!("    --wal-file <path>         Consensus WAL file path");
     println!("    --data-dir <dir>          Persistent data dir (auto snapshot on shutdown)");
     println!("    --rpc-listen <addr>       RPC listen address (default: from config)");
@@ -407,6 +400,10 @@ fn print_help() {
     println!("    --submit-key-change <hex> Submit a BLS key-change transaction (new secret key)");
     println!("    --unsafe-allow-unsigned-txs");
     println!("                            UNSAFE dev mode: admit unsigned native txs");
+    println!();
+    println!("    Multi-node flags (--num-nodes, --base-port, --bind-host,");
+    println!("    --peer-host*, --bls-key-file, --tls-dir) belong to the");
+    println!("    oxide-devnet binary — passing them here has no effect.");
     println!(
         "                            (unauthenticated sender). Refused on non-loopback binds."
     );

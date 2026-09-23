@@ -44,14 +44,15 @@ authenticated, encrypted transport with admission control.
 
 ### Status
 
-- `[x]` Complete (2025-01-30). TLS transport already existed
-      (`with_tls` constructor). Added `admission.rs` — unified
-      admission control combining reputation checks, connection
-      caps, and rate limiting. Wired into `TcpTransport` via
-      `with_admission` constructor: accept thread checks
-      `admit_connection` (banned peers + cap), `recv()` checks
-      `admit_message` (rate limit + ban). 11 admission unit tests +
-      4 TCP integration tests. Full workspace clippy + test clean.
+- `[~]` Re-opened (2026-09). The 2025-01-30 completion claim was
+      premature: `admission.rs` exists and `TcpTransport` supports
+      `with_admission`, but **no shipped binary constructs a
+      transport with admission enabled** — the plumbing stops at
+      the constructor. The follow-up audit also found the accept
+      loop stalls on an idle pre-authentication connection and
+      that plaintext peer identity is spoofable. TLS exists;
+      admission wiring, accept-loop hardening, and authenticated
+      peer identity remain open (audit `docs/audit002.md` H1–H3).
 
 ---
 
@@ -387,8 +388,12 @@ All remaining deployment blockers resolved:
 
 **Verified:** 4-node mTLS testnet with `--genesis-file` + `--wal-file`
 + `--data-dir` + `--tls-dir` + `--rpc-listen` finalizes consistently.
-SIGTERM → graceful shutdown → snapshot exported. Restart → snapshot
-imported → catches up. `/validator-set` returns current set.
+SIGTERM → graceful shutdown → snapshot exported. Restart → durable
+state (snapshot + executor journal + consensus WAL) recovered →
+finalization resumes from the last committed height. A node that was
+down while the network finalized further blocks cannot catch up —
+there is no block-sync protocol yet (open item).
+`/validator-set` returns current set.
 
 **Remaining blockers:**
 
@@ -409,10 +414,13 @@ imported → catches up. `/validator-set` returns current set.
    Full-node peer discovery (bootstrap nodes, DHT) is a separate
    concern for `oxide-fullnode`.
 5. ~~Persistent storage backend (in-memory journal)~~ — **resolved
-   via snapshot persistence.** `--data-dir` auto-exports on shutdown
-   and auto-imports on startup. The WAL protects consensus safety
-   state. A write-through `StorageBackend` for all modules (not just
-   EVM) is a future optimization, not a production blocker.
+   via crash-durable state.** `--data-dir` persists the executor
+   journal, atomic snapshots, and the consensus WAL; a restart —
+   including a `kill -9` — replays to the last finalized height and
+   resumes there. Remaining gaps: the consensus WAL grows without
+   bound (segmentation + checkpointing open), and blocks finalized
+   while a node is down cannot be fetched without block sync (open
+   item).
 6. ~~Governance validator set changes~~ — **resolved.** `VALIDATOR_ADD`
    and `VALIDATOR_REMOVE` message types with governance-by-committee
    validation and epoch-boundary application.

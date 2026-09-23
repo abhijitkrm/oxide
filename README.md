@@ -30,7 +30,7 @@ thesis is that you do not have to choose:
 | Consensus | oxideBFT — pipelined 2-chain HotStuff (Jolteon/DiemBFT/MonadBFT lineage), tail-fork resistant | MonadBFT 600ms finality; HyperBFT (Hyperliquid) |
 | Block cadence | 50–100ms | Hyperliquid ~70ms; Monad 300ms |
 | Full finality | 2 views ≈ 150–250ms (optimistic 1-view ≈ 75–125ms) | Hyperliquid median e2e ~200ms |
-| EVM throughput | 1–5 gigagas/s sustained (16–32 core validators) — **~2.5 GG/s measured on 8-core M1** (real revm, parallel); the 12.96 figure quoted earlier was a scheduler simulation | Sei Giga 5 GG/s (devnet); reth+BAL experiments 10 GG/s ceiling |
+| EVM throughput | 1–5 gigagas/s sustained (16–32 core validators) — **~2.5 GG/s measured in a single-node microbenchmark on an 8-core M1** (real revm, parallel executor, signed 21k-gas transfers — not a sustained network measurement); the 12.96 figure quoted earlier was a scheduler simulation | Sei Giga 5 GG/s (devnet); reth+BAL experiments 10 GG/s ceiling |
 | EVM compatibility | Full equivalence via revm: JSON-RPC, EIP-1559, MetaMask/Foundry/Blockscout | cosmos-evm `x/vm` (Go) |
 | Matching engine | ≥5M ops/s single-core (engine-only), ≥1M orders/s chain-wide, p50 < 200ns per order op | C++ engines ~10–160ns; Hyperliquid 200k orders/s chain-wide |
 | Order flow | Fully on-chain signed orders (no operator trust, no private order flow) | Hyperliquid model |

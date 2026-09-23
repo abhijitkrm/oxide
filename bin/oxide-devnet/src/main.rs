@@ -744,14 +744,12 @@ fn run_consensus_loop(
                         types::BlockHeader::decode(&mut reader),
                         types::Proposal::decode(&mut reader),
                     ) {
-                        // Sync our next_height from the proposal's
-                        // height. Without this, a follower that
-                        // becomes the leader after a view change
-                        // would propose at a stale height,
-                        // re-executing an already-finalized height
-                        // with different transactions and corrupting
-                        // chain state.
-                        engine.observe_block_height(header.height);
+                        // No watermark update here: this header is
+                        // decoded but unverified. `vote()` learns
+                        // `next_height` inside `authenticate_proposal`
+                        // *after* the leader+signature check, so a
+                        // forged proposal can't poison the height a
+                        // future leader turn would propose at.
                         pending_proposals.push((header, proposal));
                     }
                 }
@@ -1077,10 +1075,11 @@ fn run_consensus_loop(
             }
         }
 
-        // Height sync is now handled inline when proposals are
-        // received (MSG_PROPOSAL handler calls observe_block_height).
-        // The previous self-sync (sync_next_height(next_height_value))
-        // was a no-op — it synced the engine to its own value.
+        // Height sync is handled inside `vote()` — `authenticate_
+        // proposal` calls `observe_block_height` once the header's
+        // leader and signature check out. The previous self-sync
+        // (sync_next_height(next_height_value)) was a no-op — it
+        // synced the engine to its own value.
 
         // Report finalized height changes.
         let height = engine.finalized_height();
