@@ -57,6 +57,7 @@ use primitives::fixed::{Price, Qty};
 
 pub mod cli;
 pub mod devnet;
+pub mod peer_auth;
 pub mod rpc_adapters;
 
 /// The consensus engine selection.

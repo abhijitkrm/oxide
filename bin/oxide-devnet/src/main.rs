@@ -233,16 +233,31 @@ fn run_node(node_index_str: &str) {
         println!("oxide-devnet[{node_index}]: WAL loaded from {}", wal_path.display());
     }
 
+    // Shared validator set — created before the transport so the
+    // handshake authenticator and the RPC provider both read the
+    // same live committee. The consensus loop writes the rotated
+    // set at each epoch boundary; readers always see the current
+    // keys.
+    let shared_validator_set = Arc::new(std::sync::RwLock::new(validator_set.clone()));
+
     // Create the TCP transport: --tls-dir for mTLS, plain TCP
     // otherwise. `[network]` timeouts and the frame bound flow into
-    // `TcpTransportConfig`.
-    let mut transport = build_transport(&listen_addr, node_index, peers, &cfg.network);
+    // `TcpTransportConfig`. Peer IDs are cryptographically bound to
+    // committee keys via the signed greeting (`BlsPeerAuth`) — a
+    // self-claimed ID can neither join nor displace a live peer.
+    let mut transport = build_transport(
+        &listen_addr,
+        node_index,
+        peers,
+        &cfg.network,
+        our_key.clone(),
+        shared_validator_set.clone(),
+    );
 
     // Give connections time to establish. TLS handshakes take
     // longer than plain TCP — 2s gives all peers time to connect
     // and complete the handshake before the first proposal.
     thread::sleep(Duration::from_millis(2000));
-    let validator_set_clone = validator_set.clone();
 
     // Data directory: `--data-dir` or `[storage] data_dir` enables
     // durable state — `<dir>/block-journal/` records every finalized
@@ -279,10 +294,9 @@ fn run_node(node_index_str: &str) {
         }
     }
 
-    // Shared validator set — the consensus loop writes the updated
-    // set after each epoch rotation; the RPC handler reads it for
-    // `GET /validator-set`.
-    let shared_validator_set = Arc::new(std::sync::RwLock::new(validator_set_clone.clone()));
+    // Shared validator set — created above (before the transport)
+    // so the handshake authenticator and the RPC handler read the
+    // same live committee.
 
     // Tx-gossip channel: the RPC submitter pushes accepted txs here;
     // the consensus loop drains it and broadcasts `MSG_TX` frames to
@@ -495,12 +509,23 @@ fn build_transport(
     node_index: usize,
     peers: Vec<(Vec<u8>, String)>,
     network: &config::NetworkConfig,
+    our_key: crypto::BlsSecretKey,
+    validators: Arc<std::sync::RwLock<consensus::ValidatorSet>>,
 ) -> p2p::tcp::TcpTransport {
     let own_id = vec![u8::try_from(node_index).expect("peer id fits in u8")];
     let allowed: std::collections::HashSet<Vec<u8>> =
         peers.iter().map(|(id, _)| id.clone()).chain([own_id.clone()]).collect();
+    // Signed greeting: peer IDs are bound to committee keys, so a
+    // connection claiming validator `k` must sign with `k`'s BLS
+    // key — the ID can no longer be self-claimed, and a duplicate
+    // connection is a proven-same-identity reconnect, not a
+    // hijack. The shared set means committee rotations take effect
+    // without a transport restart.
+    let auth: Arc<dyn p2p::tcp::PeerAuth> =
+        Arc::new(node::peer_auth::BlsPeerAuth::new(our_key, validators));
     let transport_config = p2p::tcp::TcpTransportConfig {
         allowed_peer_ids: Some(allowed),
+        peer_auth: Some(auth),
         ..to_transport_config(network)
     };
     // Admission control is always on in the shipped node: connection

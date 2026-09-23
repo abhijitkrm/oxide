@@ -30,6 +30,9 @@ governance = { workspace = true }
 trading = { workspace = true }
 storage = { workspace = true, features = ["redb"] }
 rpc = { workspace = true }
+# p2p: `PeerAuth` impl for the transport's signed greeting — the
+# node assembly layer binds peer IDs to consensus keys.
+p2p = { workspace = true }
 # tracing: structured diagnostic logging for node lifecycle events
 # (startup, shutdown, block finalization). Not on the hot path.
 tracing = { workspace = true }

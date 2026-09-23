@@ -559,7 +559,7 @@ impl TcpMultiNodeDevnet {
             let node = node::devnet::assemble_devnet_node(node::devnet::DevnetNodeSpec {
                 index: i,
                 validator_set: vs.clone(),
-                secret_key: key,
+                secret_key: key.clone(),
                 config: config.clone(),
                 clock: None,
                 wal_path: None,
@@ -582,11 +582,21 @@ impl TcpMultiNodeDevnet {
 
             let port = base_port + u16::try_from(i).unwrap();
             let listen_addr = format!("127.0.0.1:{port}");
+            // Authenticate the greeting: peer `i`'s transport ID must
+            // sign with the committee key registered at index `i`.
+            // The harness committee never reorders (added members are
+            // phantoms without transports), so a per-node static view
+            // of the set is faithful here.
+            let mut node_tcp_config = tcp_config.clone();
+            node_tcp_config.peer_auth = Some(Arc::new(node::peer_auth::BlsPeerAuth::new(
+                key.clone(),
+                Arc::new(std::sync::RwLock::new(vs.clone())),
+            )));
             let transport = p2p::tcp::TcpTransport::with_config(
                 &listen_addr,
                 vec![u8::try_from(i).unwrap()],
                 peers,
-                tcp_config.clone(),
+                node_tcp_config,
             );
 
             // Wire a commit listener that pushes each committed block

@@ -38,6 +38,21 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Changed
 
+- **Peer identity is cryptographically proven at connect time**
+  (`p2p`, `node`, `crypto`, `oxide-devnet`): the TCP greeting is now
+  a mutual signed challenge–response. Each side proves ownership of
+  the consensus key registered for its peer ID — a self-claimed ID
+  can no longer join the peer map, receive another validator's
+  traffic, or displace its live connection slot. Proofs bind both
+  peers, the direction, and fresh nonces, so captured proofs replay
+  nowhere. `node::peer_auth::BlsPeerAuth` verifies against the live
+  validator set (committee rotations apply without restart), and
+  the handshake composes with mTLS when `--tls-dir` is used.
+  - **In plain words:** anyone who could reach the port used to be
+    able to claim "I am validator 1" and steal its message stream.
+    Now the connection has to sign a fresh challenge with that
+    validator's key before it counts — impossible without the key.
+
 - **RPC admission control is cost-weighted and per-source**
   (`rpc`, `config`): the per-IP rate limiter now charges each
   request its real cost — batch elements count individually and

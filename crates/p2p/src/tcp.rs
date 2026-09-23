@@ -34,12 +34,18 @@
 //! - A background accept thread that spawns a reader thread per
 //!   incoming connection.
 //!
-//! # Phase 1 scope
+//! # Authentication
 //!
-//! No TLS, no authentication, no encryption. The caps advertise
-//! `authenticated = false`, `encrypted = false`. Phase 2 adds Noise
-//! or TLS via the commonware-p2p adapter. This transport is for
-//! local devnet only — do not use across untrusted networks.
+//! Two layers, configured independently:
+//!
+//! - **mTLS** (`tls` feature + `TlsConfig`): certificates bind the
+//!   connection to the claimed peer ID; the acceptor rejects when
+//!   cert and greeting disagree.
+//! - **Signed greeting** ([`PeerAuth`]): a mutual challenge–response
+//!   that proves ownership of the consensus key registered for the
+//!   peer ID — identity cannot be spoofed even without PKI, and a
+//!   duplicate connection is only installed after proving the same
+//!   identity (safe writer-slot displacement).
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -354,6 +360,230 @@ const HANDSHAKE_QUEUE: usize = 64;
 /// in `recv` for the whole handshake budget.
 const HANDSHAKE_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// Transport-identity authenticator: the signed greeting handshake
+/// that binds a TCP connection to a consensus key.
+///
+/// Without it the first frame is a *self-claimed* peer ID — any
+/// reachable socket can claim validator `k`'s ID, receive every
+/// message this node sends `k`, and displace `k`'s live writer
+/// slot: a targeted partition (two claims halt a 4-validator
+/// committee). When [`TcpTransportConfig::peer_auth`] is set the
+/// greeting becomes a mutual challenge–response:
+///
+/// ```text
+/// dialer   → acceptor: [id_len u8][id_c][nonce_c: 32B]
+/// acceptor → dialer:   [nonce_a: 32B][sig_len u16be][sig_a]
+/// dialer   → acceptor: [sig_len u16be][sig_c]
+/// ```
+///
+/// `sig_a` covers `transcript(ROLE_ACCEPTOR, id_a, id_c, nonce_a,
+/// nonce_c)`; `sig_c` covers the same tuple under `ROLE_DIALER`.
+/// Both nonces ride in both signatures, so a captured proof replays
+/// nowhere — not to a later session, not to a different peer pair,
+/// not across roles. The dialer verifies `sig_a` against the key it
+/// *dialed* (the `peers` list's ID, never a self-claimed one); the
+/// acceptor verifies `sig_c` against the claimed ID's registered
+/// key. A connection that cannot prove its ID is dropped before it
+/// reaches the peer maps — so it can neither receive the victim's
+/// traffic nor displace its slot.
+///
+/// The transport stays crypto-free: signing, verification, and
+/// nonce generation are injected. The production implementation is
+/// `node::peer_auth::BlsPeerAuth` (BLS12-381 over
+/// `Domain::PeerHandshake`); tests use a toy scheme.
+///
+/// `Debug` is required only so `TcpTransportConfig` can keep its
+/// derive — implementors should print the identity (index/pubkey),
+/// never secret material.
+pub trait PeerAuth: Send + Sync + std::fmt::Debug {
+    /// A fresh unpredictable 32-byte challenge nonce — the replay
+    /// protection. Predictable nonces let an attacker pre-compute
+    /// proofs; this must be OS-entropy quality.
+    fn challenge(&self) -> [u8; AUTH_NONCE_LEN];
+
+    /// Sign `transcript` with this node's identity key. `None`
+    /// fails the handshake closed — a node that cannot sign cannot
+    /// prove itself.
+    fn sign(&self, transcript: &[u8]) -> Option<Vec<u8>>;
+
+    /// Verify `signature` over `transcript` as produced by `peer`'s
+    /// registered key. `false` for unknown peers — the lookup is
+    /// part of the check.
+    fn verify(&self, peer: &PeerId, transcript: &[u8], signature: &[u8]) -> bool;
+}
+
+/// Handshake nonce length in bytes. 256 bits of entropy makes a
+/// nonce collision (which would permit a replayed proof)
+/// astronomically unlikely and matches the digest width the BLS
+/// implementation signs.
+pub const AUTH_NONCE_LEN: usize = 32;
+
+/// Transcript schema version — rides inside the signed preimage so
+/// a future format change cannot reinterpret existing proofs.
+const HANDSHAKE_SCHEMA: u8 = 1;
+/// Transcript role tag for the acceptor's proof.
+const ROLE_ACCEPTOR: u8 = 1;
+/// Transcript role tag for the dialer's proof. Distinct from
+/// [`ROLE_ACCEPTOR`] so a captured acceptor proof can never be
+/// replayed as a dialer proof (or vice versa) — cross-role
+/// confusion is the classic STS downgrade.
+const ROLE_DIALER: u8 = 2;
+
+/// Upper bound on the length-prefixed signature field. BLS
+/// signatures are 96 bytes; the cap leaves room for other schemes
+/// while bounding what a peer can make us buffer mid-handshake.
+/// Units: bytes.
+const MAX_AUTH_SIG_BYTES: usize = 4096;
+
+/// Build the signed handshake transcript. Layout:
+/// `[schema][role][id_a_len u8][id_a][id_c_len u8][id_c][nonce_a][nonce_c]`.
+///
+/// Both IDs and both nonces are bound in so a proof is valid for
+/// exactly one (role, ordered peer pair, session) — nothing is
+/// replayable across connections, directions, or peers.
+fn handshake_transcript(
+    role: u8,
+    acceptor: &PeerId,
+    dialer: &PeerId,
+    nonce_a: &[u8; AUTH_NONCE_LEN],
+    nonce_c: &[u8; AUTH_NONCE_LEN],
+) -> Vec<u8> {
+    let mut t = Vec::with_capacity(4 + acceptor.len() + dialer.len() + 2 * AUTH_NONCE_LEN);
+    t.push(HANDSHAKE_SCHEMA);
+    t.push(role);
+    t.push(u8::try_from(acceptor.len()).unwrap_or(u8::MAX));
+    t.extend_from_slice(acceptor);
+    t.push(u8::try_from(dialer.len()).unwrap_or(u8::MAX));
+    t.extend_from_slice(dialer);
+    t.extend_from_slice(nonce_a);
+    t.extend_from_slice(nonce_c);
+    t
+}
+
+/// Encode the dialer's greeting frame: `[id_len u8][id][nonce]`.
+/// `None` when the peer ID exceeds the u8 length field — an
+/// oversized ID can never authenticate anyway.
+fn encode_greeting(peer_id: &PeerId, nonce: &[u8; AUTH_NONCE_LEN]) -> Option<Vec<u8>> {
+    let len = u8::try_from(peer_id.len()).ok()?;
+    let mut g = Vec::with_capacity(1 + peer_id.len() + AUTH_NONCE_LEN);
+    g.push(len);
+    g.extend_from_slice(peer_id);
+    g.extend_from_slice(nonce);
+    Some(g)
+}
+
+/// Parse a greeting frame into `(claimed_id, nonce)`.
+fn decode_greeting(frame: &[u8]) -> Option<(PeerId, [u8; AUTH_NONCE_LEN])> {
+    let (&len, rest) = frame.split_first()?;
+    let len = usize::from(len);
+    if rest.len() != len + AUTH_NONCE_LEN {
+        return None;
+    }
+    let nonce: [u8; AUTH_NONCE_LEN] = rest[len..].try_into().ok()?;
+    Some((rest[..len].to_vec(), nonce))
+}
+
+/// Encode a signature frame field: `[sig_len u16be][sig]`.
+fn encode_sig(sig: &[u8]) -> Option<Vec<u8>> {
+    let len = u16::try_from(sig.len()).ok()?;
+    let mut out = Vec::with_capacity(2 + sig.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(sig);
+    Some(out)
+}
+
+/// Parse a `[sig_len u16be][sig]` frame, rejecting trailing bytes
+/// and over-cap lengths.
+fn decode_sig(frame: &[u8]) -> Option<Vec<u8>> {
+    let (len_bytes, rest) = frame.split_at_checked(2)?;
+    let len = usize::from(u16::from_be_bytes(len_bytes.try_into().ok()?));
+    if len > MAX_AUTH_SIG_BYTES || rest.len() != len {
+        return None;
+    }
+    Some(rest.to_vec())
+}
+
+/// Run the dialer half of the authenticated greeting on `stream`:
+/// write `[id][nonce_c]`, read the acceptor's `nonce_a + sig_a`
+/// challenge, verify it against `expected_peer` (the ID this
+/// connection dialed — never a self-claimed one), then answer with
+/// `sig_c`. Returns `false` on any failure; the caller drops the
+/// connection and retries like any connect error.
+fn dialer_handshake<S: Read + Write>(
+    stream: &mut S,
+    auth: &dyn PeerAuth,
+    our_id: &PeerId,
+    expected_peer: &PeerId,
+    max_message_bytes: u64,
+) -> bool {
+    let nonce_c = auth.challenge();
+    let Some(greeting) = encode_greeting(our_id, &nonce_c) else { return false };
+    if write_frame(stream, &greeting).is_err() {
+        return false;
+    }
+    let Ok(frame) = read_frame(stream, max_message_bytes) else { return false };
+    let Some((nonce_bytes, sig_bytes)) = frame.split_at_checked(AUTH_NONCE_LEN) else {
+        return false;
+    };
+    let Ok(nonce_a) = <[u8; AUTH_NONCE_LEN]>::try_from(nonce_bytes) else { return false };
+    let Some(sig_a) = decode_sig(sig_bytes) else { return false };
+    let t = handshake_transcript(ROLE_ACCEPTOR, expected_peer, our_id, &nonce_a, &nonce_c);
+    if !auth.verify(expected_peer, &t, &sig_a) {
+        return false;
+    }
+    let t = handshake_transcript(ROLE_DIALER, expected_peer, our_id, &nonce_a, &nonce_c);
+    let Some(sig_c) = auth.sign(&t).and_then(|s| encode_sig(&s)) else { return false };
+    write_frame(stream, &sig_c).is_ok()
+}
+
+/// Run the acceptor half of the authenticated greeting: parse the
+/// dialer's `(id, nonce_c)` greeting, apply the allowlist *before*
+/// signing (a stranger gets no proof of our identity), send
+/// `nonce_a + sig_a`, then verify the dialer's `sig_c` against the
+/// claimed ID's registered key. Returns the authenticated peer ID.
+fn acceptor_handshake<S: Read + Write>(
+    stream: &mut S,
+    auth: &dyn PeerAuth,
+    our_id: &PeerId,
+    allowed: Option<&std::collections::HashSet<PeerId>>,
+    max_message_bytes: u64,
+) -> Option<PeerId> {
+    let frame = read_frame(stream, max_message_bytes).ok()?;
+    let (peer_id, nonce_c) = decode_greeting(&frame)?;
+    if let Some(set) = allowed
+        && !set.contains(&peer_id)
+    {
+        return None;
+    }
+    acceptor_proof_exchange(stream, auth, our_id, &peer_id, &nonce_c, max_message_bytes)
+}
+
+/// The challenge→proof exchange shared by the plain and TLS
+/// accept paths: send `nonce_a + sig_a`, then verify the dialer's
+/// `sig_c` against `peer_id`'s registered key. The caller has
+/// already parsed the greeting and applied the allowlist — this is
+/// only the cryptographic half. Returns the proven peer ID.
+fn acceptor_proof_exchange<S: Read + Write>(
+    stream: &mut S,
+    auth: &dyn PeerAuth,
+    our_id: &PeerId,
+    peer_id: &PeerId,
+    nonce_c: &[u8; AUTH_NONCE_LEN],
+    max_message_bytes: u64,
+) -> Option<PeerId> {
+    let nonce_a = auth.challenge();
+    let t = handshake_transcript(ROLE_ACCEPTOR, our_id, peer_id, &nonce_a, nonce_c);
+    let sig_a = auth.sign(&t)?;
+    let mut challenge = Vec::with_capacity(AUTH_NONCE_LEN + 2 + sig_a.len());
+    challenge.extend_from_slice(&nonce_a);
+    challenge.extend_from_slice(&encode_sig(&sig_a)?);
+    write_frame(stream, &challenge).ok()?;
+    let frame = read_frame(stream, max_message_bytes).ok()?;
+    let sig_c = decode_sig(&frame)?;
+    let t = handshake_transcript(ROLE_DIALER, our_id, peer_id, &nonce_a, nonce_c);
+    auth.verify(peer_id, &t, &sig_c).then_some(peer_id.clone())
+}
+
 /// Configuration for a [`TcpTransport`] instance.
 ///
 /// All values that were previously hardcoded as `const` are now
@@ -398,6 +628,17 @@ pub struct TcpTransportConfig {
     /// Must be ≥ `max_message_bytes` or every maximum-size send
     /// fails. Default [`DEFAULT_MAX_OUTBOUND_QUEUE_BYTES`].
     pub max_outbound_queue_bytes: usize,
+
+    /// Transport-identity authenticator. When `Some`, the greeting
+    /// becomes a mutual signed challenge–response (see [`PeerAuth`])
+    /// and only connections that prove their peer ID are installed —
+    /// which is also what makes writer-slot displacement safe: a
+    /// duplicate connection that proved the same key IS the same
+    /// peer reconnecting. When `None`, the first frame is a
+    /// self-claimed peer ID (legacy/test mode) and a duplicate ID
+    /// silently displaces the incumbent slot — acceptable only on
+    /// trusted loopback. Production must set this.
+    pub peer_auth: Option<Arc<dyn PeerAuth>>,
 }
 
 impl Default for TcpTransportConfig {
@@ -412,6 +653,7 @@ impl Default for TcpTransportConfig {
             allowed_peer_ids: None,
             max_inbound_queue_bytes: DEFAULT_MAX_INBOUND_QUEUE_BYTES,
             max_outbound_queue_bytes: DEFAULT_MAX_OUTBOUND_QUEUE_BYTES,
+            peer_auth: None,
         }
     }
 }
@@ -786,6 +1028,8 @@ impl TcpTransport {
             // self-claimed ID is not in the set are rejected.
             allowed_peer_ids: config.allowed_peer_ids.clone(),
             admission: admission.clone(),
+            our_id: peer_id.clone(),
+            peer_auth: config.peer_auth.clone(),
             #[cfg(feature = "tls")]
             tls: tls.clone(),
             max_message_bytes,
@@ -879,6 +1123,7 @@ impl TcpTransport {
         let connect_shutdown = shutdown.clone();
         let our_id = peer_id.clone();
         let connect_admission = admission.clone();
+        let connect_auth = config.peer_auth.clone();
         #[cfg(feature = "tls")]
         let connect_tls = tls.clone();
         // Critical: the only outbound path — a dead connect driver
@@ -896,6 +1141,7 @@ impl TcpTransport {
                 let cq = connect_queued.clone();
                 let rshut = connect_shutdown.clone();
                 let cac = connect_admission.clone();
+                let cauth = connect_auth.clone();
                 #[cfg(feature = "tls")]
                 let ctls = connect_tls.clone();
                 // One supervised reconnect loop per peer — non-critical:
@@ -918,6 +1164,7 @@ impl TcpTransport {
                         queued: cq.clone(),
                         shutdown: rshut.clone(),
                         admission: cac.clone(),
+                        peer_auth: cauth.clone(),
                         #[cfg(feature = "tls")]
                         tls: ctls.clone(),
                     };
@@ -967,8 +1214,28 @@ impl TcpTransport {
                                 )
                                 .expect("client connection must be valid");
                                 let mut tls_stream = rustls::StreamOwned::new(client_conn, stream);
-                                // Send our peer ID as the first frame.
-                                if write_frame(&mut tls_stream, &oid).is_err() {
+                                // First frame: our peer ID (legacy) or
+                                // the signed-greeting exchange. Bound
+                                // the challenge read with the handshake
+                                // timeout — a peer that stalls
+                                // mid-auth gets dropped, not polled
+                                // forever at the reader poll rate.
+                                let greeted = match ctx.peer_auth.as_deref() {
+                                    Some(auth) => {
+                                        let _ = tls_stream
+                                            .sock
+                                            .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
+                                        dialer_handshake(
+                                            &mut tls_stream,
+                                            auth,
+                                            &oid,
+                                            &pid,
+                                            max_message_bytes,
+                                        )
+                                    }
+                                    None => write_frame(&mut tls_stream, &oid).is_ok(),
+                                };
+                                if !greeted {
                                     // Connection failed — retry after backoff.
                                     thread::sleep(Duration::from_millis(500));
                                     continue;
@@ -1006,8 +1273,19 @@ impl TcpTransport {
                         let mut stream = stream;
                         // Disable Nagle (same rationale as accept path).
                         let _ = stream.set_nodelay(true);
-                        // Send our peer ID as the first frame.
-                        if write_frame(&mut stream, &oid).is_err() {
+                        // First frame: our peer ID (legacy) or the
+                        // signed-greeting exchange. The handshake
+                        // timeout bounds the challenge wait — a peer
+                        // that never answers occupies this thread for
+                        // seconds, not forever.
+                        let greeted = match ctx.peer_auth.as_deref() {
+                            Some(auth) => {
+                                let _ = stream.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
+                                dialer_handshake(&mut stream, auth, &oid, &pid, max_message_bytes)
+                            }
+                            None => write_frame(&mut stream, &oid).is_ok(),
+                        };
+                        if !greeted {
                             // Connection failed — retry after backoff.
                             thread::sleep(Duration::from_millis(500));
                             continue;
@@ -1150,6 +1428,7 @@ impl TcpTransport {
             queued: self.inbound_queued.clone(),
             shutdown: self.shutdown.clone(),
             admission: self.admission.clone(),
+            peer_auth: self.config.peer_auth.clone(),
             #[cfg(feature = "tls")]
             tls: self.tls.clone(),
         };
@@ -1181,7 +1460,20 @@ impl TcpTransport {
                     )
                     .expect("client connection must be valid");
                     let mut tls_stream = rustls::StreamOwned::new(client_conn, stream);
-                    if write_frame(&mut tls_stream, &ctx.our_id).is_err() {
+                    let greeted = match ctx.peer_auth.as_deref() {
+                        Some(auth) => {
+                            let _ = tls_stream.sock.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
+                            dialer_handshake(
+                                &mut tls_stream,
+                                auth,
+                                &ctx.our_id,
+                                &pid,
+                                ctx.max_message_bytes,
+                            )
+                        }
+                        None => write_frame(&mut tls_stream, &ctx.our_id).is_ok(),
+                    };
+                    if !greeted {
                         return;
                     }
                     let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
@@ -1195,7 +1487,14 @@ impl TcpTransport {
             }
             let mut stream = stream;
             let _ = stream.set_nodelay(true);
-            if write_frame(&mut stream, &ctx.our_id).is_err() {
+            let greeted = match ctx.peer_auth.as_deref() {
+                Some(auth) => {
+                    let _ = stream.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
+                    dialer_handshake(&mut stream, auth, &ctx.our_id, &pid, ctx.max_message_bytes)
+                }
+                None => write_frame(&mut stream, &ctx.our_id).is_ok(),
+            };
+            if !greeted {
                 return;
             }
             let _ = stream.set_read_timeout(Some(ctx.read_timeout));
@@ -1243,6 +1542,9 @@ struct ConnectCtx {
     /// connection consumes the same reader/writer/fd budget as an
     /// accepted one, and a banned peer must not be re-dialed.
     admission: Option<Arc<SharedAdmissionControl>>,
+    /// Signed-greeting authenticator ([`PeerAuth`]); `None` keeps
+    /// the legacy self-claimed-ID greeting.
+    peer_auth: Option<Arc<dyn PeerAuth>>,
     /// TLS configuration, when the transport was built with it.
     #[cfg(feature = "tls")]
     tls: Option<Arc<TlsConfig>>,
@@ -1775,6 +2077,12 @@ struct AcceptShared {
     /// Admission control (reputation, connection caps). `None`
     /// disables it (devnet mode).
     admission: Option<Arc<SharedAdmissionControl>>,
+    /// This node's own peer ID — the acceptor identity bound into
+    /// signed handshake transcripts.
+    our_id: PeerId,
+    /// Signed-greeting authenticator ([`PeerAuth`]); `None` keeps
+    /// the legacy self-claimed-ID greeting.
+    peer_auth: Option<Arc<dyn PeerAuth>>,
     /// TLS configuration, when the transport was built with it.
     #[cfg(feature = "tls")]
     tls: Option<Arc<TlsConfig>>,
@@ -1798,12 +2106,19 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
     // the map (writes), one for the reader thread (reads).
     #[cfg(feature = "tls")]
     let result = if let Some(ref tls_config) = shared.tls {
-        accept_tls_connection(stream, tls_config, shared.max_message_bytes, shared.read_timeout)
+        accept_tls_connection(
+            stream,
+            tls_config,
+            shared.max_message_bytes,
+            shared.read_timeout,
+            shared,
+        )
     } else {
-        accept_plain_connection(stream, shared.max_message_bytes, shared.read_timeout)
+        accept_plain_connection(stream, shared.max_message_bytes, shared.read_timeout, shared)
     };
     #[cfg(not(feature = "tls"))]
-    let result = accept_plain_connection(stream, shared.max_message_bytes, shared.read_timeout);
+    let result =
+        accept_plain_connection(stream, shared.max_message_bytes, shared.read_timeout, shared);
 
     let Some((peer_id, write_stream, reader_stream)) = result else {
         return; // connection closed before ID
@@ -1908,6 +2223,7 @@ fn accept_plain_connection(
     mut stream: TcpStream,
     max_message_bytes: u64,
     read_timeout: Duration,
+    shared: &AcceptShared,
 ) -> AcceptResult {
     // Disable Nagle's algorithm: consensus messages are small and
     // latency-sensitive (vote → QC → next proposal). Nagle buffers
@@ -1919,7 +2235,20 @@ fn accept_plain_connection(
     // connects and never sends must not pin a handshake worker —
     // the timeout turns a silent freeze into a dropped socket.
     let _ = stream.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
-    let peer_id = read_frame(&mut stream, max_message_bytes).ok()?;
+    let peer_id = match shared.peer_auth.as_deref() {
+        // Authenticated greeting: the peer proves its claimed ID
+        // with a signature over both nonces before this function
+        // returns — an unproven ID never reaches the peer maps.
+        Some(auth) => acceptor_handshake(
+            &mut stream,
+            auth,
+            &shared.our_id,
+            shared.allowed_peer_ids.as_ref(),
+            max_message_bytes,
+        )?,
+        // Legacy greeting: the first frame IS the self-claimed ID.
+        None => read_frame(&mut stream, max_message_bytes).ok()?,
+    };
     // Greeting received — switch to the steady-state timeout the
     // reader loop relies on.
     let _ = stream.set_read_timeout(Some(read_timeout));
@@ -1943,6 +2272,7 @@ fn accept_tls_connection(
     tls_config: &TlsConfig,
     max_message_bytes: u64,
     _read_timeout: Duration,
+    shared: &AcceptShared,
 ) -> AcceptResult {
     // Disable Nagle (same rationale as plain accept).
     let _ = stream.set_nodelay(true);
@@ -1962,10 +2292,22 @@ fn accept_tls_connection(
     // writer can acquire it. The reader loop handles TimedOut by
     // retrying.
     let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
-    // Read the first frame (self-claimed peer ID). This also
-    // completes the TLS handshake, during which the client
+    // The greeting exchange may need up to HANDSHAKE_READ_TIMEOUT —
+    // the 500ms poll would abort a healthy challenge round-trip.
+    // The stream isn't shared yet, so the longer bound starves no
+    // writer; TLS_READER_POLL_TIMEOUT is restored before install.
+    if shared.peer_auth.is_some() {
+        let _ = tls_stream.sock.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
+    }
+    // Read the first frame: the self-claimed peer ID (legacy) or
+    // the `[id][nonce_c]` greeting when peer auth is configured.
+    // This also completes the TLS handshake, during which the client
     // certificate is verified against the trust store.
-    let claimed_peer_id = read_frame(&mut tls_stream, max_message_bytes).ok()?;
+    let greeting = read_frame(&mut tls_stream, max_message_bytes).ok()?;
+    let (claimed_peer_id, nonce_c) = match shared.peer_auth.as_deref() {
+        Some(_) => decode_greeting(&greeting)?,
+        None => (greeting, [0u8; AUTH_NONCE_LEN]),
+    };
 
     // C4 fix: extract the authenticated peer ID from the verified
     // client certificate. The first-frame peer ID is self-claimed;
@@ -1983,6 +2325,26 @@ fn accept_tls_connection(
             }
             // Use the authenticated peer ID from the certificate.
             let peer_id = authenticated_id;
+            // When peer auth is configured, ALSO require the signed
+            // greeting proof: the cert binds a transport identity,
+            // the signature binds the consensus key — distinct
+            // secrets, both proven.
+            if let Some(auth) = shared.peer_auth.as_deref() {
+                if let Some(set) = shared.allowed_peer_ids.as_ref()
+                    && !set.contains(&peer_id)
+                {
+                    return None;
+                }
+                acceptor_proof_exchange(
+                    &mut tls_stream,
+                    auth,
+                    &shared.our_id,
+                    &peer_id,
+                    &nonce_c,
+                    max_message_bytes,
+                )?;
+                let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
+            }
             let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
             let write_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
             let reader_stream = Box::new(shared) as Box<dyn PeerStream>;
@@ -2363,6 +2725,7 @@ mod tests {
             allowed_peer_ids: None,
             max_inbound_queue_bytes: DEFAULT_MAX_INBOUND_QUEUE_BYTES,
             max_outbound_queue_bytes: DEFAULT_MAX_OUTBOUND_QUEUE_BYTES,
+            peer_auth: None,
         };
 
         let mut transport_a = TcpTransport::with_config(
@@ -3179,5 +3542,197 @@ mod tests {
         transport_b.send(&id_a, &[6u8; 100]).expect("send must succeed");
         let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
         assert_eq!(msg.expect("queue must accept after drain").bytes, vec![6u8; 100]);
+    }
+
+    /// Test `PeerAuth`: a toy keyed scheme — `sign` prefixes the
+    /// transcript's first 8 bytes with the signer's key byte, and
+    /// `verify` recomputes it under the claimed peer's registered
+    /// key. Not real crypto — it exercises the transport's
+    /// handshake flow (challenges, role binding, key lookup, fail
+    /// closed) without pulling a crypto dependency into `p2p`.
+    /// `node::peer_auth` tests cover the real BLS path.
+    #[derive(Debug)]
+    struct StaticAuth {
+        /// The key byte this node signs with.
+        my_key: u8,
+        /// peer ID → registered key byte.
+        keys: std::collections::HashMap<PeerId, u8>,
+        /// Monotonic nonce source — uniqueness is what the
+        /// freshness property needs in-process.
+        counter: std::sync::atomic::AtomicU64,
+    }
+
+    impl StaticAuth {
+        fn new(my_key: u8, keys: std::collections::HashMap<PeerId, u8>) -> Self {
+            Self { my_key, keys, counter: std::sync::atomic::AtomicU64::new(1) }
+        }
+    }
+
+    impl PeerAuth for StaticAuth {
+        fn challenge(&self) -> [u8; AUTH_NONCE_LEN] {
+            let mut n = [0u8; AUTH_NONCE_LEN];
+            n[..8].copy_from_slice(&self.counter.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+            n
+        }
+
+        fn sign(&self, transcript: &[u8]) -> Option<Vec<u8>> {
+            let mut sig = vec![self.my_key];
+            sig.extend_from_slice(transcript);
+            Some(sig)
+        }
+
+        fn verify(&self, peer: &PeerId, transcript: &[u8], signature: &[u8]) -> bool {
+            let Some(&key) = self.keys.get(peer) else { return false };
+            let mut expected = vec![key];
+            expected.extend_from_slice(transcript);
+            signature == expected
+        }
+    }
+
+    /// Auth config helper: `keys` maps each peer ID to its key byte.
+    fn auth_config(my_key: u8, keys: std::collections::HashMap<PeerId, u8>) -> TcpTransportConfig {
+        TcpTransportConfig {
+            peer_auth: Some(Arc::new(StaticAuth::new(my_key, keys))),
+            ..Default::default()
+        }
+    }
+
+    /// Authenticated greeting: two nodes bound to keys connect and
+    /// exchange traffic normally.
+    #[test]
+    fn tcp_authenticated_handshake_exchanges_messages() {
+        let addr_a = "127.0.0.1:19230";
+        let addr_b = "127.0.0.1:19231";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+        let keys: std::collections::HashMap<PeerId, u8> =
+            [(id_a.clone(), 10u8), (id_b.clone(), 20u8)].into_iter().collect();
+
+        let mut ta = TcpTransport::with_config(
+            addr_a,
+            id_a.clone(),
+            vec![(id_b.clone(), addr_b.to_string())],
+            auth_config(10, keys.clone()),
+        );
+        let mut tb = TcpTransport::with_config(
+            addr_b,
+            id_b.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+            auth_config(20, keys),
+        );
+        thread::sleep(Duration::from_millis(700));
+
+        ta.send(&id_b, b"auth-A->B").unwrap();
+        let msg = poll_recv(&mut tb, Duration::from_secs(5)).expect("B receives from A");
+        assert_eq!(msg.from, id_a);
+        assert_eq!(msg.bytes, b"auth-A->B");
+
+        tb.send(&id_a, b"auth-B->A").unwrap();
+        let msg = poll_recv(&mut ta, Duration::from_secs(5)).expect("A receives from B");
+        assert_eq!(msg.from, id_b);
+        assert_eq!(msg.bytes, b"auth-B->A");
+    }
+
+    /// An impostor claiming `id_b` while holding a different key is
+    /// rejected: the proof verifies under the claimed ID's
+    /// registered key, not the signer's.
+    #[test]
+    fn tcp_auth_rejects_impostor_claiming_peer_id() {
+        let addr_a = "127.0.0.1:19232";
+        let addr_c = "127.0.0.1:19233";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+        let keys: std::collections::HashMap<PeerId, u8> =
+            [(id_a.clone(), 10u8), (id_b.clone(), 20u8)].into_iter().collect();
+
+        let mut ta =
+            TcpTransport::with_config(addr_a, id_a.clone(), vec![], auth_config(10, keys.clone()));
+        // Impostor claims peer id_b but signs with key 99 — the
+        // acceptor verifies under id_b's registered key (20), so the
+        // proof fails and no connection is installed.
+        let impostor = TcpTransport::with_config(
+            addr_c,
+            id_b.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+            auth_config(99, keys),
+        );
+        thread::sleep(Duration::from_millis(700));
+        drop(impostor);
+
+        assert!(
+            poll_recv(&mut ta, Duration::from_millis(300)).is_none(),
+            "an unproven peer ID must never install a connection"
+        );
+        assert!(
+            primitives::sync::lock_state(&ta.streams).get(&id_b).is_none(),
+            "the impostor must not occupy id_b's writer slot"
+        );
+    }
+
+    /// A proven-same-identity reconnect displaces the old slot —
+    /// the displacement the audit flagged is only safe *because*
+    /// the newcomer proved the same key.
+    #[test]
+    fn tcp_auth_duplicate_same_identity_replaces_slot() {
+        let addr_a = "127.0.0.1:19234";
+        let addr_b = "127.0.0.1:19235";
+        let addr_b2 = "127.0.0.1:19236";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+        let keys: std::collections::HashMap<PeerId, u8> =
+            [(id_a.clone(), 10u8), (id_b.clone(), 20u8)].into_iter().collect();
+
+        let mut ta =
+            TcpTransport::with_config(addr_a, id_a.clone(), vec![], auth_config(10, keys.clone()));
+        let _tb = TcpTransport::with_config(
+            addr_b,
+            id_b.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+            auth_config(20, keys.clone()),
+        );
+        thread::sleep(Duration::from_millis(700));
+
+        // The same peer ID + same key reconnects from a different
+        // port — a legit reconnect. It proves identity and takes
+        // the slot.
+        let mut tb2 = TcpTransport::with_config(
+            addr_b2,
+            id_b.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+            auth_config(20, keys),
+        );
+        thread::sleep(Duration::from_millis(700));
+
+        tb2.send(&id_a, b"reconnect").unwrap();
+        let msg = poll_recv(&mut ta, Duration::from_secs(5)).expect("A receives reconnect");
+        assert_eq!(msg.from, id_b);
+        assert_eq!(msg.bytes, b"reconnect");
+    }
+
+    /// A proof from one session verifies against exactly one
+    /// transcript — fresh nonces make replays fail.
+    #[test]
+    fn handshake_proofs_bind_both_nonces() {
+        let auth = StaticAuth::new(10, std::collections::HashMap::new());
+        let nonce_a1 = auth.challenge();
+        let nonce_a2 = auth.challenge();
+        let nonce_c = auth.challenge();
+        let id_a = vec![0u8];
+        let id_c = vec![2u8];
+        let keys: std::collections::HashMap<PeerId, u8> =
+            [(id_c.clone(), 30u8)].into_iter().collect();
+        let signer = StaticAuth::new(30, keys.clone());
+        let verifier = StaticAuth::new(10, keys);
+
+        let t1 = handshake_transcript(ROLE_DIALER, &id_a, &id_c, &nonce_a1, &nonce_c);
+        let sig = signer.sign(&t1).unwrap();
+        // The signature scheme is transcript-bound: it verifies for
+        // the exact session and role, nothing else.
+        assert!(verifier.verify(&id_c, &t1, &sig));
+        let t_replayed = handshake_transcript(ROLE_DIALER, &id_a, &id_c, &nonce_a2, &nonce_c);
+        assert!(!verifier.verify(&id_c, &t_replayed, &sig), "new nonce ⇒ old proof fails");
+        let t_wrong_role = handshake_transcript(ROLE_ACCEPTOR, &id_a, &id_c, &nonce_a1, &nonce_c);
+        assert!(!verifier.verify(&id_c, &t_wrong_role, &sig), "role swap ⇒ proof fails");
+        assert_ne!(nonce_a1, nonce_a2, "challenges must be fresh");
     }
 }

@@ -65,6 +65,8 @@ use primitives::Hash;
 /// | `BlsPop` | 15 | BLS proof-of-possession (validator key admission) |
 /// | `Ed25519Owner` | 16 | matcher account derivation from Ed25519 key |
 /// | `ExecutedNonceLeaf` | 17 | executed-nonce map leaf (executor state root) |
+/// | `CommittedLeaf` | 18 | committed-map set-commitment leaf |
+/// | `PeerHandshake` | 19 | transport handshake identity proof |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -143,6 +145,13 @@ pub enum Domain {
     /// alias across maps even when their encodings coincide.
     /// Appended after `ExecutedNonceLeaf` — never renumber.
     CommittedLeaf = 18,
+    /// A transport handshake proof: `sign(sk, transcript)` where the
+    /// transcript binds `(role, acceptor_id, dialer_id, nonce_a,
+    /// nonce_c)`. Appended after `CommittedLeaf` — never renumber.
+    /// Its own domain so a handshake proof can never be
+    /// reinterpreted as a vote, attestation, or `PoP` over the same
+    /// bytes — and vice versa.
+    PeerHandshake = 19,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,

@@ -71,6 +71,7 @@ fn dst(domain: Domain) -> &'static [u8] {
         Domain::ExecutedNonceLeaf => b"oxide/executed-nonce-leaf",
         // Same — committed-map leaves are BLAKE3, never a BLS DST.
         Domain::CommittedLeaf => b"oxide/committed-leaf",
+        Domain::PeerHandshake => b"oxide/peer-handshake",
     }
 }
 

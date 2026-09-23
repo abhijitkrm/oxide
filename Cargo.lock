@@ -2623,6 +2623,7 @@ dependencies = [
  "metrics",
  "oracle",
  "oxide-core",
+ "p2p",
  "perps",
  "ports",
  "primitives",

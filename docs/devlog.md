@@ -20224,3 +20224,78 @@ asymmetric floods, they don't price CPU. `eth_estimateGas` still
 runs its binary search inside one charge. The connection limiter
 remains global-only (per-IP conn caps would punish NAT'd
 legitimate clients — documented tradeoff).
+
+## Session N+36 — peer identity is proven, not claimed
+
+H2. The plaintext greeting's first frame was a *self-claimed* peer
+ID: anyone reachable on the port could claim validator `k`'s ID,
+receive every message destined for `k`, and displace `k`'s live
+writer slot — a targeted partition; two claims halt a 4-validator
+committee. `allowed_peer_ids` only filtered membership, not proof.
+
+The greeting is now a mutual challenge–response when
+`TcpTransportConfig::peer_auth` is set (`p2p` stays crypto-free —
+`PeerAuth` is an injected trait: `challenge`/`sign`/`verify`):
+
+```text
+dialer   → acceptor: [id_len][id_c][nonce_c]
+acceptor → dialer:   [nonce_a][sig_len][sig_a]
+dialer   → acceptor: [sig_len][sig_c]
+```
+
+`sig_a`/`sig_c` sign `transcript = [schema][role][id_a][id_c]
+[nonce_a][nonce_c]` — role-tagged (acceptor/dialer proofs can't
+cross), ordered-peer-pair bound, and double-nonced so a captured
+proof replays nowhere. The dialer verifies `sig_a` against the
+key it *dialed* (peers-list ID, never self-claimed); the acceptor
+verifies `sig_c` against the claimed ID's registered key and runs
+the allowlist check *before* signing so strangers get no proof of
+our identity. Every step fails closed: bad parse, wrong sig,
+unknown key → drop, inside `HANDSHAKE_READ_TIMEOUT`.
+
+`node::peer_auth::BlsPeerAuth` implements it over BLS12-381 with
+the new `Domain::PeerHandshake` (=19), resolving `peer_id →
+committee index → pubkey` against a shared `RwLock<ValidatorSet>`
+the pump swaps at each rotation — live keys, no restart. Nonces
+come from `crypto::random_nonce` (secp256k1's re-exported thread
+RNG — OsRng-seeded, no new dep). `Debug` on `BlsPeerAuth` is
+manual and never prints secret material.
+
+The displacement half of the finding resolves *through* the proof
+rather than a policy knob: with auth on, a duplicate-ID connection
+that verifies IS the same peer (a reconnect), so replacing the
+writer slot is correct. Zombie slots still get reclaimed —
+"never displace" would have deadlocked reconnects (reader exit
+doesn't remove the slot). With `peer_auth: None` (harness-only
+mode) the legacy self-claimed greeting runs unchanged.
+
+The mTLS path composes with it: cert check first, then the signed
+exchange — transport cert binds the pipe, the BLS proof binds the
+consensus key. TLS sockets get `HANDSHAKE_READ_TIMEOUT` for the
+exchange (the 500ms poll timeout would abort a healthy round-trip),
+restored to `TLS_READER_POLL_TIMEOUT` before install.
+
+Wired end-to-end: `oxide-devnet` builds `BlsPeerAuth` over the
+shared committee for both TLS and plain transports; the
+`tcp_multinode` harness runs every TCP test through real signed
+greetings. Verified live: two `oxide-devnet` processes finalize
+together; a raw-socket impostor claiming peer 1's ID received the
+challenge, produced no proof, and was dropped — while the real
+peer-1 link kept finalizing (the displacement attack is dead).
+
+Tests: `tcp_authenticated_handshake_exchanges_messages`,
+`tcp_auth_rejects_impostor_claiming_peer_id` (wrong key → no
+install, no slot steal), `tcp_auth_duplicate_same_identity_
+replaces_slot` (proven reconnect displaces), `handshake_proofs_
+bind_both_nonces` (role/nonce binding — replay matrix), plus
+`node::peer_auth` unit tests (BLS proof verifies, wrong
+index/transcript/tampered sig rejected, malformed peer IDs fail
+closed, nonces unique). Full devnet TCP suite green through the
+authenticated path.
+
+Residual: peer-ID ↔ index binding follows the live set's ordering
+— a rotation that *reorders* committee positions is the
+validator-set-routing finding (tracked separately); `verify` takes
+the set lock per handshake (cold path, fine). `oxide-validator`
+is single-node today — it gains the authenticator when it grows a
+transport. mTLS-off-loopback stays with the key-infra work.

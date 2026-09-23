@@ -53,6 +53,17 @@ authenticated, encrypted transport with admission control.
       that plaintext peer identity is spoofable. TLS exists;
       admission wiring, accept-loop hardening, and authenticated
       peer identity remain open (audit `docs/audit002.md` H1–H3).
+- Progress: the accept loop now hands sockets to a bounded
+      handshake pool (`p2p-handshake-N` workers, 5s greeting
+      budget, 64-deep queue); admission is wired into every
+      shipped transport constructor and devnet always builds it;
+      and peer identity is authenticated — `TcpTransportConfig::
+      peer_auth` runs a mutual BLS challenge–response
+      (`node::peer_auth::BlsPeerAuth` over the live validator set)
+      so a self-claimed ID can neither join nor displace a live
+      slot. Remaining for this gate: per-peer connection cap at
+      the listener, ingress rate limiting on the receive path, and
+      the integration-test bullet above.
 
 ---
 

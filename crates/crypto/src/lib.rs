@@ -47,3 +47,22 @@ pub use secp::{
     RecoverableSignature, RecoveryId, SecpError, generate_keypair_for_test, keccak256,
     recover_sender, sign, signable_pubkey_address,
 };
+
+/// Fill `out` with bytes from the OS-seeded thread RNG.
+///
+/// Used for handshake challenge nonces — values an attacker must
+/// not be able to predict or replay. `secp256k1::rand` re-exports
+/// `rand` (OsRng-seeded `ThreadRng`), already a dependency, so no
+/// new crate is pulled in for entropy.
+pub fn fill_random(out: &mut [u8]) {
+    secp256k1::rand::Rng::fill(&mut secp256k1::rand::rng(), out);
+}
+
+/// A fresh unpredictable 32-byte challenge nonce — see
+/// [`fill_random`].
+#[must_use]
+pub fn random_nonce() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    fill_random(&mut nonce);
+    nonce
+}
