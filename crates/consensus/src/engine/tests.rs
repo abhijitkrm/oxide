@@ -4746,6 +4746,62 @@ fn c9_wal_restart_recovery() {
     }
 }
 
+/// WAL compaction: with the threshold forced to a single byte,
+/// every append triggers a checkpoint — the file must stay at one
+/// frame no matter how many votes/commits ran, and a restart must
+/// still recover the full safety state including the validator set
+/// (the checkpoint entry is written `include_set: true`).
+#[test]
+fn wal_auto_compaction_bounds_file_and_preserves_recovery() {
+    use crate::wal::Wal;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("consensus.wal");
+
+    {
+        let app = Arc::new(MockApp::new());
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(app, single_validator_set())
+            .without_signature_verification()
+            .with_wal(wal);
+        engine.wal.as_mut().expect("wal attached").set_compact_threshold(1);
+
+        // Real traffic appends per vote/QC/commit — under threshold=1
+        // each one compacts, exercising the checkpoint path hard.
+        engine.submit_tx(TxBytes::new(vec![1]));
+        engine.run_until_idle();
+
+        // Safety state for the restart assertions below.
+        engine.last_voted_view = Some(View::new(50));
+        engine.voted_at_height.insert(9, Hash([0x77; 32]));
+        engine.append_wal().expect("append must succeed");
+    }
+
+    // The compacted file holds exactly one framed entry — kilobytes,
+    // not the unbounded growth the audit flagged. Generous bound so
+    // the test doesn't couple to the encoded size of a pending tail.
+    let size = std::fs::metadata(&wal_path).expect("stat wal").len();
+    assert!(size < 64 * 1024, "compacted WAL must be one entry, got {size} bytes");
+
+    {
+        let app = Arc::new(MockApp::new());
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(app, single_validator_set())
+            .without_signature_verification()
+            .with_wal(wal);
+        engine.recover_from_wal().expect("recover from WAL");
+
+        assert_eq!(engine.last_voted_view, Some(View::new(50)));
+        assert_eq!(engine.voted_at_height.get(&9), Some(&Hash([0x77; 32])));
+        assert_eq!(
+            engine.validator_set,
+            single_validator_set(),
+            "the set-bearing checkpoint restores committee membership"
+        );
+    }
+}
+
 /// Restart continuity: the WAL must restore the uncommitted chain
 /// tail, not just safety metadata. `blocks` is in-memory only, and
 /// the recovered `high_qc` anchors into it — `propose()` stamps

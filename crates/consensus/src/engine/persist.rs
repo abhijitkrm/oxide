@@ -244,15 +244,36 @@ impl OxideBft {
         // field list — the pending tail travels with every append.
         let entry = self.wal_entry(include_set);
         let wal = self.wal.as_mut().expect("checked above");
-        match wal.append(&entry) {
+        if let Err(err) = wal.append(&entry) {
+            // Latch + alert once: repeated failures of a dead
+            // disk would otherwise spam stderr every view.
+            if !self.wal_failed {
+                self.wal_failed = true;
+                eprintln!(
+                    "oxideBFT: WAL append failed ({err}) — validator signing disabled; \
+                     restart on healthy storage"
+                );
+            }
+            return Err(err);
+        }
+        if !wal.should_compact() {
+            return Ok(());
+        }
+        // Compaction checkpoint: rewrite the WAL as a single entry
+        // carrying the *current* validator set (`include_set: true`)
+        // — the checkpoint is the only record `recover` will see, so
+        // a set-less entry would lose the committed committee a
+        // post-rotation restart depends on. A checkpoint failure is a
+        // WAL write failure: same latch, same fail-closed outcome.
+        let checkpoint = self.wal_entry(true);
+        let wal = self.wal.as_mut().expect("checked above");
+        match wal.checkpoint(&checkpoint) {
             Ok(()) => Ok(()),
             Err(err) => {
-                // Latch + alert once: repeated failures of a dead
-                // disk would otherwise spam stderr every view.
                 if !self.wal_failed {
                     self.wal_failed = true;
                     eprintln!(
-                        "oxideBFT: WAL append failed ({err}) — validator signing disabled; \
+                        "oxideBFT: WAL checkpoint failed ({err}) — validator signing disabled; \
                          restart on healthy storage"
                     );
                 }

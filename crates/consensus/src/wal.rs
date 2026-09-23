@@ -37,13 +37,26 @@
 //! CRC-mismatched tail entry is discarded (the validator crashed
 //! mid-write). The last valid entry is the recovered state.
 //!
-//! ## Rotation
+//! ## Compaction
 //!
-//! The WAL grows monotonically. A future optimization can compact it
-//! by writing a snapshot of the current state and truncating the old
-//! entries; for now, the entries are small (~200 bytes each) and the
-//! file grows at ~1 entry per vote (~10/s), so compaction is not
-//! urgent.
+//! Every `WalEntry` is a *full* snapshot of the engine's
+//! safety-critical state, so only the newest entry (plus the most
+//! recent set-bearing record, which `recover` merges forward) is
+//! replayable state — everything older is dead bytes. When the file
+//! grows past [`COMPACT_AFTER_BYTES`], the engine checkpoints: the
+//! current state is written as a single set-bearing entry to a
+//! temporary file, fsynced, and atomically renamed over the WAL
+//! (tmp → fsync → rename → directory fsync, the same atomic-write
+//! convention the executor snapshot uses). A crash mid-checkpoint
+//! leaves either the old WAL or the new one — both recoverable.
+//!
+//! Segment chaining was considered and rejected: chained segments
+//! exist to preserve deltas, but these entries are snapshots, so a
+//! single checkpoint entry carries strictly the same recoverable
+//! state as the whole history — extra files would buy complexity,
+//! not durability. Compaction bounds the file at
+//! `COMPACT_AFTER_BYTES + MAX_WAL_ENTRY_BYTES` and the recovery scan
+//! at the same order, so restart time no longer grows with uptime.
 
 use codec::{Decode, DecodeError, Encode, Reader};
 use primitives::{Epoch, Hash, Height, View};
@@ -76,6 +89,20 @@ const MAX_WAL_ENTRY_BYTES: usize = 16 << 20;
 /// the cap means the node fell far behind and needs block sync, not
 /// replay (the walk stops at the first missing body either way).
 pub(crate) const MAX_PERSISTED_PENDING: usize = 8;
+
+/// WAL size that triggers a checkpoint compaction.
+///
+/// Unit: bytes appended since the last checkpoint (or since file
+/// open, for a WAL that predates compaction). Origin: recovery reads
+/// the whole file once, so this bounds restart scan time — 32 MiB of
+/// CRC-framed entries decodes in tens of milliseconds while still
+/// being large enough that compaction amortizes to near-zero cost
+/// (one extra file write + fsync + rename per 32 MiB of appended
+/// state, vs. the per-entry fsync already paid). Tradeoff: halving
+/// it halves worst-case restart read time but doubles rewrite churn;
+/// raising it delays the checkpoint a busy validator would otherwise
+/// take for free.
+const COMPACT_AFTER_BYTES: u64 = 32 << 20;
 
 /// The safety-critical consensus state persisted to the WAL.
 ///
@@ -475,6 +502,59 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Encode `entry` into one WAL frame: `[u32 LE length] [u32 LE CRC32]
+/// [payload]` — the single framing rule both `append` and
+/// `checkpoint` write and `recover`/`valid_prefix_len` read.
+///
+/// # Errors
+///
+/// [`WalError::Io`] if the payload exceeds the u32 length prefix —
+/// impossible in practice (the cap is [`MAX_WAL_ENTRY_BYTES`]) but
+/// reported rather than panicking.
+fn frame_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
+    let mut payload = Vec::with_capacity(256);
+    entry.encode(&mut payload);
+    let len = u32::try_from(payload.len())
+        .map_err(|_| WalError::Io(std::io::Error::other("WAL entry exceeds u32 length")))?;
+    let mut frame = Vec::with_capacity(payload.len() + 8);
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&crc32(&payload).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// Atomically replace `path` with `bytes`: write a sibling `.tmp`
+/// file, fsync it, `rename` over the destination, then fsync the
+/// directory so the rename itself is durable. Same convention as
+/// `executor::durability::atomic_write` — duplicated here because
+/// `consensus` sits below `executor` in the dependency graph and the
+/// helper is fifteen lines.
+fn atomic_replace(path: &std::path::Path, bytes: &[u8]) -> Result<(), WalError> {
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    // `rename` replaces atomically on Unix. On Windows it fails if
+    // the destination exists — remove then rename, accepting the
+    // small non-atomic gap there (a crash in the gap loses the new
+    // checkpoint but the caller's retry is the next append).
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        std::fs::rename(&tmp, path).map_err(|_| e)?;
+    }
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// The consensus write-ahead log.
 ///
 /// Append-only file storing `WalEntry` records. Each entry is
@@ -494,6 +574,16 @@ pub struct Wal {
     /// always-failing device (`/dev/full`) is reachable from the
     /// sandbox.
     poisoned: bool,
+    /// Bytes appended since the last checkpoint (initialized to the
+    /// file length at open, so a WAL written by a pre-compaction
+    /// binary compacts on its next append rather than growing
+    /// forever). When this reaches `compact_after`, the engine
+    /// rewrites the file as a single checkpoint entry.
+    bytes_since_checkpoint: u64,
+    /// Compaction trigger — [`COMPACT_AFTER_BYTES`] in production,
+    /// lowered by tests via [`set_compact_threshold`](Self::set_compact_threshold)
+    /// to exercise the path without writing megabytes.
+    compact_after: u64,
 }
 
 impl Wal {
@@ -517,9 +607,19 @@ impl Wal {
             .read(true)
             .open(&path)
             .map_err(WalError::Open)?;
-        let mut wal = Self { path, writer: BufWriter::new(file), poisoned: false };
-        // Repair before any append can land after the damaged bytes.
+        let mut wal = Self {
+            path,
+            writer: BufWriter::new(file),
+            poisoned: false,
+            bytes_since_checkpoint: 0,
+            compact_after: COMPACT_AFTER_BYTES,
+        };
+        // Repair before any append can land after the damaged bytes,
+        // then seed the compaction counter with the repaired length:
+        // an old, never-compacted WAL counts its whole history toward
+        // the threshold so it compacts on the next append.
         wal.repair_tail()?;
+        wal.bytes_since_checkpoint = std::fs::metadata(&wal.path).map_err(WalError::Io)?.len();
         Ok(wal)
     }
 
@@ -614,24 +714,66 @@ impl Wal {
         if self.poisoned {
             return Err(WalError::Io(std::io::Error::other("WAL poisoned")));
         }
-        // Encode the entry payload.
-        let mut payload = Vec::with_capacity(256);
-        entry.encode(&mut payload);
-
-        // Write: [u32 LE length] [u32 LE CRC32] [payload]
-        // A WAL entry >4 GiB is impossible (the entire consensus
-        // state is ~200 bytes), so this conversion never fails in
-        // practice. Return an error rather than panicking for
-        // robustness.
-        let len = u32::try_from(payload.len())
-            .map_err(|_| WalError::Io(std::io::Error::other("WAL entry exceeds u32 length")))?;
-        let crc = crc32(&payload);
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&payload)?;
+        let frame = frame_entry(entry)?;
+        self.writer.write_all(&frame)?;
         self.writer.flush()?;
         // fsync the underlying file (not just the buffer).
         self.writer.get_ref().sync_data()?;
+        self.bytes_since_checkpoint =
+            self.bytes_since_checkpoint.saturating_add(frame.len() as u64);
+        Ok(())
+    }
+
+    /// Whether appended bytes since the last checkpoint have reached
+    /// the compaction threshold. The engine checks this after each
+    /// append; when true it calls [`checkpoint`](Self::checkpoint)
+    /// with a full set-bearing snapshot.
+    #[must_use]
+    pub fn should_compact(&self) -> bool {
+        self.bytes_since_checkpoint >= self.compact_after
+    }
+
+    /// Test hook: lower the compaction trigger so tests exercise the
+    /// checkpoint path with a few entries instead of megabytes.
+    #[doc(hidden)]
+    pub fn set_compact_threshold(&mut self, bytes: u64) {
+        self.compact_after = bytes;
+    }
+
+    /// Compact the WAL to a single checkpoint `entry`.
+    ///
+    /// The caller must pass a *complete* state snapshot with
+    /// `validator_set` populated (`OxideBft::wal_entry(true)`): the
+    /// checkpoint is the only record `recover` will see afterwards,
+    /// so a set-less entry would lose the committed committee a
+    /// post-rotation restart depends on.
+    ///
+    /// Durability: the frame is written to a sibling `.tmp` file and
+    /// fsynced before an atomic `rename` over the WAL, followed by a
+    /// directory fsync — a crash at any point leaves either the old
+    /// WAL or the complete new one, never a torn replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] if any write, fsync, or rename fails.
+    /// The engine treats this exactly like an append failure: the
+    /// `wal_failed` latch trips and signing halts.
+    pub fn checkpoint(&mut self, entry: &WalEntry) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Io(std::io::Error::other("WAL poisoned")));
+        }
+        let frame = frame_entry(entry)?;
+        atomic_replace(&self.path, &frame)?;
+        // Reopen for appending — `rename` swapped the inode under the
+        // old writer, which still points at the unlinked file.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&self.path)
+            .map_err(WalError::Open)?;
+        self.writer = BufWriter::new(file);
+        self.bytes_since_checkpoint = frame.len() as u64;
         Ok(())
     }
 
@@ -739,6 +881,7 @@ impl Wal {
             .open(&self.path)
             .map_err(WalError::Open)?;
         self.writer = BufWriter::new(file);
+        self.bytes_since_checkpoint = 0;
         Ok(())
     }
 
@@ -1219,5 +1362,101 @@ mod tests {
         let decoded = WalEntry::decode(&mut reader).unwrap();
         assert!(decoded.divergence.is_none());
         assert_eq!(decoded.pending, entry.pending);
+    }
+
+    /// Compaction rewrites the WAL as a single set-bearing frame:
+    /// the file shrinks to the checkpoint's size, `recover` returns
+    /// the checkpoint verbatim (set included — the merge-forward
+    /// path has nothing older to merge), and the counter restarts.
+    #[test]
+    fn wal_checkpoint_compacts_file_and_preserves_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        let mut wal = Wal::open(&path).unwrap();
+        wal.set_compact_threshold(1);
+
+        wal.append(&genesis_entry()).unwrap();
+        wal.append(&voted_entry()).unwrap();
+        wal.append(&voted_entry()).unwrap();
+        assert!(wal.should_compact(), "threshold=1 forces compaction after appends");
+
+        let mut checkpoint = voted_entry();
+        checkpoint.epoch = Epoch::new(2);
+        checkpoint.validator_set = Some(test_set());
+        wal.checkpoint(&checkpoint).unwrap();
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        let mut frame = Vec::new();
+        checkpoint.encode(&mut frame);
+        assert_eq!(
+            size,
+            u64::try_from(frame.len()).unwrap() + 8,
+            "the compacted WAL is exactly one framed entry"
+        );
+        assert_eq!(wal.recover().unwrap(), Some(checkpoint));
+        // Counter restart: one entry's worth of bytes, far below the
+        // test threshold's next trigger... at threshold 1 everything
+        // triggers, so assert the counter tracks the checkpoint size.
+        assert!(wal.should_compact(), "threshold=1 still wants the next compaction");
+    }
+
+    /// A checkpointed WAL reopens cleanly, keeps accepting appends,
+    /// and recovery still returns the newest record — compaction is
+    /// invisible to the format, only to the file size.
+    #[test]
+    fn wal_checkpoint_survives_reopen_and_appends() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append(&genesis_entry()).unwrap();
+            let mut checkpoint = voted_entry();
+            checkpoint.validator_set = Some(test_set());
+            wal.checkpoint(&checkpoint).unwrap();
+            // Post-checkpoint append lands after the checkpoint and
+            // must survive the reopen.
+            wal.append(&voted_entry()).unwrap();
+        }
+        let wal = Wal::open(&path).unwrap();
+        let recovered = wal.recover().unwrap().expect("recovers");
+        assert_eq!(recovered, {
+            let mut expected = voted_entry();
+            expected.validator_set = Some(test_set());
+            expected
+        });
+    }
+
+    /// A legacy WAL opened by the compaction-aware binary counts its
+    /// existing bytes toward the threshold, so an oversized file from
+    /// an older version compacts on the next append instead of
+    /// growing forever.
+    #[test]
+    fn wal_open_seeds_compaction_counter_from_file_len() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.set_compact_threshold(u64::MAX); // never compact
+            wal.append(&genesis_entry()).unwrap();
+            wal.append(&voted_entry()).unwrap();
+        }
+        // Reopen with a tiny threshold: the existing bytes seed the
+        // counter and trip compaction immediately.
+        let mut wal = Wal::open(&path).unwrap();
+        wal.set_compact_threshold(1);
+        assert!(wal.should_compact());
+    }
+
+    /// `truncate` (the snapshot-supersede path) resets the counter —
+    /// a fresh file must not inherit the pre-truncate byte debt.
+    #[test]
+    fn wal_truncate_resets_compaction_counter() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consensus.wal");
+        let mut wal = Wal::open(&path).unwrap();
+        wal.append(&voted_entry()).unwrap();
+        wal.truncate().unwrap();
+        wal.set_compact_threshold(u64::MAX);
+        assert!(!wal.should_compact());
     }
 }

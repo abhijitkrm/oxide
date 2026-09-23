@@ -1395,6 +1395,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **Consensus WAL grew without bound and recovery scanned all of
+  it** (`consensus`): the WAL appended every vote/QC/commit forever
+  (hundreds of MB per day at target rates) and `recover` replayed
+  the entire file, so restart time grew linearly with uptime. The
+  WAL now checkpoints itself: once appended bytes pass 32 MiB, the
+  engine rewrites the file as a single set-bearing snapshot entry
+  (tmp write → fsync → atomic rename → directory fsync, so a crash
+  mid-checkpoint leaves either the old log or the complete new
+  one). File size and restart scan are both bounded at ~32 MiB
+  instead of growing forever — segment chaining was unnecessary
+  because every entry is already a full state snapshot.
+  **In plain words:** the validator's safety log now stays small
+  forever, and a restarted node reads a bounded file instead of
+  replaying its whole history — restarts get faster and disk
+  growth stops.
+
 - **State sync trusted a typed-in root, not the network** (`rpc`,
   `statesync`, `oxide-fullnode`, `oxide-validator`,
   `oxide-devnet`): `--state-sync` accepted any operator-supplied

@@ -20082,3 +20082,49 @@ Residual: certs die with the engine's retention floor
 producing them — both correct fail-closeds (no live quorum, no
 trustworthy sync). Fullnode-as-server doesn't relay certs (no
 engine); a synced node can't yet re-serve the anchor it verified.
+
+## Session N+33 — the WAL checkpoints itself instead of growing forever
+
+H9. The consensus WAL grew monotonically and `recover` /
+`valid_prefix_len` scanned the whole file, so disk use grew
+unboundedly and every restart replayed the node\'s entire uptime.
+
+The key observation: every `WalEntry` is already a *full* snapshot
+of the safety state (`last_voted_view`, `voted_at_height`,
+`high_qc`, `current_view`, `next_height`, `epoch`,
+`last_committed`, `pending` tail, `timeout_signed_view`,
+`divergence`), with `validator_set` present on rotation entries and
+merged forward at recover time. Nothing older than the newest
+record is replayable state — so segment chaining buys nothing over
+a single checkpoint file.
+
+`Wal` now tracks `bytes_since_checkpoint` (seeded from file length
+at open, so a pre-compaction WAL compacts on its next append) and
+exposes `should_compact()` at `COMPACT_AFTER_BYTES` = 32 MiB. The
+engine checks it after every successful append in
+`append_wal_full`; when tripped it calls `Wal::checkpoint` with
+`wal_entry(true)` — the set must ride along because the checkpoint
+becomes the only record `recover` sees, and a set-less checkpoint
+would resurrect the genesis committee across a rotation. The write
+is tmp-file → fsync → atomic rename → directory fsync (the
+executor `atomic_write` convention, duplicated locally since
+`consensus` sits below `executor`), then the append handle is
+reopened. A crash mid-checkpoint leaves either the old WAL or the
+complete new one — never a torn replacement.
+
+A checkpoint failure is a WAL write failure: same `wal_failed`
+latch, same fail-closed signing halt. `truncate()` (the
+snapshot-supersede path) resets the counter so a fresh file doesn\'t
+inherit the old byte debt.
+
+Tests: `wal_checkpoint_compacts_file_and_preserves_state` (file
+shrinks to exactly one frame, recovery returns the checkpoint with
+the set), `wal_checkpoint_survives_reopen_and_appends` (append
+after checkpoint survives a reopen, set still merges),
+`wal_open_seeds_compaction_counter_from_file_len` (legacy oversized
+WAL compacts on next append), `wal_truncate_resets_compaction_
+counter`, and engine-level
+`wal_auto_compaction_bounds_file_and_preserves_recovery` — with the
+threshold forced to 1 byte every append checkpoints through real
+`run_until_idle` traffic, the file stays one frame, and a restart
+recovers locks + committee.
