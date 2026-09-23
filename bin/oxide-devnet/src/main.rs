@@ -866,13 +866,22 @@ fn run_consensus_loop(
                     if let Ok(voter_idx_byte) = reader.read_u8()
                         && let Ok(sig_view) = reader.read_u64()
                         && let Ok(sig_epoch) = reader.read_u64()
-                        && let (Ok(has_qc), Ok(has_tc)) = (reader.read_u8(), reader.read_u8())
+                        && let Ok(has_qc) = reader.read_u8()
                     {
+                        // The wire interleaves each flag with its
+                        // payload — has_qc then the QC bytes, then
+                        // has_tc then the TC bytes. Reading both
+                        // flags up front would consume the QC's
+                        // first byte as `has_tc` and misalign every
+                        // field after it, so the qc_ev the signature
+                        // is verified against would never match what
+                        // the sender signed.
                         let qc_ev = if has_qc == 1 {
                             types::QuorumCertificate::decode(&mut reader).ok()
                         } else {
                             None
                         };
+                        let Ok(has_tc) = reader.read_u8() else { continue };
                         let tc_ev = if has_tc == 1 {
                             types::TimeoutCertificate::decode(&mut reader).ok()
                         } else {
