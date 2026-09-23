@@ -2476,36 +2476,138 @@ fn divergence_detection_rejects_mismatched_exec_cert() {
         aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
     };
 
-    let proposal =
-        Proposal { height: Height::new(0), txs: vec![TxBytes::new(vec![1])], attestation: None };
-    // C3: sign the header so the proposer-auth check passes;
-    // the divergence check is what we're testing here.
-    let mut header = BlockHeader {
-        height: Height::new(0),
-        view: View::new(0),
-        epoch: Epoch::new(0),
-        prev_block: Hash::ZERO,
-        tx_root: OxideBft::tx_root(&proposal.txs),
-        high_qc: None,
-        timeout_cert: None,
-        proposer: proposer_hash(0),
-        timestamp: 0,
-        proposer_signature: None,
-        exec_cert: Some(exec_cert),
-        body_commitment: Hash::ZERO,
-    };
-    let signing_hash = OxideBft::proposal_signing_hash(&header);
-    header.proposer_signature =
-        Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
+    // `genesis_proposal_with_cert` signs the header AND carries the
+    // real body commitment — `vote` binds body↔commitment before the
+    // cert check, so a zero commitment would withhold the vote for
+    // the wrong reason and never reach the divergence comparison.
+    let (header, proposal) = genesis_proposal_with_cert(&sk, exec_cert);
     let vote = engine.vote(&header, &proposal);
     assert!(
         vote.is_none(),
         "proposal with divergent exec_cert must be rejected (state divergence)"
     );
+    // The verified mismatch must latch: signing halts and the
+    // divergence detail is exposed for health/metrics plumbing.
+    let d = engine.divergence().expect("verified root mismatch must latch divergence");
+    assert_eq!(d.height, Height::new(0));
+    assert_eq!(d.local_root, mock_root);
+    assert_eq!(d.certified_root, divergent_root);
+    assert!(!engine.signing_healthy(), "diverged engine must report signing-unhealthy");
 
     // Sanity: the divergent root is indeed different from the
     // mock root.
     assert_ne!(divergent_root, mock_root, "test setup: roots must differ");
+}
+
+#[test]
+fn divergence_latch_halts_every_signing_path() {
+    // Withholding the divergent vote alone is not enough: a
+    // validator whose executed state is proven wrong must go
+    // fully silent — timeouts, attestations, and proposals all
+    // extend a chain this node does not share.
+    let app = Arc::new(MockApp::new());
+    let sk = bls_key(1);
+    let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+    let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone());
+
+    let divergent_root = Hash([0xDE; 32]);
+    let att_msg = engine.attestation_signing_message(Height::new(0), &divergent_root);
+    let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+    let cert = ExecCertificate {
+        height: Height::new(0),
+        state_root: divergent_root,
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+    };
+    let (header, proposal) = genesis_proposal_with_cert(&sk, cert);
+    assert!(engine.vote(&header, &proposal).is_none(), "setup: divergent vote withheld");
+    assert!(engine.divergence().is_some(), "setup: latch must be set");
+
+    // Timeouts and attestations are signatures too — both refuse.
+    assert!(engine.on_timeout().is_none(), "diverged engine must not sign timeouts");
+    let (att, sig) = engine.vote_attestation();
+    assert!(att.is_none() && sig.is_none(), "diverged engine must not attest");
+
+    // Proposals carry a signature — refuse even with a committed
+    // anchor that would otherwise make propose() produce a block
+    // (mirrors `propose_never_embeds_stale_epoch_cert`'s setup).
+    engine.last_committed = Some((Hash([9; 32]), Height::new(1)));
+    assert!(engine.propose().is_none(), "diverged engine must not propose");
+
+    // A second divergent delivery does not move the recorded
+    // anchor: the earliest verified mismatch is the repair point.
+    let second_root = Hash([0x77; 32]);
+    let att_msg2 = engine.attestation_signing_message(Height::new(0), &second_root);
+    let att_sig2 = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg2);
+    let cert2 = ExecCertificate {
+        height: Height::new(0),
+        state_root: second_root,
+        epoch: Epoch::new(0),
+        signer_bitmap: vec![0b0000_0001],
+        aggregate_signature: crypto::aggregate(&[att_sig2]).expect("aggregate"),
+    };
+    let (header2, proposal2) = genesis_proposal_with_cert(&sk, cert2);
+    assert!(engine.vote(&header2, &proposal2).is_none());
+    assert_eq!(
+        engine.divergence().expect("latch persists").certified_root,
+        divergent_root,
+        "the first verified mismatch is the recorded repair anchor"
+    );
+}
+
+#[test]
+fn divergence_latch_survives_restart_via_wal() {
+    // The latch is safety state, not status detail: a validator
+    // that crashes after diverging must not wake up signing over
+    // the same diverged state — that would be the silent-fade
+    // failure with extra steps. The latch therefore rides the WAL
+    // like the vote locks do.
+    use crate::wal::Wal;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let wal_path = dir.path().join("consensus.wal");
+    let divergent_root = Hash([0xDE; 32]);
+
+    {
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone()).with_wal(wal);
+
+        let att_msg = engine.attestation_signing_message(Height::new(0), &divergent_root);
+        let att_sig = sk.sign(crypto::hash::Domain::ExecAttest, &att_msg);
+        let cert = ExecCertificate {
+            height: Height::new(0),
+            state_root: divergent_root,
+            epoch: Epoch::new(0),
+            signer_bitmap: vec![0b0000_0001],
+            aggregate_signature: crypto::aggregate(&[att_sig]).expect("aggregate"),
+        };
+        let (header, proposal) = genesis_proposal_with_cert(&sk, cert);
+        assert!(engine.vote(&header, &proposal).is_none());
+        assert!(engine.divergence().is_some(), "setup: latch must be set");
+        // Engine drops here — the crash.
+    }
+
+    {
+        let app = Arc::new(MockApp::new());
+        let sk = bls_key(1);
+        let vs = ValidatorSet::new(vec![sk.public_key()], vec![1]).expect("1 validator");
+        let wal = Wal::open(&wal_path).expect("open WAL");
+        let mut engine = OxideBft::new(app, vs).with_secret_key(sk.clone()).with_wal(wal);
+        engine.recover_from_wal().expect("recover from WAL");
+
+        let d = engine.divergence().expect("the divergence latch must survive restart via the WAL");
+        assert_eq!(d.certified_root, divergent_root);
+        assert!(!engine.signing_healthy());
+        assert!(
+            engine.on_timeout().is_none(),
+            "a restarted diverged engine must still refuse to sign"
+        );
+    }
 }
 
 #[test]
@@ -2558,6 +2660,10 @@ fn divergence_detection_accepts_matching_exec_cert() {
         Some(sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes()));
     let vote = engine.vote(&header, &proposal);
     assert!(vote.is_some(), "proposal with matching exec_cert must be accepted");
+    assert!(
+        engine.divergence().is_none() && engine.signing_healthy(),
+        "a matching cert must not trip the divergence latch"
+    );
 }
 
 // ---- Exec-cert validation hardening ----
@@ -2631,6 +2737,13 @@ fn forged_exec_cert_with_matching_root_rejected() {
     assert!(
         vote.is_none(),
         "a forged exec_cert must withhold the vote even when its root matches local state"
+    );
+    // Rejection by authentication is not divergence: the latch must
+    // NOT trip — a forged cert carries zero evidence about this
+    // node's execution correctness.
+    assert!(
+        engine.divergence().is_none() && engine.signing_healthy(),
+        "an unverifiable cert must not halt signing"
     );
 }
 

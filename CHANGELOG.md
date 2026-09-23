@@ -1491,6 +1491,31 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     finalizing new blocks from where it left off. Verified by
     repeatedly `kill -9`-ing a live devnet and watching it resume
     cleanly each time.
+- **A validator that provably diverged from the network used to just
+  stop voting — silently** (`crates/consensus`, `crates/types`,
+  `crates/ports`, `crates/rpc`, `bin/oxide-validator`,
+  `bin/oxide-devnet`): a verified execution certificate whose state
+  root disagreed with local execution withheld that one vote and
+  left no trace — no log, no metric, no lasting record.
+  - The mismatch now latches: the engine records the diverged
+    height, the local root, and the quorum-certified root, emits a
+    CRITICAL log, and refuses every signature from then on — votes,
+    timeouts, attestations, and proposals all fail closed. The latch
+    is written to the consensus WAL, so a crash-and-restart does not
+    clear it; only certified state repair does. A forged certificate
+    still cannot halt signing: the latch only sets after the
+    certificate passes full quorum verification.
+  - The latch surfaces operationally: `/health` returns 503 with the
+    certified `(height, root)` repair anchor, and `/metrics`
+    exposes `oxide_exec_diverged` and `oxide_exec_divergence_height`
+    gauges. `docs/runbooks.md` §7 prescribes the repair — certified
+    state sync using the emitted root as `--trusted-root`.
+  - **In plain words:** a validator that computed different state
+    than the rest of the network used to quietly fade out of
+    consensus — the chain slowed and nobody was told why. Now the
+    node loudly stops participating, marks itself unwell for any
+    monitoring that checks `/health`, and tells the operator exactly
+    which certified state to repair from.
 - **oxideBFT: hidden-QC fork — conflicting blocks could finalize at
   the same height** (`crates/consensus`, `crates/types`,
   `bin/oxide-devnet`, `crates/devnet`, `sim`, `spec/oxidebft`)

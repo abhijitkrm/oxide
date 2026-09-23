@@ -667,6 +667,14 @@ pub struct RpcServer {
     /// The pending-tx ring feeding `newPendingTransactions` subs and
     /// `eth_newPendingTransactionFilter` polls.
     pending_txs: std::sync::Mutex<PendingRing>,
+    /// Confirmed execution divergence mirrored from the consensus
+    /// engine. A `Mutex` rather than three atomics because the
+    /// detail is a coherent triple — a probe must never read the
+    /// height of one divergence alongside the root of another.
+    /// Written at most once per process (the engine's latch is
+    /// terminal) and read per `/health` + `/metrics` probe — both
+    /// cold paths, so lock cost is irrelevant.
+    exec_divergence: std::sync::Mutex<Option<types::ExecDivergence>>,
 }
 
 mod endpoints;
@@ -696,6 +704,7 @@ impl RpcServer {
             filters: std::sync::Mutex::new(HashMap::new()),
             next_filter_id: AtomicU64::new(1),
             pending_txs: std::sync::Mutex::new(PendingRing::default()),
+            exec_divergence: std::sync::Mutex::new(None),
         }
     }
 
@@ -934,6 +943,26 @@ impl RpcServer {
         self.mempool_size.load(Ordering::Relaxed)
     }
 
+    /// Record a confirmed execution divergence. First write wins:
+    /// the engine latches on the first verified mismatch and never
+    /// clears, so a later write could only describe the same event
+    /// at a worse repair anchor.
+    pub fn set_exec_divergence(&self, detail: types::ExecDivergence) {
+        let mut slot = primitives::sync::lock_state(&self.exec_divergence);
+        if slot.is_none() {
+            *slot = Some(detail);
+        }
+    }
+
+    /// The confirmed divergence mirrored from consensus, if any.
+    /// The `certified_root` is the quorum-signed anchor operators
+    /// should pass as `--trusted-root` when repairing via
+    /// `--state-sync`.
+    #[must_use]
+    pub fn exec_divergence(&self) -> Option<types::ExecDivergence> {
+        *primitives::sync::lock_state(&self.exec_divergence)
+    }
+
     /// Generate a Prometheus text exposition of all node metrics.
     ///
     /// Exposes the basic node gauges/counters:
@@ -956,6 +985,26 @@ impl RpcServer {
         let _ = writeln!(out, "# HELP oxide_mempool_size Current mempool size");
         let _ = writeln!(out, "# TYPE oxide_mempool_size gauge");
         let _ = writeln!(out, "oxide_mempool_size {}", self.mempool_size());
+        // Execution-divergence latch: the alerting surface for the
+        // fail-closed signing halt. `oxide_exec_diverged` is the
+        // pageable signal; `oxide_exec_divergence_height` (emitted
+        // only while diverged) is the repair anchor for
+        // `--state-sync --trusted-height`.
+        let divergence = self.exec_divergence();
+        let _ = writeln!(
+            out,
+            "# HELP oxide_exec_diverged Consensus halted signing on a verified execution divergence"
+        );
+        let _ = writeln!(out, "# TYPE oxide_exec_diverged gauge");
+        let _ = writeln!(out, "oxide_exec_diverged {}", u8::from(divergence.is_some()));
+        if let Some(d) = divergence {
+            let _ = writeln!(
+                out,
+                "# HELP oxide_exec_divergence_height Height of the quorum-certified root this node diverged from"
+            );
+            let _ = writeln!(out, "# TYPE oxide_exec_divergence_height gauge");
+            let _ = writeln!(out, "oxide_exec_divergence_height {}", d.height.value());
+        }
         // Append latency histogram metrics if a recorder is attached.
         let latency = self.prometheus();
         if !latency.is_empty() {

@@ -44,6 +44,13 @@ impl OxideBft {
             self.next_height = entry.next_height;
             self.epoch = entry.epoch;
             self.last_committed = entry.last_committed;
+            // The divergence latch is safety state, not status
+            // detail: a restart that forgot it would resume signing
+            // over execution state a verified certificate already
+            // proved wrong. Restored unverified for the same reason
+            // the vote locks are — the only writer is the verified
+            // mismatch path, and our own WAL is the trust interior.
+            self.divergence = entry.divergence;
             // The recorded `current_view` lags real progress by up
             // to one view: `deliver_qc` appends before its own
             // catch-up and `advance_view` does not append at all, so
@@ -191,6 +198,7 @@ impl OxideBft {
             last_committed: self.last_committed,
             validator_set: include_set.then(|| self.validator_set.clone()),
             pending: self.pending_tail(),
+            divergence: self.divergence,
         }
     }
 

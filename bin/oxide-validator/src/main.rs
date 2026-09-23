@@ -154,10 +154,7 @@ fn run_single_node() {
         // finalizing blocks as transactions arrive.
         let mut consensus_driver = driver::ConsensusDriver::with_defaults();
         let driver_metrics = consensus_driver.metrics();
-        consensus_driver.set_block_observer(Arc::new(move |height: u64| {
-            rpc_shared.set_block_height(height);
-            rpc_shared.publish_new_block(height);
-        }));
+        wire_driver_observers(&mut consensus_driver, &rpc_shared);
         consensus_driver.start(node);
         tracing::info!("oxide-validator: consensus driver started (autonomous mode)");
 
@@ -221,6 +218,26 @@ fn run_single_node() {
 /// Build the single-node JSON-RPC server: wire the executor and EVM
 /// module into `RpcServer`, seed metrics, and return the shared
 /// `Arc` (for the driver's block observer) plus the HTTP server.
+/// Wire the consensus driver's observers into the shared RPC
+/// server: block finalization keeps `eth_blockNumber` and
+/// `newHeads` pushes live, and the divergence latch flips `/health`
+/// to 503 carrying the certified repair anchor while `/metrics`
+/// exposes `oxide_exec_diverged`.
+fn wire_driver_observers(
+    consensus_driver: &mut driver::ConsensusDriver,
+    rpc_shared: &Arc<rpc::RpcServer>,
+) {
+    let rpc_divergence = rpc_shared.clone();
+    consensus_driver.set_divergence_observer(Arc::new(move |d| {
+        rpc_divergence.set_exec_divergence(d);
+    }));
+    let rpc_blocks = rpc_shared.clone();
+    consensus_driver.set_block_observer(Arc::new(move |height: u64| {
+        rpc_blocks.set_block_height(height);
+        rpc_blocks.publish_new_block(height);
+    }));
+}
+
 fn build_single_node_rpc(
     node: &Node,
     rpc_config: &config::RpcConfig,

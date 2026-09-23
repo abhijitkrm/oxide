@@ -135,7 +135,10 @@ impl OxideBft {
         // C10: refuse to sign while the WAL latch is set. A timeout
         // signature pins our evidence claim; a validator that cannot
         // trust its durability layer must not participate at all.
-        if self.wal_failed {
+        // The divergence latch gates identically: a validator whose
+        // executed state is proven wrong must not attest evidence
+        // for a chain it no longer shares.
+        if self.wal_failed || self.divergence.is_some() {
             return None;
         }
         let _ = self.pacemaker.on_local_timeout();

@@ -1101,6 +1101,16 @@ fn run_consensus_loop(
             }
         }
 
+        // A confirmed execution divergence is terminal for this
+        // process: the engine has already logged CRITICAL and
+        // stopped signing; mirror the latch into RPC status so
+        // `/health` flips to 503 and `/metrics` exposes the gauge —
+        // otherwise the only signal is a stderr line a watchdog
+        // never sees. Idempotent: the detail is write-once.
+        if let (Some(rpc), Some(d)) = (rpc, engine.divergence()) {
+            rpc.set_exec_divergence(*d);
+        }
+
         // Compact pending proposals (keep last 10 views).
         let current_view = engine.current_view().value();
         pending_proposals.retain(|(h, _)| h.view.value() >= current_view.saturating_sub(10));

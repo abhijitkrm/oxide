@@ -18,6 +18,7 @@ use super::{
     Verdict, View, Vote, VotePhase, proposer_hash,
 };
 use crate::verify::VerifiedTc;
+use types::ExecDivergence;
 
 impl OxideBft {
     /// Validator: vote on a proposal. Returns the vote, or `None` if
@@ -454,6 +455,48 @@ impl OxideBft {
             // extend it.
             let local = self.app.attest_state(cert.height)?;
             if local.root != cert.state_root {
+                // Confirmed divergence — the cert is fully verified
+                // (quorum + signature), so a supermajority attested
+                // a root this validator did not compute. Halt all
+                // signing for the process lifetime: every signature
+                // from here extends a chain built on state we do
+                // not share, and silence without a latch once let
+                // each validator quietly leak out of the quorum
+                // while operators saw only a slowing chain. The
+                // latch survives rotation — a new epoch does not
+                // repair diverged state; certified resync does.
+                if self.divergence.is_none() {
+                    let detail = ExecDivergence {
+                        height: cert.height,
+                        local_root: local.root,
+                        certified_root: cert.state_root,
+                    };
+                    // Display, not Debug: `Hash`'s Debug truncates
+                    // to 12 hex chars, and the certified root in
+                    // this line is the operator's `--trusted-root`
+                    // repair value — it must be complete.
+                    eprintln!(
+                        "oxideBFT: CRITICAL — execution divergence at height {}: \
+                         local root 0x{} != quorum-certified root 0x{}; \
+                         signing halted — repair via --state-sync with \
+                         --trusted-height {} --trusted-root 0x{}",
+                        detail.height.value(),
+                        detail.local_root,
+                        detail.certified_root,
+                        detail.height.value(),
+                        detail.certified_root,
+                    );
+                    // First write wins: a second divergent cert is
+                    // the same condition, and the earliest mismatch
+                    // is the better repair anchor.
+                    self.divergence = Some(detail);
+                    // Persist the latch BEFORE returning — a crash
+                    // between detection and the next routine append
+                    // must not wake up signing over the same
+                    // diverged state. A failed append sets
+                    // `wal_failed`, which halts signing identically.
+                    let _ = self.append_wal();
+                }
                 return None;
             }
         }
@@ -551,7 +594,11 @@ impl OxideBft {
     /// the phase byte differs. A vote from epoch 0 cannot be replayed
     /// in epoch 1 because the epoch bytes differ.
     pub(crate) fn sign_vote(&self, view: View, block_hash: Hash) -> Option<Signature> {
-        if self.wal_failed {
+        // Both latches are fail-closed: undurable safety state
+        // (WAL) and proven-wrong execution (divergence) each make
+        // any further signature equivocation- or divergence-
+        // extending, so none may leave the engine.
+        if self.wal_failed || self.divergence.is_some() {
             return None;
         }
         Some(match &self.secret_key {
@@ -594,8 +641,10 @@ impl OxideBft {
     pub(crate) fn build_attestation(&mut self) -> (Option<StateAttestation>, Option<Signature>) {
         // C10: an attestation is a signature too — a WAL-failed
         // validator goes fully silent rather than emitting any
-        // signature whose surrounding safety state is undurable.
-        if self.wal_failed {
+        // signature whose surrounding safety state is undurable. A
+        // diverged validator likewise must never attest a root it
+        // no longer stands behind.
+        if self.wal_failed || self.divergence.is_some() {
             return (None, None);
         }
         // `None` = nothing executed yet — attestations are only

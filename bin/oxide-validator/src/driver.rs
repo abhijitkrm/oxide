@@ -116,13 +116,24 @@ pub struct ConsensusDriver {
     /// `eth_subscribe(newHeads)` pushes fire — without it the RPC
     /// height is frozen at its startup seed.
     block_observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// Optional observer invoked once when the engine latches a
+    /// confirmed execution divergence. The validator wires this to
+    /// the RPC server so `/health` flips to 503 and `/metrics`
+    /// exposes the halt — without it the only signal is a stderr
+    /// line watchdogs never scrape.
+    divergence_observer: Option<Arc<dyn Fn(consensus::ExecDivergence) + Send + Sync>>,
 }
 
 impl ConsensusDriver {
     /// Create a new driver with the given configuration.
     #[must_use]
     pub fn new(config: DriverConfig) -> Self {
-        Self { config, metrics: Arc::new(DriverMetrics::new()), block_observer: None }
+        Self {
+            config,
+            metrics: Arc::new(DriverMetrics::new()),
+            block_observer: None,
+            divergence_observer: None,
+        }
     }
 
     /// Create a new driver with default configuration.
@@ -137,6 +148,17 @@ impl ConsensusDriver {
     /// publish path is (one lock + channel send per subscriber).
     pub fn set_block_observer(&mut self, observer: Arc<dyn Fn(u64) + Send + Sync>) {
         self.block_observer = Some(observer);
+    }
+
+    /// Install a callback fired once when the consensus engine
+    /// latches a confirmed execution divergence. Fires on the
+    /// driver task's tick; the latch is terminal so the callback
+    /// runs at most once per process.
+    pub fn set_divergence_observer(
+        &mut self,
+        observer: Arc<dyn Fn(consensus::ExecDivergence) + Send + Sync>,
+    ) {
+        self.divergence_observer = Some(observer);
     }
 
     /// Get a handle to the shared metrics (for wiring into the RPC
@@ -162,11 +184,14 @@ impl ConsensusDriver {
         let metrics_interval = Duration::from_millis(self.config.metrics_interval_ms);
         let metrics = self.metrics;
         let block_observer = self.block_observer;
+        let divergence_observer = self.divergence_observer;
 
         // The last finalized height we saw. Used to detect new
         // finalization events for metrics reporting.
         let mut last_height: Option<u64> = None;
         let mut last_metrics_tick = std::time::Instant::now();
+        // The divergence latch is terminal — fire the observer once.
+        let mut divergence_reported = false;
 
         tokio::spawn(async move {
             tracing::info!(block_time_ms = block_time.as_millis(), "consensus driver started");
@@ -186,6 +211,28 @@ impl ConsensusDriver {
                 // multi-validator mode (future), this processes
                 // incoming votes and proposals from the network.
                 node.engine().run_until_idle();
+
+                // Execution divergence: the engine has gone
+                // fail-closed on a verified quorum certificate whose
+                // root this node did not compute. Log through the
+                // validator's structured facility and propagate to
+                // RPC once — the latch never clears in-process.
+                if !divergence_reported && let Some(d) = node.engine().divergence() {
+                    // `%` (Display) not `?` (Debug): `Hash`'s Debug
+                    // truncates — the certified root is the repair
+                    // anchor and must be logged complete.
+                    tracing::error!(
+                        height = d.height.value(),
+                        local_root = %d.local_root,
+                        certified_root = %d.certified_root,
+                        "consensus driver: execution divergence — signing halted; \
+                         repair via --state-sync with the certified root"
+                    );
+                    if let Some(observer) = &divergence_observer {
+                        observer(d);
+                    }
+                    divergence_reported = true;
+                }
 
                 // Check for new finalization.
                 let current_height =

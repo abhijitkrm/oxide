@@ -171,4 +171,18 @@ pub trait ConsensusEngine: Send {
     /// The finalized block at `height`, if finalized (oai-spec.md §3,
     /// rule 1: after finalization, this is stable and unique).
     fn finalized_block(&self, height: Height) -> Option<FinalizedBlock>;
+
+    /// The confirmed execution divergence that halted this engine's
+    /// signing, if any. Engines that verify execution certificates
+    /// (oxideBFT) report the mismatch here so node status plumbing —
+    /// `/health`, `/metrics` — can surface the halt; engines without
+    /// certificate verification (sequencer, mocks) inherit the
+    /// default `None`, which means "cannot diverge-observe", not
+    /// "healthy".
+    ///
+    /// Terminal once `Some`: the only safe recovery is certified
+    /// state repair, never resumed participation.
+    fn divergence(&self) -> Option<types::ExecDivergence> {
+        None
+    }
 }

@@ -164,6 +164,18 @@ pub struct WalEntry {
     /// header + 1-byte body flag + proposal); absent on old files —
     /// decoded `[]`. Capped at [`MAX_PERSISTED_PENDING`] when written.
     pub pending: Vec<(types::BlockHeader, Option<types::Proposal>)>,
+    /// The confirmed execution divergence that halted signing, if
+    /// any. Safety-critical in the same way the vote locks are: a
+    /// restart that forgot the latch would resume signing over state
+    /// a verified quorum certificate already proved this node does
+    /// not share — the exact silent-divergence failure the latch
+    /// exists to close. Terminal: the only clearing path is certified
+    /// state repair (which rebuilds the executor, not this record).
+    ///
+    /// Encoded as optional trailer #5 (1-byte flag + height +
+    /// local root + certified root); absent on old files — decoded
+    /// `None`.
+    pub divergence: Option<types::ExecDivergence>,
 }
 
 impl Encode for WalEntry {
@@ -247,6 +259,18 @@ impl Encode for WalEntry {
                 }
                 None => buf.push(0),
             }
+        }
+        // Optional trailer #5: the divergence latch (1-byte flag +
+        // height + local root + certified root). Absent on old
+        // files — decoded `None`.
+        match &self.divergence {
+            Some(d) => {
+                buf.push(1);
+                d.height.encode(buf);
+                d.local_root.encode(buf);
+                d.certified_root.encode(buf);
+            }
+            None => buf.push(0),
         }
     }
 }
@@ -332,6 +356,18 @@ impl<'a> Decode<'a> for WalEntry {
         // Optional trailer #4: the uncommitted tail. Entries written
         // before it existed end here — decode `[]`.
         let pending = decode_pending_tail(reader)?;
+        // Optional trailer #5: the divergence latch. Entries written
+        // before it existed end at or before the flag byte —
+        // decode `None`.
+        let divergence = if reader.remaining() > 0 && reader.read_u8()? == 1 {
+            Some(types::ExecDivergence {
+                height: Height::decode(reader)?,
+                local_root: Hash::decode(reader)?,
+                certified_root: Hash::decode(reader)?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             last_voted_view,
             voted_at_height,
@@ -343,6 +379,7 @@ impl<'a> Decode<'a> for WalEntry {
             validator_set,
             timeout_signed_view,
             pending,
+            divergence,
         })
     }
 }
@@ -730,6 +767,7 @@ mod tests {
             validator_set: None,
             timeout_signed_view: None,
             pending: Vec::new(),
+            divergence: None,
         }
     }
 
@@ -748,6 +786,7 @@ mod tests {
             validator_set: None,
             timeout_signed_view: Some(View::new(5)),
             pending: Vec::new(),
+            divergence: None,
         }
     }
 
@@ -1115,13 +1154,16 @@ mod tests {
         let entry = voted_entry();
         let mut buf = Vec::new();
         entry.encode(&mut buf);
-        // `pending` encodes as a trailing varint count; an empty
-        // tail is a single `0x00`. Stripping it yields exactly the
-        // pre-tail byte layout.
+        // Trailer #5 (divergence flag, `0x00` when unset) sits after
+        // the tail, then `pending` encodes as a trailing varint
+        // count; an empty tail is a single `0x00`. Stripping both
+        // yields exactly the pre-tail byte layout.
+        assert_eq!(buf.pop(), Some(0), "unset divergence encodes as one zero byte");
         assert_eq!(buf.pop(), Some(0), "empty tail encodes as one zero byte");
         let mut reader = Reader::new(&buf);
         let decoded = WalEntry::decode(&mut reader).unwrap();
         assert!(decoded.pending.is_empty());
+        assert!(decoded.divergence.is_none());
         assert_eq!(decoded.timeout_signed_view, entry.timeout_signed_view);
         assert_eq!(decoded.last_committed, entry.last_committed);
     }
@@ -1134,9 +1176,48 @@ mod tests {
         let entry = voted_entry();
         let mut buf = Vec::new();
         entry.encode(&mut buf);
-        buf.pop(); // strip the real tail count
+        // Strip trailer #5's flag byte and the real tail count, then
+        // write the forged count followed by a well-formed `None`
+        // divergence flag — the failure must come from the pending
+        // bound, not a short buffer.
+        buf.pop();
+        buf.pop();
         codec::write::varint(&mut buf, 0xFFFF);
+        buf.push(0);
         let mut reader = Reader::new(&buf);
         assert!(WalEntry::decode(&mut reader).is_err());
+    }
+
+    /// The divergence latch is durable safety state: it round-trips
+    /// through the WAL so a restarted validator stays fail-closed
+    /// rather than resuming signatures over diverged state.
+    #[test]
+    fn wal_entry_divergence_roundtrip() {
+        let mut entry = voted_entry();
+        entry.divergence = Some(types::ExecDivergence {
+            height: Height::new(7),
+            local_root: Hash([0x11; 32]),
+            certified_root: Hash([0x22; 32]),
+        });
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
+        let mut reader = Reader::new(&buf);
+        let decoded = WalEntry::decode(&mut reader).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    /// Entries written before the divergence trailer existed must
+    /// still decode — a buffer that ends at the tail count decodes
+    /// with `divergence: None` (the rolling-upgrade contract).
+    #[test]
+    fn wal_entry_decodes_legacy_layout_without_divergence() {
+        let entry = voted_entry();
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
+        assert_eq!(buf.pop(), Some(0), "unset divergence encodes as one zero byte");
+        let mut reader = Reader::new(&buf);
+        let decoded = WalEntry::decode(&mut reader).unwrap();
+        assert!(decoded.divergence.is_none());
+        assert_eq!(decoded.pending, entry.pending);
     }
 }

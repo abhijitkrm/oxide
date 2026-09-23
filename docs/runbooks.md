@@ -294,44 +294,78 @@ done
 
 ### Symptoms
 
-- Two or more validators report different state roots for the same
-  height.
-- The divergence detector reports a `DivergenceReport`.
-- The log shows `state root mismatch: expected 0x..., got 0x...`.
+- The diverged validator's `/health` endpoint returns
+  **503 Service Unavailable** with a body naming the diverged
+  height, the local root, and the quorum-certified root.
+- `oxide_exec_diverged` is `1` on the node's `/metrics` endpoint,
+  and `oxide_exec_divergence_height` reports the height.
+- The log shows
+  `oxideBFT: CRITICAL — execution divergence at height N: local root
+  ... != quorum-certified root ...; signing halted`.
+- The validator stops signing entirely — no votes, timeouts,
+  attestations, or proposals — so the network's finalized-height
+  rate may drop if it was needed for quorum.
+
+This state is terminal for the node: a verified execution
+certificate proves a stake supermajority attested a state root this
+node did not compute. The latch is persisted in the consensus WAL,
+so restarting without repair does NOT clear it — the node comes
+back up still refusing to sign. The only clearing path is certified
+state repair (which rebuilds executor state, not the safety latch).
 
 ### Diagnosis
 
 ```sh
-# 1. Check each validator's state root at the current height.
-for host in validator-0 validator-1 validator-2 validator-3; do
-  echo "$host: $(curl -s http://$host:9000/attest 2>/dev/null | jq -c '{height, root}' || echo 'unreachable')"
-done
+# 1. Pull the divergence detail — the certified root in the body is
+#    the repair anchor (do NOT substitute an unverified root).
+curl -s http://diverged-host:9000/health
+# "execution divergence at height 1234: local root 0xaaaa...,
+#  certified root 0xbbbb...; signing halted — repair via
+#  --state-sync with --trusted-height 1234 --trusted-root 0xbbbb..."
 
-# 2. Identify the divergent node(s).
-#    The majority (3+) agree on the correct root. The minority is
-#    divergent.
+# 2. Confirm the metric latch.
+curl -s http://diverged-host:9000/metrics | grep oxide_exec_diverged
+# oxide_exec_diverged 1
 
-# 3. Check the divergent node's log for execution errors.
-ssh divergent-host "tail -200 /var/log/oxide/validator.log | grep -i 'error\|skip\|reject'"
+# 3. Identify the divergent node(s). The majority (quorum) agrees on
+#    the certified root — the node reporting the mismatch is the one
+#    to repair. If MULTIPLE nodes report divergence at the same
+#    height, stop all of them and escalate: that is a potential
+#    consensus-level execution bug, not a single-node fault.
 ```
 
 ### Resolution
 
-1. **Identify the correct state:** The majority (3+) agree on the
-   correct state root. The minority is divergent.
-2. **Stop the divergent node** (runbook 2).
-3. **Restore from a snapshot** taken from a correct node (runbook 4).
-4. **Restart the node** (runbook 1).
-5. **Verify** the node's state root matches the majority after sync.
+1. **Stop the diverged node** (runbook 2).
+2. **Repair via certified state sync** from a peer that agrees with
+   the certified root, using the anchor from the `/health` body:
+
+   ```sh
+   oxide-validator --config /path/to/oxide.toml \
+     --state-sync <healthy-peer-rpc-host:port> \
+     --trusted-height <height-from-health-body> \
+     --trusted-root 0x<certified-root-from-health-body>
+   ```
+
+   The certified root is quorum-signed — it is the correct trusted
+   anchor even when the local root "looks" more plausible. Never
+   pass the local root.
+3. **Restart the node** (runbook 1) and verify `/health` returns 200
+   and `oxide_exec_diverged` is 0.
+4. **Investigate the cause before wiping evidence:** preserve the
+   data directory (journal + snapshot) — the divergence may
+   indicate a nondeterministic-execution bug that must be root-caused
+   before the node rejoins.
 
 ### Prevention
 
-- The executor's nonce enforcement (H4/H5 fix) prevents most
-  divergence caused by replay or nonce reordering.
-- The snapshot import verification (M3 fix) prevents importing
-  corrupted state.
-- The divergence detector runs on every `attest_state` call and
-  reports mismatches immediately.
+- The executor's nonce enforcement prevents most divergence caused
+  by replay or nonce reordering.
+- The snapshot import verification prevents importing corrupted
+  state.
+- The divergence check runs on every verified execution certificate
+  embedded in a proposal; a confirmed mismatch latches the engine
+  and halts all signing automatically — there is no silent path.
 
 ---
 
@@ -347,12 +381,16 @@ ssh divergent-host "tail -200 /var/log/oxide/validator.log | grep -i 'error\|ski
 | Mempool size | `oxide_mempool_size` | 0–max | At max |
 | Block time | `oxide_block_time_ms` | 400–600 ms | >2000 ms |
 | State root | `oxide_state_root` | Matches majority | Mismatch |
+| Execution divergence | `oxide_exec_diverged` | 0 | 1 — page immediately (runbook 7) |
+| Divergence height | `oxide_exec_divergence_height` | absent | present — repair anchor |
 
 ### Health check
 
 ```sh
 curl -s http://localhost:9000/health
-# Expected: {"status":"healthy","height":N,"peers":M}
+# Healthy: 200 OK, "ok"
+# Diverged: 503 with the diverged height and certified root
+#           (see runbook 7)
 ```
 
 ### Prometheus

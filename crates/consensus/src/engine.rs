@@ -53,8 +53,8 @@ use crypto::hash::{Domain, Hasher};
 use ports::{AppInterface, ConsensusEngine};
 use primitives::{Address, Epoch, Hash, Height, View};
 use types::{
-    BlockHeader, ExecCertificate, FinalizedBlock, MempoolAck, Proposal, QuorumCertificate,
-    StateAttestation, TimeoutCertificate, TxBytes, Verdict, Vote, VotePhase,
+    BlockHeader, ExecCertificate, ExecDivergence, FinalizedBlock, MempoolAck, Proposal,
+    QuorumCertificate, StateAttestation, TimeoutCertificate, TxBytes, Verdict, Vote, VotePhase,
 };
 
 use crate::validator::{ValidatorIndex, ValidatorSet};
@@ -539,6 +539,16 @@ pub struct OxideBft {
     /// proposal signatures are all withheld until the operator
     /// restarts the validator on healthy storage.
     wal_failed: bool,
+    /// Confirmed execution divergence latch. Set when a *verified*
+    /// `ExecCertificate` — a stake supermajority's attested root —
+    /// disagrees with the root this validator computed at that
+    /// height. From then on the engine refuses to sign anything:
+    /// votes, timeouts, attestations, and proposals would all extend
+    /// a chain built on state this node does not share. Never
+    /// cleared in-process — the only safe recovery is certified
+    /// state repair, not more participation. Surfaced through
+    /// [`OxideBft::divergence`] so operators see the halt.
+    divergence: Option<ExecDivergence>,
     /// The block budget the engine passes to `app.prepare_proposal`.
     /// Configured via [`OxideBft::with_block_budget`]; defaults to
     /// [`types::CHAIN_BLOCK_BUDGET`]. The TOML
@@ -633,6 +643,7 @@ impl OxideBft {
             verify_per_vote: false,
             wal: None,
             wal_failed: false,
+            divergence: None,
             block_budget: types::CHAIN_BLOCK_BUDGET,
             pacemaker_base_timeout_ms: crate::pacemaker::DEFAULT_BASE_TIMEOUT_MS,
             pacemaker_max_timeout_ms: crate::pacemaker::DEFAULT_MAX_TIMEOUT_MS,
@@ -785,11 +796,25 @@ impl OxideBft {
     /// Whether this engine may still emit signatures. `false` once a
     /// WAL append has failed (C10): durable signing must not fail
     /// open, so a WAL-failed validator goes silent and stays silent
-    /// until restarted on healthy storage. Always `true` for engines
-    /// with no WAL attached — they never promised durability.
+    /// until restarted on healthy storage. Also `false` after a
+    /// confirmed execution divergence (the `divergence` latch): a
+    /// validator that disagrees with a quorum-certified root must
+    /// not extend the chain it diverged from. Always `true` for
+    /// engines with no WAL attached and no divergence — they never
+    /// promised durability.
     #[must_use]
     pub fn signing_healthy(&self) -> bool {
-        !self.wal_failed
+        !self.wal_failed && self.divergence.is_none()
+    }
+
+    /// The confirmed execution divergence that halted signing, if
+    /// any. `Some` is terminal for the process: the validator must
+    /// be repaired (certified state sync) before it can safely
+    /// participate again, so operators should treat this as a
+    /// page-worthy condition, not a transient.
+    #[must_use]
+    pub fn divergence(&self) -> Option<&ExecDivergence> {
+        self.divergence.as_ref()
     }
 
     /// The budget the engine uses when assembling proposals. Ceiling 1:
@@ -1033,8 +1058,10 @@ impl OxideBft {
         // C10: a proposal carries the leader's `proposer_signature` —
         // it is a signature, so a WAL-failed validator must not
         // produce one. Going silent lets the view time out and a
-        // healthy leader take over.
-        if self.wal_failed {
+        // healthy leader take over. A diverged validator must not
+        // propose either — its block would embed attestation state
+        // peers have already proven it does not share.
+        if self.wal_failed || self.divergence.is_some() {
             return None;
         }
         let proposal = self.app.prepare_proposal(&self.block_budget);
@@ -1594,6 +1621,13 @@ impl ConsensusEngine for OxideBft {
 
     fn finalized_block(&self, height: Height) -> Option<FinalizedBlock> {
         self.finalized.get(&height.value()).cloned()
+    }
+
+    fn divergence(&self) -> Option<types::ExecDivergence> {
+        // `OxideBft::divergence` is the inherent accessor; calling it
+        // by UFCS keeps the trait method a pure mirror rather than
+        // duplicating the field read.
+        OxideBft::divergence(self).copied()
     }
 }
 #[cfg(test)]

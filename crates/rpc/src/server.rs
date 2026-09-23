@@ -874,9 +874,33 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Health check endpoint. Returns 200 OK with "ok".
-async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+/// Health check endpoint. Returns 200 OK with "ok" while the node
+/// is signing-safe; 503 once the consensus engine has latched a
+/// verified execution divergence — the validator has stopped
+/// signing and needs certified state repair, so load balancers and
+/// watchdogs must see it as down, not merely degraded.
+///
+/// The body carries the quorum-certified `(height, root)` — the
+/// exact `--trusted-height`/`--trusted-root` pair the repair
+/// `--state-sync` requires, so the response doubles as the sync
+/// trigger material.
+async fn health_check(State(state): State<RpcState>) -> impl IntoResponse {
+    match state.rpc.exec_divergence() {
+        Some(d) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "execution divergence at height {}: local root 0x{}, certified root 0x{}; \
+                 signing halted — repair via --state-sync with --trusted-height {} \
+                 --trusted-root 0x{}",
+                d.height.value(),
+                hex_encode(d.local_root.as_bytes()),
+                hex_encode(d.certified_root.as_bytes()),
+                d.height.value(),
+                hex_encode(d.certified_root.as_bytes()),
+            ),
+        ),
+        None => (StatusCode::OK, "ok".to_string()),
+    }
 }
 
 /// Prometheus metrics endpoint (`GET /metrics`).
@@ -914,8 +938,42 @@ mod tests {
     /// Test the health check endpoint returns 200.
     #[tokio::test]
     async fn health_check_returns_ok() {
-        let response = health_check().await.into_response();
+        let state = RpcState {
+            rpc: Arc::new(RpcServer::new(1, 1_000_000_000)),
+            rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
+            work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
+        };
+        let response = health_check(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A confirmed execution divergence must flip `/health` to 503
+    /// and carry the certified repair anchor — a silently degraded
+    /// validator is exactly the failure mode this endpoint exists
+    /// to expose.
+    #[tokio::test]
+    async fn health_check_reports_divergence() {
+        let rpc = Arc::new(RpcServer::new(1, 1_000_000_000));
+        rpc.set_exec_divergence(types::ExecDivergence {
+            height: primitives::Height::new(42),
+            local_root: primitives::Hash([0xAA; 32]),
+            certified_root: primitives::Hash([0xBB; 32]),
+        });
+        let state = RpcState {
+            rpc,
+            rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC)),
+            work_permits: Arc::new(Semaphore::new(RPC_BLOCKING_PERMITS)),
+        };
+        let response = health_check(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("42"), "body must name the diverged height: {text}");
+        assert!(
+            text.contains(&"bb".repeat(32)),
+            "body must carry the certified root for --trusted-root: {text}"
+        );
     }
 
     /// Test the RPC handler responds to a simple `eth_chainId` request.

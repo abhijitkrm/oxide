@@ -19705,3 +19705,58 @@ checkpoint bounding, corrupt snapshot/corrupt checkpoint, gap
 rejection, baseline semantics), WAL codec round-trip + legacy
 decode + count-bound tests, and two engine restart tests —
 pending-tail finality resume and `Awaiting` header restore.
+
+## Session N+25 — confirmed divergence now halts the validator loudly
+
+A verified execution certificate whose root disagreed with local
+execution used to withhold exactly one vote and nothing else — no
+log, no metric, no latch. Each diverged validator quietly leaked
+out of the quorum while operators watched a slowing chain and saw
+nothing to page on.
+
+The mismatch is now a terminal, observable condition. `OxideBft`
+carries a `divergence` latch (a `types::ExecDivergence` — the type
+moved to `types` so the `ports::ConsensusEngine` seam, which cannot
+depend on the engine crate, exposes it to node plumbing). The latch
+sets only after the certificate passes full validation — epoch,
+bitmap bounds, quorum power, aggregate signature — so a forged cert
+can never halt signing, only a supermajority-attested mismatch can.
+Once set, every signing surface refuses: votes, timeouts,
+attestations, and proposals all check the latch beside the WAL
+latch, and `signing_healthy()` folds both into the single fail-
+closed answer. First write wins — the earliest mismatch is the
+repair anchor. The latch survives epoch rotation: a new validator
+set does not repair diverged state, certified resync does. And it
+survives restart — the latch rides the WAL as optional trailer #5,
+appended the moment it sets, so a validator that crashes
+mid-incident wakes up still refusing to sign rather than resuming
+over the same diverged state.
+
+Detection is loud at every layer operators actually watch. The
+engine logs a CRITICAL line naming the height, local root, and
+certified root — plus the exact `--state-sync` repair command the
+certified root feeds. The devnet pump and the validator driver's
+new `divergence_observer` mirror the latch into `RpcServer`, where
+`/health` flips to 503 (a diverged validator must look down to
+watchdogs, not degraded) with a body carrying the certified
+`(height, root)` repair anchor verbatim, and `/metrics` exposes
+`oxide_exec_diverged`/`oxide_exec_divergence_height` gauges. `docs/
+runbooks.md` §7 now prescribes the repair: stop, `--state-sync`
+against a healthy peer with `--trusted-root` = the *certified* root
+(never the local one), restart.
+
+The trigger stays operator-visible rather than automatic on
+purpose: pulling and importing a snapshot under a live engine needs
+the quorum-verified snapshot machinery the state-sync trust item
+tracks, and auto-importing an unverified root would recreate the
+trust hole the latch exists to close. The certified root the health
+body emits is already quorum-signed — it is a strictly better
+`--trusted-root` than anything an operator could source manually.
+
+Regression coverage: the mismatched-cert test now exercises the
+real path (its zero `body_commitment` had been withholding the vote
+before the cert check — the divergence assertion was vacuous) and
+asserts the latch + detail; a new test proves every signing surface
+refuses post-latch and the first mismatch stays the anchor; forged
+and stale-epoch certs assert the latch stays clear; `/health` gains
+a 503-with-anchor test and keeps the healthy 200.

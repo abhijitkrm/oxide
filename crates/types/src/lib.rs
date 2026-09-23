@@ -597,6 +597,32 @@ impl<'a> Decode<'a> for ExecCertificate {
     }
 }
 
+/// A confirmed execution divergence: a quorum-signed
+/// [`ExecCertificate`] attested a state root this validator did not
+/// compute at the same height.
+///
+/// The certificate passed full validation (epoch, bitmap bounds,
+/// quorum power, aggregate signature) before the comparison ran, so
+/// the mismatch is real evidence — either this validator's execution
+/// diverged from the network or a supermajority attested state it
+/// never ran. Either way the node must stop signing and be repaired,
+/// not quietly drop out of the quorum.
+///
+/// The type lives in `types` (not `consensus`) so the
+/// `ports::ConsensusEngine` seam — which cannot depend on the
+/// engine crate — can surface it to node status plumbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecDivergence {
+    /// The height whose state root disagrees.
+    pub height: Height,
+    /// The root this validator computed locally.
+    pub local_root: Hash,
+    /// The root the verified certificate attested. This is the
+    /// quorum-certified anchor a repair `--state-sync` should pass
+    /// as `--trusted-root`.
+    pub certified_root: Hash,
+}
+
 /// The engine-agnostic canonical ledger entry. This is what followers,
 /// indexers, the journal, and RPC consume — *never* an engine's
 /// internal header (oai-spec.md §1). Chained by `prev` into a hash

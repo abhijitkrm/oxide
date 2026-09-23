@@ -29,5 +29,6 @@ pub mod wal;
 pub use engine::{ConsensusError, EpochRotationError, OxideBft};
 pub use pacemaker::{Pacemaker, PacemakerEvent, PacemakerState};
 pub use sequencer::SequencerEngine;
+pub use types::ExecDivergence;
 pub use validator::{ValidatorIndex, ValidatorSet};
 pub use wal::{Wal, WalEntry, WalError};
