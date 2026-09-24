@@ -21408,3 +21408,47 @@ real HTTP peer + real executor): verified snapshot imports and
 the latch clears for rejoin; cert/manifest anchor mismatch,
 forged certificates, and below-anchor snapshots are all refused
 with the latch intact.
+
+## Session: per-source-IP admission cap at the listener
+
+**What landed.** The accept loop now enforces a per-source-IP
+connection cap — the last Gate-1 bullet. `SharedSourceCaps` in
+`admission.rs` counts live connections per source bucket (IPv4
+exact, IPv6 keyed by /64 prefix so rotating interface identifiers
+cannot reset the budget); the accept loop takes an RAII
+`SourceLease` before a socket reaches the handshake queue and
+drops over-cap sockets immediately — before TLS work, before the
+greeting read, before peer identity exists. The peer-ID
+`AdmissionControl` cap runs *after* the greeting and bounds the
+total; this bounds what is knowable before one — a single-source
+flood can no longer claim every handshake worker or every global
+slot. The lease rides `PendingAccept` through the handshake and
+moves into the reader thread for the connection's life: release
+is exactly-once on queue-full drop, greeting rejection, spawn
+failure, or reader exit — each lease is a counted reference under
+the caps mutex, so a stale teardown can never release a slot a
+replacement connection owns (the aliasing bug class the conn-id
+tagging fixed for stream slots). Entries remove at zero, so the
+bucket map is bounded by live connections — the tracker is not
+its own DoS vector.
+
+**Default and tradeoff.** `TcpTransportConfig::
+max_connections_per_source` defaults to 16: enough headroom for
+several committee members NAT'd behind one egress and for
+same-host devnets (~17 nodes), while bounding one source to ~6%
+of the 256-connection global cap. It is unconditional — no
+allowlist bypass — because it guards the pre-authentication
+window itself. Wired into every shipped transport through
+`to_transport_config`'s `..Default::default()` spread; no TOML
+knob yet (tuning is a code constant + config field, deployment
+tuning is a follow-up if operators need it).
+
+**Coverage.** `tcp_source_cap_binds_inbound_connections`: over-cap
+socket closed at accept, lease freed on disconnect admits retry,
+greeting peer still delivers. `gate1_tls_admission_enforced_on_listener`
+(the gate's integration bullet): TLS handshake delivers, a
+50-byte-bucket rate limiter drops over-budget frames, the
+per-source cap refuses the third same-source socket, and a
+reputation-banned peer's messages stop mid-connection. Unit
+tests cover bucket independence, lease release, empty-bucket
+removal, and IPv6 /64 bucketing.

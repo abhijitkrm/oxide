@@ -44,31 +44,43 @@ authenticated, encrypted transport with admission control.
 
 ### Status
 
-- `[~]` Re-opened (2026-09). The 2025-01-30 completion claim was
-      premature: `admission.rs` exists and `TcpTransport` supports
-      `with_admission`, but **no shipped binary constructs a
-      transport with admission enabled** — the plumbing stops at
-      the constructor. The follow-up audit also found the accept
-      loop stalls on an idle pre-authentication connection and
-      that plaintext peer identity is spoofable. TLS exists;
-      admission wiring, accept-loop hardening, and authenticated
-      peer identity remain open (audit `docs/audit002.md` H1–H3).
-- Progress: the accept loop now hands sockets to a bounded
-      handshake pool (`p2p-handshake-N` workers, 5s greeting
-      budget, 64-deep queue); admission is wired into every
-      shipped transport constructor and devnet always builds it;
-      and peer identity is authenticated — `TcpTransportConfig::
-      peer_auth` runs a mutual BLS challenge–response
-      (`node::peer_auth::BlsPeerAuth` over the live validator set)
-      so a self-claimed ID can neither join nor displace a live
-      slot. Peer IDs are the members' staking addresses, resolved
-      against the live committee (and the published pending set
-      during a rotation window), so validator-set changes cannot
-      misroute or misattribute consensus traffic. Per-peer ingress
-      rate limiting is enforced by `SharedAdmissionControl::
-      admit_message` on the receive path. Remaining for this gate:
-      a per-source-IP connection cap at the listener and the
-      integration-test bullet above.
+- `[x]` Complete. The 2025-01-30 completion claim was premature
+      (re-opened 2026-09): `admission.rs` existed but no shipped
+      binary constructed a transport with admission enabled, the
+      accept loop stalled on idle pre-authentication sockets, and
+      plaintext peer identity was spoofable (audit
+      `docs/audit002.md` H1–H3). All are now closed:
+      - The accept loop hands sockets to a bounded handshake pool
+        (`p2p-handshake-N` workers, 5s greeting budget, 64-deep
+        queue) — an idle socket can no longer freeze accepts.
+      - Admission is wired into every shipped transport
+        constructor (`with_tls_and_admission` / `with_admission`)
+        and the node always builds it.
+      - Peer identity is authenticated — `TcpTransportConfig::
+        peer_auth` runs a mutual BLS challenge–response
+        (`node::peer_auth::BlsPeerAuth` over the live validator
+        set) so a self-claimed ID can neither join nor displace a
+        live slot. Peer IDs are the members' staking addresses,
+        resolved against the live committee (and the published
+        pending set during a rotation window), so validator-set
+        changes cannot misroute or misattribute consensus traffic.
+      - Per-peer ingress rate limiting is enforced by
+        `SharedAdmissionControl::admit_message` on the receive
+        path; banned peers are rejected at `admit_connection` and
+        their messages dropped.
+      - A per-source-IP connection cap runs at the accept loop
+        (`SharedSourceCaps`, default 16 per source, IPv6 keyed by
+        /64 prefix) — the pre-authentication bound the peer-ID
+        admission check cannot provide. Each accepted socket holds
+        an RAII `SourceLease` for its whole lifetime; release is
+        exact-once and immune to stale-teardown aliasing.
+      - Integration coverage: `tcp::tests::
+        gate1_tls_admission_enforced_on_listener` exercises TLS
+        handshake, rate-limit drop, per-source cap refusal, and
+        banned-peer drop on a real `with_tls_and_admission`
+        listener; `tcp_source_cap_binds_inbound_connections`
+        covers cap binding, lease release on disconnect, and
+        retry admission.
 
 ---
 

@@ -60,7 +60,7 @@ use ports::transport::{InboundMessage, PeerId, Transport, TransportCaps, Transpo
 #[cfg(feature = "tls")]
 use crate::tls::TlsConfig;
 
-use crate::admission::SharedAdmissionControl;
+use crate::admission::{SharedAdmissionControl, SharedSourceCaps, SourceLease};
 
 /// A trait that abstracts over plain TCP and TLS streams.
 ///
@@ -622,6 +622,21 @@ const HANDSHAKE_QUEUE: usize = 64;
 /// in `recv` for the whole handshake budget.
 const HANDSHAKE_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// Default cap on simultaneous inbound connections from one source
+/// IP (IPv6: one /64 prefix), enforced at the accept loop before a
+/// socket reaches the handshake pool. Unit: connections per source.
+/// Origin: Gate 1 of `docs/production-readiness.md` — the global
+/// `AdmissionControl` cap runs after the greeting, so without this
+/// bound one flooding address can claim every slot and pin every
+/// handshake worker with stalled sockets. Tradeoff: 16 leaves
+/// headroom for several committee members NAT'd behind one egress
+/// (each member holds one connection per peer) and for a same-host
+/// devnet of up to ~17 nodes, while still bounding a single-source
+/// flood to ~6% of the global connection cap. Deployments with
+/// larger shared-egress fleets raise it via
+/// [`TcpTransportConfig::max_connections_per_source`].
+const DEFAULT_MAX_CONNECTIONS_PER_SOURCE: usize = 16;
+
 /// Transport-identity authenticator: the signed greeting handshake
 /// that binds a TCP connection to a consensus key.
 ///
@@ -901,6 +916,15 @@ pub struct TcpTransportConfig {
     /// silently displaces the incumbent slot — acceptable only on
     /// trusted loopback. Production must set this.
     pub peer_auth: Option<Arc<dyn PeerAuth>>,
+
+    /// Maximum simultaneous inbound connections from one source IP
+    /// (IPv6: one /64 prefix), enforced at the accept loop — the only
+    /// identity available before the greeting. Sockets beyond the cap
+    /// are closed immediately; the peer's dialer retries. Unlike the
+    /// `AdmissionControl` cap this is unconditional (no handshake,
+    /// no allowlist bypass): it guards the pre-authentication window
+    /// itself. Default [`DEFAULT_MAX_CONNECTIONS_PER_SOURCE`].
+    pub max_connections_per_source: usize,
 }
 
 impl Default for TcpTransportConfig {
@@ -916,6 +940,7 @@ impl Default for TcpTransportConfig {
             max_inbound_queue_bytes: DEFAULT_MAX_INBOUND_QUEUE_BYTES,
             max_outbound_queue_bytes: DEFAULT_MAX_OUTBOUND_QUEUE_BYTES,
             peer_auth: None,
+            max_connections_per_source: DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
         }
     }
 }
@@ -1383,12 +1408,26 @@ impl TcpTransport {
         // non-blocking mode, checks the shutdown flag between polls,
         // and hands each socket to the handshake pool.
         let accept_shutdown = shutdown.clone();
+        // Per-source-IP cap, checked before a socket consumes a
+        // handshake-queue slot — the source address is the only
+        // identity available this early, so this is the only place
+        // a single-source flood can be bounded.
+        let source_caps = SharedSourceCaps::new(config.max_connections_per_source);
         // Critical: the only inbound path — a dead accept loop means
         // no peer can ever reconnect inbound.
         primitives::supervision::spawn_supervised("p2p-accept", true, move || {
             while !accept_shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
+                    Ok((stream, peer_addr)) => {
+                        // Reject sources already at cap before any
+                        // further work: the socket drops closed and
+                        // the peer's dialer retries. The lease below
+                        // otherwise counts this socket until its
+                        // connection dies.
+                        let Some(source_lease) = source_caps.try_acquire(peer_addr.ip()) else {
+                            continue;
+                        };
+
                         // Switch back to blocking mode: the handshake
                         // worker owning this socket reads on a
                         // timeout, not non-blocking spin.
@@ -1402,7 +1441,11 @@ impl TcpTransport {
                         // read timeout.
                         let shutdown_stream = stream.try_clone().ok();
 
-                        match handshake_tx.try_send(PendingAccept { stream, shutdown_stream }) {
+                        match handshake_tx.try_send(PendingAccept {
+                            stream,
+                            shutdown_stream,
+                            source_lease,
+                        }) {
                             // Full queue → drop the socket:
                             // backpressure under a connection flood;
                             // an honest peer's reconnect loop retries.
@@ -2354,6 +2397,12 @@ type AcceptResult = Option<(PeerId, Box<dyn PeerStream>, Box<dyn PeerStream>)>;
 struct PendingAccept {
     stream: TcpStream,
     shutdown_stream: Option<TcpStream>,
+    /// The per-source-IP lease this socket was admitted under. Held
+    /// through the handshake and then moved into the reader thread,
+    /// so the source bucket counts the connection for its whole
+    /// life and releases it exactly once — on queue-full drop,
+    /// handshake rejection, spawn failure, or reader exit.
+    source_lease: SourceLease,
 }
 
 /// Everything [`complete_accept`] needs, cloned into each handshake
@@ -2401,7 +2450,7 @@ struct AcceptShared {
 /// connection and spawn its writer/reader pair. Any failure drops
 /// the socket, closing the connection — the peer may retry.
 fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
-    let PendingAccept { stream, shutdown_stream } = pending;
+    let PendingAccept { stream, shutdown_stream, source_lease } = pending;
 
     // Read the peer's ID and produce two stream handles: one for
     // the map (writes), one for the reader thread (reads).
@@ -2483,6 +2532,13 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
     // removes its own map slots — a dead inbound connection must
     // not leave `send()` pointed at a closed channel (`ChannelClosed`
     // forever) nor evict a newer same-peer connection's slot.
+    //
+    // The source lease moves into the reader for the same reason:
+    // the source bucket counts this connection until the loop exits
+    // (or the closure is dropped on spawn failure), releasing it
+    // exactly once. Because the lease is a counted reference under
+    // the caps mutex, a stale teardown can't release a replacement
+    // connection's slot the way untagged map removal once could.
     let actor = format!("p2p-reader-{}", peer_tag(&peer_id));
     let tx = shared.inbound_tx.clone();
     let queued = shared.inbound_queued.clone();
@@ -2497,6 +2553,7 @@ fn complete_accept(pending: PendingAccept, shared: &AcceptShared) {
     let cleanup_streams = shared.streams.clone();
     let cleanup_shutdown = shared.shutdown_streams.clone();
     let spawned = primitives::supervision::spawn_supervised(&actor, false, move || {
+        let _source_lease = source_lease;
         reader_loop(
             reader_stream,
             peer_id,
@@ -2762,6 +2819,7 @@ pub fn bench_tls_connect(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    #[cfg(feature = "tls")]
     use std::time::Instant;
 
     /// A `Read` that replays a script of `io::Result` chunks — one
@@ -3036,6 +3094,7 @@ mod tests {
             max_inbound_queue_bytes: DEFAULT_MAX_INBOUND_QUEUE_BYTES,
             max_outbound_queue_bytes: DEFAULT_MAX_OUTBOUND_QUEUE_BYTES,
             peer_auth: None,
+            max_connections_per_source: DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
         };
 
         let mut transport_a = TcpTransport::with_config(
@@ -3334,6 +3393,216 @@ mod tests {
             }
             assert_eq!(ac.current_connections(), 0, "round {round}: slot not released");
         }
+    }
+
+    /// Returns `true` if `sock` was closed by the peer within
+    /// `timeout` — the accept loop's rejection signal — or `false`
+    /// if the socket stayed open (admitted into the handshake pool).
+    fn socket_closed(sock: &mut TcpStream, timeout: Duration) -> bool {
+        sock.set_read_timeout(Some(Duration::from_millis(50))).expect("set read timeout");
+        let deadline = std::time::Instant::now() + timeout;
+        let mut buf = [0u8; 1];
+        while std::time::Instant::now() < deadline {
+            match sock.read(&mut buf) {
+                // EOF: the accept loop dropped the socket.
+                Ok(0) => return true,
+                Ok(_) => {}
+                // WouldBlock/TimedOut: still open — keep polling.
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => return true,
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Per-source-IP cap at the listener: sockets beyond the
+    /// configured per-source budget are closed at accept, before
+    /// they can occupy a handshake worker — and a freed lease
+    /// admits the next socket from that source.
+    ///
+    /// Loopback keys every connection to the same source bucket,
+    /// which is exactly the shape of a single-source flood.
+    #[test]
+    fn tcp_source_cap_binds_inbound_connections() {
+        let addr_a = "127.0.0.1:19171";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        let config =
+            TcpTransportConfig { max_connections_per_source: 2, ..TcpTransportConfig::default() };
+        let mut transport_a = TcpTransport::with_admission(
+            addr_a,
+            id_a,
+            vec![],
+            config,
+            SharedAdmissionControl::new(AdmissionControl::with_limits(64, 1 << 20, 1 << 20)),
+        );
+
+        // Two stalled sockets hold both source leases (never send
+        // their greeting → in-flight for the handshake budget).
+        let _c1 = TcpStream::connect(addr_a).expect("c1 connect");
+        let c2 = TcpStream::connect(addr_a).expect("c2 connect");
+        thread::sleep(Duration::from_millis(200));
+
+        // The third socket from the same source is refused at the
+        // listener — it never reaches a handshake worker.
+        let mut c3 = TcpStream::connect(addr_a).expect("c3 connect");
+        assert!(
+            socket_closed(&mut c3, Duration::from_secs(3)),
+            "third same-source connection must be closed at accept"
+        );
+
+        // A stalled socket that dies frees its lease: the next
+        // connection from this source is admitted (stays open in
+        // the handshake pool waiting on our greeting).
+        drop(c2);
+        let mut admitted = false;
+        for _ in 0..10 {
+            let mut c4 = TcpStream::connect(addr_a).expect("c4 connect");
+            if !socket_closed(&mut c4, Duration::from_millis(500)) {
+                admitted = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(admitted, "freed source lease must admit a retry");
+
+        // And normal greeting admission is undisturbed: a raw peer
+        // that completes the handshake delivers a message.
+        let mut c5 = TcpStream::connect(addr_a).expect("c5 connect");
+        if socket_closed(&mut c5, Duration::from_millis(500)) {
+            // One retry: c4 may still hold the freed lease above.
+            drop(c5);
+            let mut c6 = TcpStream::connect(addr_a).expect("c6 connect");
+            assert!(
+                !socket_closed(&mut c6, Duration::from_secs(3)),
+                "second free slot must accept the greeting peer"
+            );
+            c5 = c6;
+        }
+        write_frame(&mut c5, &id_b).expect("id frame");
+        write_frame(&mut c5, b"hello").expect("msg frame");
+        let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+        assert_eq!(msg.expect("greeting peer must deliver").bytes, b"hello");
+    }
+
+    /// Gate 1 integration: the production composition — TLS +
+    /// admission + per-source cap — enforces all four admission
+    /// properties on a real listener. TLS handshake delivers, the
+    /// ingress rate limiter drops, a banned peer's messages stop,
+    /// and excess same-source sockets are refused at accept.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn gate1_tls_admission_enforced_on_listener() {
+        use crate::tls::{TlsConfig, generate_ca_cert_pem};
+
+        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+
+        let addr_a = "127.0.0.1:19250";
+        let addr_b = "127.0.0.1:19251";
+        let id_a = vec![0u8];
+        let id_b = vec![1u8];
+
+        let (cert_pem_a, key_pem_a) = generate_ca_cert_pem(&id_a);
+        let (cert_pem_b, key_pem_b) = generate_ca_cert_pem(&id_b);
+        let cert_der_a = rustls_pemfile::certs(&mut cert_pem_a.as_bytes())
+            .next()
+            .expect("cert a")
+            .expect("cert a")
+            .as_ref()
+            .to_vec();
+        let cert_der_b = rustls_pemfile::certs(&mut cert_pem_b.as_bytes())
+            .next()
+            .expect("cert b")
+            .expect("cert b")
+            .as_ref()
+            .to_vec();
+        let tls_a = TlsConfig::with_cert_pem(
+            &id_a,
+            &cert_pem_a,
+            &key_pem_a,
+            vec![(id_b.clone(), cert_der_b)],
+        );
+        let tls_b = TlsConfig::with_cert_pem(
+            &id_b,
+            &cert_pem_b,
+            &key_pem_b,
+            vec![(id_a.clone(), cert_der_a)],
+        );
+
+        // Rate budget 50 bytes at 1 B/s refill — a 20-byte message
+        // stream exhausts it after two admits.
+        let ac = AdmissionControl::with_limits(64, 50, 1);
+        let config =
+            TcpTransportConfig { max_connections_per_source: 2, ..TcpTransportConfig::default() };
+        let mut transport_a = TcpTransport::with_tls_and_admission(
+            addr_a,
+            id_a.clone(),
+            vec![],
+            config,
+            tls_a,
+            SharedAdmissionControl::new(ac),
+        );
+        let mut transport_b = TcpTransport::with_tls(
+            addr_b,
+            id_b.clone(),
+            vec![(id_a.clone(), addr_a.to_string())],
+            TcpTransportConfig::default(),
+            tls_b,
+        );
+        thread::sleep(Duration::from_millis(700));
+
+        // 1. TLS handshake: an authenticated peer delivers.
+        transport_b.send(&id_a, b"hello mTLS").unwrap();
+        let msg = poll_recv(&mut transport_a, Duration::from_secs(5));
+        assert_eq!(msg.expect("TLS peer must complete handshake and deliver").bytes, b"hello mTLS");
+
+        // 2. Ingress rate limit: ten 20-byte messages against a
+        // 50-byte bucket admit at most a few — the rest are dropped
+        // at the reader, never reaching `recv()`.
+        let payload = vec![b'x'; 20];
+        for _ in 0..10 {
+            transport_b.send(&id_a, &payload).unwrap();
+        }
+        let mut received = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Some(_msg) = transport_a.recv() {
+                received += 1;
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(received < 10, "rate limiter must drop over-budget messages, got {received}/10");
+
+        // 3. Per-source cap: B's live connection already holds one
+        // lease; one stalled raw socket takes the second. The next
+        // same-source socket is closed at accept.
+        let stalled = TcpStream::connect(addr_a).expect("stalled connect");
+        thread::sleep(Duration::from_millis(200));
+        let mut excess = TcpStream::connect(addr_a).expect("excess connect");
+        assert!(
+            socket_closed(&mut excess, Duration::from_secs(3)),
+            "same-source socket beyond the cap must be refused"
+        );
+        drop(stalled);
+
+        // 4. Banned peer: enough misbehavior drops the reputation
+        // below the ban threshold — `admit_message` then refuses
+        // everything the peer sends, even on its live connection.
+        let shared = transport_a.admission().expect("admission enabled");
+        for _ in 0..100 {
+            shared.record_misbehavior(&id_b, ReputationEvent::InvalidMessage);
+        }
+        assert!(shared.is_banned(&id_b), "peer must be banned");
+        transport_b.send(&id_a, b"still here?").unwrap();
+        assert!(
+            poll_recv(&mut transport_a, Duration::from_secs(2)).is_none(),
+            "banned peer's messages must be dropped"
+        );
     }
 
     /// Rate limiting: a peer that exceeds the rate limit has its

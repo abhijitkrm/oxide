@@ -203,6 +203,29 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Added
 
+- **Per-source-IP connection cap at the listener.** The accept loop
+  now bounds simultaneous inbound connections from one source —
+  IPv4 keyed exactly, IPv6 by /64 prefix — before a socket reaches
+  the handshake pool (`SharedSourceCaps` + RAII `SourceLease`,
+  `TcpTransportConfig::max_connections_per_source`, default 16).
+  The peer-ID admission cap runs after the greeting and bounds the
+  total; this cap bounds what is knowable before a greeting —
+  a single-source flood can no longer pin every handshake worker or
+  claim every global slot during the pre-authentication window.
+  Release is exactly-once across queue-full drop, greeting
+  rejection, spawn failure, and reader exit, and cannot alias a
+  replacement connection's slot. Gate 1 of
+  `docs/production-readiness.md` is complete with integration
+  coverage (`gate1_tls_admission_enforced_on_listener`: TLS
+  handshake, rate-limit drop, per-source refusal, banned-peer drop
+  on a real `with_tls_and_admission` listener).
+  - **In plain words:** one machine used to be able to open as
+    many connections to a validator as the whole network was
+    allowed combined, and could stall the front door before ever
+    identifying itself. Now each source address gets a small,
+    fixed number of slots — floods from one address are dropped at
+    the door while everyone else connects normally.
+
 - **Automatic certified state repair — a diverged validator heals
   itself.** `oxide-validator --repair-peer <host:port>` (repeatable;
   peer RPC endpoints) turns the terminal execution-divergence halt
