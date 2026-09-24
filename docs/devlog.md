@@ -21159,3 +21159,52 @@ the smoke tx, and the signal thread — then `validator_net::run`.
 Verified live: a 4-process `oxide-devnet` fleet on ports 23100–03
 finalized 13+ heights in lockstep through the extracted pump;
 `cargo test -p devnet` 34/34; clippy clean.
+
+## Session — production validator mode (`oxide-validator --validator`)
+
+The C4 remainder — a real multi-validator path on the production
+binary — lands in two halves. `NodeMode::Validator` is the new
+third mode: `node_config_from` forces `OxideBft` for it (same as
+devnet), and `validate_effective_config` flips `[network]` from
+warned-and-ignored to LIVE — `listen_addr` is the transport bind
+and every `peers` entry must be `<40-hex-addr>=<host:port>`, so a
+peer's committee identity is bound to its endpoint *before* the
+handshake (the transport cannot dial a member it cannot name).
+Malformed entries are startup errors; empty `peers` warns (a
+1-validator "fleet" is honestly `NodeMode::Single`).
+
+`oxide-validator --validator` resolves the committee seat from the
+*key file*, not a process index: `--bls-key-file` → public key →
+`index_of_key` in the genesis validator set. A key outside the
+committee refuses at startup — its signatures would be rejected
+noise anyway, and booting first would waste an operator's deploy
+cycle on a failure mode the handshake only reveals later.
+`validator_set_from_genesis` is shared with `oxide-devnet`'s
+`--genesis-file` path so both binaries construct the identical
+committee from the same file.
+
+`tls-gen` gains `--genesis-file`: it now emits certs whose peer id
+is each member's *staking address* (the transport's identity
+model — cert-DER→peer-id map, CN is cosmetic) and writes
+`peer-<addr-hex>.pem`, the naming `resolve_tls_spec` looks up. The
+index-byte/`peer-{i}.pem` layout stays as the no-genesis fallback
+because `oxide-devnet --node`'s per-index derivation still pairs
+with it. Address-keyed naming is the load-bearing choice: a
+committee reshuffle would silently rebind index-named certs to the
+wrong member.
+
+Verified as a real fleet — `validator_fleet_converges_and_recovers`
+(devnet tests, `#[ignore]`-gated like `proposal_flood`) drives the
+full operator flow against the shipped binary: `keygen` → `genesis`
+→ `tls-gen --genesis-file` → four `--validator` processes on
+`addr=host:port` configs. Asserts seat-from-key resolution, `mTLS
+enabled`, lockstep finalization, 3-of-4 quorum surviving a SIGTERM,
+and the restart's `recovered durable state` re-attach (snapshot +
+WAL). A restarted-behind node cannot re-finalize missed heights —
+block fetch is the still-open sync protocol, and the test documents
+that boundary rather than papering over it.
+
+Also fixed: the orphaned help fragment ("(unauthenticated sender)…"
+stranded after the VALIDATOR MODE block), `tls-gen`'s stale
+index-byte peer-id model, and `validate_effective_config`'s
+`addr@host:port` doc drift (the shipped syntax is `=`).

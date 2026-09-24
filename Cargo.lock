@@ -1556,6 +1556,7 @@ dependencies = [
  "ports",
  "primitives",
  "revm",
+ "serde_json",
  "staking",
  "trading",
  "types",

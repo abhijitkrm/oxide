@@ -77,12 +77,27 @@ pub fn external_bind_surfaces(bind_host: Option<&str>, rpc_listen: Option<&str>)
 }
 
 /// Resolve every listener surface reachable from other machines —
-/// the devnet transport (`--bind-host`, Devnet mode only) and the
-/// JSON-RPC listener (`--rpc-listen` / `rpc.listen_addr`), resolved
-/// the same way the listeners themselves are.
-pub fn external_surfaces(mode: crate::NodeMode, rpc_config: &config::RpcConfig) -> Vec<String> {
-    let bind_host = matches!(mode, crate::NodeMode::Devnet)
-        .then(|| parse_cli_flag("--bind-host").unwrap_or_else(|| "127.0.0.1".to_string()));
+/// the consensus transport (`--bind-host` in Devnet mode,
+/// `network.listen_addr` in Validator mode; Single runs none) and
+/// the JSON-RPC listener (`--rpc-listen` / `rpc.listen_addr`),
+/// resolved the same way the listeners themselves are.
+pub fn external_surfaces(
+    mode: crate::NodeMode,
+    rpc_config: &config::RpcConfig,
+    network: &config::NetworkConfig,
+) -> Vec<String> {
+    let bind_host = match mode {
+        crate::NodeMode::Devnet => {
+            Some(parse_cli_flag("--bind-host").unwrap_or_else(|| "127.0.0.1".to_string()))
+        }
+        // In validator mode the transport binds `network.listen_addr`
+        // verbatim — its host part is the reachable surface.
+        crate::NodeMode::Validator => network
+            .listen_addr
+            .rsplit_once(':')
+            .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']').to_string()),
+        crate::NodeMode::Single => None,
+    };
     // `--rpc-listen` is already folded into `rpc_config.listen_addr`
     // by the loader — an empty address means the RPC server is off.
     let rpc_listen = if rpc_config.listen_addr.is_empty() {
@@ -353,12 +368,14 @@ pub fn load_config(mode: crate::NodeMode, bin: &str) -> LoadedConfig {
     // Off-loopback, the defaults themselves are the attack surface.
     // Resolve the reachable surfaces once — both refusal gates read
     // the same list so they can never disagree about what is public.
-    let external = external_surfaces(mode, &rpc_config);
+    let external = external_surfaces(mode, &rpc_config, &config.network);
     refuse_unsigned_on_external_binds(&node_config, &external, bin);
     let posture = ExternalPosture {
-        deterministic_consensus_key: matches!(mode, crate::NodeMode::Devnet)
-            && parse_cli_flag("--bls-key-file").is_none(),
-        transport_unencrypted: matches!(mode, crate::NodeMode::Devnet)
+        deterministic_consensus_key: matches!(
+            mode,
+            crate::NodeMode::Devnet | crate::NodeMode::Validator
+        ) && parse_cli_flag("--bls-key-file").is_none(),
+        transport_unencrypted: matches!(mode, crate::NodeMode::Devnet | crate::NodeMode::Validator)
             && parse_cli_flag("--tls-dir").is_none(),
         genesis_file_absent: genesis_file.is_none(),
         chain_id: node_config.chain_id,
@@ -464,6 +481,53 @@ pub fn build_signed_tx_with(
     bytes.push(sig.recid.as_u8());
     bytes.extend_from_slice(module_payload);
     types::TxBytes::new(bytes)
+}
+
+/// Build a [`consensus::ValidatorSet`] from a genesis file's
+/// `staking.validators` table.
+///
+/// Shared by `oxide-devnet` (`--genesis-file`) and `oxide-validator
+/// --validator` — the committee construction must be identical in
+/// both or the same genesis file would produce different validator
+/// sets on different binaries.
+///
+/// # Errors
+///
+/// Returns `Err` naming the offending validator when an address or
+/// `public_key` is missing, malformed, or not a valid BLS key.
+pub fn validator_set_from_genesis(
+    genesis: &config::genesis::Genesis,
+) -> Result<consensus::ValidatorSet, String> {
+    let validators = &genesis.staking.validators;
+    let pks: Vec<crypto::bls::PublicKey> = validators
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let hex = v
+                .public_key
+                .as_ref()
+                .ok_or_else(|| format!("genesis validator {i} missing public_key"))?;
+            let bytes = hex_decode(hex)
+                .map_err(|e| format!("genesis validator {i} invalid public_key hex: {e}"))?;
+            crypto::bls::PublicKey::from_slice(&bytes)
+                .map_err(|_| format!("genesis validator {i} invalid BLS public key"))
+        })
+        .collect::<Result<_, String>>()?;
+    let stakes: Vec<u64> = validators.iter().map(|v| v.stake).collect();
+    let addresses: Vec<primitives::Address> = validators
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let bytes = hex_decode(&v.address)
+                .map_err(|e| format!("genesis validator {i} invalid address hex: {e}"))?;
+            let arr: [u8; 20] = bytes
+                .try_into()
+                .map_err(|_| format!("genesis validator {i} address must be 20 bytes"))?;
+            Ok(primitives::Address(arr))
+        })
+        .collect::<Result<_, String>>()?;
+    consensus::ValidatorSet::with_addresses(pks, stakes, addresses)
+        .map_err(|e| format!("invalid genesis validator set: {e}"))
 }
 
 /// Encode bytes as a hex string (lowercase, no `0x` prefix).

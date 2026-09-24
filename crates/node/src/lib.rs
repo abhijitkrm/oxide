@@ -902,6 +902,11 @@ pub enum NodeMode {
     /// Multi-validator devnet mode (`oxide-devnet`): real `OxideBft` over the
     /// TCP transport.
     Devnet,
+    /// Production multi-validator mode (`oxide-validator --validator`):
+    /// `OxideBft` over the TCP/mTLS transport with peers resolved from
+    /// `[network] peers` (`addr=host:port` entries) — the same
+    /// `validator_net` pump the devnet binary runs.
+    Validator,
 }
 
 /// Inputs the shared conversion cannot source from `config::Config`
@@ -960,9 +965,8 @@ pub fn node_config_from(
 ) -> Result<NodeConfig, String> {
     let consensus = match (config.consensus.engine, mode) {
         (config::ConsensusEngineKind::Sequencer, NodeMode::Single) => ConsensusConfig::Sequencer,
-        (_, NodeMode::Devnet) | (config::ConsensusEngineKind::OxideBft, NodeMode::Single) => {
-            ConsensusConfig::OxideBft
-        }
+        (_, NodeMode::Devnet | NodeMode::Validator)
+        | (config::ConsensusEngineKind::OxideBft, NodeMode::Single) => ConsensusConfig::OxideBft,
     };
     // `[exchange] settlement_operator` is a 0x-hex string in TOML —
     // parse it here so a malformed address fails at startup, not at
@@ -1141,10 +1145,11 @@ pub fn validate_effective_config(
     // default IS sequencer, so the setting is indistinguishable from
     // "unset" for config-less launches — warning is the honest
     // signal.
-    if mode == NodeMode::Devnet && config.consensus.engine == config::ConsensusEngineKind::Sequencer
+    if matches!(mode, NodeMode::Devnet | NodeMode::Validator)
+        && config.consensus.engine == config::ConsensusEngineKind::Sequencer
     {
         warnings.push(
-            "consensus.engine = \"sequencer\" is overridden in devnet mode — \
+            "consensus.engine = \"sequencer\" is overridden in multi-validator mode — \
              running oxideBFT (a single-leader engine cannot run a multi-validator cluster)"
                 .to_string(),
         );
@@ -1171,18 +1176,62 @@ pub fn validate_effective_config(
     // `network.listen_addr`/`network.peers` are derived per-index in
     // devnet mode and unused entirely in single-node mode — a
     // config that sets them is valid TOML but not what the operator
-    // expects, so it warns rather than fails.
+    // expects, so it warns rather than fails. In validator mode
+    // both are LIVE: `listen_addr` is the transport bind and every
+    // `peers` entry must carry the member's staking address
+    // (`addr=host:port`) — the transport cannot dial a peer whose
+    // committee identity it does not know to expect.
     let network_addr_set = config.network.listen_addr != "127.0.0.1:20000";
     let network_peers_set = !config.network.peers.is_empty();
-    if network_addr_set || network_peers_set {
-        let why = match mode {
-            NodeMode::Devnet => "overridden by the --node/--base-port index derivation",
-            NodeMode::Single => "no transport runs in single-node mode",
-        };
-        warnings.push(format!(
-            "network.listen_addr/network.peers are set but {why} — \
-             only network.*_timeout_secs and network.max_message_bytes apply"
-        ));
+    match mode {
+        NodeMode::Validator => {
+            for entry in &config.network.peers {
+                let Some((addr_hex, hostport)) = entry.split_once('=') else {
+                    errors.push(format!(
+                        "network.peers entry {entry:?} is missing `<addr>=` — validator mode \
+                         requires `<40-hex-addr>=<host:port>` so the peer's committee identity \
+                         is bound to its endpoint before the handshake"
+                    ));
+                    continue;
+                };
+                if addr_hex.len() != 40 || !addr_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    errors.push(format!(
+                        "network.peers entry {entry:?} has a malformed address — expected \
+                         40 hex chars (20 bytes), the member's staking address"
+                    ));
+                }
+                if hostport
+                    .rsplit_once(':')
+                    .is_none_or(|(h, p)| h.is_empty() || p.parse::<u16>().is_err())
+                {
+                    errors.push(format!(
+                        "network.peers entry {entry:?} has a malformed endpoint — expected \
+                         `<host>:<port>` after `=`"
+                    ));
+                }
+            }
+            if !network_peers_set {
+                warnings.push(
+                    "network.peers is empty in validator mode — this node forms a \
+                     1-validator network; single-node mode is the honest shape for that"
+                        .to_string(),
+                );
+            }
+        }
+        _ if network_addr_set || network_peers_set => {
+            // Validator is handled above; only Devnet and Single
+            // reach this arm.
+            let why = if mode == NodeMode::Devnet {
+                "overridden by the --node/--base-port index derivation"
+            } else {
+                "no transport runs in single-node mode"
+            };
+            warnings.push(format!(
+                "network.listen_addr/network.peers are set but {why} — \
+                 only network.*_timeout_secs and network.max_message_bytes apply"
+            ));
+        }
+        _ => {}
     }
 
     if !node_config.require_signed_txs {

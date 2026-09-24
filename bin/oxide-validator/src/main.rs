@@ -1,20 +1,24 @@
 //! `oxide-validator` — the Oxide validator node binary.
 //!
-//! Runs a single node over the full consensus + executor stack:
+//! Runs a node over the full consensus + executor stack:
 //! [`node::assemble_executor`] builds the production module graph
 //! (core, evm, staking, exchange, perps, oracle, governance) with
 //! the async execution lane, and `mod driver` drives the engine.
 //!
-//! Multi-validator devnets are launched by the separate
-//! `oxide-devnet` binary (`devnet::multiprocess` spawns one process
-//! per validator) — development launchers stay out of the
-//! production binary.
+//! Two run modes: default single-node (in-process engine, no
+//! transport) and `--validator` — the production multi-validator
+//! mode running oxideBFT over the TCP/mTLS transport with peers
+//! from `[network] peers` (`addr=host:port`) and the committee from
+//! `--genesis-file`. Multi-validator *devnets* still use the
+//! separate `oxide-devnet` binary with its derivable fixtures.
 //!
 //! # Usage
 //!
 //! ```sh
 //! oxide-validator                       # single-node devnet
 //! oxide-validator --config node.toml    # configured node
+//! oxide-validator --validator --config node.toml \
+//!     --genesis-file genesis.json --bls-key-file key.hex --tls-dir tls/
 //! ```
 //!
 //! Subcommands: `version`, `init`, `genesis`, `tls-gen`, `help`.
@@ -75,6 +79,15 @@ fn main() {
             }
             _ => {} // fall through to normal mode
         }
+    }
+
+    // `--validator` runs the production multi-validator mode: real
+    // oxideBFT over the TCP/mTLS transport, committee and peer
+    // endpoints from `--genesis-file` + `[network] peers`. Without
+    // it, the binary runs the single-node in-process engine.
+    if args.iter().any(|a| a == "--validator") {
+        run_validator_node();
+        return;
     }
 
     run_single_node();
@@ -204,6 +217,248 @@ fn run_single_node() {
     });
 
     tracing::info!("oxide-validator: node stopped");
+}
+
+/// Run the production multi-validator mode (`oxide-validator --validator`).
+///
+/// Same shared pump the devnet binary runs — [`node::validator_net`]
+/// — but with production inputs: the committee comes from
+/// `--genesis-file` (no derivable fallback exists in this binary),
+/// the signing key from `--bls-key-file`, peer endpoints from
+/// `[network] peers` (`addr=host:port`) plus repeatable `--peer`
+/// overrides, and mTLS material from `--tls-dir`. The external-bind
+/// posture gate in `load_config` already refused insecure defaults
+/// before this function runs.
+///
+/// # Flags
+///
+/// | Flag | Description |
+/// |------|-------------|
+/// | `--validator` | Select multi-validator mode |
+/// | `--config <path>` | TOML config — `[network] listen_addr`/`peers` are live |
+/// | `--genesis-file <path>` | **Required.** `genesis.json` — the committee and chain state source |
+/// | `--bls-key-file <path>` | **Required.** BLS secret key (hex, raw 32B, or OXKEY keystore) |
+/// | `--tls-dir <dir>` | mTLS directory: `cert.pem`, `key.pem`, `peer-<addr-hex>.pem` per peer |
+/// | `--peer <addr>=<host:port>` | Extra/override peer endpoint, repeatable |
+/// | `--data-dir` / `--wal-file` | Durability paths |
+/// | `--rpc-listen <addr>` | RPC bind override |
+/// | `--export-snapshot` / `--import-snapshot` | Snapshot in/out |
+/// | `--unsafe-allow-insecure-posture` | Opt out of the external-bind refusal (private testnets) |
+fn run_validator_node() {
+    let cfg = node::cli::load_config(node::NodeMode::Validator, "oxide-validator");
+
+    // The committee and genesis state come from the genesis file —
+    // there is no derivable-validator-set fallback in the production
+    // binary (that is the devnet convention this mode exists to not
+    // repeat).
+    let genesis = cfg.genesis_file.clone().unwrap_or_else(|| {
+        eprintln!(
+            "oxide-validator: --validator requires --genesis-file <genesis.json> — \
+             the committee and initial state cannot be derived"
+        );
+        std::process::exit(1);
+    });
+    // Same for the signing key: `--bls-key-file` is mandatory — this
+    // binary has no deterministic key derivation (that surface is
+    // feature-gated out of production builds entirely).
+    let key_path = node::cli::parse_cli_flag("--bls-key-file").unwrap_or_else(|| {
+        eprintln!(
+            "oxide-validator: --validator requires --bls-key-file <path> — \
+             an operator key file (hex, raw 32 bytes, or OXKEY keystore)"
+        );
+        std::process::exit(1);
+    });
+    let key_bytes = node::cli::load_secret_key_file(&key_path, node::cli::SecretKind::Bls)
+        .unwrap_or_else(|e| panic!("invalid BLS key file {key_path}: {e}"));
+    let our_key = crypto::BlsSecretKey::from_bytes(&key_bytes)
+        .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
+
+    let validator_set = node::cli::validator_set_from_genesis(&genesis)
+        .unwrap_or_else(|e| panic!("invalid genesis validator set: {e}"));
+    // The committee seat is wherever OUR key is registered — never a
+    // process index. A key outside the committee would boot and then
+    // fail every peer handshake; refuse at startup instead.
+    let our_pk = our_key.public_key();
+    let Some(our_seat) = validator_set.index_of_key(&our_pk) else {
+        eprintln!(
+            "oxide-validator: refusing to start — --bls-key-file is not in the \
+             genesis validator set"
+        );
+        std::process::exit(1);
+    };
+    let our_addr = validator_set.validator_addresses()[usize::from(our_seat)];
+    let peers = resolve_peers(&cfg.network.peers, &our_addr);
+    let tls = resolve_tls_spec(&peers);
+
+    // Graceful shutdown: SIGINT/SIGTERM sets the flag the pump polls.
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    let _ = primitives::supervision::spawn_supervised("signal-handler", false, move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("signal runtime");
+        rt.block_on(async {
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("sigterm handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+            }
+            shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    });
+
+    let rpc_listen = node::cli::parse_cli_flag("--rpc-listen").or_else(|| {
+        if cfg.rpc.listen_addr.is_empty() { None } else { Some(cfg.rpc.listen_addr.clone()) }
+    });
+    let wal_path = node::cli::parse_cli_flag("--wal-file").map(PathBuf::from);
+    // Genesis `evm.alloc` — parsed here so `node` stays free of the
+    // `alloy_primitives` U256 conversion.
+    let genesis_alloc = Some(Box::new(move |m: &evm::EvmModule| apply_evm_alloc(m, &genesis))
+        as Box<dyn FnOnce(&evm::EvmModule) + Send>);
+
+    node::validator_net::run(node::validator_net::ValidatorNetSpec {
+        log_tag: "oxide-validator".to_string(),
+        seat: usize::from(our_seat),
+        validator_set,
+        secret_key: our_key,
+        node_config: cfg.node.clone(),
+        wal_path,
+        listen_addr: cfg.network.listen_addr.clone(),
+        peers,
+        tls,
+        network: cfg.network.clone(),
+        genesis_alloc,
+        data_dir: cfg.data_dir.clone(),
+        rpc_listen,
+        rpc_config: cfg.rpc.clone(),
+        smoke_tx: None,
+        shutdown,
+    });
+}
+
+/// Resolve peer endpoints for validator mode: `[network] peers`
+/// entries (format-checked by `validate_effective_config` —
+/// `addr=host:port`) plus repeatable `--peer addr=host:port`
+/// overrides, which also admit non-committee endpoints (a pending
+/// rotation member).
+///
+/// Returns `(peer_id, host:port)` pairs where `peer_id` is the
+/// member's staking-address bytes. Our own address is skipped — a
+/// config listing ourselves would open a self-connection.
+fn resolve_peers(configured: &[String], our_addr: &primitives::Address) -> Vec<(Vec<u8>, String)> {
+    let mut peers: Vec<(Vec<u8>, String)> = Vec::new();
+    let mut seen_peers: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for entry in configured.iter().cloned().chain(node::cli::parse_cli_flags("--peer")) {
+        let Some((addr_hex, hostport)) = entry.split_once('=') else {
+            // Config-file entries were already validated; a bad one
+            // here came from `--peer` argv.
+            eprintln!("oxide-validator: invalid peer '{entry}' — expected <addr_hex>=<host:port>");
+            std::process::exit(1);
+        };
+        let addr_bytes = node::cli::hex_decode(addr_hex)
+            .unwrap_or_else(|e| panic!("invalid peer address '{addr_hex}': {e}"));
+        let Ok(addr_arr): Result<[u8; 20], _> = addr_bytes.try_into() else {
+            eprintln!("oxide-validator: peer address '{addr_hex}' must be 20 bytes");
+            std::process::exit(1);
+        };
+        if addr_arr == our_addr.0 {
+            continue;
+        }
+        let id = addr_arr.to_vec();
+        if seen_peers.insert(id.clone()) {
+            peers.push((id, hostport.to_string()));
+        }
+    }
+    peers
+}
+
+/// Resolve `--tls-dir` into a [`node::validator_net::TlsSpec`]:
+/// `cert.pem`/`key.pem` for ourselves and one `peer-<addr-hex>.pem`
+/// per peer — production naming is address-keyed, never
+/// committee-indexed (a removal reshuffle would silently rebind
+/// index-named certs to the wrong member).
+fn resolve_tls_spec(peers: &[(Vec<u8>, String)]) -> Option<node::validator_net::TlsSpec> {
+    node::cli::parse_cli_flag("--tls-dir").map(|tls_dir| {
+        let trusted_peer_certs = peers
+            .iter()
+            .map(|(id, _)| {
+                (
+                    id.clone(),
+                    PathBuf::from(format!("{tls_dir}/peer-{}.pem", node::cli::hex_encode(id))),
+                )
+            })
+            .collect();
+        node::validator_net::TlsSpec {
+            cert_path: PathBuf::from(format!("{tls_dir}/cert.pem")),
+            key_path: PathBuf::from(format!("{tls_dir}/key.pem")),
+            trusted_peer_certs,
+        }
+    })
+}
+
+/// Apply a genesis file's `evm.alloc` map to the assembled EVM
+/// module: balances, nonces, code, and storage for pre-funded
+/// accounts and preinstalled contracts (Ethereum `genesis.json`
+/// convention).
+///
+/// Kept in the binary (not the shared assembly) because storage
+/// slots are 256-bit words — converting them here avoids dragging
+/// the `node` crate into a `revm`/`alloy` dependency for one map.
+/// Applied after `install_preinstalls`, so an alloc entry can still
+/// intentionally override a preinstall address.
+fn apply_evm_alloc(evm_module: &evm::EvmModule, genesis: &config::genesis::Genesis) {
+    for (addr_hex, account) in &genesis.evm.alloc {
+        let addr_bytes = node::cli::hex_decode(addr_hex)
+            .unwrap_or_else(|e| panic!("genesis evm.alloc invalid address: {e}"));
+        let addr: [u8; 20] = addr_bytes
+            .try_into()
+            .unwrap_or_else(|_| panic!("genesis evm.alloc address must be 20 bytes"));
+        let balance = if let Some(hex) = account.balance.strip_prefix("0x") {
+            u128::from_str_radix(hex, 16)
+        } else {
+            account.balance.parse::<u128>()
+        }
+        .unwrap_or_else(|e| panic!("genesis evm.alloc invalid balance: {e}"));
+        let code = account
+            .code
+            .as_deref()
+            .map(|c| node::cli::hex_decode(c).unwrap_or_else(|e| panic!("evm.alloc code: {e}")))
+            .unwrap_or_default();
+        let storage = account
+            .storage
+            .iter()
+            .map(|(slot, value)| {
+                let slot = alloy_primitives::U256::from_str_radix(
+                    slot.strip_prefix("0x").unwrap_or(slot),
+                    16,
+                )
+                .unwrap_or_else(|e| panic!("evm.alloc slot: {e}"));
+                let value = alloy_primitives::U256::from_str_radix(
+                    value.strip_prefix("0x").unwrap_or(value),
+                    16,
+                )
+                .unwrap_or_else(|e| panic!("evm.alloc storage value: {e}"));
+                (slot, value)
+            })
+            .collect();
+        evm_module.genesis_insert_account(
+            &primitives::Address(addr),
+            balance,
+            account.nonce,
+            code,
+            storage,
+        );
+    }
 }
 
 /// Spawn the periodic driver-metrics sync task under supervision.
@@ -472,7 +727,7 @@ fn print_help() {
     println!("    version      Print version information");
     println!("    help         Print this help message");
     println!();
-    println!("FLAGS (run mode — this binary runs a single node):");
+    println!("FLAGS (default run mode is single-node):");
     println!("    --config <path>          Load config from TOML file");
     println!("    --engine <kind>           Consensus engine (sequencer|oxidebft)");
     println!("    --genesis-file <path>     Load genesis.json (validator set + balances)");
@@ -486,21 +741,33 @@ fn print_help() {
     println!("    --signer-key-file <path>  same, from a file (hex or OXKEY keystore)");
     println!("    --unsafe-allow-unsigned-txs");
     println!("                            UNSAFE dev mode: admit unsigned native txs");
-    println!("    --unsafe-allow-insecure-posture");
-    println!("                            UNSAFE: allow devnet defaults on public binds");
-    println!();
-    println!("    Multi-node flags (--num-nodes, --base-port, --bind-host,");
-    println!("    --peer-host*, --bls-key-file, --tls-dir) belong to the");
-    println!("    oxide-devnet binary — passing them here has no effect.");
     println!(
         "                            (unauthenticated sender). Refused on non-loopback binds."
     );
+    println!("    --unsafe-allow-insecure-posture");
+    println!("                            UNSAFE: allow devnet defaults on public binds");
+    println!();
+    println!("VALIDATOR MODE (production multi-validator):");
+    println!("    --validator              Run oxideBFT over TCP/mTLS with peers from");
+    println!("                             [network] peers (addr=host:port) + --peer flags");
+    println!("    --bls-key-file <path>    Required. BLS secret key (hex/raw/OXKEY)");
+    println!("    --tls-dir <dir>          mTLS: cert.pem, key.pem, peer-<addr-hex>.pem");
+    println!("    --peer <addr>=<host:port>  Extra/override peer endpoint (repeatable)");
+    println!();
+    println!("    In validator mode --genesis-file is required and [network]");
+    println!("    listen_addr/peers are live. Devnet-only flags (--num-nodes,");
+    println!("    --base-port, --bind-host, --peer-host*) belong to the");
+    println!("    oxide-devnet binary.");
     println!();
     println!("EXAMPLES:");
     println!("    oxide-validator init --chain-id 1");
     println!("    oxide-validator genesis --chain-id 1 --validators 4");
     println!("    oxide-validator tls-gen --num-nodes 4 --output-dir tls/");
+    println!("    oxide-validator tls-gen --genesis-file genesis.json -o tls/   (validator mode)");
     println!("    oxide-validator keygen --output node-0.key");
+    println!("    oxide-validator --validator --config config.toml \\");
+    println!("        --genesis-file genesis.json --bls-key-file val.key \\");
+    println!("        --tls-dir tls/node-0 --data-dir data/                (multi-validator)");
     println!("    oxide-validator --config config/devnet.toml");
     println!("    oxide-validator --engine oxidebft");
     println!("    oxide-validator --export-snapshot snapshot.bin");
@@ -704,28 +971,25 @@ fn read_pubkey_file(path: &str) -> Vec<String> {
 /// `key.pem`, and `peer-{j}.pem` for every peer `j != i`.
 ///
 /// Flags:
-/// - `--num-nodes <N>`: number of validators (default: 4)
+/// - `--num-nodes <N>`: number of validators (default: 4, no-genesis path)
 /// - `--output-dir <dir>`: target directory (default: ./tls)
+/// - `--genesis-file <path>`: committee source — peer certs keyed by
+///   staking address (`peer-<addr-hex>.pem`), the production naming
+///   `oxide-validator --validator --tls-dir` consumes
 ///
 /// The output layout is:
 /// ```text
 /// tls/
 /// ├── node-0/
-/// │   ├── cert.pem       — node 0's certificate
-/// │   ├── key.pem        — node 0's private key
-/// │   ├── peer-1.pem     — node 1's certificate
-/// │   ├── peer-2.pem     — node 2's certificate
-/// │   └── peer-3.pem     — node 3's certificate
-/// ├── node-1/
-/// │   ├── cert.pem
-/// │   ├── key.pem
-/// │   ├── peer-0.pem
-/// │   ├── peer-2.pem
-/// │   └── peer-3.pem
+/// │   ├── cert.pem       — member 0's certificate
+/// │   ├── key.pem        — member 0's private key
+/// │   ├── peer-*.pem     — every other member's certificate
 /// └── ...
 /// ```
 ///
-/// Each node runs with `--tls-dir tls/node-{i}`.
+/// Each node runs with `--tls-dir tls/node-{i}` where `i` is the
+/// committee index (devnet) or the member's position in the genesis
+/// validator list (validator mode).
 ///
 /// # Security
 ///
@@ -734,9 +998,18 @@ fn read_pubkey_file(path: &str) -> Vec<String> {
 /// from a proper CA (e.g., `step ca`, `HashiCorp` Vault PKI, or
 /// cloud-native `cert-manager`) and distribute via `--tls-dir` with
 /// the CA's certificate chain in each `peer-{i}.pem`.
+/// - `--genesis-file <path>`: generate certs keyed by the genesis
+///   committee's staking addresses — peer files are written as
+///   `peer-<addr-hex>.pem` (the production `validator_net` naming)
+///   and each cert's peer id is the member's 20-byte address. This
+///   is the mode `oxide-validator --validator --tls-dir` consumes.
+/// - Without `--genesis-file`: the devnet layout — index-byte peer
+///   ids and `peer-{j}.pem` files, matching `oxide-devnet`'s
+///   `peer-{committee-index}.pem` convention.
 fn run_tls_gen(args: &[String]) {
     let mut num_nodes: usize = 4;
     let mut output_dir = "tls".to_string();
+    let mut genesis_path: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -752,24 +1025,43 @@ fn run_tls_gen(args: &[String]) {
                 }
                 i += 2;
             }
+            "--genesis-file" => {
+                if let Some(v) = args.get(i + 1) {
+                    genesis_path = Some(v.clone());
+                }
+                i += 2;
+            }
             _ => i += 1,
         }
     }
 
     let base = PathBuf::from(&output_dir);
 
-    // Generate a cert+key pair for each node. The peer_id is the
-    // node index as a single byte — matching the devnet's
-    // `vec![i]` peer ID convention.
-    let certs: Vec<(String, String)> = (0..num_nodes)
-        .map(|i| {
-            let peer_id = vec![u8::try_from(i).expect("node index fits in u8")];
-            p2p::tls::generate_ca_cert_pem(&peer_id)
-        })
-        .collect();
+    // Generate a cert+key pair per member. Peer ids: genesis mode
+    // uses the member's staking address (what `validator_net`'s
+    // transport expects); the no-genesis path keeps the index-byte
+    // convention `oxide-devnet`'s `peer-{i}.pem` files pair with —
+    // the cert's CN is cosmetic either way: `TlsConfig` binds
+    // cert-DER → peer-id through its trusted-peers map.
+    let members: Vec<(Vec<u8>, String)> = if let Some(path) = genesis_path {
+        let genesis = config::genesis::Genesis::from_json_file(&PathBuf::from(&path))
+            .unwrap_or_else(|e| panic!("failed to load genesis file {path}: {e}"));
+        let set = node::cli::validator_set_from_genesis(&genesis)
+            .unwrap_or_else(|e| panic!("invalid genesis validator set: {e}"));
+        set.validator_addresses()
+            .iter()
+            .map(|a| (a.0.to_vec(), node::cli::hex_encode(&a.0)))
+            .collect()
+    } else {
+        (0..num_nodes)
+            .map(|i| (vec![u8::try_from(i).expect("node index fits in u8")], i.to_string()))
+            .collect()
+    };
+    let certs: Vec<(String, String)> =
+        members.iter().map(|(peer_id, _)| p2p::tls::generate_ca_cert_pem(peer_id)).collect();
 
-    // Write per-node directories: cert.pem + key.pem + peer-{j}.pem.
-    for i in 0..num_nodes {
+    // Write per-node directories: cert.pem + key.pem + peer certs.
+    for (i, _) in members.iter().enumerate() {
         let dir = base.join(format!("node-{i}"));
         std::fs::create_dir_all(&dir)
             .unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
@@ -779,15 +1071,15 @@ fn run_tls_gen(args: &[String]) {
             .unwrap_or_else(|e| panic!("failed to write key.pem: {e}"));
         for (j, (cert, _)) in certs.iter().enumerate() {
             if j != i {
-                std::fs::write(dir.join(format!("peer-{j}.pem")), cert)
-                    .unwrap_or_else(|e| panic!("failed to write peer-{j}.pem: {e}"));
+                std::fs::write(dir.join(format!("peer-{}.pem", members[j].1)), cert)
+                    .unwrap_or_else(|e| panic!("failed to write peer cert: {e}"));
             }
         }
     }
 
     println!(
         "oxide-validator tls-gen: wrote {} node dirs to {} (use --tls-dir {}/node-<i>)",
-        num_nodes,
+        members.len(),
         base.display(),
         base.display()
     );

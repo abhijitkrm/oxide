@@ -215,6 +215,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     external signer, and if it can't be reached the node stays
     silent instead of emitting broken signatures or losing queued
     transactions.
+- **`oxide-validator --validator` — the production multi-validator
+  mode.** The validator binary now runs a real networked committee:
+  oxideBFT over the TCP/mTLS transport via the shared
+  `node::validator_net` pump (the same machinery `oxide-devnet`
+  exercises). `[network] listen_addr`/`peers` are live in this mode —
+  every peer entry is `<40-hex-addr>=<host:port>`, binding each
+  peer's committee identity to its endpoint before the handshake.
+  The node's committee seat resolves from `--bls-key-file`
+  membership in the `--genesis-file` validator set — never a
+  process index — and a key outside the committee refuses at
+  startup. `--tls-dir` takes `tls-gen --genesis-file`'s output:
+  address-keyed `peer-<addr-hex>.pem` certs (a committee reshuffle
+  can't rebind them to the wrong member). Startup refuses missing
+  genesis, missing key, malformed peers, and chain-id mismatches;
+  a 4-process fleet E2E proves convergence, 3-of-4 quorum survival,
+  and snapshot+WAL restart recovery.
+  - **In plain words:** the production validator binary can finally
+    join a real multi-validator network — previously only the
+    development harness could. Operators generate keys, publish a
+    genesis, mint per-validator TLS material, and each node finds
+    its own seat from its key.
 
 ### Changed
 

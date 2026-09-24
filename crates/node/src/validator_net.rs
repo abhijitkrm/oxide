@@ -537,7 +537,7 @@ fn start_rpc(
 ///
 /// `listen_addr`/`peers` are NOT taken from the file by callers that
 /// derive them per-index (`--node`, `--base-port`) or per-member
-/// (`addr@host:port` entries); the timeouts and frame bound DO apply
+/// (`addr=host:port` entries); the timeouts and frame bound DO apply
 /// to both TLS and plain TCP.
 fn to_transport_config(network: &config::NetworkConfig) -> p2p::tcp::TcpTransportConfig {
     p2p::tcp::TcpTransportConfig {

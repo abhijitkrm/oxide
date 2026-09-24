@@ -705,6 +705,114 @@ fn devnet_mode_forces_oxidebft_and_warns_on_sequencer() {
 }
 
 #[test]
+fn validator_mode_forces_oxidebft_and_activates_network_fields() {
+    // Same engine override as devnet: the serde default parses as
+    // `sequencer`, so the mode forces oxideBFT and warns.
+    let mut config = config::Config::default();
+    config.consensus.engine = config::ConsensusEngineKind::Sequencer;
+    config.network.listen_addr = "10.0.0.5:9100".to_string();
+    config.network.peers = vec![format!("{}=10.0.0.6:9100", "ab".repeat(20))];
+    let node_config = node_config_from(
+        &config,
+        &config::RpcConfig::default(),
+        &AssemblyOverrides::default(),
+        NodeMode::Validator,
+    )
+    .expect("ok");
+    assert_eq!(node_config.consensus, ConsensusConfig::OxideBft);
+    let (warnings, errors) = validate_effective_config(&config, &node_config, NodeMode::Validator);
+    assert!(errors.is_empty(), "a well-formed addr=host:port peer set must validate: {errors:?}");
+    // The sequencer-override warning fires — but the network fields
+    // are LIVE in validator mode, so no "set but unused" warning.
+    assert!(warnings.iter().any(|w| w.contains("sequencer")));
+    assert!(
+        !warnings.iter().any(|w| w.contains("listen_addr")),
+        "validator-mode network fields are live, not warnings: {warnings:?}"
+    );
+}
+
+#[test]
+fn validator_mode_rejects_malformed_peers() {
+    let node_config = |config: &config::Config| {
+        node_config_from(
+            config,
+            &config::RpcConfig::default(),
+            &AssemblyOverrides::default(),
+            NodeMode::Validator,
+        )
+        .expect("ok")
+    };
+    // Missing the `<addr>=` prefix — a bare host:port leaves the
+    // peer's committee identity unbound.
+    let mut config = config::Config::default();
+    config.network.peers = vec!["127.0.0.1:9101".to_string()];
+    let (_, errors) =
+        validate_effective_config(&config, &node_config(&config), NodeMode::Validator);
+    assert!(errors.iter().any(|e| e.contains("missing `<addr>=`")));
+
+    // Malformed address — not 40 hex chars.
+    config.network.peers = vec!["zz=127.0.0.1:9101".to_string()];
+    let (_, errors) =
+        validate_effective_config(&config, &node_config(&config), NodeMode::Validator);
+    assert!(errors.iter().any(|e| e.contains("malformed address")));
+
+    // Malformed endpoint — the port must parse.
+    config.network.peers = vec![format!("{}=127.0.0.1:notaport", "ab".repeat(20))];
+    let (_, errors) =
+        validate_effective_config(&config, &node_config(&config), NodeMode::Validator);
+    assert!(errors.iter().any(|e| e.contains("malformed endpoint")));
+}
+
+#[test]
+fn validator_mode_warns_on_empty_peers() {
+    // No peers → a 1-validator network; legal (devnet-shaped) but
+    // worth surfacing — `NodeMode::Single` is the honest shape.
+    let config = config::Config::default();
+    let node_config = node_config_from(
+        &config,
+        &config::RpcConfig::default(),
+        &AssemblyOverrides::default(),
+        NodeMode::Validator,
+    )
+    .expect("ok");
+    let (warnings, errors) = validate_effective_config(&config, &node_config, NodeMode::Validator);
+    assert!(errors.is_empty());
+    assert!(
+        warnings.iter().any(|w| w.contains("network.peers is empty")),
+        "empty peers must warn: {warnings:?}"
+    );
+}
+
+#[test]
+fn validator_set_from_genesis_builds_committee() {
+    // Two members with real public keys → the set carries both and
+    // `index_of_key` resolves each seat by key, never by position
+    // argument — the validator binary's seat derivation depends on
+    // it.
+    let mut genesis = config::genesis::Genesis::devnet(1, 2, 0, 0);
+    let keys: Vec<crypto::BlsSecretKey> = (1..=2u8).map(crate::cli::bls_key).collect();
+    for (v, k) in genesis.staking.validators.iter_mut().zip(&keys) {
+        v.public_key = Some(crate::cli::hex_encode(k.public_key().as_bytes()));
+    }
+    let set = crate::cli::validator_set_from_genesis(&genesis).expect("valid committee");
+    assert_eq!(set.validator_addresses().len(), 2);
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(usize::from(set.index_of_key(&k.public_key()).expect("member")), i);
+    }
+
+    // A missing public_key fails closed — devnet-genesis entries
+    // omit it (deterministic derivation is their fallback), but the
+    // production path has no fallback to derive from.
+    let mut genesis = config::genesis::Genesis::devnet(1, 2, 0, 0);
+    let err =
+        crate::cli::validator_set_from_genesis(&genesis).expect_err("missing public_key must fail");
+    assert!(err.contains("missing public_key"), "{err}");
+    genesis.staking.validators[0].public_key = Some("0xzz".to_string());
+    let err = crate::cli::validator_set_from_genesis(&genesis).expect_err("bad hex must fail");
+    assert!(err.contains("invalid public_key hex"), "{err}");
+}
+
+#[test]
 fn validate_effective_config_fails_on_unwired_settings() {
     let mut config = config::Config::default();
     config.storage.archive = true;

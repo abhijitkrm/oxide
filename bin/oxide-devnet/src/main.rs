@@ -390,36 +390,8 @@ fn load_validator_set(num_nodes: usize, _node_index: usize) -> consensus::Valida
             "genesis validator count {} doesn't match --num-nodes {num_nodes}",
             validators.len()
         );
-        let pks: Vec<crypto::bls::PublicKey> = validators
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let hex = v.public_key.as_ref().unwrap_or_else(|| {
-                    panic!("genesis validator {i} missing public_key — required for multi-node")
-                });
-                let bytes = node::cli::hex_decode(hex).unwrap_or_else(|e| {
-                    panic!("genesis validator {i} invalid public_key hex: {e}")
-                });
-                crypto::bls::PublicKey::from_slice(&bytes)
-                    .unwrap_or_else(|_| panic!("genesis validator {i} invalid BLS public key"))
-            })
-            .collect();
-        let stakes: Vec<u64> = validators.iter().map(|v| v.stake).collect();
-        let addresses: Vec<primitives::Address> = validators
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let bytes = node::cli::hex_decode(&v.address)
-                    .unwrap_or_else(|e| panic!("genesis validator {i} invalid address hex: {e}"));
-                primitives::Address(
-                    bytes.try_into().unwrap_or_else(|_| {
-                        panic!("genesis validator {i} address must be 20 bytes")
-                    }),
-                )
-            })
-            .collect();
-        consensus::ValidatorSet::with_addresses(pks, stakes, addresses)
-            .expect("genesis validator set")
+        node::cli::validator_set_from_genesis(&genesis)
+            .unwrap_or_else(|e| panic!("{e} — required for multi-node"))
     } else {
         // Deterministic devnet fallback — NOT suitable for production.
         let secret_keys: Vec<crypto::BlsSecretKey> = (1..=u8::try_from(num_nodes)
