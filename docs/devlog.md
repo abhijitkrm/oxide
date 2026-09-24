@@ -20793,3 +20793,19 @@ frames through real loopback mTLS — any reorder kills the
 connection before the server collects all frames) and
 `tls_split_read_half_receives_frames`. Live check: 4-node mTLS
 devnet finalizing past height 23 with no transport errors.
+
+### MPT conformance — roots pinned to upstream alloy-trie vectors
+
+audit002 M6's mechanism (sparse-storage invariant: commit-path zero
+pruning, filtered root computation, strict snapshot decode) was
+already in; the missing piece was the *external* reference — nothing
+proved our roots match a real Ethereum client. Added
+`trie_roots_match_upstream_reference_vectors` to the conformance
+suite: a 3-account state + 2-slot storage root generated once with
+upstream `alloy-trie` 0.9.5 (`state_root_unhashed`/
+`storage_root_unhashed` — the same functions reth calls) and frozen
+as constants. The third vector is the interesting one: feeding an
+explicit zero slot upstream produces a *different* root (a present
+leaf with RLP 0x80), which is exactly why the module-level filter is
+load-bearing — upstream semantics alone would diverge us from
+Ethereum. No migration needed: pre-alpha, no shipped state.

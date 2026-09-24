@@ -104,6 +104,78 @@ fn empty_state_matches_ethereum_empty_root() {
     assert_eq!(root, expected, "empty state root must match Ethereum's EMPTY_ROOT_HASH");
 }
 
+/// MPT roots pinned to upstream `alloy-trie` 0.9.5 — the same crate
+/// reth uses for `state_root`, so these constants ARE the Ethereum
+/// reference for this state. Generated once with a standalone
+/// `state_root_unhashed`/`storage_root_unhashed` run and frozen here;
+/// a drift in our encoder, hasher, or leaf layout fails this test.
+#[test]
+fn trie_roots_match_upstream_reference_vectors() {
+    use revm::primitives::B256;
+
+    let mut slot7_bytes = [0u8; 32];
+    slot7_bytes[31] = 7;
+    let mut slot255_bytes = [0u8; 32];
+    slot255_bytes[31] = 255;
+    let slot7 = B256::from(slot7_bytes);
+    let slot255 = B256::from(slot255_bytes);
+    let storage =
+        evm::trie::storage_root([(slot7, U256::from(0x2au64)), (slot255, U256::from(0xffffu64))]);
+    let expected_storage: B256 =
+        "7bd07fbc16fdccdfd45f7fa99c186cbeda14179bf199ca5ed5fd34dcc11322db".parse().unwrap();
+    assert_eq!(storage, expected_storage, "storage root must match upstream alloy-trie");
+
+    // Three accounts: one with storage + a code hash, one empty, one
+    // with a balance — exercises leaf RLP, hashing, and ordering.
+    let code_hash = B256::from([0x11u8; 32]);
+    let mut a1_bytes = [0u8; 20];
+    a1_bytes[19] = 1;
+    let mut a2_bytes = [0u8; 20];
+    a2_bytes[0] = 0x10;
+    let mut a3_bytes = [0u8; 20];
+    a3_bytes[..2].copy_from_slice(&[0xde, 0xad]);
+    a3_bytes[18..].copy_from_slice(&[0xbe, 0xef]);
+    let a1 = EvmAddress::from(a1_bytes);
+    let a2 = EvmAddress::from(a2_bytes);
+    let a3 = EvmAddress::from(a3_bytes);
+    let root = evm::trie::state_root([
+        (a1, evm::trie::build_trie_account(5, U256::from(1_000_000u64), storage, code_hash)),
+        (
+            a2,
+            evm::trie::build_trie_account(
+                0,
+                U256::ZERO,
+                evm::trie::EMPTY_ROOT,
+                evm::trie::KECCAK_EMPTY,
+            ),
+        ),
+        (
+            a3,
+            evm::trie::build_trie_account(
+                1,
+                U256::from(42u64),
+                evm::trie::EMPTY_ROOT,
+                evm::trie::KECCAK_EMPTY,
+            ),
+        ),
+    ]);
+    let expected_root: B256 =
+        "5577bc46989257a16800765c498d5d5547659f3558df1102a810dd1c9b9f310a".parse().unwrap();
+    assert_eq!(root, expected_root, "state root must match upstream alloy-trie");
+
+    // The boundary the module enforces above this layer: an
+    // *unfiltered* zero slot changes the root — upstream encodes it
+    // as a present leaf (0xc86a… below), while Ethereum's sparse rule
+    // treats it as absent. `commit_state`'s zero pruning +
+    // `zeroed_storage_slot_matches_never_written` cover the module
+    // path; this row documents why the filter exists.
+    let with_zero = evm::trie::storage_root([(slot7, U256::from(0x2au64)), (slot255, U256::ZERO)]);
+    let expected_zero: B256 =
+        "c86ac151fedd31b39e5ad0fbf0e1bc21549c09bd72b98cdae1bf56aed2ce1796".parse().unwrap();
+    assert_eq!(with_zero, expected_zero, "raw zero slot is a present leaf upstream");
+    assert_ne!(with_zero, storage, "zero slot must change the root — hence the filter");
+}
+
 /// A simple value transfer must succeed and credit the recipient.
 #[test]
 fn simple_transfer_credits_recipient() {
