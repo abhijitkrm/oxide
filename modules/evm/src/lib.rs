@@ -62,7 +62,10 @@ use framework::{Balances, module_id};
 use primitives::{Address, Hash, Height};
 // Ceiling 1: the chain-configured block gas limit is the single
 // source of truth for the EVM's block gas limit too.
-use parallel::{CoinbaseObs, GroupExecResult, SharedCacheDB, SpecTx, WriteSplit, classify_state};
+use parallel::{
+    CoinbaseObs, InfoKey, MvDb, MvState, ObservedReads, SharedCacheDB, SpecTx,
+    destructive_accounts, info_key,
+};
 use trie::{encode_trie_leaf, sparse_walk};
 use types::CHAIN_BLOCK_GAS_LIMIT;
 // rayon: parallel secp256k1 sender recovery in `handle_batch`.

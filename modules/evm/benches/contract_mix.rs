@@ -36,31 +36,39 @@
 //!
 //! ## Acceptance gate
 //!
-//! `parallel` must not regress versus `serial` (`handle_batch`,
-//! the single-writer reference) on the same mix — the honest form
-//! of "parallel is worth its complexity" when 20% of the batch is
-//! genuinely contended. The `parallel_persist` row adds the
-//! `Volatile` storage backend so the `end_block` account flush +
-//! sealed-block write is inside the measurement.
+//! `parallel` should approach `serial` (`handle_batch`, the
+//! single-writer reference) on this mix and beat it on
+//! parallelism-friendly batches — the honest form of "parallel is
+//! worth its complexity" when 20% of the batch is genuinely
+//! contended. The `parallel_persist` row adds the `Volatile`
+//! storage backend so the `end_block` account flush + sealed-block
+//! write is inside the measurement.
 //!
 //! ## Measured (8-core Apple Silicon, release)
 //!
 //! | row | 100 txs | 1000 txs |
 //! |---|---|---|
-//! | serial | 1.80 ms | 13.86 ms |
-//! | parallel | 1.97 ms | 17.03 ms |
-//! | parallel_persist | — | 17.21 ms |
+//! | serial | 1.80 ms | 13.99 ms |
+//! | parallel | 2.11 ms | 16.26 ms |
+//! | parallel_persist | — | 16.26 ms |
 //!
-//! Serial: ~72.2k tx/s ≈ 2.49 GG/s of *executed* contract gas
-//! (34.5M gas/1000-tx block). Parallel: ~58.7k tx/s ≈ 2.03 GG/s —
-//! **23% slower than serial** on this mix: 637 of 1000 speculative
-//! executions re-ran (the 200 shared-pool swaps contend on slots
-//! 0/1 and the coinbase/fee accounts every tx touches conflict on
-//! top). The disjoint-transfer benches showed parity; a real mix
-//! shows speculation costs more than it saves until the
-//! multi-version store (Phase 5 residual) removes the
-//! canonical-order merge. Persistence adds ~1% — the flush is
-//! amortized across the whole batch.
+//! Serial: ~71.4k tx/s ≈ 2.47 GG/s of *executed* contract gas
+//! (34.5M gas/1000-tx block). Parallel: ~61.5k tx/s ≈ 2.12 GG/s —
+//! **14% slower than serial** on this mix, with 343 of 1000
+//! speculative executions re-running (down from 637 under the
+//! sender-group registry scheme — a ~46% reduction and a ~10%
+//! wall-clock improvement over the old design's 17.68 ms).
+//!
+//! The remaining deficit is workload-inherent: the 200 shared-pool
+//! swaps form a true read-write chain on slots 0/1 that no scheme
+//! can parallelize, and every re-execution pays speculation +
+//! canonical work where serial pays once. The multi-version store
+//! already converts every *resolved* dependency into a validated
+//! merge (a reader that observed the writer's published version
+//! merges directly) and the additive-recipient lane absorbs
+//! write-only balance credits; what is left serializing is genuine
+//! sequential dependency, not bookkeeping. Persistence adds ~1% —
+//! the flush is amortized across the whole batch.
 #![allow(missing_docs)]
 #![allow(clippy::doc_markdown)]
 

@@ -11,8 +11,8 @@
 
 use super::{
     Address, Arc, CacheDB, CoinbaseObs, DatabaseRef, EvmModule, ExecError, ExecuteCommitEvm,
-    ExecutionResult, InspectEvm, Output, ResultGas, SpecId, SpecTx, SuccessReason, TX_GAS_TRANSFER,
-    TxEnv, TxKind, alloy_primitives_address, trace, tx, versioned,
+    ExecutionResult, InspectEvm, ObservedReads, Output, ResultGas, SpecId, SpecTx, SuccessReason,
+    TX_GAS_TRANSFER, TxEnv, TxKind, alloy_primitives_address, trace, tx, versioned,
 };
 
 impl EvmModule {
@@ -284,18 +284,18 @@ impl EvmModule {
         }
 
         // 4. Recipient has no code (is an EOA).
-        //    Check the cache directly — avoids the `AccountInfo`
-        //    clone from `basic_ref`. If the account is not in the
-        //    cache, it doesn't exist yet (no code, is an EOA).
+        //    `basic_ref` resolves the authoritative view — the local
+        //    cache first, then the inner DB on miss. Under the
+        //    parallel executor's `MvDb` this also *records* the
+        //    observation, so a code-deploying predecessor is caught by
+        //    observed-value validation; a cache-only peek would let a
+        //    speculation shortcut a contract call it never saw.
         //    `B256::ZERO` is a sentinel used by test setup; treat
         //    it the same as `KECCAK_EMPTY` (no code).
-        let recipient_has_code = match db.cache.accounts.get(&recipient) {
-            Some(account) => {
-                account.info.code_hash != revm::primitives::KECCAK_EMPTY
-                    && account.info.code_hash != revm::primitives::B256::ZERO
-            }
-            None => false, // Account doesn't exist — no code.
-        };
+        let recipient_has_code = db.basic_ref(recipient).ok()?.is_some_and(|info| {
+            info.code_hash != revm::primitives::KECCAK_EMPTY
+                && info.code_hash != revm::primitives::B256::ZERO
+        });
         if recipient_has_code {
             return None; // Recipient is a contract — needs EVM.
         }
@@ -684,14 +684,20 @@ impl EvmModule {
     /// non-additive change the delta cannot represent — so the tx is
     /// flagged `coinbase_nontrivial` and re-executes canonically.
     ///
-    /// `coinbase_before` is the coinbase balance the group cache
-    /// showed just before this tx ran — what any `BALANCE(coinbase)`
-    /// would have observed (fast paths never execute opcodes, so
+    /// `coinbase_before` is the coinbase balance the worker observed
+    /// just before this tx ran — the pre-block base under the
+    /// multi-version scheme (fast paths never execute opcodes, so
     /// `coinbase.read` only matters for the caller == coinbase case,
     /// which is already `must_reexec`).
+    ///
+    /// `observed` is the read record the `MvDb` accumulated during the
+    /// fast path — sender and recipient infos, plus any partial reads
+    /// a declined fast-path attempt left behind. It is the validity
+    /// predicate the canonical commit checks.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spec_fast_path<DB: DatabaseRef>(
         db: &CacheDB<DB>,
+        observed: ObservedReads,
         idx: usize,
         caller: revm::primitives::Address,
         signed: &tx::SignedTx,
@@ -706,24 +712,15 @@ impl EvmModule {
         };
         let caller_is_coinbase = caller == coinbase;
 
-        let mut reads: std::collections::HashSet<revm::primitives::Address> =
-            std::collections::HashSet::with_capacity(2);
-        reads.insert(caller);
-        reads.insert(recipient);
-
-        // Fast paths only ever modify `info` (balance, nonce) — never
-        // storage — so every write registers at info level and the
-        // slot sets stay empty.
-        let mut info_writes: std::collections::HashSet<revm::primitives::Address> =
-            std::collections::HashSet::with_capacity(2);
         // The merge payload: `EvmState` entries equivalent to what the
         // interpreter would record. The slot-wise `commit` merge
         // preserves every slot the account holds but this tx never
         // loaded. (`commit` extends storage; it never truncates it for
-        // a merely-Touched account.)
+        // a merely-Touched account.) Fast paths only ever modify
+        // `info` (balance, nonce) — never storage.
         let mut state = revm::state::EvmState::default();
         for addr in [caller, recipient] {
-            if addr == coinbase || !info_writes.insert(addr) {
+            if addr == coinbase || state.contains_key(&addr) {
                 continue;
             }
             if let Some(dba) = db.cache.accounts.get(&addr) {
@@ -741,10 +738,7 @@ impl EvmModule {
             idx,
             sender: caller,
             result: Ok((result, Some(frame))),
-            reads,
-            slot_reads: std::collections::HashSet::new(),
-            info_writes,
-            slot_writes: std::collections::HashSet::new(),
+            observed,
             destructive: std::collections::HashSet::new(),
             state,
             coinbase_before,
@@ -757,6 +751,14 @@ impl EvmModule {
                 nontrivial: caller_is_coinbase,
             },
             must_reexec: caller_is_coinbase,
+            // Both fast paths write `recipient.balance += value` and
+            // nothing else there — a write-only dependency the commit
+            // phase can rebase onto canonical instead of re-executing
+            // (see `SpecTx::additive`). Excluded when the recipient is
+            // the caller (self-transfer — that observation is a real
+            // input) or the coinbase (the additive-delta lane owns it).
+            additive: (recipient != caller && recipient != coinbase)
+                .then_some((recipient, signed.value())),
         }
     }
 

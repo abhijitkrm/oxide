@@ -1126,6 +1126,69 @@ fn handle_batch_parallel_conflict_matches_serial_state_root() {
     assert_eq!(serial_root, parallel_root, "conflict state roots must match");
 }
 
+/// The additive-recipient lane: a native transfer's recipient write
+/// is `post = pre + value` — the tx's result and gas never consume
+/// the observed balance. Under the multi-version commit a stale
+/// recipient observation is *rebased* onto the canonical account
+/// rather than re-executed.
+///
+/// With N distinct senders each paying the same EOA once, every
+/// sender observation is clean (nobody wrote those accounts) and
+/// every recipient observation is stale by construction — so the
+/// rebase lane must absorb all of them and the re-execution count
+/// is deterministically zero, not merely bounded.
+#[test]
+fn handle_batch_parallel_shared_recipient_rebases_instead_of_reexec() {
+    const N: u64 = 8;
+    let keys: Vec<_> = (0..N).map(|_| test_keypair()).collect();
+    let shared_recipient = revm::primitives::Address::from_slice(&[0x43; 20]);
+    // Distinct values make a dropped or double-applied credit visible.
+    let values: Vec<u128> = (0..N).map(|i| 1_000_000_000 + u128::from(i) * 7).collect();
+
+    let txs: Vec<Vec<u8>> = keys
+        .iter()
+        .zip(&values)
+        .map(|((pk, _), v)| signed_transfer_tx(pk, 0, shared_recipient, *v))
+        .collect();
+
+    // Serial reference.
+    let m_serial = make_module();
+    for (_, addr) in &keys {
+        fund(&m_serial, addr);
+    }
+    m_serial.begin_block(Height::new(1));
+    for raw in &txs {
+        m_serial.handle(&dummy_ctx(), raw).expect("serial tx");
+    }
+    m_serial.end_block(Height::new(1));
+    let serial_root = m_serial.state_root();
+
+    // Parallel.
+    let m_par = make_module();
+    for (_, addr) in &keys {
+        fund(&m_par, addr);
+    }
+    m_par.begin_block(Height::new(1));
+    let results = m_par.handle_batch_parallel(&dummy_ctx(), &txs);
+    m_par.end_block(Height::new(1));
+    let parallel_root = m_par.state_root();
+
+    assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
+    assert_eq!(serial_root, parallel_root, "shared-recipient roots must match");
+    let oxide_recipient = primitives::Address(shared_recipient.0.into());
+    assert_eq!(
+        m_par.balance(&oxide_recipient),
+        values.iter().sum::<u128>(),
+        "recipient must carry the sum of all transfers",
+    );
+    assert_eq!(
+        m_par.parallel_reexec_count_for_test(),
+        0,
+        "the additive-recipient lane must absorb every stale recipient \
+         observation — no re-executions on a write-only dependency",
+    );
+}
+
 /// Regression test for the speculative-merge storage wipe. A
 /// validated speculative tx must merge its recorded `EvmState`
 /// diff through `DatabaseCommit::commit` — the same slot-granular
@@ -1250,8 +1313,11 @@ fn handle_batch_parallel_disjoint_slots_skip_reexec() {
 }
 
 /// Two senders incrementing the SAME slot is a genuine read-write
-/// conflict: B's speculative `slot + 1` was computed on the pre-A
-/// value and must be re-executed so the counter lands at +2, not +1.
+/// dependency: B's `slot + 1` must land at +2, not +1. Under the
+/// multi-version store B either observed A's published write —
+/// computed on the correct value, so it validates and merges — or
+/// raced the publish and re-executes. Both paths produce 102; at
+/// most one tx can re-execute.
 #[test]
 fn handle_batch_parallel_same_slot_still_conflicts() {
     let (pk_a, addr_a) = test_keypair();
@@ -1289,8 +1355,10 @@ fn handle_batch_parallel_same_slot_still_conflicts() {
 
     assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
     assert!(
-        m_par.parallel_reexec_count_for_test() >= 1,
-        "same-slot read-modify-write must re-execute the later tx"
+        m_par.parallel_reexec_count_for_test() <= 1,
+        "a two-tx dependency can re-execute at most one tx — \
+         under the version store the later tx may instead have read \
+         the earlier tx's published write and validated"
     );
     assert_eq!(m_par.storage_at(&contract, &U256::from(7)), U256::from(102));
     assert_eq!(m_serial.state_root(), m_par.state_root(), "parallel root diverged");
@@ -1305,8 +1373,10 @@ fn handle_batch_parallel_same_slot_still_conflicts() {
 const COPY_RUNTIME: &[u8] = &[0x60, 0x00, 0x35, 0x54, 0x60, 0x20, 0x35, 0x55, 0x00];
 
 /// Read-vs-write at slot granularity: B reads the very slot A wrote
-/// earlier in canonical order. B's speculative read observed the
-/// pre-write value, so B must re-execute and land A's value.
+/// earlier in canonical order. If B's speculation observed A's
+/// published version it validates directly; if it raced the publish
+/// and saw the pre-write value, the observed-vs-canonical check
+/// fails and B re-executes. Either way slot 8 lands A's value.
 #[test]
 fn handle_batch_parallel_slot_read_write_conflicts() {
     let (pk_a, addr_a) = test_keypair();
@@ -1352,11 +1422,11 @@ fn handle_batch_parallel_slot_read_write_conflicts() {
 
     assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
     assert!(
-        m_par.parallel_reexec_count_for_test() >= 1,
-        "a read of a slot written earlier in canonical order must re-execute"
+        m_par.parallel_reexec_count_for_test() <= 1,
+        "a single read-write dependency bounds re-execution at one tx"
     );
-    // B's re-executed copy saw A's write: slot 8 == 42, not the
-    // speculative 0.
+    // B's committed copy saw A's write — via the version store or a
+    // canonical re-execution: slot 8 == 42, not the speculative 0.
     assert_eq!(m_par.storage_at(&contract, &U256::from(7)), U256::from(42));
     assert_eq!(m_par.storage_at(&contract, &U256::from(8)), U256::from(42));
     assert_eq!(m_serial.state_root(), m_par.state_root(), "parallel root diverged");
@@ -1562,12 +1632,15 @@ fn handle_batch_parallel_erc20_shared_slot_conflicts() {
     m_par.end_block(Height::new(1));
 
     assert!(results.iter().all(std::result::Result::is_ok), "all parallel txs must succeed");
-    // N-1 txs re-execute (the first commits; each successor read the
-    // shared slot pre-write).
-    assert_eq!(
-        m_par.parallel_reexec_count_for_test(),
-        N - 1,
-        "shared balance slot must serialize via re-execution"
+    // The shared slot serializes the chain: a tx validates only if
+    // its speculation read the *immediately preceding* tx's
+    // published version of `balances[recipient]` — timing-dependent,
+    // bounded by N-1 (the first tx can never conflict). Under the
+    // multi-version store each observed-value hit saves a
+    // re-execution, so the count is `< N`, not exactly `N - 1`.
+    assert!(
+        m_par.parallel_reexec_count_for_test() < N,
+        "shared balance slot serializes the chain — via validated versions or re-execution"
     );
     assert_eq!(
         m_par.storage_at(&token, &balance_slot(shared_recipient)),

@@ -21916,3 +21916,66 @@ longer pays a write syscall); `vote_signed_wal` unchanged
 (F_FULLFSYNC-dominated). The `O_DSYNC` fold itself needs the
 Linux re-baseline. One fsync per signature emission, unchanged;
 `wal_fsyncs_once_per_signature_emission` still pins the count.
+
+## EVM: multi-version speculative store
+
+The last Phase-5 residual is closed: `handle_batch_parallel` no
+longer speculates inside sender groups with write registries —
+every transaction now runs index-parallel against a shared
+multi-version store (`MvState`), the Block-STM read rule made
+concrete for this codebase.
+
+Mechanism: `MvState` keeps per-key version chains keyed by writer
+index (`accounts`, `slots`, deployed `code`); a worker at index `i`
+resolves `versions[K].range(..i).next_back()` — the newest write by
+a canonically-earlier tx — falling back to the immutable pre-block
+snapshot. `MvDb`, the `DatabaseRef` under each worker's `CacheDB`,
+records the *exact value* every read resolved into
+`SpecTx::observed`; finished speculations publish their writes back
+under their index so later-indexed txs see real inputs mid-flight.
+The commit loop is unchanged in order but not in predicate: each tx
+validates iff every recorded observation equals the canonical value
+at its position — a value comparison, not a set intersection. A tx
+that observed the true prefix merges its `EvmState` diff directly;
+the merge still runs through `DatabaseCommit::commit`, so
+slot-granular preservation, create/selfdestruct, and zero-pruning
+semantics are serial-identical by construction. Sender-group
+bookkeeping is gone: a same-sender successor validates iff its
+observations match, whether or not its predecessor did.
+
+Two deliberately conservative lanes survived: `SELFDESTRUCT`/`CREATE`
+addresses force accessor re-execution regardless of value equality
+(wholesale replacement isn't value-expressible), and the coinbase
+stays on its additive-delta lane since every tx writes it.
+
+The bench exposed the real lesson: first MVCC cut re-executions
+637→395 on `contract_mix` but *slowed* 17.68→18.26 ms — a single
+`Mutex` serialized every worker's every cache miss, paying the old
+overhead on top of the new. Switching the store to `RwLock` (reads
+dominate by the batch's read:write ratio) took it to 15.99 ms.
+The additive-recipient lane then removed a second invalidation
+class: a fast-path transfer's recipient balance is write-only
+(`post = pre + value`; the 21000-gas result never consumes it), so
+a stale observation rebases onto the canonical account instead of
+re-executing — gated on the canonical recipient still being
+codeless, since a deployed-code recipient would have changed the
+call semantics. Same principle as the coinbase lane, one level
+weaker. Re-executions on the real mix are now 343/1000 and
+`parallel` measures 16.26 ms vs serial 13.99 ms — 8% better than
+the sender-group scheme, still ~14% behind serial where the
+remaining deficit is the genuine sequential slot chain (200 swaps
+on pool reserves 0/1) plus the serial commit floor, not
+bookkeeping. Same-recipient transfer floods — the pathological
+case — stay at parity with the old scheme: the canonical merge is
+the floor either way.
+
+Tests: five `MvDb`/`MvState` units pin the read horizon,
+observation recording, coinbase exclusion, and atomic code+info
+publish; `shared_recipient_rebases_instead_of_reexec` asserts
+*zero* re-executions on a write-only flood (a deterministic claim
+the old scheme could never make); the three old registry-era
+conflict tests now assert serial-equivalent roots and bounded
+re-execution instead of "conflict ⇒ re-execute" — under MVCC a
+resolved conflict is a *validated merge*, not a re-run.
+Differential properties, replay, and the full workspace gates
+hold.

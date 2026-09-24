@@ -337,10 +337,11 @@ fn bench_batch_parallel(c: &mut Criterion) {
 
 /// Benchmark: parallel speculative execution with multiple senders.
 ///
-/// This is the `handle_batch_parallel` path: transactions from
-/// multiple senders execute in parallel on per-sender-group
-/// copy-on-write nested caches. This is the realistic blockchain
-/// workload — a real block contains txs from many different senders.
+/// This is the `handle_batch_parallel` path: every transaction
+/// speculates index-parallel against the shared multi-version store
+/// and commits in canonical order after observed-value validation.
+/// This is the realistic blockchain workload — a real block
+/// contains txs from many different senders.
 ///
 /// Gate: > 128k tx/s for 10k txs with 100 senders (must match the
 /// single-sender `batch_parallel` baseline). Baseline:
@@ -405,13 +406,20 @@ fn bench_batch_parallel_multi_sender(c: &mut Criterion) {
 
 /// Benchmark: parallel speculative execution with conflicts.
 ///
-/// All senders transfer to the SAME recipient, forcing conflict
-/// detection and sequential re-execution. This measures the
-/// overhead of the conflict detection and fallback path.
+/// All senders transfer to the SAME recipient — every tx's recipient
+/// read trails the canonical chain by construction. Under the
+/// multi-version executor these are *write-only* dependencies: the
+/// additive-recipient lane rebases `pre + value` onto the canonical
+/// balance instead of re-executing, so the row measures the
+/// speculation + validation overhead on a workload whose commit
+/// must still serialize.
 ///
 /// Gate: should not be more than 15% slower than `batch_parallel`
 /// (single-sender sequential execution). Baseline: `batch_parallel`
-/// (~128k tx/s). Measured: ~114k tx/s (13% slower than serial).
+/// (~128k tx/s). Measured: ~89k tx/s — slower than serial on this
+/// pathological single-hot-account shape (the canonical merge is
+/// the serial floor and speculation is pure overhead here), at
+/// parity with the previous sender-group scheme.
 fn bench_batch_parallel_conflict(c: &mut Criterion) {
     const N_SENDERS: usize = 100;
     let keys: Vec<TestKey> = (0..N_SENDERS).map(|_| TestKey::new()).collect();

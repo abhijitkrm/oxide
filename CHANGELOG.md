@@ -47,7 +47,8 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   **parallel is 23% slower on a real mix** (637/1000 speculative
   re-executions from shared-pool and coinbase/fee-account
   contention), the honest figure the transfer-only benches masked;
-  the multi-version store follow-up is the measured fix. A
+  the multi-version store follow-up was the measured fix and has
+  since landed (see the parallel-execution entry below). A
   `parallel_persist` row with the `Volatile` backend shows the
   `end_block` flush adds ~1%.
   - **In plain words:** running transactions side-by-side used to
@@ -57,6 +58,30 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     accounts — doing them in parallel is actually about a quarter
     slower today. Now we can see exactly why, and the planned
     storage upgrade is what fixes it.
+
+- **Multi-version parallel EVM execution** (`evm`): the
+  speculative executor no longer groups transactions by sender and
+  guesses at conflicts — every transaction now runs against a
+  shared *multi-version* state where it can see the writes of
+  earlier transactions directly, records the exact values it
+  observed, and at commit time simply checks those values against
+  the canonical state. Correct-order results are guaranteed by
+  value comparison, so a transaction that genuinely saw the right
+  inputs merges immediately instead of re-running. A fast-path
+  transfer's recipient balance is write-only (`post = pre +
+  value`), so a stale read there is *rebased* rather than
+  re-executed. On the real contract mix, speculative re-executions
+  fell from 637/1000 to 343/1000 and the parallel path improved
+  ~8% (17.68 → 16.26 ms); a deliberately pathological
+  everyone-pays-one-account workload stays at parity — its commit
+  is serial either way.
+  - **In plain words:** the parallel engine used to run
+    transactions in isolated lanes and throw away the work whenever
+    two lanes might have touched the same data — often guessing
+    wrong. Now every transaction sees the other transactions'
+    completed writes while it runs, keeps a receipt of what it
+    actually read, and is only redone if the final truth disagrees
+    with that receipt. Nearly half the wasted re-runs are gone.
 
 - **Parallel EVM execution on shared contracts** (`evm`):
   `handle_batch_parallel*` conflict detection is now slot-granular
