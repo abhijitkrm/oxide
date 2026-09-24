@@ -20736,3 +20736,60 @@ with **0 allocs/op** (was ~25); ws_parse_order 2.5 µs → 868 ns
 with **0 allocs/op** (was ~31). The whole authenticated request
 path — parse, verify, dispatch — is now allocation-free except
 the one response `String` per message.
+
+## Session N+40 (cont.) — TLS transport: the read/write split kills the poll-behind-the-mutex stall
+
+The TLS `PeerStream` used to be `SharedStream<StreamOwned>`: one
+mutex around a `rustls` connection that bundles crypto state AND
+the socket. The reader held it across its blocking socket poll —
+`TLS_READER_POLL_TIMEOUT` (500 ms) meant a writer could wait half
+a second per frame behind an idle read, and the reader's 1 ms
+yield loop was the only thing giving writers a window.
+
+The split decomposes `StreamOwned` after the handshake into two
+halves with disjoint socket handles (`try_clone` on the same fd)
+and two mutexes with a strict order:
+
+- `conn` — `Arc<Mutex<rustls::Connection>>` for crypto ops only
+  (`read_tls`, `process_new_packets`, `reader()`, `writer()`,
+  `write_tls` into a `Vec`). Never held across a socket call.
+- `wire` — `Arc<Mutex<TcpStream>>` for socket writes, always
+  taken BEFORE `conn` and held across `write_tls` + `write_all`.
+
+The `wire`-before-`conn` order is load-bearing, and the bench
+caught why: rustls assigns each record a sequence number at
+encrypt time, so if `write_tls` runs outside the socket-ordering
+lock, two writers' batches can land out of order — the peer's
+AEAD check sees seq k+1 before seq k and kills the connection
+(`DecryptError`, reproduced at 2 writers). Same hazard existed
+between the writer thread and the reader's `wants_write` drain
+(`KeyUpdate` replies / `close_notify` echo — `StreamOwned` used
+to flush those inside `complete_io`; the split halves drain them
+on the read path under the same `wire`+`conn` hold).
+
+Two subtleties the raw-API split has to handle that `StreamOwned`
+hid:
+
+- `sendable_tls` buffer cap: `writer().write` short-writes when
+  the ciphertext queue hits `set_buffer_limit` (64 KiB default).
+  `buffer_plaintext` drains the queue into the `Vec` sink (which
+  never applies backpressure) and retries — a 16 MiB frame just
+  works.
+- `read_tls` completeness: the deframer consumes all offered
+  bytes, but a partial consume would silently desync the stream —
+  now asserted loud (`used != n` → `InvalidData`).
+
+Also removed: the reader's 1 ms yield (existed only to let writers
+steal the shared mutex), and `write_frame`'s `flush` — the halves
+emit one `write_all` per frame batch instead of N flushes.
+
+Measured (`tls_contention`, production-poll rows): solo-writer
+wait ~3.5 ms → **~4.0 µs**; four writers on 256 B frames ~84
+ms/frame → **~29 µs/frame (~2900×)** — TLS is now within ~1.2–1.5×
+of the plain-TCP baseline (residual is AEAD + the ciphertext
+`Vec` copy, inherent). Regression tests:
+`tls_split_concurrent_writers_keep_record_order` (4 writers × 400
+frames through real loopback mTLS — any reorder kills the
+connection before the server collects all frames) and
+`tls_split_read_half_receives_frames`. Live check: 4-node mTLS
+devnet finalizing past height 23 with no transport errors.

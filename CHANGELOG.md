@@ -23,18 +23,7 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     action and per parsed message — the hot path allocates once or
     less; the parsers are the only alloc-heavy surface.
 
-- **TLS peer-write contention** (`p2p`, `tls` feature): the new
-  `tls_contention` bench measures a `write_frame` caller queueing
-  behind the reader thread on the production `SharedStream`
-  (`Arc<Mutex<TlsStream>>`). At the production 500 ms reader poll a
-  queued write waits ~3.5 ms solo and ~84 ms per frame under 4
-  writers (~48 writes/s aggregate per peer); at a 20 ms poll the
-  same shape gives ~36 µs solo and ~7 K writes/s. TLS matches the
-  plaintext TCP baseline within ~10% at every row, so the ceiling is
-  the shared-mutex discipline, not encryption.
-  - **In plain words:** writes to a TLS peer can wait behind the
-    reader's blocking poll — we measured the wait. It's a real
-    per-peer latency ceiling, far above today's send rates.
+- **Matcher authentication** (`matcher`): two changes to the order
 
 - **Matcher authentication** (`matcher`): two changes to the order
   admission signature path. Order actions (cancel/amend/replace)
@@ -63,6 +52,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     times per message now allocate nothing at all.
 
 ### Fixed
+
+- **TLS peer writes no longer queue behind the reader's poll**
+  (`p2p`, `tls` feature): the `SharedStream` mutex — one lock around
+  the whole `rustls::StreamOwned`, held across the reader's blocking
+  500 ms socket poll — is gone. `StreamOwned` is decomposed after the
+  handshake into `TlsReadHalf`/`TlsWriteHalf`: the reader pulls
+  ciphertext off its own socket handle with no lock held, and writers
+  encrypt under a µs-scale crypto lock, then emit under a `wire`
+  mutex that serializes encrypt→socket so record sequence numbers can
+  never land out of order. Measured by `tls_contention`: a queued
+  write that waited ~3.5 ms solo and ~84 ms/frame under 4 writers now
+  waits ~4 µs solo and ~29 µs/frame — TLS is within ~1.2–1.5× of the
+  plain-TCP baseline at every row.
+  - **In plain words:** a write to a TLS peer used to wait behind
+    the reader's blocking poll — potentially half a second per frame.
+    Reads and writes now share only nanosecond-scale crypto locks;
+    peer writes are as fast as the socket allows.
 
 - **View changes now recover over real TCP** (`oxide-devnet`): a
   wire-framing bug in the timeout decoder read both certificate

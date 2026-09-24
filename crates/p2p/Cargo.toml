@@ -41,8 +41,8 @@ criterion = "0.7.0"
 name = "transport"
 harness = false
 
-# TLS reader/writer contention on the SharedStream mutex (audit001
-# §7.5). Only exists when rustls is compiled in.
+# TLS reader/writer contention — split-half discipline vs the TCP
+# baseline (audit001 §7.5). Only exists when rustls is compiled in.
 [[bench]]
 name = "tls_contention"
 harness = false

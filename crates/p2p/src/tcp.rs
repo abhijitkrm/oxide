@@ -64,9 +64,9 @@ use crate::admission::SharedAdmissionControl;
 
 /// A trait that abstracts over plain TCP and TLS streams.
 ///
-/// Both `TcpStream` and `SharedStream<rustls::StreamOwned<...>>`
-/// implement this trait, allowing the transport to store either
-/// type in the same `HashMap`.
+/// Both `TcpStream` and the split TLS halves
+/// (`TlsReadHalf`/`TlsWriteHalf`) implement this trait, allowing the
+/// transport to store either type in the same `HashMap`.
 ///
 /// This is not a hot-path type — connections are established once at
 /// startup, not per message. The dynamic dispatch cost is negligible.
@@ -183,94 +183,336 @@ impl PeerStream for TcpStream {
     }
 }
 
-/// A shared, thread-safe wrapper around a stream type.
+/// Split TLS connection halves — the M4 fix.
 ///
-/// Used for TLS streams, which cannot be `try_clone()`d like
-/// `TcpStream`. The underlying stream is behind an `Arc<Mutex<...>>`,
-/// so both the reader thread and the send path can access it.
+/// rustls requires `&mut` access to its connection object for both
+/// reading and writing, so a `StreamOwned` behind one mutex made the
+/// reader's *blocking socket poll* serialize against every writer
+/// (~3.5 ms solo writer wait at the 500 ms production poll, ~84 ms
+/// per frame with four writers — measured by `tls_contention`).
 ///
-/// # Lock discipline
+/// The split exploits what actually needs the lock: rustls keeps
+/// ciphertext and plaintext in internal buffers, so the *socket* can
+/// be `try_clone()`d and driven directly. The reader thread pulls
+/// ciphertext off its own socket handle with **no lock held**, then
+/// pays a microsecond-scale `conn` lock for `read_tls` +
+/// `process_new_packets` + plaintext drain. Writers encrypt into the
+/// connection and copy the resulting ciphertext into a scratch
+/// `Vec` under the same µs lock.
 ///
-/// The reader thread sets a short read timeout (via the stream's
-/// `set_read_timeout`) before each `read_frame` call, so the mutex
-/// is not held indefinitely. The writer (send path) acquires the
-/// lock only for the duration of a `write_frame` call.
+/// Socket *writes* go through a separate `wire` mutex, always taken
+/// BEFORE `conn` and held across `write_tls` + the socket
+/// `write_all`: rustls assigns each record a sequence number at
+/// encrypt time, so encrypt→emit must be one serialized section or
+/// two writers' batches could land out of order — an AEAD failure on
+/// the peer — and a kernel-split blocking write could splice bytes
+/// mid-record. `conn` is released before the socket syscall, so the
+/// crypto lock never spans I/O, and the reader's poll can never queue
+/// a writer behind it.
 ///
-/// `#[doc(hidden)]`: the type stays crate-private in spirit — the
-/// `pub` exists so the `tls_contention` bench can measure the real
-/// contention primitive rather than a reimplemented replica. Not a
-/// supported API surface.
+/// `#[doc(hidden)]`: `pub` exists so the `tls_contention` bench can
+/// measure the real primitives rather than a reimplemented replica.
+/// Not a supported API surface.
 #[cfg(feature = "tls")]
 #[doc(hidden)]
-pub struct SharedStream<S: Read + Write + Send> {
-    inner: Arc<Mutex<S>>,
+pub struct TlsReadHalf {
+    /// The rustls connection — `read_tls`/`process_new_packets`/
+    /// `reader()` need `&mut`, so it is shared with the writer's
+    /// crypto ops. Never held across a socket call.
+    conn: Arc<Mutex<rustls::Connection>>,
+    /// Ciphertext source — reader-thread-owned socket handle. The
+    /// blocking poll (read timeout) lives here, unshared.
+    read_sock: TcpStream,
+    /// Socket write side — taken only for the rare TLS-internal
+    /// responses (`close_notify` echo, `KeyUpdate` replies) that
+    /// inbound records queue. Always acquired BEFORE `conn`, matching
+    /// the writer's lock order.
+    wire: Arc<Mutex<TcpStream>>,
+    /// Ciphertext pull buffer — one allocation for the life of the
+    /// connection, refilled per socket read. 16 KiB covers a
+    /// maximal TLS record (~16 KiB plaintext + overhead); `read_tls`
+    /// drains whatever the kernel returns anyway.
+    scratch: Box<[u8]>,
+}
+
+/// The write half of a split TLS connection — see [`TlsReadHalf`]
+/// for the lock discipline. A writer never blocks on the reader's
+/// socket poll; it contends only on the µs-scale crypto lock and on
+/// other writers' in-flight `write_all`s, which the fd serializes
+/// anyway.
+#[cfg(feature = "tls")]
+#[doc(hidden)]
+pub struct TlsWriteHalf {
+    /// Shared with [`TlsReadHalf::conn`] — rustls needs `&mut` for
+    /// `writer()`/`write_tls`, so encryption serializes against
+    /// decryption but never against socket I/O.
+    conn: Arc<Mutex<rustls::Connection>>,
+    /// Ciphertext sink — taken BEFORE `conn` and held across
+    /// `write_tls` + `write_all` so record sequence order on the
+    /// socket always matches encrypt order. Never held across a read.
+    wire: Arc<Mutex<TcpStream>>,
 }
 
 #[cfg(feature = "tls")]
-impl<S: Read + Write + Send> SharedStream<S> {
-    /// `#[doc(hidden)]` bench seam: wrap a stream in the shared
-    /// mutex the transport uses for TLS connections. Production
-    /// constructs this inline at the accept/connect sites.
+impl TlsWriteHalf {
+    /// Another write handle to the same connection — shares the
+    /// crypto and wire locks, so concurrent writers' records stay
+    /// whole on the wire. Used by multi-writer benchmarking;
+    /// production installs one writer thread per peer.
     #[doc(hidden)]
-    pub fn wrap(stream: S) -> Self {
-        Self { inner: Arc::new(Mutex::new(stream)) }
+    #[must_use]
+    pub fn try_clone(&self) -> Self {
+        Self { conn: Arc::clone(&self.conn), wire: Arc::clone(&self.wire) }
     }
 }
 
 #[cfg(feature = "tls")]
-impl<S: Read + Write + Send> Clone for SharedStream<S> {
-    fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
-    }
-}
-
-#[cfg(feature = "tls")]
-impl<S: Read + Write + Send> Read for SharedStream<S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        primitives::sync::lock_state(&self.inner).read(buf)
-    }
-}
-
-#[cfg(feature = "tls")]
-impl<S: Read + Write + Send> Write for SharedStream<S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        primitives::sync::lock_state(&self.inner).write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        primitives::sync::lock_state(&self.inner).flush()
-    }
-}
-
-#[cfg(feature = "tls")]
-impl<S: Read + Write + Send> PeerStream for SharedStream<S> {
+impl PeerStream for TlsReadHalf {
     fn read_frame(
         &mut self,
         state: &mut FrameReader,
         max_message_bytes: u64,
     ) -> io::Result<Option<Vec<u8>>> {
-        let mut stream = primitives::sync::lock_state(&self.inner);
-        state.poll(&mut *stream, max_message_bytes)
+        loop {
+            // Drain decrypted plaintext — µs-scale lock, no syscall.
+            {
+                let mut conn = primitives::sync::lock_state(&self.conn);
+                let mut plaintext = conn.reader();
+                match state.poll(&mut plaintext, max_message_bytes) {
+                    // `conn.reader()` returns WouldBlock when the
+                    // plaintext buffer is empty; `poll` maps that to
+                    // `Ok(None)`, meaning "need ciphertext" here.
+                    Ok(None) => {}
+                    other => return other,
+                }
+            }
+            // Pull ciphertext straight off the socket — the blocking
+            // read happens with NO conn lock, so writers encrypt and
+            // flush freely while this thread polls.
+            let n = match self.read_sock.read(&mut self.scratch) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "peer closed TLS stream",
+                    ));
+                }
+                Ok(n) => n,
+                // Socket poll timeout — same `Ok(None)` signal the
+                // reader loop already expects.
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            // Feed rustls under the µs lock, then loop back to drain
+            // whatever plaintext the records produced.
+            let mut conn = primitives::sync::lock_state(&self.conn);
+            let used = conn.read_tls(&mut &self.scratch[..n])?;
+            if used != n {
+                // rustls's deframer consumes all offered bytes; a
+                // partial consume would silently desync the stream,
+                // so fail loudly rather than drop ciphertext.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "rustls declined ciphertext bytes",
+                ));
+            }
+            let io_state = conn
+                .process_new_packets()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            // Inbound records can queue TLS-internal responses —
+            // `KeyUpdate` replies, the `close_notify` echo.
+            // `StreamOwned` flushed these inside `complete_io`; the
+            // split halves only flush under `wire`+`conn`, so a
+            // read-mostly peer must drain them here or the peer's
+            // bookkeeping stalls.
+            let peer_closed = io_state.peer_has_closed();
+            if peer_closed {
+                conn.send_close_notify();
+            }
+            let wants_write = conn.wants_write();
+            drop(conn);
+            if wants_write {
+                // `write_tls` emits records in encryption-sequence
+                // order, so it must run inside `wire` — otherwise a
+                // writer's earlier-queued batch could overtake this
+                // one on the socket and corrupt the record stream.
+                // Lock order `wire` → `conn` matches `write_frame`.
+                let mut wire = primitives::sync::lock_state(&self.wire);
+                let mut tls_out: Vec<u8> = Vec::new();
+                {
+                    let mut conn = primitives::sync::lock_state(&self.conn);
+                    conn.write_tls(&mut tls_out)?;
+                }
+                if !tls_out.is_empty() {
+                    wire.write_all(&tls_out)?;
+                }
+            }
+            if peer_closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer sent TLS close_notify",
+                ));
+            }
+        }
     }
 
-    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut stream = primitives::sync::lock_state(&self.inner);
-        write_frame(&mut *stream, bytes)
-    }
-
-    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
-        // One lock acquisition + one flush for the whole batch —
-        // the per-frame path took the lock and flushed per frame,
-        // which also let a competing writer interleave frames
-        // mid-batch.
-        let mut stream = primitives::sync::lock_state(&self.inner);
-        write_frames(&mut *stream, frames)
+    fn write_frame(&mut self, _bytes: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TlsReadHalf cannot write — the read half only polls",
+        ))
     }
 }
 
-/// The read timeout used by TLS reader threads. Short enough that
-/// the writer can acquire the lock between read attempts, long
-/// enough that idle connections don't busy-poll.
+#[cfg(feature = "tls")]
+impl TlsWriteHalf {
+    /// Feed `buf` into the connection's plaintext sink under the conn
+    /// lock, draining the ciphertext queue into `out` whenever rustls's
+    /// `sendable_tls` buffer cap (`set_buffer_limit`, default 64 KiB)
+    /// short-writes mid-frame. `StreamOwned::write_all` did this flush
+    /// inline; the split half drains into a `Vec` — which never
+    /// applies backpressure — then retries. Terminates because an
+    /// empty queue always restores full capacity; `WriteZero` only if
+    /// the queue drains nothing and the sink still refuses.
+    fn buffer_plaintext(
+        conn: &mut rustls::Connection,
+        buf: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let mut pos = 0;
+        while pos < buf.len() {
+            let n = conn.writer().write(&buf[pos..])?;
+            pos += n;
+            if pos < buf.len() && conn.write_tls(out)? == 0 && n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "rustls plaintext sink stuck with empty ciphertext queue",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tls")]
+impl PeerStream for TlsWriteHalf {
+    fn read_frame(
+        &mut self,
+        _state: &mut FrameReader,
+        _max_message_bytes: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TlsWriteHalf cannot read — the write half only sends",
+        ))
+    }
+
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        // `wire` first: rustls assigns each record a sequence number
+        // inside `writer().write`, so the encrypt→socket path must be
+        // atomic with respect to other emitters or records could land
+        // out of order — an AEAD tag failure on the peer. `conn` is
+        // taken inside `wire` (the single lock order) and dropped
+        // before the socket write, so the crypto lock still never
+        // spans a syscall.
+        let mut wire = primitives::sync::lock_state(&self.wire);
+        let ciphertext = {
+            let mut conn = primitives::sync::lock_state(&self.conn);
+            // TLS record overhead: ~22 B per 16 KiB record (5 B header
+            // + 16 B tag + padding room) — one extra record's headroom
+            // for the framing prefix and partial tail.
+            let mut out = Vec::with_capacity(4 + bytes.len() + (bytes.len() / 16_384 + 2) * 64);
+            Self::buffer_plaintext(&mut conn, &len.to_be_bytes(), &mut out)?;
+            Self::buffer_plaintext(&mut conn, bytes, &mut out)?;
+            conn.write_tls(&mut out)?;
+            out
+        };
+        wire.write_all(&ciphertext)
+    }
+
+    fn write_frames(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+        let mut wire = primitives::sync::lock_state(&self.wire);
+        let ciphertext = {
+            let mut conn = primitives::sync::lock_state(&self.conn);
+            let total: usize =
+                frames.iter().map(|f| 4 + f.len() + (f.len() / 16_384 + 2) * 64).sum();
+            let mut out = Vec::with_capacity(total);
+            for f in frames {
+                let len = u32::try_from(f.len()).unwrap_or(u32::MAX);
+                Self::buffer_plaintext(&mut conn, &len.to_be_bytes(), &mut out)?;
+                Self::buffer_plaintext(&mut conn, f, &mut out)?;
+            }
+            conn.write_tls(&mut out)?;
+            out
+        };
+        wire.write_all(&ciphertext)
+    }
+}
+
+/// Decompose a post-handshake `StreamOwned` into the split read/write
+/// halves ([`TlsReadHalf`]/[`TlsWriteHalf`]). `to_conn` selects the
+/// [`rustls::Connection`] variant (`Client` or `Server`) — rustls
+/// keeps the two as distinct types, and the transport handles both.
+///
+/// Returns `None` if the socket cannot be cloned — a TLS peer with no
+/// writable handle is useless, so the connection is dropped.
+///
+/// `#[doc(hidden)]`: `pub` so the `tls_contention` bench measures the
+/// production split primitive. Not a supported API surface.
+#[cfg(feature = "tls")]
+#[doc(hidden)]
+pub fn split_tls_conn<C>(
+    tls_stream: rustls::StreamOwned<C, TcpStream>,
+    to_conn: impl FnOnce(C) -> rustls::Connection,
+) -> Option<(TlsWriteHalf, TlsReadHalf)> {
+    let rustls::StreamOwned { conn, sock } = tls_stream;
+    let write_sock = sock.try_clone().ok()?;
+    let conn = Arc::new(Mutex::new(to_conn(conn)));
+    let wire = Arc::new(Mutex::new(write_sock));
+    Some((
+        TlsWriteHalf { conn: Arc::clone(&conn), wire: Arc::clone(&wire) },
+        TlsReadHalf {
+            conn,
+            read_sock: sock,
+            wire,
+            // 16 KiB — covers a maximal TLS record (~16 KiB plaintext
+            // plus record overhead); `read` returns whatever the
+            // kernel has anyway, so the size only bounds the pull.
+            scratch: vec![0u8; 16 << 10].into_boxed_slice(),
+        },
+    ))
+}
+
+/// `#[doc(hidden)]` bench seam: split a connected client-side
+/// `StreamOwned` (from [`bench_tls_connect`]) into the transport's
+/// production `(writer, reader)` halves as trait objects — the bench
+/// has no rustls dep, so it holds them unnameable.
+///
+/// # Panics
+///
+/// Panics on `try_clone` failure — a bench harness is allowed to be
+/// loud.
+#[cfg(feature = "tls")]
+#[doc(hidden)]
+pub fn bench_tls_split(
+    client: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+) -> (TlsWriteHalf, TlsReadHalf) {
+    split_tls_conn(client, rustls::Connection::Client).expect("bench tls split")
+}
+
+/// The read timeout used by TLS reader threads. Bounds how long a
+/// `FrameReader::poll` blocks on the socket before returning
+/// `TimedOut`, so `reader_loop` observes the shutdown flag at worst
+/// one interval late and a half-dead connection cannot pin the
+/// reader thread forever. Long enough that idle connections don't
+/// busy-poll; the value only bounds shutdown-detection latency —
+/// writers no longer need a scheduling window, since the split
+/// halves never hold the connection lock across a socket syscall.
 #[cfg(feature = "tls")]
 const TLS_READER_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -1245,11 +1487,16 @@ impl TcpTransport {
                                 // Clone the underlying TCP socket for
                                 // shutdown handling (see accept path).
                                 let shutdown_stream = tls_stream.sock.try_clone().ok();
-                                // Wrap in SharedStream for shared access.
-                                let shared =
-                                    SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
-                                let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
-                                let write_stream = Box::new(shared) as Box<dyn PeerStream>;
+                                // Split into read/write halves — the
+                                // reader's blocking socket poll never
+                                // holds the connection lock.
+                                let Some((write_half, read_half)) =
+                                    split_tls_conn(tls_stream, rustls::Connection::Client)
+                                else {
+                                    continue;
+                                };
+                                let reader_stream = Box::new(read_half) as Box<dyn PeerStream>;
+                                let write_stream = Box::new(write_half) as Box<dyn PeerStream>;
                                 // Install and own the connection until
                                 // it dies — the admission admit/release
                                 // pair and reader loop live inside.
@@ -1478,9 +1725,13 @@ impl TcpTransport {
                     }
                     let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
                     let shutdown_stream = tls_stream.sock.try_clone().ok();
-                    let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
-                    let reader_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
-                    let write_stream = Box::new(shared) as Box<dyn PeerStream>;
+                    let Some((write_half, read_half)) =
+                        split_tls_conn(tls_stream, rustls::Connection::Client)
+                    else {
+                        return;
+                    };
+                    let reader_stream = Box::new(read_half) as Box<dyn PeerStream>;
+                    let write_stream = Box::new(write_half) as Box<dyn PeerStream>;
                     install_connected_peer(&ctx, pid, reader_stream, write_stream, shutdown_stream);
                     return;
                 }
@@ -1857,24 +2108,6 @@ fn write_frame<W: Write>(stream: &mut W, bytes: &[u8]) -> Result<(), std::io::Er
     Ok(())
 }
 
-/// Write multiple length-prefixed frames with a single flush —
-/// the batched counterpart of [`write_frame`]. The caller
-/// (writer loop) has already drained the outbound channel, so
-/// one flush covers the whole batch.
-///
-/// Only used by the TLS `SharedStream` path today — the plain
-/// `TcpStream` batch impl builds a contiguous buffer instead.
-#[cfg(feature = "tls")]
-fn write_frames<W: Write>(stream: &mut W, frames: &[Vec<u8>]) -> Result<(), std::io::Error> {
-    for f in frames {
-        let len = u32::try_from(f.len()).unwrap_or(u32::MAX);
-        stream.write_all(&len.to_be_bytes())?;
-        stream.write_all(f)?;
-    }
-    stream.flush()?;
-    Ok(())
-}
-
 /// The reader loop: reads frames from a peer's stream and sends
 /// them to the inbound channel. Exits when the stream is closed,
 /// an error occurs, or the shutdown flag is set.
@@ -1923,16 +2156,9 @@ fn reader_loop(
             Ok(None) => {
                 // Read timeout or would block (TLS poll timeout) —
                 // the frame state is retained; loop will check the
-                // shutdown flag and retry. C4 fix: SharedStream uses
-                // a single Mutex for both read and write. The reader
-                // holds the Mutex during read_frame (up to
-                // read_timeout). Without a yield, the reader starves
-                // the writer — it re-acquires the Mutex before the
-                // writer can. A short sleep gives the writer a
-                // window to acquire the Mutex and flush pending
-                // outbound frames.
-                #[cfg(feature = "tls")]
-                thread::sleep(Duration::from_millis(1));
+                // shutdown flag and retry. No yield needed: the TLS
+                // read half's blocking poll runs on the socket with
+                // no conn lock held, so writers are never starved.
             }
             Err(_) => return, // connection closed or error
         }
@@ -2261,8 +2487,8 @@ fn accept_plain_connection(
 }
 
 /// Accept a TLS connection: perform the TLS handshake, read the
-/// peer's ID, and create shared stream handles for the map and
-/// the reader.
+/// peer's ID, and split the stream into read/write halves for the
+/// reader and the writer map.
 ///
 /// Returns `(peer_id, write_stream, reader_stream)` on success,
 /// `None` if the handshake or ID read fails.
@@ -2284,17 +2510,15 @@ fn accept_tls_connection(
     let _ = stream.set_nonblocking(false);
     let server_conn = rustls::ServerConnection::new(tls_config.server_config.clone()).ok()?;
     let mut tls_stream = rustls::StreamOwned::new(server_conn, stream);
-    // C4 fix: use TLS_READER_POLL_TIMEOUT (500ms), not the
-    // configured read_timeout (30s). SharedStream uses a single
-    // Mutex for both read and write; a long read timeout would
-    // hold the Mutex for 30s, starving the writer. The short poll
-    // timeout lets the reader release the Mutex frequently so the
-    // writer can acquire it. The reader loop handles TimedOut by
-    // retrying.
+    // Use TLS_READER_POLL_TIMEOUT (500ms), not the configured
+    // read_timeout (30s): the split reader's blocking socket poll is
+    // also its shutdown check — a 30s poll would leave a dead
+    // connection unremarked for 30s. The reader loop handles
+    // TimedOut by retrying.
     let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
     // The greeting exchange may need up to HANDSHAKE_READ_TIMEOUT —
     // the 500ms poll would abort a healthy challenge round-trip.
-    // The stream isn't shared yet, so the longer bound starves no
+    // The conn isn't split yet, so the longer bound starves no
     // writer; TLS_READER_POLL_TIMEOUT is restored before install.
     if shared.peer_auth.is_some() {
         let _ = tls_stream.sock.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
@@ -2345,9 +2569,12 @@ fn accept_tls_connection(
                 )?;
                 let _ = tls_stream.sock.set_read_timeout(Some(TLS_READER_POLL_TIMEOUT));
             }
-            let shared = SharedStream { inner: Arc::new(Mutex::new(tls_stream)) };
-            let write_stream = Box::new(shared.clone()) as Box<dyn PeerStream>;
-            let reader_stream = Box::new(shared) as Box<dyn PeerStream>;
+            // Split into read/write halves — the reader's blocking
+            // socket poll never holds the connection lock, so a
+            // writer's crypto + flush is never queued behind it.
+            let (write_half, read_half) = split_tls_conn(tls_stream, rustls::Connection::Server)?;
+            let write_stream = Box::new(write_half) as Box<dyn PeerStream>;
+            let reader_stream = Box::new(read_half) as Box<dyn PeerStream>;
             Some((peer_id, write_stream, reader_stream))
         }
         None => {
@@ -2395,10 +2622,10 @@ pub fn bench_tls_configs() -> (crate::tls::TlsConfig, crate::tls::TlsConfig) {
 /// `#[doc(hidden)]` bench seam: open a loopback mTLS connection
 /// `(client, server)` through a [`bench_tls_configs`] pair and drive
 /// the handshake to completion — so a bench measures the production
-/// crypto path and `SharedStream` discipline rather than a
-/// reimplemented replica. The caller owns both stream ends: wrap
-/// `client` in [`SharedStream`] to reproduce the transport's
-/// reader-shares-the-write-mutex shape; drain `server` directly.
+/// crypto path and split-half discipline rather than a reimplemented
+/// replica. The caller owns both stream ends: pass `client` to
+/// [`bench_tls_split`] for the transport's read/write halves; drain
+/// `server` directly.
 ///
 /// # Panics
 ///
@@ -2453,6 +2680,7 @@ pub fn bench_tls_connect(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::time::Instant;
 
     /// A `Read` that replays a script of `io::Result` chunks — one
     /// entry per `read()` call — so partial frames and stalls are
@@ -3357,6 +3585,126 @@ mod tests {
         thread::sleep(Duration::from_millis(500));
         let msg = poll_recv(&mut transport_a, Duration::from_millis(500));
         assert!(msg.is_none(), "A must not receive from untrusted C");
+    }
+
+    /// TLS record-sequence regression: rustls assigns each record a
+    /// sequence number at encrypt time, so the split halves must emit
+    /// ciphertext to the socket in exactly that order. Two writers
+    /// whose `encrypt → write_tls → socket` sections are NOT atomic
+    /// can land records out of order on the wire — the peer's AEAD
+    /// check fails and the connection dies (`DecryptError`). This
+    /// test races several writers through `TlsWriteHalf::try_clone`
+    /// handles; any reorder corrupts the stream and the server side
+    /// cannot deliver all frames.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_split_concurrent_writers_keep_record_order() {
+        const WRITERS: usize = 4;
+        const FRAMES: usize = 400;
+
+        let (tls_a, tls_b) = bench_tls_configs();
+        let (client, mut server) = bench_tls_connect(&tls_a, &tls_b);
+        client.sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let (write_half, mut read_half) = bench_tls_split(client);
+
+        // Client reader: polls the read half — exercises the inbound
+        // path while writers saturate the outbound direction. The
+        // server sends nothing back besides handshake bookkeeping,
+        // so every poll is expected to time out (`Ok(None)`).
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader = thread::spawn(move || {
+            let mut fr = FrameReader::new();
+            while !reader_stop.load(Ordering::Relaxed) {
+                match read_half.read_frame(&mut fr, DEFAULT_MAX_MESSAGE_BYTES) {
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        thread::scope(|s| {
+            for w in 0..WRITERS {
+                let mut wh = write_half.try_clone();
+                s.spawn(move || {
+                    for i in 0..FRAMES {
+                        // Tag each frame `w:seq` — the server asserts
+                        // per-writer sequence integrity below.
+                        let frame = format!("{w}:{i}").into_bytes();
+                        wh.write_frame(&frame).expect("write_frame must not fail");
+                    }
+                });
+            }
+        });
+
+        // Server side: collect frames until every one arrives — any
+        // record reorder kills the connection with DecryptError before
+        // this point. The 50 ms read timeout lets the deadline fire
+        // inside `poll` instead of blocking forever on a dead socket.
+        server.sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let expected = WRITERS * FRAMES;
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(expected);
+        let mut fr = FrameReader::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while frames.len() < expected {
+            assert!(Instant::now() < deadline, "timed out waiting for {expected} frames");
+            match fr.poll(&mut server, DEFAULT_MAX_MESSAGE_BYTES) {
+                Ok(Some(bytes)) => frames.push(bytes),
+                Ok(None) => {}
+                Err(e) => panic!("server decrypt/read failed: {e:?}"),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        // Every frame is `w:i`; per-writer `i` must be strictly
+        // increasing (a writer's own frames can interleave with
+        // others' but can never pass each other).
+        let mut next = [0usize; WRITERS];
+        for frame in &frames {
+            let body = std::str::from_utf8(frame).unwrap();
+            let (w, i) = body.split_once(':').unwrap();
+            let (w, i) = (w.parse::<usize>().unwrap(), i.parse::<usize>().unwrap());
+            assert_eq!(i, next[w], "writer {w} frames out of order");
+            next[w] += 1;
+        }
+        for &n in &next {
+            assert_eq!(n, FRAMES);
+        }
+    }
+
+    /// TLS read-half correctness: a frame sent server→client over the
+    /// split halves must decode identically to the `StreamOwned` path —
+    /// including the incremental `FrameReader` state across socket
+    /// timeouts.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_split_read_half_receives_frames() {
+        let (tls_a, tls_b) = bench_tls_configs();
+        let (client, mut server) = bench_tls_connect(&tls_a, &tls_b);
+        client.sock.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let (_write_half, mut read_half) = bench_tls_split(client);
+
+        // Server sends one framed message; the read half must decode
+        // it after however many empty polls the 30 ms timeout yields.
+        let payload = b"server-to-client over split halves";
+        let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
+        server.write_all(&len).unwrap();
+        server.write_all(payload).unwrap();
+        server.flush().unwrap();
+
+        let mut fr = FrameReader::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match read_half.read_frame(&mut fr, DEFAULT_MAX_MESSAGE_BYTES) {
+                Ok(Some(bytes)) => {
+                    assert_eq!(bytes, payload);
+                    break;
+                }
+                Ok(None) => assert!(Instant::now() < deadline, "read half timed out"),
+                Err(e) => panic!("read half failed: {e:?}"),
+            }
+        }
     }
 
     // ------------------------------------------------------------------
