@@ -42,8 +42,8 @@ pub mod secp;
 
 pub use bls::{AggregateSignature, PublicKey, Signature, ValidatorIndex};
 pub use bls_signer::{
-    BlsError, BlsSecretKey, ConsensusSigner, SignerError, aggregate, aggregate_verify, pop_verify,
-    verify,
+    BlsError, BlsSecretKey, ConsensusSigner, SignContext, SignerError, aggregate, aggregate_verify,
+    pop_verify, verify,
 };
 pub use ed25519::{
     Ed25519Error, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, derive_public,

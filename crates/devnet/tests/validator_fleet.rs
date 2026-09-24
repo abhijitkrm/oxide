@@ -48,6 +48,16 @@ const NUM_NODES: usize = 4;
 const BASE_PORT: u16 = 26_400;
 /// First JSON-RPC port; node `i` binds `RPC_BASE + i`.
 const RPC_BASE: u16 = 32_400;
+/// Port ranges for the remote-signer fleet — every test in this
+/// file needs its own range: `cargo test` runs the `#[ignore]`d
+/// tests in parallel when both are selected.
+const SIGNER_P2P_BASE: u16 = 27_400;
+const SIGNER_RPC_BASE: u16 = 33_400;
+/// The signer daemon's listen port in the remote-signer test.
+const SIGNER_DAEMON_PORT: u16 = 33_900;
+/// Port range for the absent-leader boot test.
+const ABSENT_P2P_BASE: u16 = 28_400;
+const ABSENT_RPC_BASE: u16 = 34_400;
 /// Chain id shared by the genesis file and every node's `[rpc]`
 /// config — the loader refuses a mismatch.
 const CHAIN_ID: u64 = 31_337;
@@ -100,20 +110,40 @@ struct NodeProc {
     lines: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+/// `Child::drop` does not kill — a panicking test would orphan the
+/// fleet and its ports would poison the next run.
+impl Drop for NodeProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Spawn `oxide-validator --validator` for committee member `i`.
-fn spawn_validator(i: usize, dir: &Path, bin: &Path) -> NodeProc {
-    let mut child = Command::new(bin)
-        .arg("--validator")
+/// `signer_port` selects the identity source: `Some(port)` delegates
+/// signing to the daemon at `127.0.0.1:port` (the member's key file
+/// then lives only inside the daemon), `None` uses the local
+/// `val{i}.key` file.
+fn spawn_validator(i: usize, dir: &Path, bin: &Path, signer_port: Option<u16>) -> NodeProc {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--validator")
         .arg("--config")
         .arg(dir.join(format!("config{i}.toml")))
         .arg("--genesis-file")
         .arg(dir.join("genesis.json"))
-        .arg("--bls-key-file")
-        .arg(dir.join(format!("val{i}.key")))
         .arg("--tls-dir")
         .arg(dir.join(format!("tls/node-{i}")))
         .arg("--data-dir")
-        .arg(dir.join(format!("data-{i}")))
+        .arg(dir.join(format!("data-{i}")));
+    match signer_port {
+        Some(port) => {
+            cmd.arg("--signer-addr").arg(format!("127.0.0.1:{port}"));
+        }
+        None => {
+            cmd.arg("--bls-key-file").arg(dir.join(format!("val{i}.key")));
+        }
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -140,14 +170,16 @@ fn spawn_validator(i: usize, dir: &Path, bin: &Path) -> NodeProc {
 
 /// Write member `i`'s config: its own `listen_addr`, every other
 /// member as `addr=host:port`, and the matching `[rpc]` chain id.
-fn write_config(i: usize, addrs: &[String], dir: &Path) {
+/// `p2p_base`/`rpc_base` select the test's port range — parallel
+/// tests must not share them.
+fn write_config(i: usize, addrs: &[String], dir: &Path, p2p_base: u16, rpc_base: u16) {
     let peers: Vec<String> = (0..NUM_NODES)
         .filter(|j| *j != i)
         .map(|j| {
             format!(
                 "{}=127.0.0.1:{}",
                 addrs[j],
-                BASE_PORT + u16::try_from(j).expect("fleet fits in u16")
+                p2p_base + u16::try_from(j).expect("fleet fits in u16")
             )
         })
         .collect();
@@ -157,8 +189,8 @@ fn write_config(i: usize, addrs: &[String], dir: &Path) {
         format!(
             "[network]\nlisten_addr = \"127.0.0.1:{}\"\npeers = [{peers_toml}]\n\n\
              [rpc]\nlisten_addr = \"127.0.0.1:{}\"\nchain_id = {CHAIN_ID}\nbase_fee = 1\n",
-            BASE_PORT + u16::try_from(i).expect("fleet fits in u16"),
-            RPC_BASE + u16::try_from(i).expect("fleet fits in u16"),
+            p2p_base + u16::try_from(i).expect("fleet fits in u16"),
+            rpc_base + u16::try_from(i).expect("fleet fits in u16"),
         ),
     )
     .expect("write config");
@@ -242,8 +274,8 @@ fn validator_fleet_converges_and_recovers() {
     // 2. Configs + launch.
     let mut nodes = Vec::new();
     for i in 0..NUM_NODES {
-        write_config(i, &addrs, &dir);
-        nodes.push(spawn_validator(i, &dir, &bin));
+        write_config(i, &addrs, &dir, BASE_PORT, RPC_BASE);
+        nodes.push(spawn_validator(i, &dir, &bin, None));
     }
 
     // 3. Convergence gate: every node reaches height 5 — proof that
@@ -288,7 +320,7 @@ fn validator_fleet_converges_and_recovers() {
     //    sync (a separate protocol); the gate here is that restart
     //    succeeds and the node rejoins consensus, not that it
     //    re-finalizes.
-    let mut restarted = spawn_validator(3, &dir, &bin);
+    let mut restarted = spawn_validator(3, &dir, &bin, None);
     let rejoin_deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let log = restarted.lines.lock().expect("lines").join("\n");
@@ -310,6 +342,149 @@ fn validator_fleet_converges_and_recovers() {
 
 fn heights(nodes: &[NodeProc]) -> Vec<u64> {
     nodes.iter().map(|n| n.height.load(Ordering::Relaxed)).collect()
+}
+
+/// Block until `host:port` accepts a TCP connection — the daemon's
+/// listener is up. Without this the validator's `RemoteSigner`
+/// connect can race the daemon's bind and exit on `ECONNREFUSED`.
+fn wait_for_port(addr: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("{addr} did not accept a connection within {timeout:?}");
+}
+
+/// A spawned signer daemon — killed on drop for the same reason as
+/// [`NodeProc`]: a panicking test must not leave it holding its
+/// port for the next run.
+struct DaemonGuard(Child);
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawn the `signer` daemon for committee member `i` — the remote
+/// signing endpoint a `--signer-addr` validator delegates to.
+fn spawn_signer_daemon(i: usize, dir: &Path, bin: &Path, port: u16) -> DaemonGuard {
+    let child = Command::new(bin)
+        .arg("signer")
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--bls-key-file")
+        .arg(dir.join(format!("val{i}.key")))
+        .arg("--state-file")
+        .arg(dir.join(format!("signer-{i}.state")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn signer daemon {i}: {e}"));
+    DaemonGuard(child)
+}
+
+/// Same fleet shape as `validator_fleet_converges_and_recovers`, but
+/// node 0 holds no key file at all — it signs through a remote
+/// signer daemon (`--signer-addr`). Proves the production path end
+/// to end: the validator process never touches the secret, the
+/// daemon's fence file is the only anti-equivocation state.
+#[test]
+#[ignore = "process-level e2e — spawns real binaries; run explicitly"]
+fn validator_fleet_runs_through_remote_signer() {
+    let bin = validator_binary();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oxide-valsns-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create workdir");
+    let _dir_guard = DirGuard(dir.clone());
+
+    provision(&bin, &dir);
+    let addrs = genesis_addrs(&dir);
+
+    // Node 0's key lives in the signer daemon; the validator gets
+    // `--signer-addr`, never `--bls-key-file`.
+    let _daemon = spawn_signer_daemon(0, &dir, &bin, SIGNER_DAEMON_PORT);
+    wait_for_port(&format!("127.0.0.1:{SIGNER_DAEMON_PORT}"), Duration::from_secs(10));
+    let mut nodes = Vec::new();
+    for i in 0..NUM_NODES {
+        write_config(i, &addrs, &dir, SIGNER_P2P_BASE, SIGNER_RPC_BASE);
+        let signer = (i == 0).then_some(SIGNER_DAEMON_PORT);
+        nodes.push(spawn_validator(i, &dir, &bin, signer));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if nodes.iter().all(|n| n.height.load(Ordering::Relaxed) >= 5) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fleet with remote signer did not converge: {:?}",
+            heights(&nodes)
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    for n in &mut nodes {
+        terminate(n);
+    }
+}
+
+/// Boot-time fault tolerance: member 0 — the view-0 leader — is
+/// never started. The remaining three must still converge: the TC
+/// for view 0 justifies view 1's proposal, which is what breaks the
+/// boot livelock (regression: the pump once required a `high_qc`
+/// to propose, and with the first leader dead no QC could ever
+/// form — the fleet sat at height 0 forever).
+#[test]
+#[ignore = "process-level e2e — spawns real binaries; run explicitly"]
+fn validator_fleet_boots_without_first_leader() {
+    let bin = validator_binary();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oxide-valboot-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create workdir");
+    let _dir_guard = DirGuard(dir.clone());
+
+    provision(&bin, &dir);
+    let addrs = genesis_addrs(&dir);
+
+    // Nodes 1..=3 only — node 0's process never exists.
+    let mut nodes = Vec::new();
+    for i in 1..NUM_NODES {
+        write_config(i, &addrs, &dir, ABSENT_P2P_BASE, ABSENT_RPC_BASE);
+        nodes.push(spawn_validator(i, &dir, &bin, None));
+    }
+
+    // Convergence is slower than the healthy fleet: every fourth
+    // view belongs to the absent leader and costs a view timeout.
+    // Height 3 needs ~5 live views plus two dead-leader timeouts.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if nodes.iter().all(|n| n.height.load(Ordering::Relaxed) >= 3) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fleet without its view-0 leader did not converge: {:?}",
+            heights(&nodes)
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    for n in &mut nodes {
+        terminate(n);
+    }
 }
 
 /// SIGTERM on unix (the graceful path — snapshot export runs),

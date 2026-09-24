@@ -333,7 +333,7 @@ fn run_node(node_index_str: &str) {
         log_tag: format!("oxide-devnet[{node_index}]"),
         seat: usize::from(our_seat),
         validator_set,
-        secret_key: our_key,
+        signer: std::sync::Arc::new(our_key),
         node_config: cfg.node.clone(),
         wal_path,
         listen_addr,

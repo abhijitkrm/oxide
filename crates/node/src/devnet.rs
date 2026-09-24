@@ -51,8 +51,12 @@ pub struct DevnetNodeSpec {
     /// The committee: genesis-file validators in the binary, the
     /// harness's deterministic set otherwise.
     pub validator_set: consensus::ValidatorSet,
-    /// This node's BLS secret key — signs votes/QC contributions.
-    pub secret_key: crypto::BlsSecretKey,
+    /// This node's consensus signer — votes/QC contributions and
+    /// handshake proofs. A trait object, not the raw key: a
+    /// remote-signer deployment keeps the secret outside the node
+    /// process entirely. `Arc::new(secret_key)` is the in-process
+    /// path every current caller takes.
+    pub signer: Arc<dyn crypto::ConsensusSigner>,
     /// The resolved node config — executor graph, genesis, chain
     /// id, block budget, and pacemaker timeouts all propagate from
     /// here (never from engine-compiled defaults).
@@ -184,7 +188,7 @@ pub fn assemble_devnet_node(spec: DevnetNodeSpec) -> Result<DevnetNode, DevnetSt
         spec.validator_set,
         u16::try_from(spec.index).expect("validator index fits in u16"),
     )
-    .with_secret_key(spec.secret_key.clone())
+    .with_signer(Arc::clone(&spec.signer))
     // Configured timeouts/budget — not engine-compiled defaults —
     // so a `[consensus]` TOML change reaches the harnesses too.
     .with_pacemaker_timeouts(spec.config.base_timeout_ms, spec.config.max_timeout_ms)
@@ -223,7 +227,7 @@ pub fn assemble_devnet_node(spec: DevnetNodeSpec) -> Result<DevnetNode, DevnetSt
     // it must be exactly `spec.index` — landing elsewhere means the
     // key file belongs to a different validator, and signing under
     // `spec.index` would emit only invalid votes.
-    let our_index = engine.validator_set().index_of_key(&spec.secret_key.public_key());
+    let our_index = engine.validator_set().index_of_key(&spec.signer.public_key());
     let epoch = engine.epoch().value();
     match (recovered, our_index) {
         (_, None) => return Err(DevnetStartError::NotInCommittee { epoch }),

@@ -1117,7 +1117,7 @@ fn devnet_spec(index: usize, key_byte: u8) -> devnet::DevnetNodeSpec {
     devnet::DevnetNodeSpec {
         index,
         validator_set: vs,
-        secret_key: crate::cli::bls_key(key_byte),
+        signer: std::sync::Arc::new(crate::cli::bls_key(key_byte)),
         config: NodeConfig::default(),
         clock: None,
         wal_path: None,

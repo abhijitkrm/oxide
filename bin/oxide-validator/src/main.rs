@@ -73,6 +73,10 @@ fn main() {
                 run_keygen(&args[2..]);
                 return;
             }
+            "signer" => {
+                run_signer_daemon(&args[2..]);
+                return;
+            }
             "help" | "--help" | "-h" => {
                 print_help();
                 return;
@@ -258,27 +262,19 @@ fn run_validator_node() {
         );
         std::process::exit(1);
     });
-    // Same for the signing key: `--bls-key-file` is mandatory — this
-    // binary has no deterministic key derivation (that surface is
-    // feature-gated out of production builds entirely).
-    let key_path = node::cli::parse_cli_flag("--bls-key-file").unwrap_or_else(|| {
-        eprintln!(
-            "oxide-validator: --validator requires --bls-key-file <path> — \
-             an operator key file (hex, raw 32 bytes, or OXKEY keystore)"
-        );
-        std::process::exit(1);
-    });
-    let key_bytes = node::cli::load_secret_key_file(&key_path, node::cli::SecretKind::Bls)
-        .unwrap_or_else(|e| panic!("invalid BLS key file {key_path}: {e}"));
-    let our_key = crypto::BlsSecretKey::from_bytes(&key_bytes)
-        .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
+    // The signing key is a local key file XOR a remote signer —
+    // exactly one. A remote signer holds the secret in a fenced
+    // daemon (`oxide-validator signer`); the validator process then
+    // never touches it. There is no deterministic key derivation —
+    // that surface is feature-gated out of production builds.
+    let signer = resolve_signer();
 
     let validator_set = node::cli::validator_set_from_genesis(&genesis)
         .unwrap_or_else(|e| panic!("invalid genesis validator set: {e}"));
     // The committee seat is wherever OUR key is registered — never a
     // process index. A key outside the committee would boot and then
     // fail every peer handshake; refuse at startup instead.
-    let our_pk = our_key.public_key();
+    let our_pk = signer.public_key();
     let Some(our_seat) = validator_set.index_of_key(&our_pk) else {
         eprintln!(
             "oxide-validator: refusing to start — --bls-key-file is not in the \
@@ -330,7 +326,7 @@ fn run_validator_node() {
         log_tag: "oxide-validator".to_string(),
         seat: usize::from(our_seat),
         validator_set,
-        secret_key: our_key,
+        signer,
         node_config: cfg.node.clone(),
         wal_path,
         listen_addr: cfg.network.listen_addr.clone(),
@@ -380,6 +376,51 @@ fn resolve_peers(configured: &[String], our_addr: &primitives::Address) -> Vec<(
         }
     }
     peers
+}
+
+/// Resolve the validator's signing identity: a local
+/// `--bls-key-file` XOR a remote `--signer-addr`. Both absent or
+/// both present is a startup refusal — the secret must live in
+/// exactly one place, and this binary has no derivable fallback.
+fn resolve_signer() -> Arc<dyn crypto::ConsensusSigner> {
+    let key_path = node::cli::parse_cli_flag("--bls-key-file");
+    let signer_addr = node::cli::parse_cli_flag("--signer-addr");
+    match (key_path, signer_addr) {
+        (Some(key_path), None) => {
+            let key_bytes = node::cli::load_secret_key_file(&key_path, node::cli::SecretKind::Bls)
+                .unwrap_or_else(|e| panic!("invalid BLS key file {key_path}: {e}"));
+            let our_key = crypto::BlsSecretKey::from_bytes(&key_bytes)
+                .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
+            Arc::new(our_key)
+        }
+        (None, Some(addr)) => {
+            let remote = node::remote_signer::RemoteSigner::connect(
+                &addr,
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("oxide-validator: cannot reach signer at {addr}: {e}");
+                std::process::exit(1);
+            });
+            println!("oxide-validator: remote signer at {addr} (key loaded in daemon)");
+            Arc::new(remote)
+        }
+        (None, None) => {
+            eprintln!(
+                "oxide-validator: --validator requires --bls-key-file <path> or \
+                 --signer-addr <host:port> — an operator key file (hex, raw 32 \
+                 bytes, OXKEY keystore) or a fenced remote signer"
+            );
+            std::process::exit(1);
+        }
+        (Some(_), Some(_)) => {
+            eprintln!(
+                "oxide-validator: --bls-key-file and --signer-addr are exclusive — \
+                 the key lives in exactly one place"
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Resolve `--tls-dir` into a [`node::validator_net::TlsSpec`]:
@@ -724,6 +765,7 @@ fn print_help() {
     println!("    tls-gen      Generate TLS certificates for a multi-node testnet");
     println!("    keygen       Generate a fresh BLS (or --secp) secret key file");
     println!("                   --encrypt writes an OXKEY passphrase-keystore");
+    println!("    signer       Run the remote-signing daemon (fenced, holds the key)");
     println!("    version      Print version information");
     println!("    help         Print this help message");
     println!();
@@ -750,7 +792,9 @@ fn print_help() {
     println!("VALIDATOR MODE (production multi-validator):");
     println!("    --validator              Run oxideBFT over TCP/mTLS with peers from");
     println!("                             [network] peers (addr=host:port) + --peer flags");
-    println!("    --bls-key-file <path>    Required. BLS secret key (hex/raw/OXKEY)");
+    println!("    --bls-key-file <path>    BLS secret key (hex/raw/OXKEY)");
+    println!("    --signer-addr <host:port>  Use a remote signer daemon instead of");
+    println!("                             a key file (exactly one of the two required)");
     println!("    --tls-dir <dir>          mTLS: cert.pem, key.pem, peer-<addr-hex>.pem");
     println!("    --peer <addr>=<host:port>  Extra/override peer endpoint (repeatable)");
     println!();
@@ -1083,6 +1127,103 @@ fn run_tls_gen(args: &[String]) {
         base.display(),
         base.display()
     );
+}
+
+/// `oxide-validator signer` — run the remote-signing daemon.
+///
+/// Holds the consensus secret behind a TCP listener and a durable
+/// high-watermark fence (`--state-file`): `Vote`/`Timeout`/
+/// `Proposal`/`ExecAttest` requests sign only at monotonically
+/// advancing `(epoch, mark, phase)` coordinates, and a conflicting
+/// message at a repeated coordinate is refused — the
+/// anti-equivocation property a validator failover pair gets by
+/// pointing both processes at one daemon. The fence is persisted
+/// before each signature is released, so a restarted daemon cannot
+/// be made to equivocate either.
+///
+/// Flags:
+/// - `--listen <host:port>`: bind address (default `127.0.0.1:26261`).
+///   Bind loopback or a private interface — the link is trusted;
+///   the daemon does not authenticate clients beyond it.
+/// - `--bls-key-file <path>`: the consensus secret (hex, raw 32B,
+///   or OXKEY keystore). Required.
+/// - `--state-file <path>`: the durable fence file. Required —
+///   without it a restart would forget what was signed.
+fn run_signer_daemon(args: &[String]) {
+    let mut listen = "127.0.0.1:26261".to_string();
+    let mut key_path: Option<String> = None;
+    let mut state_path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--listen" => {
+                if let Some(v) = args.get(i + 1) {
+                    listen.clone_from(v);
+                }
+                i += 2;
+            }
+            "--bls-key-file" => {
+                if let Some(v) = args.get(i + 1) {
+                    key_path = Some(v.clone());
+                }
+                i += 2;
+            }
+            "--state-file" => {
+                if let Some(v) = args.get(i + 1) {
+                    state_path = Some(v.clone());
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let (Some(key_path), Some(state_path)) = (key_path, state_path) else {
+        eprintln!(
+            "oxide-validator signer: requires --bls-key-file <path> and \
+             --state-file <path> — the key and the durable fence are both \
+             mandatory (an in-memory fence forgets what it signed)"
+        );
+        std::process::exit(1);
+    };
+    let key_bytes = node::cli::load_secret_key_file(&key_path, node::cli::SecretKind::Bls)
+        .unwrap_or_else(|e| panic!("invalid BLS key file {key_path}: {e}"));
+    let key = crypto::BlsSecretKey::from_bytes(&key_bytes)
+        .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
+    let daemon = node::remote_signer::SignerDaemon::new(key, PathBuf::from(&state_path))
+        .unwrap_or_else(|e| panic!("cannot open signer state {state_path}: {e}"));
+    let listener = std::net::TcpListener::bind(&listen)
+        .unwrap_or_else(|e| panic!("cannot bind signer listener {listen}: {e}"));
+    println!(
+        "oxide-validator signer: serving {} on {listen} (fence: {state_path})",
+        node::cli::hex_encode(daemon.public_key().as_bytes())
+    );
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    let _ = primitives::supervision::spawn_supervised("signer-signal", false, move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("signal runtime");
+        rt.block_on(async {
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("sigterm handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+            }
+            shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    });
+    daemon.serve(listener, &shutdown);
+    println!("oxide-validator signer: shutdown");
 }
 
 /// `oxide-validator keygen` — generate a fresh secret key from the

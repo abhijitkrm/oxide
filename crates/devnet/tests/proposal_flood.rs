@@ -192,7 +192,7 @@ fn junk_proposal_flood_keeps_committing() {
     // passes the signed greeting — the test measures the
     // *consensus* intake path, not the handshake.
     let attacker_auth: Arc<dyn p2p::tcp::PeerAuth> = Arc::new(node::peer_auth::BlsPeerAuth::new(
-        node::cli::bls_key(7),
+        Arc::new(node::cli::bls_key(7)),
         Arc::new(std::sync::RwLock::new(set.clone())),
         Arc::new(std::sync::RwLock::new(None)),
     ));

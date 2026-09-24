@@ -91,6 +91,22 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 
 ### Fixed
 
+- **A fleet whose first leader never boots no longer livelocks**
+  (`consensus`, `node`): the networked pump required an existing
+  `high_qc` before a leader would propose — but with the view-0
+  leader absent from startup, no QC could ever form, so every
+  subsequent leader waited on it forever and the chain sat at
+  height 0. Leaders may now propose on a timeout certificate that
+  directly justifies the view (`OxideBft::view_justified`), matching
+  what voters already accepted. Verified end to end:
+  `validator_fleet_boots_without_first_leader` converges a fleet
+  that never starts member 0.
+  - **In plain words:** if the validator scheduled to produce the
+    very first block was offline, the whole network used to wait
+    for it forever. Now the others vote to skip its turn and the
+    next leader proposes with that skip-vote as its proof — the
+    network starts even with one founder missing.
+
 - **A backed-up execution lane no longer freezes consensus**
   (`executor`, `consensus`): the async lane's hand-off was a bounded
   channel — once it filled, `finalize_block` blocked the consensus
@@ -215,6 +231,25 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     external signer, and if it can't be reached the node stays
     silent instead of emitting broken signatures or losing queued
     transactions.
+- **`node::remote_signer` + `oxide-validator signer` — a concrete
+  fenced remote signer.** The `ConsensusSigner` seam now has a
+  shipped implementation: a length-framed TCP protocol carrying the
+  signable plus a fencing coordinate `(epoch, mark, phase)`, a
+  reconnecting client (`--signer-addr` on `--validator`), and a
+  daemon subcommand (`oxide-validator signer --listen <addr>
+  --bls-key-file <k> --state-file <fence>`). The daemon persists a
+  high-watermark fence per consensus domain before every signature
+  (atomic rename + directory fsync): identical retries re-sign,
+  conflicting or regressed coordinates are refused, and
+  non-consensus domains (peer handshakes) sign unfenced. Consensus
+  votes, timeouts, proposals, execution attestations, and the peer
+  handshake all route through it — the validator process never
+  holds the secret.
+  - **In plain words:** the validator key can live in a small
+    separate process (or behind one, a KMS/HSM adapter) that keeps
+    an on-disk "never double-sign" ledger. If the node restarts or
+    a second node points at the same signer, the ledger is what
+    stops it from signing two different blocks at the same slot.
 - **`oxide-validator --validator` — the production multi-validator
   mode.** The validator binary now runs a real networked committee:
   oxideBFT over the TCP/mTLS transport via the shared
@@ -222,10 +257,10 @@ lives in [`docs/devlog.md`](docs/devlog.md).
   exercises). `[network] listen_addr`/`peers` are live in this mode —
   every peer entry is `<40-hex-addr>=<host:port>`, binding each
   peer's committee identity to its endpoint before the handshake.
-  The node's committee seat resolves from `--bls-key-file`
-  membership in the `--genesis-file` validator set — never a
-  process index — and a key outside the committee refuses at
-  startup. `--tls-dir` takes `tls-gen --genesis-file`'s output:
+  The node's committee seat resolves from the signing identity —
+  `--bls-key-file` or `--signer-addr` — matching its public key
+  against the `--genesis-file` validator set, never a process
+  index; an identity outside the committee refuses at startup. `--tls-dir` takes `tls-gen --genesis-file`'s output:
   address-keyed `peer-<addr-hex>.pem` certs (a committee reshuffle
   can't rebind them to the wrong member). Startup refuses missing
   genesis, missing key, malformed peers, and chain-id mismatches;

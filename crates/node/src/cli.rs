@@ -374,7 +374,11 @@ pub fn load_config(mode: crate::NodeMode, bin: &str) -> LoadedConfig {
         deterministic_consensus_key: matches!(
             mode,
             crate::NodeMode::Devnet | crate::NodeMode::Validator
-        ) && parse_cli_flag("--bls-key-file").is_none(),
+        ) && parse_cli_flag("--bls-key-file").is_none()
+            // A remote signer is not a deterministic key — the
+            // secret lives in the fenced daemon, outside this
+            // process entirely.
+            && parse_cli_flag("--signer-addr").is_none(),
         transport_unencrypted: matches!(mode, crate::NodeMode::Devnet | crate::NodeMode::Validator)
             && parse_cli_flag("--tls-dir").is_none(),
         genesis_file_absent: genesis_file.is_none(),

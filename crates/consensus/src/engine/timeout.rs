@@ -166,7 +166,17 @@ impl OxideBft {
                 // Signer failure withholds the timeout signature —
                 // the view can still advance on peers' TCs, and a
                 // placeholder signature would just be noise.
-                signer.sign(crypto::hash::Domain::Timeout, &msg).ok()
+                signer
+                    .sign(
+                        crypto::hash::Domain::Timeout,
+                        &msg,
+                        crypto::SignContext {
+                            epoch: self.epoch.value(),
+                            mark: self.current_view.value(),
+                            phase: 0,
+                        },
+                    )
+                    .ok()
             }
             None => Some(Signature::ZERO),
         }

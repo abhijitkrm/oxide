@@ -183,7 +183,7 @@ impl MultiNodeDevnet {
             let node = node::devnet::assemble_devnet_node(node::devnet::DevnetNodeSpec {
                 index: i,
                 validator_set: vs.clone(),
-                secret_key: key,
+                signer: std::sync::Arc::new(key),
                 config: config.clone(),
                 clock: Some(std::sync::Arc::new(move || {
                     clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

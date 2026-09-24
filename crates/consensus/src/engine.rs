@@ -1108,6 +1108,30 @@ impl OxideBft {
         self.high_qc.as_ref().map(VerifiedQc::qc)
     }
 
+    /// Whether the current view carries the justification a proposal
+    /// needs: view 0 is self-justifying at boot; later views need
+    /// either a `high_qc` to extend or a timeout certificate that
+    /// directly carried us into this view (`tc.view + 1 == view`,
+    /// same epoch — the same filter `propose_inner` applies when
+    /// embedding it into the header).
+    ///
+    /// Drivers must gate `propose()` on this — and must *not* gate
+    /// on `high_qc` alone: when the first view times out before any
+    /// QC formed (e.g. the view-0 leader never booted), `high_qc`
+    /// stays `None` permanently and only the TC justifies the next
+    /// leader. Without the TC alternative the fleet livelocks at
+    /// height 0 — every leader waits for a QC that can never form.
+    #[must_use]
+    pub fn view_justified(&self) -> bool {
+        if self.current_view.value() == 0 || self.high_qc.is_some() {
+            return true;
+        }
+        self.last_tc.as_ref().is_some_and(|v| {
+            let tc = v.tc();
+            tc.epoch == self.epoch && tc.view.saturating_next() == self.current_view
+        })
+    }
+
     /// Current vote count collected for the current view (diagnostic).
     #[must_use]
     pub fn vote_count(&self) -> usize {
@@ -1706,21 +1730,8 @@ impl OxideBft {
         // that cannot produce the signature (remote endpoint down)
         // withholds the proposal entirely — an unsigned proposal
         // would fail authentication at every peer anyway.
-        if let Some(signer) = &self.signer {
-            let signing_hash = Self::proposal_signing_hash(&header);
-            let Ok(sig) = signer.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes())
-            else {
-                // `prepare_proposal` consumed these txs — a bare
-                // `None` return would drop them on the floor.
-                // Requeue through the app's own intake: best-effort
-                // (a mempool that filled meanwhile can refuse, and
-                // the client retries), but a downed signer must not
-                // eat the queue.
-                let txs = std::mem::take(&mut proposal.txs);
-                let _ = self.app.ingest_tx_batch(txs);
-                return None;
-            };
-            header.proposer_signature = Some(sig);
+        if self.signer.is_some() && !self.sign_proposal_header(&mut header, &mut proposal) {
+            return None;
         }
         let block_hash = Self::block_hash(&header);
         self.blocks.insert(block_hash, (header.clone(), BlockBody::Complete(proposal.clone())));
@@ -1730,6 +1741,34 @@ impl OxideBft {
         // watermark for catch-up sync and the WAL.
         self.next_height = self.next_height.max(height.saturating_next());
         Some((header, proposal))
+    }
+
+    /// Sign `header` under [`Domain::Proposal`] and stamp the
+    /// signature on it. On signer failure the proposal's txs are
+    /// requeued through `ingest_tx_batch` — `prepare_proposal`
+    /// consumed them, so a bare failure would leak the mempool's
+    /// contents — and `false` returns to abort the proposal.
+    ///
+    /// The fencing coordinate a remote signer persists is the
+    /// proposal's `(view, epoch)`: the signable is an opaque hash,
+    /// so the coordinate is what lets the daemon refuse a second
+    /// distinct proposal at the same view.
+    fn sign_proposal_header(&mut self, header: &mut BlockHeader, proposal: &mut Proposal) -> bool {
+        let Some(signer) = &self.signer else { return true };
+        let signing_hash = Self::proposal_signing_hash(header);
+        let ctx = crypto::SignContext {
+            epoch: header.epoch.value(),
+            mark: header.view.value(),
+            phase: 0,
+        };
+        let Ok(sig) = signer.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes(), ctx)
+        else {
+            let txs = std::mem::take(&mut proposal.txs);
+            let _ = self.app.ingest_tx_batch(txs);
+            return false;
+        };
+        header.proposer_signature = Some(sig);
+        true
     }
 
     /// Supply a reconstructed body for a header-verified block — the

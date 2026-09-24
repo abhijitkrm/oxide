@@ -24,8 +24,10 @@
 use std::sync::{Arc, RwLock};
 
 use consensus::ValidatorSet;
+#[cfg(test)]
+use crypto::BlsSecretKey;
+use crypto::Domain;
 use crypto::bls::Signature;
-use crypto::{BlsSecretKey, Domain};
 use p2p::tcp::{AUTH_NONCE_LEN, PeerAuth};
 use ports::transport::PeerId;
 use primitives::Address;
@@ -49,9 +51,12 @@ use primitives::Address;
 /// positional index cannot: removal reshuffles indices, key rotation
 /// replaces keys, and neither moves the address.
 pub struct BlsPeerAuth {
-    /// This node's consensus secret key — never printed (the manual
-    /// `Debug` impl shows only the committee size).
-    secret: BlsSecretKey,
+    /// This node's consensus signer — the trait object, not the raw
+    /// key, so a remote-signer deployment can answer handshake
+    /// proofs without the secret existing in this process. Never
+    /// printed (the manual `Debug` impl shows only the committee
+    /// size).
+    signer: Arc<dyn crypto::ConsensusSigner>,
     /// Live committee, index → BLS public key (+ staking addresses).
     validators: Arc<RwLock<ValidatorSet>>,
     /// Scheduled next-epoch committee during the activation window.
@@ -70,15 +75,15 @@ impl std::fmt::Debug for BlsPeerAuth {
 
 impl BlsPeerAuth {
     /// Create an authenticator over `validators` (shared, mutable at
-    /// epoch boundaries) signing with `secret`. `pending` carries the
+    /// epoch boundaries) signing with `signer`. `pending` carries the
     /// scheduled next-epoch set during the activation window.
     #[must_use]
     pub fn new(
-        secret: BlsSecretKey,
+        signer: Arc<dyn crypto::ConsensusSigner>,
         validators: Arc<RwLock<ValidatorSet>>,
         pending: Arc<RwLock<Option<ValidatorSet>>>,
     ) -> Self {
-        Self { secret, validators, pending }
+        Self { signer, validators, pending }
     }
 
     /// Decode a peer ID into a staking address — exactly 20 bytes.
@@ -119,7 +124,15 @@ impl PeerAuth for BlsPeerAuth {
     }
 
     fn sign(&self, transcript: &[u8]) -> Option<Vec<u8>> {
-        Some(self.secret.sign(Domain::PeerHandshake, transcript).as_bytes().to_vec())
+        // `UNFENCED`: handshake proofs sign a fresh random transcript
+        // — there is no progress coordinate to fence and no
+        // equivocation concept; a remote signer applies no
+        // high-watermark rule to this domain. A signer error (remote
+        // endpoint down) fails the handshake closed.
+        self.signer
+            .sign(Domain::PeerHandshake, transcript, crypto::SignContext::UNFENCED)
+            .ok()
+            .map(|s| s.as_bytes().to_vec())
     }
 
     fn verify(&self, peer: &PeerId, transcript: &[u8], signature: &[u8]) -> bool {
@@ -156,13 +169,15 @@ mod tests {
     fn handshake_proof_verifies_and_rejects_spoofers() {
         let (secrets, set) = committee();
         let pending = Arc::new(RwLock::new(None));
-        let auth = BlsPeerAuth::new(secrets[0].clone(), Arc::clone(&set), Arc::clone(&pending));
+        let auth =
+            BlsPeerAuth::new(Arc::new(secrets[0].clone()), Arc::clone(&set), Arc::clone(&pending));
         // A proof signed by validator 1's key verifies under its
         // address peer ID, and fails under every other claim.
         let transcript = b"test transcript";
-        let proof = BlsPeerAuth::new(secrets[1].clone(), Arc::clone(&set), Arc::clone(&pending))
-            .sign(transcript)
-            .expect("sign");
+        let proof =
+            BlsPeerAuth::new(Arc::new(secrets[1].clone()), Arc::clone(&set), Arc::clone(&pending))
+                .sign(transcript)
+                .expect("sign");
         let id1 = peer_id(&set, 1);
         assert!(auth.verify(&id1, transcript, &proof));
         assert!(!auth.verify(&peer_id(&set, 0), transcript, &proof), "wrong member");
@@ -207,12 +222,14 @@ mod tests {
         addrs.push(new_addr);
         let next = ValidatorSet::with_addresses(keys, stakes, addrs).expect("pending committee");
         let pending = Arc::new(RwLock::new(Some(next)));
-        let auth = BlsPeerAuth::new(secrets[0].clone(), Arc::clone(&set), Arc::clone(&pending));
+        let auth =
+            BlsPeerAuth::new(Arc::new(secrets[0].clone()), Arc::clone(&set), Arc::clone(&pending));
 
         let transcript = b"join handshake";
-        let proof = BlsPeerAuth::new(new_secret.clone(), Arc::clone(&set), Arc::clone(&pending))
-            .sign(transcript)
-            .expect("sign");
+        let proof =
+            BlsPeerAuth::new(Arc::new(new_secret.clone()), Arc::clone(&set), Arc::clone(&pending))
+                .sign(transcript)
+                .expect("sign");
         assert!(
             auth.verify(&new_addr.0.to_vec(), transcript, &proof),
             "pending member must authenticate during the window"
@@ -223,7 +240,7 @@ mod tests {
         // quorum until then).
         let evicted_addr = peer_id(&set, 0);
         let evicted_proof =
-            BlsPeerAuth::new(secrets[0].clone(), Arc::clone(&set), Arc::clone(&pending))
+            BlsPeerAuth::new(Arc::new(secrets[0].clone()), Arc::clone(&set), Arc::clone(&pending))
                 .sign(transcript)
                 .expect("sign");
         assert!(

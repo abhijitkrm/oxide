@@ -764,7 +764,17 @@ impl OxideBft {
                 // A failed signer (e.g. a downed remote endpoint)
                 // withholds the vote — the signature path is
                 // fail-closed, not fail-open.
-                signer.sign(crypto::hash::Domain::Vote, &msg).ok()?
+                signer
+                    .sign(
+                        crypto::hash::Domain::Vote,
+                        &msg,
+                        crypto::SignContext {
+                            epoch: self.epoch.value(),
+                            mark: view.value(),
+                            phase: phase_byte,
+                        },
+                    )
+                    .ok()?
             }
             None => Signature::ZERO,
         })
@@ -837,7 +847,15 @@ impl OxideBft {
                 // Signer failure withholds the attestation — the
                 // vote still goes out (attestations are advisory),
                 // just without a cert claim this round.
-                match signer.sign(crypto::hash::Domain::ExecAttest, &msg) {
+                match signer.sign(
+                    crypto::hash::Domain::ExecAttest,
+                    &msg,
+                    crypto::SignContext {
+                        epoch: self.epoch.value(),
+                        mark: att.height.value(),
+                        phase: 0,
+                    },
+                ) {
                     Ok(sig) => sig,
                     Err(_) => return (Some(att), None),
                 }

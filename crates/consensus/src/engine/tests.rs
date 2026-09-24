@@ -1450,6 +1450,7 @@ fn remote_signer_seam_signs_and_fails_closed() {
             &self,
             domain: crypto::Domain,
             msg: &[u8],
+            _ctx: crypto::SignContext,
         ) -> Result<crypto::Signature, crypto::SignerError> {
             if self.up.load(Ordering::Relaxed) {
                 Ok(self.key.sign(domain, msg))
@@ -4170,6 +4171,67 @@ fn faulty_leader_bypassed_via_timeout() {
 
     // The leader for view 1 is validator 1 (round-robin).
     assert!(v1.is_leader(), "v1 should be leader for view 1");
+}
+
+/// Regression test (liveness): when the view-0 leader is absent
+/// *from boot* the fleet must not livelock. Headers always carried
+/// `timeout_cert`, but the networked pump gated proposals on
+/// `high_qc.is_some()` — which no proposal can ever produce, so
+/// with the first leader dead every later leader stayed silent
+/// forever and the chain never committed block 0.
+/// `view_justified()` admits the TC path; this test proves a
+/// TC-justified proposal is also *votable*: it extends the genesis
+/// anchor and its embedded TC clears the evidence gate.
+#[test]
+fn tc_justified_proposal_breaks_boot_livelock() {
+    let mut v1 = make_multi_engine(1);
+    let mut v2 = make_multi_engine(2);
+    let mut v3 = make_multi_engine(3);
+    // Validator 0 (the view-0 leader) exists only as an address —
+    // it never boots, never proposes, never signs a timeout.
+
+    // View 0: the three live validators time out and form a TC —
+    // quorum does not need the absent leader's signature.
+    let sig1 = v1.on_timeout().expect("v1 timeout sig");
+    let sig2 = v2.on_timeout().expect("v2 timeout sig");
+    let sig3 = v3.on_timeout().expect("v3 timeout sig");
+    let tc = [(1u16, sig1), (2, sig2), (3, sig3)]
+        .iter()
+        .find_map(|&(voter, sig)| v1.collect_timeout_signature(voter, sig, None).ok().flatten())
+        .expect("3-of-4 forms a TC");
+    let _ = v2.on_timeout_certificate(&tc);
+    let _ = v3.on_timeout_certificate(&tc);
+
+    // View 1, still no QC anywhere — but the TC justifies it.
+    assert!(v1.is_leader(), "v1 leads view 1");
+    assert!(v1.high_qc().is_none(), "no QC could have formed yet");
+    assert!(v1.view_justified(), "TC(0) must justify proposing at view 1");
+
+    // The proposal extends the genesis anchor and embeds the TC as
+    // its succession proof.
+    let (header, proposal) = v1.propose_heartbeat().expect("TC-justified proposal");
+    assert_eq!(header.height, Height::new(0), "extends the committed anchor");
+    assert_eq!(header.prev_block, Hash::ZERO);
+    assert!(header.high_qc.is_none(), "no QC exists to embed");
+    assert_eq!(
+        header.timeout_cert.as_ref().map(|t| t.view),
+        Some(View::new(0)),
+        "the entry TC must be embedded for voters' evidence check"
+    );
+
+    // All three live validators vote — the proposal clears every
+    // gate (anchor rule, evidence floor, view match).
+    let leader_idx = v1.validator_index();
+    let self_vote = v1.vote(&header, &proposal).expect("leader self-votes");
+    v1.collect_vote(leader_idx, self_vote).expect("self vote");
+    for (idx, follower) in [(2u16, &mut v2), (3, &mut v3)] {
+        let vote = follower.vote(&header, &proposal).expect("followers vote");
+        v1.collect_vote(idx, vote).expect("collect follower vote");
+    }
+
+    // The QC forms and the block commits — the livelock is broken.
+    let qc = v1.try_form_qc().expect("quorum of three forms a QC");
+    assert_eq!(qc.view, View::new(1));
 }
 
 // ---- Deterministic multi-node simulation ----

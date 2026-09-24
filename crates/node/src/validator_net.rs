@@ -104,15 +104,17 @@ pub struct ValidatorNetSpec {
     /// `oxide-devnet[0]` or `oxide-validator`.
     pub log_tag: String,
     /// This node's committee seat: the index into `validator_set`
-    /// its `secret_key` resolves to. Decoupled from any process/
+    /// its `signer` resolves to. Decoupled from any process/
     /// port index — a post-rotation genesis legitimately seats a
     /// node differently than its address sort or launch order.
     pub seat: usize,
     /// The committee this node joins.
     pub validator_set: consensus::ValidatorSet,
-    /// This node's BLS secret key — signs votes/QC contributions
-    /// and the peer-handshake proof.
-    pub secret_key: crypto::BlsSecretKey,
+    /// This node's consensus signer — votes/QC contributions and
+    /// the peer-handshake proof. A trait object so a remote-signer
+    /// deployment (`--signer-addr`) keeps the secret outside the
+    /// validator process; `Arc::new(secret_key)` is the local path.
+    pub signer: Arc<dyn crypto::ConsensusSigner>,
     /// The resolved node config — executor graph, genesis, chain
     /// id, block budget, pacemaker timeouts.
     pub node_config: crate::NodeConfig,
@@ -180,7 +182,7 @@ pub fn run(spec: ValidatorNetSpec) {
         log_tag,
         seat,
         validator_set,
-        secret_key,
+        signer,
         node_config,
         wal_path,
         listen_addr,
@@ -224,7 +226,7 @@ pub fn run(spec: ValidatorNetSpec) {
     } = crate::devnet::assemble_devnet_node(crate::devnet::DevnetNodeSpec {
         index: seat,
         validator_set: validator_set.clone(),
-        secret_key: secret_key.clone(),
+        signer: Arc::clone(&signer),
         config: node_config.clone(),
         clock: None, // production wall clock
         wal_path,
@@ -274,7 +276,7 @@ pub fn run(spec: ValidatorNetSpec) {
         peers,
         tls,
         &network,
-        secret_key,
+        signer,
         shared_validator_set.clone(),
         shared_next_validator_set.clone(),
     );
@@ -393,7 +395,7 @@ fn build_transport(
     peers: Vec<(Vec<u8>, String)>,
     tls: Option<TlsSpec>,
     network: &config::NetworkConfig,
-    our_key: crypto::BlsSecretKey,
+    signer: Arc<dyn crypto::ConsensusSigner>,
     validators: Arc<std::sync::RwLock<consensus::ValidatorSet>>,
     pending: Arc<std::sync::RwLock<Option<consensus::ValidatorSet>>>,
 ) -> p2p::tcp::TcpTransport {
@@ -405,7 +407,7 @@ fn build_transport(
     // mean committee rotations take effect without a transport
     // restart.
     let auth: Arc<dyn p2p::tcp::PeerAuth> =
-        Arc::new(crate::peer_auth::BlsPeerAuth::new(our_key, validators, pending));
+        Arc::new(crate::peer_auth::BlsPeerAuth::new(signer, validators, pending));
     let transport_config =
         p2p::tcp::TcpTransportConfig { peer_auth: Some(auth), ..to_transport_config(network) };
     // Admission control is always on in the shipped node: connection
@@ -643,52 +645,52 @@ fn run_consensus_loop(
         // re-seated index, so a rotated epoch can't strand us on the
         // startup set's schedule (or our startup slot).
         let view = engine.current_view().value();
-        if engine.is_leader() && !proposed_views.contains(&view) {
-            if view > 0 && engine.high_qc().is_none() {
-                // Need the previous QC before proposing.
-            } else {
-                // Idle mode is an explicit heartbeat, not silence:
-                // `propose()` returns None when no work is pending, but
-                // a silent leader is indistinguishable from a dead one —
-                // followers' view timers would fire and views would
-                // churn through timeout certificates without committing
-                // anything. If this view has been idle past
-                // `IDLE_HEARTBEAT`, propose anyway: the QC advances the
-                // chain on the healthy path and commits the uncommitted
-                // tail. (Replaces the keep-alive transaction, which
-                // needed a funded test identity to fake real work.)
-                let produced = engine.propose().or_else(|| {
-                    if view_start.elapsed() >= IDLE_HEARTBEAT {
-                        engine.propose_heartbeat()
-                    } else {
-                        None
-                    }
-                });
-                if let Some((header, proposal)) = produced {
-                    let proposal_view = header.view.value();
-                    proposed_views.insert(proposal_view);
-                    pending_proposals.push((header.clone(), proposal.clone()));
-                    // C10: the leader self-votes through `engine.vote()` —
-                    // the single signing authority — which records the
-                    // vote locks and appends the WAL BEFORE signing. The
-                    // manual sign-then-collect this replaces emitted a
-                    // signature whose anti-equivocation state was never
-                    // durable: a restart could then double-vote.
-                    if let Some(leader_vote) = engine.vote(&header, &proposal) {
-                        let _ = engine.collect_vote(engine.validator_index(), leader_vote);
-                        voted_views.insert(proposal_view);
-                    }
-                    // Broadcast proposal to followers — every live
-                    // committee member except us, addressed by the
-                    // staking address that IS its peer id.
-                    let mut buf = Vec::with_capacity(1 + 512);
-                    buf.push(MSG_PROPOSAL);
-                    header.encode(&mut buf);
-                    proposal.encode(&mut buf);
-                    for addr in engine.validator_set().validator_addresses() {
-                        if *addr != our_addr {
-                            let _ = transport.send(&addr.0.to_vec(), &buf);
-                        }
+        // `view_justified` admits a TC-justified proposal, not just a
+        // high-QC one: without it a fleet whose view-0 leader is dead
+        // from boot livelocks — no QC can ever form, so `high_qc`
+        // stays `None` and every later leader would wait forever.
+        if engine.is_leader() && !proposed_views.contains(&view) && engine.view_justified() {
+            // Idle mode is an explicit heartbeat, not silence:
+            // `propose()` returns None when no work is pending, but
+            // a silent leader is indistinguishable from a dead one —
+            // followers' view timers would fire and views would
+            // churn through timeout certificates without committing
+            // anything. If this view has been idle past
+            // `IDLE_HEARTBEAT`, propose anyway: the QC advances the
+            // chain on the healthy path and commits the uncommitted
+            // tail. (Replaces the keep-alive transaction, which
+            // needed a funded test identity to fake real work.)
+            let produced = engine.propose().or_else(|| {
+                if view_start.elapsed() >= IDLE_HEARTBEAT {
+                    engine.propose_heartbeat()
+                } else {
+                    None
+                }
+            });
+            if let Some((header, proposal)) = produced {
+                let proposal_view = header.view.value();
+                proposed_views.insert(proposal_view);
+                pending_proposals.push((header.clone(), proposal.clone()));
+                // C10: the leader self-votes through `engine.vote()` —
+                // the single signing authority — which records the
+                // vote locks and appends the WAL BEFORE signing. The
+                // manual sign-then-collect this replaces emitted a
+                // signature whose anti-equivocation state was never
+                // durable: a restart could then double-vote.
+                if let Some(leader_vote) = engine.vote(&header, &proposal) {
+                    let _ = engine.collect_vote(engine.validator_index(), leader_vote);
+                    voted_views.insert(proposal_view);
+                }
+                // Broadcast proposal to followers — every live
+                // committee member except us, addressed by the
+                // staking address that IS its peer id.
+                let mut buf = Vec::with_capacity(1 + 512);
+                buf.push(MSG_PROPOSAL);
+                header.encode(&mut buf);
+                proposal.encode(&mut buf);
+                for addr in engine.validator_set().validator_addresses() {
+                    if *addr != our_addr {
+                        let _ = transport.send(&addr.0.to_vec(), &buf);
                     }
                 }
             }

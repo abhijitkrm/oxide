@@ -21208,3 +21208,62 @@ Also fixed: the orphaned help fragment ("(unauthenticated sender)…"
 stranded after the VALIDATOR MODE block), `tls-gen`'s stale
 index-byte peer-id model, and `validate_effective_config`'s
 `addr@host:port` doc drift (the shipped syntax is `=`).
+
+## Session — remote signer (`--signer-addr` + `signer` subcommand) and the boot-livelock fix
+
+Two findings from wiring the fenced remote signer end to end — one
+of them a real liveness bug the E2E surfaced.
+
+**Remote signer.** `ConsensusSigner::sign` now takes a `SignContext`
+— `(epoch, mark, phase)`, the fencing coordinate — because half the
+signables are opaque hashes (a proposal's signing hash carries no
+visible view). The daemon fences on the coordinate sent on the
+wire, never on bytes it cannot interpret. `node::remote_signer` is
+the concrete piece: a length-framed TCP protocol (`[tag][domain]
+[ctx][msg]` → `[status][payload]`), `RemoteSigner` client (reconnect
++ idempotent retry — the fence makes a re-signed request safe), and
+`SignerDaemon` holding the key plus a durable fence file
+(`OXSG\x01`, append-only records over `(domain → epoch, mark,
+phase, msg_hash)`, tmp-file + rename + dir-fsync so a crash can
+lose the newest record but never corrupt). Fence semantics: per
+domain, a request at a regressed coordinate is refused; at the
+same coordinate only the *identical* message re-signs — a conflict
+is refused. Unfenced domains (`PeerHandshake` — no progress
+coordinate) sign unconditionally. Both ends fail closed: a downed
+daemon withholds signatures (the validator goes silent rather than
+emitting a placeholder), a malformed frame drops the connection.
+
+`oxide-validator signer --listen <addr> --bls-key-file <k>
+--state-file <fence>` runs the daemon; `--validator` accepts
+`--signer-addr` as the identity source XOR `--bls-key-file` —
+`load_config`'s posture gate now counts a configured signer as
+satisfying the key requirement. `BlsPeerAuth` moved onto
+`Arc<dyn ConsensusSigner>` too, so the peer-handshake proof signs
+through the same seam — the secret genuinely never enters the
+validator process.
+
+**Boot livelock (the E2E's real catch).** A fleet whose view-0
+leader is absent *from boot* could never commit block 0: the pump
+gated proposals on `high_qc.is_some()`, and with no first proposal
+no QC can ever form — every later leader waited on a QC that could
+not exist. TCs formed and views advanced; nothing committed. The
+engine already embedded `timeout_cert` and voters already accepted
+anchor-extending proposals — only the gate was wrong. New
+`OxideBft::view_justified()` admits a view when it has a `high_qc`
+*or* a TC that directly carried us in (`tc.view + 1 == view`, same
+epoch); the pump gates on that. Regression coverage:
+`tc_justified_proposal_breaks_boot_livelock` (engine: TC(0) →
+view-1 proposal extends genesis anchor → 3-vote QC) and
+`validator_fleet_boots_without_first_leader` (spawn nodes 1–3 only,
+never member 0 → converge). The mid-flight kill in the earlier
+fleet test never saw this because `high_qc` already existed — only
+a never-started leader triggers it.
+
+Tests: `remote_signer` unit tests cover fence progress/identical-
+retry/conflict/regression/persistence plus a real TCP roundtrip;
+`validator_fleet_runs_through_remote_signer` drives the shipped
+binary — node 0 holds no key file, signs through the daemon, fleet
+converges. `RemoteSigner::connect` retries ~5s so daemon/validator
+boot order doesn't matter. Fleet tests now kill spawned processes
+on drop and run on disjoint port ranges — a failed run can no
+longer orphan ports into the next.

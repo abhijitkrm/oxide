@@ -181,6 +181,42 @@ impl std::fmt::Display for SignerError {
 
 impl std::error::Error for SignerError {}
 
+/// The consensus-progress coordinate a signature request carries.
+///
+/// The signed bytes alone are not enough to fence a remote signer:
+/// a proposal's signable payload is an opaque hash, so the daemon
+/// cannot recover `(view, epoch)` from `msg`. The coordinate travels
+/// beside it. A fencing implementation persists, per fenced domain,
+/// the last `(epoch, mark, phase)` it signed plus the message hash —
+/// a request at a *smaller* coordinate, or a *different* message at
+/// the same coordinate, is an equivocation attempt and is refused;
+/// re-signing identical bytes at the same coordinate is safe (BLS
+/// signing is deterministic — the same signature comes back) and is
+/// what makes a retried request after a dropped connection sound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignContext {
+    /// The epoch the signature is valid under. The outer coordinate:
+    /// a new epoch legitimately restarts `mark` at low values, so
+    /// ordering is `(epoch, mark, phase)` lexicographic.
+    pub epoch: u64,
+    /// The progress coordinate within the epoch — the *view* for
+    /// proposals, votes, and timeouts; the *block height* for
+    /// execution attestations. Must be non-decreasing per
+    /// `(domain, epoch)` on an honest engine.
+    pub mark: u64,
+    /// The sub-step inside `mark` — the vote phase byte. Distinct
+    /// phases at one `(epoch, mark)` are distinct signatures, not
+    /// equivocations; zero for phase-less domains.
+    pub phase: u8,
+}
+
+impl SignContext {
+    /// The coordinate for domains with no consensus progress
+    /// dimension — handshake proofs, `PoP`s, anything the fence
+    /// treats as sign-always.
+    pub const UNFENCED: Self = Self { epoch: 0, mark: 0, phase: 0 };
+}
+
 /// The signing surface the consensus engine needs from a key:
 /// its public identity plus a domain-separated signature.
 ///
@@ -196,27 +232,31 @@ impl std::error::Error for SignerError {}
 /// `timeout_signed_view`) protect *this* engine process. A remote
 /// signer shared across restarts — or across a failed-over pair —
 /// sees signing requests without that process state, so it **must**
-/// enforce its own high-watermark fence (refuse a second signature
-/// for `(view, epoch)` once a conflicting one was issued), or two
-/// honest-looking processes can equivocate through it. The trait is
-/// deliberately synchronous: the engine is a sync state machine,
-/// and a local-socket signer round-trip (~µs) sits well inside the
-/// view-timeout budget — an async boundary would push executor
-/// concerns into consensus for no benefit.
+/// enforce its own high-watermark fence on [`SignContext`]: refuse a
+/// coordinate regression and a conflicting message at a repeated
+/// coordinate, or two honest-looking processes can equivocate
+/// through it. The trait is deliberately synchronous: the engine is
+/// a sync state machine, and a local-socket signer round-trip (~µs)
+/// sits well inside the view-timeout budget — an async boundary
+/// would push executor concerns into consensus for no benefit.
 pub trait ConsensusSigner: Send + Sync {
     /// The public key whose signatures this signer produces — the
     /// identity the engine uses to re-seat itself in the committee
     /// after rotation or recovery.
     fn public_key(&self) -> PublicKey;
 
-    /// Sign `msg` under `domain`. Returns `Err` when the endpoint
-    /// cannot or will not sign — the caller withholds the signature
-    /// rather than emitting a placeholder.
+    /// Sign `msg` under `domain`. `ctx` is the fencing coordinate —
+    /// remote implementations persist and enforce it; in-process
+    /// keys may ignore it (the engine's own guards cover them).
+    /// Returns `Err` when the endpoint cannot or will not sign —
+    /// the caller withholds the signature rather than emitting a
+    /// placeholder.
     ///
     /// # Errors
     /// Returns [`SignerError::Unavailable`] when the backing
-    /// endpoint is unreachable or refuses the request.
-    fn sign(&self, domain: Domain, msg: &[u8]) -> Result<Signature, SignerError>;
+    /// endpoint is unreachable or refuses the request (including a
+    /// fence refusal).
+    fn sign(&self, domain: Domain, msg: &[u8], ctx: SignContext) -> Result<Signature, SignerError>;
 }
 
 impl ConsensusSigner for BlsSecretKey {
@@ -224,9 +264,16 @@ impl ConsensusSigner for BlsSecretKey {
         BlsSecretKey::public_key(self)
     }
 
-    fn sign(&self, domain: Domain, msg: &[u8]) -> Result<Signature, SignerError> {
+    fn sign(
+        &self,
+        domain: Domain,
+        msg: &[u8],
+        _ctx: SignContext,
+    ) -> Result<Signature, SignerError> {
         // In-process signing cannot fail — `blst::sign` over a
-        // valid `SecretKey` always produces a signature.
+        // valid `SecretKey` always produces a signature. The engine's
+        // own vote-lock/timeout-WAL guards already fence this
+        // process, so the coordinate is unused here.
         Ok(BlsSecretKey::sign(self, domain, msg))
     }
 }

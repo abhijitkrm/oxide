@@ -587,10 +587,11 @@ impl TcpMultiNodeDevnet {
             // transport stays harness-side (the threaded pump drives
             // it); the clock seam stays at the production default
             // (wall clock — TCP timing is deliberately real).
+            let signer: std::sync::Arc<dyn crypto::ConsensusSigner> = std::sync::Arc::new(key);
             let node = node::devnet::assemble_devnet_node(node::devnet::DevnetNodeSpec {
                 index: i,
                 validator_set: vs.clone(),
-                secret_key: key.clone(),
+                signer: std::sync::Arc::clone(&signer),
                 config: config.clone(),
                 clock: None,
                 wal_path: None,
@@ -618,7 +619,7 @@ impl TcpMultiNodeDevnet {
             // membership without a transport restart.
             let mut node_tcp_config = tcp_config.clone();
             node_tcp_config.peer_auth = Some(Arc::new(node::peer_auth::BlsPeerAuth::new(
-                key.clone(),
+                signer,
                 live_sets[i].clone(),
                 pending_sets[i].clone(),
             )));

@@ -58,6 +58,7 @@ use primitives::fixed::{Price, Qty};
 pub mod cli;
 pub mod devnet;
 pub mod peer_auth;
+pub mod remote_signer;
 pub mod rpc_adapters;
 pub mod validator_net;
 
