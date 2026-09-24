@@ -136,8 +136,8 @@ impl OxideBft {
                 // committee: leave the stale index — our
                 // signatures will fail verification against the
                 // new set anyway, which is fail-closed.
-                if let Some(ref key) = self.secret_key
-                    && let Some(idx) = self.validator_set.index_of_key(&key.public_key())
+                if let Some(ref signer) = self.signer
+                    && let Some(idx) = self.validator_set.index_of_key(&signer.public_key())
                 {
                     self.validator_index = idx;
                 }

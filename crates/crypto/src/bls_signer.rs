@@ -154,6 +154,83 @@ impl BlsSecretKey {
     }
 }
 
+/// Why a signature request failed.
+///
+/// Local keys never fail — signing is pure arithmetic. The variant
+/// exists for implementations backed by a remote endpoint (a
+/// privval-style signer daemon, KMS, or HSM), where the request can
+/// be refused or the transport can die mid-call. The engine treats
+/// `Err` as "no signature emitted" — a withheld vote/proposal is
+/// recoverable, a forged placeholder signature on the wire is not.
+#[derive(Debug)]
+pub enum SignerError {
+    /// The signing endpoint refused or could not be reached —
+    /// e.g. the signer daemon's socket dropped, or its double-sign
+    /// fence rejected the request. The payload is a human-readable
+    /// diagnostic; no wire format depends on it.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for SignerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(msg) => write!(f, "signer unavailable: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SignerError {}
+
+/// The signing surface the consensus engine needs from a key:
+/// its public identity plus a domain-separated signature.
+///
+/// [`BlsSecretKey`] implements this in-process. The trait object is
+/// the remote-signer seam (privval / KMS / HSM): a validator binary
+/// can hold `Arc<dyn ConsensusSigner>` backed by a signer daemon
+/// over a local socket, keeping the secret off the validator host
+/// entirely. The engine never learns where the key lives.
+///
+/// # What a remote implementation must guarantee
+///
+/// The engine's own double-sign guards (vote locks, the WAL's
+/// `timeout_signed_view`) protect *this* engine process. A remote
+/// signer shared across restarts — or across a failed-over pair —
+/// sees signing requests without that process state, so it **must**
+/// enforce its own high-watermark fence (refuse a second signature
+/// for `(view, epoch)` once a conflicting one was issued), or two
+/// honest-looking processes can equivocate through it. The trait is
+/// deliberately synchronous: the engine is a sync state machine,
+/// and a local-socket signer round-trip (~µs) sits well inside the
+/// view-timeout budget — an async boundary would push executor
+/// concerns into consensus for no benefit.
+pub trait ConsensusSigner: Send + Sync {
+    /// The public key whose signatures this signer produces — the
+    /// identity the engine uses to re-seat itself in the committee
+    /// after rotation or recovery.
+    fn public_key(&self) -> PublicKey;
+
+    /// Sign `msg` under `domain`. Returns `Err` when the endpoint
+    /// cannot or will not sign — the caller withholds the signature
+    /// rather than emitting a placeholder.
+    ///
+    /// # Errors
+    /// Returns [`SignerError::Unavailable`] when the backing
+    /// endpoint is unreachable or refuses the request.
+    fn sign(&self, domain: Domain, msg: &[u8]) -> Result<Signature, SignerError>;
+}
+
+impl ConsensusSigner for BlsSecretKey {
+    fn public_key(&self) -> PublicKey {
+        BlsSecretKey::public_key(self)
+    }
+
+    fn sign(&self, domain: Domain, msg: &[u8]) -> Result<Signature, SignerError> {
+        // In-process signing cannot fail — `blst::sign` over a
+        // valid `SecretKey` always produces a signature.
+        Ok(BlsSecretKey::sign(self, domain, msg))
+    }
+}
+
 /// Verify a single signature against a public key.
 ///
 /// # Errors

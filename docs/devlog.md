@@ -21009,3 +21009,46 @@ back on fast rounds, post-timeout views stay unsampled);
 `adaptive_timeout_caps_at_max`, and `backoff_doubles_from_adapted_base`
 pin the pacemaker arithmetic directly. No bench delta worth
 measuring — the hot path gained three integer ops per view.
+
+### The consensus key is a trait object now — the remote-signer seam
+
+`docs/audit002.md` C4 remainder, second half: the engine held a
+concrete `BlsSecretKey`, so a validator process had to carry its
+consensus secret in its own address space — no KMS, no signer
+daemon, no HSM.
+
+`crypto::ConsensusSigner` is the seam: `public_key()` (the identity
+the engine re-seats itself by after rotation/recovery) plus a
+*fallible* `sign(domain, msg)`. Fallibility is the honest part —
+a remote endpoint can refuse or drop, and `Signature::ZERO` on the
+error path would be a forged placeholder on the wire, worse than
+silence. `BlsSecretKey` implements the trait in-process
+(infallibly), `OxideBft::with_signer` takes
+`Arc<dyn ConsensusSigner>`, and `with_secret_key` stays as the
+local-key convenience.
+
+Every signing site now withholds on `Err` instead of emitting:
+the proposal is abandoned (unsigned proposals authenticate
+nowhere), votes/timeout signatures return `None`, and an
+attestation goes out unsigned — advisory, never required. No
+`wal_failed`-style latch: a signer outage is transient liveness,
+not durable-safety corruption.
+
+The refactor caught a real leak: `prepare_proposal` *consumes* the
+mempool, so an infallible-sign assumption meant a post-prepare
+early return could drop the selected txs forever. The failed-sign
+path now requeues them through `ingest_tx_batch` — best-effort,
+client-retriable, but the queue survives a signer flap.
+
+The trait doc carries the security contract a remote
+implementation must keep: the engine's own double-sign guards die
+with its process, so a signer shared across restarts or fail-over
+pairs must fence `(view, epoch)` itself — two honest-looking
+processes must not be able to equivocate through it. The sync
+shape is deliberate: a local-socket signer round-trip sits well
+inside the view-timeout budget.
+
+`remote_signer_seam_signs_and_fails_closed` pins all of it: a
+toggleable stub signer proves live signing produces verifiable
+QCs, a downed signer withholds proposals and votes, and recovery
+resumes without a restart.

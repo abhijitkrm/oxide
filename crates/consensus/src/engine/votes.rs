@@ -757,11 +757,14 @@ impl OxideBft {
         if self.wal_failed || self.divergence.is_some() {
             return None;
         }
-        Some(match &self.secret_key {
-            Some(sk) => {
+        Some(match &self.signer {
+            Some(signer) => {
                 let phase_byte = Self::current_phase_byte();
                 let msg = self.vote_signing_message(view, phase_byte, &block_hash);
-                sk.sign(crypto::hash::Domain::Vote, &msg)
+                // A failed signer (e.g. a downed remote endpoint)
+                // withholds the vote — the signature path is
+                // fail-closed, not fail-open.
+                signer.sign(crypto::hash::Domain::Vote, &msg).ok()?
             }
             None => Signature::ZERO,
         })
@@ -828,10 +831,16 @@ impl OxideBft {
         {
             return (Some(*cached_att), Some(*cached_sig));
         }
-        let sig = match &self.secret_key {
-            Some(sk) => {
+        let sig = match &self.signer {
+            Some(signer) => {
                 let msg = self.attestation_signing_message(att.height, &att.root);
-                sk.sign(crypto::hash::Domain::ExecAttest, &msg)
+                // Signer failure withholds the attestation — the
+                // vote still goes out (attestations are advisory),
+                // just without a cert claim this round.
+                match signer.sign(crypto::hash::Domain::ExecAttest, &msg) {
+                    Ok(sig) => sig,
+                    Err(_) => return (Some(att), None),
+                }
             }
             None => Signature::ZERO,
         };
@@ -1202,10 +1211,10 @@ impl OxideBft {
         let first_vote = self.votes.iter().find_map(Option::clone)?;
 
         // Stage 5: aggregate the collected signatures via blst.
-        // If no secret key is set (conformance mode), use ZERO.
+        // If no signer is set (conformance mode), use ZERO.
         // H6 fix: propagate aggregation errors instead of silently
         // replacing with ZERO (which would produce an invalid QC).
-        let aggregate_signature = if self.secret_key.is_some() {
+        let aggregate_signature = if self.signer.is_some() {
             self.aggregate_collected_votes()?
         } else {
             AggregateSignature::ZERO

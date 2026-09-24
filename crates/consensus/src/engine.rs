@@ -476,9 +476,15 @@ pub struct OxideBft {
     /// leader can't masquerade as a slow network and inflate the
     /// timeout floor it was excluded for.
     view_round_mark: Option<ViewMark>,
-    /// This engine's BLS secret key (stage 5). Used to sign votes and
-    /// timeout messages. `None` in conformance mode (no real signing).
-    secret_key: Option<crypto::BlsSecretKey>,
+    /// This engine's consensus signer (stage 5) — the key that signs
+    /// votes, proposals, timeouts, and attestations behind the
+    /// [`crypto::ConsensusSigner`] seam: in-process [`BlsSecretKey`]
+    /// today, a remote signer daemon (privval/KMS-style) tomorrow,
+    /// without the engine learning where the key lives. `None` in
+    /// conformance mode (placeholder `Signature::ZERO`).
+    ///
+    /// [`BlsSecretKey`]: crypto::BlsSecretKey
+    signer: Option<Arc<dyn crypto::ConsensusSigner>>,
     /// The pacemaker (stage 2). Drives view changes on timeout.
     pacemaker: crate::pacemaker::Pacemaker,
     /// The highest QC the engine has seen. Carried in the next
@@ -788,7 +794,7 @@ impl OxideBft {
             validator_index,
             recent_signers: std::collections::VecDeque::new(),
             view_round_mark: None,
-            secret_key: None,
+            signer: None,
             pacemaker,
             high_qc: None,
             last_voted_view: None,
@@ -844,7 +850,21 @@ impl OxideBft {
     /// `Signature::ZERO` is used (conformance mode).
     #[must_use]
     pub fn with_secret_key(mut self, sk: crypto::BlsSecretKey) -> Self {
-        self.secret_key = Some(sk);
+        self.signer = Some(Arc::new(sk));
+        self
+    }
+
+    /// Set an arbitrary consensus signer — the remote-signer seam.
+    ///
+    /// A [`crypto::ConsensusSigner`] implementation may proxy
+    /// signatures to a signer daemon, KMS, or HSM so the validator
+    /// process never holds the secret. Signing failures withhold the
+    /// signature (no vote/proposal is emitted) rather than latching
+    /// the engine — a transient signer outage is a liveness event,
+    /// not a durable-safety failure like `wal_failed`.
+    #[must_use]
+    pub fn with_signer(mut self, signer: Arc<dyn crypto::ConsensusSigner>) -> Self {
+        self.signer = Some(signer);
         self
     }
 
@@ -1491,7 +1511,7 @@ impl OxideBft {
         if self.wal_failed || self.divergence.is_some() {
             return None;
         }
-        let proposal = self.app.prepare_proposal(&self.block_budget);
+        let mut proposal = self.app.prepare_proposal(&self.block_budget);
         let has_pending_txs = !proposal.txs.is_empty();
         // Liveness gate: the leader stays silent only when no work
         // is locally visible. Two sources count as work:
@@ -1672,20 +1692,34 @@ impl OxideBft {
         // wire-level equivocation the WAL exists to prevent. A failed
         // append latches `wal_failed` inside `append_wal`; refuse to
         // sign rather than emit a signature over undurable state.
-        // Conformance mode (no secret key) signs nothing, so it pays
+        // Conformance mode (no signer) signs nothing, so it pays
         // no fsync here.
-        if self.secret_key.is_some() && self.append_wal().is_err() {
+        if self.signer.is_some() && self.append_wal().is_err() {
             return None;
         }
-        // C3 fix: sign the header with the leader's BLS secret key.
+        // C3 fix: sign the header with the leader's consensus key.
         // The signature authenticates that the claimed proposer
         // actually created this proposal — preventing a byzantine
         // node from fabricating a proposal in another validator's
-        // name. In conformance mode (no secret key), the signature
-        // stays `None` and `vote()` skips verification.
-        if let Some(sk) = &self.secret_key {
+        // name. In conformance mode (no signer), the signature
+        // stays `None` and `vote()` skips verification. A signer
+        // that cannot produce the signature (remote endpoint down)
+        // withholds the proposal entirely — an unsigned proposal
+        // would fail authentication at every peer anyway.
+        if let Some(signer) = &self.signer {
             let signing_hash = Self::proposal_signing_hash(&header);
-            let sig = sk.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes());
+            let Ok(sig) = signer.sign(crypto::hash::Domain::Proposal, signing_hash.as_bytes())
+            else {
+                // `prepare_proposal` consumed these txs — a bare
+                // `None` return would drop them on the floor.
+                // Requeue through the app's own intake: best-effort
+                // (a mempool that filled meanwhile can refuse, and
+                // the client retries), but a downed signer must not
+                // eat the queue.
+                let txs = std::mem::take(&mut proposal.txs);
+                let _ = self.app.ingest_tx_batch(txs);
+                return None;
+            };
             header.proposer_signature = Some(sig);
         }
         let block_hash = Self::block_hash(&header);
@@ -2116,7 +2150,7 @@ impl OxideBft {
         let mut signer_bitmap = vec![0u8; bitmap_len];
         let idx = usize::from(self.validator_index);
         signer_bitmap[idx / 8] |= 1u8 << (idx % 8);
-        let aggregate_signature = if self.secret_key.is_some() {
+        let aggregate_signature = if self.signer.is_some() {
             // Real BLS: aggregate the single self-vote.
             // H6 fix: propagate aggregation errors.
             match crypto::aggregate(&[vote.signature]) {

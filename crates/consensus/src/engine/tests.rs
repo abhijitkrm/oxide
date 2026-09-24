@@ -1428,6 +1428,64 @@ fn bls_signed_vote_verifies() {
     assert!(result.is_ok(), "QC aggregate signature must verify");
 }
 
+/// The `ConsensusSigner` seam: an engine built on a trait-object
+/// signer produces verifiable signatures, a failing signer
+/// withholds them (no proposal, no vote), and recovery needs no
+/// restart — a transient outage is a liveness event, not a latch.
+#[test]
+fn remote_signer_seam_signs_and_fails_closed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A stand-in for a remote-signer client: delegates to a real
+    /// key but can be toggled to report the endpoint down.
+    struct StubSigner {
+        key: crypto::BlsSecretKey,
+        up: AtomicBool,
+    }
+    impl crypto::ConsensusSigner for StubSigner {
+        fn public_key(&self) -> crypto::bls::PublicKey {
+            self.key.public_key()
+        }
+        fn sign(
+            &self,
+            domain: crypto::Domain,
+            msg: &[u8],
+        ) -> Result<crypto::Signature, crypto::SignerError> {
+            if self.up.load(Ordering::Relaxed) {
+                Ok(self.key.sign(domain, msg))
+            } else {
+                Err(crypto::SignerError::Unavailable("endpoint down".into()))
+            }
+        }
+    }
+
+    let key = bls_key(1);
+    let pk = key.public_key();
+    let signer = Arc::new(StubSigner { key, up: AtomicBool::new(true) });
+    let vs = ValidatorSet::new(vec![pk], vec![1]).expect("1 validator with real PK");
+    let mut engine = OxideBft::new(Arc::new(MockApp::new()), vs)
+        .with_signer(signer.clone() as Arc<dyn crypto::ConsensusSigner>);
+
+    // Signer up: the engine signs and a real QC forms.
+    engine.submit_tx(TxBytes::new(vec![7]));
+    let (header, _) = engine.propose().expect("propose with live signer");
+    assert!(header.proposer_signature.is_some(), "proposal must carry the signature");
+    engine.run_until_idle();
+    let qc = engine.high_qc.as_ref().map(VerifiedQc::qc).expect("high_qc");
+    assert_ne!(qc.aggregate_signature, AggregateSignature::ZERO);
+
+    // Signer down: proposal withheld entirely (an unsigned proposal
+    // would fail authentication everywhere), and no vote/attest
+    // signature leaks — fail-closed silence, not a latch.
+    signer.up.store(false, Ordering::Relaxed);
+    engine.submit_tx(TxBytes::new(vec![8]));
+    assert!(engine.propose().is_none(), "a downed signer must withhold the proposal");
+
+    // Signer back: signing resumes without a restart.
+    signer.up.store(true, Ordering::Relaxed);
+    assert!(engine.propose().is_some(), "a recovered signer must resume signing");
+}
+
 #[test]
 fn bls_multi_validator_qc_verifies() {
     // 4 validators with real BLS keys.

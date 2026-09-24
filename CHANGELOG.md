@@ -179,6 +179,23 @@ lives in [`docs/devlog.md`](docs/devlog.md).
 - **`oxide-validator genesis --validator-pubkeys <file>`** builds
   the committee from real operator public keys — one 0x-prefixed
   96-hex line per validator, each validated at genesis time.
+- **`crypto::ConsensusSigner` — the remote-signer seam.** The
+  consensus engine now signs through `Arc<dyn ConsensusSigner>`
+  instead of holding a `BlsSecretKey` directly, so a validator can
+  delegate signing to a KMS/HSM or a privval-style signer daemon
+  over a local socket — the secret never has to live in the node
+  process. `sign` is fallible: a failed endpoint withholds the
+  vote/proposal (fail-closed silence, no placeholder bytes on the
+  wire, no permanent latch), and `OxideBft::with_signer` installs
+  the trait object while `with_secret_key` stays the in-process
+  path. Implementations carry a documented contract: a remote
+  signer shared across restarts must fence `(view, epoch)` itself,
+  or two honest processes could equivocate through it.
+  - **In plain words:** validator consensus keys no longer have to
+    live inside the node — the signing path can be pointed at an
+    external signer, and if it can't be reached the node stays
+    silent instead of emitting broken signatures or losing queued
+    transactions.
 
 ### Changed
 

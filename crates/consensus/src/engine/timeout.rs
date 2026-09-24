@@ -156,14 +156,17 @@ impl OxideBft {
         if self.append_wal().is_err() {
             return None;
         }
-        match &self.secret_key {
-            Some(sk) => {
+        match &self.signer {
+            Some(signer) => {
                 let msg = crate::verify::timeout_signing_message(
                     self.current_view,
                     self.epoch,
                     self.high_qc.as_ref().map(VerifiedQc::qc),
                 );
-                Some(sk.sign(crypto::hash::Domain::Timeout, &msg))
+                // Signer failure withholds the timeout signature —
+                // the view can still advance on peers' TCs, and a
+                // placeholder signature would just be noise.
+                signer.sign(crypto::hash::Domain::Timeout, &msg).ok()
             }
             None => Some(Signature::ZERO),
         }

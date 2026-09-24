@@ -82,8 +82,8 @@ impl OxideBft {
         // `None` means we were removed: keep the stale index — our
         // signatures fail verification against the new set, which
         // is fail-closed silence, not authority.
-        if let Some(ref key) = self.secret_key
-            && let Some(idx) = self.validator_set.index_of_key(&key.public_key())
+        if let Some(ref signer) = self.signer
+            && let Some(idx) = self.validator_set.index_of_key(&signer.public_key())
         {
             self.validator_index = idx;
         }
@@ -206,8 +206,8 @@ impl OxideBft {
     /// epoch, not the stale one.
     pub(crate) fn adopt_certified_epoch(&mut self, epoch: Epoch) {
         self.epoch = epoch;
-        if let Some(ref key) = self.secret_key
-            && let Some(idx) = self.validator_set.index_of_key(&key.public_key())
+        if let Some(ref signer) = self.signer
+            && let Some(idx) = self.validator_set.index_of_key(&signer.public_key())
         {
             self.validator_index = idx;
         }
