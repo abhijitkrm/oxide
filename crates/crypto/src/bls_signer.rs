@@ -72,6 +72,10 @@ fn dst(domain: Domain) -> &'static [u8] {
         // Same — committed-map leaves are BLAKE3, never a BLS DST.
         Domain::CommittedLeaf => b"oxide/committed-leaf",
         Domain::PeerHandshake => b"oxide/peer-handshake",
+        // Never signed — `SignerLink` exists only for keyed-BLAKE3
+        // link MACs, and the remote-signer daemon refuses requests
+        // naming it. Present for exhaustiveness.
+        Domain::SignerLink => b"oxide/signer-link",
     }
 }
 

@@ -21728,3 +21728,59 @@ arc, not a snapshot). E2E:
 `governance_applies_chain_min_fee_end_to_end` — real sequencer
 blocks, propose→deposit→vote→timelock→apply, the shared atomic
 moves to 200 and a fee-100 tx then lands `Skipped{FeeFloor}`.
+
+## Session: authenticated remote-signer link
+
+The remote signer's TCP link was unauthenticated by design — the
+module docs called it a "physically trusted link" and left
+authentication as a deployment decision. That left two real
+attacks to anyone who could reach the port: fence-burning (a
+request at a coordinate ahead of the engine stalls the real
+validator behind a regression refusal — pure DoS) and, worse, an
+unconditional signing oracle on unfenced domains — a
+`PeerHandshake` signature is a validator-identity forgery on the
+peer transport. The fence protected fenced domains; nothing
+protected anything else.
+
+**The scheme** — a pre-shared 32-byte link key and keyed BLAKE3
+(new `Hasher::new_keyed` under `Domain::SignerLink`, a domain the
+daemon refuses to sign in, so link MACs can never alias signature
+preimages). Every connection opens with `AuthHello` carrying the
+client's nonce and `MAC(key, "client"‖nonce)`; the daemon answers
+`AuthOk` with its own nonce and `MAC(key, "daemon"‖cn‖dn)` —
+mutual proof before any request is served. Per-connection session
+keys `MAC(key, "c2s"‖cn‖dn)` / `MAC(key, "s2c"‖cn‖dn)` then MAC
+every request and response frame at a shared sequence number:
+replayed, tampered, or reflected frames all fail verification and
+drop the connection — there is no soft error for an inauthentic
+frame. The key is mandatory: `signer --link-key-file` and
+`--signer-link-key-file` on the validator (same file — any hex,
+raw-32B, or OXKEY `generic` keystore; `KeyKind::Generic` added so
+a `generic` blob fed to `--bls-key-file` still fails the kind
+check rather than silently keying consensus).
+
+**Thread-per-connection.** Serial `serve_conn` made the
+documented failover pair impossible: two validators each hold a
+persistent session, and the second's accept queued behind the
+first's whole connection lifetime. Each accepted socket now gets
+a thread — signing stays correct because check→persist→sign
+already runs under the fence mutex. Pre-auth connections get a
+10 s handshake timeout so a connect-and-idle peer can't pin a
+thread; authenticated sessions may idle by design.
+
+**Latent bug surfaced.** The nonblocking accept listener made
+accepted sockets nonblocking on BSD/macOS (`accept()` inherits
+`O_NONBLOCK` there; Linux clears it) — every `read_exact` on a
+fresh connection raced to `WouldBlock`. The original code had the
+same bug; it simply never ran on an inheriting platform.
+`serve_conn` now explicitly sets the stream back to blocking —
+correct on every platform.
+
+**Tests.** Wrong link key fails the handshake; pre-auth garbage
+gets an `Error` frame + close; a forged-MAC frame drops only the
+forged connection while the honest session survives; two
+concurrent clients sign through one daemon and the fence still
+refuses a conflicting pair across sessions;
+`validator_fleet_runs_through_remote_signer` re-verified end to
+end through the authenticated link (the test's daemon and
+validator now carry `--link-key-file`/`--signer-link-key-file`).

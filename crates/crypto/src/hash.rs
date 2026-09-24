@@ -67,6 +67,7 @@ use primitives::Hash;
 /// | `ExecutedNonceLeaf` | 17 | executed-nonce map leaf (executor state root) |
 /// | `CommittedLeaf` | 18 | committed-map set-commitment leaf |
 /// | `PeerHandshake` | 19 | transport handshake identity proof |
+/// | `SignerLink` | 20 | remote-signer link MACs + session keys |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Domain {
@@ -152,6 +153,14 @@ pub enum Domain {
     /// reinterpreted as a vote, attestation, or `PoP` over the same
     /// bytes — and vice versa.
     PeerHandshake = 19,
+    /// The remote-signer link's authentication material: handshake
+    /// proofs, per-frame MACs, and derived session keys all live in
+    /// keyed BLAKE3 under this domain (`Hasher::new_keyed`). It is
+    /// NOT a signing domain — the signer daemon refuses to sign in
+    /// it — so a link MAC can never be reinterpreted as a signature
+    /// preimage and vice versa. Appended after `PeerHandshake` —
+    /// never renumber.
+    SignerLink = 20,
 }
 
 /// A domain-separated BLAKE3 hasher. The domain tag is written first,
@@ -171,6 +180,23 @@ impl Hasher {
         // The domain tag is a single byte; write it before any payload
         // so the preimage always starts with the tag, regardless of
         // how many update calls follow.
+        inner.update(&[domain as u8]);
+        Self { inner }
+    }
+
+    /// Begin a keyed (MAC) hash in `domain`. BLAKE3's keyed mode is
+    /// a PRF — the output authenticates the preimage to anyone
+    /// holding `key` and derives sub-keys indistinguishable from
+    /// random to anyone who does not. The domain tag is still
+    /// written first, so keyed and unkeyed preimages share the
+    /// domain-separation contract.
+    ///
+    /// Used where a shared secret authenticates messages — the
+    /// remote-signer link's handshake proofs and per-frame MACs.
+    /// Signatures use [`BlsSecretKey`](crate::BlsSecretKey), not
+    /// this: keyed hashing proves key *possession*, not identity.
+    pub fn new_keyed(domain: Domain, key: &[u8; 32]) -> Self {
+        let mut inner = blake3::Hasher::new_keyed(key);
         inner.update(&[domain as u8]);
         Self { inner }
     }

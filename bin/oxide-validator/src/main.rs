@@ -417,9 +417,26 @@ fn resolve_signer() -> Arc<dyn crypto::ConsensusSigner> {
             Arc::new(our_key)
         }
         (None, Some(addr)) => {
+            // The link key is the client credential — without it
+            // the daemon refuses the handshake before any request
+            // reaches the fence. Same file the daemon was started
+            // with (`signer --link-key-file`).
+            let link_path =
+                node::cli::parse_cli_flag("--signer-link-key-file").unwrap_or_else(|| {
+                    eprintln!(
+                        "oxide-validator: --signer-addr requires \
+                         --signer-link-key-file <path> — the shared link \
+                         secret that authenticates the signer connection"
+                    );
+                    std::process::exit(1);
+                });
+            let link_key =
+                node::cli::load_secret_key_file(&link_path, node::cli::SecretKind::Generic)
+                    .unwrap_or_else(|e| panic!("invalid link key file {link_path}: {e}"));
             let remote = node::remote_signer::RemoteSigner::connect(
                 &addr,
                 std::time::Duration::from_secs(5),
+                link_key,
             )
             .unwrap_or_else(|e| {
                 eprintln!("oxide-validator: cannot reach signer at {addr}: {e}");
@@ -818,6 +835,9 @@ fn print_help() {
     println!("    --bls-key-file <path>    BLS secret key (hex/raw/OXKEY)");
     println!("    --signer-addr <host:port>  Use a remote signer daemon instead of");
     println!("                             a key file (exactly one of the two required)");
+    println!("    --signer-link-key-file <path>  Shared 32-byte link secret for");
+    println!("                             --signer-addr (same file as the daemon's");
+    println!("                             --link-key-file)");
     println!("    --tls-dir <dir>          mTLS: cert.pem, key.pem, peer-<addr-hex>.pem");
     println!("    --peer <addr>=<host:port>  Extra/override peer endpoint (repeatable)");
     println!();
@@ -1168,16 +1188,22 @@ fn run_tls_gen(args: &[String]) {
 ///
 /// Flags:
 /// - `--listen <host:port>`: bind address (default `127.0.0.1:26261`).
-///   Bind loopback or a private interface — the link is trusted;
-///   the daemon does not authenticate clients beyond it.
+///   Every client must prove the `--link-key-file` secret in the
+///   connect handshake — still bind loopback or a private interface
+///   so the port stays off hostile networks.
 /// - `--bls-key-file <path>`: the consensus secret (hex, raw 32B,
 ///   or OXKEY keystore). Required.
 /// - `--state-file <path>`: the durable fence file. Required —
 ///   without it a restart would forget what was signed.
+/// - `--link-key-file <path>`: the 32-byte shared link secret
+///   authenticating validator connections (hex, raw, or OXKEY
+///   `generic` keystore). Required — an unauthenticated signer
+///   link is a signing oracle for anyone who can reach the port.
 fn run_signer_daemon(args: &[String]) {
     let mut listen = "127.0.0.1:26261".to_string();
     let mut key_path: Option<String> = None;
     let mut state_path: Option<String> = None;
+    let mut link_path: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1199,14 +1225,23 @@ fn run_signer_daemon(args: &[String]) {
                 }
                 i += 2;
             }
+            "--link-key-file" => {
+                if let Some(v) = args.get(i + 1) {
+                    link_path = Some(v.clone());
+                }
+                i += 2;
+            }
             _ => i += 1,
         }
     }
-    let (Some(key_path), Some(state_path)) = (key_path, state_path) else {
+    let (Some(key_path), Some(state_path), Some(link_path)) = (key_path, state_path, link_path)
+    else {
         eprintln!(
-            "oxide-validator signer: requires --bls-key-file <path> and \
-             --state-file <path> — the key and the durable fence are both \
-             mandatory (an in-memory fence forgets what it signed)"
+            "oxide-validator signer: requires --bls-key-file <path>, \
+             --state-file <path>, and --link-key-file <path> — the key, \
+             the durable fence, and the link credential are all mandatory \
+             (an in-memory fence forgets what it signed; an unauthenticated \
+             link is a signing oracle)"
         );
         std::process::exit(1);
     };
@@ -1214,8 +1249,11 @@ fn run_signer_daemon(args: &[String]) {
         .unwrap_or_else(|e| panic!("invalid BLS key file {key_path}: {e}"));
     let key = crypto::BlsSecretKey::from_bytes(&key_bytes)
         .unwrap_or_else(|e| panic!("invalid BLS secret key in {key_path}: {e:?}"));
-    let daemon = node::remote_signer::SignerDaemon::new(key, PathBuf::from(&state_path))
+    let link_key = node::cli::load_secret_key_file(&link_path, node::cli::SecretKind::Generic)
+        .unwrap_or_else(|e| panic!("invalid link key file {link_path}: {e}"));
+    let daemon = node::remote_signer::SignerDaemon::new(key, PathBuf::from(&state_path), link_key)
         .unwrap_or_else(|e| panic!("cannot open signer state {state_path}: {e}"));
+    let daemon = std::sync::Arc::new(daemon);
     let listener = std::net::TcpListener::bind(&listen)
         .unwrap_or_else(|e| panic!("cannot bind signer listener {listen}: {e}"));
     println!(

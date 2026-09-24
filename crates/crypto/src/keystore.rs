@@ -80,6 +80,12 @@ pub enum KeyKind {
     Bls = 1,
     /// secp256k1 secret (settlement operator, signer, account keys).
     Secp256k1 = 2,
+    /// A raw 32-byte symmetric secret with no public-key derivation —
+    /// shared-link keys (remote signer), API tokens, anything whose
+    /// security is possession alone rather than a keypair. Distinct
+    /// kind so a `generic` blob fed to `--bls-key-file` still fails
+    /// the kind check instead of silently seeding a consensus key.
+    Generic = 3,
 }
 
 impl KeyKind {
@@ -87,6 +93,7 @@ impl KeyKind {
         match b {
             1 => Some(Self::Bls),
             2 => Some(Self::Secp256k1),
+            3 => Some(Self::Generic),
             _ => None,
         }
     }

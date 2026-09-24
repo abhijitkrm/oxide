@@ -454,6 +454,27 @@ lives in [`docs/devlog.md`](docs/devlog.md).
     an on-disk "never double-sign" ledger. If the node restarts or
     a second node points at the same signer, the ledger is what
     stops it from signing two different blocks at the same slot.
+- **Authenticated signer link.** The daemon↔validator connection is
+  now mutually authenticated by a shared 32-byte link key
+  (`signer --link-key-file`, `--signer-link-key-file` on the
+  validator — any hex/raw/OXKEY `generic` file). The handshake
+  proves the key both ways, then every request and response frame
+  carries a keyed-BLAKE3 MAC at a sequence number, so nobody else
+  on the network can request signatures (previously anyone who
+  could reach the port could sign on unfenced domains or stall the
+  validator by advancing its anti-equivocation fence) or tamper
+  with answers. The flag is mandatory — the daemon refuses
+  unauthenticated connections outright. The daemon also serves
+  each connection on its own thread now, so the documented
+  failover pair (two validators, one shared signer) can hold
+  simultaneous sessions instead of the second waiting for the
+  first to disconnect.
+  - **In plain words:** the signer daemon used to trust anyone who
+    could reach its port — including people who could trick it into
+    signing things or jam the validator's safety ledger. Now both
+    sides prove a shared secret on every connection and every
+    message is tamper-checked; keep the port on a private network
+    anyway, but a hostile neighbor can no longer use it.
 - **`oxide-validator --validator` — the production multi-validator
   mode.** The validator binary now runs a real networked committee:
   oxideBFT over the TCP/mTLS transport via the shared

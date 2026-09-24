@@ -137,7 +137,10 @@ fn spawn_validator(i: usize, dir: &Path, bin: &Path, signer_port: Option<u16>) -
         .arg(dir.join(format!("data-{i}")));
     match signer_port {
         Some(port) => {
-            cmd.arg("--signer-addr").arg(format!("127.0.0.1:{port}"));
+            cmd.arg("--signer-addr")
+                .arg(format!("127.0.0.1:{port}"))
+                .arg("--signer-link-key-file")
+                .arg(dir.join("signer-link.key"));
         }
         None => {
             cmd.arg("--bls-key-file").arg(dir.join(format!("val{i}.key")));
@@ -412,6 +415,11 @@ impl Drop for DaemonGuard {
 /// Spawn the `signer` daemon for committee member `i` — the remote
 /// signing endpoint a `--signer-addr` validator delegates to.
 fn spawn_signer_daemon(i: usize, dir: &Path, bin: &Path, port: u16) -> DaemonGuard {
+    // The link secret both ends prove — written here rather than
+    // provisioned: it is not consensus material, just the shared
+    // credential for this test's signer link.
+    let link_path = dir.join("signer-link.key");
+    std::fs::write(&link_path, format!("{:064x}\n", 0x5eed)).expect("write link key");
     let child = Command::new(bin)
         .arg("signer")
         .arg("--listen")
@@ -420,6 +428,8 @@ fn spawn_signer_daemon(i: usize, dir: &Path, bin: &Path, port: u16) -> DaemonGua
         .arg(dir.join(format!("val{i}.key")))
         .arg("--state-file")
         .arg(dir.join(format!("signer-{i}.state")))
+        .arg("--link-key-file")
+        .arg(&link_path)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

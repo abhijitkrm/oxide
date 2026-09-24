@@ -638,6 +638,9 @@ pub enum SecretKind {
     Bls,
     /// secp256k1 secret (`--settlement-key-file`, `--signer-key-file`).
     Secp256k1,
+    /// A raw 32-byte symmetric secret (`--signer-link-key-file`) —
+    /// possession alone is the credential; there is no public half.
+    Generic,
 }
 
 /// Decode a secret from raw file bytes — the shared sniff used by
@@ -650,6 +653,7 @@ fn parse_secret_key_bytes(raw: &[u8], want_kind: SecretKind) -> Result<[u8; 32],
         let expected = match want_kind {
             SecretKind::Bls => crypto::keystore::KeyKind::Bls,
             SecretKind::Secp256k1 => crypto::keystore::KeyKind::Secp256k1,
+            SecretKind::Generic => crypto::keystore::KeyKind::Generic,
         };
         if kind != expected {
             return Err(format!("keystore holds a {kind:?} key but {expected:?} was expected"));
